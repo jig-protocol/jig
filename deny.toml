@@ -1,0 +1,38 @@
+# cargo-deny configuration for jig-protocol workspace
+# Enforces license compliance and dependency policies
+
+[licenses]
+# Allow unlicensed workspace crates during development
+unlicensed = "warn"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",  # cranelift/wasmtime
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",  # Boost Software License
+    "ISC",  # ISC License (OpenBSD)
+    "0BSD",  # Zero-Clause BSD
+    "Zlib",  # Zlib License
+    "Unicode-3.0",  # Unicode License
+    "Unicode-DFS-2016",  # Unicode Data Files
+    "CDDL-1.0",  # CDDL (SQLite/RocksDB optional backend)
+    "CDLA-Permissive-2.0",  # Community Data License
+    "AGPL-3.0",  # Allowed for internal jig-protocol workspace crates only
+]
+# External dependencies should avoid AGPL/GPL (monitor via manual review)
+deny = ["GPL-2.0", "GPL-3.0"]
+
+# Allow internal gigue private crates and workspace crates
+[licenses.private]
+ignore = true
+registries = ["gigue-internal"]
+
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

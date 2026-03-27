@@ -1,0 +1,250 @@
+/* Riverdance global styles - Force light mode for prototype parity */
+html, body {
+  height: 100%;
+  background-color: #fafafa !important;
+  color: #171717 !important;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  margin: 0;
+  padding: 0;
+  color-scheme: light !important;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Riverdance component styles */
+.riverdance-layout {
+  display: flex;
+  height: 100vh;
+  background-color: #fafafa;
+}
+
+.riverdance-left-nav {
+  width: 48px;
+  background-color: #262626;
+  border-right: 1px solid #404040;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 0;
+  gap: 8px;
+}
+
+.riverdance-sidebar {
+  width: 280px;
+  background-color: #f5f5f5;
+  border-right: 1px solid #e5e5e5;
+  display: flex;
+  flex-direction: column;
+}
+
+.riverdance-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background-color: #ffffff;
+}
+
+.riverdance-header {
+  height: 60px;
+  background-color: #ffffff;
+  border-bottom: 1px solid #e5e5e5;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 20px;
+}
+
+.riverdance-content {
+  flex: 1;
+  padding: 20px;
+  overflow-y: auto;
+}
+
+/* Navigation icons */
+.nav-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  background-color: #404040;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #a3a3a3;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.nav-icon:hover {
+  background-color: #525252;
+  color: #ffffff;
+  transform: scale(1.1);
+}
+
+.nav-icon.active {
+  background-color: #3b82f6;
+  color: #ffffff;
+}
+
+/* Profile and org switchers */
+.profile-switcher, .org-switcher {
+  padding: 12px 16px;
+  border-bottom: 1px solid #e5e5e5;
+  background-color: #f5f5f5;
+}
+
+.dropdown-button {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background-color: #ffffff;
+  border: 1px solid #d4d4d4;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.dropdown-button:hover {
+  border-color: #a3a3a3;
+}
+
+/* Sidebar sections */
+.sidebar-section {
+  padding: 16px;
+}
+
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #525252;
+}
+
+.channel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.channel-item {
+  display: flex;
+  align-items: center;
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  color: #525252;
+  transition: all 0.2s ease;
+}
+
+.channel-item:hover {
+  background-color: #e5e5e5;
+  cursor: pointer;
+  transform: translateX(2px);
+}
+
+.channel-item.active {
+  background-color: #3b82f6;
+  color: #ffffff;
+}
+
+.channel-icon {
+  width: 16px;
+  height: 16px;
+  margin-right: 8px;
+  opacity: 0.7;
+}
+
+.channel-name {
+  flex: 1;
+}
+
+.channel-badge {
+  background-color: #dc2626;
+  color: #ffffff;
+  border-radius: 10px;
+  padding: 2px 6px;
+  font-size: 11px;
+  min-width: 16px;
+  text-align: center;
+}
+
+/* Button micro-interactions */
+button {
+  transition: all 0.2s ease;
+}
+
+button:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+/* Dropdown buttons */
+.dropdown-button:hover {
+  background-color: #f5f5f5;
+  cursor: pointer;
+}
+
+/* Message input enhancements */
+textarea:focus {
+  outline: none;
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}
+
+/* Search input enhancements */
+input:focus {
+  outline: none;
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}
+
+/* Message reactions hover effects */
+button[title*="React"]:hover {
+  background-color: #e5e7eb !important;
+  transform: scale(1.1);
+}
+
+/* Section headers hover effect */
+.section-header:hover {
+  background-color: #f9fafb;
+}
+
+/* Subtle animations for badges */
+.channel-badge {
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.8;
+  }
+}
+
+/* Message block interactions */
+.message-block {
+  transition: all 0.2s ease;
+  padding: 8px;
+  border-radius: 6px;
+  margin: -8px;
+}
+
+.message-block:hover {
+  background-color: #f9fafb;
+  transform: translateX(4px);
+}
+
+/* Header polish */
+.riverdance-header {
+  background: linear-gradient(135deg, #ffffff 0%, #fafafa 100%);
+  border-bottom: 1px solid #e5e5e5;
+}

@@ -1,0 +1,79 @@
+[workspace]
+members = [
+    "jig-core",
+    "jig-server", 
+    "jig-cli",
+    "jig-nameserver",
+    "jig-email-bridge",
+    "jig-runtime",
+    # Archived (WASM-only runtime): jig-wasmtime, jig-podman, jig-docker, jig-runtime-select
+    "hello-wasm",
+    "jig-config",
+    "integration-tests",
+    "jig-gui/riverdance/ui",
+    "jig-gui/riverdance/web",
+    "jig-gui/riverdance/desktop",
+    "jig-gui/riverdance/mobile",
+    "jig-gui/riverdance/api",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+authors = ["Jig Protocol Contributors"]
+license = "AGPL-3.0"
+repository = "https://github.com/jig-protocol/jig"
+homepage = "https://jig.onl"
+
+[workspace.dependencies]
+# Core dependencies
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+jig-core = { path = "jig-core", features = ["ed25519"] }
+jig-config = { path = "jig-config" }
+jig-runtime = { path = "jig-runtime" }
+# Riverdance GUI
+dioxus = "0.6.0"
+ui = { path = "jig-gui/riverdance/ui" }
+api = { path = "jig-gui/riverdance/api" }
+tokio = { version = "1.0", features = ["full"] }
+async-trait = "0.1"
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Crypto
+ed25519-dalek = "2.0"
+x25519-dalek = "2.0"
+blake3 = "1.5"
+rand = "0.8"
+hex = "0.4"
+
+# Storage
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# CLI
+clap = { version = "4.0", features = ["derive", "env"] }
+
+# Networking
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+hyper = "1.0"
+http-body-util = "0.1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v7", "serde"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true

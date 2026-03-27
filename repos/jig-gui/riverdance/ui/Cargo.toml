@@ -1,0 +1,9 @@
+[package]
+name = "ui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dioxus = { workspace = true, features = ["router"] }
+api = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }

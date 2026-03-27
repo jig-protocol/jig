@@ -1,0 +1,9 @@
+[package]
+name = "hello-wasm"
+version = "0.0.1"
+edition = "2024"
+description = "Minimal WASI hello-world for bakeoff measurements"
+license = "MIT"
+
+[dependencies]
+
