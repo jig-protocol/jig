@@ -35,6 +35,13 @@ pub mod bridges;
 pub mod templates;
 pub mod validation;
 
+// v0.0.2 hello-world server config (jig-server boot path)
+pub mod v0_0_2_server;
+pub use v0_0_2_server::{
+    DebugSection, FederationPeer, FederationSection, IdentityMode, IdentitySection,
+    JigServerConfig, ServerSection,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum EngineKind {
