@@ -71,7 +71,7 @@ impl EmailMessage {
         let mut builder = BlockManifest::builder()
             .version(Version::new(0, 1, 0))
             .author(Author {
-                did: author_did.to_string(),
+                did: author_did.into(),
                 public_key: None,
                 roles: vec!["email-bridge".to_string()],
             });

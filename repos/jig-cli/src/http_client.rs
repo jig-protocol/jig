@@ -30,7 +30,7 @@ impl JigHttpClient {
         let manifest = BlockManifest::builder()
             .version(Version::new(0, 1, 0))
             .author(Author {
-                did: author_did.to_string(),
+                did: author_did.into(),
                 public_key: None,
                 roles: vec![],
             })
