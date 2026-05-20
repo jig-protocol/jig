@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Carries the originating server DID so that ties can be broken deterministically
 /// across federation peers even when wall time and logical counters match.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct HlcTimestamp {
     /// Wall-clock time in milliseconds since the Unix epoch.
     pub wall_ms: u64,
@@ -28,6 +28,13 @@ pub struct HlcTimestamp {
 
 impl HlcTimestamp {
     /// Create a new timestamp anchored to the current wall clock.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the system clock is set before the Unix epoch — that is a
+    /// hardware/admin misconfiguration, not a recoverable condition, and emitting
+    /// bogus HLC values would corrupt protocol state.  Operators must ensure NTP /
+    /// a sane clock source before running jig-server.
     pub fn now_wall(server_did: Did) -> Self {
         let wall_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -44,7 +51,7 @@ impl HlcTimestamp {
     pub fn tick(&self) -> Self {
         Self {
             wall_ms: self.wall_ms,
-            logical: self.logical + 1,
+            logical: self.logical.saturating_add(1),
             server_did: self.server_did.clone(),
         }
     }
@@ -58,11 +65,11 @@ impl HlcTimestamp {
         let max_wall = local.wall_ms.max(received.wall_ms).max(wall_now_ms);
         let logical = if max_wall == local.wall_ms && max_wall == received.wall_ms {
             // Both clocks are at the same max wall time — keep the higher logical + 1.
-            local.logical.max(received.logical) + 1
+            local.logical.max(received.logical).saturating_add(1)
         } else if max_wall == local.wall_ms {
-            local.logical + 1
+            local.logical.saturating_add(1)
         } else if max_wall == received.wall_ms {
-            received.logical + 1
+            received.logical.saturating_add(1)
         } else {
             // wall_now_ms is strictly ahead of both; reset logical counter.
             0
