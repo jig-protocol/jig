@@ -16,7 +16,8 @@ members = [
     "jig-gui/riverdance/mobile",
     "jig-gui/riverdance/api",
     "text-block",
-    # jig-pipeline and jig-client declared here once Phase B/C tasks scaffold their directories
+    "jig-pipeline",
+    # jig-client declared here once Phase C tasks scaffold its directory
 ]
 resolver = "2"
 
