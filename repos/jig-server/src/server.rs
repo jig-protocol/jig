@@ -91,7 +91,16 @@ impl JigServer {
             v0_0_2: self.v0_0_2.clone(),
         };
 
-        let router: Router = handler::build_router(app_state);
+        let main_router: Router = handler::build_router(app_state);
+
+        // Merge the v0.0.2 WSS router when the pipeline state is present.
+        // The v0.0.2 routes have their own AppState (Arc<v0_0_2::AppState>)
+        // and do not conflict with any existing v0.0.1 routes.
+        let router = if let Some(v002_state) = &self.v0_0_2 {
+            main_router.merge(crate::v0_0_2_ws::build_v0_0_2_router(v002_state.clone()))
+        } else {
+            main_router
+        };
 
         let addr: SocketAddr = format!("{}:{}", self.config.bind_address, self.config.port)
             .parse()
