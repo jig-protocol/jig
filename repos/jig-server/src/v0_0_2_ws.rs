@@ -55,10 +55,19 @@ pub async fn ws_handler(
 
 /// Build a router that mounts the WSS endpoint on the v0.0.2 `AppState`.
 /// Mount this alongside (not instead of) the v0.0.1 `build_router`.
+///
+/// When `state.config.debug.admin_endpoints` is true, the admin-only
+/// `/_admin_v0_0_2/*` routes are merged in. Otherwise those paths return 404.
 pub fn build_v0_0_2_router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let ws_router = Router::new()
         .route("/api/v1/ws", get(ws_handler))
-        .with_state(state)
+        .with_state(state.clone());
+
+    if state.config.debug.admin_endpoints {
+        ws_router.merge(crate::v0_0_2_admin::build_admin_router(state))
+    } else {
+        ws_router
+    }
 }
 
 // ---- Per-connection handler ------------------------------------------------

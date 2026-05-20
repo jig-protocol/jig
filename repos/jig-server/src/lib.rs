@@ -9,6 +9,7 @@ pub mod runtime;
 pub mod server;
 pub mod storage;
 pub mod v0_0_2;
+pub mod v0_0_2_admin;
 pub mod v0_0_2_ws;
 
 pub use config::ServerConfig;

@@ -94,6 +94,7 @@ tempfile = "3.8"
 semver = "1.0"
 blake3 = "1.5"
 futures-util = "0.3"
+tower = { version = "0.5", features = ["util"] }
 
 [features]
 default = ["sqlite"]
