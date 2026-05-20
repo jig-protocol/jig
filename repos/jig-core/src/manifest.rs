@@ -238,9 +238,10 @@ impl BlockManifest {
         self
     }
 
-    /// Set the CRDT block kind.  Reserved for v0.0.3+; pass `None` in v0.0.2.
-    pub fn with_crdt_kind(mut self, kind: Option<String>) -> Self {
-        self.crdt_kind = kind;
+    /// Set the CRDT block kind.  Reserved for v0.0.3+.
+    /// Wraps the value in `Some` internally; to clear, assign `crdt_kind` directly.
+    pub fn with_crdt_kind(mut self, kind: impl Into<String>) -> Self {
+        self.crdt_kind = Some(kind.into());
         self
     }
 }
@@ -401,11 +402,11 @@ mod tests {
         let hlc = HlcTimestamp::now_wall(crate::Did::from_test_string("origin"));
         let m = minimal_manifest()
             .with_hlc(hlc.clone())
-            .with_attested_by(vec![])
-            .with_crdt_kind(None);
+            .with_attested_by(vec![]);
 
         assert_eq!(m.hlc_ts, Some(hlc));
         assert!(m.attested_by.is_empty());
+        // crdt_kind defaults to None when not set
         assert!(m.crdt_kind.is_none());
     }
 
@@ -440,5 +441,90 @@ mod tests {
         let hlc = HlcTimestamp::now_wall(crate::Did::from_test_string("o"));
         let m2 = m.with_hlc(hlc);
         assert_eq!(m2.version, original_version);
+    }
+
+    #[test]
+    fn manifest_with_crdt_kind_round_trips_value() {
+        let m = BlockManifest::builder()
+            .version(semver::Version::new(0, 1, 0))
+            .author(Author {
+                did: "did:jig:alice".into(),
+                public_key: None,
+                roles: vec![],
+            })
+            .build()
+            .unwrap()
+            .with_crdt_kind("lww-register");
+        assert_eq!(m.crdt_kind.as_deref(), Some("lww-register"));
+
+        // Round-trips through canonical JSON
+        let bytes = m.to_canonical_bytes().unwrap();
+        let parsed: BlockManifest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.crdt_kind.as_deref(), Some("lww-register"));
+    }
+
+    #[test]
+    fn manifest_canonical_bytes_are_stable_under_serde_roundtrip() {
+        // CID stability anchor: any manifest built by v0.0.2 callers must
+        // produce canonical bytes that survive a serde round-trip unchanged.
+        // Phase B's ingest pipeline blake3-hashes canonical bytes to derive the
+        // block CID; if this property breaks, every block CID computed by the
+        // recipient differs from the sender's CID, breaking federation.
+        let hlc = HlcTimestamp {
+            wall_ms: 1234,
+            logical: 5,
+            server_did: crate::Did::from_test_string("o"),
+        };
+        let m = BlockManifest::builder()
+            .version(semver::Version::new(0, 1, 0))
+            .author(Author {
+                did: "did:jig:alice".into(),
+                public_key: None,
+                roles: vec!["author".into()],
+            })
+            .metadata_entry("example", serde_json::json!({"foo": "bar"}))
+            .build()
+            .unwrap()
+            .with_hlc(hlc)
+            .with_attested_by(vec![])
+            .with_crdt_kind("lww-register");
+
+        let bytes_first = m.to_canonical_bytes().unwrap();
+        let parsed: BlockManifest = serde_json::from_slice(&bytes_first).unwrap();
+        let bytes_second = parsed.to_canonical_bytes().unwrap();
+        assert_eq!(
+            bytes_first, bytes_second,
+            "manifest canonical bytes drifted across serde roundtrip — \
+             this breaks CID stability between sender and recipient"
+        );
+
+        // Also verify all three new fields survive the roundtrip with values intact.
+        assert_eq!(parsed.hlc_ts.as_ref().map(|h| h.wall_ms), Some(1234));
+        assert_eq!(parsed.attested_by.len(), 0);
+        assert_eq!(parsed.crdt_kind.as_deref(), Some("lww-register"));
+    }
+
+    #[test]
+    fn legacy_fixture_round_trip_does_not_panic() {
+        // Sanity check: deserializing the legacy manifest fixture (no hlc_ts,
+        // no attested_by, no crdt_kind keys) succeeds and produces defaults.
+        // Note: this test does NOT assert byte-stability across that round-trip,
+        // because legacy fixtures lack the v0.0.2 keys and their re-serialized
+        // form will (intentionally) differ. That divergence is acceptable;
+        // legacy CIDs are author-time-frozen.
+        let fixture = include_str!("../tests/fixtures/manifest_v0.1.json");
+        let parsed: BlockManifest = serde_json::from_str(fixture).unwrap();
+        assert!(
+            parsed.hlc_ts.is_none(),
+            "legacy fixture should default hlc_ts to None"
+        );
+        assert!(
+            parsed.attested_by.is_empty(),
+            "legacy fixture should default attested_by to []"
+        );
+        assert!(
+            parsed.crdt_kind.is_none(),
+            "legacy fixture should default crdt_kind to None"
+        );
     }
 }
