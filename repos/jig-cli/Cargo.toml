@@ -23,6 +23,11 @@ local-runtime = ["jig-runtime"]
 # Core protocol
 jig-core = { path = "../jig-core" }
 jig-runtime = { workspace = true, optional = true }
+# Shared client library (added v0.0.2 C5). Used by Phase F's new commands
+# (`jig init`, `jig send`, `jig tail`, `jig chat`). Existing jig-cli code
+# paths (e.g., src/http_client.rs) stay as legacy until Phase F replaces
+# them with jig-client-backed equivalents.
+jig-client = { path = "../jig-client" }
 
 # CLI
 clap = { version = "4.4", features = ["derive"] }
