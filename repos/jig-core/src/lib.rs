@@ -11,6 +11,7 @@ pub mod capability_scope;
 pub mod capability_validation;
 pub mod crypto;
 pub mod error;
+pub mod hlc;
 pub mod lint;
 pub mod manifest;
 #[cfg(test)]
@@ -31,6 +32,7 @@ pub use capability_validation::{
 };
 pub use crypto::{HashBuilder, blake3_hash, hash_labeled_parts};
 pub use error::{JigError, Result};
+pub use hlc::HlcTimestamp;
 pub use lint::{BlockLintResult, allowlist_from_manifest, lint_block};
 pub use manifest::{
     Attestation, Author, BlockManifest, BlockManifestBuilder, Capability, Constraints, Did,
