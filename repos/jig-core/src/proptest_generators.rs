@@ -293,6 +293,9 @@ impl Arbitrary for BlockManifest {
                         attestations,
                         privacy,
                         metadata: BTreeMap::new(),
+                        hlc_ts: None,
+                        attested_by: vec![],
+                        crdt_kind: None,
                     }
                 },
             )

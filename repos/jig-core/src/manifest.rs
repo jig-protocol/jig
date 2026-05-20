@@ -1,6 +1,7 @@
 use crate::capability_scope::CapabilityScopePattern;
 use crate::did::Did;
 use crate::error::{JigError, Result};
+use crate::hlc::HlcTimestamp;
 use crate::serde_helpers::{
     deserialize_cid, deserialize_cid_vec, deserialize_opt_cid, serialize_cid, serialize_cid_vec,
     serialize_opt_cid, to_canonical_json_bytes,
@@ -158,6 +159,27 @@ pub struct BlockManifest {
     pub privacy: Option<Privacy>,
     #[serde(default)]
     pub metadata: BTreeMap<String, Value>,
+
+    // --- v0.0.2 fields ---
+    /// HLC timestamp set by the ingest pipeline.  `None` in pre-ingest constructed
+    /// manifests and legacy fixtures (backward-compat via `#[serde(default)]`).
+    /// Populated to `Some` in Phase B ingest; used for causal ordering in v0.0.3+.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hlc_ts: Option<HlcTimestamp>,
+
+    /// CIDs of `time-attestation` blocks that vouch for this manifest's timestamp.
+    /// Empty in v0.0.2; populated in v0.0.3+ when time-authority emitters land.
+    #[serde(
+        default,
+        serialize_with = "serialize_cid_vec",
+        deserialize_with = "deserialize_cid_vec"
+    )]
+    pub attested_by: Vec<Cid>,
+
+    /// Reserved for v0.0.3+ CRDT block kinds (e.g. `"lww-register"`, `"add-wins-set"`).
+    /// `None` in v0.0.2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crdt_kind: Option<String>,
 }
 
 fn default_schema() -> String {
@@ -200,6 +222,25 @@ impl BlockManifest {
     /// Attach a computed block ID (CID) to the manifest.
     pub fn with_block_id(mut self, cid: Cid) -> Self {
         self.block_id = Some(cid);
+        self
+    }
+
+    /// Set the HLC timestamp (typically by the ingest pipeline after block creation).
+    pub fn with_hlc(mut self, ts: HlcTimestamp) -> Self {
+        self.hlc_ts = Some(ts);
+        self
+    }
+
+    /// Set the list of time-attestation block CIDs that vouch for this manifest.
+    /// Pass an empty `Vec` to assert "no attestations yet" (the default).
+    pub fn with_attested_by(mut self, cids: Vec<Cid>) -> Self {
+        self.attested_by = cids;
+        self
+    }
+
+    /// Set the CRDT block kind.  Reserved for v0.0.3+; pass `None` in v0.0.2.
+    pub fn with_crdt_kind(mut self, kind: Option<String>) -> Self {
+        self.crdt_kind = kind;
         self
     }
 }
@@ -325,8 +366,79 @@ impl BlockManifestBuilder {
             attestations: self.attestations,
             privacy: self.privacy,
             metadata: self.metadata,
+            hlc_ts: None,
+            attested_by: vec![],
+            crdt_kind: None,
         };
         manifest.validate()?;
         Ok(manifest)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hlc::HlcTimestamp;
+
+    fn test_author() -> Author {
+        Author {
+            did: "did:jig:alice".into(),
+            public_key: None,
+            roles: vec!["author".into()],
+        }
+    }
+
+    fn minimal_manifest() -> BlockManifest {
+        BlockManifest::builder()
+            .version(semver::Version::new(0, 1, 0))
+            .author(test_author())
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn manifest_carries_hlc_attested_by_and_crdt_kind() {
+        let hlc = HlcTimestamp::now_wall(crate::Did::from_test_string("origin"));
+        let m = minimal_manifest()
+            .with_hlc(hlc.clone())
+            .with_attested_by(vec![])
+            .with_crdt_kind(None);
+
+        assert_eq!(m.hlc_ts, Some(hlc));
+        assert!(m.attested_by.is_empty());
+        assert!(m.crdt_kind.is_none());
+    }
+
+    #[test]
+    fn manifest_canonical_json_roundtrip_includes_new_fields() {
+        let hlc = HlcTimestamp {
+            wall_ms: 1234,
+            logical: 5,
+            server_did: crate::Did::from_test_string("o"),
+        };
+        let m = minimal_manifest().with_hlc(hlc);
+        let bytes = m.to_canonical_bytes().unwrap();
+        let parsed: BlockManifest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed, m);
+    }
+
+    #[test]
+    fn manifest_canonical_json_handles_absent_optional_fields() {
+        let m = minimal_manifest();
+        let json = String::from_utf8(m.to_canonical_bytes().unwrap()).unwrap();
+        // attested_by always serialized (Vec defaults to []); hlc_ts/crdt_kind
+        // are absent when None due to skip_serializing_if = "Option::is_none"
+        assert!(json.contains("\"attested_by\":[]"), "json={json}");
+        assert!(!json.contains("\"hlc_ts\""), "json={json}");
+        assert!(!json.contains("\"crdt_kind\""), "json={json}");
+    }
+
+    #[test]
+    fn manifest_with_hlc_preserves_other_fields() {
+        let m = minimal_manifest();
+        let original_version = m.version.clone();
+        let hlc = HlcTimestamp::now_wall(crate::Did::from_test_string("o"));
+        let m2 = m.with_hlc(hlc);
+        assert_eq!(m2.version, original_version);
     }
 }
