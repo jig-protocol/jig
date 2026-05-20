@@ -1,0 +1,87 @@
+[package]
+name = "jig-nameserver"
+version = "0.0.1"
+edition = "2024"
+authors = ["Jig Protocol Contributors"]
+license = "AGPL-3.0"
+
+[dependencies]
+# Workspace-shared deps
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+clap = { workspace = true, features = ["derive", "env"] }
+chrono = { workspace = true, features = ["serde"] }
+uuid = { workspace = true, features = ["v7", "serde"] }
+rusqlite = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+blake3 = { workspace = true }
+axum = { workspace = true, features = ["macros"] }
+tower = { workspace = true, features = ["make", "util"] }
+tower-http = { workspace = true, features = ["cors", "trace"] }
+hyper = { workspace = true }
+hyper-util = { version = "0.1", features = ["server", "http1", "http2", "tokio"] }
+async-trait = { workspace = true }
+hex = { workspace = true }
+
+reqwest = { version = "0.12", features = ["json"] }
+trust-dns-resolver = { version = "0.23", default-features = false, features = ["dnssec-ring", "tokio-runtime"] }
+urlencoding = "2"
+toml = "0.8"
+
+# Profiling tools (only needed for perf binary, not core nameserver)
+hdrhistogram = { version = "7", optional = true }
+pprof = { version = "0.13", features = ["flamegraph"], optional = true }
+dirs = "5"
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+cid = { version = "0.10", features = ["serde"] }
+jig-config = { workspace = true }
+jig-core = { workspace = true }
+jig-runtime = { path = "../jig-runtime", features = ["wasi-preview2", "receipt-signing"] }
+
+# Tier 2 Storage: Postgres backend
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid"], optional = true, default-features = false }
+
+# Tier 2 Hot: Redis backend
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"], optional = true }
+
+# Tier 2 Analytics: DuckDB and Parquet backends
+duckdb = { version = "1.0", features = ["bundled"], optional = true }
+arrow = { version = "53", optional = true }
+parquet = { version = "53", optional = true }
+csv = { version = "1.3", optional = true }
+
+# Tier 3 Hot: ScyllaDB backend (using latest stable version)
+scylla = { version = "0.15", optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+http-body-util = { workspace = true }
+semver = { version = "1.0", features = ["serde"] }
+
+[features]
+default = []
+# Profiling tools for performance analysis (not needed for core nameserver)
+profiling = ["dep:hdrhistogram", "dep:pprof"]
+# Analytics tier features (Phase 3)
+tier2-analytics = ["dep:duckdb", "dep:arrow", "dep:parquet", "dep:csv"]  # DuckDB and Parquet export
+tier3-analytics = []  # Placeholder for ClickHouse streaming (future dependency: clickhouse)
+# Storage tier features (Phase 2: Truth backend abstraction)
+tier2-storage = ["dep:sqlx"]  # Postgres backend
+# Hot state tier features (Phase 3: Hot backend abstraction)
+tier2-hot = ["dep:redis"]  # Redis/Valkey/DragonflyDB backend
+tier3-hot = ["dep:scylla"]  # ScyllaDB backend
+
+[[bin]]
+name = "jig-nameserver-perf"
+path = "src/bin/perf.rs"
+required-features = ["profiling"]
+
+[package.metadata.nextest]
+# Allow cargo-nextest to run tests in parallel safely
+profile = { default = { test-threads = 4 } }

@@ -1,0 +1,15 @@
+{
+  "concurrency": 100,
+  "endpoint": "challenge",
+  "failed": 0,
+  "latency_ms": {
+    "mean": 3.810044666666668,
+    "p50": 3.445,
+    "p95": 6.807
+  },
+  "requests": 1500,
+  "rps": 23661.654244929166,
+  "success": 1500,
+  "total_secs": 0.063393708,
+  "url": "http://127.0.0.1:65437"
+}
