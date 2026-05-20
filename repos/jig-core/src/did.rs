@@ -14,6 +14,9 @@
 //! existing manifest and receipt fixtures remain valid:
 //! ```json
 //! { "did": "did:jig:zaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+//!
+//! The 52-char base32-nopad-lowercase body encodes a 32-byte Ed25519 public key
+//! (the all-zeros example above). Standard BASE32_NOPAD: `ceil(32 * 8 / 5) = 52` chars.
 //! ```
 
 use data_encoding::BASE32_NOPAD;
@@ -56,12 +59,21 @@ impl Did {
         Self(format!("did:jig:z{body}"))
     }
 
-    /// Return the raw 32-byte public key for a canonical `did:jig:z…` DID.
+    /// Returns the 32-byte ed25519 public key embedded in a canonical `did:jig:z<base32>` DID.
     ///
-    /// # Errors
+    /// Error semantics (callers handling identity must distinguish these):
+    /// - [`DidError::NotCanonical`] — this DID string does not begin with `did:jig:z`
+    ///   (e.g. a legacy DID like `did:jig:alice`). Such DIDs cannot be decoded to
+    ///   pubkey bytes and are treated as opaque labels.
+    /// - [`DidError::BadEncoding`] — the `did:jig:z` prefix is present but the body
+    ///   is not valid base32-nopad.
+    /// - [`DidError::WrongLength`] — the `did:jig:z` prefix is present and the body
+    ///   decodes, but the result is not exactly 32 bytes.
     ///
-    /// Returns [`DidError::NotCanonical`] if this DID was not created from
-    /// a public key (e.g. it is a legacy test DID like `did:jig:alice`).
+    /// Note: a z-prefixed-but-corrupted DID returns `BadEncoding` or `WrongLength`,
+    /// NOT `NotCanonical`. Callers that pattern-match on `NotCanonical` to "fall back
+    /// to opaque-label handling" will miss z-prefixed corrupted DIDs — those are
+    /// genuine errors and should be rejected, not treated as legacy labels.
     pub fn as_bytes(&self) -> Result<[u8; 32], DidError> {
         let body = self
             .0
@@ -275,5 +287,34 @@ mod tests {
         let a: Did = "did:jig:aaa".into();
         let b: Did = "did:jig:bbb".into();
         assert!(a < b);
+    }
+
+    #[test]
+    fn did_jig_is_stable_across_versions() {
+        // GOLDEN — protocol-level wire-format anchor.
+        // If this assertion changes, every receipt fixture in every test in
+        // the project must be regenerated. Treat any change here as a
+        // breaking protocol-version bump.
+        let did = Did::from_ed25519_pubkey(&[0u8; 32]);
+        assert_eq!(
+            did.to_did_jig_string(),
+            "did:jig:zaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
+
+    #[test]
+    fn did_as_bytes_z_prefix_short_body_is_not_not_canonical() {
+        // A z-prefixed DID with a body too short to decode to 32 bytes
+        // must NOT return NotCanonical (NotCanonical is reserved for
+        // non-z-prefixed legacy DIDs). It should return BadEncoding or
+        // WrongLength — a callers-must-reject error, not a legacy-label
+        // fallback signal.
+        let did: Did = "did:jig:zdj".into();
+        let err = did.as_bytes().unwrap_err();
+        assert!(
+            !matches!(err, DidError::NotCanonical),
+            "z-prefixed corrupted DID returned NotCanonical, which would let \
+             callers silently fall back to legacy-label handling. err: {err:?}"
+        );
     }
 }
