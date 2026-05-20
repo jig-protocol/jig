@@ -296,6 +296,7 @@ impl Arbitrary for BlockManifest {
                         hlc_ts: None,
                         attested_by: vec![],
                         crdt_kind: None,
+                        kind: None,
                     }
                 },
             )

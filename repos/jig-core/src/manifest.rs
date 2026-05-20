@@ -1,3 +1,4 @@
+use crate::block_kind::BlockKind;
 use crate::capability_scope::CapabilityScopePattern;
 use crate::did::Did;
 use crate::error::{JigError, Result};
@@ -180,6 +181,16 @@ pub struct BlockManifest {
     /// `None` in v0.0.2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crdt_kind: Option<String>,
+
+    /// Block kind discriminator per v0.0.2 spec §4.4.
+    ///
+    /// `None` for legacy / pre-v0.0.2 fixtures that lack the `kind` key.
+    /// `Some(...)` for any block authored under v0.0.2+ — the ingest
+    /// pipeline (Phase B) sets and validates this. Reaching a v0.0.2+
+    /// runtime path with `kind: None` is a programmer error; Phase B will
+    /// reject such blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<BlockKind>,
 }
 
 fn default_schema() -> String {
@@ -242,6 +253,13 @@ impl BlockManifest {
     /// Wraps the value in `Some` internally; to clear, assign `crdt_kind` directly.
     pub fn with_crdt_kind(mut self, kind: impl Into<String>) -> Self {
         self.crdt_kind = Some(kind.into());
+        self
+    }
+
+    /// Set the [`BlockKind`] discriminator. Phase B's ingest pipeline will
+    /// validate this against per-server `allowed_block_kinds`.
+    pub fn with_kind(mut self, kind: BlockKind) -> Self {
+        self.kind = Some(kind);
         self
     }
 }
@@ -370,6 +388,7 @@ impl BlockManifestBuilder {
             hlc_ts: None,
             attested_by: vec![],
             crdt_kind: None,
+            kind: None,
         };
         manifest.validate()?;
         Ok(manifest)
@@ -502,6 +521,37 @@ mod tests {
         assert_eq!(parsed.hlc_ts.as_ref().map(|h| h.wall_ms), Some(1234));
         assert_eq!(parsed.attested_by.len(), 0);
         assert_eq!(parsed.crdt_kind.as_deref(), Some("lww-register"));
+    }
+
+    #[test]
+    fn manifest_with_kind_round_trips() {
+        let m = BlockManifest::builder()
+            .version(semver::Version::new(0, 1, 0))
+            .author(Author {
+                did: "did:jig:alice".into(),
+                public_key: None,
+                roles: vec![],
+            })
+            .build()
+            .unwrap()
+            .with_kind(crate::block_kind::BlockKind::TextRender);
+        assert_eq!(m.kind, Some(crate::block_kind::BlockKind::TextRender));
+
+        let bytes = m.to_canonical_bytes().unwrap();
+        let parsed: BlockManifest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.kind, Some(crate::block_kind::BlockKind::TextRender));
+        let json = String::from_utf8(bytes).unwrap();
+        assert!(json.contains("\"kind\":\"text-render\""), "json={json}");
+    }
+
+    #[test]
+    fn manifest_kind_absent_in_legacy_fixture() {
+        let fixture = include_str!("../tests/fixtures/manifest_v0.1.json");
+        let parsed: BlockManifest = serde_json::from_str(fixture).unwrap();
+        assert!(
+            parsed.kind.is_none(),
+            "legacy fixture should default kind to None (no kind key in fixture JSON)"
+        );
     }
 
     #[test]

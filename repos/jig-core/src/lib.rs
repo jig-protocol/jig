@@ -4,6 +4,7 @@
 //! interfaces shared across the protocol. It intentionally avoids network, storage, or registry
 //! dependencies so other crates can embed these primitives directly.
 
+pub mod block_kind;
 pub mod bundle;
 pub mod capability_dsl;
 pub mod capability_registry;
@@ -22,6 +23,7 @@ mod serde_helpers;
 pub mod signing;
 pub mod wasm_validation;
 
+pub use block_kind::{BlockKind, BlockKindError};
 pub use bundle::{Artifact, BlockBundle};
 pub use capability_dsl::{build_capability, parse_scopes};
 pub use capability_registry::{CapabilityDefinition, CapabilityRegistry};
