@@ -17,5 +17,7 @@ pub mod identity;
 pub mod ingest;
 pub mod persist;
 
+pub use effect::apply_effect;
 pub use envelope::{Envelope, Frame, HlcCursor, ReceiptRef, Scope};
+pub use fanout::{Fanout, SubscriptionScope};
 pub use ingest::{IngestContext, IngestError, IngestSource, ingest};
