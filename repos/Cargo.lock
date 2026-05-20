@@ -5299,6 +5299,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "jig-client"
+version = "0.0.2"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "blake3",
+ "chrono",
+ "dirs 5.0.1",
+ "ed25519-dalek 2.2.0",
+ "futures-util",
+ "hex",
+ "jig-config",
+ "jig-core",
+ "jig-pipeline",
+ "rand 0.8.5",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite 0.21.0",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "jig-config"
 version = "0.0.1"
 dependencies = [
