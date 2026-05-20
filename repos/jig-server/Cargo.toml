@@ -17,7 +17,12 @@ path = "src/main.rs"
 # Core protocol
 jig-core = { path = "../jig-core" }
 jig-runtime = { workspace = true }
-jig-config = { path = "../jig-config" }
+jig-config = { workspace = true }
+
+# v0.0.2 hello-world milestone — pipeline + client + new config sections
+jig-pipeline = { path = "../jig-pipeline" }
+jig-client   = { path = "../jig-client" }
+shellexpand  = "3"
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
@@ -59,8 +64,8 @@ time = { version = "0.3", features = ["formatting"] }
 uuid = { version = "1.6", features = ["v7", "serde"] }
 
 # Federation
-ed25519-dalek = "1.0"
-rand = "0.7"
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
 base64 = "0.21"
 trust-dns-resolver = { version = "0.23", features = ["tokio-runtime"] }
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }

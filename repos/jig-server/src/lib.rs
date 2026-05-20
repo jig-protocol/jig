@@ -8,6 +8,7 @@ pub mod handler;
 pub mod runtime;
 pub mod server;
 pub mod storage;
+pub mod v0_0_2;
 
 pub use config::ServerConfig;
 pub use error::{Result, ServerError};
