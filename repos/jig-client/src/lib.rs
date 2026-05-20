@@ -10,5 +10,6 @@ pub mod blocks;
 pub mod connection;
 pub mod identity;
 
+pub use connection::envelope;
+pub use connection::{BlockStream, Client, ClientError, DeliveredBlock};
 pub use identity::{Identity, IdentityError};
-// Connection types are exported from `connection` module in Task C4.
