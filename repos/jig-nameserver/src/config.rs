@@ -2036,8 +2036,13 @@ mod tests {
 
     #[test]
     fn default_config_is_sane() {
-        // Set required env var for test environment
-        std::env::set_var("JIG_NS_SECRET", "test-secret-for-unit-tests");
+        // Set required env var for test environment. Edition 2024 makes
+        // set_var unsafe; this test is single-threaded and runs once, so
+        // the requirements (no concurrent env access from other threads)
+        // are satisfied trivially.
+        unsafe {
+            std::env::set_var("JIG_NS_SECRET", "test-secret-for-unit-tests");
+        }
         let cfg = NameServerConfig::from_env();
         assert!(!cfg.pow.server_secret.is_empty());
         assert!(cfg.pow.base_difficulty >= cfg.pow.min_difficulty);
@@ -2050,7 +2055,9 @@ mod tests {
 
     #[test]
     fn compute_pow_respects_bounds() {
-        std::env::set_var("JIG_NS_SECRET", "test-secret-for-unit-tests");
+        unsafe {
+            std::env::set_var("JIG_NS_SECRET", "test-secret-for-unit-tests");
+        }
         let mut cfg = NameServerConfig::from_env();
         cfg.pow.base_difficulty = 18;
         cfg.pow.min_difficulty = 8;
