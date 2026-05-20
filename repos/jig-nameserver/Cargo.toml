@@ -44,6 +44,12 @@ jig-config = { workspace = true }
 jig-core = { workspace = true }
 jig-runtime = { path = "../jig-runtime", features = ["wasi-preview2", "receipt-signing"] }
 
+# v0.0.2 hello-world milestone
+jig-pipeline = { path = "../jig-pipeline" }
+jig-client = { path = "../jig-client" }
+shellexpand = "3"
+base64 = "0.21"
+
 # Tier 2 Storage: Postgres backend
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid"], optional = true, default-features = false }
 

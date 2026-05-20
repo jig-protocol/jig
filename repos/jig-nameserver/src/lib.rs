@@ -14,6 +14,9 @@ pub mod server;
 pub mod storage;
 pub mod transparency;
 pub mod types;
+pub mod v0_0_2;
+pub mod v0_0_2_register;
+pub mod v0_0_2_resolve;
 
 pub use config::NameServerConfig;
 pub use error::{NameServerError, Result};
