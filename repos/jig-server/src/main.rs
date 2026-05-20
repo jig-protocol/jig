@@ -87,7 +87,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting Jig server v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("Database: {}", config.database_path.display());
 
-    let server = JigServer::new(config)?;
+    // Build the v0.0.2 pipeline AppState alongside the existing ServerConfig.
+    // Uses JigServerConfig::default() for D2 — full config loading arrives in
+    // later D tasks. The important thing here is proving the wiring works: when
+    // this succeeds, the /.well-known/jig response includes server_did, etc.
+    let v0_0_2_state = {
+        use jig_config::v0_0_2_server::JigServerConfig;
+        let v002_config = JigServerConfig::default();
+        let db_path = config.database_path.with_file_name(
+            config
+                .database_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+                + "_v002.db",
+        );
+        match jig_server::v0_0_2::AppState::new(v002_config, db_path) {
+            Ok(state) => {
+                let state = std::sync::Arc::new(state);
+                tracing::info!(
+                    "v0.0.2 module active: server_did = {}",
+                    state.server_did.to_did_jig_string()
+                );
+                for opt in state.config.unsafe_options_active() {
+                    tracing::warn!("v0.0.2 unsafe option active: {}", opt);
+                }
+                Some(state)
+            }
+            Err(e) => {
+                tracing::warn!("v0.0.2 module failed to initialize, running without it: {e}");
+                None
+            }
+        }
+    };
+
+    let server = JigServer::new_with_v0_0_2(config, v0_0_2_state)?;
     server.start().await?;
 
     Ok(())

@@ -16,6 +16,8 @@ pub struct JigServer {
     config: ServerConfig,
     store: Arc<SqliteBlockStore>,
     runtime: Arc<BlockRuntime>,
+    /// v0.0.2 pipeline state. `None` when only running v0.0.1 routes.
+    v0_0_2: Option<Arc<crate::v0_0_2::AppState>>,
 }
 
 impl JigServer {
@@ -29,6 +31,29 @@ impl JigServer {
             config,
             store,
             runtime,
+            v0_0_2: None,
+        })
+    }
+
+    /// Construct a JigServer with the v0.0.2 pipeline state wired in. When
+    /// `v0_0_2` is `Some(...)`, the `/.well-known/jig` handler emits the
+    /// v0.0.2 discovery fields (server_did, unsafe_options_active,
+    /// allowed_block_kinds, peers) so federated peers can detect
+    /// misconfigured neighbors (spec §6.6).
+    pub fn new_with_v0_0_2(
+        config: ServerConfig,
+        v0_0_2: Option<Arc<crate::v0_0_2::AppState>>,
+    ) -> Result<Self> {
+        let store = Arc::new(SqliteBlockStore::new(&config.database_path)?);
+        store.health_check()?;
+
+        let runtime = Arc::new(BlockRuntime::new(config.execution_config())?);
+
+        Ok(Self {
+            config,
+            store,
+            runtime,
+            v0_0_2,
         })
     }
 
@@ -63,6 +88,7 @@ impl JigServer {
             config: self.config.clone(),
             #[cfg(feature = "analytics_clickhouse")]
             dispatcher,
+            v0_0_2: self.v0_0_2.clone(),
         };
 
         let router: Router = handler::build_router(app_state);

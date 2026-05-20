@@ -29,6 +29,12 @@ pub struct AppState {
     pub config: ServerConfig,
     #[cfg(feature = "analytics_clickhouse")]
     pub dispatcher: Option<crate::analytics::dispatcher::AnalyticsDispatcher>,
+    /// v0.0.2 hello-world pipeline state (Phase D wiring). `None` when the
+    /// v0.0.2 module isn't constructed (e.g., in some unit tests). When
+    /// `Some(...)`, the well-known handler emits server_did +
+    /// unsafe_options_active + allowed_block_kinds + peers fields from this
+    /// state so federated peers can detect misconfigured neighbors (§6.6).
+    pub v0_0_2: Option<Arc<crate::v0_0_2::AppState>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,6 +177,30 @@ struct ServerInfoResponse {
     version: String,
     host_id: String,
     endpoints: ServerEndpoints,
+    /// v0.0.2: server's DID for federation handshake verification (§6.6).
+    /// Absent when v0.0.2 module is not active — v0.0.1 consumers see no schema drift.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_did: Option<String>,
+    /// v0.0.2: active antipattern flags so peers can refuse federation with
+    /// misconfigured neighbors. Always includes `naively_unbounded_clock_skew`
+    /// in v0.0.2. Absent (not serialized) when v0.0.2 module is not active.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unsafe_options_active: Vec<String>,
+    /// v0.0.2: block kinds this server accepts on ingest. Absent when v0.0.2
+    /// module is not active.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    allowed_block_kinds: Vec<String>,
+    /// v0.0.2: federated peers configured in TOML. Absent when v0.0.2 module
+    /// is not active or when no peers are configured.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    peers: Vec<PeerInfo>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct PeerInfo {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -179,12 +209,38 @@ struct ServerEndpoints {
 }
 
 async fn server_info(State(state): State<AppState>) -> Result<Json<ServerInfoResponse>, ApiError> {
+    let (server_did, unsafe_options_active, allowed_block_kinds, peers) =
+        if let Some(v002) = &state.v0_0_2 {
+            let peers = v002
+                .config
+                .federation
+                .peers
+                .iter()
+                .map(|p| PeerInfo {
+                    url: p.url.clone(),
+                    alias: p.alias.clone(),
+                })
+                .collect();
+            (
+                Some(v002.server_did.to_did_jig_string()),
+                v002.config.unsafe_options_active(),
+                v002.config.server.allowed_block_kinds.clone(),
+                peers,
+            )
+        } else {
+            (None, vec![], vec![], vec![])
+        };
+
     Ok(Json(ServerInfoResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         host_id: state.config.host_id.clone(),
         endpoints: ServerEndpoints {
             http: format!("http://{}:{}", state.config.bind_address, state.config.port),
         },
+        server_did,
+        unsafe_options_active,
+        allowed_block_kinds,
+        peers,
     }))
 }
 
@@ -584,6 +640,7 @@ mod tests {
             config: config.clone(),
             #[cfg(feature = "analytics_clickhouse")]
             dispatcher: None,
+            v0_0_2: None,
         };
 
         let code_bytes: Vec<u8> = vec![0u8];
@@ -640,6 +697,7 @@ mod tests {
             config: config.clone(),
             #[cfg(feature = "analytics_clickhouse")]
             dispatcher: None,
+            v0_0_2: None,
         };
 
         // Execute simple WASM a few times to populate histograms
@@ -697,6 +755,7 @@ mod tests {
             config: config.clone(),
             #[cfg(feature = "analytics_clickhouse")]
             dispatcher: None,
+            v0_0_2: None,
         };
 
         let res = get_receipt_stats(
@@ -732,6 +791,7 @@ mod tests {
             config: config.clone(),
             #[cfg(feature = "analytics_clickhouse")]
             dispatcher: None,
+            v0_0_2: None,
         };
 
         // Insert two receipts: one ok with capability fuel, one hard_fail
@@ -889,6 +949,7 @@ mod tests {
             config: config.clone(),
             #[cfg(feature = "analytics_clickhouse")]
             dispatcher: None,
+            v0_0_2: None,
         };
 
         let res = server_info(State(state)).await.unwrap();
@@ -896,6 +957,55 @@ mod tests {
         assert_eq!(body.host_id, config.host_id);
         assert!(body.endpoints.http.contains(&config.bind_address));
         assert!(!body.version.is_empty());
+        // v0_0_2 is None — new fields must be absent from response (skip_serializing_if)
+        assert!(body.server_did.is_none());
+        assert!(body.unsafe_options_active.is_empty());
+        assert!(body.allowed_block_kinds.is_empty());
+        assert!(body.peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn server_info_includes_v0_0_2_fields_when_v0_0_2_state_present() {
+        let dir = tempdir().unwrap();
+        let config = ServerConfig {
+            database_path: dir.path().join("test.db"),
+            bind_address: "127.0.0.1".into(),
+            port: 7117,
+            ..Default::default()
+        };
+        let store = Arc::new(SqliteBlockStore::new(&config.database_path).unwrap());
+        let runtime = Arc::new(BlockRuntime::new(config.execution_config()).unwrap());
+
+        let v002 = Arc::new(crate::v0_0_2::AppState::for_test().unwrap());
+        let v002_did = v002.server_did.to_did_jig_string();
+
+        let state = AppState {
+            store,
+            runtime,
+            config: config.clone(),
+            #[cfg(feature = "analytics_clickhouse")]
+            dispatcher: None,
+            v0_0_2: Some(v002),
+        };
+
+        let res = server_info(State(state)).await.unwrap();
+        let body = res.0;
+
+        // server_did must be present and match the v0.0.2 state's DID
+        assert_eq!(body.server_did.as_deref(), Some(v002_did.as_str()));
+        // naively_unbounded_clock_skew is always present in v0.0.2
+        assert!(
+            body.unsafe_options_active
+                .contains(&"naively_unbounded_clock_skew".to_string()),
+            "expected naively_unbounded_clock_skew in unsafe_options_active"
+        );
+        // default config includes "text-render" in allowed_block_kinds
+        assert!(
+            body.allowed_block_kinds.contains(&"text-render".to_string()),
+            "expected text-render in allowed_block_kinds"
+        );
+        // default config has no federation peers configured
+        assert!(body.peers.is_empty());
     }
 
     #[test]
@@ -936,6 +1046,7 @@ mod tests {
             config: config.clone(),
             #[cfg(feature = "analytics_clickhouse")]
             dispatcher: None,
+            v0_0_2: None,
         };
 
         let e = get_block(State(state.clone()), Path("not-a-cid".to_string()))
@@ -967,6 +1078,7 @@ mod tests {
             config: config.clone(),
             #[cfg(feature = "analytics_clickhouse")]
             dispatcher: None,
+            v0_0_2: None,
         };
 
         let bad_manifest = serde_json::json!({ "not": "a manifest" });
@@ -1039,6 +1151,7 @@ mod tests {
             config: config.clone(),
             #[cfg(feature = "analytics_clickhouse")]
             dispatcher: None,
+            v0_0_2: None,
         };
 
         use blake3::hash;
@@ -1138,6 +1251,7 @@ mod tests {
             config: config.clone(),
             #[cfg(feature = "analytics_clickhouse")]
             dispatcher: None,
+            v0_0_2: None,
         };
 
         let code_bytes: Vec<u8> = vec![0u8];
@@ -1305,6 +1419,7 @@ mod tests {
             runtime,
             config: config.clone(),
             dispatcher: Some(dispatcher),
+            v0_0_2: None,
         };
 
         use blake3::hash;
@@ -1356,6 +1471,7 @@ mod tests {
             config: config.clone(),
             #[cfg(feature = "analytics_clickhouse")]
             dispatcher: None,
+            v0_0_2: None,
         };
 
         use blake3::hash;
