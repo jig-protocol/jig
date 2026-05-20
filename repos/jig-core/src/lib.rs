@@ -10,6 +10,7 @@ pub mod capability_registry;
 pub mod capability_scope;
 pub mod capability_validation;
 pub mod crypto;
+pub mod did;
 pub mod error;
 pub mod hlc;
 pub mod lint;
@@ -31,11 +32,12 @@ pub use capability_validation::{
     CapabilityReport, check_manifest_capabilities, validate_capability_request,
 };
 pub use crypto::{HashBuilder, blake3_hash, hash_labeled_parts};
+pub use did::{Did, DidError};
 pub use error::{JigError, Result};
 pub use hlc::HlcTimestamp;
 pub use lint::{BlockLintResult, allowlist_from_manifest, lint_block};
 pub use manifest::{
-    Attestation, Author, BlockManifest, BlockManifestBuilder, Capability, Constraints, Did,
+    Attestation, Author, BlockManifest, BlockManifestBuilder, Capability, Constraints,
     MetadataVisibility, Privacy, Provenance, RenderDescriptor, Resource,
 };
 pub use receipt::{

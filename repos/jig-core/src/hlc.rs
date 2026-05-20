@@ -103,9 +103,9 @@ impl Ord for HlcTimestamp {
 mod tests {
     use super::*;
 
-    // Helper — Did is just a String type alias, so we construct it directly.
+    // Helper — construct a test DID by deriving 32 bytes from the label via blake3.
     fn server_did(s: &str) -> crate::Did {
-        s.to_string()
+        crate::Did::from_test_string(s)
     }
 
     #[test]

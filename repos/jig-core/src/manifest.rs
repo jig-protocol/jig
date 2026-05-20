@@ -1,4 +1,5 @@
 use crate::capability_scope::CapabilityScopePattern;
+use crate::did::Did;
 use crate::error::{JigError, Result};
 use crate::serde_helpers::{
     deserialize_cid, deserialize_cid_vec, deserialize_opt_cid, serialize_cid, serialize_cid_vec,
@@ -13,7 +14,6 @@ use std::collections::BTreeMap;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-pub type Did = String;
 pub type CapabilityName = String;
 pub type HashHex = String;
 

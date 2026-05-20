@@ -16,6 +16,7 @@ serde_with = "3.6"
 time = { version = "0.3", features = ["serde", "formatting"] }
 semver = { version = "1.0", features = ["serde"] }
 blake3 = "1.5"
+data-encoding = "2"
 cid = { version = "0.10", features = ["serde"] }
 multihash = { version = "0.18", default-features = false, features = ["std", "blake3"] }
 hex = "0.4"

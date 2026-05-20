@@ -72,7 +72,7 @@ impl Arbitrary for Author {
             prop::collection::vec(prop::string::string_regex("[a-z]{4,12}").unwrap(), 0..3),
         )
             .prop_map(|(did, public_key, roles)| Author {
-                did,
+                did: crate::Did::from(did.as_str()),
                 public_key,
                 roles,
             })
@@ -224,7 +224,10 @@ impl Arbitrary for Privacy {
         )
             .prop_map(|(encryption, recipients, metadata_visibility)| Privacy {
                 encryption,
-                recipients,
+                recipients: recipients
+                    .into_iter()
+                    .map(|s| crate::Did::from(s.as_str()))
+                    .collect(),
                 metadata_visibility,
             })
             .boxed()
