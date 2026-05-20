@@ -63,10 +63,13 @@ pub fn build_v0_0_2_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/ws", get(ws_handler))
         .with_state(state.clone());
 
+    // REST block endpoints are always active (not debug-gated).
+    let router = ws_router.merge(crate::v0_0_2_blocks::build_blocks_router(state.clone()));
+
     if state.config.debug.admin_endpoints {
-        ws_router.merge(crate::v0_0_2_admin::build_admin_router(state))
+        router.merge(crate::v0_0_2_admin::build_admin_router(state))
     } else {
-        ws_router
+        router
     }
 }
 
