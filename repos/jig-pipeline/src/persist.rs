@@ -525,6 +525,43 @@ impl SqliteStore {
         .map_err(Into::into)
     }
 
+    /// Immediately expire an attestation for a specific (did, ns_did) pair by
+    /// setting valid_until = as_of. Called during key rotation to ensure the
+    /// old-DID row no longer appears as a current binding for its alias.
+    pub fn expire_alias_attestation(&self, did: &str, ns_did: &str, as_of: i64) -> Result<()> {
+        self.conn.lock().expect("poisoned").execute(
+            "UPDATE alias_attestations SET valid_until = ?
+             WHERE did = ? AND ns_did = ?",
+            rusqlite::params![as_of, did, ns_did],
+        )?;
+        Ok(())
+    }
+
+    /// List all currently-valid attestations (valid_from <= as_of < valid_until).
+    /// Used by the debug-gated /v1/handles enumeration.
+    pub fn list_alias_attestations(&self, as_of: i64) -> Result<Vec<StoredAliasAttestation>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT did, alias, ns_did, valid_from, valid_until, attestation_bytes
+             FROM alias_attestations
+             WHERE valid_from <= ? AND valid_until > ?
+             ORDER BY alias ASC",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![as_of, as_of], |r| {
+                Ok(StoredAliasAttestation {
+                    did: r.get(0)?,
+                    alias: r.get(1)?,
+                    ns_did: r.get(2)?,
+                    valid_from: r.get(3)?,
+                    valid_until: r.get(4)?,
+                    attestation_bytes: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     // --- TOFU keys ---
 
     /// Returns the existing locked DID if present, else None.
@@ -820,6 +857,52 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn list_alias_attestations_returns_only_valid_window_rows() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let now = 1000_i64;
+
+        // Valid (now is between valid_from and valid_until)
+        store
+            .upsert_alias_attestation(&StoredAliasAttestation {
+                did: "did:jig:zA".into(),
+                alias: "a@dj.jig".into(),
+                ns_did: "did:jig:zNs".into(),
+                valid_from: 500,
+                valid_until: 2000,
+                attestation_bytes: b"{}".to_vec(),
+            })
+            .unwrap();
+
+        // Expired (valid_until <= now)
+        store
+            .upsert_alias_attestation(&StoredAliasAttestation {
+                did: "did:jig:zB".into(),
+                alias: "b@dj.jig".into(),
+                ns_did: "did:jig:zNs".into(),
+                valid_from: 100,
+                valid_until: 500,
+                attestation_bytes: b"{}".to_vec(),
+            })
+            .unwrap();
+
+        // Future (valid_from > now)
+        store
+            .upsert_alias_attestation(&StoredAliasAttestation {
+                did: "did:jig:zC".into(),
+                alias: "c@dj.jig".into(),
+                ns_did: "did:jig:zNs".into(),
+                valid_from: 2000,
+                valid_until: 3000,
+                attestation_bytes: b"{}".to_vec(),
+            })
+            .unwrap();
+
+        let valid = store.list_alias_attestations(now).unwrap();
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid[0].alias, "a@dj.jig");
     }
 
     #[test]
