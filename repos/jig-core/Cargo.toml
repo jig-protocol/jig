@@ -1,0 +1,38 @@
+[package]
+name = "jig-core"
+version = "0.0.1"
+edition = "2024"
+license = "AGPL-3.0"
+authors = ["Jig Protocol Contributors"]
+description = "Core protocol implementation for Jig messaging"
+repository = "https://github.com/jig-protocol/jig-core"
+keywords = ["messaging", "protocol", "encryption", "federation"]
+categories = ["network-programming", "cryptography"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_with = "3.6"
+time = { version = "0.3", features = ["serde", "formatting"] }
+semver = { version = "1.0", features = ["serde"] }
+blake3 = "1.5"
+cid = { version = "0.10", features = ["serde"] }
+multihash = { version = "0.18", default-features = false, features = ["std", "blake3"] }
+hex = "0.4"
+base64 = "0.22"
+thiserror = "1.0"
+wasmparser = "0.118"
+
+# Optional cryptography/signing helpers
+ed25519-dalek = { version = "2.0", optional = true, features = ["serde"] }
+rand = { version = "0.8", optional = true }
+sigstore = { version = "0.6", optional = true }
+
+[dev-dependencies]
+proptest = "1.0"
+wat = "1.0"
+
+[features]
+default = []
+ed25519 = ["ed25519-dalek", "rand"]
+sigstore = ["dep:sigstore"]

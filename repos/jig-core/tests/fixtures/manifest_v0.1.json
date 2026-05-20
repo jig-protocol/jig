@@ -1,0 +1,30 @@
+{
+  "schema": "https://jig.dev/schema/block-manifest/v0.1",
+  "version": "0.1.0",
+  "authors": [
+    {
+      "did": "did:jig:alice123",
+      "public_key": "ed25519:abc123def456",
+      "roles": ["author", "maintainer"]
+    }
+  ],
+  "parents": [],
+  "capabilities": [
+    {
+      "name": "core:compute",
+      "scope": [],
+      "fuel": 500000,
+      "attestations": [],
+      "metadata": {}
+    }
+  ],
+  "constraints": {
+    "fuel_max": 5000000,
+    "memory_max_mb": 32,
+    "execution_timeout_ms": 250,
+    "deterministic": true
+  },
+  "resources": [],
+  "attestations": [],
+  "metadata": {}
+}
