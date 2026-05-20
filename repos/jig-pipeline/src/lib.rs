@@ -18,3 +18,4 @@ pub mod ingest;
 pub mod persist;
 
 pub use envelope::{Envelope, Frame, HlcCursor, ReceiptRef, Scope};
+pub use ingest::{IngestContext, IngestError, IngestSource, ingest};

@@ -27,3 +27,5 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 [dev-dependencies]
 tempfile = "3"
 proptest = "1.4"
+rand = { workspace = true }
+semver = { version = "1.0", features = ["serde"] }
