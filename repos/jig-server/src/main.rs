@@ -122,6 +122,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Spawn one long-running federation task per configured [[federation.peers]] entry.
+    // Done before handing state to JigServer so we hold a clone while the Arc is still
+    // available. Tasks are fire-and-forget (reconnect internally on disconnect).
+    if let Some(ref state) = v0_0_2_state {
+        jig_server::v0_0_2_federation::spawn_federation_peers(state.clone());
+    }
+
     let server = JigServer::new_with_v0_0_2(config, v0_0_2_state)?;
     server.start().await?;
 
