@@ -1,0 +1,265 @@
+# jig-config/nameserver - Federated Configuration
+#
+# Scenario: High-trust federation with parent organization
+# Use case: Enterprise deployment with multiple nameservers under same org
+# Trust model: Automatic trust for siblings, shared policy repository
+#
+# This configuration demonstrates:
+# - Parent organization verification
+# - Automatic sibling trust
+# - Shared policy synchronization
+# - Mutual TLS requirement
+# - Aggressive gossip for fast consensus
+
+[network]
+# Public-facing configuration for federated nameserver
+bind_address = "0.0.0.0"
+port = 7070
+public_address = "ns1.acme.com"
+
+[network.dns_discovery]
+enabled = true
+domain = "acme.com"
+cache_ttl_secs = 300
+
+[storage]
+# Production-grade storage configuration
+path = "/var/lib/jig/nameserver.db"
+max_connections = 20
+wal_mode = true
+
+[pow]
+# PoW configuration with zone-specific overrides
+secret = "production-secret-change-me"
+base_difficulty = 18
+min_difficulty = 16
+max_difficulty = 28
+penalty_step_bits = 2
+
+[pow.zone_overrides]
+"null-sec" = 24    # Anonymous accounts require high PoW
+"low-sec" = 18     # Registered accounts
+"high-sec" = 12    # Trusted accounts get easier PoW
+
+[rate_limits]
+# Higher limits for federated environment
+per_key_limit = 120
+per_ip_limit = 240
+global_limit = 2000
+burst_multiplier = 2.0
+
+[rate_limits.zone_overrides]
+"high-sec" = { per_key_limit = 300, per_ip_limit = 600 }
+
+[penalties]
+# Faster decay in trusted federation
+decay_window_secs = 300         # 5 minutes (faster for trusted env)
+max_penalty_points = 100.0
+penalty_floor_secs = 30
+tribunal_escalation_threshold = 50.0
+
+[anonymous]
+# Anonymous accounts allowed but restricted
+enabled = true
+min_difficulty = 24
+token_ttl_secs = 1800           # 30 minutes
+max_sessions_per_ip = 3
+
+# ============================================================================
+# Federation Configuration (Federated Mode)
+# ============================================================================
+
+[federation]
+mode = "federated"
+enabled = true
+max_peers = 100
+
+# Seed peers - other nameservers in the organization
+seed_peers = [
+    "https://ns2.acme.com",
+    "https://ns3.acme.com",
+    "https://ns-backup.acme.com"
+]
+
+# Allow all sibling nameservers in the org
+allow_list = ["*.acme.com"]
+deny_list = []
+
+# Computed policy hash (updated when config changes)
+policy_hash = "federated-v1-abc123"
+
+[federation.gossip]
+# Aggressive gossip for fast consensus
+interval_secs = 60              # 1 minute (fast for federated)
+batch_size = 200
+message_types = [
+    "policy_hash",
+    "reputation_summary",
+    "tribunal_decision",
+    "handshake"
+]
+verify_signatures = true
+
+[federation.handshake]
+timeout_secs = 30
+require_mtls = true             # mTLS required for federated trust
+protocol_versions = ["1.0"]
+
+[federation.parent_org]
+# Parent organization configuration
+org_did = "did:jig:acme-corp"
+verification_endpoint = "https://org.acme.com/verify"
+auto_trust_siblings = true      # Automatically trust other acme.com nameservers
+policy_repo = "https://git.acme.com/jig/policies"
+policy_sync_interval_secs = 600 # Sync policies every 10 minutes
+
+# ============================================================================
+# Reputation Configuration
+# ============================================================================
+
+[reputation]
+damping_factor = 0.85
+min_observations_for_aggregate = 3
+
+[[reputation.rulesets]]
+id = "enterprise"
+name = "Acme Corp Enterprise Network"
+
+[reputation.rulesets.pow_policy]
+base_difficulty = 16
+penalty_multiplier = 1.2
+
+[reputation.rulesets.tribunal_policy]
+auto_escalate = true
+escalation_severity = "medium"
+quorum_size = 5
+
+[reputation.rulesets.zone_thresholds]
+"low-sec" = 0.4
+"high-sec" = 0.8
+
+[[reputation.rulesets]]
+id = "federation"
+name = "Federation Network"
+
+[reputation.rulesets.pow_policy]
+base_difficulty = 14
+penalty_multiplier = 1.0
+
+[reputation.rulesets.tribunal_policy]
+auto_escalate = true
+escalation_severity = "high"
+quorum_size = 7
+
+# Translation between rulesets
+[[reputation.translation_contracts]]
+from_ruleset = "federation"
+to_ruleset = "enterprise"
+transform = "linear"
+parameters = { "multiplier" = 0.9 }
+
+# ============================================================================
+# Automation Policy
+# ============================================================================
+
+[automation]
+# Conservative automation in trusted federation
+power_law_exponent = 1.5
+pile_on_factor = 0.7
+quorum_requirement = 5
+evidence_window_secs = 300
+max_escalations_per_hour = 20   # Higher limit for enterprise
+
+# ============================================================================
+# Transparency Configuration
+# ============================================================================
+
+[transparency]
+enabled = true
+log_path = "/var/log/jig/transparency.log"
+publish_interval_secs = 3600    # 1 hour
+events = [
+    "tribunal_decision",
+    "reputation_update",
+    "penalty_applied",
+    "identity_claimed",
+    "host_runtime_published"
+]
+public_endpoint = true          # Enable public transparency queries
+
+# ============================================================================
+# Useful Work Configuration
+# ============================================================================
+
+[useful_work]
+enabled = true
+assignment_ttl_secs = 3600
+max_queue_depth = 2000          # Higher queue for enterprise
+retention_days = 90             # Longer retention for compliance
+enabled_work_types = [
+    "validate_block",
+    "verify_observation",
+    "process_executable_block",
+    "validate_fuel_counts",
+    "cross_validate_receipt",
+    "resolve_receipt_dispute"
+]
+
+[useful_work.validator_requirements]
+"process_executable_block" = { min_validators = 3, consensus_threshold = 0.67, min_zone = "low-sec" }
+"resolve_receipt_dispute" = { min_validators = 5, consensus_threshold = 0.8, min_zone = "high-sec" }
+"cross_validate_receipt" = { min_validators = 3, consensus_threshold = 0.67, min_zone = "low-sec" }
+
+# ============================================================================
+# Capabilities Configuration
+# ============================================================================
+
+[capabilities]
+enabled = true
+endpoint_path = "/.well-known/jig-ns/capabilities"
+
+# Advertise enterprise capabilities
+advertised_capabilities = [
+    "identity.claim",
+    "identity.resolve",
+    "reputation.query",
+    "tribunal.submit",
+    "useful_work.submit"
+]
+
+# Affordances for enterprise features
+affordances = [
+    "email.delivered",
+    "bridge.forwarded",
+    "audit.logged",
+    "compliance.soc2"
+]
+
+# ============================================================================
+# Anomaly Detection Configuration
+# ============================================================================
+
+[anomaly_detection]
+enabled = true
+max_network_fuel = 750_000      # Higher limit for enterprise
+
+[anomaly_detection.fuel_anomaly]
+enabled = true
+excessive_threshold = 3.5       # More lenient for legit enterprise use
+suspicious_threshold = 0.2
+min_sample_size = 20
+
+[anomaly_detection.hard_failure]
+enabled = true
+consecutive_threshold = 7       # More lenient for transient failures
+time_window_secs = 300
+
+[anomaly_detection.auto_escalation]
+enabled = true
+severities = ["high", "critical"]
+
+[anomaly_detection.auto_escalation.pow_penalties]
+low = 2
+medium = 4
+high = 6
+critical = 8

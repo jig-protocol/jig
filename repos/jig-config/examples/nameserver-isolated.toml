@@ -1,0 +1,210 @@
+# jig-config/nameserver - Isolated Configuration
+#
+# Scenario: Zero-trust isolated nameserver (no federation)
+# Use case: Single-node deployment, development, or air-gapped environment
+# Trust model: No federation, no external peers, local-only operation
+#
+# This configuration demonstrates:
+# - Federation disabled
+# - Maximum security isolation
+# - Highest PoW requirements
+# - Strict rate limiting
+# - Self-contained operation
+# - Development-friendly defaults
+
+[network]
+# Localhost-only binding for isolated mode
+bind_address = "127.0.0.1"
+port = 7070
+# No public address in isolated mode
+# public_address = null
+
+[network.dns_discovery]
+# DNS discovery disabled for isolated mode
+enabled = false
+
+[storage]
+# Local SQLite storage
+path = "~/.jig/nameserver.db"
+max_connections = 10
+wal_mode = true
+
+[pow]
+secret = "isolated-development-secret"
+base_difficulty = 20            # Higher baseline for isolation
+min_difficulty = 18
+max_difficulty = 32
+penalty_step_bits = 3           # Faster escalation
+
+[pow.zone_overrides]
+"null-sec" = 28                 # Very high for anonymous
+"low-sec" = 20
+"high-sec" = 16
+
+[rate_limits]
+# Conservative limits for isolated mode
+per_key_limit = 60
+per_ip_limit = 120
+global_limit = 1000
+burst_multiplier = 1.2
+
+[penalties]
+# Strict penalty policy
+decay_window_secs = 900         # 15 minutes (slower decay)
+max_penalty_points = 100.0
+penalty_floor_secs = 120        # 2 minutes minimum
+tribunal_escalation_threshold = 30.0
+
+[anonymous]
+# Restrictive anonymous policy
+enabled = true
+min_difficulty = 28
+token_ttl_secs = 600            # 10 minutes
+max_sessions_per_ip = 1         # Very restrictive
+
+# ============================================================================
+# Federation Configuration (Isolated Mode)
+# ============================================================================
+
+[federation]
+mode = "isolated"
+enabled = false                 # Federation completely disabled
+max_peers = 0                   # No peers allowed
+
+# No seed peers
+seed_peers = []
+
+# Empty lists - no federation
+allow_list = []
+deny_list = []
+
+# No policy hash needed in isolated mode
+# policy_hash = null
+
+[federation.gossip]
+# Gossip disabled in isolated mode
+interval_secs = 0
+batch_size = 0
+message_types = []
+verify_signatures = false
+
+[federation.handshake]
+# Handshake disabled in isolated mode
+timeout_secs = 0
+require_mtls = false
+protocol_versions = []
+
+# No parent_org or shared_ruleset in isolated mode
+
+# ============================================================================
+# Reputation Configuration
+# ============================================================================
+
+[reputation]
+damping_factor = 0.85
+min_observations_for_aggregate = 3
+
+# Single local ruleset for isolated mode
+[[reputation.rulesets]]
+id = "local-only"
+name = "Local Isolated Ruleset"
+
+[reputation.rulesets.pow_policy]
+base_difficulty = 20
+penalty_multiplier = 2.0        # Aggressive penalties
+
+[reputation.rulesets.tribunal_policy]
+auto_escalate = true
+escalation_severity = "low"     # Escalate more aggressively
+quorum_size = 1                 # Single-node tribunal
+
+[reputation.rulesets.zone_thresholds]
+"low-sec" = 0.6
+"high-sec" = 0.9
+
+# No translation contracts needed in isolated mode
+
+# ============================================================================
+# Automation Policy
+# ============================================================================
+
+[automation]
+# Aggressive automation for local enforcement
+power_law_exponent = 2.0        # Stronger exponential scaling
+pile_on_factor = 0.9
+quorum_requirement = 1          # Single-node decision
+evidence_window_secs = 180      # 3 minutes
+max_escalations_per_hour = 10
+
+# ============================================================================
+# Transparency Configuration
+# ============================================================================
+
+[transparency]
+enabled = true
+log_path = "~/.jig/transparency.log"
+publish_interval_secs = 7200    # 2 hours (less frequent for local)
+events = [
+    "tribunal_decision",
+    "penalty_applied",
+    "identity_claimed"
+]
+public_endpoint = false         # No public endpoint in isolated mode
+
+# ============================================================================
+# Useful Work Configuration
+# ============================================================================
+
+[useful_work]
+enabled = false                 # Useful work disabled in isolated mode
+assignment_ttl_secs = 3600
+max_queue_depth = 100
+retention_days = 7              # Short retention for dev
+enabled_work_types = []
+
+# No validator requirements in isolated mode
+
+# ============================================================================
+# Capabilities Configuration
+# ============================================================================
+
+[capabilities]
+enabled = false                 # No capability advertisement in isolated mode
+endpoint_path = "/.well-known/jig-ns/capabilities"
+
+# Minimal capabilities for local operation
+advertised_capabilities = [
+    "identity.claim",
+    "identity.resolve"
+]
+
+affordances = []
+
+# ============================================================================
+# Anomaly Detection Configuration
+# ============================================================================
+
+[anomaly_detection]
+enabled = true
+max_network_fuel = 500_000
+
+[anomaly_detection.fuel_anomaly]
+enabled = true
+excessive_threshold = 2.5       # Stricter threshold
+suspicious_threshold = 0.4
+min_sample_size = 5             # Lower sample size for local
+
+[anomaly_detection.hard_failure]
+enabled = true
+consecutive_threshold = 3       # Lower threshold
+time_window_secs = 180          # 3 minutes
+
+[anomaly_detection.auto_escalation]
+enabled = true
+severities = ["medium", "high", "critical"]  # Escalate more aggressively
+
+[anomaly_detection.auto_escalation.pow_penalties]
+low = 3
+medium = 6
+high = 9
+critical = 12

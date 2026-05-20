@@ -1,0 +1,15 @@
+[package]
+name = "jig-config"
+version = "0.0.1"
+edition = "2024"
+license = "AGPL-3.0"
+description = "Configuration types and loader for Jig runtime selection"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+toml = "0.8"
+dirs = "5"
+chrono = "0.4"
+

@@ -1,0 +1,570 @@
+# jig-config.toml - Hyperscale Profile
+#
+# Hyperscale profile: optimized for 100K+ users and federated hubs
+# - Multi-tier storage (CockroachDB + ScyllaDB + ClickHouse + S3)
+# - All features enabled
+# - High execution limits (50M fuel, 256MB memory, 2000ms timeout)
+# - Strict determinism maintained (same as potato)
+# - Federation enabled with TLS
+
+[meta]
+profile = "hyperscale"
+
+# Execution Runtime Configuration
+[runtime]
+engine = "wasmtime"
+
+# Execution constraints (hyperscale limits)
+[runtime.constraints]
+fuel_max = 50_000_000       # 50M fuel = high-throughput workloads
+memory_max_mb = 256         # 256 MB linear memory
+execution_timeout_ms = 2000 # 2s timeout for multi-hop federation
+deterministic = true        # Strict determinism (same as potato!)
+
+import_allowlist = [
+    "jig_host::*",
+    "env::get"
+]
+
+# Determinism configuration (same strict defaults as potato)
+[runtime.determinism]
+float_policy = "deny"          # Still deny floats (determinism over performance)
+prng_seed_source = "manifest"  # Manifest-seeded PRNG
+
+forbidden_imports = [
+    "wasi_snapshot_preview1::random_get",
+    "wasi_snapshot_preview1::clock_time_get",
+    "wasi_snapshot_preview1::clock_res_get",
+    "wasi_snapshot_preview1::sock_accept",
+    "wasi_snapshot_preview1::sock_recv",
+    "wasi_snapshot_preview1::sock_send",
+]
+
+# Capability configuration (higher rate limits)
+[runtime.capabilities]
+default_grants = []              # Still zero ambient authority
+scope_pattern_syntax = "glob"
+rate_limit_global = 10_000       # 10K req/s global limit
+
+# Per-capability rate limits (examples)
+[runtime.capabilities.rate_limits]
+"net.fetch" = 5_000    # Higher limit for federation
+"crypto.sign" = 10_000 # High signing throughput
+"storage.read" = 20_000
+
+# Multi-Tier Storage Configuration
+# Truth layer: CockroachDB (distributed SQL for ACID guarantees)
+[storage.truth]
+backend = "cockroachdb"
+connection_string = "postgres://jig_user:password@cockroach-cluster:26257/jig?sslmode=verify-full"
+max_connections = 100
+cache_size_mb = 1024
+
+# Speed layer: ScyllaDB (fast writes, real-time subscriptions)
+[storage.speed]
+backend = "scylladb"
+contact_points = ["10.0.1.1:9042", "10.0.1.2:9042", "10.0.1.3:9042"]
+keyspace = "jig_speed"
+replication_factor = 3
+consistency_level = "QUORUM"
+
+# Intelligence layer: ClickHouse (analytics, outcome-based pricing)
+[storage.intelligence]
+backend = "clickhouse"
+connection_string = "tcp://analytics-cluster:9000/jig_analytics"
+batch_size = 10_000
+flush_interval_sec = 30
+compression = "lz4"
+
+# Archive layer: S3 (historical blocks, attachments, backups)
+[storage.archive]
+backend = "s3"
+bucket = "jig-blocks-prod"
+region = "us-east-1"
+endpoint = ""  # Use default AWS endpoint
+access_key_id = "${JIG_S3_ACCESS_KEY}"  # From environment
+secret_access_key = "${JIG_S3_SECRET_KEY}"
+
+# Object lifecycle: transition to Glacier after 90 days
+[storage.archive.lifecycle]
+transition_to_glacier_days = 90
+expiration_days = 2555  # 7 years (compliance)
+
+# Network Configuration (Public-facing)
+[network]
+bind_address = "0.0.0.0"           # Public binding
+public_address = "jig.example.com" # Federation endpoint
+
+federation_port = 7117
+irc_port = 6667
+ssh_port = 2222
+websocket_port = 8080
+smtp_port = 2525
+
+# TLS Configuration (required for hyperscale)
+[network.tls]
+cert_path = "/etc/jig/tls/cert.pem"
+key_path = "/etc/jig/tls/key.pem"
+federation_tls = true  # Federated traffic requires TLS
+websocket_tls = true   # WSS instead of WS
+
+# Feature Flags (Hyperscale = all enabled)
+[features]
+core = true
+federation = true    # Federation enabled
+irc = true
+ssh = true          # SSH transport for secure admin
+websocket = true
+email = true        # Email bridge enabled
+web_ui = true
+metrics = true      # Prometheus metrics
+anonymous = false   # Require authentication
+encryption = true   # E2E encryption required
+
+# Analytics (Hyperscale = ClickHouse federated)
+[analytics]
+backend = "clickhouse"
+retention_days = 365     # 1 year retention
+sample_rate = 0.1        # 10% sampling (high volume)
+privacy_mode = "aggregated"  # Aggregate before storing
+
+[analytics.clickhouse]
+dsn = "tcp://analytics-cluster:9000"
+database = "jig_analytics"
+batch_size = 10_000
+flush_interval_sec = 60
+
+# Telemetry (Hyperscale = full observability)
+[telemetry]
+metrics_enabled = true
+metrics_endpoint = "http://prometheus:9090/metrics"
+trace_sampling = 0.01     # 1% trace sampling
+log_level = "info"
+structured_logging = true
+
+[telemetry.opentelemetry]
+enabled = true
+endpoint = "http://otel-collector:4317"
+service_name = "jig-server-hyperscale"
+
+# Governance Integration
+[governance]
+nameserver_url = "https://ns.jig.dev"
+transparency_log_url = "https://transparency.jig.dev"
+
+# Reputation tiers (PoW difficulty per tier)
+[governance.reputation_tiers]
+null_sec_pow_difficulty = 24
+low_sec_pow_difficulty = 16
+high_sec_pow_difficulty = 8
+verified_pow_difficulty = 0  # No PoW for verified accounts
+
+# Tribunal configuration
+[governance.tribunal]
+panel_size = 7             # Larger panels for hyperscale
+quorum_threshold = 5
+appeal_window_hrs = 168    # 7 days
+evidence_retention_days = 365
+
+# Progressive cost (abuse mitigation)
+[governance.progressive_cost]
+suspicious_pow_multiplier = 2.0
+blocked_pow_multiplier = 999.0
+penalty_decay_half_life_days = 30
+
+# Receipt Configuration (Hyperscale = strict)
+[receipts]
+require_v2_fields = true
+require_renders_match = true  # Strict render verification
+require_fuel_breakdown = true
+
+[receipts.canonicalization]
+block_id_algorithm = "blake3-256"
+render_hash_algorithm = "sha256"
+strict_field_order = true
+compact_json = true
+
+[receipts.outcome]
+require_outcome = true
+default_affordances = []
+
+[receipts.retention]
+persist = true
+retention_days = 365  # 1 year retention (compliance)
+archive_after_days = 90  # Archive to S3 after 90 days
+compress = true
+storage_tier = "intelligence"
+
+# Pricing Configuration (Outcome-based)
+[pricing]
+model = "outcome_based"
+
+# Fuel bands (per-capability pricing)
+[[pricing.fuel_bands]]
+capability_type = "cpu"
+cost_per_million = 0.001   # $0.001 per 1M fuel
+metering_mode = "fuel"
+
+[[pricing.fuel_bands]]
+capability_type = "bandwidth"
+cost_per_gb = 0.05         # $0.05 per GB
+metering_mode = "bandwidth"
+
+[[pricing.fuel_bands]]
+capability_type = "crypto"
+cost_per_operation = 0.0001  # $0.0001 per crypto operation
+metering_mode = "operations"
+
+[[pricing.fuel_bands]]
+capability_type = "storage"
+cost_per_gb_hour = 0.0001  # $0.0001 per GB-hour
+metering_mode = "storage"
+
+# Useful work discounts (reputation-based pricing)
+[pricing.useful_work_discounts]
+enabled = true
+null_sec_discount_pct = 0      # No discount for new users
+low_sec_discount_pct = 10      # 10% discount for low-sec
+high_sec_discount_pct = 25     # 25% discount for high-sec
+verified_discount_pct = 40     # 40% discount for verified users
+min_streak_days = 30           # Require 30-day streak
+max_discount_pct = 50          # Cap discounts at 50%
+
+# Outcome adjustments (charge only on success by default)
+[pricing.outcome_adjustments]
+charge_on_success = true       # Charge for successful executions
+charge_on_soft_fail = false    # No charge for transient failures
+charge_on_hard_fail = false    # No charge for permanent failures
+soft_fail_refund_pct = 100     # 100% refund on soft failures
+hard_fail_refund_pct = 100     # 100% refund on hard failures
+
+# Audit Configuration (Enterprise Compliance)
+[audit]
+compliance_standard = "enterprise"  # All compliance standards (SOC2, HIPAA, GDPR)
+enabled_categories = [
+    "security",     # Authentication and authorization events
+    "access",       # User access and permission changes
+    "execution",    # Block execution events
+    "storage",      # Storage operations
+    "billing",      # Billing and pricing events
+    "config",       # Configuration changes
+    "system",       # System health and performance
+]
+min_severity = "info"          # Log all severity levels
+log_payloads = true            # Include full request/response payloads
+anonymize_pii = true           # Anonymize PII for GDPR/HIPAA compliance
+include_stack_traces = true    # Include stack traces in error events
+sign_audit_logs = true         # Cryptographically sign audit logs
+tamper_evident = true          # Enable tamper-evident audit log chaining
+
+[audit.retention]
+enabled = true
+retention_days = 2555          # 7 years retention (HIPAA/enterprise requirement)
+archive_after_days = 365       # Archive to cold storage after 1 year
+compress = true
+storage_tier = "truth"         # Store in primary database
+stream_to_siem = true          # Stream to external SIEM
+siem_endpoint = "https://siem.example.com/ingest"  # SIEM ingestion endpoint
+
+# ============================================================================
+# Bridge-Specific Configuration (Phase 7)
+# ============================================================================
+
+# IRC Bridge (Native Protocol)
+[bridges.irc]
+enabled = true
+server_name = "jig.irc.network"
+port = 6667
+bind_address = "0.0.0.0"
+auto_join_channels = ["#jig", "#jig-dev"]
+
+[bridges.irc.nick_validation]
+max_length = 30
+require_unique = true
+
+[bridges.irc.block_wrapper]
+enabled = true
+fuel_budget = 10_000
+preserve_metadata = true
+
+# Email Bridge (Native Protocol)
+[bridges.email]
+enabled = true
+
+[bridges.email.smtp]
+enabled = true
+port = 25
+submission_port = 587
+bind_address = "0.0.0.0"
+mx_domains = ["jig.example.com"]
+starttls = true
+require_auth = true
+
+[bridges.email.imap]
+enabled = true
+port = 143
+bind_address = "0.0.0.0"
+starttls = true
+
+[bridges.email.relay]
+method = { direct = null }
+community_relay = true
+donated_quota_bytes = 107374182400  # 100 GB/day
+relay_quota_per_day = 10_000
+dns_discovery = true
+spf_dkim_enforcement = "strict"
+
+[bridges.email.deliverability]
+enabled = true
+analytics_backend = "clickhouse"
+track_opens = false       # Privacy-first
+track_bounces = true
+track_clicks = false
+
+# WebSocket Bridge (Native Protocol)
+[bridges.websocket]
+enabled = true
+port = 8080
+bind_address = "0.0.0.0"
+tls_enabled = true
+max_connections = 100_000
+ping_interval_sec = 30
+compression = true
+max_message_size_bytes = 52428800  # 50 MB
+
+# Federation Bridge (Native Protocol)
+[bridges.federation]
+enabled = true
+port = 7117
+bind_address = "0.0.0.0"
+public_address = "jig.example.com"
+require_tls = true
+
+[bridges.federation.discovery]
+enabled = true
+method = "web_finger"
+known_endpoints = []
+
+[bridges.federation.identity]
+require_proof = true
+key_algorithm = "ed25519"
+verification_level = "ca_with_transparency"
+
+[bridges.federation.trust]
+default_policy = "allow_all"
+trusted_servers = []
+blocked_servers = []
+
+# ATProto Bridge (External - Bluesky)
+[bridges.atproto]
+enabled = true
+pds_endpoint = "https://bsky.social"
+server_did = "did:plc:example123"
+did_resolution = true
+firehose_enabled = true
+
+[[bridges.atproto.ingest_transforms]]
+transform_type = { custom = "atproto_to_jig" }
+fuel_budget = 200_000
+fuel_max = 2_000_000
+required_capabilities = ["atproto.read", "net.http"]
+validate_determinism = true
+preserve_provenance = true
+
+[[bridges.atproto.export_transforms]]
+transform_type = { custom = "jig_to_atproto" }
+fuel_budget = 200_000
+fuel_max = 2_000_000
+required_capabilities = ["atproto.write", "net.http"]
+validate_determinism = true
+preserve_provenance = true
+
+# ActivityPub Bridge (External - Fediverse)
+[bridges.activitypub]
+enabled = true
+actor_name = "@jig@example.com"
+inbox_endpoint = "/inbox"
+outbox_endpoint = "/outbox"
+webfinger_enabled = true
+accept_follows = true
+
+[[bridges.activitypub.ingest_transforms]]
+transform_type = { custom = "activitypub_to_jig" }
+fuel_budget = 200_000
+fuel_max = 2_000_000
+required_capabilities = ["activitypub.read", "net.http"]
+validate_determinism = true
+preserve_provenance = true
+
+[[bridges.activitypub.export_transforms]]
+transform_type = { custom = "jig_to_activitypub" }
+fuel_budget = 200_000
+fuel_max = 2_000_000
+required_capabilities = ["activitypub.write", "net.http"]
+validate_determinism = true
+preserve_provenance = true
+
+# ============================================================================
+# Generic Bridge Configuration (Phase 6 - for custom bridges)
+# ============================================================================
+
+# Bridge Configuration (Hyperscale = full bridge support with transforms)
+[bridges.generic]
+enabled = true                     # Bridges enabled
+bridge_version = "1.0"
+
+# Ingest: External → Jig Block
+[bridges.generic.ingest]
+schema_validation = "lenient"      # Lenient validation for diverse sources
+max_content_size_mb = 50           # Large limit (50MB)
+sanitization_mode = "moderate"     # Moderate sanitization
+mark_legacy_source = true
+
+# Example transform pipeline: Audio → Text → Structured Data
+[[bridges.generic.ingest.transform_pipeline]]
+transform_type = "audio_to_text"
+fuel_budget = 200_000
+fuel_max = 2_000_000
+required_capabilities = ["audio.decode", "ml.stt"]
+validate_determinism = true
+preserve_provenance = true
+
+[[bridges.generic.ingest.transform_pipeline]]
+transform_type = "text_to_structured"
+fuel_budget = 100_000
+fuel_max = 1_000_000
+required_capabilities = ["nlp.parse"]
+validate_determinism = true
+preserve_provenance = true
+
+# Block: Deterministic Core
+[bridges.generic.block]
+fuel_budget_default = 500_000      # High fuel budget
+fuel_budget_max = 5_000_000
+
+# Capability mapping: external actions → Jig capabilities
+[bridges.generic.block.capability_mapping]
+send_email = ["net.smtp", "net.dns"]
+upload_file = ["storage.write", "net.http"]
+fetch_url = ["net.http", "net.dns"]
+read_contacts = ["storage.read"]
+
+# Export: Jig Block → External
+[bridges.generic.export]
+render_mode = "full"
+include_provenance = true
+include_receipt = false
+privacy_mode = "anonymized"
+
+# Example export transform: Structured Data → Audio
+[[bridges.generic.export.transform_pipeline]]
+transform_type = "structured_to_text"
+fuel_budget = 80_000
+fuel_max = 800_000
+required_capabilities = ["nlp.generate"]
+validate_determinism = true
+preserve_provenance = true
+
+[[bridges.generic.export.transform_pipeline]]
+transform_type = "text_to_audio"
+fuel_budget = 150_000
+fuel_max = 1_500_000
+required_capabilities = ["audio.encode", "ml.tts"]
+validate_determinism = true
+preserve_provenance = true
+
+# Rate Limiting (reputation-gated)
+[bridges.generic.limits]
+rate_limit_per_user = 1000         # High per-user limit
+rate_limit_global = 100_000        # High global limit
+min_reputation_tier = "low_sec"    # Require some reputation
+require_verified_for_outbound = true
+
+# Monitoring & Observability
+[bridges.generic.monitoring]
+log_all_ingress = true
+log_all_egress = true
+track_fuel_usage = true
+alert_on_anomalies = true
+analytics_backend = "clickhouse"   # ClickHouse for hyperscale
+
+# Export Format Configuration
+[export.yaml]
+enabled = true
+canonical_format = false
+include_comments = true
+include_provenance = true
+pretty_print = true
+
+[export.json]
+enabled = true
+canonical_format = false
+include_comments = false
+include_provenance = true
+pretty_print = true
+
+[export.jcs]
+enabled = true
+canonical_format = true            # JCS is THE canonical format
+include_comments = false
+include_provenance = true
+pretty_print = false
+
+[export.activitypub]
+enabled = true                     # Enable ActivityPub export
+canonical_format = false
+include_comments = false
+include_provenance = true
+pretty_print = false
+
+[export.atproto]
+enabled = true                     # Enable AT Protocol export
+canonical_format = false
+include_comments = false
+include_provenance = true
+pretty_print = false
+
+# ============================================================================
+# Analytics Configuration (Hyperscale Profile)
+# ============================================================================
+
+[analytics]
+backend = "clickhouse"           # Distributed analytics for hyperscale
+retention_days = 365             # 1 year retention
+sample_rate = 1.0                # 100% sampling (full observability)
+privacy_mode = "aggregated"      # Summary statistics, no PII
+
+[analytics.clickhouse]
+dsn = "tcp://clickhouse.internal:9000"
+database = "jig_analytics"
+batch_size = 5000                # Large batches for efficiency
+flush_interval_secs = 30         # Frequent flushes
+pool_size = 20                   # Large connection pool
+compression = true               # Enable compression
+
+# ============================================================================
+# Telemetry Configuration (Hyperscale Profile)
+# ============================================================================
+
+[telemetry]
+metrics_enabled = true
+metrics_endpoint = "http://localhost:9090/metrics"
+metrics_format = "otlp"          # OpenTelemetry Protocol
+trace_sampling = 1.0             # 100% tracing (full observability)
+log_level = "debug"              # Detailed logging
+structured_logging = true        # JSON structured logs
+stdout_logging = true
+log_file_path = "/var/log/jig/server.log"
+log_rotation_size_mb = 500       # Large rotation size
+
+[telemetry.opentelemetry]
+enabled = true
+endpoint = "http://otel-collector.internal:4317"
+service_name = "jig-server"
+service_version = "0.2.0"
+environment = "production"
+
+[telemetry.opentelemetry.resource_attributes]
+cluster = "us-east-1"
+datacenter = "aws"
+tier = "hyperscale"
