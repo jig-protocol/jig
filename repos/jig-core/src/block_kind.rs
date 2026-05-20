@@ -137,9 +137,12 @@ mod tests {
         assert!(!BlockKind::ChannelPromote.is_wasm_executable());
         assert!(!BlockKind::FedHello.is_wasm_executable());
         assert!(!BlockKind::NsRegister.is_wasm_executable());
+        assert!(!BlockKind::NsRotate.is_wasm_executable());
+        assert!(!BlockKind::NsRenew.is_wasm_executable());
         assert!(!BlockKind::NsAttestation.is_wasm_executable());
         assert!(!BlockKind::TimeAttestation.is_wasm_executable());
         assert!(!BlockKind::EmailRender.is_wasm_executable());
+        assert!(!BlockKind::EmailEncrypted.is_wasm_executable());
         assert!(!BlockKind::Receipt.is_wasm_executable());
     }
 
