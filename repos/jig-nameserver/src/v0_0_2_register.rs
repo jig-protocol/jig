@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::v0_0_2::AppState;
 
 /// v0.0.2 attestation default TTL: 90 days, per the design spec.
-const DEFAULT_TTL_SECONDS: i64 = 90 * 24 * 60 * 60;
+pub(crate) const DEFAULT_TTL_SECONDS: i64 = 90 * 24 * 60 * 60;
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterReq {
@@ -44,7 +44,7 @@ pub struct ErrorBody {
     pub message: String,
 }
 
-fn err(
+pub(crate) fn err(
     status: StatusCode,
     code: &'static str,
     msg: impl Into<String>,
@@ -79,7 +79,7 @@ fn validate_local_part(s: &str) -> Result<(), (StatusCode, Json<ErrorBody>)> {
     Ok(())
 }
 
-fn verify_proof_of_control(
+pub(crate) fn verify_proof_of_control(
     did_str: &str,
     challenge: &str,
     proof_b64: &str,
