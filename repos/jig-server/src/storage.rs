@@ -413,7 +413,7 @@ mod tests {
             let manifest = BlockManifest::builder()
                 .version(semver::Version::new(1, 0, i))
                 .author(jig_core::manifest::Author {
-                    did: format!("did:jig:test-{i}"),
+                    did: format!("did:jig:test-{i}").into(),
                     ..Default::default()
                 })
                 .render(jig_core::manifest::RenderDescriptor {

@@ -592,7 +592,7 @@ mod tests {
             let manifest = BlockManifest::builder()
                 .version(semver::Version::new(1, 0, i))
                 .author(MAuthor {
-                    did: format!("did:jig:test-{i}"),
+                    did: format!("did:jig:test-{i}").into(),
                     ..Default::default()
                 })
                 .render(RenderDescriptor {
@@ -1049,7 +1049,7 @@ mod tests {
             let manifest = BlockManifest::builder()
                 .version(semver::Version::new(1, 0, i))
                 .author(MAuthor {
-                    did: format!("did:jig:test-{i}"),
+                    did: format!("did:jig:test-{i}").into(),
                     ..Default::default()
                 })
                 .render(RenderDescriptor {

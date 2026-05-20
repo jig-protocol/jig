@@ -362,7 +362,7 @@ mod tests {
         BlockManifest::builder()
             .version(Version::new(1, 0, 0))
             .author(Author {
-                did: "did:test:author".to_string(),
+                did: "did:test:author".into(),
                 ..Default::default()
             })
             .capability(Capability {
