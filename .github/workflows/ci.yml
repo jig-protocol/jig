@@ -11,6 +11,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
@@ -20,6 +22,24 @@ jobs:
         run: |
           cargo install cargo-nextest --locked
           cargo nextest run --workspace
+
+  wasm-build:
+    name: wasm-build (text-block, wasm32-wasip1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: repos
+          key: wasm32-wasip1
+      - name: Build text-block (wasm32-wasip1)
+        working-directory: repos
+        run: cargo build --release --target wasm32-wasip1 -p text-block
+      - name: Verify wasm artifact exists
+        run: test -f repos/target/wasm32-wasip1/release/text_block.wasm
 
   jig-server-matrix:
     runs-on: ubuntu-latest
