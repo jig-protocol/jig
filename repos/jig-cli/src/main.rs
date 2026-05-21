@@ -416,28 +416,33 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Commands::Send { message, channel }) => {
+            // F5: route through jig-client WSS submit. The CLI surface
+            // preserves the `<message...>` positional vec so `jig send "hello
+            // world"` and `jig send hello world` both work, and the
+            // `--channel` flag still falls back to `[user] default_channel`
+            // from cli.toml.
             let msg = if message.is_empty() {
                 direct_message.join(" ")
             } else {
                 message.join(" ")
             };
-            let msg = msg.trim();
-            if msg.is_empty() {
+            let body = msg.trim().to_string();
+            if body.is_empty() {
                 return Ok(());
             }
             let channel = channel.unwrap_or(default_channel.clone());
-            let cid = commands::send_text(&client, &config, &channel, msg).await?;
-            if !cli.quiet {
-                println!("Block published: {}", cid);
-            }
+            cmd::send::run(channel, body).await?;
         }
         Some(Commands::Read { channel, limit }) => {
             let channel = channel.unwrap_or(default_channel.clone());
             commands::read_messages(&client, &channel, limit, cli.json).await?;
         }
         Some(Commands::Tail { channel }) => {
+            // F5: route through jig-client WSS subscribe. v0.0.1's HTTP-
+            // polling tail (`commands::tail_messages`) is removed; this is
+            // an intentional regression — v0.0.2 only ships the WSS path.
             let channel = channel.unwrap_or(default_channel.clone());
-            commands::tail_messages(&client, &channel).await?;
+            cmd::tail::run(channel).await?;
         }
         Some(Commands::Receipt { action }) => match action {
             ReceiptAction::View { file, block } => {

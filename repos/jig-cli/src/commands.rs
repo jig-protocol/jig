@@ -12,7 +12,6 @@ use chrono::{DateTime, Utc};
 use cid::Cid;
 use serde_json::Value;
 use std::io::{self, BufRead, Write};
-use std::time::Duration;
 
 pub async fn send_text(
     client: &JigHttpClient,
@@ -46,36 +45,6 @@ pub async fn read_messages(
         print_summary(&block);
     }
     Ok(())
-}
-
-pub async fn tail_messages(client: &JigHttpClient, channel: &str) -> Result<()> {
-    println!("Following {}... (Ctrl+C to exit)", channel);
-    let mut last_seen: Option<DateTime<Utc>> = None;
-    loop {
-        let summaries = client.list_blocks(200).await?;
-        let mut filtered = summaries
-            .into_iter()
-            .filter(|summary| manifest_matches_channel(&summary.manifest, channel))
-            .collect::<Vec<_>>();
-        filtered.sort_by_key(|b| b.created_at());
-
-        for block in filtered {
-            let block_ts = block.created_at();
-            let should_print = match (block_ts, last_seen) {
-                (Some(ts), Some(last)) => ts > last,
-                (Some(_), None) => true,
-                (None, _) => true,
-            };
-            if should_print {
-                print_summary(&block);
-                if let Some(ts) = block_ts {
-                    last_seen = Some(ts);
-                }
-            }
-        }
-
-        tokio::time::sleep(Duration::from_millis(750)).await;
-    }
 }
 
 pub async fn interactive_mode(

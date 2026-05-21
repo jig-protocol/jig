@@ -1,10 +1,13 @@
 //! Command implementations
 
 pub mod channel;
+pub mod common;
 pub mod init;
 pub mod keys;
 pub mod receipt;
+pub mod send;
 pub mod server;
+pub mod tail;
 
 #[cfg(feature = "local-runtime")]
 pub mod block_run;
