@@ -1,5 +1,6 @@
 //! Command implementations
 
+pub mod init;
 pub mod receipt;
 
 #[cfg(feature = "local-runtime")]

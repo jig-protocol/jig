@@ -55,11 +55,24 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Initialize a default configuration file
+    /// Generate a fresh keypair and write `~/.jig/cli.toml`. Optionally
+    /// request an alias attestation from a nameserver.
     Init {
-        /// Overwrite existing config if present
+        /// Optional nickname; defaults to whoami::username()
+        #[arg()]
+        nickname: Option<String>,
+
+        /// Overwrite existing cli.toml if present
         #[arg(long)]
         force: bool,
+
+        /// Request an alias from a nameserver after generating keys
+        #[arg(long)]
+        request_alias: Option<String>,
+
+        /// Nameserver URL (required with --request-alias)
+        #[arg(long)]
+        nameserver: Option<String>,
     },
 
     /// Send a text message block
@@ -217,9 +230,21 @@ enum ReceiptAction {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Handle config init early
-    if let Some(Commands::Init { force }) = cli.command {
-        commands::init_config(force)?;
+    // Handle init early — it doesn't need the loaded config / HTTP client.
+    if let Some(Commands::Init {
+        nickname,
+        force,
+        request_alias,
+        nameserver,
+    }) = cli.command
+    {
+        cmd::init::run(cmd::init::InitArgs {
+            nickname,
+            force,
+            request_alias,
+            nameserver,
+        })
+        .await?;
         return Ok(());
     }
 

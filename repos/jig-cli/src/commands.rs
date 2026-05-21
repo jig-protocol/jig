@@ -1,6 +1,11 @@
-//! Command implementations for the block-based CLI
+//! Command implementations for the block-based CLI.
+//!
+//! Note: the `jig init` command moved to `cmd::init` for Phase F1 of the
+//! v0.0.2 hello-world plan (keypair generation + optional alias
+//! registration). The legacy `init_config` placeholder that used to live
+//! here has been removed.
 
-use crate::config::{self, Config};
+use crate::config::Config;
 use crate::http_client::{BlockDetail, BlockSummary, JigHttpClient};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -8,23 +13,6 @@ use cid::Cid;
 use serde_json::Value;
 use std::io::{self, BufRead, Write};
 use std::time::Duration;
-
-pub fn init_config(force: bool) -> Result<()> {
-    let config_path = config::default_config_path();
-    if config_path.exists() && !force {
-        println!(
-            "Config already exists at {}. Use --force to overwrite.",
-            config_path.display()
-        );
-        return Ok(());
-    }
-
-    let cfg = Config::default();
-    config::save_config(&cfg, Some(&config_path))?;
-    println!("Initialized config at {}", config_path.display());
-    println!("Server URL: {}", cfg.server.base_url);
-    Ok(())
-}
 
 pub async fn send_text(
     client: &JigHttpClient,

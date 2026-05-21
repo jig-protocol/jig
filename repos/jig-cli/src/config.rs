@@ -64,9 +64,13 @@ pub fn save_config(config: &Config, path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// Path to the v0.0.2 CLI config: `~/.jig/cli.toml`.
+///
+/// This is intentionally distinct from `~/.jig/config.toml` (the legacy
+/// v0.0.1 path) and from `~/.jig/server.toml` (the server-side config).
 pub fn default_config_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".jig")
-        .join("config.toml")
+        .join("cli.toml")
 }
