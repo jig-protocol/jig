@@ -103,6 +103,12 @@ enum Commands {
         action: ReceiptAction,
     },
 
+    /// Manage identity keys (renew / rotate alias attestations).
+    Keys {
+        #[command(subcommand)]
+        action: KeysAction,
+    },
+
     /// Execute WASM blocks locally
     #[cfg(feature = "local-runtime")]
     Block {
@@ -200,6 +206,34 @@ enum BlockAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum KeysAction {
+    /// Renew the validity window of an existing alias attestation
+    /// (same DID, extended TTL).
+    Renew {
+        /// Fully-qualified alias to renew, e.g. `dj@dj.jig`.
+        #[arg()]
+        alias: String,
+
+        /// Nameserver base URL (e.g. http://127.0.0.1:7118).
+        #[arg(long)]
+        nameserver: String,
+    },
+
+    /// Mint a fresh keypair and rotate the alias binding from the
+    /// current DID to the new one. The old keyfile is preserved as
+    /// `<old_did>.key.rotated` for offline recovery.
+    Rotate {
+        /// Fully-qualified alias whose DID binding is being rotated.
+        #[arg()]
+        alias: String,
+
+        /// Nameserver base URL.
+        #[arg(long)]
+        nameserver: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum ReceiptAction {
     /// View a receipt from a file or server
     View {
@@ -245,6 +279,20 @@ async fn main() -> Result<()> {
             nameserver,
         })
         .await?;
+        return Ok(());
+    }
+
+    // Handle keys subcommands early — they own their own config load
+    // and don't touch the messaging HTTP client.
+    if let Some(Commands::Keys { action }) = cli.command {
+        match action {
+            KeysAction::Renew { alias, nameserver } => {
+                cmd::keys::renew(cmd::keys::KeysRenewArgs { alias, nameserver }).await?;
+            }
+            KeysAction::Rotate { alias, nameserver } => {
+                cmd::keys::rotate(cmd::keys::KeysRotateArgs { alias, nameserver }).await?;
+            }
+        }
         return Ok(());
     }
 
@@ -403,6 +451,7 @@ async fn main() -> Result<()> {
             }
         },
         Some(Commands::Init { .. }) => unreachable!("init handled earlier"),
+        Some(Commands::Keys { .. }) => unreachable!("keys handled earlier"),
         None => {
             if !direct_message.is_empty() {
                 let msg = direct_message.join(" ");
