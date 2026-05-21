@@ -4,8 +4,32 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 jig-runtime = { workspace = true }
+jig-server = { path = "../jig-server" }
+jig-nameserver = { path = "../jig-nameserver" }
+jig-client = { path = "../jig-client" }
+jig-pipeline = { path = "../jig-pipeline" }
+jig-core = { workspace = true }
+jig-config = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"
+anyhow = { workspace = true }
+chrono = { workspace = true }
+base64 = "0.22"
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+blake3 = { workspace = true }
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
 
 [dev-dependencies]
 wat = "1.0"
