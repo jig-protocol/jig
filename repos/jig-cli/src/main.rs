@@ -97,6 +97,15 @@ enum Commands {
         channel: Option<String>,
     },
 
+    /// Interactive ratatui TUI: scrolling history + input box. The
+    /// "demo command" — `install.sh` invokes this at the end of
+    /// first-run setup. Enter sends, Ctrl+Q or Esc quits.
+    Chat {
+        /// Channel slug to join (e.g. `#hello`).
+        #[arg()]
+        channel: String,
+    },
+
     /// View and inspect block receipts
     Receipt {
         #[command(subcommand)]
@@ -443,6 +452,11 @@ async fn main() -> Result<()> {
             // an intentional regression — v0.0.2 only ships the WSS path.
             let channel = channel.unwrap_or(default_channel.clone());
             cmd::tail::run(channel).await?;
+        }
+        Some(Commands::Chat { channel }) => {
+            // F6: ratatui TUI combining `tail` (live history) with an
+            // input box. The end-of-install demo command.
+            cmd::chat::run(cmd::chat::ChatArgs { channel }).await?;
         }
         Some(Commands::Receipt { action }) => match action {
             ReceiptAction::View { file, block } => {

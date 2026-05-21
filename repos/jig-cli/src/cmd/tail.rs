@@ -17,11 +17,11 @@
 //!     should never fire; the wiring is here for v0.0.3+ federation.)
 
 use anyhow::{Context, Result};
-use base64::Engine as _;
-use jig_client::{Client, DeliveredBlock, envelope::ReceiptRef};
-use jig_core::BlockManifest;
-use std::collections::HashSet;
+use jig_client::{Client, DeliveredBlock};
 
+use crate::cmd::blocks_decode::decode;
+#[cfg(test)]
+use crate::cmd::blocks_decode::distinct_render_hashes;
 use crate::cmd::common::{load_active_identity, load_server_url};
 
 /// Apply `jig tail <channel>`.
@@ -53,57 +53,47 @@ pub async fn run(channel: String) -> Result<()> {
 
 /// Decode a delivered block bundle and format the one-line summary.
 ///
-/// Bundle layout (must match `jig_client::blocks::BuiltBlock::canonical_bytes`):
-///   * `bundle_b64` decodes to JSON-encoded `(manifest_bytes, code_bytes)`.
-///   * `manifest_bytes` decodes to `BlockManifest`.
-///   * Body lives at `manifest.metadata["body"]` (a JSON string).
-///   * Sender DID is `manifest.authors[0].did`.
-///   * Wall-clock timestamp comes from `manifest.hlc_ts.wall_ms` if set.
+/// Delegates the heavy lifting (b64 + manifest parsing + receipt
+/// dedupe) to `blocks_decode::decode` — shared with `jig chat`. This
+/// function only owns the textual line format `<ts>  <sender>  <body>`
+/// plus the optional render-parity warning suffix.
 fn decode_and_format(d: &DeliveredBlock) -> Result<String> {
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(&d.bundle_b64)
-        .context("decoding bundle_b64")?;
-    let (manifest_bytes, _code_bytes): (Vec<u8>, Vec<u8>) =
-        serde_json::from_slice(&raw).context("decoding bundle tuple")?;
-    let manifest: BlockManifest =
-        serde_json::from_slice(&manifest_bytes).context("decoding block manifest")?;
-
-    let sender = manifest
-        .authors
-        .first()
-        .map(|a| a.did.to_did_jig_string())
-        .unwrap_or_else(|| "<no-author>".into());
-    let body = manifest
-        .metadata
-        .get("body")
-        .and_then(|v| v.as_str())
-        .unwrap_or("<no-body>");
-    let ts = manifest.hlc_ts.as_ref().map(|t| t.wall_ms).unwrap_or(0);
-    let parity = render_parity_marker(&d.receipts);
-    Ok(format!("{ts}  {sender}  {body}{parity}"))
+    let decoded = decode(d)?;
+    let parity = render_parity_marker_from_count(decoded.parity_hash_count);
+    Ok(format!(
+        "{ts}  {sender}  {body}{parity}",
+        ts = decoded.ts,
+        sender = decoded.sender,
+        body = decoded.body,
+    ))
 }
 
-/// Compute the render-parity marker over a slice of receipts.
+/// Compute the render-parity marker string from a distinct-hash count.
 ///
-/// Returns an empty string if all receipts agree (or there are 0–1
-/// `render_hash` values present) and an explicit `⚠ render mismatch (N
-/// hashes)` warning otherwise. N counts distinct hash values, not receipts.
-fn render_parity_marker(receipts: &[ReceiptRef]) -> String {
-    let hashes: HashSet<&str> = receipts
-        .iter()
-        .filter_map(|r| r.render_hash.as_deref())
-        .collect();
-    match hashes.len() {
+/// Returns an empty string for 0 or 1 distinct hashes (the common case)
+/// and an explicit `⚠ render mismatch (N hashes)` warning otherwise.
+fn render_parity_marker_from_count(n: usize) -> String {
+    match n {
         0 | 1 => String::new(),
         n => format!("  ⚠ render mismatch ({n} hashes)"),
     }
 }
 
+/// Backwards-compat wrapper for tests that exercised the old API by
+/// passing a receipt slice. Inlines the distinct-hash computation so
+/// the parity-marker test cases keep working unchanged.
+#[cfg(test)]
+fn render_parity_marker(receipts: &[jig_client::envelope::ReceiptRef]) -> String {
+    render_parity_marker_from_count(distinct_render_hashes(receipts))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use jig_client::Identity;
     use jig_client::blocks::build_text_render;
+    use jig_client::envelope::ReceiptRef;
     use jig_core::HlcTimestamp;
     use tempfile::tempdir;
 

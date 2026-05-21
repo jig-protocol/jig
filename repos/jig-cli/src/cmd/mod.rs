@@ -1,6 +1,8 @@
 //! Command implementations
 
+pub mod blocks_decode;
 pub mod channel;
+pub mod chat;
 pub mod common;
 pub mod init;
 pub mod keys;
