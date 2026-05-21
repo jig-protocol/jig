@@ -3,6 +3,7 @@
 pub mod init;
 pub mod keys;
 pub mod receipt;
+pub mod server;
 
 #[cfg(feature = "local-runtime")]
 pub mod block_run;

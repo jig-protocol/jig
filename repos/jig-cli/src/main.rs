@@ -109,11 +109,39 @@ enum Commands {
         action: KeysAction,
     },
 
+    /// Configure the server this client talks to (`set`) or query its
+    /// `/.well-known/jig` advertised capabilities (`info`).
+    Server {
+        #[command(subcommand)]
+        action: ServerAction,
+    },
+
     /// Execute WASM blocks locally
     #[cfg(feature = "local-runtime")]
     Block {
         #[command(subcommand)]
         action: BlockAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ServerAction {
+    /// Persist a new server base URL to `~/.jig/cli.toml`. Accepts
+    /// `http://`, `https://`, `ws://`, or `wss://`. v0.0.2 stores
+    /// whatever the operator supplies (validated for basic URL shape).
+    Set {
+        /// e.g. `http://127.0.0.1:7117` or `wss://deji.jig.onl`.
+        #[arg()]
+        url: String,
+    },
+
+    /// Fetch `/.well-known/jig` from the configured server (or
+    /// `--url <override>`) and pretty-print the response.
+    Info {
+        /// Query a different server without modifying `cli.toml`. Useful
+        /// for diagnostics ("does that peer think it's federated with me?").
+        #[arg(long)]
+        url: Option<String>,
     },
 }
 
@@ -296,6 +324,21 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Handle server subcommands early — `set` mutates ~/.jig/cli.toml
+    // and `info` issues a one-shot HTTP GET; neither needs the messaging
+    // pipeline wired up.
+    if let Some(Commands::Server { action }) = cli.command {
+        match action {
+            ServerAction::Set { url } => {
+                cmd::server::set(&url)?;
+            }
+            ServerAction::Info { url } => {
+                cmd::server::info(url.as_deref()).await?;
+            }
+        }
+        return Ok(());
+    }
+
     let mut config = config::load_config(cli.config.as_deref())?;
     if let Some(server) = cli.server {
         config.server.base_url = server;
@@ -452,6 +495,7 @@ async fn main() -> Result<()> {
         },
         Some(Commands::Init { .. }) => unreachable!("init handled earlier"),
         Some(Commands::Keys { .. }) => unreachable!("keys handled earlier"),
+        Some(Commands::Server { .. }) => unreachable!("server handled earlier"),
         None => {
             if !direct_message.is_empty() {
                 let msg = direct_message.join(" ");

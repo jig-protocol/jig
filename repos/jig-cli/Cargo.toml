@@ -50,6 +50,9 @@ reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 # Base64 for alias-registration proof-of-control signatures
 base64 = "0.22"
 
+# URL parsing (validates `jig server set <url>` input)
+url = "2"
+
 # Terminal detection
 atty = "0.2"
 
