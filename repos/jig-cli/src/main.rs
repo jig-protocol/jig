@@ -116,12 +116,49 @@ enum Commands {
         action: ServerAction,
     },
 
+    /// Create, join, or list channels on the configured server. Uses the
+    /// `/_admin_v0_0_2/*` admin endpoints in v0.0.2 (server must have
+    /// `[debug] admin_endpoints = true`); the list endpoint is public.
+    Channel {
+        #[command(subcommand)]
+        action: ChannelAction,
+    },
+
     /// Execute WASM blocks locally
     #[cfg(feature = "local-runtime")]
     Block {
         #[command(subcommand)]
         action: BlockAction,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum ChannelAction {
+    /// Create a new channel. Builds a signed channel-create block and
+    /// POSTs it to `/_admin_v0_0_2/channels` on the configured server.
+    Create {
+        /// Channel slug (e.g. `#hello`).
+        #[arg()]
+        slug: String,
+
+        /// Channel visibility — `open` (anyone can read; default) or
+        /// `restricted` (membership-gated reads).
+        #[arg(long, default_value = "open")]
+        visibility: String,
+    },
+
+    /// Join an existing channel by adding the caller's DID as a member.
+    /// Builds a signed member-add block and POSTs it to
+    /// `/_admin_v0_0_2/channels/<slug>/members`.
+    Join {
+        /// Channel slug to join (e.g. `#hello`).
+        #[arg()]
+        slug: String,
+    },
+
+    /// List all channels known to the configured server.
+    /// GETs `/api/v1/channels` and renders an aligned table.
+    List,
 }
 
 #[derive(Subcommand, Debug)]
@@ -339,6 +376,24 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Handle channel subcommands early — they don't touch the legacy
+    // messaging HTTP client; they go straight to `/_admin_v0_0_2/*` or
+    // `/api/v1/channels` via reqwest.
+    if let Some(Commands::Channel { action }) = cli.command {
+        match action {
+            ChannelAction::Create { slug, visibility } => {
+                cmd::channel::create(slug, visibility).await?;
+            }
+            ChannelAction::Join { slug } => {
+                cmd::channel::join(slug).await?;
+            }
+            ChannelAction::List => {
+                cmd::channel::list().await?;
+            }
+        }
+        return Ok(());
+    }
+
     let mut config = config::load_config(cli.config.as_deref())?;
     if let Some(server) = cli.server {
         config.server.base_url = server;
@@ -496,6 +551,7 @@ async fn main() -> Result<()> {
         Some(Commands::Init { .. }) => unreachable!("init handled earlier"),
         Some(Commands::Keys { .. }) => unreachable!("keys handled earlier"),
         Some(Commands::Server { .. }) => unreachable!("server handled earlier"),
+        Some(Commands::Channel { .. }) => unreachable!("channel handled earlier"),
         None => {
             if !direct_message.is_empty() {
                 let msg = direct_message.join(" ");

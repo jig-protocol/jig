@@ -1,5 +1,6 @@
 //! Command implementations
 
+pub mod channel;
 pub mod init;
 pub mod keys;
 pub mod receipt;

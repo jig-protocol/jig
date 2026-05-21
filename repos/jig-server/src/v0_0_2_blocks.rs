@@ -241,6 +241,47 @@ pub async fn get_block_by_cid(
     }))
 }
 
+// ---- Channel list endpoint --------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct ChannelView {
+    pub slug: String,
+    pub visibility: String,
+    pub owner_did: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChannelsResponse {
+    pub channels: Vec<ChannelView>,
+}
+
+/// GET /api/v1/channels — list all channels known to this server.
+///
+/// Channels are public state in v0.0.2 (no per-channel ACL on listing — the
+/// visibility flag governs join semantics, not listing). Not debug-gated.
+pub async fn list_channels(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ChannelsResponse>, (StatusCode, Json<ErrorBody>)> {
+    let stored = state.ingest_ctx.store.list_channels().map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "PERSIST_ERROR",
+            e.to_string(),
+        )
+    })?;
+    let channels = stored
+        .into_iter()
+        .map(|c| ChannelView {
+            slug: c.slug,
+            visibility: c.visibility,
+            owner_did: c.owner_did,
+            created_at: c.created_at,
+        })
+        .collect();
+    Ok(Json(ChannelsResponse { channels }))
+}
+
 /// Construct the REST sub-router. Merged into the v0.0.2 router by
 /// `v0_0_2_ws::build_v0_0_2_router`. Not debug-gated — these are
 /// production endpoints.
@@ -248,6 +289,7 @@ pub fn build_blocks_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/v1/blocks", post(submit_block))
         .route("/api/v1/blocks/:cid", get(get_block_by_cid))
+        .route("/api/v1/channels", get(list_channels))
         .with_state(state)
 }
 
@@ -402,5 +444,92 @@ mod tests {
             "must have at least one receipt"
         );
         assert!(!get_body["bundle_b64"].as_str().unwrap_or("").is_empty());
+    }
+
+    // ---- list_channels tests --------------------------------------------------
+
+    #[tokio::test]
+    async fn list_channels_returns_empty_when_no_channels_exist() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let router = build_blocks_router(state);
+
+        let (status, body) = get_path(router, "/api/v1/channels").await;
+        assert_eq!(status, StatusCode::OK);
+        let channels = body["channels"].as_array().expect("channels array");
+        assert!(channels.is_empty(), "fresh store has no channels");
+    }
+
+    #[tokio::test]
+    async fn list_channels_returns_channels_after_admin_create() {
+        // Round-trip: create a channel via the admin endpoint, then GET
+        // /api/v1/channels and assert the new channel appears. This is the
+        // happy-path coverage the F4 spec asks for.
+        use jig_client::blocks::build_channel_create;
+
+        let state = Arc::new(AppState::for_test().unwrap());
+
+        // Build a combined router with both blocks (list_channels) and
+        // admin (create_channel) routes mounted on the same state.
+        let router = build_blocks_router(state.clone())
+            .merge(crate::v0_0_2_admin::build_admin_router(state.clone()));
+
+        let id = test_identity();
+        let hlc = test_hlc(&id);
+        let block = build_channel_create(&id, "#hello", "open", hlc);
+        let submission = serde_json::json!({
+            "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
+            "sig_b64": base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
+        });
+
+        let (status, _body) =
+            post_json(router.clone(), "/_admin_v0_0_2/channels", submission).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = get_path(router, "/api/v1/channels").await;
+        assert_eq!(status, StatusCode::OK);
+        let channels = body["channels"].as_array().expect("channels array");
+        assert_eq!(channels.len(), 1, "exactly one channel expected");
+        assert_eq!(channels[0]["slug"], "#hello");
+        assert_eq!(channels[0]["visibility"], "open");
+        assert_eq!(channels[0]["owner_did"], id.did_string());
+        assert!(
+            channels[0]["created_at"].as_i64().unwrap_or(0) >= 0,
+            "created_at must be present as an integer"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_channels_returns_multiple_channels_sorted_by_slug() {
+        // SqliteStore::list_channels ORDERs BY slug — confirm we surface
+        // that ordering so CLI output is stable across invocations.
+        use jig_client::blocks::build_channel_create;
+
+        let state = Arc::new(AppState::for_test().unwrap());
+        let router = build_blocks_router(state.clone())
+            .merge(crate::v0_0_2_admin::build_admin_router(state.clone()));
+
+        let id = test_identity();
+        // Create channels in a non-sorted order; expect sorted output.
+        for slug in ["#zulu", "#alpha", "#mike"] {
+            let hlc = test_hlc(&id);
+            let block = build_channel_create(&id, slug, "open", hlc);
+            let submission = serde_json::json!({
+                "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
+                "sig_b64":    base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
+            });
+            let (status, _) =
+                post_json(router.clone(), "/_admin_v0_0_2/channels", submission).await;
+            assert_eq!(status, StatusCode::OK, "creating {slug}");
+        }
+
+        let (status, body) = get_path(router, "/api/v1/channels").await;
+        assert_eq!(status, StatusCode::OK);
+        let slugs: Vec<_> = body["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["slug"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(slugs, vec!["#alpha", "#mike", "#zulu"]);
     }
 }
