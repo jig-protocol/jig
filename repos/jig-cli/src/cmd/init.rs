@@ -77,13 +77,13 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .with_context(|| format!("generating identity under {}", keys_dir.display()))?;
     let did_string = id.did_string();
     println!("generated DID: {did_string}");
-    println!("keyfile: {}", keys_dir.join(format!("{did_string}.key")).display());
+    println!(
+        "keyfile: {}",
+        keys_dir.join(format!("{did_string}.key")).display()
+    );
 
     // 3. Persist nickname + DID binding to ~/.jig/cli.toml.
-    let nickname = args
-        .nickname
-        .clone()
-        .unwrap_or_else(whoami::username);
+    let nickname = args.nickname.clone().unwrap_or_else(whoami::username);
     write_cli_config(&id, &nickname)?;
     println!("wrote {} (nickname: {nickname})", cfg_path.display());
 

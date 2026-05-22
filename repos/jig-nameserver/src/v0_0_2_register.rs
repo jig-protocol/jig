@@ -86,19 +86,43 @@ pub(crate) fn verify_proof_of_control(
 ) -> Result<(), (StatusCode, Json<ErrorBody>)> {
     let proof_bytes = base64::engine::general_purpose::STANDARD
         .decode(proof_b64)
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "BAD_PROOF_B64", "proof_of_control is not base64"))?;
-    let did = jig_core::Did::from_did_jig_string(did_str)
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "BAD_DID", "DID is not did:jig:z<base32> canonical form"))?;
-    let pubkey_bytes = did
-        .as_bytes()
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "BAD_DID", "DID does not decode to a 32-byte ed25519 pubkey"))?;
+        .map_err(|_| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "BAD_PROOF_B64",
+                "proof_of_control is not base64",
+            )
+        })?;
+    let did = jig_core::Did::from_did_jig_string(did_str).map_err(|_| {
+        err(
+            StatusCode::BAD_REQUEST,
+            "BAD_DID",
+            "DID is not did:jig:z<base32> canonical form",
+        )
+    })?;
+    let pubkey_bytes = did.as_bytes().map_err(|_| {
+        err(
+            StatusCode::BAD_REQUEST,
+            "BAD_DID",
+            "DID does not decode to a 32-byte ed25519 pubkey",
+        )
+    })?;
     let pubkey = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes)
         .map_err(|_| err(StatusCode::BAD_REQUEST, "BAD_DID", "DID pubkey invalid"))?;
-    let sig = ed25519_dalek::Signature::from_slice(&proof_bytes)
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "BAD_PROOF", "signature wrong length"))?;
-    pubkey
-        .verify(challenge.as_bytes(), &sig)
-        .map_err(|_| err(StatusCode::UNAUTHORIZED, "PROOF_FAILED", "proof_of_control signature did not verify"))?;
+    let sig = ed25519_dalek::Signature::from_slice(&proof_bytes).map_err(|_| {
+        err(
+            StatusCode::BAD_REQUEST,
+            "BAD_PROOF",
+            "signature wrong length",
+        )
+    })?;
+    pubkey.verify(challenge.as_bytes(), &sig).map_err(|_| {
+        err(
+            StatusCode::UNAUTHORIZED,
+            "PROOF_FAILED",
+            "proof_of_control signature did not verify",
+        )
+    })?;
     Ok(())
 }
 
@@ -135,19 +159,20 @@ pub async fn register(
 
     // 4. Compose full alias and check uniqueness
     let full_alias = format!("{}@{}", req.requested_alias, state.suffix());
-    if let Some(existing_did) = state
-        .alias_holder(&full_alias)
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "PERSIST_ERROR", e.to_string()))?
+    if let Some(existing_did) = state.alias_holder(&full_alias).await.map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "PERSIST_ERROR",
+            e.to_string(),
+        )
+    })? && existing_did != req.did
     {
-        if existing_did != req.did {
-            return Err(err(
-                StatusCode::CONFLICT,
-                "ALIAS_TAKEN",
-                format!("alias `{full_alias}` is already attested to a different DID"),
-            ));
-        }
-        // Same DID re-registering — that's idempotent re-issuance with a fresh TTL.
+        return Err(err(
+            StatusCode::CONFLICT,
+            "ALIAS_TAKEN",
+            format!("alias `{full_alias}` is already attested to a different DID"),
+        ));
+        // Same DID re-registering is idempotent re-issuance with a fresh TTL.
     }
 
     // 5. Build + sign attestation (90d TTL)
@@ -169,7 +194,13 @@ pub async fn register(
         "valid_until": attestation.valid_until,
         "profile_ttl_seconds": attestation.profile_ttl_seconds,
     }))
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "SIGN_ERROR", e.to_string()))?;
+    .map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SIGN_ERROR",
+            e.to_string(),
+        )
+    })?;
     let sig = state.ingest_ctx.server_key.sign(&canonical);
     attestation.sig = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
 
@@ -180,14 +211,31 @@ pub async fn register(
         ns_did: attestation.ns_did.clone(),
         valid_from: attestation.valid_from,
         valid_until: attestation.valid_until,
-        attestation_bytes: serde_json::to_vec(&attestation)
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "PERSIST_ERROR", e.to_string()))?,
+        attestation_bytes: serde_json::to_vec(&attestation).map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "PERSIST_ERROR",
+                e.to_string(),
+            )
+        })?,
     };
     let store = state.ingest_ctx.store.clone();
     tokio::task::spawn_blocking(move || store.upsert_alias_attestation(&stored))
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "JOIN_ERROR", e.to_string()))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "PERSIST_ERROR", e.to_string()))?;
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "JOIN_ERROR",
+                e.to_string(),
+            )
+        })?
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "PERSIST_ERROR",
+                e.to_string(),
+            )
+        })?;
 
     Ok(Json(attestation))
 }

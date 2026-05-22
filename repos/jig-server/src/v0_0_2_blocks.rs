@@ -71,14 +71,10 @@ fn map_ingest_error(e: IngestError) -> (StatusCode, Json<ErrorBody>) {
             "KIND_REQUIRED",
             "manifest must declare block kind",
         ),
-        IngestError::BundleMalformed(m) => {
-            err(StatusCode::BAD_REQUEST, "BUNDLE_MALFORMED", m)
+        IngestError::BundleMalformed(m) => err(StatusCode::BAD_REQUEST, "BUNDLE_MALFORMED", m),
+        IngestError::Identity(ide) => {
+            err(StatusCode::UNAUTHORIZED, "IDENTITY_ERROR", ide.to_string())
         }
-        IngestError::Identity(ide) => err(
-            StatusCode::UNAUTHORIZED,
-            "IDENTITY_ERROR",
-            ide.to_string(),
-        ),
         IngestError::Persist(pe) => err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "PERSIST_ERROR",
@@ -122,8 +118,8 @@ pub async fn submit_block(
 
     // Decode the canonical-bytes tuple: (manifest_bytes, code_bytes).
     // BlockBundle has no from_canonical_bytes — decode manually (same as D3/D4 pattern).
-    let (manifest_bytes, code_bytes): (Vec<u8>, Vec<u8>) =
-        serde_json::from_slice(&bundle_bytes).map_err(|e| {
+    let (manifest_bytes, code_bytes): (Vec<u8>, Vec<u8>) = serde_json::from_slice(&bundle_bytes)
+        .map_err(|e| {
             err(
                 StatusCode::BAD_REQUEST,
                 "BAD_BUNDLE",
@@ -219,8 +215,7 @@ pub async fn get_block_by_cid(
             cid: r.cid,
             server_id: r.server_id,
             render_hash: r.render_hash,
-            receipt_bytes_b64: base64::engine::general_purpose::STANDARD
-                .encode(&r.receipt_bytes),
+            receipt_bytes_b64: base64::engine::general_purpose::STANDARD.encode(&r.receipt_bytes),
             produced_at: r.produced_at,
         })
         .collect();
@@ -428,13 +423,11 @@ mod tests {
             "sig_b64": base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
         });
 
-        let (status, submit_body) =
-            post_json(router.clone(), "/api/v1/blocks", submission).await;
+        let (status, submit_body) = post_json(router.clone(), "/api/v1/blocks", submission).await;
         assert_eq!(status, StatusCode::OK);
         let cid = submit_body["block_cid"].as_str().unwrap().to_string();
 
-        let (status, get_body) =
-            get_path(router, &format!("/api/v1/blocks/{cid}")).await;
+        let (status, get_body) = get_path(router, &format!("/api/v1/blocks/{cid}")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(get_body["block_cid"], cid);
         assert_eq!(get_body["block_kind"], "text-render");

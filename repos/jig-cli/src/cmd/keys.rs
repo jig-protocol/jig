@@ -130,19 +130,13 @@ pub async fn renew_with_nameserver(
             resp.text().await.unwrap_or_default()
         );
     }
-    let attestation: AttestationResponse = resp
-        .json()
-        .await
-        .context("decoding /v1/renew response")?;
+    let attestation: AttestationResponse =
+        resp.json().await.context("decoding /v1/renew response")?;
     Ok(attestation)
 }
 
 /// Build the POST /v1/renew body. Factored out for unit testing.
-pub(crate) fn build_renew_request(
-    id: &Identity,
-    alias: &str,
-    challenge: &str,
-) -> RenewRequestBody {
+pub(crate) fn build_renew_request(id: &Identity, alias: &str, challenge: &str) -> RenewRequestBody {
     let sig = id.sign(challenge.as_bytes());
     let proof_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
     RenewRequestBody {
@@ -169,7 +163,10 @@ pub async fn rotate(args: KeysRotateArgs) -> Result<()> {
     }
     let keys_dir = jig_client::identity::default_keys_dir();
     let old_id = Identity::load_from_dir(&keys_dir, &old_did_str).with_context(|| {
-        format!("loading old identity {old_did_str} from {}", keys_dir.display())
+        format!(
+            "loading old identity {old_did_str} from {}",
+            keys_dir.display()
+        )
     })?;
 
     // 2. Mint a fresh keypair. This writes the new keyfile to disk.
@@ -210,8 +207,14 @@ pub async fn rotate(args: KeysRotateArgs) -> Result<()> {
 
     let ttl_days = (attestation.valid_until - attestation.valid_from) / 86_400;
     println!("rotated alias: {}", attestation.alias);
-    println!("  old DID: {old_did_str} (keyfile -> {})", rotated_keyfile.display());
-    println!("  new DID: {new_did_str} (keyfile -> {})", new_keyfile.display());
+    println!(
+        "  old DID: {old_did_str} (keyfile -> {})",
+        rotated_keyfile.display()
+    );
+    println!(
+        "  new DID: {new_did_str} (keyfile -> {})",
+        new_keyfile.display()
+    );
     println!("  ns={} valid {ttl_days}d", attestation.ns_did);
     Ok(())
 }
@@ -246,10 +249,8 @@ pub async fn rotate_with_nameserver(
             resp.text().await.unwrap_or_default()
         );
     }
-    let attestation: AttestationResponse = resp
-        .json()
-        .await
-        .context("decoding /v1/rotate response")?;
+    let attestation: AttestationResponse =
+        resp.json().await.context("decoding /v1/rotate response")?;
     Ok(attestation)
 }
 
@@ -313,7 +314,11 @@ mod tests {
         let req = build_renew_request(&id, "dj@dj.jig", &challenge);
 
         assert_eq!(req.did, id.did_string());
-        assert!(req.did.starts_with("did:jig:z"), "DID must be canonical: {}", req.did);
+        assert!(
+            req.did.starts_with("did:jig:z"),
+            "DID must be canonical: {}",
+            req.did
+        );
         assert_eq!(req.alias, "dj@dj.jig");
         assert_eq!(req.challenge, challenge);
 

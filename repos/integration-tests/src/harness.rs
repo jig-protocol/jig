@@ -320,9 +320,7 @@ impl TestNameserver {
             .merge(jig_nameserver::v0_0_2_resolve::build_resolve_router(
                 state.clone(),
             ))
-            .merge(jig_nameserver::v0_0_2_rotate_renew::build_rotate_renew_router(
-                state.clone(),
-            ))
+            .merge(jig_nameserver::v0_0_2_rotate_renew::build_rotate_renew_router(state.clone()))
             .merge(jig_nameserver::v0_0_2_handles::build_handles_router(
                 state.clone(),
             ));
@@ -517,10 +515,7 @@ fn build_legacy_routes(
 /// Spawn a single peer-loop on an ad-hoc basis (used by `add_peer`).
 /// Mirrors `jig_server::v0_0_2_federation::run_peer_loop` but takes a
 /// peer struct directly instead of iterating `config.federation.peers`.
-async fn spawn_one_peer_loop(
-    state: Arc<jig_server::v0_0_2::AppState>,
-    peer: FederationPeer,
-) {
+async fn spawn_one_peer_loop(state: Arc<jig_server::v0_0_2::AppState>, peer: FederationPeer) {
     use futures_util::{SinkExt, StreamExt};
     use jig_pipeline::{Envelope, Frame, Scope, envelope::ReceiptRef};
     use tokio_tungstenite::tungstenite::Message;
@@ -616,8 +611,7 @@ async fn handle_inbound_test_frame(
         return Ok(());
     };
     let bundle_bytes = base64::engine::general_purpose::STANDARD.decode(&bundle_b64)?;
-    let (manifest_bytes, _code_bytes): (Vec<u8>, Vec<u8>) =
-        serde_json::from_slice(&bundle_bytes)?;
+    let (manifest_bytes, _code_bytes): (Vec<u8>, Vec<u8>) = serde_json::from_slice(&bundle_bytes)?;
     let manifest: BlockManifest = serde_json::from_slice(&manifest_bytes)?;
 
     let block_cid = format!(

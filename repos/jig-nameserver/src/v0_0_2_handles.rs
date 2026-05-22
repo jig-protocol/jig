@@ -6,12 +6,7 @@
 
 use std::sync::Arc;
 
-use axum::{
-    Json, Router,
-    extract::State,
-    http::StatusCode,
-    routing::get,
-};
+use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use serde::Serialize;
 
 use crate::v0_0_2::AppState;
@@ -38,8 +33,20 @@ pub async fn list_handles(
     let store = state.ingest_ctx.store.clone();
     let rows = tokio::task::spawn_blocking(move || store.list_alias_attestations(now))
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "JOIN_ERROR", e.to_string()))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "PERSIST_ERROR", e.to_string()))?;
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "JOIN_ERROR",
+                e.to_string(),
+            )
+        })?
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "PERSIST_ERROR",
+                e.to_string(),
+            )
+        })?;
 
     let aliases = rows
         .into_iter()
@@ -83,15 +90,26 @@ mod tests {
     }
 
     async fn get_path(router: Router, path: &str) -> (StatusCode, serde_json::Value) {
-        let req = Request::builder().method("GET").uri(path).body(Body::empty()).unwrap();
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, json)
     }
 
-    async fn post_json(router: Router, path: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+    async fn post_json(
+        router: Router,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
         let req = Request::builder()
             .method("POST")
             .uri(path)
@@ -100,8 +118,11 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, json)
     }
 
@@ -118,8 +139,7 @@ mod tests {
     #[tokio::test]
     async fn handles_returns_registered_aliases() {
         let state = Arc::new(AppState::for_test().unwrap());
-        let combined = build_register_router(state.clone())
-            .merge(build_handles_router(state));
+        let combined = build_register_router(state.clone()).merge(build_handles_router(state));
 
         // Register two aliases
         for nick in ["dj", "deji"] {

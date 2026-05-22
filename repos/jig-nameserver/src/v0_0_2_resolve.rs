@@ -39,12 +39,23 @@ pub async fn resolve(
     let now = chrono::Utc::now().timestamp();
     let store = state.ingest_ctx.store.clone();
     let alias_for_lookup = alias.clone();
-    let row = tokio::task::spawn_blocking(move || {
-        store.find_alias_attestation(&alias_for_lookup, now)
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "JOIN_ERROR", e.to_string()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "PERSIST_ERROR", e.to_string()))?;
+    let row =
+        tokio::task::spawn_blocking(move || store.find_alias_attestation(&alias_for_lookup, now))
+            .await
+            .map_err(|e| {
+                err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "JOIN_ERROR",
+                    e.to_string(),
+                )
+            })?
+            .map_err(|e| {
+                err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "PERSIST_ERROR",
+                    e.to_string(),
+                )
+            })?;
     let row = row.ok_or_else(|| {
         err(
             StatusCode::NOT_FOUND,
@@ -53,9 +64,14 @@ pub async fn resolve(
         )
     })?;
 
-    let attestation_json: serde_json::Value =
-        serde_json::from_slice(&row.attestation_bytes)
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "PARSE_ERROR", e.to_string()))?;
+    let attestation_json: serde_json::Value = serde_json::from_slice(&row.attestation_bytes)
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "PARSE_ERROR",
+                e.to_string(),
+            )
+        })?;
     Ok(Json(attestation_json))
 }
 

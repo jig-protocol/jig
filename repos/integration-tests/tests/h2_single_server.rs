@@ -66,11 +66,9 @@ async fn single_server_two_client_text_render_round_trip() {
         let Message::Text(text) = msg else { continue };
         let env: Envelope = serde_json::from_str(&text).expect("envelope parse");
         if let Frame::Block { bundle_b64, .. } = env.frame {
-            let bundle_bytes = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                &bundle_b64,
-            )
-            .expect("bundle b64");
+            let bundle_bytes =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &bundle_b64)
+                    .expect("bundle b64");
             let (manifest_bytes, _code_bytes): (Vec<u8>, Vec<u8>) =
                 serde_json::from_slice(&bundle_bytes).expect("bundle tuple");
             let manifest: jig_core::BlockManifest =

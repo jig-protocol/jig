@@ -76,8 +76,7 @@ struct BundleSubmission {
 
 fn submission_for(block: &BuiltBlock) -> BundleSubmission {
     BundleSubmission {
-        bundle_b64: base64::engine::general_purpose::STANDARD
-            .encode(block.canonical_bytes()),
+        bundle_b64: base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
         sig_b64: base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
     }
 }
@@ -99,9 +98,7 @@ struct AdminResult {
 pub async fn create(slug: String, visibility: String) -> Result<()> {
     let visibility = visibility.trim().to_lowercase();
     if !matches!(visibility.as_str(), "open" | "restricted") {
-        anyhow::bail!(
-            "--visibility must be `open` or `restricted` (got `{visibility}`)"
-        );
+        anyhow::bail!("--visibility must be `open` or `restricted` (got `{visibility}`)");
     }
 
     let (id, cfg) = load_active_identity()?;
@@ -170,10 +167,7 @@ pub async fn join(slug: String) -> Result<()> {
             resp.text().await.unwrap_or_default()
         );
     }
-    let result: AdminResult = resp
-        .json()
-        .await
-        .context("decoding member-add response")?;
+    let result: AdminResult = resp.json().await.context("decoding member-add response")?;
     println!("joined {slug} as {my_did}");
     println!("  block_cid: {}", result.block_cid);
     Ok(())
@@ -268,7 +262,12 @@ fn print_channels(channels: &[ChannelView]) {
         return;
     }
     // Pad slug + visibility to the widest entry so the DID column lines up.
-    let slug_w = channels.iter().map(|c| c.slug.len()).max().unwrap_or(0).max(8);
+    let slug_w = channels
+        .iter()
+        .map(|c| c.slug.len())
+        .max()
+        .unwrap_or(0)
+        .max(8);
     let vis_w = channels
         .iter()
         .map(|c| c.visibility.len())
@@ -297,18 +296,12 @@ mod tests {
             base_http_url("ws://127.0.0.1:7117/"),
             "http://127.0.0.1:7117"
         );
-        assert_eq!(
-            base_http_url("wss://deji.jig.onl"),
-            "https://deji.jig.onl"
-        );
+        assert_eq!(base_http_url("wss://deji.jig.onl"), "https://deji.jig.onl");
         assert_eq!(
             base_http_url("http://localhost:7117"),
             "http://localhost:7117"
         );
-        assert_eq!(
-            base_http_url("https://jig.onl/"),
-            "https://jig.onl"
-        );
+        assert_eq!(base_http_url("https://jig.onl/"), "https://jig.onl");
     }
 
     #[test]
@@ -318,7 +311,10 @@ mod tests {
         // fragment delimiter on the server side.
         assert_eq!(escape_slug_for_url("#hello"), "%23hello");
         assert_eq!(escape_slug_for_url("#dev-ops"), "%23dev-ops");
-        assert_eq!(escape_slug_for_url("#with_underscore"), "%23with_underscore");
+        assert_eq!(
+            escape_slug_for_url("#with_underscore"),
+            "%23with_underscore"
+        );
     }
 
     #[test]

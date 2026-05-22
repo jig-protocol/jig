@@ -153,7 +153,9 @@ fn print_server_info(base_url: &str, info: &ServerInfoResponse) {
     println!(
         "{:<22}{}",
         "server_did",
-        info.server_did.as_deref().unwrap_or("[absent — v0.0.1 server?]")
+        info.server_did
+            .as_deref()
+            .unwrap_or("[absent — v0.0.1 server?]")
     );
 
     let kinds = if info.allowed_block_kinds.is_empty() {

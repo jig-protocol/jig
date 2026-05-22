@@ -42,7 +42,11 @@ pub struct AppState {
 impl AppState {
     /// Boot the v0.0.2 state. The nameserver-specific block-kind allowlist
     /// is enforced here: only `ns-*` and `fed-hello` blocks ingest.
-    pub fn new(mut config: JigServerConfig, db_path: PathBuf, alias_suffix: String) -> Result<Self> {
+    pub fn new(
+        mut config: JigServerConfig,
+        db_path: PathBuf,
+        alias_suffix: String,
+    ) -> Result<Self> {
         // Override the allowlist for nameserver mode (config defaults to text-render).
         config.server.allowed_block_kinds = vec![
             "ns-register".to_string(),
@@ -141,7 +145,10 @@ impl AppState {
 
     /// Record a challenge nonce so a later /v1/register can verify it was issued.
     pub async fn remember_challenge(&self, nonce: &str) {
-        self.pending_challenges.write().await.insert(nonce.to_string());
+        self.pending_challenges
+            .write()
+            .await
+            .insert(nonce.to_string());
     }
 
     /// Consume a challenge nonce. Returns true if it was registered (and removes it).

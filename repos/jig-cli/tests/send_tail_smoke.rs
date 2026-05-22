@@ -170,5 +170,8 @@ default_channel = "#general"
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stderr.contains("panicked"), "must not panic — stderr: {stderr}");
+    assert!(
+        !stderr.contains("panicked"),
+        "must not panic — stderr: {stderr}"
+    );
 }

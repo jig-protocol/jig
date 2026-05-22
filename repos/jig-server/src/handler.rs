@@ -1001,7 +1001,8 @@ mod tests {
         );
         // default config includes "text-render" in allowed_block_kinds
         assert!(
-            body.allowed_block_kinds.contains(&"text-render".to_string()),
+            body.allowed_block_kinds
+                .contains(&"text-render".to_string()),
             "expected text-render in allowed_block_kinds"
         );
         // default config has no federation peers configured

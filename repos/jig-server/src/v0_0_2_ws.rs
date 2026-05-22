@@ -45,10 +45,7 @@ static CONN_COUNTER: AtomicU64 = AtomicU64::new(1);
 // ---- Public API ------------------------------------------------------------
 
 /// Axum handler for `GET /api/v1/ws` — upgrades the HTTP request to WebSocket.
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> Response {
+pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
     let conn_id = CONN_COUNTER.fetch_add(1, Ordering::SeqCst);
     ws.on_upgrade(move |socket| handle_socket(socket, state, conn_id))
 }
@@ -156,7 +153,13 @@ async fn handle_client_frame(
         Ok(e) => e,
         Err(e) => {
             // Best-effort error reply; ignore send failure (client may have gone away).
-            let _ = send_error(socket, "BAD_JSON", None, &format!("envelope parse failed: {e}")).await;
+            let _ = send_error(
+                socket,
+                "BAD_JSON",
+                None,
+                &format!("envelope parse failed: {e}"),
+            )
+            .await;
             return Err(e.to_string());
         }
     };
@@ -179,19 +182,29 @@ async fn handle_client_frame(
         }
 
         // ------------------------------------------------------------------ Submit
-        Frame::Submit { bundle_b64, sig_b64 } => {
+        Frame::Submit {
+            bundle_b64,
+            sig_b64,
+        } => {
             // 1. base64-decode the canonical-bytes tuple.
             let bundle_bytes = match base64::engine::general_purpose::STANDARD.decode(&bundle_b64) {
                 Ok(b) => b,
                 Err(_) => {
-                    let _ = send_error(socket, "BAD_BUNDLE_B64", None, "bundle_b64 is not valid base64").await;
+                    let _ = send_error(
+                        socket,
+                        "BAD_BUNDLE_B64",
+                        None,
+                        "bundle_b64 is not valid base64",
+                    )
+                    .await;
                     return Ok(());
                 }
             };
             let sig = match base64::engine::general_purpose::STANDARD.decode(&sig_b64) {
                 Ok(s) => s,
                 Err(_) => {
-                    let _ = send_error(socket, "BAD_SIG_B64", None, "sig_b64 is not valid base64").await;
+                    let _ = send_error(socket, "BAD_SIG_B64", None, "sig_b64 is not valid base64")
+                        .await;
                     return Ok(());
                 }
             };
@@ -232,11 +245,15 @@ async fn handle_client_frame(
             {
                 Ok(block_cid) => {
                     let ack = Envelope::new(Frame::Ack { block_cid });
-                    let Ok(json) = serde_json::to_string(&ack) else { return Ok(()) };
+                    let Ok(json) = serde_json::to_string(&ack) else {
+                        return Ok(());
+                    };
                     let _ = socket.send(Message::Text(json)).await;
                 }
                 Err(IngestError::InvalidSignature) => {
-                    let _ = send_error(socket, "INVALID_SIG", None, "signature verification failed").await;
+                    let _ =
+                        send_error(socket, "INVALID_SIG", None, "signature verification failed")
+                            .await;
                 }
                 Err(IngestError::DisallowedBlockKind { kind }) => {
                     let _ = send_error(
@@ -354,8 +371,7 @@ mod tests {
         let block = build_text_render(&id, "#hello", "hi", hlc);
 
         let submit = Envelope::new(Frame::Submit {
-            bundle_b64: base64::engine::general_purpose::STANDARD
-                .encode(block.canonical_bytes()),
+            bundle_b64: base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
             sig_b64: base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
         });
         ws.send(TMessage::Text(serde_json::to_string(&submit).unwrap()))
@@ -390,11 +406,9 @@ mod tests {
         let hlc = test_hlc(&id);
         let block = build_text_render(&id, "#hello", "hi", hlc);
 
-        let bad_sig_b64 =
-            base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+        let bad_sig_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
         let submit = Envelope::new(Frame::Submit {
-            bundle_b64: base64::engine::general_purpose::STANDARD
-                .encode(block.canonical_bytes()),
+            bundle_b64: base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
             sig_b64: bad_sig_b64,
         });
         ws.send(TMessage::Text(serde_json::to_string(&submit).unwrap()))
@@ -432,7 +446,9 @@ mod tests {
 
         // 1. Subscribe federation-scope (no kind filter = all kinds).
         let sub = Envelope::new(Frame::Subscribe {
-            scope: Scope::Federation { block_kinds: vec![] },
+            scope: Scope::Federation {
+                block_kinds: vec![],
+            },
         });
         ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap()))
             .await
@@ -446,8 +462,7 @@ mod tests {
         let hlc = test_hlc(&id);
         let block = build_text_render(&id, "#hello", "hi", hlc);
         let submit = Envelope::new(Frame::Submit {
-            bundle_b64: base64::engine::general_purpose::STANDARD
-                .encode(block.canonical_bytes()),
+            bundle_b64: base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
             sig_b64: base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
         });
         ws.send(TMessage::Text(serde_json::to_string(&submit).unwrap()))

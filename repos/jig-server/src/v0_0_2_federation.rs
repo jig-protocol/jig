@@ -260,10 +260,7 @@ async fn ingest_peer_block(
 
     // Broadcast to local CLI subscribers ONLY — broadcast_local_only skips
     // peer fanout and prevents relay loops between federated servers.
-    let receipts_in_db = state
-        .ingest_ctx
-        .store
-        .get_receipts_for_block(&block_cid)?;
+    let receipts_in_db = state.ingest_ctx.store.get_receipts_for_block(&block_cid)?;
     if let Some(rep_receipt) = receipts_in_db.into_iter().next() {
         state
             .ingest_ctx
@@ -357,7 +354,10 @@ mod tests {
     async fn build_fed_hello_bundle_carries_server_metadata() {
         let state = Arc::new(AppState::for_test().unwrap());
         let (manifest_bytes, code_bytes) = build_fed_hello_bundle(&state).unwrap();
-        assert!(code_bytes.is_empty(), "fed-hello code payload must be empty in v0.0.2");
+        assert!(
+            code_bytes.is_empty(),
+            "fed-hello code payload must be empty in v0.0.2"
+        );
         let manifest: BlockManifest = serde_json::from_slice(&manifest_bytes).unwrap();
         assert_eq!(manifest.kind, Some(BlockKind::FedHello));
         assert!(
@@ -419,16 +419,13 @@ mod tests {
                 server_did: did_str.into(),
             });
         let manifest_bytes = manifest.to_canonical_bytes().unwrap();
-        let bundle_bytes =
-            serde_json::to_vec(&(manifest_bytes, Vec::<u8>::new())).unwrap();
-        let bundle_b64 =
-            base64::engine::general_purpose::STANDARD.encode(&bundle_bytes);
+        let bundle_bytes = serde_json::to_vec(&(manifest_bytes, Vec::<u8>::new())).unwrap();
+        let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(&bundle_bytes);
 
         let receipts = vec![ReceiptRef {
             server_did: "did:jig:zPeer".to_string(),
             render_hash: Some("rh_test".to_string()),
-            receipt_bytes_b64: base64::engine::general_purpose::STANDARD
-                .encode(b"{\"v\":\"0.2\"}"),
+            receipt_bytes_b64: base64::engine::general_purpose::STANDARD.encode(b"{\"v\":\"0.2\"}"),
         }];
 
         // First ingest: must persist block + receipt.
@@ -439,12 +436,11 @@ mod tests {
             "bafy_{}",
             hex::encode(blake3::hash(&bundle_bytes).as_bytes())
         );
-        let stored = state
-            .ingest_ctx
-            .store
-            .get_block(&block_cid)
-            .unwrap();
-        assert!(stored.is_some(), "block must be persisted after first ingest");
+        let stored = state.ingest_ctx.store.get_block(&block_cid).unwrap();
+        assert!(
+            stored.is_some(),
+            "block must be persisted after first ingest"
+        );
 
         // Second ingest of the same bundle: must dedupe without error.
         ingest_peer_block(&state, &peer, &bundle_b64, &receipts, "delivery:test2")

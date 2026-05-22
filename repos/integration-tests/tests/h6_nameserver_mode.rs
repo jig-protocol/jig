@@ -57,7 +57,10 @@ async fn nameserver_rejects_mismatched_did_claim() {
         err.to_string().contains("dj.jig")
             || err.to_string().contains("did:jig:zEvilImpostor")
             || err.to_string().contains("alice")
-            || matches!(err, jig_pipeline::identity::IdentityError::TofuMismatch { .. }),
+            || matches!(
+                err,
+                jig_pipeline::identity::IdentityError::TofuMismatch { .. }
+            ),
         "expected an identity-mismatch error, got: {err}"
     );
 }
@@ -86,7 +89,10 @@ async fn nameserver_expires_attestation_after_explicit_expiry() {
     let resolver = NameserverResolver::new(vec![ns.http_url()], 1);
 
     // Initial resolution succeeds.
-    let did = resolver.resolve(&alias_full).await.expect("initial resolve");
+    let did = resolver
+        .resolve(&alias_full)
+        .await
+        .expect("initial resolve");
     assert_eq!(did, alice.did_string());
 
     // Expire the attestation on the NS side directly (mimics the

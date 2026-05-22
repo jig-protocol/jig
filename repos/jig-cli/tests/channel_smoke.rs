@@ -158,7 +158,10 @@ default_channel = "#general"
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stderr.contains("panicked"), "must not panic — stderr: {stderr}");
+    assert!(
+        !stderr.contains("panicked"),
+        "must not panic — stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -183,5 +186,8 @@ fn channel_create_rejects_invalid_visibility() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stderr.contains("panicked"), "must not panic — stderr: {stderr}");
+    assert!(
+        !stderr.contains("panicked"),
+        "must not panic — stderr: {stderr}"
+    );
 }

@@ -88,11 +88,9 @@ async fn two_server_federation_chat_with_receipt_parity() {
             Err(_) => continue,
         };
         if let Frame::Block { bundle_b64, .. } = env.frame {
-            let bundle_bytes = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                &bundle_b64,
-            )
-            .expect("bundle b64");
+            let bundle_bytes =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &bundle_b64)
+                    .expect("bundle b64");
             let derived_cid = format!(
                 "bafy_{}",
                 hex::encode(blake3::hash(&bundle_bytes).as_bytes())
@@ -133,7 +131,9 @@ async fn two_server_federation_chat_with_receipt_parity() {
     let receipts_b_with_b_cid = server_b
         .receipts_for(&bob_received_cid.clone().unwrap())
         .expect("receipts on b");
-    let receipts_b_with_a_cid = server_b.receipts_for(&cid_a).expect("receipts on b via a-cid");
+    let receipts_b_with_a_cid = server_b
+        .receipts_for(&cid_a)
+        .expect("receipts on b via a-cid");
 
     let receipts_b = if !receipts_b_with_b_cid.is_empty() {
         receipts_b_with_b_cid

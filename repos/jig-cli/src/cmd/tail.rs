@@ -203,19 +203,13 @@ mod tests {
 
     #[test]
     fn parity_marker_empty_for_matching_hashes() {
-        let receipts = vec![
-            rr("did:jig:zA", Some("h1")),
-            rr("did:jig:zB", Some("h1")),
-        ];
+        let receipts = vec![rr("did:jig:zA", Some("h1")), rr("did:jig:zB", Some("h1"))];
         assert_eq!(render_parity_marker(&receipts), "");
     }
 
     #[test]
     fn parity_marker_flags_mismatch_for_two_distinct_hashes() {
-        let receipts = vec![
-            rr("did:jig:zA", Some("h1")),
-            rr("did:jig:zB", Some("h2")),
-        ];
+        let receipts = vec![rr("did:jig:zA", Some("h1")), rr("did:jig:zB", Some("h2"))];
         assert_eq!(
             render_parity_marker(&receipts),
             "  ⚠ render mismatch (2 hashes)"

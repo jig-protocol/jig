@@ -55,6 +55,7 @@ fn err(
 }
 
 /// Decode a BundleSubmission into (manifest_bytes, code_bytes, sig).
+#[allow(clippy::type_complexity)]
 fn decode_submission(
     body: &BundleSubmission,
 ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), (StatusCode, Json<AdminError>)> {
@@ -89,9 +90,7 @@ fn decode_submission(
     Ok((manifest_bytes, code_bytes, sig))
 }
 
-fn parse_manifest(
-    manifest_bytes: &[u8],
-) -> Result<BlockManifest, (StatusCode, Json<AdminError>)> {
+fn parse_manifest(manifest_bytes: &[u8]) -> Result<BlockManifest, (StatusCode, Json<AdminError>)> {
     serde_json::from_slice(manifest_bytes).map_err(|e| {
         err(
             StatusCode::BAD_REQUEST,
@@ -118,14 +117,10 @@ fn map_ingest_error(e: IngestError) -> (StatusCode, Json<AdminError>) {
             "KIND_REQUIRED",
             "manifest must declare block kind",
         ),
-        IngestError::BundleMalformed(m) => {
-            err(StatusCode::BAD_REQUEST, "BUNDLE_MALFORMED", m)
+        IngestError::BundleMalformed(m) => err(StatusCode::BAD_REQUEST, "BUNDLE_MALFORMED", m),
+        IngestError::Identity(ide) => {
+            err(StatusCode::UNAUTHORIZED, "IDENTITY_ERROR", ide.to_string())
         }
-        IngestError::Identity(ide) => err(
-            StatusCode::UNAUTHORIZED,
-            "IDENTITY_ERROR",
-            ide.to_string(),
-        ),
         IngestError::Persist(pe) => err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "PERSIST_ERROR",
@@ -237,10 +232,7 @@ pub async fn add_member(
 pub fn build_admin_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/_admin_v0_0_2/channels", post(create_channel))
-        .route(
-            "/_admin_v0_0_2/channels/:slug/members",
-            post(add_member),
-        )
+        .route("/_admin_v0_0_2/channels/:slug/members", post(add_member))
         .with_state(state)
 }
 
@@ -257,10 +249,7 @@ mod tests {
     };
     use jig_core::{Did, HlcTimestamp};
     use jig_pipeline::{
-        fanout::Fanout,
-        hlc::HlcClock,
-        identity::TofuResolver,
-        ingest::IngestContext,
+        fanout::Fanout, hlc::HlcClock, identity::TofuResolver, ingest::IngestContext,
         persist::SqliteStore,
     };
     use rand::Rng;
@@ -424,11 +413,7 @@ mod tests {
             .get_channel_by_slug("#room")
             .unwrap()
             .unwrap();
-        let members = state
-            .ingest_ctx
-            .store
-            .list_members(&channel.id)
-            .unwrap();
+        let members = state.ingest_ctx.store.list_members(&channel.id).unwrap();
         assert!(
             members.iter().any(|m| m.member_did == member_did),
             "member must be present; got: {members:?}"
@@ -470,8 +455,7 @@ mod tests {
             "sig_b64":    base64::engine::general_purpose::STANDARD.encode([0u8; 64]),
         });
 
-        let (status, body) =
-            post_json(router, "/_admin_v0_0_2/channels", submission).await;
+        let (status, body) = post_json(router, "/_admin_v0_0_2/channels", submission).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["code"], "INVALID_SIG");
     }

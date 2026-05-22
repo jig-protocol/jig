@@ -211,9 +211,7 @@ async fn event_loop(
             state.messages.push(msg);
         }
 
-        terminal
-            .draw(|f| render(f, state))
-            .context("draw frame")?;
+        terminal.draw(|f| render(f, state)).context("draw frame")?;
 
         if event::poll(Duration::from_millis(50)).context("event poll")?
             && let Event::Key(key) = event::read().context("event read")?
@@ -298,7 +296,9 @@ fn delete_before_cursor(state: &mut ChatState) {
     while new_cursor > 0 && !state.input.is_char_boundary(new_cursor) {
         new_cursor -= 1;
     }
-    state.input.replace_range(new_cursor..state.input_cursor, "");
+    state
+        .input
+        .replace_range(new_cursor..state.input_cursor, "");
     state.input_cursor = new_cursor;
 }
 

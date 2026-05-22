@@ -4,12 +4,7 @@
 
 use std::sync::Arc;
 
-use axum::{
-    Json, Router,
-    extract::State,
-    http::StatusCode,
-    routing::post,
-};
+use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use base64::Engine as _;
 use ed25519_dalek::Signer;
 use jig_pipeline::persist::StoredAliasAttestation;
@@ -58,17 +53,23 @@ pub async fn rotate(
     verify_proof_of_control(&req.new_did, &req.challenge, &req.sig_by_new)?;
 
     // 3. Check the alias currently binds to old_did
-    let current_holder = state
-        .alias_holder(&req.alias)
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "PERSIST_ERROR", e.to_string()))?;
+    let current_holder = state.alias_holder(&req.alias).await.map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "PERSIST_ERROR",
+            e.to_string(),
+        )
+    })?;
     match current_holder {
         Some(did) if did == req.old_did => {}
         Some(other) => {
             return Err(err(
                 StatusCode::CONFLICT,
                 "WRONG_HOLDER",
-                format!("alias `{}` is held by `{other}`, not `{}`", req.alias, req.old_did),
+                format!(
+                    "alias `{}` is held by `{other}`, not `{}`",
+                    req.alias, req.old_did
+                ),
             ));
         }
         None => {
@@ -94,8 +95,20 @@ pub async fn rotate(
         store_expire.expire_alias_attestation(&old_did_clone, &ns_did_clone, now)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "JOIN_ERROR", e.to_string()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "PERSIST_ERROR", e.to_string()))?;
+    .map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "JOIN_ERROR",
+            e.to_string(),
+        )
+    })?
+    .map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "PERSIST_ERROR",
+            e.to_string(),
+        )
+    })?;
 
     // 5. Issue + sign new attestation under new_did.
     issue_and_persist_attestation(&state, req.new_did, req.alias).await
@@ -120,10 +133,13 @@ pub async fn renew(
     verify_proof_of_control(&req.did, &req.challenge, &req.proof_of_control)?;
 
     // 3. Check current holder matches the renewing DID
-    let current_holder = state
-        .alias_holder(&req.alias)
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "PERSIST_ERROR", e.to_string()))?;
+    let current_holder = state.alias_holder(&req.alias).await.map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "PERSIST_ERROR",
+            e.to_string(),
+        )
+    })?;
     match current_holder {
         Some(did) if did == req.did => {}
         Some(_) => {
@@ -170,7 +186,13 @@ async fn issue_and_persist_attestation(
         "valid_until": attestation.valid_until,
         "profile_ttl_seconds": attestation.profile_ttl_seconds,
     }))
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "SIGN_ERROR", e.to_string()))?;
+    .map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SIGN_ERROR",
+            e.to_string(),
+        )
+    })?;
     let sig = state.ingest_ctx.server_key.sign(&canonical);
     attestation.sig = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
 
@@ -180,14 +202,31 @@ async fn issue_and_persist_attestation(
         ns_did: attestation.ns_did.clone(),
         valid_from: attestation.valid_from,
         valid_until: attestation.valid_until,
-        attestation_bytes: serde_json::to_vec(&attestation)
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "PERSIST_ERROR", e.to_string()))?,
+        attestation_bytes: serde_json::to_vec(&attestation).map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "PERSIST_ERROR",
+                e.to_string(),
+            )
+        })?,
     };
     let store = state.ingest_ctx.store.clone();
     tokio::task::spawn_blocking(move || store.upsert_alias_attestation(&stored))
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "JOIN_ERROR", e.to_string()))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "PERSIST_ERROR", e.to_string()))?;
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "JOIN_ERROR",
+                e.to_string(),
+            )
+        })?
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "PERSIST_ERROR",
+                e.to_string(),
+            )
+        })?;
 
     Ok(Json(attestation))
 }
@@ -219,15 +258,26 @@ mod tests {
     }
 
     async fn get_path(router: Router, path: &str) -> (StatusCode, serde_json::Value) {
-        let req = Request::builder().method("GET").uri(path).body(Body::empty()).unwrap();
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, json)
     }
 
-    async fn post_json(router: Router, path: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+    async fn post_json(
+        router: Router,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
         let req = Request::builder()
             .method("POST")
             .uri(path)
@@ -236,8 +286,11 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, json)
     }
 

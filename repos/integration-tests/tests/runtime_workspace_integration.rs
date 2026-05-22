@@ -52,7 +52,10 @@ fn test_execution_context_builder() {
 #[test]
 fn test_receipt_types_accessible() {
     // Receipt is assembled by the runtime; verify the outcome enum is accessible
-    assert!(matches!(ExecutionOutcome::Success, ExecutionOutcome::Success));
+    assert!(matches!(
+        ExecutionOutcome::Success,
+        ExecutionOutcome::Success
+    ));
     assert!(matches!(
         ExecutionOutcome::ExecutionFailed,
         ExecutionOutcome::ExecutionFailed

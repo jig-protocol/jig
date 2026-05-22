@@ -76,7 +76,13 @@ fn keys_renew_fails_loudly_when_no_cli_toml_or_keyfile() {
     // bogus identity. Confirm we get a non-zero exit and a useful stderr.
     let tmp = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
-        .args(["keys", "renew", "dj@dj.jig", "--nameserver", "http://127.0.0.1:1"])
+        .args([
+            "keys",
+            "renew",
+            "dj@dj.jig",
+            "--nameserver",
+            "http://127.0.0.1:1",
+        ])
         .env("HOME", tmp.path())
         .output()
         .unwrap();

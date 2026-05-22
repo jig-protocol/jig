@@ -159,10 +159,12 @@ mod tests {
     fn for_test_constructs_appstate_with_defaults() {
         let state = AppState::for_test().unwrap();
         assert_eq!(state.config.identity.mode, IdentityMode::Tofu);
-        assert!(state
-            .server_did
-            .to_did_jig_string()
-            .starts_with("did:jig:z"));
+        assert!(
+            state
+                .server_did
+                .to_did_jig_string()
+                .starts_with("did:jig:z")
+        );
     }
 
     #[test]

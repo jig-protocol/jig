@@ -43,9 +43,7 @@ pub fn load_server_url() -> Result<String> {
     let cfg = config::load_config(None)?;
     let url = cfg.server.base_url.trim().to_string();
     if url.is_empty() {
-        anyhow::bail!(
-            "no server base URL configured — run `jig server set <url>` first."
-        );
+        anyhow::bail!("no server base URL configured — run `jig server set <url>` first.");
     }
     Ok(url)
 }

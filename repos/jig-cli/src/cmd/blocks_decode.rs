@@ -156,10 +156,7 @@ mod tests {
         let block = build_text_render(&id, "#hello", "x", hlc);
         let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes());
 
-        let receipts = vec![
-            rr("did:jig:zA", Some("h1")),
-            rr("did:jig:zB", Some("h2")),
-        ];
+        let receipts = vec![rr("did:jig:zA", Some("h1")), rr("did:jig:zB", Some("h2"))];
         let d = delivered_for(bundle_b64, receipts);
         let decoded = decode(&d).unwrap();
         assert!(decoded.parity_warning);
