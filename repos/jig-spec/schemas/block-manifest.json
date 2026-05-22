@@ -1,0 +1,262 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "JigBlockManifest",
+  "type": "object",
+  "required": ["schema", "block_id", "version", "authors", "constraints"],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "format": "uri",
+      "const": "https://jig.dev/schema/block-manifest/v0.1"
+    },
+    "block_id": {
+      "type": "string",
+      "pattern": "^cid:bafy[a-z0-9]+$",
+      "description": "Content identifier (CID) matching computed Merkle root"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "Semantic version of the block"
+    },
+    "authors": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/author" },
+      "minItems": 1
+    },
+    "parents": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^cid:bafy[a-z0-9]+$"
+      },
+      "description": "Parent block CIDs for lineage tracking"
+    },
+    "capabilities": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/capability" },
+      "description": "Requested host capabilities"
+    },
+    "constraints": { "$ref": "#/definitions/constraints" },
+    "resources": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/resource" },
+      "description": "Optional data payloads"
+    },
+    "render": { "$ref": "#/definitions/render" },
+    "provenance": { "$ref": "#/definitions/provenance" },
+    "attestations": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/attestation" }
+    },
+    "privacy": { "$ref": "#/definitions/privacy" }
+  },
+  "additionalProperties": false,
+
+  "definitions": {
+    "author": {
+      "type": "object",
+      "required": ["did"],
+      "properties": {
+        "did": {
+          "type": "string",
+          "pattern": "^did:jig:[a-z0-9]+$",
+          "description": "Decentralized identifier"
+        },
+        "public_key": {
+          "type": "string",
+          "pattern": "^ed25519:[a-f0-9]+$",
+          "description": "Ed25519 public key"
+        },
+        "roles": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["author", "maintainer", "contributor"]
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "capability": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*([.][a-z][a-z0-9]*)*$",
+          "description": "Capability identifier (e.g., net.fetch, crypto.sign)"
+        },
+        "scope": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Scoped access patterns (e.g., https://*.example.com/*)"
+        },
+        "fuel": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Fuel budget for this capability"
+        },
+        "attestations": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^did:jig:[a-z0-9]+$"
+          },
+          "description": "Third-party attestations vouching for safe usage"
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "constraints": {
+      "type": "object",
+      "required": ["fuel_max", "memory_max_mb", "execution_timeout_ms", "deterministic"],
+      "properties": {
+        "fuel_max": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum fuel (instruction count)"
+        },
+        "memory_max_mb": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096,
+          "description": "Maximum WebAssembly linear memory in MB"
+        },
+        "execution_timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300000,
+          "description": "Maximum wall-clock time in milliseconds"
+        },
+        "deterministic": {
+          "type": "boolean",
+          "description": "Require deterministic execution (no floats, no nondeterministic syscalls)"
+        },
+        "import_allowlist": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Allowed WASM imports (default: host capabilities only)"
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "resource": {
+      "type": "object",
+      "required": ["name", "cid"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Resource filename"
+        },
+        "cid": {
+          "type": "string",
+          "pattern": "^bafy[a-z0-9]+$",
+          "description": "Content identifier"
+        },
+        "mime": {
+          "type": "string",
+          "description": "MIME type"
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "render": {
+      "type": "object",
+      "required": ["entry"],
+      "properties": {
+        "entry": {
+          "type": "string",
+          "description": "WebAssembly export to call (default: _start)"
+        },
+        "expected_hash": {
+          "type": "string",
+          "pattern": "^(sha256|blake3):[a-f0-9]+$",
+          "description": "Hash of expected deterministic output"
+        },
+        "output_type": {
+          "type": "string",
+          "description": "MIME type of render output"
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "provenance": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Block creation timestamp (RFC 3339)"
+        },
+        "useful_work_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^cid:bafy[a-z0-9]+$"
+          },
+          "description": "References to useful work attestations"
+        },
+        "reputation_tier": {
+          "type": "string",
+          "enum": ["null_sec", "low_sec", "high_sec", "verified"],
+          "description": "Author reputation tier"
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "attestation": {
+      "type": "object",
+      "required": ["issuer", "claim", "signature"],
+      "properties": {
+        "issuer": {
+          "type": "string",
+          "pattern": "^did:jig:[a-z0-9]+$",
+          "description": "DID of attestation issuer"
+        },
+        "claim": {
+          "type": "string",
+          "description": "Claim type (e.g., fact_checked:v1)"
+        },
+        "signature": {
+          "type": "string",
+          "pattern": "^ed25519:[a-f0-9]+$",
+          "description": "Ed25519 signature over claim"
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "privacy": {
+      "type": "object",
+      "properties": {
+        "encryption": {
+          "type": "string",
+          "enum": ["age+x25519", "none"],
+          "description": "Encryption scheme"
+        },
+        "recipients": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^did:jig:[a-z0-9]+$"
+          },
+          "description": "Recipient DIDs for encrypted blocks"
+        },
+        "metadata_visibility": {
+          "type": "string",
+          "enum": ["public", "private"],
+          "description": "Metadata visibility"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

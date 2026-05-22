@@ -1,0 +1,19 @@
+{
+  "counters": {
+    "bytes_rx": 0,
+    "bytes_tx": 0,
+    "fuel_by_capability": {
+      "engine.wasm": 1713
+    },
+    "fuel_total": 1713
+  },
+  "description": "WASI hello world with stdout",
+  "fixture": "hello_wasi.wasm",
+  "fuel_used": 1713,
+  "limits": {
+    "fuel_max": 5000000,
+    "memory_max_mb": 32
+  },
+  "module_hash": "578e52925b1b52c356d82caa7b39defdb49cca02ff13e765be022370f175f6c6",
+  "outcome": "Success"
+}

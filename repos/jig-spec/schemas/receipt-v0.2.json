@@ -1,0 +1,230 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "JigBlockReceipt",
+  "description": "Receipt v0.2 - Deterministic attestation of block execution",
+  "type": "object",
+  "required": ["block_id", "host", "executed_at", "render_hash", "fuel_used", "capabilities_used"],
+  "properties": {
+    "block_id": {
+      "type": "string",
+      "pattern": "^cid:bafy[a-z0-9]+$",
+      "description": "Content identifier of the executed block"
+    },
+    "host": {
+      "type": "string",
+      "pattern": "^did:jig:(server|cli|gui):[a-z0-9]+$",
+      "description": "DID of the host that executed the block"
+    },
+    "executed_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC timestamp of execution start (RFC 3339)"
+    },
+    "render_hash": {
+      "type": "string",
+      "pattern": "^(sha256|blake3):[a-f0-9]+$",
+      "description": "Hash of deterministic render output"
+    },
+    "renders_match": {
+      "type": "boolean",
+      "description": "Whether render_hash matches manifest.render.expected_hash (v0.2)"
+    },
+    "fuel_used": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total fuel consumed during execution"
+    },
+    "memory_peak_mb": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Peak memory usage in megabytes"
+    },
+    "counters": { "$ref": "#/definitions/counters" },
+    "timings_ms": { "$ref": "#/definitions/timings" },
+    "limits": { "$ref": "#/definitions/limits" },
+    "outcome": { "$ref": "#/definitions/outcome" },
+    "capabilities_used": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9]*:[a-z][a-z0-9]*(:[a-z][a-z0-9]*)*(\\|.+)?$"
+      },
+      "description": "Capabilities invoked during execution (canonicalized)"
+    },
+    "attestations": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Useful-work validator signatures or references"
+    },
+    "signature": {
+      "type": "string",
+      "pattern": "^ed25519:[a-f0-9]+$",
+      "description": "Host signature over canonical receipt bytes"
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Extensible metadata (e.g., timing.clock_source)"
+    }
+  },
+  "additionalProperties": false,
+
+  "definitions": {
+    "counters": {
+      "type": "object",
+      "required": ["fuel_total"],
+      "properties": {
+        "fuel_total": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total fuel consumed (MUST equal receipt.fuel_used)"
+        },
+        "fuel_by_capability": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "description": "Per-capability fuel attribution"
+        },
+        "status_by_capability": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "description": "Status code bins per capability (uppercase labels)"
+        },
+        "bytes_tx": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Network bytes transmitted"
+        },
+        "bytes_rx": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Network bytes received"
+        },
+        "syscalls": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "System calls made (0 unless WASI enabled)"
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "timings": {
+      "type": "object",
+      "required": ["init", "exec", "total"],
+      "properties": {
+        "queue_wait": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Milliseconds waiting in execution queue (not counted in total)"
+        },
+        "init": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Milliseconds spent in module initialization"
+        },
+        "exec": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Milliseconds spent in actual execution"
+        },
+        "total": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total time (MUST equal init + exec)"
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "limits": {
+      "type": "object",
+      "required": ["fuel_max", "memory_max_mb", "execution_timeout_ms"],
+      "properties": {
+        "fuel_max": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum fuel budget for this execution"
+        },
+        "memory_max_mb": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum memory limit in MB"
+        },
+        "execution_timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum execution time in milliseconds"
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "outcome": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["ok", "soft_fail", "hard_fail"],
+          "description": "Execution result status"
+        },
+        "affordances": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*(:[a-z][a-z0-9_]*(:[a-z][a-z0-9_]*)*)?$"
+          },
+          "description": "Success signals (e.g., email.delivered, net.http_2xx)"
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "FUEL_EXHAUSTED",
+            "MEMORY_LIMIT_EXCEEDED",
+            "TABLE_LIMIT_EXCEEDED",
+            "RUNTIME_TIMEOUT",
+            "RUNTIME_TRAP",
+            "CAPABILITY_DENIED",
+            "MANIFEST_INVALID",
+            "NONDETERMINISM_DETECTED",
+            "RENDER_MISMATCH",
+            "NET_TIMEOUT",
+            "UPSTREAM_5XX",
+            "HOST_PANIC",
+            "UNKNOWN"
+          ],
+          "description": "Machine-readable failure code (REQUIRED for failures)"
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "enum": ["soft_fail", "hard_fail"] } }
+          },
+          "then": {
+            "required": ["reason"],
+            "not": { "required": ["affordances"] }
+          }
+        },
+        {
+          "if": {
+            "properties": { "status": { "const": "ok" } }
+          },
+          "then": {
+            "not": { "required": ["reason"] }
+          }
+        }
+      ]
+    }
+  }
+}

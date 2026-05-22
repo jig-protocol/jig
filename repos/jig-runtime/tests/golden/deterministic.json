@@ -1,0 +1,19 @@
+{
+  "counters": {
+    "bytes_rx": 0,
+    "bytes_tx": 0,
+    "fuel_by_capability": {
+      "engine.wasm": 2512
+    },
+    "fuel_total": 2512
+  },
+  "description": "Pure computation: sum of squares 1..=100",
+  "fixture": "deterministic.wasm",
+  "fuel_used": 2512,
+  "limits": {
+    "fuel_max": 5000000,
+    "memory_max_mb": 32
+  },
+  "module_hash": "9f1ee025974033ea072efd94b30b7968c2d11d1748c2102e1dd9b8b6fb7cfcb1",
+  "outcome": "Success"
+}

@@ -1,0 +1,58 @@
+version = "0.1.0"
+description = "Initial baseline cost schedule for jig-runtime"
+
+[instruction_costs]
+wasm_instruction_base = 1
+memory_load = 1
+memory_store = 2
+call = 10
+branch = 1
+
+[capability_costs.http]
+call_base = 1000
+per_byte_in = 1
+per_byte_out = 1
+
+[capability_costs.http.operations]
+get = 500
+post = 750
+put = 750
+delete = 500
+
+[capability_costs.kv]
+call_base = 100
+per_byte_in = 1
+per_byte_out = 1
+
+[capability_costs.kv.operations]
+get = 50
+set = 100
+delete = 50
+list = 200
+
+[capability_costs.clock]
+call_base = 10
+per_byte_in = 0
+per_byte_out = 0
+
+[capability_costs.clock.operations]
+now = 10
+
+[capability_costs.rand]
+call_base = 50
+per_byte_in = 0
+per_byte_out = 1
+
+[capability_costs.rand.operations]
+random_bytes = 50
+random_u64 = 25
+
+[capability_costs.crypto]
+call_base = 100
+per_byte_in = 1
+per_byte_out = 1
+
+[capability_costs.crypto.operations]
+hash_blake3 = 200
+hash_sha256 = 250
+verify_ed25519 = 500

@@ -1,0 +1,94 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "JigMessage",
+  "type": "object",
+  "required": ["id", "version", "routing", "content", "signatures"],
+  "properties": {
+    "id": { "type": "string", "format": "uuid" },
+    "version": { "type": "integer", "minimum": 1 },
+    "routing": {
+      "type": "object",
+      "required": ["from", "to", "timestamp"],
+      "properties": {
+        "from": { "type": "string" },
+        "to": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "thread": { "type": "string", "format": "uuid" },
+        "reply_to": { "type": "string", "format": "uuid" },
+        "extensions": { "type": "object", "additionalProperties": true }
+      },
+      "additionalProperties": false
+    },
+    "content": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "text"],
+          "properties": {
+            "type": { "const": "text" },
+            "text": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["type", "blocks"],
+          "properties": {
+            "type": { "const": "blocks" },
+            "blocks": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/block" }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["type", "binary"],
+          "properties": {
+            "type": { "const": "binary" },
+            "binary": {
+              "type": "object",
+              "required": ["mime_type", "data"],
+              "properties": {
+                "mime_type": { "type": "string" },
+                "data": { "type": "string", "contentEncoding": "base64" },
+                "metadata": { "type": "object", "additionalProperties": true }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["type", "control"],
+          "properties": {
+            "type": { "const": "control" },
+            "control": { "type": "object", "additionalProperties": true }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "signatures": {
+      "type": "array",
+      "items": { "type": "object", "additionalProperties": true },
+      "minItems": 1
+    },
+    "extensions": { "type": "object", "additionalProperties": true }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "block": {
+      "type": "object",
+      "required": ["type", "content"],
+      "properties": {
+        "type": { "type": "string" },
+        "content": { "type": ["string", "object", "array", "number", "boolean", "null"] },
+        "metadata": { "type": "object", "additionalProperties": true }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,90 @@
+# cargo-deny configuration for jig-runtime
+# https://embarkstudios.github.io/cargo-deny/
+
+# Note: This file was generated for jig-runtime to enforce licensing policies.
+# It prioritizes permissive licenses and avoids restrictive copyleft (AGPL, GPL).
+
+[licenses]
+# Licensing policy for dependencies
+unlicensed = "deny"
+allow-osi-fsf-free = "neither"
+copyleft = "deny"
+default = "deny"
+
+# Explicitly allowed licenses (permissive)
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "0BSD",
+    "Zlib",
+]
+
+# Exceptions for specific crates
+[[licenses.exceptions]]
+allow = ["AGPL-3.0"]
+name = "jig-runtime"
+
+# Clarifications for licenses with multiple identifiers
+[[licenses.clarify]]
+name = "ring"
+expression = "ISC AND MIT AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+# Note: Internal gigue packages should be skipped in [bans.skip] if needed
+
+[bans]
+# Dependency banning rules
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+# Explicitly deny problematic licenses
+deny = [
+    # Non-commercial licenses
+    { name = "CC-BY-NC-*" },
+    
+    # Restrictive copyleft licenses
+    { name = "AGPL-3.0" },
+    { name = "GPL-2.0" },
+    { name = "GPL-3.0" },
+    { name = "LGPL-2.0" },
+    { name = "LGPL-2.1" },
+    { name = "LGPL-3.0" },
+]
+
+# Skip checking certain crates (e.g., internal tools)
+# Skip jig-runtime itself from license checks (AGPL-3.0 is project license)
+skip = [
+    { name = "jig-runtime", version = "*" },
+]
+
+# Skip checking specific trees (e.g., dev dependencies in certain cases)
+skip-tree = []
+
+[advisories]
+# Security vulnerability database checks
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+vulnerability = "deny"
+unmaintained = "warn"
+unsound = "warn"
+yanked = "warn"
+notice = "warn"
+
+# Ignore specific advisories (use sparingly, with justification)
+ignore = []
+
+[sources]
+# Source code repository checks
+unknown-registry = "warn"
+unknown-git = "warn"
+
+# Allow crates.io and git sources
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

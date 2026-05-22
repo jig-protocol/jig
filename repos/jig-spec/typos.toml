@@ -1,0 +1,37 @@
+# Typos configuration (TOML)
+[default]
+extend-ignore-re = [
+  "book/.*",
+  "target/.*",
+  ".git/.*",
+]
+
+[files]
+extend-exclude = [
+  "book/**",
+  "target/**",
+]
+
+[type.os]
+# Allow common technical terms
+extend-words = [
+  "mdbook",
+  "JEP",
+  "jig",
+  "websocket",
+  "privmsg",
+  "AEAD",
+  "PFS",
+  "SPKI",
+  "SNI",
+  "mTLS",
+  "UUIDv7",
+  "CBOR",
+  "Ed25519",
+  "X25519",
+  "BLAKE3",
+  "base64url",
+  "HKDF",
+  "DoS",
+  "SRV",
+]

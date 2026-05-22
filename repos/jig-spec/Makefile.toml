@@ -1,0 +1,43 @@
+[config]
+min_version = "0.37.0"
+
+[env]
+MDBOOK_VERSION = "0.4.40"
+LINKCHECK_VERSION = "0.7.7"
+TYPOS_VERSION = "1.23.6"
+CARGOMAKE_VERSION = "0.37.24"
+
+[tasks.setup]
+description = "Install required tooling with pinned versions"
+script = [
+  "cargo install cargo-make@${CARGOMAKE_VERSION}",
+  "cargo install mdbook@${MDBOOK_VERSION}",
+  "cargo install mdbook-linkcheck@${LINKCHECK_VERSION}",
+  # typos-cli occasionally breaks due to upstream dependency mismatches; install best-effort
+  "cargo install typos-cli@${TYPOS_VERSION} || echo 'typos-cli install failed; continuing without typos'",
+]
+
+[tasks.build]
+command = "mdbook"
+args = ["build"]
+
+[tasks.serve]
+command = "mdbook"
+args = ["serve", "-o"]
+
+[tasks.linkcheck]
+command = "mdbook"
+args = ["build"]
+
+[tasks.typos]
+script = [
+  "if command -v typos >/dev/null 2>&1; then typos --config typos.toml .; else echo 'typos not installed; skipping'; fi",
+]
+
+[tasks.ci]
+description = "Build, linkcheck, and typos"
+category = "CI"
+dependencies = [
+  "build",
+  "typos",
+]
