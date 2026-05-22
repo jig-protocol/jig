@@ -4,7 +4,6 @@ members = [
     "jig-server", 
     "jig-cli",
     "jig-nameserver",
-    "jig-email-bridge",
     "jig-runtime",
     # Archived (WASM-only runtime): jig-wasmtime, jig-podman, jig-docker, jig-runtime-select
     "hello-wasm",
