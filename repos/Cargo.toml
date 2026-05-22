@@ -18,6 +18,7 @@ members = [
     "text-block",
     "jig-pipeline",
     "jig-client",
+    "bridges/*",
 ]
 resolver = "2"
 

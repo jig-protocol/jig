@@ -1,0 +1,18 @@
+[package]
+name = "jig-bridge-core"
+version = "0.0.3"
+edition = "2024"
+authors = ["Jig Protocol Contributors"]
+license = "AGPL-3.0-only"
+description = "Common Bridge trait + context types for jig-protocol bridges (email, slack, irc, ssh, ...)"
+repository = "https://github.com/jig-protocol/jig"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+thiserror = "1.0"
+toml = "0.8"
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
