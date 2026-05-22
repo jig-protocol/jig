@@ -24,7 +24,8 @@ allow = [
     "Unicode-DFS-2016",  # Unicode Data Files
     "CDDL-1.0",  # CDDL (SQLite/RocksDB optional backend)
     "CDLA-Permissive-2.0",  # Community Data License
-    "AGPL-3.0",  # Allowed for internal jig-protocol workspace crates only
+    "AGPL-3.0-only",  # Internal jig-protocol crates use modern SPDX form
+    "MPL-2.0",  # transient via dirs/option-ext
 ]
 confidence-threshold = 0.8
 
@@ -34,15 +35,15 @@ ignore = true
 registries = ["gigue-internal"]
 
 # ring 0.16's license expression doesn't parse as standard SPDX — it's a
-# multi-clause "ISC AND MIT AND OpenSSL" string with custom formatting.
-# Pulled in transitively via trust-dns-proto 0.23 (DNS resolution for
-# jig-email-bridge / jig-nameserver / jig-server). The trust-dns crate was
-# renamed to hickory-dns and modernized; an upgrade would drop the legacy
-# ring. Track as v0.0.3 followup.
-[[licenses.exceptions]]
+# multi-clause string cargo-deny can't tokenize. Pulled in transitively
+# via trust-dns-proto 0.23 (DNS resolution for jig-email-bridge /
+# jig-nameserver / jig-server). The trust-dns crate has been renamed to
+# hickory-dns and modernized; upgrading would drop legacy ring. Track as
+# v0.0.3 followup.
+[[licenses.clarify]]
 name = "ring"
-version = "0.16"
-allow = ["ISC", "MIT", "OpenSSL"]
+expression = "ISC AND MIT AND OpenSSL"
+license-files = []
 
 
 [bans]

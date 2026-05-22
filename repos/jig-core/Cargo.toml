@@ -2,7 +2,7 @@
 name = "jig-core"
 version = "0.0.1"
 edition = "2024"
-license = "AGPL-3.0"
+license = "AGPL-3.0-only"
 authors = ["Jig Protocol Contributors"]
 description = "Core protocol implementation for Jig messaging"
 repository = "https://github.com/jig-protocol/jig-core"

@@ -2,7 +2,7 @@
 name = "jig-server"
 version = "0.0.1"
 edition = "2024"
-license = "AGPL-3.0"
+license = "AGPL-3.0-only"
 authors = ["Jig Protocol Contributors"]
 description = "Reference server implementation for Jig protocol"
 repository = "https://github.com/jig-protocol/jig-server"

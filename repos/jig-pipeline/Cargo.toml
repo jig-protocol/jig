@@ -3,7 +3,7 @@ name = "jig-pipeline"
 version = "0.0.2"
 edition.workspace = true
 authors.workspace = true
-license = "AGPL-3.0"
+license = "AGPL-3.0-only"
 description = "Shared block ingest/effect/persist pipeline for jig-server and jig-nameserver"
 
 [dependencies]

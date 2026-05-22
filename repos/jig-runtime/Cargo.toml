@@ -2,7 +2,7 @@
 name = "jig-runtime"
 version = "0.1.0"
 edition = "2024"
-license = "AGPL-3.0"
+license = "AGPL-3.0-only"
 description = "Unified WASM runtime for Jig Protocol with deterministic execution, WASI support, capability sandboxing, and instrumented fuel metering"
 repository = "https://github.com/jig-protocol/repos"
 keywords = ["wasm", "runtime", "wasi", "capabilities", "deterministic"]
