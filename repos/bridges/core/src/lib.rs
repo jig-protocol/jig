@@ -12,7 +12,8 @@
 pub mod bridge;
 pub mod context;
 
-// Re-exports added incrementally as Tasks A2-A4 populate the modules:
-// - Task A2: pub use context::SubmitDenied;
+pub use context::SubmitDenied;
+
+// Re-exports added incrementally as Tasks A3-A4 populate the modules:
 // - Task A3: pub use context::{BridgeContext, SubmitHandle, SubscribeHandle};
 // - Task A4: pub use bridge::Bridge;
