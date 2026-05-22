@@ -5574,6 +5574,7 @@ dependencies = [
  "hex",
  "hmac",
  "humantime-serde",
+ "jig-bridge-core",
  "jig-client",
  "jig-config",
  "jig-core",

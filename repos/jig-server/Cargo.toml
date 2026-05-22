@@ -18,6 +18,7 @@ path = "src/main.rs"
 jig-core = { path = "../jig-core" }
 jig-runtime = { workspace = true }
 jig-config = { workspace = true }
+jig-bridge-core = { path = "../bridges/core" }
 
 # v0.0.2 hello-world milestone — pipeline + client + new config sections
 jig-pipeline = { path = "../jig-pipeline" }
