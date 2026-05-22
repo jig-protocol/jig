@@ -1,0 +1,161 @@
+name: Release
+
+# Phase G2 of v0.0.2 hello-world. Tag-triggered: cuts per-platform tarballs
+# containing jig-server, jig, jig-nameserver + text_block.wasm and publishes
+# them as a GitHub Release. install.sh fetches from these URLs at first run.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Reduce duplicate runs if a tag push races with a branch push.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.platform.tarball_name }}
+    runs-on: ${{ matrix.platform.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - tarball_name: jig-linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            runs_on: ubuntu-latest
+            archive: tar.gz
+          - tarball_name: jig-linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            runs_on: ubuntu-latest
+            archive: tar.gz
+            cross: true
+          - tarball_name: jig-darwin-x86_64
+            target: x86_64-apple-darwin
+            runs_on: macos-13
+            archive: tar.gz
+          - tarball_name: jig-darwin-aarch64
+            target: aarch64-apple-darwin
+            runs_on: macos-14
+            archive: tar.gz
+          - tarball_name: jig-windows-x86_64
+            target: x86_64-pc-windows-msvc
+            runs_on: windows-latest
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }},wasm32-wasip1
+
+      - name: Install cross-compilation tools (aarch64 linux)
+        if: matrix.platform.cross == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<EOF
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: repos
+          key: release-${{ matrix.platform.target }}
+
+      - name: Build native binaries (jig-server, jig, jig-nameserver)
+        working-directory: repos
+        shell: bash
+        run: |
+          cargo build --release --target ${{ matrix.platform.target }} \
+            -p jig-server -p jig-cli -p jig-nameserver
+
+      - name: Build text-block (wasm32-wasip1)
+        working-directory: repos
+        shell: bash
+        run: |
+          cargo build --release --target wasm32-wasip1 -p text-block
+
+      - name: Stage tarball contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="dist/${{ matrix.platform.tarball_name }}"
+          mkdir -p "$STAGE/bin" "$STAGE/blocks"
+          BIN_DIR="repos/target/${{ matrix.platform.target }}/release"
+          EXT=""
+          if [[ "${{ matrix.platform.target }}" == *"windows"* ]]; then
+            EXT=".exe"
+          fi
+          cp "$BIN_DIR/jig-server${EXT}"     "$STAGE/bin/jig-server${EXT}"
+          cp "$BIN_DIR/jig${EXT}"            "$STAGE/bin/jig${EXT}"
+          cp "$BIN_DIR/jig-nameserver${EXT}" "$STAGE/bin/jig-nameserver${EXT}"
+          cp "repos/target/wasm32-wasip1/release/text_block.wasm" \
+             "$STAGE/blocks/text_block.wasm"
+          cp install.sh README.md LICENSE "$STAGE/" 2>/dev/null || true
+
+      - name: Package tarball (unix)
+        if: matrix.platform.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          tar -czf "${{ matrix.platform.tarball_name }}.tar.gz" "${{ matrix.platform.tarball_name }}"
+          (command -v sha256sum >/dev/null && sha256sum "${{ matrix.platform.tarball_name }}.tar.gz" > "${{ matrix.platform.tarball_name }}.tar.gz.sha256") \
+            || shasum -a 256 "${{ matrix.platform.tarball_name }}.tar.gz" > "${{ matrix.platform.tarball_name }}.tar.gz.sha256"
+
+      - name: Package zip (windows)
+        if: matrix.platform.archive == 'zip'
+        shell: pwsh
+        run: |
+          cd dist
+          Compress-Archive -Path "${{ matrix.platform.tarball_name }}" -DestinationPath "${{ matrix.platform.tarball_name }}.zip"
+          (Get-FileHash -Algorithm SHA256 "${{ matrix.platform.tarball_name }}.zip").Hash | Out-File -Encoding ascii "${{ matrix.platform.tarball_name }}.zip.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform.tarball_name }}
+          path: |
+            dist/${{ matrix.platform.tarball_name }}.tar.gz
+            dist/${{ matrix.platform.tarball_name }}.tar.gz.sha256
+            dist/${{ matrix.platform.tarball_name }}.zip
+            dist/${{ matrix.platform.tarball_name }}.zip.sha256
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    name: publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Mark v0.0.x as a prerelease while we're still on hello-world.
+          prerelease: ${{ startsWith(github.ref_name, 'v0.0.') }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.zip
+            dist/*.zip.sha256

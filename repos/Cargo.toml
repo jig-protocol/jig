@@ -15,6 +15,9 @@ members = [
     "jig-gui/riverdance/desktop",
     "jig-gui/riverdance/mobile",
     "jig-gui/riverdance/api",
+    "text-block",
+    "jig-pipeline",
+    "jig-client",
 ]
 resolver = "2"
 

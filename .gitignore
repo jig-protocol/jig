@@ -1,6 +1,26 @@
+# Build artifacts
 target/
+
+# Runtime data
 *.db
 *.db-shm
 *.db-wal
+
+# Local config / secrets
 .env
+.env.local
+.claude/settings.local.json
+
+# OS noise
 .DS_Store
+Thumbs.db
+
+# Editor noise
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Internal / closed-source — kept in sibling jig-protocol-internal/, do NOT track here
+executable-internet-master-plan/
+gigue-ai/

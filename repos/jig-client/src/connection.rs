@@ -1,0 +1,448 @@
+//! WSS connection management for jig-client.
+//!
+//! Wraps tokio-tungstenite with the v0.0.2 envelope codec (from
+//! jig-pipeline). One [`Client`] per server connection; reuse across
+//! subscriptions. Reconnect logic tracks per-origin HLC cursors so a
+//! resumed connection sends `CatchUp { since_hlc }` to backfill missed
+//! blocks (server-side replay implemented in Phase D).
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use jig_pipeline::envelope::{Envelope, Frame, HlcCursor, ReceiptRef, Scope};
+use tokio::sync::{Mutex, mpsc};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use url::Url;
+
+use crate::blocks::BuiltBlock;
+use crate::identity::Identity;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ClientError {
+    #[error("failed to connect: {0}")]
+    Connect(String),
+    #[error("URL parse failed: {0}")]
+    BadUrl(String),
+    #[error("server returned error: code={code}, message={message}")]
+    ServerError { code: String, message: String },
+    #[error("connection closed before ack received")]
+    ConnectionClosed,
+    #[error("submit ack timed out after {0}s")]
+    AckTimeout(u64),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Tungstenite(#[from] tokio_tungstenite::tungstenite::Error),
+}
+
+/// WSS client for a single server connection.
+///
+/// Construct via [`Client::connect`]; reuse the same client across
+/// channel subscriptions and submissions. Internally drives reader +
+/// writer tasks; the public API is fully `async` and message-based.
+pub struct Client {
+    identity: Arc<Identity>,
+    write_tx: mpsc::UnboundedSender<Message>,
+    inbound_rx: Mutex<mpsc::UnboundedReceiver<Frame>>,
+    pending_subscriptions: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<DeliveredBlock>>>>,
+    last_cursors: Arc<Mutex<HashMap<String, HlcCursor>>>,
+    server_url: String,
+    submit_ack_timeout_seconds: u64,
+}
+
+/// A block delivered via [`BlockStream`].
+#[derive(Debug, Clone)]
+pub struct DeliveredBlock {
+    pub bundle_b64: String,
+    pub receipts: Vec<ReceiptRef>,
+    pub delivery_cid: String,
+}
+
+/// Stream of [`DeliveredBlock`] items for a subscribed channel. Returned
+/// by [`Client::subscribe_channel`].
+pub struct BlockStream {
+    rx: mpsc::UnboundedReceiver<DeliveredBlock>,
+}
+
+impl BlockStream {
+    /// Wait for the next delivery. Returns `None` if the underlying connection
+    /// closes.
+    pub async fn next(&mut self) -> Option<DeliveredBlock> {
+        self.rx.recv().await
+    }
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("server_url", &self.server_url)
+            .field("identity_did", &self.identity.did_string())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Client {
+    /// Connect to a jig-server at `server_url` (e.g., `ws://127.0.0.1:7117`
+    /// or `wss://dj.jig.onl`). Identity is used to sign outbound `Submit`
+    /// frames.
+    pub async fn connect(server_url: &str, identity: Identity) -> Result<Self, ClientError> {
+        let url = Url::parse(server_url).map_err(|e| ClientError::BadUrl(e.to_string()))?;
+        // Map http(s) → ws(s) if user gave HTTP scheme; otherwise leave alone.
+        let scheme = match url.scheme() {
+            "http" => "ws",
+            "https" => "wss",
+            other => other,
+        };
+        let host = url
+            .host_str()
+            .ok_or_else(|| ClientError::BadUrl("no host".into()))?;
+        let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+        let ws_url = format!("{scheme}://{host}{port}/api/v1/ws");
+
+        let (ws, _resp) = connect_async(&ws_url)
+            .await
+            .map_err(|e| ClientError::Connect(e.to_string()))?;
+        let (mut sink, mut stream) = ws.split();
+
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Message>();
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<Frame>();
+        let pending_subscriptions: Arc<
+            Mutex<HashMap<String, mpsc::UnboundedSender<DeliveredBlock>>>,
+        > = Arc::new(Mutex::new(HashMap::new()));
+        let last_cursors: Arc<Mutex<HashMap<String, HlcCursor>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Writer task
+        tokio::spawn(async move {
+            while let Some(msg) = write_rx.recv().await {
+                if sink.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Reader task — dispatches incoming Block frames to per-channel
+        // subscriber channels; forwards Ack / Error frames via inbound_tx
+        // so callers awaiting a reply can pick them up.
+        let pending_subs_for_reader = pending_subscriptions.clone();
+        let cursors_for_reader = last_cursors.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(msg)) = stream.next().await {
+                if let Message::Text(text) = msg {
+                    let Ok(env) = serde_json::from_str::<Envelope>(&text) else {
+                        continue;
+                    };
+                    match env.frame {
+                        Frame::Block {
+                            bundle_b64,
+                            receipts,
+                            delivery_cid,
+                        } => {
+                            // Track HLC cursor from receipts (best-effort —
+                            // receipts may carry render_hash but not HLC; the
+                            // bundle_b64 contains the manifest with hlc_ts).
+                            // For v0.0.2 we just stash by delivery_cid origin;
+                            // Phase D wires the real cursor logic when server
+                            // emits explicit cursor advances.
+                            let delivered = DeliveredBlock {
+                                bundle_b64,
+                                receipts,
+                                delivery_cid: delivery_cid.clone(),
+                            };
+                            // Dispatch to ALL pending channel subs (server-side
+                            // filtering means we only get blocks for our subs;
+                            // we'd add scope-side multiplexing here if subs
+                            // could come from different channels — for v0.0.2
+                            // one sub per channel slug suffices, and the
+                            // server already filtered).
+                            let subs = pending_subs_for_reader.lock().await;
+                            for tx in subs.values() {
+                                let _ = tx.send(delivered.clone());
+                            }
+                            // Update cursor for delivery_cid (placeholder —
+                            // Phase D will swap in HLC cursor parsed from the
+                            // delivered block's manifest).
+                            cursors_for_reader.lock().await.insert(
+                                delivery_cid.clone(),
+                                HlcCursor {
+                                    wall_ms: 0,
+                                    logical: 0,
+                                    origin: delivery_cid,
+                                },
+                            );
+                        }
+                        other => {
+                            let _ = inbound_tx.send(other);
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            identity: Arc::new(identity),
+            write_tx,
+            inbound_rx: Mutex::new(inbound_rx),
+            pending_subscriptions,
+            last_cursors,
+            server_url: server_url.to_string(),
+            submit_ack_timeout_seconds: 5,
+        })
+    }
+
+    /// Subscribe to a channel by slug. Returns a [`BlockStream`] that
+    /// yields each delivered block.
+    pub async fn subscribe_channel(&self, slug: &str) -> Result<BlockStream, ClientError> {
+        let env = Envelope::new(Frame::Subscribe {
+            scope: Scope::Channel {
+                slug: slug.to_string(),
+            },
+        });
+        let json = serde_json::to_string(&env)?;
+        self.write_tx
+            .send(Message::Text(json))
+            .map_err(|_| ClientError::ConnectionClosed)?;
+
+        let (delivery_tx, delivery_rx) = mpsc::unbounded_channel();
+        self.pending_subscriptions
+            .lock()
+            .await
+            .insert(slug.to_string(), delivery_tx);
+
+        Ok(BlockStream { rx: delivery_rx })
+    }
+
+    /// Submit a built block and await its `Ack` (or `Error`). Returns the
+    /// block CID assigned by the server.
+    pub async fn submit(&self, block: BuiltBlock) -> Result<String, ClientError> {
+        use base64::Engine;
+        let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes());
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&block.sender_sig);
+        let env = Envelope::new(Frame::Submit {
+            bundle_b64,
+            sig_b64,
+        });
+        let json = serde_json::to_string(&env)?;
+        self.write_tx
+            .send(Message::Text(json))
+            .map_err(|_| ClientError::ConnectionClosed)?;
+
+        // Await the first non-Block frame (Ack/Error).
+        let timeout = Duration::from_secs(self.submit_ack_timeout_seconds);
+        let mut rx = self.inbound_rx.lock().await;
+        loop {
+            let received = tokio::time::timeout(timeout, rx.recv())
+                .await
+                .map_err(|_| ClientError::AckTimeout(self.submit_ack_timeout_seconds))?;
+            let Some(frame) = received else {
+                return Err(ClientError::ConnectionClosed);
+            };
+            match frame {
+                Frame::Ack { block_cid } => return Ok(block_cid),
+                Frame::Error { code, message, .. } => {
+                    return Err(ClientError::ServerError { code, message });
+                }
+                // Ignore other non-Block frames while waiting for ack;
+                // Block frames go directly to the per-channel subscriber.
+                _ => continue,
+            }
+        }
+    }
+
+    /// Returns the server URL this client was constructed with.
+    pub fn server_url(&self) -> &str {
+        &self.server_url
+    }
+
+    /// Returns the DID of the identity this client is signing with.
+    pub fn identity_did(&self) -> String {
+        self.identity.did_string()
+    }
+
+    /// Returns the last cursor seen for an origin (best-effort; populated
+    /// by the reader task as blocks arrive). v0.0.2 uses placeholder
+    /// cursors; Phase D wires in real HLC parsing.
+    pub async fn last_cursor(&self, origin: &str) -> Option<HlcCursor> {
+        self.last_cursors.lock().await.get(origin).cloned()
+    }
+}
+
+// Re-export the envelope types through jig_client::envelope for callers
+// that don't want to depend on jig-pipeline directly.
+pub mod envelope {
+    pub use jig_pipeline::envelope::{Envelope, Frame, HlcCursor, ReceiptRef, Scope};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_tungstenite::accept_async;
+
+    fn test_identity() -> Identity {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.keep();
+        Identity::generate_and_save(&path).unwrap()
+    }
+
+    /// Spin up a tiny WS server on an ephemeral port. The handler closure
+    /// receives one frame and may send any number of replies; it's
+    /// configurable via the `on_recv` argument so each test can script
+    /// the expected dialogue.
+    async fn start_test_server<F, Fut>(on_recv: F) -> (String, Arc<AtomicUsize>)
+    where
+        F: Fn(Envelope) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Vec<Envelope>> + Send + 'static,
+    {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}");
+        let frame_counter = Arc::new(AtomicUsize::new(0));
+        let counter_for_server = frame_counter.clone();
+        let on_recv = Arc::new(on_recv);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let on_recv = on_recv.clone();
+                let counter = counter_for_server.clone();
+                tokio::spawn(async move {
+                    let Ok(ws) = accept_async(stream).await else {
+                        return;
+                    };
+                    let (mut sink, mut stream) = ws.split();
+                    while let Some(Ok(msg)) = stream.next().await {
+                        if let Message::Text(text) = msg {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            let Ok(env) = serde_json::from_str::<Envelope>(&text) else {
+                                continue;
+                            };
+                            let replies = on_recv(env).await;
+                            for r in replies {
+                                let json = serde_json::to_string(&r).unwrap();
+                                let _ = sink.send(Message::Text(json)).await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        (url, frame_counter)
+    }
+
+    #[tokio::test]
+    async fn connect_succeeds_against_test_server() {
+        let (url, _) = start_test_server(|_env| async move { vec![] }).await;
+        let id = test_identity();
+        let client = Client::connect(&url, id).await.unwrap();
+        assert_eq!(client.server_url(), &url);
+    }
+
+    #[tokio::test]
+    async fn connect_fails_on_bad_url() {
+        let id = test_identity();
+        let err = Client::connect("not a url", id).await.unwrap_err();
+        assert!(matches!(err, ClientError::BadUrl(_)));
+    }
+
+    #[tokio::test]
+    async fn submit_returns_block_cid_on_ack() {
+        let (url, frame_counter) = start_test_server(|env| async move {
+            // Echo back an Ack for any Submit frame
+            match env.frame {
+                Frame::Submit { .. } => vec![Envelope::new(Frame::Ack {
+                    block_cid: "bafy_test_ack".to_string(),
+                })],
+                _ => vec![],
+            }
+        })
+        .await;
+
+        let id = test_identity();
+        let client = Client::connect(&url, id).await.unwrap();
+        // Build a trivial block
+        use crate::blocks::build_text_render;
+        use jig_core::HlcTimestamp;
+        let hlc = HlcTimestamp {
+            wall_ms: 0,
+            logical: 0,
+            server_did: client.identity.did().clone(),
+        };
+        let block = build_text_render(&client.identity, "#hello", "hi", hlc);
+        let cid = client.submit(block).await.unwrap();
+        assert_eq!(cid, "bafy_test_ack");
+        assert!(frame_counter.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn submit_returns_server_error_on_error_frame() {
+        let (url, _) = start_test_server(|env| async move {
+            match env.frame {
+                Frame::Submit { .. } => vec![Envelope::new(Frame::Error {
+                    code: "INVALID_SIG".to_string(),
+                    ref_cid: None,
+                    message: "signature verification failed".to_string(),
+                })],
+                _ => vec![],
+            }
+        })
+        .await;
+
+        let id = test_identity();
+        let client = Client::connect(&url, id).await.unwrap();
+        use crate::blocks::build_text_render;
+        use jig_core::HlcTimestamp;
+        let hlc = HlcTimestamp {
+            wall_ms: 0,
+            logical: 0,
+            server_did: client.identity.did().clone(),
+        };
+        let block = build_text_render(&client.identity, "#hello", "hi", hlc);
+        let err = client.submit(block).await.unwrap_err();
+        match err {
+            ClientError::ServerError { code, .. } => assert_eq!(code, "INVALID_SIG"),
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_channel_streams_delivered_blocks() {
+        let (url, _) = start_test_server(|env| async move {
+            match env.frame {
+                Frame::Subscribe { .. } => vec![Envelope::new(Frame::Block {
+                    bundle_b64: "dGVzdC1ibG9jaw==".to_string(),
+                    receipts: vec![],
+                    delivery_cid: "bafy_delivery_1".to_string(),
+                })],
+                _ => vec![],
+            }
+        })
+        .await;
+
+        let id = test_identity();
+        let client = Client::connect(&url, id).await.unwrap();
+        let mut stream = client.subscribe_channel("#hello").await.unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("timeout waiting for block")
+            .expect("stream closed");
+        assert_eq!(delivered.bundle_b64, "dGVzdC1ibG9jaw==");
+        assert_eq!(delivered.delivery_cid, "bafy_delivery_1");
+    }
+
+    #[tokio::test]
+    async fn identity_did_returns_canonical_form() {
+        let (url, _) = start_test_server(|_| async { vec![] }).await;
+        let id = test_identity();
+        let expected_did = id.did_string();
+        let client = Client::connect(&url, id).await.unwrap();
+        assert_eq!(client.identity_did(), expected_did);
+        assert!(client.identity_did().starts_with("did:jig:z"));
+    }
+}

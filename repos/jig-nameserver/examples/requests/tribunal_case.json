@@ -1,0 +1,20 @@
+{
+  "create": {
+    "subject": "user",
+    "subject_id": "eve@example.net",
+    "ruleset": "high-sec",
+    "reason": "Automated escalation: repeated phishing blocks",
+    "reporter": "did:jig:ns:alpha",
+    "severity": "high",
+    "metadata": {
+      "observations": ["block://bafycaseobs1", "block://bafycaseobs2"],
+      "escalated_by": "useful-work-monitor"
+    }
+  },
+  "decision": {
+    "outcome": "sustain",
+    "decided_by": "did:jig:ns:beta",
+    "penalty_delta": 3.5,
+    "notes": "Consensus reached by automated panel."
+  }
+}

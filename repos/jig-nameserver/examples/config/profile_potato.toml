@@ -1,0 +1,36 @@
+# Minimal nameserver config for a "potato" single-node deployment
+[nameserver]
+profile = "potato"
+
+[nameserver.network]
+bind = "127.0.0.1"
+port = 7070
+
+[nameserver.pow]
+server_secret = "local-dev-secret"
+base_difficulty = 16
+min_difficulty = 8
+max_difficulty = 24
+
+[nameserver.rate_limits]
+per_key_per_min = 30
+per_ip_per_min = 120
+
+[nameserver.reputation]
+default_ruleset = "high-sec"
+
+[[nameserver.reputation.local_rulesets]]
+key = "high-sec"
+description = "Baseline high-sec contract"
+authority = "did:jig:central"
+weight = 1.0
+
+[nameserver.reputation.local_rulesets.pow_policy]
+min_bits = 12
+max_bits = 26
+multiplier = 1.2
+
+[nameserver.reputation.local_rulesets.tribunal_policy]
+quorum = 5
+auto_escalate_score = 0.15
+evidence_window_secs = 1800

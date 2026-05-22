@@ -1,0 +1,268 @@
+//! Block bundle builders for the canonical v0.0.2 block kinds.
+//!
+//! Used by `jig-cli`, future email-bridge, future riverdance — anywhere
+//! a signed block needs to be constructed before submission. Each helper
+//! returns a `(manifest_bytes, code_bytes)` pair plus the signed sig over
+//! canonical bytes. Callers can submit via WSS or REST as appropriate.
+
+use jig_core::{Author, BlockKind, BlockManifest, HlcTimestamp};
+use serde_json::{Value, json};
+
+use crate::identity::Identity;
+
+/// A built + signed bundle ready for submission. The `manifest_bytes` and
+/// `code_bytes` fields can be wrapped into a `jig_core::BlockBundle` at the
+/// call site (BlockBundle has lifetime borrows so we don't construct it here).
+#[derive(Debug, Clone)]
+pub struct BuiltBlock {
+    pub manifest_bytes: Vec<u8>,
+    pub code_bytes: Vec<u8>,
+    pub sender_sig: Vec<u8>,
+}
+
+impl BuiltBlock {
+    /// Concatenated canonical bytes used for signature verification on the
+    /// server side. Must match `jig-pipeline::ingest::bundle_canonical_bytes`.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let payload = (self.manifest_bytes.clone(), self.code_bytes.clone());
+        serde_json::to_vec(&payload).expect("canonical bytes serialize")
+    }
+}
+
+/// Build a signed `text-render` block: the v0.0.2 chat-message block.
+/// Channel slug carried via metadata key `"channel"`; body via `"body"`.
+pub fn build_text_render(
+    sender: &Identity,
+    channel_slug: &str,
+    body: &str,
+    hlc: HlcTimestamp,
+) -> BuiltBlock {
+    build_with_metadata(
+        sender,
+        BlockKind::TextRender,
+        hlc,
+        json!({
+            "channel": channel_slug,
+            "body": body,
+        }),
+    )
+}
+
+/// Build a signed `channel-create` block. v0.0.2 sends this through the
+/// `/_admin_v0_0_2/channels` REST endpoint (debug-gated). v0.0.3 makes
+/// channel-create a real Wasm block submitted via `submit`.
+pub fn build_channel_create(
+    sender: &Identity,
+    slug: &str,
+    visibility: &str,
+    hlc: HlcTimestamp,
+) -> BuiltBlock {
+    build_with_metadata(
+        sender,
+        BlockKind::ChannelCreate,
+        hlc,
+        json!({
+            "slug": slug,
+            "visibility": visibility,
+        }),
+    )
+}
+
+/// Build a signed `member-add` block.
+pub fn build_member_add(
+    sender: &Identity,
+    channel_slug: &str,
+    member_did: &str,
+    hlc: HlcTimestamp,
+) -> BuiltBlock {
+    build_with_metadata(
+        sender,
+        BlockKind::MemberAdd,
+        hlc,
+        json!({
+            "channel": channel_slug,
+            "member_did": member_did,
+        }),
+    )
+}
+
+/// Build a signed `fed-hello` block — emitted by jig-server when initiating
+/// a federation handshake. Sender is the server's own identity.
+pub fn build_fed_hello(
+    sender: &Identity,
+    server_url: &str,
+    alias: Option<&str>,
+    hlc: HlcTimestamp,
+) -> BuiltBlock {
+    let mut meta = json!({"server_url": server_url});
+    if let Some(a) = alias {
+        meta["alias"] = json!(a);
+    }
+    build_with_metadata(sender, BlockKind::FedHello, hlc, meta)
+}
+
+fn build_with_metadata(
+    sender: &Identity,
+    kind: BlockKind,
+    hlc: HlcTimestamp,
+    metadata: Value,
+) -> BuiltBlock {
+    let mut builder = BlockManifest::builder()
+        .version(semver::Version::new(0, 1, 0))
+        .author(Author {
+            did: sender.did().clone(),
+            public_key: None,
+            roles: vec![],
+        });
+    if let Value::Object(map) = metadata {
+        for (k, v) in map {
+            builder = builder.metadata_entry(&k, v);
+        }
+    }
+    let manifest = builder
+        .build()
+        .expect("manifest builds")
+        .with_kind(kind)
+        .with_hlc(hlc);
+    let manifest_bytes = manifest.to_canonical_bytes().expect("canonical bytes");
+    // v0.0.2: no per-block Wasm; canonical wasm artifact bundled separately
+    let code_bytes: Vec<u8> = vec![];
+    let payload = (manifest_bytes.clone(), code_bytes.clone());
+    let canonical = serde_json::to_vec(&payload).expect("payload serialize");
+    let sig = sender.sign(&canonical).to_bytes().to_vec();
+    BuiltBlock {
+        manifest_bytes,
+        code_bytes,
+        sender_sig: sig,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::Verifier;
+    use jig_core::Did;
+    use tempfile::tempdir;
+
+    fn test_identity() -> Identity {
+        let dir = tempdir().unwrap();
+        // Keep the tempdir on disk so the keyfile survives — tests only.
+        let dir_path = dir.keep();
+        Identity::generate_and_save(&dir_path).unwrap()
+    }
+
+    fn test_hlc(id: &Identity) -> HlcTimestamp {
+        HlcTimestamp {
+            wall_ms: 1_747_680_000_000,
+            logical: 0,
+            server_did: id.did().clone(),
+        }
+    }
+
+    #[test]
+    fn build_text_render_carries_kind_and_channel_metadata() {
+        let id = test_identity();
+        let hlc = test_hlc(&id);
+        let block = build_text_render(&id, "#hello", "hi", hlc);
+        let manifest: BlockManifest = serde_json::from_slice(&block.manifest_bytes).unwrap();
+        assert_eq!(manifest.kind, Some(BlockKind::TextRender));
+        assert_eq!(
+            manifest.metadata.get("channel").and_then(|v| v.as_str()),
+            Some("#hello")
+        );
+        assert_eq!(
+            manifest.metadata.get("body").and_then(|v| v.as_str()),
+            Some("hi")
+        );
+    }
+
+    #[test]
+    fn build_text_render_signature_verifies_against_sender_pubkey() {
+        let id = test_identity();
+        let hlc = test_hlc(&id);
+        let block = build_text_render(&id, "#hello", "hi", hlc);
+        let sig = ed25519_dalek::Signature::from_slice(&block.sender_sig).unwrap();
+        id.public_key()
+            .verify(&block.canonical_bytes(), &sig)
+            .expect("signature must verify against sender pubkey");
+    }
+
+    #[test]
+    fn build_channel_create_metadata_includes_slug_and_visibility() {
+        let id = test_identity();
+        let hlc = test_hlc(&id);
+        let block = build_channel_create(&id, "#room", "restricted", hlc);
+        let manifest: BlockManifest = serde_json::from_slice(&block.manifest_bytes).unwrap();
+        assert_eq!(manifest.kind, Some(BlockKind::ChannelCreate));
+        assert_eq!(
+            manifest.metadata.get("slug").and_then(|v| v.as_str()),
+            Some("#room")
+        );
+        assert_eq!(
+            manifest.metadata.get("visibility").and_then(|v| v.as_str()),
+            Some("restricted")
+        );
+    }
+
+    #[test]
+    fn build_member_add_metadata_includes_channel_and_member() {
+        let id = test_identity();
+        let hlc = test_hlc(&id);
+        let block = build_member_add(&id, "#hello", "did:jig:zDeji", hlc);
+        let manifest: BlockManifest = serde_json::from_slice(&block.manifest_bytes).unwrap();
+        assert_eq!(manifest.kind, Some(BlockKind::MemberAdd));
+        assert_eq!(
+            manifest.metadata.get("channel").and_then(|v| v.as_str()),
+            Some("#hello")
+        );
+        assert_eq!(
+            manifest.metadata.get("member_did").and_then(|v| v.as_str()),
+            Some("did:jig:zDeji")
+        );
+    }
+
+    #[test]
+    fn build_fed_hello_omits_alias_when_none() {
+        let id = test_identity();
+        let hlc = test_hlc(&id);
+        let block = build_fed_hello(&id, "wss://server-a", None, hlc);
+        let manifest: BlockManifest = serde_json::from_slice(&block.manifest_bytes).unwrap();
+        assert_eq!(manifest.kind, Some(BlockKind::FedHello));
+        assert_eq!(
+            manifest.metadata.get("server_url").and_then(|v| v.as_str()),
+            Some("wss://server-a")
+        );
+        assert!(!manifest.metadata.contains_key("alias"));
+    }
+
+    #[test]
+    fn build_fed_hello_includes_alias_when_some() {
+        let id = test_identity();
+        let hlc = test_hlc(&id);
+        let block = build_fed_hello(&id, "wss://server-a", Some("a.jig"), hlc);
+        let manifest: BlockManifest = serde_json::from_slice(&block.manifest_bytes).unwrap();
+        assert_eq!(
+            manifest.metadata.get("alias").and_then(|v| v.as_str()),
+            Some("a.jig")
+        );
+    }
+
+    #[test]
+    fn built_block_canonical_bytes_are_deterministic() {
+        let id = test_identity();
+        let hlc = test_hlc(&id);
+        let block_a = build_text_render(&id, "#hello", "hi", hlc.clone());
+        let block_b = build_text_render(&id, "#hello", "hi", hlc);
+        assert_eq!(block_a.canonical_bytes(), block_b.canonical_bytes());
+    }
+
+    #[test]
+    fn sender_did_matches_identity_did() {
+        let id = test_identity();
+        let hlc = test_hlc(&id);
+        let block = build_text_render(&id, "#hello", "hi", hlc);
+        let manifest: BlockManifest = serde_json::from_slice(&block.manifest_bytes).unwrap();
+        let sender: Did = manifest.authors[0].did.clone();
+        assert_eq!(sender, *id.did());
+    }
+}

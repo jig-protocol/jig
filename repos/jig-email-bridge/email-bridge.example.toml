@@ -1,0 +1,40 @@
+# Example configuration for jig-email-bridge
+# Copy to email-bridge.toml and edit values for your environment.
+# email-bridge.toml is gitignored by default.
+
+[smtp_server]
+# Not required for P0 outbound sending; inbound is a stub.
+enabled = false
+listen_addr = "127.0.0.1"
+port = 2525
+domain = "localhost"
+require_tls = false
+
+# Select outbound transport: "resend" or "smtp"
+outbound_transport = "resend"
+
+[resend_client]
+# Resend transport (preferred for quick start)
+enabled = true
+from_address = "noreply@yourdomain.com"
+# Environment variable name where API key is stored (do not put secrets in this file)
+api_key_env = "RESEND_API_KEY"
+
+[smtp_client]
+# SMTP relay (optional alternative)
+enabled = false
+relay_host = "smtp.example.com"
+relay_port = 587
+# Optional auth
+username = null
+password = null
+from_address = "jig@example.com"
+
+[formatting]
+signature = "\n\n--\nSent via Jig Protocol - https://jig.onl"
+html_template = null
+wrap_at = 72
+add_signature = true
+add_x_jig_header = true
+add_thread_headers = true
+

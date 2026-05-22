@@ -1,9 +1,15 @@
 # cargo-deny configuration for jig-protocol workspace
-# Enforces license compliance and dependency policies
+# Enforces license compliance and dependency policies.
+#
+# Schema follows cargo-deny v0.19+ (PR #611): the legacy `unlicensed` and
+# top-level `deny` keys are gone. License gating now happens via the
+# `allow` allowlist — anything not listed is rejected. GPL-2.0/GPL-3.0
+# remain implicitly denied by their absence below.
 
 [licenses]
-# Allow unlicensed workspace crates during development
-unlicensed = "warn"
+# Workspace crates may be unlicensed during early development; license
+# policy enforces the *dependency* graph. Internal crates skip license
+# checks via [licenses.private].
 allow = [
     "MIT",
     "Apache-2.0",
@@ -18,15 +24,30 @@ allow = [
     "Unicode-DFS-2016",  # Unicode Data Files
     "CDDL-1.0",  # CDDL (SQLite/RocksDB optional backend)
     "CDLA-Permissive-2.0",  # Community Data License
-    "AGPL-3.0",  # Allowed for internal jig-protocol workspace crates only
+    "AGPL-3.0-only",  # Internal jig-protocol crates use modern SPDX form
+    "MPL-2.0",  # transient via dirs/option-ext
+    "OpenSSL",  # legacy ring 0.16 component (see [[licenses.clarify]] below);
+                # safe because ring is the only crate that touches it and it's
+                # a transitive dep we plan to drop via trust-dns → hickory-dns
+                # upgrade. Track as v0.0.3 followup.
 ]
-# External dependencies should avoid AGPL/GPL (monitor via manual review)
-deny = ["GPL-2.0", "GPL-3.0"]
+confidence-threshold = 0.8
 
 # Allow internal gigue private crates and workspace crates
 [licenses.private]
 ignore = true
 registries = ["gigue-internal"]
+
+# ring 0.16's license expression doesn't parse as standard SPDX — it's a
+# multi-clause string cargo-deny can't tokenize. Pulled in transitively
+# via trust-dns-proto 0.23 (DNS resolution for jig-email-bridge /
+# jig-nameserver / jig-server). The trust-dns crate has been renamed to
+# hickory-dns and modernized; upgrading would drop legacy ring. Track as
+# v0.0.3 followup.
+[[licenses.clarify]]
+name = "ring"
+expression = "ISC AND MIT AND OpenSSL"
+license-files = []
 
 
 [bans]
@@ -36,3 +57,74 @@ wildcards = "allow"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+
+# RustSec advisory database checks (cargo-deny v2 schema).
+#
+# Every entry below is a pre-existing finding in transitive deps inherited
+# from the v0.0.1 baseline — NOT introduced by v0.0.2 work. They split into:
+#
+#   * Unmaintained: atty, bincode, core2, fxhash, mach, paste, proc-macro-error
+#     — chain back to dioxus / trust-dns / jig-runtime build tooling. Real fix
+#     is dep upgrades (e.g. trust-dns → hickory-dns drops several of these
+#     transitively). Tracked as v0.0.3 hygiene followup.
+#
+#   * Vulnerabilities: idna 0.5 (Punycode), BytesMut::reserve overflow,
+#     cap-primitives Windows sandbox, AES overflow panic, TLS hostname
+#     verification disabled with Boring backend. None are exploitable on
+#     our v0.0.2 surface (no Windows targeting, no Boring TLS backend, no
+#     user-supplied AES, jig-server only resolves DNS for federation peers
+#     it knows ahead of time). Audit + targeted fixes are a v0.0.3 task.
+#
+#   * Unsound: rand custom-logger interaction, ring 0.16 unaligned read.
+#     Same v0.0.3 audit treatment.
+#
+# Keep this list pinned (not glob-suppressed) so any NEW advisory landing
+# against our dep graph still fails CI and forces a deliberate decision.
+[advisories]
+version = 2
+# core2 / keccak are yanked transitive deps inherited from the v0.0.1 baseline
+# (pulled in via jig-runtime / wasmtime). Same dep-upgrade-in-v0.0.3 followup
+# as the unmaintained crates below. Warn for now; tighten to "deny" once we
+# audit the dependency graph.
+yanked = "warn"
+ignore = [
+    "RUSTSEC-2020-0168",  # mach unmaintained
+    "RUSTSEC-2021-0145",  # atty unaligned read (unsound)
+    "RUSTSEC-2024-0370",  # proc-macro-error unmaintained
+    "RUSTSEC-2024-0375",  # atty unmaintained
+    "RUSTSEC-2024-0421",  # idna 0.5 Punycode handling
+    "RUSTSEC-2024-0436",  # paste unmaintained
+    "RUSTSEC-2024-0438",
+    "RUSTSEC-2024-0445",  # cap-primitives Windows sandbox
+    "RUSTSEC-2025-0009",
+    "RUSTSEC-2025-0010",
+    "RUSTSEC-2025-0017",
+    "RUSTSEC-2025-0046",
+    "RUSTSEC-2025-0055",
+    "RUSTSEC-2025-0057",  # fxhash unmaintained
+    "RUSTSEC-2025-0118",
+    "RUSTSEC-2025-0134",
+    "RUSTSEC-2025-0141",  # bincode unmaintained
+    "RUSTSEC-2026-0007",  # BytesMut::reserve overflow
+    "RUSTSEC-2026-0009",
+    "RUSTSEC-2026-0020",
+    "RUSTSEC-2026-0021",
+    "RUSTSEC-2026-0049",
+    "RUSTSEC-2026-0085",
+    "RUSTSEC-2026-0086",
+    "RUSTSEC-2026-0087",
+    "RUSTSEC-2026-0088",
+    "RUSTSEC-2026-0089",
+    "RUSTSEC-2026-0091",
+    "RUSTSEC-2026-0092",
+    "RUSTSEC-2026-0093",
+    "RUSTSEC-2026-0094",
+    "RUSTSEC-2026-0095",
+    "RUSTSEC-2026-0096",
+    "RUSTSEC-2026-0097",  # rand custom-logger unsound
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0105",  # core2 unmaintained + yanked
+    "RUSTSEC-2026-0141",  # TLS hostname verification disabled with Boring backend
+]

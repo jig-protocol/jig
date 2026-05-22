@@ -1,0 +1,111 @@
+[package]
+name = "jig-server"
+version = "0.0.1"
+edition = "2024"
+license = "AGPL-3.0-only"
+authors = ["Jig Protocol Contributors"]
+description = "Reference server implementation for Jig protocol"
+repository = "https://github.com/jig-protocol/jig-server"
+keywords = ["messaging", "server", "irc", "federation"]
+categories = ["network-programming"]
+
+[[bin]]
+name = "jig-server"
+path = "src/main.rs"
+
+[dependencies]
+# Core protocol
+jig-core = { path = "../jig-core" }
+jig-runtime = { workspace = true }
+jig-config = { workspace = true }
+
+# v0.0.2 hello-world milestone — pipeline + client + new config sections
+jig-pipeline = { path = "../jig-pipeline" }
+jig-client   = { path = "../jig-client" }
+shellexpand  = "3"
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+
+# Database
+rusqlite = { workspace = true }
+
+# Web framework
+axum = { version = "0.7", features = ["ws"] }
+# tower 0.5 to match the dev-deps entry below; having both 0.4 and 0.5 in the
+# same crate confuses rustc's crate resolution (E0464 multiple candidates).
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_repr = "0.1"
+humantime-serde = "1.1"
+cid = { version = "0.10", features = ["serde"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Configuration
+clap = { version = "4.4", features = ["derive"] }
+toml = "0.8"
+
+# Time
+chrono = "0.4"
+time = { version = "0.3", features = ["formatting"] }
+
+# UUID
+uuid = { version = "1.6", features = ["v7", "serde"] }
+
+# Federation
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+base64 = "0.21"
+blake3 = { workspace = true }
+hex = { workspace = true }
+futures-util = "0.3"
+semver = "1.0"
+trust-dns-resolver = { version = "0.23", features = ["tokio-runtime"] }
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+
+# WebSocket
+tokio-tungstenite = "0.21"
+dashmap = "5"
+jsonwebtoken = "9"
+wasmtime = { version = "16.0.0", features = ["async"] }
+wasmtime-wasi = "16.0.0"
+
+# Capability enforcement (Phase 1)
+hmac = "0.12"
+sha2 = "0.10"
+
+# Telemetry & Analytics (Phase 3)
+hdrhistogram = "7.5"
+duckdb = { version = "1.0", features = ["bundled"], optional = true }
+clickhouse = { version = "0.11", optional = true }
+arrow = { version = "54", optional = true }
+parquet = { version = "54", features = ["zstd"], optional = true }
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3.8"
+
+[features]
+default = ["sqlite"]
+sqlite = []
+telemetry_v0_2 = []
+analytics_duckdb = ["dep:duckdb"]
+analytics_clickhouse = ["dep:clickhouse"]
+analytics_parquet = ["dep:arrow", "dep:parquet"]
+transports_irc = []
+transports_ssh = []
+transports_ws = []
+hyperscale = ["analytics_clickhouse", "transports_irc", "transports_ssh", "transports_ws"]

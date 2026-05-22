@@ -1,0 +1,76 @@
+name: "JEP Proposal"
+description: "Propose a Jig Enhancement Proposal (JEP)"
+labels: ["JEP", "spec-change"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for proposing a JEP. Please complete the sections below.
+        Use RFC 2119 terminology (MUST/SHOULD/MAY). Assume a zero-trust environment.
+  - type: input
+    id: title
+    attributes:
+      label: Title
+      description: Short descriptive title for the JEP
+    validations:
+      required: true
+  - type: input
+    id: authors
+    attributes:
+      label: Authors
+      description: Comma-separated list (Name <email>)
+    validations:
+      required: true
+  - type: dropdown
+    id: type
+    attributes:
+      label: Type
+      options:
+        - Standards Track
+        - Informational
+        - Process
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Problem statement, context, goals, non-goals
+    validations:
+      required: true
+  - type: textarea
+    id: specification
+    attributes:
+      label: Specification
+      description: Normative definitions, wire formats (prefer TOML for examples), state machines
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security Considerations (Zero-Trust)
+      description: Threat model, mitigations, downgrade-prevention, replay protection, metadata minimization
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Backwards Compatibility
+      description: Versioning, negotiation, migration plan
+    validations:
+      required: true
+  - type: textarea
+    id: test_vectors
+    attributes:
+      label: Test Vectors
+      description: Canonical inputs/outputs for interoperability
+  - type: textarea
+    id: llm
+    attributes:
+      label: LLM Influence (if applicable)
+      description: Pointers to LLM-generated code/content, validation, and analysis
+  - type: textarea
+    id: references
+    attributes:
+      label: References
+      description: Links to related specs, RFCs, and prior art

@@ -1,0 +1,50 @@
+[package]
+name = "jig-runtime"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Unified WASM runtime for Jig Protocol with deterministic execution, WASI support, capability sandboxing, and instrumented fuel metering"
+repository = "https://github.com/jig-protocol/repos"
+keywords = ["wasm", "runtime", "wasi", "capabilities", "deterministic"]
+
+[features]
+default = ["deterministic", "wasi-preview2"]
+deterministic = []
+component-model = ["wasmtime/component-model"]
+wasi-preview2 = ["wasmtime-wasi"]
+tracing = ["dep:tracing", "dep:tracing-subscriber"]
+receipt-signing = ["dep:ed25519-dalek"]
+
+[dependencies]
+# Core
+anyhow = "1.0"
+thiserror = "1.0"
+
+# WASM Runtime
+wasmtime = { version = "23", features = ["cranelift", "pooling-allocator"] }
+wasmtime-wasi = { version = "23", optional = true }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Cryptography
+blake3 = "1.5"
+ed25519-dalek = { version = "2.1", optional = true }
+
+# Logging (optional)
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
+
+# Async (for future async API)
+tokio = { version = "1.35", features = ["sync"], optional = true }
+chrono = { workspace = true, features = ["serde"] }
+jig-core = { path = "../jig-core" }
+cid = { version = "0.10", features = ["serde"] }
+multihash = { version = "0.18", default-features = false, features = ["std", "multihash-impl", "blake3"] }
+time = { version = "0.3", features = ["serde"] }
+
+[dev-dependencies]
+tokio = { version = "1.35", features = ["rt", "macros"] }
+wat = "1.0"

@@ -1,0 +1,18 @@
+[book]
+title = "Jig Protocol Specification"
+authors = ["Jig Protocol Contributors"]
+language = "en"
+multilingual = false
+src = "src"
+
+[build]
+create-missing = true
+
+[output.html]
+preferred-dark-theme = "navy"
+default-theme = "light"
+
+[output.linkcheck]
+follow-web-links = false
+optional = false
+warning-policy = "error"

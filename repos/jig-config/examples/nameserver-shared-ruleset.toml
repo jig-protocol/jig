@@ -1,0 +1,267 @@
+# jig-config/nameserver - Shared Ruleset Configuration
+#
+# Scenario: Medium-trust federation with shared ruleset or data contract
+# Use case: Participation in high-sec network OR bilateral trust via data contract
+# Trust model: Verified policy match, contract-based trust, explicit peering
+#
+# This configuration demonstrates:
+# - Network-based shared ruleset (high-sec network)
+# - Data contract verification
+# - Policy drift tolerance
+# - Selective federation
+# - Contract-based trust boundaries
+
+[network]
+bind_address = "0.0.0.0"
+port = 7070
+public_address = "ns.trusted-partner.com"
+
+[network.dns_discovery]
+enabled = true
+domain = "trusted-partner.com"
+cache_ttl_secs = 600            # Longer cache for stability
+
+[storage]
+path = "/var/lib/jig/nameserver.db"
+max_connections = 15
+wal_mode = true
+
+[pow]
+secret = "shared-ruleset-secret-change-me"
+base_difficulty = 19            # Slightly higher baseline
+min_difficulty = 17
+max_difficulty = 30
+penalty_step_bits = 2
+
+[pow.zone_overrides]
+"null-sec" = 26
+"low-sec" = 19
+"high-sec" = 14
+
+[rate_limits]
+# Moderate limits for shared ruleset
+per_key_limit = 80
+per_ip_limit = 160
+global_limit = 1500
+burst_multiplier = 1.5
+
+[penalties]
+# Standard decay for shared ruleset
+decay_window_secs = 600         # 10 minutes
+max_penalty_points = 100.0
+penalty_floor_secs = 60
+tribunal_escalation_threshold = 40.0
+
+[anonymous]
+# More restrictive anonymous policy
+enabled = true
+min_difficulty = 26
+token_ttl_secs = 900            # 15 minutes
+max_sessions_per_ip = 2
+
+# ============================================================================
+# Federation Configuration (Shared Ruleset Mode)
+# ============================================================================
+
+[federation]
+mode = "shared_ruleset"
+enabled = true
+max_peers = 50                  # Moderate peer limit
+
+# Bootstrap from high-sec network
+seed_peers = [
+    "https://bootstrap.high-sec.network",
+    "https://ns1.high-sec.network"
+]
+
+# No blanket allow - validated by contract
+allow_list = []
+
+# Explicit deny list for known bad actors
+deny_list = [
+    "known-spam.example",
+    "bad-actor.net"
+]
+
+# Policy hash for ruleset compatibility
+policy_hash = "high-sec-v1-def456"
+
+[federation.gossip]
+# Standard gossip interval
+interval_secs = 300             # 5 minutes
+batch_size = 100
+message_types = [
+    "policy_hash",
+    "reputation_summary",
+    "tribunal_decision"
+]
+verify_signatures = true
+
+[federation.handshake]
+timeout_secs = 30
+require_mtls = false            # Optional for shared ruleset
+protocol_versions = ["1.0"]
+
+[federation.shared_ruleset]
+# Network-based shared ruleset
+network_id = "high-sec-network"
+
+# Data contracts for trust establishment
+contract_dids = [
+    "did:jig:contract:high-sec-v1",
+    "did:jig:contract:tribunal-protocol",
+    "did:jig:contract:reputation-sharing"
+]
+
+# Require policy hash match for peering
+require_policy_match = true
+
+# Acceptable policy drift (10%)
+policy_drift_tolerance = 0.1
+
+# Contract verification endpoint
+contract_verification_endpoint = "https://verify.high-sec.network/contracts"
+
+# ============================================================================
+# Reputation Configuration
+# ============================================================================
+
+[reputation]
+damping_factor = 0.85
+min_observations_for_aggregate = 5
+
+[[reputation.rulesets]]
+id = "high-sec"
+name = "High Security Network"
+
+[reputation.rulesets.pow_policy]
+base_difficulty = 18
+penalty_multiplier = 1.5
+
+[reputation.rulesets.tribunal_policy]
+auto_escalate = true
+escalation_severity = "medium"
+quorum_size = 5
+
+[reputation.rulesets.zone_thresholds]
+"low-sec" = 0.5
+"high-sec" = 0.8
+
+[[reputation.rulesets]]
+id = "bilateral-trust"
+name = "Bilateral Trust Contract"
+
+[reputation.rulesets.pow_policy]
+base_difficulty = 16
+penalty_multiplier = 1.3
+
+[reputation.rulesets.tribunal_policy]
+auto_escalate = true
+escalation_severity = "high"
+quorum_size = 3
+
+# Translation between rulesets
+[[reputation.translation_contracts]]
+from_ruleset = "bilateral-trust"
+to_ruleset = "high-sec"
+transform = "linear"
+parameters = { "multiplier" = 0.95 }
+
+# ============================================================================
+# Automation Policy
+# ============================================================================
+
+[automation]
+# Moderate automation for shared ruleset
+power_law_exponent = 1.6
+pile_on_factor = 0.8
+quorum_requirement = 5
+evidence_window_secs = 300
+max_escalations_per_hour = 15
+
+# ============================================================================
+# Transparency Configuration
+# ============================================================================
+
+[transparency]
+enabled = true
+log_path = "/var/log/jig/transparency.log"
+publish_interval_secs = 3600
+events = [
+    "tribunal_decision",
+    "reputation_update",
+    "penalty_applied",
+    "identity_claimed"
+]
+public_endpoint = true
+
+# ============================================================================
+# Useful Work Configuration
+# ============================================================================
+
+[useful_work]
+enabled = true
+assignment_ttl_secs = 3600
+max_queue_depth = 1500
+retention_days = 60
+enabled_work_types = [
+    "validate_block",
+    "verify_observation",
+    "process_executable_block",
+    "validate_fuel_counts",
+    "cross_validate_receipt"
+]
+
+[useful_work.validator_requirements]
+"process_executable_block" = { min_validators = 3, consensus_threshold = 0.67, min_zone = "low-sec" }
+"cross_validate_receipt" = { min_validators = 3, consensus_threshold = 0.67, min_zone = "low-sec" }
+"validate_fuel_counts" = { min_validators = 2, consensus_threshold = 0.5 }
+
+# ============================================================================
+# Capabilities Configuration
+# ============================================================================
+
+[capabilities]
+enabled = true
+endpoint_path = "/.well-known/jig-ns/capabilities"
+
+advertised_capabilities = [
+    "identity.claim",
+    "identity.resolve",
+    "reputation.query",
+    "tribunal.submit"
+]
+
+affordances = [
+    "contract.verified",
+    "network.high-sec"
+]
+
+# ============================================================================
+# Anomaly Detection Configuration
+# ============================================================================
+
+[anomaly_detection]
+enabled = true
+max_network_fuel = 600_000
+
+[anomaly_detection.fuel_anomaly]
+enabled = true
+excessive_threshold = 3.0
+suspicious_threshold = 0.3
+min_sample_size = 15
+
+[anomaly_detection.hard_failure]
+enabled = true
+consecutive_threshold = 5
+time_window_secs = 300
+
+[anomaly_detection.auto_escalation]
+enabled = true
+severities = ["high", "critical"]
+
+[anomaly_detection.auto_escalation.pow_penalties]
+low = 2
+medium = 5
+high = 7
+critical = 10

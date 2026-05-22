@@ -1,0 +1,376 @@
+# jig-config.toml - Potato Profile (Default)
+#
+# Potato profile: optimized for <60 second first message
+# - SQLite only (truth layer)
+# - Minimal features (core + IRC)
+# - Anonymous by default
+# - Tight execution limits (1M fuel, 32MB memory, 250ms timeout)
+# - Strict determinism enforced
+#
+# This config shows the EXPLICIT form. In practice, you can omit everything
+# and get these defaults automatically (potato is the default profile).
+
+[meta]
+# Profile selection (potato is default, can be omitted)
+profile = "potato"
+
+# Execution Runtime Configuration
+[runtime]
+# Runtime engine (wasmtime for Wasm blocks)
+engine = "wasmtime"
+
+# Execution constraints (potato defaults shown)
+[runtime.constraints]
+fuel_max = 1_000_000        # 1M fuel = ~100K instructions
+memory_max_mb = 32          # 32 MB linear memory
+execution_timeout_ms = 250  # 250ms wall-clock timeout
+deterministic = true        # Strict determinism enforced
+
+# Import allowlist (only these imports permitted)
+import_allowlist = [
+    "jig_host::*",    # All Jig host APIs
+    "env::get"        # Read-only environment queries
+]
+
+# Determinism configuration
+[runtime.determinism]
+float_policy = "deny"       # Deny all float instructions (strictest)
+prng_seed_source = "manifest"  # Seed PRNG from block manifest
+
+# Forbidden imports (always denied, even if allowlisted)
+forbidden_imports = [
+    "wasi_snapshot_preview1::random_get",
+    "wasi_snapshot_preview1::clock_time_get",
+    "wasi_snapshot_preview1::clock_res_get",
+    "wasi_snapshot_preview1::sock_accept",
+    "wasi_snapshot_preview1::sock_recv",
+    "wasi_snapshot_preview1::sock_send",
+]
+
+# Capability configuration
+[runtime.capabilities]
+# Zero ambient authority: no default grants
+default_grants = []
+
+# Scope pattern syntax (glob = Unix-style wildcards)
+scope_pattern_syntax = "glob"
+
+# Global rate limit (requests/second across all capabilities)
+rate_limit_global = 100
+
+# Per-capability rate limits
+[runtime.capabilities.rate_limits]
+# Example: uncomment to override global limit for specific capabilities
+# "net.fetch" = 50
+# "crypto.sign" = 200
+
+# Storage Configuration (Potato = Two-tier: Truth + Intelligence)
+# Truth layer: SQLite (ACID-compliant source of truth)
+[storage.truth]
+backend = "sqlite"
+connection_string = "~/.jig/jig.db"
+max_connections = 10
+sqlite_wal = true        # Write-Ahead Logging for better concurrency
+cache_size_mb = 100
+
+# Intelligence layer: DuckDB (local analytics)
+[storage.intelligence]
+backend = "duckdb"
+path = "~/.jig/analytics.duckdb"
+batch_size = 1000
+
+# Network Configuration
+[network]
+bind_address = "127.0.0.1"  # Localhost only (safe default)
+public_address = ""          # No public address (single-node)
+
+# Port configuration
+federation_port = 7117
+irc_port = 6667
+ssh_port = 2222
+websocket_port = 8080
+smtp_port = 2525
+
+# Feature Flags (Potato = minimal)
+[features]
+core = true
+federation = false
+irc = true          # IRC enabled for compatibility
+ssh = false
+websocket = false
+email = false
+web_ui = false
+metrics = false
+anonymous = true    # Anonymous by default
+encryption = false  # E2E encryption disabled (single-node)
+
+# Analytics (Potato = DuckDB local file)
+[analytics]
+backend = "duckdb"
+path = "~/.jig/analytics.duckdb"
+retention_days = 30
+sample_rate = 1.0   # 100% sampling (low volume)
+privacy_mode = "anonymized"
+
+# Telemetry (Potato = minimal)
+[telemetry]
+metrics_enabled = false
+log_level = "info"
+structured_logging = false
+
+# Receipt Configuration (Potato = relaxed)
+[receipts]
+require_v2_fields = true
+require_renders_match = false
+require_fuel_breakdown = true
+
+[receipts.canonicalization]
+block_id_algorithm = "blake3-256"
+render_hash_algorithm = "sha256"
+strict_field_order = true
+compact_json = true
+
+[receipts.outcome]
+require_outcome = true
+default_affordances = []
+
+[receipts.retention]
+persist = true
+retention_days = 30  # 30 days retention
+compress = true
+storage_tier = "intelligence"
+
+# Pricing Configuration (Potato = Free tier)
+[pricing]
+model = "free"
+
+# Free tier limits (generous for development)
+[pricing.free_tier]
+fuel_per_month = 1_000_000_000    # 1B fuel/month
+bandwidth_per_month = 10737418240  # 10 GB/month
+operations_per_month = 10_000      # 10K operations/month
+
+# No useful work discounts (free tier)
+[pricing.useful_work_discounts]
+enabled = false
+
+# Outcome adjustments (charge only on success)
+[pricing.outcome_adjustments]
+charge_on_success = true
+charge_on_soft_fail = false
+charge_on_hard_fail = false
+soft_fail_refund_pct = 100
+hard_fail_refund_pct = 100
+
+# Audit Configuration (Potato = minimal audit logging)
+[audit]
+compliance_standard = "none"
+enabled_categories = ["security", "execution"]
+min_severity = "warn"
+log_payloads = false
+anonymize_pii = false
+include_stack_traces = false
+sign_audit_logs = false
+tamper_evident = false
+
+[audit.retention]
+enabled = true
+retention_days = 7  # 7 days retention
+compress = true
+storage_tier = "truth"
+stream_to_siem = false
+
+# ============================================================================
+# Bridge-Specific Configuration (Phase 7)
+# ============================================================================
+
+# IRC Bridge (Native Protocol - enabled for potato for compatibility)
+[bridges.irc]
+enabled = true  # IRC is enabled even for potato (minimal overhead)
+server_name = "jig.irc.local"
+port = 6667
+bind_address = "127.0.0.1"
+auto_join_channels = []
+
+[bridges.irc.nick_validation]
+max_length = 30
+require_unique = true
+
+[bridges.irc.block_wrapper]
+enabled = true
+fuel_budget = 10_000
+preserve_metadata = true
+
+# Email Bridge (Native Protocol - disabled for potato)
+[bridges.email]
+enabled = false
+
+[bridges.email.smtp]
+enabled = false
+port = 2525  # Dev port
+submission_port = 587
+bind_address = "127.0.0.1"
+mx_domains = []
+starttls = true
+require_auth = true
+
+[bridges.email.imap]
+enabled = false
+port = 143
+bind_address = "127.0.0.1"
+starttls = true
+
+[bridges.email.relay]
+method = { community = null }
+community_relay = false
+donated_quota_bytes = 0
+relay_quota_per_day = 100
+dns_discovery = true
+spf_dkim_enforcement = "lenient"
+
+[bridges.email.deliverability]
+enabled = false
+analytics_backend = "duckdb"
+track_opens = false
+track_bounces = true
+track_clicks = false
+
+# WebSocket Bridge (Native Protocol - disabled for potato)
+[bridges.websocket]
+enabled = false
+port = 8080
+bind_address = "127.0.0.1"
+tls_enabled = false
+max_connections = 100
+ping_interval_sec = 60
+compression = false
+max_message_size_bytes = 1048576  # 1 MB
+
+# Federation Bridge (Native Protocol - disabled for potato)
+[bridges.federation]
+enabled = false
+port = 7117
+bind_address = "127.0.0.1"
+public_address = ""
+require_tls = false
+
+[bridges.federation.discovery]
+enabled = false
+method = "manual"
+known_endpoints = []
+
+[bridges.federation.identity]
+require_proof = false
+key_algorithm = "ed25519"
+verification_level = "none"
+
+[bridges.federation.trust]
+default_policy = "block_all"
+trusted_servers = []
+blocked_servers = []
+
+# ATProto Bridge (External - disabled for potato)
+[bridges.atproto]
+enabled = false
+pds_endpoint = "https://bsky.social"
+did_resolution = true
+firehose_enabled = false
+
+# ActivityPub Bridge (External - disabled for potato)
+[bridges.activitypub]
+enabled = false
+actor_name = "@jig@localhost"
+inbox_endpoint = "/inbox"
+outbox_endpoint = "/outbox"
+webfinger_enabled = false
+accept_follows = false
+
+# ============================================================================
+# Generic Bridge Configuration (Phase 6 - for custom bridges)
+# ============================================================================
+
+# Bridge Configuration (Potato = bridges disabled by default)
+[bridges.generic]
+enabled = false                    # Bridges disabled for resource-constrained potato
+bridge_version = "1.0"
+
+[bridges.generic.ingest]
+schema_validation = "strict"       # Strict validation
+max_content_size_mb = 5            # Small limit (5MB)
+sanitization_mode = "aggressive"   # Aggressive sanitization
+mark_legacy_source = true
+
+[bridges.generic.block]
+fuel_budget_default = 50_000       # Low fuel budget
+fuel_budget_max = 500_000
+
+[bridges.generic.export]
+render_mode = "full"
+include_provenance = true
+include_receipt = false
+privacy_mode = "anonymized"
+
+[bridges.generic.limits]
+rate_limit_per_user = 10           # Very low rate limits
+rate_limit_global = 100
+min_reputation_tier = "null_sec"
+require_verified_for_outbound = false
+
+[bridges.generic.monitoring]
+log_all_ingress = true
+log_all_egress = true
+track_fuel_usage = true
+alert_on_anomalies = true
+analytics_backend = "duckdb"
+
+# Export Format Configuration
+[export.yaml]
+enabled = true
+canonical_format = false           # YAML is not canonical
+include_comments = true
+include_provenance = true
+pretty_print = true
+
+[export.json]
+enabled = true
+canonical_format = false           # JSON is not canonical
+include_comments = false
+include_provenance = true
+pretty_print = true
+
+[export.jcs]
+enabled = true
+canonical_format = true            # JCS is THE canonical format
+include_comments = false
+include_provenance = true
+pretty_print = false
+
+# ============================================================================
+# Analytics Configuration (Potato Profile)
+# ============================================================================
+
+[analytics]
+backend = "duckdb"               # Local embedded analytics
+retention_days = 30              # 1 month retention (minimal)
+sample_rate = 0.1                # 10% sampling (low overhead)
+privacy_mode = "anonymized"      # PII removed, hashed identifiers
+
+[analytics.duckdb]
+path = "~/.jig/analytics.duckdb"
+memory_limit_mb = 256            # Lower limit for potato
+threads = 2                      # Minimal threads
+read_only = false
+
+# ============================================================================
+# Telemetry Configuration (Potato Profile)
+# ============================================================================
+
+[telemetry]
+metrics_enabled = true
+metrics_endpoint = "http://localhost:9090/metrics"
+metrics_format = "prometheus"    # Standard Prometheus exposition
+trace_sampling = 0.01            # 1% tracing (minimal overhead)
+log_level = "info"               # Standard logging
+structured_logging = false       # Plain text logs for simplicity
+stdout_logging = true            # Log to stdout
+log_rotation_size_mb = 50
