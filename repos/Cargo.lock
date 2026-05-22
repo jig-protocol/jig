@@ -5321,6 +5321,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "jig-bridge-core"
+version = "0.0.3"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "jig-cli"
 version = "0.0.1"
 dependencies = [
