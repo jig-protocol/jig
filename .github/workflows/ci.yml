@@ -43,9 +43,9 @@ jobs:
             -p text-block \
             -p integration-tests
       - name: Clippy (v0.0.2 surface)
-        # `-A` suppresses style-nudge lints (derivable_impls, collapsible_match,
-        # collapsible_if) that the legacy jig-config/src/validation.rs surfaces
-        # under stable rust. Pre-existing debt; tighten when we audit jig-config.
+        # `-A` suppresses style-nudge lints that pre-existing legacy code
+        # (jig-config/src/validation.rs, jig-nameserver/src/*) surfaces under
+        # stable rust 1.95. Pre-existing debt — tighten as we audit each crate.
         run: |
           cargo clippy \
             -p jig-core \
@@ -57,7 +57,8 @@ jobs:
             -- -D warnings \
             -A clippy::derivable_impls \
             -A clippy::collapsible_match \
-            -A clippy::collapsible_if
+            -A clippy::collapsible_if \
+            -A clippy::unnecessary_sort_by
       - name: Nextest (v0.0.2 surface)
         run: |
           cargo install cargo-nextest --locked
