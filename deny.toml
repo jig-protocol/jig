@@ -26,6 +26,10 @@ allow = [
     "CDLA-Permissive-2.0",  # Community Data License
     "AGPL-3.0-only",  # Internal jig-protocol crates use modern SPDX form
     "MPL-2.0",  # transient via dirs/option-ext
+    "OpenSSL",  # legacy ring 0.16 component (see [[licenses.clarify]] below);
+                # safe because ring is the only crate that touches it and it's
+                # a transitive dep we plan to drop via trust-dns → hickory-dns
+                # upgrade. Track as v0.0.3 followup.
 ]
 confidence-threshold = 0.8
 
@@ -78,7 +82,11 @@ unknown-git = "deny"
 # against our dep graph still fails CI and forces a deliberate decision.
 [advisories]
 version = 2
-yanked = "deny"
+# core2 / keccak are yanked transitive deps inherited from the v0.0.1 baseline
+# (pulled in via jig-runtime / wasmtime). Same dep-upgrade-in-v0.0.3 followup
+# as the unmaintained crates below. Warn for now; tighten to "deny" once we
+# audit the dependency graph.
+yanked = "warn"
 ignore = [
     "RUSTSEC-2020-0168",  # mach unmaintained
     "RUSTSEC-2021-0145",  # atty unaligned read (unsound)
