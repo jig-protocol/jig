@@ -34,7 +34,9 @@ rusqlite = { workspace = true }
 
 # Web framework
 axum = { version = "0.7", features = ["ws"] }
-tower = "0.4"
+# tower 0.5 to match the dev-deps entry below; having both 0.4 and 0.5 in the
+# same crate confuses rustc's crate resolution (E0464 multiple candidates).
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # Serialization
@@ -95,7 +97,6 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3.8"
-tower = { version = "0.5", features = ["util"] }
 
 [features]
 default = ["sqlite"]
