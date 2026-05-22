@@ -194,6 +194,13 @@ struct ServerInfoResponse {
     /// is not active or when no peers are configured.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     peers: Vec<PeerInfo>,
+    /// v0.0.3: bridges currently permitted to load (per `[bridges]` policy).
+    /// Empty when no bridges are allowlisted or all are disabled. Absent
+    /// (not serialized) for v0.0.2 consumers thanks to skip_serializing_if.
+    /// Federated peers can observe what's bridged on this server before
+    /// deciding to peer with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    bridges: Vec<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -209,7 +216,7 @@ struct ServerEndpoints {
 }
 
 async fn server_info(State(state): State<AppState>) -> Result<Json<ServerInfoResponse>, ApiError> {
-    let (server_did, unsafe_options_active, allowed_block_kinds, peers) =
+    let (server_did, unsafe_options_active, allowed_block_kinds, peers, bridges) =
         if let Some(v002) = &state.v0_0_2 {
             let peers = v002
                 .config
@@ -226,9 +233,10 @@ async fn server_info(State(state): State<AppState>) -> Result<Json<ServerInfoRes
                 v002.config.unsafe_options_active(),
                 v002.config.server.allowed_block_kinds.clone(),
                 peers,
+                v002.bridges.permitted_names().to_vec(),
             )
         } else {
-            (None, vec![], vec![], vec![])
+            (None, vec![], vec![], vec![], vec![])
         };
 
     Ok(Json(ServerInfoResponse {
@@ -241,6 +249,7 @@ async fn server_info(State(state): State<AppState>) -> Result<Json<ServerInfoRes
         unsafe_options_active,
         allowed_block_kinds,
         peers,
+        bridges,
     }))
 }
 
@@ -1007,6 +1016,53 @@ mod tests {
         );
         // default config has no federation peers configured
         assert!(body.peers.is_empty());
+        // default config has no bridges configured (deny-by-default)
+        assert!(body.bridges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn server_info_advertises_permitted_bridges() {
+        use jig_config::v0_0_2_server::JigServerConfig;
+
+        let dir = tempdir().unwrap();
+        let config = ServerConfig {
+            database_path: dir.path().join("test.db"),
+            bind_address: "127.0.0.1".into(),
+            port: 7117,
+            ..Default::default()
+        };
+        let store = Arc::new(SqliteBlockStore::new(&config.database_path).unwrap());
+        let runtime = Arc::new(BlockRuntime::new(config.execution_config()).unwrap());
+
+        // Build a v0.0.2 AppState with a bridge policy that permits one bridge.
+        let mut v002 = crate::v0_0_2::AppState::for_test().unwrap();
+        let toml_cfg = r##"
+            [bridges]
+            allow_list = ["email"]
+
+            [bridges.per_bridge.email]
+            enabled = true
+
+            [bridges.per_bridge.slack]
+            enabled = false
+        "##;
+        v002.config = toml::from_str::<JigServerConfig>(toml_cfg).unwrap();
+        v002.bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&v002.config));
+        let v002 = Arc::new(v002);
+
+        let state = AppState {
+            store,
+            runtime,
+            config: config.clone(),
+            #[cfg(feature = "analytics_clickhouse")]
+            dispatcher: None,
+            v0_0_2: Some(v002),
+        };
+
+        let res = server_info(State(state)).await.unwrap();
+        let body = res.0;
+        // Only "email" should appear; slack is disabled (kill-switch).
+        assert_eq!(body.bridges, vec!["email".to_string()]);
     }
 
     #[test]
