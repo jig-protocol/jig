@@ -1,9 +1,15 @@
 # cargo-deny configuration for jig-protocol workspace
-# Enforces license compliance and dependency policies
+# Enforces license compliance and dependency policies.
+#
+# Schema follows cargo-deny v0.19+ (PR #611): the legacy `unlicensed` and
+# top-level `deny` keys are gone. License gating now happens via the
+# `allow` allowlist — anything not listed is rejected. GPL-2.0/GPL-3.0
+# remain implicitly denied by their absence below.
 
 [licenses]
-# Allow unlicensed workspace crates during development
-unlicensed = "warn"
+# Workspace crates may be unlicensed during early development; license
+# policy enforces the *dependency* graph. Internal crates skip license
+# checks via [licenses.private].
 allow = [
     "MIT",
     "Apache-2.0",
@@ -20,8 +26,7 @@ allow = [
     "CDLA-Permissive-2.0",  # Community Data License
     "AGPL-3.0",  # Allowed for internal jig-protocol workspace crates only
 ]
-# External dependencies should avoid AGPL/GPL (monitor via manual review)
-deny = ["GPL-2.0", "GPL-3.0"]
+confidence-threshold = 0.8
 
 # Allow internal gigue private crates and workspace crates
 [licenses.private]
