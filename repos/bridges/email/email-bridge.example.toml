@@ -1,4 +1,4 @@
-# Example configuration for jig-email-bridge
+# Example configuration for jig-bridge-email
 # Copy to email-bridge.toml and edit values for your environment.
 # email-bridge.toml is gitignored by default.
 

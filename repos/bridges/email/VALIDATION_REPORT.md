@@ -5,7 +5,7 @@
 
 ## Executive Summary
 
-The `jig-email-bridge` has been successfully validated against all specified criteria for the three-pronged email routing trojan horse strategy. The bridge is production-ready for deployment as a growth vector for Jig protocol adoption.
+The `jig-bridge-email` has been successfully validated against all specified criteria for the three-pronged email routing trojan horse strategy. The bridge is production-ready for deployment as a growth vector for Jig protocol adoption.
 
 ---
 
@@ -84,7 +84,7 @@ PRONG 1: Jig <> Jig (NATIVE PROTOCOL)
 
 PRONG 2: Email -> Jig (CONVERT & FORWARD)
 ┌──────────────────────────────────────────────┐
-│ external@gmail.com → jig-email-bridge        │
+│ external@gmail.com → jig-bridge-email        │
 │ Parse RFC822 → EmailMessage                  │
 │ Convert to BlockManifest with metadata       │
 │ POST to default Jig server                   │
@@ -176,13 +176,13 @@ pub fn emit_delivery_receipt(
 
 ### Build
 ```bash
-$ cargo build -p jig-email-bridge
+$ cargo build -p jig-bridge-email
 ✅ Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.47s
 ```
 
 ### Unit Tests
 ```bash
-$ cargo test -p jig-email-bridge
+$ cargo test -p jig-bridge-email
 ✅ test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
@@ -360,7 +360,7 @@ Three-Pronged Email Bridge Status:
 
 ## Conclusion
 
-The `jig-email-bridge` **successfully meets all specified criteria** for the three-pronged trojan horse strategy:
+The `jig-bridge-email` **successfully meets all specified criteria** for the three-pronged trojan horse strategy:
 
 ✅ **Block wrapper** with DKIM/SPF metadata  
 ✅ **DNS discovery** for native routing  

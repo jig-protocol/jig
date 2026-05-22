@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand};
 use tracing::{error, info};
 
 #[derive(Parser)]
-#[command(name = "jig-email-bridge")]
+#[command(name = "jig-bridge-email")]
 #[command(about = "Email bridge for Jig protocol", long_about = None)]
 struct Cli {
     /// Configuration file path

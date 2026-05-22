@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Real Integration Test for jig-email-bridge
+# Real Integration Test for jig-bridge-email
 #
 # This test spins up actual jig-servers and tests the full three-pronged flow:
 # 1. Jig <> Jig: dj@gigue.ai <-> dev@jig.onl via native protocol
@@ -8,7 +8,7 @@
 #
 # Requirements:
 # - .env.local with RESEND_API_KEY and email addresses
-# - jig-server and jig-email-bridge built
+# - jig-server and jig-bridge-email built
 # - Ports 7117, 7118 available
 
 set -euo pipefail
@@ -88,16 +88,16 @@ echo "  • External Recipient: $FOREIGN_RECIPIENT_EMAIL"
 echo ""
 
 # Build everything
-log_step "Step 0: Building jig-server and jig-email-bridge..."
+log_step "Step 0: Building jig-server and jig-bridge-email..."
 cd "$PROJECT_ROOT"
-cargo build -p jig-server -p jig-email-bridge --quiet 2>&1 | grep -E "(error|warning:)" || true
+cargo build -p jig-server -p jig-bridge-email --quiet 2>&1 | grep -E "(error|warning:)" || true
 
 if [ ! -f "$BUILD_DIR/jig-server" ]; then
     log_error "jig-server binary not found"
     exit 1
 fi
-if [ ! -f "$BUILD_DIR/jig-email-bridge" ]; then
-    log_error "jig-email-bridge binary not found"
+if [ ! -f "$BUILD_DIR/jig-bridge-email" ]; then
+    log_error "jig-bridge-email binary not found"
     exit 1
 fi
 log_success "Build complete"
@@ -338,7 +338,7 @@ echo ""
 # Use email bridge to send via Resend
 export RESEND_API_KEY="$RESEND_API_KEY"
 
-"$BUILD_DIR/jig-email-bridge" \
+"$BUILD_DIR/jig-bridge-email" \
     --config "$BRIDGE_CONFIG" \
     --database "$BRIDGE_DB" \
     send-email \

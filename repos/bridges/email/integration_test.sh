@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Integration test for jig-email-bridge three-pronged routing
+# Integration test for jig-bridge-email three-pronged routing
 #
 # Tests all three routing paths against a running jig-server:
 # 1. Jig <> Jig: Native protocol via HTTP to server
@@ -16,9 +16,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="$PROJECT_ROOT/target/debug"
-BRIDGE_BIN="$BUILD_DIR/jig-email-bridge"
-TEST_DB="/tmp/jig-email-bridge-test.db"
-TEST_CONFIG="/tmp/jig-email-bridge-test.toml"
+BRIDGE_BIN="$BUILD_DIR/jig-bridge-email"
+TEST_DB="/tmp/jig-bridge-email-test.db"
+TEST_CONFIG="/tmp/jig-bridge-email-test.toml"
 
 # Colors for output
 RED='\033[0;31m'
@@ -51,12 +51,12 @@ cleanup() {
 trap cleanup EXIT
 
 # Build the bridge
-log_info "Building jig-email-bridge..."
+log_info "Building jig-bridge-email..."
 cd "$PROJECT_ROOT"
-cargo build -p jig-email-bridge --quiet
+cargo build -p jig-bridge-email --quiet
 
 if [ ! -f "$BRIDGE_BIN" ]; then
-    log_error "Failed to build jig-email-bridge"
+    log_error "Failed to build jig-bridge-email"
     exit 1
 fi
 log_success "Build complete"
@@ -124,7 +124,7 @@ log_info "Enqueuing test email..."
     enqueue-email \
     --to "test@example.com" \
     --subject "Integration Test" \
-    --body "This is an integration test from jig-email-bridge."
+    --body "This is an integration test from jig-bridge-email."
 
 if [ $? -eq 0 ]; then
     log_success "Email enqueued successfully"
@@ -151,7 +151,7 @@ fi
 log_info "TEST 4: Three-pronged routing verification"
 log_info "Running routing decision tests..."
 cd "$PROJECT_ROOT"
-cargo test -p jig-email-bridge --quiet test_prong
+cargo test -p jig-bridge-email --quiet test_prong
 
 if [ $? -eq 0 ]; then
     log_success "All three routing prongs verified"
@@ -163,7 +163,7 @@ fi
 # Test 5: Viral Signature
 log_info "TEST 5: Viral block signature"
 log_info "Testing viral signature generation..."
-cargo test -p jig-email-bridge --quiet test_viral_signature_with_block_cid
+cargo test -p jig-bridge-email --quiet test_viral_signature_with_block_cid
 
 if [ $? -eq 0 ]; then
     log_success "Viral signature generation verified"
@@ -175,7 +175,7 @@ fi
 # Test 6: DKIM/SPF/DMARC Metadata Preservation
 log_info "TEST 6: DKIM/SPF/DMARC metadata preservation"
 log_info "Testing email security metadata preservation in blocks..."
-cargo test -p jig-email-bridge --quiet test_email_message_block_conversion
+cargo test -p jig-bridge-email --quiet test_email_message_block_conversion
 
 if [ $? -eq 0 ]; then
     log_success "DKIM/SPF/DMARC metadata preservation verified"
@@ -207,5 +207,5 @@ log_info "Next steps:"
 echo "  1. Start jig-server on http://localhost:7117"
 echo "  2. Test actual HTTP block submission to server"
 echo "  3. Configure production SMTP relay"
-echo "  4. Deploy with MX records pointing to jig-email-bridge"
+echo "  4. Deploy with MX records pointing to jig-bridge-email"
 echo ""

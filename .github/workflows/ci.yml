@@ -29,7 +29,7 @@ jobs:
           workspaces: repos
       - name: Format (v0.0.2 surface)
         # Scoped to v0.0.2-touched crates. Pre-existing legacy crates
-        # (jig-runtime, jig-spec, jig-email-bridge, jig-gui/*) may have
+        # (jig-runtime, jig-spec, jig-bridge-email, jig-gui/*) may have
         # upstream formatting drift; not gating on those here.
         run: |
           cargo fmt --check \

@@ -34,7 +34,7 @@ cargo build --release
    ```
 3. Send a message as an email:
    ```bash
-   ./target/release/jig-email-bridge \
+   ./target/release/jig-bridge-email \
      --config email-bridge.toml \
      send-email --to you@example.com \
      --subject "Hello from Jig" \
@@ -48,14 +48,14 @@ cargo build --release
 ## Running as a service (queue worker + inbound stub)
 
 ```bash
-./target/release/jig-email-bridge --config email-bridge.toml
+./target/release/jig-bridge-email --config email-bridge.toml
 ```
 
 ## Queue and worker usage
 
 - Enqueue an email to be sent by the background worker:
   ```bash
-  ./target/release/jig-email-bridge \
+  ./target/release/jig-bridge-email \
     --config email-bridge.toml \
     --database ~/.jig/email.db \
     enqueue-email --to you@example.com \

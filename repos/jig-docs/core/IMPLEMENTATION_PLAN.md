@@ -436,7 +436,7 @@ fn schema_v0_2_compatible_with_v0_1() {
 
 - **jig-server**: needs to call `BlockBundle::validate_code()` before execution
 - **jig-cli**: should pre-validate locally before upload
-- **jig-email-bridge**: may need capability attestations for email→block transforms
+- **jig-bridge-email**: may need capability attestations for email→block transforms
 
 ---
 

@@ -1,4 +1,4 @@
-// jig-email-bridge/src/router.rs
+// jig-bridge-email/src/router.rs
 // License: MIT (encourage adoption)
 // Purpose: Route messages between Jig<>Jig, Email->Jig, Jig->Email
 
