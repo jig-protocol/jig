@@ -12,7 +12,5 @@
 pub mod bridge;
 pub mod context;
 
+pub use bridge::{Bridge, DeliveredBlock, ReceiptRef};
 pub use context::{BridgeContext, SubmitDenied, SubmitHandle, SubscribeHandle};
-
-// Re-exports added in Task A4:
-// - pub use bridge::Bridge;
