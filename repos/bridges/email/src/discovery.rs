@@ -4,9 +4,10 @@
 //! before falling back to SMTP.
 
 use anyhow::Result;
-use std::net::ToSocketAddrs;
-use trust_dns_resolver::TokioAsyncResolver;
-use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::TokioResolver;
+use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::proto::rr::RData;
 
 /// Result of Jig discovery for a domain
 #[derive(Debug, Clone)]
@@ -21,13 +22,18 @@ pub struct JigEndpoint {
 
 /// DNS-based Jig protocol discovery
 pub struct JigDiscovery {
-    resolver: TokioAsyncResolver,
+    resolver: TokioResolver,
 }
 
 impl JigDiscovery {
     pub fn new() -> Result<Self> {
-        let resolver =
-            TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+        let resolver = TokioResolver::builder_with_config(
+            ResolverConfig::default(),
+            TokioRuntimeProvider::default(),
+        )
+        .with_options(ResolverOpts::default())
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build DNS resolver: {e}"))?;
         Ok(Self { resolver })
     }
 
@@ -61,9 +67,17 @@ impl JigDiscovery {
         match self.resolver.srv_lookup(&srv_query).await {
             Ok(lookup) => {
                 // Get the highest priority (lowest number) SRV record
-                if let Some(srv) = lookup.iter().min_by_key(|s| s.priority()) {
-                    let host = srv.target().to_utf8();
-                    let port = srv.port();
+                let srv = lookup
+                    .answers()
+                    .iter()
+                    .filter_map(|r| match &r.data {
+                        RData::SRV(srv) => Some(srv),
+                        _ => None,
+                    })
+                    .min_by_key(|s| s.priority);
+                if let Some(srv) = srv {
+                    let host = srv.target.to_utf8();
+                    let port = srv.port;
 
                     // Construct URL - default to https if port is 443, http otherwise
                     let scheme = if port == 443 { "https" } else { "http" };
@@ -75,7 +89,7 @@ impl JigDiscovery {
 
                     return Ok(Some(JigEndpoint {
                         url,
-                        priority: srv.priority(),
+                        priority: srv.priority,
                         requires_tls: port == 443,
                     }));
                 }
@@ -93,10 +107,13 @@ impl JigDiscovery {
 
         match self.resolver.txt_lookup(&txt_query).await {
             Ok(lookup) => {
-                for record in lookup.iter() {
+                for record in lookup.answers() {
+                    let RData::TXT(txt) = &record.data else {
+                        continue;
+                    };
                     // TXT record format: "jig=https://jig.example.com:7117"
-                    for txt in record.iter() {
-                        let txt_str = String::from_utf8_lossy(txt);
+                    for segment in txt.txt_data.iter() {
+                        let txt_str = String::from_utf8_lossy(segment);
                         if let Some(url) = txt_str.strip_prefix("jig=") {
                             return Ok(Some(JigEndpoint {
                                 url: url.to_string(),

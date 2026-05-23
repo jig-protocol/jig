@@ -2,12 +2,14 @@
 
 use crate::error::{NameServerError, Result};
 use crate::types::IdentityRecord;
+use hickory_resolver::{
+    TokioResolver,
+    config::{ResolverConfig, ResolverOpts},
+    net::runtime::TokioRuntimeProvider,
+    proto::rr::RData,
+};
 use reqwest::Client;
 use std::net::SocketAddr;
-use trust_dns_resolver::{
-    TokioAsyncResolver,
-    config::{ResolverConfig, ResolverOpts},
-};
 
 #[async_trait::async_trait]
 pub trait FederationResolver: Send + Sync + 'static {
@@ -61,14 +63,26 @@ pub(crate) fn parse_domain_from_handle(handle: &str) -> Option<String> {
 }
 
 async fn discover_nameservers(domain: &str) -> Result<Vec<SocketAddr>> {
-    let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+    let resolver = TokioResolver::builder_with_config(
+        ResolverConfig::default(),
+        TokioRuntimeProvider::default(),
+    )
+    .with_options(ResolverOpts::default())
+    .build()
+    .map_err(|e| NameServerError::Other(anyhow::anyhow!(e.to_string())))?;
     let name = format!("_jig-ns._tcp.{domain}");
     match resolver.srv_lookup(name).await {
         Ok(lookup) => {
             let mut addrs = Vec::new();
-            for srv in lookup.iter() {
-                let target = srv.target().to_utf8();
-                let port = srv.port();
+            for record in lookup.answers() {
+                let Some(srv) = (match &record.data {
+                    RData::SRV(srv) => Some(srv),
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                let target = srv.target.to_utf8();
+                let port = srv.port;
                 if let Ok(ips) = resolver.lookup_ip(target).await {
                     for ip in ips.iter() {
                         addrs.push(SocketAddr::new(ip, port));

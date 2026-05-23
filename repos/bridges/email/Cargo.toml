@@ -35,7 +35,7 @@ uuid = { version = "1.6", features = ["v4"] }
 semver = { version = "1.0", features = ["serde"] }
 
 # DNS discovery
-trust-dns-resolver = "0.23"
+hickory-resolver = { version = "0.26", features = ["tokio"] }
 
 [dev-dependencies]
 tempfile = "3.10"
