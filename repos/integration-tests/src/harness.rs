@@ -571,6 +571,14 @@ async fn spawn_one_peer_loop(state: Arc<jig_server::v0_0_2::AppState>, peer: Fed
                     let frame = Envelope::new(Frame::Block {
                         bundle_b64: base64::engine::general_purpose::STANDARD
                             .encode(&block.bundle_bytes),
+                        sig_b64: if block.sender_sig.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                base64::engine::general_purpose::STANDARD
+                                    .encode(&block.sender_sig),
+                            )
+                        },
                         receipts: vec![ReceiptRef {
                             server_did: receipt.server_id.clone(),
                             render_hash: receipt.render_hash.clone(),
@@ -605,6 +613,7 @@ async fn handle_inbound_test_frame(
     let env: Envelope = serde_json::from_str(text)?;
     let Frame::Block {
         bundle_b64,
+        sig_b64,
         receipts,
         delivery_cid,
     } = env.frame
@@ -621,6 +630,33 @@ async fn handle_inbound_test_frame(
     );
     if state.ingest_ctx.store.get_block(&block_cid)?.is_some() {
         return Ok(());
+    }
+
+    // Mirror the production peer-block sig-verify path. The harness shares
+    // semantics with v0_0_2_federation::ingest_peer_block so integration
+    // tests exercise the same enforcement.
+    let sig_bytes = match sig_b64.as_deref() {
+        Some(s) => base64::engine::general_purpose::STANDARD
+            .decode(s)
+            .unwrap_or_default(),
+        None => vec![],
+    };
+    if !state
+        .config
+        .federation
+        .naively_trust_peer_authored_blocks
+    {
+        if let Err(e) = jig_server::v0_0_2_federation::verify_peer_block_sig(
+            &bundle_bytes,
+            &manifest,
+            &sig_bytes,
+        ) {
+            eprintln!(
+                "harness rejecting peer block from {} (cid {block_cid}): {e}",
+                peer.url
+            );
+            return Ok(());
+        }
     }
 
     let sender_did_str = manifest
@@ -644,7 +680,7 @@ async fn handle_inbound_test_frame(
         channel_id: None,
         block_kind: kind_str,
         sender_did: sender_did_str,
-        sender_sig: vec![],
+        sender_sig: sig_bytes,
         bundle_bytes: bundle_bytes.clone(),
         is_synthetic: false,
         hlc_wall_ms,

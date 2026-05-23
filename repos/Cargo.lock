@@ -5246,6 +5246,7 @@ dependencies = [
  "jig-server",
  "rand 0.8.5",
  "reqwest 0.12.23",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",

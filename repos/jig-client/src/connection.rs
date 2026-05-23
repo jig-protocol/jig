@@ -137,6 +137,7 @@ impl Client {
                     match env.frame {
                         Frame::Block {
                             bundle_b64,
+                            sig_b64: _,
                             receipts,
                             delivery_cid,
                         } => {
@@ -417,6 +418,7 @@ mod tests {
             match env.frame {
                 Frame::Subscribe { .. } => vec![Envelope::new(Frame::Block {
                     bundle_b64: "dGVzdC1ibG9jaw==".to_string(),
+                    sig_b64: None,
                     receipts: vec![],
                     delivery_cid: "bafy_delivery_1".to_string(),
                 })],

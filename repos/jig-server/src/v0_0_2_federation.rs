@@ -7,16 +7,19 @@
 //! local on each server. Channel ops happen via /_admin_v0_0_2/* or
 //! (v0.0.3+) Wasm-executed channel-create blocks; they don't replicate.
 //!
-//! Trust model: the configured peer's URL + expected_did is the trust
-//! anchor. Inbound Block frames from a federated peer are NOT re-verified
-//! through ingest's sig-verify path — that's the peer-connection
-//! responsibility, established via fed-hello at session start.
+//! Trust model: the configured peer's URL + expected_did is the transport
+//! trust anchor (established via fed-hello at session start). v0.0.3+ ALSO
+//! re-verifies the sender's ed25519 signature on each inbound Block frame —
+//! a peer cannot relay a block forged under a third party's DID. The
+//! `naively_trust_peer_authored_blocks` antipattern flag in
+//! `[federation]` skips that check and is surfaced in
+//! `GET /.well-known/jig`'s `unsafe_options_active` list.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
-use ed25519_dalek::Signer;
+use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use futures_util::{SinkExt, StreamExt};
 use jig_core::{Author, BlockKind, BlockManifest};
 use jig_pipeline::{
@@ -160,9 +163,20 @@ async fn handle_inbound_frame(
     match env.frame {
         Frame::Block {
             bundle_b64,
+            sig_b64,
             receipts,
             delivery_cid,
-        } => ingest_peer_block(state, peer, &bundle_b64, &receipts, &delivery_cid).await,
+        } => {
+            ingest_peer_block(
+                state,
+                peer,
+                &bundle_b64,
+                sig_b64.as_deref(),
+                &receipts,
+                &delivery_cid,
+            )
+            .await
+        }
         Frame::Ack { block_cid } => {
             debug!(peer_url = %peer.url, %block_cid, "peer acked our submission");
             Ok(())
@@ -180,6 +194,7 @@ async fn ingest_peer_block(
     state: &Arc<AppState>,
     peer: &jig_config::v0_0_2_server::FederationPeer,
     bundle_b64: &str,
+    sig_b64: Option<&str>,
     receipts: &[ReceiptRef],
     delivery_cid: &str,
 ) -> anyhow::Result<()> {
@@ -196,6 +211,46 @@ async fn ingest_peer_block(
     // Already have this block? Avoid duplicate insert.
     if state.ingest_ctx.store.get_block(&block_cid)?.is_some() {
         debug!(%delivery_cid, %block_cid, "already have block; skipping");
+        return Ok(());
+    }
+
+    // Decode sig once; we either verify it (default) or stash it (antipattern path).
+    let sig_bytes = match sig_b64 {
+        Some(s) => base64::engine::general_purpose::STANDARD
+            .decode(s)
+            .unwrap_or_default(),
+        None => vec![],
+    };
+
+    // Re-verify the sender's signature against the manifest's claimed
+    // sender_did. Forged-author relays (peer X relays a block whose manifest
+    // claims authorship by DID Y but is signed by some other key) are rejected.
+    //
+    // Operators who explicitly want the old v0.0.2 trust-the-peer behavior
+    // can set [federation] naively_trust_peer_authored_blocks = true; the flag
+    // is advertised in /.well-known/jig unsafe_options_active.
+    if state
+        .config
+        .federation
+        .naively_trust_peer_authored_blocks
+    {
+        warn!(
+            peer_url = %peer.url,
+            %block_cid,
+            "skipping peer-block sig verify (federation.naively_trust_peer_authored_blocks=true)"
+        );
+    } else if let Err(e) = verify_peer_block_sig(&bundle_bytes, &manifest, &sig_bytes) {
+        let claimed_did = manifest
+            .authors
+            .first()
+            .map(|a| a.did.to_did_jig_string())
+            .unwrap_or_default();
+        warn!(
+            peer_url = %peer.url,
+            %block_cid,
+            %claimed_did,
+            "rejecting peer block: sender_sig verification failed ({e})"
+        );
         return Ok(());
     }
 
@@ -221,9 +276,9 @@ async fn ingest_peer_block(
         channel_id: None,
         block_kind: kind_str,
         sender_did: sender_did_str,
-        // sig is not transmitted in Frame::Block; the peer connection itself is
-        // the trust anchor (established via fed-hello). See trust model in doc comment.
-        sender_sig: vec![],
+        // Verified above (unless naively_trust_peer_authored_blocks is set);
+        // store the real sig so downstream code can re-check on read.
+        sender_sig: sig_bytes,
         bundle_bytes: bundle_bytes.clone(),
         is_synthetic: false,
         hlc_wall_ms,
@@ -279,6 +334,11 @@ async fn forward_outbound(
 ) -> anyhow::Result<()> {
     let frame = Envelope::new(Frame::Block {
         bundle_b64: base64::engine::general_purpose::STANDARD.encode(&block.bundle_bytes),
+        sig_b64: if block.sender_sig.is_empty() {
+            None
+        } else {
+            Some(base64::engine::general_purpose::STANDARD.encode(&block.sender_sig))
+        },
         receipts: vec![ReceiptRef {
             server_did: receipt.server_id.clone(),
             render_hash: receipt.render_hash.clone(),
@@ -289,6 +349,38 @@ async fn forward_outbound(
     });
     let json = serde_json::to_string(&frame)?;
     sink.send(Message::Text(json)).await?;
+    Ok(())
+}
+
+/// Re-verify the sender's ed25519 signature on an inbound peer block.
+///
+/// Mirrors `jig_pipeline::ingest::verify_sig`: the signature is over the
+/// canonical bundle bytes (the `(manifest_bytes, code_bytes)` JSON tuple
+/// the peer transmitted) and is verified against the public key derived
+/// from `manifest.authors[0].did`. A peer cannot fake authorship under a
+/// third party's DID.
+///
+/// Exposed `pub` for the test harness so it can run the same check on its
+/// inline relay loop without exposing the entire `ingest_peer_block` body.
+pub fn verify_peer_block_sig(
+    bundle_bytes: &[u8],
+    manifest: &BlockManifest,
+    sig: &[u8],
+) -> Result<(), &'static str> {
+    if sig.is_empty() {
+        return Err("missing sender_sig on peer block frame");
+    }
+    let sender_did = manifest
+        .authors
+        .first()
+        .map(|a| a.did.clone())
+        .ok_or("manifest has no authors")?;
+    let pubkey_bytes = sender_did.as_bytes().map_err(|_| "sender_did not canonical")?;
+    let pubkey = VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| "sender_did not a valid ed25519 pubkey")?;
+    let signature = Signature::from_slice(sig).map_err(|_| "sig is not 64 bytes")?;
+    pubkey
+        .verify(bundle_bytes, &signature)
+        .map_err(|_| "sig does not verify against sender_did")?;
     Ok(())
 }
 
@@ -390,7 +482,8 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_peer_block_persists_and_dedupes() {
-        use jig_core::{Author, BlockKind, BlockManifest, HlcTimestamp};
+        use ed25519_dalek::SigningKey;
+        use jig_core::{Author, BlockKind, BlockManifest, Did, HlcTimestamp};
 
         let state = Arc::new(AppState::for_test().unwrap());
         let peer = jig_config::v0_0_2_server::FederationPeer {
@@ -400,12 +493,16 @@ mod tests {
         };
 
         // Build a fake block bundle in the same (manifest_bytes, code_bytes) shape
-        // that the ingest pipeline and federation module both expect.
-        let did_str = "did:jig:zTest";
+        // that the ingest pipeline and federation module both expect. The sig
+        // MUST verify against the manifest's claimed author DID — v0.0.3+ peer
+        // ingest re-verifies on every inbound block.
+        let secret: [u8; 32] = rand::random();
+        let signing_key = SigningKey::from_bytes(&secret);
+        let sender_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
         let manifest = BlockManifest::builder()
             .version(semver::Version::new(0, 1, 0))
             .author(Author {
-                did: did_str.into(),
+                did: sender_did.clone(),
                 public_key: None,
                 roles: vec![],
             })
@@ -416,11 +513,13 @@ mod tests {
             .with_hlc(HlcTimestamp {
                 wall_ms: 1_747_680_000_000,
                 logical: 0,
-                server_did: did_str.into(),
+                server_did: sender_did.clone(),
             });
         let manifest_bytes = manifest.to_canonical_bytes().unwrap();
         let bundle_bytes = serde_json::to_vec(&(manifest_bytes, Vec::<u8>::new())).unwrap();
+        let sig = signing_key.sign(&bundle_bytes).to_bytes().to_vec();
         let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(&bundle_bytes);
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&sig);
 
         let receipts = vec![ReceiptRef {
             server_did: "did:jig:zPeer".to_string(),
@@ -429,9 +528,16 @@ mod tests {
         }];
 
         // First ingest: must persist block + receipt.
-        ingest_peer_block(&state, &peer, &bundle_b64, &receipts, "delivery:test1")
-            .await
-            .unwrap();
+        ingest_peer_block(
+            &state,
+            &peer,
+            &bundle_b64,
+            Some(&sig_b64),
+            &receipts,
+            "delivery:test1",
+        )
+        .await
+        .unwrap();
         let block_cid = format!(
             "bafy_{}",
             hex::encode(blake3::hash(&bundle_bytes).as_bytes())
@@ -441,11 +547,23 @@ mod tests {
             stored.is_some(),
             "block must be persisted after first ingest"
         );
+        assert_eq!(
+            stored.unwrap().sender_sig,
+            sig,
+            "verified peer block must store the sender_sig, not vec![]"
+        );
 
         // Second ingest of the same bundle: must dedupe without error.
-        ingest_peer_block(&state, &peer, &bundle_b64, &receipts, "delivery:test2")
-            .await
-            .unwrap();
+        ingest_peer_block(
+            &state,
+            &peer,
+            &bundle_b64,
+            Some(&sig_b64),
+            &receipts,
+            "delivery:test2",
+        )
+        .await
+        .unwrap();
         let receipts_in_db = state
             .ingest_ctx
             .store
@@ -456,6 +574,160 @@ mod tests {
             1,
             "duplicate ingest must not produce duplicate receipt; got {} receipts",
             receipts_in_db.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_peer_block_rejects_forged_sender_did() {
+        use ed25519_dalek::SigningKey;
+        use jig_core::{Author, BlockKind, BlockManifest, Did, HlcTimestamp};
+
+        let state = Arc::new(AppState::for_test().unwrap());
+        let peer = jig_config::v0_0_2_server::FederationPeer {
+            url: "wss://test-peer".to_string(),
+            expected_did: "did:jig:zPeer".to_string(),
+            alias: None,
+        };
+
+        // Alice signs; manifest claims bob as author. Sig verifies against
+        // alice's pubkey but NOT against bob's.
+        let alice_secret: [u8; 32] = rand::random();
+        let alice_key = SigningKey::from_bytes(&alice_secret);
+        let bob_secret: [u8; 32] = rand::random();
+        let bob_key = SigningKey::from_bytes(&bob_secret);
+        let bob_did = Did::from_ed25519_pubkey(bob_key.verifying_key().as_bytes());
+
+        let manifest = BlockManifest::builder()
+            .version(semver::Version::new(0, 1, 0))
+            .author(Author {
+                did: bob_did.clone(),
+                public_key: None,
+                roles: vec![],
+            })
+            .metadata_entry("body", serde_json::json!("i am bob"))
+            .build()
+            .unwrap()
+            .with_kind(BlockKind::TextRender)
+            .with_hlc(HlcTimestamp {
+                wall_ms: 1_747_680_000_000,
+                logical: 0,
+                server_did: bob_did.clone(),
+            });
+        let manifest_bytes = manifest.to_canonical_bytes().unwrap();
+        let bundle_bytes = serde_json::to_vec(&(manifest_bytes, Vec::<u8>::new())).unwrap();
+        // Forged: signed by ALICE, manifest claims BOB.
+        let sig = alice_key.sign(&bundle_bytes).to_bytes().to_vec();
+        let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(&bundle_bytes);
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&sig);
+
+        ingest_peer_block(&state, &peer, &bundle_b64, Some(&sig_b64), &[], "d:forged")
+            .await
+            .unwrap();
+
+        let block_cid = format!(
+            "bafy_{}",
+            hex::encode(blake3::hash(&bundle_bytes).as_bytes())
+        );
+        assert!(
+            state.ingest_ctx.store.get_block(&block_cid).unwrap().is_none(),
+            "forged-author peer block must be rejected (not persisted)"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_peer_block_rejects_missing_sig() {
+        use ed25519_dalek::SigningKey;
+        use jig_core::{Author, BlockKind, BlockManifest, Did};
+
+        let state = Arc::new(AppState::for_test().unwrap());
+        let peer = jig_config::v0_0_2_server::FederationPeer {
+            url: "wss://test-peer".to_string(),
+            expected_did: "did:jig:zPeer".to_string(),
+            alias: None,
+        };
+
+        let secret: [u8; 32] = rand::random();
+        let key = SigningKey::from_bytes(&secret);
+        let did = Did::from_ed25519_pubkey(key.verifying_key().as_bytes());
+        let manifest = BlockManifest::builder()
+            .version(semver::Version::new(0, 1, 0))
+            .author(Author {
+                did,
+                public_key: None,
+                roles: vec![],
+            })
+            .build()
+            .unwrap()
+            .with_kind(BlockKind::TextRender);
+        let manifest_bytes = manifest.to_canonical_bytes().unwrap();
+        let bundle_bytes = serde_json::to_vec(&(manifest_bytes, Vec::<u8>::new())).unwrap();
+        let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(&bundle_bytes);
+
+        // No sig_b64 at all (legacy v0.0.2 emitter shape). Default policy must reject.
+        ingest_peer_block(&state, &peer, &bundle_b64, None, &[], "d:nosig")
+            .await
+            .unwrap();
+
+        let block_cid = format!(
+            "bafy_{}",
+            hex::encode(blake3::hash(&bundle_bytes).as_bytes())
+        );
+        assert!(
+            state.ingest_ctx.store.get_block(&block_cid).unwrap().is_none(),
+            "peer block without sig must be rejected under default policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn naively_trust_peer_authored_blocks_bypasses_sig_check() {
+        use jig_core::{Author, BlockKind, BlockManifest};
+
+        // Build an AppState with the antipattern flag enabled.
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.federation.naively_trust_peer_authored_blocks = true;
+        let tempdir = tempfile::tempdir().unwrap();
+        config.server.server_did_keyfile = tempdir
+            .path()
+            .join("server.key")
+            .to_string_lossy()
+            .into_owned();
+        let state = Arc::new(
+            AppState::new(config, tempdir.path().join("server.db")).unwrap(),
+        );
+
+        let peer = jig_config::v0_0_2_server::FederationPeer {
+            url: "wss://test-peer".to_string(),
+            expected_did: "did:jig:zPeer".to_string(),
+            alias: None,
+        };
+
+        // A manifest with a wholly-bogus author DID and an empty sig: under
+        // the antipattern flag we skip verification and persist anyway.
+        let manifest = BlockManifest::builder()
+            .version(semver::Version::new(0, 1, 0))
+            .author(Author {
+                did: "did:jig:zBogusAuthor".into(),
+                public_key: None,
+                roles: vec![],
+            })
+            .build()
+            .unwrap()
+            .with_kind(BlockKind::TextRender);
+        let manifest_bytes = manifest.to_canonical_bytes().unwrap();
+        let bundle_bytes = serde_json::to_vec(&(manifest_bytes, Vec::<u8>::new())).unwrap();
+        let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(&bundle_bytes);
+
+        ingest_peer_block(&state, &peer, &bundle_b64, None, &[], "d:trusted")
+            .await
+            .unwrap();
+
+        let block_cid = format!(
+            "bafy_{}",
+            hex::encode(blake3::hash(&bundle_bytes).as_bytes())
+        );
+        assert!(
+            state.ingest_ctx.store.get_block(&block_cid).unwrap().is_some(),
+            "naively_trust_peer_authored_blocks must persist even invalid-sig peer blocks"
         );
     }
 }

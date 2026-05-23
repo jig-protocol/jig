@@ -11,10 +11,16 @@
 //! { "v": 1, "op": "subscribe", "scope": {"kind": "channel", "slug": "#hello"} }
 //! { "v": 1, "op": "submit", "bundle_b64": "...", "sig_b64": "..." }
 //! { "v": 1, "op": "ack", "block_cid": "bafy..." }
-//! { "v": 1, "op": "block", "bundle_b64": "...", "receipts": [...], "delivery_cid": "..." }
+//! { "v": 1, "op": "block", "bundle_b64": "...", "sig_b64": "...", "receipts": [...], "delivery_cid": "..." }
 //! { "v": 1, "op": "catch_up", "since_hlc": {"wall_ms":1234,"logical":5,"origin":"did:jig:..."} }
 //! { "v": 1, "op": "error", "code": "INVALID_SIG", "ref_cid": null, "message": "..." }
 //! ```
+//!
+//! `sig_b64` on `Frame::Block` is `Option<String>` for v0.0.2 backward
+//! compatibility (older peers don't carry it). v0.0.3 servers re-verify
+//! the signature against the manifest's claimed sender_did when the field
+//! is present; the `naively_trust_peer_authored_blocks` antipattern flag
+//! bypasses that check (see `jig-config::v0_0_2_server::FederationSection`).
 
 use serde::{Deserialize, Serialize};
 
@@ -46,8 +52,16 @@ pub enum Frame {
     /// Acknowledge a submitted block's persistence.
     Ack { block_cid: String },
     /// Deliver a block to a subscriber, with all known receipts.
+    ///
+    /// `sig_b64` carries the sender's ed25519 signature over the canonical
+    /// bundle bytes. It's `Option<String>` for v0.0.2 wire compatibility
+    /// with peers that don't emit it; v0.0.3 servers MUST emit it and
+    /// reject inbound peer blocks whose claimed sender_did doesn't verify
+    /// against this signature.
     Block {
         bundle_b64: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sig_b64: Option<String>,
         receipts: Vec<ReceiptRef>,
         delivery_cid: String,
     },
@@ -121,6 +135,7 @@ mod tests {
     fn block_delivery_envelope_carries_receipts() {
         let env = Envelope::new(Frame::Block {
             bundle_b64: "Yg==".into(),
+            sig_b64: Some("c2ln".into()),
             receipts: vec![ReceiptRef {
                 server_did: "did:jig:zA".into(),
                 render_hash: Some("rh".into()),
@@ -131,6 +146,17 @@ mod tests {
         let json = serde_json::to_string(&env).unwrap();
         let parsed: Envelope = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, env);
+    }
+
+    #[test]
+    fn block_delivery_envelope_back_compat_without_sig() {
+        // Older v0.0.2 peers don't include sig_b64; deserialization must still work.
+        let json = r##"{"v":1,"op":"block","bundle_b64":"Yg==","receipts":[],"delivery_cid":"bafy"}"##;
+        let parsed: Envelope = serde_json::from_str(json).unwrap();
+        match parsed.frame {
+            Frame::Block { sig_b64, .. } => assert!(sig_b64.is_none()),
+            other => panic!("expected Block, got {other:?}"),
+        }
     }
 
     #[test]
