@@ -194,8 +194,7 @@ impl JigServerConfig {
             return false;
         }
         // Step 2: allow_list gate
-        if !self.bridges.allow_list.is_empty()
-            && !self.bridges.allow_list.iter().any(|a| a == name)
+        if !self.bridges.allow_list.is_empty() && !self.bridges.allow_list.iter().any(|a| a == name)
         {
             return false;
         }
@@ -369,7 +368,10 @@ mod tests {
         assert_eq!(email.rate_limit_per_day, Some(5000));
         assert_eq!(email.allow_channels, vec!["#email-inbox", "#email-team"]);
         assert_eq!(
-            email.config.get("smtp_listen_addr").and_then(|v| v.as_str()),
+            email
+                .config
+                .get("smtp_listen_addr")
+                .and_then(|v| v.as_str()),
             Some("0.0.0.0:25"),
         );
 
