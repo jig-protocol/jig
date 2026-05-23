@@ -1,21 +1,28 @@
 //! DNS-based discovery of Jig servers
 
 use crate::error::Result;
+use hickory_resolver::{TokioResolver, proto::rr::RData};
 use std::net::SocketAddr;
-use trust_dns_resolver::TokioAsyncResolver;
 
 /// Discover Jig servers for a domain using SRV records with A/AAAA fallback
 pub async fn discover(domain: &str) -> Result<Vec<SocketAddr>> {
-    let resolver = TokioAsyncResolver::tokio_from_system_conf()
-        .map_err(|e| crate::error::ServerError::Server(e.to_string()))?;
+    let resolver = TokioResolver::builder_tokio()
+        .map_err(|e| crate::error::ServerError::Server(e.to_string()))?
+        .build();
 
     let name = format!("_jig._tcp.{}", domain);
     match resolver.srv_lookup(name).await {
         Ok(lookup) => {
             let mut addrs = Vec::new();
-            for srv in lookup.iter() {
-                let target = srv.target().to_utf8();
-                let port = srv.port();
+            for record in lookup.answers() {
+                let Some(srv) = (match &record.data {
+                    RData::SRV(srv) => Some(srv),
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                let target = srv.target.to_utf8();
+                let port = srv.port;
                 if let Ok(ips) = resolver.lookup_ip(target).await {
                     for ip in ips.iter() {
                         addrs.push(SocketAddr::new(ip, port));
