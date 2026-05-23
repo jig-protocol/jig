@@ -140,7 +140,11 @@ pub struct BridgeContext {
 impl BridgeContext {
     /// Real constructor (used by the server).
     pub fn new(submit: SubmitHandle, subscribe: SubscribeHandle, config: toml::Value) -> Self {
-        Self { submit, subscribe, config }
+        Self {
+            submit,
+            subscribe,
+            config,
+        }
     }
 
     /// Test convenience constructor (identical shape).
@@ -170,7 +174,9 @@ mod tests {
 
     #[test]
     fn submit_denied_rate_limited_carries_retry_after() {
-        let d = SubmitDenied::RateLimited { retry_after_secs: 30 };
+        let d = SubmitDenied::RateLimited {
+            retry_after_secs: 30,
+        };
         match d {
             SubmitDenied::RateLimited { retry_after_secs } => {
                 assert_eq!(retry_after_secs, 30)
@@ -190,9 +196,8 @@ mod tests {
     async fn submit_handle_with_noop_resolver_accepts() {
         // Construct a SubmitHandle wired to a noop ingest fn that always
         // returns a CID. Verify the handle can be called and returns Ok.
-        let handle = SubmitHandle::new_for_test(|_payload| async move {
-            Ok("test-cid-12345".to_string())
-        });
+        let handle =
+            SubmitHandle::new_for_test(|_payload| async move { Ok("test-cid-12345".to_string()) });
         let cid = handle.submit(b"manifest|code|sig".to_vec()).await.unwrap();
         assert_eq!(cid, "test-cid-12345");
     }
@@ -217,13 +222,20 @@ mod tests {
         let cfg: toml::Value = toml::toml! {
             smtp_listen = "0.0.0.0:25"
             resend_key = "rk_test"
-        }.into();
+        }
+        .into();
         let ctx = BridgeContext::new_for_test(
             SubmitHandle::new_for_test(|_| async { Ok("cid".into()) }),
             SubscribeHandle::new_for_test(),
             cfg,
         );
-        assert_eq!(ctx.config.get("smtp_listen").and_then(|v| v.as_str()), Some("0.0.0.0:25"));
-        assert_eq!(ctx.config.get("resend_key").and_then(|v| v.as_str()), Some("rk_test"));
+        assert_eq!(
+            ctx.config.get("smtp_listen").and_then(|v| v.as_str()),
+            Some("0.0.0.0:25")
+        );
+        assert_eq!(
+            ctx.config.get("resend_key").and_then(|v| v.as_str()),
+            Some("rk_test")
+        );
     }
 }
