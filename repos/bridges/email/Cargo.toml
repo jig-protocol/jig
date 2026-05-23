@@ -1,15 +1,15 @@
 [package]
-name = "jig-email-bridge"
-version = "0.0.1"
+name = "jig-bridge-email"
+version = "0.0.3"
 edition = "2024"
 authors = ["Jig Protocol Contributors"]
 license = "MIT"
-description = "Email bridge for Jig protocol - bidirectional SMTP/IMAP gateway"
-repository = "https://github.com/jig-protocol/jig-email-bridge"
+description = "Email bridge for Jig protocol (jig-bridge-email; bidirectional SMTP/IMAP gateway)"
+repository = "https://github.com/jig-protocol/jig"
 
 [dependencies]
-# Core dependencies
-jig-core = { path = "../jig-core" }
+# Core dependencies — note paths now go up two levels (bridges/email/ → repos/)
+jig-core = { path = "../../jig-core" }
 tokio = { version = "1.38", features = ["full"] }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }

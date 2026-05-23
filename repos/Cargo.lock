@@ -5321,6 +5321,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "jig-bridge-core"
+version = "0.0.3"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "jig-bridge-email"
+version = "0.0.3"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "jig-core",
+ "lettre",
+ "mail-parser",
+ "reqwest 0.12.23",
+ "rusqlite",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+ "trust-dns-resolver",
+ "uuid",
+]
+
+[[package]]
 name = "jig-cli"
 version = "0.0.1"
 dependencies = [
@@ -5412,30 +5447,6 @@ dependencies = [
  "time",
  "wasmparser 0.118.2",
  "wat",
-]
-
-[[package]]
-name = "jig-email-bridge"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "async-trait",
- "clap",
- "jig-core",
- "lettre",
- "mail-parser",
- "reqwest 0.12.23",
- "rusqlite",
- "semver",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml 0.8.23",
- "tracing",
- "tracing-subscriber",
- "trust-dns-resolver",
- "uuid",
 ]
 
 [[package]]
@@ -5563,6 +5574,7 @@ dependencies = [
  "hex",
  "hmac",
  "humantime-serde",
+ "jig-bridge-core",
  "jig-client",
  "jig-config",
  "jig-core",

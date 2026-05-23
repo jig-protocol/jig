@@ -3,7 +3,7 @@
 ## Bringing Configuration to Executable Internet Spec
 
 **Purpose**
-Transform `jig-config` into the cross-binary contract for deployment profiles, execution guardrails, and outcome-based pricing that supports jig-core, jig-server, jig-cli, jig-nameserver, jig-email-bridge, and jig-gui.
+Transform `jig-config` into the cross-binary contract for deployment profiles, execution guardrails, and outcome-based pricing that supports jig-core, jig-server, jig-cli, jig-nameserver, jig-bridge-email, and jig-gui.
 
 **Status**
 ✅ **READY TO PROCEED** - All upstream blockers resolved (2025-11-04)
@@ -725,7 +725,7 @@ backend = "clickhouse"
 - ✅ `jig-cli` uses new config
 - ✅ `jig-runtime` reads execution constraints
 - ✅ `jig-nameserver` reads governance config
-- ✅ `jig-email-bridge` reads bridge config
+- ✅ `jig-bridge-email` reads bridge config
 
 ---
 
@@ -767,7 +767,7 @@ These repos can proceed once `jig-config` Phase 0-3 complete:
 ### Parallel (Can Develop Concurrently)
 
 - ✅ `jig-gui` - Can start config integration in parallel (Phase 3+)
-- ✅ `jig-email-bridge` - Can define bridge config independently (Phase 7)
+- ✅ `jig-bridge-email` - Can define bridge config independently (Phase 7)
 - ✅ Testing infrastructure - Can develop test harness alongside all phases
 
 ---
@@ -811,7 +811,7 @@ These repos can proceed once `jig-config` Phase 0-3 complete:
 - **After Phase 2**: Notify `jig-server` and `jig-runtime` teams (execution constraints ready)
 - **After Phase 3**: Notify `jig-core` integration team (receipt config ready)
 - **After Phase 5**: Notify `jig-nameserver` team (governance config ready)
-- **After Phase 7**: Notify `jig-email-bridge` team (bridge config ready)
+- **After Phase 7**: Notify `jig-bridge-email` team (bridge config ready)
 - **After Phase 10**: Full downstream rollout coordination meeting
 
 ---

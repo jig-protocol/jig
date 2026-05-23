@@ -33,6 +33,10 @@ pub struct AppState {
     pub ingest_ctx: Arc<IngestContext>,
     pub server_did: Did,
     pub server_url: String,
+    /// v0.0.3: bridge load-time policy gate + lifecycle owner. Populated
+    /// from `config.bridges`; no bridges actually registered in alpha.1a
+    /// (alpha.email is the first real registrant).
+    pub bridges: Arc<crate::v0_0_2_bridges::BridgeRegistry>,
 }
 
 impl AppState {
@@ -69,11 +73,14 @@ impl AppState {
             server_url: server_url.clone(),
         });
 
+        let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
+
         Ok(Self {
             config,
             ingest_ctx,
             server_did,
             server_url,
+            bridges,
         })
     }
 
@@ -103,11 +110,14 @@ impl AppState {
             server_url: server_url.clone(),
         });
 
+        let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
+
         Ok(Self {
             config,
             ingest_ctx,
             server_did,
             server_url,
+            bridges,
         })
     }
 }

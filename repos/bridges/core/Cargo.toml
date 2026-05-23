@@ -1,0 +1,23 @@
+[package]
+name = "jig-bridge-core"
+version = "0.0.3"
+edition = "2024"
+authors = ["Jig Protocol Contributors"]
+license = "AGPL-3.0-only"
+description = "Common Bridge trait + context types for jig-protocol bridges (email, slack, irc, ssh, ...)"
+repository = "https://github.com/jig-protocol/jig"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+# Workspace tokio has `features = ["full"]`; the sync subset is sufficient
+# for jig-bridge-core but cargo unifies features across the workspace, so
+# we accept full here for consistency. If features are ever pared back at
+# the workspace level, narrow here with `features = ["sync"]` and verify
+# nothing in dev-deps requires "macros + rt-multi-thread" separately.
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

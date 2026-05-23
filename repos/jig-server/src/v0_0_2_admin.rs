@@ -304,11 +304,14 @@ mod tests {
             server_url: server_url.clone(),
         });
 
+        let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
+
         Arc::new(AppState {
             config,
             ingest_ctx,
             server_did,
             server_url,
+            bridges,
         })
     }
 

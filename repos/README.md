@@ -14,7 +14,7 @@ Jig Protocol has adopted **WebAssembly (WASM) as the single unified runtime** fo
 - **jig-runtime** - Unified WASM runtime (deterministic execution, fuel metering, Receipt v0.2)
 - **jig-server** - Reference server implementation
 - **jig-cli** - Command-line client
-- **jig-email-bridge** - Email gateway
+- **jig-bridge-email** - Email gateway
 - **jig-gui** - Dioxus-based UI (Riverdance)
 - **jig-nameserver** - DNS/discovery service
 - **jig-config** - Shared configuration
@@ -97,7 +97,7 @@ repos/
 ├── jig-server/         # Server implementation
 ├── jig-cli/            # CLI client
 ├── jig-gui/            # Dioxus UI
-├── jig-email-bridge/   # Email gateway
+├── jig-bridge-email/   # Email gateway
 ├── jig-nameserver/     # DNS/discovery
 ├── jig-config/         # Shared config
 ├── integration-tests/  # Cross-component tests

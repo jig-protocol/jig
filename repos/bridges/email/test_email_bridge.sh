@@ -1,6 +1,6 @@
 #!/bin/bash
 # Start email bridge
-./target/release/jig-email-bridge --config email.toml &
+./target/release/jig-bridge-email --config email.toml &
 BRIDGE_PID=$!
 
 # Send test email via SMTP

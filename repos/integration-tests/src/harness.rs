@@ -451,6 +451,7 @@ fn base_config() -> Result<JigServerConfig> {
         identity: IdentitySection::default(),
         federation: FederationSection::default(),
         debug: jig_config::v0_0_2_server::DebugSection::default(),
+        bridges: jig_config::v0_0_2_server::BridgesSection::default(),
     })
 }
 

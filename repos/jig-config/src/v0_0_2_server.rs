@@ -16,9 +16,11 @@
 //! [`JigServerConfig::unsafe_options_active`] for advertisement in
 //! `GET /.well-known/jig`.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct JigServerConfig {
     #[serde(default)]
     pub server: ServerSection,
@@ -28,6 +30,8 @@ pub struct JigServerConfig {
     pub federation: FederationSection,
     #[serde(default)]
     pub debug: DebugSection,
+    #[serde(default)]
+    pub bridges: BridgesSection,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -104,6 +108,57 @@ pub struct DebugSection {
     pub list_handles: bool,
 }
 
+/// Server-side bridge policy. Read at startup; gates whether
+/// [`JigServerConfig::bridge_permitted`] returns true for each bridge name.
+///
+/// Defaults to deny-all: no bridges loaded unless explicitly allowlisted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct BridgesSection {
+    /// Allowlist: if non-empty, only these bridges may load. If empty, all
+    /// bridges with `per_bridge.<name>.enabled = true` (and not in deny_list)
+    /// may load. Empty + nothing in deny_list = deny-by-default (no bridges).
+    #[serde(default)]
+    pub allow_list: Vec<String>,
+
+    /// Denylist: bridges in this list may not load regardless of allow_list.
+    /// Special value `"*"` blocks all bridges (useful for high-sec lockdown).
+    #[serde(default)]
+    pub deny_list: Vec<String>,
+
+    /// Per-bridge configuration. Keyed by bridge name (matches
+    /// `Bridge::name()`).
+    #[serde(default)]
+    pub per_bridge: BTreeMap<String, BridgeSection>,
+}
+
+/// Per-bridge policy + configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct BridgeSection {
+    /// Kill-switch independent of allow_list / deny_list. A bridge with
+    /// `enabled = false` does NOT load even if it's in allow_list.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Max submissions per minute. Enforcement scaffolded in alpha.1a;
+    /// actual rate-counting lands in alpha.email.
+    #[serde(default)]
+    pub rate_limit_per_minute: Option<u32>,
+
+    /// Max submissions per day. Same scaffold-now-enforce-later treatment.
+    #[serde(default)]
+    pub rate_limit_per_day: Option<u32>,
+
+    /// If non-empty, bridge submissions are restricted to these channel
+    /// slugs. Empty = no channel restriction.
+    #[serde(default)]
+    pub allow_channels: Vec<String>,
+
+    /// Bridge-specific opaque config table. Server passes this through to
+    /// `BridgeContext::config` without inspection.
+    #[serde(default)]
+    pub config: toml::Table,
+}
+
 impl JigServerConfig {
     /// List of active antipattern flags. Returned by `GET /.well-known/jig`
     /// so federated peers can detect a misconfigured node. ALWAYS includes
@@ -123,6 +178,29 @@ impl JigServerConfig {
             active.push("debug.list_handles".to_string());
         }
         active
+    }
+
+    /// Returns true if the bridge may load per current policy. Combines
+    /// `allow_list`, `deny_list`, and per-bridge `enabled` checks.
+    ///
+    /// Decision order:
+    /// 1. If bridge is in `deny_list` (or deny_list contains `"*"`) → false
+    /// 2. If `allow_list` is non-empty AND bridge is not in it → false
+    /// 3. If bridge has no `per_bridge` entry OR entry has `enabled = false` → false
+    /// 4. Otherwise → true
+    pub fn bridge_permitted(&self, name: &str) -> bool {
+        // Step 1: deny_list check
+        if self.bridges.deny_list.iter().any(|d| d == "*" || d == name) {
+            return false;
+        }
+        // Step 2: allow_list gate
+        if !self.bridges.allow_list.is_empty() && !self.bridges.allow_list.iter().any(|a| a == name)
+        {
+            return false;
+        }
+        // Step 3: per-bridge enabled check (also acts as deny-by-default
+        // for bridges with no per_bridge entry at all)
+        matches!(self.bridges.per_bridge.get(name), Some(b) if b.enabled)
     }
 }
 
@@ -250,5 +328,124 @@ mod tests {
         assert_eq!(cfg.identity.mode, IdentityMode::Tofu);
         assert!(cfg.federation.peers.is_empty());
         assert!(!cfg.debug.admin_endpoints);
+    }
+
+    #[test]
+    fn bridges_section_default_is_empty_allowlist() {
+        let cfg = JigServerConfig::default();
+        assert!(cfg.bridges.allow_list.is_empty());
+        assert!(cfg.bridges.deny_list.is_empty());
+        assert!(cfg.bridges.per_bridge.is_empty());
+    }
+
+    #[test]
+    fn bridges_section_parses_full_toml() {
+        let toml = r##"
+            [bridges]
+            allow_list = ["email", "slack"]
+            deny_list = []
+
+            [bridges.per_bridge.email]
+            enabled = true
+            rate_limit_per_minute = 60
+            rate_limit_per_day = 5000
+            allow_channels = ["#email-inbox", "#email-team"]
+
+            [bridges.per_bridge.email.config]
+            smtp_listen_addr = "0.0.0.0:25"
+            resend_api_key = "rk_test"
+
+            [bridges.per_bridge.slack]
+            enabled = false
+        "##;
+        let cfg: JigServerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.bridges.allow_list, vec!["email", "slack"]);
+        assert!(cfg.bridges.deny_list.is_empty());
+
+        let email = cfg.bridges.per_bridge.get("email").unwrap();
+        assert!(email.enabled);
+        assert_eq!(email.rate_limit_per_minute, Some(60));
+        assert_eq!(email.rate_limit_per_day, Some(5000));
+        assert_eq!(email.allow_channels, vec!["#email-inbox", "#email-team"]);
+        assert_eq!(
+            email
+                .config
+                .get("smtp_listen_addr")
+                .and_then(|v| v.as_str()),
+            Some("0.0.0.0:25"),
+        );
+
+        let slack = cfg.bridges.per_bridge.get("slack").unwrap();
+        assert!(!slack.enabled);
+    }
+
+    #[test]
+    fn bridge_permitted_default_deny_for_unknown() {
+        // Empty config: nothing in allow_list, nothing in deny_list, no
+        // per-bridge entry. Per spec: deny-by-default for unknown bridges.
+        let cfg = JigServerConfig::default();
+        assert!(!cfg.bridge_permitted("email"));
+        assert!(!cfg.bridge_permitted("slack"));
+    }
+
+    #[test]
+    fn bridge_permitted_allow_list_only() {
+        let toml = r#"
+            [bridges]
+            allow_list = ["email"]
+
+            [bridges.per_bridge.email]
+            enabled = true
+        "#;
+        let cfg: JigServerConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.bridge_permitted("email"));
+        assert!(!cfg.bridge_permitted("slack"));
+    }
+
+    #[test]
+    fn bridge_permitted_deny_list_overrides_allow_list() {
+        let toml = r#"
+            [bridges]
+            allow_list = ["email"]
+            deny_list = ["*"]
+
+            [bridges.per_bridge.email]
+            enabled = true
+        "#;
+        let cfg: JigServerConfig = toml::from_str(toml).unwrap();
+        // deny_list ["*"] blocks everything including allowlisted bridges.
+        assert!(!cfg.bridge_permitted("email"));
+    }
+
+    #[test]
+    fn bridge_permitted_per_bridge_enabled_false_overrides_allow_list() {
+        let toml = r#"
+            [bridges]
+            allow_list = ["email"]
+
+            [bridges.per_bridge.email]
+            enabled = false
+        "#;
+        let cfg: JigServerConfig = toml::from_str(toml).unwrap();
+        // Per-bridge kill-switch beats allowlist.
+        assert!(!cfg.bridge_permitted("email"));
+    }
+
+    #[test]
+    fn bridge_permitted_specific_deny_works() {
+        let toml = r#"
+            [bridges]
+            allow_list = ["email", "slack"]
+            deny_list = ["slack"]
+
+            [bridges.per_bridge.email]
+            enabled = true
+
+            [bridges.per_bridge.slack]
+            enabled = true
+        "#;
+        let cfg: JigServerConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.bridge_permitted("email"));
+        assert!(!cfg.bridge_permitted("slack"));
     }
 }

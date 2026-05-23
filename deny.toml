@@ -127,4 +127,11 @@ ignore = [
     "RUSTSEC-2026-0104",
     "RUSTSEC-2026-0105",  # core2 unmaintained + yanked
     "RUSTSEC-2026-0141",  # TLS hostname verification disabled with Boring backend
+    # NEW since PR #1: wasmtime / wasmtime-wasi vulnerability (CVE GHSA-2r75-cxrj-cmph).
+    # Affects wasmtime-wasi 16.0.0 (jig-server) and 23.0.3 (jig-runtime). Not
+    # exploitable on v0.0.2 surface — text-render uses the synthetic-receipt
+    # path, not jig-runtime execution (tracked as issue #5). Wasmtime upgrade
+    # paired with the runtime wiring is v0.0.3 work; this pin documents the
+    # deliberate carve-out.
+    "RUSTSEC-2026-0149",
 ]

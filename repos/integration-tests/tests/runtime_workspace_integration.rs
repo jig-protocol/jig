@@ -1,7 +1,7 @@
 //! Workspace integration test: Verify jig-runtime can be consumed by other workspace members
 
 use jig_runtime::{
-    BlockPackage, CostSchedule, ExecutionContext, ExecutionOutcome, Receipt, Runtime, RuntimeConfig,
+    BlockPackage, CostSchedule, ExecutionContext, ExecutionOutcome, Runtime, RuntimeConfig,
 };
 
 #[test]

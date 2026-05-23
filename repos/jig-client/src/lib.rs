@@ -2,7 +2,7 @@
 //!
 //! Provides connection management, identity loading, and block bundle
 //! construction. Consumed by `jig-cli` (Phase C5 refactor) and — in
-//! v0.0.3 — by `jig-email-bridge` and `jig-gui/riverdance`. The
+//! v0.0.3 — by `jig-bridge-email` and `jig-gui/riverdance`. The
 //! goal is one shared client implementation so bug fixes propagate
 //! to every consumer.
 

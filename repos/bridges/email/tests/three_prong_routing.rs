@@ -5,8 +5,8 @@
 //! 2. Jig -> Email: SMTP with viral block signature  
 //! 3. Email -> Jig: Convert to block and forward
 
-use jig_email_bridge::router::{MessageRouter, RouteDecision};
-use jig_email_bridge::types::EmailMessage;
+use jig_bridge_email::router::{MessageRouter, RouteDecision};
+use jig_bridge_email::types::EmailMessage;
 
 #[tokio::test]
 async fn test_prong_1_jig_to_jig_no_discovery() {
@@ -146,8 +146,8 @@ fn test_email_message_block_conversion() {
 
 #[test]
 fn test_viral_signature_with_block_cid() {
-    use jig_email_bridge::config::FormattingConfig;
-    use jig_email_bridge::formatter::format_text_body_with_cid;
+    use jig_bridge_email::config::FormattingConfig;
+    use jig_bridge_email::formatter::format_text_body_with_cid;
 
     let config = FormattingConfig {
         signature: "\n--\nSent via Jig".to_string(),
@@ -177,7 +177,7 @@ fn test_viral_signature_with_block_cid() {
 
 #[test]
 fn test_thread_info_generation() {
-    use jig_email_bridge::types::ThreadInfo;
+    use jig_bridge_email::types::ThreadInfo;
 
     let message_id = ThreadInfo::generate_message_id("example.com");
 
@@ -189,7 +189,7 @@ fn test_thread_info_generation() {
 
 #[tokio::test]
 async fn test_dns_discovery_invalid_email() {
-    use jig_email_bridge::discovery::JigDiscovery;
+    use jig_bridge_email::discovery::JigDiscovery;
 
     let discovery = JigDiscovery::new().unwrap();
     let result = discovery.discover("not-an-email").await;
@@ -200,7 +200,7 @@ async fn test_dns_discovery_invalid_email() {
 
 #[tokio::test]
 async fn test_dns_discovery_no_records() {
-    use jig_email_bridge::discovery::JigDiscovery;
+    use jig_bridge_email::discovery::JigDiscovery;
 
     let discovery = JigDiscovery::new().unwrap();
     let result = discovery.discover("alice@example.com").await.unwrap();

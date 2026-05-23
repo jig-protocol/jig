@@ -3,7 +3,7 @@
 ## Date: 2025-10-28
 
 ## Overview
-Successfully reworked `jig-email-bridge` to interface with the newly-updated block-based core/server/cli architecture. The bridge now properly adapts between traditional email (SMTP/IMAP) and the Jig executable internet protocol using `BlockManifest` and `BlockBundle`.
+Successfully reworked `jig-bridge-email` to interface with the newly-updated block-based core/server/cli architecture. The bridge now properly adapts between traditional email (SMTP/IMAP) and the Jig executable internet protocol using `BlockManifest` and `BlockBundle`.
 
 ## Key Changes
 
@@ -94,7 +94,7 @@ Emails are converted to blocks with semantic metadata:
 ## Testing Status
 
 ### Build Status
-✅ **Success**: `cargo build -p jig-email-bridge` compiles without errors (5 warnings for unused code)
+✅ **Success**: `cargo build -p jig-bridge-email` compiles without errors (5 warnings for unused code)
 
 ### Manual Testing Required
 - [ ] Test SendEmail command via SMTP
