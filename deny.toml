@@ -26,10 +26,6 @@ allow = [
     "CDLA-Permissive-2.0",  # Community Data License
     "AGPL-3.0-only",  # Internal jig-protocol crates use modern SPDX form
     "MPL-2.0",  # transient via dirs/option-ext
-    "OpenSSL",  # legacy ring 0.16 component (see [[licenses.clarify]] below);
-                # safe because ring is the only crate that touches it and it's
-                # a transitive dep we plan to drop via trust-dns → hickory-dns
-                # upgrade. Track as v0.0.3 followup.
 ]
 confidence-threshold = 0.8
 
@@ -37,17 +33,6 @@ confidence-threshold = 0.8
 [licenses.private]
 ignore = true
 registries = ["gigue-internal"]
-
-# ring 0.16's license expression doesn't parse as standard SPDX — it's a
-# multi-clause string cargo-deny can't tokenize. Pulled in transitively
-# via trust-dns-proto 0.23 (DNS resolution for jig-email-bridge /
-# jig-nameserver / jig-server). The trust-dns crate has been renamed to
-# hickory-dns and modernized; upgrading would drop legacy ring. Track as
-# v0.0.3 followup.
-[[licenses.clarify]]
-name = "ring"
-expression = "ISC AND MIT AND OpenSSL"
-license-files = []
 
 
 [bans]
@@ -63,19 +48,20 @@ unknown-git = "deny"
 # Every entry below is a pre-existing finding in transitive deps inherited
 # from the v0.0.1 baseline — NOT introduced by v0.0.2 work. They split into:
 #
-#   * Unmaintained: atty, bincode, core2, fxhash, mach, paste, proc-macro-error
-#     — chain back to dioxus / trust-dns / jig-runtime build tooling. Real fix
-#     is dep upgrades (e.g. trust-dns → hickory-dns drops several of these
-#     transitively). Tracked as v0.0.3 hygiene followup.
+#   * Unmaintained: bincode, core2, fxhash, mach, paste, proc-macro-error
+#     — chain back to dioxus / jig-runtime build tooling. Real fix is dep
+#     upgrades (the trust-dns → hickory-dns migration in v0.0.3-alpha.1b
+#     already cleared the trust-dns / idna 0.5 / ring 0.16 cluster).
+#     Tracked as v0.0.3 hygiene followup.
 #
-#   * Vulnerabilities: idna 0.5 (Punycode), BytesMut::reserve overflow,
-#     cap-primitives Windows sandbox, AES overflow panic, TLS hostname
-#     verification disabled with Boring backend. None are exploitable on
-#     our v0.0.2 surface (no Windows targeting, no Boring TLS backend, no
-#     user-supplied AES, jig-server only resolves DNS for federation peers
-#     it knows ahead of time). Audit + targeted fixes are a v0.0.3 task.
+#   * Vulnerabilities: BytesMut::reserve overflow, cap-primitives Windows
+#     sandbox, AES overflow panic, TLS hostname verification disabled with
+#     Boring backend. None are exploitable on our v0.0.2 surface (no
+#     Windows targeting, no Boring TLS backend, no user-supplied AES,
+#     jig-server only resolves DNS for federation peers it knows ahead of
+#     time). Audit + targeted fixes are a v0.0.3 task.
 #
-#   * Unsound: rand custom-logger interaction, ring 0.16 unaligned read.
+#   * Unsound: rand custom-logger interaction.
 #     Same v0.0.3 audit treatment.
 #
 # Keep this list pinned (not glob-suppressed) so any NEW advisory landing
@@ -92,13 +78,9 @@ ignore = [
     "RUSTSEC-2021-0145",  # atty unaligned read (unsound)
     "RUSTSEC-2024-0370",  # proc-macro-error unmaintained
     "RUSTSEC-2024-0375",  # atty unmaintained
-    "RUSTSEC-2024-0421",  # idna 0.5 Punycode handling
     "RUSTSEC-2024-0436",  # paste unmaintained
     "RUSTSEC-2024-0438",
     "RUSTSEC-2024-0445",  # cap-primitives Windows sandbox
-    "RUSTSEC-2025-0009",
-    "RUSTSEC-2025-0010",
-    "RUSTSEC-2025-0017",
     "RUSTSEC-2025-0046",
     "RUSTSEC-2025-0055",
     "RUSTSEC-2025-0057",  # fxhash unmaintained
