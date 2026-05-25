@@ -99,48 +99,6 @@ jobs:
         working-directory: .
         run: test -f repos/target/wasm32-wasip1/release/text_block.wasm
 
-  jig-server-matrix:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: default
-            features: ""
-          - name: telemetry
-            features: "telemetry_v0_2"
-          - name: duckdb
-            features: "analytics_duckdb"
-          - name: parquet
-            features: "analytics_parquet"
-          - name: clickhouse
-            features: "analytics_clickhouse"
-    # These exercise pre-v0.0.2 jig-server feature flags. v0.0.2 didn't
-    # audit them; allowed to fail without blocking the PR until we
-    # explicitly take them on.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: repos
-      - name: Clippy (jig-server ${{ matrix.name }})
-        run: |
-          if [ -z "${{ matrix.features }}" ]; then
-            cargo clippy -p jig-server -- -D warnings
-          else
-            cargo clippy -p jig-server --features "${{ matrix.features }}" -- -D warnings
-          fi
-      - name: Nextest (jig-server ${{ matrix.name }})
-        run: |
-          cargo install cargo-nextest --locked
-          if [ -z "${{ matrix.features }}" ]; then
-            cargo nextest run -p jig-server
-          else
-            cargo nextest run -p jig-server --features "${{ matrix.features }}"
-          fi
-
   e2e-receipt:
     runs-on: ubuntu-latest
     # Pre-existing legacy transport receipt script; not v0.0.2 path.

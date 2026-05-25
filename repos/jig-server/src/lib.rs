@@ -1,6 +1,5 @@
 //! Jig Server crate entry point.
 
-pub mod analytics;
 pub mod capability;
 pub mod config;
 pub mod error;
@@ -24,11 +23,3 @@ pub use storage::{
     SqliteBlockStore, StoredBlock, StoredBlockSummary, StoredReceipt, StoredResource,
     encode_resource_data,
 };
-
-#[cfg(feature = "telemetry_v0_2")]
-pub mod telemetry;
-
-#[cfg(feature = "telemetry_v0_2")]
-pub use telemetry::{Percentiles, TimingsRecorder, TimingsSnapshot};
-
-pub use analytics::{ReceiptStats, TimeRange, receipt_stats_for_range};

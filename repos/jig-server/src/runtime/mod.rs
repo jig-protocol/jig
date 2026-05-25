@@ -27,8 +27,6 @@
 //!
 //! See `jig-runtime/README.md` and `jig-core/src/receipt.rs` for full rationale.
 
-#[cfg(feature = "telemetry_v0_2")]
-use crate::telemetry::{TimingsRecorder, TimingsSnapshot};
 use cid::Cid;
 use jig_core::capability_scope::{CAPABILITY_SCOPE_SEPARATOR, CapabilityUsageKey};
 use jig_core::{
@@ -38,8 +36,6 @@ use jig_runtime::{
     BlockPackage, ExecutionContext, Receipt as JigReceipt, Runtime, RuntimeConfig,
     config::ResourceLimits,
 };
-#[cfg(feature = "telemetry_v0_2")]
-use std::sync::Arc;
 use time::OffsetDateTime;
 
 use crate::error::{Result, ServerError};
@@ -76,8 +72,6 @@ impl Default for ExecutionConfig {
 pub struct BlockRuntime {
     runtime: Runtime,
     config: ExecutionConfig,
-    #[cfg(feature = "telemetry_v0_2")]
-    telemetry: Arc<TimingsRecorder>,
 }
 
 impl BlockRuntime {
@@ -103,17 +97,7 @@ impl BlockRuntime {
         let runtime = Runtime::with_config(runtime_config)
             .map_err(|e| ServerError::Runtime(format!("failed to create jig-runtime: {e}")))?;
 
-        Ok(Self {
-            runtime,
-            config,
-            #[cfg(feature = "telemetry_v0_2")]
-            telemetry: Arc::new(TimingsRecorder::new()),
-        })
-    }
-
-    #[cfg(feature = "telemetry_v0_2")]
-    pub fn timings_snapshot(&self) -> TimingsSnapshot {
-        self.telemetry.snapshot()
+        Ok(Self { runtime, config })
     }
 
     /// Execute the supplied block bundle using jig-runtime.
@@ -305,12 +289,6 @@ impl BlockRuntime {
             total: exec_ms,
         };
         builder = builder.timings(timings);
-
-        #[cfg(feature = "telemetry_v0_2")]
-        {
-            // Queue wait and init are currently 0; we record exec to drive histograms.
-            self.telemetry.record(0, 0, exec_ms);
-        }
 
         // Compute renders_match using module_hash vs manifest.render.expected_hash
         let module_hash = jig_receipt.module_hash.as_ref().map(|m| m.value.clone());

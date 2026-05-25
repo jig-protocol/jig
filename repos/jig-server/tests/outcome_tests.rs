@@ -77,15 +77,3 @@ fn outcome_status_from_str() {
     );
     assert!(OutcomeStatus::from_str("invalid").is_err());
 }
-
-#[test]
-#[cfg(feature = "telemetry_v0_2")]
-fn outcome_converts_to_jig_core_outcome() {
-    use jig_core::Outcome as CoreOutcome;
-
-    let server_outcome = Outcome::ok().with_affordance("test.affordance");
-
-    let core_outcome: CoreOutcome = server_outcome.into();
-    assert_eq!(core_outcome.status, jig_core::OutcomeStatus::Ok);
-    assert_eq!(core_outcome.affordances, vec!["test.affordance"]);
-}

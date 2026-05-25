@@ -64,30 +64,10 @@ impl JigServer {
             self.config.port
         );
 
-        #[cfg(feature = "analytics_clickhouse")]
-        let dispatcher = {
-            use crate::analytics::clickhouse::ClickHouseSink;
-            use crate::analytics::dispatcher::AnalyticsDispatcher;
-            if let Some(ch) = self.config.clickhouse_settings() {
-                let sink =
-                    std::sync::Arc::new(ClickHouseSink::new(&ch.url, &ch.database, &ch.table)?);
-                Some(AnalyticsDispatcher::new(
-                    sink,
-                    ch.queue_capacity,
-                    ch.batch_size,
-                    std::time::Duration::from_millis(ch.flush_interval_ms),
-                ))
-            } else {
-                None
-            }
-        };
-
         let app_state = AppState {
             store: self.store.clone(),
             runtime: self.runtime.clone(),
             config: self.config.clone(),
-            #[cfg(feature = "analytics_clickhouse")]
-            dispatcher,
             v0_0_2: self.v0_0_2.clone(),
         };
 
