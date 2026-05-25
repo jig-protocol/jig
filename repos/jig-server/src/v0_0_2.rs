@@ -62,6 +62,9 @@ impl AppState {
         let fanout = Arc::new(Fanout::new());
         let server_url = format!("ws://{}", config.server.listen);
 
+        let naively_allow_unknown_handles_fallback =
+            config.identity.naively_allow_unknown_handles_fallback;
+
         let ingest_ctx = Arc::new(IngestContext {
             store,
             identity,
@@ -71,6 +74,7 @@ impl AppState {
             server_key: signing_key,
             fanout,
             server_url: server_url.clone(),
+            naively_allow_unknown_handles_fallback,
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
@@ -99,6 +103,9 @@ impl AppState {
         let config = JigServerConfig::default();
         let server_url = format!("ws://{}", config.server.listen);
 
+        let naively_allow_unknown_handles_fallback =
+            config.identity.naively_allow_unknown_handles_fallback;
+
         let ingest_ctx = Arc::new(IngestContext {
             store,
             identity,
@@ -108,6 +115,7 @@ impl AppState {
             server_key: signing_key,
             fanout,
             server_url: server_url.clone(),
+            naively_allow_unknown_handles_fallback,
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));

@@ -66,6 +66,9 @@ impl AppState {
         let hlc_clock = Arc::new(HlcClock::new(ns_did.clone()));
         let fanout = Arc::new(Fanout::new());
 
+        let naively_allow_unknown_handles_fallback =
+            config.identity.naively_allow_unknown_handles_fallback;
+
         let ingest_ctx = Arc::new(IngestContext {
             store,
             identity,
@@ -75,6 +78,7 @@ impl AppState {
             server_key: signing_key,
             fanout,
             server_url: format!("ws://{}", config.server.listen),
+            naively_allow_unknown_handles_fallback,
         });
 
         Ok(Self {
@@ -124,6 +128,7 @@ impl AppState {
             server_key: signing_key,
             fanout,
             server_url: format!("ws://{}", config.server.listen),
+            naively_allow_unknown_handles_fallback: false,
         });
 
         Ok(Self {
