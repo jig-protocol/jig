@@ -641,10 +641,7 @@ async fn handle_inbound_test_frame(
             .unwrap_or_default(),
         None => vec![],
     };
-    if !state
-        .config
-        .federation
-        .naively_trust_peer_authored_blocks
+    if !state.config.federation.naively_trust_peer_authored_blocks
         && let Err(e) = jig_server::v0_0_2_federation::verify_peer_block_sig(
             &bundle_bytes,
             &manifest,

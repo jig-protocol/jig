@@ -31,8 +31,8 @@ use std::time::Duration;
 
 use jig_server::v0_0_2_federation_tls::build_insecure_connector;
 use rcgen::generate_simple_self_signed;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig as RustlsServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{connect_async_tls_with_config, tungstenite};
@@ -42,8 +42,8 @@ use tokio_tungstenite::{connect_async_tls_with_config, tungstenite};
 /// port so the test can build a `wss://localhost:<port>` URL.
 async fn spawn_one_shot_tls_server() -> u16 {
     // 1. Self-signed cert for `localhost`.
-    let cert = generate_simple_self_signed(vec!["localhost".to_string()])
-        .expect("rcgen self-signed cert");
+    let cert =
+        generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen self-signed cert");
     let cert_der = CertificateDer::from(cert.cert.der().to_vec());
     let key_pkcs8 = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
     let key_der: PrivateKeyDer<'static> = PrivateKeyDer::Pkcs8(key_pkcs8);
@@ -91,10 +91,7 @@ async fn federation_rejects_self_signed_cert_by_default() {
     // The exact error variant differs across rustls/tungstenite versions, but
     // the failure MUST originate at the TLS layer (not the WS upgrade or the
     // socket). Accept Tls or Io — both are valid for "verifier rejected".
-    let is_tls_or_io = matches!(
-        &e,
-        tungstenite::Error::Tls(_) | tungstenite::Error::Io(_)
-    );
+    let is_tls_or_io = matches!(&e, tungstenite::Error::Tls(_) | tungstenite::Error::Io(_));
     assert!(
         is_tls_or_io,
         "expected Tls/Io error from default verifier; got {e:?}"
@@ -110,8 +107,7 @@ async fn dangerously_disable_federation_tls_skips_cert_verification() {
     // NoCertVerifier-backed Connector and try to talk WSS to the
     // self-signed peer. The TLS handshake must succeed.
     let connector = build_insecure_connector();
-    let result =
-        connect_async_tls_with_config(&ws_url, None, false, Some(connector)).await;
+    let result = connect_async_tls_with_config(&ws_url, None, false, Some(connector)).await;
 
     // The test server only does TLS, not WS. So a successful TLS handshake
     // is followed by the WS upgrade failing (Protocol/Http/Io error). What

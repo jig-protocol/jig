@@ -319,10 +319,9 @@ mod tests {
     #[tokio::test]
     async fn challenge_nonces_expire_after_ttl() {
         // Tight TTL so the test doesn't sit in the runtime for 60s.
-        let state = AppState::for_test_with_short_challenge_ttl(
-            std::time::Duration::from_millis(50),
-        )
-        .unwrap();
+        let state =
+            AppState::for_test_with_short_challenge_ttl(std::time::Duration::from_millis(50))
+                .unwrap();
 
         state.remember_challenge("nonce-a").await;
         // Fresh: consume succeeds.

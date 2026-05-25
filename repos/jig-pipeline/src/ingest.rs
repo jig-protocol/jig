@@ -97,11 +97,7 @@ pub async fn ingest(
     // nickname are not subject to the lock at ingest time — the carve-out
     // is documented in the H5 integration test. v0.0.3+ promotes channel/
     // membership blocks to carry the identifier explicitly.
-    if let Some(nickname) = manifest
-        .metadata
-        .get("nickname")
-        .and_then(|v| v.as_str())
-    {
+    if let Some(nickname) = manifest.metadata.get("nickname").and_then(|v| v.as_str()) {
         let sender_did = manifest
             .authors
             .first()

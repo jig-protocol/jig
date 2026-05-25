@@ -151,7 +151,8 @@ mod tests {
     #[test]
     fn block_delivery_envelope_back_compat_without_sig() {
         // Older v0.0.2 peers don't include sig_b64; deserialization must still work.
-        let json = r##"{"v":1,"op":"block","bundle_b64":"Yg==","receipts":[],"delivery_cid":"bafy"}"##;
+        let json =
+            r##"{"v":1,"op":"block","bundle_b64":"Yg==","receipts":[],"delivery_cid":"bafy"}"##;
         let parsed: Envelope = serde_json::from_str(json).unwrap();
         match parsed.frame {
             Frame::Block { sig_b64, .. } => assert!(sig_b64.is_none()),

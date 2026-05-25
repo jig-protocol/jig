@@ -28,9 +28,7 @@ use jig_pipeline::{
     persist::{StoredBlock, StoredReceipt},
 };
 use tokio::sync::mpsc;
-use tokio_tungstenite::{
-    connect_async, connect_async_tls_with_config, tungstenite::Message,
-};
+use tokio_tungstenite::{connect_async, connect_async_tls_with_config, tungstenite::Message};
 use tracing::{debug, info, warn};
 
 use crate::v0_0_2::AppState;
@@ -251,11 +249,7 @@ async fn ingest_peer_block(
     // Operators who explicitly want the old v0.0.2 trust-the-peer behavior
     // can set [federation] naively_trust_peer_authored_blocks = true; the flag
     // is advertised in /.well-known/jig unsafe_options_active.
-    if state
-        .config
-        .federation
-        .naively_trust_peer_authored_blocks
-    {
+    if state.config.federation.naively_trust_peer_authored_blocks {
         warn!(
             peer_url = %peer.url,
             %block_cid,
@@ -397,8 +391,11 @@ pub fn verify_peer_block_sig(
         .first()
         .map(|a| a.did.clone())
         .ok_or("manifest has no authors")?;
-    let pubkey_bytes = sender_did.as_bytes().map_err(|_| "sender_did not canonical")?;
-    let pubkey = VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| "sender_did not a valid ed25519 pubkey")?;
+    let pubkey_bytes = sender_did
+        .as_bytes()
+        .map_err(|_| "sender_did not canonical")?;
+    let pubkey = VerifyingKey::from_bytes(&pubkey_bytes)
+        .map_err(|_| "sender_did not a valid ed25519 pubkey")?;
     let signature = Signature::from_slice(sig).map_err(|_| "sig is not 64 bytes")?;
     pubkey
         .verify(bundle_bytes, &signature)
@@ -651,7 +648,12 @@ mod tests {
             hex::encode(blake3::hash(&bundle_bytes).as_bytes())
         );
         assert!(
-            state.ingest_ctx.store.get_block(&block_cid).unwrap().is_none(),
+            state
+                .ingest_ctx
+                .store
+                .get_block(&block_cid)
+                .unwrap()
+                .is_none(),
             "forged-author peer block must be rejected (not persisted)"
         );
     }
@@ -695,7 +697,12 @@ mod tests {
             hex::encode(blake3::hash(&bundle_bytes).as_bytes())
         );
         assert!(
-            state.ingest_ctx.store.get_block(&block_cid).unwrap().is_none(),
+            state
+                .ingest_ctx
+                .store
+                .get_block(&block_cid)
+                .unwrap()
+                .is_none(),
             "peer block without sig must be rejected under default policy"
         );
     }
@@ -713,9 +720,7 @@ mod tests {
             .join("server.key")
             .to_string_lossy()
             .into_owned();
-        let state = Arc::new(
-            AppState::new(config, tempdir.path().join("server.db")).unwrap(),
-        );
+        let state = Arc::new(AppState::new(config, tempdir.path().join("server.db")).unwrap());
 
         let peer = jig_config::v0_0_2_server::FederationPeer {
             url: "wss://test-peer".to_string(),
@@ -748,7 +753,12 @@ mod tests {
             hex::encode(blake3::hash(&bundle_bytes).as_bytes())
         );
         assert!(
-            state.ingest_ctx.store.get_block(&block_cid).unwrap().is_some(),
+            state
+                .ingest_ctx
+                .store
+                .get_block(&block_cid)
+                .unwrap()
+                .is_some(),
             "naively_trust_peer_authored_blocks must persist even invalid-sig peer blocks"
         );
     }
