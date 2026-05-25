@@ -90,26 +90,6 @@ jobs:
         working-directory: .
         run: test -f repos/target/wasm32-wasip1/release/text_block.wasm
 
-  e2e-receipt:
-    runs-on: ubuntu-latest
-    # Pre-existing legacy transport receipt script; not v0.0.2 path.
-    # Surface as advisory until we either port to the v0.0.2 surface
-    # or retire it.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: repos
-      - name: Install tooling
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq xxd
-      - name: Run transport receipt path
-        working-directory: .
-        run: bash repos/integration-tests/transport-tests/receipt_path.sh
-
   license-compliance:
     runs-on: ubuntu-latest
     steps:
