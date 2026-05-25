@@ -137,6 +137,22 @@ fn load_or_generate_server_key(path: &str) -> Result<SigningKey> {
     let expanded = shellexpand::tilde(path).into_owned();
     let path = Path::new(&expanded);
     if path.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path)
+                .with_context(|| format!("stating keyfile at {}", path.display()))?
+                .permissions()
+                .mode()
+                & 0o777;
+            if mode & 0o077 != 0 {
+                anyhow::bail!(
+                    "server keyfile at {} has insecure permissions {:#o} (must be 0o600 — group/other access is forbidden)",
+                    path.display(),
+                    mode,
+                );
+            }
+        }
         let bytes = std::fs::read(path)
             .with_context(|| format!("reading server keyfile at {}", path.display()))?;
         if bytes.len() != 32 {
@@ -218,7 +234,31 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("bad.key");
         std::fs::write(&path, b"too short").unwrap();
+        // Set 0600 so the permission check passes and we hit the length check.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let err = load_or_generate_server_key(path.to_str().unwrap()).unwrap_err();
         assert!(err.to_string().contains("malformed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_or_generate_rejects_world_readable_keyfile() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("server.key");
+        // Write a valid 32-byte keyfile but with permissive (0644) mode.
+        std::fs::write(&path, [0u8; 32]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = load_or_generate_server_key(path.to_str().unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("permissions") || msg.contains("0644") || msg.contains("0o644"),
+            "expected permission error, got: {msg}"
+        );
     }
 }
