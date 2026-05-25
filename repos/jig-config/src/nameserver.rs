@@ -317,7 +317,7 @@ fn default_anon_sessions() -> u32 {
 // ============================================================================
 
 /// Federation mode selector
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum FederationMode {
     /// Fully federated with parent organization (high trust)
@@ -325,6 +325,7 @@ pub enum FederationMode {
     /// Shared ruleset via network or data contract (medium trust)
     SharedRuleset,
     /// Isolated operation (zero trust)
+    #[default]
     Isolated,
 }
 
@@ -387,12 +388,6 @@ pub struct FederationConfig {
     /// **Hot-reload:** Yes (new hash computed on config change)
     #[serde(default)]
     pub policy_hash: Option<String>,
-}
-
-impl Default for FederationMode {
-    fn default() -> Self {
-        Self::Isolated
-    }
 }
 
 fn default_max_peers() -> usize {

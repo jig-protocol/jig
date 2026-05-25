@@ -27,10 +27,11 @@ use std::collections::HashMap;
 ///
 /// **Hot-reload:** No (requires restart)
 /// **Reason:** Backend changes require new connection pools and storage initialization
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum AnalyticsBackend {
     /// DuckDB embedded analytics (potato/standard default)
+    #[default]
     DuckDB,
     /// Parquet files on local/distributed filesystem
     Parquet,
@@ -43,10 +44,11 @@ pub enum AnalyticsBackend {
 /// Privacy mode for analytics data collection
 ///
 /// **Hot-reload:** Yes
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum PrivacyMode {
     /// Anonymized - PII removed, hashed identifiers
+    #[default]
     Anonymized,
     /// Aggregated - Summary statistics only, no individual records
     Aggregated,
@@ -249,18 +251,6 @@ fn default_sample_rate() -> f64 {
     1.0 // 100% by default
 }
 
-impl Default for AnalyticsBackend {
-    fn default() -> Self {
-        Self::DuckDB
-    }
-}
-
-impl Default for PrivacyMode {
-    fn default() -> Self {
-        Self::Anonymized
-    }
-}
-
 impl Default for DuckDBConfig {
     fn default() -> Self {
         Self {
@@ -304,21 +294,23 @@ impl Default for AnalyticsConfig {
 /// Log level enumeration
 ///
 /// **Hot-reload:** Yes
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Trace,
     Debug,
+    #[default]
     Info,
     Warn,
     Error,
 }
 
 /// Metrics export format
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum MetricsFormat {
     /// Prometheus exposition format
+    #[default]
     Prometheus,
     /// OpenTelemetry Protocol
     OTLP,
@@ -452,18 +444,6 @@ fn default_trace_sampling() -> f64 {
 
 fn default_log_rotation_size() -> u32 {
     100 // MB
-}
-
-impl Default for LogLevel {
-    fn default() -> Self {
-        Self::Info
-    }
-}
-
-impl Default for MetricsFormat {
-    fn default() -> Self {
-        Self::Prometheus
-    }
 }
 
 impl Default for OpenTelemetryConfig {

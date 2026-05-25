@@ -11,10 +11,11 @@ use serde::{Deserialize, Serialize};
 use crate::profiles::Profile;
 
 /// Pricing model type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PricingModel {
     /// Free tier (no billing)
+    #[default]
     Free,
 
     /// Outcome-based pricing (pay per execution outcome)
@@ -25,12 +26,6 @@ pub enum PricingModel {
 
     /// Custom pricing (user-defined)
     Custom,
-}
-
-impl Default for PricingModel {
-    fn default() -> Self {
-        Self::Free
-    }
 }
 
 /// Pricing configuration.
@@ -85,10 +80,11 @@ pub struct FuelBand {
 }
 
 /// Metering mode for fuel consumption.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MeteringMode {
     /// Meter by fuel (CPU instructions)
+    #[default]
     Fuel,
 
     /// Meter by bytes transferred
@@ -99,12 +95,6 @@ pub enum MeteringMode {
 
     /// Meter by storage capacity × time
     Storage,
-}
-
-impl Default for MeteringMode {
-    fn default() -> Self {
-        Self::Fuel
-    }
 }
 
 /// Useful work discounts based on reputation.
