@@ -77,8 +77,13 @@ semver = "1.0"
 hickory-resolver = { version = "0.26", features = ["tokio"] }
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 
-# WebSocket
-tokio-tungstenite = "0.21"
+# WebSocket — rustls-tls-native-roots feature pulls in tokio-rustls 0.25 +
+# rustls 0.22 so we can install a custom rustls::ClientConfig at the
+# federation peer connect site (alpha.1c #4 — wires
+# `federation.dangerously_disable_federation_tls`).
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
+rustls = "0.22"
+rustls-pki-types = "1.0"
 dashmap = "5"
 jsonwebtoken = "9"
 wasmtime = { version = "16.0.0", features = ["async"] }
