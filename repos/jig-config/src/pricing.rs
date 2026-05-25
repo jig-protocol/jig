@@ -563,7 +563,7 @@ mod tests {
 
     #[test]
     fn test_reputation_tier_ordering() {
-        let tiers = vec![
+        let tiers = [
             ReputationTier::NullSec,
             ReputationTier::LowSec,
             ReputationTier::HighSec,

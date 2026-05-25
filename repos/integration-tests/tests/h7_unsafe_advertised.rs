@@ -29,11 +29,13 @@ async fn default_install_always_advertises_unbounded_clock_skew() {
     // Even with no antipatterns enabled, naively_unbounded_clock_skew must
     // be present — it captures the v0.0.2 reality that no time-attestation
     // server exists yet.
-    let mut config = JigServerConfig::default();
     // No debug.admin_endpoints, no TLS-disabled, no allow-unknown-handles.
     // (Default config already has these off, but be explicit.)
-    config.debug = DebugSection::default();
-    config.identity = IdentitySection::default();
+    let config = JigServerConfig {
+        debug: DebugSection::default(),
+        identity: IdentitySection::default(),
+        ..Default::default()
+    };
 
     let server = TestJigServer::start_with_config(config)
         .await

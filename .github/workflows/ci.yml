@@ -44,9 +44,8 @@ jobs:
             -p integration-tests \
             -p jig-bridge-core
       - name: Clippy (v0.0.2 surface)
-        # `-A` suppresses style-nudge lints that pre-existing legacy code
-        # (jig-config/src/validation.rs, jig-nameserver/src/*) surfaces under
-        # stable rust 1.95. Pre-existing debt — tighten as we audit each crate.
+        # All clippy lints enforced; alpha.1c #10 cleaned up the legacy
+        # v0.0.1 lint debt that the previous `-A` mute list was carrying.
         run: |
           cargo clippy \
             -p jig-core \
@@ -56,15 +55,7 @@ jobs:
             -p text-block \
             -p integration-tests \
             -p jig-bridge-core \
-            -- -D warnings \
-            -A clippy::derivable_impls \
-            -A clippy::collapsible_match \
-            -A clippy::collapsible_if \
-            -A clippy::unnecessary_sort_by \
-            -A clippy::field_reassign_with_default \
-            -A clippy::bool_assert_comparison \
-            -A clippy::uninlined_format_args \
-            -A clippy::useless_vec
+            -- -D warnings
       - name: Nextest (v0.0.2 surface)
         run: |
           cargo install cargo-nextest --locked

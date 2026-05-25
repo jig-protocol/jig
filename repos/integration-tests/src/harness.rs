@@ -645,18 +645,17 @@ async fn handle_inbound_test_frame(
         .config
         .federation
         .naively_trust_peer_authored_blocks
-    {
-        if let Err(e) = jig_server::v0_0_2_federation::verify_peer_block_sig(
+        && let Err(e) = jig_server::v0_0_2_federation::verify_peer_block_sig(
             &bundle_bytes,
             &manifest,
             &sig_bytes,
-        ) {
-            eprintln!(
-                "harness rejecting peer block from {} (cid {block_cid}): {e}",
-                peer.url
-            );
-            return Ok(());
-        }
+        )
+    {
+        eprintln!(
+            "harness rejecting peer block from {} (cid {block_cid}): {e}",
+            peer.url
+        );
+        return Ok(());
     }
 
     let sender_did_str = manifest

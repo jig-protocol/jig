@@ -590,7 +590,7 @@ mod tests {
     #[test]
     fn test_validation_error_display() {
         let error = ValidationError::error("test", Some("field"), "message");
-        let display = format!("{}", error);
+        let display = format!("{error}");
         assert!(display.contains("ERROR"));
         assert!(display.contains("test.field"));
         assert!(display.contains("message"));
