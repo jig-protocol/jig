@@ -460,23 +460,19 @@ impl ConfigValidator {
                         ));
                     }
                 }
-                "gdpr" => {
-                    if !anonymize_pii {
-                        self.add_error(ValidationError::warning(
-                            "audit",
-                            Some("anonymize_pii"),
-                            "GDPR strongly recommends PII anonymization in audit logs",
-                        ));
-                    }
+                "gdpr" if !anonymize_pii => {
+                    self.add_error(ValidationError::warning(
+                        "audit",
+                        Some("anonymize_pii"),
+                        "GDPR strongly recommends PII anonymization in audit logs",
+                    ));
                 }
-                "soc2" => {
-                    if retention_days < 365 {
-                        self.add_error(ValidationError::error(
-                            "audit",
-                            Some("retention_days"),
-                            "SOC 2 requires audit logs to be retained for at least 1 year (365 days)",
-                        ));
-                    }
+                "soc2" if retention_days < 365 => {
+                    self.add_error(ValidationError::error(
+                        "audit",
+                        Some("retention_days"),
+                        "SOC 2 requires audit logs to be retained for at least 1 year (365 days)",
+                    ));
                 }
                 _ => {}
             }
@@ -590,7 +586,7 @@ mod tests {
     #[test]
     fn test_validation_error_display() {
         let error = ValidationError::error("test", Some("field"), "message");
-        let display = format!("{}", error);
+        let display = format!("{error}");
         assert!(display.contains("ERROR"));
         assert!(display.contains("test.field"));
         assert!(display.contains("message"));

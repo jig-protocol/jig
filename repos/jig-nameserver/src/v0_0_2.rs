@@ -5,9 +5,10 @@
 //! nameserver endpoints. Existing jig-nameserver modules (handler/
 //! identity/pow/etc.) are untouched.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
@@ -22,6 +23,11 @@ use jig_pipeline::{
 };
 use tokio::sync::RwLock;
 
+/// Default time-to-live for an issued challenge nonce. Picked to comfortably
+/// exceed normal HTTP round-trip + signing time while staying small enough
+/// that the in-memory map can't grow without bound under DoS.
+const DEFAULT_CHALLENGE_TTL: Duration = Duration::from_secs(60);
+
 /// Nameserver-scoped v0.0.2 boot state. Identity resolution in a
 /// nameserver is always TOFU — nameservers don't query other
 /// nameservers (recursion is a v0.0.3+ concern).
@@ -34,9 +40,15 @@ pub struct AppState {
     /// Read from config.identity.trusted_nameservers[0] as a v0.0.2 placeholder;
     /// real config field lands in v0.0.3+.
     pub alias_suffix: String,
-    /// Recently-issued challenge nonces (in-memory, expire after ~60s).
-    /// Production would use a TTL store; v0.0.2 keeps this simple.
-    pub pending_challenges: Arc<RwLock<HashSet<String>>>,
+    /// Recently-issued challenge nonces with their issued-at timestamp.
+    /// A background task started in `new` / `for_test*` sweeps entries
+    /// older than `challenge_ttl` every `challenge_ttl / 2`. Without the
+    /// sweeper an attacker spamming GET /v1/challenge would grow this
+    /// map without bound (issue #6).
+    pub pending_challenges: Arc<RwLock<HashMap<String, Instant>>>,
+    /// How long a challenge nonce remains valid before being swept. Configurable
+    /// so tests can use a tight TTL instead of waiting 60s.
+    pub challenge_ttl: Duration,
 }
 
 impl AppState {
@@ -66,6 +78,9 @@ impl AppState {
         let hlc_clock = Arc::new(HlcClock::new(ns_did.clone()));
         let fanout = Arc::new(Fanout::new());
 
+        let naively_allow_unknown_handles_fallback =
+            config.identity.naively_allow_unknown_handles_fallback;
+
         let ingest_ctx = Arc::new(IngestContext {
             store,
             identity,
@@ -75,14 +90,19 @@ impl AppState {
             server_key: signing_key,
             fanout,
             server_url: format!("ws://{}", config.server.listen),
+            naively_allow_unknown_handles_fallback,
         });
+
+        let pending_challenges = Arc::new(RwLock::new(HashMap::new()));
+        spawn_challenge_sweeper(pending_challenges.clone(), DEFAULT_CHALLENGE_TTL);
 
         Ok(Self {
             config,
             ingest_ctx,
             ns_did,
             alias_suffix,
-            pending_challenges: Arc::new(RwLock::new(HashSet::new())),
+            pending_challenges,
+            challenge_ttl: DEFAULT_CHALLENGE_TTL,
         })
     }
 
@@ -90,6 +110,21 @@ impl AppState {
     #[cfg(test)]
     pub fn for_test() -> Result<Self> {
         Self::for_test_with_suffix("dj.jig")
+    }
+
+    /// Tests-only constructor that overrides the challenge TTL so we can
+    /// exercise expiry without waiting the full default. Otherwise identical
+    /// to `for_test()`.
+    #[cfg(test)]
+    pub fn for_test_with_short_challenge_ttl(ttl: Duration) -> Result<Self> {
+        let mut state = Self::for_test_with_suffix("dj.jig")?;
+        // The sweeper spawned in for_test_with_suffix already uses the default
+        // TTL; replace pending_challenges + restart the sweeper at the new TTL.
+        let pending = Arc::new(RwLock::new(HashMap::new()));
+        spawn_challenge_sweeper(pending.clone(), ttl);
+        state.pending_challenges = pending;
+        state.challenge_ttl = ttl;
+        Ok(state)
     }
 
     #[cfg(test)]
@@ -124,14 +159,19 @@ impl AppState {
             server_key: signing_key,
             fanout,
             server_url: format!("ws://{}", config.server.listen),
+            naively_allow_unknown_handles_fallback: false,
         });
+
+        let pending_challenges = Arc::new(RwLock::new(HashMap::new()));
+        spawn_challenge_sweeper(pending_challenges.clone(), DEFAULT_CHALLENGE_TTL);
 
         Ok(Self {
             config,
             ingest_ctx,
             ns_did,
             alias_suffix: alias_suffix.to_string(),
-            pending_challenges: Arc::new(RwLock::new(HashSet::new())),
+            pending_challenges,
+            challenge_ttl: DEFAULT_CHALLENGE_TTL,
         })
     }
 
@@ -144,16 +184,27 @@ impl AppState {
     }
 
     /// Record a challenge nonce so a later /v1/register can verify it was issued.
+    /// The nonce is tagged with the current `Instant` so the background sweeper
+    /// can drop it once it's older than `challenge_ttl`.
     pub async fn remember_challenge(&self, nonce: &str) {
         self.pending_challenges
             .write()
             .await
-            .insert(nonce.to_string());
+            .insert(nonce.to_string(), Instant::now());
     }
 
-    /// Consume a challenge nonce. Returns true if it was registered (and removes it).
+    /// Consume a challenge nonce. Returns true if it was registered AND still
+    /// within its TTL; in either failure mode (never-issued, already-consumed,
+    /// or expired-but-not-yet-swept) we return false without distinguishing —
+    /// callers must surface the same "challenge not recognized" error to avoid
+    /// leaking whether a nonce was swept vs never-issued.
     pub async fn take_challenge(&self, nonce: &str) -> bool {
-        self.pending_challenges.write().await.remove(nonce)
+        let mut guard = self.pending_challenges.write().await;
+        match guard.remove(nonce) {
+            Some(issued_at) if issued_at.elapsed() <= self.challenge_ttl => true,
+            // Either no entry or stale entry — fall through to the same false.
+            _ => false,
+        }
     }
 
     /// Check if a `<local>@<suffix>` alias is already attested. Returns the
@@ -166,6 +217,36 @@ impl AppState {
             .await??;
         Ok(row.map(|r| r.did))
     }
+}
+
+/// Spawn a background task that drops challenge nonces older than `ttl`
+/// every `ttl / 2`. The task holds a clone of the inner `Arc<RwLock<...>>`,
+/// so when `AppState` is dropped the task continues briefly until the last
+/// strong reference goes away — acceptable for v0.0.3 since the nameserver
+/// only constructs `AppState` once per process. No teardown signaling: the
+/// sweeper exits naturally when the map's last `Arc` is dropped (we check
+/// `Arc::strong_count` each tick).
+fn spawn_challenge_sweeper(pending: Arc<RwLock<HashMap<String, Instant>>>, ttl: Duration) {
+    // Sweep at half the TTL so worst-case expired-but-still-present is bounded
+    // by ttl/2. Floor at 1ms so test TTLs near zero don't spin.
+    let interval = std::cmp::max(ttl / 2, Duration::from_millis(1));
+    let weak = Arc::downgrade(&pending);
+    drop(pending); // don't keep AppState alive ourselves
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // First tick fires immediately; skip it so we don't sweep an empty map.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Some(pending) = weak.upgrade() else {
+                // AppState gone — stop sweeping.
+                break;
+            };
+            let mut guard = pending.write().await;
+            guard.retain(|_, issued_at| issued_at.elapsed() <= ttl);
+        }
+    });
 }
 
 fn load_or_generate_server_key(path: &str) -> Result<SigningKey> {
@@ -233,6 +314,30 @@ mod tests {
         assert!(state.take_challenge("nonce-1").await);
         // Already taken — consumed
         assert!(!state.take_challenge("nonce-1").await);
+    }
+
+    #[tokio::test]
+    async fn challenge_nonces_expire_after_ttl() {
+        // Tight TTL so the test doesn't sit in the runtime for 60s.
+        let state =
+            AppState::for_test_with_short_challenge_ttl(std::time::Duration::from_millis(50))
+                .unwrap();
+
+        state.remember_challenge("nonce-a").await;
+        // Fresh: consume succeeds.
+        assert!(
+            state.take_challenge("nonce-a").await,
+            "fresh challenge must be accepted"
+        );
+
+        state.remember_challenge("nonce-b").await;
+        // Wait past the TTL and the sweep interval (sweep = ttl/2 = 25ms,
+        // so 200ms guarantees at least one sweep has fired and dropped it).
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !state.take_challenge("nonce-b").await,
+            "expired challenge must be rejected"
+        );
     }
 
     #[tokio::test]

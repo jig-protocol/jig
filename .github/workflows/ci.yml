@@ -44,9 +44,8 @@ jobs:
             -p integration-tests \
             -p jig-bridge-core
       - name: Clippy (v0.0.2 surface)
-        # `-A` suppresses style-nudge lints that pre-existing legacy code
-        # (jig-config/src/validation.rs, jig-nameserver/src/*) surfaces under
-        # stable rust 1.95. Pre-existing debt — tighten as we audit each crate.
+        # All clippy lints enforced; alpha.1c #10 cleaned up the legacy
+        # v0.0.1 lint debt that the previous `-A` mute list was carrying.
         run: |
           cargo clippy \
             -p jig-core \
@@ -56,15 +55,7 @@ jobs:
             -p text-block \
             -p integration-tests \
             -p jig-bridge-core \
-            -- -D warnings \
-            -A clippy::derivable_impls \
-            -A clippy::collapsible_match \
-            -A clippy::collapsible_if \
-            -A clippy::unnecessary_sort_by \
-            -A clippy::field_reassign_with_default \
-            -A clippy::bool_assert_comparison \
-            -A clippy::uninlined_format_args \
-            -A clippy::useless_vec
+            -- -D warnings
       - name: Nextest (v0.0.2 surface)
         run: |
           cargo install cargo-nextest --locked
@@ -98,68 +89,6 @@ jobs:
       - name: Verify wasm artifact exists
         working-directory: .
         run: test -f repos/target/wasm32-wasip1/release/text_block.wasm
-
-  jig-server-matrix:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: default
-            features: ""
-          - name: telemetry
-            features: "telemetry_v0_2"
-          - name: duckdb
-            features: "analytics_duckdb"
-          - name: parquet
-            features: "analytics_parquet"
-          - name: clickhouse
-            features: "analytics_clickhouse"
-    # These exercise pre-v0.0.2 jig-server feature flags. v0.0.2 didn't
-    # audit them; allowed to fail without blocking the PR until we
-    # explicitly take them on.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: repos
-      - name: Clippy (jig-server ${{ matrix.name }})
-        run: |
-          if [ -z "${{ matrix.features }}" ]; then
-            cargo clippy -p jig-server -- -D warnings
-          else
-            cargo clippy -p jig-server --features "${{ matrix.features }}" -- -D warnings
-          fi
-      - name: Nextest (jig-server ${{ matrix.name }})
-        run: |
-          cargo install cargo-nextest --locked
-          if [ -z "${{ matrix.features }}" ]; then
-            cargo nextest run -p jig-server
-          else
-            cargo nextest run -p jig-server --features "${{ matrix.features }}"
-          fi
-
-  e2e-receipt:
-    runs-on: ubuntu-latest
-    # Pre-existing legacy transport receipt script; not v0.0.2 path.
-    # Surface as advisory until we either port to the v0.0.2 surface
-    # or retire it.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: repos
-      - name: Install tooling
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq xxd
-      - name: Run transport receipt path
-        working-directory: .
-        run: bash repos/integration-tests/transport-tests/receipt_path.sh
 
   license-compliance:
     runs-on: ubuntu-latest

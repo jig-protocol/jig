@@ -116,6 +116,14 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, conn_id: u64
                 let frame = Envelope::new(Frame::Block {
                     bundle_b64: base64::engine::general_purpose::STANDARD
                         .encode(&block.bundle_bytes),
+                    sig_b64: if block.sender_sig.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            base64::engine::general_purpose::STANDARD
+                                .encode(&block.sender_sig),
+                        )
+                    },
                     receipts,
                     delivery_cid: format!("delivery:{}", block.cid),
                 });

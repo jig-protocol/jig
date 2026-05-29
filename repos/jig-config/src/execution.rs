@@ -603,7 +603,7 @@ mod tests {
         assert_eq!(base.fuel_max, 10_000_000);
         assert_eq!(base.memory_max_mb, 128);
         assert_eq!(base.execution_timeout_ms, 250); // Original preserved
-        assert_eq!(base.deterministic, false);
+        assert!(!base.deterministic);
         assert_eq!(base.import_allowlist, vec!["custom::*".to_string()]);
     }
 
@@ -721,8 +721,7 @@ mod tests {
             let config = CapabilityConfig::default_for_profile(profile);
             assert!(
                 config.default_grants.is_empty(),
-                "Profile {:?} should have zero ambient authority",
-                profile
+                "Profile {profile:?} should have zero ambient authority"
             );
         }
     }

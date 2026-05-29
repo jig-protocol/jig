@@ -644,14 +644,20 @@ max_peers = 0
 #[test]
 fn test_hot_reload_safe_configs() {
     // These configs should be safe to hot-reload
-    let mut rate_limits = RateLimitConfig::default();
-    rate_limits.per_key_limit = 120; // Adjusted dynamically
+    let rate_limits = RateLimitConfig {
+        per_key_limit: 120, // Adjusted dynamically
+        ..Default::default()
+    };
 
-    let mut penalties = PenaltyConfig::default();
-    penalties.decay_window_secs = 900; // Adjusted dynamically
+    let penalties = PenaltyConfig {
+        decay_window_secs: 900, // Adjusted dynamically
+        ..Default::default()
+    };
 
-    let mut gossip = GossipConfig::default();
-    gossip.interval_secs = 600; // Adjusted dynamically
+    let gossip = GossipConfig {
+        interval_secs: 600, // Adjusted dynamically
+        ..Default::default()
+    };
 
     // Verify adjustments
     assert_eq!(rate_limits.per_key_limit, 120);

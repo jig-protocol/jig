@@ -6,7 +6,7 @@ license = "AGPL-3.0-only"
 authors = ["Jig Protocol Contributors"]
 description = "Reference server implementation for Jig protocol"
 repository = "https://github.com/jig-protocol/jig-server"
-keywords = ["messaging", "server", "irc", "federation"]
+keywords = ["messaging", "server", "federation"]
 categories = ["network-programming"]
 
 [[bin]]
@@ -77,8 +77,13 @@ semver = "1.0"
 hickory-resolver = { version = "0.26", features = ["tokio"] }
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 
-# WebSocket
-tokio-tungstenite = "0.21"
+# WebSocket — rustls-tls-native-roots feature pulls in tokio-rustls 0.25 +
+# rustls 0.22 so we can install a custom rustls::ClientConfig at the
+# federation peer connect site (alpha.1c #4 — wires
+# `federation.dangerously_disable_federation_tls`).
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
+rustls = "0.22"
+rustls-pki-types = "1.0"
 dashmap = "5"
 jsonwebtoken = "9"
 wasmtime = { version = "16.0.0", features = ["async"] }
@@ -88,12 +93,7 @@ wasmtime-wasi = "16.0.0"
 hmac = "0.12"
 sha2 = "0.10"
 
-# Telemetry & Analytics (Phase 3)
-hdrhistogram = "7.5"
-duckdb = { version = "1.0", features = ["bundled"], optional = true }
-clickhouse = { version = "0.11", optional = true }
-arrow = { version = "54", optional = true }
-parquet = { version = "54", features = ["zstd"], optional = true }
+# Async traits (used by v0.0.2 bridge trait impls)
 async-trait = "0.1"
 
 [dev-dependencies]
@@ -102,11 +102,3 @@ tempfile = "3.8"
 [features]
 default = ["sqlite"]
 sqlite = []
-telemetry_v0_2 = []
-analytics_duckdb = ["dep:duckdb"]
-analytics_clickhouse = ["dep:clickhouse"]
-analytics_parquet = ["dep:arrow", "dep:parquet"]
-transports_irc = []
-transports_ssh = []
-transports_ws = []
-hyperscale = ["analytics_clickhouse", "transports_irc", "transports_ssh", "transports_ws"]

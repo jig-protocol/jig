@@ -302,6 +302,7 @@ mod tests {
             server_key: signing_key,
             fanout,
             server_url: server_url.clone(),
+            naively_allow_unknown_handles_fallback: false,
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));

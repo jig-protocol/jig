@@ -30,6 +30,13 @@ hex = { workspace = true }
 blake3 = { workspace = true }
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
+semver = "1.0"
 
 [dev-dependencies]
 wat = "1.0"
+# alpha.1c #4 (h_tls_verifier): drive a real TLS handshake against a
+# self-signed cert to verify dangerously_disable_federation_tls.
+rcgen = "0.13"
+tokio-rustls = "0.25"
+rustls = "0.22"
+rustls-pki-types = "1.0"

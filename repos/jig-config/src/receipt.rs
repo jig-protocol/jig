@@ -93,10 +93,11 @@ pub struct ReasonCodeTemplate {
 }
 
 /// Outcome status enum (mirrors jig-core OutcomeStatus).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutcomeStatus {
     /// Execution completed successfully
+    #[default]
     Ok,
 
     /// Soft failure (partial success, may retry)
@@ -104,12 +105,6 @@ pub enum OutcomeStatus {
 
     /// Hard failure (permanent error, do not retry)
     HardFail,
-}
-
-impl Default for OutcomeStatus {
-    fn default() -> Self {
-        Self::Ok
-    }
 }
 
 /// Retention and storage policies for receipts.

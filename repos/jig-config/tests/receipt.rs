@@ -145,8 +145,10 @@ fn test_canonicalization_is_default() {
     let rules = CanonicalizationRules::default();
     assert!(rules.is_default());
 
-    let mut custom_rules = CanonicalizationRules::default();
-    custom_rules.block_id_algorithm = "sha256".to_string();
+    let custom_rules = CanonicalizationRules {
+        block_id_algorithm: "sha256".to_string(),
+        ..Default::default()
+    };
     assert!(!custom_rules.is_default());
 }
 

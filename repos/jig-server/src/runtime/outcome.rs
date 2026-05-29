@@ -95,44 +95,6 @@ impl Outcome {
     }
 }
 
-/// Convert server Outcome to jig-core Outcome for receipt emission.
-#[cfg(feature = "telemetry_v0_2")]
-impl From<Outcome> for jig_core::Outcome {
-    fn from(outcome: Outcome) -> Self {
-        jig_core::Outcome {
-            status: match outcome.status {
-                OutcomeStatus::Ok => jig_core::OutcomeStatus::Ok,
-                OutcomeStatus::SoftFail => jig_core::OutcomeStatus::SoftFail,
-                OutcomeStatus::HardFail => jig_core::OutcomeStatus::HardFail,
-            },
-            affordances: outcome.affordances,
-            reason: map_reason_code(outcome.reason),
-        }
-    }
-}
-
-#[cfg(feature = "telemetry_v0_2")]
-fn map_reason_code(reason: Option<String>) -> Option<jig_core::ReasonCode> {
-    let s = reason?;
-    let norm = s.to_ascii_uppercase().replace(['-', ' '], "_");
-    use jig_core::ReasonCode as R;
-    Some(match norm.as_str() {
-        "NET_TIMEOUT" => R::NetTimeout,
-        "UPSTREAM5XX" | "UPSTREAM_5XX" => R::Upstream5xx,
-        "CAPABILITY_DENIED" => R::CapabilityDenied,
-        "MANIFEST_INVALID" => R::ManifestInvalid,
-        "NON_DETERMINISM_DETECTED" | "NONDETERMINISM_DETECTED" => R::NonDeterminismDetected,
-        "RENDER_MISMATCH" => R::RenderMismatch,
-        "RUNTIME_TIMEOUT" => R::RuntimeTimeout,
-        "RUNTIME_TRAP" => R::RuntimeTrap,
-        "FUEL_EXHAUSTED" => R::FuelExhausted,
-        "MEMORY_LIMIT_EXCEEDED" => R::MemoryLimitExceeded,
-        "TABLE_LIMIT_EXCEEDED" => R::TableLimitExceeded,
-        "HOST_PANIC" => R::HostPanic,
-        _ => R::Unknown,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

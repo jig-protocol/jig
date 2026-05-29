@@ -35,6 +35,11 @@ pub struct IngestContext {
     pub server_key: ed25519_dalek::SigningKey,
     pub fanout: Arc<Fanout>,
     pub server_url: String,
+    /// Antipattern carve-out: when true, identity mismatches at the
+    /// resolver step are logged as warnings and the block is admitted
+    /// anyway. Wired from `[identity] naively_allow_unknown_handles_fallback`.
+    /// Surfaces in `unsafe_options_active`.
+    pub naively_allow_unknown_handles_fallback: bool,
     // Wasm runtime is optional in v0.0.2 B6: Wasm-executable block kinds
     // fall back to the synthetic-receipt path. Phase D wires in the real
     // jig-runtime once text-render.wasm is loaded as a canonical artifact.
@@ -63,12 +68,15 @@ pub enum IngestError {
 /// Pipeline (each step bails on first error):
 ///
 /// 1. Verify the sender's ed25519 signature over canonical bundle bytes.
-/// 2. Validate `block_kind` against `allowed_block_kinds`.
-/// 3. Update the local HLC clock against the received timestamp.
-/// 4. Build a server-signed synthetic receipt (Wasm exec wired in Phase D).
-/// 5. Apply effects (channels/memberships/peers — Task B7 stub).
-/// 6. Persist block + receipt.
-/// 7. Fanout: local subscribers always; federated peers only if source
+/// 2. Resolve identity: if `manifest.metadata["nickname"]` is present, the
+///    configured `IdentityResolver` locks the binding (TOFU first-sight) or
+///    rejects a mismatched DID. Bypassed when `naively_allow_unknown_handles_fallback`.
+/// 3. Validate `block_kind` against `allowed_block_kinds`.
+/// 4. Update the local HLC clock against the received timestamp.
+/// 5. Build a server-signed synthetic receipt (Wasm exec wired in Phase D).
+/// 6. Apply effects (channels/memberships/peers — Task B7 stub).
+/// 7. Persist block + receipt.
+/// 8. Fanout: local subscribers always; federated peers only if source
 ///    isn't itself a federated peer (loop avoidance).
 pub async fn ingest(
     ctx: &IngestContext,
@@ -82,7 +90,39 @@ pub async fn ingest(
     // Step 1: signature verification
     verify_sig(bundle.manifest_bytes, bundle.code_bytes, &manifest, &sig)?;
 
-    // Step 2: block-kind whitelist
+    // Step 2: identity resolution (TOFU lock / nameserver verify).
+    //
+    // v0.0.2 blocks have no first-class nickname field; we read it from
+    // `manifest.metadata["nickname"]` when present. Blocks that omit the
+    // nickname are not subject to the lock at ingest time — the carve-out
+    // is documented in the H5 integration test. v0.0.3+ promotes channel/
+    // membership blocks to carry the identifier explicitly.
+    if let Some(nickname) = manifest.metadata.get("nickname").and_then(|v| v.as_str()) {
+        let sender_did = manifest
+            .authors
+            .first()
+            .map(|a| a.did.to_string())
+            .unwrap_or_default();
+        match ctx.identity.verify(nickname, &sender_did).await {
+            Ok(()) => {}
+            Err(err) => {
+                if ctx.naively_allow_unknown_handles_fallback {
+                    tracing::warn!(
+                        nickname = %nickname,
+                        sender_did = %sender_did,
+                        error = %err,
+                        "identity.naively_allow_unknown_handles_fallback=true: \
+                         admitting block despite identity-resolver rejection \
+                         (unsafe carve-out; lift in v0.0.3+)"
+                    );
+                } else {
+                    return Err(IngestError::Identity(err));
+                }
+            }
+        }
+    }
+
+    // Step 3: block-kind whitelist
     let kind = manifest.kind.ok_or(IngestError::KindRequired)?;
     let kind_str = kind.as_str();
     if !ctx.allowed_block_kinds.iter().any(|k| k == kind_str) {
@@ -292,6 +332,7 @@ mod tests {
             server_key,
             fanout: Arc::new(Fanout::new()),
             server_url: "ws://127.0.0.1:7117".to_string(),
+            naively_allow_unknown_handles_fallback: false,
         }
     }
 
