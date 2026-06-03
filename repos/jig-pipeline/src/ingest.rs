@@ -22,6 +22,10 @@ pub enum IngestSource {
     LocalClient { conn_id: u64 },
     FederatedPeer { peer_did: Did, peer_url: String },
     AdminEndpoint,
+    /// Submitted by an in-process bridge (e.g. the email bridge translating
+    /// inbound mail). Behaves like a local submission for fanout + origin
+    /// tagging.
+    Bridge,
 }
 
 /// All resources the ingest pipeline needs. Constructed once at server
@@ -206,17 +210,33 @@ pub async fn ingest(
     };
     ctx.store.insert_receipt(&stored_receipt)?;
 
+    // Channel membership for bridge-sink dispatch (empty if the block has no
+    // channel or the channel has no recorded members).
+    let member_dids: Vec<String> = match stored_block.channel_id.as_deref() {
+        Some(chan) => ctx
+            .store
+            .list_members(chan)
+            .map(|ms| ms.into_iter().map(|m| m.member_did).collect())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+
     // Step 7: fanout — broadcast policy depends on source
     match source {
         IngestSource::FederatedPeer { .. } => {
+            // Federated source: locals + bridge sinks, but NOT re-broadcast to
+            // peers (would cause a relay loop).
             ctx.fanout
                 .broadcast_local_only(&stored_block, &stored_receipt)
                 .await
                 .map_err(IngestError::Other)?;
-        }
-        IngestSource::LocalClient { .. } | IngestSource::AdminEndpoint => {
             ctx.fanout
-                .broadcast(&stored_block, &stored_receipt)
+                .dispatch_to_bridges_public(&stored_block, &stored_receipt, &member_dids)
+                .await;
+        }
+        IngestSource::LocalClient { .. } | IngestSource::AdminEndpoint | IngestSource::Bridge => {
+            ctx.fanout
+                .broadcast_with_members(&stored_block, &stored_receipt, &member_dids)
                 .await
                 .map_err(IngestError::Other)?;
         }
@@ -473,5 +493,78 @@ mod tests {
             .unwrap();
         let stored = ctx.store.get_block(&cid).unwrap().unwrap();
         assert_eq!(stored.channel_id.as_deref(), Some("#hello"));
+    }
+
+    #[tokio::test]
+    async fn ingest_dispatches_to_bridge_sink_for_managed_member() {
+        use crate::persist::{StoredChannel, StoredMembership};
+        let ctx = test_ctx(); // allows "text-render"
+        let bob_key = random_signing_key();
+        let bob_did = Did::from_ed25519_pubkey(bob_key.verifying_key().as_bytes()).to_string();
+
+        // A shadow DID for alice, registered as a bridge sink.
+        let shadow = "did:jig:zShadowAlice".to_string();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.fanout.register_bridge_did(shadow.clone(), tx).await;
+
+        // Channel "#dm/x" with members [bob, shadow].
+        ctx.store
+            .upsert_channel(&StoredChannel {
+                id: "#dm/x".into(),
+                slug: "#dm/x".into(),
+                visibility: "restricted".into(),
+                created_at: 0,
+                owner_did: bob_did.clone(),
+            })
+            .unwrap();
+        for did in [bob_did.clone(), shadow.clone()] {
+            ctx.store
+                .upsert_membership(&StoredMembership {
+                    channel_id: "#dm/x".into(),
+                    member_did: did,
+                    role: "member".into(),
+                    joined_at: 0,
+                    source_block_cid: "seed".into(),
+                })
+                .unwrap();
+        }
+
+        // bob posts a text-render to #dm/x.
+        let (mb, cb, sig) =
+            build_bundle_parts_with_channel(&bob_key, BlockKind::TextRender, "#dm/x");
+        do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap();
+
+        let got = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("bridge sink should receive within timeout")
+            .expect("a delivery");
+        assert_eq!(got.0.channel_id.as_deref(), Some("#dm/x"));
+        assert_eq!(got.0.sender_did, bob_did);
+    }
+
+    #[tokio::test]
+    async fn ingest_bridge_source_broadcasts_like_local() {
+        // A block ingested with IngestSource::Bridge should reach a local
+        // channel subscriber (full broadcast), same as LocalClient.
+        let ctx = test_ctx();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.fanout
+            .subscribe_local(
+                crate::fanout::SubscriptionScope::Channel("#dm/y".to_string()),
+                tx,
+            )
+            .await;
+        let key = random_signing_key();
+        let (mb, cb, sig) = build_bundle_parts_with_channel(&key, BlockKind::TextRender, "#dm/y");
+        do_ingest(&ctx, mb, cb, sig, IngestSource::Bridge)
+            .await
+            .unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("local sub should receive")
+            .expect("a delivery");
+        assert_eq!(got.0.channel_id.as_deref(), Some("#dm/y"));
     }
 }
