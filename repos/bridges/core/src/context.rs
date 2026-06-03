@@ -1,12 +1,17 @@
-//! [`BridgeContext`] + denial types.
+//! [`BridgeContext`] + the handles a bridge receives at `start()`.
 //!
-//! `BridgeContext` (Task A3) is what `Bridge::start` receives. It carries:
-//! - `submit`: push translated blocks into ingest (may be denied)
-//! - `subscribe`: watch channels for outbound-triggering events
+//! `BridgeContext` is what `Bridge::start` receives. It carries:
+//! - `submit`: push translated blocks into ingest (may be denied — see [`SubmitDenied`])
+//! - `subscribe`: watch channels for deliveries (unused by server-driven bridges)
 //! - `config`: the bridge-specific `[bridge.<name>.config]` TOML table
+//! - `storage`: the server's canonical [`crate::BridgeStorage`] backend (no bridge-owned DB)
+//! - `managed_dids`: a [`ManagedDidRegistrar`] for DIDs the bridge owns, so the
+//!   server routes those channels' deliveries to [`crate::Bridge::outbound`]
+//! - `mount_router` (with the `web` feature): a [`crate::web::RouterMount`] for
+//!   registering HTTP routes under `/_bridge/<name>/`
 //!
-//! This task (A2) introduces the [`SubmitDenied`] error type that the
-//! submit handle returns when server policy rejects a submission.
+//! [`SubmitDenied`] is the error the submit handle returns when server policy
+//! rejects a submission; the bridge must translate it back to its transport.
 
 use thiserror::Error;
 
@@ -141,6 +146,12 @@ impl ManagedDidRegistrar {
         Self { inner: Arc::new(f) }
     }
     /// Register `did` as owned by this bridge.
+    ///
+    /// Registration is infallible and idempotent: the server-supplied callback
+    /// inserts into a managed-DID map (re-registering the same DID is a no-op).
+    /// Keep it infallible — bridges call this on every shadow-DID mint, and a
+    /// fallible signature would force error handling on a hot path that can't
+    /// meaningfully fail.
     pub fn register(&self, did: String) {
         (self.inner)(did);
     }
