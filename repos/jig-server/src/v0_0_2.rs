@@ -37,6 +37,12 @@ pub struct AppState {
     /// from `config.bridges`; no bridges actually registered in alpha.1a
     /// (alpha.email is the first real registrant).
     pub bridges: Arc<crate::v0_0_2_bridges::BridgeRegistry>,
+    /// v0.0.3 (alpha.email): shared collector for bridge-contributed HTTP
+    /// routes. `build_v0_0_2_router` drains it and nests each under
+    /// `/_bridge/<name>/`. A bridge mounts into it during `start()` via its
+    /// `BridgeContext::mount_router`. Empty until PR2 registers a real bridge
+    /// in the boot path.
+    pub bridge_router_mount: jig_bridge_core::RouterMount,
 }
 
 impl AppState {
@@ -85,6 +91,7 @@ impl AppState {
             server_did,
             server_url,
             bridges,
+            bridge_router_mount: jig_bridge_core::RouterMount::new(),
         })
     }
 
@@ -126,6 +133,7 @@ impl AppState {
             server_did,
             server_url,
             bridges,
+            bridge_router_mount: jig_bridge_core::RouterMount::new(),
         })
     }
 }

@@ -63,11 +63,22 @@ pub fn build_v0_0_2_router(state: Arc<AppState>) -> Router {
     // REST block endpoints are always active (not debug-gated).
     let router = ws_router.merge(crate::v0_0_2_blocks::build_blocks_router(state.clone()));
 
-    if state.config.debug.admin_endpoints {
-        router.merge(crate::v0_0_2_admin::build_admin_router(state))
+    let mut router = if state.config.debug.admin_endpoints {
+        router.merge(crate::v0_0_2_admin::build_admin_router(state.clone()))
     } else {
         router
+    };
+
+    // Merge bridge-contributed routes under `/_bridge/<name>/`. Each drained
+    // sub-router is a `Router<()>` carrying its own state, so it nests cleanly
+    // into the already-state-applied `Router<()>` here. In PR1 nothing mounts
+    // (no real bridge is registered in the boot path yet), so this is a no-op;
+    // PR2's EmailBridge mounts its inbound webhook into `bridge_router_mount`
+    // during `start()`.
+    for (bridge_name, sub) in state.bridge_router_mount.drain() {
+        router = router.nest(&format!("/_bridge/{bridge_name}"), sub);
     }
+    router
 }
 
 // ---- Per-connection handler ------------------------------------------------

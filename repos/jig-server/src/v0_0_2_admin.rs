@@ -313,6 +313,7 @@ mod tests {
             server_did,
             server_url,
             bridges,
+            bridge_router_mount: jig_bridge_core::RouterMount::new(),
         })
     }
 
