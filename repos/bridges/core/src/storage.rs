@@ -45,8 +45,17 @@ mod tests {
 
     #[async_trait]
     impl BridgeStorage for MemStore {
-        async fn put(&self, ns: &str, key: &str, value: &[u8], expires_at: Option<i64>) -> Result<()> {
-            self.map.lock().unwrap().insert((ns.into(), key.into()), (value.to_vec(), expires_at));
+        async fn put(
+            &self,
+            ns: &str,
+            key: &str,
+            value: &[u8],
+            expires_at: Option<i64>,
+        ) -> Result<()> {
+            self.map
+                .lock()
+                .unwrap()
+                .insert((ns.into(), key.into()), (value.to_vec(), expires_at));
             Ok(())
         }
         async fn get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {
@@ -72,21 +81,32 @@ mod tests {
     #[tokio::test]
     async fn put_get_roundtrip() {
         let s = MemStore::default();
-        s.put("addrbook", "alice@example.com", b"did:jig:zShadow", None).await.unwrap();
-        assert_eq!(s.get("addrbook", "alice@example.com").await.unwrap().as_deref(), Some(&b"did:jig:zShadow"[..]));
+        s.put("addrbook", "alice@example.com", b"did:jig:zShadow", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get("addrbook", "alice@example.com")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(&b"did:jig:zShadow"[..])
+        );
     }
 
     #[tokio::test]
     async fn expired_entry_reads_none() {
-        let s = MemStore { now: 100, ..Default::default() };
-        s.put("addrbook", "k", b"v", Some(50)).await.unwrap();   // expired (50 <= 100)
+        let s = MemStore {
+            now: 100,
+            ..Default::default()
+        };
+        s.put("addrbook", "k", b"v", Some(50)).await.unwrap(); // expired (50 <= 100)
         assert!(s.get("addrbook", "k").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn delete_is_idempotent() {
         let s = MemStore::default();
-        s.delete("ns", "absent").await.unwrap();   // no panic
+        s.delete("ns", "absent").await.unwrap(); // no panic
         s.put("ns", "k", b"v", None).await.unwrap();
         s.delete("ns", "k").await.unwrap();
         assert!(s.get("ns", "k").await.unwrap().is_none());

@@ -88,7 +88,8 @@ impl Fanout {
     ) -> anyhow::Result<()> {
         self.broadcast_to_locals(block, receipt).await;
         self.broadcast_to_peers(block, receipt).await;
-        self.dispatch_to_bridges(block, receipt, channel_member_dids).await;
+        self.dispatch_to_bridges(block, receipt, channel_member_dids)
+            .await;
         Ok(())
     }
 
@@ -100,7 +101,8 @@ impl Fanout {
         receipt: &StoredReceipt,
         channel_member_dids: &[String],
     ) {
-        self.dispatch_to_bridges(block, receipt, channel_member_dids).await;
+        self.dispatch_to_bridges(block, receipt, channel_member_dids)
+            .await;
     }
 
     async fn dispatch_to_bridges(
@@ -364,18 +366,27 @@ mod tests {
     async fn bridge_sink_receives_when_managed_did_is_member_and_not_sender() {
         let f = Fanout::new();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        f.register_bridge_did("did:jig:zShadowAlice".to_string(), tx).await;
+        f.register_bridge_did("did:jig:zShadowAlice".to_string(), tx)
+            .await;
 
         // Block authored by bob (real), channel members = [bob, shadow-alice].
         let mut blk = sample_block(Some("#dm/x"), "text-render");
         blk.sender_did = "did:jig:zBob".to_string();
         f.broadcast_with_members(
-            &blk, &sample_receipt(),
-            &["did:jig:zBob".to_string(), "did:jig:zShadowAlice".to_string()],
-        ).await.unwrap();
+            &blk,
+            &sample_receipt(),
+            &[
+                "did:jig:zBob".to_string(),
+                "did:jig:zShadowAlice".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
 
         let got = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got.0.sender_did, "did:jig:zBob");
     }
 
@@ -383,30 +394,49 @@ mod tests {
     async fn bridge_sink_skips_when_managed_did_is_the_sender() {
         let f = Fanout::new();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        f.register_bridge_did("did:jig:zShadowAlice".to_string(), tx).await;
+        f.register_bridge_did("did:jig:zShadowAlice".to_string(), tx)
+            .await;
 
         // Inbound: block authored BY shadow-alice. Must not echo back to her.
         let mut blk = sample_block(Some("#dm/x"), "text-render");
         blk.sender_did = "did:jig:zShadowAlice".to_string();
         f.broadcast_with_members(
-            &blk, &sample_receipt(),
-            &["did:jig:zBob".to_string(), "did:jig:zShadowAlice".to_string()],
-        ).await.unwrap();
+            &blk,
+            &sample_receipt(),
+            &[
+                "did:jig:zBob".to_string(),
+                "did:jig:zShadowAlice".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
 
         let res = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
-        assert!(res.is_err(), "sender's own managed DID must not receive outbound");
+        assert!(
+            res.is_err(),
+            "sender's own managed DID must not receive outbound"
+        );
     }
 
     #[tokio::test]
     async fn unregister_bridge_did_stops_delivery() {
         let f = Fanout::new();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        f.register_bridge_did("did:jig:zShadowAlice".to_string(), tx).await;
+        f.register_bridge_did("did:jig:zShadowAlice".to_string(), tx)
+            .await;
         f.unregister_bridge_did("did:jig:zShadowAlice").await;
         let mut blk = sample_block(Some("#dm/x"), "text-render");
         blk.sender_did = "did:jig:zBob".to_string();
-        f.broadcast_with_members(&blk, &sample_receipt(),
-            &["did:jig:zBob".to_string(), "did:jig:zShadowAlice".to_string()]).await.unwrap();
+        f.broadcast_with_members(
+            &blk,
+            &sample_receipt(),
+            &[
+                "did:jig:zBob".to_string(),
+                "did:jig:zShadowAlice".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
         let res = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
         let no_delivery = res.is_err() || matches!(res, Ok(None));
         assert!(no_delivery, "unregistered bridge DID should not receive");

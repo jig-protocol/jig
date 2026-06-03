@@ -1022,8 +1022,14 @@ mod tests {
     fn bridge_kv_put_get_expiry_delete_sweep() {
         let s = SqliteStore::open_in_memory().unwrap();
         // put + get (no expiry)
-        s.bridge_kv_put("email", "addrbook", "alice@example.com", b"did:jig:zS", None)
-            .unwrap();
+        s.bridge_kv_put(
+            "email",
+            "addrbook",
+            "alice@example.com",
+            b"did:jig:zS",
+            None,
+        )
+        .unwrap();
         assert_eq!(
             s.bridge_kv_get("email", "addrbook", "alice@example.com", 0)
                 .unwrap()

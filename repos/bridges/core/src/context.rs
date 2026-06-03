@@ -373,9 +373,17 @@ mod tests {
     struct NoopStorage;
     #[async_trait::async_trait]
     impl crate::BridgeStorage for NoopStorage {
-        async fn put(&self, _: &str, _: &str, _: &[u8], _: Option<i64>) -> anyhow::Result<()> { Ok(()) }
-        async fn get(&self, _: &str, _: &str) -> anyhow::Result<Option<Vec<u8>>> { Ok(None) }
-        async fn delete(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn sweep_expired(&self, _: &str) -> anyhow::Result<u64> { Ok(0) }
+        async fn put(&self, _: &str, _: &str, _: &[u8], _: Option<i64>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get(&self, _: &str, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn delete(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn sweep_expired(&self, _: &str) -> anyhow::Result<u64> {
+            Ok(0)
+        }
     }
 }

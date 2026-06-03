@@ -56,6 +56,10 @@ jobs:
             -p integration-tests \
             -p jig-bridge-core \
             -- -D warnings
+      - name: Clippy (jig-bridge-core web feature)
+        # The webhook-mount path (RouterMount + cfg'd BridgeContext field) is
+        # gated behind the `web` feature; lint it explicitly so it's covered.
+        run: cargo clippy -p jig-bridge-core --all-targets --features web -- -D warnings
       - name: Nextest (v0.0.2 surface)
         run: |
           cargo install cargo-nextest --locked
@@ -71,6 +75,8 @@ jobs:
             -p integration-tests \
             -p jig-bridge-core \
             -p jig-bridge-email
+      - name: Nextest (jig-bridge-core web feature)
+        run: cargo nextest run -p jig-bridge-core --features web
 
   wasm-build:
     name: wasm-build (text-block, wasm32-wasip1)

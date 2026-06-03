@@ -44,7 +44,9 @@ impl BridgeStorage for SqliteBridgeStorage {
         Ok(())
     }
     async fn sweep_expired(&self, ns: &str) -> Result<u64> {
-        Ok(self.store.bridge_kv_sweep(&self.bridge_name, ns, Self::now())?)
+        Ok(self
+            .store
+            .bridge_kv_sweep(&self.bridge_name, ns, Self::now())?)
     }
 }
 
@@ -60,7 +62,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            s.get("addrbook", "alice@example.com").await.unwrap().as_deref(),
+            s.get("addrbook", "alice@example.com")
+                .await
+                .unwrap()
+                .as_deref(),
             Some(&b"did:jig:zS"[..])
         );
         s.delete("addrbook", "alice@example.com").await.unwrap();

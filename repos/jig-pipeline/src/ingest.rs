@@ -19,8 +19,13 @@ use crate::persist::{SqliteStore, StoredBlock, StoredReceipt};
 /// blocks ARE broadcast to peers.
 #[derive(Debug, Clone)]
 pub enum IngestSource {
-    LocalClient { conn_id: u64 },
-    FederatedPeer { peer_did: Did, peer_url: String },
+    LocalClient {
+        conn_id: u64,
+    },
+    FederatedPeer {
+        peer_did: Did,
+        peer_url: String,
+    },
     AdminEndpoint,
     /// Submitted by an in-process bridge (e.g. the email bridge translating
     /// inbound mail). Behaves like a local submission for fanout + origin
