@@ -165,9 +165,16 @@ pub async fn ingest(
     let hlc = manifest.hlc_ts.as_ref();
     let stored_block = StoredBlock {
         cid: block_cid.clone(),
-        // channel_id is not yet a first-class manifest field in v0.0.2;
-        // it lives in manifest metadata. Populated in v0.0.3+.
-        channel_id: None,
+        // Lift the channel slug from manifest metadata into the first-class
+        // column so channel-scoped fanout + the bridge sink can find it.
+        // text-render / member-add use metadata["channel"]; channel-create
+        // uses metadata["slug"].
+        channel_id: manifest
+            .metadata
+            .get("channel")
+            .or_else(|| manifest.metadata.get("slug"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         block_kind: kind_str.to_string(),
         sender_did: sender_did_str,
         sender_sig: sig,
@@ -359,6 +366,35 @@ mod tests {
         (manifest_bytes, code_bytes, sig)
     }
 
+    /// Like `build_bundle_parts` but sets `metadata["channel"]` so we can test
+    /// the channel_id lift. jig-pipeline can't use jig-client (dep cycle), so
+    /// we set metadata directly on the manifest.
+    fn build_bundle_parts_with_channel(
+        signing_key: &SigningKey,
+        kind: BlockKind,
+        channel: &str,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let sender_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
+        let mut manifest = BlockManifest::builder()
+            .version(Version::new(0, 1, 0))
+            .author(Author {
+                did: sender_did,
+                public_key: None,
+                roles: vec![],
+            })
+            .build()
+            .unwrap()
+            .with_kind(kind);
+        manifest
+            .metadata
+            .insert("channel".to_string(), serde_json::json!(channel));
+        let manifest_bytes = manifest.to_canonical_bytes().unwrap();
+        let code_bytes: Vec<u8> = vec![];
+        let canonical = serde_json::to_vec(&(&manifest_bytes, &code_bytes)).unwrap();
+        let sig = signing_key.sign(&canonical).to_bytes().to_vec();
+        (manifest_bytes, code_bytes, sig)
+    }
+
     /// Ingest from owned vecs. Uses Box::leak to satisfy BlockBundle's reference
     /// lifetimes — intentional test-only leak (bounded; one per test invocation).
     async fn do_ingest(
@@ -424,5 +460,18 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, IngestError::InvalidSignature));
+    }
+
+    #[tokio::test]
+    async fn ingest_lifts_channel_id_from_metadata() {
+        let ctx = test_ctx(); // allows "text-render"
+        let sender_key = random_signing_key();
+        let (mb, cb, sig) =
+            build_bundle_parts_with_channel(&sender_key, BlockKind::TextRender, "#hello");
+        let cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap();
+        let stored = ctx.store.get_block(&cid).unwrap().unwrap();
+        assert_eq!(stored.channel_id.as_deref(), Some("#hello"));
     }
 }
