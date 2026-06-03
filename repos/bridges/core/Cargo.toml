@@ -18,6 +18,12 @@ toml = { workspace = true }
 # the workspace level, narrow here with `features = ["sync"]` and verify
 # nothing in dev-deps requires "macros + rt-multi-thread" separately.
 tokio = { workspace = true }
+axum = { workspace = true, optional = true }
+
+[features]
+# HTTP-capable bridges (email webhook, future REST bridges) opt in. Non-HTTP
+# bridges (e.g. a future IRC bridge) skip the axum dependency entirely.
+web = ["dep:axum"]
 
 [dev-dependencies]
 tokio = { workspace = true }
