@@ -107,8 +107,14 @@ struct StoredResolution {
 impl From<&Resolution> for StoredResolution {
     fn from(r: &Resolution) -> Self {
         match r {
-            Resolution::NativeJig(d) => Self { kind: "native".into(), did: d.clone() },
-            Resolution::EmailShadow(d) => Self { kind: "shadow".into(), did: d.clone() },
+            Resolution::NativeJig(d) => Self {
+                kind: "native".into(),
+                did: d.clone(),
+            },
+            Resolution::EmailShadow(d) => Self {
+                kind: "shadow".into(),
+                did: d.clone(),
+            },
         }
     }
 }
@@ -135,12 +141,26 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl BridgeStorage for MemStore {
-        async fn put(&self, ns: &str, key: &str, value: &[u8], _expires_at: Option<i64>) -> Result<()> {
-            self.map.lock().unwrap().insert((ns.into(), key.into()), value.to_vec());
+        async fn put(
+            &self,
+            ns: &str,
+            key: &str,
+            value: &[u8],
+            _expires_at: Option<i64>,
+        ) -> Result<()> {
+            self.map
+                .lock()
+                .unwrap()
+                .insert((ns.into(), key.into()), value.to_vec());
             Ok(())
         }
         async fn get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {
-            Ok(self.map.lock().unwrap().get(&(ns.into(), key.into())).cloned())
+            Ok(self
+                .map
+                .lock()
+                .unwrap()
+                .get(&(ns.into(), key.into()))
+                .cloned())
         }
         async fn delete(&self, ns: &str, key: &str) -> Result<()> {
             self.map.lock().unwrap().remove(&(ns.into(), key.into()));
@@ -164,7 +184,13 @@ mod tests {
         let r2 = ab.resolve("alice@example.com").await.unwrap();
         assert_eq!(r1, r2);
         // The entry is actually in storage under the addrbook ns.
-        assert!(storage.get("addrbook", "alice@example.com").await.unwrap().is_some());
+        assert!(
+            storage
+                .get("addrbook", "alice@example.com")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -173,7 +199,13 @@ mod tests {
         let ab = AddressBook::new(storage.clone(), None, "secret".into(), false, 3600);
         let _ = ab.resolve("alice@example.com").await.unwrap();
         ab.invalidate("alice@example.com").await.unwrap();
-        assert!(storage.get("addrbook", "alice@example.com").await.unwrap().is_none());
+        assert!(
+            storage
+                .get("addrbook", "alice@example.com")
+                .await
+                .unwrap()
+                .is_none()
+        );
         // resolve again — still shadow (deterministic), exercising the miss path.
         let r = ab.resolve("alice@example.com").await.unwrap();
         assert!(matches!(r, Resolution::EmailShadow(_)));
@@ -184,7 +216,8 @@ mod tests {
         let storage = test_storage();
         let ab = AddressBook::new(storage, None, "secret".into(), false, 3600);
         let r = ab.resolve("alice@example.com").await.unwrap();
-        let expected = identity::shadow_did("secret", "alice@example.com", false).to_did_jig_string();
+        let expected =
+            identity::shadow_did("secret", "alice@example.com", false).to_did_jig_string();
         assert_eq!(r.did(), expected);
     }
 }

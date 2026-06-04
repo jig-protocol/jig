@@ -31,7 +31,11 @@ pub struct InboundState {
 }
 
 /// Handle one provider webhook POST. Returns the HTTP status to reply with.
-pub async fn handle_inbound(state: Arc<InboundState>, headers: HeaderMap, body: Bytes) -> StatusCode {
+pub async fn handle_inbound(
+    state: Arc<InboundState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
     if state.provider.verify_webhook(&headers, &body).is_err() {
         return StatusCode::UNAUTHORIZED;
     }
@@ -45,12 +49,19 @@ pub async fn handle_inbound(state: Arc<InboundState>, headers: HeaderMap, body: 
     };
 
     if email.body.len() > MAX_INLINE_BYTES {
-        tracing::warn!("email bridge: inbound body {} bytes exceeds cap, rejecting", email.body.len());
+        tracing::warn!(
+            "email bridge: inbound body {} bytes exceeds cap, rejecting",
+            email.body.len()
+        );
         return StatusCode::PAYLOAD_TOO_LARGE;
     }
 
     // Dedup on the provider's stable message id (handles provider redelivery).
-    match state.storage.get(INBOUND_SEEN_NS, &email.provider_message_id).await {
+    match state
+        .storage
+        .get(INBOUND_SEEN_NS, &email.provider_message_id)
+        .await
+    {
         Ok(Some(_)) => return StatusCode::OK,
         Ok(None) => {}
         Err(e) => {
@@ -80,8 +91,14 @@ pub async fn handle_inbound(state: Arc<InboundState>, headers: HeaderMap, body: 
 
     let slug = dm_channel_slug(&shadow_did, &recipient_did);
 
-    if let Err(e) =
-        ensure_dm_channel(&state.submit, &*state.storage, &shadow, &recipient_did, &slug).await
+    if let Err(e) = ensure_dm_channel(
+        &state.submit,
+        &*state.storage,
+        &shadow,
+        &recipient_did,
+        &slug,
+    )
+    .await
     {
         tracing::error!("email bridge: ensure channel {slug} failed: {e}");
         return StatusCode::BAD_GATEWAY;
@@ -90,7 +107,11 @@ pub async fn handle_inbound(state: Arc<InboundState>, headers: HeaderMap, body: 
     // Record slug -> external sender email so outbound() can find the recipient
     // when the Jig user replies (shadow DIDs are KDF-derived, not reversible).
     // Best-effort; last writer wins for a 1:1 conversation.
-    if let Err(e) = state.storage.put("channel-email", &slug, email.from.as_bytes(), None).await {
+    if let Err(e) = state
+        .storage
+        .put("channel-email", &slug, email.from.as_bytes(), None)
+        .await
+    {
         tracing::warn!("email bridge: failed to record channel-email map for {slug}: {e}");
     }
 
@@ -104,7 +125,12 @@ pub async fn handle_inbound(state: Arc<InboundState>, headers: HeaderMap, body: 
             let expires = chrono::Utc::now().timestamp() + INBOUND_SEEN_TTL_SECS;
             if let Err(e) = state
                 .storage
-                .put(INBOUND_SEEN_NS, &email.provider_message_id, b"1", Some(expires))
+                .put(
+                    INBOUND_SEEN_NS,
+                    &email.provider_message_id,
+                    b"1",
+                    Some(expires),
+                )
                 .await
             {
                 tracing::warn!("email bridge: failed to mark inbound-seen: {e}");
@@ -138,11 +164,19 @@ mod tests {
     #[async_trait]
     impl BridgeStorage for MemStore {
         async fn put(&self, ns: &str, key: &str, value: &[u8], _e: Option<i64>) -> Result<()> {
-            self.map.lock().unwrap().insert((ns.into(), key.into()), value.to_vec());
+            self.map
+                .lock()
+                .unwrap()
+                .insert((ns.into(), key.into()), value.to_vec());
             Ok(())
         }
         async fn get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {
-            Ok(self.map.lock().unwrap().get(&(ns.into(), key.into())).cloned())
+            Ok(self
+                .map
+                .lock()
+                .unwrap()
+                .get(&(ns.into(), key.into()))
+                .cloned())
         }
         async fn delete(&self, ns: &str, key: &str) -> Result<()> {
             self.map.lock().unwrap().remove(&(ns.into(), key.into()));
@@ -167,7 +201,11 @@ mod tests {
             Ok(self.email.clone())
         }
         fn verify_webhook(&self, _: &HeaderMap, _: &[u8]) -> Result<()> {
-            if self.verify_ok { Ok(()) } else { Err(anyhow::anyhow!("bad sig")) }
+            if self.verify_ok {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("bad sig"))
+            }
         }
     }
 
@@ -194,8 +232,13 @@ mod tests {
         storage: Arc<dyn BridgeStorage>,
         submit: SubmitHandle,
     ) -> InboundState {
-        let address_book =
-            Arc::new(AddressBook::new(storage.clone(), None, "secret".into(), false, 3600));
+        let address_book = Arc::new(AddressBook::new(
+            storage.clone(),
+            None,
+            "secret".into(),
+            false,
+            3600,
+        ));
         InboundState {
             provider,
             address_book,
@@ -218,17 +261,26 @@ mod tests {
         let sender = shadow_did("secret", "alice@example.com", false).to_did_jig_string();
         let recipient = shadow_did("secret", "dj@jig.onl", false).to_did_jig_string();
         let slug = dm_channel_slug(&sender, &recipient);
-        storage.put("channel-ensured", &slug, b"1", None).await.unwrap();
+        storage
+            .put("channel-ensured", &slug, b"1", None)
+            .await
+            .unwrap();
 
         let submit = SubmitHandle::new_for_test(move |_p: Vec<u8>| async move {
             Err::<String, SubmitDenied>(match denial_kind {
-                DenialKind::Rate => SubmitDenied::RateLimited { retry_after_secs: 1 },
-                DenialKind::Policy => SubmitDenied::PolicyBlocked { reason: "nope".into() },
+                DenialKind::Rate => SubmitDenied::RateLimited {
+                    retry_after_secs: 1,
+                },
+                DenialKind::Policy => SubmitDenied::PolicyBlocked {
+                    reason: "nope".into(),
+                },
                 DenialKind::Unavailable => SubmitDenied::Unavailable,
             })
         });
-        let provider: Arc<dyn EmailProvider> =
-            Arc::new(StubProvider { email: Some(sample_email("hi")), verify_ok: true });
+        let provider: Arc<dyn EmailProvider> = Arc::new(StubProvider {
+            email: Some(sample_email("hi")),
+            verify_ok: true,
+        });
         Arc::new(build_state(provider, storage, submit))
     }
 
@@ -251,10 +303,14 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_submits_text_render_then_dedupes() {
-        let provider = Arc::new(StubProvider { email: Some(sample_email("hello from alice")), verify_ok: true });
+        let provider = Arc::new(StubProvider {
+            email: Some(sample_email("hello from alice")),
+            verify_ok: true,
+        });
         let (state, submitted) = make_state(provider);
 
-        let code1 = handle_inbound(state.clone(), HeaderMap::new(), Bytes::from_static(b"{}")).await;
+        let code1 =
+            handle_inbound(state.clone(), HeaderMap::new(), Bytes::from_static(b"{}")).await;
         assert_eq!(code1, StatusCode::OK);
         let n1 = submitted.lock().unwrap().len();
         assert!(n1 >= 1, "should have submitted at least the text-render");
@@ -264,19 +320,33 @@ mod tests {
         let (manifest_bytes, _code, _sig): (Vec<u8>, Vec<u8>, Vec<u8>) =
             serde_json::from_slice(&last).unwrap();
         let manifest: jig_core::BlockManifest = serde_json::from_slice(&manifest_bytes).unwrap();
-        assert_eq!(manifest.metadata.get("body").and_then(|v| v.as_str()), Some("hello from alice"));
+        assert_eq!(
+            manifest.metadata.get("body").and_then(|v| v.as_str()),
+            Some("hello from alice")
+        );
         let expected_shadow = shadow_did("secret", "alice@example.com", false).to_did_jig_string();
-        assert_eq!(manifest.authors.first().unwrap().did.to_string(), expected_shadow);
+        assert_eq!(
+            manifest.authors.first().unwrap().did.to_string(),
+            expected_shadow
+        );
 
         // Second identical webhook (same provider_message_id) -> dedup, no new submits.
-        let code2 = handle_inbound(state.clone(), HeaderMap::new(), Bytes::from_static(b"{}")).await;
+        let code2 =
+            handle_inbound(state.clone(), HeaderMap::new(), Bytes::from_static(b"{}")).await;
         assert_eq!(code2, StatusCode::OK);
-        assert_eq!(submitted.lock().unwrap().len(), n1, "dedup: no second submit");
+        assert_eq!(
+            submitted.lock().unwrap().len(),
+            n1,
+            "dedup: no second submit"
+        );
     }
 
     #[tokio::test]
     async fn bad_signature_is_unauthorized() {
-        let provider = Arc::new(StubProvider { email: Some(sample_email("x")), verify_ok: false });
+        let provider = Arc::new(StubProvider {
+            email: Some(sample_email("x")),
+            verify_ok: false,
+        });
         let (state, submitted) = make_state(provider);
         let code = handle_inbound(state, HeaderMap::new(), Bytes::from_static(b"{}")).await;
         assert_eq!(code, StatusCode::UNAUTHORIZED);
@@ -285,7 +355,10 @@ mod tests {
 
     #[tokio::test]
     async fn non_deliverable_event_is_ok_no_submit() {
-        let provider = Arc::new(StubProvider { email: None, verify_ok: true });
+        let provider = Arc::new(StubProvider {
+            email: None,
+            verify_ok: true,
+        });
         let (state, submitted) = make_state(provider);
         let code = handle_inbound(state, HeaderMap::new(), Bytes::from_static(b"{}")).await;
         assert_eq!(code, StatusCode::OK);
@@ -295,7 +368,10 @@ mod tests {
     #[tokio::test]
     async fn oversized_body_is_413() {
         let big = "x".repeat(MAX_INLINE_BYTES + 1);
-        let provider = Arc::new(StubProvider { email: Some(sample_email(&big)), verify_ok: true });
+        let provider = Arc::new(StubProvider {
+            email: Some(sample_email(&big)),
+            verify_ok: true,
+        });
         let (state, submitted) = make_state(provider);
         let code = handle_inbound(state, HeaderMap::new(), Bytes::from_static(b"{}")).await;
         assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE);

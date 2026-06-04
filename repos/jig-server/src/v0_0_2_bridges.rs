@@ -213,7 +213,9 @@ fn build_email_bridge(
         .map(|b| toml::Value::Table(b.config.clone()))
         .unwrap_or_else(|| toml::Value::Table(Default::default()));
     let email_cfg = jig_bridge_email::EmailBridgeConfig::from_toml(&bcfg)?;
-    Ok(Box::new(jig_bridge_email::EmailBridge::from_config(email_cfg)))
+    Ok(Box::new(jig_bridge_email::EmailBridge::from_config(
+        email_cfg,
+    )))
 }
 
 /// Decode a bridge submit payload `(manifest_bytes, code_bytes, sig)` and run
@@ -643,7 +645,11 @@ mod tests {
 
         // The bridge actually started.
         assert!(
-            state.bridges.loaded_names().await.contains(&"email".to_string()),
+            state
+                .bridges
+                .loaded_names()
+                .await
+                .contains(&"email".to_string()),
             "email bridge should be in loaded_names after boot"
         );
 

@@ -26,7 +26,11 @@ pub struct ResendProvider {
 
 impl ResendProvider {
     pub fn new(api_key: String, webhook_secret: String) -> Self {
-        Self { api_key, webhook_secret, http: reqwest::Client::new() }
+        Self {
+            api_key,
+            webhook_secret,
+            http: reqwest::Client::new(),
+        }
     }
 }
 
@@ -66,10 +70,16 @@ impl EmailProvider for ResendProvider {
             return Ok(None);
         }
         let data = v.get("data").unwrap_or(&v);
-        let from = data.get("from").and_then(value_as_email).unwrap_or_default();
+        let from = data
+            .get("from")
+            .and_then(value_as_email)
+            .unwrap_or_default();
         let to = data.get("to").and_then(value_as_email).unwrap_or_default();
-        let subject =
-            data.get("subject").and_then(|s| s.as_str()).unwrap_or_default().to_string();
+        let subject = data
+            .get("subject")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string();
         let text = data
             .get("text")
             .or_else(|| data.get("body"))
@@ -85,7 +95,13 @@ impl EmailProvider for ResendProvider {
         if from.is_empty() || to.is_empty() || provider_message_id.is_empty() {
             bail!("resend inbound event missing required fields");
         }
-        Ok(Some(InboundEmail { from, to, subject, body: text, provider_message_id }))
+        Ok(Some(InboundEmail {
+            from,
+            to,
+            subject,
+            body: text,
+            provider_message_id,
+        }))
     }
 
     fn verify_webhook(&self, headers: &HeaderMap, body: &[u8]) -> Result<()> {
@@ -99,8 +115,10 @@ impl EmailProvider for ResendProvider {
         // ±5min window — so a *verbatim* captured webhook can be replayed.
         // Add a tolerance check against wall-clock before live Resend use.
 
-        let secret_b64 =
-            self.webhook_secret.strip_prefix("whsec_").unwrap_or(&self.webhook_secret);
+        let secret_b64 = self
+            .webhook_secret
+            .strip_prefix("whsec_")
+            .unwrap_or(&self.webhook_secret);
         let key = B64.decode(secret_b64).context("decoding webhook secret")?;
 
         let body_str = std::str::from_utf8(body).context("webhook body utf8")?;
@@ -120,7 +138,11 @@ impl EmailProvider for ResendProvider {
             .filter_map(|s| B64.decode(s).ok())
             .any(|candidate| mac.clone().verify_slice(&candidate).is_ok());
 
-        if matched { Ok(()) } else { bail!("svix signature mismatch") }
+        if matched {
+            Ok(())
+        } else {
+            bail!("svix signature mismatch")
+        }
     }
 }
 
@@ -140,7 +162,9 @@ fn value_as_email(v: &serde_json::Value) -> Option<String> {
     if let Some(arr) = v.as_array() {
         return arr.first().and_then(value_as_email);
     }
-    v.get("email").and_then(|e| e.as_str()).map(|s| s.to_string())
+    v.get("email")
+        .and_then(|e| e.as_str())
+        .map(|s| s.to_string())
 }
 
 #[cfg(test)]
@@ -182,7 +206,9 @@ mod tests {
         let ts = "1700000000";
         let sig = sign(TEST_SECRET, id, ts, body);
         let headers = svix_headers(id, ts, &sig);
-        provider().verify_webhook(&headers, body).expect("should verify");
+        provider()
+            .verify_webhook(&headers, body)
+            .expect("should verify");
     }
 
     #[test]
@@ -220,7 +246,9 @@ mod tests {
                 "email_id": "m_1"
             }
         }"#;
-        let result = provider().parse_webhook(&HeaderMap::new(), fixture).unwrap();
+        let result = provider()
+            .parse_webhook(&HeaderMap::new(), fixture)
+            .unwrap();
         let inbound = result.expect("should be Some for email.received");
         assert_eq!(inbound.from, "alice@example.com");
         assert_eq!(inbound.to, "bridge@jig.onl");
@@ -239,7 +267,9 @@ mod tests {
                 "to": "recipient@example.com"
             }
         }"#;
-        let result = provider().parse_webhook(&HeaderMap::new(), fixture).unwrap();
+        let result = provider()
+            .parse_webhook(&HeaderMap::new(), fixture)
+            .unwrap();
         assert!(result.is_none(), "delivery-status events should yield None");
     }
 
@@ -257,7 +287,9 @@ mod tests {
                 "text": "bounce notification"
             }
         }"#;
-        let result = provider().parse_webhook(&HeaderMap::new(), fixture).unwrap();
+        let result = provider()
+            .parse_webhook(&HeaderMap::new(), fixture)
+            .unwrap();
         assert!(result.is_none(), "bounce events should yield None");
     }
 }

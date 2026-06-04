@@ -39,7 +39,11 @@ pub struct EmailBridge {
 impl EmailBridge {
     /// Production constructor — uses a `ResendProvider` built from config.
     pub fn from_config(config: EmailBridgeConfig) -> Self {
-        Self { config, injected_provider: None, outbound: None }
+        Self {
+            config,
+            injected_provider: None,
+            outbound: None,
+        }
     }
 
     /// Test/extension constructor — inject any `EmailProvider` (e.g. a mock).
@@ -47,7 +51,11 @@ impl EmailBridge {
         config: EmailBridgeConfig,
         provider: Arc<dyn EmailProvider>,
     ) -> Self {
-        Self { config, injected_provider: Some(provider), outbound: None }
+        Self {
+            config,
+            injected_provider: Some(provider),
+            outbound: None,
+        }
     }
 }
 
@@ -65,11 +73,16 @@ impl Bridge for EmailBridge {
                 // misconfiguration fails loudly at startup, not silently as a
                 // 401 on the first send/webhook.
                 let api_key = self.config.resend_api_key.clone().ok_or_else(|| {
-                    anyhow::anyhow!("email bridge: resend_api_key is required when provider = resend")
+                    anyhow::anyhow!(
+                        "email bridge: resend_api_key is required when provider = resend"
+                    )
                 })?;
-                let webhook_secret = self.config.resend_webhook_secret.clone().ok_or_else(|| {
-                    anyhow::anyhow!("email bridge: resend_webhook_secret is required when provider = resend")
-                })?;
+                let webhook_secret =
+                    self.config.resend_webhook_secret.clone().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "email bridge: resend_webhook_secret is required when provider = resend"
+                        )
+                    })?;
                 Arc::new(ResendProvider::new(api_key, webhook_secret))
             }
         };
@@ -122,12 +135,20 @@ impl Bridge for EmailBridge {
             .ok_or_else(|| anyhow::anyhow!("email bridge outbound() called before start()"))?;
 
         // Dedup on the delivery CID (the fanout layer may deliver more than once).
-        if octx.storage.get(OUTBOUND_SEEN_NS, &block.delivery_cid).await?.is_some() {
+        if octx
+            .storage
+            .get(OUTBOUND_SEEN_NS, &block.delivery_cid)
+            .await?
+            .is_some()
+        {
             return Ok(());
         }
 
         let Some((slug, author_did)) = decode_channel_and_author(&block.bundle_b64) else {
-            tracing::warn!("email bridge: undecodable outbound block {}", block.delivery_cid);
+            tracing::warn!(
+                "email bridge: undecodable outbound block {}",
+                block.delivery_cid
+            );
             return Ok(());
         };
 
@@ -137,7 +158,9 @@ impl Bridge for EmailBridge {
         let to = match octx.storage.get(CHANNEL_EMAIL_NS, &slug).await? {
             Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             None => {
-                tracing::warn!("email bridge: no recipient email mapped for channel {slug}, dropping outbound");
+                tracing::warn!(
+                    "email bridge: no recipient email mapped for channel {slug}, dropping outbound"
+                );
                 return Ok(());
             }
         };
@@ -150,7 +173,10 @@ impl Bridge for EmailBridge {
 
         match octx.provider.send(&email).await {
             Ok(_id) => {
-                let _ = octx.storage.put(OUTBOUND_SEEN_NS, &block.delivery_cid, b"1", None).await;
+                let _ = octx
+                    .storage
+                    .put(OUTBOUND_SEEN_NS, &block.delivery_cid, b"1", None)
+                    .await;
                 Ok(())
             }
             Err(e) => {
@@ -172,10 +198,16 @@ impl Bridge for EmailBridge {
 /// (via `outbound::decode_manifest`). When the outbound path is refactored,
 /// decode the manifest once and thread it through to avoid the double parse.
 fn decode_channel_and_author(bundle_b64: &str) -> Option<(String, String)> {
-    let raw = base64::engine::general_purpose::STANDARD.decode(bundle_b64).ok()?;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(bundle_b64)
+        .ok()?;
     let (manifest_bytes, _code): (Vec<u8>, Vec<u8>) = serde_json::from_slice(&raw).ok()?;
     let manifest: jig_core::BlockManifest = serde_json::from_slice(&manifest_bytes).ok()?;
-    let slug = manifest.metadata.get("channel").and_then(|v| v.as_str())?.to_string();
+    let slug = manifest
+        .metadata
+        .get("channel")
+        .and_then(|v| v.as_str())?
+        .to_string();
     let author = manifest.authors.first()?.did.to_string();
     Some((slug, author))
 }
@@ -210,11 +242,19 @@ mod tests {
     #[async_trait]
     impl BridgeStorage for MemStore {
         async fn put(&self, ns: &str, k: &str, v: &[u8], _e: Option<i64>) -> anyhow::Result<()> {
-            self.map.lock().unwrap().insert((ns.into(), k.into()), v.to_vec());
+            self.map
+                .lock()
+                .unwrap()
+                .insert((ns.into(), k.into()), v.to_vec());
             Ok(())
         }
         async fn get(&self, ns: &str, k: &str) -> anyhow::Result<Option<Vec<u8>>> {
-            Ok(self.map.lock().unwrap().get(&(ns.into(), k.into())).cloned())
+            Ok(self
+                .map
+                .lock()
+                .unwrap()
+                .get(&(ns.into(), k.into()))
+                .cloned())
         }
         async fn delete(&self, ns: &str, k: &str) -> anyhow::Result<()> {
             self.map.lock().unwrap().remove(&(ns.into(), k.into()));
@@ -260,7 +300,9 @@ mod tests {
     }
 
     fn test_ctx(storage: Arc<dyn BridgeStorage>, mount: RouterMount) -> BridgeContext {
-        let submit = SubmitHandle::new_for_test(|_p| async { Ok::<String, jig_bridge_core::SubmitDenied>("cid".into()) });
+        let submit = SubmitHandle::new_for_test(|_p| async {
+            Ok::<String, jig_bridge_core::SubmitDenied>("cid".into())
+        });
         BridgeContext::new_with_web(
             submit,
             SubscribeHandle::new_for_test(),
@@ -276,7 +318,10 @@ mod tests {
         let storage: Arc<dyn BridgeStorage> = Arc::new(MemStore::default());
         let mount = RouterMount::new();
         let mut bridge = EmailBridge::from_config(test_config());
-        bridge.start(test_ctx(storage, mount.clone())).await.unwrap();
+        bridge
+            .start(test_ctx(storage, mount.clone()))
+            .await
+            .unwrap();
         let drained = mount.drain();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].0, "email");
@@ -289,7 +334,10 @@ mod tests {
         cfg.resend_api_key = None;
         let storage: Arc<dyn BridgeStorage> = Arc::new(MemStore::default());
         let mut bridge = EmailBridge::from_config(cfg);
-        let err = bridge.start(test_ctx(storage, RouterMount::new())).await.unwrap_err();
+        let err = bridge
+            .start(test_ctx(storage, RouterMount::new()))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("resend_api_key"), "got: {err}");
     }
 
@@ -324,10 +372,16 @@ mod tests {
         };
 
         // Pre-seed the slug -> email map (the inbound handler would have done this).
-        storage.put("channel-email", &slug, b"alice@example.com", None).await.unwrap();
+        storage
+            .put("channel-email", &slug, b"alice@example.com", None)
+            .await
+            .unwrap();
 
         let mut bridge = EmailBridge::from_config_with_provider(test_config(), mock.clone());
-        bridge.start(test_ctx(storage.clone(), RouterMount::new())).await.unwrap();
+        bridge
+            .start(test_ctx(storage.clone(), RouterMount::new()))
+            .await
+            .unwrap();
 
         bridge.outbound(&delivered).await.unwrap();
         {
@@ -358,7 +412,10 @@ mod tests {
             delivery_cid: "deliv-2".into(),
         };
         let mut bridge = EmailBridge::from_config_with_provider(test_config(), mock.clone());
-        bridge.start(test_ctx(storage, RouterMount::new())).await.unwrap();
+        bridge
+            .start(test_ctx(storage, RouterMount::new()))
+            .await
+            .unwrap();
         bridge.outbound(&delivered).await.unwrap(); // no mapping -> Ok, no send
         assert_eq!(mock.sent.lock().unwrap().len(), 0);
     }

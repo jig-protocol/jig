@@ -20,8 +20,8 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use jig_bridge_email::{
-    EmailBridge, EmailBridgeConfig, EmailProvider, InboundEmail, OutboundEmail,
-    ProviderMessageId, dm_channel_slug, shadow_did, shadow_signing_key,
+    EmailBridge, EmailBridgeConfig, EmailProvider, InboundEmail, OutboundEmail, ProviderMessageId,
+    dm_channel_slug, shadow_did, shadow_signing_key,
 };
 use jig_config::v0_0_2_server::JigServerConfig;
 use jig_server::v0_0_2::AppState;
@@ -132,8 +132,11 @@ async fn setup_with_toml(
     // only overrides [bridges], so ServerSection uses its Default which
     // includes text-render + channel-create + member-add.)
     // Belt-and-suspenders: set explicitly so the test is self-documenting.
-    config.server.allowed_block_kinds =
-        vec!["text-render".into(), "channel-create".into(), "member-add".into()];
+    config.server.allowed_block_kinds = vec![
+        "text-render".into(),
+        "channel-create".into(),
+        "member-add".into(),
+    ];
 
     let db_path = tempdir.path().join("server.db");
     let state = Arc::new(AppState::new(config.clone(), db_path).expect("AppState::new"));
@@ -242,7 +245,11 @@ async fn inbound_webhook_creates_channel_and_lands_block() {
         .unwrap()
         .expect("DM channel must be created on first inbound");
 
-    let members = state.ingest_ctx.store.list_members(&chan.id).expect("list_members should succeed");
+    let members = state
+        .ingest_ctx
+        .store
+        .list_members(&chan.id)
+        .expect("list_members should succeed");
     let alice_did = shadow_did(SECRET, "alice@example.com", false).to_did_jig_string();
     assert!(
         members.iter().any(|m| m.member_did == alice_did),
@@ -283,8 +290,7 @@ async fn round_trip_reply_emails_original_sender() {
     let dj_sk = shadow_signing_key(SECRET, "dj@jig.onl", false);
     let dj = jig_client::Identity::from_signing_key(dj_sk);
     let hlc = jig_core::HlcTimestamp::now_wall(dj.did().clone());
-    let block =
-        jig_client::blocks::build_text_render(&dj, &slug, "reply from dj", hlc);
+    let block = jig_client::blocks::build_text_render(&dj, &slug, "reply from dj", hlc);
     let bundle = jig_core::BlockBundle {
         manifest_bytes: &block.manifest_bytes,
         code_bytes: &block.code_bytes,
@@ -311,7 +317,11 @@ async fn round_trip_reply_emails_original_sender() {
     }
 
     let sent = mock.sent.lock().unwrap();
-    assert_eq!(sent.len(), 1, "exactly one outbound email expected; got {sent:?}");
+    assert_eq!(
+        sent.len(),
+        1,
+        "exactly one outbound email expected; got {sent:?}"
+    );
     assert_eq!(
         sent[0].to, "alice@example.com",
         "outbound email must be addressed to the original inbound sender"
@@ -381,7 +391,11 @@ async fn inbound_webhook_is_idempotent_on_redelivery() {
         .get_channel_by_slug(&slug)
         .unwrap()
         .expect("channel must exist after first inbound");
-    let members = state.ingest_ctx.store.list_members(&chan.id).expect("list_members should succeed");
+    let members = state
+        .ingest_ctx
+        .store
+        .list_members(&chan.id)
+        .expect("list_members should succeed");
     assert_eq!(
         members.len(),
         2,

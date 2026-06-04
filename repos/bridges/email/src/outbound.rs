@@ -112,8 +112,7 @@ mod tests {
         let hlc = jig_core::HlcTimestamp::now_wall(id.did().clone());
         let blk = jig_client::blocks::build_text_render(&id, "#dm/x", body, hlc);
         DeliveredBlock {
-            bundle_b64: base64::engine::general_purpose::STANDARD
-                .encode(blk.canonical_bytes()),
+            bundle_b64: base64::engine::general_purpose::STANDARD.encode(blk.canonical_bytes()),
             receipts: vec![],
             delivery_cid: "cid1".into(),
         }
@@ -134,9 +133,7 @@ mod tests {
     #[test]
     fn empty_body_yields_none() {
         let delivered = delivered_from_body("");
-        assert!(
-            block_to_outbound_email(&delivered, "a@b".into(), "c@d".into()).is_none()
-        );
+        assert!(block_to_outbound_email(&delivered, "a@b".into(), "c@d".into()).is_none());
     }
 
     #[test]
@@ -162,8 +159,6 @@ mod tests {
             receipts: vec![],
             delivery_cid: "bad".into(),
         };
-        assert!(
-            block_to_outbound_email(&delivered, "a@b".into(), "c@d".into()).is_none()
-        );
+        assert!(block_to_outbound_email(&delivered, "a@b".into(), "c@d".into()).is_none());
     }
 }
