@@ -9,11 +9,8 @@ use base64::Engine as _;
 use jig_bridge_core::DeliveredBlock;
 use jig_core::BlockManifest;
 
+use crate::MAX_INLINE_BYTES;
 use crate::provider::OutboundEmail;
-
-/// Max inline message size we will turn into an email body (25 MB). Larger
-/// blocks are dropped — attachment/large-payload handling is a later iteration.
-const MAX_INLINE_BYTES: usize = 25 * 1024 * 1024;
 
 /// Cap a derived subject so a body without newlines can't produce an enormous
 /// Subject header.

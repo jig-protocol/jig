@@ -10,6 +10,7 @@ repository = "https://github.com/jig-protocol/jig"
 [dependencies]
 jig-bridge-core = { path = "../core", features = ["web"] }
 jig-core = { workspace = true }
+jig-client = { path = "../../jig-client" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -29,5 +30,4 @@ base64 = "0.22"
 
 [dev-dependencies]
 tokio = { workspace = true }
-jig-client = { path = "../../jig-client" }
 tempfile = "3"
