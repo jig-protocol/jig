@@ -15,8 +15,15 @@ jig-client = { path = "../jig-client" }
 jig-pipeline = { path = "../jig-pipeline" }
 jig-core = { workspace = true }
 jig-config = { workspace = true }
+jig-bridge-core = { path = "../bridges/core", features = ["web"] }
+jig-bridge-email = { path = "../bridges/email" }
 tokio = { workspace = true }
 axum = { workspace = true }
+# tower 0.5 to match jig-server's dep (workspace default is 0.4; a mixed
+# 0.4+0.5 resolution causes E0464 duplicate crate in the same compilation unit).
+tower = { version = "0.5", features = ["util"] }
+async-trait = { workspace = true }
+toml = { workspace = true }
 reqwest = { version = "0.12", features = ["json"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
