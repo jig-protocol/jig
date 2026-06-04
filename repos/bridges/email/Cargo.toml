@@ -29,3 +29,5 @@ base64 = "0.22"
 
 [dev-dependencies]
 tokio = { workspace = true }
+jig-client = { path = "../../jig-client" }
+tempfile = "3"
