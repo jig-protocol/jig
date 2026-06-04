@@ -100,6 +100,16 @@ impl BridgeRegistry {
             let f = fanout_for_reg.clone();
             let tx = sink_tx_for_reg.clone();
             // register_bridge_did is async; spawn to call it from this sync callback.
+            //
+            // KNOWN LIMITATION (alpha): registration is fire-and-forget, so there
+            // is a brief window between a bridge calling `register` and the sink
+            // actually landing in the fanout's bridge_dids map. A reply delivered
+            // in that window is not matched (the broadcast is one-shot, no replay)
+            // and its outbound is silently lost. In restricted-mode email a reply
+            // always trails the inbound that registered the DID by a full network
+            // round-trip, so the practical risk is negligible — but a
+            // deterministic "await first registration" path is the proper fix
+            // before higher-throughput or non-email bridges rely on this.
             tokio::spawn(async move {
                 f.register_bridge_did(did, tx).await;
             });

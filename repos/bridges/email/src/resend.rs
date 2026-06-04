@@ -63,7 +63,14 @@ impl EmailProvider for ResendProvider {
     }
 
     fn parse_webhook(&self, _headers: &HeaderMap, body: &[u8]) -> Result<Option<InboundEmail>> {
-        // TODO(alpha.email follow-up): confirm Resend inbound webhook schema against live docs.
+        // PRODUCTION BLOCKER (tracked; not exercised in MockProvider-based alpha):
+        // Resend `email.received` webhooks are METADATA-ONLY — the body is NOT in
+        // the payload and must be fetched from the Resend Receiving API by message
+        // id (an async call this sync method can't make). Until that fetch is wired,
+        // `text` is empty for real Resend traffic; the inbound handler drops
+        // empty-bodied mail rather than forwarding blanks. The event type +
+        // field paths below are also unconfirmed against live docs. Do NOT enable
+        // a live Resend deployment on this provider until both are resolved.
         let v: serde_json::Value = serde_json::from_slice(body).context("webhook json")?;
         let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
         if event_type != "email.received" && event_type != "inbound.email.received" {

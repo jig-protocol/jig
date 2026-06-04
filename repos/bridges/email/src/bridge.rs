@@ -17,8 +17,9 @@ use crate::outbound::block_to_outbound_email;
 use crate::provider::EmailProvider;
 use crate::resend::ResendProvider;
 
+use crate::CHANNEL_EMAIL_NS;
+
 const OUTBOUND_SEEN_NS: &str = "outbound-seen";
-const CHANNEL_EMAIL_NS: &str = "channel-email";
 
 /// State the bridge needs to emit outbound email. Populated in `start()`.
 struct OutboundCtx {

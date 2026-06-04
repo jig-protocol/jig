@@ -6,6 +6,11 @@
 /// `inbound` and `outbound` so the two directions never drift.
 pub(crate) const MAX_INLINE_BYTES: usize = 25 * 1024 * 1024;
 
+/// BridgeStorage namespace for the `channel-slug -> external-sender-email` map.
+/// Written by the inbound handler, read by `outbound()` — a shared const so the
+/// two sides of this string-keyed seam can never silently drift apart.
+pub(crate) const CHANNEL_EMAIL_NS: &str = "channel-email";
+
 pub mod address_book;
 pub mod bridge;
 pub mod channel;

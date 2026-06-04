@@ -9,11 +9,11 @@ use axum::http::{HeaderMap, StatusCode};
 use jig_bridge_core::{BridgeStorage, ManagedDidRegistrar, SubmitDenied, SubmitHandle};
 use jig_client::Identity;
 
-use crate::MAX_INLINE_BYTES;
 use crate::address_book::AddressBook;
 use crate::channel::{dm_channel_slug, ensure_dm_channel, submit_built_block};
 use crate::identity::shadow_signing_key;
 use crate::provider::EmailProvider;
+use crate::{CHANNEL_EMAIL_NS, MAX_INLINE_BYTES};
 
 /// How long to remember a processed provider message id for dedup (1 week).
 const INBOUND_SEEN_TTL_SECS: i64 = 7 * 24 * 3600;
@@ -54,6 +54,20 @@ pub async fn handle_inbound(
             email.body.len()
         );
         return StatusCode::PAYLOAD_TOO_LARGE;
+    }
+
+    // Never forward a blank message. Notably, real Resend `email.received`
+    // webhooks are metadata-only — the body must be fetched from the Receiving
+    // API, which is NOT yet implemented (see resend.rs). Until that lands, drop
+    // empty-bodied inbound loudly rather than submitting an empty block. (200 so
+    // the provider doesn't retry-storm; the error log is the signal.)
+    if email.body.trim().is_empty() {
+        tracing::error!(
+            "email bridge: inbound email {} has an empty body, dropping — the provider may \
+             deliver metadata-only webhooks that require a separate body fetch (unimplemented)",
+            email.provider_message_id
+        );
+        return StatusCode::OK;
     }
 
     // Dedup on the provider's stable message id (handles provider redelivery).
@@ -109,7 +123,7 @@ pub async fn handle_inbound(
     // Best-effort; last writer wins for a 1:1 conversation.
     if let Err(e) = state
         .storage
-        .put("channel-email", &slug, email.from.as_bytes(), None)
+        .put(CHANNEL_EMAIL_NS, &slug, email.from.as_bytes(), None)
         .await
     {
         tracing::warn!("email bridge: failed to record channel-email map for {slug}: {e}");
@@ -376,6 +390,24 @@ mod tests {
         let code = handle_inbound(state, HeaderMap::new(), Bytes::from_static(b"{}")).await;
         assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(submitted.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_body_is_dropped_not_submitted() {
+        // A whitespace-only body (e.g. a metadata-only provider webhook) must be
+        // dropped, never submitted as a blank block.
+        let provider = Arc::new(StubProvider {
+            email: Some(sample_email("   ")),
+            verify_ok: true,
+        });
+        let (state, submitted) = make_state(provider);
+        let code = handle_inbound(state, HeaderMap::new(), Bytes::from_static(b"{}")).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(
+            submitted.lock().unwrap().len(),
+            0,
+            "blank-body email must not submit a block"
+        );
     }
 
     #[tokio::test]

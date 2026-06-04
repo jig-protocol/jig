@@ -289,7 +289,15 @@ async fn ingest_peer_block(
 
     let stored_block = StoredBlock {
         cid: block_cid.clone(),
-        channel_id: None,
+        // Lift the channel slug from manifest metadata (mirrors the ingest
+        // pipeline's B1 lift) so channel-scoped fanout + the bridge sink can
+        // match this federated block against a channel's members.
+        channel_id: manifest
+            .metadata
+            .get("channel")
+            .or_else(|| manifest.metadata.get("slug"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         block_kind: kind_str,
         sender_did: sender_did_str,
         // Verified above (unless naively_trust_peer_authored_blocks is set);
@@ -330,7 +338,23 @@ async fn ingest_peer_block(
     }
 
     // Broadcast to local CLI subscribers ONLY — broadcast_local_only skips
-    // peer fanout and prevents relay loops between federated servers.
+    // peer fanout and prevents relay loops between federated servers. Then also
+    // dispatch to bridge sinks for any managed-DID member of the block's
+    // channel, so a federated message posted to a bridged channel reaches
+    // Bridge::outbound (mirrors ingest's FederatedPeer-source path). Resolve the
+    // channel slug -> CID before listing members (memberships key by CID).
+    let member_dids: Vec<String> = match stored_block.channel_id.as_deref() {
+        Some(slug) => match state.ingest_ctx.store.get_channel_by_slug(slug) {
+            Ok(Some(chan)) => state
+                .ingest_ctx
+                .store
+                .list_members(&chan.id)
+                .map(|ms| ms.into_iter().map(|m| m.member_did).collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        },
+        None => Vec::new(),
+    };
     let receipts_in_db = state.ingest_ctx.store.get_receipts_for_block(&block_cid)?;
     if let Some(rep_receipt) = receipts_in_db.into_iter().next() {
         state
@@ -338,6 +362,11 @@ async fn ingest_peer_block(
             .fanout
             .broadcast_local_only(&stored_block, &rep_receipt)
             .await?;
+        state
+            .ingest_ctx
+            .fanout
+            .dispatch_to_bridges_public(&stored_block, &rep_receipt, &member_dids)
+            .await;
     }
 
     Ok(())
@@ -594,6 +623,106 @@ mod tests {
             "duplicate ingest must not produce duplicate receipt; got {} receipts",
             receipts_in_db.len()
         );
+    }
+
+    #[tokio::test]
+    async fn federated_peer_block_reaches_bridge_sink_for_managed_member() {
+        use ed25519_dalek::SigningKey;
+        use jig_core::{Author, BlockKind, BlockManifest, Did, HlcTimestamp};
+        use jig_pipeline::persist::{StoredChannel, StoredMembership};
+
+        let state = Arc::new(AppState::for_test().unwrap());
+        let peer = jig_config::v0_0_2_server::FederationPeer {
+            url: "wss://test-peer".to_string(),
+            expected_did: "did:jig:zPeer".to_string(),
+            alias: None,
+        };
+
+        // A managed (bridge-owned) DID is a member of channel "#dm/x". Channels
+        // key by their channel-create CID (distinct from the slug); register the
+        // membership under that CID, and wire a bridge sink for the managed DID.
+        let managed_did = "did:jig:zManagedShadow".to_string();
+        state
+            .ingest_ctx
+            .store
+            .upsert_channel(&StoredChannel {
+                id: "bafyChanX".into(),
+                slug: "#dm/x".into(),
+                visibility: "restricted".into(),
+                created_at: 0,
+                owner_did: managed_did.clone(),
+            })
+            .unwrap();
+        state
+            .ingest_ctx
+            .store
+            .upsert_membership(&StoredMembership {
+                channel_id: "bafyChanX".into(),
+                member_did: managed_did.clone(),
+                role: "member".into(),
+                joined_at: 0,
+                source_block_cid: "seed".into(),
+            })
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        state
+            .ingest_ctx
+            .fanout
+            .register_bridge_did(managed_did.clone(), tx)
+            .await;
+
+        // A peer relays a text-render authored by a DIFFERENT DID, posted to
+        // "#dm/x" (carried in metadata["channel"]).
+        let secret: [u8; 32] = rand::random();
+        let signing_key = SigningKey::from_bytes(&secret);
+        let sender_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
+        let manifest = BlockManifest::builder()
+            .version(semver::Version::new(0, 1, 0))
+            .author(Author {
+                did: sender_did.clone(),
+                public_key: None,
+                roles: vec![],
+            })
+            .metadata_entry("channel", serde_json::json!("#dm/x"))
+            .metadata_entry("body", serde_json::json!("hello from a peer"))
+            .build()
+            .unwrap()
+            .with_kind(BlockKind::TextRender)
+            .with_hlc(HlcTimestamp {
+                wall_ms: 1_747_680_000_000,
+                logical: 0,
+                server_did: sender_did.clone(),
+            });
+        let manifest_bytes = manifest.to_canonical_bytes().unwrap();
+        let bundle_bytes = serde_json::to_vec(&(manifest_bytes, Vec::<u8>::new())).unwrap();
+        let sig = signing_key.sign(&bundle_bytes).to_bytes().to_vec();
+        let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(&bundle_bytes);
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&sig);
+        let receipts = vec![ReceiptRef {
+            server_did: "did:jig:zPeer".to_string(),
+            render_hash: Some("rh".into()),
+            receipt_bytes_b64: base64::engine::general_purpose::STANDARD.encode(b"{}"),
+        }];
+
+        ingest_peer_block(
+            &state,
+            &peer,
+            &bundle_b64,
+            Some(&sig_b64),
+            &receipts,
+            "delivery:fed-bridge",
+        )
+        .await
+        .unwrap();
+
+        // The bridge sink for the managed member must have received the delivery
+        // (federated block on a bridged channel reaches Bridge::outbound).
+        let got = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("bridge sink should receive the federated block")
+            .expect("delivery present");
+        assert_eq!(got.0.channel_id.as_deref(), Some("#dm/x"));
+        assert_eq!(got.0.sender_did, sender_did.to_did_jig_string());
     }
 
     #[tokio::test]
