@@ -213,6 +213,15 @@ impl SqliteStore {
                 last_hlc_logical INTEGER NOT NULL,
                 PRIMARY KEY (peer_server_url, origin_did)
             );
+
+            CREATE TABLE IF NOT EXISTS bridge_kv (
+                bridge_name  TEXT NOT NULL,
+                ns           TEXT NOT NULL,
+                key          TEXT NOT NULL,
+                value        BLOB NOT NULL,
+                expires_at   INTEGER,
+                PRIMARY KEY (bridge_name, ns, key)
+            );
             "#,
         )?;
         Ok(())
@@ -633,6 +642,65 @@ impl SqliteStore {
         .optional()
         .map_err(Into::into)
     }
+
+    // --- bridge KV (namespaced, per-bridge-scoped, optional TTL) ---
+
+    pub fn bridge_kv_put(
+        &self,
+        bridge: &str,
+        ns: &str,
+        key: &str,
+        value: &[u8],
+        expires_at: Option<i64>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
+        conn.execute(
+            "INSERT INTO bridge_kv (bridge_name, ns, key, value, expires_at) VALUES (?,?,?,?,?)
+             ON CONFLICT(bridge_name, ns, key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at",
+            rusqlite::params![bridge, ns, key, value, expires_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn bridge_kv_get(
+        &self,
+        bridge: &str,
+        ns: &str,
+        key: &str,
+        now: i64,
+    ) -> Result<Option<Vec<u8>>> {
+        let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
+        let row = conn
+            .query_row(
+                "SELECT value, expires_at FROM bridge_kv WHERE bridge_name=? AND ns=? AND key=?",
+                rusqlite::params![bridge, ns, key],
+                |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((_, Some(exp))) if exp <= now => None, // expired
+            Some((v, _)) => Some(v),
+            None => None,
+        })
+    }
+
+    pub fn bridge_kv_delete(&self, bridge: &str, ns: &str, key: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
+        conn.execute(
+            "DELETE FROM bridge_kv WHERE bridge_name=? AND ns=? AND key=?",
+            rusqlite::params![bridge, ns, key],
+        )?;
+        Ok(())
+    }
+
+    pub fn bridge_kv_sweep(&self, bridge: &str, ns: &str, now: i64) -> Result<u64> {
+        let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
+        let n = conn.execute(
+            "DELETE FROM bridge_kv WHERE bridge_name=? AND ns=? AND expires_at IS NOT NULL AND expires_at <= ?",
+            rusqlite::params![bridge, ns, now],
+        )?;
+        Ok(n as u64)
+    }
 }
 
 #[cfg(test)]
@@ -948,5 +1016,50 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(fetched.last_hlc_logical, 9);
+    }
+
+    #[test]
+    fn bridge_kv_put_get_expiry_delete_sweep() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        // put + get (no expiry)
+        s.bridge_kv_put(
+            "email",
+            "addrbook",
+            "alice@example.com",
+            b"did:jig:zS",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            s.bridge_kv_get("email", "addrbook", "alice@example.com", 0)
+                .unwrap()
+                .as_deref(),
+            Some(&b"did:jig:zS"[..])
+        );
+        // expiry: now past expires_at -> None
+        s.bridge_kv_put("email", "addrbook", "bob@example.com", b"x", Some(50))
+            .unwrap();
+        assert!(
+            s.bridge_kv_get("email", "addrbook", "bob@example.com", 100)
+                .unwrap()
+                .is_none()
+        );
+        // but readable before expiry
+        assert!(
+            s.bridge_kv_get("email", "addrbook", "bob@example.com", 10)
+                .unwrap()
+                .is_some()
+        );
+        // sweep removes expired
+        let removed = s.bridge_kv_sweep("email", "addrbook", 100).unwrap();
+        assert_eq!(removed, 1);
+        // delete
+        s.bridge_kv_delete("email", "addrbook", "alice@example.com")
+            .unwrap();
+        assert!(
+            s.bridge_kv_get("email", "addrbook", "alice@example.com", 0)
+                .unwrap()
+                .is_none()
+        );
     }
 }

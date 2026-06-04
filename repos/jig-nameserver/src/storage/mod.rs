@@ -764,7 +764,7 @@ impl NamesStorage for MemoryStorage {
             .collect();
 
         // Sort by executed_at descending (most recent first)
-        filtered.sort_by(|a, b| b.executed_at.cmp(&a.executed_at));
+        filtered.sort_by_key(|r| std::cmp::Reverse(r.executed_at));
         filtered.truncate(limit);
         Ok(filtered)
     }
@@ -812,7 +812,7 @@ impl NamesStorage for MemoryStorage {
             .collect();
 
         // Sort by attested_at descending (most recent first)
-        filtered.sort_by(|a, b| b.attested_at.cmp(&a.attested_at));
+        filtered.sort_by_key(|r| std::cmp::Reverse(r.attested_at));
         filtered.truncate(limit);
         Ok(filtered)
     }
@@ -864,7 +864,7 @@ impl NamesStorage for MemoryStorage {
             .collect();
 
         // Sort by detected_at descending (most recent first)
-        filtered.sort_by(|a, b| b.detected_at.cmp(&a.detected_at));
+        filtered.sort_by_key(|r| std::cmp::Reverse(r.detected_at));
         filtered.truncate(limit);
         Ok(filtered)
     }

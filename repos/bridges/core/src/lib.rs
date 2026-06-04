@@ -11,6 +11,16 @@
 
 pub mod bridge;
 pub mod context;
+pub mod storage;
 
 pub use bridge::{Bridge, DeliveredBlock, ReceiptRef};
-pub use context::{BridgeContext, SubmitDenied, SubmitHandle, SubscribeHandle};
+pub use context::{
+    BridgeContext, ManagedDidRegistrar, SubmitDenied, SubmitHandle, SubscribeHandle,
+};
+pub use storage::BridgeStorage;
+
+#[cfg(feature = "web")]
+pub mod web;
+
+#[cfg(feature = "web")]
+pub use web::RouterMount;

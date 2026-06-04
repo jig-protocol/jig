@@ -35,6 +35,7 @@ pub struct Fanout {
     next_id: AtomicU64,
     local: RwLock<HashMap<u64, (SubscriptionScope, DeliverySender)>>,
     peers: RwLock<HashMap<String, DeliverySender>>,
+    bridge_dids: RwLock<HashMap<String, DeliverySender>>,
 }
 
 impl Fanout {
@@ -63,6 +64,65 @@ impl Fanout {
 
     pub async fn unregister_peer(&self, peer_server_url: &str) {
         self.peers.write().await.remove(peer_server_url);
+    }
+
+    /// Register a sink for a bridge-managed DID. When a broadcast block's
+    /// channel includes this DID (and it isn't the sender), the delivery is
+    /// routed here so the bridge can emit it externally. Re-registering the
+    /// same DID replaces the previous sender.
+    pub async fn register_bridge_did(&self, managed_did: String, tx: DeliverySender) {
+        self.bridge_dids.write().await.insert(managed_did, tx);
+    }
+
+    pub async fn unregister_bridge_did(&self, managed_did: &str) {
+        self.bridge_dids.write().await.remove(managed_did);
+    }
+
+    /// Like `broadcast`, but also dispatches to bridge sinks for any managed
+    /// DID in `channel_member_dids` that isn't the block's sender.
+    pub async fn broadcast_with_members(
+        &self,
+        block: &StoredBlock,
+        receipt: &StoredReceipt,
+        channel_member_dids: &[String],
+    ) -> anyhow::Result<()> {
+        self.broadcast_to_locals(block, receipt).await;
+        self.broadcast_to_peers(block, receipt).await;
+        self.dispatch_to_bridges(block, receipt, channel_member_dids)
+            .await;
+        Ok(())
+    }
+
+    /// Public wrapper so ingest can dispatch to bridge sinks on the
+    /// federated-source path (which must skip peer re-broadcast).
+    pub async fn dispatch_to_bridges_public(
+        &self,
+        block: &StoredBlock,
+        receipt: &StoredReceipt,
+        channel_member_dids: &[String],
+    ) {
+        self.dispatch_to_bridges(block, receipt, channel_member_dids)
+            .await;
+    }
+
+    async fn dispatch_to_bridges(
+        &self,
+        block: &StoredBlock,
+        receipt: &StoredReceipt,
+        channel_member_dids: &[String],
+    ) {
+        let sinks = self.bridge_dids.read().await;
+        if sinks.is_empty() {
+            return;
+        }
+        for did in channel_member_dids {
+            if did == &block.sender_did {
+                continue; // don't echo the author's own message back to them
+            }
+            if let Some(tx) = sinks.get(did) {
+                let _ = tx.send((block.clone(), receipt.clone()));
+            }
+        }
     }
 
     /// Broadcast to BOTH local subscribers (filtered by scope match) and
@@ -300,5 +360,85 @@ mod tests {
             no_delivery,
             "unsubscribed receiver should not get a delivery"
         );
+    }
+
+    #[tokio::test]
+    async fn bridge_sink_receives_when_managed_did_is_member_and_not_sender() {
+        let f = Fanout::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        f.register_bridge_did("did:jig:zShadowAlice".to_string(), tx)
+            .await;
+
+        // Block authored by bob (real), channel members = [bob, shadow-alice].
+        let mut blk = sample_block(Some("#dm/x"), "text-render");
+        blk.sender_did = "did:jig:zBob".to_string();
+        f.broadcast_with_members(
+            &blk,
+            &sample_receipt(),
+            &[
+                "did:jig:zBob".to_string(),
+                "did:jig:zShadowAlice".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let got = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.0.sender_did, "did:jig:zBob");
+    }
+
+    #[tokio::test]
+    async fn bridge_sink_skips_when_managed_did_is_the_sender() {
+        let f = Fanout::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        f.register_bridge_did("did:jig:zShadowAlice".to_string(), tx)
+            .await;
+
+        // Inbound: block authored BY shadow-alice. Must not echo back to her.
+        let mut blk = sample_block(Some("#dm/x"), "text-render");
+        blk.sender_did = "did:jig:zShadowAlice".to_string();
+        f.broadcast_with_members(
+            &blk,
+            &sample_receipt(),
+            &[
+                "did:jig:zBob".to_string(),
+                "did:jig:zShadowAlice".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let res = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            res.is_err(),
+            "sender's own managed DID must not receive outbound"
+        );
+    }
+
+    #[tokio::test]
+    async fn unregister_bridge_did_stops_delivery() {
+        let f = Fanout::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        f.register_bridge_did("did:jig:zShadowAlice".to_string(), tx)
+            .await;
+        f.unregister_bridge_did("did:jig:zShadowAlice").await;
+        let mut blk = sample_block(Some("#dm/x"), "text-render");
+        blk.sender_did = "did:jig:zBob".to_string();
+        f.broadcast_with_members(
+            &blk,
+            &sample_receipt(),
+            &[
+                "did:jig:zBob".to_string(),
+                "did:jig:zShadowAlice".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        let res = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        let no_delivery = res.is_err() || matches!(res, Ok(None));
+        assert!(no_delivery, "unregistered bridge DID should not receive");
     }
 }

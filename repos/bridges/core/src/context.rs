@@ -1,12 +1,17 @@
-//! [`BridgeContext`] + denial types.
+//! [`BridgeContext`] + the handles a bridge receives at `start()`.
 //!
-//! `BridgeContext` (Task A3) is what `Bridge::start` receives. It carries:
-//! - `submit`: push translated blocks into ingest (may be denied)
-//! - `subscribe`: watch channels for outbound-triggering events
+//! `BridgeContext` is what `Bridge::start` receives. It carries:
+//! - `submit`: push translated blocks into ingest (may be denied — see [`SubmitDenied`])
+//! - `subscribe`: watch channels for deliveries (unused by server-driven bridges)
 //! - `config`: the bridge-specific `[bridge.<name>.config]` TOML table
+//! - `storage`: the server's canonical [`crate::BridgeStorage`] backend (no bridge-owned DB)
+//! - `managed_dids`: a [`ManagedDidRegistrar`] for DIDs the bridge owns, so the
+//!   server routes those channels' deliveries to [`crate::Bridge::outbound`]
+//! - `mount_router` (with the `web` feature): a [`crate::web::RouterMount`] for
+//!   registering HTTP routes under `/_bridge/<name>/`
 //!
-//! This task (A2) introduces the [`SubmitDenied`] error type that the
-//! submit handle returns when server policy rejects a submission.
+//! [`SubmitDenied`] is the error the submit handle returns when server policy
+//! rejects a submission; the bridge must translate it back to its transport.
 
 use thiserror::Error;
 
@@ -31,6 +36,7 @@ pub enum SubmitDenied {
     Unavailable,
 }
 
+use crate::storage::BridgeStorage;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -125,36 +131,130 @@ impl Default for SubscribeHandle {
     }
 }
 
-/// What `Bridge::start` receives. Owned by the bridge for the bridge's
-/// lifetime; cloned/shared internally as needed.
+/// Handle a bridge uses to register a DID it owns ("managed DID"). The server
+/// records these so its fanout layer can call `Bridge::outbound` whenever a
+/// delivered block's channel includes a managed DID (the server-driven
+/// outbound model — see the email bridge design). Wraps a server-supplied
+/// callback.
+#[derive(Clone)]
+pub struct ManagedDidRegistrar {
+    inner: Arc<dyn Fn(String) + Send + Sync>,
+}
+
+impl ManagedDidRegistrar {
+    pub fn new<F: Fn(String) + Send + Sync + 'static>(f: F) -> Self {
+        Self { inner: Arc::new(f) }
+    }
+    /// Register `did` as owned by this bridge.
+    ///
+    /// Registration is infallible and idempotent: the server-supplied callback
+    /// inserts into a managed-DID map (re-registering the same DID is a no-op).
+    /// Keep it infallible — bridges call this on every shadow-DID mint, and a
+    /// fallible signature would force error handling on a hot path that can't
+    /// meaningfully fail.
+    pub fn register(&self, did: String) {
+        (self.inner)(did);
+    }
+}
+
+/// What `Bridge::start` receives. Owned by the bridge for its lifetime.
 pub struct BridgeContext {
     /// Push inbound-translated blocks to ingest. May be denied (see [`SubmitDenied`]).
     pub submit: SubmitHandle,
-    /// Subscribe to channel-scoped block deliveries (drives `Bridge::outbound`).
+    /// Subscribe to channel-scoped block deliveries. Unused by the email
+    /// bridge (server-driven outbound), retained for other bridges.
     pub subscribe: SubscribeHandle,
-    /// Bridge-specific config from `[bridge.<name>.config]`. Opaque to
-    /// `jig-bridge-core`; the bridge parses what it expects.
+    /// Bridge-specific config from `[bridge.<name>.config]`.
     pub config: toml::Value,
+    /// Canonical persistence handle (server's storage backend).
+    pub storage: Arc<dyn BridgeStorage>,
+    /// Register a DID this bridge owns, so the server routes its channels'
+    /// deliveries to `Bridge::outbound`.
+    pub managed_dids: ManagedDidRegistrar,
+    /// HTTP route mount (only with the `web` feature).
+    #[cfg(feature = "web")]
+    pub mount_router: crate::web::RouterMount,
 }
 
 impl BridgeContext {
-    /// Real constructor (used by the server).
-    pub fn new(submit: SubmitHandle, subscribe: SubscribeHandle, config: toml::Value) -> Self {
+    /// Real constructor (server). The arg list is identical across feature
+    /// states; with `web`, `mount_router` is initialized to a fresh collector.
+    /// Prefer [`BridgeContext::new_with_web`] when the server supplies its own
+    /// shared `RouterMount`.
+    pub fn new(
+        submit: SubmitHandle,
+        subscribe: SubscribeHandle,
+        config: toml::Value,
+        storage: Arc<dyn BridgeStorage>,
+        managed_dids: ManagedDidRegistrar,
+    ) -> Self {
         Self {
             submit,
             subscribe,
             config,
+            storage,
+            managed_dids,
+            #[cfg(feature = "web")]
+            mount_router: crate::web::RouterMount::new(),
         }
     }
 
-    /// Test convenience constructor (identical shape).
+    /// `web` build with an explicit mount collector supplied by the server.
+    #[cfg(feature = "web")]
+    pub fn new_with_web(
+        submit: SubmitHandle,
+        subscribe: SubscribeHandle,
+        config: toml::Value,
+        storage: Arc<dyn BridgeStorage>,
+        managed_dids: ManagedDidRegistrar,
+        mount_router: crate::web::RouterMount,
+    ) -> Self {
+        Self {
+            submit,
+            subscribe,
+            config,
+            storage,
+            managed_dids,
+            mount_router,
+        }
+    }
+
+    /// Convenience: register a managed DID.
+    pub fn register_managed_did(&self, did: String) {
+        self.managed_dids.register(did);
+    }
+
+    /// Test convenience: 3-arg shape preserved. Fills storage with a no-op
+    /// stub and a no-op registrar (+ fresh RouterMount under `web`).
     #[doc(hidden)]
     pub fn new_for_test(
         submit: SubmitHandle,
         subscribe: SubscribeHandle,
         config: toml::Value,
     ) -> Self {
-        Self::new(submit, subscribe, config)
+        struct NoopStore;
+        #[async_trait::async_trait]
+        impl BridgeStorage for NoopStore {
+            async fn put(&self, _: &str, _: &str, _: &[u8], _: Option<i64>) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn get(&self, _: &str, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            async fn delete(&self, _: &str, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn sweep_expired(&self, _: &str) -> anyhow::Result<u64> {
+                Ok(0)
+            }
+        }
+        Self::new(
+            submit,
+            subscribe,
+            config,
+            Arc::new(NoopStore),
+            ManagedDidRegistrar::new(|_| {}),
+        )
     }
 }
 
@@ -237,5 +337,53 @@ mod tests {
             ctx.config.get("resend_key").and_then(|v| v.as_str()),
             Some("rk_test")
         );
+    }
+
+    #[tokio::test]
+    async fn managed_did_registrar_records_dids() {
+        use std::sync::{Arc, Mutex};
+        let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let rec2 = recorded.clone();
+        let registrar = ManagedDidRegistrar::new(move |did: String| {
+            rec2.lock().unwrap().push(did);
+        });
+        registrar.register("did:jig:zShadowAlice".to_string());
+        registrar.register("did:jig:zShadowBob".to_string());
+        assert_eq!(recorded.lock().unwrap().len(), 2);
+        assert_eq!(recorded.lock().unwrap()[0], "did:jig:zShadowAlice");
+    }
+
+    #[tokio::test]
+    async fn bridge_context_exposes_storage_and_registrar() {
+        use std::sync::Arc;
+        let storage: Arc<dyn crate::BridgeStorage> = Arc::new(NoopStorage);
+        let registrar = ManagedDidRegistrar::new(|_| {});
+        let ctx = BridgeContext::new(
+            SubmitHandle::new_for_test(|_| async { Ok("cid".into()) }),
+            SubscribeHandle::new_for_test(),
+            toml::Value::Table(Default::default()),
+            storage,
+            registrar,
+        );
+        ctx.storage.put("ns", "k", b"v", None).await.unwrap();
+        ctx.register_managed_did("did:jig:zX".to_string());
+    }
+
+    // Minimal storage stub for the context test.
+    struct NoopStorage;
+    #[async_trait::async_trait]
+    impl crate::BridgeStorage for NoopStorage {
+        async fn put(&self, _: &str, _: &str, _: &[u8], _: Option<i64>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get(&self, _: &str, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn delete(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn sweep_expired(&self, _: &str) -> anyhow::Result<u64> {
+            Ok(0)
+        }
     }
 }

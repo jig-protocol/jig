@@ -188,6 +188,18 @@ impl JigServerConfig {
         if self.debug.list_handles {
             active.push("debug.list_handles".to_string());
         }
+        // v0.0.3 (alpha.email): only the SQLite BridgeStorage backend ships;
+        // the abstraction is unproven against Postgres/CockroachDB. Advertise
+        // the limitation whenever any bridge would load, so federated peers +
+        // operators can see it via /.well-known/jig.
+        if self
+            .bridges
+            .per_bridge
+            .keys()
+            .any(|n| self.bridge_permitted(n))
+        {
+            active.push("naively_single_backend_bridge_storage".to_string());
+        }
         active
     }
 
@@ -477,5 +489,48 @@ mod tests {
         let cfg: JigServerConfig = toml::from_str(toml).unwrap();
         assert!(cfg.bridge_permitted("email"));
         assert!(!cfg.bridge_permitted("slack"));
+    }
+
+    #[test]
+    fn single_backend_bridge_storage_flag_present_when_a_bridge_is_permitted() {
+        let toml = r##"
+            [bridges]
+            allow_list = ["email"]
+            [bridges.per_bridge.email]
+            enabled = true
+        "##;
+        let cfg: JigServerConfig = toml::from_str(toml).unwrap();
+        assert!(
+            cfg.unsafe_options_active()
+                .contains(&"naively_single_backend_bridge_storage".to_string()),
+            "expected the single-backend flag when a bridge is permitted"
+        );
+    }
+
+    #[test]
+    fn no_bridge_storage_flag_when_no_bridge_permitted() {
+        let cfg = JigServerConfig::default();
+        assert!(
+            !cfg.unsafe_options_active()
+                .contains(&"naively_single_backend_bridge_storage".to_string()),
+            "no bridge permitted by default -> flag absent"
+        );
+    }
+
+    #[test]
+    fn no_bridge_storage_flag_when_bridge_present_but_disabled() {
+        // A bridge entry that is NOT permitted (enabled=false) must not trip the flag.
+        let toml = r##"
+            [bridges]
+            allow_list = ["email"]
+            [bridges.per_bridge.email]
+            enabled = false
+        "##;
+        let cfg: JigServerConfig = toml::from_str(toml).unwrap();
+        assert!(
+            !cfg.unsafe_options_active()
+                .contains(&"naively_single_backend_bridge_storage".to_string()),
+            "disabled bridge is not permitted -> flag absent"
+        );
     }
 }
