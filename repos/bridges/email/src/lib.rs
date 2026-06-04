@@ -1,17 +1,9 @@
-//! Jig Email Bridge Library
+//! Jig email bridge — in-process `Bridge` implementation.
 //!
-//! Provides email bridge functionality for the Jig protocol,
-//! bridging traditional email (SMTP/IMAP) with block-based messaging.
+//! Migrated from a standalone SMTP daemon to a library loaded in-process by
+//! jig-server. Subsequent tasks add the provider/identity/address_book/
+//! resend/channel/outbound/inbound/bridge modules.
 
 pub mod config;
-pub mod discovery;
-pub mod formatter;
-pub mod parser;
-pub mod router;
-pub mod types;
 
-// Re-export commonly used types
-pub use config::{Config, FormattingConfig};
-pub use discovery::{JigDiscovery, JigEndpoint};
-pub use router::{MessageRouter, RouteDecision};
-pub use types::{EmailMessage, ThreadInfo};
+pub use config::EmailBridgeConfig;
