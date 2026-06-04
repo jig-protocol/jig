@@ -87,6 +87,13 @@ pub async fn handle_inbound(state: Arc<InboundState>, headers: HeaderMap, body: 
         return StatusCode::BAD_GATEWAY;
     }
 
+    // Record slug -> external sender email so outbound() can find the recipient
+    // when the Jig user replies (shadow DIDs are KDF-derived, not reversible).
+    // Best-effort; last writer wins for a 1:1 conversation.
+    if let Err(e) = state.storage.put("channel-email", &slug, email.from.as_bytes(), None).await {
+        tracing::warn!("email bridge: failed to record channel-email map for {slug}: {e}");
+    }
+
     // TODO(C9 round-trip): email.subject is currently dropped — text-render has
     // no subject metadata slot, and outbound derives a subject from the body.
     // Thread it through if/when blocks carry a subject field.
