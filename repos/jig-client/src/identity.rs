@@ -82,6 +82,16 @@ impl Identity {
         Ok(Self { did, signing })
     }
 
+    /// Construct an in-memory identity directly from a raw ed25519 signing key,
+    /// without touching disk. For ephemeral/derived identities — e.g. the email
+    /// bridge's deterministic "shadow" identities — that are never persisted and
+    /// don't need keyfile permission discipline. The DID is derived from the
+    /// key's public half.
+    pub fn from_signing_key(signing: SigningKey) -> Self {
+        let did = Did::from_ed25519_pubkey(signing.verifying_key().as_bytes());
+        Self { did, signing }
+    }
+
     pub fn did(&self) -> &Did {
         &self.did
     }
@@ -209,6 +219,18 @@ mod tests {
             did_str.starts_with("did:jig:z"),
             "generated DID must use canonical form, got `{did_str}`"
         );
+    }
+
+    #[test]
+    fn from_signing_key_derives_matching_did_and_signs() {
+        use ed25519_dalek::SigningKey;
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let expected_did = jig_core::Did::from_ed25519_pubkey(sk.verifying_key().as_bytes());
+        let id = Identity::from_signing_key(sk);
+        assert_eq!(id.did(), &expected_did);
+        // The identity can sign (no panic, produces a 64-byte sig).
+        let sig = id.sign(b"hello");
+        assert_eq!(sig.to_bytes().len(), 64);
     }
 
     #[test]

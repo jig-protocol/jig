@@ -215,14 +215,20 @@ pub async fn ingest(
     };
     ctx.store.insert_receipt(&stored_receipt)?;
 
-    // Channel membership for bridge-sink dispatch (empty if the block has no
-    // channel or the channel has no recorded members).
+    // Channel membership for bridge-sink dispatch. `channel_id` here is the
+    // channel SLUG (lifted from manifest metadata), but memberships are keyed
+    // by the channel's CID (its channel-create block CID). Resolve slug -> CID
+    // via get_channel_by_slug before listing members; empty if the channel row
+    // doesn't exist yet or has no members.
     let member_dids: Vec<String> = match stored_block.channel_id.as_deref() {
-        Some(chan) => ctx
-            .store
-            .list_members(chan)
-            .map(|ms| ms.into_iter().map(|m| m.member_did).collect())
-            .unwrap_or_default(),
+        Some(slug) => match ctx.store.get_channel_by_slug(slug) {
+            Ok(Some(chan)) => ctx
+                .store
+                .list_members(&chan.id)
+                .map(|ms| ms.into_iter().map(|m| m.member_did).collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        },
         None => Vec::new(),
     };
 
@@ -546,6 +552,63 @@ mod tests {
             .expect("bridge sink should receive within timeout")
             .expect("a delivery");
         assert_eq!(got.0.channel_id.as_deref(), Some("#dm/x"));
+        assert_eq!(got.0.sender_did, bob_did);
+    }
+
+    #[tokio::test]
+    async fn bridge_sink_resolves_slug_to_channel_cid_for_members() {
+        // Regression: memberships are keyed by the channel's CID, not its slug.
+        // The prior dispatch used `list_members(slug)` which returns nothing when
+        // `channel.id != channel.slug` (the realistic shape from channel-create).
+        // This test stores channel.id = "bafyCID_xyz" and channel.slug = "#dm/z"
+        // and verifies the bridge sink still fires.
+        use crate::persist::{StoredChannel, StoredMembership};
+        let ctx = test_ctx(); // allows "text-render"
+        let bob_key = random_signing_key();
+        let bob_did = Did::from_ed25519_pubkey(bob_key.verifying_key().as_bytes()).to_string();
+
+        // A shadow DID for alice, registered as a bridge sink.
+        let shadow = "did:jig:zShadowAliceCID".to_string();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.fanout.register_bridge_did(shadow.clone(), tx).await;
+
+        // Channel stored with a CID as id (distinct from slug) — realistic
+        // shape written by channel-create effect handling.
+        let channel_cid = "bafyCID_xyz".to_string();
+        ctx.store
+            .upsert_channel(&StoredChannel {
+                id: channel_cid.clone(),
+                slug: "#dm/z".into(),
+                visibility: "restricted".into(),
+                created_at: 0,
+                owner_did: bob_did.clone(),
+            })
+            .unwrap();
+        // Memberships are keyed by the CID, not the slug.
+        for did in [bob_did.clone(), shadow.clone()] {
+            ctx.store
+                .upsert_membership(&StoredMembership {
+                    channel_id: channel_cid.clone(),
+                    member_did: did,
+                    role: "member".into(),
+                    joined_at: 0,
+                    source_block_cid: "seed".into(),
+                })
+                .unwrap();
+        }
+
+        // bob posts a text-render to #dm/z (the slug — what manifest metadata carries).
+        let (mb, cb, sig) =
+            build_bundle_parts_with_channel(&bob_key, BlockKind::TextRender, "#dm/z");
+        do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap();
+
+        let got = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("bridge sink should receive within timeout — slug->CID resolution must fire")
+            .expect("a delivery");
+        assert_eq!(got.0.channel_id.as_deref(), Some("#dm/z"));
         assert_eq!(got.0.sender_did, bob_did);
     }
 

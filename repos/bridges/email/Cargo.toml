@@ -4,38 +4,30 @@ version = "0.0.3"
 edition = "2024"
 authors = ["Jig Protocol Contributors"]
 license = "MIT"
-description = "Email bridge for Jig protocol (jig-bridge-email; bidirectional SMTP/IMAP gateway)"
+description = "Email bridge for Jig protocol — in-process library loaded by jig-server"
 repository = "https://github.com/jig-protocol/jig"
 
 [dependencies]
-# Core dependencies — note paths now go up two levels (bridges/email/ → repos/)
-jig-core = { path = "../../jig-core" }
-tokio = { version = "1.38", features = ["full"] }
-anyhow = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Email handling
-lettre = { version = "0.11", default-features = false, features = ["tokio1", "smtp-transport", "builder", "tokio1-rustls-tls"] }
-mail-parser = "0.9"
-async-trait = "0.1"
-
-# Outbound via Resend (optional)
+jig-bridge-core = { path = "../core", features = ["web"] }
+jig-core = { workspace = true }
+jig-client = { path = "../../jig-client" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-
-# Storage
-rusqlite = { workspace = true }
-
-# Configuration
-toml = "0.8"
-clap = { version = "4.5", features = ["derive", "env"] }
-uuid = { version = "1.6", features = ["v4"] }
-semver = { version = "1.0", features = ["serde"] }
-
-# DNS discovery
-hickory-resolver = { version = "0.26", features = ["tokio"] }
+hkdf = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
 
 [dev-dependencies]
-tempfile = "3.10"
+tokio = { workspace = true }
+tempfile = "3"

@@ -1,121 +1,73 @@
-//! Configuration for email bridge
+//! Config parsed from the `[bridge.email.config]` TOML table.
 
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
-use std::path::Path;
+use serde::Deserialize;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Config {
-    pub smtp_server: SmtpServerConfig,
-    pub smtp_client: SmtpClientConfig,
-    pub resend_client: ResendClientConfig,
-    pub outbound_transport: OutboundTransport,
-    pub formatting: FormattingConfig,
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmailBridgeConfig {
+    /// Secret used to derive shadow-DID keypairs (HKDF salt/ikm). MUST be
+    /// stable across restarts and kept private.
+    pub bridge_secret: String,
+    /// Domain the bridge sends from / receives for (e.g. "jig.onl").
+    pub bridge_domain: String,
+    /// Address-book cache TTL in seconds.
+    #[serde(default = "default_addrbook_ttl")]
+    pub addrbook_ttl_secs: i64,
+    /// Strip `+tag` from local-parts when normalizing emails.
+    #[serde(default)]
+    pub strip_plus_tags: bool,
+    /// Provider selection (only "resend" in v0.0.3).
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    /// Resend API key (read from config; operators may use ${ENV} indirection
+    /// at the deployment layer).
+    pub resend_api_key: Option<String>,
+    /// Resend webhook signing secret (verifies inbound POSTs).
+    pub resend_webhook_secret: Option<String>,
+    /// Nameserver base URL for alias resolution (address book).
+    pub nameserver_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SmtpServerConfig {
-    pub enabled: bool,
-    pub listen_addr: String,
-    pub port: u16,
-    pub domain: String,
-    pub require_tls: bool,
+fn default_addrbook_ttl() -> i64 {
+    3600
+}
+fn default_provider() -> String {
+    "resend".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub enum OutboundTransport {
-    #[serde(rename = "smtp")]
-    Smtp,
-    #[serde(rename = "resend")]
-    Resend,
+impl EmailBridgeConfig {
+    pub fn from_toml(v: &toml::Value) -> anyhow::Result<Self> {
+        Ok(v.clone().try_into()?)
+    }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SmtpClientConfig {
-    pub enabled: bool,
-    pub relay_host: String,
-    pub relay_port: u16,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub from_address: String,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ResendClientConfig {
-    pub enabled: bool,
-    pub from_address: String,
-    #[serde(default = "default_resend_api_env")]
-    pub api_key_env: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct FormattingConfig {
-    pub signature: String,
-    pub html_template: Option<String>,
-    pub wrap_at: usize,
-    /// Inject viral signature into outbound emails
-    #[serde(default = "default_true")]
-    pub add_signature: bool,
-    /// Add X-Jig-Protocol header to outbound emails
-    #[serde(default = "default_true")]
-    pub add_x_jig_header: bool,
-    /// Add Message-Id, In-Reply-To, and References thread headers
-    #[serde(default = "default_true")]
-    pub add_thread_headers: bool,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            smtp_server: SmtpServerConfig {
-                enabled: true,
-                listen_addr: "127.0.0.1".to_string(),
-                port: 2525,
-                domain: "localhost".to_string(),
-                require_tls: false,
-            },
-            smtp_client: SmtpClientConfig {
-                enabled: false,
-                relay_host: "smtp.gmail.com".to_string(),
-                relay_port: 587,
-                username: None,
-                password: None,
-                from_address: "jig@example.com".to_string(),
-            },
-            resend_client: ResendClientConfig {
-                enabled: false,
-                from_address: "jig@example.com".to_string(),
-                api_key_env: default_resend_api_env(),
-            },
-            outbound_transport: OutboundTransport::Smtp,
-            formatting: FormattingConfig {
-                signature: "\n\n--\nSent via Jig Protocol - https://jig.onl".to_string(),
-                html_template: None,
-                wrap_at: 72,
-                add_signature: true,
-                add_x_jig_header: true,
-                add_thread_headers: true,
-            },
+    #[test]
+    fn parses_minimal_config() {
+        let v: toml::Value = toml::toml! {
+            bridge_secret = "s3cr3t"
+            bridge_domain = "jig.onl"
+            resend_api_key = "rk_test"
+            resend_webhook_secret = "whsec_test"
+            nameserver_url = "http://127.0.0.1:7200"
         }
-    }
-}
-
-fn default_true() -> bool {
-    true
-}
-fn default_resend_api_env() -> String {
-    "RESEND_API_KEY".to_string()
-}
-
-pub fn load_config(path: &Path) -> Result<Config> {
-    if !path.exists() {
-        let config = Config::default();
-        let toml = toml::to_string_pretty(&config)?;
-        std::fs::write(path, toml)?;
-        return Ok(config);
+        .into();
+        let cfg = EmailBridgeConfig::from_toml(&v).unwrap();
+        assert_eq!(cfg.bridge_domain, "jig.onl");
+        assert_eq!(cfg.addrbook_ttl_secs, 3600); // default
+        assert_eq!(cfg.provider, "resend"); // default
     }
 
-    let contents = std::fs::read_to_string(path)?;
-    let config: Config = toml::from_str(&contents)?;
-    Ok(config)
+    #[test]
+    fn rejects_missing_required_fields() {
+        // `bridge_secret` is required (non-Option); a config without it must
+        // fail to parse rather than silently default.
+        let v: toml::Value = toml::toml! {
+            bridge_domain = "jig.onl"
+        }
+        .into();
+        assert!(EmailBridgeConfig::from_toml(&v).is_err());
+    }
 }

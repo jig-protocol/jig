@@ -95,6 +95,49 @@ impl AppState {
         })
     }
 
+    /// Convenience constructor for tests: in-memory SQLite, supplied config,
+    /// freshly generated keypair (never written to disk). Mirrors `for_test`
+    /// but uses the provided config so callers can test non-default settings
+    /// (e.g. bridge policy, feature flags).
+    #[cfg(test)]
+    pub fn for_test_with_config(config: JigServerConfig) -> Result<Self> {
+        let store = Arc::new(SqliteStore::open_in_memory()?);
+        let secret: [u8; 32] = rand::random();
+        let signing_key = SigningKey::from_bytes(&secret);
+        let server_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
+
+        let identity: Arc<dyn IdentityResolver> = Arc::new(TofuResolver::new(store.clone()));
+        let hlc_clock = Arc::new(HlcClock::new(server_did.clone()));
+        let fanout = Arc::new(Fanout::new());
+        let server_url = format!("ws://{}", config.server.listen);
+
+        let naively_allow_unknown_handles_fallback =
+            config.identity.naively_allow_unknown_handles_fallback;
+
+        let ingest_ctx = Arc::new(IngestContext {
+            store,
+            identity,
+            hlc_clock,
+            allowed_block_kinds: config.server.allowed_block_kinds.clone(),
+            server_did: server_did.clone(),
+            server_key: signing_key,
+            fanout,
+            server_url: server_url.clone(),
+            naively_allow_unknown_handles_fallback,
+        });
+
+        let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
+
+        Ok(Self {
+            config,
+            ingest_ctx,
+            server_did,
+            server_url,
+            bridges,
+            bridge_router_mount: jig_bridge_core::RouterMount::new(),
+        })
+    }
+
     /// Convenience constructor for tests: in-memory SQLite, defaults config,
     /// freshly generated keypair (never written to disk).
     #[cfg(test)]

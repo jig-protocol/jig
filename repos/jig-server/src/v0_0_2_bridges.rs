@@ -100,6 +100,16 @@ impl BridgeRegistry {
             let f = fanout_for_reg.clone();
             let tx = sink_tx_for_reg.clone();
             // register_bridge_did is async; spawn to call it from this sync callback.
+            //
+            // KNOWN LIMITATION (alpha): registration is fire-and-forget, so there
+            // is a brief window between a bridge calling `register` and the sink
+            // actually landing in the fanout's bridge_dids map. A reply delivered
+            // in that window is not matched (the broadcast is one-shot, no replay)
+            // and its outbound is silently lost. In restricted-mode email a reply
+            // always trails the inbound that registered the DID by a full network
+            // round-trip, so the practical risk is negligible — but a
+            // deterministic "await first registration" path is the proper fix
+            // before higher-throughput or non-email bridges rely on this.
             tokio::spawn(async move {
                 f.register_bridge_did(did, tx).await;
             });
@@ -169,6 +179,53 @@ impl BridgeRegistry {
         loaded.clear();
         Ok(())
     }
+}
+
+/// Construct + start every config-permitted bridge the server knows how to
+/// build, mounting their routes into `state.bridge_router_mount`. Call this at
+/// boot BEFORE `build_v0_0_2_router` drains the mount. A per-bridge start
+/// failure is logged and skipped (the server runs without that bridge) — it
+/// does not abort the whole boot.
+pub async fn start_configured_bridges(state: &crate::v0_0_2::AppState) -> anyhow::Result<()> {
+    if state.config.bridge_permitted("email") {
+        match build_email_bridge(&state.config) {
+            Ok(bridge) => {
+                let started = state
+                    .bridges
+                    .register_and_start(
+                        bridge,
+                        &state.config,
+                        state.ingest_ctx.store.clone(),
+                        state.ingest_ctx.clone(),
+                        state.ingest_ctx.fanout.clone(),
+                        state.bridge_router_mount.clone(),
+                    )
+                    .await;
+                match started {
+                    Ok(true) => tracing::info!("email bridge started"),
+                    Ok(false) => tracing::warn!("email bridge denied by policy after permit check"),
+                    Err(e) => tracing::error!("email bridge failed to start: {e}"),
+                }
+            }
+            Err(e) => tracing::error!("email bridge config invalid, not starting: {e}"),
+        }
+    }
+    Ok(())
+}
+
+fn build_email_bridge(
+    config: &JigServerConfig,
+) -> anyhow::Result<Box<dyn jig_bridge_core::Bridge>> {
+    let bcfg = config
+        .bridges
+        .per_bridge
+        .get("email")
+        .map(|b| toml::Value::Table(b.config.clone()))
+        .unwrap_or_else(|| toml::Value::Table(Default::default()));
+    let email_cfg = jig_bridge_email::EmailBridgeConfig::from_toml(&bcfg)?;
+    Ok(Box::new(jig_bridge_email::EmailBridge::from_config(
+        email_cfg,
+    )))
 }
 
 /// Decode a bridge submit payload `(manifest_bytes, code_bytes, sig)` and run
@@ -246,7 +303,7 @@ mod tests {
         hlc::HlcClock,
         identity::TofuResolver,
         ingest::{IngestContext, IngestSource, ingest},
-        persist::{SqliteStore, StoredMembership},
+        persist::{SqliteStore, StoredChannel, StoredMembership},
     };
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -502,12 +559,24 @@ mod tests {
         // Let the spawned register_bridge_did task run.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Channel "#dm/x" has the shadow DID as a member. (The ingest pipeline
-        // keys `list_members` on the block's channel_id == the slug, so we set
-        // the membership's channel_id to the slug directly.)
+        // Channel "#dm/x" has the shadow DID as a member. Channels are keyed by
+        // their channel-create CID (not the slug), and memberships reference that
+        // CID — so we create the channel row with a CID-shaped id distinct from
+        // the slug, and key the membership on that id. Ingest resolves the
+        // block's slug -> channel CID via get_channel_by_slug before listing
+        // members (see jig-pipeline ingest bridge-sink dispatch).
+        store
+            .upsert_channel(&StoredChannel {
+                id: "bafyDmX".to_string(),
+                slug: "#dm/x".to_string(),
+                visibility: "restricted".to_string(),
+                created_at: 0,
+                owner_did: shadow_did.clone(),
+            })
+            .unwrap();
         store
             .upsert_membership(&StoredMembership {
-                channel_id: "#dm/x".to_string(),
+                channel_id: "bafyDmX".to_string(),
                 member_did: shadow_did.clone(),
                 role: "member".to_string(),
                 joined_at: 0,
@@ -557,5 +626,58 @@ mod tests {
             err,
             jig_bridge_core::SubmitDenied::PolicyBlocked { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn boot_starts_and_mounts_email_bridge_when_permitted() {
+        use tower::ServiceExt;
+
+        // Config that permits the email bridge with a minimal valid config.
+        let toml = r##"
+            [bridges]
+            allow_list = ["email"]
+
+            [bridges.per_bridge.email]
+            enabled = true
+
+            [bridges.per_bridge.email.config]
+            bridge_secret = "s3cr3t"
+            bridge_domain = "jig.onl"
+            resend_api_key = "rk_test"
+            resend_webhook_secret = "whsec_test"
+        "##;
+        let cfg: JigServerConfig = toml::from_str(toml).expect("parse config");
+        let state = std::sync::Arc::new(
+            crate::v0_0_2::AppState::for_test_with_config(cfg).expect("build state"),
+        );
+
+        start_configured_bridges(&state).await.unwrap();
+
+        // The bridge actually started.
+        assert!(
+            state
+                .bridges
+                .loaded_names()
+                .await
+                .contains(&"email".to_string()),
+            "email bridge should be in loaded_names after boot"
+        );
+
+        // Its inbound route is mounted: build the router (drains the mount) and
+        // POST to /_bridge/email/inbound — expect NOT 404 (route exists). With no
+        // svix signature headers the ResendProvider verify fails -> some non-404 status.
+        let router = crate::v0_0_2_ws::build_v0_0_2_router(state.clone());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/_bridge/email/inbound")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "inbound route should be mounted (got {})",
+            resp.status()
+        );
     }
 }

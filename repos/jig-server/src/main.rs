@@ -96,6 +96,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // available. Tasks are fire-and-forget (reconnect internally on disconnect).
     if let Some(ref state) = v0_0_2_state {
         jig_server::v0_0_2_federation::spawn_federation_peers(state.clone());
+        // Start config-permitted bridges before the router is built (they mount
+        // their HTTP routes into bridge_router_mount, which build_v0_0_2_router
+        // drains). A bridge that fails to start is logged and skipped inside.
+        if let Err(e) = jig_server::v0_0_2_bridges::start_configured_bridges(state).await {
+            tracing::warn!("error starting configured bridges: {e}");
+        }
     }
 
     let server = JigServer::new_with_v0_0_2(config, v0_0_2_state)?;
