@@ -20,8 +20,8 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use jig_bridge_email::{
-    EmailBridge, EmailBridgeConfig, EmailProvider, InboundEmail, OutboundEmail, ProviderMessageId,
-    dm_channel_slug, shadow_did, shadow_signing_key,
+    EmailBridge, EmailBridgeConfig, EmailProvider, InboundEmail, InboundNotification,
+    OutboundEmail, ProviderMessageId, dm_channel_slug, shadow_did, shadow_signing_key,
 };
 use jig_config::v0_0_2_server::JigServerConfig;
 use jig_server::v0_0_2::AppState;
@@ -35,11 +35,14 @@ const SECRET: &str = "test-secret";
 // ---------------------------------------------------------------------------
 
 /// Captures every `send()` call. `parse_webhook` returns the configured
-/// `InboundEmail` (or `None` if unset). `verify_webhook` always succeeds.
+/// `InboundNotification` (or `None` if unset). `fetch_inbound` builds an
+/// `InboundEmail` from the notification + the configured body.
+/// `verify_webhook` always succeeds.
 #[derive(Default)]
 struct MockProvider {
     sent: Mutex<Vec<OutboundEmail>>,
-    inbound: Mutex<Option<InboundEmail>>,
+    notification: Mutex<Option<InboundNotification>>,
+    body: Mutex<String>,
 }
 
 #[async_trait]
@@ -49,16 +52,27 @@ impl EmailProvider for MockProvider {
         Ok("mock-id".into())
     }
 
+    fn verify_webhook(&self, _headers: &HeaderMap, _body: &[u8]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn parse_webhook(
         &self,
         _headers: &HeaderMap,
         _body: &[u8],
-    ) -> anyhow::Result<Option<InboundEmail>> {
-        Ok(self.inbound.lock().unwrap().clone())
+    ) -> anyhow::Result<Option<InboundNotification>> {
+        Ok(self.notification.lock().unwrap().clone())
     }
 
-    fn verify_webhook(&self, _headers: &HeaderMap, _body: &[u8]) -> anyhow::Result<()> {
-        Ok(())
+    async fn fetch_inbound(&self, n: &InboundNotification) -> anyhow::Result<InboundEmail> {
+        let body = self.body.lock().unwrap().clone();
+        Ok(InboundEmail {
+            from: n.from.clone(),
+            to: n.to.clone(),
+            subject: n.subject.clone(),
+            body,
+            provider_message_id: n.provider_message_id.clone(),
+        })
     }
 }
 
@@ -161,13 +175,12 @@ async fn setup_with_toml(
     (state, router, tempdir)
 }
 
-fn inbound_email() -> InboundEmail {
-    InboundEmail {
+fn inbound_notification() -> InboundNotification {
+    InboundNotification {
+        provider_message_id: "m1".into(),
         from: "alice@example.com".into(),
         to: "dj@jig.onl".into(),
         subject: "Hi".into(),
-        body: "hello from alice".into(),
-        provider_message_id: "m1".into(),
     }
 }
 
@@ -220,7 +233,8 @@ async fn wait_until<F: FnMut() -> bool>(mut cond: F, secs: u64, what: &str) {
 #[tokio::test]
 async fn inbound_webhook_creates_channel_and_lands_block() {
     let mock = Arc::new(MockProvider::default());
-    *mock.inbound.lock().unwrap() = Some(inbound_email());
+    *mock.notification.lock().unwrap() = Some(inbound_notification());
+    *mock.body.lock().unwrap() = "hello from alice".into();
     let (state, router, _tmp) = setup(mock, true).await;
 
     let status = post_inbound(&router).await;
@@ -256,7 +270,8 @@ async fn inbound_webhook_creates_channel_and_lands_block() {
 #[tokio::test]
 async fn round_trip_reply_emails_original_sender() {
     let mock = Arc::new(MockProvider::default());
-    *mock.inbound.lock().unwrap() = Some(inbound_email());
+    *mock.notification.lock().unwrap() = Some(inbound_notification());
+    *mock.body.lock().unwrap() = "hello from alice".into();
     let (state, router, _tmp) = setup(mock.clone(), true).await;
 
     // Inbound: alice → creates dm(shadow_alice, shadow_dj), registers
@@ -323,7 +338,8 @@ async fn round_trip_reply_emails_original_sender() {
 #[tokio::test]
 async fn denied_bridge_route_is_not_mounted() {
     let mock = Arc::new(MockProvider::default());
-    *mock.inbound.lock().unwrap() = Some(inbound_email());
+    *mock.notification.lock().unwrap() = Some(inbound_notification());
+    *mock.body.lock().unwrap() = "hello from alice".into();
     let (_state, router, _tmp) = setup(mock, false).await;
 
     let status = post_inbound(&router).await;
@@ -340,7 +356,8 @@ async fn denied_bridge_route_is_not_mounted() {
 #[tokio::test]
 async fn disabled_bridge_route_is_not_mounted() {
     let mock = Arc::new(MockProvider::default());
-    *mock.inbound.lock().unwrap() = Some(inbound_email());
+    *mock.notification.lock().unwrap() = Some(inbound_notification());
+    *mock.body.lock().unwrap() = "hello from alice".into();
     let toml = r#"
 [bridges]
 allow_list = ["email"]
@@ -362,7 +379,8 @@ enabled = false
 #[tokio::test]
 async fn inbound_webhook_is_idempotent_on_redelivery() {
     let mock = Arc::new(MockProvider::default());
-    *mock.inbound.lock().unwrap() = Some(inbound_email());
+    *mock.notification.lock().unwrap() = Some(inbound_notification());
+    *mock.body.lock().unwrap() = "hello from alice".into();
     let (state, router, _tmp) = setup(mock, true).await;
 
     assert_eq!(post_inbound(&router).await, StatusCode::OK);

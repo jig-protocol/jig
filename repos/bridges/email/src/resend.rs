@@ -3,7 +3,9 @@
 //! Outbound: POST https://api.resend.com/emails with a Bearer API key.
 //! Inbound: Resend signs webhooks with the Svix scheme — verify the `svix-*`
 //! headers (HMAC-SHA256 over `{id}.{timestamp}.{body}`, base64-encoded, key =
-//! base64-decoded webhook secret), then parse the event into an InboundEmail.
+//! base64-decoded webhook secret), then parse the event into an
+//! `InboundNotification` (metadata only — Resend webhooks carry no body). The
+//! body is fetched separately via `fetch_inbound` (GET /emails/receiving/{id}).
 //! Non-deliverable events (delivery status, bounces) -> Ok(None).
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -14,7 +16,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use crate::provider::{EmailProvider, InboundEmail, OutboundEmail, ProviderMessageId};
+use crate::provider::{EmailProvider, InboundEmail, InboundNotification, OutboundEmail, ProviderMessageId};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -62,55 +64,6 @@ impl EmailProvider for ResendProvider {
             .ok_or_else(|| anyhow!("resend send response missing id"))
     }
 
-    fn parse_webhook(&self, _headers: &HeaderMap, body: &[u8]) -> Result<Option<InboundEmail>> {
-        // PRODUCTION BLOCKER (tracked; not exercised in MockProvider-based alpha):
-        // Resend `email.received` webhooks are METADATA-ONLY — the body is NOT in
-        // the payload and must be fetched from the Resend Receiving API by message
-        // id (an async call this sync method can't make). Until that fetch is wired,
-        // `text` is empty for real Resend traffic; the inbound handler drops
-        // empty-bodied mail rather than forwarding blanks. The event type +
-        // field paths below are also unconfirmed against live docs. Do NOT enable
-        // a live Resend deployment on this provider until both are resolved.
-        let v: serde_json::Value = serde_json::from_slice(body).context("webhook json")?;
-        let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
-        if event_type != "email.received" && event_type != "inbound.email.received" {
-            return Ok(None);
-        }
-        let data = v.get("data").unwrap_or(&v);
-        let from = data
-            .get("from")
-            .and_then(value_as_email)
-            .unwrap_or_default();
-        let to = data.get("to").and_then(value_as_email).unwrap_or_default();
-        let subject = data
-            .get("subject")
-            .and_then(|s| s.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let text = data
-            .get("text")
-            .or_else(|| data.get("body"))
-            .and_then(|t| t.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let provider_message_id = data
-            .get("email_id")
-            .or_else(|| data.get("id"))
-            .and_then(|i| i.as_str())
-            .unwrap_or_default()
-            .to_string();
-        if from.is_empty() || to.is_empty() || provider_message_id.is_empty() {
-            bail!("resend inbound event missing required fields");
-        }
-        Ok(Some(InboundEmail {
-            from,
-            to,
-            subject,
-            body: text,
-            provider_message_id,
-        }))
-    }
-
     fn verify_webhook(&self, headers: &HeaderMap, body: &[u8]) -> Result<()> {
         let id = header_str(headers, "svix-id")?;
         let ts = header_str(headers, "svix-timestamp")?;
@@ -151,6 +104,101 @@ impl EmailProvider for ResendProvider {
             bail!("svix signature mismatch")
         }
     }
+
+    fn parse_webhook(
+        &self,
+        _headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<Option<InboundNotification>> {
+        let v: serde_json::Value = serde_json::from_slice(body).context("webhook json")?;
+        let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+        if event_type != "email.received" && event_type != "inbound.email.received" {
+            return Ok(None);
+        }
+        let data = v.get("data").unwrap_or(&v);
+        let provider_message_id = data
+            .get("email_id")
+            .or_else(|| data.get("id"))
+            .and_then(|i| i.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let from = data.get("from").and_then(value_as_email).unwrap_or_default();
+        let to = data.get("to").and_then(value_as_email).unwrap_or_default();
+        let subject = data
+            .get("subject")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if provider_message_id.is_empty() || from.is_empty() || to.is_empty() {
+            bail!("resend email.received missing email_id/from/to");
+        }
+        Ok(Some(InboundNotification {
+            provider_message_id,
+            from,
+            to,
+            subject,
+        }))
+    }
+
+    async fn fetch_inbound(&self, n: &InboundNotification) -> Result<InboundEmail> {
+        let url = format!(
+            "https://api.resend.com/emails/receiving/{}",
+            n.provider_message_id
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.api_key)
+            // data_uri (Resend's default) inlines images as base64 so the html
+            // fallback is self-contained — no broken `cid:` refs once we drop the
+            // (unfetched) attachments.
+            .query(&[("html_format", "data_uri")])
+            .send()
+            .await
+            .context("resend fetch received email")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("resend fetch received email failed: {status}: {body}");
+        }
+        let bytes = resp.bytes().await.context("resend fetch body")?;
+        let body = parse_received_email_json(&bytes)?;
+        Ok(InboundEmail {
+            from: n.from.clone(),
+            to: n.to.clone(),
+            subject: n.subject.clone(),
+            body,
+            provider_message_id: n.provider_message_id.clone(),
+        })
+    }
+}
+
+/// Map a Resend "retrieve received email" response into the message body:
+/// prefer `text`, fall back to raw `html` (proper HTML->text is a later
+/// refinement), and append a footer when attachments are present (we do not
+/// fetch attachment content in this iteration). Pure — unit-testable.
+fn parse_received_email_json(bytes: &[u8]) -> Result<String> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).context("received-email json")?;
+    let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
+    let html = v.get("html").and_then(|h| h.as_str()).unwrap_or("");
+    let mut body = if !text.trim().is_empty() {
+        text.to_string()
+    } else {
+        html.to_string()
+    };
+    let n_attach = v
+        .get("attachments")
+        .and_then(|a| a.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    // Intentional: an attachment-only email (blank text + html) yields a
+    // footer-only body, which passes the inbound empty-body guard and is
+    // forwarded — telling the recipient something arrived but wasn't delivered,
+    // rather than silently dropping it.
+    if n_attach > 0 {
+        body.push_str(&format!("\n\n[{n_attach} attachment(s) not delivered]"));
+    }
+    Ok(body)
 }
 
 fn header_str(headers: &HeaderMap, name: &str) -> Result<String> {
@@ -256,12 +304,48 @@ mod tests {
         let result = provider()
             .parse_webhook(&HeaderMap::new(), fixture)
             .unwrap();
-        let inbound = result.expect("should be Some for email.received");
-        assert_eq!(inbound.from, "alice@example.com");
-        assert_eq!(inbound.to, "bridge@jig.onl");
-        assert_eq!(inbound.subject, "Hi");
-        assert_eq!(inbound.body, "hello");
-        assert_eq!(inbound.provider_message_id, "m_1");
+        // parse_webhook now returns InboundNotification (no body — body is fetched separately)
+        let notif = result.expect("should be Some for email.received");
+        assert_eq!(notif.provider_message_id, "m_1");
+        assert_eq!(notif.from, "alice@example.com");
+        assert_eq!(notif.to, "bridge@jig.onl");
+        assert_eq!(notif.subject, "Hi");
+    }
+
+    #[test]
+    fn parse_received_prefers_text() {
+        let j = br#"{"text":"hello","html":"<p>hello</p>"}"#;
+        assert_eq!(parse_received_email_json(j).unwrap(), "hello");
+    }
+
+    #[test]
+    fn parse_received_falls_back_to_html() {
+        let j = br#"{"text":null,"html":"<p>hi</p>"}"#;
+        assert_eq!(parse_received_email_json(j).unwrap(), "<p>hi</p>");
+    }
+
+    #[test]
+    fn parse_received_empty_when_both_blank_no_attachments() {
+        let j = br#"{"text":"","html":""}"#;
+        assert_eq!(parse_received_email_json(j).unwrap(), "");
+    }
+
+    #[test]
+    fn parse_received_appends_attachment_footer() {
+        let j = br#"{"text":"body","attachments":[{"id":"a"},{"id":"b"}]}"#;
+        assert_eq!(
+            parse_received_email_json(j).unwrap(),
+            "body\n\n[2 attachment(s) not delivered]"
+        );
+    }
+    #[test]
+    fn parse_received_attachment_only_produces_footer_body() {
+        // Blank text + html but an attachment: the footer is the whole body and
+        // (after trim) is non-empty, so the inbound guard forwards it.
+        let j = br#"{"text":"","html":"","attachments":[{"id":"a"}]}"#;
+        let body = parse_received_email_json(j).unwrap();
+        assert_eq!(body, "\n\n[1 attachment(s) not delivered]");
+        assert!(!body.trim().is_empty());
     }
 
     #[test]
