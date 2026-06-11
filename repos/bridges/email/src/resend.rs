@@ -383,4 +383,28 @@ mod tests {
             .unwrap();
         assert!(result.is_none(), "bounce events should yield None");
     }
+
+    /// Live smoke against real Resend. Ignored by default (no network in CI).
+    /// Run manually with credentials from 1Password, e.g.:
+    ///   RESEND_API_KEY=$(op read 'op://...') RESEND_TEST_TO=you@example.com \
+    ///     cargo test -p jig-bridge-email resend_live_send -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "live: needs RESEND_API_KEY + RESEND_TEST_TO"]
+    async fn resend_live_send() {
+        let api_key = std::env::var("RESEND_API_KEY").expect("set RESEND_API_KEY");
+        let to = std::env::var("RESEND_TEST_TO").expect("set RESEND_TEST_TO");
+        let from =
+            std::env::var("RESEND_TEST_FROM").unwrap_or_else(|_| "onboarding@resend.dev".into());
+        let p = ResendProvider::new(api_key, String::new());
+        let id = p
+            .send(&OutboundEmail {
+                to,
+                from,
+                subject: "jig live smoke".into(),
+                body: "hello from the jig email bridge".into(),
+            })
+            .await
+            .expect("live send should succeed");
+        assert!(!id.is_empty(), "Resend returned an empty message id");
+    }
 }
