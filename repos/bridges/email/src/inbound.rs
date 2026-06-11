@@ -49,7 +49,11 @@ pub async fn handle_inbound(
     };
 
     // Dedup on the provider message id BEFORE the network fetch.
-    match state.storage.get(INBOUND_SEEN_NS, &notif.provider_message_id).await {
+    match state
+        .storage
+        .get(INBOUND_SEEN_NS, &notif.provider_message_id)
+        .await
+    {
         Ok(Some(_)) => return StatusCode::OK,
         Ok(None) => {}
         Err(e) => {
@@ -95,8 +99,14 @@ pub async fn handle_inbound(
         }
     };
     let slug = dm_channel_slug(&shadow_did, &recipient_did);
-    if let Err(e) =
-        ensure_dm_channel(&state.submit, &*state.storage, &shadow, &recipient_did, &slug).await
+    if let Err(e) = ensure_dm_channel(
+        &state.submit,
+        &*state.storage,
+        &shadow,
+        &recipient_did,
+        &slug,
+    )
+    .await
     {
         tracing::error!("email bridge: ensure channel {slug} failed: {e}");
         return StatusCode::BAD_GATEWAY;
@@ -115,7 +125,12 @@ pub async fn handle_inbound(
             let expires = chrono::Utc::now().timestamp() + INBOUND_SEEN_TTL_SECS;
             if let Err(e) = state
                 .storage
-                .put(INBOUND_SEEN_NS, &notif.provider_message_id, b"1", Some(expires))
+                .put(
+                    INBOUND_SEEN_NS,
+                    &notif.provider_message_id,
+                    b"1",
+                    Some(expires),
+                )
                 .await
             {
                 tracing::warn!("email bridge: failed to mark inbound-seen: {e}");
@@ -223,9 +238,7 @@ mod tests {
     /// Captured submit payloads, shared with the test for assertions.
     type Submitted = Arc<Mutex<Vec<Vec<u8>>>>;
 
-    fn make_state(
-        provider: Arc<dyn EmailProvider>,
-    ) -> (Arc<InboundState>, Submitted) {
+    fn make_state(provider: Arc<dyn EmailProvider>) -> (Arc<InboundState>, Submitted) {
         let storage: Arc<dyn BridgeStorage> = Arc::new(MemStore::default());
         let submitted: Submitted = Arc::new(Mutex::new(Vec::new()));
         let s2 = submitted.clone();
@@ -377,7 +390,11 @@ mod tests {
         let code = handle_inbound(state, HeaderMap::new(), Bytes::from_static(b"{}")).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(submitted.lock().unwrap().len(), 0);
-        assert_eq!(*fetch_calls.lock().unwrap(), 0, "non-deliverable must not fetch");
+        assert_eq!(
+            *fetch_calls.lock().unwrap(),
+            0,
+            "non-deliverable must not fetch"
+        );
     }
 
     #[tokio::test]

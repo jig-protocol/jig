@@ -16,7 +16,9 @@ use base64::engine::general_purpose::STANDARD as B64;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use crate::provider::{EmailProvider, InboundEmail, InboundNotification, OutboundEmail, ProviderMessageId};
+use crate::provider::{
+    EmailProvider, InboundEmail, InboundNotification, OutboundEmail, ProviderMessageId,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -122,7 +124,10 @@ impl EmailProvider for ResendProvider {
             .and_then(|i| i.as_str())
             .unwrap_or_default()
             .to_string();
-        let from = data.get("from").and_then(value_as_email).unwrap_or_default();
+        let from = data
+            .get("from")
+            .and_then(value_as_email)
+            .unwrap_or_default();
         let to = data.get("to").and_then(value_as_email).unwrap_or_default();
         let subject = data
             .get("subject")

@@ -28,5 +28,7 @@ pub use config::EmailBridgeConfig;
 pub use identity::{normalize_email, shadow_did, shadow_signing_key};
 pub use inbound::{InboundState, handle_inbound};
 pub use outbound::block_to_outbound_email;
-pub use provider::{EmailProvider, InboundEmail, InboundNotification, OutboundEmail, ProviderMessageId};
+pub use provider::{
+    EmailProvider, InboundEmail, InboundNotification, OutboundEmail, ProviderMessageId,
+};
 pub use resend::ResendProvider;
