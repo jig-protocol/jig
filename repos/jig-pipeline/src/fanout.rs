@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock as StdRwLock;
 use tokio::sync::{RwLock, mpsc};
 
 use crate::persist::{StoredBlock, StoredReceipt};
@@ -35,7 +36,7 @@ pub struct Fanout {
     next_id: AtomicU64,
     local: RwLock<HashMap<u64, (SubscriptionScope, DeliverySender)>>,
     peers: RwLock<HashMap<String, DeliverySender>>,
-    bridge_dids: RwLock<HashMap<String, DeliverySender>>,
+    bridge_dids: StdRwLock<HashMap<String, DeliverySender>>,
 }
 
 impl Fanout {
@@ -66,16 +67,22 @@ impl Fanout {
         self.peers.write().await.remove(peer_server_url);
     }
 
-    /// Register a sink for a bridge-managed DID. When a broadcast block's
-    /// channel includes this DID (and it isn't the sender), the delivery is
-    /// routed here so the bridge can emit it externally. Re-registering the
-    /// same DID replaces the previous sender.
-    pub async fn register_bridge_did(&self, managed_did: String, tx: DeliverySender) {
-        self.bridge_dids.write().await.insert(managed_did, tx);
+    /// Register a sink for a bridge-managed DID. Synchronous: the insert
+    /// completes before this returns, so a caller that registers a DID and then
+    /// returns can be sure a subsequently-delivered block finds the sink (no
+    /// fire-and-forget window). Re-registering the same DID replaces the sender.
+    pub fn register_bridge_did(&self, managed_did: String, tx: DeliverySender) {
+        self.bridge_dids
+            .write()
+            .expect("bridge_dids poisoned")
+            .insert(managed_did, tx);
     }
 
-    pub async fn unregister_bridge_did(&self, managed_did: &str) {
-        self.bridge_dids.write().await.remove(managed_did);
+    pub fn unregister_bridge_did(&self, managed_did: &str) {
+        self.bridge_dids
+            .write()
+            .expect("bridge_dids poisoned")
+            .remove(managed_did);
     }
 
     /// Like `broadcast`, but also dispatches to bridge sinks for any managed
@@ -88,8 +95,7 @@ impl Fanout {
     ) -> anyhow::Result<()> {
         self.broadcast_to_locals(block, receipt).await;
         self.broadcast_to_peers(block, receipt).await;
-        self.dispatch_to_bridges(block, receipt, channel_member_dids)
-            .await;
+        self.dispatch_to_bridges(block, receipt, channel_member_dids);
         Ok(())
     }
 
@@ -101,27 +107,27 @@ impl Fanout {
         receipt: &StoredReceipt,
         channel_member_dids: &[String],
     ) {
-        self.dispatch_to_bridges(block, receipt, channel_member_dids)
-            .await;
+        self.dispatch_to_bridges(block, receipt, channel_member_dids);
     }
 
-    async fn dispatch_to_bridges(
+    fn dispatch_to_bridges(
         &self,
         block: &StoredBlock,
         receipt: &StoredReceipt,
         channel_member_dids: &[String],
     ) {
-        let sinks = self.bridge_dids.read().await;
-        if sinks.is_empty() {
-            return;
-        }
-        for did in channel_member_dids {
-            if did == &block.sender_did {
-                continue; // don't echo the author's own message back to them
-            }
-            if let Some(tx) = sinks.get(did) {
-                let _ = tx.send((block.clone(), receipt.clone()));
-            }
+        // Collect matching sinks under a brief read lock, then send after
+        // dropping it (never hold the lock across the send loop).
+        let senders: Vec<DeliverySender> = {
+            let sinks = self.bridge_dids.read().expect("bridge_dids poisoned");
+            channel_member_dids
+                .iter()
+                .filter(|did| *did != &block.sender_did) // don't echo to the author
+                .filter_map(|did| sinks.get(did).cloned())
+                .collect()
+        };
+        for tx in senders {
+            let _ = tx.send((block.clone(), receipt.clone()));
         }
     }
 
@@ -366,8 +372,7 @@ mod tests {
     async fn bridge_sink_receives_when_managed_did_is_member_and_not_sender() {
         let f = Fanout::new();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        f.register_bridge_did("did:jig:zShadowAlice".to_string(), tx)
-            .await;
+        f.register_bridge_did("did:jig:zShadowAlice".to_string(), tx);
 
         // Block authored by bob (real), channel members = [bob, shadow-alice].
         let mut blk = sample_block(Some("#dm/x"), "text-render");
@@ -394,8 +399,7 @@ mod tests {
     async fn bridge_sink_skips_when_managed_did_is_the_sender() {
         let f = Fanout::new();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        f.register_bridge_did("did:jig:zShadowAlice".to_string(), tx)
-            .await;
+        f.register_bridge_did("did:jig:zShadowAlice".to_string(), tx);
 
         // Inbound: block authored BY shadow-alice. Must not echo back to her.
         let mut blk = sample_block(Some("#dm/x"), "text-render");
@@ -422,9 +426,8 @@ mod tests {
     async fn unregister_bridge_did_stops_delivery() {
         let f = Fanout::new();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        f.register_bridge_did("did:jig:zShadowAlice".to_string(), tx)
-            .await;
-        f.unregister_bridge_did("did:jig:zShadowAlice").await;
+        f.register_bridge_did("did:jig:zShadowAlice".to_string(), tx);
+        f.unregister_bridge_did("did:jig:zShadowAlice");
         let mut blk = sample_block(Some("#dm/x"), "text-render");
         blk.sender_did = "did:jig:zBob".to_string();
         f.broadcast_with_members(

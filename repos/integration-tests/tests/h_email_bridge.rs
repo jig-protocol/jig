@@ -196,17 +196,6 @@ fn convo_slug() -> String {
     dm_channel_slug(&alice, &dj)
 }
 
-/// Drain ready spawned tasks on the current-thread test runtime by yielding
-/// repeatedly. Deterministic (no wall-clock dependence): used to let the
-/// `register_bridge_did` task wire the bridge sink into the Fanout BEFORE we
-/// ingest the reply block — the fanout broadcast is one-shot, so the sink must
-/// be registered at broadcast time.
-async fn drain_spawned_tasks() {
-    for _ in 0..50 {
-        tokio::task::yield_now().await;
-    }
-}
-
 /// Poll `cond` every 20ms until it is true or `secs` elapse (then panic).
 /// Replaces fixed sleeps so the test isn't flaky under CI load — it waits only
 /// as long as needed and fails loudly with a clear message on a real hang.
@@ -277,10 +266,6 @@ async fn round_trip_reply_emails_original_sender() {
         StatusCode::OK,
         "inbound webhook must return 200"
     );
-
-    // Let the spawned `register_bridge_did` task wire the bridge sink into the
-    // Fanout map before we ingest the reply block (the broadcast is one-shot).
-    drain_spawned_tasks().await;
 
     // The other channel member (shadow-dj) replies. `shadow_signing_key`
     // derives the same key that the inbound handler resolved for dj@jig.onl
