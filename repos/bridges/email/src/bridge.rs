@@ -230,7 +230,7 @@ fn synth_from(author_did: &str, bridge_domain: &str) -> String {
 mod tests {
     use super::*;
     use crate::channel::dm_channel_slug;
-    use crate::provider::{InboundEmail, OutboundEmail, ProviderMessageId};
+    use crate::provider::{InboundEmail, InboundNotification, OutboundEmail, ProviderMessageId};
     use async_trait::async_trait;
     use jig_bridge_core::{ManagedDidRegistrar, RouterMount, SubmitHandle, SubscribeHandle};
     use std::collections::HashMap;
@@ -277,11 +277,25 @@ mod tests {
             self.sent.lock().unwrap().push(msg.clone());
             Ok("mock-id".into())
         }
-        fn parse_webhook(&self, _: &HeaderMap, _: &[u8]) -> anyhow::Result<Option<InboundEmail>> {
-            Ok(None)
-        }
         fn verify_webhook(&self, _: &HeaderMap, _: &[u8]) -> anyhow::Result<()> {
             Ok(())
+        }
+        fn parse_webhook(
+            &self,
+            _: &HeaderMap,
+            _: &[u8],
+        ) -> anyhow::Result<Option<InboundNotification>> {
+            Ok(None)
+        }
+        async fn fetch_inbound(&self, n: &InboundNotification) -> anyhow::Result<InboundEmail> {
+            // Never called by outbound-path tests, but satisfies the trait.
+            Ok(InboundEmail {
+                from: n.from.clone(),
+                to: n.to.clone(),
+                subject: n.subject.clone(),
+                body: String::new(),
+                provider_message_id: n.provider_message_id.clone(),
+            })
         }
     }
 

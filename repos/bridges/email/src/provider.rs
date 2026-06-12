@@ -2,6 +2,11 @@
 //! integration tests inject a MockProvider. The trait abstracts "send an
 //! outbound email" and "verify + parse an inbound provider webhook" so the
 //! bridge logic is provider-agnostic.
+//!
+//! Inbound is a two-step process because providers like Resend send
+//! metadata-only webhooks — the body must be fetched separately:
+//!   1. `parse_webhook` → `InboundNotification` (sync, no network)
+//!   2. `fetch_inbound`  → `InboundEmail`        (async, HTTP fetch)
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -27,6 +32,18 @@ pub struct InboundEmail {
     pub provider_message_id: String,
 }
 
+/// Metadata parsed synchronously from a provider webhook. The body is fetched
+/// separately (async) via [`EmailProvider::fetch_inbound`], because providers
+/// like Resend send metadata-only webhooks. `provider_message_id` is both the
+/// fetch key and the inbound dedup key.
+#[derive(Debug, Clone)]
+pub struct InboundNotification {
+    pub provider_message_id: String,
+    pub from: String,
+    pub to: String,
+    pub subject: String,
+}
+
 /// A provider's stable identifier for a sent message.
 pub type ProviderMessageId = String;
 
@@ -35,13 +52,19 @@ pub trait EmailProvider: Send + Sync {
     /// Send an outbound email; returns the provider's message id on success.
     async fn send(&self, msg: &OutboundEmail) -> Result<ProviderMessageId>;
 
-    /// Parse a webhook payload into an inbound email. `Ok(None)` means the
-    /// event is non-deliverable (a bounce / delivery-status notification) that
-    /// should be logged but not forwarded into the protocol.
-    fn parse_webhook(&self, headers: &HeaderMap, body: &[u8]) -> Result<Option<InboundEmail>>;
-
     /// Verify the webhook signature. `Err` => reject the request (HTTP 401).
     fn verify_webhook(&self, headers: &HeaderMap, body: &[u8]) -> Result<()>;
+
+    /// Parse a webhook into inbound *metadata* (no body). `Ok(None)` = a
+    /// non-deliverable event (bounce/status) to log but not forward.
+    fn parse_webhook(
+        &self,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<Option<InboundNotification>>;
+
+    /// Fetch the full inbound email (body) for a parsed notification.
+    async fn fetch_inbound(&self, notification: &InboundNotification) -> Result<InboundEmail>;
 }
 
 #[cfg(test)]
@@ -55,11 +78,20 @@ mod tests {
         async fn send(&self, _: &OutboundEmail) -> Result<ProviderMessageId> {
             Ok("pmid".into())
         }
-        fn parse_webhook(&self, _: &HeaderMap, _: &[u8]) -> Result<Option<InboundEmail>> {
-            Ok(None)
-        }
         fn verify_webhook(&self, _: &HeaderMap, _: &[u8]) -> Result<()> {
             Ok(())
+        }
+        fn parse_webhook(&self, _: &HeaderMap, _: &[u8]) -> Result<Option<InboundNotification>> {
+            Ok(None)
+        }
+        async fn fetch_inbound(&self, n: &InboundNotification) -> Result<InboundEmail> {
+            Ok(InboundEmail {
+                from: n.from.clone(),
+                to: n.to.clone(),
+                subject: n.subject.clone(),
+                body: "stub body".into(),
+                provider_message_id: n.provider_message_id.clone(),
+            })
         }
     }
 

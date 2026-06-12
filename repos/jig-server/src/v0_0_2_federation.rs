@@ -668,8 +668,7 @@ mod tests {
         state
             .ingest_ctx
             .fanout
-            .register_bridge_did(managed_did.clone(), tx)
-            .await;
+            .register_bridge_did(managed_did.clone(), tx);
 
         // A peer relays a text-render authored by a DIFFERENT DID, posted to
         // "#dm/x" (carried in metadata["channel"]).

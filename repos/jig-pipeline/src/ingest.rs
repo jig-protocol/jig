@@ -516,7 +516,7 @@ mod tests {
         // A shadow DID for alice, registered as a bridge sink.
         let shadow = "did:jig:zShadowAlice".to_string();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        ctx.fanout.register_bridge_did(shadow.clone(), tx).await;
+        ctx.fanout.register_bridge_did(shadow.clone(), tx);
 
         // Channel "#dm/x" with members [bob, shadow].
         ctx.store
@@ -570,7 +570,7 @@ mod tests {
         // A shadow DID for alice, registered as a bridge sink.
         let shadow = "did:jig:zShadowAliceCID".to_string();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        ctx.fanout.register_bridge_did(shadow.clone(), tx).await;
+        ctx.fanout.register_bridge_did(shadow.clone(), tx);
 
         // Channel stored with a CID as id (distinct from slug) — realistic
         // shape written by channel-create effect handling.

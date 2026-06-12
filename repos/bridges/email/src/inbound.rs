@@ -39,41 +39,19 @@ pub async fn handle_inbound(
     if state.provider.verify_webhook(&headers, &body).is_err() {
         return StatusCode::UNAUTHORIZED;
     }
-    let email = match state.provider.parse_webhook(&headers, &body) {
-        Ok(Some(e)) => e,
-        Ok(None) => return StatusCode::OK, // bounce/status — logged upstream, no forward
+    let notif = match state.provider.parse_webhook(&headers, &body) {
+        Ok(Some(n)) => n,
+        Ok(None) => return StatusCode::OK,
         Err(e) => {
             tracing::warn!("email bridge: inbound parse failed: {e}");
             return StatusCode::BAD_REQUEST;
         }
     };
 
-    if email.body.len() > MAX_INLINE_BYTES {
-        tracing::warn!(
-            "email bridge: inbound body {} bytes exceeds cap, rejecting",
-            email.body.len()
-        );
-        return StatusCode::PAYLOAD_TOO_LARGE;
-    }
-
-    // Never forward a blank message. Notably, real Resend `email.received`
-    // webhooks are metadata-only — the body must be fetched from the Receiving
-    // API, which is NOT yet implemented (see resend.rs). Until that lands, drop
-    // empty-bodied inbound loudly rather than submitting an empty block. (200 so
-    // the provider doesn't retry-storm; the error log is the signal.)
-    if email.body.trim().is_empty() {
-        tracing::error!(
-            "email bridge: inbound email {} has an empty body, dropping — the provider may \
-             deliver metadata-only webhooks that require a separate body fetch (unimplemented)",
-            email.provider_message_id
-        );
-        return StatusCode::OK;
-    }
-
-    // Dedup on the provider's stable message id (handles provider redelivery).
+    // Dedup on the provider message id BEFORE the network fetch.
     match state
         .storage
-        .get(INBOUND_SEEN_NS, &email.provider_message_id)
+        .get(INBOUND_SEEN_NS, &notif.provider_message_id)
         .await
     {
         Ok(Some(_)) => return StatusCode::OK,
@@ -84,17 +62,35 @@ pub async fn handle_inbound(
         }
     }
 
-    // The sender is always represented by the bridge's own shadow identity — the
-    // bridge can only sign as itself, never as a real user. (Author = shadow.)
+    // Fetch the body (provider webhooks are metadata-only).
+    let email = match state.provider.fetch_inbound(&notif).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("email bridge: inbound body fetch failed: {e}");
+            return StatusCode::BAD_GATEWAY;
+        }
+    };
+
+    if email.body.trim().is_empty() {
+        tracing::error!(
+            "email bridge: inbound email {} has an empty body, dropping",
+            email.provider_message_id
+        );
+        return StatusCode::OK;
+    }
+    if email.body.len() > MAX_INLINE_BYTES {
+        tracing::warn!(
+            "email bridge: inbound body {} bytes exceeds cap, rejecting",
+            email.body.len()
+        );
+        return StatusCode::PAYLOAD_TOO_LARGE;
+    }
+
     let sk = shadow_signing_key(&state.bridge_secret, &email.from, state.strip_plus_tags);
     let shadow = Identity::from_signing_key(sk);
     let shadow_did = shadow.did().to_string();
-    // Register the shadow so the server routes this channel's replies to outbound().
-    // Idempotent; the registry is in-memory and rebuilt as inbound mail arrives (a
-    // restart loses registrations until the next inbound per conversation).
     state.managed_dids.register(shadow_did.clone());
 
-    // Recipient (the bridge address) -> the Jig user's DID (native if known).
     let recipient_did = match state.address_book.resolve(&email.to).await {
         Ok(r) => r.did().to_string(),
         Err(e) => {
@@ -102,9 +98,7 @@ pub async fn handle_inbound(
             return StatusCode::INTERNAL_SERVER_ERROR;
         }
     };
-
     let slug = dm_channel_slug(&shadow_did, &recipient_did);
-
     if let Err(e) = ensure_dm_channel(
         &state.submit,
         &*state.storage,
@@ -117,10 +111,6 @@ pub async fn handle_inbound(
         tracing::error!("email bridge: ensure channel {slug} failed: {e}");
         return StatusCode::BAD_GATEWAY;
     }
-
-    // Record slug -> external sender email so outbound() can find the recipient
-    // when the Jig user replies (shadow DIDs are KDF-derived, not reversible).
-    // Best-effort; last writer wins for a 1:1 conversation.
     if let Err(e) = state
         .storage
         .put(CHANNEL_EMAIL_NS, &slug, email.from.as_bytes(), None)
@@ -128,10 +118,6 @@ pub async fn handle_inbound(
     {
         tracing::warn!("email bridge: failed to record channel-email map for {slug}: {e}");
     }
-
-    // TODO(C9 round-trip): email.subject is currently dropped — text-render has
-    // no subject metadata slot, and outbound derives a subject from the body.
-    // Thread it through if/when blocks carry a subject field.
     let hlc = jig_core::HlcTimestamp::now_wall(shadow.did().clone());
     let block = jig_client::blocks::build_text_render(&shadow, &slug, &email.body, hlc);
     match submit_built_block(&state.submit, block).await {
@@ -141,7 +127,7 @@ pub async fn handle_inbound(
                 .storage
                 .put(
                     INBOUND_SEEN_NS,
-                    &email.provider_message_id,
+                    &notif.provider_message_id,
                     b"1",
                     Some(expires),
                 )
@@ -164,7 +150,7 @@ pub async fn handle_inbound(
 mod tests {
     use super::*;
     use crate::identity::shadow_did;
-    use crate::provider::{InboundEmail, OutboundEmail, ProviderMessageId};
+    use crate::provider::{InboundEmail, InboundNotification, OutboundEmail, ProviderMessageId};
     use anyhow::Result;
     use async_trait::async_trait;
     use std::collections::HashMap;
@@ -201,18 +187,19 @@ mod tests {
         }
     }
 
-    // Stub provider: configurable parse result + verify outcome.
+    // Stub provider: drives parse + fetch with configurable outcomes.
+    // `fetch_body = Some(s)` → fetch returns Ok with that body.
+    // `fetch_body = None`    → fetch returns Err (simulates network failure).
     struct StubProvider {
-        email: Option<InboundEmail>,
+        notification: Option<InboundNotification>,
+        fetch_body: Option<String>,
         verify_ok: bool,
+        fetch_calls: Arc<Mutex<u32>>,
     }
     #[async_trait]
     impl EmailProvider for StubProvider {
         async fn send(&self, _: &OutboundEmail) -> Result<ProviderMessageId> {
             Ok("pmid".into())
-        }
-        fn parse_webhook(&self, _: &HeaderMap, _: &[u8]) -> Result<Option<InboundEmail>> {
-            Ok(self.email.clone())
         }
         fn verify_webhook(&self, _: &HeaderMap, _: &[u8]) -> Result<()> {
             if self.verify_ok {
@@ -220,6 +207,31 @@ mod tests {
             } else {
                 Err(anyhow::anyhow!("bad sig"))
             }
+        }
+        fn parse_webhook(&self, _: &HeaderMap, _: &[u8]) -> Result<Option<InboundNotification>> {
+            Ok(self.notification.clone())
+        }
+        async fn fetch_inbound(&self, n: &InboundNotification) -> Result<InboundEmail> {
+            *self.fetch_calls.lock().unwrap() += 1;
+            match &self.fetch_body {
+                Some(b) => Ok(InboundEmail {
+                    from: n.from.clone(),
+                    to: n.to.clone(),
+                    subject: n.subject.clone(),
+                    body: b.clone(),
+                    provider_message_id: n.provider_message_id.clone(),
+                }),
+                None => anyhow::bail!("stub fetch error"),
+            }
+        }
+    }
+
+    fn sample_notif() -> InboundNotification {
+        InboundNotification {
+            provider_message_id: "m1".into(),
+            from: "alice@example.com".into(),
+            to: "dj@jig.onl".into(),
+            subject: "Hi".into(),
         }
     }
 
@@ -264,14 +276,10 @@ mod tests {
         }
     }
 
-    /// A state whose submit handle always denies with `denial`, with the
-    /// channel-ensure marker pre-seeded so the denial lands on the text-render
-    /// submit (not the channel-create) — exercising the SubmitDenied->status map.
+    /// A state whose submit handle always denies. The channel-ensure marker is
+    /// pre-seeded so the denial lands on the text-render submit (not channel-create).
     async fn denying_state(denial_kind: DenialKind) -> Arc<InboundState> {
         let storage: Arc<dyn BridgeStorage> = Arc::new(MemStore::default());
-        // Pre-seed the channel-ensured marker for the conversation sample_email
-        // produces, so ensure_dm_channel short-circuits and the text-render submit
-        // is the first (and denied) submission.
         let sender = shadow_did("secret", "alice@example.com", false).to_did_jig_string();
         let recipient = shadow_did("secret", "dj@jig.onl", false).to_did_jig_string();
         let slug = dm_channel_slug(&sender, &recipient);
@@ -292,8 +300,10 @@ mod tests {
             })
         });
         let provider: Arc<dyn EmailProvider> = Arc::new(StubProvider {
-            email: Some(sample_email("hi")),
+            notification: Some(sample_notif()),
+            fetch_body: Some("hi".into()),
             verify_ok: true,
+            fetch_calls: Arc::new(Mutex::new(0)),
         });
         Arc::new(build_state(provider, storage, submit))
     }
@@ -305,21 +315,14 @@ mod tests {
         Unavailable,
     }
 
-    fn sample_email(body: &str) -> InboundEmail {
-        InboundEmail {
-            from: "alice@example.com".into(),
-            to: "dj@jig.onl".into(),
-            subject: "Hi".into(),
-            body: body.into(),
-            provider_message_id: "m1".into(),
-        }
-    }
-
     #[tokio::test]
     async fn inbound_submits_text_render_then_dedupes() {
+        let fetch_calls = Arc::new(Mutex::new(0u32));
         let provider = Arc::new(StubProvider {
-            email: Some(sample_email("hello from alice")),
+            notification: Some(sample_notif()),
+            fetch_body: Some("hello from alice".into()),
             verify_ok: true,
+            fetch_calls: fetch_calls.clone(),
         });
         let (state, submitted) = make_state(provider);
 
@@ -344,7 +347,7 @@ mod tests {
             expected_shadow
         );
 
-        // Second identical webhook (same provider_message_id) -> dedup, no new submits.
+        // Second identical webhook (same provider_message_id) -> dedup, no new submits, no fetch.
         let code2 =
             handle_inbound(state.clone(), HeaderMap::new(), Bytes::from_static(b"{}")).await;
         assert_eq!(code2, StatusCode::OK);
@@ -353,13 +356,20 @@ mod tests {
             n1,
             "dedup: no second submit"
         );
+        assert_eq!(
+            *fetch_calls.lock().unwrap(),
+            1,
+            "dedup must skip the fetch on redelivery"
+        );
     }
 
     #[tokio::test]
     async fn bad_signature_is_unauthorized() {
         let provider = Arc::new(StubProvider {
-            email: Some(sample_email("x")),
+            notification: Some(sample_notif()),
+            fetch_body: Some("x".into()),
             verify_ok: false,
+            fetch_calls: Arc::new(Mutex::new(0)),
         });
         let (state, submitted) = make_state(provider);
         let code = handle_inbound(state, HeaderMap::new(), Bytes::from_static(b"{}")).await;
@@ -369,36 +379,45 @@ mod tests {
 
     #[tokio::test]
     async fn non_deliverable_event_is_ok_no_submit() {
+        let fetch_calls = Arc::new(Mutex::new(0u32));
         let provider = Arc::new(StubProvider {
-            email: None,
+            notification: None,
+            fetch_body: None,
             verify_ok: true,
+            fetch_calls: fetch_calls.clone(),
         });
         let (state, submitted) = make_state(provider);
         let code = handle_inbound(state, HeaderMap::new(), Bytes::from_static(b"{}")).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(submitted.lock().unwrap().len(), 0);
+        assert_eq!(
+            *fetch_calls.lock().unwrap(),
+            0,
+            "non-deliverable must not fetch"
+        );
     }
 
     #[tokio::test]
-    async fn oversized_body_is_413() {
-        let big = "x".repeat(MAX_INLINE_BYTES + 1);
+    async fn fetch_error_is_bad_gateway() {
         let provider = Arc::new(StubProvider {
-            email: Some(sample_email(&big)),
+            notification: Some(sample_notif()),
+            fetch_body: None, // triggers fetch Err
             verify_ok: true,
+            fetch_calls: Arc::new(Mutex::new(0)),
         });
         let (state, submitted) = make_state(provider);
         let code = handle_inbound(state, HeaderMap::new(), Bytes::from_static(b"{}")).await;
-        assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(code, StatusCode::BAD_GATEWAY);
         assert_eq!(submitted.lock().unwrap().len(), 0);
     }
 
     #[tokio::test]
     async fn empty_body_is_dropped_not_submitted() {
-        // A whitespace-only body (e.g. a metadata-only provider webhook) must be
-        // dropped, never submitted as a blank block.
         let provider = Arc::new(StubProvider {
-            email: Some(sample_email("   ")),
+            notification: Some(sample_notif()),
+            fetch_body: Some("   ".into()),
             verify_ok: true,
+            fetch_calls: Arc::new(Mutex::new(0)),
         });
         let (state, submitted) = make_state(provider);
         let code = handle_inbound(state, HeaderMap::new(), Bytes::from_static(b"{}")).await;
@@ -408,6 +427,21 @@ mod tests {
             0,
             "blank-body email must not submit a block"
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_413() {
+        let big = "x".repeat(MAX_INLINE_BYTES + 1);
+        let provider = Arc::new(StubProvider {
+            notification: Some(sample_notif()),
+            fetch_body: Some(big),
+            verify_ok: true,
+            fetch_calls: Arc::new(Mutex::new(0)),
+        });
+        let (state, submitted) = make_state(provider);
+        let code = handle_inbound(state, HeaderMap::new(), Bytes::from_static(b"{}")).await;
+        assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(submitted.lock().unwrap().len(), 0);
     }
 
     #[tokio::test]
