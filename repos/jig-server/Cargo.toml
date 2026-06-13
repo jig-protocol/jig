@@ -76,7 +76,7 @@ hex = { workspace = true }
 futures-util = "0.3"
 semver = "1.0"
 hickory-resolver = { version = "0.26", features = ["tokio"] }
-reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+reqwest = { workspace = true }
 
 # WebSocket — rustls-tls-native-roots feature pulls in tokio-rustls 0.25 +
 # rustls 0.22 so we can install a custom rustls::ClientConfig at the

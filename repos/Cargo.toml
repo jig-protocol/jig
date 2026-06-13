@@ -61,6 +61,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # CLI
 clap = { version = "4.0", features = ["derive", "env"] }
 
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
 # Networking
 axum = "0.7"
 tower = "0.4"
