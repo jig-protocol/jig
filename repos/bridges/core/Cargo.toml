@@ -12,11 +12,9 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
-# Workspace tokio has `features = ["full"]`; the sync subset is sufficient
-# for jig-bridge-core but cargo unifies features across the workspace, so
-# we accept full here for consistency. If features are ever pared back at
-# the workspace level, narrow here with `features = ["sync"]` and verify
-# nothing in dev-deps requires "macros + rt-multi-thread" separately.
+# Workspace tokio is trimmed to the minimal needed set (rt-multi-thread, macros,
+# net, time, sync, signal, io-util). jig-bridge-core only needs "sync" at the
+# library level; cargo unifies the workspace set automatically so no override needed.
 tokio = { workspace = true }
 axum = { workspace = true, optional = true }
 

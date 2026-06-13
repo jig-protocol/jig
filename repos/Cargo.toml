@@ -40,7 +40,7 @@ jig-runtime = { path = "jig-runtime" }
 dioxus = "0.6.0"
 ui = { path = "jig-gui/riverdance/ui" }
 api = { path = "jig-gui/riverdance/api" }
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util"] }
 async-trait = "0.1"
 thiserror = "1.0"
 anyhow = "1.0"
