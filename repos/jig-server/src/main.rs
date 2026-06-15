@@ -43,7 +43,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let mut config = if let Some(path) = args.config {
+    let config_path = args.config.clone();
+    let mut config = if let Some(path) = &config_path {
         ServerConfig::load(path)?
     } else {
         // Precedence: jig-config in CWD or ~/.jig/config.toml, then defaults
@@ -62,7 +63,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // this succeeds, the /.well-known/jig response includes server_did, etc.
     let v0_0_2_state = {
         use jig_config::v0_0_2_server::JigServerConfig;
-        let v002_config = JigServerConfig::default();
+        // C: load the operator's v0.0.2 config (server/identity/federation/bridges)
+        // from the same explicit --config file. Falls back to defaults when no
+        // explicit path is given (dev/well-known flow) or on parse error, so a
+        // v0.0.1-only deploy still boots.
+        let v002_config = match &config_path {
+            Some(path) => JigServerConfig::load(path).unwrap_or_else(|e| {
+                tracing::warn!(
+                    "v0.0.2 config load from {} failed ({e}); using defaults",
+                    path.display()
+                );
+                JigServerConfig::default()
+            }),
+            None => JigServerConfig::default(),
+        };
         let db_path = config.database_path.with_file_name(
             config
                 .database_path
