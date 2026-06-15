@@ -1,7 +1,7 @@
 //! Main Jig server orchestration.
 
-use std::io::BufReader;
 use std::fs::File;
+use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -98,9 +98,16 @@ impl JigServer {
             .map_err(|e| ServerError::Server(format!("binding {addr}: {e}")))?;
 
         if self.config.tls.enabled {
-            let (cert, key) = self.config.tls.resolved_paths().map_err(ServerError::Config)?;
+            let (cert, key) = self
+                .config
+                .tls
+                .resolved_paths()
+                .map_err(ServerError::Config)?;
             let rustls_config = load_rustls_config(cert, key)?;
-            tracing::info!("HTTPS (rustls) listening on https://{}", listener.local_addr()?);
+            tracing::info!(
+                "HTTPS (rustls) listening on https://{}",
+                listener.local_addr()?
+            );
             serve_tls(listener, router, rustls_config).await?;
         } else {
             tracing::info!("HTTP API listening on http://{}", listener.local_addr()?);
@@ -119,14 +126,21 @@ impl JigServer {
 /// over http/1.1), so HTTP/2 is a deferred optimization rather than a
 /// requirement. Uses rustls 0.22's default `ring` provider (same as the
 /// federation client config in v0_0_2_federation_tls).
-fn load_rustls_config(cert_path: &std::path::Path, key_path: &std::path::Path) -> Result<RustlsServerConfig> {
-    let cert_file = File::open(cert_path)
-        .map_err(|e| ServerError::Config(format!("opening TLS cert {}: {e}", cert_path.display())))?;
+fn load_rustls_config(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> Result<RustlsServerConfig> {
+    let cert_file = File::open(cert_path).map_err(|e| {
+        ServerError::Config(format!("opening TLS cert {}: {e}", cert_path.display()))
+    })?;
     let certs = rustls_pemfile::certs(&mut BufReader::new(cert_file))
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| ServerError::Config(format!("parsing TLS cert: {e}")))?;
     if certs.is_empty() {
-        return Err(ServerError::Config(format!("no certificates in {}", cert_path.display())));
+        return Err(ServerError::Config(format!(
+            "no certificates in {}",
+            cert_path.display()
+        )));
     }
     let key_file = File::open(key_path)
         .map_err(|e| ServerError::Config(format!("opening TLS key {}: {e}", key_path.display())))?;
@@ -169,9 +183,10 @@ async fn serve_tls(
                 }
             };
             let io = TokioIo::new(tls);
-            let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                router.clone().oneshot(req)
-            });
+            let service =
+                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    router.clone().oneshot(req)
+                });
             if let Err(e) = AutoBuilder::new(TokioExecutor::new())
                 .serve_connection_with_upgrades(io, service)
                 .await
