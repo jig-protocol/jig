@@ -33,7 +33,7 @@ jig-client = { path = "../jig-client" }
 clap = { version = "4.4", features = ["derive"] }
 
 # Async
-tokio = { version = "1.35", features = ["full"] }
+tokio = { workspace = true }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -45,7 +45,7 @@ anyhow = "1.0"
 thiserror = "1.0"
 
 # HTTP client
-reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+reqwest = { workspace = true }
 
 # Base64 for alias-registration proof-of-control signatures
 base64 = "0.22"

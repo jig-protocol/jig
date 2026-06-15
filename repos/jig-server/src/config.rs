@@ -15,6 +15,33 @@ pub struct ServerConfig {
     pub host_id: String,
     #[serde(default)]
     pub execution: ExecutionSection,
+    #[serde(default)]
+    pub tls: TlsConfig,
+}
+
+/// Opt-in TLS for the public HTTPS edge. Absent / `enabled = false` keeps the
+/// server on plaintext HTTP (the localhost dev default). The operator supplies
+/// a static cert + key (e.g. from certbot or a Cloudflare origin cert).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TlsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub cert_path: Option<PathBuf>,
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
+}
+
+impl TlsConfig {
+    /// `(cert_path, key_path)` when both are present; an error otherwise. The
+    /// server calls this only when `enabled`, so a missing path is a
+    /// misconfiguration that must fail loudly at startup.
+    pub fn resolved_paths(&self) -> Result<(&PathBuf, &PathBuf), String> {
+        match (&self.cert_path, &self.key_path) {
+            (Some(cert), Some(key)) => Ok((cert, key)),
+            _ => Err("[tls] enabled = true requires both cert_path and key_path".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +68,7 @@ impl Default for ServerConfig {
             port: 7117,
             host_id: default_host_id(),
             execution: ExecutionSection::default(),
+            tls: TlsConfig::default(),
         }
     }
 }
@@ -183,6 +211,49 @@ fn default_memory_max_mb() -> u32 {
 
 fn default_timeout_ms() -> u64 {
     250
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tls_defaults_disabled() {
+        let cfg = ServerConfig::default();
+        assert!(!cfg.tls.enabled);
+        assert!(cfg.tls.resolved_paths().is_err());
+    }
+
+    #[test]
+    fn tls_section_parses() {
+        let toml_str = r#"
+            database_path = "/tmp/x.db"
+            bind_address = "0.0.0.0"
+            port = 443
+            [tls]
+            enabled = true
+            cert_path = "/etc/jig/tls/fullchain.pem"
+            key_path = "/etc/jig/tls/privkey.pem"
+        "#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.tls.enabled);
+        let (cert, key) = cfg.tls.resolved_paths().unwrap();
+        assert_eq!(cert.to_str().unwrap(), "/etc/jig/tls/fullchain.pem");
+        assert_eq!(key.to_str().unwrap(), "/etc/jig/tls/privkey.pem");
+    }
+
+    #[test]
+    fn tls_enabled_without_paths_is_error() {
+        let toml_str = r#"
+            database_path = "/tmp/x.db"
+            bind_address = "0.0.0.0"
+            port = 443
+            [tls]
+            enabled = true
+        "#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.tls.resolved_paths().is_err());
+    }
 }
 
 #[cfg(test)]

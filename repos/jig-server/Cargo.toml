@@ -27,7 +27,7 @@ jig-client   = { path = "../jig-client" }
 shellexpand  = "3"
 
 # Async runtime
-tokio = { version = "1.35", features = ["full"] }
+tokio = { workspace = true }
 tokio-util = "0.7"
 futures = "0.3"
 
@@ -76,7 +76,7 @@ hex = { workspace = true }
 futures-util = "0.3"
 semver = "1.0"
 hickory-resolver = { version = "0.26", features = ["tokio"] }
-reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+reqwest = { workspace = true }
 
 # WebSocket — rustls-tls-native-roots feature pulls in tokio-rustls 0.25 +
 # rustls 0.22 so we can install a custom rustls::ClientConfig at the
@@ -97,8 +97,17 @@ sha2 = "0.10"
 # Async traits (used by v0.0.2 bridge trait impls)
 async-trait = "0.1"
 
+# TLS serving — reuses the rustls 0.22 / tokio-rustls 0.25 already pulled by
+# tokio-tungstenite (federation WSS). Hand-wired over hyper-util to avoid
+# axum-server, which would drag in rustls 0.23 + aws-lc-rs (a heavy C build).
+tokio-rustls = "0.25"
+rustls-pemfile = "2"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+
 [dev-dependencies]
 tempfile = "3.8"
+rcgen = "0.13"
 
 [features]
 default = ["sqlite"]
