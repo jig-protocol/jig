@@ -17,6 +17,7 @@
 //! `GET /.well-known/jig`.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -168,6 +169,15 @@ pub struct BridgeSection {
 }
 
 impl JigServerConfig {
+    /// Load the v0.0.2 server config from a TOML file. The file MAY also carry
+    /// root-level jig-server `ServerConfig` keys (database_path/bind_address/
+    /// port/[tls]/[execution]) — serde ignores unknown fields, so one
+    /// production config.toml can drive both `ServerConfig::load` and this.
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        let s = std::fs::read_to_string(path)?;
+        toml::from_str(&s).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
     /// List of active antipattern flags. Returned by `GET /.well-known/jig`
     /// so federated peers can detect a misconfigured node. ALWAYS includes
     /// `naively_unbounded_clock_skew` in v0.0.2 (no time-attestation servers exist yet).
@@ -532,5 +542,37 @@ mod tests {
                 .contains(&"naively_single_backend_bridge_storage".to_string()),
             "disabled bridge is not permitted -> flag absent"
         );
+    }
+
+    #[test]
+    fn load_reads_bridges_from_hybrid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+database_path = "/var/lib/jig/jig.db"
+bind_address = "0.0.0.0"
+port = 443
+
+[tls]
+enabled = true
+cert_path = "/etc/jig/tls/fullchain.pem"
+key_path = "/etc/jig/tls/privkey.pem"
+
+[bridges.per_bridge.email]
+enabled = true
+
+[bridges.per_bridge.email.config]
+bridge_domain = "mail.jig.onl"
+provider = "resend"
+bridge_secret = "literal-secret"
+"#,
+        )
+        .unwrap();
+
+        let cfg = JigServerConfig::load(&path).expect("load");
+        assert!(cfg.bridge_permitted("email"));
+        assert!(cfg.bridges.per_bridge.contains_key("email"));
     }
 }
