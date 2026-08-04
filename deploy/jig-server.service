@@ -1,0 +1,74 @@
+[Unit]
+Description=jig-server (v0.0.2 block server, tailnet-only)
+Documentation=file:/opt/jig/deploy/README.md
+
+# ORDERING IS LOAD-BEARING, NOT DECORATION.
+# jig-server binds a Tailscale address (100.x.y.z from [bind_address] in
+# /etc/jig/config.toml), and that address does not exist until tailscaled has
+# brought up the tun interface. A unit that waits only on network-online.target
+# starts too early, bind(2) returns EADDRNOTAVAIL, and the unit dies — silently,
+# on reboot, discovered the next morning by the whole team at once.
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+User=jig
+Group=jig
+
+# tailscaled being "active" still does not guarantee the 100.x address is
+# assigned yet — After= only orders unit *start*. Restart=on-failure is the
+# actual fix for that residual race: the first boot attempt may lose it, and
+# the retry 5s later wins. Do not remove this thinking After= covers it.
+Restart=on-failure
+RestartSec=5s
+
+# Secrets (bridge tokens, Resend keys) are read from an EnvironmentFile, never
+# inlined here — unit files are world-readable via `systemctl cat`. Leading '-'
+# makes it optional: a plain tailnet deploy with no bridges needs no secrets.
+# When bridges are enabled the file must exist and be chmod 600 root:jig.
+EnvironmentFile=-/etc/jig/jig-server.env
+
+# The hybrid config: root-level keys feed ServerConfig (what actually binds),
+# [server]/[identity]/[debug]/[bridges] feed JigServerConfig. See config.example.toml.
+ExecStart=/opt/jig/bin/jig-server --config /etc/jig/config.toml
+
+WorkingDirectory=/var/lib/jig
+# systemd creates and chowns /var/lib/jig on first start (mode 0750).
+StateDirectory=jig
+StateDirectoryMode=0750
+# The server writes server.key and refuses to boot next time if that file is
+# group/other-readable (it hard-fails on any mode & 0o077). A permissive umask
+# inherited from the shell is the classic way to brick the second start.
+UMask=0077
+
+# --- hardening -------------------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# ProtectSystem=strict makes everything read-only except this. SQLite needs to
+# write its -wal/-shm siblings here too, so the directory (not just the file)
+# must be writable.
+ReadWritePaths=/var/lib/jig
+
+# DELIBERATELY NOT SET: MemoryDenyWriteExecute.
+# jig-server executes blocks through wasmtime's cranelift JIT, which maps pages
+# writable and then executable. W^X denial turns every block execution into a
+# SIGSEGV. Leave this off.
+
+# Ports 7117/7070 are unprivileged, so no CAP_NET_BIND_SERVICE is needed. If you
+# ever move the public edge to :443, add AmbientCapabilities=CAP_NET_BIND_SERVICE
+# and CapabilityBoundingSet=CAP_NET_BIND_SERVICE rather than running as root.
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

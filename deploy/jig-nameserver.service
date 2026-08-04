@@ -1,0 +1,69 @@
+[Unit]
+Description=jig-nameserver (DID/handle registry, tailnet-only)
+Documentation=file:/opt/jig/deploy/README.md
+
+# Same reboot trap as jig-server: the nameserver binds a Tailscale 100.x
+# address, which does not exist until tailscaled has brought the interface up.
+# Without this ordering the unit fails on every reboot with EADDRNOTAVAIL.
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+
+# Deliberately a separate process from jig-server on the same host: different
+# port, different database, different blast radius. /v1/register has NO
+# authentication beyond proof-of-control of a self-minted key, so it must never
+# be reachable off the tailnet.
+After=jig-server.service
+
+[Service]
+Type=simple
+User=jig
+Group=jig
+
+Restart=on-failure
+RestartSec=5s
+
+# JIG_NS_SECRET is MANDATORY — the nameserver panics at startup without it
+# ("JIG_NS_SECRET env var is required"). It is a secret, so it lives in a
+# chmod 600 root:jig file, never inline in this unit (unit files are readable
+# by anyone who can run `systemctl cat`). NOTE: no leading '-' — if the file is
+# missing we want the unit to fail immediately and loudly, not to boot a
+# nameserver with a default PoW secret.
+EnvironmentFile=/etc/jig/jig-nameserver.env
+
+# `jig-nameserver serve --bind/--port` currently PARSES those flags and ignores
+# them (documented TODO in src/main.rs), so bind/port must come from the
+# environment. These env vars are applied AFTER any TOML config is loaded, so
+# they win over a stray ~/.jig/config.toml. Set the real tailnet IP here.
+Environment=JIG_NS_BIND=100.x.y.z
+Environment=JIG_NS_PORT=7070
+Environment=JIG_NS_DB_PATH=/var/lib/jig/nameserver.db
+# Pin HOME so config discovery cannot wander into another account's ~/.jig.
+Environment=HOME=/var/lib/jig
+
+ExecStart=/opt/jig/bin/jig-nameserver serve
+
+WorkingDirectory=/var/lib/jig
+StateDirectory=jig
+StateDirectoryMode=0750
+UMask=0077
+
+# --- hardening -------------------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/lib/jig
+
+# DELIBERATELY NOT SET: MemoryDenyWriteExecute — see jig-server.service.
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
