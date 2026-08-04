@@ -13,6 +13,18 @@ pub struct ServerConfig {
     pub port: u16,
     #[serde(default = "default_host_id")]
     pub host_id: String,
+    /// Opt-in escape hatch for the legacy v0.0.1 `POST /blocks` + `/receipts`
+    /// routes. Those routes take an attacker-chosen author DID with no
+    /// signature anywhere in the request, execute the supplied Wasm, and sign a
+    /// receipt attesting to it — so they are off unless an operator says
+    /// otherwise. Declared here as the single owner of the key; the routing
+    /// layer is what reads it.
+    ///
+    /// Must stay ahead of the `[execution]` / `[tls]` tables: `write_template`
+    /// serializes this struct in declaration order, and TOML forbids a bare
+    /// value after a table.
+    #[serde(default)]
+    pub dangerously_enable_v0_0_1_rest: bool,
     #[serde(default)]
     pub execution: ExecutionSection,
     #[serde(default)]
@@ -67,6 +79,7 @@ impl Default for ServerConfig {
             bind_address: "127.0.0.1".into(),
             port: 7117,
             host_id: default_host_id(),
+            dangerously_enable_v0_0_1_rest: false,
             execution: ExecutionSection::default(),
             tls: TlsConfig::default(),
         }
@@ -240,6 +253,33 @@ mod tests {
         let (cert, key) = cfg.tls.resolved_paths().unwrap();
         assert_eq!(cert.to_str().unwrap(), "/etc/jig/tls/fullchain.pem");
         assert_eq!(key.to_str().unwrap(), "/etc/jig/tls/privkey.pem");
+    }
+
+    #[test]
+    fn dangerously_enable_v0_0_1_rest_defaults_false() {
+        assert!(!ServerConfig::default().dangerously_enable_v0_0_1_rest);
+
+        // Existing operator configs predate the key, so omitting it must still
+        // parse — and must land on the safe (disabled) side.
+        let toml_str = r#"
+            database_path = "/tmp/x.db"
+            bind_address = "127.0.0.1"
+            port = 7117
+        "#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.dangerously_enable_v0_0_1_rest);
+    }
+
+    #[test]
+    fn dangerously_enable_v0_0_1_rest_parses_true() {
+        let toml_str = r#"
+            database_path = "/tmp/x.db"
+            bind_address = "127.0.0.1"
+            port = 7117
+            dangerously_enable_v0_0_1_rest = true
+        "#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.dangerously_enable_v0_0_1_rest);
     }
 
     #[test]
