@@ -452,6 +452,9 @@ fn base_config() -> Result<JigServerConfig> {
         federation: FederationSection::default(),
         debug: jig_config::v0_0_2_server::DebugSection::default(),
         bridges: jig_config::v0_0_2_server::BridgesSection::default(),
+        // Spread the remainder so adding a section to JigServerConfig doesn't
+        // break every integration test that only cares about the fields above.
+        ..Default::default()
     })
 }
 
