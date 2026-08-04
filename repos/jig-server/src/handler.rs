@@ -35,13 +35,25 @@ pub struct AppState {
 }
 
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
-        .route("/.well-known/jig", get(server_info))
-        .route("/blocks", get(list_blocks))
-        .route("/blocks", post(ingest_block))
-        .route("/blocks/:cid", get(get_block))
-        .route("/receipts/:cid", get(get_receipt))
-        .with_state(state)
+    // The v0.0.1 REST surface takes an attacker-chosen author DID with no
+    // signature anywhere in the request, executes the supplied Wasm, and signs
+    // a receipt attesting to it. It bypasses the v0.0.2 signature and
+    // allowed_block_kinds gates entirely, so it is off unless an operator
+    // opts in. `/.well-known/jig` stays mounted either way — peers need it to
+    // detect a misconfigured neighbour.
+    let legacy_enabled = state.config.dangerously_enable_v0_0_1_rest;
+
+    let mut router = Router::new().route("/.well-known/jig", get(server_info));
+
+    if legacy_enabled {
+        router = router
+            .route("/blocks", get(list_blocks))
+            .route("/blocks", post(ingest_block))
+            .route("/blocks/:cid", get(get_block))
+            .route("/receipts/:cid", get(get_receipt));
+    }
+
+    router.with_state(state)
 }
 
 #[derive(Serialize)]
@@ -411,6 +423,67 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    /// The v0.0.1 REST surface executes caller-supplied Wasm with no signature
+    /// check at all. Default-off is the security property; these two tests are
+    /// what keep it from silently regressing to always-on.
+    async fn router_status(
+        enable_legacy: bool,
+        method: &str,
+        path: &str,
+    ) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+        let dir = tempdir().unwrap();
+        let mut config = ServerConfig::default();
+        config.database_path = dir.path().join("gate.db");
+        config.dangerously_enable_v0_0_1_rest = enable_legacy;
+        let store = Arc::new(SqliteBlockStore::new(&config.database_path).unwrap());
+        let runtime = Arc::new(BlockRuntime::new(config.execution_config()).unwrap());
+        let app = build_router(AppState {
+            store,
+            runtime,
+            config,
+            v0_0_2: None,
+        });
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn v0_0_1_rest_routes_are_absent_by_default() {
+        for (m, p) in [
+            ("GET", "/blocks"),
+            ("POST", "/blocks"),
+            ("GET", "/blocks/bafyfake"),
+            ("GET", "/receipts/bafyfake"),
+        ] {
+            assert_eq!(
+                router_status(false, m, p).await,
+                axum::http::StatusCode::NOT_FOUND,
+                "{m} {p} must not be routable when the opt-in flag is false"
+            );
+        }
+        // The discovery endpoint is deliberately unaffected by the gate.
+        assert_ne!(
+            router_status(false, "GET", "/.well-known/jig").await,
+            axum::http::StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn v0_0_1_rest_routes_mount_when_operator_opts_in() {
+        for (m, p) in [("GET", "/blocks"), ("GET", "/blocks/bafyfake")] {
+            assert_ne!(
+                router_status(true, m, p).await,
+                axum::http::StatusCode::NOT_FOUND,
+                "{m} {p} must be routable when the operator opts in"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn list_blocks_clamps_limit_to_200() {
