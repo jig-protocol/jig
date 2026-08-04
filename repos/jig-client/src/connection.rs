@@ -54,11 +54,12 @@ pub struct Client {
 
 /// A block delivered via [`BlockStream`].
 ///
-/// Serde derives are part of a cross-crate wire contract, not a convenience:
-/// the REST history endpoint (`GET /api/v1/channels/:slug/blocks`) serves a
-/// JSON array of exactly this shape, and the CLI deserializes it straight
-/// back into `Vec<DeliveredBlock>`. Renaming or reordering fields here is a
-/// breaking wire change for both sides.
+/// Serde derives are part of a cross-crate wire contract, not a convenience.
+/// The planned REST history endpoint (`GET /api/v1/channels/:slug/blocks`,
+/// not yet implemented) will serve a JSON array of exactly this shape for the
+/// CLI to deserialize into `Vec<DeliveredBlock>`. Once that endpoint exists,
+/// renaming or reordering these fields is a breaking wire change for both
+/// sides.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeliveredBlock {
     pub bundle_b64: String,

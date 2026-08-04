@@ -16,9 +16,13 @@ pub struct ServerConfig {
     /// Opt-in escape hatch for the legacy v0.0.1 `POST /blocks` + `/receipts`
     /// routes. Those routes take an attacker-chosen author DID with no
     /// signature anywhere in the request, execute the supplied Wasm, and sign a
-    /// receipt attesting to it — so they are off unless an operator says
-    /// otherwise. Declared here as the single owner of the key; the routing
-    /// layer is what reads it.
+    /// receipt attesting to it.
+    ///
+    /// NOT YET ENFORCED. Nothing reads this flag today, and those routes are
+    /// mounted unconditionally — setting it `false` does not turn them off.
+    /// The key is declared here so the routing change can land without also
+    /// editing this file; until that lands, the only thing keeping the routes
+    /// unreachable is the network boundary (tailnet-only deployment).
     ///
     /// Must stay ahead of the `[execution]` / `[tls]` tables: `write_template`
     /// serializes this struct in declaration order, and TOML forbids a bare

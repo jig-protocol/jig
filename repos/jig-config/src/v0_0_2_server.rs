@@ -186,9 +186,15 @@ pub struct BridgeSection {
 /// Nameserver-mode settings. Only meaningful when this process runs as a
 /// jig-nameserver; a plain chat server parses and ignores the section.
 ///
-/// Supersedes the v0.0.2 carve-out where `alias_suffix` was a bare parameter
-/// of `AppState::new` (its doc comment claimed it came from
-/// `identity.trusted_nameservers[0]`, which no code ever implemented).
+/// NOT YET WIRED. Nothing reads `alias_suffix` and nothing calls
+/// [`NameserverSection::validate`] — `JigServerConfig::load` is a bare
+/// `toml::from_str` with no validation hook. `jig_nameserver::v0_0_2::
+/// AppState::new` still takes `alias_suffix` as a bare parameter, and the
+/// nameserver binary does not construct that state at all.
+///
+/// This section is declared ahead of the change that mounts the v0.0.2 alias
+/// routers, so that work can read config without also editing this file. The
+/// validation below only takes effect once `load` calls it.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NameserverSection {
