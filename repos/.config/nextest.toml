@@ -1,0 +1,32 @@
+# cargo-nextest configuration for the jig workspace.
+#
+# WHY THIS FILE EXISTS: `cargo nextest run --workspace` with nothing exported
+# used to fail — jig-nameserver's config defaults panic on a missing
+# `JIG_NS_SECRET`, and only the CI workflow knew the variable was required. That
+# made a clean checkout fail on a new contributor's very first test run. This
+# supplies a throwaway fixture value so the bare, obvious command just works.
+#
+# WHY A SETUP SCRIPT AND NOT `[env]`: cargo-nextest 0.9.136 does not recognise an
+# `[env]` table (nor `[profile.<name>.env]`, nor an `env` key on an override) —
+# it warns "ignoring unknown configuration key: env" and runs tests without it.
+# Injecting via `$NEXTEST_ENV` from a setup script is the mechanism this version
+# actually supports. Revisit and collapse this to a plain `[env]` table if a
+# future nextest gains one.
+experimental = ["setup-scripts"]
+
+[scripts.setup.jig-test-env]
+# The guard means an externally supplied JIG_NS_SECRET (CI, a developer shell)
+# still wins: we only append a value when the variable is absent or empty.
+#
+# TEST FIXTURE ONLY — this string is hardcoded, public and source-controlled, so
+# it has no secrecy whatsoever and MUST NEVER be used in any deployment, config,
+# or running server. Real deployments supply JIG_NS_SECRET from the secret store.
+command = [
+    "sh",
+    "-c",
+    '''[ -n "${JIG_NS_SECRET:-}" ] || printf 'JIG_NS_SECRET=nextest_local_fixture_secret_not_for_production\n' >> "$NEXTEST_ENV"''',
+]
+
+[[profile.default.scripts]]
+filter = "all()"
+setup = "jig-test-env"
