@@ -53,7 +53,13 @@ pub struct Client {
 }
 
 /// A block delivered via [`BlockStream`].
-#[derive(Debug, Clone)]
+///
+/// Serde derives are part of a cross-crate wire contract, not a convenience:
+/// the REST history endpoint (`GET /api/v1/channels/:slug/blocks`) serves a
+/// JSON array of exactly this shape, and the CLI deserializes it straight
+/// back into `Vec<DeliveredBlock>`. Renaming or reordering fields here is a
+/// breaking wire change for both sides.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeliveredBlock {
     pub bundle_b64: String,
     pub receipts: Vec<ReceiptRef>,
@@ -436,6 +442,53 @@ mod tests {
             .expect("stream closed");
         assert_eq!(delivered.bundle_b64, "dGVzdC1ibG9jaw==");
         assert_eq!(delivered.delivery_cid, "bafy_delivery_1");
+    }
+
+    /// Guards the cross-lane contract: `GET /api/v1/channels/:slug/blocks`
+    /// returns a JSON array that must deserialize into `Vec<DeliveredBlock>`.
+    #[test]
+    fn delivered_block_round_trips_through_json() {
+        let original = DeliveredBlock {
+            bundle_b64: "dGVzdC1ibG9jaw==".to_string(),
+            receipts: vec![ReceiptRef {
+                server_did: "did:jig:zServer".to_string(),
+                render_hash: Some("blake3:abc123".to_string()),
+                receipt_bytes_b64: "cmVjZWlwdA==".to_string(),
+            }],
+            delivery_cid: "bafy_delivery_1".to_string(),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: DeliveredBlock = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.bundle_b64, original.bundle_b64);
+        assert_eq!(decoded.delivery_cid, original.delivery_cid);
+        assert_eq!(decoded.receipts.len(), 1);
+        assert_eq!(decoded.receipts[0].server_did, "did:jig:zServer");
+        assert_eq!(
+            decoded.receipts[0].render_hash.as_deref(),
+            Some("blake3:abc123")
+        );
+        assert_eq!(decoded.receipts[0].receipt_bytes_b64, "cmVjZWlwdA==");
+    }
+
+    #[test]
+    fn delivered_block_vec_round_trips_as_json_array() {
+        let blocks = vec![
+            DeliveredBlock {
+                bundle_b64: "YQ==".to_string(),
+                receipts: vec![],
+                delivery_cid: "bafy_a".to_string(),
+            },
+            DeliveredBlock {
+                bundle_b64: "Yg==".to_string(),
+                receipts: vec![],
+                delivery_cid: "bafy_b".to_string(),
+            },
+        ];
+        let json = serde_json::to_string(&blocks).unwrap();
+        assert!(json.starts_with('['));
+        let decoded: Vec<DeliveredBlock> = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[1].delivery_cid, "bafy_b");
     }
 
     #[tokio::test]

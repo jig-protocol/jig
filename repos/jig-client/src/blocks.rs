@@ -37,15 +37,43 @@ pub fn build_text_render(
     body: &str,
     hlc: HlcTimestamp,
 ) -> BuiltBlock {
-    build_with_metadata(
-        sender,
-        BlockKind::TextRender,
-        hlc,
-        json!({
-            "channel": channel_slug,
-            "body": body,
-        }),
-    )
+    build_text_render_with_nickname(sender, channel_slug, body, None, hlc)
+}
+
+/// Same as [`build_text_render`], plus an optional `nickname` metadata entry.
+///
+/// ⚠️ DANGER — passing `Some(..)` ACTIVATES SERVER-SIDE TOFU ENFORCEMENT.
+/// The server's identity check is currently dormant *by absence*:
+/// jig-pipeline's `ingest()` only calls `ctx.identity.verify(..)` when the
+/// `nickname` metadata key is present. So this argument is not cosmetic — it
+/// is the trigger. Any caller that starts sending `Some(..)` silently opts
+/// the whole channel into trust-on-first-use binding of nickname → DID, which
+/// can produce hard `IDENTITY_ERROR`s in ordinary situations: e.g. one human
+/// on two machines mints two DIDs, and the second one is rejected under the
+/// nickname the first one claimed.
+///
+/// NOTHING SHOULD CALL THIS WITH `Some` YET. It exists so that a future lane
+/// can opt in deliberately, with the TOFU story (key sync / rebinding /
+/// recovery) designed first. Until then, use [`build_text_render`].
+///
+/// (A server may soften this with `identity.naively_allow_unknown_handles_
+/// fallback = true`, which downgrades rejection to a warning — but that is an
+/// unsafe v0.0.x carve-out and must not be assumed on the receiving side.)
+pub fn build_text_render_with_nickname(
+    sender: &Identity,
+    channel_slug: &str,
+    body: &str,
+    nickname: Option<&str>,
+    hlc: HlcTimestamp,
+) -> BuiltBlock {
+    let mut meta = json!({
+        "channel": channel_slug,
+        "body": body,
+    });
+    if let Some(n) = nickname {
+        meta["nickname"] = json!(n);
+    }
+    build_with_metadata(sender, BlockKind::TextRender, hlc, meta)
 }
 
 /// Build a signed `channel-create` block. v0.0.2 sends this through the
@@ -174,6 +202,55 @@ mod tests {
             manifest.metadata.get("body").and_then(|v| v.as_str()),
             Some("hi")
         );
+    }
+
+    /// The dormant-identity-check contract: plain `build_text_render` must
+    /// never emit a `nickname` key, or every existing caller would silently
+    /// switch on server-side TOFU enforcement.
+    #[test]
+    fn build_text_render_never_sets_nickname_metadata() {
+        let id = test_identity();
+        let hlc = test_hlc(&id);
+        let block = build_text_render(&id, "#hello", "hi", hlc);
+        let manifest: BlockManifest = serde_json::from_slice(&block.manifest_bytes).unwrap();
+        assert!(!manifest.metadata.contains_key("nickname"));
+    }
+
+    #[test]
+    fn build_text_render_with_nickname_sets_nickname_when_some() {
+        let id = test_identity();
+        let hlc = test_hlc(&id);
+        let block = build_text_render_with_nickname(&id, "#hello", "hi", Some("dj"), hlc);
+        let manifest: BlockManifest = serde_json::from_slice(&block.manifest_bytes).unwrap();
+        assert_eq!(manifest.kind, Some(BlockKind::TextRender));
+        assert_eq!(
+            manifest.metadata.get("nickname").and_then(|v| v.as_str()),
+            Some("dj")
+        );
+    }
+
+    #[test]
+    fn build_text_render_with_nickname_omits_nickname_when_none() {
+        let id = test_identity();
+        let hlc = test_hlc(&id);
+        let block = build_text_render_with_nickname(&id, "#hello", "hi", None, hlc);
+        let manifest: BlockManifest = serde_json::from_slice(&block.manifest_bytes).unwrap();
+        assert!(!manifest.metadata.contains_key("nickname"));
+        assert_eq!(
+            manifest.metadata.get("channel").and_then(|v| v.as_str()),
+            Some("#hello")
+        );
+    }
+
+    /// Delegation must be byte-identical, not merely similar — the canonical
+    /// bytes are what the sender signature covers.
+    #[test]
+    fn build_text_render_delegates_identically_to_none_variant() {
+        let id = test_identity();
+        let hlc = test_hlc(&id);
+        let legacy = build_text_render(&id, "#hello", "hi", hlc.clone());
+        let delegated = build_text_render_with_nickname(&id, "#hello", "hi", None, hlc);
+        assert_eq!(legacy.canonical_bytes(), delegated.canonical_bytes());
     }
 
     #[test]
