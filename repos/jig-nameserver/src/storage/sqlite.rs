@@ -307,7 +307,9 @@ impl SqliteStorage {
             CREATE INDEX IF NOT EXISTS idx_anomalies_severity ON anomalies(severity);
             CREATE INDEX IF NOT EXISTS idx_anomalies_detected ON anomalies(detected_at);
 
-            CREATE TABLE IF NOT EXISTS penalties (
+            -- Phase-D PoW penalties are a separate system from the legacy
+            -- points-based `penalties` table above; they must not share a name.
+            CREATE TABLE IF NOT EXISTS pow_penalties (
                 id TEXT PRIMARY KEY,
                 host_did TEXT NOT NULL,
                 reason TEXT NOT NULL,
@@ -319,9 +321,9 @@ impl SqliteStorage {
                 FOREIGN KEY (anomaly_id) REFERENCES anomalies(id) ON DELETE CASCADE,
                 FOREIGN KEY (tribunal_case_id) REFERENCES tribunal_cases(id) ON DELETE SET NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_penalties_host ON penalties(host_did);
-            CREATE INDEX IF NOT EXISTS idx_penalties_expires ON penalties(expires_at);
-            CREATE INDEX IF NOT EXISTS idx_penalties_applied ON penalties(applied_at);
+            CREATE INDEX IF NOT EXISTS idx_pow_penalties_host ON pow_penalties(host_did);
+            CREATE INDEX IF NOT EXISTS idx_pow_penalties_expires ON pow_penalties(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_pow_penalties_applied ON pow_penalties(applied_at);
             "#,
         )?;
         Ok(())
@@ -2463,7 +2465,7 @@ impl NamesStorage for SqliteStorage {
         tokio::task::spawn_blocking(move || {
             let conn = Connection::open(path)?;
             conn.execute(
-                "INSERT INTO penalties(id, host_did, reason, additional_bits, applied_at, expires_at, anomaly_id, tribunal_case_id)
+                "INSERT INTO pow_penalties(id, host_did, reason, additional_bits, applied_at, expires_at, anomaly_id, tribunal_case_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     penalty.id.to_string(),
@@ -2491,7 +2493,7 @@ impl NamesStorage for SqliteStorage {
             let conn = Connection::open(path)?;
             let mut stmt = conn.prepare(
                 "SELECT id, host_did, reason, additional_bits, applied_at, expires_at, anomaly_id, tribunal_case_id
-                 FROM penalties WHERE host_did = ?1 AND (expires_at IS NULL OR expires_at > ?2)
+                 FROM pow_penalties WHERE host_did = ?1 AND (expires_at IS NULL OR expires_at > ?2)
                  ORDER BY applied_at DESC",
             )?;
             let mut rows = stmt.query(params![host_did, now])?;
@@ -2512,7 +2514,7 @@ impl NamesStorage for SqliteStorage {
         tokio::task::spawn_blocking(move || {
             let conn = Connection::open(path)?;
             conn.execute(
-                "DELETE FROM penalties WHERE id = ?1",
+                "DELETE FROM pow_penalties WHERE id = ?1",
                 params![penalty_id_str],
             )?;
             Ok::<_, NameServerError>(())
@@ -2781,4 +2783,146 @@ fn row_to_attestation(row: &rusqlite::Row<'_>) -> Result<crate::types::Attestati
             .unwrap_or_else(|| Utc.timestamp_opt(attested_at, 0).single().unwrap()),
         signature: row.get(7)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scratch directory that removes itself, so tests never depend on a
+    /// tempfile dev-dependency the workspace does not carry.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("jig_ns_sqlite_{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            Self(dir)
+        }
+
+        fn db_path(&self) -> PathBuf {
+            self.0.join("names.db")
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn column_names(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("prepare pragma");
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query pragma");
+        rows.map(|r| r.expect("column name")).collect()
+    }
+
+    #[test]
+    fn init_succeeds_on_fresh_db_and_is_idempotent() {
+        let scratch = ScratchDir::new();
+        SqliteStorage::new(scratch.db_path()).expect("first init on a fresh database");
+        SqliteStorage::new(scratch.db_path()).expect("re-init over an existing database");
+    }
+
+    /// The two penalty systems are distinct schemas that both must survive
+    /// migration; a careless rename silently rewires one onto the other.
+    #[test]
+    fn legacy_and_pow_penalty_tables_keep_distinct_schemas() {
+        let scratch = ScratchDir::new();
+        SqliteStorage::new(scratch.db_path()).expect("init");
+        let conn = Connection::open(scratch.db_path()).expect("open db");
+
+        let legacy = column_names(&conn, "penalties");
+        assert!(
+            legacy.iter().any(|c| c == "key") && legacy.iter().any(|c| c == "points"),
+            "legacy `penalties` must keep its key/points shape, got {legacy:?}"
+        );
+        assert!(
+            !legacy.iter().any(|c| c == "host_did"),
+            "legacy `penalties` must not carry the PoW shape, got {legacy:?}"
+        );
+
+        let pow = column_names(&conn, "pow_penalties");
+        assert!(
+            pow.iter().any(|c| c == "host_did") && pow.iter().any(|c| c == "additional_bits"),
+            "`pow_penalties` must carry the Phase-D shape, got {pow:?}"
+        );
+        assert!(
+            !pow.iter().any(|c| c == "points"),
+            "`pow_penalties` must not carry the legacy shape, got {pow:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pow_penalty_round_trip_against_file_backed_store() {
+        let scratch = ScratchDir::new();
+        let store = SqliteStorage::new(scratch.db_path()).expect("init");
+
+        let penalty = PoWPenalty {
+            id: Uuid::now_v7(),
+            host_did: "did:key:zPenaltyHost".to_string(),
+            reason: PenaltyReason::ManualOverride,
+            additional_bits: 4,
+            applied_at: Utc::now(),
+            expires_at: None,
+            anomaly_id: None,
+            tribunal_case_id: None,
+        };
+
+        store.apply_penalty(penalty.clone()).await.expect("apply");
+
+        let active = store
+            .get_active_penalties(&penalty.host_did)
+            .await
+            .expect("get active");
+        assert_eq!(active.len(), 1, "expected the applied penalty back");
+        assert_eq!(active[0].id, penalty.id);
+        assert_eq!(active[0].additional_bits, 4);
+        assert_eq!(
+            store
+                .get_total_penalty_bits(&penalty.host_did)
+                .await
+                .expect("total bits"),
+            4
+        );
+
+        store.lift_penalty(penalty.id).await.expect("lift");
+        assert!(
+            store
+                .get_active_penalties(&penalty.host_did)
+                .await
+                .expect("get active after lift")
+                .is_empty(),
+            "lifted penalty must not remain active"
+        );
+    }
+
+    /// The legacy points API must keep working off its own table.
+    #[tokio::test]
+    async fn legacy_penalty_points_round_trip() {
+        let scratch = ScratchDir::new();
+        let store = SqliteStorage::new(scratch.db_path()).expect("init");
+
+        store.add_penalty("ip:203.0.113.7", 3).await.expect("add");
+        assert_eq!(
+            store
+                .get_penalty_points("ip:203.0.113.7", 0)
+                .await
+                .expect("points"),
+            3
+        );
+
+        store.reset_penalty("ip:203.0.113.7").await.expect("reset");
+        assert_eq!(
+            store
+                .get_penalty_points("ip:203.0.113.7", 0)
+                .await
+                .expect("points after reset"),
+            0
+        );
+    }
 }
