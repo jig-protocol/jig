@@ -10,6 +10,11 @@
 //! - `[identity]`   — TOFU vs nameserver mode + trusted nameservers
 //! - `[federation]` — peers + TLS toggle
 //! - `[debug]`      — antipattern-flag-gated REST endpoints + nameserver enumeration
+//! - `[nameserver]` — alias suffix this node is authoritative for (nameserver mode)
+//!
+//! Every section carries a container-level `#[serde(default)]`, so a config
+//! file may omit a section entirely or set only the keys it cares about; the
+//! rest come from that section's `impl Default`.
 //!
 //! All antipattern flags follow the project convention (`dangerously_`,
 //! `naively_`, `unsafe_`, `debug_`-prefixed) and are listed by
@@ -33,9 +38,16 @@ pub struct JigServerConfig {
     pub debug: DebugSection,
     #[serde(default)]
     pub bridges: BridgesSection,
+    #[serde(default)]
+    pub nameserver: NameserverSection,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+// Container-level (not per-field) default: a partially-written section must
+// keep the documented defaults for the keys the operator omitted, rather than
+// failing to parse. Container-level reuses the hand-written `impl Default`
+// below, which per-field `#[serde(default)]` cannot do.
+#[serde(default)]
 pub struct ServerSection {
     pub listen: String,
     pub server_did_keyfile: String,
@@ -69,9 +81,13 @@ pub enum IdentityMode {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+// Must stay container-level: `IdentityMode` deliberately has no `Default`
+// (neither variant is a safe automatic pick), so per-field `#[serde(default)]`
+// on `mode` would not compile. The container form takes `mode` from the
+// hand-written `impl Default` below instead.
+#[serde(default)]
 pub struct IdentitySection {
     pub mode: IdentityMode,
-    #[serde(default)]
     pub trusted_nameservers: Vec<String>,
     pub cache_ttl_seconds: u64,
     pub naively_allow_unknown_handles_fallback: bool,
@@ -89,17 +105,15 @@ impl Default for IdentitySection {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct FederationSection {
-    #[serde(default)]
     pub peers: Vec<FederationPeer>,
-    #[serde(default)]
     pub dangerously_disable_federation_tls: bool,
     /// Antipattern flag: when true, inbound peer blocks are persisted
     /// WITHOUT re-verifying the sender's ed25519 signature. v0.0.2 default
     /// behavior; v0.0.3+ rejects forged-author relays unless this is set.
     /// Surfaces in `unsafe_options_active` so federated peers and operators
     /// notice the carve-out via `GET /.well-known/jig`.
-    #[serde(default)]
     pub naively_trust_peer_authored_blocks: bool,
 }
 
@@ -112,6 +126,7 @@ pub struct FederationPeer {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct DebugSection {
     pub admin_endpoints: bool,
     pub list_handles: bool,
@@ -166,6 +181,62 @@ pub struct BridgeSection {
     /// `BridgeContext::config` without inspection.
     #[serde(default)]
     pub config: toml::Table,
+}
+
+/// Nameserver-mode settings. Only meaningful when this process runs as a
+/// jig-nameserver; a plain chat server parses and ignores the section.
+///
+/// Supersedes the v0.0.2 carve-out where `alias_suffix` was a bare parameter
+/// of `AppState::new` (its doc comment claimed it came from
+/// `identity.trusted_nameservers[0]`, which no code ever implemented).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NameserverSection {
+    /// The alias suffix this nameserver is authoritative for — the part after
+    /// the `@` in `dj@gigue.jig`. Stored WITHOUT the `@` so callers can
+    /// `format!("{local}@{alias_suffix}")` without stripping.
+    pub alias_suffix: String,
+}
+
+impl Default for NameserverSection {
+    fn default() -> Self {
+        Self {
+            // gigue runs the default nameserver for the `.jig` protocol
+            // namespace, so an unconfigured install lands there.
+            alias_suffix: "gigue.jig".to_string(),
+        }
+    }
+}
+
+impl NameserverSection {
+    /// Reject alias suffixes that would produce unresolvable aliases. Aliases
+    /// are compared byte-wise downstream, so a suffix that differs only in
+    /// case or padding silently fails to resolve — catch it at boot instead.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.alias_suffix.is_empty() {
+            return Err("nameserver.alias_suffix must not be empty".to_string());
+        }
+        if self.alias_suffix.contains('@') {
+            return Err(format!(
+                "nameserver.alias_suffix must not contain '@' — it is the suffix alone \
+                 (e.g. `gigue.jig`), not a full alias; got `{}`",
+                self.alias_suffix
+            ));
+        }
+        if self.alias_suffix.chars().any(|c| c.is_uppercase()) {
+            return Err(format!(
+                "nameserver.alias_suffix must be lowercase; got `{}`",
+                self.alias_suffix
+            ));
+        }
+        if self.alias_suffix.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "nameserver.alias_suffix must not contain whitespace; got `{}`",
+                self.alias_suffix
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl JigServerConfig {
@@ -380,6 +451,139 @@ mod tests {
         assert_eq!(cfg.identity.mode, IdentityMode::Tofu);
         assert!(cfg.federation.peers.is_empty());
         assert!(!cfg.debug.admin_endpoints);
+    }
+
+    // --- partial-section defaults -------------------------------------
+    // Operators routinely write a config that names a section but only sets
+    // the one key they care about. Without container-level serde defaults
+    // that is a hard parse error, which is why neither install.sh's config
+    // nor `--init-config`'s template produced a bootable server.
+
+    #[test]
+    fn partial_server_section_keeps_sibling_defaults() {
+        let cfg: JigServerConfig = toml::from_str(
+            r#"
+            [server]
+            listen = "0.0.0.0:9999"
+        "#,
+        )
+        .expect("partial [server] must deserialize");
+        let d = ServerSection::default();
+        assert_eq!(cfg.server.listen, "0.0.0.0:9999");
+        assert_eq!(cfg.server.server_did_keyfile, d.server_did_keyfile);
+        assert_eq!(cfg.server.allowed_block_kinds, d.allowed_block_kinds);
+    }
+
+    #[test]
+    fn partial_identity_section_keeps_sibling_defaults() {
+        let cfg: JigServerConfig = toml::from_str(
+            r#"
+            [identity]
+            cache_ttl_seconds = 60
+        "#,
+        )
+        .expect("partial [identity] must deserialize");
+        assert_eq!(cfg.identity.cache_ttl_seconds, 60);
+        assert_eq!(cfg.identity.mode, IdentityMode::Tofu);
+        assert!(cfg.identity.trusted_nameservers.is_empty());
+        assert!(!cfg.identity.naively_allow_unknown_handles_fallback);
+    }
+
+    #[test]
+    fn partial_debug_section_keeps_sibling_defaults() {
+        let cfg: JigServerConfig = toml::from_str(
+            r#"
+            [debug]
+            admin_endpoints = true
+        "#,
+        )
+        .expect("partial [debug] must deserialize");
+        assert!(cfg.debug.admin_endpoints);
+        assert!(!cfg.debug.list_handles);
+    }
+
+    #[test]
+    fn partial_federation_section_keeps_sibling_defaults() {
+        let cfg: JigServerConfig = toml::from_str(
+            r#"
+            [federation]
+            dangerously_disable_federation_tls = true
+        "#,
+        )
+        .expect("partial [federation] must deserialize");
+        assert!(cfg.federation.dangerously_disable_federation_tls);
+        assert!(cfg.federation.peers.is_empty());
+        assert!(!cfg.federation.naively_trust_peer_authored_blocks);
+    }
+
+    #[test]
+    fn empty_config_file_equals_full_default() {
+        let cfg: JigServerConfig = toml::from_str("").expect("empty config must deserialize");
+        assert_eq!(cfg, JigServerConfig::default());
+    }
+
+    // --- [nameserver] --------------------------------------------------
+
+    #[test]
+    fn nameserver_alias_suffix_defaults_to_gigue_jig() {
+        assert_eq!(
+            JigServerConfig::default().nameserver.alias_suffix,
+            "gigue.jig"
+        );
+        let cfg: JigServerConfig = toml::from_str("[nameserver]").unwrap();
+        assert_eq!(cfg.nameserver.alias_suffix, "gigue.jig");
+    }
+
+    #[test]
+    fn nameserver_alias_suffix_round_trips_explicit_value() {
+        let cfg: JigServerConfig = toml::from_str(
+            r#"
+            [nameserver]
+            alias_suffix = "dj.jig"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.nameserver.alias_suffix, "dj.jig");
+        cfg.nameserver.validate().expect("dj.jig is valid");
+
+        let reparsed: JigServerConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(reparsed, cfg);
+    }
+
+    #[test]
+    fn nameserver_validate_rejects_the_four_malformed_suffixes() {
+        let cases = [
+            ("", "empty"),
+            ("alice@dj.jig", "'@'"),
+            ("DJ.jig", "lowercase"),
+            ("dj .jig", "whitespace"),
+        ];
+        let mut messages = Vec::new();
+        for (suffix, expected_fragment) in cases {
+            let section = NameserverSection {
+                alias_suffix: suffix.to_string(),
+            };
+            let err = section
+                .validate()
+                .expect_err("malformed alias_suffix must be rejected");
+            assert!(
+                err.contains(expected_fragment),
+                "message for {suffix:?} should mention {expected_fragment}; got {err}"
+            );
+            messages.push(err);
+        }
+        // Each malformed shape gets its own message so an operator can tell
+        // which rule they tripped from the log line alone.
+        let distinct: std::collections::BTreeSet<&String> = messages.iter().collect();
+        assert_eq!(distinct.len(), messages.len(), "messages: {messages:?}");
+    }
+
+    #[test]
+    fn nameserver_default_suffix_validates() {
+        JigServerConfig::default()
+            .nameserver
+            .validate()
+            .expect("shipped default must be valid");
     }
 
     #[test]
