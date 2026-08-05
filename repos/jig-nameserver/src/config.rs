@@ -47,11 +47,52 @@ pub struct NameServerConfig {
     pub anomaly_detection: AnomalyDetectionConfig, // Phase D: Anomaly detection and cross-validation
     pub analytics: AnalyticsConfig,                // Phase F: Analytics and insights
     pub hot: HotConfig, // Phase F Tier 2/3: Hot state backend (rate limiting, caching)
+    /// v0.0.2 alias-API wiring (`[v0_0_2]`), consumed by
+    /// [`crate::server::build_app`] to boot `crate::v0_0_2::AppState`.
+    ///
+    /// Reuses jig-server's `JigServerConfig` verbatim so `[v0_0_2.nameserver]
+    /// alias_suffix` and `[v0_0_2.server] server_did_keyfile` mean exactly what
+    /// they mean in a jig-server config. Only the keys the nameserver actually
+    /// consumes are honoured (`server.server_did_keyfile`,
+    /// `identity.naively_allow_unknown_handles_fallback`, `nameserver.alias_suffix`);
+    /// `server.allowed_block_kinds` is overridden with the ns-only allowlist by
+    /// `v0_0_2::AppState::new`.
+    #[serde(default)]
+    pub v0_0_2: jig_config::v0_0_2_server::JigServerConfig,
 }
 
 impl NameServerConfig {
-    /// Load configuration from disk if available, otherwise fall back to env defaults.
+    /// Load configuration from disk if available, otherwise fall back to env
+    /// defaults. The result is [`validate`](Self::validate)d, so a missing
+    /// `[pow].server_secret` surfaces as an `Err` the caller can log — it used
+    /// to panic inside `Default` during deserialization, which reached stderr
+    /// via the panic hook only and looked like a silent death under systemd.
     pub fn load() -> Result<Self> {
+        let cfg = Self::load_unvalidated()?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Operator-fixable-misconfiguration check. Separate from parsing so tests
+    /// (and callers who want to patch a field before booting) can build an
+    /// unvalidated config, and so failures are errors rather than panics.
+    pub fn validate(&self) -> Result<()> {
+        if self.pow.server_secret.trim().is_empty() {
+            return Err(NameServerError::Other(anyhow::anyhow!(
+                "JIG_NS_SECRET env var is required. \
+                 Set it to a strong random secret (e.g. `openssl rand -hex 32`), \
+                 or set [pow].server_secret in the nameserver config file. \
+                 See .env.example for all required variables."
+            )));
+        }
+        self.v0_0_2
+            .nameserver
+            .validate()
+            .map_err(|e| NameServerError::Other(anyhow::anyhow!("[v0_0_2] {e}")))?;
+        Ok(())
+    }
+
+    fn load_unvalidated() -> Result<Self> {
         let env_profile = std::env::var("JIG_NS_PROFILE").ok();
 
         if let Ok(explicit) = std::env::var("JIG_NS_CONFIG") {
@@ -80,9 +121,11 @@ impl NameServerConfig {
         Ok(cfg)
     }
 
-    /// Load configuration from the given path.
+    /// Load configuration from the given path. Validated like [`load`](Self::load).
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
-        Self::load_from_path_with_profile(path, std::env::var("JIG_NS_PROFILE").ok())
+        let cfg = Self::load_from_path_with_profile(path, std::env::var("JIG_NS_PROFILE").ok())?;
+        cfg.validate()?;
+        Ok(cfg)
     }
 
     fn load_from_path_with_profile(
@@ -238,6 +281,7 @@ impl NameServerConfig {
             anomaly_detection: AnomalyDetectionConfig::from_env(),
             analytics: AnalyticsConfig::from_env(),
             hot: HotConfig::from_env(),
+            v0_0_2: jig_config::v0_0_2_server::JigServerConfig::default(),
         }
     }
 
@@ -1757,14 +1801,15 @@ fn default_database_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("nameserver.db"))
 }
 
+/// Empty when `JIG_NS_SECRET` is unset — deliberately NOT auto-generated and
+/// deliberately not a panic. A `Default` impl runs during deserialization of
+/// any config lacking `[pow].server_secret`, so panicking here killed the
+/// process before `tracing` was ever consulted. The empty value is caught by
+/// [`NameServerConfig::validate`]. Auto-generating would be worse: the secret
+/// is security-relevant, and a fresh one per restart invalidates every
+/// outstanding PoW challenge.
 fn default_server_secret() -> String {
-    std::env::var("JIG_NS_SECRET").unwrap_or_else(|_| {
-        panic!(
-            "JIG_NS_SECRET env var is required. \
-            Set it to a strong random secret (e.g. `openssl rand -hex 32`). \
-            See .env.example for all required variables."
-        )
-    })
+    std::env::var("JIG_NS_SECRET").unwrap_or_default()
 }
 
 fn default_base_pow() -> u16 {
@@ -2028,6 +2073,19 @@ fallback_to_memory = true  # Fallback if Redis/ScyllaDB unavailable
 # [hot.backend_config]
 # nodes = "node1:9042,node2:9042,node3:9042"
 # keyspace = "jig_hot"
+
+# v0.0.2 alias API — GET /v1/challenge, POST /v1/register,
+# GET /v1/resolve/:alias, GET /v1/handles, POST /v1/rotate, POST /v1/renew.
+# Same key names as a jig-server config (`JigServerConfig`).
+[v0_0_2.nameserver]
+# The suffix this nameserver is authoritative for: `<local>@<alias_suffix>`.
+alias_suffix = "gigue.jig"
+
+[v0_0_2.server]
+# Ed25519 key that signs alias attestations. Left at the jig-server default
+# (or empty) it is derived as a sibling of [storage].database_path, so a
+# nameserver never signs with the chat server's DID.
+# server_did_keyfile = "/var/lib/jig-nameserver/nameserver.key"
 "#;
 
 #[cfg(test)]
@@ -2202,5 +2260,90 @@ federation_enabled = true
         assert!(cfg.capabilities.tribunal_enabled);
         assert!(cfg.capabilities.transparency_enabled);
         assert!(!cfg.capabilities.federation_enabled);
+    }
+
+    // --- startup validation -------------------------------------------------
+    //
+    // These two tests mutate JIG_NS_SECRET. Safe under `cargo nextest`, which
+    // runs every test in its own process; they would race under `cargo test`'s
+    // shared-process threads.
+
+    #[test]
+    fn missing_secret_yields_empty_default_instead_of_panicking() {
+        unsafe {
+            std::env::remove_var("JIG_NS_SECRET");
+        }
+        // A `Default` impl must never panic — the panic used to fire during
+        // *deserialization* of any config lacking `[pow].server_secret`.
+        let cfg = NameServerConfig::from_env();
+        assert!(cfg.pow.server_secret.is_empty());
+
+        let err = cfg
+            .validate()
+            .expect_err("empty server_secret must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("JIG_NS_SECRET"),
+            "operator-facing message must name the env var, got: {msg}"
+        );
+        assert!(
+            msg.contains("openssl rand -hex 32"),
+            "operator-facing message must keep the remediation hint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn configured_secret_passes_validation() {
+        unsafe {
+            std::env::set_var("JIG_NS_SECRET", "test-secret-for-unit-tests");
+        }
+        let cfg = NameServerConfig::from_env();
+        cfg.validate().expect("a configured secret validates");
+    }
+
+    // --- [v0_0_2] alias-API section ----------------------------------------
+
+    #[test]
+    fn v0_0_2_alias_suffix_defaults_to_gigue_jig() {
+        unsafe {
+            std::env::set_var("JIG_NS_SECRET", "test-secret-for-unit-tests");
+        }
+        let cfg = NameServerConfig::from_env();
+        assert_eq!(cfg.v0_0_2.nameserver.alias_suffix, "gigue.jig");
+    }
+
+    #[test]
+    fn v0_0_2_alias_suffix_is_operator_settable() {
+        let doc = r#"
+[v0_0_2.nameserver]
+alias_suffix = "dj.jig"
+
+[v0_0_2.server]
+server_did_keyfile = "/var/lib/jig-ns/ns.key"
+
+[pow]
+server_secret = "s"
+"#;
+        let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
+        assert_eq!(cfg.v0_0_2.nameserver.alias_suffix, "dj.jig");
+        assert_eq!(
+            cfg.v0_0_2.server.server_did_keyfile,
+            "/var/lib/jig-ns/ns.key"
+        );
+        cfg.validate().expect("valid");
+    }
+
+    #[test]
+    fn validate_rejects_a_malformed_alias_suffix() {
+        let doc = r#"
+[v0_0_2.nameserver]
+alias_suffix = "dj@dj.jig"
+
+[pow]
+server_secret = "s"
+"#;
+        let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
+        let err = cfg.validate().expect_err("'@' in a suffix must be caught");
+        assert!(err.to_string().contains("alias_suffix"));
     }
 }
