@@ -42,6 +42,148 @@ use crate::v0_0_2::AppState;
 /// disambiguation. Not auth-significant.
 static CONN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Process-lifetime counters behind `GET /metrics` (served from
+/// [`crate::handler::build_router`]).
+///
+/// Hand-rolled Prometheus text on purpose: the exposition format is a dozen
+/// lines and a metrics crate would be a new dependency.
+///
+/// SCOPE — read before trusting a number. Every counter here is bumped from
+/// the WebSocket path in THIS module only. Blocks arriving over federation or
+/// from a bridge are NOT counted; those paths live in other modules and are
+/// not instrumented yet. Counters reset to zero on restart, which is normal
+/// for Prometheus counters.
+pub mod metrics {
+    use std::collections::BTreeMap;
+    use std::sync::RwLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CONNECTIONS_ACTIVE: AtomicU64 = AtomicU64::new(0);
+    static SUBSCRIBERS_ACTIVE: AtomicU64 = AtomicU64::new(0);
+    static BLOCKS_INGESTED: AtomicU64 = AtomicU64::new(0);
+    /// Cardinality is bounded by the channels this server actually serves,
+    /// which is the same bound the block store already carries.
+    static CHANNEL_MESSAGES: RwLock<BTreeMap<String, u64>> = RwLock::new(BTreeMap::new());
+
+    /// Point-in-time copy of every counter. Used by tests; rendering reads the
+    /// atomics directly.
+    #[derive(Debug, Clone)]
+    pub struct Snapshot {
+        pub connections_active: u64,
+        pub subscribers_active: u64,
+        pub blocks_ingested: u64,
+        pub channels: BTreeMap<String, u64>,
+    }
+
+    pub fn connection_opened() {
+        CONNECTIONS_ACTIVE.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn connection_closed() {
+        decrement(&CONNECTIONS_ACTIVE);
+    }
+
+    pub fn subscriber_added() {
+        SUBSCRIBERS_ACTIVE.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn subscriber_removed() {
+        decrement(&SUBSCRIBERS_ACTIVE);
+    }
+
+    /// Record one accepted block. `channel` is the slug lifted from the
+    /// manifest; `None` for blocks that carry no channel metadata.
+    pub fn block_ingested(channel: Option<&str>) {
+        BLOCKS_INGESTED.fetch_add(1, Ordering::Relaxed);
+        if let Some(slug) = channel {
+            let mut map = CHANNEL_MESSAGES
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *map.entry(slug.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    /// Saturating decrement — a gauge that underflows to u64::MAX is worse
+    /// than one that is briefly wrong.
+    fn decrement(counter: &AtomicU64) {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(1))
+        });
+    }
+
+    pub fn snapshot() -> Snapshot {
+        let channels = CHANNEL_MESSAGES
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        Snapshot {
+            connections_active: CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
+            subscribers_active: SUBSCRIBERS_ACTIVE.load(Ordering::Relaxed),
+            blocks_ingested: BLOCKS_INGESTED.load(Ordering::Relaxed),
+            channels,
+        }
+    }
+
+    /// Prometheus text exposition (format version 0.0.4) of the live counters.
+    pub fn render_prometheus() -> String {
+        let snap = snapshot();
+        render(
+            snap.connections_active,
+            snap.subscribers_active,
+            snap.blocks_ingested,
+            &snap.channels,
+        )
+    }
+
+    /// Pure renderer — separated from the globals so its output format is
+    /// testable without touching process-wide state.
+    pub(crate) fn render(
+        connections: u64,
+        subscribers: u64,
+        blocks: u64,
+        channels: &BTreeMap<String, u64>,
+    ) -> String {
+        let mut out = String::new();
+        out.push_str(
+            "# HELP jig_ws_connections_active Open WebSocket connections on /api/v1/ws.\n\
+             # TYPE jig_ws_connections_active gauge\n",
+        );
+        out.push_str(&format!("jig_ws_connections_active {connections}\n"));
+        out.push_str(
+            "# HELP jig_ws_subscribers_active WebSocket connections holding a live subscription.\n\
+             # TYPE jig_ws_subscribers_active gauge\n",
+        );
+        out.push_str(&format!("jig_ws_subscribers_active {subscribers}\n"));
+        out.push_str(
+            "# HELP jig_ws_blocks_ingested_total Blocks accepted over WebSocket since start \
+             (excludes federation and bridge ingest).\n\
+             # TYPE jig_ws_blocks_ingested_total counter\n",
+        );
+        out.push_str(&format!("jig_ws_blocks_ingested_total {blocks}\n"));
+        out.push_str(
+            "# HELP jig_ws_channel_messages_total Blocks accepted over WebSocket per channel \
+             slug.\n\
+             # TYPE jig_ws_channel_messages_total counter\n",
+        );
+        for (slug, count) in channels {
+            out.push_str(&format!(
+                "jig_ws_channel_messages_total{{channel=\"{}\"}} {count}\n",
+                escape_label(slug)
+            ));
+        }
+        out
+    }
+
+    /// Escape a label value per the exposition format: backslash, double
+    /// quote, and newline. An unescaped quote corrupts the whole scrape.
+    fn escape_label(value: &str) -> String {
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+    }
+}
+
 // ---- Public API ------------------------------------------------------------
 
 /// Axum handler for `GET /api/v1/ws` — upgrades the HTTP request to WebSocket.
@@ -78,12 +220,17 @@ pub fn build_v0_0_2_router(state: Arc<AppState>) -> Router {
     for (bridge_name, sub) in state.bridge_router_mount.drain() {
         router = router.nest(&format!("/_bridge/{bridge_name}"), sub);
     }
-    router
+    // Applied here as well as in `handler::build_router` because `Router::layer`
+    // only wraps the routes already present; `server.rs` merges these two
+    // routers afterwards, so a single layer on one of them would leave the
+    // other's routes untraced.
+    router.layer(crate::handler::http_trace_layer())
 }
 
 // ---- Per-connection handler ------------------------------------------------
 
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, conn_id: u64) {
+    metrics::connection_opened();
     // Per-connection channel: fanout delivers (StoredBlock, StoredReceipt) here.
     let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
     let mut sub_id: Option<u64> = None;
@@ -151,7 +298,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, conn_id: u64
     // Clean up the subscription so the Fanout map doesn't grow without bound.
     if let Some(id) = sub_id {
         state.ingest_ctx.fanout.unsubscribe_local(id).await;
+        metrics::subscriber_removed();
     }
+    metrics::connection_closed();
     tracing::debug!(conn_id, "ws connection closed");
 }
 
@@ -195,6 +344,13 @@ async fn handle_client_frame(
                 .fanout
                 .subscribe_local(sub_scope, sub_tx.clone())
                 .await;
+            // The gauge counts connections holding a subscription, matching the
+            // single `sub_id` slot that the disconnect path decrements. A
+            // re-Subscribe on the same connection replaces that slot, so it
+            // must not add a second unit.
+            if sub_id.is_none() {
+                metrics::subscriber_added();
+            }
             *sub_id = Some(id);
             tracing::debug!(conn_id, sub_id = id, "ws subscription registered");
             Ok(())
@@ -263,6 +419,7 @@ async fn handle_client_frame(
             .await
             {
                 Ok(block_cid) => {
+                    metrics::block_ingested(channel_slug_peek(&manifest_bytes).as_deref());
                     let ack = Envelope::new(Frame::Ack { block_cid });
                     let Ok(json) = serde_json::to_string(&ack) else {
                         return Ok(());
@@ -314,6 +471,28 @@ async fn handle_client_frame(
 }
 
 // ---- Helpers ---------------------------------------------------------------
+
+/// Read the channel slug out of manifest bytes for the per-channel metric,
+/// without paying for a full `BlockManifest` deserialization.
+///
+/// Mirrors the lift in `jig_pipeline::ingest` — text-render / member-add put
+/// the slug under `metadata.channel`, channel-create under `metadata.slug`.
+/// Metrics-only: nothing downstream reads this value.
+fn channel_slug_peek(manifest_bytes: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct MetadataOnly {
+        #[serde(default)]
+        metadata: serde_json::Map<String, serde_json::Value>,
+    }
+
+    let peeked: MetadataOnly = serde_json::from_slice(manifest_bytes).ok()?;
+    peeked
+        .metadata
+        .get("channel")
+        .or_else(|| peeked.metadata.get("slug"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
 
 async fn send_error(
     socket: &mut WebSocket,
@@ -456,10 +635,13 @@ mod tests {
         // Single client subscribes federation-scope (matches all blocks), then
         // submits a text-render block and expects both Ack and Block frames.
         //
-        // Channel-scope fanout won't match text-render blocks in v0.0.2 because
-        // channel_id is None on StoredBlock (it lives in manifest metadata, not
-        // as a first-class field — per B6 implementation). Federation scope
-        // with empty block_kinds matches everything, so we use that.
+        // Federation scope with empty block_kinds is the kind-filter-off path,
+        // which is what this test covers. Channel scope is exercised by
+        // integration-tests/tests/h2_single_server.rs: `ingest` lifts the slug
+        // from manifest metadata into `StoredBlock.channel_id`, so
+        // `SubscriptionScope::Channel` does match text-render blocks. (An
+        // earlier revision of this comment claimed otherwise — that caveat is
+        // obsolete.)
         let (_state, url) = start_test_server().await;
         let (mut ws, _) = connect_async(&url).await.unwrap();
 
@@ -507,6 +689,95 @@ mod tests {
         }
         assert!(got_ack, "must receive Ack for submitted block");
         assert!(got_block, "subscribed client must receive Block frame");
+    }
+
+    // --- observability counters ---------------------------------------------
+
+    #[test]
+    fn prometheus_render_emits_help_type_and_escaped_channel_labels() {
+        let mut channels = std::collections::BTreeMap::new();
+        channels.insert("#hello".to_string(), 3u64);
+        channels.insert("weird\"name".to_string(), 1u64);
+        let text = metrics::render(2, 1, 4, &channels);
+
+        assert!(text.contains("# TYPE jig_ws_connections_active gauge"));
+        assert!(text.contains("# TYPE jig_ws_blocks_ingested_total counter"));
+        assert!(text.contains("\njig_ws_connections_active 2\n"));
+        assert!(text.contains("\njig_ws_subscribers_active 1\n"));
+        assert!(text.contains("\njig_ws_blocks_ingested_total 4\n"));
+        assert!(text.contains("jig_ws_channel_messages_total{channel=\"#hello\"} 3"));
+        // An unescaped quote in a label value corrupts the whole exposition.
+        assert!(
+            text.contains(r#"jig_ws_channel_messages_total{channel="weird\"name"} 1"#),
+            "label values must be escaped; got:\n{text}"
+        );
+        assert!(text.ends_with('\n'), "exposition must end with a newline");
+    }
+
+    #[test]
+    fn channel_slug_peek_reads_the_same_metadata_keys_as_ingest() {
+        let id = test_identity();
+        let hlc = test_hlc(&id);
+        let block = build_text_render(&id, "#hello", "hi", hlc);
+        let (manifest_bytes, _code): (Vec<u8>, Vec<u8>) =
+            serde_json::from_slice(&block.canonical_bytes()).unwrap();
+        assert_eq!(
+            channel_slug_peek(&manifest_bytes).as_deref(),
+            Some("#hello")
+        );
+
+        // channel-create writes the slug under `slug`, not `channel`.
+        let created = serde_json::to_vec(&serde_json::json!({
+            "metadata": { "slug": "#other" }
+        }))
+        .unwrap();
+        assert_eq!(channel_slug_peek(&created).as_deref(), Some("#other"));
+
+        assert_eq!(channel_slug_peek(b"not json").as_deref(), None);
+    }
+
+    #[tokio::test]
+    async fn ws_submit_increments_block_and_channel_counters() {
+        let before = metrics::snapshot();
+
+        let (_state, url) = start_test_server().await;
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+
+        let id = test_identity();
+        let hlc = test_hlc(&id);
+        let block = build_text_render(&id, "#metrics-probe", "hi", hlc);
+        let submit = Envelope::new(Frame::Submit {
+            bundle_b64: base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
+            sig_b64: base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
+        });
+        ws.send(TMessage::Text(serde_json::to_string(&submit).unwrap()))
+            .await
+            .unwrap();
+
+        // Wait for the Ack so the counter bump has definitely happened.
+        let msg = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .expect("timeout waiting for ack")
+            .expect("stream closed")
+            .expect("ws error");
+        let TMessage::Text(reply) = msg else {
+            panic!("expected text frame, got {msg:?}");
+        };
+        let reply_env: Envelope = serde_json::from_str(&reply).unwrap();
+        assert!(matches!(reply_env.frame, Frame::Ack { .. }));
+
+        let after = metrics::snapshot();
+        assert!(
+            after.blocks_ingested > before.blocks_ingested,
+            "blocks_ingested must advance ({} -> {})",
+            before.blocks_ingested,
+            after.blocks_ingested
+        );
+        assert_eq!(
+            after.channels.get("#metrics-probe").copied(),
+            Some(1),
+            "per-channel counter must record the slug lifted from the manifest"
+        );
     }
 
     // --- bad JSON → connection stays alive ----------------------------------

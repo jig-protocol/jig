@@ -177,8 +177,18 @@ impl ServerConfig {
         Ok(config)
     }
 
+    /// Write a config template covering BOTH halves of the hybrid file.
+    ///
+    /// `jig-server --config <file>` loads the same file into two unrelated
+    /// types, so a template with only `ServerConfig` keys leaves
+    /// `JigServerConfig` on `::default()` — which means `admin_endpoints =
+    /// false` and a bare 404 from `jig channel create`.
     pub fn write_template(path: impl AsRef<Path>) -> std::io::Result<()> {
-        let template = toml::to_string_pretty(&Self::default()).map_err(std::io::Error::other)?;
+        let defaults = Self::default();
+        let mut template = toml::to_string_pretty(&defaults).map_err(std::io::Error::other)?;
+        // Appended after the serialized struct because TOML forbids a bare
+        // key/value pair once a table header has been emitted.
+        template.push_str(&v0_0_2_template_sections(&defaults));
         fs::write(path, template)
     }
 
@@ -211,6 +221,72 @@ impl ServerConfig {
             self.port = port;
         }
     }
+}
+
+/// The `[server]`/`[identity]`/`[debug]` half of the hybrid config file, as
+/// commented TOML. Values track `JigServerConfig`'s own defaults so the
+/// template can't drift from them; `admin_endpoints` is the one deliberate
+/// departure (see the comment it emits).
+fn v0_0_2_template_sections(server: &ServerConfig) -> String {
+    let defaults = jig_config::v0_0_2_server::JigServerConfig::default();
+    let kinds = defaults
+        .server
+        .allowed_block_kinds
+        .iter()
+        .map(|k| format!("\"{k}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let listen = format!("{}:{}", server.bind_address, server.port);
+
+    format!(
+        r#"
+# ============================================================================
+# JigServerConfig — the v0.0.2 half of this file.
+#
+# jig-server loads THIS SAME PATH into a second type. The keys above open the
+# socket; the sections below configure identity, federation, bridges and the
+# admin surface. Neither type rejects the other's keys, which is what makes
+# one file legal for both.
+# ============================================================================
+
+[server]
+# DECORATIVE. Only builds the ws:// origin-tag string stamped onto blocks —
+# the socket binds bind_address/port above. jig-server logs a WARN at startup
+# when the two disagree.
+listen = "{listen}"
+
+# The ed25519 seed the server DID is derived from. BACK IT UP: losing it
+# changes the server DID and breaks TOFU pinning for every client.
+server_did_keyfile = "{keyfile}"
+
+# channel-create and member-add are not optional extras — `jig channel create`
+# and `jig channel join` submit exactly these kinds.
+allowed_block_kinds = [{kinds}]
+
+[identity]
+# tofu = trust the first key seen for a DID and pin it. No nameserver needed.
+mode = "tofu"
+trusted_nameservers = []
+cache_ttl_seconds = {cache_ttl}
+naively_allow_unknown_handles_fallback = {unknown_handles}
+
+[debug]
+# Required: with admin_endpoints = false the /_admin_v0_0_2/* router is not
+# mounted and `jig channel create` fails with a bare 404 that looks like a
+# wrong URL or a broken build. These endpoints are UNAUTHENTICATED — they are
+# only safe because bind_address above is loopback. Never enable them on a
+# publicly-bound server.
+admin_endpoints = true
+# Handle enumeration stays off — it dumps the registry to any caller.
+list_handles = {list_handles}
+"#,
+        listen = listen,
+        keyfile = defaults.server.server_did_keyfile,
+        kinds = kinds,
+        cache_ttl = defaults.identity.cache_ttl_seconds,
+        unknown_handles = defaults.identity.naively_allow_unknown_handles_fallback,
+        list_handles = defaults.debug.list_handles,
+    )
 }
 
 fn default_host_id() -> String {
@@ -346,6 +422,103 @@ connection_string = "{db}"
         let exec = loaded.execution_config();
         assert_eq!(exec.fuel_max, loaded.execution.fuel_max);
         assert_eq!(exec.timeout_ms, loaded.execution.timeout_ms);
+    }
+
+    #[test]
+    fn write_template_emits_a_bootable_v0_0_2_half() {
+        use jig_config::v0_0_2_server::JigServerConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server-config.toml");
+        ServerConfig::write_template(&path).unwrap();
+
+        // Half 1: the socket-opening half.
+        let server = ServerConfig::load(&path).unwrap();
+
+        // Half 2: the v0.0.2 half. `--init-config` that omits it leaves
+        // admin_endpoints = false, and `jig channel create` 404s.
+        let v002 = JigServerConfig::load(&path).unwrap();
+        assert!(
+            v002.debug.admin_endpoints,
+            "template must enable admin_endpoints; without it `jig channel create` 404s"
+        );
+        assert_eq!(
+            v002.server.listen,
+            format!("{}:{}", server.bind_address, server.port),
+            "template's decorative `listen` must agree with the real bind address"
+        );
+        for kind in ["text-render", "channel-create", "member-add"] {
+            assert!(
+                v002.server.allowed_block_kinds.contains(&kind.to_string()),
+                "template must allow {kind}"
+            );
+        }
+    }
+
+    /// Extract the literal heredoc `install.sh` writes to `~/.jig/config.toml`
+    /// and expand the shell variables it interpolates. Any variable the
+    /// installer adds later that isn't in this map trips the `$`-residue
+    /// assertion below, which is exactly the rot we want to catch.
+    fn install_sh_config(jig_home: &str, listen: &str) -> String {
+        let install_sh = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../install.sh")
+            .canonicalize()
+            .expect("install.sh must sit at the repo root");
+        let script = fs::read_to_string(&install_sh).unwrap();
+
+        let start = script
+            .find("cat > \"$cfg\" <<EOF\n")
+            .expect("install.sh must still write the config via a `cat > \"$cfg\" <<EOF` heredoc");
+        let body_start = start + script[start..].find('\n').unwrap() + 1;
+        let body_end = body_start
+            + script[body_start..]
+                .find("\nEOF\n")
+                .expect("unterminated heredoc in install.sh")
+            + 1;
+
+        let (host, port) = listen.rsplit_once(':').unwrap();
+        script[body_start..body_end]
+            .replace("${JIG_SERVER_LISTEN%%:*}", host)
+            .replace("${JIG_SERVER_LISTEN##*:}", port)
+            .replace("$JIG_SERVER_LISTEN", listen)
+            .replace("$JIG_HOME", jig_home)
+    }
+
+    /// The installer's own output must boot the server it just installed.
+    /// This is the test that stops `install.sh` from silently rotting: the
+    /// config it writes feeds BOTH config structs, and omitting either half
+    /// ships a first-run flow that dies on `jig-server --config`.
+    #[test]
+    fn install_sh_writes_a_config_that_boots_both_halves() {
+        use jig_config::v0_0_2_server::JigServerConfig;
+
+        let rendered = install_sh_config("/opt/jig-home", "127.0.0.1:7117");
+        assert!(
+            !rendered.contains('$'),
+            "unexpanded shell variable in install.sh's config heredoc:\n{rendered}"
+        );
+
+        let server: ServerConfig = toml::from_str(&rendered)
+            .expect("install.sh's config must parse as ServerConfig — this is what binds");
+        assert_eq!(server.bind_address, "127.0.0.1");
+        assert_eq!(server.port, 7117);
+        assert!(
+            server.database_path.starts_with("/opt/jig-home"),
+            "database_path must live under JIG_HOME, got {}",
+            server.database_path.display()
+        );
+
+        let v002: JigServerConfig = toml::from_str(&rendered).unwrap();
+        assert!(
+            v002.debug.admin_endpoints,
+            "install.sh must enable admin_endpoints or the first-run `jig channel create` 404s"
+        );
+        assert_eq!(v002.server.listen, "127.0.0.1:7117");
+        assert_eq!(
+            v002.server.listen,
+            format!("{}:{}", server.bind_address, server.port),
+            "install.sh must keep the decorative `listen` in sync with the real bind address"
+        );
     }
 
     #[test]
