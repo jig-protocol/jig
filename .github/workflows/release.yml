@@ -1,8 +1,21 @@
 name: Release
 
-# Phase G2 of v0.0.2 hello-world. Tag-triggered: cuts per-platform tarballs
-# containing jig-server, jig, jig-nameserver + text_block.wasm and publishes
-# them as a GitHub Release. install.sh fetches from these URLs at first run.
+# Tag-triggered: cuts per-platform tarballs containing jig-server, jig,
+# jig-nameserver + text_block.wasm and publishes them as a GitHub Release.
+# install.sh fetches from these URLs at first run.
+#
+# Matrix scope (F0): every internal client is a Mac, and the only server we
+# run is the x86_64 Linux VPS. Linux->macOS cross-compilation is not viable in
+# either direction, so darwin builds must run on macOS runners. Windows, musl
+# and aarch64-linux were dropped — nobody on the team consumes them and each
+# one costs CI minutes plus a cross-toolchain to maintain. Re-add a row here
+# when a real consumer appears; install.sh's os/arch detection already covers
+# linux+darwin x x86_64+aarch64.
+#
+# macOS Gatekeeper: these darwin binaries are unsigned and unnotarized, so a
+# copy that arrives via download or AirDrop carries com.apple.quarantine and
+# is refused on launch. The removal command is published in the release body
+# and shipped inside each darwin tarball as QUARANTINE-README.txt.
 
 on:
   push:
@@ -25,27 +38,18 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          - tarball_name: jig-linux-x86_64
-            target: x86_64-unknown-linux-gnu
-            runs_on: ubuntu-latest
-            archive: tar.gz
-          - tarball_name: jig-linux-aarch64
-            target: aarch64-unknown-linux-gnu
-            runs_on: ubuntu-latest
-            archive: tar.gz
-            cross: true
-          - tarball_name: jig-darwin-x86_64
-            target: x86_64-apple-darwin
-            runs_on: macos-13
-            archive: tar.gz
+          # Primary client: DJ's Mac and most teammates.
           - tarball_name: jig-darwin-aarch64
             target: aarch64-apple-darwin
             runs_on: macos-14
-            archive: tar.gz
-          - tarball_name: jig-windows-x86_64
-            target: x86_64-pc-windows-msvc
-            runs_on: windows-latest
-            archive: zip
+          # Secondary client: any Intel Mac still on the team.
+          - tarball_name: jig-darwin-x86_64
+            target: x86_64-apple-darwin
+            runs_on: macos-13
+          # Server: the VPS jig-server runs on.
+          - tarball_name: jig-linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            runs_on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -54,22 +58,14 @@ jobs:
         with:
           targets: ${{ matrix.platform.target }},wasm32-wasip1
 
-      - name: Install cross-compilation tools (aarch64 linux)
-        if: matrix.platform.cross == true
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          mkdir -p .cargo
-          cat >> .cargo/config.toml <<EOF
-          [target.aarch64-unknown-linux-gnu]
-          linker = "aarch64-linux-gnu-gcc"
-          EOF
-
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: repos
           key: release-${{ matrix.platform.target }}
 
+      # All three binaries ship in every tarball: install.sh copies bin/jig-server
+      # and bin/jig unconditionally out of whatever tarball it fetched, so trimming
+      # the darwin rows down to jig-cli alone would break `curl | sh` on a Mac.
       - name: Build native binaries (jig-server, jig, jig-nameserver)
         working-directory: repos
         shell: bash
@@ -90,19 +86,37 @@ jobs:
           STAGE="dist/${{ matrix.platform.tarball_name }}"
           mkdir -p "$STAGE/bin" "$STAGE/blocks"
           BIN_DIR="repos/target/${{ matrix.platform.target }}/release"
-          EXT=""
-          if [[ "${{ matrix.platform.target }}" == *"windows"* ]]; then
-            EXT=".exe"
-          fi
-          cp "$BIN_DIR/jig-server${EXT}"     "$STAGE/bin/jig-server${EXT}"
-          cp "$BIN_DIR/jig${EXT}"            "$STAGE/bin/jig${EXT}"
-          cp "$BIN_DIR/jig-nameserver${EXT}" "$STAGE/bin/jig-nameserver${EXT}"
+          cp "$BIN_DIR/jig-server"     "$STAGE/bin/jig-server"
+          cp "$BIN_DIR/jig"            "$STAGE/bin/jig"
+          cp "$BIN_DIR/jig-nameserver" "$STAGE/bin/jig-nameserver"
           cp "repos/target/wasm32-wasip1/release/text_block.wasm" \
              "$STAGE/blocks/text_block.wasm"
           cp install.sh README.md LICENSE "$STAGE/" 2>/dev/null || true
 
-      - name: Package tarball (unix)
-        if: matrix.platform.archive == 'tar.gz'
+      # Ships next to the binaries so the caveat survives being AirDropped or
+      # re-zipped, not just read on the release page.
+      - name: Add macOS Gatekeeper note (darwin only)
+        if: contains(matrix.platform.target, 'apple-darwin')
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "dist/${{ matrix.platform.tarball_name }}/QUARANTINE-README.txt" <<'EOF'
+          macOS Gatekeeper
+          ================
+
+          These binaries are unsigned and unnotarized. Anything you download or
+          AirDrop gets tagged with com.apple.quarantine, and macOS refuses to
+          launch it ("cannot be opened because the developer cannot be verified").
+
+          Strip the quarantine flag before first run:
+
+              xattr -d com.apple.quarantine ./jig
+
+          Do the same for ./jig-server and ./jig-nameserver if you run those.
+          If xattr reports "No such xattr", the flag was never set — you are fine.
+          EOF
+
+      - name: Package tarball
         shell: bash
         run: |
           set -euo pipefail
@@ -111,14 +125,10 @@ jobs:
           (command -v sha256sum >/dev/null && sha256sum "${{ matrix.platform.tarball_name }}.tar.gz" > "${{ matrix.platform.tarball_name }}.tar.gz.sha256") \
             || shasum -a 256 "${{ matrix.platform.tarball_name }}.tar.gz" > "${{ matrix.platform.tarball_name }}.tar.gz.sha256"
 
-      - name: Package zip (windows)
-        if: matrix.platform.archive == 'zip'
-        shell: pwsh
-        run: |
-          cd dist
-          Compress-Archive -Path "${{ matrix.platform.tarball_name }}" -DestinationPath "${{ matrix.platform.tarball_name }}.zip"
-          (Get-FileHash -Algorithm SHA256 "${{ matrix.platform.tarball_name }}.zip").Hash | Out-File -Encoding ascii "${{ matrix.platform.tarball_name }}.zip.sha256"
-
+      # NOTE for whoever downloads this artifact: the darwin binaries are
+      # unsigned/unnotarized. Run `xattr -d com.apple.quarantine ./jig` after
+      # unpacking or macOS will refuse to launch it. See QUARANTINE-README.txt
+      # inside the tarball.
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -126,9 +136,7 @@ jobs:
           path: |
             dist/${{ matrix.platform.tarball_name }}.tar.gz
             dist/${{ matrix.platform.tarball_name }}.tar.gz.sha256
-            dist/${{ matrix.platform.tarball_name }}.zip
-            dist/${{ matrix.platform.tarball_name }}.zip.sha256
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 7
 
   publish:
@@ -154,8 +162,28 @@ jobs:
           prerelease: ${{ startsWith(github.ref_name, 'v0.0.') }}
           fail_on_unmatched_files: true
           generate_release_notes: true
+          # Prepended to the auto-generated notes, so it is the first thing
+          # anyone sees on the page they download the tarball from.
+          body: |
+            ### macOS: clear the quarantine flag before first run
+
+            The darwin binaries below are **unsigned and unnotarized**. macOS tags
+            anything downloaded or AirDropped with `com.apple.quarantine` and refuses
+            to launch it. After unpacking:
+
+            ```sh
+            xattr -d com.apple.quarantine ./jig
+            ```
+
+            Repeat for `./jig-server` and `./jig-nameserver` if you run those.
+
+            ### Artifacts
+
+            | file | for |
+            | --- | --- |
+            | `jig-darwin-aarch64.tar.gz` | Apple Silicon Mac (primary client) |
+            | `jig-darwin-x86_64.tar.gz` | Intel Mac |
+            | `jig-linux-x86_64.tar.gz` | the Linux server / VPS |
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
-            dist/*.zip
-            dist/*.zip.sha256

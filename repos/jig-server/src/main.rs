@@ -1,8 +1,9 @@
 //! Jig server binary.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
+use jig_config::v0_0_2_server::JigServerConfig;
 use jig_server::{JigServer, ServerConfig};
 
 #[derive(Parser, Debug)]
@@ -29,11 +30,55 @@ struct Args {
     port: Option<u16>,
 }
 
+/// Load the v0.0.2 half of the config (`[server]`, `[identity]`,
+/// `[federation]`, `[bridges]`, `[debug]`) from the same file `ServerConfig`
+/// was read from.
+///
+/// An EXPLICIT `--config` that fails to parse is an error, never a silent
+/// fall back to defaults. Swallowing it discards the operator's entire file:
+/// `server_did_keyfile` reverts to the default path, the server mints a FRESH
+/// ed25519 identity, and it comes up under a NEW server DID — which breaks
+/// TOFU pinning for every already-connected client. The same swallow silently
+/// reverts `[bridges]`, federation peers, and `debug.admin_endpoints`.
+///
+/// `None` (no `--config` given) legitimately means defaults.
+fn load_v0_0_2_config(config_path: Option<&Path>) -> Result<JigServerConfig, String> {
+    match config_path {
+        Some(path) => JigServerConfig::load(path)
+            .map_err(|e| format!("v0.0.2 config load from {} failed: {e}", path.display())),
+        None => Ok(JigServerConfig::default()),
+    }
+}
+
+/// `[server] listen` is DECORATIVE: it only builds the `ws://` origin-tag
+/// string stamped onto blocks. The socket binds the root-level
+/// `bind_address`/`port`. An operator who sets `listen = "0.0.0.0:7117"` and
+/// expects a reachable server still gets a loopback-only one, so say so out
+/// loud at startup.
+///
+/// Deliberately a textual comparison — `listen` is a free-form origin tag, and
+/// "close enough" spellings (`localhost` vs `127.0.0.1`) still hand clients a
+/// URL that differs from what the server advertises elsewhere.
+fn listen_disagreement_warning(listen: &str, bind_address: &str, port: u16) -> Option<String> {
+    let effective = format!("{bind_address}:{port}");
+    if listen == effective {
+        return None;
+    }
+    Some(format!(
+        "[server] listen = \"{listen}\" disagrees with the effective bind address {effective}. \
+         `listen` is decorative — it only builds the ws:// origin tag; the socket binds \
+         bind_address/port. Clients handed ws://{listen} may not reach this server."
+    ))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    // Default to `info` when RUST_LOG is unset: `from_default_env()` alone
+    // yields an empty filter, which silences every startup diagnostic below
+    // (including the fatal-config and decorative-`listen` warnings).
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let args = Args::parse();
 
@@ -58,25 +103,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Database: {}", config.database_path.display());
 
     // Build the v0.0.2 pipeline AppState alongside the existing ServerConfig.
-    // Uses JigServerConfig::default() for D2 — full config loading arrives in
-    // later D tasks. The important thing here is proving the wiring works: when
-    // this succeeds, the /.well-known/jig response includes server_did, etc.
+    // Both halves come from the same --config file: root-level keys drive
+    // ServerConfig (which opens the socket), and [server]/[identity]/
+    // [federation]/[bridges]/[debug] drive JigServerConfig. Neither type uses
+    // deny_unknown_fields, which is what makes one file legal for both.
     let v0_0_2_state = {
-        use jig_config::v0_0_2_server::JigServerConfig;
-        // C: load the operator's v0.0.2 config (server/identity/federation/bridges)
-        // from the same explicit --config file. Falls back to defaults when no
-        // explicit path is given (dev/well-known flow) or on parse error, so a
-        // v0.0.1-only deploy still boots.
-        let v002_config = match &config_path {
-            Some(path) => JigServerConfig::load(path).unwrap_or_else(|e| {
-                tracing::warn!(
-                    "v0.0.2 config load from {} failed ({e}); using defaults",
-                    path.display()
-                );
-                JigServerConfig::default()
-            }),
-            None => JigServerConfig::default(),
+        let v002_config = match load_v0_0_2_config(config_path.as_deref()) {
+            Ok(cfg) => cfg,
+            Err(msg) => {
+                // Both sinks on purpose: RUST_LOG can filter tracing away
+                // entirely, and an operator who typo'd a key must still be
+                // told why the server refused to start.
+                tracing::error!("{msg}");
+                eprintln!("[jig-server] FATAL: {msg}");
+                std::process::exit(1);
+            }
         };
+
+        if let Some(warning) = listen_disagreement_warning(
+            &v002_config.server.listen,
+            &config.bind_address,
+            config.port,
+        ) {
+            tracing::warn!("{warning}");
+            eprintln!("[jig-server] WARN: {warning}");
+        }
+
         let db_path = config.database_path.with_file_name(
             config
                 .database_path
@@ -122,4 +174,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     server.start().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(dir: &tempfile::TempDir, name: &str, body: &str) -> PathBuf {
+        let path = dir.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn explicit_config_that_fails_to_parse_is_an_error_naming_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(&dir, "bad.toml", "[identity]\nmode = \"toffu\"\n");
+
+        let err = load_v0_0_2_config(Some(&path)).unwrap_err();
+        assert!(
+            err.contains(path.to_str().unwrap()),
+            "error must name the offending file, got: {err}"
+        );
+        assert!(
+            err.contains("toffu"),
+            "error must carry the underlying serde message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn explicit_config_that_parses_is_honoured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            &dir,
+            "good.toml",
+            "[server]\nserver_did_keyfile = \"/srv/keep-me.key\"\n\n[debug]\nadmin_endpoints = true\n",
+        );
+
+        let cfg = load_v0_0_2_config(Some(&path)).unwrap();
+        // The whole point: the operator's keyfile must survive. Falling back to
+        // defaults here mints a new server DID and breaks TOFU pinning.
+        assert_eq!(cfg.server.server_did_keyfile, "/srv/keep-me.key");
+        assert!(cfg.debug.admin_endpoints);
+    }
+
+    #[test]
+    fn missing_config_flag_uses_defaults() {
+        let cfg = load_v0_0_2_config(None).unwrap();
+        assert_eq!(cfg, JigServerConfig::default());
+    }
+
+    #[test]
+    fn absent_explicit_config_file_is_still_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.toml");
+        // A --config pointing at nothing is a typo'd path, not a request for
+        // defaults.
+        assert!(load_v0_0_2_config(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn listen_matching_the_bind_address_is_silent() {
+        assert!(listen_disagreement_warning("127.0.0.1:7117", "127.0.0.1", 7117).is_none());
+    }
+
+    #[test]
+    fn listen_disagreeing_with_the_bind_address_warns() {
+        let warning = listen_disagreement_warning("0.0.0.0:7117", "127.0.0.1", 7117)
+            .expect("a listen/bind mismatch must warn");
+        assert!(warning.contains("0.0.0.0:7117"));
+        assert!(warning.contains("127.0.0.1:7117"));
+        assert!(warning.contains("decorative"));
+
+        // Port-only drift is the same trap.
+        assert!(listen_disagreement_warning("127.0.0.1:7118", "127.0.0.1", 7117).is_some());
+    }
 }

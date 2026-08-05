@@ -16,18 +16,29 @@
 //!     rendered output. (v0.0.2 has only one server in the demo, so this
 //!     should never fire; the wiring is here for v0.0.3+ federation.)
 
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result};
 use jig_client::{Client, DeliveredBlock};
 
-use crate::cmd::blocks_decode::decode;
 #[cfg(test)]
 use crate::cmd::blocks_decode::distinct_render_hashes;
-use crate::cmd::common::{load_active_identity, load_server_url};
+use crate::cmd::blocks_decode::{DecodedBlock, decode};
+use crate::cmd::common::CliContext;
+use crate::cmd::display::{bell_on_inbound, connection_lost, display_sender, format_hhmm};
+use crate::cmd::history;
 
 /// Apply `jig tail <channel>`.
-pub async fn run(channel: String) -> Result<()> {
-    let id = load_active_identity()?;
-    let server_url = load_server_url()?;
+pub async fn run(ctx: &CliContext, channel: String) -> Result<()> {
+    let id = ctx.identity()?;
+    let server_url = ctx.server_url()?;
+
+    let contacts = ctx.effective().contacts.clone();
+
+    // Backfill first: a fresh tail on a busy channel used to sit silent
+    // until the next live message. Failures here degrade to "no backlog"
+    // (see `history::backfill`) rather than aborting the tail.
+    let backlog = history::backfill(&server_url, &channel, history::DEFAULT_HISTORY_LIMIT).await;
 
     let client = Client::connect(&server_url, id)
         .await
@@ -38,34 +49,85 @@ pub async fn run(channel: String) -> Result<()> {
         .await
         .with_context(|| format!("subscribing to {channel}"))?;
 
+    for line in backfill_lines(&backlog, &contacts) {
+        println!("{line}");
+    }
+    // No bell for replayed history — the operator was not present for it.
     println!("Tailing {channel} on {server_url}... (Ctrl-C to exit)");
-    while let Some(delivered) = stream.next().await {
-        match decode_and_format(&delivered) {
-            Ok(line) => println!("{line}"),
+    pump(&mut stream, &channel, &contacts).await
+}
+
+/// Anything that yields delivered blocks until it ends.
+///
+/// Exists so the "stream ended" branch — the one that used to return
+/// `Ok(())` and exit 0 on a dead connection — is unit-testable without a
+/// live socket. `jig_client::BlockStream` is the only production impl.
+pub trait BlockSource {
+    fn next_block(&mut self) -> impl std::future::Future<Output = Option<DeliveredBlock>> + Send;
+}
+
+impl BlockSource for jig_client::BlockStream {
+    fn next_block(&mut self) -> impl std::future::Future<Output = Option<DeliveredBlock>> + Send {
+        self.next()
+    }
+}
+
+/// Print every block the source yields, then report the disconnect.
+///
+/// Always terminates in an `Err`: a source that has stopped yielding is a
+/// closed connection, and `jig tail` exiting 0 on one is precisely the
+/// silent-success bug this replaces.
+async fn pump(
+    source: &mut impl BlockSource,
+    channel: &str,
+    contacts: &BTreeMap<String, String>,
+) -> Result<()> {
+    while let Some(delivered) = source.next_block().await {
+        match decode_and_format(&delivered, contacts) {
+            Ok(line) => {
+                println!("{line}");
+                bell_on_inbound(1, &mut std::io::stderr());
+            }
             // Best-effort: skip blocks we can't decode rather than panicking
             // the whole tail. Operators get a one-line diagnostic so they
             // know data was dropped.
             Err(e) => eprintln!("[skip block: {e}]"),
         }
     }
-    Ok(())
+    Err(connection_lost(channel))
 }
 
 /// Decode a delivered block bundle and format the one-line summary.
 ///
 /// Delegates the heavy lifting (b64 + manifest parsing + receipt
 /// dedupe) to `blocks_decode::decode` — shared with `jig chat`. This
-/// function only owns the textual line format `<ts>  <sender>  <body>`
+/// function only owns the textual line format `HH:MM  <sender>: <body>`
 /// plus the optional render-parity warning suffix.
-fn decode_and_format(d: &DeliveredBlock) -> Result<String> {
-    let decoded = decode(d)?;
+///
+/// `contacts` is the local `[contacts]` address book; senders with no entry
+/// fall back to a truncated DID.
+fn decode_and_format(d: &DeliveredBlock, contacts: &BTreeMap<String, String>) -> Result<String> {
+    Ok(format_decoded(&decode(d)?, contacts))
+}
+
+/// Format one already-decoded block. Shared by the live stream and the
+/// replayed backlog so history and live traffic look identical.
+fn format_decoded(decoded: &DecodedBlock, contacts: &BTreeMap<String, String>) -> String {
     let parity = render_parity_marker_from_count(decoded.parity_hash_count);
-    Ok(format!(
-        "{ts}  {sender}  {body}{parity}",
-        ts = decoded.ts,
-        sender = decoded.sender,
+    format!(
+        "{ts}  {sender}: {body}{parity}",
+        ts = format_hhmm(decoded.ts),
+        sender = display_sender(contacts, &decoded.sender),
         body = decoded.body,
-    ))
+    )
+}
+
+/// Render a fetched backlog, oldest first.
+fn backfill_lines(backlog: &[DecodedBlock], contacts: &BTreeMap<String, String>) -> Vec<String> {
+    backlog
+        .iter()
+        .map(|d| format_decoded(d, contacts))
+        .collect()
 }
 
 /// Compute the render-parity marker string from a distinct-hash count.
@@ -124,15 +186,23 @@ mod tests {
         let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes());
 
         let d = delivered_for(bundle_b64, vec![]);
-        let line = decode_and_format(&d).unwrap();
+        let line = decode_and_format(&d, &BTreeMap::new()).unwrap();
 
         assert!(
-            line.contains("1747680000000"),
-            "wall_ms must appear: {line}"
+            !line.contains("1747680000000"),
+            "raw epoch millis must not be printed: {line}"
         );
         assert!(
-            line.contains(&did.to_did_jig_string()),
-            "sender DID must appear: {line}"
+            line.starts_with(&crate::cmd::display::format_hhmm(1_747_680_000_000)),
+            "line must open with the HH:MM clock: {line}"
+        );
+        assert!(
+            !line.contains(&did.to_did_jig_string()),
+            "the full 61-char DID must not be printed: {line}"
+        );
+        assert!(
+            line.contains(&crate::cmd::display::shorten_did(&did.to_did_jig_string())),
+            "shortened sender must appear: {line}"
         );
         assert!(line.contains("hi there"), "body must appear: {line}");
         assert!(
@@ -165,16 +235,39 @@ mod tests {
         let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(canonical);
 
         let d = delivered_for(bundle_b64, vec![]);
-        let line = decode_and_format(&d).unwrap();
-        // Wall-clock fallback is `0` — the line must start with `0  `.
-        assert!(line.starts_with("0  "), "ts fallback should be 0: {line}");
+        let line = decode_and_format(&d, &BTreeMap::new()).unwrap();
+        // Wall-clock fallback is `0`, which renders as the `--:--` placeholder
+        // rather than a misleading epoch-zero clock time.
+        assert!(
+            line.starts_with("--:--  "),
+            "missing HLC should render as --:--: {line}"
+        );
         assert!(line.contains("no clock"));
+    }
+
+    #[test]
+    fn decode_and_format_renders_a_contact_name_when_one_is_configured() {
+        let id = test_identity();
+        let did = id.did().clone();
+        let hlc = HlcTimestamp {
+            wall_ms: 1_747_680_000_000,
+            logical: 0,
+            server_did: did.clone(),
+        };
+        let block = build_text_render(&id, "#hello", "yo", hlc);
+        let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes());
+
+        let contacts: BTreeMap<String, String> =
+            [(did.to_did_jig_string(), "dj".to_string())].into();
+        let d = delivered_for(bundle_b64, vec![]);
+        let line = decode_and_format(&d, &contacts).unwrap();
+        assert!(line.contains("  dj: yo"), "contact name must win: {line}");
     }
 
     #[test]
     fn decode_and_format_reports_skip_on_invalid_b64() {
         let d = delivered_for("not_base64_!!!".into(), vec![]);
-        let err = decode_and_format(&d).unwrap_err();
+        let err = decode_and_format(&d, &BTreeMap::new()).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("decoding bundle_b64"),
@@ -188,6 +281,106 @@ mod tests {
             render_hash: render_hash.map(str::to_string),
             receipt_bytes_b64: "cmI=".into(),
         }
+    }
+
+    /// Stand-in for a `BlockStream` that yields a fixed backlog and then
+    /// ends — exactly what a dropped connection looks like to the caller.
+    struct FiniteSource {
+        items: std::collections::VecDeque<DeliveredBlock>,
+    }
+
+    impl BlockSource for FiniteSource {
+        fn next_block(
+            &mut self,
+        ) -> impl std::future::Future<Output = Option<DeliveredBlock>> + Send {
+            let next = self.items.pop_front();
+            async move { next }
+        }
+    }
+
+    fn one_text_block() -> DeliveredBlock {
+        let id = test_identity();
+        let hlc = HlcTimestamp {
+            wall_ms: 1_747_680_000_000,
+            logical: 0,
+            server_did: id.did().clone(),
+        };
+        let block = build_text_render(&id, "#hello", "hi", hlc);
+        delivered_for(
+            base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
+            vec![],
+        )
+    }
+
+    #[test]
+    fn backfill_lines_render_oldest_first() {
+        // `jig tail` on a busy channel used to sit silent until someone
+        // spoke; the replayed backlog must come out in timeline order.
+        let backlog = vec![
+            DecodedBlock {
+                sender: "did:jig:zAAAA".into(),
+                body: "first".into(),
+                ts: 1_747_680_000_000,
+                parity_warning: false,
+                parity_hash_count: 0,
+                kind: Some(jig_core::BlockKind::TextRender),
+            },
+            DecodedBlock {
+                sender: "did:jig:zAAAA".into(),
+                body: "second".into(),
+                ts: 1_747_680_060_000,
+                parity_warning: false,
+                parity_hash_count: 0,
+                kind: Some(jig_core::BlockKind::TextRender),
+            },
+        ];
+        let lines = backfill_lines(&backlog, &BTreeMap::new());
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].ends_with("first"), "got {}", lines[0]);
+        assert!(lines[1].ends_with("second"), "got {}", lines[1]);
+    }
+
+    #[tokio::test]
+    async fn pump_reports_connection_lost_once_the_stream_ends() {
+        // The whole point of Task 4: an ended stream is a dead connection,
+        // not a successful tail. Returning Ok here is what made `jig tail`
+        // exit 0 on a server restart.
+        let mut source = FiniteSource {
+            items: [one_text_block()].into(),
+        };
+        let err = pump(&mut source, "#hello", &BTreeMap::new())
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("connection lost"),
+            "operator-facing message must say connection lost: {msg}"
+        );
+        assert!(
+            msg.contains("#hello"),
+            "message must name the channel: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_keeps_going_past_an_undecodable_block() {
+        // One bad block must not end the tail early — it should be skipped
+        // and the stream drained to its real end.
+        let mut source = FiniteSource {
+            items: [
+                delivered_for("not_base64_!!!".into(), vec![]),
+                one_text_block(),
+            ]
+            .into(),
+        };
+        let err = pump(&mut source, "#hello", &BTreeMap::new())
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("connection lost"));
+        assert!(
+            source.items.is_empty(),
+            "the whole backlog must be consumed"
+        );
     }
 
     #[test]

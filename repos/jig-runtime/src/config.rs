@@ -190,7 +190,19 @@ pub struct PricingConfig {
     /// Currency or unit (e.g., "USD", "tokens", "credits")
     pub currency: Option<String>,
 
-    /// Cost schedule version to use
+    /// Cost schedule version to use.
+    ///
+    /// Bump this whenever the fuel a given operation costs changes, not just
+    /// when `cost_per_fuel_unit` changes: receipts carry this string, and it is
+    /// the only signal a consumer has that two receipts were metered under
+    /// different rules and are therefore not cost-comparable.
+    ///
+    /// 0.1.0 -> 0.2.0: wasmtime 47 bills bulk memory operations (`memory.copy`,
+    /// `memory.fill`) per byte where 24.x charged a flat rate. Per-operator
+    /// costs for ordinary compute are unchanged. A block doing large memcpys is
+    /// materially more expensive under 0.2.0 — the WASI reference fixture went
+    /// from 1713 to 18098 fuel, all of it the 16 KiB memcpy in `_start`. This
+    /// is the metering half of the fix for RUSTSEC-2026-0223.
     pub schedule_version: String,
 }
 
@@ -200,7 +212,7 @@ impl Default for PricingConfig {
             enabled: false,               // Disabled by default
             cost_per_fuel_unit: 0.000001, // 1 micro-unit per fuel
             currency: None,
-            schedule_version: "0.1.0".to_string(),
+            schedule_version: "0.2.0".to_string(),
         }
     }
 }

@@ -1,0 +1,16 @@
+[Unit]
+Description=Run jig backup daily
+Documentation=file:/opt/jig/deploy/README.md
+
+[Timer]
+# 03:17 rather than 03:00: nothing else on the box competes for the disk, and
+# an off-the-hour minute avoids the thundering herd if this ever runs on a fleet.
+OnCalendar=*-*-* 03:17:00
+# Catch up after a reboot or a box that was powered off overnight. Without this
+# a VPS that reboots daily at 04:00 would never take a backup.
+Persistent=true
+RandomizedDelaySec=300
+Unit=jig-backup.service
+
+[Install]
+WantedBy=timers.target

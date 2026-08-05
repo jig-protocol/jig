@@ -14,20 +14,22 @@ use anyhow::{Context, Result};
 use jig_client::{Client, blocks::build_text_render};
 use jig_core::HlcTimestamp;
 
-use crate::cmd::common::{load_active_identity, load_server_url};
+use crate::cmd::common::CliContext;
 
 /// Apply `jig send <channel> <body>`.
 ///
 /// Behaviour:
-///   1. Load identity from `~/.jig/cli.toml` / `~/.jig/keys/<did>.key`.
-///   2. Load server base URL from `~/.jig/cli.toml`.
+///   1. Load the identity named by the resolved context (`--did` override
+///      or `[user] did`) from `~/.jig/keys/<did>.key`.
+///   2. Take the resolved server base URL (`--server` override or
+///      `[server] base_url`).
 ///   3. Open a WSS connection (or transpose `http(s)://` → `ws(s)://` —
 ///      `Client::connect` handles that itself).
 ///   4. Build + submit a signed `text-render` block.
 ///   5. Print the assigned block CID. Exit.
-pub async fn run(channel: String, body: String) -> Result<()> {
-    let id = load_active_identity()?;
-    let server_url = load_server_url()?;
+pub async fn run(ctx: &CliContext, channel: String, body: String) -> Result<()> {
+    let id = ctx.identity()?;
+    let server_url = ctx.server_url()?;
 
     let client = Client::connect(&server_url, id)
         .await
@@ -40,7 +42,7 @@ pub async fn run(channel: String, body: String) -> Result<()> {
     // We re-load the identity to derive a DID for the HLC stamp; the
     // Client owns the original Identity at this point. This is cheap —
     // identity load is a 32-byte file read + ed25519 pubkey derivation.
-    let id_for_hlc = load_active_identity()?;
+    let id_for_hlc = ctx.identity()?;
     let hlc = HlcTimestamp::now_wall(id_for_hlc.did().clone());
     let block = build_text_render(&id_for_hlc, &channel, &body, hlc);
 

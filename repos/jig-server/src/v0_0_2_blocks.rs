@@ -12,13 +12,15 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
 };
 use base64::Engine as _;
 use jig_core::BlockBundle;
+use jig_pipeline::envelope::ReceiptRef;
 use jig_pipeline::ingest::{IngestError, IngestSource, ingest};
+use jig_pipeline::persist::MAX_HISTORY_LIMIT;
 use serde::{Deserialize, Serialize};
 
 use crate::v0_0_2::AppState;
@@ -277,6 +279,90 @@ pub async fn list_channels(
     Ok(Json(ChannelsResponse { channels }))
 }
 
+// ---- Channel history endpoint -----------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct HistoryQuery {
+    /// Omitted means "as much as the store will give" — the store clamps to
+    /// `MAX_HISTORY_LIMIT` either way, so this is never unbounded.
+    pub limit: Option<usize>,
+}
+
+/// One entry of a channel timeline.
+///
+/// ⚠️ CROSS-CRATE WIRE CONTRACT: a JSON array of these MUST deserialize into
+/// `Vec<jig_client::DeliveredBlock>`, which is how the CLI reads history.
+/// It is a deliberate mirror rather than a re-use of the client struct so the
+/// server's response shape isn't welded to a client-crate definition; the
+/// `channel_history_deserializes_into_delivered_blocks` test below is what
+/// keeps the two honest.
+#[derive(Debug, Serialize)]
+pub struct TimelineBlock {
+    pub bundle_b64: String,
+    /// Sender's ed25519 signature over the canonical bundle bytes.
+    ///
+    /// NOT YET WIRED on the read side: `jig_client::DeliveredBlock` has no
+    /// `sig_b64` field today, so clients discard this. It is emitted now so
+    /// that adding the field client-side is a one-sided change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sig_b64: Option<String>,
+    pub receipts: Vec<ReceiptRef>,
+    pub delivery_cid: String,
+}
+
+fn persist_err(e: impl std::fmt::Display) -> (StatusCode, Json<ErrorBody>) {
+    err(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "PERSIST_ERROR",
+        e.to_string(),
+    )
+}
+
+/// GET /api/v1/channels/:slug/blocks?limit=N — replay a channel's timeline.
+///
+/// Clients percent-encode the leading `#` (`%23hello`); axum's `Path`
+/// extractor decodes the segment before this handler sees it.
+///
+/// Blocks come back **oldest-first**, capped to the newest `limit` (see
+/// `SqliteStore::list_blocks_by_channel`), so a chat client renders the array
+/// straight down the pane. An unknown or silent channel is `200` with `[]`.
+pub async fn get_channel_history(
+    State(state): State<Arc<AppState>>,
+    Path(slug): Path<String>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<Vec<TimelineBlock>>, (StatusCode, Json<ErrorBody>)> {
+    let store = &state.ingest_ctx.store;
+    let blocks = store
+        .list_blocks_by_channel(&slug, query.limit.unwrap_or(MAX_HISTORY_LIMIT), None)
+        .map_err(persist_err)?;
+
+    let mut timeline = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        let receipts = store
+            .get_receipts_for_block(&block.cid)
+            .map_err(persist_err)?
+            .into_iter()
+            .map(|r| ReceiptRef {
+                server_did: r.server_id,
+                render_hash: r.render_hash,
+                receipt_bytes_b64: base64::engine::general_purpose::STANDARD
+                    .encode(&r.receipt_bytes),
+            })
+            .collect();
+        timeline.push(TimelineBlock {
+            bundle_b64: base64::engine::general_purpose::STANDARD.encode(&block.bundle_bytes),
+            sig_b64: (!block.sender_sig.is_empty())
+                .then(|| base64::engine::general_purpose::STANDARD.encode(&block.sender_sig)),
+            receipts,
+            // Same `delivery:<cid>` shape the WSS fanout emits, so a client
+            // that dedupes on delivery_cid sees replay and live delivery of
+            // the same block as one identity.
+            delivery_cid: format!("delivery:{}", block.cid),
+        });
+    }
+    Ok(Json(timeline))
+}
+
 /// Construct the REST sub-router. Merged into the v0.0.2 router by
 /// `v0_0_2_ws::build_v0_0_2_router`. Not debug-gated — these are
 /// production endpoints.
@@ -285,6 +371,7 @@ pub fn build_blocks_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/blocks", post(submit_block))
         .route("/api/v1/blocks/:cid", get(get_block_by_cid))
         .route("/api/v1/channels", get(list_channels))
+        .route("/api/v1/channels/:slug/blocks", get(get_channel_history))
         .with_state(state)
 }
 
@@ -524,5 +611,136 @@ mod tests {
             .map(|c| c["slug"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(slugs, vec!["#alpha", "#mike", "#zulu"]);
+    }
+
+    // ---- channel history tests ------------------------------------------
+
+    /// Submit `texts` to `slug` in order, each with a distinct HLC logical
+    /// tick so the timeline order is deterministic.
+    async fn submit_texts(router: &Router, id: &Identity, slug: &str, texts: &[&str]) {
+        for (i, text) in texts.iter().enumerate() {
+            let mut hlc = test_hlc(id);
+            hlc.logical = i as u32;
+            let block = build_text_render(id, slug, text, hlc);
+            let submission = serde_json::json!({
+                "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
+                "sig_b64": base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
+            });
+            let (status, body) = post_json(router.clone(), "/api/v1/blocks", submission).await;
+            assert_eq!(status, StatusCode::OK, "submitting {text}: {body}");
+        }
+    }
+
+    /// Decode the base64 bundle back to the text payload the sender wrote,
+    /// so assertions read as message content rather than opaque CIDs.
+    fn text_of(bundle_b64: &str) -> String {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(bundle_b64)
+            .unwrap();
+        let (manifest_bytes, _code): (Vec<u8>, Vec<u8>) = serde_json::from_slice(&bytes).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+        manifest["metadata"]["body"]
+            .as_str()
+            .expect("text-render manifest carries metadata.body")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn channel_history_deserializes_into_delivered_blocks() {
+        // Cross-lane wire contract: the CLI decodes this response body with
+        // `serde_json::from_str::<Vec<DeliveredBlock>>`.
+        let state = Arc::new(AppState::for_test().unwrap());
+        let router = build_blocks_router(state.clone());
+        let id = test_identity();
+        submit_texts(&router, &id, "#hello", &["one", "two"]).await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/channels/%23hello/blocks")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let history: Vec<jig_client::DeliveredBlock> = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|e| panic!("not a Vec<DeliveredBlock>: {e}\nbody={bytes:?}"));
+        assert_eq!(history.len(), 2);
+        assert_eq!(text_of(&history[0].bundle_b64), "one");
+        assert_eq!(text_of(&history[1].bundle_b64), "two");
+        assert!(!history[0].delivery_cid.is_empty());
+    }
+
+    #[tokio::test]
+    async fn channel_history_percent_decodes_the_slug_and_scopes_to_it() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let router = build_blocks_router(state.clone());
+        let id = test_identity();
+        submit_texts(&router, &id, "#hello", &["h1", "h2"]).await;
+        submit_texts(&router, &id, "#other", &["o1"]).await;
+
+        let (status, body) = get_path(router, "/api/v1/channels/%23hello/blocks").await;
+        assert_eq!(status, StatusCode::OK);
+        let texts: Vec<String> = body
+            .as_array()
+            .expect("history is a JSON array")
+            .iter()
+            .map(|b| text_of(b["bundle_b64"].as_str().unwrap()))
+            .collect();
+        assert_eq!(texts, vec!["h1", "h2"]);
+    }
+
+    #[tokio::test]
+    async fn channel_history_honours_the_limit_query_param() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let router = build_blocks_router(state.clone());
+        let id = test_identity();
+        submit_texts(&router, &id, "#hello", &["a", "b", "c"]).await;
+
+        // A truncating limit keeps the newest window, still oldest-first.
+        let (status, body) = get_path(router, "/api/v1/channels/%23hello/blocks?limit=2").await;
+        assert_eq!(status, StatusCode::OK);
+        let texts: Vec<String> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| text_of(b["bundle_b64"].as_str().unwrap()))
+            .collect();
+        assert_eq!(texts, vec!["b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn channel_history_returns_empty_array_for_unknown_channel() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let router = build_blocks_router(state);
+
+        let (status, body) = get_path(router, "/api/v1/channels/%23nope/blocks").await;
+        assert_eq!(status, StatusCode::OK, "an unread channel is not an error");
+        assert_eq!(body.as_array().map(|a| a.len()), Some(0));
+    }
+
+    #[tokio::test]
+    async fn channel_history_rejects_a_non_numeric_limit() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let router = build_blocks_router(state);
+
+        let (status, _body) = get_path(router, "/api/v1/channels/%23hello/blocks?limit=lots").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn channel_history_carries_receipts_for_parity_checks() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let router = build_blocks_router(state.clone());
+        let id = test_identity();
+        submit_texts(&router, &id, "#hello", &["only"]).await;
+
+        let (status, body) = get_path(router, "/api/v1/channels/%23hello/blocks").await;
+        assert_eq!(status, StatusCode::OK);
+        let receipts = body[0]["receipts"].as_array().expect("receipts array");
+        assert!(!receipts.is_empty(), "ingest always writes a local receipt");
+        assert!(!receipts[0]["server_did"].as_str().unwrap_or("").is_empty());
     }
 }

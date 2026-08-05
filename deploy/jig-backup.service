@@ -1,0 +1,38 @@
+[Unit]
+Description=jig backup (SQLite snapshots + server.key)
+Documentation=file:/opt/jig/deploy/README.md
+# Nothing to snapshot if the state directory was never created. This is a
+# oneshot, so it does not need tailscaled — it touches the filesystem only.
+ConditionPathExists=/var/lib/jig
+
+[Service]
+Type=oneshot
+User=jig
+Group=jig
+UMask=0077
+
+Environment=JIG_STATE_DIR=/var/lib/jig
+Environment=JIG_BACKUP_DIR=/var/backups/jig
+Environment=JIG_BACKUP_RETENTION_DAYS=14
+
+ExecStart=/opt/jig/bin/jig-backup.sh
+
+# --- hardening -------------------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# Reads /var/lib/jig, writes /var/backups/jig. ProtectSystem=strict makes both
+# read-only otherwise, and VACUUM INTO needs the destination writable.
+ReadWritePaths=/var/lib/jig /var/backups/jig
+# Owned by the same user as the server so it can read server.key (0600 jig:jig).
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

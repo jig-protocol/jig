@@ -4,9 +4,17 @@ on:
   push:
     branches: [ main ]
   pull_request:
+  # The RustSec advisory DB moves independently of this repo, so a brand-new
+  # advisory against an untouched dependency would otherwise first surface as a
+  # red build on whatever unrelated PR happens to run next (this has already
+  # happened once). Run the dependency-policy job on its own cadence against the
+  # default branch so drift is attributed to the advisory DB, not a contributor.
+  # NOTE: GitHub disables scheduled workflows after 60 days of repo inactivity.
+  schedule:
+    - cron: '17 7 * * *'  # daily 07:17 UTC; off-the-hour to dodge cron peak queueing
 
 # All cargo invocations expect to be run from the `repos/` workspace root.
-# License compliance is the exception — `deny.toml` lives at the repo root.
+# The dependency-policy job is the exception — `deny.toml` lives at the repo root.
 defaults:
   run:
     working-directory: repos
@@ -18,6 +26,9 @@ env:
 
 jobs:
   workspace:
+    # The scheduled run exists only to re-check the advisory DB; skip the
+    # expensive build/test matrix on that trigger.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -86,6 +97,7 @@ jobs:
 
   wasm-build:
     name: wasm-build (text-block, wasm32-wasip1)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -102,15 +114,23 @@ jobs:
         working-directory: .
         run: test -f repos/target/wasm32-wasip1/release/text_block.wasm
 
-  license-compliance:
+  # Renamed from `license-compliance`: bare `cargo deny check` runs ALL FOUR
+  # checks (advisories, bans, licenses, sources). The old name once sent a
+  # failure investigation at the licenses check when the actual red was
+  # advisories. Name the job after what it runs.
+  dependency-policy:
+    name: dependency-policy (cargo-deny)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
-      - name: License check
+      - name: cargo deny check (advisories, bans, licenses, sources)
         # deny.toml lives at the repo root; Cargo.toml lives at repos/Cargo.toml.
         # Run from root and point cargo deny at the workspace manifest explicitly.
+        # Running from inside repos/ makes cargo-deny silently fall back to its
+        # DEFAULT config (allows no licenses, ignores nothing) — do not "fix"
+        # this by dropping the working-directory override.
         working-directory: .
         run: cargo deny --manifest-path repos/Cargo.toml check

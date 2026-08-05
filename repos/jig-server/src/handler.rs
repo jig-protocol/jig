@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -35,13 +35,74 @@ pub struct AppState {
 }
 
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    // The v0.0.1 REST surface takes an attacker-chosen author DID with no
+    // signature anywhere in the request, executes the supplied Wasm, and signs
+    // a receipt attesting to it. It bypasses the v0.0.2 signature and
+    // allowed_block_kinds gates entirely, so it is off unless an operator
+    // opts in. `/.well-known/jig` stays mounted either way — peers need it to
+    // detect a misconfigured neighbour.
+    let legacy_enabled = state.config.dangerously_enable_v0_0_1_rest;
+
+    let mut router = Router::new()
         .route("/.well-known/jig", get(server_info))
-        .route("/blocks", get(list_blocks))
-        .route("/blocks", post(ingest_block))
-        .route("/blocks/:cid", get(get_block))
-        .route("/receipts/:cid", get(get_receipt))
-        .with_state(state)
+        // Deliberately OUTSIDE the v0.0.1 gate: systemd and uptime checks must
+        // be able to tell "up" from "crash-looping" on a default deployment,
+        // and a scrape target that disappears when the operator locks the
+        // server down is not a scrape target.
+        .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics));
+
+    if legacy_enabled {
+        router = router
+            .route("/blocks", get(list_blocks))
+            .route("/blocks", post(ingest_block))
+            .route("/blocks/:cid", get(get_block))
+            .route("/receipts/:cid", get(get_receipt));
+    }
+
+    router.with_state(state).layer(http_trace_layer())
+}
+
+/// Request/response tracing for the HTTP surface.
+///
+/// Levels are pinned to INFO because tower-http defaults span AND events to
+/// DEBUG, and `RUST_LOG=info` is what operators actually run — at the default
+/// levels a whole session of traffic produces no log lines at all. The span
+/// level matters as much as the events': it carries the method and URI, so a
+/// DEBUG span under an INFO filter yields "started processing request" with no
+/// indication of what was requested.
+///
+/// Public so `v0_0_2_ws::build_v0_0_2_router` can apply the same layer: axum's
+/// `Router::layer` only wraps routes already added, and `server.rs` merges the
+/// two routers after each is built.
+pub fn http_trace_layer() -> tower_http::trace::TraceLayer<
+    tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>,
+> {
+    use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
+    TraceLayer::new_for_http()
+        .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
+        .on_request(DefaultOnRequest::new().level(tracing::Level::INFO))
+        .on_response(DefaultOnResponse::new().level(tracing::Level::INFO))
+}
+
+/// Liveness probe. Deliberately trivial: it answers "this process is serving
+/// HTTP", nothing more. It does NOT touch the block store, so it stays honest
+/// under load and cannot itself become the thing that fails.
+async fn healthz() -> impl IntoResponse {
+    (StatusCode::OK, "ok\n")
+}
+
+/// Prometheus text exposition of the v0.0.2 WebSocket counters.
+///
+/// The numbers are hand-rolled `AtomicU64`s living in
+/// [`crate::v0_0_2_ws::metrics`] — see that module for what is and is not
+/// counted (federation and bridge ingest are NOT).
+async fn metrics() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        crate::v0_0_2_ws::metrics::render_prometheus(),
+    )
 }
 
 #[derive(Serialize)]
@@ -411,6 +472,145 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    /// The v0.0.1 REST surface executes caller-supplied Wasm with no signature
+    /// check at all. Default-off is the security property; these two tests are
+    /// what keep it from silently regressing to always-on.
+    async fn router_status(
+        enable_legacy: bool,
+        method: &str,
+        path: &str,
+    ) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+        let dir = tempdir().unwrap();
+        let mut config = ServerConfig::default();
+        config.database_path = dir.path().join("gate.db");
+        config.dangerously_enable_v0_0_1_rest = enable_legacy;
+        let store = Arc::new(SqliteBlockStore::new(&config.database_path).unwrap());
+        let runtime = Arc::new(BlockRuntime::new(config.execution_config()).unwrap());
+        let app = build_router(AppState {
+            store,
+            runtime,
+            config,
+            v0_0_2: None,
+        });
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    /// Full response (status, content-type, body) for a GET against a router
+    /// built with the v0.0.1 gate in the given position.
+    async fn router_get(enable_legacy: bool, path: &str) -> (StatusCode, String, String) {
+        use tower::ServiceExt;
+        let dir = tempdir().unwrap();
+        let config = ServerConfig {
+            database_path: dir.path().join("probe.db"),
+            dangerously_enable_v0_0_1_rest: enable_legacy,
+            ..Default::default()
+        };
+        let store = Arc::new(SqliteBlockStore::new(&config.database_path).unwrap());
+        let runtime = Arc::new(BlockRuntime::new(config.execution_config()).unwrap());
+        let app = build_router(AppState {
+            store,
+            runtime,
+            config,
+            v0_0_2: None,
+        });
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, content_type, String::from_utf8_lossy(&bytes).into())
+    }
+
+    /// systemd and uptime checks need to tell "up" from "crash-looping" on a
+    /// DEFAULT deployment, so /healthz must not sit behind the v0.0.1 gate.
+    #[tokio::test]
+    async fn healthz_is_200_outside_the_v0_0_1_gate() {
+        for legacy in [false, true] {
+            let (status, _ct, body) = router_get(legacy, "/healthz").await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "/healthz must be 200 with dangerously_enable_v0_0_1_rest={legacy}"
+            );
+            assert!(!body.is_empty(), "/healthz must return a body");
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_exposes_prometheus_text_outside_the_v0_0_1_gate() {
+        for legacy in [false, true] {
+            let (status, content_type, body) = router_get(legacy, "/metrics").await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "/metrics must be 200 with dangerously_enable_v0_0_1_rest={legacy}"
+            );
+            assert!(
+                content_type.starts_with("text/plain"),
+                "Prometheus scrapes need text/plain, got {content_type:?}"
+            );
+            for metric in [
+                "jig_ws_blocks_ingested_total",
+                "jig_ws_subscribers_active",
+                "jig_ws_channel_messages_total",
+            ] {
+                assert!(
+                    body.contains(&format!("# TYPE {metric} ")),
+                    "missing TYPE line for {metric}; body was:\n{body}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn v0_0_1_rest_routes_are_absent_by_default() {
+        for (m, p) in [
+            ("GET", "/blocks"),
+            ("POST", "/blocks"),
+            ("GET", "/blocks/bafyfake"),
+            ("GET", "/receipts/bafyfake"),
+        ] {
+            assert_eq!(
+                router_status(false, m, p).await,
+                axum::http::StatusCode::NOT_FOUND,
+                "{m} {p} must not be routable when the opt-in flag is false"
+            );
+        }
+        // The discovery endpoint is deliberately unaffected by the gate.
+        assert_ne!(
+            router_status(false, "GET", "/.well-known/jig").await,
+            axum::http::StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn v0_0_1_rest_routes_mount_when_operator_opts_in() {
+        for (m, p) in [("GET", "/blocks"), ("GET", "/blocks/bafyfake")] {
+            assert_ne!(
+                router_status(true, m, p).await,
+                axum::http::StatusCode::NOT_FOUND,
+                "{m} {p} must be routable when the operator opts in"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn list_blocks_clamps_limit_to_200() {

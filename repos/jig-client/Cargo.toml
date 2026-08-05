@@ -13,7 +13,10 @@ jig-config = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-tokio-tungstenite = "0.21"
+# TLS is declared here, not inherited: without an explicit feature a standalone
+# `cargo build -p jig-cli` yields a CLI that cannot dial wss://. It only appeared
+# to work inside the workspace because jig-server unified the feature in.
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 ed25519-dalek = { workspace = true }
 blake3 = { workspace = true }

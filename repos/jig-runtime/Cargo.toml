@@ -2,6 +2,7 @@
 name = "jig-runtime"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 license = "AGPL-3.0-only"
 description = "Unified WASM runtime for Jig Protocol with deterministic execution, WASI support, capability sandboxing, and instrumented fuel metering"
 repository = "https://github.com/jig-protocol/repos"
@@ -21,8 +22,8 @@ anyhow = "1.0"
 thiserror = "1.0"
 
 # WASM Runtime
-wasmtime = { version = "23", features = ["cranelift", "pooling-allocator"] }
-wasmtime-wasi = { version = "23", optional = true }
+wasmtime = { version = "47.0.3", features = ["cranelift", "pooling-allocator"] }
+wasmtime-wasi = { version = "47.0.3", optional = true }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

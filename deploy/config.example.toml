@@ -1,0 +1,103 @@
+# /etc/jig/config.toml — jig-server, tailnet deployment
+#
+# ############################################################################
+# # THIS IS ONE FILE FEEDING TWO DIFFERENT CONFIG STRUCTS. READ THIS PART.   #
+# ############################################################################
+#
+# jig-server's main.rs loads the SAME --config path twice, into two unrelated
+# types:
+#
+#   * ROOT-LEVEL keys (database_path, bind_address, port, [tls], [execution])
+#       -> jig_server::ServerConfig      <- THIS IS WHAT ACTUALLY BINDS
+#   * [server] / [identity] / [federation] / [debug] / [bridges]
+#       -> jig_config::v0_0_2_server::JigServerConfig
+#
+# Neither type uses serde(deny_unknown_fields), so each one silently ignores
+# the other's sections. That is what makes one file legal — and it is also why
+# a typo or a value set in the wrong place fails SILENTLY instead of erroring.
+# When something "isn't taking effect", check which of the two halves you edited.
+
+# ============================================================================
+# ServerConfig  —  the half that actually opens the socket
+# ============================================================================
+
+database_path = "/var/lib/jig/jig.db"
+
+# THE REAL BIND ADDRESS. Set this to this host's Tailscale IP (`tailscale ip -4`).
+# NOT 0.0.0.0. The tailnet is the only authentication this server has — there is
+# no authn/authz layer behind it. Binding 0.0.0.0 on a public VPS publishes an
+# unauthenticated block store to the internet.
+bind_address = "100.x.y.z"
+port = 7117
+
+# Optional real TLS with no certbot and no public DNS — see deploy/README.md:
+#   tailscale cert <host>.<tailnet>.ts.net
+# [tls]
+# enabled = true
+# cert_path = "/var/lib/jig/tls/<host>.<tailnet>.ts.net.crt"
+# key_path  = "/var/lib/jig/tls/<host>.<tailnet>.ts.net.key"
+
+# ============================================================================
+# JigServerConfig  —  the v0.0.2 half
+# ============================================================================
+
+[server]
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# `listen` HERE IS DECORATIVE. IT DOES NOT CONTROL THE BIND ADDRESS.
+# Its only job is building the `ws://{listen}` origin-tag string stamped onto
+# blocks and returned by the admin endpoints. Changing it moves nothing; the
+# socket is opened from the ROOT-LEVEL bind_address/port above.
+# Keep it in sync with them anyway, or clients will be handed an origin URL
+# that points somewhere the server isn't.
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+listen = "100.x.y.z:7117"
+
+# The ed25519 seed the server DID is derived from. BACK THIS UP OFFSITE.
+# Losing it changes the server DID and breaks TOFU pinning for every client.
+# The server generates it 0600 on first boot and REFUSES TO START if the file
+# is later group- or other-readable.
+server_did_keyfile = "/var/lib/jig/server.key"
+
+# channel-create and member-add are not optional extras: `jig channel create`
+# and `jig channel join` submit exactly these kinds, and a channel cannot be
+# bootstrapped any other way until v0.0.3+ ships Wasm-executed channel ops.
+allowed_block_kinds = ["text-render", "channel-create", "member-add"]
+
+[identity]
+# tofu = trust the first key seen for a DID and pin it. No nameserver required.
+# Switch to "nameserver" (and populate trusted_nameservers) once the tailnet
+# nameserver on :7070 is the source of truth for handles.
+mode = "tofu"
+trusted_nameservers = []
+cache_ttl_seconds = 300
+naively_allow_unknown_handles_fallback = false
+
+[debug]
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# REQUIRED FOR v0.0.2. `admin_endpoints = false` does not mount the
+# /_admin_v0_0_2/* router, and then `jig channel create` / `jig channel join`
+# fail with a bare 404 that looks like a wrong URL, a wrong port, or a broken
+# build. It is none of those — it is this line.
+# These endpoints are unauthenticated: they are only safe because the server is
+# bound to a tailnet address. Never enable them on a publicly-bound server.
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+admin_endpoints = true
+# Handle enumeration stays off — it dumps the registry to any caller.
+list_handles = false
+
+# [federation]
+# dangerously_disable_federation_tls = false
+# [[federation.peers]]
+# url = "wss://peer.example.ts.net:7117/v0_0_2/federation"
+# expected_did = "did:jig:..."
+
+# [bridges]
+# Deny-by-default: with no allow_list and no per_bridge entry, no bridge loads.
+# Bridge secrets come from the systemd EnvironmentFile via ${VAR} expansion —
+# never write a literal key into this file.
+# allow_list = ["email"]
+# [bridges.per_bridge.email]
+# enabled = true
+# [bridges.per_bridge.email.config]
+# bridge_secret = "${JIG_BRIDGE_SECRET}"
+# resend_api_key = "${RESEND_API_KEY}"

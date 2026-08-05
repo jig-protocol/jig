@@ -109,6 +109,73 @@ pub struct StoredCursor {
     pub last_hlc_logical: i64,
 }
 
+/// Hard ceiling on how many blocks one history read returns, matching the
+/// v0.0.1 store's clamp. Callers pass a caller-supplied `limit` straight
+/// through from a query string, so the clamp lives here rather than at the
+/// edge — no REST handler can turn `?limit=` into a whole-channel dump.
+pub const MAX_HISTORY_LIMIT: usize = 200;
+
+/// A point on a channel's HLC timeline, used as an exclusive read cursor by
+/// [`SqliteStore::list_blocks_by_channel`].
+///
+/// `hlc_origin` is deliberately absent: it only breaks ties between blocks
+/// that share a `(wall_ms, logical)` pair, and a cursor that resumes from
+/// "strictly after this point" does not need that resolution.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct HlcPoint {
+    pub wall_ms: u64,
+    pub logical: u32,
+}
+
+/// Every column of `blocks`, in the order [`row_to_stored_block`] reads them.
+const BLOCK_COLUMNS: &str = "cid, channel_id, block_kind, sender_did, sender_sig, \
+     bundle_bytes, is_synthetic, hlc_wall_ms, hlc_logical, hlc_origin, posted_at, \
+     origin_server, federated_from";
+
+fn row_to_stored_block(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredBlock> {
+    Ok(StoredBlock {
+        cid: r.get(0)?,
+        channel_id: r.get(1)?,
+        block_kind: r.get(2)?,
+        sender_did: r.get(3)?,
+        sender_sig: r.get(4)?,
+        bundle_bytes: r.get(5)?,
+        is_synthetic: r.get::<_, i64>(6)? != 0,
+        hlc_wall_ms: r.get::<_, i64>(7)? as u64,
+        hlc_logical: r.get::<_, i64>(8)? as u32,
+        hlc_origin: r.get(9)?,
+        posted_at: r.get(10)?,
+        origin_server: r.get(11)?,
+        federated_from: r.get(12)?,
+    })
+}
+
+/// The statement behind [`SqliteStore::list_blocks_by_channel`]. Factored out
+/// so the `EXPLAIN QUERY PLAN` test asserts against the exact SQL that runs
+/// and cannot drift away from it.
+///
+/// Both variants are shaped to ride the `blocks_channel_hlc` index end to end:
+/// equality on the leading `channel_id`, then an ordered walk of the trailing
+/// HLC columns (backwards for the no-cursor case) so SQLite never materialises
+/// a sort.
+fn history_sql(with_cursor: bool) -> String {
+    if with_cursor {
+        format!(
+            "SELECT {BLOCK_COLUMNS} FROM blocks \
+             WHERE channel_id = ?1 AND (hlc_wall_ms, hlc_logical) > (?2, ?3) \
+             ORDER BY hlc_wall_ms ASC, hlc_logical ASC, hlc_origin ASC \
+             LIMIT ?4"
+        )
+    } else {
+        format!(
+            "SELECT {BLOCK_COLUMNS} FROM blocks \
+             WHERE channel_id = ?1 \
+             ORDER BY hlc_wall_ms DESC, hlc_logical DESC, hlc_origin DESC \
+             LIMIT ?2"
+        )
+    }
+}
+
 impl SqliteStore {
     /// Open (or create) a SQLite file at `path` and run migrations.
     pub fn open(path: &Path) -> Result<Self> {
@@ -116,6 +183,14 @@ impl SqliteStore {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        // WAL so the history readers (REST replay, CLI catch-up) and the
+        // ingest writer can hold the same file open concurrently; the busy
+        // timeout absorbs the brief writer-vs-writer overlap that remains.
+        // The v0.0.1 store (jig-server/src/storage.rs) has done this since
+        // day one — without it, concurrent readers hit SQLITE_BUSY.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "busy_timeout", 5_000)?;
         Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -270,31 +345,60 @@ impl SqliteStore {
         let conn = self.conn.lock().expect("poisoned");
         let row = conn
             .query_row(
-                "SELECT cid, channel_id, block_kind, sender_did, sender_sig,
-                    bundle_bytes, is_synthetic, hlc_wall_ms, hlc_logical,
-                    hlc_origin, posted_at, origin_server, federated_from
-             FROM blocks WHERE cid = ?",
+                &format!("SELECT {BLOCK_COLUMNS} FROM blocks WHERE cid = ?"),
                 [cid],
-                |r| {
-                    Ok(StoredBlock {
-                        cid: r.get(0)?,
-                        channel_id: r.get(1)?,
-                        block_kind: r.get(2)?,
-                        sender_did: r.get(3)?,
-                        sender_sig: r.get(4)?,
-                        bundle_bytes: r.get(5)?,
-                        is_synthetic: r.get::<_, i64>(6)? != 0,
-                        hlc_wall_ms: r.get::<_, i64>(7)? as u64,
-                        hlc_logical: r.get::<_, i64>(8)? as u32,
-                        hlc_origin: r.get(9)?,
-                        posted_at: r.get(10)?,
-                        origin_server: r.get(11)?,
-                        federated_from: r.get(12)?,
-                    })
-                },
+                row_to_stored_block,
             )
             .optional()?;
         Ok(row)
+    }
+
+    /// Read one channel's timeline, **oldest-first** — the order a chat client
+    /// renders top-to-bottom, so no caller has to reverse it.
+    ///
+    /// `slug` is the channel slug exactly as blocks carry it (`#hello`):
+    /// `blocks.channel_id` holds the slug lifted from manifest metadata, not
+    /// the channel-create CID. A slug with no blocks — including one that was
+    /// never created — yields an empty vec, never an error; to a reader
+    /// "nothing said yet" and "no such channel" are the same answer.
+    ///
+    /// `limit` is clamped to [`MAX_HISTORY_LIMIT`].
+    ///
+    /// `since_hlc` selects *which* window of at most `limit` blocks:
+    /// - `None` → the **newest** `limit` blocks (initial pane fill: a client
+    ///   opening a busy channel wants the tail, not the first 200 ever sent).
+    /// - `Some(cursor)` → the **oldest** `limit` blocks strictly after
+    ///   `cursor` (forward catch-up paging).
+    ///
+    /// Both windows come back oldest-first.
+    pub fn list_blocks_by_channel(
+        &self,
+        slug: &str,
+        limit: usize,
+        since_hlc: Option<HlcPoint>,
+    ) -> Result<Vec<StoredBlock>> {
+        let limit = limit.min(MAX_HISTORY_LIMIT) as i64;
+        let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
+        let mut stmt = conn.prepare(&history_sql(since_hlc.is_some()))?;
+
+        let blocks = match since_hlc {
+            Some(cursor) => stmt
+                .query_map(
+                    params![slug, cursor.wall_ms as i64, cursor.logical as i64, limit],
+                    row_to_stored_block,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => {
+                // The no-cursor query walks the index backwards to take the
+                // newest rows; flip it so callers always see oldest-first.
+                let mut newest_first = stmt
+                    .query_map(params![slug, limit], row_to_stored_block)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                newest_first.reverse();
+                newest_first
+            }
+        };
+        Ok(blocks)
     }
 
     // --- receipts ---
@@ -1061,5 +1165,200 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    // ---- connection pragmas ---------------------------------------------
+
+    #[test]
+    fn file_backed_store_opens_in_wal_mode_with_busy_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(&dir.path().join("jig.sqlite")).unwrap();
+        let conn = store.conn.lock().unwrap();
+
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+
+        let busy_ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert!(busy_ms >= 1000, "busy_timeout too small: {busy_ms}ms");
+    }
+
+    #[test]
+    fn writer_is_not_blocked_by_a_concurrent_open_reader() {
+        // Under the default rollback journal an open read transaction holds a
+        // SHARED lock, so a second connection's commit fails with SQLITE_BUSY.
+        // WAL lets the two coexist — this is the regression this test pins.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jig.sqlite");
+        let reader = SqliteStore::open(&path).unwrap();
+        let writer = SqliteStore::open(&path).unwrap();
+
+        let rconn = reader.conn.lock().unwrap();
+        rconn.execute_batch("BEGIN").unwrap();
+        let _: i64 = rconn
+            .query_row("SELECT COUNT(*) FROM blocks", [], |r| r.get(0))
+            .unwrap();
+
+        writer
+            .insert_block(&sample_block("bafy_concurrent", Some("#h")))
+            .expect("write must succeed while a reader transaction is open");
+
+        rconn.execute_batch("COMMIT").unwrap();
+        drop(rconn);
+
+        assert!(reader.get_block("bafy_concurrent").unwrap().is_some());
+    }
+
+    // ---- list_blocks_by_channel ------------------------------------------
+
+    /// Blocks share a wall clock so ordering is decided by `hlc_logical` —
+    /// exactly the tie-break the `blocks_channel_hlc` index encodes.
+    fn timeline_block(cid: &str, channel: &str, logical: u32) -> StoredBlock {
+        StoredBlock {
+            hlc_logical: logical,
+            ..sample_block(cid, Some(channel))
+        }
+    }
+
+    fn seed_two_channel_timeline(store: &SqliteStore) {
+        for (cid, channel, logical) in [
+            ("bafy_h1", "#hello", 0),
+            ("bafy_o1", "#other", 0),
+            ("bafy_h2", "#hello", 1),
+            ("bafy_o2", "#other", 1),
+            ("bafy_h3", "#hello", 2),
+        ] {
+            store
+                .insert_block(&timeline_block(cid, channel, logical))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn list_blocks_by_channel_returns_only_that_channel_oldest_first() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        seed_two_channel_timeline(&store);
+
+        let cids: Vec<String> = store
+            .list_blocks_by_channel("#hello", 50, None)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.cid)
+            .collect();
+        assert_eq!(cids, vec!["bafy_h1", "bafy_h2", "bafy_h3"]);
+    }
+
+    #[test]
+    fn list_blocks_by_channel_keeps_the_newest_blocks_when_limit_truncates() {
+        // A chat pane wants the tail of the timeline, rendered oldest-at-top.
+        let store = SqliteStore::open_in_memory().unwrap();
+        seed_two_channel_timeline(&store);
+
+        let cids: Vec<String> = store
+            .list_blocks_by_channel("#hello", 2, None)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.cid)
+            .collect();
+        assert_eq!(cids, vec!["bafy_h2", "bafy_h3"]);
+    }
+
+    #[test]
+    fn list_blocks_by_channel_clamps_limit_to_max_history_limit() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for i in 0..(MAX_HISTORY_LIMIT + 25) {
+            store
+                .insert_block(&timeline_block(&format!("bafy_{i:04}"), "#hello", i as u32))
+                .unwrap();
+        }
+        let got = store
+            .list_blocks_by_channel("#hello", usize::MAX, None)
+            .unwrap();
+        assert_eq!(got.len(), MAX_HISTORY_LIMIT);
+        // Clamping keeps the newest window, so the last block is the newest one.
+        assert_eq!(got.last().unwrap().cid, format!("bafy_{:04}", 224));
+    }
+
+    #[test]
+    fn list_blocks_by_channel_returns_empty_for_unknown_slug() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        seed_two_channel_timeline(&store);
+        assert!(
+            store
+                .list_blocks_by_channel("#nope", 50, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn list_blocks_by_channel_since_hlc_pages_forward_from_the_cursor() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        seed_two_channel_timeline(&store);
+        let first = store.list_blocks_by_channel("#hello", 50, None).unwrap();
+        let cursor = HlcPoint {
+            wall_ms: first[0].hlc_wall_ms,
+            logical: first[0].hlc_logical,
+        };
+
+        let cids: Vec<String> = store
+            .list_blocks_by_channel("#hello", 50, Some(cursor))
+            .unwrap()
+            .into_iter()
+            .map(|b| b.cid)
+            .collect();
+        assert_eq!(cids, vec!["bafy_h2", "bafy_h3"], "cursor is exclusive");
+    }
+
+    #[test]
+    fn list_blocks_by_channel_since_hlc_takes_the_oldest_page_after_the_cursor() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        seed_two_channel_timeline(&store);
+        let cursor = HlcPoint {
+            wall_ms: 1747680000000,
+            logical: 0,
+        };
+        let cids: Vec<String> = store
+            .list_blocks_by_channel("#hello", 1, Some(cursor))
+            .unwrap()
+            .into_iter()
+            .map(|b| b.cid)
+            .collect();
+        assert_eq!(cids, vec!["bafy_h2"]);
+    }
+
+    #[test]
+    fn list_blocks_by_channel_queries_use_the_blocks_channel_hlc_index() {
+        // The index exists precisely for this read path; a regression to a
+        // full table scan or a TEMP B-TREE sort would be invisible otherwise.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+
+        // EXPLAIN QUERY PLAN keeps the statement's bound parameters, so each
+        // variant has to be given its full arity before it will step.
+        let variants: [(String, Vec<i64>); 2] = [
+            (history_sql(false), vec![0, 50]),
+            (history_sql(true), vec![0, 0, 0, 50]),
+        ];
+        for (sql, args) in variants {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let plan: String = stmt
+                .query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join(" | ");
+            assert!(
+                plan.contains("blocks_channel_hlc"),
+                "query does not use the channel/HLC index: {plan}\nsql: {sql}"
+            );
+            assert!(
+                !plan.contains("TEMP B-TREE"),
+                "ORDER BY is not satisfied by the index: {plan}\nsql: {sql}"
+            );
+        }
     }
 }

@@ -144,7 +144,15 @@ install_from_release() {
 
 # -----------------------------------------------------------------------------
 # Write a TOFU-default server config to ~/.jig/config.toml.
-# Schema matches jig-config::v0_0_2_server::JigServerConfig exactly.
+#
+# ONE FILE, TWO STRUCTS. jig-server loads this same path twice:
+#   * root-level keys      -> jig_server::ServerConfig  (this is what BINDS)
+#   * [server]/[identity]/[federation]/[debug] -> jig-config's JigServerConfig
+# Neither type rejects the other's keys, which is what makes one file legal.
+# Omitting the root-level half leaves jig-server with no database_path and it
+# refuses to start, so both halves must stay here.
+# Covered by `install_sh_writes_a_config_that_boots_both_halves` in
+# repos/jig-server/src/config.rs — that test parses THIS heredoc.
 # -----------------------------------------------------------------------------
 write_server_config() {
   local cfg="$JIG_HOME/config.toml"
@@ -153,11 +161,25 @@ write_server_config() {
     return 0
   fi
   cat > "$cfg" <<EOF
-# jig-server v0.0.2 config written by install.sh.
-# Schema: jig-config::v0_0_2_server::JigServerConfig.
-# Edit this file to change listen address, federation peers, etc.
+# jig-server config written by install.sh. One file, two structs — see the
+# install.sh comment above write_server_config() for why.
+
+# ---------------------------------------------------------------------------
+# ServerConfig — the half that actually opens the socket.
+# ---------------------------------------------------------------------------
+database_path = "$JIG_HOME/jig.db"
+bind_address = "${JIG_SERVER_LISTEN%%:*}"
+port = ${JIG_SERVER_LISTEN##*:}
+
+# ---------------------------------------------------------------------------
+# JigServerConfig — the v0.0.2 half.
+# ---------------------------------------------------------------------------
 
 [server]
+# DECORATIVE. This only builds the ws:// origin-tag string stamped onto blocks;
+# the socket binds bind_address/port above. Keep the two in sync or clients get
+# handed an origin URL that points somewhere the server isn't (jig-server logs
+# a WARN at startup when they disagree).
 listen = "$JIG_SERVER_LISTEN"
 server_did_keyfile = "$JIG_HOME/server/server.key"
 allowed_block_kinds = ["text-render", "channel-create", "member-add"]

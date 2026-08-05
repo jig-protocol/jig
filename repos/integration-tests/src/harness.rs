@@ -82,6 +82,26 @@ impl TestJigServer {
     /// H-series tests (H5 unsafe-options-flag flips, etc.).
     pub async fn start_with_config(config: JigServerConfig) -> Result<Self> {
         let tempdir = tempfile::tempdir().context("tempdir")?;
+        Self::boot(config, tempdir).await
+    }
+
+    /// Stop this server and boot a fresh one over the SAME tempdir — same
+    /// `server.db` and same `server.key`. This is the restart-persistence
+    /// path: the process is new, the on-disk state is not.
+    ///
+    /// The new instance binds a NEW ephemeral port, so callers must re-read
+    /// `ws_url()` / `http_url()`; only the on-disk state is carried over.
+    pub async fn restart(self) -> Result<Self> {
+        let config = self.state.config.clone();
+        let tempdir = self._tempdir;
+        self._handle.abort();
+        // Let the aborted task release the old listener before we rebind.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        Self::boot(config, tempdir).await
+    }
+
+    /// Shared boot path for [`Self::start_with_config`] and [`Self::restart`].
+    async fn boot(config: JigServerConfig, tempdir: TempDir) -> Result<Self> {
         let db_path = tempdir.path().join("server.db");
 
         // Override the keyfile path to live inside the tempdir so multiple
@@ -297,7 +317,6 @@ impl TestNameserver {
 
     pub async fn start_with_suffix(alias_suffix: &str) -> Result<Self> {
         let tempdir = tempfile::tempdir().context("tempdir")?;
-        let db_path = tempdir.path().join("nameserver.db");
 
         let mut config = base_config()?;
         config.server.server_did_keyfile = tempdir
@@ -306,27 +325,32 @@ impl TestNameserver {
             .to_string_lossy()
             .into_owned();
         config.server.listen = "127.0.0.1:0".to_string();
+        config.nameserver.alias_suffix = alias_suffix.to_string();
+        // Tests enumerate registered aliases; production leaves this off.
+        config.debug.list_handles = true;
 
-        let state = Arc::new(jig_nameserver::v0_0_2::AppState::new(
-            config,
-            db_path,
-            alias_suffix.to_string(),
-        )?);
+        // Go through the same `build_app` the binary serves. Hand-assembling
+        // the v0.0.2 routers here is what let `jig-nameserver serve` ship with
+        // none of them mounted while these tests stayed green.
+        let mut ns_config = jig_nameserver::config::NameServerConfig::default();
+        ns_config.storage.database_path = tempdir.path().join("nameserver.db");
+        ns_config.pow.server_secret = "harness-test-secret".to_string();
+        ns_config.federation.enabled = false;
+        ns_config.v0_0_2 = config;
+
+        let app = jig_nameserver::server::build_app_parts(&ns_config).context("build_app_parts")?;
+        let state = app.v0_0_2_state.clone();
+        let router = app.router;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.context("bind")?;
         let bound_addr = listener.local_addr().context("local_addr")?;
 
-        let router = jig_nameserver::v0_0_2_register::build_register_router(state.clone())
-            .merge(jig_nameserver::v0_0_2_resolve::build_resolve_router(
-                state.clone(),
-            ))
-            .merge(jig_nameserver::v0_0_2_rotate_renew::build_rotate_renew_router(state.clone()))
-            .merge(jig_nameserver::v0_0_2_handles::build_handles_router(
-                state.clone(),
-            ));
-
         let handle = tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -452,6 +476,9 @@ fn base_config() -> Result<JigServerConfig> {
         federation: FederationSection::default(),
         debug: jig_config::v0_0_2_server::DebugSection::default(),
         bridges: jig_config::v0_0_2_server::BridgesSection::default(),
+        // Spread the remainder so adding a section to JigServerConfig doesn't
+        // break every integration test that only cares about the fields above.
+        ..Default::default()
     })
 }
 

@@ -490,7 +490,7 @@ impl Runtime {
 
         // Create linker and add WASI preview1 imports
         let mut linker = wasmtime::Linker::<StoreContext>::new(self.engine.engine());
-        wasmtime_wasi::preview1::add_to_linker_sync(&mut linker, |ctx| &mut ctx.wasi)
+        wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |ctx| &mut ctx.wasi)
             .map_err(|e| RuntimeError::InternalError(format!("Failed to add WASI: {e}")))?;
 
         // Instantiate the module with WASI imports

@@ -1399,8 +1399,63 @@ async fn get_runtime_config(State(state): State<AppState>) -> Result<Json<Runtim
     }))
 }
 
-pub async fn run_http_server() -> Result<()> {
-    let cfg = NameServerConfig::load()?;
+/// Everything [`build_app_parts`] assembles.
+///
+/// [`build_app`] returns only the two pieces the binary needs. This superset
+/// exists so tests can reach the v0.0.2 store the mounted routers write to —
+/// without it, a test harness would have to hand-assemble its own `AppState`,
+/// which is exactly the divergence that let the binary ship with the alias
+/// routers unmounted while the harness tests stayed green.
+pub struct NameServerApp {
+    pub router: Router,
+    /// `Some` only when `[federation].enabled`. Construction only — the gossip
+    /// loop is spawned by [`run_http_server`], never here.
+    pub federation_coordinator: Option<Arc<FederationCoordinator>>,
+    pub v0_0_2_state: Arc<crate::v0_0_2::AppState>,
+}
+
+/// jig-server's keyfile default (`~/.jig/server/server.key`) belongs to the
+/// chat server. A nameserver signing alias attestations with that key would
+/// attest under the chat server's DID, so treat the untouched default (and an
+/// empty string) as "operator did not choose" and derive a sibling of the
+/// nameserver database instead.
+fn resolve_v0_0_2_keyfile(cfg: &NameServerConfig) -> String {
+    let configured = cfg.v0_0_2.server.server_did_keyfile.trim();
+    let jig_server_default = jig_config::v0_0_2_server::ServerSection::default().server_did_keyfile;
+    if !configured.is_empty() && configured != jig_server_default {
+        return configured.to_string();
+    }
+    db_sibling(&cfg.storage.database_path, "_v002.key")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Alias attestations live in `jig_pipeline::persist::SqliteStore`, a different
+/// database from the legacy `SqliteStorage`. Derive it as a sibling of the
+/// configured DB so a one-line deploy needs no extra path (mirrors the
+/// `_v002.db` convention in jig-server's `main.rs`).
+fn db_sibling(database_path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let stem = database_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "nameserver".to_string());
+    database_path.with_file_name(format!("{stem}{suffix}"))
+}
+
+/// Construct the router the binary serves: the legacy v0.0.1 `app_router`
+/// merged with the four v0.0.2 alias routers (challenge/register, resolve,
+/// rotate/renew, handles).
+///
+/// Spawns no background work of its own, so callers control when — and
+/// whether — the gossip loop starts. (`v0_0_2::AppState::new` does spawn its
+/// own challenge-nonce sweeper internally, so a tokio runtime must be live.)
+pub fn build_app(cfg: &NameServerConfig) -> Result<(Router, Option<Arc<FederationCoordinator>>)> {
+    let app = build_app_parts(cfg)?;
+    Ok((app.router, app.federation_coordinator))
+}
+
+/// [`build_app`] plus the v0.0.2 state — see [`NameServerApp`].
+pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
     // Prefer persistent SQLite storage using configured DB path
     let storage: Arc<dyn NamesStorage> = match SqliteStorage::new(cfg.storage.database_path.clone())
     {
@@ -1415,7 +1470,8 @@ pub async fn run_http_server() -> Result<()> {
     let ns_pubkey_hex = hex::encode(ns_identity.public_key.as_bytes());
     let ns_id = ns_id_from_pubkey(&ns_identity.public_key);
 
-    // Initialize federation coordinator if enabled
+    // Initialize federation coordinator if enabled. Constructed only; see
+    // `run_http_server` for the gossip spawn.
     let federation_coordinator = if cfg.federation.enabled {
         let our_domain = cfg
             .capabilities
@@ -1423,20 +1479,12 @@ pub async fn run_http_server() -> Result<()> {
             .clone()
             .unwrap_or_else(|| format!("{}:{}", cfg.network.bind, cfg.network.port));
 
-        let coordinator = Arc::new(FederationCoordinator::new(
+        Some(Arc::new(FederationCoordinator::new(
             cfg.federation.clone(),
             storage.clone(),
             our_domain,
             cfg.capabilities.version.clone(),
-        ));
-
-        // Start gossip loop in background
-        let coordinator_clone = coordinator.clone();
-        tokio::spawn(async move {
-            coordinator_clone.start_gossip_loop().await;
-        });
-
-        Some(coordinator)
+        )))
     } else {
         None
     };
@@ -1447,9 +1495,74 @@ pub async fn run_http_server() -> Result<()> {
         ns_id,
         ns_pubkey_hex,
         federation: Some(Arc::new(DefaultFederationResolver::new())),
-        federation_coordinator,
+        federation_coordinator: federation_coordinator.clone(),
     };
-    let app = app_router(state);
+
+    let mut v0_0_2_cfg = cfg.v0_0_2.clone();
+    v0_0_2_cfg.server.server_did_keyfile = resolve_v0_0_2_keyfile(cfg);
+    let v0_0_2_state = Arc::new(crate::v0_0_2::AppState::new(
+        v0_0_2_cfg,
+        db_sibling(&cfg.storage.database_path, "_v002.db"),
+        cfg.v0_0_2.nameserver.alias_suffix.clone(),
+    )?);
+
+    // `merge` is safe here even though both halves register `/v1/challenge`:
+    // the legacy handler is POST and the v0.0.2 handler is GET, and axum
+    // merges method-disjoint routers for the same path. Adding a same-method
+    // duplicate would panic at startup — covered by
+    // `both_challenge_methods_survive_the_merge`.
+    let mut router = app_router(state)
+        .merge(crate::v0_0_2_register::build_register_router(
+            v0_0_2_state.clone(),
+        ))
+        .merge(crate::v0_0_2_resolve::build_resolve_router(
+            v0_0_2_state.clone(),
+        ))
+        .merge(crate::v0_0_2_rotate_renew::build_rotate_renew_router(
+            v0_0_2_state.clone(),
+        ));
+
+    // `/v1/handles` enumerates every registered alias. `build_handles_router`
+    // documents that the caller must gate it; honour that here rather than
+    // exposing a directory of every DID on the nameserver by default.
+    if cfg.v0_0_2.debug.list_handles {
+        router = router.merge(crate::v0_0_2_handles::build_handles_router(
+            v0_0_2_state.clone(),
+        ));
+    }
+
+    Ok(NameServerApp {
+        router,
+        federation_coordinator,
+        v0_0_2_state,
+    })
+}
+
+/// Load config, apply the CLI overrides, and serve. `bind_override` /
+/// `port_override` come from `jig-nameserver serve --bind/--port` and win over
+/// both the config file and `JIG_NS_BIND`/`JIG_NS_PORT`, which `load` has
+/// already applied.
+pub async fn run_http_server(
+    bind_override: Option<String>,
+    port_override: Option<u16>,
+) -> Result<()> {
+    let mut cfg = NameServerConfig::load()?;
+    if let Some(bind) = bind_override {
+        cfg.network.bind = bind;
+    }
+    if let Some(port) = port_override {
+        cfg.network.port = port;
+    }
+
+    let (app, federation_coordinator) = build_app(&cfg)?;
+
+    // The only background task the binary owns. Kept out of `build_app` so a
+    // test can build the router without any live tasks.
+    if let Some(coordinator) = federation_coordinator {
+        tokio::spawn(async move {
+            coordinator.start_gossip_loop().await;
+        });
+    }
 
     let addr = format!("{}:{}", cfg.network.bind, cfg.network.port);
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -2790,5 +2903,208 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_app: the router the binary actually serves
+    // -----------------------------------------------------------------------
+
+    /// Unique scratch directory that deletes itself on drop. jig-nameserver has
+    /// no `tempfile` dev-dependency and this lane may not add one.
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock before epoch")
+                .as_nanos();
+            let mut path = std::env::temp_dir();
+            path.push(format!("jig-ns-{tag}-{}-{nanos}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("create scratch dir");
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch_config(dir: &ScratchDir, alias_suffix: &str) -> NameServerConfig {
+        let mut cfg = NameServerConfig::default();
+        cfg.storage.database_path = dir.0.join("nameserver.db");
+        cfg.pow.server_secret = "test-secret".to_string();
+        cfg.federation.enabled = false;
+        cfg.v0_0_2.nameserver.alias_suffix = alias_suffix.to_string();
+        cfg.v0_0_2.server.server_did_keyfile = dir.0.join("ns.key").to_string_lossy().into_owned();
+        // Off by default in production; on here so the route-presence assertions
+        // exercise the mounted handler.
+        cfg.v0_0_2.debug.list_handles = true;
+        cfg
+    }
+
+    async fn get(router: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// Regression witness for the bug this lane fixes: the legacy router alone
+    /// answers `POST /v1/challenge` and nothing else of the v0.0.2 alias API.
+    /// Shipping `app_router` as the whole app is what made the binary return
+    /// 405 on `GET /v1/challenge` and 404 on register/resolve/handles.
+    #[tokio::test]
+    async fn legacy_router_alone_does_not_serve_the_alias_api() {
+        let cfg = NameServerConfig::default();
+        let router = app_router(AppState {
+            cfg,
+            storage: Arc::new(MemoryStorage::default()),
+            ns_id: "test".into(),
+            ns_pubkey_hex: String::new(),
+            federation: None,
+            federation_coordinator: None,
+        });
+
+        let (status, _) = get(&router, "/v1/challenge").await;
+        assert_eq!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "legacy /v1/challenge is POST-only"
+        );
+        for uri in ["/v1/resolve/nobody@dj.jig", "/v1/handles"] {
+            let (status, _) = get(&router, uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri} is not in app_router");
+        }
+    }
+
+    #[tokio::test]
+    async fn build_app_mounts_the_v0_0_2_alias_routers() {
+        let dir = ScratchDir::new("build-app-surface");
+        let cfg = scratch_config(&dir, "dj.jig");
+        let (router, coordinator) = build_app(&cfg).expect("build_app");
+        assert!(
+            coordinator.is_none(),
+            "federation is off by default — nothing to gossip with"
+        );
+
+        let (status, body) = get(&router, "/v1/challenge").await;
+        assert_eq!(status, StatusCode::OK, "GET /v1/challenge must be served");
+        assert!(
+            body["challenge"].as_str().is_some_and(|c| c.len() == 64),
+            "expected a 32-byte hex nonce, got {body}"
+        );
+
+        let (status, body) = get(&router, "/v1/handles").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["aliases"].is_array(), "got {body}");
+
+        // A mounted-but-empty resolve answers with the handler's JSON error;
+        // an unmounted route would 404 with an empty body.
+        let (status, body) = get(&router, "/v1/resolve/nobody@dj.jig").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "NOT_FOUND", "got {body}");
+    }
+
+    #[tokio::test]
+    async fn handles_stays_unmounted_unless_debug_list_handles_is_set() {
+        let dir = ScratchDir::new("handles-gated");
+        let mut cfg = scratch_config(&dir, "dj.jig");
+        cfg.v0_0_2.debug.list_handles = false;
+        let (router, _) = build_app(&cfg).expect("build_app");
+
+        let (status, _) = get(&router, "/v1/handles").await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "alias enumeration must stay off unless the operator opts in"
+        );
+        // The rest of the alias API is unaffected by the flag.
+        let (status, _) = get(&router, "/v1/challenge").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// `Router::merge` panics on a genuine route conflict. Legacy POST and
+    /// v0.0.2 GET share `/v1/challenge`, so pin that both survive the merge —
+    /// if axum ever stops merging method-disjoint routers, this fails loudly
+    /// instead of one handler silently disappearing.
+    #[tokio::test]
+    async fn both_challenge_methods_survive_the_merge() {
+        let dir = ScratchDir::new("challenge-merge");
+        let cfg = scratch_config(&dir, "dj.jig");
+        let (router, _) = build_app(&cfg).expect("build_app");
+
+        let (status, _) = get(&router, "/v1/challenge").await;
+        assert_eq!(status, StatusCode::OK, "v0.0.2 GET handler");
+
+        let legacy = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/challenge")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "action": "claim",
+                            "subject": "alice@example.com",
+                            "ttl_seconds": 120,
+                            "difficulty": 8
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy.status(), StatusCode::OK, "legacy POST handler");
+    }
+
+    #[tokio::test]
+    async fn build_app_constructs_a_coordinator_without_starting_gossip() {
+        let dir = ScratchDir::new("federation-on");
+        let mut cfg = scratch_config(&dir, "dj.jig");
+        cfg.federation.enabled = true;
+        let app = build_app_parts(&cfg).expect("build_app_parts");
+        assert!(
+            app.federation_coordinator.is_some(),
+            "[federation].enabled must yield a coordinator for run_http_server to spawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_app_uses_the_configured_alias_suffix() {
+        let dir = ScratchDir::new("alias-suffix");
+        let cfg = scratch_config(&dir, "deji.jig");
+        let app = build_app_parts(&cfg).expect("build_app_parts");
+        assert_eq!(app.v0_0_2_state.suffix(), "deji.jig");
+    }
+
+    #[test]
+    fn v0_0_2_keyfile_defaults_to_a_sibling_of_the_nameserver_db() {
+        let mut cfg = NameServerConfig::default();
+        cfg.storage.database_path = std::path::PathBuf::from("/var/lib/jig-ns/nameserver.db");
+        // Untouched jig-server default → derived, never ~/.jig/server/server.key.
+        cfg.v0_0_2.server.server_did_keyfile =
+            jig_config::v0_0_2_server::ServerSection::default().server_did_keyfile;
+        assert_eq!(
+            resolve_v0_0_2_keyfile(&cfg),
+            "/var/lib/jig-ns/nameserver_v002.key"
+        );
+
+        cfg.v0_0_2.server.server_did_keyfile = "/etc/jig/ns.key".to_string();
+        assert_eq!(resolve_v0_0_2_keyfile(&cfg), "/etc/jig/ns.key");
     }
 }

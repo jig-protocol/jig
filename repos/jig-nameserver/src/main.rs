@@ -133,12 +133,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         // If no command specified, run the server
-        None => run_http_server().await?,
+        None => serve(None, None).await,
 
-        Some(Command::Serve { bind: _, port: _ }) => {
-            // TODO: Use bind/port args when server supports them
-            run_http_server().await?;
-        }
+        Some(Command::Serve { bind, port }) => serve(bind, port).await,
 
         Some(Command::Analyze { analyze_cmd }) => {
             handle_analyze(cli.db_path, analyze_cmd).await?;
@@ -154,6 +151,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Start the HTTP server, or exit(1) with an operator-legible reason.
+///
+/// Startup failures (missing `[pow].server_secret`, a port already in use, an
+/// unreadable DB) used to surface as a panic — which reaches stderr through the
+/// default panic hook only, so a systemd unit capturing stdout logged nothing
+/// but an exit code. Log through BOTH `tracing` and stderr, then exit non-zero.
+async fn serve(bind: Option<String>, port: Option<u16>) {
+    if let Err(e) = run_http_server(bind, port).await {
+        tracing::error!("jig-nameserver failed to start: {e}");
+        eprintln!("error: jig-nameserver failed to start: {e}");
+        std::process::exit(1);
+    }
 }
 
 async fn handle_analyze(
