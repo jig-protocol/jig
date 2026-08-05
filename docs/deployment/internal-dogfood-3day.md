@@ -1,24 +1,72 @@
 # Internal dogfooding: 3-day plan (solo + parallel agents)
 
-**Status:** proposed, not executed. All forensics verified against the **main checkout**
-(`b04df60`) on 2026-08-04 by running real binaries.
-
 **Shape:** DJ solo, traveling. Coding agents run in parallel lanes; DJ reviews and owns
 every commit. Tailnet is the security boundary. macOS-only clients. Nameserver in scope,
 GUI out.
 
+**Original status:** proposed, not executed. All forensics verified against the **main
+checkout** (`b04df60`) on 2026-08-04 by running real binaries. Most of the code below has
+since landed — see the status section immediately following.
+
 ---
 
-## Rule zero: branch from `main`, not this worktree
+## STATUS (as of the internal-MVP batch)
 
-The worktree is at `e59e3be` (PR #20). It **does not** contain PR #21, so
-`jig-server/src/main.rs` still reads `JigServerConfig::default()` — meaning
-`[debug] admin_endpoints` is always false, `jig channel create` 404s, and **there is no way
-to create `#hello`.** Merge `origin/main` first. It's a fast-forward.
+The plan below was written against a pre-implementation tree. Read this section first; the
+rest is preserved for its reasoning, not as a to-do list.
 
-**Line numbers in this document were derived at `e59e3be` and are ~0–4 lines drifted on
-main** (`jig-config/src/v0_0_2_server.rs` is +42, `jig-server/src/main.rs` is +18). Every
-agent brief must carry this preamble:
+### Shipped
+
+| Area | What landed | Where to check |
+| --- | --- | --- |
+| History read path | `GET /api/v1/channels/:slug/blocks?limit=N`, oldest-first, limit clamped to 200 | `jig-server/src/v0_0_2_blocks.rs`, `jig-pipeline/src/persist.rs::list_blocks_by_channel` |
+| Stream termination | `BlockStream` ends when the reader task exits — the silent zombie connection is gone | `jig-client/src/connection.rs` (`ReaderCleanup`) |
+| Fatal config load | An explicit `--config` that fails to parse logs `FATAL` and exits 1; no silent fall back to a fresh server DID | `jig-server/src/main.rs::load_v0_0_2_config` |
+| Bootable templates | `install.sh` and `--init-config` both emit a hybrid config with `admin_endpoints = true` | `install.sh`, `jig-server/src/config.rs::write_template` |
+| CLI global flags | `--server`, `--config`, `--did` are lifted before dispatch, so `init`/`keys`/`server`/`channel` honour them | `jig-cli/src/main.rs` |
+| Observability | `/healthz` + `/metrics`, mounted outside the v0.0.1 gate; `TraceLayer` at INFO on both routers; `jig-server` defaults `RUST_LOG` to `info` | `jig-server/src/handler.rs` |
+| Nameserver alias API | Binary serves `GET /v1/challenge`, `POST /v1/register`, `GET /v1/resolve/:alias`, `/v1/rotate`, `/v1/renew`; `/v1/handles` gated behind `[debug] list_handles` | `jig-nameserver/src/server.rs` (merge at ~L1509) |
+| v0.0.1 REST gated off | `GET`/`POST /blocks`, `/blocks/:cid`, `/receipts/:cid` mount only under `dangerously_enable_v0_0_1_rest` (default false) | `jig-server/src/handler.rs::build_router` |
+| wasmtime | 47.0.3. The aarch64 sandbox-escape advisory is closed **by upgrade, not by suppression**. `pricing.schedule_version` is `0.2.0` because bulk memory ops are now billed per byte | `repos/Cargo.toml`, `jig-runtime/src/config.rs` |
+| MSRV | **1.94**, set by wasmtime 47 and inherited by `jig-runtime` + `jig-server` | `repos/Cargo.toml` |
+| Deploy assets | systemd units, hybrid config template, `VACUUM INTO` backup timer | `deploy/`, `deploy/README.md` |
+| History prefetch | `jig chat` and `jig tail` backfill the last 100 blocks before streaming; a failed fetch warns and opens empty rather than aborting | `jig-cli/src/cmd/history.rs`, `chat.rs` |
+| Readable output | `HH:MM` timestamps, a local `[contacts]` DID→name map in `cli.toml`, shortened DIDs when unknown, inbound bell | `jig-cli/src/cmd/display.rs`, `config.rs` |
+| Disconnect UX | `jig tail`/`jig chat` exit non-zero with `connection lost`; `scripts/jig-room.sh` loops on that | `jig-cli/src/cmd/display.rs`, `scripts/jig-room.sh` |
+| Nameserver CLI | `jig ns resolve <alias>` / `jig ns list`, with errors that distinguish an unregistered alias from a gated route | `jig-cli/src/cmd/ns.rs` |
+
+### Not done — know these before the first group session
+
+- **No authz beyond the tailnet.** No authn, no authz, no per-channel ACL enforcement on
+  reads or sends. Membership is derived state for bridge dispatch only. Tailnet membership
+  *is* the access control; removing someone from the tailnet is how you revoke them.
+- **No reconnect with backoff.** `jig tail` and `jig chat` now *detect* a dropped connection
+  and exit non-zero with `connection lost`, but neither reconnects on its own.
+  `scripts/jig-room.sh` (`until jig chat "$1"; do sleep 2; done`) is the deliberate
+  stand-in — it works only because of that non-zero exit, so anything that reverts chat to
+  exiting 0 silently breaks reconnect.
+- **`jig read` 404s by default** — it still calls the now-gated `GET /blocks`
+  (`jig-cli/src/http_client.rs` → `commands::read_messages`). Do not enable
+  `dangerously_enable_v0_0_1_rest` to fix it; use `jig chat` or curl the history endpoint.
+- **No GUI.** Still cut.
+- **No E2EE.** Blocks are signed, not encrypted. The tailnet (and optionally
+  `tailscale cert` TLS) is the only confidentiality layer.
+- **No public exposure, deliberately.** Nothing is reachable off the tailnet, and nothing in
+  this plan makes it so.
+- **`jig --version` is not implemented.**
+
+### Corrections to statements below
+
+- "Rule zero" is spent — PR #21 is merged; `main.rs` loads the real `JigServerConfig`.
+- Day 2's exit criterion "`jig tail` exits non-zero on disconnect" **is** met — `pump`
+  returns an error carrying `connection lost`, so `until`-style loops retry correctly.
+- Day 3's "`/v1/challenge` returns a 64-char hex string (was 405)" is now true for **GET**.
+  The legacy **POST** handler still coexists on the same path; the merge is method-disjoint
+  and is covered by `both_challenge_methods_survive_the_merge`.
+- `jig-nameserver serve --bind/--port` are now honoured and win over the env vars. The
+  comment inside `deploy/jig-nameserver.service` still says they are ignored — stale.
+
+**Line numbers throughout this document are approximate.** Every agent brief must carry:
 
 > Line numbers are approximate. If a cited line doesn't match, **grep for the quoted code
 > and report the drift** — do not guess, and do not edit a different symbol that looks close.
@@ -41,6 +89,11 @@ is the highest-leverage action in the entire plan and it costs five minutes.
 What's still rough at first contact: **no history at all** (joiners see an empty box and
 will report it as broken), senders render as raw 61-char DIDs next to raw epoch-millis, and
 a dropped connection is silent.
+
+> **Now:** all three are fixed. `jig chat` and `jig tail` backfill the last 100 blocks on
+> open, senders render as `14:32  dj:` via the local `[contacts]` map (shortened DID when
+> unknown), and a dropped connection exits non-zero with `connection lost`. What remains
+> rough: no auto-reconnect without `scripts/jig-room.sh`, and `jig read` still 404s.
 
 ### On the nameserver, plainly
 
@@ -230,6 +283,10 @@ two identities.
 **Exit:** 5+ teammates have posted. `jig tail` exits non-zero on disconnect (so
 `jig-room.sh` actually retries). Chat shows `14:23  dj: hi`. `POST /blocks` returns 404.
 
+> **Outcome:** `POST /blocks` 404s as intended. The other two did not land — `jig tail`
+> exits **0**, `jig-room.sh` does not exist, and chat still shows raw DIDs and epoch-millis.
+> Use `while true; do jig tail …; sleep 2; done`, not `until`.
+
 ### Day 3 — nameserver, history, keys
 
 - Review the Lane N mount diff **carefully**. `Router::merge` on the shared `/v1/challenge`
@@ -243,13 +300,19 @@ two identities.
 **Exit:** `curl <tailscale-ip>:7070/v1/challenge` returns a 64-char hex string (was 405); an
 alias registers and resolves across a restart; `jig chat '#hello'` opens with history.
 
+> **Outcome:** the `Router::merge` analysis held — legacy POST and v0.0.2 GET coexist on
+> `/v1/challenge`, no startup panic, covered by `both_challenge_methods_survive_the_merge`.
+> `GET /v1/challenge` returns `{"challenge":"<64 hex>"}`; register/resolve/rotate/renew are
+> mounted, `/v1/handles` only under `[debug] list_handles`.
+
 ---
 
 ## Cut list
 
 Unchanged from the 24h plan, plus: **the GUI entirely**, **`Frame::CatchUp` cursor replay**
-(REST "last 100" gets 95% of the value), **real in-client reconnect** (stream-close + `until`
-loop is indistinguishable at this scale), **flipping `[identity] mode` to nameserver** (a
+(REST "last 100" gets 95% of the value), **real in-client reconnect** (stream-close plus
+`scripts/jig-room.sh`'s `until` loop is indistinguishable at this scale, now that the
+clients exit non-zero), **flipping `[identity] mode` to nameserver** (a
 literal no-op today, and a live enforcement path the moment builders stamp nicknames — 12–20h),
 and **the master-plan doc refresh** (after, per DJ).
 
@@ -262,7 +325,11 @@ and **the master-plan doc refresh** (after, per DJ).
 4. **DJ review is the throughput ceiling** — ~11 F0 diffs plus 8 lanes, while traveling.
 5. **Tier-A agents on mis-tiered tasks** will produce plausible-looking wrong diffs. The four
    corrections above are the ones that matter.
-6. **Zero observability until Lane B lands.** A verified run of 8 messages and 4 WS
-   connections produced *zero* log lines at `RUST_LOG=info`.
+6. ~~**Zero observability until Lane B lands.**~~ **Closed.** A verified run of 8 messages
+   and 4 WS connections produced *zero* log lines at `RUST_LOG=info`; the fix was pinning
+   the tower-http span *and* event levels to INFO (tower-http defaults both to DEBUG, and a
+   DEBUG span under an INFO filter logs "started processing request" with no method or URI).
+   `/healthz` and `/metrics` now exist and sit outside the v0.0.1 gate — a scrape target
+   that vanishes when the operator locks the server down is not a scrape target.
 7. **The tailnet is doing 100% of your security.** The danger is six weeks of "it's been
    fine" becoming the argument for port 443.
