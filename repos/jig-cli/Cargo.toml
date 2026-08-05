@@ -57,7 +57,7 @@ url = "2"
 atty = "0.2"
 
 # Core helpers
-cid = { version = "0.10", features = ["serde"] }
+cid.workspace = true
 semver = "1.0"
 
 # Utils

@@ -62,6 +62,15 @@ blake3 = "1.5"
 rand = "0.8"
 hex = "0.4"
 
+# Content addressing. `cid` and `multihash` must move together: `cid` 0.11
+# re-exports `multihash` 0.19, and a `Multihash` from a different major is a
+# different type. `multihash` 0.19 dropped the hasher code table into the
+# separate `multihash-codetable` crate, which is where `Code`/`MultihashDigest`
+# now live. Declared workspace-wide so a future bump cannot half-land: block
+# CIDs are the protocol's content addresses and must stay byte-identical.
+cid = { version = "0.11", features = ["serde"] }
+multihash-codetable = { version = "0.2", default-features = false, features = ["blake3"] }
+
 # Storage
 rusqlite = { version = "0.31", features = ["bundled"] }
 

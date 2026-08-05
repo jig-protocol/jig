@@ -55,7 +55,7 @@ fn timestamp_strategy() -> impl Strategy<Value = OffsetDateTime> {
 /// Generate valid CIDs.
 fn cid_strategy() -> impl Strategy<Value = Cid> {
     any::<[u8; 32]>().prop_map(|bytes| {
-        use multihash::{Code, MultihashDigest};
+        use multihash_codetable::{Code, MultihashDigest};
         let mh = Code::Blake3_256.digest(&bytes);
         Cid::new_v1(0x55, mh)
     })

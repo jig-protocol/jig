@@ -42,8 +42,8 @@ tracing-subscriber = { version = "0.3", optional = true }
 tokio = { version = "1.35", features = ["sync"], optional = true }
 chrono = { workspace = true, features = ["serde"] }
 jig-core = { path = "../jig-core" }
-cid = { version = "0.10", features = ["serde"] }
-multihash = { version = "0.18", default-features = false, features = ["std", "multihash-impl", "blake3"] }
+cid.workspace = true
+multihash-codetable.workspace = true
 time = { version = "0.3", features = ["serde"] }
 
 [dev-dependencies]

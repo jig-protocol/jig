@@ -56,18 +56,23 @@ unknown-git = "deny"
 # landing against our dep graph still fails CI and forces a deliberate call.
 # Each entry carries the crate it suppresses and why it is acceptable today.
 #
-# Last audited against the graph: 2026-08-04 (post wasmtime 24.0.12 -> 47.0.3,
-# which closed the six wasmtime advisories outright and — via the transitive
-# minimums that bump forced — also retired the fxhash and bytes entries).
+# Last audited against the graph: 2026-08-05 (post cid 0.10 -> 0.11 /
+# multihash 0.18 -> 0.19, which dropped core2 and proc-macro-error from the
+# graph; before that, post wasmtime 24.0.12 -> 47.0.3, which closed the six
+# wasmtime advisories outright and — via the transitive minimums that bump
+# forced — also retired the fxhash and bytes entries).
 [advisories]
 version = 2
-# core2 / keccak are yanked transitive deps (cid -> multihash -> sha3/core2)
-# inherited from the v0.0.1 baseline. No upgrade path without moving off
-# cid 0.10; warn for now, tighten to "deny" when that migration happens.
-yanked = "warn"
+# The yanked transitive dep inherited from the v0.0.1 baseline was core2, via
+# cid 0.10 -> multihash 0.18. cid 0.11 pairs with multihash 0.19, which moved
+# the hashers out to multihash-codetable and dropped core2 with them, so the
+# graph now resolves with no yanked crates and this is enforced rather than
+# merely reported. (The sha3/keccak the previous note lumped in here never
+# came from multihash at all — they arrive via the optional `sigstore`
+# feature -> picky, and are not yanked.)
+yanked = "deny"
 ignore = [
     # --- build-time only: proc macros, never linked into a shipped binary ---
-    "RUSTSEC-2024-0370",  # proc-macro-error unmaintained; via multihash-derive. Build-time only, no runtime surface.
     "RUSTSEC-2024-0436",  # paste unmaintained; via ratatui -> jig-cli. Build-time only, no runtime surface.
 
     # --- jig-cli-local, non-network ---
@@ -76,7 +81,6 @@ ignore = [
 
     # --- unmaintained, no safe upgrade published ---
     "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained; jig-server TLS cert loading + rustls-native-certs. Thin wrapper over rustls-pki-types; migrate with the tokio-tungstenite 0.21 bump.
-    "RUSTSEC-2026-0105",  # core2 unmaintained + all versions yanked; via cid/multihash. Needs the cid 0.10 migration above.
 
     # --- fixable by a lockfile bump; deliberately NOT done in this change
     #     because this lane may not touch Cargo.lock. Tracked as followups. ---
