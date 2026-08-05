@@ -2,13 +2,16 @@
 //!
 //! One-step onboarding:
 //!   1. Generate a fresh ed25519 identity under `~/.jig/keys/<did>.key`.
-//!   2. Write `~/.jig/cli.toml` binding the new DID to a nickname.
+//!   2. Write `~/.jig/cli.toml` (or the global `--config <path>`) binding
+//!      the new DID to a nickname.
 //!   3. Optionally `--request-alias <local> --nameserver <url>`:
 //!      GET `/v1/challenge` → sign → POST `/v1/register` → print attestation.
 //!
 //! The nameserver wire-shape (`requested_alias` + `proof_of_control` +
 //! `challenge`) is defined by `jig-nameserver::v0_0_2_register`. Keep
 //! the field names in sync with that module.
+
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
@@ -20,16 +23,27 @@ use crate::config::{self, Config};
 /// Parsed flags for `jig init`. Construct directly from `clap`-parsed args
 /// in `main.rs`; this struct keeps the CLI surface and the implementation
 /// decoupled for testability.
+///
+/// `init` is the one command that does NOT take a resolved
+/// [`crate::cmd::common::CliContext`]: it *creates* the config file, so
+/// requiring an existing one would be circular. It takes the two global
+/// overrides that still apply — where to write, and what to write.
 #[derive(Debug, Clone, Default)]
 pub struct InitArgs {
     /// Optional nickname; defaults to `whoami::username()`.
     pub nickname: Option<String>,
-    /// Overwrite `~/.jig/cli.toml` if it already exists.
+    /// Overwrite the config file if it already exists.
     pub force: bool,
     /// Local part of an alias to request from a nameserver (e.g. `dj`).
     pub request_alias: Option<String>,
     /// Nameserver base URL (required when `request_alias` is set).
     pub nameserver: Option<String>,
+    /// Config file to write. `None` means `~/.jig/cli.toml`; a `Some`
+    /// value comes from the global `--config <path>` flag.
+    pub config_path: Option<PathBuf>,
+    /// `[server] base_url` to record. `None` keeps `Config::default()`'s
+    /// `http://127.0.0.1:7117`; a `Some` value comes from `--server`.
+    pub server_url: Option<String>,
 }
 
 /// Body of GET `/v1/challenge` (we only consume the `challenge` field).
@@ -62,8 +76,11 @@ pub struct AttestationResponse {
 }
 
 pub async fn run(args: InitArgs) -> Result<()> {
-    // 1. Refuse to clobber existing cli.toml unless --force was passed.
-    let cfg_path = config::default_config_path();
+    // 1. Refuse to clobber an existing config unless --force was passed.
+    let cfg_path = args
+        .config_path
+        .clone()
+        .unwrap_or_else(config::default_config_path);
     if cfg_path.exists() && !args.force {
         anyhow::bail!(
             "cli config already exists at {}. Pass --force to overwrite.",
@@ -84,7 +101,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
 
     // 3. Persist nickname + DID binding to ~/.jig/cli.toml.
     let nickname = args.nickname.clone().unwrap_or_else(whoami::username);
-    write_cli_config(&id, &nickname)?;
+    write_cli_config(&id, &nickname, &cfg_path, args.server_url.as_deref())?;
     println!("wrote {} (nickname: {nickname})", cfg_path.display());
 
     // 4. Optional alias registration.
@@ -103,14 +120,24 @@ pub async fn run(args: InitArgs) -> Result<()> {
     Ok(())
 }
 
-/// Write `~/.jig/cli.toml` with the freshly generated DID and the
-/// caller-supplied nickname. Server URL + default channel are pulled
-/// from `Config::default()` so v0.0.2 stays one-line-installable.
-fn write_cli_config(id: &Identity, nickname: &str) -> Result<()> {
+/// Write the config file with the freshly generated DID and the
+/// caller-supplied nickname. Default channel (and the server URL, unless
+/// `--server` supplied one) comes from `Config::default()` so v0.0.2 stays
+/// one-line-installable.
+fn write_cli_config(
+    id: &Identity,
+    nickname: &str,
+    cfg_path: &std::path::Path,
+    server_url: Option<&str>,
+) -> Result<()> {
     let mut cfg = Config::default();
     cfg.user.did = id.did_string();
     cfg.user.display_name = nickname.to_string();
-    config::save_config(&cfg, None)?;
+    if let Some(url) = server_url {
+        cfg.server.base_url = url.to_string();
+    }
+    config::save_config(&cfg, Some(cfg_path))
+        .with_context(|| format!("writing {}", cfg_path.display()))?;
     Ok(())
 }
 

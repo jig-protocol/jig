@@ -18,7 +18,7 @@ use std::{io, io::IsTerminal};
 #[derive(Parser, Debug)]
 #[command(name = "jig", about = "Command-line client for Jig blocks")]
 struct Cli {
-    /// Optional path to configuration file
+    /// Config file to use instead of ~/.jig/cli.toml (must exist)
     #[arg(long)]
     config: Option<PathBuf>,
 
@@ -338,7 +338,22 @@ enum ReceiptAction {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Handle init early — it doesn't need the loaded config / HTTP client.
+    // Lift the global flags out of `cli` FIRST. Everything below reads
+    // config through the resolved context, so `--server` / `--config` /
+    // `--did` apply uniformly. They used to be applied only after the
+    // Init/Keys/Server/Channel blocks had already dispatched and
+    // returned, which meant those four commands silently ignored them.
+    let overrides = cmd::common::GlobalOverrides {
+        config: cli.config,
+        server: cli.server,
+        did: cli.did,
+        display_name: cli.display_name,
+        channel: cli.channel,
+    };
+
+    // `init` is resolved from the raw overrides rather than a loaded
+    // context: it CREATES the config file, so demanding one exist first
+    // would be circular.
     if let Some(Commands::Init {
         nickname,
         force,
@@ -351,35 +366,39 @@ async fn main() -> Result<()> {
             force,
             request_alias,
             nameserver,
+            config_path: overrides.config.clone(),
+            server_url: overrides.server.clone(),
         })
         .await?;
         return Ok(());
     }
 
-    // Handle keys subcommands early — they own their own config load
-    // and don't touch the messaging HTTP client.
+    let ctx = cmd::common::CliContext::resolve(&overrides)?;
+
+    // Handle keys subcommands early — they don't touch the messaging
+    // HTTP client.
     if let Some(Commands::Keys { action }) = cli.command {
         match action {
             KeysAction::Renew { alias, nameserver } => {
-                cmd::keys::renew(cmd::keys::KeysRenewArgs { alias, nameserver }).await?;
+                cmd::keys::renew(&ctx, cmd::keys::KeysRenewArgs { alias, nameserver }).await?;
             }
             KeysAction::Rotate { alias, nameserver } => {
-                cmd::keys::rotate(cmd::keys::KeysRotateArgs { alias, nameserver }).await?;
+                cmd::keys::rotate(&ctx, cmd::keys::KeysRotateArgs { alias, nameserver }).await?;
             }
         }
         return Ok(());
     }
 
-    // Handle server subcommands early — `set` mutates ~/.jig/cli.toml
+    // Handle server subcommands early — `set` mutates the config file
     // and `info` issues a one-shot HTTP GET; neither needs the messaging
     // pipeline wired up.
     if let Some(Commands::Server { action }) = cli.command {
         match action {
             ServerAction::Set { url } => {
-                cmd::server::set(&url)?;
+                cmd::server::set(&ctx, &url)?;
             }
             ServerAction::Info { url } => {
-                cmd::server::info(url.as_deref()).await?;
+                cmd::server::info(&ctx, url.as_deref()).await?;
             }
         }
         return Ok(());
@@ -391,32 +410,19 @@ async fn main() -> Result<()> {
     if let Some(Commands::Channel { action }) = cli.command {
         match action {
             ChannelAction::Create { slug, visibility } => {
-                cmd::channel::create(slug, visibility).await?;
+                cmd::channel::create(&ctx, slug, visibility).await?;
             }
             ChannelAction::Join { slug } => {
-                cmd::channel::join(slug).await?;
+                cmd::channel::join(&ctx, slug).await?;
             }
             ChannelAction::List => {
-                cmd::channel::list().await?;
+                cmd::channel::list(&ctx).await?;
             }
         }
         return Ok(());
     }
 
-    let mut config = config::load_config(cli.config.as_deref())?;
-    if let Some(server) = cli.server {
-        config.server.base_url = server;
-    }
-    if let Some(did) = cli.did {
-        config.user.did = did;
-    }
-    if let Some(name) = cli.display_name {
-        config.user.display_name = name;
-    }
-    if let Some(ch) = cli.channel.clone() {
-        config.user.default_channel = ch;
-    }
-
+    let config = ctx.effective().clone();
     let client = JigHttpClient::new(&config.server.base_url)?;
     let default_channel = config.user.default_channel.clone();
 
@@ -440,7 +446,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             let channel = channel.unwrap_or(default_channel.clone());
-            cmd::send::run(channel, body).await?;
+            cmd::send::run(&ctx, channel, body).await?;
         }
         Some(Commands::Read { channel, limit }) => {
             let channel = channel.unwrap_or(default_channel.clone());
@@ -451,12 +457,12 @@ async fn main() -> Result<()> {
             // polling tail (`commands::tail_messages`) is removed; this is
             // an intentional regression — v0.0.2 only ships the WSS path.
             let channel = channel.unwrap_or(default_channel.clone());
-            cmd::tail::run(channel).await?;
+            cmd::tail::run(&ctx, channel).await?;
         }
         Some(Commands::Chat { channel }) => {
             // F6: ratatui TUI combining `tail` (live history) with an
             // input box. The end-of-install demo command.
-            cmd::chat::run(cmd::chat::ChatArgs { channel }).await?;
+            cmd::chat::run(&ctx, cmd::chat::ChatArgs { channel }).await?;
         }
         Some(Commands::Receipt { action }) => match action {
             ReceiptAction::View { file, block } => {

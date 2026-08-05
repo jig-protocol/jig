@@ -16,8 +16,9 @@
 //!      removed before bailing so we never end up with two valid keys
 //!      and a stale config.
 //!   5. On success: rename the OLD keyfile to `<old_did>.key.rotated`
-//!      (kept for offline recovery) and rewrite `~/.jig/cli.toml` so
-//!      `[user] did` points at the new DID.
+//!      (kept for offline recovery) and rewrite the active config file
+//!      (`--config <path>`, else `~/.jig/cli.toml`) so `[user] did`
+//!      points at the new DID.
 //!
 //! The `.key.rotated` rename is a design call — `v0_0_2_rotate_renew.rs`
 //! handles the server-side expiry but is silent on client-side cleanup;
@@ -29,8 +30,8 @@ use base64::Engine as _;
 use jig_client::Identity;
 use serde::{Deserialize, Serialize};
 
+use crate::cmd::common::CliContext;
 use crate::cmd::init::{AttestationResponse, ChallengeResponse};
-use crate::config;
 
 /// Parsed flags for `jig keys renew`.
 #[derive(Debug, Clone)]
@@ -76,19 +77,9 @@ pub(crate) struct RotateRequestBody {
 // renew
 // ============================================================================
 
-pub async fn renew(args: KeysRenewArgs) -> Result<()> {
-    // 1. Load current identity from cli.toml's DID.
-    let cfg = config::load_config(None)?;
-    let did_str = cfg.user.did.clone();
-    if !did_str.starts_with("did:jig:") {
-        anyhow::bail!(
-            "cli.toml `[user] did = \"{did_str}\"` does not look like a Jig DID. \
-             Run `jig init` first or fix the config."
-        );
-    }
-    let keys_dir = jig_client::identity::default_keys_dir();
-    let id = Identity::load_from_dir(&keys_dir, &did_str)
-        .with_context(|| format!("loading identity {did_str} from {}", keys_dir.display()))?;
+pub async fn renew(ctx: &CliContext, args: KeysRenewArgs) -> Result<()> {
+    // 1. Load the active identity (`--did` override or `[user] did`).
+    let id = ctx.identity()?;
 
     // 2. Run the renew handshake.
     let attestation = renew_with_nameserver(&id, &args.alias, &args.nameserver).await?;
@@ -151,23 +142,11 @@ pub(crate) fn build_renew_request(id: &Identity, alias: &str, challenge: &str) -
 // rotate
 // ============================================================================
 
-pub async fn rotate(args: KeysRotateArgs) -> Result<()> {
-    // 1. Load current identity from cli.toml's DID.
-    let cfg = config::load_config(None)?;
-    let old_did_str = cfg.user.did.clone();
-    if !old_did_str.starts_with("did:jig:") {
-        anyhow::bail!(
-            "cli.toml `[user] did = \"{old_did_str}\"` does not look like a Jig DID. \
-             Run `jig init` first or fix the config."
-        );
-    }
+pub async fn rotate(ctx: &CliContext, args: KeysRotateArgs) -> Result<()> {
+    // 1. Load the active identity (`--did` override or `[user] did`).
+    let old_id = ctx.identity()?;
+    let old_did_str = old_id.did_string();
     let keys_dir = jig_client::identity::default_keys_dir();
-    let old_id = Identity::load_from_dir(&keys_dir, &old_did_str).with_context(|| {
-        format!(
-            "loading old identity {old_did_str} from {}",
-            keys_dir.display()
-        )
-    })?;
 
     // 2. Mint a fresh keypair. This writes the new keyfile to disk.
     let new_id = Identity::generate_and_save(&keys_dir)
@@ -200,10 +179,12 @@ pub async fn rotate(args: KeysRotateArgs) -> Result<()> {
         )
     })?;
 
-    // 5. Update cli.toml to point at the new DID.
-    let mut updated_cfg = cfg.clone();
+    // 5. Point the config file at the new DID. Start from the on-disk
+    //    config so a one-shot `--server`/`--display-name` override isn't
+    //    persisted as a side effect of rotating.
+    let mut updated_cfg = ctx.file_config().clone();
     updated_cfg.user.did = new_did_str.clone();
-    config::save_config(&updated_cfg, None)?;
+    ctx.save_file_config(&updated_cfg)?;
 
     let ttl_days = (attestation.valid_until - attestation.valid_from) / 86_400;
     println!("rotated alias: {}", attestation.alias);

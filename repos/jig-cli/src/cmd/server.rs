@@ -1,6 +1,7 @@
 //! `jig server set` and `jig server info` — Phase F3 of v0.0.2 hello-world.
 //!
-//! `set <url>` rewrites `[server] base_url` in `~/.jig/cli.toml`. The URL
+//! `set <url>` rewrites `[server] base_url` in the active config file
+//! (`--config <path>` when given, else `~/.jig/cli.toml`). The URL
 //! can be `http://`, `https://`, `ws://`, or `wss://`. v0.0.2 does not try
 //! to be clever about scheme rewriting — whatever the operator passes is
 //! what gets persisted (validated only for basic URL shape via the `url`
@@ -19,19 +20,22 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::config;
+use crate::cmd::common::CliContext;
 
 // ============================================================================
 // set
 // ============================================================================
 
 /// Apply `jig server set <url>` — validates the URL shape, then rewrites
-/// `[server] base_url` in `~/.jig/cli.toml` (or whatever
-/// `default_config_path()` resolves to).
+/// `[server] base_url` in the active config file (`--config <path>` when
+/// given, otherwise `~/.jig/cli.toml`).
+///
+/// Writes start from the *on-disk* config, so a one-shot `--server`
+/// override never gets persisted as a side effect.
 ///
 /// Synchronous: no network calls happen here. To verify the URL is
 /// reachable, the operator should run `jig server info` afterwards.
-pub fn set(url: &str) -> Result<()> {
+pub fn set(ctx: &CliContext, url: &str) -> Result<()> {
     let url = url.trim();
     if url.is_empty() {
         anyhow::bail!("server URL must not be empty");
@@ -48,9 +52,9 @@ pub fn set(url: &str) -> Result<()> {
         anyhow::bail!("`{url}` has no host component");
     }
 
-    let mut cfg = config::load_config(None)?;
+    let mut cfg = ctx.file_config().clone();
     cfg.server.base_url = url.to_string();
-    config::save_config(&cfg, None)?;
+    ctx.save_file_config(&cfg)?;
     println!("server set: {url}");
     Ok(())
 }
@@ -60,14 +64,17 @@ pub fn set(url: &str) -> Result<()> {
 // ============================================================================
 
 /// Apply `jig server info` — fetch and pretty-print `/.well-known/jig`
-/// from the configured server (or `override_url` if supplied, useful for
-/// diagnostics against a server you haven't `jig server set` to).
-pub async fn info(override_url: Option<&str>) -> Result<()> {
+/// from the resolved server.
+///
+/// URL precedence: the subcommand's own `--url` (the diagnostic escape
+/// hatch, "does that peer think it's federated with me?") beats the global
+/// `--server`, which beats `[server] base_url` in the config file.
+pub async fn info(ctx: &CliContext, override_url: Option<&str>) -> Result<()> {
     let base = match override_url {
-        Some(u) => u.to_string(),
-        None => config::load_config(None)?.server.base_url,
+        Some(u) => u.trim().to_string(),
+        None => ctx.server_url()?,
     };
-    if base.trim().is_empty() {
+    if base.is_empty() {
         anyhow::bail!("no server base URL configured — run `jig server set <url>` first");
     }
 

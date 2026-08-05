@@ -42,7 +42,7 @@ use std::{
 use tokio::sync::mpsc;
 
 use crate::cmd::blocks_decode::{DecodedBlock, decode};
-use crate::cmd::common::{load_active_identity, load_server_url};
+use crate::cmd::common::CliContext;
 
 /// Args struct for `jig chat <channel>`. Lives here (rather than in
 /// `main.rs`) so the run loop stays self-contained — the clap layer
@@ -137,9 +137,14 @@ impl Drop for TerminalGuard {
 }
 
 /// Apply `jig chat <channel>`.
-pub async fn run(args: ChatArgs) -> Result<()> {
-    let id = load_active_identity()?;
-    let server_url = load_server_url()?;
+pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
+    let id = ctx.identity()?;
+    let server_url = ctx.server_url()?;
+
+    // `handle_submit` re-loads the identity from a spawned task, so the
+    // context has to outlive this frame. Cloning is cheap (two small
+    // Configs + a PathBuf) and keeps `main.rs` free of Arc bookkeeping.
+    let ctx = Arc::new(ctx.clone());
 
     let client = Client::connect(&server_url, id)
         .await
@@ -187,7 +192,7 @@ pub async fn run(args: ChatArgs) -> Result<()> {
 
     let mut state = ChatState::new(args.channel.clone());
 
-    let result = event_loop(&mut terminal, &mut state, &mut msg_rx, &client).await;
+    let result = event_loop(&mut terminal, &mut state, &mut msg_rx, &client, &ctx).await;
 
     // Always restore the terminal before returning, even on error,
     // and prefer the explicit-teardown error over the loop's error
@@ -203,6 +208,7 @@ async fn event_loop(
     state: &mut ChatState,
     msg_rx: &mut mpsc::UnboundedReceiver<Message>,
     client: &Arc<Client>,
+    ctx: &Arc<CliContext>,
 ) -> Result<()> {
     loop {
         // Drain any inbound messages before redrawing so we paint the
@@ -230,7 +236,7 @@ async fn event_loop(
                 KeyCode::Esc => return Ok(()),
                 KeyCode::Char('q') | KeyCode::Char('c') if ctrl => return Ok(()),
                 KeyCode::Enter => {
-                    handle_submit(state, client);
+                    handle_submit(state, client, ctx);
                 }
                 KeyCode::Backspace => {
                     delete_before_cursor(state);
@@ -257,7 +263,7 @@ async fn event_loop(
 /// own message echo back from the server, which is the same UX as a
 /// dropped network packet. v0.0.3 will surface submit errors via a
 /// status line.
-fn handle_submit(state: &mut ChatState, client: &Arc<Client>) {
+fn handle_submit(state: &mut ChatState, client: &Arc<Client>, ctx: &Arc<CliContext>) {
     if state.input.is_empty() {
         return;
     }
@@ -265,6 +271,7 @@ fn handle_submit(state: &mut ChatState, client: &Arc<Client>) {
     state.input_cursor = 0;
     let channel = state.channel.clone();
     let client = client.clone();
+    let ctx = ctx.clone();
     tokio::spawn(async move {
         // We need an Identity to derive the HLC stamp + sign the block.
         // The Client owns the original Identity by Arc, but doesn't
@@ -272,7 +279,7 @@ fn handle_submit(state: &mut ChatState, client: &Arc<Client>) {
         // read + ed25519 pubkey derivation) and matches how `jig send`
         // does it in F5. Errors here are silently dropped — see
         // doc-comment above.
-        let Ok(id) = load_active_identity() else {
+        let Ok(id) = ctx.identity() else {
             return;
         };
         let hlc = HlcTimestamp::now_wall(id.did().clone());

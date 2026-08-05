@@ -22,14 +22,11 @@
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use jig_client::{
-    Identity,
-    blocks::{BuiltBlock, build_channel_create, build_member_add},
-};
+use jig_client::blocks::{BuiltBlock, build_channel_create, build_member_add};
 use jig_core::HlcTimestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::config;
+use crate::cmd::common::CliContext;
 
 // ============================================================================
 // Helpers
@@ -45,24 +42,6 @@ pub(crate) fn base_http_url(base_url: &str) -> String {
         .replace("ws://", "http://")
         .trim_end_matches('/')
         .to_string()
-}
-
-/// Load the identity referenced by `[user] did` in `~/.jig/cli.toml`.
-/// Fails loudly if the config has no DID yet (operator hasn't run
-/// `jig init`) or if the keyfile is missing.
-fn load_active_identity() -> Result<(Identity, config::Config)> {
-    let cfg = config::load_config(None)?;
-    let did_str = cfg.user.did.clone();
-    if !did_str.starts_with("did:jig:") {
-        anyhow::bail!(
-            "cli.toml `[user] did = \"{did_str}\"` does not look like a Jig DID. \
-             Run `jig init` first."
-        );
-    }
-    let keys_dir = jig_client::identity::default_keys_dir();
-    let id = Identity::load_from_dir(&keys_dir, &did_str)
-        .with_context(|| format!("loading identity {did_str} from {}", keys_dir.display()))?;
-    Ok((id, cfg))
 }
 
 /// Wire shape for the admin endpoints. Matches
@@ -95,17 +74,17 @@ struct AdminResult {
 /// Builds a signed channel-create block, POSTs it to
 /// `/_admin_v0_0_2/channels`, and prints the new channel slug + block CID
 /// on success.
-pub async fn create(slug: String, visibility: String) -> Result<()> {
+pub async fn create(ctx: &CliContext, slug: String, visibility: String) -> Result<()> {
     let visibility = visibility.trim().to_lowercase();
     if !matches!(visibility.as_str(), "open" | "restricted") {
         anyhow::bail!("--visibility must be `open` or `restricted` (got `{visibility}`)");
     }
 
-    let (id, cfg) = load_active_identity()?;
+    let id = ctx.identity()?;
     let hlc = HlcTimestamp::now_wall(id.did().clone());
     let block = build_channel_create(&id, &slug, &visibility, hlc);
 
-    let base = base_http_url(&cfg.server.base_url);
+    let base = base_http_url(&ctx.server_url()?);
     let url = format!("{base}/_admin_v0_0_2/channels");
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -141,13 +120,13 @@ pub async fn create(slug: String, visibility: String) -> Result<()> {
 ///
 /// Builds a signed member-add block that adds the caller's own DID, then
 /// POSTs it to `/_admin_v0_0_2/channels/<url-escaped slug>/members`.
-pub async fn join(slug: String) -> Result<()> {
-    let (id, cfg) = load_active_identity()?;
+pub async fn join(ctx: &CliContext, slug: String) -> Result<()> {
+    let id = ctx.identity()?;
     let hlc = HlcTimestamp::now_wall(id.did().clone());
     let my_did = id.did_string();
     let block = build_member_add(&id, &slug, &my_did, hlc);
 
-    let base = base_http_url(&cfg.server.base_url);
+    let base = base_http_url(&ctx.server_url()?);
     let escaped = escape_slug_for_url(&slug);
     let url = format!("{base}/_admin_v0_0_2/channels/{escaped}/members");
     let http = reqwest::Client::builder()
@@ -219,9 +198,8 @@ struct ChannelsResponse {
 }
 
 /// Apply `jig channel list`. GETs `/api/v1/channels` and renders a table.
-pub async fn list() -> Result<()> {
-    let cfg = config::load_config(None)?;
-    let base = base_http_url(&cfg.server.base_url);
+pub async fn list(ctx: &CliContext) -> Result<()> {
+    let base = base_http_url(&ctx.server_url()?);
     let url = format!("{base}/api/v1/channels");
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))

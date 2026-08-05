@@ -22,12 +22,12 @@ use jig_client::{Client, DeliveredBlock};
 use crate::cmd::blocks_decode::decode;
 #[cfg(test)]
 use crate::cmd::blocks_decode::distinct_render_hashes;
-use crate::cmd::common::{load_active_identity, load_server_url};
+use crate::cmd::common::CliContext;
 
 /// Apply `jig tail <channel>`.
-pub async fn run(channel: String) -> Result<()> {
-    let id = load_active_identity()?;
-    let server_url = load_server_url()?;
+pub async fn run(ctx: &CliContext, channel: String) -> Result<()> {
+    let id = ctx.identity()?;
+    let server_url = ctx.server_url()?;
 
     let client = Client::connect(&server_url, id)
         .await
