@@ -44,7 +44,7 @@ impl FuelTracker {
     /// Returns a guard that captures the fuel delta when dropped.
     ///
     /// TODO: Integrate with actual Wasmtime Store fuel tracking once runtime wiring is complete.
-    pub fn begin<'a, T>(
+    pub fn begin<'a, T: 'static>(
         &'a mut self,
         _store: &'a mut Store<T>,
         capability: &str,
@@ -84,14 +84,14 @@ impl FuelTracker {
 /// TODO: Full Wasmtime Store integration for automatic fuel delta tracking.
 /// For now, this serves as the API surface for future runtime integration.
 #[allow(dead_code)]
-pub struct FuelGuard<'a, T> {
+pub struct FuelGuard<'a, T: 'static> {
     tracker: &'a mut FuelTracker,
     capability: String,
     fuel_before: u64,
     _phantom: std::marker::PhantomData<&'a mut Store<T>>,
 }
 
-impl<'a, T> Drop for FuelGuard<'a, T> {
+impl<'a, T: 'static> Drop for FuelGuard<'a, T> {
     fn drop(&mut self) {
         // TODO: Capture actual fuel delta from Wasmtime Store
         // For now, this is a no-op placeholder.

@@ -56,9 +56,9 @@ unknown-git = "deny"
 # landing against our dep graph still fails CI and forces a deliberate call.
 # Each entry carries the crate it suppresses and why it is acceptable today.
 #
-# Last audited against the graph: 2026-08-03 (post wasmtime 16/23 -> 24.0.12
-# dedupe, which removed the mach / bincode / cap-primitives / Boring-TLS
-# cluster and made 15 previous entries dead).
+# Last audited against the graph: 2026-08-04 (post wasmtime 24.0.12 -> 47.0.3,
+# which closed the six wasmtime advisories outright and — via the transitive
+# minimums that bump forced — also retired the fxhash and bytes entries).
 [advisories]
 version = 2
 # core2 / keccak are yanked transitive deps (cid -> multihash -> sha3/core2)
@@ -68,23 +68,21 @@ yanked = "warn"
 ignore = [
     # --- build-time only: proc macros, never linked into a shipped binary ---
     "RUSTSEC-2024-0370",  # proc-macro-error unmaintained; via multihash-derive. Build-time only, no runtime surface.
-    "RUSTSEC-2024-0436",  # paste unmaintained; via ratatui + wasmtime. Build-time only, no runtime surface.
+    "RUSTSEC-2024-0436",  # paste unmaintained; via ratatui -> jig-cli. Build-time only, no runtime surface.
 
     # --- jig-cli-local, non-network ---
     "RUSTSEC-2021-0145",  # atty unaligned read (unsound); via jig-cli. Windows-only AND only under a custom global allocator, which we do not install.
     "RUSTSEC-2024-0375",  # atty unmaintained; same jig-cli dep. Superseded by std::io::IsTerminal — swap when jig-cli's arg parsing is next touched.
 
     # --- unmaintained, no safe upgrade published ---
-    "RUSTSEC-2025-0057",  # fxhash unmaintained; via fxprof-processed-profile -> wasmtime. Hashing only, no untrusted-input parsing.
     "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained; jig-server TLS cert loading + rustls-native-certs. Thin wrapper over rustls-pki-types; migrate with the tokio-tungstenite 0.21 bump.
     "RUSTSEC-2026-0105",  # core2 unmaintained + all versions yanked; via cid/multihash. Needs the cid 0.10 migration above.
 
     # --- fixable by a lockfile bump; deliberately NOT done in this change
     #     because this lane may not touch Cargo.lock. Tracked as followups. ---
-    "RUSTSEC-2026-0007",  # bytes BytesMut::reserve integer overflow. Only reachable when overflow checks wrap; fix is bytes >=1.11.1.
     "RUSTSEC-2026-0009",  # time RFC-2822 parse stack exhaustion; via hickory-resolver + jig-core. We do not parse attacker-supplied RFC 2822 dates today; fix is time >=0.3.47.
     "RUSTSEC-2025-0055",  # tracing-subscriber ANSI escape injection into logs; jig-server/jig-nameserver. Log poisoning only, no memory safety; fix is tracing-subscriber >=0.3.20.
-    "RUSTSEC-2026-0097",  # rand ThreadRng unsound with a custom log::Logger; via cap-rand -> wasmtime-wasi. We install no custom logger that draws randomness; fix is rand >=0.8.6.
+    "RUSTSEC-2026-0097",  # rand ThreadRng unsound with a custom log::Logger; our own workspace rand 0.8 dep. We install no custom logger that draws randomness; fix is rand >=0.8.6.
 
     # --- rustls-webpki (both 0.102.8 via rustls 0.22 and 0.103.4 via rustls 0.23).
     #     All four need webpki >=0.103.12/0.103.13, i.e. rustls 0.23 everywhere —
@@ -95,18 +93,11 @@ ignore = [
     "RUSTSEC-2026-0099",  # wildcard name constraints wrongly accepted; same, no name-constrained CAs.
     "RUSTSEC-2026-0104",  # reachable panic parsing a CRL; unreachable while no CRLs are supplied.
 
-    # --- wasmtime 24.0.12 (jig-runtime + jig-server). Fixes only exist on
-    #     wasmtime >=36, a multi-major jump that has to be scheduled with the
-    #     jig-runtime block-execution wiring rather than dropped in here. ---
-    "RUSTSEC-2026-0086",  # host data leakage with 64-bit tables + Winch. Winch backend not enabled; we use the Cranelift default.
-    "RUSTSEC-2026-0089",  # host panic on Winch table.fill. Winch not enabled.
-    "RUSTSEC-2026-0094",  # Winch table.grow return value masking. Winch not enabled.
-    "RUSTSEC-2026-0095",  # Winch sandbox-escaping memory access. Winch not enabled.
-    "RUSTSEC-2026-0088",  # data leakage between pooling-allocator instances. Pooling allocator not enabled; default on-demand allocator in use.
-    # NOT mitigated by configuration — this one is real on aarch64 (Apple
-    # Silicon dev machines) with the default Cranelift backend. Accepted only
-    # because jig-runtime still executes blocks we author, not untrusted
-    # third-party Wasm. This carve-out MUST be revisited before any untrusted
-    # block execution ships.
-    "RUSTSEC-2026-0096",  # aarch64 Cranelift miscompiled guest heap access -> sandbox escape.
+    # --- No wasmtime entries. jig-runtime + jig-server are on wasmtime 47.0.3,
+    #     which carries fixes for every wasmtime advisory currently published
+    #     against our graph — including RUSTSEC-2026-0096 (aarch64 Cranelift
+    #     miscompiled guest heap access -> sandbox escape), which had no fix on
+    #     the 24.x line and was previously carved out on the premise that
+    #     jig-runtime only executes blocks we author. That premise no longer has
+    #     to hold; do not reintroduce a wasmtime suppression here without one. ---
 ]

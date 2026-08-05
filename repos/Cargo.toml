@@ -24,6 +24,13 @@ resolver = "2"
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
+# Floor set by wasmtime 47.x. Inherited by jig-runtime and jig-server via
+# `rust-version.workspace = true`; other members do not opt in, so this is not
+# a workspace-wide assertion. CI runs dtolnay/rust-toolchain@stable, which is
+# comfortably above it. Cargo still reports the offending transitive crates
+# rather than this floor when a toolchain is too old, so the value here is the
+# declaration itself, not a friendlier error.
+rust-version = "1.94"
 authors = ["Jig Protocol Contributors"]
 license = "AGPL-3.0"
 repository = "https://github.com/jig-protocol/jig"

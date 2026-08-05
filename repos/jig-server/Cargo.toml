@@ -2,6 +2,7 @@
 name = "jig-server"
 version = "0.0.1"
 edition = "2024"
+rust-version.workspace = true
 license = "AGPL-3.0-only"
 authors = ["Jig Protocol Contributors"]
 description = "Reference server implementation for Jig protocol"
@@ -87,7 +88,7 @@ rustls = "0.22"
 rustls-pki-types = "1.0"
 dashmap = "5"
 jsonwebtoken = "9"
-wasmtime = { version = "24.0.12", features = ["async"] }
+wasmtime = { version = "47.0.3", features = ["async"] }
 
 # Capability enforcement (Phase 1)
 hmac = "0.12"

@@ -13,7 +13,7 @@ use std::time::Duration;
 use wasmtime::*;
 
 #[cfg(feature = "wasi-preview2")]
-use wasmtime_wasi::{WasiCtxBuilder, preview1::WasiP1Ctx};
+use wasmtime_wasi::{WasiCtxBuilder, p1::WasiP1Ctx};
 
 use crate::config::RuntimeConfig;
 use crate::error::{Result, RuntimeError};
@@ -24,7 +24,7 @@ pub struct StoreLimits {
     /// Maximum memory size in bytes
     pub memory_size: usize,
     /// Maximum table elements
-    pub table_elements: u32,
+    pub table_elements: usize,
     /// Maximum instances
     #[allow(dead_code)] // Reserved for future limits
     pub instances: usize,
@@ -49,16 +49,16 @@ impl ResourceLimiter for StoreLimits {
         _current: usize,
         desired: usize,
         _maximum: Option<usize>,
-    ) -> anyhow::Result<bool> {
+    ) -> wasmtime::Result<bool> {
         Ok(desired <= self.memory_size)
     }
 
     fn table_growing(
         &mut self,
-        _current: u32,
-        desired: u32,
-        _maximum: Option<u32>,
-    ) -> anyhow::Result<bool> {
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
         Ok(desired <= self.table_elements)
     }
 }
@@ -70,16 +70,16 @@ impl ResourceLimiter for StoreContext {
         current: usize,
         desired: usize,
         maximum: Option<usize>,
-    ) -> anyhow::Result<bool> {
+    ) -> wasmtime::Result<bool> {
         self.limits.memory_growing(current, desired, maximum)
     }
 
     fn table_growing(
         &mut self,
-        current: u32,
-        desired: u32,
-        maximum: Option<u32>,
-    ) -> anyhow::Result<bool> {
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
         self.limits.table_growing(current, desired, maximum)
     }
 }
@@ -117,9 +117,13 @@ impl WasmEngine {
         }
 
         // Memory configuration
+        //
+        // `memory_reservation` / `memory_guard_size` are wasmtime's successors to
+        // the 24.x `static_memory_maximum_size` / `dynamic_memory_guard_size`
+        // pair; upstream merged the static/dynamic split into one knob each.
         let memory_limit_bytes = (config.limits.memory_max_mb as u64) * 1024 * 1024;
-        wasm_config.static_memory_maximum_size(memory_limit_bytes);
-        wasm_config.dynamic_memory_guard_size(0x10000); // 64KB guard
+        wasm_config.memory_reservation(memory_limit_bytes);
+        wasm_config.memory_guard_size(0x10000); // 64KB guard
         wasm_config.max_wasm_stack(2 * 1024 * 1024); // 2MB stack limit
 
         // Pooling allocator keeps allocation behaviour predictable
@@ -134,9 +138,9 @@ impl WasmEngine {
         if config.engine.enable_cache
             && let Some(cache_dir) = &config.engine.cache_dir
         {
-            wasm_config
-                .cache_config_load(cache_dir)
+            let cache = Cache::from_file(Some(std::path::Path::new(cache_dir)))
                 .map_err(|e| RuntimeError::InvalidConfig(format!("Cache config: {e}")))?;
+            wasm_config.cache(Some(cache));
         }
 
         // Build the engine
@@ -290,13 +294,13 @@ impl WasmEngine {
         let mut builder = WasiCtxBuilder::new();
 
         // Stdin: Use empty pipe (no host stdin)
-        builder.stdin(wasmtime_wasi::pipe::MemoryInputPipe::new(vec![]));
+        builder.stdin(wasmtime_wasi::p2::pipe::MemoryInputPipe::new(vec![]));
 
         // Stdout: Capture to memory (don't inherit host stdout)
-        builder.stdout(wasmtime_wasi::pipe::MemoryOutputPipe::new(1024 * 1024)); // 1MB buffer
+        builder.stdout(wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(1024 * 1024)); // 1MB buffer
 
         // Stderr: Capture to memory
-        builder.stderr(wasmtime_wasi::pipe::MemoryOutputPipe::new(1024 * 1024));
+        builder.stderr(wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(1024 * 1024));
 
         // Environment variables: Empty by default (can be added via ExecutionContext)
         // Args: Empty by default (can be added via ExecutionContext)

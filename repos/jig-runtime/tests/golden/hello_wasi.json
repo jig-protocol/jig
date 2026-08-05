@@ -3,13 +3,13 @@
     "bytes_rx": 0,
     "bytes_tx": 0,
     "fuel_by_capability": {
-      "engine.wasm": 1713
+      "engine.wasm": 18098
     },
-    "fuel_total": 1713
+    "fuel_total": 18098
   },
   "description": "WASI hello world with stdout",
   "fixture": "hello_wasi.wasm",
-  "fuel_used": 1713,
+  "fuel_used": 18098,
   "limits": {
     "fuel_max": 5000000,
     "memory_max_mb": 32

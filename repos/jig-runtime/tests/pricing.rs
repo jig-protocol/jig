@@ -57,7 +57,10 @@ fn test_pricing_enabled() {
     let pricing = receipt.pricing.as_ref().unwrap();
     assert_eq!(pricing.cost_per_fuel_unit, 0.00001);
     assert_eq!(pricing.currency, Some("USD".to_string()));
-    assert_eq!(pricing.schedule_version, "0.1.0");
+    // Pins the DEFAULT schedule version. Bumped to 0.2.0 when wasmtime 47
+    // started billing bulk memory ops per byte; update deliberately, never to
+    // make a failure go away.
+    assert_eq!(pricing.schedule_version, "0.2.0");
 
     // Total cost should be fuel_used * cost_per_fuel_unit
     let expected_cost = receipt.fuel_used() as f64 * 0.00001;
