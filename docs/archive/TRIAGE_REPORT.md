@@ -1,3 +1,10 @@
+> **HISTORICAL — archived.** A snapshot of the workspace on 2026-03-26. Its test count
+> ("658/658"), its per-crate table, and its file paths (e.g. `repos/jig-core/install.sh`,
+> the `jig-email-bridge` crate) no longer match the tree — `install.sh` is at the repo
+> root and the bridges are `repos/bridges/{core,email}`. Retained for its triage
+> narrative and its blocker analysis, not as a status page. For current state see
+> [`docs/README.md`](../README.md) and the deployment docs it indexes.
+
 # Jig Protocol — Triage Report
 
 **Generated:** 2026-03-26  
