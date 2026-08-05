@@ -13,7 +13,7 @@
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use jig_client::{DeliveredBlock, envelope::ReceiptRef};
-use jig_core::BlockManifest;
+use jig_core::{BlockKind, BlockManifest};
 use std::collections::HashSet;
 
 /// Presentation-layer view of a delivered block. All fields are owned so
@@ -38,6 +38,22 @@ pub struct DecodedBlock {
     /// Number of distinct render hashes — populated alongside
     /// `parity_warning` so tail.rs can keep emitting "(N hashes)".
     pub parity_hash_count: usize,
+    /// Declared block kind, when the manifest carries one. Lets callers
+    /// tell a chat message from a control block (channel-create,
+    /// member-add, …) that happens to share the same timeline.
+    pub kind: Option<BlockKind>,
+}
+
+impl DecodedBlock {
+    /// True for kinds a human reads as a message. Control blocks share the
+    /// channel timeline but carry no body, so replaying them prints a
+    /// `<no-body>` line the operator can do nothing with.
+    pub fn is_message(&self) -> bool {
+        matches!(
+            self.kind,
+            Some(BlockKind::TextRender | BlockKind::EmailRender)
+        )
+    }
 }
 
 /// Decode a delivered block bundle into a `DecodedBlock`.
@@ -77,6 +93,7 @@ pub fn decode(d: &DeliveredBlock) -> Result<DecodedBlock> {
         ts,
         parity_warning,
         parity_hash_count,
+        kind: manifest.kind,
     })
 }
 

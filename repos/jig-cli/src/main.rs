@@ -133,6 +133,13 @@ enum Commands {
         action: ChannelAction,
     },
 
+    /// Query a nameserver: resolve an alias to a DID, or list the aliases
+    /// it knows about.
+    Ns {
+        #[command(subcommand)]
+        action: NsAction,
+    },
+
     /// Execute WASM blocks locally
     #[cfg(feature = "local-runtime")]
     Block {
@@ -168,6 +175,30 @@ enum ChannelAction {
     /// List all channels known to the configured server.
     /// GETs `/api/v1/channels` and renders an aligned table.
     List,
+}
+
+#[derive(Subcommand, Debug)]
+enum NsAction {
+    /// Resolve an alias (e.g. `dj@dj.jig`) to the DID it is attested to.
+    Resolve {
+        /// Fully-qualified alias to look up.
+        #[arg()]
+        alias: String,
+
+        /// Nameserver base URL. Defaults to `[server] nameserver_url`
+        /// in cli.toml.
+        #[arg(long)]
+        nameserver: Option<String>,
+    },
+
+    /// List every alias the nameserver currently attests. Debug-gated
+    /// server-side behind `[debug] list_handles`.
+    List {
+        /// Nameserver base URL. Defaults to `[server] nameserver_url`
+        /// in cli.toml.
+        #[arg(long)]
+        nameserver: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -404,6 +435,20 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Handle nameserver lookups early — read-only HTTP GETs against a
+    // nameserver, nothing to do with the messaging pipeline.
+    if let Some(Commands::Ns { action }) = cli.command {
+        match action {
+            NsAction::Resolve { alias, nameserver } => {
+                cmd::ns::resolve(&ctx, alias, nameserver).await?;
+            }
+            NsAction::List { nameserver } => {
+                cmd::ns::list(&ctx, nameserver).await?;
+            }
+        }
+        return Ok(());
+    }
+
     // Handle channel subcommands early — they don't touch the legacy
     // messaging HTTP client; they go straight to `/_admin_v0_0_2/*` or
     // `/api/v1/channels` via reqwest.
@@ -577,6 +622,7 @@ async fn main() -> Result<()> {
         Some(Commands::Keys { .. }) => unreachable!("keys handled earlier"),
         Some(Commands::Server { .. }) => unreachable!("server handled earlier"),
         Some(Commands::Channel { .. }) => unreachable!("channel handled earlier"),
+        Some(Commands::Ns { .. }) => unreachable!("ns handled earlier"),
         None => {
             if !direct_message.is_empty() {
                 let msg = direct_message.join(" ");

@@ -109,7 +109,26 @@ pub async fn create(ctx: &CliContext, slug: String, visibility: String) -> Resul
         .context("decoding /_admin_v0_0_2/channels response")?;
     println!("channel created: {slug} ({visibility})");
     println!("  block_cid: {}", result.block_cid);
+
+    // A freshly created channel is almost always the one the operator wants
+    // to talk in next; without this, a bare `jig send hi` still goes to
+    // `#general` and the message appears to vanish.
+    if let Err(e) = remember_default_channel(ctx, &slug) {
+        eprintln!("warning: channel created but default_channel not saved: {e:#}");
+    } else {
+        println!("  default channel is now {slug}");
+    }
     Ok(())
+}
+
+/// Persist `slug` as `[user] default_channel`.
+///
+/// Starts from the on-disk config (not the effective one) so a one-shot
+/// `--server` / `--did` override never gets written back to `cli.toml`.
+fn remember_default_channel(ctx: &CliContext, slug: &str) -> Result<()> {
+    let mut cfg = ctx.file_config().clone();
+    cfg.user.default_channel = slug.to_string();
+    ctx.save_file_config(&cfg)
 }
 
 // ============================================================================
@@ -149,7 +168,22 @@ pub async fn join(ctx: &CliContext, slug: String) -> Result<()> {
     let result: AdminResult = resp.json().await.context("decoding member-add response")?;
     println!("joined {slug} as {my_did}");
     println!("  block_cid: {}", result.block_cid);
+
+    // Cheap moment to populate the address book: we know the DID and the
+    // name it belongs to. Purely local — nothing about the name goes into
+    // the member-add block.
+    if let Err(e) = remember_joiner(ctx, &my_did) {
+        eprintln!("warning: joined but contact name not saved: {e:#}");
+    }
     Ok(())
+}
+
+/// Record the joining DID under the configured display name.
+fn remember_joiner(ctx: &CliContext, did: &str) -> Result<()> {
+    let display_name = ctx.effective().user.display_name.clone();
+    let mut cfg = ctx.file_config().clone();
+    crate::config::remember_contact(&mut cfg, did, &display_name);
+    ctx.save_file_config(&cfg)
 }
 
 /// URL-escape the channel slug so `#hello` becomes `%23hello` and similar.
@@ -308,6 +342,80 @@ mod tests {
         // through percent-encoded UTF-8 bytes, not naively `\u{...}`.
         // `é` is 0xC3 0xA9 in UTF-8 → %C3%A9.
         assert_eq!(escape_slug_for_url("#caf\u{00E9}"), "%23caf%C3%A9");
+    }
+
+    fn ctx_over(path: &std::path::Path) -> CliContext {
+        std::fs::write(
+            path,
+            "[server]\nbase_url = \"http://127.0.0.1:7117\"\n\n\
+             [user]\ndid = \"did:jig:zFile\"\ndisplay_name = \"dj\"\n\
+             default_channel = \"#general\"\n",
+        )
+        .unwrap();
+        CliContext::resolve(&crate::cmd::common::GlobalOverrides {
+            config: Some(path.to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn creating_a_channel_makes_it_the_default_for_bare_sends() {
+        // Without this, `jig channel create '#hello'` followed by
+        // `jig send hi` silently posts to `#general`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cli.toml");
+        let ctx = ctx_over(&path);
+
+        remember_default_channel(&ctx, "#hello").unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("default_channel = \"#hello\""),
+            "create must persist the new default channel: {written}"
+        );
+    }
+
+    #[test]
+    fn joining_a_channel_records_the_joiner_in_the_address_book() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cli.toml");
+        let ctx = ctx_over(&path);
+
+        remember_joiner(&ctx, "did:jig:zJoiner").unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("did:jig:zJoiner") && written.contains("dj"),
+            "join must map the joiner's DID to their display name: {written}"
+        );
+    }
+
+    #[test]
+    fn remembering_a_default_channel_does_not_persist_one_shot_overrides() {
+        // `--server` is a per-invocation override; it must never be written
+        // back to cli.toml as a side effect of `channel create`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cli.toml");
+        ctx_over(&path);
+        let ctx = CliContext::resolve(&crate::cmd::common::GlobalOverrides {
+            config: Some(path.clone()),
+            server: Some("http://127.0.0.1:1".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        remember_default_channel(&ctx, "#hello").unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("http://127.0.0.1:7117"),
+            "on-disk base_url must survive: {written}"
+        );
+        assert!(
+            !written.contains("127.0.0.1:1\""),
+            "the --server override leaked into the file: {written}"
+        );
     }
 
     #[test]

@@ -130,15 +130,26 @@ fn write_cli_config(
     cfg_path: &std::path::Path,
     server_url: Option<&str>,
 ) -> Result<()> {
+    let cfg = build_initial_config(id, nickname, server_url);
+    config::save_config(&cfg, Some(cfg_path))
+        .with_context(|| format!("writing {}", cfg_path.display()))?;
+    Ok(())
+}
+
+/// Build the first-run config for a freshly generated identity.
+///
+/// Split out from the file write so it can be unit-tested without touching
+/// `~/.jig`. Seeds `[contacts]` with the operator's own DID so their own
+/// messages render as their nickname from the very first `jig chat`.
+fn build_initial_config(id: &Identity, nickname: &str, server_url: Option<&str>) -> Config {
     let mut cfg = Config::default();
     cfg.user.did = id.did_string();
     cfg.user.display_name = nickname.to_string();
     if let Some(url) = server_url {
         cfg.server.base_url = url.to_string();
     }
-    config::save_config(&cfg, Some(cfg_path))
-        .with_context(|| format!("writing {}", cfg_path.display()))?;
-    Ok(())
+    config::remember_contact(&mut cfg, &id.did_string(), nickname);
+    cfg
 }
 
 /// Run the challenge → sign → register handshake against a nameserver.
@@ -252,6 +263,40 @@ mod tests {
         id.public_key()
             .verify(challenge.as_bytes(), &sig)
             .expect("proof_of_control must verify under the identity's pubkey");
+    }
+
+    #[test]
+    fn initial_config_records_the_local_user_as_a_contact() {
+        // Seeding the address book with your own DID is what stops `jig chat`
+        // rendering a 61-char DID for every line you write yourself.
+        let dir = tempdir().unwrap();
+        let id = Identity::generate_and_save(dir.path()).unwrap();
+
+        let cfg = build_initial_config(&id, "dj", None);
+
+        assert_eq!(cfg.user.did, id.did_string());
+        assert_eq!(
+            cfg.contacts.get(&id.did_string()).map(String::as_str),
+            Some("dj"),
+            "own DID must map to the chosen nickname: {:?}",
+            cfg.contacts
+        );
+    }
+
+    #[test]
+    fn initial_config_keeps_the_default_server_unless_overridden() {
+        let dir = tempdir().unwrap();
+        let id = Identity::generate_and_save(dir.path()).unwrap();
+        assert_eq!(
+            build_initial_config(&id, "dj", None).server.base_url,
+            Config::default().server.base_url
+        );
+        assert_eq!(
+            build_initial_config(&id, "dj", Some("wss://deji.jig.onl"))
+                .server
+                .base_url,
+            "wss://deji.jig.onl"
+        );
     }
 
     #[test]

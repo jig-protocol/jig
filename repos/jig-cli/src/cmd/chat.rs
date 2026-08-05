@@ -28,12 +28,7 @@ use crossterm::{
 };
 use jig_client::{Client, blocks::build_text_render};
 use jig_core::HlcTimestamp;
-use ratatui::{
-    Frame, Terminal,
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
-};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     io::{Stdout, stdout},
     sync::Arc,
@@ -41,8 +36,11 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-use crate::cmd::blocks_decode::{DecodedBlock, decode};
+use crate::cmd::blocks_decode::decode;
+use crate::cmd::chat_view::{ChatState, Message, drain_inbound, render, submit_failure_status};
 use crate::cmd::common::CliContext;
+use crate::cmd::display::{bell_on_inbound, connection_lost};
+use crate::cmd::history;
 
 /// Args struct for `jig chat <channel>`. Lives here (rather than in
 /// `main.rs`) so the run loop stays self-contained — the clap layer
@@ -50,49 +48,6 @@ use crate::cmd::common::CliContext;
 #[derive(Debug, Clone)]
 pub struct ChatArgs {
     pub channel: String,
-}
-
-/// In-memory view-model for the TUI. `messages` is append-only;
-/// `render` slices it from the tail when there are more entries than
-/// fit on screen (auto-scroll). `input_cursor` is a byte index into
-/// `input` and is kept aligned to char boundaries by the key handler.
-pub struct ChatState {
-    pub channel: String,
-    pub messages: Vec<Message>,
-    pub input: String,
-    pub input_cursor: usize,
-}
-
-/// One decoded entry to display in the history pane.
-#[derive(Debug, Clone)]
-pub struct Message {
-    pub sender: String,
-    pub body: String,
-    /// Wall-clock ms (matches `HlcTimestamp::wall_ms` / `DecodedBlock::ts`).
-    pub ts: u64,
-    pub parity_warning: bool,
-}
-
-impl From<DecodedBlock> for Message {
-    fn from(d: DecodedBlock) -> Self {
-        Self {
-            sender: d.sender,
-            body: d.body,
-            ts: d.ts,
-            parity_warning: d.parity_warning,
-        }
-    }
-}
-
-impl ChatState {
-    pub fn new(channel: String) -> Self {
-        Self {
-            channel,
-            messages: Vec::new(),
-            input: String::new(),
-            input_cursor: 0,
-        }
-    }
 }
 
 /// RAII guard that restores the terminal on drop — including panic
@@ -146,6 +101,12 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
     // Configs + a PathBuf) and keeps `main.rs` free of Arc bookkeeping.
     let ctx = Arc::new(ctx.clone());
 
+    // Fetch history BEFORE the terminal goes into raw mode: any warning
+    // from a server without the history endpoint has to print as ordinary
+    // text, not into the alternate screen we would otherwise already own.
+    let backlog =
+        history::backfill(&server_url, &args.channel, history::DEFAULT_HISTORY_LIMIT).await;
+
     let client = Client::connect(&server_url, id)
         .await
         .with_context(|| format!("connecting to {server_url}"))?;
@@ -185,14 +146,33 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
         }
     });
 
+    // Submit failures travel on their own channel: `msg_tx` belongs to the
+    // reader task alone, so that its drop is an unambiguous "connection
+    // gone" signal. A send-task clone of it would keep the queue alive past
+    // the disconnect and hide the very thing we now detect.
+    let (status_tx, mut status_rx) = mpsc::unbounded_channel::<String>();
+
     let guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal: Terminal<CrosstermBackend<Stdout>> =
         Terminal::new(backend).context("constructing terminal")?;
 
-    let mut state = ChatState::new(args.channel.clone());
+    let mut state = ChatState::with_history(
+        args.channel.clone(),
+        backlog,
+        ctx.effective().contacts.clone(),
+    );
 
-    let result = event_loop(&mut terminal, &mut state, &mut msg_rx, &client, &ctx).await;
+    let result = event_loop(
+        &mut terminal,
+        &mut state,
+        &mut msg_rx,
+        &mut status_rx,
+        &status_tx,
+        &client,
+        &ctx,
+    )
+    .await;
 
     // Always restore the terminal before returning, even on error,
     // and prefer the explicit-teardown error over the loop's error
@@ -207,14 +187,29 @@ async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &mut ChatState,
     msg_rx: &mut mpsc::UnboundedReceiver<Message>,
+    status_rx: &mut mpsc::UnboundedReceiver<String>,
+    status_tx: &mpsc::UnboundedSender<String>,
     client: &Arc<Client>,
     ctx: &Arc<CliContext>,
 ) -> Result<()> {
     loop {
         // Drain any inbound messages before redrawing so we paint the
         // latest state in one pass.
-        while let Ok(msg) = msg_rx.try_recv() {
-            state.messages.push(msg);
+        let drained = drain_inbound(state, msg_rx);
+        // Bell on stderr: stdout belongs to ratatui for the duration of the
+        // TUI, so a `\x07` written there would land inside the frame buffer.
+        bell_on_inbound(drained.count, &mut std::io::stderr());
+
+        // Drain submit failures reported by the fire-and-forget send tasks.
+        while let Ok(status) = status_rx.try_recv() {
+            state.status = Some(status);
+        }
+
+        if drained.disconnected {
+            // Paint the backlog we just drained before tearing the TUI down,
+            // so the last messages are not lost with the connection.
+            terminal.draw(|f| render(f, state)).context("draw frame")?;
+            return Err(connection_lost(&state.channel));
         }
 
         terminal.draw(|f| render(f, state)).context("draw frame")?;
@@ -236,7 +231,7 @@ async fn event_loop(
                 KeyCode::Esc => return Ok(()),
                 KeyCode::Char('q') | KeyCode::Char('c') if ctrl => return Ok(()),
                 KeyCode::Enter => {
-                    handle_submit(state, client, ctx);
+                    handle_submit(state, client, ctx, status_tx);
                 }
                 KeyCode::Backspace => {
                     delete_before_cursor(state);
@@ -258,33 +253,43 @@ async fn event_loop(
     }
 }
 
-/// Fire-and-forget submit. Spawning means the WSS round-trip doesn't
-/// block redraws; if the submit fails the user just won't see their
-/// own message echo back from the server, which is the same UX as a
-/// dropped network packet. v0.0.3 will surface submit errors via a
-/// status line.
-fn handle_submit(state: &mut ChatState, client: &Arc<Client>, ctx: &Arc<CliContext>) {
+/// Spawned submit. Spawning means the WSS round-trip doesn't block
+/// redraws; failures come back over `status_tx` and are painted in the
+/// input pane, so a message that did not send never looks sent.
+fn handle_submit(
+    state: &mut ChatState,
+    client: &Arc<Client>,
+    ctx: &Arc<CliContext>,
+    status_tx: &mpsc::UnboundedSender<String>,
+) {
     if state.input.is_empty() {
         return;
     }
     let body = std::mem::take(&mut state.input);
     state.input_cursor = 0;
+    state.status = None;
     let channel = state.channel.clone();
     let client = client.clone();
     let ctx = ctx.clone();
+    let status_tx = status_tx.clone();
     tokio::spawn(async move {
         // We need an Identity to derive the HLC stamp + sign the block.
         // The Client owns the original Identity by Arc, but doesn't
         // expose it; re-loading from disk is cheap (a single 32-byte
         // read + ed25519 pubkey derivation) and matches how `jig send`
-        // does it in F5. Errors here are silently dropped — see
-        // doc-comment above.
-        let Ok(id) = ctx.identity() else {
-            return;
+        // does it in F5.
+        let id = match ctx.identity() {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = status_tx.send(submit_failure_status(&body, &format!("{e:#}")));
+                return;
+            }
         };
         let hlc = HlcTimestamp::now_wall(id.did().clone());
         let block = build_text_render(&id, &channel, &body, hlc);
-        let _ = client.submit(block).await;
+        if let Err(e) = client.submit(block).await {
+            let _ = status_tx.send(submit_failure_status(&body, &format!("{e}")));
+        }
     });
 }
 
@@ -331,170 +336,9 @@ fn move_cursor_right(state: &mut ChatState) {
     state.input_cursor = new_cursor;
 }
 
-/// Render the two-pane chat view.
-///
-/// Auto-scroll strategy: rather than wiring a stateful `ListState`,
-/// we slice `state.messages` to the last N entries where N is the
-/// visible row count of the history pane. This always paints the
-/// newest message at the bottom, which is the only behavior the demo
-/// needs. Trade-off: no scroll-back, but v0.0.3 will add a proper
-/// history viewer (PageUp/PageDown bound to a `ListState`).
-pub fn render(f: &mut Frame, state: &ChatState) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
-        .split(f.size());
-
-    // `f.size()` is whole-terminal; the history pane is `chunks[0]`.
-    // Inner height = pane height minus the 2 rows of border. Saturating
-    // sub keeps us safe on a 1-row terminal.
-    let visible_rows = (chunks[0].height as usize).saturating_sub(2);
-    let start = state.messages.len().saturating_sub(visible_rows.max(1));
-    let visible = &state.messages[start..];
-
-    let history: Vec<ListItem> = visible
-        .iter()
-        .map(|m| {
-            let warning = if m.parity_warning { "  ⚠" } else { "" };
-            ListItem::new(format!("{}  {}: {}{}", m.ts, m.sender, m.body, warning))
-        })
-        .collect();
-
-    f.render_widget(
-        List::new(history).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(state.channel.as_str()),
-        ),
-        chunks[0],
-    );
-
-    f.render_widget(
-        Paragraph::new(state.input.as_str()).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("input — Enter to send, Ctrl+Q or Esc to quit"),
-        ),
-        chunks[1],
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
-
-    /// Render the chat view into a fresh TestBackend at the given size
-    /// and return the buffer for assertions.
-    fn render_to_buffer(state: &ChatState, width: u16, height: u16) -> Buffer {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, state)).unwrap();
-        terminal.backend().buffer().clone()
-    }
-
-    /// Walk a buffer row-by-row and return one `String` per row,
-    /// preserving column order. The TestBackend stores cells as a
-    /// flat row-major vec so we can iterate by chunks of `width`.
-    fn buffer_to_lines(buf: &Buffer) -> Vec<String> {
-        let width = buf.area.width as usize;
-        let height = buf.area.height as usize;
-        let mut lines = Vec::with_capacity(height);
-        for y in 0..height {
-            let mut line = String::with_capacity(width);
-            for x in 0..width {
-                let cell = buf.get(x as u16, y as u16);
-                line.push_str(cell.symbol());
-            }
-            lines.push(line);
-        }
-        lines
-    }
-
-    #[test]
-    fn render_chat_view_includes_history_and_input() {
-        let state = ChatState {
-            channel: "#hello".into(),
-            messages: vec![Message {
-                sender: "dj".into(),
-                body: "hi".into(),
-                ts: 0,
-                parity_warning: false,
-            }],
-            input: "world".into(),
-            input_cursor: 5,
-        };
-        let buf = render_to_buffer(&state, 80, 24);
-        let lines = buffer_to_lines(&buf);
-        assert!(
-            lines.iter().any(|l| l.contains("#hello")),
-            "channel title must appear: {lines:#?}"
-        );
-        assert!(
-            lines.iter().any(|l| l.contains("hi")),
-            "message body must appear: {lines:#?}"
-        );
-        assert!(
-            lines.iter().any(|l| l.contains("world")),
-            "input must appear: {lines:#?}"
-        );
-    }
-
-    #[test]
-    fn render_parity_warning_emits_warning_glyph() {
-        let state = ChatState {
-            channel: "#hello".into(),
-            messages: vec![Message {
-                sender: "deji".into(),
-                body: "diverged".into(),
-                ts: 42,
-                parity_warning: true,
-            }],
-            input: String::new(),
-            input_cursor: 0,
-        };
-        let buf = render_to_buffer(&state, 80, 24);
-        let lines = buffer_to_lines(&buf);
-        assert!(
-            lines.iter().any(|l| l.contains("⚠")),
-            "parity warning glyph must appear: {lines:#?}"
-        );
-        assert!(
-            lines.iter().any(|l| l.contains("diverged")),
-            "body must still render: {lines:#?}"
-        );
-    }
-
-    #[test]
-    fn render_auto_scrolls_to_show_latest_message() {
-        // 50 messages into a 24-row buffer (~22 visible history rows
-        // after border). Latest message must appear; the earliest
-        // must NOT (it's been scrolled off the top).
-        let messages: Vec<Message> = (0..50)
-            .map(|i| Message {
-                sender: "dj".into(),
-                body: format!("msg-{i:02}"),
-                ts: i,
-                parity_warning: false,
-            })
-            .collect();
-        let state = ChatState {
-            channel: "#hello".into(),
-            messages,
-            input: String::new(),
-            input_cursor: 0,
-        };
-        let buf = render_to_buffer(&state, 80, 24);
-        let lines = buffer_to_lines(&buf);
-        assert!(
-            lines.iter().any(|l| l.contains("msg-49")),
-            "latest message must be visible: {lines:#?}"
-        );
-        assert!(
-            !lines.iter().any(|l| l.contains("msg-00")),
-            "earliest message must be scrolled off: {lines:#?}"
-        );
-    }
 
     #[test]
     fn insert_char_appends_at_cursor_and_advances() {
@@ -558,21 +402,5 @@ mod tests {
         assert_eq!(state.input_cursor, 2);
         move_cursor_left(&mut state);
         assert_eq!(state.input_cursor, 0);
-    }
-
-    #[test]
-    fn message_from_decoded_block_copies_fields() {
-        let decoded = DecodedBlock {
-            sender: "did:jig:zABC".into(),
-            body: "hello".into(),
-            ts: 12345,
-            parity_warning: true,
-            parity_hash_count: 2,
-        };
-        let m: Message = decoded.into();
-        assert_eq!(m.sender, "did:jig:zABC");
-        assert_eq!(m.body, "hello");
-        assert_eq!(m.ts, 12345);
-        assert!(m.parity_warning);
     }
 }
