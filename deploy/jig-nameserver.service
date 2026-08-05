@@ -30,10 +30,11 @@ RestartSec=5s
 # nameserver with a default PoW secret.
 EnvironmentFile=/etc/jig/jig-nameserver.env
 
-# `jig-nameserver serve --bind/--port` currently PARSES those flags and ignores
-# them (documented TODO in src/main.rs), so bind/port must come from the
-# environment. These env vars are applied AFTER any TOML config is loaded, so
-# they win over a stray ~/.jig/config.toml. Set the real tailnet IP here.
+# `jig-nameserver serve --bind/--port` are honoured as of the v0.0.2 alias-API
+# work — main.rs passes them into run_http_server and they override the loaded
+# config. These env vars are equivalent and are applied after any TOML config,
+# so they win over a stray ~/.jig/config.toml. Set the real tailnet IP here.
+# Either mechanism works; pick one and stay with it.
 Environment=JIG_NS_BIND=100.x.y.z
 Environment=JIG_NS_PORT=7070
 Environment=JIG_NS_DB_PATH=/var/lib/jig/nameserver.db

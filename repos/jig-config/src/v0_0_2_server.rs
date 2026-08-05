@@ -186,15 +186,14 @@ pub struct BridgeSection {
 /// Nameserver-mode settings. Only meaningful when this process runs as a
 /// jig-nameserver; a plain chat server parses and ignores the section.
 ///
-/// NOT YET WIRED. Nothing reads `alias_suffix` and nothing calls
-/// [`NameserverSection::validate`] — `JigServerConfig::load` is a bare
-/// `toml::from_str` with no validation hook. `jig_nameserver::v0_0_2::
-/// AppState::new` still takes `alias_suffix` as a bare parameter, and the
-/// nameserver binary does not construct that state at all.
+/// `alias_suffix` IS wired: `jig_nameserver::server::build_app_parts` reads it
+/// when constructing the v0.0.2 `AppState`, covered by
+/// `build_app_uses_the_configured_alias_suffix`.
 ///
-/// This section is declared ahead of the change that mounts the v0.0.2 alias
-/// routers, so that work can read config without also editing this file. The
-/// validation below only takes effect once `load` calls it.
+/// [`NameserverSection::validate`] is NOT yet called on any production path —
+/// `JigServerConfig::load` is a bare `toml::from_str` with no validation hook,
+/// so a malformed suffix reaches the router instead of failing at load. Call it
+/// from `load` to close that gap.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NameserverSection {
