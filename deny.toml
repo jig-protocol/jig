@@ -45,75 +45,68 @@ unknown-git = "deny"
 
 # RustSec advisory database checks (cargo-deny v2 schema).
 #
-# Every entry below is a pre-existing finding in transitive deps inherited
-# from the v0.0.1 baseline — NOT introduced by v0.0.2 work. They split into:
+# INVARIANT: every id below must still match a crate in the current graph.
+# A suppression whose crate has left the tree is worse than useless — if that
+# crate ever returns transitively the advisory is silently re-muted instead of
+# being re-evaluated. cargo-deny reports these as `advisory-not-detected`
+# ("no crate matched advisory criteria"); treat any such warning as a bug in
+# this file and delete the entry.
 #
-#   * Unmaintained: bincode, core2, fxhash, mach, paste, proc-macro-error
-#     — chain back to dioxus / jig-runtime build tooling. Real fix is dep
-#     upgrades (the trust-dns → hickory-dns migration in v0.0.3-alpha.1b
-#     already cleared the trust-dns / idna 0.5 / ring 0.16 cluster).
-#     Tracked as v0.0.3 hygiene followup.
+# Every id is pinned individually (never glob-suppressed) so a NEW advisory
+# landing against our dep graph still fails CI and forces a deliberate call.
+# Each entry carries the crate it suppresses and why it is acceptable today.
 #
-#   * Vulnerabilities: BytesMut::reserve overflow, cap-primitives Windows
-#     sandbox, AES overflow panic, TLS hostname verification disabled with
-#     Boring backend. None are exploitable on our v0.0.2 surface (no
-#     Windows targeting, no Boring TLS backend, no user-supplied AES,
-#     jig-server only resolves DNS for federation peers it knows ahead of
-#     time). Audit + targeted fixes are a v0.0.3 task.
-#
-#   * Unsound: rand custom-logger interaction.
-#     Same v0.0.3 audit treatment.
-#
-# Keep this list pinned (not glob-suppressed) so any NEW advisory landing
-# against our dep graph still fails CI and forces a deliberate decision.
+# Last audited against the graph: 2026-08-03 (post wasmtime 16/23 -> 24.0.12
+# dedupe, which removed the mach / bincode / cap-primitives / Boring-TLS
+# cluster and made 15 previous entries dead).
 [advisories]
 version = 2
-# core2 / keccak are yanked transitive deps inherited from the v0.0.1 baseline
-# (pulled in via jig-runtime / wasmtime). Same dep-upgrade-in-v0.0.3 followup
-# as the unmaintained crates below. Warn for now; tighten to "deny" once we
-# audit the dependency graph.
+# core2 / keccak are yanked transitive deps (cid -> multihash -> sha3/core2)
+# inherited from the v0.0.1 baseline. No upgrade path without moving off
+# cid 0.10; warn for now, tighten to "deny" when that migration happens.
 yanked = "warn"
 ignore = [
-    "RUSTSEC-2020-0168",  # mach unmaintained
-    "RUSTSEC-2021-0145",  # atty unaligned read (unsound)
-    "RUSTSEC-2024-0370",  # proc-macro-error unmaintained
-    "RUSTSEC-2024-0375",  # atty unmaintained
-    "RUSTSEC-2024-0436",  # paste unmaintained
-    "RUSTSEC-2024-0438",
-    "RUSTSEC-2024-0445",  # cap-primitives Windows sandbox
-    "RUSTSEC-2025-0046",
-    "RUSTSEC-2025-0055",
-    "RUSTSEC-2025-0057",  # fxhash unmaintained
-    "RUSTSEC-2025-0118",
-    "RUSTSEC-2025-0134",
-    "RUSTSEC-2025-0141",  # bincode unmaintained
-    "RUSTSEC-2026-0007",  # BytesMut::reserve overflow
-    "RUSTSEC-2026-0009",
-    "RUSTSEC-2026-0020",
-    "RUSTSEC-2026-0021",
-    "RUSTSEC-2026-0049",
-    "RUSTSEC-2026-0085",
-    "RUSTSEC-2026-0086",
-    "RUSTSEC-2026-0087",
-    "RUSTSEC-2026-0088",
-    "RUSTSEC-2026-0089",
-    "RUSTSEC-2026-0091",
-    "RUSTSEC-2026-0092",
-    "RUSTSEC-2026-0093",
-    "RUSTSEC-2026-0094",
-    "RUSTSEC-2026-0095",
-    "RUSTSEC-2026-0096",
-    "RUSTSEC-2026-0097",  # rand custom-logger unsound
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099",
-    "RUSTSEC-2026-0104",
-    "RUSTSEC-2026-0105",  # core2 unmaintained + yanked
-    "RUSTSEC-2026-0141",  # TLS hostname verification disabled with Boring backend
-    # NEW since PR #1: wasmtime / wasmtime-wasi vulnerability (CVE GHSA-2r75-cxrj-cmph).
-    # Affects wasmtime-wasi 16.0.0 (jig-server) and 23.0.3 (jig-runtime). Not
-    # exploitable on v0.0.2 surface — text-render uses the synthetic-receipt
-    # path, not jig-runtime execution (tracked as issue #5). Wasmtime upgrade
-    # paired with the runtime wiring is v0.0.3 work; this pin documents the
-    # deliberate carve-out.
-    "RUSTSEC-2026-0149",
+    # --- build-time only: proc macros, never linked into a shipped binary ---
+    "RUSTSEC-2024-0370",  # proc-macro-error unmaintained; via multihash-derive. Build-time only, no runtime surface.
+    "RUSTSEC-2024-0436",  # paste unmaintained; via ratatui + wasmtime. Build-time only, no runtime surface.
+
+    # --- jig-cli-local, non-network ---
+    "RUSTSEC-2021-0145",  # atty unaligned read (unsound); via jig-cli. Windows-only AND only under a custom global allocator, which we do not install.
+    "RUSTSEC-2024-0375",  # atty unmaintained; same jig-cli dep. Superseded by std::io::IsTerminal — swap when jig-cli's arg parsing is next touched.
+
+    # --- unmaintained, no safe upgrade published ---
+    "RUSTSEC-2025-0057",  # fxhash unmaintained; via fxprof-processed-profile -> wasmtime. Hashing only, no untrusted-input parsing.
+    "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained; jig-server TLS cert loading + rustls-native-certs. Thin wrapper over rustls-pki-types; migrate with the tokio-tungstenite 0.21 bump.
+    "RUSTSEC-2026-0105",  # core2 unmaintained + all versions yanked; via cid/multihash. Needs the cid 0.10 migration above.
+
+    # --- fixable by a lockfile bump; deliberately NOT done in this change
+    #     because this lane may not touch Cargo.lock. Tracked as followups. ---
+    "RUSTSEC-2026-0007",  # bytes BytesMut::reserve integer overflow. Only reachable when overflow checks wrap; fix is bytes >=1.11.1.
+    "RUSTSEC-2026-0009",  # time RFC-2822 parse stack exhaustion; via hickory-resolver + jig-core. We do not parse attacker-supplied RFC 2822 dates today; fix is time >=0.3.47.
+    "RUSTSEC-2025-0055",  # tracing-subscriber ANSI escape injection into logs; jig-server/jig-nameserver. Log poisoning only, no memory safety; fix is tracing-subscriber >=0.3.20.
+    "RUSTSEC-2026-0097",  # rand ThreadRng unsound with a custom log::Logger; via cap-rand -> wasmtime-wasi. We install no custom logger that draws randomness; fix is rand >=0.8.6.
+
+    # --- rustls-webpki (both 0.102.8 via rustls 0.22 and 0.103.4 via rustls 0.23).
+    #     All four need webpki >=0.103.12/0.103.13, i.e. rustls 0.23 everywhere —
+    #     blocked on the tokio-tungstenite 0.21 -> newer bump that removes the
+    #     rustls 0.22 branch. We do not use CRLs or name constraints today. ---
+    "RUSTSEC-2026-0049",  # CRL distributionPoint matching; we perform no CRL revocation checking.
+    "RUSTSEC-2026-0098",  # URI-name constraints wrongly accepted; we issue no name-constrained CAs.
+    "RUSTSEC-2026-0099",  # wildcard name constraints wrongly accepted; same, no name-constrained CAs.
+    "RUSTSEC-2026-0104",  # reachable panic parsing a CRL; unreachable while no CRLs are supplied.
+
+    # --- wasmtime 24.0.12 (jig-runtime + jig-server). Fixes only exist on
+    #     wasmtime >=36, a multi-major jump that has to be scheduled with the
+    #     jig-runtime block-execution wiring rather than dropped in here. ---
+    "RUSTSEC-2026-0086",  # host data leakage with 64-bit tables + Winch. Winch backend not enabled; we use the Cranelift default.
+    "RUSTSEC-2026-0089",  # host panic on Winch table.fill. Winch not enabled.
+    "RUSTSEC-2026-0094",  # Winch table.grow return value masking. Winch not enabled.
+    "RUSTSEC-2026-0095",  # Winch sandbox-escaping memory access. Winch not enabled.
+    "RUSTSEC-2026-0088",  # data leakage between pooling-allocator instances. Pooling allocator not enabled; default on-demand allocator in use.
+    # NOT mitigated by configuration — this one is real on aarch64 (Apple
+    # Silicon dev machines) with the default Cranelift backend. Accepted only
+    # because jig-runtime still executes blocks we author, not untrusted
+    # third-party Wasm. This carve-out MUST be revisited before any untrusted
+    # block execution ships.
+    "RUSTSEC-2026-0096",  # aarch64 Cranelift miscompiled guest heap access -> sandbox escape.
 ]
