@@ -2,12 +2,18 @@
 //!
 //! Wraps tokio-tungstenite with the v0.0.2 envelope codec (from
 //! jig-pipeline). One [`Client`] per server connection; reuse across
-//! subscriptions. Reconnect logic tracks per-origin HLC cursors so a
-//! resumed connection sends `CatchUp { since_hlc }` to backfill missed
-//! blocks (server-side replay implemented in Phase D).
+//! subscriptions. Per-origin HLC cursors are tracked so that a resumed
+//! connection can eventually send `CatchUp { since_hlc }` to backfill missed
+//! blocks — NOT YET WIRED: the cursors are placeholders and nothing sends
+//! `CatchUp` today.
+//!
+//! There is also NO automatic reconnect: when the connection drops, every
+//! [`BlockStream`] ends and further `submit` calls fail, so callers can
+//! detect the loss and decide what to do (a supervising shell loop, for now).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -46,20 +52,64 @@ pub struct Client {
     identity: Arc<Identity>,
     write_tx: mpsc::UnboundedSender<Message>,
     inbound_rx: Mutex<mpsc::UnboundedReceiver<Frame>>,
-    pending_subscriptions: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<DeliveredBlock>>>>,
+    pending_subscriptions: SubscriptionMap,
     last_cursors: Arc<Mutex<HashMap<String, HlcCursor>>>,
+    /// Set by [`ReaderCleanup`] when the reader task exits. Lets `submit`
+    /// and `subscribe_channel` fail fast instead of waiting on a socket
+    /// nobody is reading.
+    closed: Arc<AtomicBool>,
     server_url: String,
     submit_ack_timeout_seconds: u64,
 }
 
+/// Per-channel delivery senders, keyed by channel slug.
+///
+/// A `std` mutex, not a `tokio` one, so [`ReaderCleanup::drop`] can clear the
+/// map — `Drop` cannot await. Nothing holds this guard across an await point.
+type SubscriptionMap = Arc<StdMutex<HashMap<String, mpsc::UnboundedSender<DeliveredBlock>>>>;
+
+/// Lock the subscription map, recovering from poisoning: a panicking holder
+/// must not wedge every live [`BlockStream`] for the rest of the process.
+fn lock_subscriptions(
+    map: &SubscriptionMap,
+) -> MutexGuard<'_, HashMap<String, mpsc::UnboundedSender<DeliveredBlock>>> {
+    map.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Owned by the reader task; clearing the subscription map on drop is what
+/// stops `jig tail` / `jig chat` from becoming silent zombies when the server
+/// restarts or the link dies.
+///
+/// WHY a `Drop` guard rather than a cleanup block after the read loop: the
+/// reader task can be cancelled mid-`await` (runtime shutdown, task abort),
+/// and `Drop` is the only path that runs in every case. Dropping each
+/// subscriber's sender is what makes `BlockStream::next` return `None`.
+struct ReaderCleanup {
+    pending_subscriptions: SubscriptionMap,
+    closed: Arc<AtomicBool>,
+}
+
+impl Drop for ReaderCleanup {
+    fn drop(&mut self) {
+        // Flag first, then clear: `subscribe_channel` re-checks the flag while
+        // holding the map lock, so this ordering means a subscription can never
+        // be registered after the clear and left dangling forever.
+        self.closed.store(true, Ordering::SeqCst);
+        lock_subscriptions(&self.pending_subscriptions).clear();
+    }
+}
+
 /// A block delivered via [`BlockStream`].
 ///
-/// Serde derives are part of a cross-crate wire contract, not a convenience.
-/// The planned REST history endpoint (`GET /api/v1/channels/:slug/blocks`,
-/// not yet implemented) will serve a JSON array of exactly this shape for the
-/// CLI to deserialize into `Vec<DeliveredBlock>`. Once that endpoint exists,
-/// renaming or reordering these fields is a breaking wire change for both
-/// sides.
+/// Serde derives are part of a cross-crate wire contract, not a convenience:
+/// the REST history endpoint (`GET /api/v1/channels/:slug/blocks`) serves a
+/// JSON array that deserializes into `Vec<DeliveredBlock>`. Renaming or
+/// reordering these fields is a breaking wire change for both sides.
+///
+/// The server's response carries an extra `sig_b64` that this struct does not
+/// model, because the reader task already discards it when decoding
+/// `Frame::Block`. Serde ignores it. Adding the field here later is therefore
+/// a one-sided, non-breaking change.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeliveredBlock {
     pub bundle_b64: String,
@@ -74,8 +124,10 @@ pub struct BlockStream {
 }
 
 impl BlockStream {
-    /// Wait for the next delivery. Returns `None` if the underlying connection
-    /// closes.
+    /// Wait for the next delivery. Returns `None` once the underlying
+    /// connection closes — the reader task drops every subscription sender on
+    /// exit, so a server restart or dead link ends the stream instead of
+    /// blocking here forever. Callers should treat `None` as "disconnected".
     pub async fn next(&mut self) -> Option<DeliveredBlock> {
         self.rx.recv().await
     }
@@ -115,11 +167,10 @@ impl Client {
 
         let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Message>();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<Frame>();
-        let pending_subscriptions: Arc<
-            Mutex<HashMap<String, mpsc::UnboundedSender<DeliveredBlock>>>,
-        > = Arc::new(Mutex::new(HashMap::new()));
+        let pending_subscriptions: SubscriptionMap = Arc::new(StdMutex::new(HashMap::new()));
         let last_cursors: Arc<Mutex<HashMap<String, HlcCursor>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let closed = Arc::new(AtomicBool::new(false));
 
         // Writer task
         tokio::spawn(async move {
@@ -132,10 +183,17 @@ impl Client {
 
         // Reader task — dispatches incoming Block frames to per-channel
         // subscriber channels; forwards Ack / Error frames via inbound_tx
-        // so callers awaiting a reply can pick them up.
+        // so callers awaiting a reply can pick them up. On every exit path
+        // `ReaderCleanup` drops the subscription senders so each BlockStream
+        // terminates instead of blocking forever.
         let pending_subs_for_reader = pending_subscriptions.clone();
         let cursors_for_reader = last_cursors.clone();
+        let closed_for_reader = closed.clone();
         tokio::spawn(async move {
+            let _cleanup = ReaderCleanup {
+                pending_subscriptions: pending_subs_for_reader.clone(),
+                closed: closed_for_reader,
+            };
             while let Some(Ok(msg)) = stream.next().await {
                 if let Message::Text(text) = msg {
                     let Ok(env) = serde_json::from_str::<Envelope>(&text) else {
@@ -165,9 +223,11 @@ impl Client {
                             // could come from different channels — for v0.0.2
                             // one sub per channel slug suffices, and the
                             // server already filtered).
-                            let subs = pending_subs_for_reader.lock().await;
-                            for tx in subs.values() {
-                                let _ = tx.send(delivered.clone());
+                            {
+                                let subs = lock_subscriptions(&pending_subs_for_reader);
+                                for tx in subs.values() {
+                                    let _ = tx.send(delivered.clone());
+                                }
                             }
                             // Update cursor for delivery_cid (placeholder —
                             // Phase D will swap in HLC cursor parsed from the
@@ -195,6 +255,7 @@ impl Client {
             inbound_rx: Mutex::new(inbound_rx),
             pending_subscriptions,
             last_cursors,
+            closed,
             server_url: server_url.to_string(),
             submit_ack_timeout_seconds: 5,
         })
@@ -202,30 +263,47 @@ impl Client {
 
     /// Subscribe to a channel by slug. Returns a [`BlockStream`] that
     /// yields each delivered block.
+    ///
+    /// Returns [`ClientError::ConnectionClosed`] if the connection is already
+    /// dead — better a loud error than a stream that can never yield or end.
     pub async fn subscribe_channel(&self, slug: &str) -> Result<BlockStream, ClientError> {
         let env = Envelope::new(Frame::Subscribe {
             scope: Scope::Channel {
                 slug: slug.to_string(),
             },
         });
+        // Serialize before registering so a serde failure can't leave a
+        // half-registered subscription behind.
         let json = serde_json::to_string(&env)?;
-        self.write_tx
-            .send(Message::Text(json))
-            .map_err(|_| ClientError::ConnectionClosed)?;
 
         let (delivery_tx, delivery_rx) = mpsc::unbounded_channel();
-        self.pending_subscriptions
-            .lock()
-            .await
-            .insert(slug.to_string(), delivery_tx);
+        {
+            let mut subs = lock_subscriptions(&self.pending_subscriptions);
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(ClientError::ConnectionClosed);
+            }
+            subs.insert(slug.to_string(), delivery_tx);
+        }
+
+        if self.write_tx.send(Message::Text(json)).is_err() {
+            lock_subscriptions(&self.pending_subscriptions).remove(slug);
+            return Err(ClientError::ConnectionClosed);
+        }
 
         Ok(BlockStream { rx: delivery_rx })
     }
 
     /// Submit a built block and await its `Ack` (or `Error`). Returns the
     /// block CID assigned by the server.
+    ///
+    /// Fails immediately with [`ClientError::ConnectionClosed`] once the
+    /// reader task has exited, rather than waiting out the ack timeout for
+    /// an answer that can never arrive.
     pub async fn submit(&self, block: BuiltBlock) -> Result<String, ClientError> {
         use base64::Engine;
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(ClientError::ConnectionClosed);
+        }
         let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes());
         let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&block.sender_sig);
         let env = Envelope::new(Frame::Submit {
@@ -342,6 +420,107 @@ mod tests {
         });
 
         (url, frame_counter)
+    }
+
+    /// Accepts one WS connection, consumes `frames_before_close` text frames,
+    /// then closes and drops the socket — simulating a server restart or a
+    /// dead link while the client believes it is still subscribed.
+    async fn start_closing_test_server(frames_before_close: usize) -> String {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}");
+
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = accept_async(stream).await else {
+                return;
+            };
+            let mut seen = 0;
+            while seen < frames_before_close {
+                match ws.next().await {
+                    Some(Ok(Message::Text(_))) => seen += 1,
+                    Some(Ok(_)) => continue,
+                    _ => break,
+                }
+            }
+            let _ = ws.close(None).await;
+            drop(ws);
+        });
+
+        url
+    }
+
+    /// Regression guard for the "silent zombie" bug: when the server goes
+    /// away, every [`BlockStream`] must terminate so callers can notice.
+    /// Before the reader-task cleanup existed, the subscription's sender was
+    /// never dropped and `next()` blocked forever.
+    #[tokio::test]
+    async fn block_stream_ends_when_server_closes() {
+        let url = start_closing_test_server(1).await;
+        let id = test_identity();
+        let client = Client::connect(&url, id).await.unwrap();
+        let mut stream = client.subscribe_channel("#hello").await.unwrap();
+
+        let ended = tokio::time::timeout(Duration::from_secs(2), stream.next()).await;
+        match ended {
+            Ok(None) => {}
+            Ok(Some(block)) => panic!("expected stream end, got block {block:?}"),
+            Err(_) => panic!("stream never ended after server closed (silent zombie)"),
+        }
+    }
+
+    /// A submit on a dead connection must fail fast rather than waiting out
+    /// the 5s ack timeout.
+    #[tokio::test]
+    async fn submit_after_close_returns_error() {
+        use crate::blocks::build_text_render;
+        use jig_core::HlcTimestamp;
+
+        let url = start_closing_test_server(0).await;
+        let id = test_identity();
+        let client = Client::connect(&url, id).await.unwrap();
+        // Let the reader task observe the closed socket before we submit.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let hlc = HlcTimestamp {
+            wall_ms: 0,
+            logical: 0,
+            server_did: client.identity.did().clone(),
+        };
+        let block = build_text_render(&client.identity, "#hello", "hi", hlc);
+
+        let started = std::time::Instant::now();
+        let err = client.submit(block).await.unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(err, ClientError::ConnectionClosed),
+            "expected ConnectionClosed, got {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "submit took {elapsed:?}; it waited out the ack timeout instead of failing fast"
+        );
+    }
+
+    /// Subscribing after the connection is already dead must fail loudly
+    /// rather than handing back a stream that can never yield or end.
+    #[tokio::test]
+    async fn subscribe_after_close_returns_error() {
+        let url = start_closing_test_server(0).await;
+        let id = test_identity();
+        let client = Client::connect(&url, id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // `BlockStream` has no Debug impl, so match instead of unwrap_err.
+        match client.subscribe_channel("#hello").await {
+            Err(ClientError::ConnectionClosed) => {}
+            Err(other) => panic!("expected ConnectionClosed, got {other:?}"),
+            Ok(_) => panic!("expected ConnectionClosed, got a stream that can never yield"),
+        }
     }
 
     #[tokio::test]
