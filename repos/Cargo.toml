@@ -32,7 +32,7 @@ edition = "2024"
 # declaration itself, not a friendlier error.
 rust-version = "1.94"
 authors = ["Jig Protocol Contributors"]
-license = "AGPL-3.0"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/jig-protocol/jig"
 homepage = "https://jig.onl"
 

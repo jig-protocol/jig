@@ -192,19 +192,30 @@ There is no `CONTRIBUTING.md` for the implementation yet;
 
 ## License
 
-The workspace declares **AGPL-3.0** (`repos/Cargo.toml`, `[workspace.package]`).
+Dual-licensed under either of
 
-Per-crate declarations are not yet consistent with that, and there is no `LICENSE` file at
-the repo root — treat the licensing as unsettled until it is:
+- Apache License, Version 2.0 ([`LICENSE-APACHE`](LICENSE-APACHE))
+- MIT license ([`LICENSE-MIT`](LICENSE-MIT))
 
-| Scope | Declared |
-| --- | --- |
-| `jig-core`, `jig-server`, `jig-config`, `jig-pipeline`, `jig-runtime`, `jig-nameserver`, `bridges/core` | `AGPL-3.0-only` |
-| `jig-cli`, `jig-client`, `bridges/email`, `text-block` | `MIT` |
-| `repos/jig-spec` | CC BY-SA 4.0 |
+at your option. This is the customary Rust dual licence, chosen deliberately: a protocol
+that cannot be embedded is not a protocol, so every crate you would need to speak jig —
+`jig-core`, `jig-client`, `jig-server`, `jig-pipeline`, `jig-runtime`, `jig-nameserver`,
+`jig-config`, `jig-cli`, the bridges, and the sample blocks — is permissively licensed for
+any use, commercial included.
 
-The `LICENSE` files under `repos/jig-core`, `repos/jig-server` and `repos/jig-cli` are
-short notices, not full license texts.
+Two deliberate exceptions:
+
+| Scope | Licence | Why |
+| --- | --- | --- |
+| [`repos/jig-gui/`](repos/jig-gui/NOTICE.md) (Riverdance) | **None granted yet** | A client application, not protocol surface. Copyleft or source-available may be the right answer; the call has not been made. Default copyright applies until it is. |
+| [`repos/jig-spec/`](repos/jig-spec/) | CC BY-SA 4.0 | The written specification, not code. Under review — share-alike on a spec can impede the implementations the permissive code licence is meant to encourage. |
+
+### Contribution
+
+Unless you state otherwise, any contribution you intentionally submit for inclusion in the
+work, as defined in the Apache-2.0 licence, shall be dual-licensed as above, without any
+additional terms or conditions. Contributions to `repos/jig-gui/` are the exception — see
+its [`NOTICE.md`](repos/jig-gui/NOTICE.md).
 
 ## Relationship to gigue
 

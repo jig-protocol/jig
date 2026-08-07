@@ -3,7 +3,7 @@ name = "hello-wasm"
 version = "0.0.1"
 edition = "2024"
 description = "Minimal WASI hello-world for bakeoff measurements"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 

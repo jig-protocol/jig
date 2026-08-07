@@ -3,7 +3,7 @@ name = "jig-client"
 version = "0.0.2"
 edition.workspace = true
 authors.workspace = true
-license = "MIT"
+license = "MIT OR Apache-2.0"
 description = "Client library for jig-protocol: WSS connection, identity loading, bundle construction"
 
 [dependencies]

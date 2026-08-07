@@ -24,7 +24,6 @@ allow = [
     "Unicode-DFS-2016",  # Unicode Data Files
     "CDDL-1.0",  # CDDL (SQLite/RocksDB optional backend)
     "CDLA-Permissive-2.0",  # Community Data License
-    "AGPL-3.0-only",  # Internal jig-protocol crates use modern SPDX form
     "MPL-2.0",  # transient via dirs/option-ext
 ]
 confidence-threshold = 0.8

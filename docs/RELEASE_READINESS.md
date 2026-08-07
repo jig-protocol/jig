@@ -210,24 +210,36 @@ a security-communication BLOCKER than a docs gap (see §1.3).
 
 ## 5. Legal / licensing
 
-The intent is AGPL-3.0. The tree does not consistently say so.
+**RESOLVED.** The protocol is dual-licensed **MIT OR Apache-2.0**, the customary Rust
+pair, decided 2026-08-06. Rationale, in DJ's words: *"the protocol doesn't work if most of
+it isn't reusable by everyone for everything."*
 
-| Finding | Detail |
+| Item | State |
 | --- | --- |
-| No root `LICENSE` | There is no `LICENSE` file at the repository root. GitHub therefore shows the repo as unlicensed. `release.yml` tries to copy one into every tarball and silently skips it. |
-| Workspace declares a deprecated SPDX id | `repos/Cargo.toml` sets `[workspace.package] license = "AGPL-3.0"`. The current SPDX id is `AGPL-3.0-only` (or `-or-later`). `deny.toml`'s allowlist contains only `AGPL-3.0-only`; this passes solely because `[licenses.private] ignore = true` exempts workspace members. |
-| Crate licenses are split, not uniform | AGPL-3.0-only: `jig-core`, `jig-server`, `jig-config`, `jig-pipeline`, `jig-runtime`, `jig-nameserver`, `jig-bridge-core`. **MIT**: `jig-cli`, `jig-client`, `text-block`, `hello-wasm`, `jig-bridge-email`. **None declared**: `integration-tests`, and all five `jig-gui/riverdance/*` crates. |
-| `LICENSE` files are notice stubs, not license text | `repos/jig-core/LICENSE` and `repos/jig-server/LICENSE` are 18 lines: the AGPL §14-style notice followed by `[Full AGPL-3.0 license text available at https://www.gnu.org/licenses/agpl-3.0.txt]`. AGPL requires the full text accompany the work. `repos/jig-cli/LICENSE` is genuine MIT text; `repos/jig-spec/LICENSE` is CC-BY-SA-4.0 (reasonable for a spec, but a third licence nobody has written down). |
-| Copyright line | "Jig Protocol Contributors", 2024. Fine, but there is no CLA/DCO and no `.github` contribution config to attach one to. |
+| Root licence files | `LICENSE-MIT` and `LICENSE-APACHE` at the repo root, full texts. GitHub now detects the licence. |
+| Per-crate SPDX | Every protocol crate declares `MIT OR Apache-2.0`, including the workspace default, `integration-tests`, and the fuzz target. No crate declares AGPL any more, so the earlier MIT-linking-AGPL incoherence is gone. |
+| Superseded files | The AGPL notice stubs under `jig-core`/`jig-server` and the standalone MIT under `jig-cli` are deleted; the root pair covers them. |
+| `deny.toml` | The `AGPL-3.0-only` allowance is removed — no dependency needed it, and cargo-deny reported it as an unmatched allowance. |
+| Contribution terms | The standard Apache-2.0 §5 inbound=outbound paragraph is in the README. No CLA. |
 
-**Ready means**: a root `LICENSE` with full AGPL-3.0 text; every crate
-declaring an intentional SPDX id; the MIT/AGPL split documented as a decision
-(MIT for the client and the blocks is defensible — say so) rather than looking
-like drift; `jig-spec`'s CC-BY-SA noted in the README.
+### Two deliberate carve-outs
 
-**Verdict: BLOCKER.** Not because the risk is high, but because "the licence
-file is missing and five crates disagree about the licence" is the first thing
-a serious external adopter checks, and the cost to fix is an afternoon.
+**`repos/jig-gui/` (Riverdance) — no licence granted.** A client application is not
+protocol surface, and the reusability argument does not transfer to it. AGPL or BSL may be
+correct; that decision is open. Until then default copyright applies, all five crates are
+`publish = false`, and [`repos/jig-gui/NOTICE.md`](../repos/jig-gui/NOTICE.md) states this
+explicitly so the silence is not read as an oversight. Nothing in the protocol crates
+depends on this subtree, so its status cannot contaminate them.
+
+**`repos/jig-spec/` — still CC BY-SA 4.0, and this needs a decision.** Share-alike on a
+written specification can impede exactly the independent implementations the permissive
+code licence exists to encourage: a derived implementation guide inherits the share-alike
+obligation. Most protocol specs that want wide adoption use CC-BY-4.0 or the same terms as
+the code. Recommend aligning it; flagged rather than changed, because spec licensing has
+different norms from code licensing and this is a judgement call, not a cleanup.
+
+**Verdict: no longer a blocker.** Downgraded from BLOCKER to the open `jig-spec` question
+above.
 
 ### The DAG rule (external contributors must know this)
 
@@ -280,7 +292,7 @@ would be handing strangers a footgun with our name on it.
 | --- | --- | --- |
 | 1 | **Authn + authz on `jig-server`** | Everything else is cosmetic while the port is open to the world. Includes enforcing `visibility`/membership on reads, or removing the flag and its `--help` text. |
 | 2 | **Root `SECURITY.md` with an external reporting path** | Cheap, and blocker #1 guarantees findings. Without it the first report is public. |
-| 3 | **Root `LICENSE` (full AGPL-3.0 text) + consistent per-crate SPDX ids** | An afternoon. First thing an adopter checks; currently the repo reads as unlicensed. |
+| ~~3~~ | ~~**Root `LICENSE` + consistent per-crate SPDX ids**~~ | **DONE 2026-08-06** — dual-licensed MIT OR Apache-2.0, root licence pair added, every protocol crate aligned. Only the `jig-spec` CC BY-SA question remains, and it does not gate release. |
 | 4 | **Fix the binary install path** | `install.sh` points at a host that serves nothing, unpacks the wrong paths, and verifies no checksum — while `release.yml` already publishes the `.sha256`. A `curl \| sh` KPI that does not work is worse than not having one. |
 | 5 | **Say plainly that v0.0.x has no compatibility guarantee** | README + release notes. Every version field in the system is a label, not a gate; users must not infer stability from their presence. |
 | 6 | **Implementation-status banner on `jig-spec`** | It documents E2EE we have not written, in the present tense. Shipping that unqualified is a claim about privacy we cannot back. |
