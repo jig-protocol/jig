@@ -148,6 +148,30 @@ struct ServerEndpoints {
     http: String,
 }
 
+/// The origin a federated peer should dial, as advertised at
+/// `/.well-known/jig`.
+///
+/// `public_url` wins when set. Otherwise this derives
+/// `{scheme}://{bind_address}:{port}`, taking the scheme from `[tls] enabled` —
+/// the scheme used to be hardcoded `http://`, so a TLS deployment advertised an
+/// origin no peer could use.
+///
+/// The derived form is still only correct for plaintext deployments. Under TLS,
+/// `bind_address` is typically an IP while the certificate is issued for a
+/// hostname, so a peer following it hits a certificate-name mismatch. That is
+/// why `public_url` exists, and why the operator docs tell you to set it
+/// whenever you enable TLS.
+fn advertised_origin(config: &ServerConfig) -> String {
+    if let Some(url) = config.public_url.as_deref() {
+        let trimmed = url.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let scheme = if config.tls.enabled { "https" } else { "http" };
+    format!("{scheme}://{}:{}", config.bind_address, config.port)
+}
+
 async fn server_info(State(state): State<AppState>) -> Result<Json<ServerInfoResponse>, ApiError> {
     let (server_did, unsafe_options_active, allowed_block_kinds, peers, bridges) =
         if let Some(v002) = &state.v0_0_2 {
@@ -176,7 +200,7 @@ async fn server_info(State(state): State<AppState>) -> Result<Json<ServerInfoRes
         version: env!("CARGO_PKG_VERSION").to_string(),
         host_id: state.config.host_id.clone(),
         endpoints: ServerEndpoints {
-            http: format!("http://{}:{}", state.config.bind_address, state.config.port),
+            http: advertised_origin(&state.config),
         },
         server_did,
         unsafe_options_active,
@@ -472,6 +496,54 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    /// `/.well-known/jig` is what a federated peer reads to learn how to reach
+    /// us. Advertising the wrong scheme, or an address the TLS cert does not
+    /// cover, makes the peer fail with a confusing error rather than a clear
+    /// one — so the advertised origin is pinned by tests.
+    fn advertised_http(cfg: ServerConfig) -> String {
+        advertised_origin(&cfg)
+    }
+
+    #[test]
+    fn advertised_origin_is_http_when_tls_is_off() {
+        let mut cfg = ServerConfig::default();
+        cfg.bind_address = "100.74.254.110".into();
+        cfg.port = 7117;
+        assert_eq!(advertised_http(cfg), "http://100.74.254.110:7117");
+    }
+
+    #[test]
+    fn advertised_origin_is_https_when_tls_is_on() {
+        let mut cfg = ServerConfig::default();
+        cfg.bind_address = "100.74.254.110".into();
+        cfg.port = 7117;
+        cfg.tls.enabled = true;
+        assert_eq!(advertised_http(cfg), "https://100.74.254.110:7117");
+    }
+
+    #[test]
+    fn public_url_overrides_the_derived_origin() {
+        // The bind address is an IP, but a TLS cert is issued for a hostname.
+        // Peers must be told the name the cert actually covers, or they hit a
+        // certificate-name mismatch.
+        let mut cfg = ServerConfig::default();
+        cfg.bind_address = "100.74.254.110".into();
+        cfg.port = 7117;
+        cfg.tls.enabled = true;
+        cfg.public_url = Some("https://jig-vps.tail323521.ts.net:7117".into());
+        assert_eq!(
+            advertised_http(cfg),
+            "https://jig-vps.tail323521.ts.net:7117"
+        );
+    }
+
+    #[test]
+    fn public_url_trailing_slash_is_trimmed() {
+        let mut cfg = ServerConfig::default();
+        cfg.public_url = Some("https://jig.example:7117/".into());
+        assert_eq!(advertised_http(cfg), "https://jig.example:7117");
+    }
 
     /// The v0.0.1 REST surface executes caller-supplied Wasm with no signature
     /// check at all. Default-off is the security property; these two tests are

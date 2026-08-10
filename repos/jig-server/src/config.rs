@@ -28,6 +28,20 @@ pub struct ServerConfig {
     /// value after a table.
     #[serde(default)]
     pub dangerously_enable_v0_0_1_rest: bool,
+    /// The origin to advertise at `/.well-known/jig`, e.g.
+    /// `https://jig-vps.tail323521.ts.net:7117`.
+    ///
+    /// When unset, the origin is derived as `{scheme}://{bind_address}:{port}`
+    /// with the scheme following `[tls] enabled`. That derivation is right for a
+    /// plaintext deployment and WRONG for most TLS ones: `bind_address` is
+    /// usually an IP, while a certificate is issued for a hostname, so a peer
+    /// that follows the advertisement gets a certificate-name mismatch rather
+    /// than a useful error. Set this to whatever name the cert actually covers.
+    ///
+    /// Must stay ahead of the `[execution]` / `[tls]` tables — see the note on
+    /// `dangerously_enable_v0_0_1_rest`.
+    #[serde(default)]
+    pub public_url: Option<String>,
     #[serde(default)]
     pub execution: ExecutionSection,
     #[serde(default)]
@@ -83,6 +97,7 @@ impl Default for ServerConfig {
             port: 7117,
             host_id: default_host_id(),
             dangerously_enable_v0_0_1_rest: false,
+            public_url: None,
             execution: ExecutionSection::default(),
             tls: TlsConfig::default(),
         }

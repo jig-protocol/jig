@@ -37,6 +37,14 @@ port = 7117
 # cert_path = "/var/lib/jig/tls/<host>.<tailnet>.ts.net.crt"
 # key_path  = "/var/lib/jig/tls/<host>.<tailnet>.ts.net.key"
 
+# SET THIS WHENEVER YOU ENABLE [tls]. It is the origin advertised at
+# /.well-known/jig for federated peers to dial. Left unset, the server derives
+# {scheme}://{bind_address}:{port} — the scheme now follows [tls], but
+# bind_address is an IP while your certificate is issued for a HOSTNAME, so a
+# peer that follows the advertisement gets a certificate-name mismatch instead
+# of a useful error. Must appear BEFORE any [table] header (it is a root key).
+# public_url = "https://<host>.<tailnet>.ts.net:7117"
+
 # ============================================================================
 # JigServerConfig  —  the v0.0.2 half
 # ============================================================================
