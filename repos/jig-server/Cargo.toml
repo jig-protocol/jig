@@ -87,7 +87,7 @@ tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
 rustls = "0.22"
 rustls-pki-types = "1.0"
 dashmap = "5"
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 wasmtime = { version = "47.0.3", features = ["async"] }
 
 # Capability enforcement (Phase 1)
