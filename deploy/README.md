@@ -120,6 +120,19 @@ enabling it.
 | Nameserver alias API | `curl http://100.x.y.z:7070/v1/challenge` | `{"challenge":"<64 hex>"}` |
 | Units | `systemctl status jig-server jig-nameserver` | both `active (running)` |
 
+> ⚠️ **Once you enable `[tls]`, every one of the `:7117` rows above becomes
+> `https://`, not just the ones you were thinking about.** TLS wraps the *whole*
+> router on the single configured port — `/healthz`, `/metrics`,
+> `/.well-known/jig`, `/api/v1/*` and the WebSocket alike. An `http://` request
+> to a TLS port produces no usable response, and **`curl -s` hides the error**,
+> so a working server looks like a silently dead one. Drop the `-s`, or use
+> `https://<host>.<tailnet>.ts.net:7117/healthz`. Clients must move to
+> `https://` / `wss://` too (`jig server set https://…`).
+>
+> The nameserver on `:7070` is **not** covered by `[tls]` — that section belongs
+> to `jig-server` only — so its rows stay `http://` unless you terminate TLS in
+> front of it yourself.
+
 `/healthz` and `/metrics` are deliberately mounted **outside** the v0.0.1 gate,
 so they answer on a default, locked-down deployment. Use `/healthz` — not
 `/.well-known/jig` — as the uptime check: it touches no storage.
@@ -209,8 +222,13 @@ sudo tailscale cert \
   --cert-file /var/lib/jig/tls/<host>.<tailnet>.ts.net.crt \
   --key-file  /var/lib/jig/tls/<host>.<tailnet>.ts.net.key \
   <host>.<tailnet>.ts.net
-sudo chown jig:jig /var/lib/jig/tls/*
-sudo chmod 600 /var/lib/jig/tls/*.key
+# `-R` and the wrapped shell are both deliberate. `sudo chown jig:jig
+# /var/lib/jig/tls/*` FAILS: your shell expands the glob before sudo runs, and
+# the directory is 0750 jig:jig, so an unprivileged shell cannot list it. chown
+# then reports "cannot access '/var/lib/jig/tls/*'" even though tailscale just
+# wrote the files. sudo elevates the command, not the globbing.
+sudo chown -R jig:jig /var/lib/jig/tls
+sudo sh -c 'chmod 600 /var/lib/jig/tls/*.key'
 ```
 
 Point the server's existing `[tls]` block at them:
@@ -359,7 +377,8 @@ to object storage. At minimum, get `server.key` off the box (top of this file).
 sudo systemctl stop jig-server jig-nameserver
 sudo cp /path/to/snapshot/{jig.db,jig_v002.db,nameserver.db} /var/lib/jig/
 sudo cp /path/to/snapshot/server.key /var/lib/jig/server.key
-sudo chown jig:jig /var/lib/jig/*
+sudo chown -R jig:jig /var/lib/jig          # -R, not /var/lib/jig/* — see the
+                                            # glob note in the TLS section above
 sudo chmod 600 /var/lib/jig/server.key      # or the server refuses to start
 sudo systemctl start jig-server jig-nameserver
 curl http://100.x.y.z:7117/.well-known/jig  # server_did MUST match the old one

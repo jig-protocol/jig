@@ -33,9 +33,18 @@ EnvironmentFile=/etc/jig/jig-nameserver.env
 # `jig-nameserver serve --bind/--port` are honoured as of the v0.0.2 alias-API
 # work — main.rs passes them into run_http_server and they override the loaded
 # config. These env vars are equivalent and are applied after any TOML config,
-# so they win over a stray ~/.jig/config.toml. Set the real tailnet IP here.
+# so they win over a stray ~/.jig/config.toml.
 # Either mechanism works; pick one and stay with it.
-Environment=JIG_NS_BIND=100.x.y.z
+#
+# ⚠️ YOU MUST REPLACE THE BIND ADDRESS BELOW. Unlike jig-server — which takes
+# `bind_address` from /etc/jig/config.toml — the nameserver's bind lives here in
+# the unit, so it is easy to install this file and never notice it is unset.
+# The value must be a LITERAL tailnet IP (`tailscale ip -4`), not a hostname and
+# not a placeholder: the bind goes through getaddrinfo, so anything unresolvable
+# fails with "failed to lookup address information: Name or service not known"
+# and systemd will crash-loop on it indefinitely. An earlier placeholder of
+# `100.x.y.z` looked plausibly like an address and cost 600 restarts to spot.
+Environment=JIG_NS_BIND=REPLACE_WITH_TAILNET_IPV4
 Environment=JIG_NS_PORT=7070
 Environment=JIG_NS_DB_PATH=/var/lib/jig/nameserver.db
 # Pin HOME so config discovery cannot wander into another account's ~/.jig.
