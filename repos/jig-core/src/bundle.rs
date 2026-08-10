@@ -1,5 +1,5 @@
 use cid::Cid;
-use multihash::{Code, MultihashDigest};
+use multihash_codetable::{Code, MultihashDigest};
 
 use crate::crypto::hash_labeled_parts;
 use crate::error::{JigError, Result};

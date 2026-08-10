@@ -2,7 +2,7 @@
 name = "jig-core"
 version = "0.0.1"
 edition = "2024"
-license = "AGPL-3.0-only"
+license = "MIT OR Apache-2.0"
 authors = ["Jig Protocol Contributors"]
 description = "Core protocol implementation for Jig messaging"
 repository = "https://github.com/jig-protocol/jig-core"
@@ -17,8 +17,8 @@ time = { version = "0.3", features = ["serde", "formatting"] }
 semver = { version = "1.0", features = ["serde"] }
 blake3 = "1.5"
 data-encoding = "2"
-cid = { version = "0.10", features = ["serde"] }
-multihash = { version = "0.18", default-features = false, features = ["std", "blake3"] }
+cid.workspace = true
+multihash-codetable.workspace = true
 hex = "0.4"
 base64 = "0.22"
 thiserror = "1.0"

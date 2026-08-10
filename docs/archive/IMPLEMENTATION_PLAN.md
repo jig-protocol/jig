@@ -1,3 +1,10 @@
+> **HISTORICAL — archived, not a work queue.** Describes the tree as of 2025-11-09
+> (Receipt v0.2 cross-binary alignment); every task in it is marked "Not Started" and
+> the numbering has not been maintained since. For current planning records see
+> [`docs/superpowers/plans/`](../superpowers/plans/) and
+> [`docs/superpowers/specs/`](../superpowers/specs/); for what is shipped today see
+> [`docs/README.md`](../README.md).
+
 # Cross-Binary Protocol Implementation Plan
 
 **Created:** 2025-11-09

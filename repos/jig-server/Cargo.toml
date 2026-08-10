@@ -3,7 +3,7 @@ name = "jig-server"
 version = "0.0.1"
 edition = "2024"
 rust-version.workspace = true
-license = "AGPL-3.0-only"
+license = "MIT OR Apache-2.0"
 authors = ["Jig Protocol Contributors"]
 description = "Reference server implementation for Jig protocol"
 repository = "https://github.com/jig-protocol/jig-server"
@@ -47,7 +47,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_repr = "0.1"
 humantime-serde = "1.1"
-cid = { version = "0.10", features = ["serde"] }
+cid.workspace = true
 
 # Error handling
 anyhow = "1.0"

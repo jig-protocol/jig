@@ -3,7 +3,7 @@ name = "jig-nameserver"
 version = "0.0.1"
 edition = "2024"
 authors = ["Jig Protocol Contributors"]
-license = "AGPL-3.0-only"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 # Workspace-shared deps
@@ -39,7 +39,7 @@ hdrhistogram = { version = "7", optional = true }
 pprof = { version = "0.13", features = ["flamegraph"], optional = true }
 dirs = "5"
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
-cid = { version = "0.10", features = ["serde"] }
+cid.workspace = true
 jig-config = { workspace = true }
 jig-core = { workspace = true }
 jig-runtime = { path = "../jig-runtime", features = ["wasi-preview2", "receipt-signing"] }

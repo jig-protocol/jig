@@ -3,7 +3,7 @@ name = "jig-bridge-email"
 version = "0.0.3"
 edition = "2024"
 authors = ["Jig Protocol Contributors"]
-license = "MIT"
+license = "MIT OR Apache-2.0"
 description = "Email bridge for Jig protocol — in-process library loaded by jig-server"
 repository = "https://github.com/jig-protocol/jig"
 

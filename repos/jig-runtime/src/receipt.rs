@@ -5,7 +5,7 @@ use jig_core::receipt::{
     BlockReceipt, Counters as CoreCounters, HashAlgorithms, Limits as CoreLimits,
     Outcome as CoreOutcome, OutcomeStatus, Timings as CoreTimings,
 };
-use multihash::{Code, MultihashDigest};
+use multihash_codetable::{Code, MultihashDigest};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -388,5 +388,47 @@ impl From<&Outcome> for CoreOutcome {
                 reason: Some(reason.clone()),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod cid_stability_tests {
+    use super::*;
+
+    /// The runtime derives a block's content address independently of
+    /// `jig-core`, so it needs its own golden. A change here re-addresses every
+    /// receipt the runtime has ever emitted: treat a diff as a protocol break,
+    /// not as a stale expectation.
+    #[test]
+    fn block_id_from_wasm_is_stable() {
+        let wasm = b"\0asm\x01\0\0\0";
+        let builder = ReceiptBuilder::new().block_id_from_wasm(wasm);
+        let cid = builder.block_id.expect("block id");
+
+        assert_eq!(
+            cid.to_string(),
+            "bafkr4ifdheemyqqvtlplr7imjw225dc5r5ihwagwfjdj3alaglfc4am76e"
+        );
+        assert_eq!(cid.version(), cid::Version::V1);
+        assert_eq!(cid.codec(), RAW_CODEC);
+        // blake3 multihash code, 32-byte digest.
+        assert_eq!(cid.hash().code(), 0x1e);
+        assert_eq!(cid.hash().size(), 32);
+        // The multihash commits to blake3(module_hash), where the module hash
+        // is itself blake3 over the wasm bytes.
+        let module_hash = blake3::hash(wasm.as_slice());
+        assert_eq!(
+            cid.hash().digest(),
+            blake3::hash(module_hash.as_bytes()).as_bytes()
+        );
+    }
+
+    #[test]
+    fn block_id_from_str_round_trips() {
+        let golden = "bafkreigh2akiscaildcw453u6enm6kdwy5cae2f5z5ky3g4zz6p3r6jwhu";
+        let builder = ReceiptBuilder::new()
+            .block_id_from_str(golden)
+            .expect("parse");
+        assert_eq!(builder.block_id.expect("block id").to_string(), golden);
     }
 }

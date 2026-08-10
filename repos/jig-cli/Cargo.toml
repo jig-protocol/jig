@@ -2,7 +2,7 @@
 name = "jig-cli"
 version = "0.0.1"
 edition = "2024"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 authors = ["Jig Protocol Contributors"]
 description = "CLI client for Jig messaging protocol"
 repository = "https://github.com/jig-protocol/jig-cli"
@@ -57,7 +57,7 @@ url = "2"
 atty = "0.2"
 
 # Core helpers
-cid = { version = "0.10", features = ["serde"] }
+cid.workspace = true
 semver = "1.0"
 
 # Utils

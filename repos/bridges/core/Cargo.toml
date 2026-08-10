@@ -3,7 +3,7 @@ name = "jig-bridge-core"
 version = "0.0.3"
 edition = "2024"
 authors = ["Jig Protocol Contributors"]
-license = "AGPL-3.0-only"
+license = "MIT OR Apache-2.0"
 description = "Common Bridge trait + context types for jig-protocol bridges (email, slack, irc, ssh, ...)"
 repository = "https://github.com/jig-protocol/jig"
 

@@ -3,7 +3,7 @@ name = "jig-runtime"
 version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
-license = "AGPL-3.0-only"
+license = "MIT OR Apache-2.0"
 description = "Unified WASM runtime for Jig Protocol with deterministic execution, WASI support, capability sandboxing, and instrumented fuel metering"
 repository = "https://github.com/jig-protocol/repos"
 keywords = ["wasm", "runtime", "wasi", "capabilities", "deterministic"]
@@ -42,8 +42,8 @@ tracing-subscriber = { version = "0.3", optional = true }
 tokio = { version = "1.35", features = ["sync"], optional = true }
 chrono = { workspace = true, features = ["serde"] }
 jig-core = { path = "../jig-core" }
-cid = { version = "0.10", features = ["serde"] }
-multihash = { version = "0.18", default-features = false, features = ["std", "multihash-impl", "blake3"] }
+cid.workspace = true
+multihash-codetable.workspace = true
 time = { version = "0.3", features = ["serde"] }
 
 [dev-dependencies]
