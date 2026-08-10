@@ -27,16 +27,25 @@ swap for 90; then run on 2 GB for the rest of its life.
 | **Run machine type** | `e2-small` (2 vCPU shared, 2 GB) |
 | **Image** | `debian-12` (`debian-cloud`) |
 | **Disk** | 50 GB `pd-balanced` |
-| **Region/zone** | `us-central1-a` (or nearest your team) |
-| **Ingress firewall rules** | **none**, after you delete the temporary SSH rule |
-| **Steady-state cost** | **~$21/month** (see the cost table — approximate) |
+| **Region/zone** | `us-central1-a` in the examples below. **The live `jig-internal` box is `us-west1-a`.** |
+| **External IP** | **none** (`--no-address`) — required by org policy and correct anyway |
+| **Egress** | Cloud NAT (mandatory — see below) |
+| **Ingress firewall rules** | **none**, after you delete the temporary IAP rule |
+| **Steady-state cost** | ~$21/month for the VM **plus Cloud NAT** (see the cost table — approximate) |
+
+> **Pick a zone once and use it everywhere.** The commands below say
+> `us-central1-a`; substitute yours consistently. There is now a second place
+> that must agree: **the Cloud Router / NAT is regional and its `--region` must
+> match your instance's region** (`us-west1-a` → `--region=us-west1`). A
+> mismatch here produces a VM with no route to the internet and no error at
+> create time.
 
 Why `e2-standard-4` and not `c4-standard-4`: **C4 requires Hyperdisk Balanced,
 and E2 cannot attach Hyperdisk.** If you build on C4 you cannot shrink to E2
 afterwards without migrating the disk. Staying inside the E2 family makes the
 resize a three-command no-op. That single constraint decides the machine family.
 
-### The six commands
+### The commands, in order
 
 ```bash
 # 0. one-time project setup
@@ -47,31 +56,76 @@ gcloud services enable compute.googleapis.com
 # 1. a dedicated VPC with NO ingress rules (default-deny is the whole security model)
 gcloud compute networks create jig-net --subnet-mode=auto
 
-# 2. ONE temporary SSH rule, deleted in step 6 — it is the bootstrap only
-gcloud compute firewall-rules create jig-tmp-ssh \
-  --network=jig-net --direction=INGRESS --action=ALLOW \
-  --rules=tcp:22 --source-ranges=<YOUR_CURRENT_IP>/32 \
-  --description='TEMPORARY. delete once tailscale ssh works.'
+# 2. Cloud NAT — outbound only. MANDATORY, not optional: a VM with no external
+#    IP also has no outbound internet, so it cannot apt-get, fetch rustup, or
+#    reach controlplane.tailscale.com to join the tailnet. --region MUST match
+#    the instance's region.
+gcloud compute routers create jig-nat-router \
+  --network=jig-net --region=us-central1
 
-# 3. the box, built big
+gcloud compute routers nats create jig-nat \
+  --router=jig-nat-router --region=us-central1 \
+  --auto-allocate-nat-external-ips \
+  --nat-all-subnet-ip-ranges
+
+# 3. ONE temporary SSH rule for the bootstrap, deleted in step 7.
+#    Scoped to Google's IAP range — NOT your IP, NOT 0.0.0.0/0. With no
+#    external IP there is nothing to reach directly; IAP tunnels in.
+gcloud compute firewall-rules create jig-iap-ssh \
+  --network=jig-net --direction=INGRESS --action=ALLOW \
+  --rules=tcp:22 --source-ranges=35.235.240.0/20 \
+  --description='TEMPORARY: IAP TCP forwarding for bootstrap. Delete once tailscale ssh works.'
+
+# 4. the box, built big, with NO external IP
 gcloud compute instances create jig-vps \
   --zone=us-central1-a \
   --machine-type=e2-standard-4 \
   --image-family=debian-12 --image-project=debian-cloud \
   --boot-disk-size=50GB --boot-disk-type=pd-balanced --boot-disk-device-name=jig-vps \
   --network=jig-net --subnet=jig-net \
+  --no-address \
   --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring \
   --metadata=enable-oslogin=TRUE \
   --no-service-account --no-scopes
 
-# 4. get on it
-gcloud compute ssh jig-vps --zone=us-central1-a
+# 5. get on it, through the IAP tunnel
+gcloud compute ssh jig-vps --zone=us-central1-a --tunnel-through-iap
 
-# 5. (on the box) everything else — see "Provisioning the box" below
+# 6. (on the box) everything else — see "Provisioning the box" below
 
-# 6. (back on your Mac, AFTER tailscale ssh is verified working)
-gcloud compute firewall-rules delete jig-tmp-ssh
+# 7. (back on your Mac, AFTER tailscale ssh is verified working)
+gcloud compute firewall-rules delete jig-iap-ssh
 ```
+
+### Why `--no-address`, and what it costs you
+
+Omit it and `instances create` assigns an ephemeral external IP by default. On
+an org with `constraints/compute.vmExternalIpAccess` set — which `jig-internal`
+has — that fails outright:
+
+```
+ERROR: Constraint constraints/compute.vmExternalIpAccess violated for project ...
+```
+
+Work with the policy rather than requesting an exception: jig is tailnet-only by
+design and never wanted a public address. The policy and the architecture agree.
+
+Three consequences, none of them blockers but all of them surprises if you meet
+them at 2am:
+
+- **Cloud NAT is a real line item.** It bills per gateway-hour *plus* per-GB
+  processed, so it can be a meaningful fraction of the VM's ~$21/month. Check
+  the pricing calculator — the figure is not quoted here because it was not
+  verified. There is no way to avoid it: `tailscaled` must reach its
+  coordination server even if you build the binaries somewhere else.
+- **IAP needs an IAM grant on *you*, not just the firewall rule** —
+  `roles/iap.tunnelResourceAccessor`. If step 5 fails with a permissions error
+  rather than a network timeout, that is why.
+- **`--no-service-account --no-scopes` blocks the GCS backup** described later
+  in this document. A VM with no service account cannot call any Google API.
+  Keep the flags for now (safer default, and backup is not day-one); §8b
+  ("A write-only service account") has the `set-service-account` sequence, which
+  requires stopping the instance.
 
 `--no-service-account --no-scopes` means the VM has no Google API credentials at
 all. That is the right default; **Section 8** re-attaches a narrow, write-only
@@ -306,8 +360,9 @@ if you use it at all.
 
 ## 4. Provisioning the box
 
-Everything from here runs **on the VM**, over `gcloud compute ssh` (step 4 of the
-recommendation box) until noted otherwise.
+Everything from here runs **on the VM**, over
+`gcloud compute ssh … --tunnel-through-iap` (step 5 of the recommendation box)
+until noted otherwise.
 
 ### 4a. Tailscale first — before anything else
 
@@ -360,17 +415,21 @@ Concretely:
   a network rather than reusing `default` and deleting `default-allow-ssh` —
   deleting that rule would affect every other VM in the project.
 
-**Tradeoff on removing SSH access.** After step 6 there is no inbound path except
+**Tradeoff on removing SSH access.** After step 7 there is no inbound path except
 Tailscale. If `tailscaled` fails to start after a reboot, or the tailnet auth key
 expires, or you get removed from your own tailnet, you are locked out of the
 guest OS. Your break-glass options, best first:
 
-1. **Re-add the firewall rule.** You still have full control-plane access via
+1. **Re-add the IAP rule.** You still have full control-plane access via
    `gcloud`; it is one command and ~30 seconds. This is the real answer.
    ```bash
-   gcloud compute firewall-rules create jig-tmp-ssh --network=jig-net \
-     --direction=INGRESS --action=ALLOW --rules=tcp:22 --source-ranges=<YOUR_IP>/32
+   gcloud compute firewall-rules create jig-iap-ssh --network=jig-net \
+     --direction=INGRESS --action=ALLOW --rules=tcp:22 --source-ranges=35.235.240.0/20
+   gcloud compute ssh jig-vps --zone=us-central1-a --tunnel-through-iap
    ```
+   **It must be the IAP range, not `<YOUR_IP>/32`.** The box has no external
+   address, so a rule scoped to your own IP allows traffic that can never
+   arrive — a trap that only reveals itself at the moment you are locked out.
 2. **Serial console.** Requires enabling it *and* having a local account with a
    password set — GCP hands you a login prompt, not a root shell. Set that up in
    advance or it is useless in the moment:
@@ -679,7 +738,8 @@ may be out of date. Verify at cloud.google.com/products/calculator.**
 | `c4-standard-4` (4 vCPU, 15 GB) | ~$0.19-0.21/hr | ~$140-155 if left running |
 | 50 GB `pd-balanced` | ~$0.10/GB-mo | **~$5** |
 | 50 GB `pd-standard` | ~$0.04/GB-mo | ~$2 |
-| External IPv4 (in use) | ~$0.005/hr | **~$3.65** |
+| External IPv4 (in use) | ~$0.005/hr | **~$3.65** — now billed to the NAT gateway, not the VM |
+| Cloud NAT gateway | per gateway-hour **plus** per-GB processed | **NOT VERIFIED — check the calculator** |
 | Internet egress | first ~200 GB/mo free, then ~$0.085-0.12/GB | **~$0** at this scale |
 
 ### Recommended configuration, totalled
@@ -688,9 +748,17 @@ may be out of date. Verify at cloud.google.com/products/calculator.**
 |---|---|
 | `e2-small` running 24/7 | ~$12.25 |
 | 50 GB `pd-balanced` | ~$5.00 |
-| External IPv4 | ~$3.65 |
+| External IPv4 (on the NAT gateway) | ~$3.65 |
 | Egress (10-person chat) | ~$0.00 |
-| **Steady state** | **~$21/month** |
+| Cloud NAT gateway + data processing | **unverified** |
+| **Steady state** | **~$21/month + Cloud NAT** |
+
+The VM has no external IP (`--no-address`, org policy), so that ~$3.65 moves to
+the NAT gateway's auto-allocated address rather than disappearing — and Cloud NAT
+adds its own gateway and data-processing charges on top. That figure is
+deliberately left blank rather than guessed; it is the one line item in this
+table that changed structurally and was never measured. Price it before assuming
+~$21 still holds.
 | One-time: `e2-standard-4` for a ~1.5 h build | **~$0.20** |
 
 The build burst is a rounding error. **The external IP is ~17% of your bill and
@@ -740,8 +808,19 @@ gcloud compute instances describe jig-vps --zone=us-central1-a \
   --format='value(disks[].deviceName,disks[].autoDelete)'
 
 gcloud compute instances delete jig-vps --zone=us-central1-a   # boot disk goes with it by default
+
+# Cloud NAT + its router bill independently of the VM, and `networks delete`
+# refuses while they exist. Remove them before the network, in this order.
+gcloud compute routers nats delete jig-nat --router=jig-nat-router --region=us-central1
+gcloud compute routers delete jig-nat-router --region=us-central1
+
+gcloud compute firewall-rules delete jig-iap-ssh   # if you re-added it for break-glass
 gcloud compute networks delete jig-net
 ```
+
+> **Stopping the VM does not stop the NAT bill.** If you are pausing the box
+> while travelling rather than tearing it down, delete the NAT gateway and
+> router too and recreate them on return — they are two commands each way.
 
 **Before you ever run that:** confirm `server.key` is in 1Password and the
 databases are in GCS. `--keep-disks=boot` preserves the disk if you want an
