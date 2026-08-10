@@ -27,18 +27,18 @@ swap for 90; then run on 2 GB for the rest of its life.
 | **Run machine type** | `e2-small` (2 vCPU shared, 2 GB) |
 | **Image** | `debian-12` (`debian-cloud`) |
 | **Disk** | 50 GB `pd-balanced` |
-| **Region/zone** | `us-central1-a` in the examples below. **The live `jig-internal` box is `us-west1-a`.** |
+| **Region/zone** | `us-west1-a` — what the live `jig-internal` box actually runs, so the commands below are copy-pasteable as written |
 | **External IP** | **none** (`--no-address`) — required by org policy and correct anyway |
 | **Egress** | Cloud NAT (mandatory — see below) |
 | **Ingress firewall rules** | **none**, after you delete the temporary IAP rule |
 | **Steady-state cost** | ~$21/month for the VM **plus Cloud NAT** (see the cost table — approximate) |
 
-> **Pick a zone once and use it everywhere.** The commands below say
-> `us-central1-a`; substitute yours consistently. There is now a second place
-> that must agree: **the Cloud Router / NAT is regional and its `--region` must
-> match your instance's region** (`us-west1-a` → `--region=us-west1`). A
-> mismatch here produces a VM with no route to the internet and no error at
-> create time.
+> **If you change the zone, change it everywhere.** Every command below is
+> `us-west1-a` / `us-west1` so it works unedited. Should you move regions, note
+> that **the Cloud Router / NAT is regional and its `--region` must match the
+> instance's region** (`us-west1-a` → `--region=us-west1`) — a mismatch there
+> yields a VM with no route to the internet and *no error at create time*, which
+> is the worst combination to debug.
 
 Why `e2-standard-4` and not `c4-standard-4`: **C4 requires Hyperdisk Balanced,
 and E2 cannot attach Hyperdisk.** If you build on C4 you cannot shrink to E2
@@ -50,7 +50,7 @@ resize a three-command no-op. That single constraint decides the machine family.
 ```bash
 # 0. one-time project setup
 gcloud config set project <PROJECT_ID>
-gcloud config set compute/zone us-central1-a
+gcloud config set compute/zone us-west1-a
 gcloud services enable compute.googleapis.com
 
 # 1. a dedicated VPC with NO ingress rules (default-deny is the whole security model)
@@ -61,10 +61,10 @@ gcloud compute networks create jig-net --subnet-mode=auto
 #    reach controlplane.tailscale.com to join the tailnet. --region MUST match
 #    the instance's region.
 gcloud compute routers create jig-nat-router \
-  --network=jig-net --region=us-central1
+  --network=jig-net --region=us-west1
 
 gcloud compute routers nats create jig-nat \
-  --router=jig-nat-router --region=us-central1 \
+  --router=jig-nat-router --region=us-west1 \
   --auto-allocate-nat-external-ips \
   --nat-all-subnet-ip-ranges
 
@@ -78,7 +78,7 @@ gcloud compute firewall-rules create jig-iap-ssh \
 
 # 4. the box, built big, with NO external IP
 gcloud compute instances create jig-vps \
-  --zone=us-central1-a \
+  --zone=us-west1-a \
   --machine-type=e2-standard-4 \
   --image-family=debian-12 --image-project=debian-cloud \
   --boot-disk-size=50GB --boot-disk-type=pd-balanced --boot-disk-device-name=jig-vps \
@@ -89,7 +89,7 @@ gcloud compute instances create jig-vps \
   --no-service-account --no-scopes
 
 # 5. get on it, through the IAP tunnel
-gcloud compute ssh jig-vps --zone=us-central1-a --tunnel-through-iap
+gcloud compute ssh jig-vps --zone=us-west1-a --tunnel-through-iap
 
 # 6. (on the box) everything else — see "Provisioning the box" below
 
@@ -183,10 +183,10 @@ climbing past 8. If it does not OOM-kill `rustc` outright, it takes many hours.
 
 ```bash
 # instance MUST be TERMINATED to change machine type
-gcloud compute instances stop  jig-vps --zone=us-central1-a
-gcloud compute instances set-machine-type jig-vps --zone=us-central1-a \
+gcloud compute instances stop  jig-vps --zone=us-west1-a
+gcloud compute instances set-machine-type jig-vps --zone=us-west1-a \
   --machine-type=e2-small
-gcloud compute instances start jig-vps --zone=us-central1-a
+gcloud compute instances start jig-vps --zone=us-west1-a
 ```
 
 What survives the stop/start: the boot disk, `/var/lib/jig`, `server.key`, the
@@ -425,7 +425,7 @@ guest OS. Your break-glass options, best first:
    ```bash
    gcloud compute firewall-rules create jig-iap-ssh --network=jig-net \
      --direction=INGRESS --action=ALLOW --rules=tcp:22 --source-ranges=35.235.240.0/20
-   gcloud compute ssh jig-vps --zone=us-central1-a --tunnel-through-iap
+   gcloud compute ssh jig-vps --zone=us-west1-a --tunnel-through-iap
    ```
    **It must be the IAP range, not `<YOUR_IP>/32`.** The box has no external
    address, so a rule scoped to your own IP allows traffic that can never
@@ -435,7 +435,7 @@ guest OS. Your break-glass options, best first:
    advance or it is useless in the moment:
    ```bash
    gcloud compute instances add-metadata jig-vps --metadata=serial-port-enable=TRUE
-   gcloud compute connect-to-serial-port jig-vps --zone=us-central1-a
+   gcloud compute connect-to-serial-port jig-vps --zone=us-west1-a
    ```
 
 Because option 1 exists, deleting the SSH rule is low-risk. Do it.
@@ -642,8 +642,13 @@ sudo tailscale cert \
   --cert-file /var/lib/jig/tls/$HOST.crt \
   --key-file  /var/lib/jig/tls/$HOST.key \
   "$HOST"
-sudo chown jig:jig /var/lib/jig/tls/*
-sudo chmod 600 /var/lib/jig/tls/*.key
+# NOT `sudo chown jig:jig /var/lib/jig/tls/*` — your shell expands the glob
+# BEFORE sudo runs, and the directory is 0750 jig:jig, so an unprivileged
+# shell cannot list it. The glob stays literal and chown reports
+# "cannot access '/var/lib/jig/tls/*': No such file or directory" while the
+# files are sitting there perfectly. sudo elevates the command, not the globbing.
+sudo chown -R jig:jig /var/lib/jig/tls
+sudo sh -c 'chmod 600 /var/lib/jig/tls/*.key'
 ```
 
 Wire it into the server's existing `[tls]` block in `/etc/jig/config.toml` — the
@@ -725,7 +730,10 @@ encrypted. Do not "fix" it by putting a reverse proxy in front.
 
 ## 6. Cost — approximate, confirm in the console
 
-All figures: `us-central1`, on-demand list price, **before** E2's automatic
+All figures were quoted for `us-central1` and are left as-is rather than
+silently relabelled — **the deploy is `us-west1`, where prices differ slightly.**
+Treat these as the right order of magnitude, not the bill. On-demand list price,
+**before** E2's automatic
 sustained-use discount (up to ~20% for a full month). **These are estimates and
 may be out of date. Verify at cloud.google.com/products/calculator.**
 
@@ -785,7 +793,7 @@ Note that `cargo` downloads and `apt` are **ingress**, which is free.
 ### Pause it while traveling
 
 ```bash
-gcloud compute instances stop jig-vps --zone=us-central1-a
+gcloud compute instances stop jig-vps --zone=us-west1-a
 ```
 
 A **stopped** instance bills **no vCPU and no RAM** — you keep paying only for
@@ -794,7 +802,7 @@ IP. The Tailscale node, `/var/lib/jig`, and `server.key` all persist. Start it
 again with:
 
 ```bash
-gcloud compute instances start jig-vps --zone=us-central1-a
+gcloud compute instances start jig-vps --zone=us-west1-a
 ```
 
 Give it ~60 seconds; the units order after `tailscaled` and will retry once the
@@ -804,15 +812,15 @@ Give it ~60 seconds; the units order after `tailscaled` and will retry once the
 
 ```bash
 # check what you would destroy first
-gcloud compute instances describe jig-vps --zone=us-central1-a \
+gcloud compute instances describe jig-vps --zone=us-west1-a \
   --format='value(disks[].deviceName,disks[].autoDelete)'
 
-gcloud compute instances delete jig-vps --zone=us-central1-a   # boot disk goes with it by default
+gcloud compute instances delete jig-vps --zone=us-west1-a   # boot disk goes with it by default
 
 # Cloud NAT + its router bill independently of the VM, and `networks delete`
 # refuses while they exist. Remove them before the network, in this order.
-gcloud compute routers nats delete jig-nat --router=jig-nat-router --region=us-central1
-gcloud compute routers delete jig-nat-router --region=us-central1
+gcloud compute routers nats delete jig-nat --router=jig-nat-router --region=us-west1
+gcloud compute routers delete jig-nat-router --region=us-west1
 
 gcloud compute firewall-rules delete jig-iap-ssh   # if you re-added it for break-glass
 gcloud compute networks delete jig-net
@@ -867,7 +875,7 @@ same disk as the thing it is backing up."*
 
 ```bash
 gcloud storage buckets create gs://<PROJECT_ID>-jig-backups \
-  --location=us-central1 \
+  --location=us-west1 \
   --uniform-bucket-level-access \
   --public-access-prevention \
   --soft-delete-duration=30d
@@ -910,12 +918,12 @@ Attach it to the VM. **The instance must be stopped**, so fold this into the
 resize you are already doing:
 
 ```bash
-gcloud compute instances stop jig-vps --zone=us-central1-a
-gcloud compute instances set-service-account jig-vps --zone=us-central1-a \
+gcloud compute instances stop jig-vps --zone=us-west1-a
+gcloud compute instances set-service-account jig-vps --zone=us-west1-a \
   --service-account="$SA" --scopes=https://www.googleapis.com/auth/devstorage.read_write
-gcloud compute instances set-machine-type jig-vps --zone=us-central1-a \
+gcloud compute instances set-machine-type jig-vps --zone=us-west1-a \
   --machine-type=e2-small
-gcloud compute instances start jig-vps --zone=us-central1-a
+gcloud compute instances start jig-vps --zone=us-west1-a
 ```
 
 (The `devstorage.read_write` scope is a ceiling, not a grant — IAM still limits
