@@ -21,7 +21,9 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Duration, Utc};
-use rand::{Rng, distributions::Alphanumeric};
+// rand 0.10: the `distributions` module is now `distr`, and `sample` lives on
+// the `RngExt` extension trait rather than on `Rng` itself.
+use rand::{RngExt, distr::Alphanumeric};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
@@ -649,7 +651,7 @@ async fn mint_alias(
     let ttl = req.ttl_seconds.unwrap_or(3600);
     let expires_at = Utc::now() + Duration::seconds(ttl);
     let rand_part: String = {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         (0..8)
             .map(|_| char::from(rng.sample(Alphanumeric)))
             .collect()

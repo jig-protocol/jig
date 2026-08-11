@@ -133,7 +133,7 @@ impl AppState {
 
         let store = Arc::new(SqliteStore::open_in_memory()?);
         let mut secret = [0u8; 32];
-        rand::thread_rng().fill(&mut secret);
+        rand::rng().fill_bytes(&mut secret);
         let signing_key = SigningKey::from_bytes(&secret);
         let ns_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
 
@@ -271,7 +271,7 @@ fn load_or_generate_server_key(path: &str) -> Result<SigningKey> {
             std::fs::create_dir_all(parent)?;
         }
         let mut secret = [0u8; 32];
-        rand::thread_rng().fill(&mut secret);
+        rand::rng().fill_bytes(&mut secret);
         let signing = SigningKey::from_bytes(&secret);
         std::fs::write(path, signing.to_bytes())?;
         #[cfg(unix)]

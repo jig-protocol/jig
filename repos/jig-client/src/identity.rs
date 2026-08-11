@@ -73,7 +73,10 @@ impl Identity {
     pub fn generate_and_save(keys_dir: &Path) -> Result<Self, IdentityError> {
         std::fs::create_dir_all(keys_dir)?;
         let mut secret = [0u8; 32];
-        rand::Rng::fill(&mut rand::thread_rng(), &mut secret);
+        // rand 0.10: `thread_rng()` -> `rng()`, and the raw byte-filling method
+        // moved from the old `Rng` extension trait (now `RngExt::fill`) to
+        // `Rng::fill_bytes`. Still the OS-seeded ChaCha `ThreadRng`, unchanged.
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut secret);
         let signing = SigningKey::from_bytes(&secret);
         let did = Did::from_ed25519_pubkey(signing.verifying_key().as_bytes());
         let path = keys_dir.join(format!("{}.key", did.to_did_jig_string()));

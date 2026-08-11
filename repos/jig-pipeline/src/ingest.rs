@@ -157,12 +157,13 @@ pub async fn ingest(
         Some(slug) => ctx.store.get_channel_by_slug(slug)?,
         None => None,
     };
-    if let Some(slug) = channel_slug {
-        if resolved_channel.is_none() && requires_existing_channel(kind, &source) {
-            return Err(IngestError::UnknownChannel {
-                slug: slug.to_string(),
-            });
-        }
+    if let Some(slug) = channel_slug
+        && resolved_channel.is_none()
+        && requires_existing_channel(kind, &source)
+    {
+        return Err(IngestError::UnknownChannel {
+            slug: slug.to_string(),
+        });
     }
 
     // Step 3: HLC update on receive
@@ -246,10 +247,10 @@ pub async fn ingest(
     // resolved slug -> row for kinds carrying metadata["channel"]; re-resolve
     // only for channel-create, whose row is written by apply_effect above (and
     // whose slug lives under metadata["slug"], not metadata["channel"]).
-    if resolved_channel.is_none() {
-        if let Some(slug) = stored_block.channel_id.as_deref() {
-            resolved_channel = ctx.store.get_channel_by_slug(slug).unwrap_or_default();
-        }
+    if resolved_channel.is_none()
+        && let Some(slug) = stored_block.channel_id.as_deref()
+    {
+        resolved_channel = ctx.store.get_channel_by_slug(slug).unwrap_or_default();
     }
     let member_dids: Vec<String> = match &resolved_channel {
         Some(chan) => ctx
