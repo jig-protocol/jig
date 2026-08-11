@@ -1,6 +1,7 @@
 # Is `fuel_used` a protocol quantity? — investigation for #33
 
-**Status:** findings below are settled except where marked *pending matrix*.
+**Status:** settled. The cross-platform matrix has run; results in Finding 2.
+My leading hypothesis (a wall-clock deadline) was **wrong** and is retracted there.
 **Blocks:** receipt work (PR-B of the Wasm execution series).
 **Trigger:** CI reported `fuel_used=1713` for a module whose golden says `18098`
 — same module bytes, same wasmtime 47.0.3, same rustc 1.97.1.
@@ -53,28 +54,62 @@ servers agree on.** Making it one would require pinning a single runtime *and*
 version protocol-wide — the exact lock-in we are trying to avoid, and a hard
 ceiling on who can implement a conforming server.
 
-## Finding 2 — the observed 10x is almost certainly ours, not the architecture
+## Finding 2 — the matrix results, and the retraction of my leading hypothesis
 
-*Pending matrix confirmation.*
+I predicted the 10x came from our own wall-clock deadline: jig-runtime enables
+`epoch_interruption(true)` **alongside** fuel with a 250 ms default
+(`config.rs:108`), and wasmtime's guide names epoch interruption as the
+non-deterministic alternative to fuel. **The matrix disproves that as the cause.**
 
-jig-runtime enables `epoch_interruption(true)` **alongside** fuel, with a default
-`execution_timeout_ms` of **250 ms** (`config.rs:108`).
-`schedule_epoch_interrupt` spawns a thread that sleeps for the timeout then calls
-`increment_epoch()`, and the store is armed with `set_epoch_deadline(1)` — so the
-first increment traps the guest.
+Same committed module, generous 30 s budget, `outcome=Success` on every row:
 
-Wasmtime's determinism guide names **epoch-based interruption as the
-non-deterministic alternative to fuel**. Mixing the two means a wall-clock timer
-can cut a run short, and the fuel counter then honestly reports a *partial*
-execution. `fuel_used` becomes a function of how fast and how loaded the host was.
+| Host | `hello_wasi` (imports WASI) | `deterministic` (no imports) |
+|---|---|---|
+| aarch64 macOS | **18098** | **2512** |
+| x86_64 Windows | **9906** | **2512** |
+| aarch64 Linux | **1713** | **2512** |
+| x86_64 Linux | **1713** | **2512** |
 
-The numbers fit: 1713 is a fraction of 18098, and CI ran ~1232 tests in parallel
-on a shared runner where a 250 ms budget is easily blown. Not reproducible on an
-idle 12-core laptop — even a 1 ms budget completes at 18098 there, which is why
-this needs the matrix rather than local measurement.
+And the wall-clock sweep is **flat on every platform** from 5 ms through 1000 ms —
+1713 stays 1713, 9906 stays 9906, 18098 stays 18098. A deadline-truncation story
+would have produced budget-dependent numbers. It did not.
 
-If confirmed, **no multi-currency mechanism is needed for this defect.** The fix
-is to stop letting a wall-clock timer decide how much of a program runs.
+Two things fall out, and they matter more than the original hypothesis:
+
+**1. Fuel for a no-import module is portable.** `deterministic` is 2512 on all
+four hosts, across two architectures and three operating systems. So fuel is not
+inherently host-dependent.
+
+**2. The divergence tracks the host OS, not the architecture.** Both Linux hosts
+agree exactly (1713 on aarch64 and x86_64) while the two aarch64 hosts disagree by
+10x (1713 Linux vs 18098 macOS). Architecture is not the variable; the platform's
+WASI implementation is.
+
+The mechanism is **not established**. The module bytes are identical and the WASI
+context is hermetic (empty env and args, memory pipes for stdio), so the guest
+ought to execute the same instructions. Something in the host WASI surface must be
+returning different results during Rust's `_start` initialisation, causing the
+guest to run different amounts of code. Worth knowing, but not needed for the
+decision below.
+
+The deadline is still a real hazard — the 1 ms rows on both Linux hosts failed
+with `ExecutionFailed` at 63 and 0 fuel — just not the cause of this spread. See
+Finding 3.
+
+### Why this is good news
+
+jig's byte-payload convention **instantiates with an empty import list**, so a
+module importing WASI cannot be loaded at all. Canonical blocks are pure
+no-import modules built for `wasm32-unknown-unknown`.
+
+That means the divergence lives entirely in a class of module jig already refuses
+to execute, and for the blocks jig actually runs, fuel is portable across every
+host measured. The no-imports policy was added in PR #32 as a *security*
+property; it turns out to be the *determinism* property too.
+
+This does not rescue fuel as a protocol quantity — Finding 1's version and
+cross-runtime arguments are untouched by any of this — but it does mean fuel is a
+usable local metric rather than noise.
 
 ## Finding 3 — a truncated run is indistinguishable from a guest fault
 
@@ -102,8 +137,14 @@ by panicking inside its harness, which means
 > receipt describing a failed run.
 
 So contention does not merely change the fuel number — it can make execution fail
-entirely. A single idle machine reproduces this; no cross-architecture explanation
-is required, which is strong corroboration for Finding 2 ahead of the matrix.
+entirely, on a single idle machine, with no cross-architecture explanation needed.
+
+At the time I read this as corroborating the wall-clock hypothesis. It is not:
+the matrix showed fuel to be flat across budgets on every host, so contention
+*failing* a run and contention *changing its fuel* are separate effects. This
+finding stands on its own — an execution path that returns `Err` under load is a
+problem for ingest regardless of what it does to fuel — but it is not evidence
+about the cause of #33's divergence, and I over-read it as such.
 
 It also means an ingest path calling `execute` under load gets an error rather
 than a receipt, so "the server was busy" and "the block is invalid" arrive at the
@@ -151,20 +192,29 @@ schema work makes them otherwise.
 5. **Do not regenerate the WASI golden** to make CI green. It would assert the
    other platform's number and hide all of the above.
 
-## What the matrix settles
+## What the matrix settled
 
-`.github/workflows/fuel-portability.yml` runs the same module across
-x86_64-linux, aarch64-linux, aarch64-macOS, and x86_64-Windows on otherwise idle
-runners with a generous budget, plus a deliberately CPU-loaded run.
+`.github/workflows/fuel-portability.yml` ran the same module on four hosts, idle
+and loaded. Results are in Finding 2. Summarising against the branches I wrote
+before seeing them:
 
-- **Reference rows identical across platforms** → Finding 2 confirmed; the cause
-  is our config, and recommendations 3 and 4 are the fix.
-- **Reference rows differ per platform** → fuel diverges at the engine level too.
-  Findings 1 and 3 and recommendations 1, 2, 5 stand regardless; only the
-  additional question of whether even same-version-same-engine fuel is portable
-  changes, and recommendation 2 becomes load-bearing rather than tidy.
-- **`fuel_is_stable_under_host_load` fails while references agree** → direct
-  confirmation that contention alone moves fuel.
+- **Reference rows identical across platforms** — happened for the no-import
+  module (2512 everywhere), NOT for the WASI module.
+- **Reference rows differ per platform** — happened for the WASI module, and by
+  OS rather than architecture. But since jig refuses to load modules with imports,
+  this does not affect the blocks jig executes.
+- **`fuel_is_stable_under_host_load` fails** — it did **not** fail on any host, so
+  contention alone does not move fuel at realistic budgets.
+
+Net effect on the recommendations: **1, 2, 4 and 5 stand unchanged.** Number 3
+(deterministic termination) drops from "the fix" to "a real but separate hazard" —
+worth doing, since a 1 ms budget produced `ExecutionFailed` at 63 fuel on Linux,
+but it is not what caused #33's divergence.
+
+The remaining open question is narrow and does not block receipts: *why* does an
+identical module with a hermetic WASI context execute a different number of
+instructions per host OS? Answering it would let us decide whether WASI blocks
+could ever be admitted, which is not a v0.0.x question.
 
 ## Sources
 
