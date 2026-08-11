@@ -22,8 +22,10 @@ use serde_json;
 /// This is the primary interface for executing WebAssembly modules
 /// with deterministic, capability-secured, fuel-metered execution.
 pub struct Runtime {
-    config: RuntimeConfig,
-    engine: WasmEngine,
+    // pub(crate) so the byte-payload convention in `crate::payload` can reuse
+    // the same engine and limits rather than standing up a second one.
+    pub(crate) config: RuntimeConfig,
+    pub(crate) engine: WasmEngine,
 }
 
 impl Runtime {

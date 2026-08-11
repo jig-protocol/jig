@@ -12,7 +12,9 @@ path = "src/lib.rs"
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }
+# See the workspace-level comment: serde_json would make this module fail
+# jig-core's determinism validation, because its number parser links f64 code.
+postcard = { workspace = true }
 unicode-normalization = "0.1"
 blake3 = { workspace = true }
 

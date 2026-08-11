@@ -49,3 +49,9 @@ time = { version = "0.3", features = ["serde"] }
 [dev-dependencies]
 tokio = { version = "1.35", features = ["rt", "macros"] }
 wat = "1.0"
+# For tests/text_block_payload.rs, which runs the real canonical module through
+# the byte-payload convention. text-block depends on no workspace crate, so this
+# adds no cycle; jig-runtime does not depend on it outside tests.
+text-block = { path = "../text-block" }
+# The block ABI codec; the test encodes Input and decodes Output host-side.
+postcard = { workspace = true }

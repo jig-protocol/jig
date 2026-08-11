@@ -39,10 +39,12 @@ jobs:
         with:
           workspaces: repos
       - name: Format (v0.0.2 surface)
-        # Scoped to v0.0.2-touched crates. Pre-existing legacy crates
-        # (jig-runtime, jig-spec, jig-gui/*) may have upstream formatting
-        # drift; not gating on those here. jig-bridge-email is now first-class
-        # (alpha.email rewrote it as an in-process library) so it's gated.
+        # Scoped to v0.0.2-touched crates. jig-spec and jig-gui/* may still have
+        # upstream formatting drift and are not gated. jig-bridge-email is
+        # first-class (alpha.email rewrote it as an in-process library), and
+        # jig-runtime joined the gate when the byte-payload convention landed
+        # there — it is verified clean, and it is no longer a crate we can afford
+        # to leave unchecked now that block execution lives in it.
         run: |
           cargo fmt --check \
             -p jig-core \
@@ -52,6 +54,7 @@ jobs:
             -p jig-server \
             -p jig-nameserver \
             -p jig-cli \
+            -p jig-runtime \
             -p text-block \
             -p integration-tests \
             -p jig-bridge-core \
@@ -65,9 +68,11 @@ jobs:
             -p jig-config \
             -p jig-pipeline \
             -p jig-client \
+            -p jig-runtime \
             -p text-block \
             -p integration-tests \
             -p jig-bridge-core \
+            --all-targets \
             -- -D warnings
       - name: Clippy (jig-bridge-core web feature)
         # The webhook-mount path (RouterMount + cfg'd BridgeContext field) is
@@ -88,6 +93,7 @@ jobs:
             -p jig-server \
             -p jig-nameserver \
             -p jig-cli \
+            -p jig-runtime \
             -p text-block \
             -p integration-tests \
             -p jig-bridge-core \
@@ -96,23 +102,44 @@ jobs:
         run: cargo nextest run -p jig-bridge-core --features web
 
   wasm-build:
-    name: wasm-build (text-block, wasm32-wasip1)
+    name: wasm-build (text-block, wasm32-unknown-unknown)
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-wasip1
+          # NOT wasm32-wasip1. text-block is a pure function; the
+          # unknown-unknown target emits a module with no imports, which is what
+          # lets jig-runtime instantiate it under a no-imports policy. A wasip1
+          # build imports wasi_snapshot_preview1 and gets rejected at load.
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: repos
-          key: wasm32-wasip1
-      - name: Build text-block (wasm32-wasip1)
-        run: cargo build --release --target wasm32-wasip1 -p text-block
-      - name: Verify wasm artifact exists
+          key: wasm32-unknown-unknown
+      - name: Install wasm-tools
+        run: cargo install wasm-tools --locked
+      # The committed artifact is what jig-pipeline embeds and executes, so it
+      # has to be the artifact this source actually produces. Rebuild it and
+      # require byte-identity: otherwise the module that runs in production can
+      # drift from the code reviewers read, and `render_hash` provenance —
+      # the whole point of the module identity — becomes a guess.
+      #
+      # build-artifact.sh also fails on any float instruction in the module,
+      # which is what a switch back to serde_json would reintroduce.
+      - name: Rebuild the canonical artifact
+        working-directory: repos
+        run: ./text-block/build-artifact.sh
+      - name: Committed artifact must match a fresh build
         working-directory: .
-        run: test -f repos/target/wasm32-wasip1/release/text_block.wasm
+        run: |
+          if ! git diff --exit-code -- repos/text-block/artifacts/text_block.wasm; then
+            echo "::error::repos/text-block/artifacts/text_block.wasm is stale."
+            echo "Run repos/text-block/build-artifact.sh and commit the result."
+            exit 1
+          fi
+          echo "committed artifact matches a fresh build"
 
   # Renamed from `license-compliance`: bare `cargo deny check` runs ALL FOUR
   # checks (advisories, bans, licenses, sources). The old name once sent a
