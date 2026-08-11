@@ -72,12 +72,12 @@ impl Identity {
     /// `create_dir_all` if missing.
     pub fn generate_and_save(keys_dir: &Path) -> Result<Self, IdentityError> {
         std::fs::create_dir_all(keys_dir)?;
-        let mut secret = [0u8; 32];
-        // rand 0.10: `thread_rng()` -> `rng()`, and the raw byte-filling method
-        // moved from the old `Rng` extension trait (now `RngExt::fill`) to
-        // `Rng::fill_bytes`. Still the OS-seeded ChaCha `ThreadRng`, unchanged.
-        rand::Rng::fill_bytes(&mut rand::rng(), &mut secret);
-        let signing = SigningKey::from_bytes(&secret);
+        // Keygen lives in jig-core, deliberately: this call and the nameserver's
+        // are the protocol's only two identity-minting sites, and they used to
+        // pick their own RNGs (this one reached for `rand::rng()`, a userspace
+        // ChaCha PRNG, for a key that lives forever on disk). `jig-client` no
+        // longer depends on `rand` at all, so that cannot drift back.
+        let signing = jig_core::crypto::ed25519::generate_signing_key();
         let did = Did::from_ed25519_pubkey(signing.verifying_key().as_bytes());
         let path = keys_dir.join(format!("{}.key", did.to_did_jig_string()));
         std::fs::write(&path, signing.to_bytes())?;
@@ -234,6 +234,41 @@ mod tests {
         // The identity can sign (no panic, produces a 64-byte sig).
         let sig = id.sign(b"hello");
         assert_eq!(sig.to_bytes().len(), 64);
+    }
+
+    /// Keyfile format freeze.
+    ///
+    /// `generate_and_save` changed which RNG mints the seed; `load_from_dir` did
+    /// not change at all, and it must not. This writes the same 32-byte seed that
+    /// `jig-core`'s `signing_stability` vectors use and asserts it loads to the
+    /// same DID those vectors pin — so an existing `~/.jig/keys/<did>.key` from
+    /// before the keygen consolidation still resolves to its original identity.
+    ///
+    /// A failure here means already-issued identities were renamed. It is not a
+    /// fixture to refresh.
+    #[test]
+    fn a_preexisting_keyfile_still_loads_to_its_original_did() {
+        const SEED: [u8; 32] = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32,
+        ];
+        const GOLDEN_DID: &str = "did:jig:zpg2vmlup4zkpsqdywejorkmlu6ib7bj242k35v7a4oiqxlieszsa";
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(format!("{GOLDEN_DID}.key"));
+        std::fs::write(&path, SEED).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let id = Identity::load_from_dir(dir.path(), GOLDEN_DID).unwrap();
+        assert_eq!(
+            id.did_string(),
+            GOLDEN_DID,
+            "a keyfile from before the keygen change loads as a different identity"
+        );
     }
 
     #[test]

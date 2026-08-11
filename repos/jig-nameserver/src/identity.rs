@@ -2,11 +2,6 @@
 
 use crate::error::Result;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-// rand 0.10 renamed `RngCore` -> `Rng` and replaced `rngs::OsRng` with a
-// re-export of getrandom's `SysRng`, which is fallible-only (`TryRng`). This is
-// the nameserver's long-lived signing identity, so it must come from the OS
-// CSPRNG — not `rand::rng()` and never a seedable RNG.
-use rand::{TryRng, rngs::SysRng};
 use rusqlite::{Connection, params};
 use std::path::PathBuf;
 
@@ -46,14 +41,10 @@ pub fn get_or_create(db_path: &PathBuf) -> Result<NsIdentity> {
         }
     }
 
-    // Create new
-    let mut seed = [0u8; 32];
-    // rand 0.8's `OsRng` panicked internally on entropy failure; `expect` keeps
-    // that contract instead of persisting a key from a degraded source.
-    SysRng
-        .try_fill_bytes(&mut seed)
-        .expect("OS CSPRNG must be available to generate the nameserver identity");
-    let sk = SigningKey::from_bytes(&seed);
+    // Create new. Keygen lives in jig-core so the nameserver's long-lived
+    // signing identity and client identities cannot drift apart; see
+    // `jig_core::crypto::ed25519::generate_signing_key` for the entropy choice.
+    let sk = jig_core::crypto::ed25519::generate_signing_key();
     let pk = sk.verifying_key();
     conn.execute(
         "INSERT OR REPLACE INTO ns_identity(id, secret, public) VALUES (1, ?1, ?2)",
