@@ -420,7 +420,7 @@ mod tests {
 
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let mut secret = [0u8; 32];
-        rand::thread_rng().fill(&mut secret);
+        rand::rng().fill_bytes(&mut secret);
         let signing_key = SigningKey::from_bytes(&secret);
         let server_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
         let identity = Arc::new(TofuResolver::new(store.clone()));

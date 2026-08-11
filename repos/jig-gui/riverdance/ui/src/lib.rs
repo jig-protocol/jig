@@ -22,19 +22,18 @@ pub use state::{
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
+    /// Naming each public export binds it, so this fails to compile if one is
+    /// renamed or dropped. That is the whole of what this crate can check
+    /// without a component-rendering harness — the previous `assert!(true)`
+    /// bodies asserted nothing and tripped `clippy::assertions_on_constants`.
     #[test]
-    fn test_module_exports() {
-        // Basic smoke test to ensure modules can be imported
-        // This will be expanded as we add more functionality
-        assert!(true, "Module exports work correctly");
-    }
+    fn every_public_export_is_reachable() {
+        use super::{
+            use_app_state, AppState, Channel, ChannelType, ChatView, Echo, Hero, Message,
+            MessageType, Navbar, RiverdanceLayout, User, UserStatus,
+        };
 
-    #[test]
-    fn test_component_structure() {
-        // Test that our core components exist and are properly exported
-        // In a real UI test framework, we'd render these components
-        assert!(true, "Component structure is valid");
+        let _ = (Hero, Navbar, Echo, RiverdanceLayout, ChatView, use_app_state);
+        type _Types = (AppState, Channel, ChannelType, Message, MessageType, User, UserStatus);
     }
 }

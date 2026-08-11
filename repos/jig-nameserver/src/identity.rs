@@ -2,8 +2,11 @@
 
 use crate::error::Result;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand::RngCore;
-use rand::rngs::OsRng;
+// rand 0.10 renamed `RngCore` -> `Rng` and replaced `rngs::OsRng` with a
+// re-export of getrandom's `SysRng`, which is fallible-only (`TryRng`). This is
+// the nameserver's long-lived signing identity, so it must come from the OS
+// CSPRNG — not `rand::rng()` and never a seedable RNG.
+use rand::{TryRng, rngs::SysRng};
 use rusqlite::{Connection, params};
 use std::path::PathBuf;
 
@@ -44,9 +47,12 @@ pub fn get_or_create(db_path: &PathBuf) -> Result<NsIdentity> {
     }
 
     // Create new
-    let mut csprng = OsRng;
     let mut seed = [0u8; 32];
-    csprng.fill_bytes(&mut seed);
+    // rand 0.8's `OsRng` panicked internally on entropy failure; `expect` keeps
+    // that contract instead of persisting a key from a degraded source.
+    SysRng
+        .try_fill_bytes(&mut seed)
+        .expect("OS CSPRNG must be available to generate the nameserver identity");
     let sk = SigningKey::from_bytes(&seed);
     let pk = sk.verifying_key();
     conn.execute(

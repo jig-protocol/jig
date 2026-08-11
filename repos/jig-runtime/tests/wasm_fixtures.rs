@@ -215,7 +215,7 @@ fn test_fuel_exhaustion_with_nested_loops() {
 
 #[test]
 fn test_all_fixtures_have_unique_hashes() {
-    let fixtures = vec![
+    let fixtures = [
         fixture_empty(),
         fixture_sum_loop(),
         fixture_memory_usage(),

@@ -131,7 +131,7 @@ pub(crate) fn verify_proof_of_control(
 pub async fn get_challenge(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let mut nonce = [0u8; 32];
     use rand::Rng;
-    rand::thread_rng().fill(&mut nonce);
+    rand::rng().fill_bytes(&mut nonce);
     let nonce_hex = hex::encode(nonce);
     state.remember_challenge(&nonce_hex).await;
     Json(serde_json::json!({ "challenge": nonce_hex }))
@@ -258,7 +258,7 @@ mod tests {
     fn fresh_did_and_key() -> (String, SigningKey) {
         use rand::Rng;
         let mut secret = [0u8; 32];
-        rand::thread_rng().fill(&mut secret);
+        rand::rng().fill_bytes(&mut secret);
         let key = SigningKey::from_bytes(&secret);
         let did = Did::from_ed25519_pubkey(key.verifying_key().as_bytes());
         (did.to_did_jig_string(), key)

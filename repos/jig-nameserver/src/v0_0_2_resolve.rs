@@ -94,7 +94,7 @@ mod tests {
     fn fresh_did_and_key() -> (String, SigningKey) {
         use rand::Rng;
         let mut secret = [0u8; 32];
-        rand::thread_rng().fill(&mut secret);
+        rand::rng().fill_bytes(&mut secret);
         let key = SigningKey::from_bytes(&secret);
         let did = Did::from_ed25519_pubkey(key.verifying_key().as_bytes());
         (did.to_did_jig_string(), key)

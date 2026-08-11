@@ -270,8 +270,8 @@ mod tests {
 
         // Generate a key using from_bytes (ed25519-dalek 2.x API)
         use ed25519_dalek::SigningKey;
-        use rand::RngCore;
-        let mut rng = rand::thread_rng();
+        use rand::Rng; // rand 0.10 renamed the `RngCore` trait to `Rng`
+        let mut rng = rand::rng();
         let mut seed = [0u8; 32];
         rng.fill_bytes(&mut seed);
         let signing_key = SigningKey::from_bytes(&seed);
@@ -283,10 +283,10 @@ mod tests {
     #[test]
     fn test_signature_verification_roundtrip() {
         use ed25519_dalek::SigningKey;
-        use rand::RngCore;
+        use rand::Rng; // rand 0.10 renamed the `RngCore` trait to `Rng`
 
         // Generate key pair
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut seed = [0u8; 32];
         rng.fill_bytes(&mut seed);
         let signing_key = SigningKey::from_bytes(&seed);
