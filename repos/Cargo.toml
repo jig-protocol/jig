@@ -55,6 +55,18 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Wire codec for the Wasm block ABI.
+#
+# NOT serde_json, deliberately. serde_json's number parser drags f64 code into
+# every module that links it (`f64_from_parts`, `parse_number`,
+# `parse_exponent_overflow`), and jig-core's determinism validator rejects any
+# module containing float instructions — so a JSON ABI made the canonical
+# text-block unrunnable even though its types hold no floats. postcard keeps
+# `#[derive(Serialize, Deserialize)]` ergonomics for block authors, emits zero
+# float instructions, and is more compact. Codec choice does not affect
+# `render_hash`, which is computed over the canonical text, not the encoded bytes.
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+
 # Crypto
 ed25519-dalek = "3.0"
 x25519-dalek = "2.0"

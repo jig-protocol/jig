@@ -5,6 +5,8 @@
 //! message, hashes the output as `render_hash`, and uses that hash as
 //! the federation-side parity check.
 
+pub mod canonical;
+
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
@@ -154,19 +156,89 @@ fn render_safe_html(text: &str) -> String {
     html
 }
 
+/// Guest-side allocator exports.
+///
+/// [`execute`] documents that the caller owns the input and output buffers, but
+/// a host cannot honour that without a way to obtain an address inside this
+/// module's linear memory. Picking a raw address and hoping it is unused is
+/// unsound — it can land on the shadow stack or on live allocator state. These
+/// two exports are the supported way in.
+///
+/// Deliberately named `jig_alloc`/`jig_dealloc` rather than `alloc`/`free`, so
+/// they cannot be confused with (or shadowed by) the WASI libc symbols that
+/// `wasm32-wasip1` links in.
+///
+/// Every pointer returned here must be released with [`jig_dealloc`] using the
+/// SAME length that was passed to [`jig_alloc`]: the allocation is made with an
+/// explicit `Layout`, so a mismatched size is undefined behaviour rather than a
+/// tolerated leak.
+mod abi {
+    use std::alloc::{Layout, alloc, dealloc};
+
+    /// Reserve `len` bytes and hand the host the address. Returns null on a
+    /// zero length or an invalid layout, which the host must treat as failure.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn jig_alloc(len: usize) -> *mut u8 {
+        if len == 0 {
+            return std::ptr::null_mut();
+        }
+        // Align 1: these are opaque byte buffers (JSON), never typed values.
+        match Layout::from_size_align(len, 1) {
+            // SAFETY: layout has non-zero size, checked above.
+            Ok(layout) => unsafe { alloc(layout) },
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// Release a buffer from [`jig_alloc`].
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must have come from `jig_alloc(len)` with the same `len`, and must
+    /// not have been freed already.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn jig_dealloc(ptr: *mut u8, len: usize) {
+        if ptr.is_null() || len == 0 {
+            return;
+        }
+        if let Ok(layout) = Layout::from_size_align(len, 1) {
+            // SAFETY: caller guarantees ptr came from jig_alloc with this len.
+            unsafe { dealloc(ptr, layout) };
+        }
+    }
+}
+
 /// Wasm entry point.
 ///
 /// Reads serialized [`Input`] JSON from `input_ptr/input_len`, writes
 /// serialized [`Output`] JSON to `out_ptr/out_len`. Returns 0 on success,
-/// nonzero on failure. The host caller is responsible for the memory layout.
+/// nonzero on failure. The host caller is responsible for the memory layout;
+/// see [`abi`] for the allocator exports that make that possible.
+///
+/// Return codes are part of the ABI contract, not just diagnostics:
+/// `0` success, `1` input did not decode as an `Input`, `2` output failed to
+/// encode, `3` the output buffer was too small — in which case `*out_len_ptr`
+/// is overwritten with the REQUIRED length so the host can retry with a
+/// correctly sized buffer.
 ///
 /// This is a thin wrapper around [`execute_pure`]; pure-Rust unit tests
 /// exercise `execute_pure` directly, and the Wasm runtime exercises this
 /// function from inside the sandbox.
 ///
+/// # Encoding
+///
+/// postcard, not JSON. `serde_json`'s number parser links f64 code into any
+/// module that uses it, and jig-core's determinism validator rejects modules
+/// containing float instructions — so a JSON ABI made this module unrunnable
+/// despite [`Input`] and [`Output`] holding no floats. postcard keeps the same
+/// derive-based ergonomics and emits none.
+///
+/// This choice cannot move any `render_hash`: the hash is taken over
+/// `canonical_text`, not over the encoded bytes.
+///
 /// # Safety
 ///
-/// - `input_ptr` must point to `input_len` valid UTF-8 bytes (JSON-encoded `Input`).
+/// - `input_ptr` must point to `input_len` readable bytes (a postcard-encoded `Input`).
 /// - `out_ptr` must point to a buffer of at least `*out_len_ptr` bytes.
 /// - `out_len_ptr` must be a valid mutable pointer to a `usize`.
 /// - All pointers must remain valid for the duration of this call.
@@ -180,12 +252,12 @@ pub unsafe extern "C" fn execute(
 ) -> i32 {
     // SAFETY: caller guarantees input_ptr..input_ptr+input_len is valid for reads
     let input_slice = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-    let input: Input = match serde_json::from_slice(input_slice) {
+    let input: Input = match postcard::from_bytes(input_slice) {
         Ok(i) => i,
         Err(_) => return 1,
     };
     let output = execute_pure(&input);
-    let bytes = match serde_json::to_vec(&output) {
+    let bytes = match postcard::to_allocvec(&output) {
         Ok(b) => b,
         Err(_) => return 2,
     };
