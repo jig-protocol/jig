@@ -63,9 +63,27 @@ git clone git@github.com:jig-protocol/jig.git && cd jig/repos
 cargo +stable build -p jig-cli
 ```
 
-The binary lands at `repos/target/debug/jig`. Copy it somewhere on your `PATH` (e.g.
-`~/bin/jig`) so you can type `jig` instead of the full path. jig needs Rust 1.94 or newer;
-`+stable` makes sure you get a new enough one.
+The binary lands at **`repos/target/debug/jig`** — the *workspace* target directory. Copy
+it somewhere on your `PATH` (e.g. `~/bin/jig`) so you can type `jig` instead of the full
+path. jig needs Rust 1.94 or newer; `+stable` makes sure you get a new enough one.
+
+> **Run the right binary.** Older checkouts may have a stale per-crate build at
+> `repos/jig-cli/target/release/jig`. That path is **not** the current CLI and can be a
+> year out of date. The giveaway is that `jig init yourname` rejects the name:
+>
+> ```
+> error: unexpected argument 'yourname' found
+> ```
+>
+> and `~/.jig/config.toml` appears instead of `~/.jig/cli.toml`. If you see either, you
+> are running the old binary — use `repos/target/debug/jig`. Confirm with:
+>
+> ```bash
+> jig --help | head -3
+> ```
+>
+> The current CLI lists `chat`, `channel`, and `ns` among its commands. The old one does
+> not. A leftover `~/.jig/config.toml` is harmless — the current CLI never reads it.
 
 ## First run
 

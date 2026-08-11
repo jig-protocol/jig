@@ -155,7 +155,7 @@ port          = 7117
 [server]                                   # these drive JigServerConfig
 listen              = "100.x.y.z:7117"     # cosmetic only — does NOT bind
 server_did_keyfile  = "/var/lib/jig/server.key"
-allowed_block_kinds = ["text-render", "channel-create", "member-add"]
+allowed_block_kinds = ["text-render", "channel-create", "member-add", "channel-archive"]
 
 [identity]
 mode = "tofu"

@@ -176,6 +176,38 @@ fn history_sql(with_cursor: bool) -> String {
     }
 }
 
+/// Additively add `column` to `table` when an older database predates it.
+///
+/// SQLite has no `ADD COLUMN IF NOT EXISTS`, so probe `pragma_table_info`
+/// first. Only nullable / defaulted columns are safe to add this way, which is
+/// all v0.0.2 needs.
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<bool> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+        params![table, column],
+        |r| r.get(0),
+    )?;
+    if present {
+        return Ok(false);
+    }
+    // Table/column names are compile-time constants at every call site, so the
+    // format! is not an injection vector — SQLite forbids binding identifiers.
+    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+    Ok(true)
+}
+
+fn row_to_stored_channel(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChannel> {
+    Ok(StoredChannel {
+        id: r.get(0)?,
+        slug: r.get(1)?,
+        visibility: r.get(2)?,
+        created_at: r.get(3)?,
+        owner_did: r.get(4)?,
+    })
+}
+
+const CHANNEL_COLUMNS: &str = "id, slug, visibility, created_at, owner_did";
+
 impl SqliteStore {
     /// Open (or create) a SQLite file at `path` and run migrations.
     pub fn open(path: &Path) -> Result<Self> {
@@ -244,7 +276,11 @@ impl SqliteStore {
                 slug        TEXT UNIQUE NOT NULL,
                 visibility  TEXT NOT NULL,
                 created_at  INTEGER NOT NULL,
-                owner_did   TEXT NOT NULL
+                owner_did   TEXT NOT NULL,
+                -- NULL = live. Set by the channel-archive effect (soft delete);
+                -- see `add_column_if_missing` below for why it is also applied
+                -- as an ALTER for databases created before this column existed.
+                archived_at INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS memberships (
@@ -299,6 +335,12 @@ impl SqliteStore {
             );
             "#,
         )?;
+
+        // `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already
+        // exists, so columns added after a database was first created must be
+        // ALTERed in. Every already-deployed server has a `channels` table
+        // without `archived_at`.
+        add_column_if_missing(conn, "channels", "archived_at", "INTEGER")?;
         Ok(())
     }
 
@@ -456,6 +498,9 @@ impl SqliteStore {
 
     // --- channels ---
 
+    /// Insert or update a channel row. Deliberately does NOT touch
+    /// `archived_at`: re-applying a channel-create block (federation replay,
+    /// restart catch-up) must never resurrect a channel an owner archived.
     pub fn upsert_channel(&self, c: &StoredChannel) -> Result<()> {
         self.conn.lock().expect("poisoned").execute(
             "INSERT INTO channels (id, slug, visibility, created_at, owner_did) VALUES (?,?,?,?,?)
@@ -468,42 +513,94 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Look up a live channel. Archived channels read as absent so ops that
+    /// mutate an active channel (member-add, channel-promote) fail loudly
+    /// instead of silently editing a retired one.
     pub fn get_channel_by_slug(&self, slug: &str) -> Result<Option<StoredChannel>> {
         let conn = self.conn.lock().expect("poisoned");
         conn.query_row(
-            "SELECT id, slug, visibility, created_at, owner_did FROM channels WHERE slug = ?",
+            &format!(
+                "SELECT {CHANNEL_COLUMNS} FROM channels WHERE slug = ? AND archived_at IS NULL"
+            ),
             [slug],
-            |r| {
-                Ok(StoredChannel {
-                    id: r.get(0)?,
-                    slug: r.get(1)?,
-                    visibility: r.get(2)?,
-                    created_at: r.get(3)?,
-                    owner_did: r.get(4)?,
-                })
-            },
+            row_to_stored_channel,
         )
         .optional()
         .map_err(Into::into)
     }
 
+    /// Look up a channel whether or not it is archived. Used by the archive
+    /// path itself (which must distinguish "no such channel" from "already
+    /// archived") and by diagnostics.
+    pub fn get_channel_by_slug_including_archived(
+        &self,
+        slug: &str,
+    ) -> Result<Option<StoredChannel>> {
+        let conn = self.conn.lock().expect("poisoned");
+        conn.query_row(
+            &format!("SELECT {CHANNEL_COLUMNS} FROM channels WHERE slug = ?"),
+            [slug],
+            row_to_stored_channel,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// List live channels — what `jig channel list` shows.
     pub fn list_channels(&self) -> Result<Vec<StoredChannel>> {
         let conn = self.conn.lock().expect("poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT id, slug, visibility, created_at, owner_did FROM channels ORDER BY slug",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CHANNEL_COLUMNS} FROM channels WHERE archived_at IS NULL ORDER BY slug"
+        ))?;
         let rows = stmt
-            .query_map([], |r| {
-                Ok(StoredChannel {
-                    id: r.get(0)?,
-                    slug: r.get(1)?,
-                    visibility: r.get(2)?,
-                    created_at: r.get(3)?,
-                    owner_did: r.get(4)?,
-                })
-            })?
+            .query_map([], row_to_stored_channel)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// List every channel row, archived ones included. For operator
+    /// diagnostics — an archived channel is retired, not erased.
+    pub fn list_channels_including_archived(&self) -> Result<Vec<StoredChannel>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CHANNEL_COLUMNS} FROM channels ORDER BY slug"
+        ))?;
+        let rows = stmt
+            .query_map([], row_to_stored_channel)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Soft-delete a channel: mark it archived so it drops out of
+    /// [`list_channels`] and [`get_channel_by_slug`].
+    ///
+    /// Returns `false` when nothing changed — the slug is unknown, or the
+    /// channel was already archived — so callers can report that instead of
+    /// claiming a delete that did not happen. Already-archived rows keep their
+    /// original timestamp (`archived_at IS NULL` guard), which makes this the
+    /// audit record of when the channel was actually retired.
+    ///
+    /// [`list_channels`]: SqliteStore::list_channels
+    /// [`get_channel_by_slug`]: SqliteStore::get_channel_by_slug
+    pub fn archive_channel(&self, slug: &str, archived_at: i64) -> Result<bool> {
+        let changed = self.conn.lock().expect("poisoned").execute(
+            "UPDATE channels SET archived_at = ?2 WHERE slug = ?1 AND archived_at IS NULL",
+            params![slug, archived_at],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// When a channel was archived, or `None` if it is live or unknown.
+    pub fn channel_archived_at(&self, slug: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().expect("poisoned");
+        conn.query_row(
+            "SELECT archived_at FROM channels WHERE slug = ?",
+            [slug],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(Into::into)
     }
 
     // --- memberships ---
@@ -866,6 +963,50 @@ mod tests {
         }
     }
 
+    /// `CREATE TABLE IF NOT EXISTS` never adds columns to a table that already
+    /// exists, so a live server's `jig.db` would keep the pre-archive
+    /// `channels` shape. Migration must backfill the column.
+    #[test]
+    fn migrate_adds_archived_at_to_a_pre_existing_channels_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE channels (
+                 id          TEXT PRIMARY KEY,
+                 slug        TEXT UNIQUE NOT NULL,
+                 visibility  TEXT NOT NULL,
+                 created_at  INTEGER NOT NULL,
+                 owner_did   TEXT NOT NULL
+             );
+             INSERT INTO channels VALUES ('ch_1', '#legacy', 'open', 0, 'did:jig:zOwner');",
+        )
+        .unwrap();
+
+        SqliteStore::migrate(&conn).unwrap();
+        // Idempotent: running it twice must not error on a duplicate column.
+        SqliteStore::migrate(&conn).unwrap();
+
+        let cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('channels')")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            cols.contains(&"archived_at".to_string()),
+            "channels must gain archived_at; got {cols:?}"
+        );
+
+        let store = SqliteStore {
+            conn: Mutex::new(conn),
+        };
+        assert_eq!(
+            store.list_channels().unwrap().len(),
+            1,
+            "pre-existing rows must read as un-archived"
+        );
+    }
+
     #[test]
     fn insert_and_get_block_round_trip() {
         let store = SqliteStore::open_in_memory().unwrap();
@@ -957,6 +1098,141 @@ mod tests {
         store.upsert_channel(&ch).unwrap();
         let fetched = store.get_channel_by_slug("#hello").unwrap().unwrap();
         assert_eq!(fetched, ch);
+    }
+
+    fn sample_channel(id: &str, slug: &str) -> StoredChannel {
+        StoredChannel {
+            id: id.to_string(),
+            slug: slug.to_string(),
+            visibility: "open".to_string(),
+            created_at: 0,
+            owner_did: "did:jig:zOwner".to_string(),
+        }
+    }
+
+    #[test]
+    fn archive_channel_hides_it_from_list_channels() {
+        // The user-visible symptom of "there is no way to delete a channel" is
+        // that the row stays in `jig channel list` forever. Archiving must fix
+        // exactly that.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_channel(&sample_channel("ch_1", "#keep"))
+            .unwrap();
+        store
+            .upsert_channel(&sample_channel("ch_2", "#scratch"))
+            .unwrap();
+
+        assert!(store.archive_channel("#scratch", 1_747_680_000).unwrap());
+
+        let slugs: Vec<String> = store
+            .list_channels()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.slug)
+            .collect();
+        assert_eq!(slugs, vec!["#keep".to_string()]);
+    }
+
+    #[test]
+    fn archive_channel_keeps_the_row_and_records_when() {
+        // Soft delete: the row survives so receipts/blocks referencing the
+        // channel CID stay resolvable, and the decision is auditable.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_channel(&sample_channel("ch_1", "#scratch"))
+            .unwrap();
+
+        store.archive_channel("#scratch", 4_242).unwrap();
+
+        assert_eq!(store.channel_archived_at("#scratch").unwrap(), Some(4_242));
+        let row = store
+            .get_channel_by_slug_including_archived("#scratch")
+            .unwrap()
+            .expect("archived channel row must still exist");
+        assert_eq!(row.id, "ch_1");
+        assert_eq!(
+            store.list_channels_including_archived().unwrap().len(),
+            1,
+            "archived channels must remain visible to diagnostics"
+        );
+    }
+
+    #[test]
+    fn archived_channel_is_not_resolvable_as_an_active_channel() {
+        // member-add / channel-promote resolve via get_channel_by_slug; an
+        // archived channel must read as absent so those ops fail loudly.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_channel(&sample_channel("ch_1", "#scratch"))
+            .unwrap();
+        store.archive_channel("#scratch", 1).unwrap();
+        assert!(store.get_channel_by_slug("#scratch").unwrap().is_none());
+    }
+
+    #[test]
+    fn archive_channel_reports_false_for_an_unknown_slug() {
+        // A silent Ok on a nonexistent channel would let the CLI print
+        // "deleted" for a typo'd slug.
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(!store.archive_channel("#never-existed", 1).unwrap());
+        assert_eq!(store.channel_archived_at("#never-existed").unwrap(), None);
+    }
+
+    #[test]
+    fn archive_channel_reports_false_when_already_archived() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_channel(&sample_channel("ch_1", "#scratch"))
+            .unwrap();
+        assert!(store.archive_channel("#scratch", 10).unwrap());
+        assert!(!store.archive_channel("#scratch", 20).unwrap());
+        assert_eq!(
+            store.channel_archived_at("#scratch").unwrap(),
+            Some(10),
+            "re-archiving must not rewrite the original timestamp"
+        );
+    }
+
+    /// Pins the history decision: archiving a channel destroys NO blocks.
+    /// If a future change makes delete cascade to `blocks`, this fails.
+    #[test]
+    fn archiving_a_channel_destroys_no_message_history() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_channel(&sample_channel("ch_1", "#scratch"))
+            .unwrap();
+        store
+            .insert_block(&sample_block("bafy_msg_1", Some("#scratch")))
+            .unwrap();
+        store
+            .insert_receipt(&sample_receipt("r_1", "bafy_msg_1", "srv", None))
+            .unwrap();
+
+        store.archive_channel("#scratch", 1).unwrap();
+
+        assert!(store.get_block("bafy_msg_1").unwrap().is_some());
+        assert_eq!(
+            store
+                .list_blocks_by_channel("#scratch", 100, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(store.get_receipts_for_block("bafy_msg_1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn upsert_channel_does_not_resurrect_an_archived_channel() {
+        // upsert_channel is the channel-create effect path; it must not be an
+        // accidental un-archive, or replaying an old create block would undo
+        // a deliberate delete.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let ch = sample_channel("ch_1", "#scratch");
+        store.upsert_channel(&ch).unwrap();
+        store.archive_channel("#scratch", 7).unwrap();
+        store.upsert_channel(&ch).unwrap();
+        assert_eq!(store.channel_archived_at("#scratch").unwrap(), Some(7));
     }
 
     #[test]

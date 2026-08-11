@@ -66,10 +66,13 @@ listen = "100.x.y.z:7117"
 # is later group- or other-readable.
 server_did_keyfile = "/var/lib/jig/server.key"
 
-# channel-create and member-add are not optional extras: `jig channel create`
-# and `jig channel join` submit exactly these kinds, and a channel cannot be
-# bootstrapped any other way until v0.0.3+ ships Wasm-executed channel ops.
-allowed_block_kinds = ["text-render", "channel-create", "member-add"]
+# channel-create, member-add and channel-archive are not optional extras:
+# `jig channel create`, `jig channel join` and `jig channel delete` submit
+# exactly these kinds, and a channel cannot be bootstrapped or retired any
+# other way until v0.0.3+ ships Wasm-executed channel ops. channel-archive is
+# owner-gated against channels.owner_did, so listing it does not let anyone
+# else retire your channels.
+allowed_block_kinds = ["text-render", "channel-create", "member-add", "channel-archive"]
 
 [identity]
 # tofu = trust the first key seen for a DID and pin it. No nameserver required.

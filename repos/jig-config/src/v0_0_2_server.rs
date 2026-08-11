@@ -60,14 +60,17 @@ impl Default for ServerSection {
             listen: "127.0.0.1:7117".to_string(),
             server_did_keyfile: "~/.jig/server/server.key".to_string(),
             // Core v0.0.2 block kinds. text-render is the chat-message kind;
-            // channel-create + member-add are required by F4's `jig channel
-            // create/join` flow and are core (not opt-in) for v0.0.2 because
-            // there's no other way to bootstrap a channel until v0.0.3+
-            // ships Wasm-executed channel ops.
+            // channel-create + member-add + channel-archive are required by
+            // F4's `jig channel create/join/delete` flow and are core (not
+            // opt-in) for v0.0.2 because there's no other way to bootstrap or
+            // retire a channel until v0.0.3+ ships Wasm-executed channel ops.
+            // channel-archive is owner-gated server-side, so allowing it by
+            // default does not widen who can change what.
             allowed_block_kinds: vec![
                 "text-render".to_string(),
                 "channel-create".to_string(),
                 "member-add".to_string(),
+                "channel-archive".to_string(),
             ],
         }
     }
@@ -340,13 +343,19 @@ mod tests {
 
     #[test]
     fn default_allowed_block_kinds_includes_core_v0_0_2_kinds() {
-        // v0.0.2 needs text-render (chat messages), channel-create, and
-        // member-add (channel ops) in the default allow list — the
-        // hello-world flow can't run without them. Operators should
+        // v0.0.2 needs text-render (chat messages), channel-create,
+        // member-add, and channel-archive (channel ops) in the default allow
+        // list — the hello-world flow can't run without them, and without
+        // channel-archive a stray channel can never be removed. Operators should
         // explicitly remove kinds to restrict; v0.0.2 doesn't ship a
         // narrower default.
         let cfg = JigServerConfig::default();
-        for required in ["text-render", "channel-create", "member-add"] {
+        for required in [
+            "text-render",
+            "channel-create",
+            "member-add",
+            "channel-archive",
+        ] {
             assert!(
                 cfg.server.allowed_block_kinds.iter().any(|k| k == required),
                 "default allowed_block_kinds must include `{required}`; got {:?}",
