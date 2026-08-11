@@ -36,7 +36,14 @@ WORKSPACE_DIR="$(cd "$CRATE_DIR/.." && pwd)"
 TARGET="wasm32-unknown-unknown"
 OUT="$CRATE_DIR/artifacts/text_block.wasm"
 
-if ! rustup target list --installed | grep -qx "$TARGET"; then
+# Capture first, then match. Piping into `grep -q` under `set -o pipefail` is a
+# trap: grep exits on its first match, the writer gets EPIPE, and the pipeline
+# reports failure even though the match succeeded — so "target is installed" can
+# read as "target is missing". It happens to work here because the output is
+# small enough to be written before grep exits, which makes it a latent flake
+# rather than a visible bug.
+INSTALLED_TARGETS="$(rustup target list --installed)"
+if ! printf '%s\n' "$INSTALLED_TARGETS" | grep -qx "$TARGET"; then
 	echo "error: $TARGET is not installed. Run: rustup target add $TARGET" >&2
 	exit 1
 fi
@@ -65,7 +72,11 @@ if command -v wasm-tools >/dev/null 2>&1; then
 	# EPIPE, and the pipeline reports failure even though the match SUCCEEDED —
 	# so a passing check reads as a failing one. Grepping a file has no writer to
 	# kill.
-	WAT="$(mktemp -t text_block_wat)"
+	# Explicit template, not `mktemp -t <prefix>`. BSD/macOS mktemp accepts a bare
+	# prefix and appends its own suffix; GNU coreutils rejects it with "too few
+	# X's in template", so the `-t` form builds locally on macOS and fails on
+	# Linux CI. A full template with six X's is accepted by both.
+	WAT="$(mktemp "${TMPDIR:-/tmp}/text_block_wat.XXXXXX")"
 	trap 'rm -f "$WAT"' EXIT
 	wasm-tools print "$BUILT" >"$WAT"
 
