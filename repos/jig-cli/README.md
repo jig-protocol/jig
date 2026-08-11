@@ -18,23 +18,23 @@ Command-line interface for the Jig executable internet.
 ```bash
 # Ensure a jig-server is running (see repos/jig-server)
 
-# Initialise config (~/.jig/config.toml)
+# Initialise config (~/.jig/cli.toml)
 jig init
 
 # Send a block to the default channel
 jig send "Hello, Jig!"
 
 # Override channel and server on the fly
-jig --server http://127.0.0.1:7117 send --channel #ops "Deploying now"
+jig --server http://127.0.0.1:7117 send --channel '#ops' "Deploying now"
 
 # Read the latest blocks
-ojig read --limit 20
+jig read --limit 20
 
 # Follow new blocks in real-time
-jig tail --channel #ops
+jig tail '#ops'
 ```
 
-Example config (`~/.jig/config.toml`):
+Example config (`~/.jig/cli.toml`):
 
 ```toml
 [server]
@@ -49,10 +49,17 @@ default_channel = "#general"
 ## Commands
 
 - `jig init` – create a config file if none exists.
-- `jig send <message>` – publish a text block (optional `--channel`).
-- `jig read` – list recent blocks (filterable by `--channel`, `--limit`, `--json`).
-- `jig tail` – poll the server for new blocks on a channel.
-- Piping: `echo "alert" | jig --channel #alerts`
+- `jig send <message>` – publish a text block (optional `--channel`; flag-only,
+  because the positional slot is the message body).
+- `jig read [channel]` – list recent blocks (`--limit`, `--json`).
+- `jig tail [channel]` – stream new blocks on a channel over the WebSocket
+  subscribe path.
+- `jig chat [channel]` – interactive TUI: scrolling history plus an input box.
+- Piping: `echo "alert" | jig --channel '#alerts'`
+
+`read`, `tail`, and `chat` accept the channel either positionally or as
+`--channel <CHANNEL>`, and fall back to `[user] default_channel` when neither is
+given. Supplying both forms at once is a usage error, not a silent pick.
 
 ## Installation
 
