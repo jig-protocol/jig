@@ -21,6 +21,13 @@ async fn text_render_block_produces_deterministic_receipts_across_servers() {
 
     // Submit 10 different bundles. For each bundle, both servers must
     // agree on the receipt's render_hash (whether Some(h) or None).
+    // Precondition: ingest now rejects text-render for an unknown channel.
+    // Both servers need the channel; seeded directly because these run with
+    // allowed_block_kinds = ["text-render"] and cannot create one.
+    let seed_id = test_identity();
+    app1.seed_channel(&seed_id, "#hello").expect("seed app1");
+    app2.seed_channel(&seed_id, "#hello").expect("seed app2");
+
     // Within a single server, submitting the same bundle yields the same
     // block CID (insert_block primary key dedupes), so we vary the body
     // to get 10 distinct CIDs.
@@ -71,6 +78,8 @@ async fn text_render_block_receipts_render_hash_documented_as_none_in_v0_0_2() {
         .await
         .expect("start app");
     let id = test_identity();
+    // Precondition, not the subject of this test — see the note above.
+    app.seed_channel(&id, "#hello").expect("seed channel");
     let hlc = jig_core::HlcTimestamp {
         wall_ms: 1_700_000_000_000,
         logical: 0,

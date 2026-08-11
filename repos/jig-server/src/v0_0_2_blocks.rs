@@ -74,6 +74,10 @@ fn map_ingest_error(e: IngestError) -> (StatusCode, Json<ErrorBody>) {
             "manifest must declare block kind",
         ),
         IngestError::BundleMalformed(m) => err(StatusCode::BAD_REQUEST, "BUNDLE_MALFORMED", m),
+        // 404, not 400: the request is well-formed, the named channel isn't here.
+        ref e @ IngestError::UnknownChannel { .. } => {
+            err(StatusCode::NOT_FOUND, "UNKNOWN_CHANNEL", e.to_string())
+        }
         IngestError::Identity(ide) => {
             err(StatusCode::UNAUTHORIZED, "IDENTITY_ERROR", ide.to_string())
         }
@@ -400,6 +404,23 @@ mod tests {
         }
     }
 
+    /// Seed a channel row so `text-render` submissions clear ingest's
+    /// channel-existence guard. Writing the row directly keeps these tests
+    /// focused on the blocks endpoints rather than on channel-create.
+    fn seed_channel(state: &AppState, slug: &str) {
+        state
+            .ingest_ctx
+            .store
+            .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                id: format!("bafySeed{slug}"),
+                slug: slug.to_string(),
+                visibility: "open".to_string(),
+                created_at: 0,
+                owner_did: "did:jig:zSeedOwner".to_string(),
+            })
+            .unwrap();
+    }
+
     async fn post_json(
         router: Router,
         path: &str,
@@ -441,6 +462,7 @@ mod tests {
     async fn submit_block_round_trips_through_ingest() {
         let state = Arc::new(AppState::for_test().unwrap());
         let router = build_blocks_router(state.clone());
+        seed_channel(&state, "#hello");
 
         let id = test_identity();
         let hlc = test_hlc(&id);
@@ -501,6 +523,7 @@ mod tests {
     async fn submit_then_get_round_trips() {
         let state = Arc::new(AppState::for_test().unwrap());
         let router = build_blocks_router(state.clone());
+        seed_channel(&state, "#hello");
 
         let id = test_identity();
         let hlc = test_hlc(&id);
@@ -616,8 +639,16 @@ mod tests {
     // ---- channel history tests ------------------------------------------
 
     /// Submit `texts` to `slug` in order, each with a distinct HLC logical
-    /// tick so the timeline order is deterministic.
-    async fn submit_texts(router: &Router, id: &Identity, slug: &str, texts: &[&str]) {
+    /// tick so the timeline order is deterministic. Seeds the channel first —
+    /// ingest rejects text-render to a channel that doesn't exist.
+    async fn submit_texts(
+        state: &AppState,
+        router: &Router,
+        id: &Identity,
+        slug: &str,
+        texts: &[&str],
+    ) {
+        seed_channel(state, slug);
         for (i, text) in texts.iter().enumerate() {
             let mut hlc = test_hlc(id);
             hlc.logical = i as u32;
@@ -652,7 +683,7 @@ mod tests {
         let state = Arc::new(AppState::for_test().unwrap());
         let router = build_blocks_router(state.clone());
         let id = test_identity();
-        submit_texts(&router, &id, "#hello", &["one", "two"]).await;
+        submit_texts(&state, &router, &id, "#hello", &["one", "two"]).await;
 
         let req = Request::builder()
             .method("GET")
@@ -678,8 +709,8 @@ mod tests {
         let state = Arc::new(AppState::for_test().unwrap());
         let router = build_blocks_router(state.clone());
         let id = test_identity();
-        submit_texts(&router, &id, "#hello", &["h1", "h2"]).await;
-        submit_texts(&router, &id, "#other", &["o1"]).await;
+        submit_texts(&state, &router, &id, "#hello", &["h1", "h2"]).await;
+        submit_texts(&state, &router, &id, "#other", &["o1"]).await;
 
         let (status, body) = get_path(router, "/api/v1/channels/%23hello/blocks").await;
         assert_eq!(status, StatusCode::OK);
@@ -697,7 +728,7 @@ mod tests {
         let state = Arc::new(AppState::for_test().unwrap());
         let router = build_blocks_router(state.clone());
         let id = test_identity();
-        submit_texts(&router, &id, "#hello", &["a", "b", "c"]).await;
+        submit_texts(&state, &router, &id, "#hello", &["a", "b", "c"]).await;
 
         // A truncating limit keeps the newest window, still oldest-first.
         let (status, body) = get_path(router, "/api/v1/channels/%23hello/blocks?limit=2").await;
@@ -735,7 +766,7 @@ mod tests {
         let state = Arc::new(AppState::for_test().unwrap());
         let router = build_blocks_router(state.clone());
         let id = test_identity();
-        submit_texts(&router, &id, "#hello", &["only"]).await;
+        submit_texts(&state, &router, &id, "#hello", &["only"]).await;
 
         let (status, body) = get_path(router, "/api/v1/channels/%23hello/blocks").await;
         assert_eq!(status, StatusCode::OK);

@@ -47,6 +47,7 @@ pub async fn apply_effect(
         BlockKind::ChannelCreate => apply_channel_create(store, &manifest, block_cid),
         BlockKind::MemberAdd => apply_member_add(store, &manifest, block_cid),
         BlockKind::ChannelPromote => apply_channel_promote(store, &manifest),
+        BlockKind::ChannelArchive => apply_channel_archive(store, &manifest),
         BlockKind::FedHello => apply_fed_hello(store, &manifest, block_cid),
 
         BlockKind::NsRegister | BlockKind::NsAttestation => apply_ns_attestation(store, &manifest),
@@ -128,6 +129,59 @@ fn apply_channel_promote(store: &Arc<SqliteStore>, m: &BlockManifest) -> anyhow:
     })?;
     channel.visibility = "open".to_string();
     store.upsert_channel(&channel)?;
+    Ok(())
+}
+
+/// Retire a channel: soft delete, owner only.
+///
+/// ## Why archive rather than delete rows
+///
+/// Blocks are content-addressed and referenced from outside the channel row:
+/// `receipts.block_cid` has a foreign key onto `blocks(cid)`, federated peers
+/// already hold copies of anything that was fanned out, and a block CID may be
+/// cited by later blocks. So the three candidate semantics are:
+///
+/// * **Delete the channel row only** — leaves `blocks` rows whose `channel_id`
+///   resolves to nothing. History becomes unreachable but still occupies the
+///   database, and re-creating the slug silently adopts the orphans. Worst of
+///   both worlds.
+/// * **Cascade to blocks** — irreversible destruction of shared history from a
+///   single unauthenticated request, breaks receipt FKs, and does not even buy
+///   privacy since peers keep their copies. Not something a v0.0.x admin
+///   endpoint should be able to do.
+/// * **Archive (chosen)** — flip `channels.archived_at`. The channel vanishes
+///   from `jig channel list` and stops resolving as an active channel, so the
+///   reported problem (a stray channel nobody can remove) is fixed, while every
+///   block, receipt and CID reference stays intact and the decision is
+///   reversible by an operator with database access.
+///
+/// ## Why the owner check lives here
+///
+/// The `/_admin_v0_0_2/*` endpoints are unauthenticated, so anything they can
+/// reach must authorize itself. `ingest()` has already verified the sender's
+/// ed25519 signature against the pubkey embedded in their DID by the time this
+/// runs, which makes `manifest.authors[0].did` a trustworthy identity — and
+/// this runs *before* the block is persisted, so a rejection leaves no trace.
+/// The HTTP handler repeats the check only to return a precise 403/404.
+fn apply_channel_archive(store: &Arc<SqliteStore>, m: &BlockManifest) -> anyhow::Result<()> {
+    let channel_slug = meta_str(m, "channel")
+        .ok_or_else(|| anyhow::anyhow!("channel-archive missing `channel` in metadata"))?;
+    let channel = store
+        .get_channel_by_slug_including_archived(channel_slug)?
+        .ok_or_else(|| {
+            anyhow::anyhow!("channel-archive references unknown channel `{channel_slug}`")
+        })?;
+
+    let sender = sender_did_string(m);
+    // An empty owner_did would make an author-less manifest match; refuse
+    // rather than treat "we don't know who owns this" as permission.
+    if channel.owner_did.is_empty() || channel.owner_did != sender {
+        anyhow::bail!("channel-archive rejected: `{sender}` is not the owner of `{channel_slug}`");
+    }
+
+    if !store.archive_channel(channel_slug, chrono::Utc::now().timestamp())? {
+        anyhow::bail!("channel `{channel_slug}` is already archived");
+    }
     Ok(())
 }
 
@@ -326,6 +380,113 @@ mod tests {
 
         let ch = s.get_channel_by_slug("#private").unwrap().unwrap();
         assert_eq!(ch.visibility, "open");
+    }
+
+    /// Apply a single manifest through `apply_effect`, returning its result.
+    async fn apply(s: &Arc<SqliteStore>, m: M, cid: &str) -> anyhow::Result<()> {
+        let (mb, cb) = as_bundle(m);
+        apply_effect(
+            s,
+            &BlockBundle {
+                manifest_bytes: &mb,
+                code_bytes: &cb,
+                resources: vec![],
+            },
+            &[],
+            cid,
+        )
+        .await
+    }
+
+    async fn store_with_channel(slug: &str, owner: &str) -> Arc<SqliteStore> {
+        let s = store();
+        let create = manifest_with(
+            BlockKind::ChannelCreate,
+            owner,
+            json!({"slug": slug, "visibility": "open"}),
+        );
+        apply(&s, create, "bafy_create").await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn channel_archive_by_the_owner_archives_the_channel() {
+        let s = store_with_channel("#scratch", "did:jig:zOwner").await;
+        let archive = manifest_with(
+            BlockKind::ChannelArchive,
+            "did:jig:zOwner",
+            json!({"channel": "#scratch"}),
+        );
+        apply(&s, archive, "bafy_archive").await.unwrap();
+
+        assert!(s.list_channels().unwrap().is_empty());
+        assert!(s.channel_archived_at("#scratch").unwrap().is_some());
+    }
+
+    /// The security-relevant case. The admin endpoints are unauthenticated, so
+    /// this check in the apply layer — which runs only after ingest has verified
+    /// the sender signature — is the authoritative one.
+    #[tokio::test]
+    async fn channel_archive_by_a_non_owner_is_rejected() {
+        let s = store_with_channel("#scratch", "did:jig:zOwner").await;
+        let archive = manifest_with(
+            BlockKind::ChannelArchive,
+            "did:jig:zAttacker",
+            json!({"channel": "#scratch"}),
+        );
+        let err = apply(&s, archive, "bafy_archive").await.unwrap_err();
+        assert!(
+            err.to_string().contains("owner"),
+            "error must name the owner check; got: {err}"
+        );
+        assert_eq!(
+            s.list_channels().unwrap().len(),
+            1,
+            "a rejected archive must leave the channel alone"
+        );
+        assert_eq!(s.channel_archived_at("#scratch").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn channel_archive_of_an_unknown_channel_errors() {
+        let s = store();
+        let archive = manifest_with(
+            BlockKind::ChannelArchive,
+            "did:jig:zOwner",
+            json!({"channel": "#never-existed"}),
+        );
+        let err = apply(&s, archive, "bafy_archive").await.unwrap_err();
+        assert!(
+            err.to_string().contains("#never-existed"),
+            "error must name the missing channel; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_archive_missing_channel_metadata_errors() {
+        let s = store_with_channel("#scratch", "did:jig:zOwner").await;
+        let archive = manifest_with(BlockKind::ChannelArchive, "did:jig:zOwner", json!({}));
+        let err = apply(&s, archive, "bafy_archive").await.unwrap_err();
+        assert!(err.to_string().contains("channel"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn member_add_to_an_archived_channel_is_rejected() {
+        let s = store_with_channel("#scratch", "did:jig:zOwner").await;
+        let archive = manifest_with(
+            BlockKind::ChannelArchive,
+            "did:jig:zOwner",
+            json!({"channel": "#scratch"}),
+        );
+        apply(&s, archive, "bafy_archive").await.unwrap();
+
+        let add = manifest_with(
+            BlockKind::MemberAdd,
+            "did:jig:zOwner",
+            json!({"channel": "#scratch", "member_did": "did:jig:zDeji"}),
+        );
+        let err = apply(&s, add, "bafy_add").await.unwrap_err();
+        assert!(err.to_string().contains("unknown channel"), "got: {err}");
     }
 
     #[tokio::test]

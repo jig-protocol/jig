@@ -21,6 +21,12 @@ async fn injected_divergent_receipts_are_detectable_via_persist() {
         .await
         .expect("start server");
     let (sender, _dir) = test_identity_with_dir();
+    // Precondition, not the subject of this test: ingest rejects text-render
+    // for an unknown channel. Seeded directly because this server runs with
+    // allowed_block_kinds = ["text-render"] and so cannot create one.
+    server
+        .seed_channel(&sender, "#hello")
+        .expect("seed channel");
 
     // Submit a real block so we have a stored_block entry to attach
     // receipts to.
@@ -96,6 +102,9 @@ async fn divergent_render_hashes_produce_parity_warning_in_decoder() {
         .await
         .expect("start server");
     let (sender, _dir) = test_identity_with_dir();
+    server
+        .seed_channel(&sender, "#hello")
+        .expect("seed channel");
     let cid = server
         .send_text_render(&sender, "#hello", "render me")
         .await

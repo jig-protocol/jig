@@ -114,6 +114,24 @@ pub fn build_member_add(
     )
 }
 
+/// Build a signed `channel-archive` block — the v0.0.2 channel delete.
+///
+/// Archiving is a soft delete: the server hides the channel but keeps every
+/// block and receipt. Only the channel's owner DID can archive it, enforced
+/// server-side against `channels.owner_did`.
+pub fn build_channel_archive(
+    sender: &Identity,
+    channel_slug: &str,
+    hlc: HlcTimestamp,
+) -> BuiltBlock {
+    build_with_metadata(
+        sender,
+        BlockKind::ChannelArchive,
+        hlc,
+        json!({ "channel": channel_slug }),
+    )
+}
+
 /// Build a signed `fed-hello` block — emitted by jig-server when initiating
 /// a federation handshake. Sender is the server's own identity.
 pub fn build_fed_hello(
@@ -296,6 +314,33 @@ mod tests {
             manifest.metadata.get("member_did").and_then(|v| v.as_str()),
             Some("did:jig:zDeji")
         );
+    }
+
+    #[test]
+    fn build_channel_archive_metadata_uses_the_channel_key() {
+        // `channel` (not `slug`) — matches member-add / channel-promote, which
+        // is what the server-side apply reads and what the admin endpoint
+        // cross-checks against the URL slug.
+        let id = test_identity();
+        let hlc = test_hlc(&id);
+        let block = build_channel_archive(&id, "#scratch", hlc);
+        let manifest: BlockManifest = serde_json::from_slice(&block.manifest_bytes).unwrap();
+        assert_eq!(manifest.kind, Some(BlockKind::ChannelArchive));
+        assert_eq!(
+            manifest.metadata.get("channel").and_then(|v| v.as_str()),
+            Some("#scratch")
+        );
+    }
+
+    #[test]
+    fn build_channel_archive_signature_verifies_against_sender_pubkey() {
+        let id = test_identity();
+        let hlc = test_hlc(&id);
+        let block = build_channel_archive(&id, "#scratch", hlc);
+        let sig = ed25519_dalek::Signature::from_slice(&block.sender_sig).unwrap();
+        id.public_key()
+            .verify(&block.canonical_bytes(), &sig)
+            .expect("signature must verify against sender pubkey");
     }
 
     #[test]

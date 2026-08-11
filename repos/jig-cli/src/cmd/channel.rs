@@ -1,4 +1,5 @@
-//! `jig channel create` / `join` / `list` — Phase F4 of v0.0.2 hello-world.
+//! `jig channel create` / `join` / `delete` / `list` — Phase F4 of v0.0.2
+//! hello-world, plus the channel delete that F4 shipped without.
 //!
 //! `create #hello [--visibility open|restricted]` builds a signed
 //! `channel-create` block via `jig_client::blocks::build_channel_create`,
@@ -6,6 +7,10 @@
 //!
 //! `join #hello` builds a signed `member-add` block that adds the caller's
 //! own DID and POSTs it to `/_admin_v0_0_2/channels/<url-escaped slug>/members`.
+//!
+//! `delete #hello [--yes]` builds a signed `channel-archive` block and POSTs it
+//! to `/_admin_v0_0_2/channels/<url-escaped slug>/archive`. Owner-only, and a
+//! soft delete: the server retires the channel and keeps its history.
 //!
 //! `list` GETs `/api/v1/channels` and pretty-prints a column-aligned table.
 //!
@@ -22,7 +27,9 @@
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use jig_client::blocks::{BuiltBlock, build_channel_create, build_member_add};
+use jig_client::blocks::{
+    BuiltBlock, build_channel_archive, build_channel_create, build_member_add,
+};
 use jig_core::HlcTimestamp;
 use serde::{Deserialize, Serialize};
 
@@ -206,6 +213,99 @@ pub(crate) fn escape_slug_for_url(slug: &str) -> String {
         }
     }
     out
+}
+
+// ============================================================================
+// delete (archive)
+// ============================================================================
+
+/// Whether a `channel delete` may proceed without an interactive prompt.
+///
+/// `--yes` is the only non-interactive way through. When stdin is not a TTY
+/// (CI, `ssh host jig ...`, a script) there is nobody to answer the prompt, so
+/// refusing is the safe outcome rather than reading EOF as consent.
+fn deletion_confirmed(yes: bool, stdin_is_tty: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !stdin_is_tty {
+        anyhow::bail!(
+            "refusing to delete a channel without confirmation — pass --yes to confirm \
+             (stdin is not a terminal, so there is nobody to prompt)"
+        );
+    }
+    Ok(())
+}
+
+/// Read a typed confirmation from `reader` and check it against `slug`.
+///
+/// Typing the slug back, rather than "y", is deliberate: deleting a channel
+/// retires shared history for everyone on the server and cannot be undone from
+/// the CLI.
+fn confirmation_matches(input: &str, slug: &str) -> bool {
+    input.trim() == slug
+}
+
+/// Apply `jig channel delete <slug> [--yes]`.
+///
+/// Builds a signed `channel-archive` block and POSTs it to
+/// `/_admin_v0_0_2/channels/<url-escaped slug>/archive`. The server accepts it
+/// only from the channel's owner DID.
+///
+/// This is a soft delete: the channel stops appearing in `jig channel list` and
+/// stops accepting new blocks, but the server keeps its history. Nothing here
+/// erases messages from disk, and copies already federated to peers are
+/// unaffected — so this is not a privacy tool.
+pub async fn delete(ctx: &CliContext, slug: String, yes: bool) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+
+    let stdin = std::io::stdin();
+    deletion_confirmed(yes, stdin.is_terminal())?;
+    if !yes {
+        print!(
+            "Delete {slug}? History is kept but the channel is retired. Type the slug to confirm: "
+        );
+        std::io::stdout().flush().ok();
+        let mut answer = String::new();
+        std::io::BufRead::read_line(&mut stdin.lock(), &mut answer)
+            .context("reading confirmation from stdin")?;
+        if !confirmation_matches(&answer, &slug) {
+            anyhow::bail!("confirmation did not match `{slug}` — nothing was deleted");
+        }
+    }
+
+    let id = ctx.identity()?;
+    let hlc = HlcTimestamp::now_wall(id.did().clone());
+    let block = build_channel_archive(&id, &slug, hlc);
+
+    let base = base_http_url(&ctx.server_url()?);
+    let escaped = escape_slug_for_url(&slug);
+    let url = format!("{base}/_admin_v0_0_2/channels/{escaped}/archive");
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .context("building HTTP client for admin endpoint")?;
+    let resp = http
+        .post(&url)
+        .json(&submission_for(&block))
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "POST {url} returned {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        );
+    }
+    let result: AdminResult = resp
+        .json()
+        .await
+        .context("decoding channel-archive response")?;
+    println!("channel deleted: {slug}");
+    println!("  block_cid: {}", result.block_cid);
+    println!("  history is retained server-side; the channel is no longer listed");
+    Ok(())
 }
 
 // ============================================================================
@@ -416,6 +516,39 @@ mod tests {
             !written.contains("127.0.0.1:1\""),
             "the --server override leaked into the file: {written}"
         );
+    }
+
+    #[test]
+    fn delete_without_yes_is_refused_when_stdin_is_not_a_terminal() {
+        // `ssh box jig channel delete '#x'` or a CI step has no terminal to
+        // prompt on; reading EOF must not count as "yes".
+        let e = deletion_confirmed(false, false).unwrap_err();
+        assert!(
+            e.to_string().contains("--yes"),
+            "error must point at --yes: {e}"
+        );
+    }
+
+    #[test]
+    fn delete_with_yes_needs_no_terminal() {
+        deletion_confirmed(true, false).unwrap();
+        deletion_confirmed(true, true).unwrap();
+    }
+
+    #[test]
+    fn delete_without_yes_proceeds_to_the_prompt_on_a_terminal() {
+        deletion_confirmed(false, true).unwrap();
+    }
+
+    #[test]
+    fn confirmation_must_be_the_slug_not_just_yes() {
+        // One keystroke must not retire shared history.
+        assert!(confirmation_matches("#scratch\n", "#scratch"));
+        assert!(confirmation_matches("  #scratch  ", "#scratch"));
+        assert!(!confirmation_matches("y\n", "#scratch"));
+        assert!(!confirmation_matches("yes\n", "#scratch"));
+        assert!(!confirmation_matches("\n", "#scratch"));
+        assert!(!confirmation_matches("#other\n", "#scratch"));
     }
 
     #[test]

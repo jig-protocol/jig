@@ -118,6 +118,10 @@ fn map_ingest_error(e: IngestError) -> (StatusCode, Json<AdminError>) {
             "manifest must declare block kind",
         ),
         IngestError::BundleMalformed(m) => err(StatusCode::BAD_REQUEST, "BUNDLE_MALFORMED", m),
+        // 404, not 400: the request is well-formed, the named channel isn't here.
+        ref e @ IngestError::UnknownChannel { .. } => {
+            err(StatusCode::NOT_FOUND, "UNKNOWN_CHANNEL", e.to_string())
+        }
         IngestError::Identity(ide) => {
             err(StatusCode::UNAUTHORIZED, "IDENTITY_ERROR", ide.to_string())
         }
@@ -227,12 +231,141 @@ pub async fn add_member(
     Ok(Json(AdminResult { block_cid: cid }))
 }
 
+/// POST /_admin_v0_0_2/channels/:slug/archive
+///
+/// The v0.0.2 channel delete. Body: signed `channel-archive` block. Archiving
+/// is a **soft delete** — the channel stops being listed and stops resolving as
+/// an active channel, but every block and receipt survives; the reasoning is in
+/// `jig_pipeline::effect::apply_channel_archive`.
+///
+/// ## Authorization
+///
+/// These endpoints are unauthenticated, and a delete is far more destructive
+/// than a create, so the sender DID must equal the channel's `owner_did`. The
+/// check below is what produces a precise 403/404/409; it reads the *claimed*
+/// sender from the manifest, which is only meaningful because `ingest()` then
+/// refuses the block unless that same DID actually signed it, and
+/// `apply_channel_archive` re-checks ownership after verification. Neither
+/// check alone is sufficient — together they are.
+///
+/// Returns `{ "block_cid": "bafy..." }` on success.
+pub async fn archive_channel(
+    State(state): State<Arc<AppState>>,
+    Path(slug): Path<String>,
+    Json(body): Json<BundleSubmission>,
+) -> Result<Json<AdminResult>, (StatusCode, Json<AdminError>)> {
+    let (manifest_bytes, code_bytes, sig) = decode_submission(&body)?;
+    let manifest = parse_manifest(&manifest_bytes)?;
+
+    if manifest.kind != Some(BlockKind::ChannelArchive) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "WRONG_KIND",
+            format!("expected channel-archive bundle, got {:?}", manifest.kind),
+        ));
+    }
+
+    // Defense in depth, as for member-add: the URL must agree with the bundle
+    // so an authoritative-looking URL can't retire a different channel.
+    let bundle_slug = manifest
+        .metadata
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "MISSING_CHANNEL",
+                "channel-archive bundle metadata missing `channel`",
+            )
+        })?;
+    if bundle_slug != slug {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "SLUG_MISMATCH",
+            format!("URL slug `{slug}` doesn't match bundle channel `{bundle_slug}`"),
+        ));
+    }
+
+    let channel = state
+        .ingest_ctx
+        .store
+        .get_channel_by_slug_including_archived(&slug)
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "PERSIST_ERROR",
+                e.to_string(),
+            )
+        })?
+        .ok_or_else(|| {
+            // Explicit 404 rather than a cheerful 200: deleting a channel that
+            // isn't there is a typo, and reporting success teaches operators to
+            // trust a delete that never happened.
+            err(
+                StatusCode::NOT_FOUND,
+                "NO_SUCH_CHANNEL",
+                format!("no channel `{slug}` on this server"),
+            )
+        })?;
+
+    let sender_did = manifest
+        .authors
+        .first()
+        .map(|a| a.did.to_string())
+        .unwrap_or_default();
+    if channel.owner_did.is_empty() || channel.owner_did != sender_did {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "NOT_CHANNEL_OWNER",
+            format!(
+                "`{slug}` is owned by `{}`; only its owner can archive it",
+                channel.owner_did
+            ),
+        ));
+    }
+
+    let already_archived = state
+        .ingest_ctx
+        .store
+        .channel_archived_at(&slug)
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "PERSIST_ERROR",
+                e.to_string(),
+            )
+        })?;
+    if let Some(when) = already_archived {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "ALREADY_ARCHIVED",
+            format!("`{slug}` was already archived at {when}"),
+        ));
+    }
+
+    let bundle = BlockBundle {
+        manifest_bytes: &manifest_bytes,
+        code_bytes: &code_bytes,
+        resources: vec![],
+    };
+
+    let cid = ingest(&state.ingest_ctx, bundle, sig, IngestSource::AdminEndpoint)
+        .await
+        .map_err(map_ingest_error)?;
+
+    Ok(Json(AdminResult { block_cid: cid }))
+}
+
 /// Build the admin-only sub-router. Caller is responsible for gating this
 /// on `state.config.debug.admin_endpoints`.
 pub fn build_admin_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/_admin_v0_0_2/channels", post(create_channel))
         .route("/_admin_v0_0_2/channels/:slug/members", post(add_member))
+        .route(
+            "/_admin_v0_0_2/channels/:slug/archive",
+            post(archive_channel),
+        )
         .with_state(state)
 }
 
@@ -245,7 +378,9 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use jig_client::{
         Identity,
-        blocks::{build_channel_create, build_member_add, build_text_render},
+        blocks::{
+            build_channel_archive, build_channel_create, build_member_add, build_text_render,
+        },
     };
     use jig_core::{Did, HlcTimestamp};
     use jig_pipeline::{
@@ -443,6 +578,227 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "SLUG_MISMATCH");
+    }
+
+    // ---- channel archive (the v0.0.2 channel delete) ------------------------
+
+    /// Create `slug` owned by `owner` and return the router used to do it.
+    async fn router_with_channel(state: Arc<AppState>, owner: &Identity, slug: &str) -> Router {
+        let router = build_admin_router(state);
+        let create = build_channel_create(owner, slug, "open", test_hlc(owner));
+        let (status, body) = post_json(
+            router.clone(),
+            "/_admin_v0_0_2/channels",
+            submission_from(&create),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "setup create failed: {body}");
+        router
+    }
+
+    fn archive_path(slug: &str) -> String {
+        format!(
+            "/_admin_v0_0_2/channels/{}/archive",
+            slug.replace('#', "%23")
+        )
+    }
+
+    #[tokio::test]
+    async fn archive_channel_by_owner_removes_it_from_the_channel_list() {
+        let state = state_with_channel_kinds_allowed();
+        let owner = test_identity();
+        let router = router_with_channel(state.clone(), &owner, "#scratch").await;
+
+        let block = build_channel_archive(&owner, "#scratch", test_hlc(&owner));
+        let (status, body) =
+            post_json(router, &archive_path("#scratch"), submission_from(&block)).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert!(!body["block_cid"].as_str().unwrap_or("").is_empty());
+
+        let channels = state.ingest_ctx.store.list_channels().unwrap();
+        assert!(
+            !channels.iter().any(|c| c.slug == "#scratch"),
+            "archived channel must disappear from the list; got {channels:?}"
+        );
+    }
+
+    /// The security case: the admin endpoints are unauthenticated, so a delete
+    /// that only checked "is the signature valid" would let anyone with a DID
+    /// destroy anyone's channel.
+    #[tokio::test]
+    async fn archive_channel_rejects_a_non_owner() {
+        let state = state_with_channel_kinds_allowed();
+        let owner = test_identity();
+        let router = router_with_channel(state.clone(), &owner, "#scratch").await;
+
+        // A *validly signed* block from a different identity — the signature
+        // check passes and the request must still be refused.
+        let attacker = test_identity();
+        let block = build_channel_archive(&attacker, "#scratch", test_hlc(&attacker));
+        let (status, body) =
+            post_json(router, &archive_path("#scratch"), submission_from(&block)).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
+        assert_eq!(body["code"], "NOT_CHANNEL_OWNER");
+        let channels = state.ingest_ctx.store.list_channels().unwrap();
+        assert!(
+            channels.iter().any(|c| c.slug == "#scratch"),
+            "a rejected archive must leave the channel live; got {channels:?}"
+        );
+        assert_eq!(
+            state
+                .ingest_ctx
+                .store
+                .channel_archived_at("#scratch")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_channel_reports_a_missing_channel_instead_of_succeeding() {
+        let state = state_with_channel_kinds_allowed();
+        let router = build_admin_router(state);
+
+        let owner = test_identity();
+        let block = build_channel_archive(&owner, "#never-existed", test_hlc(&owner));
+        let (status, body) = post_json(
+            router,
+            &archive_path("#never-existed"),
+            submission_from(&block),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body={body}");
+        assert_eq!(body["code"], "NO_SUCH_CHANNEL");
+    }
+
+    #[tokio::test]
+    async fn archive_channel_is_not_silently_repeatable() {
+        let state = state_with_channel_kinds_allowed();
+        let owner = test_identity();
+        let router = router_with_channel(state.clone(), &owner, "#scratch").await;
+
+        let first = build_channel_archive(&owner, "#scratch", test_hlc(&owner));
+        let (status, _) = post_json(
+            router.clone(),
+            &archive_path("#scratch"),
+            submission_from(&first),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let again = build_channel_archive(&owner, "#scratch", test_hlc(&owner));
+        let (status, body) =
+            post_json(router, &archive_path("#scratch"), submission_from(&again)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(body["code"], "ALREADY_ARCHIVED");
+    }
+
+    #[tokio::test]
+    async fn archive_channel_rejects_slug_mismatch() {
+        let state = state_with_channel_kinds_allowed();
+        let owner = test_identity();
+        let router = router_with_channel(state, &owner, "#scratch").await;
+
+        let block = build_channel_archive(&owner, "#scratch", test_hlc(&owner));
+        let (status, body) =
+            post_json(router, &archive_path("#other"), submission_from(&block)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+        assert_eq!(body["code"], "SLUG_MISMATCH");
+    }
+
+    #[tokio::test]
+    async fn archive_channel_rejects_wrong_kind_bundle() {
+        let state = state_with_channel_kinds_allowed();
+        let owner = test_identity();
+        let router = router_with_channel(state, &owner, "#scratch").await;
+
+        let block = build_member_add(&owner, "#scratch", "did:jig:zX", test_hlc(&owner));
+        let (status, body) =
+            post_json(router, &archive_path("#scratch"), submission_from(&block)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+        assert_eq!(body["code"], "WRONG_KIND");
+    }
+
+    #[tokio::test]
+    async fn archive_channel_rejects_invalid_signature() {
+        let state = state_with_channel_kinds_allowed();
+        let owner = test_identity();
+        let router = router_with_channel(state, &owner, "#scratch").await;
+
+        let block = build_channel_archive(&owner, "#scratch", test_hlc(&owner));
+        let submission = serde_json::json!({
+            "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
+            "sig_b64":    base64::engine::general_purpose::STANDARD.encode([0u8; 64]),
+        });
+        let (status, body) = post_json(router, &archive_path("#scratch"), submission).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "body={body}");
+        assert_eq!(body["code"], "INVALID_SIG");
+    }
+
+    /// Pins the history decision at the HTTP boundary: `jig channel delete`
+    /// must not be a way to destroy messages.
+    #[tokio::test]
+    async fn archiving_a_channel_keeps_its_message_history() {
+        let state = state_with_channel_kinds_allowed();
+        let owner = test_identity();
+        let router = router_with_channel(state.clone(), &owner, "#scratch").await;
+
+        // Seed one message directly through the store (the admin router has no
+        // text-render endpoint; the history-retention claim is about storage).
+        let msg = jig_pipeline::persist::StoredBlock {
+            cid: "bafy_msg_1".into(),
+            channel_id: Some("#scratch".into()),
+            block_kind: "text-render".into(),
+            sender_did: owner.did_string(),
+            sender_sig: vec![0u8; 64],
+            bundle_bytes: b"{}".to_vec(),
+            is_synthetic: false,
+            hlc_wall_ms: 1,
+            hlc_logical: 0,
+            hlc_origin: owner.did_string(),
+            posted_at: 1,
+            origin_server: "ws://test".into(),
+            federated_from: None,
+        };
+        state.ingest_ctx.store.insert_block(&msg).unwrap();
+
+        let block = build_channel_archive(&owner, "#scratch", test_hlc(&owner));
+        let (status, _) =
+            post_json(router, &archive_path("#scratch"), submission_from(&block)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert!(
+            state
+                .ingest_ctx
+                .store
+                .get_block("bafy_msg_1")
+                .unwrap()
+                .is_some(),
+            "archive must not delete blocks"
+        );
+        // The channel's timeline also carries the channel-create and
+        // channel-archive blocks; what matters is that the message is still
+        // readable from it.
+        let timeline = state
+            .ingest_ctx
+            .store
+            .list_blocks_by_channel("#scratch", 100, None)
+            .unwrap();
+        assert!(
+            timeline.iter().any(|b| b.cid == "bafy_msg_1"),
+            "channel history must still be readable from storage; got {:?}",
+            timeline.iter().map(|b| &b.cid).collect::<Vec<_>>()
+        );
+        assert!(
+            state
+                .ingest_ctx
+                .store
+                .get_channel_by_slug_including_archived("#scratch")
+                .unwrap()
+                .is_some(),
+            "the channel row itself must survive as an audit record"
+        );
     }
 
     #[tokio::test]

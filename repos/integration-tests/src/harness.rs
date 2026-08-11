@@ -187,6 +187,35 @@ impl TestJigServer {
         Ok(())
     }
 
+    /// Seed a channel STRAIGHT INTO THE STORE, bypassing ingest.
+    ///
+    /// Use this when a channel's existence is a *precondition* of the test
+    /// rather than part of what it exercises. Ingest now rejects a text-render
+    /// block whose channel does not exist, so tests that only care about
+    /// receipts, render-hash parity or TOFU pinning need the channel to be
+    /// there — but several of them deliberately run with
+    /// `allowed_block_kinds = ["text-render"]`, which makes it impossible to
+    /// create one through the admin path.
+    ///
+    /// Going around ingest keeps `allowed_block_kinds` meaningful in those
+    /// tests instead of widening it just to satisfy a precondition. Reach for
+    /// [`Self::create_channel`] whenever the test is actually about channel
+    /// creation.
+    pub fn seed_channel(&self, owner: &Identity, slug: &str) -> Result<String> {
+        let id = format!("seeded-{}", slug.trim_start_matches('#'));
+        self.state
+            .ingest_ctx
+            .store
+            .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                id: id.clone(),
+                slug: slug.to_string(),
+                visibility: "open".to_string(),
+                created_at: chrono::Utc::now().timestamp_millis(),
+                owner_did: owner.did().to_did_jig_string(),
+            })?;
+        Ok(id)
+    }
+
     /// Create a channel via the admin REST endpoint. Returns the channel CID
     /// (the channel's `id` in the StoredChannel table).
     pub async fn create_channel(

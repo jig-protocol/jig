@@ -6,7 +6,7 @@
 //! `jig-nameserver`.
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use jig_core::{BlockBundle, Did};
+use jig_core::{BlockBundle, BlockKind, Did};
 use std::sync::Arc;
 
 use crate::fanout::Fanout;
@@ -64,6 +64,12 @@ pub enum IngestError {
     BundleMalformed(String),
     #[error("manifest missing kind field — v0.0.2 blocks must declare kind")]
     KindRequired,
+    /// A channel-scoped block named a channel this server has no row for.
+    /// The message is user-facing: it is what a mistyped `jig send` prints.
+    #[error(
+        "unknown channel '{slug}': create it with `jig channel create` or check `jig channel list`"
+    )]
+    UnknownChannel { slug: String },
     #[error(transparent)]
     Identity(#[from] crate::identity::IdentityError),
     #[error(transparent)]
@@ -81,11 +87,13 @@ pub enum IngestError {
 ///    configured `IdentityResolver` locks the binding (TOFU first-sight) or
 ///    rejects a mismatched DID. Bypassed when `naively_allow_unknown_handles_fallback`.
 /// 3. Validate `block_kind` against `allowed_block_kinds`.
-/// 4. Update the local HLC clock against the received timestamp.
-/// 5. Build a server-signed synthetic receipt (Wasm exec wired in Phase D).
-/// 6. Apply effects (channels/memberships/peers — Task B7 stub).
-/// 7. Persist block + receipt.
-/// 8. Fanout: local subscribers always; federated peers only if source
+/// 4. Reject channel-scoped blocks naming a channel this server has no row
+///    for (see [`requires_existing_channel`] for the per-source policy).
+/// 5. Update the local HLC clock against the received timestamp.
+/// 6. Build a server-signed synthetic receipt (Wasm exec wired in Phase D).
+/// 7. Apply effects (channels/memberships/peers — Task B7 stub).
+/// 8. Persist block + receipt.
+/// 9. Fanout: local subscribers always; federated peers only if source
 ///    isn't itself a federated peer (loop avoidance).
 pub async fn ingest(
     ctx: &IngestContext,
@@ -138,6 +146,23 @@ pub async fn ingest(
         return Err(IngestError::DisallowedBlockKind {
             kind: kind_str.to_string(),
         });
+    }
+
+    // Step 3b: channel-existence guard for channel-scoped kinds.
+    //
+    // Resolved once here and reused for the bridge-sink member lookup after
+    // persist, so the guard costs no extra query.
+    let channel_slug = manifest.metadata.get("channel").and_then(|v| v.as_str());
+    let mut resolved_channel = match channel_slug {
+        Some(slug) => ctx.store.get_channel_by_slug(slug)?,
+        None => None,
+    };
+    if let Some(slug) = channel_slug {
+        if resolved_channel.is_none() && requires_existing_channel(kind, &source) {
+            return Err(IngestError::UnknownChannel {
+                slug: slug.to_string(),
+            });
+        }
     }
 
     // Step 3: HLC update on receive
@@ -217,18 +242,21 @@ pub async fn ingest(
 
     // Channel membership for bridge-sink dispatch. `channel_id` here is the
     // channel SLUG (lifted from manifest metadata), but memberships are keyed
-    // by the channel's CID (its channel-create block CID). Resolve slug -> CID
-    // via get_channel_by_slug before listing members; empty if the channel row
-    // doesn't exist yet or has no members.
-    let member_dids: Vec<String> = match stored_block.channel_id.as_deref() {
-        Some(slug) => match ctx.store.get_channel_by_slug(slug) {
-            Ok(Some(chan)) => ctx
-                .store
-                .list_members(&chan.id)
-                .map(|ms| ms.into_iter().map(|m| m.member_did).collect())
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        },
+    // by the channel's CID (its channel-create block CID). Step 3b already
+    // resolved slug -> row for kinds carrying metadata["channel"]; re-resolve
+    // only for channel-create, whose row is written by apply_effect above (and
+    // whose slug lives under metadata["slug"], not metadata["channel"]).
+    if resolved_channel.is_none() {
+        if let Some(slug) = stored_block.channel_id.as_deref() {
+            resolved_channel = ctx.store.get_channel_by_slug(slug).unwrap_or_default();
+        }
+    }
+    let member_dids: Vec<String> = match &resolved_channel {
+        Some(chan) => ctx
+            .store
+            .list_members(&chan.id)
+            .map(|ms| ms.into_iter().map(|m| m.member_did).collect())
+            .unwrap_or_default(),
         None => Vec::new(),
     };
 
@@ -254,6 +282,35 @@ pub async fn ingest(
     }
 
     Ok(block_cid)
+}
+
+/// Whether a block of `kind` arriving from `source` must name a channel that
+/// already exists on this server.
+///
+/// Locally-submitted `text-render` is the case that matters: before this check,
+/// a mistyped slug persisted an orphan block and handed the sender a CID, so a
+/// typo was indistinguishable from a delivered message.
+///
+/// Federated blocks are deliberately EXEMPT. Channel and membership state does
+/// not replicate between peers — jig-server's federation relay persists inbound
+/// blocks without running `apply_effect` — so a peer's block routinely names a
+/// channel this server has no row for. Gating on local channel state would
+/// reject legitimate federated traffic.
+///
+/// Bridges are deliberately NOT exempt. The email bridge awaits
+/// `ensure_dm_channel` (a real channel-create through this same pipeline) before
+/// it submits a `text-render`, so an unknown channel from a bridge means the
+/// ensure step silently failed — worth surfacing loudly rather than writing an
+/// orphan block nobody will ever read.
+///
+/// Other channel-scoped kinds need no check here: `channel-create` names the
+/// channel it is creating, and `member-add` / `channel-promote` resolve the
+/// channel inside `apply_effect`, which already errors on a miss.
+fn requires_existing_channel(kind: BlockKind, source: &IngestSource) -> bool {
+    if matches!(source, IngestSource::FederatedPeer { .. }) {
+        return false;
+    }
+    matches!(kind, BlockKind::TextRender)
 }
 
 // ---- Bundle / manifest helpers --------------------------------------------
@@ -358,6 +415,10 @@ mod tests {
     }
 
     fn test_ctx() -> IngestContext {
+        test_ctx_allowing(&["text-render"])
+    }
+
+    fn test_ctx_allowing(kinds: &[&str]) -> IngestContext {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let server_key = random_signing_key();
         let server_did = Did::from_ed25519_pubkey(server_key.verifying_key().as_bytes());
@@ -365,13 +426,29 @@ mod tests {
             store: store.clone(),
             identity: Arc::new(crate::identity::TofuResolver::new(store)),
             hlc_clock: Arc::new(HlcClock::new(server_did.clone())),
-            allowed_block_kinds: vec!["text-render".to_string()],
+            allowed_block_kinds: kinds.iter().map(|k| k.to_string()).collect(),
             server_did,
             server_key,
             fanout: Arc::new(Fanout::new()),
             server_url: "ws://127.0.0.1:7117".to_string(),
             naively_allow_unknown_handles_fallback: false,
         }
+    }
+
+    /// Seed a channel row directly, standing in for a prior channel-create
+    /// ingest. Returns the channel's id (its notional channel-create CID).
+    fn seed_channel(ctx: &IngestContext, slug: &str) -> String {
+        let id = format!("bafySeed_{}", slug.trim_start_matches('#'));
+        ctx.store
+            .upsert_channel(&crate::persist::StoredChannel {
+                id: id.clone(),
+                slug: slug.to_string(),
+                visibility: "open".into(),
+                created_at: 0,
+                owner_did: "did:jig:zSeedOwner".into(),
+            })
+            .unwrap();
+        id
     }
 
     /// Build manifest bytes, code bytes, and a valid signature for a given BlockKind.
@@ -405,6 +482,16 @@ mod tests {
         kind: BlockKind,
         channel: &str,
     ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        build_bundle_parts_with_meta(signing_key, kind, &[("channel", channel)])
+    }
+
+    /// Like `build_bundle_parts` but seeds arbitrary string metadata entries —
+    /// channel-create needs `slug`, member-add needs `channel` + `member_did`.
+    fn build_bundle_parts_with_meta(
+        signing_key: &SigningKey,
+        kind: BlockKind,
+        entries: &[(&str, &str)],
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let sender_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
         let mut manifest = BlockManifest::builder()
             .version(Version::new(0, 1, 0))
@@ -416,9 +503,11 @@ mod tests {
             .build()
             .unwrap()
             .with_kind(kind);
-        manifest
-            .metadata
-            .insert("channel".to_string(), serde_json::json!(channel));
+        for (k, v) in entries {
+            manifest
+                .metadata
+                .insert((*k).to_string(), serde_json::json!(v));
+        }
         let manifest_bytes = manifest.to_canonical_bytes().unwrap();
         let code_bytes: Vec<u8> = vec![];
         let canonical = serde_json::to_vec(&(&manifest_bytes, &code_bytes)).unwrap();
@@ -493,9 +582,147 @@ mod tests {
         assert!(matches!(err, IngestError::InvalidSignature));
     }
 
+    // ---- Channel-existence guard -----------------------------------------
+
+    #[tokio::test]
+    async fn ingest_rejects_text_render_to_unknown_channel() {
+        // The headline bug: a typo'd channel slug used to persist an orphan
+        // block and return a CID, so a mistyped send was indistinguishable
+        // from a working one.
+        let ctx = test_ctx();
+        let sender_key = random_signing_key();
+        let (mb, cb, sig) =
+            build_bundle_parts_with_channel(&sender_key, BlockKind::TextRender, "#gigeu");
+
+        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, IngestError::UnknownChannel { slug } if slug == "#gigeu"),
+            "expected UnknownChannel, got {err:?}"
+        );
+        // The message must name the slug and point at a recovery action.
+        let msg = err.to_string();
+        assert!(msg.contains("#gigeu"), "error must name the slug: {msg}");
+        assert!(
+            msg.contains("jig channel create") && msg.contains("jig channel list"),
+            "error must be actionable: {msg}"
+        );
+        // Nothing may be persisted for a rejected block.
+        assert!(
+            ctx.store
+                .list_blocks_by_channel("#gigeu", 10, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_accepts_text_render_to_existing_channel() {
+        // Regression guard for the fix above.
+        let ctx = test_ctx();
+        seed_channel(&ctx, "#hello");
+        let sender_key = random_signing_key();
+        let (mb, cb, sig) =
+            build_bundle_parts_with_channel(&sender_key, BlockKind::TextRender, "#hello");
+
+        let cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .expect("existing channel must still accept text-render");
+        assert!(ctx.store.get_block(&cid).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn channel_create_bootstraps_on_a_server_with_no_channels() {
+        // Bootstrap guard: channel-create names the channel it is creating, so
+        // it must never be subject to the pre-existence check.
+        let ctx = test_ctx_allowing(&["channel-create"]);
+        assert!(ctx.store.list_channels().unwrap().is_empty());
+        let owner_key = random_signing_key();
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &owner_key,
+            BlockKind::ChannelCreate,
+            &[("slug", "#first"), ("visibility", "open")],
+        );
+
+        do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .expect("channel-create must bootstrap on an empty server");
+        assert!(ctx.store.get_channel_by_slug("#first").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn member_add_against_existing_channel_still_ingests() {
+        let ctx = test_ctx_allowing(&["member-add"]);
+        let channel_id = seed_channel(&ctx, "#hello");
+        let owner_key = random_signing_key();
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &owner_key,
+            BlockKind::MemberAdd,
+            &[("channel", "#hello"), ("member_did", "did:jig:zDeji")],
+        );
+
+        do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .expect("member-add against an existing channel must succeed");
+        let members = ctx.store.list_members(&channel_id).unwrap();
+        assert!(members.iter().any(|m| m.member_did == "did:jig:zDeji"));
+    }
+
+    #[tokio::test]
+    async fn federated_text_render_to_unknown_channel_is_admitted() {
+        // Deliberate exemption: channel state does not replicate between peers
+        // (see jig-server v0_0_2_federation docs), so a peer's block routinely
+        // names a channel this server has no row for. Rejecting would break
+        // federation; we admit and let fanout match on the slug.
+        let ctx = test_ctx();
+        let sender_key = random_signing_key();
+        let (mb, cb, sig) =
+            build_bundle_parts_with_channel(&sender_key, BlockKind::TextRender, "#remote-only");
+
+        let cid = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::FederatedPeer {
+                peer_did: Did::default(),
+                peer_url: "wss://peer-a.jig.onl".into(),
+            },
+        )
+        .await
+        .expect("federated blocks must not be gated on local channel state");
+        assert!(ctx.store.get_block(&cid).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn bridge_text_render_to_unknown_channel_is_rejected() {
+        // Bridges are NOT exempt: the email bridge awaits `ensure_dm_channel`
+        // (a real channel-create through this same pipeline) before submitting
+        // a text-render, so an unknown channel here is a bridge bug, not a
+        // legitimate case.
+        let ctx = test_ctx();
+        let sender_key = random_signing_key();
+        let (mb, cb, sig) = build_bundle_parts_with_channel(
+            &sender_key,
+            BlockKind::TextRender,
+            "#dm/never-ensured",
+        );
+
+        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::Bridge)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, IngestError::UnknownChannel { slug } if slug == "#dm/never-ensured"),
+            "expected UnknownChannel, got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn ingest_lifts_channel_id_from_metadata() {
         let ctx = test_ctx(); // allows "text-render"
+        seed_channel(&ctx, "#hello");
         let sender_key = random_signing_key();
         let (mb, cb, sig) =
             build_bundle_parts_with_channel(&sender_key, BlockKind::TextRender, "#hello");
@@ -617,6 +844,7 @@ mod tests {
         // A block ingested with IngestSource::Bridge should reach a local
         // channel subscriber (full broadcast), same as LocalClient.
         let ctx = test_ctx();
+        seed_channel(&ctx, "#dm/y");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         ctx.fanout
             .subscribe_local(

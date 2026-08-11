@@ -125,7 +125,7 @@ enum Commands {
         action: ServerAction,
     },
 
-    /// Create, join, or list channels on the configured server. Uses the
+    /// Create, join, delete, or list channels on the configured server. Uses the
     /// `/_admin_v0_0_2/*` admin endpoints in v0.0.2 (server must have
     /// `[debug] admin_endpoints = true`); the list endpoint is public.
     Channel {
@@ -170,6 +170,23 @@ enum ChannelAction {
         /// Channel slug to join (e.g. `#hello`).
         #[arg()]
         slug: String,
+    },
+
+    /// Delete (archive) a channel you own. Builds a signed channel-archive
+    /// block and POSTs it to `/_admin_v0_0_2/channels/<slug>/archive`.
+    ///
+    /// Soft delete: the server stops listing the channel but keeps its
+    /// history, and only the channel's owner DID may do it.
+    #[command(alias = "archive")]
+    Delete {
+        /// Channel slug to delete (e.g. `#hello`).
+        #[arg()]
+        slug: String,
+
+        /// Skip the interactive confirmation. Required when stdin is not a
+        /// terminal, since there is nobody to prompt.
+        #[arg(long)]
+        yes: bool,
     },
 
     /// List all channels known to the configured server.
@@ -459,6 +476,9 @@ async fn main() -> Result<()> {
             }
             ChannelAction::Join { slug } => {
                 cmd::channel::join(&ctx, slug).await?;
+            }
+            ChannelAction::Delete { slug, yes } => {
+                cmd::channel::delete(&ctx, slug, yes).await?;
             }
             ChannelAction::List => {
                 cmd::channel::list(&ctx).await?;
