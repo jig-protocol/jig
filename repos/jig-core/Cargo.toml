@@ -25,8 +25,8 @@ thiserror = "1.0"
 wasmparser = "0.118"
 
 # Optional cryptography/signing helpers
-ed25519-dalek = { version = "2.0", optional = true, features = ["serde"] }
-rand = { version = "0.8", optional = true }
+ed25519-dalek = { version = "3.0", optional = true, features = ["serde"] }
+rand = { version = "0.10", optional = true }
 sigstore = { version = "0.6", optional = true }
 
 [dev-dependencies]
