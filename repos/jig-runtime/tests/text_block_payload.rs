@@ -15,6 +15,42 @@
 use jig_runtime::Runtime;
 use text_block::{Input, Output, canonical, execute_pure};
 
+/// Which module bytes to exercise.
+///
+/// Defaults to the committed artifact. CI also runs this whole suite with
+/// `JIG_TEXT_BLOCK_WASM` pointing at a freshly-built module, which is how the
+/// committed artifact is held to the source without requiring bit-identical
+/// builds — Wasm output here is not reproducible across hosts (an identical tree
+/// differs by ~1.4 KB between aarch64 macOS and CI's x86_64 Linux, and
+/// `--remap-path-prefix` does not close it).
+///
+/// Both runs assert agreement with `execute_pure`, so the native function is the
+/// shared oracle: if the committed artifact and a fresh build both match it,
+/// they are functionally equivalent on this corpus.
+fn module_bytes() -> std::borrow::Cow<'static, [u8]> {
+    let Some(raw) = std::env::var_os("JIG_TEXT_BLOCK_WASM") else {
+        return std::borrow::Cow::Borrowed(canonical::CANONICAL_WASM);
+    };
+
+    // A relative path is resolved against the WORKSPACE root, not the process
+    // cwd: cargo runs a test binary with cwd set to the package directory
+    // (repos/jig-runtime), so a sensible-looking `target/…` would otherwise miss.
+    let path = std::path::PathBuf::from(&raw);
+    let resolved = if path.is_relative() {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("package dir has a parent")
+            .join(&path)
+    } else {
+        path
+    };
+
+    let bytes = std::fs::read(&resolved).unwrap_or_else(|e| {
+        panic!("JIG_TEXT_BLOCK_WASM={raw:?} (resolved to {resolved:?}) could not be read: {e}")
+    });
+    std::borrow::Cow::Owned(bytes)
+}
+
 fn input_with_body(body: &str) -> Input {
     Input {
         sender_did: "did:jig:zabc".to_string(),
@@ -32,7 +68,7 @@ fn run_wasm(body: &str) -> Output {
     let runtime = Runtime::new().expect("runtime construction");
     let input = postcard::to_allocvec(&input_with_body(body)).expect("input encodes");
     let result = runtime
-        .execute_payload(canonical::CANONICAL_WASM, canonical::ENTRY_POINT, &input)
+        .execute_payload(&module_bytes(), canonical::ENTRY_POINT, &input)
         .expect("canonical text-block module must execute");
     postcard::from_bytes(&result.bytes).expect("guest output decodes as Output")
 }
@@ -42,12 +78,19 @@ fn run_wasm(body: &str) -> Output {
 /// anywhere else is an assumption rather than a fact.
 #[test]
 fn wasm_and_native_agree_on_render_hash() {
+    // The corpus must exercise every branch of `render_safe_html`, or a real
+    // render change slips through. An earlier version of this list had no
+    // apostrophe in any body, so swapping `&#39;` for `&apos;` in the escaper
+    // left all of these green — a change to the rendered output that the gate
+    // could not see. Every escaped character now appears at least once.
     for body in [
         "hello world",
         "hi @deji! check https://jig.onl",
         "", // empty body — still a valid render
         "unicode: café ﬁ ½ 🎻",
         "<script>alert(1)</script> & \"quotes\"",
+        "it's a 'quoted' apostrophe test",
+        "all five at once: < > & \" '",
     ] {
         let from_wasm = run_wasm(body);
         let from_native = execute_pure(&input_with_body(body));
@@ -142,13 +185,22 @@ fn execution_reports_the_canonical_module_hash() {
     let runtime = Runtime::new().expect("runtime construction");
     let input = postcard::to_allocvec(&input_with_body("hi")).unwrap();
     let result = runtime
-        .execute_payload(canonical::CANONICAL_WASM, canonical::ENTRY_POINT, &input)
+        .execute_payload(&module_bytes(), canonical::ENTRY_POINT, &input)
         .expect("execution");
+    let expected = blake3::hash(&module_bytes()).to_hex().to_string();
     assert_eq!(
-        result.module_hash,
-        canonical::module_hash(),
-        "reported module hash must match the embedded artifact's identity"
+        result.module_hash, expected,
+        "reported module hash must match the bytes that were executed"
     );
+    if std::env::var_os("JIG_TEXT_BLOCK_WASM").is_none() {
+        // Default run: the executed bytes ARE the embedded artifact, so the
+        // identity helper must agree too.
+        assert_eq!(
+            result.module_hash,
+            canonical::module_hash(),
+            "committed artifact's declared identity must match its own bytes"
+        );
+    }
 }
 
 /// Malformed input must surface as a clean error, not a trap or a silent
@@ -158,7 +210,7 @@ fn malformed_input_is_reported_as_an_error() {
     let runtime = Runtime::new().expect("runtime construction");
     let err = runtime
         .execute_payload(
-            canonical::CANONICAL_WASM,
+            &module_bytes(),
             canonical::ENTRY_POINT,
             b"\xff\xff not a valid Input encoding",
         )
@@ -176,7 +228,7 @@ fn a_missing_entry_point_names_the_export() {
     let runtime = Runtime::new().expect("runtime construction");
     let input = postcard::to_allocvec(&input_with_body("hi")).unwrap();
     let err = runtime
-        .execute_payload(canonical::CANONICAL_WASM, "no_such_export", &input)
+        .execute_payload(&module_bytes(), "no_such_export", &input)
         .expect_err("a missing export must fail");
     assert!(
         err.to_string().contains("no_such_export"),
