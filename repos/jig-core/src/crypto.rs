@@ -58,10 +58,51 @@ pub mod ed25519 {
     use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
     // rand 0.10 renamed the byte-filling trait `RngCore` -> `Rng` and removed
     // `rngs::OsRng`, re-exporting getrandom's `SysRng` in its place. `SysRng` is
-    // fallible-only (`TryRng`), hence `try_fill_bytes` below. This site mints a
-    // long-lived identity key, so it must stay on the OS CSPRNG — do not swap it
-    // for `rand::rng()` or any seedable RNG.
+    // fallible-only (`TryRng`), hence `try_fill_bytes` below. The policy — OS
+    // CSPRNG, never a seedable RNG — is documented on `generate_signing_key`,
+    // which is the only function in the tree that reads this import.
     use rand::{TryRng, rngs::SysRng};
+    use zeroize::Zeroize;
+
+    /// Mint fresh ed25519 key material for a long-lived jig identity.
+    ///
+    /// **This is the only sanctioned keygen path in the protocol, and the only
+    /// place the entropy source is chosen.** A public key *is* an identity here
+    /// — `did:jig:z` + base32 of these 32 bytes — which makes that choice a
+    /// protocol-level decision rather than a local one. Every identity in the
+    /// tree funnels through this function: `jig-client`'s keyfiles (and so
+    /// `jig init` and `jig keys rotate`), the nameserver's persistent signing
+    /// identity, and [`KeyPair::generate`].
+    ///
+    /// **Forks and algorithm changes belong here, in this one body.** That is
+    /// the reason the function exists. Before it, each caller picked its own
+    /// source, and they had already drifted: `jig-client` minted long-lived
+    /// identity keys from `rand::rng()` — an OS-seeded userspace ChaCha PRNG —
+    /// while this crate and the nameserver read the OS CSPRNG directly. Nobody
+    /// chose that split; it accumulated, in precisely the place a fork is most
+    /// likely to touch.
+    ///
+    /// Callers that need to *load* an existing key still build it themselves
+    /// from stored bytes via `SigningKey::from_bytes`; this function is for
+    /// minting new material only.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS CSPRNG is unavailable. `rand` 0.8's `OsRng` panicked
+    /// internally on entropy failure and this preserves that contract
+    /// deliberately: minting a long-lived identity from a degraded source is
+    /// worse than failing to start.
+    pub fn generate_signing_key() -> SigningKey {
+        let mut seed = [0u8; 32];
+        SysRng
+            .try_fill_bytes(&mut seed)
+            .expect("OS CSPRNG must be available to generate an identity key");
+        let signing = SigningKey::from_bytes(&seed);
+        // `SigningKey` zeroizes itself on drop; this clears the extra copy the
+        // seed buffer holds, which would otherwise outlive it on the stack.
+        seed.zeroize();
+        signing
+    }
 
     /// Convenience wrapper around an ed25519 keypair.
     #[derive(Clone)]
@@ -71,16 +112,9 @@ pub mod ed25519 {
     }
 
     impl KeyPair {
-        /// Generate a new random key pair.
+        /// Generate a new random key pair via [`generate_signing_key`].
         pub fn generate() -> Self {
-            let mut seed = [0u8; 32];
-            // rand 0.8's `OsRng` panicked internally when the OS CSPRNG was
-            // unavailable; `expect` preserves that behaviour rather than minting
-            // a key from a degraded entropy source.
-            SysRng
-                .try_fill_bytes(&mut seed)
-                .expect("OS CSPRNG must be available to generate an identity key");
-            let signing = SigningKey::from_bytes(&seed);
+            let signing = generate_signing_key();
             let verifying = signing.verifying_key();
             Self { signing, verifying }
         }
@@ -113,6 +147,100 @@ pub mod ed25519 {
         pub fn verify_hash(&self, hash: &Hash, signature: &[u8]) -> Result<()> {
             self.verify(hash.as_bytes(), signature)
         }
+    }
+}
+
+/// The sanctioned keygen path, exercised through its public surface.
+///
+/// These tests do not assert *which* entropy source is used — that is a single
+/// documented line in [`ed25519::generate_signing_key`] and asserting on it here
+/// would only restate the implementation. What they pin down is the contract
+/// every caller depends on: keys are distinct, fully written, and survive the
+/// seed round-trip that both persistence paths (client keyfiles, nameserver
+/// SQLite blobs) are built on.
+#[cfg(all(test, feature = "ed25519"))]
+mod keygen {
+    use super::ed25519::{KeyPair, generate_signing_key};
+    use crate::Did;
+    use ed25519_dalek::{Signer, SigningKey, Verifier};
+    use std::collections::HashSet;
+
+    #[test]
+    fn successive_keys_are_distinct() {
+        let keys: HashSet<[u8; 32]> = (0..16)
+            .map(|_| generate_signing_key().verifying_key().to_bytes())
+            .collect();
+        assert_eq!(
+            keys.len(),
+            16,
+            "keygen returned a repeated key — the entropy source is degenerate"
+        );
+    }
+
+    /// An unfilled buffer is the realistic refactor bug here: `[0u8; 32]` is a
+    /// perfectly valid ed25519 seed, so a keygen that silently skipped filling
+    /// it would mint one shared identity for every user and still pass a
+    /// sign/verify test.
+    #[test]
+    fn a_generated_key_is_not_the_all_zero_seed() {
+        let key = generate_signing_key();
+        assert_ne!(
+            key.to_bytes(),
+            [0u8; 32],
+            "keygen produced the all-zero seed — the entropy buffer was never filled"
+        );
+    }
+
+    /// Both persistence paths store the 32 seed bytes and rebuild the key from
+    /// them later. If that round-trip ever stopped being identity-preserving,
+    /// every stored key would load as a different identity.
+    #[test]
+    fn a_key_round_trips_through_its_stored_seed_bytes() {
+        let key = generate_signing_key();
+        let reloaded = SigningKey::from_bytes(&key.to_bytes());
+        assert_eq!(
+            reloaded.verifying_key().to_bytes(),
+            key.verifying_key().to_bytes(),
+            "a key rebuilt from its stored seed is a different identity"
+        );
+    }
+
+    #[test]
+    fn a_generated_key_signs_and_verifies() {
+        let key = generate_signing_key();
+        let msg = b"jig keygen smoke test";
+        let sig = key.sign(msg);
+        key.verifying_key()
+            .verify(msg, &sig)
+            .expect("a freshly generated key must verify its own signature");
+    }
+
+    #[test]
+    fn a_generated_key_derives_a_canonical_did() {
+        let did = Did::from_ed25519_pubkey(&generate_signing_key().verifying_key().to_bytes());
+        let s = did.to_did_jig_string();
+        assert!(
+            s.starts_with("did:jig:z"),
+            "generated identity must be canonical key-derived form, got `{s}`"
+        );
+        assert_eq!(
+            s.len(),
+            61,
+            "canonical DID is `did:jig:z` + 52 base32 chars"
+        );
+    }
+
+    /// [`KeyPair`] is a thin wrapper over the same path; it must not become a
+    /// second, quietly divergent keygen.
+    #[test]
+    fn keypair_generate_produces_distinct_usable_keys() {
+        let a = KeyPair::generate();
+        let b = KeyPair::generate();
+        assert_ne!(a.public_key_bytes(), b.public_key_bytes());
+        assert_ne!(a.public_key_bytes(), [0u8; 32]);
+        let sig = a.sign(b"hello");
+        a.verify(b"hello", &sig)
+            .expect("keypair verifies its own signature");
     }
 }
 
@@ -178,6 +306,23 @@ mod signing_stability {
         sk.verifying_key()
             .verify(MSG, &sig)
             .expect("a signature captured under dalek 2.0 must verify under the current version");
+    }
+
+    /// The chain that actually defines a jig identity is seed → pubkey → DID.
+    /// The two tests above freeze the first hop; without this one the last hop
+    /// is unpinned, so a change to base32 alphabet, case, or prefix could
+    /// silently rename every user while both golden vectors above still pass.
+    #[test]
+    fn the_golden_pubkey_still_derives_the_same_did() {
+        const GOLDEN_DID: &str = "did:jig:zpg2vmlup4zkpsqdywejorkmlu6ib7bj242k35v7a4oiqxlieszsa";
+
+        let sk = SigningKey::from_bytes(&SEED);
+        let did = crate::Did::from_ed25519_pubkey(&sk.verifying_key().to_bytes());
+        assert_eq!(
+            did.to_did_jig_string(),
+            GOLDEN_DID,
+            "DID derivation changed — every existing identity would be renamed"
+        );
     }
 
     fn hex_to_bytes(s: &str) -> Vec<u8> {

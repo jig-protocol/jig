@@ -5313,7 +5313,6 @@ dependencies = [
  "jig-config",
  "jig-core",
  "jig-pipeline",
- "rand 0.10.1",
  "semver",
  "serde",
  "serde_json",
@@ -5360,6 +5359,7 @@ dependencies = [
  "time",
  "wasmparser 0.118.2",
  "wat",
+ "zeroize",
 ]
 
 [[package]]
