@@ -79,6 +79,9 @@ async fn v0_0_2_ingest_enforces_tofu_lock() {
     let server = TestJigServer::start_with_full_kinds().await.unwrap();
     let (alice, _alice_dir) = test_identity_with_dir();
     let (bob, _bob_dir) = test_identity_with_dir();
+    // Precondition: ingest now rejects text-render for an unknown channel.
+    // Seeded directly so this test stays about the TOFU nickname lock, not channel setup.
+    server.seed_channel(&alice, "#hello").expect("seed channel");
     assert_ne!(
         alice.did_string(),
         bob.did_string(),
@@ -220,6 +223,9 @@ async fn naively_allow_unknown_handles_fallback_bypasses_lock() {
 
     let (alice, _alice_dir) = test_identity_with_dir();
     let (bob, _bob_dir) = test_identity_with_dir();
+    // Precondition: ingest now rejects text-render for an unknown channel.
+    // Seeded directly so this test stays about the fallback antipattern flag, not channel setup.
+    server.seed_channel(&alice, "#hello").expect("seed channel");
 
     let _cid_a = send_text_render_with_nickname(&server, &alice, "#hello", "alice", "dj")
         .await

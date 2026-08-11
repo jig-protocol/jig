@@ -455,6 +455,12 @@ async fn handle_client_frame(
                     )
                     .await;
                 }
+                // Distinct code (not the generic INGEST_ERROR) because this is
+                // the one ingest failure an ordinary user causes by mistyping a
+                // channel name; the Display text is already actionable prose.
+                Err(e @ IngestError::UnknownChannel { .. }) => {
+                    let _ = send_error(socket, "UNKNOWN_CHANNEL", None, &e.to_string()).await;
+                }
                 Err(e) => {
                     let _ = send_error(socket, "INGEST_ERROR", None, &e.to_string()).await;
                 }
@@ -563,11 +569,29 @@ mod tests {
         }
     }
 
+    /// Seed a channel row so `text-render` submissions clear ingest's
+    /// channel-existence guard. These tests are about the WS transport, not
+    /// about channel-create, so the row is written directly.
+    fn seed_channel(state: &AppState, slug: &str) {
+        state
+            .ingest_ctx
+            .store
+            .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                id: format!("bafySeed{slug}"),
+                slug: slug.to_string(),
+                visibility: "open".to_string(),
+                created_at: 0,
+                owner_did: "did:jig:zSeedOwner".to_string(),
+            })
+            .unwrap();
+    }
+
     // --- submit → Ack -------------------------------------------------------
 
     #[tokio::test]
     async fn ws_submit_returns_ack() {
-        let (_state, url) = start_test_server().await;
+        let (state, url) = start_test_server().await;
+        seed_channel(&state, "#hello");
         let (mut ws, _) = connect_async(&url).await.unwrap();
 
         let id = test_identity();
@@ -634,6 +658,47 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn ws_submit_to_unknown_channel_returns_an_actionable_error_frame() {
+        // The whole point of the ingest guard is user-visible feedback: a
+        // mistyped slug must come back as prose naming the slug, not an Ack
+        // carrying a CID for a block nobody will ever read.
+        let (_state, url) = start_test_server().await; // no channels seeded
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+
+        let id = test_identity();
+        let hlc = test_hlc(&id);
+        let block = build_text_render(&id, "#gigeu", "hi", hlc);
+        let submit = Envelope::new(Frame::Submit {
+            bundle_b64: base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
+            sig_b64: base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
+        });
+        ws.send(TMessage::Text(serde_json::to_string(&submit).unwrap()))
+            .await
+            .unwrap();
+
+        let msg = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .expect("timeout waiting for reply")
+            .expect("stream closed")
+            .expect("ws error");
+        let TMessage::Text(reply) = msg else {
+            panic!("expected text, got {msg:?}");
+        };
+        let reply_env: Envelope = serde_json::from_str(&reply).unwrap();
+        match reply_env.frame {
+            Frame::Error { code, message, .. } => {
+                assert_eq!(code, "UNKNOWN_CHANNEL");
+                assert!(message.contains("#gigeu"), "must name the slug: {message}");
+                assert!(
+                    message.contains("jig channel create"),
+                    "must say how to recover: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
     // --- subscribe + submit → Block delivered to subscriber -----------------
 
     #[tokio::test]
@@ -648,7 +713,8 @@ mod tests {
         // `SubscriptionScope::Channel` does match text-render blocks. (An
         // earlier revision of this comment claimed otherwise — that caveat is
         // obsolete.)
-        let (_state, url) = start_test_server().await;
+        let (state, url) = start_test_server().await;
+        seed_channel(&state, "#hello");
         let (mut ws, _) = connect_async(&url).await.unwrap();
 
         // 1. Subscribe federation-scope (no kind filter = all kinds).
@@ -746,7 +812,8 @@ mod tests {
     async fn ws_submit_increments_block_and_channel_counters() {
         let before = metrics::snapshot();
 
-        let (_state, url) = start_test_server().await;
+        let (state, url) = start_test_server().await;
+        seed_channel(&state, "#metrics-probe");
         let (mut ws, _) = connect_async(&url).await.unwrap();
 
         let id = test_identity();

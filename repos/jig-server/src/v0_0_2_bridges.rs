@@ -273,6 +273,12 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         IngestError::BundleMalformed(m) => SubmitDenied::PolicyBlocked {
             reason: format!("bundle malformed: {m}"),
         },
+        // PolicyBlocked, not Unavailable: retrying will not conjure the
+        // channel. The bridge should bounce, and the operator should look at
+        // why its ensure-channel step didn't run.
+        ref e @ IngestError::UnknownChannel { .. } => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
         IngestError::Identity(ide) => SubmitDenied::PolicyBlocked {
             reason: format!("identity: {ide}"),
         },
