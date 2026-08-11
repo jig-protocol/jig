@@ -1,5 +1,6 @@
 //! Jig CLI - block-first command line interface
 
+mod channel_arg;
 mod cmd;
 mod commands;
 mod config;
@@ -10,6 +11,7 @@ mod receipt;
 mod runtime;
 
 use anyhow::Result;
+use channel_arg::ChannelArg;
 use clap::{Parser, Subcommand};
 use http_client::JigHttpClient;
 use std::path::PathBuf;
@@ -79,31 +81,33 @@ enum Commands {
     Send {
         #[arg()]
         message: Vec<String>,
+        /// Flag-only, unlike the other channel-scoped commands: the
+        /// positional slot here is the message body, so a positional channel
+        /// would be ambiguous. See `channel_arg::ChannelArg`.
         #[arg(long)]
         channel: Option<String>,
     },
 
     /// List recent blocks
     Read {
-        #[arg(long)]
-        channel: Option<String>,
+        #[command(flatten)]
+        channel: ChannelArg,
         #[arg(long, default_value = "50")]
         limit: usize,
     },
 
     /// Follow new blocks in real time
     Tail {
-        #[arg(long)]
-        channel: Option<String>,
+        #[command(flatten)]
+        channel: ChannelArg,
     },
 
     /// Interactive ratatui TUI: scrolling history + input box. The
     /// "demo command" — `install.sh` invokes this at the end of
     /// first-run setup. Enter sends, Ctrl+Q or Esc quits.
     Chat {
-        /// Channel slug to join (e.g. `#hello`).
-        #[arg()]
-        channel: String,
+        #[command(flatten)]
+        channel: ChannelArg,
     },
 
     /// View and inspect block receipts
@@ -514,19 +518,20 @@ async fn main() -> Result<()> {
             cmd::send::run(&ctx, channel, body).await?;
         }
         Some(Commands::Read { channel, limit }) => {
-            let channel = channel.unwrap_or(default_channel.clone());
+            let channel = channel.resolve(&default_channel);
             commands::read_messages(&client, &channel, limit, cli.json).await?;
         }
         Some(Commands::Tail { channel }) => {
             // F5: route through jig-client WSS subscribe. v0.0.1's HTTP-
             // polling tail (`commands::tail_messages`) is removed; this is
             // an intentional regression — v0.0.2 only ships the WSS path.
-            let channel = channel.unwrap_or(default_channel.clone());
+            let channel = channel.resolve(&default_channel);
             cmd::tail::run(&ctx, channel).await?;
         }
         Some(Commands::Chat { channel }) => {
             // F6: ratatui TUI combining `tail` (live history) with an
             // input box. The end-of-install demo command.
+            let channel = channel.resolve(&default_channel);
             cmd::chat::run(&ctx, cmd::chat::ChatArgs { channel }).await?;
         }
         Some(Commands::Receipt { action }) => match action {

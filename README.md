@@ -103,8 +103,10 @@ jig channel create '#hello'
 jig chat '#hello'                   # Enter sends; Ctrl+Q or Esc quits
 ```
 
-`jig send "text" --channel '#hello'` and `jig tail --channel '#hello'` are the
-non-interactive equivalents. `jig server info` prints the server's advertised
+`jig send "text" --channel '#hello'` and `jig tail '#hello'` are the
+non-interactive equivalents. `chat`, `tail`, and `read` each take the channel
+either positionally or as `--channel`; `send` is flag-only, since its positional
+slot is the message body. `jig server info` prints the server's advertised
 `/.well-known/jig` capabilities, including any unsafe options it has enabled.
 
 `jig chat` and `jig tail` exit non-zero when the connection drops but do not reconnect on

@@ -196,8 +196,13 @@ bafkr4ie4g5wia2dmkmwtinzclm37dt5ylkrkbiaoakmofbbrgl2buk7vku
 Watch a channel as plain scrolling text, no window frame:
 
 ```bash
-jig tail --channel '#gigue'
+jig tail '#gigue'
 ```
+
+Same channel argument as `jig chat`. Leave it off and you get your default
+channel from `cli.toml`. (`jig tail --channel '#gigue'` works too, and older
+notes use that form — the two are interchangeable, but passing both at once is
+an error rather than a guess.)
 
 ```
 14:22  did:jig:z4rhh3…: first real message on the VPS
