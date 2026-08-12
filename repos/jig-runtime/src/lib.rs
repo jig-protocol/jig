@@ -54,7 +54,7 @@ pub use config::{PricingConfig, RuntimeConfig};
 pub use costs::{CapabilityCosts, CostSchedule, InstructionCosts};
 pub use error::{Result, RuntimeError};
 pub use fuel::{CapabilityMeterHandle, CapabilityMeterSnapshot};
-pub use payload::{PayloadOutput, RC_OUTPUT_TOO_SMALL};
+pub use payload::{CompiledBlock, PayloadOutput, RC_OUTPUT_TOO_SMALL};
 pub use receipt::{
     CapabilityCall, ExecutionOutcome, ModuleHash, Receipt, ReceiptBuilder, ReceiptError,
     ReceiptPricing,

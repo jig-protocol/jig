@@ -235,3 +235,117 @@ fn a_missing_entry_point_names_the_export() {
         "error should name the missing export, got: {err}"
     );
 }
+
+// --- the precompiled path (what ingest uses) -------------------------------
+
+/// `execute_precompiled` must be indistinguishable from `execute_payload` in
+/// result. It exists purely to move compilation off the hot path, so if the two
+/// ever disagree, the fast path is producing different receipts from the slow one.
+#[test]
+fn precompiled_and_one_shot_execution_agree() {
+    let runtime = Runtime::new().expect("runtime construction");
+    let wasm = module_bytes();
+    let compiled = runtime
+        .precompile(&wasm)
+        .expect("canonical module compiles");
+
+    // Self-consistent for whichever artifact is under test — CI runs this suite a
+    // second time against a freshly-built module, whose bytes legitimately differ
+    // from the committed one.
+    assert_eq!(
+        compiled.module_hash(),
+        blake3::hash(&wasm).to_hex().to_string(),
+        "a compiled block must report the identity of the bytes it came from"
+    );
+    if std::env::var_os("JIG_TEXT_BLOCK_WASM").is_none() {
+        assert_eq!(compiled.module_hash(), canonical::module_hash());
+    }
+
+    for body in [
+        "hello world",
+        "",
+        "hi @deji https://jig.onl",
+        "<b>&amp;</b>",
+    ] {
+        let input = postcard::to_allocvec(&input_with_body(body)).expect("input encodes");
+
+        let fast = runtime
+            .execute_precompiled(&compiled, canonical::ENTRY_POINT, &input)
+            .expect("precompiled execution");
+        let slow = runtime
+            .execute_payload(&wasm, canonical::ENTRY_POINT, &input)
+            .expect("one-shot execution");
+
+        assert_eq!(
+            fast.bytes, slow.bytes,
+            "precompiled and one-shot output differ for body {body:?}"
+        );
+        assert_eq!(fast.module_hash, slow.module_hash);
+
+        let out: Output = postcard::from_bytes(&fast.bytes).expect("decodes");
+        let native = execute_pure(&input_with_body(body));
+        assert_eq!(out.render_hash, native.render_hash);
+    }
+}
+
+/// One compiled block serves many executions without state leaking between them.
+/// Instances are fresh per call; a guest that could see the previous message's
+/// memory would break both determinism and confidentiality.
+#[test]
+fn a_compiled_block_is_reusable_without_carrying_state() {
+    let runtime = Runtime::new().expect("runtime construction");
+    let compiled = runtime.precompile(&module_bytes()).unwrap();
+
+    let first = |b: &str| -> Output {
+        let input = postcard::to_allocvec(&input_with_body(b)).unwrap();
+        postcard::from_bytes(
+            &runtime
+                .execute_precompiled(&compiled, canonical::ENTRY_POINT, &input)
+                .expect("execution")
+                .bytes,
+        )
+        .unwrap()
+    };
+
+    // Interleave a long body with a short one: if instance memory persisted, the
+    // short render would show remnants of the long one.
+    let long = "x".repeat(3000);
+    for _ in 0..3 {
+        assert_eq!(first(&long).canonical_text.len(), 3000);
+        let short = first("hi");
+        assert_eq!(short.canonical_text, "hi");
+        assert_eq!(short.length_bytes, 2);
+    }
+}
+
+/// Throughput benchmark for the 10,000 msg/sec KPI. `#[ignore]`d: it measures
+/// wall-clock, so it would be meaningless on a shared CI runner. Run deliberately:
+///
+///   cargo test -p jig-runtime --test text_block_payload --release -- --ignored --nocapture
+///
+/// Measured on an M-series laptop, release: precompiled ~85us/msg (~11,800/s);
+/// recompiling per message ~16ms/msg (~62/s). That ~200x gap is why ingest must
+/// hold a `CompiledBlock` rather than call `execute_payload`.
+#[test]
+#[ignore = "wall-clock benchmark; run explicitly with --ignored --release"]
+fn precompiled_throughput_benchmark() {
+    use std::time::Instant;
+    let runtime = Runtime::new().expect("runtime construction");
+    let compiled = runtime.precompile(&module_bytes()).unwrap();
+    let n = 2000;
+
+    let start = Instant::now();
+    for i in 0..n {
+        let input = postcard::to_allocvec(&input_with_body(&format!("message {i}"))).unwrap();
+        runtime
+            .execute_precompiled(&compiled, canonical::ENTRY_POINT, &input)
+            .expect("execution");
+    }
+    let elapsed = start.elapsed();
+    let per_sec = n as f64 / elapsed.as_secs_f64();
+    println!(
+        "precompiled: {:?}/msg => {:.0} msg/s over {n} messages",
+        elapsed / n,
+        per_sec
+    );
+}
