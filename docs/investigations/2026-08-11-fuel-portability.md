@@ -198,8 +198,17 @@ schema work makes them otherwise.
 ## What the matrix settled
 
 `.github/workflows/fuel-portability.yml` ran the same module on four hosts, idle
-and loaded. Results are in Finding 2. Summarising against the branches I wrote
-before seeing them:
+and loaded. Results are in Finding 2, and a second independent run reproduced every
+number exactly — so these are per-host constants, not sampling noise.
+
+The workflow now runs **Linux only on pull requests** (both architectures, which
+preserves the axis that mattered) and the full four platforms on
+`workflow_dispatch`. macOS and Windows minutes bill above baseline, and re-running
+them on every review round buys nothing once the table above is recorded. Dispatch
+manually when the table itself needs redoing — a PR run cannot surface an
+OS-dependent difference, because Linux is the only OS in it.
+
+Summarising against the branches I wrote before seeing the results:
 
 - **Reference rows identical across platforms** — happened for the no-import
   module (2512 everywhere), NOT for the WASI module.

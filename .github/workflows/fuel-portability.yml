@@ -44,24 +44,65 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
+# A new push supersedes the previous run rather than racing it. Without this,
+# review rounds stack concurrent matrices on top of each other.
+concurrency:
+  group: fuel-portability-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # The platform set depends on why we are running.
+  #
+  # On a pull request: **Linux only**. macOS bills at a premium and Windows above
+  # baseline, and re-running all four on every review round buys nothing once the
+  # cross-platform table is recorded in
+  # docs/investigations/2026-08-11-fuel-portability.md. Both Linux runners are kept
+  # so the ARCHITECTURE axis survives at Linux prices — that axis is what showed
+  # architecture is not the variable (x86_64 and aarch64 Linux agree exactly).
+  #
+  # On workflow_dispatch: the full four, for when the table itself needs redoing.
+  #
+  # Note on why this is not a `paths-ignore`: for `pull_request`, GitHub evaluates
+  # path filters against the whole PR diff rather than the latest push, so once a PR
+  # touches repos/jig-runtime/** every later push re-triggers no matter what the
+  # push contained. Trimming the matrix is the lever that actually works.
+  select-platforms:
+    name: select platforms
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.pick.outputs.include }}
+    steps:
+      - id: pick
+        env:
+          FULL: >-
+            [{"label":"x86_64-linux","runner":"ubuntu-latest"},
+             {"label":"aarch64-linux","runner":"ubuntu-24.04-arm"},
+             {"label":"aarch64-macos","runner":"macos-latest"},
+             {"label":"x86_64-windows","runner":"windows-latest"}]
+          LINUX_ONLY: >-
+            [{"label":"x86_64-linux","runner":"ubuntu-latest"},
+             {"label":"aarch64-linux","runner":"ubuntu-24.04-arm"}]
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SET="$FULL"
+            echo "full matrix (manual dispatch)"
+          else
+            SET="$LINUX_ONLY"
+            echo "linux-only matrix (pull request); dispatch manually for all platforms"
+          fi
+          # Collapse to one line: GITHUB_OUTPUT is line-oriented.
+          printf 'include=%s\n' "$(printf '%s' "$SET" | tr -d '\n ')" >>"$GITHUB_OUTPUT"
+
   profile:
     name: fuel profile (${{ matrix.label }})
+    needs: select-platforms
     # An unavailable runner label must not hide the results from the others —
     # arm64 Linux in particular is plan-dependent on private repositories.
     continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - label: x86_64-linux
-            runner: ubuntu-latest
-          - label: aarch64-linux
-            runner: ubuntu-24.04-arm
-          - label: aarch64-macos
-            runner: macos-latest
-          - label: x86_64-windows
-            runner: windows-latest
+        include: ${{ fromJSON(needs.select-platforms.outputs.include) }}
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -99,6 +140,12 @@ jobs:
         run: |
           cat >>"$GITHUB_STEP_SUMMARY" <<'MD'
           ## Reading the fuel-portability matrix (#33)
+
+          **Pull requests run Linux only** (x86_64 + aarch64). That still covers the
+          architecture axis, which is the one that mattered — but it cannot show an
+          OS-dependent difference, since Linux is the only OS present. Re-run via
+          **workflow_dispatch** for the full four-platform set including macOS and
+          Windows.
 
           Pull the `FUEL-PROFILE` lines from each job above.
 
