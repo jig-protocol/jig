@@ -1,0 +1,173 @@
+name: fuel-portability
+
+# Investigation workflow for #33: does `fuel_used` depend on the host?
+#
+# Receipts carry fuel and pricing derives from it, so cross-server receipt
+# agreement requires fuel to be a property of the PROGRAM. CI reported 1713 for a
+# module whose golden (generated on aarch64 macOS) says 18098 — same module bytes,
+# same wasmtime, same rustc.
+#
+# Two candidate explanations, and they imply very different fixes:
+#
+#   (a) Fuel genuinely differs per host architecture/OS. Then a single fuel
+#       number cannot be canonical and receipts need to carry which host
+#       "currency" produced it — assuming a translation even exists.
+#   (b) Our own config makes it differ. jig-runtime enables `epoch_interruption`
+#       alongside fuel with a 250ms WALL-CLOCK default, and wasmtime's
+#       determinism guide names epoch interruption as the non-deterministic
+#       alternative to fuel. A deadline firing mid-run truncates execution, and
+#       the fuel counter honestly reports a partial run — making `fuel_used` a
+#       function of host speed and load rather than of the program.
+#
+# This matrix distinguishes them. Every job runs the SAME module on an otherwise
+# idle runner with a generous budget: if (a), the reference numbers differ across
+# the matrix. It also runs `fuel_is_stable_under_host_load`, which loads the CPU
+# deliberately: if (b), that test fails while the references agree.
+#
+# Runner selection covers the arch x OS corners rather than every combination:
+# x86_64+Linux (the CI baseline that disagreed), aarch64+Linux (isolates arch from
+# OS), aarch64+macOS (where the golden was generated), x86_64+Windows (different
+# OS and ABI). x86_64+macOS is the redundant corner and is omitted to keep the
+# spend down — macOS minutes bill at a premium.
+#
+# Not part of the normal CI gate: manual dispatch, plus PRs that touch
+# jig-runtime, since that is where the answer would change.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'repos/jig-runtime/**'
+      - '.github/workflows/fuel-portability.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+# A new push supersedes the previous run rather than racing it. Without this,
+# review rounds stack concurrent matrices on top of each other.
+concurrency:
+  group: fuel-portability-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The platform set depends on why we are running.
+  #
+  # On a pull request: **Linux only**. macOS bills at a premium and Windows above
+  # baseline, and re-running all four on every review round buys nothing once the
+  # cross-platform table is recorded in
+  # docs/investigations/2026-08-11-fuel-portability.md. Both Linux runners are kept
+  # so the ARCHITECTURE axis survives at Linux prices — that axis is what showed
+  # architecture is not the variable (x86_64 and aarch64 Linux agree exactly).
+  #
+  # On workflow_dispatch: the full four, for when the table itself needs redoing.
+  #
+  # Note on why this is not a `paths-ignore`: for `pull_request`, GitHub evaluates
+  # path filters against the whole PR diff rather than the latest push, so once a PR
+  # touches repos/jig-runtime/** every later push re-triggers no matter what the
+  # push contained. Trimming the matrix is the lever that actually works.
+  select-platforms:
+    name: select platforms
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.pick.outputs.include }}
+    steps:
+      - id: pick
+        env:
+          FULL: >-
+            [{"label":"x86_64-linux","runner":"ubuntu-latest"},
+             {"label":"aarch64-linux","runner":"ubuntu-24.04-arm"},
+             {"label":"aarch64-macos","runner":"macos-latest"},
+             {"label":"x86_64-windows","runner":"windows-latest"}]
+          LINUX_ONLY: >-
+            [{"label":"x86_64-linux","runner":"ubuntu-latest"},
+             {"label":"aarch64-linux","runner":"ubuntu-24.04-arm"}]
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SET="$FULL"
+            echo "full matrix (manual dispatch)"
+          else
+            SET="$LINUX_ONLY"
+            echo "linux-only matrix (pull request); dispatch manually for all platforms"
+          fi
+          # Collapse to one line: GITHUB_OUTPUT is line-oriented.
+          printf 'include=%s\n' "$(printf '%s' "$SET" | tr -d '\n ')" >>"$GITHUB_OUTPUT"
+
+  profile:
+    name: fuel profile (${{ matrix.label }})
+    needs: select-platforms
+    # An unavailable runner label must not hide the results from the others —
+    # arm64 Linux in particular is plan-dependent on private repositories.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.select-platforms.outputs.include) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: repos
+          key: fuel-${{ matrix.label }}
+      # --test-threads=1 so the portability tests do not contend with each other.
+      # Self-contention would muddy exactly the signal being measured: a loaded
+      # host is the suspected cause, so the baseline has to be quiet.
+      #
+      # --include-ignored picks up the two timing-sensitive diagnostics
+      # (starved-budget truncation, stability under manufactured load). They are
+      # #[ignore]d in the normal suite because they flake there — for precisely
+      # the reason they exist. Here a flake is the datum.
+      - name: Fuel profile and portability assertions
+        working-directory: repos
+        run: cargo test -p jig-runtime --test fuel_portability -- --nocapture --test-threads=1 --include-ignored
+
+      # The assertions above may fail — that IS the finding, and the reference
+      # numbers still need collecting. `if: always()` keeps the table complete.
+      - name: Restate this host's profile
+        if: always()
+        working-directory: repos
+        run: cargo test -p jig-runtime --test fuel_portability report_this_host -- --nocapture --test-threads=1
+
+  interpret:
+    name: how to read the results
+    needs: profile
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          cat >>"$GITHUB_STEP_SUMMARY" <<'MD'
+          ## Reading the fuel-portability matrix (#33)
+
+          **Pull requests run Linux only** (x86_64 + aarch64). That still covers the
+          architecture axis, which is the one that mattered — but it cannot show an
+          OS-dependent difference, since Linux is the only OS present. Re-run via
+          **workflow_dispatch** for the full four-platform set including macOS and
+          Windows.
+
+          Pull the `FUEL-PROFILE` lines from each job above.
+
+          **Compare the `reference` rows across platforms** — those are generous-budget
+          runs on an idle runner:
+
+          - **Identical everywhere** → fuel is portable and this is NOT a
+            cross-target translation problem. The divergence came from our own
+            configuration, and the fix is to stop letting a wall-clock deadline
+            decide how much of a program runs. No multi-currency receipts needed.
+          - **Different per platform** → fuel is host-dependent at the engine
+            level. A single canonical number is not available, and receipts have
+            to record which host produced a measurement.
+
+          **Then check `fuel_is_stable_under_host_load`.** If it fails while the
+          reference rows agree, the 250ms `execution_timeout_ms` default is
+          truncating runs under contention and `fuel_used` is reporting partial
+          executions.
+
+          **And check the `sweep` rows.** Any row whose `fuel_used` is below the
+          reference is a run the deadline cut short. The `timeout_ms=250` row is
+          the production default, so a low value there is the bug reproducing
+          under real settings.
+          MD
+          echo "summary written"
