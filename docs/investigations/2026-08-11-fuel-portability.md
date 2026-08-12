@@ -2,7 +2,10 @@
 
 **Status:** settled. The cross-platform matrix has run; results in Finding 2.
 My leading hypothesis (a wall-clock deadline) was **wrong** and is retracted there.
-**Blocks:** receipt work (PR-B of the Wasm execution series).
+**Blocks:** receipt work (PR-B of the Wasm execution series) — **now unblocked**, on
+the terms in Recommendation below.
+**Also covers:** what the no-imports rule actually costs, and how metered blocks
+differ from free ones — see "What this means for metered blocks".
 **Trigger:** CI reported `fuel_used=1713` for a module whose golden says `18098`
 — same module bytes, same wasmtime 47.0.3, same rustc 1.97.1.
 
@@ -215,6 +218,134 @@ The remaining open question is narrow and does not block receipts: *why* does an
 identical module with a hermetic WASI context execute a different number of
 instructions per host OS? Answering it would let us decide whether WASI blocks
 could ever be admitted, which is not a v0.0.x question.
+
+## What this means for metered blocks and the effectful tier
+
+Follow-on questions after the matrix: what is actually locked behind "no imports",
+do we still need multiple fuel currencies, must blocks ship their own imports to be
+fuel-safe, and does a billed block differ from a free one. Answered against the
+code, because the tree already contains more of this than it appears to.
+
+### The no-imports rule is narrower than it sounds
+
+It belongs to `jig_runtime::payload::execute_payload`, **not** to the runtime.
+`Runtime::execute` validates against a `HostImportAllowlist`
+(`jig-core/src/wasm_validation.rs:102`), and the `Default` impl is
+`default_jig_allowlist()` — which already permits
+`jig_host::{log, emit_message, read_resource}` plus
+`wasi_snapshot_preview1::proc_exit`. There is also
+`wasi_preview1_deterministic()`, a broad stdio/environ/args subset that explicitly
+excludes `random_get`, `clock_*` and `sock_*`.
+
+`jig-core/src/capability_registry.rs` goes further and already names the effectful
+capabilities — `net:http:fetch`, `storage:read`, `storage:write`,
+`ai:llm:inference`, `log:emit`, `message:emit` — each with `required_imports`, a
+`fuel_cost_estimate`, and `attestation_requirements`.
+
+**But no `jig_host` function is implemented.** jig-runtime does build a
+`wasmtime::Linker` (`api.rs:494`), and it populates it with exactly one thing —
+WASI preview1, via `wasmtime_wasi::p1::add_to_linker_sync`. Nothing anywhere
+provides `jig_host::*`, so a module importing it cannot instantiate however
+thoroughly the allowlist and registry describe it.
+
+The effectful tier today is therefore declarative scaffolding: a vocabulary
+(capability names, required imports, cost estimates, attestation requirements)
+with no implementation behind it. Useful — it means the shape is already agreed —
+but nothing about it is exercised or tested.
+
+### What is genuinely locked out
+
+Only effects the block performs **itself, mid-execution**. Side data is not locked;
+it is **inverted into explicit input**. jig already does this — `Input.hlc_wall_ms`
+is the clock, handed in as data — and the same works for randomness, config, or
+prior state.
+
+That inversion is why receipts are verifiable by re-execution: the input is
+recorded, so anyone can re-derive the output. Pure computation over a payload
+covers most render/transform work (markdown, LaTeX, diff, CRDT merge, syntax
+highlighting, validation). What it cannot express is "fetch this URL", "query this
+row", "call this model".
+
+### Multiple currencies: no. A validity predicate.
+
+Since fuel is portable for no-import modules and jig only executes those, fuel
+within one engine+version is already comparable across hosts. What remains
+incomparable is across wasmtime *versions* and across *runtimes* (Finding 1).
+
+That is not an exchange-rate problem, it is a **compatibility predicate**: a fuel
+number may be compared with another only when engine, version, and cost schedule
+match. One tag, not a conversion matrix.
+
+`fuel_by_capability` is already the right structure — a labelled breakdown, not a
+single currency, with in-module work bucketed under the pseudo-capability
+`engine.wasm`.
+
+> **Defect:** `fuel_total` is the **sum** of `fuel_by_capability`
+> (`jig-runtime/src/api.rs:332`). That adds the portable quantity (`engine.wasm`)
+> to non-portable host-attributed buckets, producing one number that reads as
+> comparable and is not. For billing, keep the buckets separate.
+
+Note also three distinct fuel-ish quantities that must not be conflated: measured
+wasm fuel (the `engine.wasm` bucket), the `CapabilityCosts` charging schedule in
+jig-runtime (`call_base` / `per_byte_in` / `per_byte_out` / per-operation), and the
+advisory `fuel_cost_estimate` per capability in jig-core's registry. Only the first
+is a measurement.
+
+### Blocks already ship their own imports, and that is the fuel-safety rule
+
+`wasm32-unknown-unknown` statically links the allocator, `memcpy`, and everything
+else, so all the work is in-module and counted as wasm operators.
+
+Work behind an import is host-native and consumes **zero wasm fuel**. So:
+
+> An import is a fuel-accounting hole unless its capability has a `CapabilityCosts`
+> entry. Otherwise a block can offload compute to the host and under-pay.
+
+Enforce it when the tier lands: no allowlisted import without a cost entry. This is
+also the mechanism behind Finding 2's WASI spread — the host-side work was never
+counted at all; only the guest-side portion, which varied by host OS.
+
+### Metered and free blocks differ materially
+
+| | Free (e.g. IRC text server) | Metered (e.g. inference server) |
+|---|---|---|
+| Fuel is | a safety ceiling | an invoice |
+| Question it answers | "did it exceed the budget?" | "what is owed?" |
+| Needs | a bound | precision, non-gameability, agreement |
+| Portability | irrelevant — a local ceiling | required between biller and billed |
+| Expensive work | in-module | behind an import (GPU) |
+| Verified by | re-execution | **attestation** |
+
+For inference the wasm fuel is nearly blind to the real cost: GPU seconds are not
+wasm operators. It has to be metered in tokens or GPU-ms by whoever ran the model,
+and that number cannot be re-derived from the receipt the way `render_hash` can.
+
+> **The dividing line:** pure blocks are verifiable by **re-execution**; effectful
+> blocks are only auditable by **attestation**.
+
+This is already latent in the design rather than a new proposal —
+`CapabilityDefinition.attestation_requirements` exists, and `ai:llm:inference`
+already declares `["ai_usage_policy:v1"]`. The work is to make it load-bearing:
+an effect meter is a *signed claim by its executor*, carried in the same receipt
+envelope as the reproducible parts but never confused with them.
+
+### Practical upshot
+
+Today's no-imports tier needs nothing further. When the effectful tier is built,
+two things must be right from the start: **every allowlisted import has a cost
+entry**, and **effect meters are never summed into a field that reads as
+reproducible**.
+
+### A lead on the open mechanism
+
+`wasi_preview1_deterministic()` permits `environ_get`/`environ_sizes_get`,
+`args_get`/`args_sizes_get`, and `fd_prestat_get`/`fd_prestat_dir_name`. Their
+host-side answers plausibly differ per platform (preopens in particular), and Rust's
+`_start` walks them during init — so the *number of guest instructions spent
+processing the reply* can differ even though each call is individually
+"deterministic from context". That is a candidate explanation for why an identical
+module with a hermetic context executes differently per host OS, and where I would
+look first.
 
 ## Sources
 
