@@ -78,6 +78,26 @@ fn map_ingest_error(e: IngestError) -> (StatusCode, Json<ErrorBody>) {
         ref e @ IngestError::UnknownChannel { .. } => {
             err(StatusCode::NOT_FOUND, "UNKNOWN_CHANNEL", e.to_string())
         }
+        // 400: the sender omitted a field its block kind requires (text-render
+        // must carry metadata.body). Naming the field is the point — the client
+        // cannot fix what it cannot identify.
+        ref e @ IngestError::MissingMetadata { .. } => {
+            err(StatusCode::BAD_REQUEST, "MISSING_METADATA", e.to_string())
+        }
+        // 500: this server has no Wasm executor, so it cannot produce a
+        // render_hash for the kind. Nothing the client did, nothing it can fix.
+        ref e @ IngestError::NoExecutor { .. } => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "NO_EXECUTOR",
+            e.to_string(),
+        ),
+        // 500: the block was acceptable and executing it failed here. May be
+        // transient, so the message says so rather than implying a bad request.
+        ref e @ IngestError::RenderFailed { .. } => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "RENDER_FAILED",
+            format!("{e} (may be transient; retry is reasonable)"),
+        ),
         IngestError::Identity(ide) => {
             err(StatusCode::UNAUTHORIZED, "IDENTITY_ERROR", ide.to_string())
         }

@@ -282,6 +282,19 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         IngestError::Identity(ide) => SubmitDenied::PolicyBlocked {
             reason: format!("identity: {ide}"),
         },
+        // The bridge built a block without the field the kind requires — its bug,
+        // and a retry sends the same thing again.
+        ref e @ IngestError::MissingMetadata { .. } => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
+        // This server does not execute the kind at all, which is a standing
+        // property of its configuration rather than a passing condition.
+        ref e @ IngestError::NoExecutor { .. } => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
+        // Unavailable, not PolicyBlocked: the block is fine and execution failed
+        // on this host, so a retry may well succeed.
+        IngestError::RenderFailed { .. } => SubmitDenied::Unavailable,
         IngestError::Persist(_) | IngestError::Other(_) => SubmitDenied::Unavailable,
     }
 }
@@ -292,6 +305,7 @@ mod tests {
     use async_trait::async_trait;
     use jig_bridge_core::{BridgeContext, DeliveredBlock, RouterMount};
     use jig_pipeline::{
+        executor::BlockExecutor,
         fanout::Fanout,
         hlc::HlcClock,
         identity::TofuResolver,
@@ -391,6 +405,7 @@ mod tests {
             fanout: fanout.clone(),
             server_url: "ws://127.0.0.1:0".to_string(),
             naively_allow_unknown_handles_fallback: false,
+            executor: Some(BlockExecutor::shared()),
         });
         (store, ingest_ctx, fanout, RouterMount::new())
     }

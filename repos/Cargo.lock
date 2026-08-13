@@ -5007,6 +5007,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "text-block",
  "tokio",
  "tokio-rustls 0.25.0",
  "tokio-tungstenite 0.21.0",

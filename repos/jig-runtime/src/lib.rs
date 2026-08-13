@@ -53,6 +53,18 @@ pub use api::{BlockPackage, ExecutionContext, Limits, Outcome, Runtime};
 pub use config::{PricingConfig, RuntimeConfig};
 pub use costs::{CapabilityCosts, CostSchedule, InstructionCosts};
 pub use error::{Result, RuntimeError};
+
+/// Version of this crate, for recording which engine produced a measurement.
+///
+/// jig-runtime pins its wasmtime dependency, so this is a single-source proxy for
+/// the whole engine stack — preferable to a hardcoded wasmtime version string,
+/// which would be a second source of truth able to drift from Cargo.toml.
+///
+/// Needed because fuel is only comparable against a number from the same engine
+/// at the same version: wasmtime has changed its own cost schedule (bulk-memory
+/// operations now bill per byte). Anything recording `fuel_used` should record
+/// this beside it.
+pub const RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub use fuel::{CapabilityMeterHandle, CapabilityMeterSnapshot};
 pub use payload::{CompiledBlock, PayloadOutput, RC_OUTPUT_TOO_SMALL};
 pub use receipt::{

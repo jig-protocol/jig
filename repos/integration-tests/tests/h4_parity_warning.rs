@@ -35,18 +35,23 @@ async fn injected_divergent_receipts_are_detectable_via_persist() {
         .await
         .expect("send");
 
-    // The ingest pipeline already inserted one receipt with render_hash=None.
-    // Verify that.
+    // The local ingest receipt now carries a REAL render_hash, because
+    // text-render executes. Before #5 it was NULL and was excluded from
+    // divergence counting, which meant this scenario only worked because both
+    // *injected* receipts carried hashes — the honest local one contributed
+    // nothing. Now the local render participates, which is what makes the check
+    // meaningful: divergence is measured against a value this server derived
+    // itself rather than purely among values peers asserted.
     let receipts_before = server.receipts_for(&cid).expect("receipts");
     assert_eq!(receipts_before.len(), 1);
-    assert!(receipts_before[0].render_hash.is_none());
+    let local_hash = receipts_before[0]
+        .render_hash
+        .clone()
+        .expect("local ingest must produce a render_hash now that text-render executes");
 
-    // Inject two synthetic receipts from peers with DIFFERENT render_hash
-    // values. (In production these would arrive via federation. Note that
-    // `count_distinct_render_hashes` filters out NULL render_hash — so for
-    // the count to register divergence in v0.0.2, both divergent receipts
-    // must carry Some(hash). The local ingest path produces None receipts
-    // which are correctly excluded from divergence detection.)
+    // Inject two receipts from peers with DIFFERENT render_hash values, as
+    // federation would deliver them. Neither matches the local hash, so all three
+    // disagree.
     let synthetic_a = StoredReceipt {
         cid: format!("r_synthetic_a_{cid}"),
         block_cid: cid.clone(),
@@ -85,9 +90,14 @@ async fn injected_divergent_receipts_are_detectable_via_persist() {
         .store
         .count_distinct_render_hashes(&cid)
         .expect("count distinct");
-    assert!(
-        distinct >= 2,
-        "distinct render_hash count must be >= 2 (got {distinct})"
+    // Three receipts, three different hashes — the local render plus two
+    // disagreeing peers. Asserted exactly rather than `>= 2`: with the local
+    // receipt now carrying a hash, a count of 2 would mean one of the three got
+    // silently dropped from the tally.
+    assert_eq!(
+        distinct, 3,
+        "expected all three receipts to count as distinct (local {local_hash}, \
+         plus two injected peers); got {distinct}"
     );
 }
 

@@ -16,6 +16,7 @@ use ed25519_dalek::SigningKey;
 use jig_config::v0_0_2_server::{IdentityMode, JigServerConfig};
 use jig_core::Did;
 use jig_pipeline::{
+    executor::BlockExecutor,
     fanout::Fanout,
     hlc::HlcClock,
     identity::{IdentityResolver, NameserverResolver, TofuResolver},
@@ -81,6 +82,7 @@ impl AppState {
             fanout,
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback,
+            executor: Some(BlockExecutor::shared()),
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
@@ -124,6 +126,7 @@ impl AppState {
             fanout,
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback,
+            executor: Some(BlockExecutor::shared()),
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
@@ -166,6 +169,7 @@ impl AppState {
             fanout,
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback,
+            executor: Some(BlockExecutor::shared()),
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));

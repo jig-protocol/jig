@@ -91,6 +91,11 @@ impl AppState {
             fanout,
             server_url: format!("ws://{}", config.server.listen),
             naively_allow_unknown_handles_fallback,
+            // `allowed_block_kinds` above never includes `text-render`, so this
+            // nameserver has no use for a text-render Wasm module and shouldn't
+            // pay to compile one. `None` means "does not execute Wasm kinds",
+            // not "fall back" — a text-render block would be rejected outright.
+            executor: None,
         });
 
         let pending_challenges = Arc::new(RwLock::new(HashMap::new()));
@@ -160,6 +165,10 @@ impl AppState {
             fanout,
             server_url: format!("ws://{}", config.server.listen),
             naively_allow_unknown_handles_fallback: false,
+            // Same rationale as the `new()` constructor above: nameservers never
+            // allow `text-render`, so there's no Wasm module for this server to
+            // execute. `None` is a hard "won't execute", not a fallback.
+            executor: None,
         });
 
         let pending_challenges = Arc::new(RwLock::new(HashMap::new()));
