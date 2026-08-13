@@ -81,7 +81,13 @@ impl BlockRuntime {
                 fuel_max: config.fuel_max,
                 memory_max_mb: config.memory_max_mb,
                 execution_timeout_ms: config.timeout_ms,
-                max_instances: 1,
+                max_instances: 1, // one instance per execution
+                // `..Default::default()` for the rest — notably
+                // `max_concurrent_instances`, the engine-wide concurrency
+                // ceiling. Spelling every field out here is what let a
+                // single-instance cap reach the live server unnoticed; taking
+                // the runtime's default means a new limit lands here too.
+                ..Default::default()
             },
             ..Default::default()
         };

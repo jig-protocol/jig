@@ -96,17 +96,41 @@ pub struct ResourceLimits {
     /// Wall-clock execution timeout in milliseconds
     pub execution_timeout_ms: u64,
 
-    /// Maximum number of instances (for future multi-instance support)
+    /// Maximum instances a SINGLE execution may create. One, always, for the
+    /// byte-payload convention: a block gets one instance per invocation.
+    ///
+    /// Not to be confused with [`ResourceLimits::max_concurrent_instances`],
+    /// which bounds how many executions can be in flight at once. Conflating the
+    /// two capped the whole process at one concurrent execution — see that field.
     pub max_instances: u32,
+
+    /// How many executions may be in flight simultaneously, process-wide per
+    /// engine.
+    ///
+    /// This sizes wasmtime's pooling allocator (`total_core_instances` /
+    /// `total_memories`). Exceeding it does not queue — instantiation fails with
+    /// "maximum concurrent limit of N for core instances reached", so a server
+    /// under concurrent load drops messages rather than slowing down. Callers on
+    /// a hot path should bound their own concurrency to this number; jig-pipeline's
+    /// `BlockExecutor` does exactly that.
+    ///
+    /// Costs address space, not resident memory: the pool reserves
+    /// `max_concurrent_instances * memory_max_mb` of virtual address space, which
+    /// pages in only as guests touch it. The default of 16 is 512 MB of
+    /// reservation at the default 32 MB limit — fine on 64-bit, including the
+    /// $5-VPS and Raspberry Pi targets, while leaving real headroom over the
+    /// single-execution cap this replaced.
+    pub max_concurrent_instances: u32,
 }
 
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
-            fuel_max: 5_000_000,       // 5M instructions
-            memory_max_mb: 32,         // 32MB
-            execution_timeout_ms: 250, // 250ms
-            max_instances: 1,          // Single instance for now
+            fuel_max: 5_000_000,          // 5M instructions
+            memory_max_mb: 32,            // 32MB
+            execution_timeout_ms: 250,    // 250ms
+            max_instances: 1,             // one instance per execution
+            max_concurrent_instances: 16, // 16 executions in flight
         }
     }
 }
