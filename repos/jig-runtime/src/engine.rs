@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use wasmtime::*;
 
@@ -123,7 +123,7 @@ struct EpochTicker {
 }
 
 impl EpochTicker {
-    fn start(engine: Engine, cadence: Duration) -> Self {
+    fn start(engine: Engine, cadence: Duration) -> Result<Self> {
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let stop_for_thread = Arc::clone(&stop);
 
@@ -131,26 +131,46 @@ impl EpochTicker {
             .name("jig-epoch-ticker".into())
             .spawn(move || {
                 let (lock, cvar) = &*stop_for_thread;
+                // A monotonic deadline, NOT a fresh `cadence` wait each pass.
+                // `wait_timeout` may return early for reasons other than the stop
+                // signal, and restarting a full cadence on each of those would let
+                // repeated early wakes defer the tick indefinitely — breaking the
+                // "overshoot by at most one tick" bound this module documents.
+                // Waiting only the REMAINING time keeps the tick on schedule
+                // regardless of how often the wait is interrupted.
+                let mut next_tick = Instant::now() + cadence;
                 loop {
+                    let remaining = next_tick.saturating_duration_since(Instant::now());
                     let stopping = lock.lock().expect("epoch ticker mutex poisoned");
-                    let (stopping, timeout) = cvar
-                        .wait_timeout(stopping, cadence)
+                    let (stopping, _) = cvar
+                        .wait_timeout(stopping, remaining)
                         .expect("epoch ticker mutex poisoned");
                     if *stopping {
                         break;
                     }
-                    // Spurious wakeups are possible; only tick on a real timeout.
-                    if timeout.timed_out() {
+                    drop(stopping);
+
+                    let now = Instant::now();
+                    if now >= next_tick {
                         engine.increment_epoch();
+                        next_tick += cadence;
+                        // If the thread was descheduled long enough to miss whole
+                        // ticks, resync rather than firing a burst to catch up:
+                        // the epoch is a deadline signal, not an event count.
+                        if next_tick <= now {
+                            next_tick = now + cadence;
+                        }
                     }
                 }
             })
-            .expect("spawning the epoch ticker thread");
+            .map_err(|e| {
+                RuntimeError::InternalError(format!("spawning the epoch ticker thread: {e}"))
+            })?;
 
-        Self {
+        Ok(Self {
             stop,
             handle: Some(handle),
-        }
+        })
     }
 }
 
@@ -249,7 +269,7 @@ impl WasmEngine {
         // One ticker for the whole engine, started here rather than per
         // execution. Its thread holds an `Engine` clone, so it must stop when
         // this struct drops — see `EpochTicker::drop`.
-        let _epoch_ticker = Some(EpochTicker::start(engine.clone(), EPOCH_TICK));
+        let _epoch_ticker = Some(EpochTicker::start(engine.clone(), EPOCH_TICK)?);
 
         Ok(Self {
             engine,

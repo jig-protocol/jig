@@ -35,8 +35,20 @@ fn thread_count() -> Option<usize> {
     None
 }
 
+/// Execute the fixture, requiring it to actually succeed.
+///
+/// Discarding the result would let both thread-count tests pass while the
+/// fixture failed before ever reaching the execution path — measuring the thread
+/// count around a no-op and reporting it as evidence.
 fn run_once(runtime: &Runtime) {
-    let _ = runtime.execute(DETERMINISTIC_WASM, ExecutionContext::default());
+    let receipt = runtime
+        .execute(DETERMINISTIC_WASM, ExecutionContext::default())
+        .expect("the deterministic fixture must execute");
+    assert_eq!(
+        receipt.outcome,
+        jig_runtime::ExecutionOutcome::Success,
+        "the deterministic fixture must succeed, not merely return a receipt"
+    );
 }
 
 /// The headline property from #36: executions must not accumulate threads.
@@ -99,11 +111,35 @@ fn dropping_a_runtime_reclaims_its_ticker_thread() {
     );
 }
 
+/// Execute on a worker thread, failing the test if nothing comes back in time.
+///
+/// These two tests run a guest that loops forever, so a ticker that stopped
+/// advancing would leave `execute` blocked and the assertions unreachable — the
+/// test would hang until CI's job timeout rather than failing. Bounding it turns
+/// a broken ticker into a prompt, legible failure.
+///
+/// The worker is abandoned rather than joined on timeout: it is still spinning
+/// inside the guest by definition, and the process reaps it on exit.
+fn run_bounded(
+    runtime: Runtime,
+    wasm: Vec<u8>,
+) -> (jig_runtime::Result<jig_runtime::Receipt>, Duration) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let result = runtime.execute(&wasm, ExecutionContext::default());
+        let _ = tx.send((result, started.elapsed()));
+    });
+
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("execution did not return within 10s — the epoch deadline never fired")
+}
+
 /// The deadline must still interrupt a guest that overruns it.
 ///
-/// Uses a module that runs effectively forever, with a short timeout: without a
-/// working deadline this test hangs rather than fails, which is itself the
-/// signal — a hung run is a deadline that never fired.
+/// Uses a module that runs effectively forever with a short timeout, so only the
+/// deadline can end it. Bounded via `run_bounded`, so a deadline that never fires
+/// surfaces as a 10s failure rather than a hang.
 #[test]
 fn a_deadline_still_interrupts_a_long_running_guest() {
     // An infinite loop, so only the deadline can end it. Fuel is set high enough
@@ -117,9 +153,7 @@ fn a_deadline_still_interrupts_a_long_running_guest() {
     config.limits.fuel_max = u64::MAX;
     let runtime = Runtime::with_config(config).expect("runtime creation");
 
-    let started = Instant::now();
-    let result = runtime.execute(&wasm, ExecutionContext::default());
-    let elapsed = started.elapsed();
+    let (result, elapsed) = run_bounded(runtime, wasm);
 
     // Either an Err or a receipt with a failed outcome is acceptable; what
     // matters is that it STOPPED.
@@ -152,9 +186,7 @@ fn a_deadline_never_fires_before_its_timeout() {
     config.limits.fuel_max = u64::MAX;
     let runtime = Runtime::with_config(config).expect("runtime creation");
 
-    let started = Instant::now();
-    let _ = runtime.execute(&wasm, ExecutionContext::default());
-    let elapsed = started.elapsed();
+    let (_, elapsed) = run_bounded(runtime, wasm);
 
     assert!(
         elapsed >= Duration::from_millis(timeout_ms),

@@ -79,6 +79,16 @@ impl RuntimeConfig {
                 "memory_max_mb must be greater than 0".into(),
             ));
         }
+        // Rejected rather than clamped. Callers used to `.max(1)` it, so an
+        // operator asking for 0 silently got serialized execution — a
+        // configuration they did not request and were never told about.
+        if self.limits.max_concurrent_instances == 0 {
+            return Err(RuntimeError::InvalidConfig(
+                "max_concurrent_instances must be greater than 0 (it is the number \
+                 of executions allowed at once; 0 would permit none)"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -279,6 +289,32 @@ impl Default for EngineConfig {
 
 #[cfg(test)]
 mod tests {
+    /// Zero concurrency is rejected, not clamped.
+    ///
+    /// Callers `.max(1)` this value, so before validation an operator writing
+    /// `max_concurrent_executions = 0` silently got serialized execution — a
+    /// configuration they never asked for and were never told about. Rejecting
+    /// makes the mistake visible at startup.
+    #[test]
+    fn zero_concurrency_is_rejected_rather_than_silently_clamped() {
+        let mut config = RuntimeConfig::default();
+        config.limits.max_concurrent_instances = 0;
+
+        let err = config
+            .validate()
+            .expect_err("zero concurrent instances must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_concurrent_instances"),
+            "the error must name the offending key, got: {msg}"
+        );
+
+        // And a sane value still validates, so the check is not simply refusing
+        // everything.
+        config.limits.max_concurrent_instances = 1;
+        config.validate().expect("one concurrent instance is valid");
+    }
+
     use super::*;
 
     #[test]
