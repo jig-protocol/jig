@@ -100,42 +100,13 @@ fn parse_manifest(manifest_bytes: &[u8]) -> Result<BlockManifest, (StatusCode, J
     })
 }
 
-fn map_ingest_error(e: IngestError) -> (StatusCode, Json<AdminError>) {
-    match e {
-        IngestError::InvalidSignature => err(
-            StatusCode::UNAUTHORIZED,
-            "INVALID_SIG",
-            "signature verification failed",
-        ),
-        IngestError::DisallowedBlockKind { kind } => err(
-            StatusCode::FORBIDDEN,
-            "DISALLOWED_BLOCK_KIND",
-            format!("kind not in allow list: {kind}"),
-        ),
-        IngestError::KindRequired => err(
-            StatusCode::BAD_REQUEST,
-            "KIND_REQUIRED",
-            "manifest must declare block kind",
-        ),
-        IngestError::BundleMalformed(m) => err(StatusCode::BAD_REQUEST, "BUNDLE_MALFORMED", m),
-        // 404, not 400: the request is well-formed, the named channel isn't here.
-        ref e @ IngestError::UnknownChannel { .. } => {
-            err(StatusCode::NOT_FOUND, "UNKNOWN_CHANNEL", e.to_string())
-        }
-        IngestError::Identity(ide) => {
-            err(StatusCode::UNAUTHORIZED, "IDENTITY_ERROR", ide.to_string())
-        }
-        IngestError::Persist(pe) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "PERSIST_ERROR",
-            pe.to_string(),
-        ),
-        IngestError::Other(o) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INGEST_ERROR",
-            o.to_string(),
-        ),
-    }
+/// Thin wrapper around the shared classifier (`v0_0_2_ingest_error`): decide
+/// the (status, code) here once, wrap it in this endpoint's `AdminError`.
+/// `pub(crate)` so the cross-wrapper agreement test in that module can call
+/// it directly.
+pub(crate) fn map_ingest_error(e: IngestError) -> (StatusCode, Json<AdminError>) {
+    let (status, code, message) = crate::v0_0_2_ingest_error::classify_ingest_error(&e);
+    err(status, code, message)
 }
 
 /// POST /_admin_v0_0_2/channels
@@ -384,8 +355,8 @@ mod tests {
     };
     use jig_core::{Did, HlcTimestamp};
     use jig_pipeline::{
-        fanout::Fanout, hlc::HlcClock, identity::TofuResolver, ingest::IngestContext,
-        persist::SqliteStore,
+        executor::BlockExecutor, fanout::Fanout, hlc::HlcClock, identity::TofuResolver,
+        ingest::IngestContext, persist::SqliteStore,
     };
     use rand::Rng;
     use tempfile::tempdir;
@@ -438,6 +409,7 @@ mod tests {
             fanout,
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback: false,
+            executor: Some(BlockExecutor::shared()),
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));

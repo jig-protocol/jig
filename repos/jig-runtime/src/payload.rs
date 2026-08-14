@@ -73,23 +73,81 @@ pub struct PayloadOutput {
     pub module_hash: String,
 }
 
+/// A validated, compiled module, ready to execute repeatedly.
+///
+/// Compilation is the dominant cost of running a block: measured at ~16 ms for
+/// the 178 KB canonical text-block on an M-series laptop in release mode, which
+/// is ~62 messages/second if you pay it per message. The protocol targets 10,000
+/// messages/second, so anything on the ingest path must compile once at startup
+/// and instantiate per message. That is the entire reason this type exists.
+///
+/// Tied to the [`Runtime`] that produced it — a `Module` belongs to its `Engine`.
+/// Executing one against a different `Runtime` fails at instantiation rather than
+/// silently misbehaving, but don't rely on that: keep them together.
+pub struct CompiledBlock {
+    module: wasmtime::Module,
+    module_hash: String,
+}
+
+impl CompiledBlock {
+    /// blake3 of the module bytes this was compiled from, hex.
+    pub fn module_hash(&self) -> &str {
+        &self.module_hash
+    }
+}
+
+impl std::fmt::Debug for CompiledBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The Module itself has no useful Debug and is large; the hash identifies
+        // it exactly, which is what a log line actually wants.
+        f.debug_struct("CompiledBlock")
+            .field("module_hash", &self.module_hash)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Runtime {
-    /// Execute `export` under the byte-payload convention, passing `input` and
-    /// returning whatever the guest wrote.
+    /// Validate and compile a module once, for repeated execution.
     ///
-    /// Fails if the module imports anything, lacks `memory`, lacks the
-    /// allocator exports, or reports a nonzero code other than a single
-    /// recoverable [`RC_OUTPUT_TOO_SMALL`].
+    /// Do this at startup for any block on a hot path; see [`CompiledBlock`] for
+    /// the measurement that motivates it.
+    pub fn precompile(&self, wasm_bytes: &[u8]) -> Result<CompiledBlock> {
+        self.validate_module(wasm_bytes)?;
+        Ok(CompiledBlock {
+            module: self.engine.compile_module(wasm_bytes)?,
+            module_hash: blake3::hash(wasm_bytes).to_hex().to_string(),
+        })
+    }
+
+    /// Compile and execute in one call.
+    ///
+    /// Convenient for tests and one-shot tooling. **Not for a hot path** — it
+    /// recompiles on every invocation. Use [`Runtime::precompile`] plus
+    /// [`Runtime::execute_precompiled`] there.
     pub fn execute_payload(
         &self,
         wasm_bytes: &[u8],
         export: &str,
         input: &[u8],
     ) -> Result<PayloadOutput> {
-        let module_hash = blake3::hash(wasm_bytes).to_hex().to_string();
+        let compiled = self.precompile(wasm_bytes)?;
+        self.execute_precompiled(&compiled, export, input)
+    }
 
-        self.validate_module(wasm_bytes)?;
-        let module = self.engine.compile_module(wasm_bytes)?;
+    /// Execute `export` on an already-compiled block under the byte-payload
+    /// convention, passing `input` and returning whatever the guest wrote.
+    ///
+    /// Fails if the module imports anything, lacks `memory`, lacks the
+    /// allocator exports, or reports a nonzero code other than a single
+    /// recoverable [`RC_OUTPUT_TOO_SMALL`].
+    pub fn execute_precompiled(
+        &self,
+        block: &CompiledBlock,
+        export: &str,
+        input: &[u8],
+    ) -> Result<PayloadOutput> {
+        let module_hash = block.module_hash.clone();
+        let module = &block.module;
 
         let limits = &self.config.limits;
         let timeout = std::time::Duration::from_millis(limits.execution_timeout_ms);
@@ -101,7 +159,7 @@ impl Runtime {
         let fuel_before = store.get_fuel().unwrap_or(0);
 
         // Empty import list: a module with imports cannot instantiate here, by design.
-        let instance = wasmtime::Instance::new(&mut store, &module, &[]).map_err(|e| {
+        let instance = wasmtime::Instance::new(&mut store, module, &[]).map_err(|e| {
             RuntimeError::InstantiationError(format!(
                 "{e} (this convention instantiates with no host imports; \
                  a module importing WASI or anything else cannot be used here)"

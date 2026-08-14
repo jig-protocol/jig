@@ -126,10 +126,20 @@ impl WasmEngine {
         wasm_config.memory_guard_size(0x10000); // 64KB guard
         wasm_config.max_wasm_stack(2 * 1024 * 1024); // 2MB stack limit
 
-        // Pooling allocator keeps allocation behaviour predictable
+        // Pooling allocator keeps allocation behaviour predictable.
+        //
+        // These two are the CONCURRENCY ceiling for the whole engine, not a
+        // per-execution limit. They were previously sized from
+        // `limits.max_instances` (default 1, documented as "single instance for
+        // now"), which meant a second simultaneous execution failed outright with
+        // "maximum concurrent limit of 1 for core instances reached" — invisible
+        // to any sequential benchmark, fatal to a server handling concurrent
+        // messages. `max_instances` remains the per-execution cap, enforced via
+        // StoreLimits.
         let mut pooling = PoolingAllocationConfig::default();
-        pooling.total_core_instances(config.limits.max_instances.max(1));
-        pooling.total_memories(config.limits.max_instances.max(1));
+        let concurrency = config.limits.max_concurrent_instances.max(1);
+        pooling.total_core_instances(concurrency);
+        pooling.total_memories(concurrency);
         pooling.max_memories_per_module(1);
         pooling.max_memory_size(memory_limit_bytes as usize);
         wasm_config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling));

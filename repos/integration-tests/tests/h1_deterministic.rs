@@ -63,36 +63,70 @@ async fn text_render_block_produces_deterministic_receipts_across_servers() {
     }
 }
 
+/// A text-render block EXECUTES, and its receipt carries the resulting hash.
+///
+/// This test replaces `text_render_block_receipts_render_hash_documented_as_none_in_v0_0_2`,
+/// which asserted the opposite. That test was a characterization of the v0.0.2
+/// carve-out and said so in its own comment: *"If this assertion starts failing
+/// because v0.0.3+ wires real Wasm execution, that's the expected behavior change
+/// — update this test to assert Some(h) instead."* This is that update, and it is
+/// the acceptance criterion for issue #5.
+///
+/// It asserts against an independently computed expectation rather than merely
+/// `is_some()`: a receipt carrying *some* hash proves the field is populated, not
+/// that the module rendered the message that was actually sent.
 #[tokio::test]
-async fn text_render_block_receipts_render_hash_documented_as_none_in_v0_0_2() {
-    // Explicit characterization of the v0.0.2 behavior: text-render Wasm
-    // execution is NOT wired in v0.0.2 (the canonical text-render.wasm
-    // exists but the ingest pipeline uses the synthetic-receipt path for
-    // all kinds). render_hash should be None.
-    //
-    // If this assertion starts failing because v0.0.3+ wires real Wasm
-    // execution, that's the expected behavior change — update this test
-    // to assert Some(h) instead and confirm parity in H1's main test.
-
+async fn a_text_render_block_executes_and_its_receipt_carries_the_render_hash() {
     let app = TestJigServer::start_with_text_render_only()
         .await
         .expect("start app");
     let id = test_identity();
-    // Precondition, not the subject of this test — see the note above.
     app.seed_channel(&id, "#hello").expect("seed channel");
     let hlc = jig_core::HlcTimestamp {
         wall_ms: 1_700_000_000_000,
         logical: 0,
         server_did: id.did().clone(),
     };
-    let block = jig_client::blocks::build_text_render(&id, "#hello", "v0.0.2 snapshot", hlc);
+    const BODY: &str = "the first message to really execute";
+    let block = jig_client::blocks::build_text_render(&id, "#hello", BODY, hlc);
 
     let cid = app.submit_block(&block).await.expect("submit");
     let receipts = app.receipts_for(&cid).expect("receipts");
 
     assert_eq!(receipts.len(), 1);
-    assert!(
-        receipts[0].render_hash.is_none(),
-        "v0.0.2 text-render uses the synthetic-receipt path; render_hash should be None"
+    let hash = receipts[0]
+        .render_hash
+        .as_deref()
+        .expect("text-render must execute and produce a render_hash");
+
+    // The value must be the render of THIS body. `execute_pure` is the native
+    // reference, pinned to the Wasm module by jig-runtime's payload tests.
+    let expected = text_block::execute_pure(&text_block::Input {
+        sender_did: id.did().to_did_jig_string(),
+        channel_id: "#hello".to_string(),
+        body_raw: BODY.to_string(),
+        hlc_wall_ms: 1_700_000_000_000,
+        hlc_logical: 0,
+        hlc_origin: id.did().to_did_jig_string(),
+        client_version: String::new(),
+    })
+    .render_hash;
+    assert_eq!(
+        hash, expected,
+        "render_hash must be the render of the submitted body"
     );
+
+    // A different body must not produce the same hash, or the value carries no
+    // information about the message.
+    let other = text_block::execute_pure(&text_block::Input {
+        sender_did: String::new(),
+        channel_id: String::new(),
+        body_raw: format!("{BODY}!"),
+        hlc_wall_ms: 0,
+        hlc_logical: 0,
+        hlc_origin: String::new(),
+        client_version: String::new(),
+    })
+    .render_hash;
+    assert_ne!(hash, other);
 }

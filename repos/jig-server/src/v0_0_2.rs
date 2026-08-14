@@ -16,6 +16,7 @@ use ed25519_dalek::SigningKey;
 use jig_config::v0_0_2_server::{IdentityMode, JigServerConfig};
 use jig_core::Did;
 use jig_pipeline::{
+    executor::BlockExecutor,
     fanout::Fanout,
     hlc::HlcClock,
     identity::{IdentityResolver, NameserverResolver, TofuResolver},
@@ -71,6 +72,19 @@ impl AppState {
         let naively_allow_unknown_handles_fallback =
             config.identity.naively_allow_unknown_handles_fallback;
 
+        // The server owns its executor rather than taking the process-wide test
+        // one, so a module compile failure is reported through this function's
+        // `Result` instead of aborting the process.
+        //
+        // Limits are jig-runtime's defaults, NOT the operator's `[execution]`
+        // settings — those live on `ServerConfig`, a different type in the hybrid
+        // config split, and `AppState::new` only receives `JigServerConfig`.
+        // `BlockExecutor::with_config` exists for the day that is plumbed through;
+        // until then the ingest render path runs under library defaults, which is
+        // a real (if narrow) divergence from `BlockRuntime`.
+        let executor =
+            Arc::new(BlockExecutor::new().context("compiling the canonical text-render module")?);
+
         let ingest_ctx = Arc::new(IngestContext {
             store,
             identity,
@@ -81,6 +95,7 @@ impl AppState {
             fanout,
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback,
+            executor: Some(executor),
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
@@ -124,6 +139,7 @@ impl AppState {
             fanout,
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback,
+            executor: Some(BlockExecutor::shared()),
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
@@ -166,6 +182,7 @@ impl AppState {
             fanout,
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback,
+            executor: Some(BlockExecutor::shared()),
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));

@@ -90,7 +90,12 @@ fn test_infinite_loop_timeout() {
 fn test_concurrent_executions_isolated() {
     // Verify that concurrent executions don't interfere with each other's resource limits
     let mut config = RuntimeConfig::default();
-    config.limits.max_instances = 4; // Allow 4 concurrent instances
+    // 4 concurrent executions, matching the 4 threads spawned below. This must be
+    // `max_concurrent_instances`, NOT `max_instances`: the latter caps instances
+    // within a single execution and has no bearing on how many can run at once.
+    // The two were previously the same field, which is how a one-instance
+    // concurrency ceiling shipped.
+    config.limits.max_concurrent_instances = 4;
     let runtime = Runtime::with_config(config).expect("runtime creation");
 
     use std::sync::Arc;

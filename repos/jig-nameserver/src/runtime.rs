@@ -36,7 +36,10 @@ impl NameserverRuntime {
                 fuel_max: config.fuel_max,
                 memory_max_mb: config.memory_max_mb,
                 execution_timeout_ms: config.execution_timeout_ms,
-                max_instances: 1, // Single instance per execution
+                max_instances: 1, // one instance per execution
+                // Rest from the runtime default — see the matching note in
+                // jig-server's BlockRuntime.
+                ..Default::default()
             },
             capabilities: jig_runtime::config::CapabilityConfig {
                 allowed: config.allowed_capabilities.clone(),

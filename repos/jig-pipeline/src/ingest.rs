@@ -49,9 +49,18 @@ pub struct IngestContext {
     /// anyway. Wired from `[identity] naively_allow_unknown_handles_fallback`.
     /// Surfaces in `unsafe_options_active`.
     pub naively_allow_unknown_handles_fallback: bool,
-    // Wasm runtime is optional in v0.0.2 B6: Wasm-executable block kinds
-    // fall back to the synthetic-receipt path. Phase D wires in the real
-    // jig-runtime once text-render.wasm is loaded as a canonical artifact.
+    /// Executes canonical Wasm block modules, holding them pre-compiled.
+    ///
+    /// `None` is a statement that this server does not execute Wasm-backed kinds
+    /// — the nameserver, whose `allowed_block_kinds` excludes `text-render`, has
+    /// no use for a text-render module and should not pay to compile one.
+    ///
+    /// It is **not** a fallback to the synthetic-receipt path. A `text-render`
+    /// block arriving with no executor is rejected
+    /// ([`IngestError::NoExecutor`]), because silently issuing a receipt with no
+    /// `render_hash` is exactly the carve-out this replaced: it would look like
+    /// success while the block never executed.
+    pub executor: Option<Arc<crate::executor::BlockExecutor>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -70,6 +79,29 @@ pub enum IngestError {
         "unknown channel '{slug}': create it with `jig channel create` or check `jig channel list`"
     )]
     UnknownChannel { slug: String },
+    /// A block of a kind that must execute arrived at a server with no executor
+    /// configured. Deliberately an error rather than a synthetic-receipt
+    /// fallback — see [`IngestContext::executor`].
+    #[error(
+        "this server has no Wasm executor configured, so it cannot accept `{kind}` \
+         blocks (they must execute to produce a render_hash)"
+    )]
+    NoExecutor { kind: String },
+    /// A required metadata field is absent. `text-render` carries its message in
+    /// `metadata.body`; without it there is nothing to render, and rendering the
+    /// empty string instead would silently hash a message nobody sent.
+    #[error("`{kind}` block is missing required metadata field `{field}`")]
+    MissingMetadata { kind: String, field: String },
+    /// The module ran but did not produce a usable result.
+    ///
+    /// Rejecting is deliberate: a receipt without a real `render_hash` cannot
+    /// participate in cross-server parity, so admitting the block would record a
+    /// message that no peer can verify against. The cost is that a transient host
+    /// problem (the wall-clock epoch deadline firing under extreme load) rejects
+    /// a legitimate message — visible and loud, rather than a quietly degraded
+    /// receipt.
+    #[error("executing the `{kind}` module failed: {detail}")]
+    RenderFailed { kind: String, detail: String },
     #[error(transparent)]
     Identity(#[from] crate::identity::IdentityError),
     #[error(transparent)]
@@ -90,7 +122,10 @@ pub enum IngestError {
 /// 4. Reject channel-scoped blocks naming a channel this server has no row
 ///    for (see [`requires_existing_channel`] for the per-source policy).
 /// 5. Update the local HLC clock against the received timestamp.
-/// 6. Build a server-signed synthetic receipt (Wasm exec wired in Phase D).
+/// 6. Build a server-signed receipt. `text-render` EXECUTES the server's own
+///    canonical Wasm module and signs the resulting `render_hash`; other kinds
+///    are control-plane blocks with no rendered output and take the synthetic
+///    path.
 /// 7. Apply effects (channels/memberships/peers — Task B7 stub).
 /// 8. Persist block + receipt.
 /// 9. Fanout: local subscribers always; federated peers only if source
@@ -176,15 +211,23 @@ pub async fn ingest(
 
     // Step 4: Wasm-exec or synthetic-receipt branch.
     //
-    // v0.0.2 B6: all kinds — including TextRender which `is_wasm_executable()`
-    // returns true for — use the synthetic receipt path. Phase D replaces this
-    // for TextRender once text-render.wasm is loaded into jig-runtime.
+    // `text-render` executes for real: the server runs its OWN canonical module
+    // over the message body and signs the resulting `render_hash`. That hash is
+    // computed INSIDE the sandbox, which is what lets two servers agree on it
+    // without trusting each other.
+    //
+    // Every other kind still takes the synthetic path. Those are control-plane
+    // blocks (channel-create, member-add, …) whose effect is applied by
+    // `apply_effect`; they have no rendered output to hash. Promoting them is a
+    // separate piece of work, not an oversight.
     let block_cid = bundle
         .block_cid()
         .map(|c| c.to_string())
         .unwrap_or_else(|_| "bafy_invalid".to_string());
-    let (receipt_bytes, render_hash, is_synthetic) =
-        build_synth_receipt(&block_cid, &ctx.server_did, &ctx.server_key);
+    let (receipt_bytes, render_hash, is_synthetic) = match kind {
+        BlockKind::TextRender => build_render_receipt(ctx, &manifest, &block_cid, kind_str).await?,
+        _ => build_synth_receipt(&block_cid, &ctx.server_did, &ctx.server_key),
+    };
 
     // Step 5: apply effect (B7 stub returns Ok)
     let canonical = bundle_canonical_bytes(bundle.manifest_bytes, bundle.code_bytes)
@@ -365,6 +408,134 @@ fn verify_sig(
     Ok(())
 }
 
+/// Execute the canonical text-render module and build a server-signed receipt
+/// carrying the resulting `render_hash`.
+///
+/// Returns `(receipt_bytes, Some(render_hash), is_synthetic = false)`.
+///
+/// # What is signed, and why the shape matters
+///
+/// The payload separates two kinds of claim, because they have different
+/// standing:
+///
+/// - `render` — the `render_hash`, the identity of the module that produced it,
+///   and the rendered length. Reproducible: any conforming runtime executing the
+///   same module over the same body derives the same hash, so this is what
+///   federated servers compare. The module identity is inside the SIGNED bytes
+///   deliberately; an unsigned provenance claim is not worth having, since a
+///   mismatch between peers is only diagnosable if you can trust which code each
+///   one ran.
+/// - `engine` — the engine name, its version, and fuel consumed. **Local
+///   telemetry, never comparable across servers.** There is no cross-runtime
+///   metering standard, no published conversion between engines, and wasmtime has
+///   changed its own cost schedule. Recording the version beside the number is
+///   what keeps it honest; nesting it separately is what stops a future reader
+///   mistaking it for part of the agreed value.
+///
+/// See `docs/investigations/2026-08-11-fuel-portability.md`.
+async fn build_render_receipt(
+    ctx: &IngestContext,
+    manifest: &jig_core::BlockManifest,
+    block_cid: &str,
+    kind_str: &str,
+) -> Result<(Vec<u8>, Option<String>, bool), IngestError> {
+    use ed25519_dalek::Signer;
+
+    let executor = ctx
+        .executor
+        .as_ref()
+        .ok_or_else(|| IngestError::NoExecutor {
+            kind: kind_str.to_string(),
+        })?;
+
+    // The body is required. Rendering the empty string in its absence would hash
+    // a message nobody sent and report it as a successful render.
+    let body = manifest
+        .metadata
+        .get("body")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| IngestError::MissingMetadata {
+            kind: kind_str.to_string(),
+            field: "body".to_string(),
+        })?;
+
+    let channel = manifest
+        .metadata
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let sender_did = manifest
+        .authors
+        .first()
+        .map(|a| a.did.to_string())
+        .unwrap_or_default();
+    let hlc = manifest.hlc_ts.as_ref();
+
+    // Only `body_raw` reaches the hash — `text_block::execute_pure` derives
+    // `canonical_text` from it alone. The rest is passed faithfully so the guest
+    // has full context if a future module version wants it, and so a receipt
+    // reader can see what the module was given.
+    let input = text_block::Input {
+        sender_did,
+        channel_id: channel.to_string(),
+        body_raw: body.to_string(),
+        hlc_wall_ms: hlc.map(|h| h.wall_ms).unwrap_or(0),
+        hlc_logical: hlc.map(|h| h.logical).unwrap_or(0),
+        hlc_origin: hlc.map(|h| h.server_did.to_string()).unwrap_or_default(),
+        client_version: manifest.version.to_string(),
+    };
+
+    // Off the async worker: `render_text` is synchronous end to end. It parks on
+    // a condvar waiting for a concurrency slot and then runs the guest on that
+    // same thread, so calling it inline would hold a tokio worker for the whole
+    // wait plus execution. Execution is bounded by the epoch deadline; the slot
+    // wait is NOT bounded, so under load enough workers could park to stall the
+    // runtime — including the tasks that would have freed the slots.
+    let executor = Arc::clone(executor);
+    let kind_owned = kind_str.to_string();
+    let rendered = tokio::task::spawn_blocking(move || executor.render_text(&input))
+        .await
+        // A join error means the blocking task panicked or the pool shut down.
+        // Distinct from a render failure, and worth saying so: it points at the
+        // host, not the block.
+        .map_err(|e| IngestError::RenderFailed {
+            kind: kind_owned.clone(),
+            detail: format!("render task did not complete: {e}"),
+        })?
+        .map_err(|e| IngestError::RenderFailed {
+            kind: kind_owned,
+            detail: e.to_string(),
+        })?;
+
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "v": "0.3-render",
+        "block_cid": block_cid,
+        "server_did": ctx.server_did.to_string(),
+        "synthetic": false,
+        "render": {
+            "hash": rendered.output.render_hash,
+            "module": rendered.module_id,
+            "length_bytes": rendered.output.length_bytes,
+        },
+        "engine": {
+            "name": "wasmtime",
+            "runtime_version": jig_runtime::RUNTIME_VERSION,
+            "fuel_used": rendered.fuel_used,
+        },
+        "produced_at": chrono::Utc::now().timestamp(),
+    }))
+    .expect("render receipt JSON is always valid");
+
+    let sig = ctx.server_key.sign(&canonical);
+    let wrapped = serde_json::json!({
+        "canonical_hex": hex::encode(&canonical),
+        "sig_hex": hex::encode(sig.to_bytes()),
+    });
+    let bytes = serde_json::to_vec(&wrapped).expect("render receipt wrap is always valid");
+
+    Ok((bytes, Some(rendered.output.render_hash), false))
+}
+
 /// Build a server-signed synthetic receipt for blocks that lack a Wasm artifact.
 ///
 /// The receipt carries the server DID and a signature over a small JSON
@@ -433,6 +604,9 @@ mod tests {
             fanout: Arc::new(Fanout::new()),
             server_url: "ws://127.0.0.1:7117".to_string(),
             naively_allow_unknown_handles_fallback: false,
+            // Shared, so the ~16ms module compile is paid once for the whole
+            // test binary rather than per test.
+            executor: Some(crate::executor::BlockExecutor::shared()),
         }
     }
 
@@ -452,27 +626,20 @@ mod tests {
         id
     }
 
+    /// A body for helper-built blocks.
+    ///
+    /// `text-render` now REQUIRES `metadata.body` — it is what gets rendered, and
+    /// ingest rejects a text-render block without it rather than hashing the
+    /// empty string. Helpers therefore always set one, so tests build blocks a
+    /// real client could have sent.
+    const TEST_BODY: &str = "test message";
+
     /// Build manifest bytes, code bytes, and a valid signature for a given BlockKind.
     fn build_bundle_parts(
         signing_key: &SigningKey,
         kind: BlockKind,
     ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let sender_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
-        let manifest = BlockManifest::builder()
-            .version(Version::new(0, 1, 0))
-            .author(Author {
-                did: sender_did,
-                public_key: None,
-                roles: vec![],
-            })
-            .build()
-            .unwrap()
-            .with_kind(kind);
-        let manifest_bytes = manifest.to_canonical_bytes().unwrap();
-        let code_bytes: Vec<u8> = vec![];
-        let canonical = serde_json::to_vec(&(&manifest_bytes, &code_bytes)).unwrap();
-        let sig = signing_key.sign(&canonical).to_bytes().to_vec();
-        (manifest_bytes, code_bytes, sig)
+        build_bundle_parts_with_meta(signing_key, kind, &[("body", TEST_BODY)])
     }
 
     /// Like `build_bundle_parts` but sets `metadata["channel"]` so we can test
@@ -483,7 +650,11 @@ mod tests {
         kind: BlockKind,
         channel: &str,
     ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        build_bundle_parts_with_meta(signing_key, kind, &[("channel", channel)])
+        build_bundle_parts_with_meta(
+            signing_key,
+            kind,
+            &[("channel", channel), ("body", TEST_BODY)],
+        )
     }
 
     /// Like `build_bundle_parts` but seeds arbitrary string metadata entries —
@@ -548,8 +719,125 @@ mod tests {
         assert!(ctx.store.get_block(&block_cid).unwrap().is_some());
         let receipts = ctx.store.get_receipts_for_block(&block_cid).unwrap();
         assert_eq!(receipts.len(), 1);
-        // Synthetic receipts have no render hash
-        assert!(receipts[0].render_hash.is_none());
+
+        // The reversal of the v0.0.2 carve-out: a text-render block EXECUTES, so
+        // its receipt carries a real render_hash. This assertion used to require
+        // `is_none()` — the whole point of #5 was that it should not.
+        let hash = receipts[0]
+            .render_hash
+            .as_deref()
+            .expect("text-render must produce a render_hash; synthetic receipts are gone");
+
+        // It must be the hash of the actual body, verified independently of the
+        // guest's own claim rather than merely being non-empty.
+        let expected = text_block::execute_pure(&text_block::Input {
+            sender_did: String::new(),
+            channel_id: String::new(),
+            body_raw: TEST_BODY.to_string(),
+            hlc_wall_ms: 0,
+            hlc_logical: 0,
+            hlc_origin: String::new(),
+            client_version: String::new(),
+        })
+        .render_hash;
+        assert_eq!(
+            hash, expected,
+            "render_hash must be blake3 of the canonical body text"
+        );
+
+        // Also stored as a real receipt, not a synthetic one.
+        let stored = ctx.store.get_block(&block_cid).unwrap().unwrap();
+        assert!(
+            !stored.is_synthetic,
+            "a block that executed must not be marked synthetic"
+        );
+    }
+
+    /// Absent `metadata.body`, there is nothing to render. Ingest must say so
+    /// rather than hash the empty string and report success.
+    #[tokio::test]
+    async fn ingest_rejects_text_render_without_a_body() {
+        let ctx = test_ctx();
+        seed_channel(&ctx, "#hello");
+        let sender_key = random_signing_key();
+        // Deliberately only a channel, no body.
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &sender_key,
+            BlockKind::TextRender,
+            &[("channel", "#hello")],
+        );
+
+        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, IngestError::MissingMetadata { field, .. } if field == "body"),
+            "expected MissingMetadata for `body`, got {err:?}"
+        );
+        assert!(
+            ctx.store
+                .list_blocks_by_channel("#hello", 10, None)
+                .unwrap()
+                .is_empty(),
+            "a rejected block must not be persisted"
+        );
+    }
+
+    /// A server with no executor must refuse text-render outright. The tempting
+    /// alternative — fall back to a synthetic receipt — would reinstate exactly
+    /// the carve-out #5 removed, while looking like success.
+    #[tokio::test]
+    async fn ingest_rejects_text_render_when_no_executor_is_configured() {
+        let mut ctx = test_ctx();
+        ctx.executor = None;
+        seed_channel(&ctx, "#hello");
+        let sender_key = random_signing_key();
+        let (mb, cb, sig) =
+            build_bundle_parts_with_channel(&sender_key, BlockKind::TextRender, "#hello");
+
+        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, IngestError::NoExecutor { kind } if kind == "text-render"),
+            "expected NoExecutor, got {err:?}"
+        );
+    }
+
+    /// Two servers rendering the same body must produce the same hash, and a
+    /// different body must produce a different one. This is cross-server parity
+    /// in miniature — the property H3 checks across a real federation pair, and
+    /// which was previously vacuous because both sides produced `None`.
+    #[tokio::test]
+    async fn identical_bodies_agree_and_different_bodies_diverge() {
+        async fn hash_for(body: &str) -> String {
+            let ctx = test_ctx();
+            seed_channel(&ctx, "#hello");
+            let key = random_signing_key();
+            let (mb, cb, sig) = build_bundle_parts_with_meta(
+                &key,
+                BlockKind::TextRender,
+                &[("channel", "#hello"), ("body", body)],
+            );
+            let cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+                .await
+                .expect("ingest");
+            ctx.store.get_receipts_for_block(&cid).unwrap()[0]
+                .render_hash
+                .clone()
+                .expect("render_hash present")
+        }
+
+        // Distinct IngestContexts stand in for distinct servers: different server
+        // DIDs, different signing keys, different stores.
+        let a = hash_for("the same message").await;
+        let b = hash_for("the same message").await;
+        assert_eq!(a, b, "two servers must agree on the same body");
+
+        let c = hash_for("the same message.").await;
+        assert_ne!(a, c, "a one-character change must change the hash");
     }
 
     #[tokio::test]

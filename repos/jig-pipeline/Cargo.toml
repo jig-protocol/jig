@@ -10,6 +10,14 @@ description = "Shared block ingest/effect/persist pipeline for jig-server and ji
 jig-core = { workspace = true }
 jig-config = { workspace = true }
 jig-runtime = { workspace = true }
+# The canonical text-render block: its embedded Wasm artifact, its module
+# identity, and the Input/Output types that define the ABI. Depending on the
+# crate rather than re-declaring the types keeps one definition of the wire
+# shape — a mismatch here would decode as garbage rather than fail to compile.
+text-block = { path = "../text-block" }
+# The block ABI codec. NOT serde_json: its number parser links f64 code, which
+# jig-core's determinism validator rejects. See the workspace-level comment.
+postcard = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

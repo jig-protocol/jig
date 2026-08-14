@@ -36,6 +36,11 @@ ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 blake3 = { workspace = true }
+# Native reference for render_hash expectations. H1 asserts the receipt's hash
+# equals what `execute_pure` derives for the submitted body, rather than merely
+# that the field is populated — jig-runtime's payload tests pin this native
+# function to the Wasm module, which is what makes it a valid oracle here.
+text-block = { path = "../text-block" }
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
 semver = "1.0"

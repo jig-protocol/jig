@@ -153,11 +153,26 @@ async fn two_server_federation_chat_with_receipt_parity() {
         bob_received_cid.unwrap_or_default()
     );
 
-    // Cross-server receipt parity: render_hash agreement. Both are None in
-    // v0.0.2 (synthetic-receipt path) — see H1 for the rationale.
+    // Cross-server receipt parity: render_hash agreement.
+    //
+    // This is the assertion issue #5 was filed about. Until text-render actually
+    // executed, both sides produced `None` and this compared nothing to nothing —
+    // it passed no matter what either server did. The `is_some()` checks below
+    // exist so it can never silently return to that state: an equality assertion
+    // over two absent values is indistinguishable from agreement.
+    let hash_a = receipts_a[0]
+        .render_hash
+        .as_deref()
+        .expect("server_a must have executed the block and recorded a render_hash");
+    let hash_b = receipts_b[0]
+        .render_hash
+        .as_deref()
+        .expect("server_b must have executed the federated block and recorded a render_hash");
+
     assert_eq!(
-        receipts_a[0].render_hash, receipts_b[0].render_hash,
-        "cross-server render_hash parity must hold for federated text-render"
+        hash_a, hash_b,
+        "cross-server render_hash parity must hold for federated text-render: \
+         two servers independently rendering the same body must derive the same hash"
     );
 }
 
