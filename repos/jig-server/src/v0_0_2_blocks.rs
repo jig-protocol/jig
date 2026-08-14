@@ -56,62 +56,13 @@ fn err(
     )
 }
 
-fn map_ingest_error(e: IngestError) -> (StatusCode, Json<ErrorBody>) {
-    match e {
-        IngestError::InvalidSignature => err(
-            StatusCode::UNAUTHORIZED,
-            "INVALID_SIG",
-            "signature verification failed",
-        ),
-        IngestError::DisallowedBlockKind { kind } => err(
-            StatusCode::FORBIDDEN,
-            "DISALLOWED_BLOCK_KIND",
-            format!("kind not in allow list: {kind}"),
-        ),
-        IngestError::KindRequired => err(
-            StatusCode::BAD_REQUEST,
-            "KIND_REQUIRED",
-            "manifest must declare block kind",
-        ),
-        IngestError::BundleMalformed(m) => err(StatusCode::BAD_REQUEST, "BUNDLE_MALFORMED", m),
-        // 404, not 400: the request is well-formed, the named channel isn't here.
-        ref e @ IngestError::UnknownChannel { .. } => {
-            err(StatusCode::NOT_FOUND, "UNKNOWN_CHANNEL", e.to_string())
-        }
-        // 400: the sender omitted a field its block kind requires (text-render
-        // must carry metadata.body). Naming the field is the point — the client
-        // cannot fix what it cannot identify.
-        ref e @ IngestError::MissingMetadata { .. } => {
-            err(StatusCode::BAD_REQUEST, "MISSING_METADATA", e.to_string())
-        }
-        // 500: this server has no Wasm executor, so it cannot produce a
-        // render_hash for the kind. Nothing the client did, nothing it can fix.
-        ref e @ IngestError::NoExecutor { .. } => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "NO_EXECUTOR",
-            e.to_string(),
-        ),
-        // 500: the block was acceptable and executing it failed here. May be
-        // transient, so the message says so rather than implying a bad request.
-        ref e @ IngestError::RenderFailed { .. } => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "RENDER_FAILED",
-            format!("{e} (may be transient; retry is reasonable)"),
-        ),
-        IngestError::Identity(ide) => {
-            err(StatusCode::UNAUTHORIZED, "IDENTITY_ERROR", ide.to_string())
-        }
-        IngestError::Persist(pe) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "PERSIST_ERROR",
-            pe.to_string(),
-        ),
-        IngestError::Other(o) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INGEST_ERROR",
-            o.to_string(),
-        ),
-    }
+/// Thin wrapper around the shared classifier (`v0_0_2_ingest_error`): decide
+/// the (status, code) here once, wrap it in this endpoint's `ErrorBody`.
+/// `pub(crate)` so the cross-wrapper agreement test in that module can call
+/// it directly.
+pub(crate) fn map_ingest_error(e: IngestError) -> (StatusCode, Json<ErrorBody>) {
+    let (status, code, message) = crate::v0_0_2_ingest_error::classify_ingest_error(&e);
+    err(status, code, message)
 }
 
 /// POST /api/v1/blocks — submit a signed block bundle (non-streaming alt to WSS).

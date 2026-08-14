@@ -14,6 +14,7 @@ pub mod v0_0_2_bridge_storage;
 pub mod v0_0_2_bridges;
 pub mod v0_0_2_federation;
 pub mod v0_0_2_federation_tls;
+pub mod v0_0_2_ingest_error;
 pub mod v0_0_2_ws;
 
 pub use config::ServerConfig;

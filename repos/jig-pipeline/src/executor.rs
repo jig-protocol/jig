@@ -141,8 +141,25 @@ pub struct BlockExecutor {
 
 impl BlockExecutor {
     /// Build a runtime and compile the canonical modules. Do this once, at boot.
+    ///
+    /// Uses the default [`jig_runtime::RuntimeConfig`]. A server that lets an
+    /// operator configure execution limits should call
+    /// [`BlockExecutor::with_config`] instead and pass the same config it gives
+    /// every other execution path — otherwise the ingest render path silently
+    /// runs under different limits from the rest of the server.
     pub fn new() -> Result<Self, ExecutorError> {
-        let config = jig_runtime::RuntimeConfig::default();
+        Self::with_config(jig_runtime::RuntimeConfig::default())
+    }
+
+    /// Build a runtime under operator-supplied limits and compile the canonical
+    /// modules.
+    ///
+    /// The concurrency gate is sized from `config.limits.max_concurrent_instances`,
+    /// so lowering that in config lowers both the engine's pooling ceiling and the
+    /// gate that keeps callers under it. They must move together: a gate wider
+    /// than the pool reintroduces the hard instantiation failure the gate exists
+    /// to prevent.
+    pub fn with_config(config: jig_runtime::RuntimeConfig) -> Result<Self, ExecutorError> {
         let concurrency = config.limits.max_concurrent_instances.max(1) as usize;
         let runtime =
             Runtime::with_config(config).map_err(|e| ExecutorError::Runtime(e.to_string()))?;
@@ -170,19 +187,32 @@ impl BlockExecutor {
         self.slots.peak.load(Ordering::Relaxed)
     }
 
-    /// A process-wide executor, compiled on first use.
+    /// A process-wide executor for **tests**, compiled on first use.
     ///
-    /// A server should own its own via [`BlockExecutor::new`]. This exists so the
-    /// many tests that build an `IngestContext` don't each pay the compile — the
-    /// executor is immutable after construction, so sharing is safe.
+    /// Exists so the many tests that build an `IngestContext` don't each pay the
+    /// module compile; the executor is immutable after construction, so sharing
+    /// is safe.
+    ///
+    /// **Panics** if the canonical module fails to compile. That is acceptable in
+    /// a test binary and not in a server, which is why production code must use
+    /// [`BlockExecutor::new`] or [`BlockExecutor::with_config`] and propagate the
+    /// error — a server that cannot compile its module should report why, not
+    /// abort. `jig-server` does this in `AppState::new`.
+    ///
+    /// Note the sharing is per-process, so it does not amortize under
+    /// `cargo nextest`, which runs a process per test.
+    ///
+    /// Tests that measure [`BlockExecutor::in_flight_peak`] must build their own
+    /// via `new()`: `peak` is per-executor, so a shared one accumulates other
+    /// tests' concurrency and an assertion on it would not be measuring the test
+    /// that made it.
     pub fn shared() -> Arc<Self> {
         static SHARED: OnceLock<Arc<BlockExecutor>> = OnceLock::new();
         SHARED
             .get_or_init(|| {
                 Arc::new(Self::new().expect(
-                    "the canonical text-block module must compile; \
-                                        it is embedded at build time and covered by \
-                                        jig-runtime's payload tests",
+                    "the canonical text-block module must compile; it is embedded \
+                     at build time and covered by jig-runtime's payload tests",
                 ))
             })
             .clone()
@@ -325,7 +355,12 @@ mod tests {
     /// the slot gate is exercised rather than merely present.
     #[test]
     fn many_concurrent_renders_all_succeed() {
-        let ex = BlockExecutor::shared();
+        // Its OWN executor, not `shared()`. `peak` is per-executor, so a shared
+        // one accumulates every other test's concurrency in this process — and
+        // the `in_flight_peak() > 1` assertion below would then pass on someone
+        // else's overlap rather than this test's, which is precisely the evidence
+        // it is supposed to provide.
+        let ex = Arc::new(BlockExecutor::new().expect("executor construction"));
         let threads = 64;
         let per_thread = 8;
 

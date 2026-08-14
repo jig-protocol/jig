@@ -485,10 +485,25 @@ async fn build_render_receipt(
         client_version: manifest.version.to_string(),
     };
 
-    let rendered = executor
-        .render_text(&input)
+    // Off the async worker: `render_text` is synchronous end to end. It parks on
+    // a condvar waiting for a concurrency slot and then runs the guest on that
+    // same thread, so calling it inline would hold a tokio worker for the whole
+    // wait plus execution. Execution is bounded by the epoch deadline; the slot
+    // wait is NOT bounded, so under load enough workers could park to stall the
+    // runtime — including the tasks that would have freed the slots.
+    let executor = Arc::clone(executor);
+    let kind_owned = kind_str.to_string();
+    let rendered = tokio::task::spawn_blocking(move || executor.render_text(&input))
+        .await
+        // A join error means the blocking task panicked or the pool shut down.
+        // Distinct from a render failure, and worth saying so: it points at the
+        // host, not the block.
         .map_err(|e| IngestError::RenderFailed {
-            kind: kind_str.to_string(),
+            kind: kind_owned.clone(),
+            detail: format!("render task did not complete: {e}"),
+        })?
+        .map_err(|e| IngestError::RenderFailed {
+            kind: kind_owned,
             detail: e.to_string(),
         })?;
 
