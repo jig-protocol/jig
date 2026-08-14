@@ -138,7 +138,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into_owned()
                 + "_v002.db",
         );
-        match jig_server::v0_0_2::AppState::new(v002_config, db_path) {
+        // The operator's `[execution]` limits live on `ServerConfig`, so they are
+        // handed over explicitly — this is what makes the ingest render path honour
+        // configured fuel, memory, timeout and concurrency.
+        match jig_server::v0_0_2::AppState::new(v002_config, db_path, config.execution_config()) {
             Ok(state) => {
                 let state = std::sync::Arc::new(state);
                 tracing::info!(

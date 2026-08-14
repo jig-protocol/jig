@@ -53,6 +53,8 @@ pub struct ExecutionConfig {
     pub host_id: String,
     pub pricing_enabled: bool,
     pub cost_per_fuel: Option<f64>,
+    /// Concurrent executions permitted; see `ServerConfig`'s `[execution]`.
+    pub max_concurrent_executions: u32,
 }
 
 impl Default for ExecutionConfig {
@@ -61,6 +63,7 @@ impl Default for ExecutionConfig {
             fuel_max: 5_000_000,
             memory_max_mb: 64,
             timeout_ms: 250,
+            max_concurrent_executions: 16,
             host_id: "did:jig:server:local".into(),
             pricing_enabled: false,
             cost_per_fuel: None,
@@ -82,12 +85,22 @@ impl BlockRuntime {
                 memory_max_mb: config.memory_max_mb,
                 execution_timeout_ms: config.timeout_ms,
                 max_instances: 1, // one instance per execution
-                // `..Default::default()` for the rest — notably
-                // `max_concurrent_instances`, the engine-wide concurrency
-                // ceiling. Spelling every field out here is what let a
-                // single-instance cap reach the live server unnoticed; taking
-                // the runtime's default means a new limit lands here too.
-                ..Default::default()
+                max_concurrent_instances: config.max_concurrent_executions,
+                // Every field is now spelled out, and the `..Default::default()`
+                // that used to be here is gone — clippy correctly flags it as
+                // having no effect.
+                //
+                // This reverses the reasoning from PR #35, and the reversal is the
+                // point. Back then a default-spread was right because the missing
+                // field (`max_concurrent_instances`) had a safe default and
+                // enumerating fields is what let a wrong one ship unnoticed. Now
+                // that field must come from the OPERATOR, so a default is exactly
+                // what must not happen silently.
+                //
+                // The cost is that adding a limit to `ResourceLimits` breaks this
+                // build. That is the desired behaviour for a config-mapping site:
+                // a new runtime limit deserves a decision about whether operators
+                // should be able to set it, not a silent default.
             },
             ..Default::default()
         };

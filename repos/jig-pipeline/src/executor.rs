@@ -397,4 +397,35 @@ mod tests {
             ex.in_flight_peak()
         );
     }
+
+    /// `with_config` must actually apply the limits it is handed.
+    ///
+    /// This is the far end of the operator-config chain: `[execution]` ->
+    /// `ExecutionConfig` -> `runtime_config_from` -> here. A starved fuel budget
+    /// is the cheapest limit to prove, because a render that would otherwise
+    /// succeed must now fail. Without this, `with_config` could ignore its
+    /// argument entirely and every other test would still pass.
+    #[test]
+    fn a_configured_fuel_limit_is_enforced() {
+        let mut config = jig_runtime::RuntimeConfig::default();
+        config.limits.fuel_max = 100; // far below what a real render costs
+        let ex = BlockExecutor::with_config(config).expect("executor builds");
+
+        let err = ex
+            .render_text(&input("this render cannot fit in 100 fuel"))
+            .expect_err("a starved fuel budget must fail the render");
+
+        assert!(
+            matches!(err, ExecutorError::Execute { .. }),
+            "expected an execution failure, got {err:?}"
+        );
+
+        // And the same executor at a normal budget succeeds, so the failure above
+        // is attributable to the limit rather than to anything else.
+        let ok = BlockExecutor::with_config(jig_runtime::RuntimeConfig::default())
+            .expect("executor builds")
+            .render_text(&input("this render cannot fit in 100 fuel"))
+            .expect("a default budget must succeed");
+        assert!(!ok.output.render_hash.is_empty());
+    }
 }
