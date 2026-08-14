@@ -154,7 +154,8 @@ impl Runtime {
         let mut store =
             self.engine
                 .create_store_with_limits(limits.fuel_max, limits.memory_max_mb, timeout)?;
-        let _epoch_guard = self.engine.schedule_epoch_interrupt(timeout);
+        // The store's epoch deadline is driven by the engine's shared ticker;
+        // nothing to schedule or cancel per execution.
 
         let fuel_before = store.get_fuel().unwrap_or(0);
 
