@@ -153,7 +153,8 @@ impl Runtime {
             self.engine
                 .create_store_with_limits(fuel_limit, memory_limit_mb, timeout_duration)?;
 
-        let epoch_guard = self.engine.schedule_epoch_interrupt(timeout_duration);
+        // No per-execution timer: the engine's shared epoch ticker drives the
+        // deadline set on the store. See `engine::EpochTicker`.
 
         // Track initial fuel (if fuel metering is enabled)
         let initial_fuel = if self.config.fuel.enabled {
@@ -368,9 +369,6 @@ impl Runtime {
             builder = builder.capability(capability);
         }
 
-        if let Some(guard) = epoch_guard.as_ref() {
-            guard.cancel();
-        }
         builder.build()
     }
 
@@ -481,7 +479,8 @@ impl Runtime {
             timeout_duration,
         )?;
 
-        let epoch_guard = self.engine.schedule_epoch_interrupt(timeout_duration);
+        // No per-execution timer: the engine's shared epoch ticker drives the
+        // deadline set on the store. See `engine::EpochTicker`.
 
         // Track initial fuel (if fuel metering is enabled)
         let initial_fuel = if self.config.fuel.enabled {
@@ -688,10 +687,6 @@ impl Runtime {
             && let Ok(value) = serde_json::to_value(&snapshot.status_bins)
         {
             builder = builder.metadata("runtime.status_bins", value);
-        }
-
-        if let Some(guard) = epoch_guard.as_ref() {
-            guard.cancel();
         }
 
         builder.build()

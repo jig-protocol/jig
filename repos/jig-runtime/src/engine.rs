@@ -3,12 +3,9 @@
 //! This module provides a deterministic WebAssembly execution engine using Wasmtime.
 //! All execution is fuel-metered, with canonicalized NaNs, and no non-deterministic features.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use wasmtime::*;
 
@@ -84,10 +81,122 @@ impl ResourceLimiter for StoreContext {
     }
 }
 
+/// Cadence of the shared epoch ticker.
+///
+/// Epoch interruption counts *ticks*, not milliseconds, so this is the
+/// granularity of every wall-clock deadline in the runtime: a timeout can
+/// overshoot its nominal value by up to one tick.
+///
+/// 10 ms is chosen to overshoot the 250 ms default by at most 4%, while keeping
+/// the ticker at 100 wakeups/second — negligible on the $5-VPS and Raspberry Pi
+/// targets, and unlike the previous design it does not scale with message rate.
+const EPOCH_TICK: Duration = Duration::from_millis(10);
+
+/// Ticks a store must survive to be granted at least `timeout` of wall clock.
+///
+/// Rounds **up** and then adds one. The extra tick is not slop: the ticker runs
+/// free, so a store created immediately before a tick would otherwise see that
+/// tick consume most of its first interval and be interrupted early. Overshooting
+/// is the safe direction — a run cut short reports a partial `fuel_used` that is
+/// not the program's cost, which is precisely the receipt corruption documented
+/// in `docs/investigations/2026-08-11-fuel-portability.md`.
+fn deadline_ticks(timeout: Duration) -> u64 {
+    let tick_ms = EPOCH_TICK.as_millis().max(1);
+    (timeout.as_millis().div_ceil(tick_ms) as u64).saturating_add(1)
+}
+
+/// One thread per engine that advances the epoch on a fixed cadence.
+///
+/// Replaces a detached sleeper thread per execution. That design left a thread
+/// asleep for the full timeout even after its execution finished — at 10,000
+/// msg/s with a 250 ms timeout, roughly 2,500 sleeping threads at steady state,
+/// scaling with message rate on the ingest hot path. This is O(1) per engine.
+///
+/// Stops when the engine drops, which matters more than it looks: tests build
+/// many short-lived `Runtime`s, and a ticker that outlived its engine would leak
+/// a thread per construction.
+struct EpochTicker {
+    /// `true` once the engine is going away. Paired with the condvar so shutdown
+    /// is immediate rather than waiting out the current tick.
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    fn start(engine: Engine, cadence: Duration) -> Result<Self> {
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let stop_for_thread = Arc::clone(&stop);
+
+        let handle = thread::Builder::new()
+            .name("jig-epoch-ticker".into())
+            .spawn(move || {
+                let (lock, cvar) = &*stop_for_thread;
+                // A monotonic deadline, NOT a fresh `cadence` wait each pass.
+                // `wait_timeout` may return early for reasons other than the stop
+                // signal, and restarting a full cadence on each of those would let
+                // repeated early wakes defer the tick indefinitely — breaking the
+                // "overshoot by at most one tick" bound this module documents.
+                // Waiting only the REMAINING time keeps the tick on schedule
+                // regardless of how often the wait is interrupted.
+                let mut next_tick = Instant::now() + cadence;
+                loop {
+                    let remaining = next_tick.saturating_duration_since(Instant::now());
+                    let stopping = lock.lock().expect("epoch ticker mutex poisoned");
+                    let (stopping, _) = cvar
+                        .wait_timeout(stopping, remaining)
+                        .expect("epoch ticker mutex poisoned");
+                    if *stopping {
+                        break;
+                    }
+                    drop(stopping);
+
+                    let now = Instant::now();
+                    if now >= next_tick {
+                        engine.increment_epoch();
+                        next_tick += cadence;
+                        // If the thread was descheduled long enough to miss whole
+                        // ticks, resync rather than firing a burst to catch up:
+                        // the epoch is a deadline signal, not an event count.
+                        if next_tick <= now {
+                            next_tick = now + cadence;
+                        }
+                    }
+                }
+            })
+            .map_err(|e| {
+                RuntimeError::InternalError(format!("spawning the epoch ticker thread: {e}"))
+            })?;
+
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        {
+            let (lock, cvar) = &*self.stop;
+            if let Ok(mut stopping) = lock.lock() {
+                *stopping = true;
+                cvar.notify_all();
+            }
+        }
+        if let Some(handle) = self.handle.take() {
+            // Joining keeps the thread from outliving the `Engine` it holds, and
+            // makes "engine dropped" mean "ticker gone" for the thread-count test.
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Wasmtime-based execution engine configured for determinism
 pub struct WasmEngine {
     engine: Engine,
     epoch_enabled: bool,
+    /// Held for its `Drop`; never read. One per engine, not one per execution.
+    _epoch_ticker: Option<EpochTicker>,
 }
 
 impl WasmEngine {
@@ -157,9 +266,15 @@ impl WasmEngine {
         let engine = Engine::new(&wasm_config)
             .map_err(|e| RuntimeError::InternalError(format!("Engine creation failed: {e}")))?;
 
+        // One ticker for the whole engine, started here rather than per
+        // execution. Its thread holds an `Engine` clone, so it must stop when
+        // this struct drops — see `EpochTicker::drop`.
+        let _epoch_ticker = Some(EpochTicker::start(engine.clone(), EPOCH_TICK)?);
+
         Ok(Self {
             engine,
             epoch_enabled: true,
+            _epoch_ticker,
         })
     }
 
@@ -225,7 +340,10 @@ impl WasmEngine {
         store.limiter(|data| data);
 
         if self.epoch_enabled && timeout.as_millis() > 0 {
-            store.set_epoch_deadline(1);
+            // Ticks, not milliseconds: the shared ticker advances the epoch on a
+            // fixed cadence, so a deadline is expressed in how many ticks the
+            // store may survive.
+            store.set_epoch_deadline(deadline_ticks(timeout));
         }
 
         Ok(store)
@@ -267,29 +385,13 @@ impl WasmEngine {
         store.limiter(|data| data);
 
         if self.epoch_enabled && timeout.as_millis() > 0 {
-            store.set_epoch_deadline(1);
+            // Ticks, not milliseconds: the shared ticker advances the epoch on a
+            // fixed cadence, so a deadline is expressed in how many ticks the
+            // store may survive.
+            store.set_epoch_deadline(deadline_ticks(timeout));
         }
 
         Ok(store)
-    }
-
-    pub fn schedule_epoch_interrupt(&self, timeout: Duration) -> Option<EpochGuard> {
-        if !self.epoch_enabled || timeout.as_millis() == 0 {
-            return None;
-        }
-
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-        let cancel_clone = Arc::clone(&cancel_flag);
-        let engine = self.engine.clone();
-
-        thread::spawn(move || {
-            thread::sleep(timeout);
-            if !cancel_clone.swap(true, Ordering::Relaxed) {
-                engine.increment_epoch();
-            }
-        });
-
-        Some(EpochGuard { cancel_flag })
     }
 
     /// Build a minimal, deterministic WASI preview1 context
@@ -319,22 +421,6 @@ impl WasmEngine {
         let wasi_ctx = builder.build_p1();
 
         Ok(wasi_ctx)
-    }
-}
-
-pub struct EpochGuard {
-    cancel_flag: Arc<AtomicBool>,
-}
-
-impl EpochGuard {
-    pub fn cancel(&self) {
-        self.cancel_flag.store(true, Ordering::Relaxed);
-    }
-}
-
-impl Drop for EpochGuard {
-    fn drop(&mut self) {
-        self.cancel();
     }
 }
 

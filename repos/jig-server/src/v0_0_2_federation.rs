@@ -848,7 +848,9 @@ mod tests {
             .join("server.key")
             .to_string_lossy()
             .into_owned();
-        let state = Arc::new(AppState::new(config, tempdir.path().join("server.db")).unwrap());
+        let state = Arc::new(
+            AppState::new(config, tempdir.path().join("server.db"), Default::default()).unwrap(),
+        );
 
         let peer = jig_config::v0_0_2_server::FederationPeer {
             url: "wss://test-peer".to_string(),

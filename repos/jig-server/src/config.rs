@@ -85,6 +85,15 @@ pub struct ExecutionSection {
     pub pricing_enabled: bool,
     #[serde(default)]
     pub cost_per_fuel: Option<f64>,
+    /// How many block executions may run at once.
+    ///
+    /// Sizes wasmtime's instance pool. Past it, execution does not queue inside
+    /// the engine — it fails — so the ingest executor gates itself to this number
+    /// and callers wait for a slot instead. Costs address space rather than
+    /// resident memory: roughly `max_concurrent_executions * memory_max_mb`
+    /// reserved, paged in only as guests touch it.
+    #[serde(default = "default_max_concurrent_executions")]
+    pub max_concurrent_executions: u32,
 }
 
 impl Default for ServerConfig {
@@ -178,6 +187,7 @@ impl Default for ExecutionSection {
             fuel_max: default_fuel_max(),
             memory_max_mb: default_memory_max_mb(),
             timeout_ms: default_timeout_ms(),
+            max_concurrent_executions: default_max_concurrent_executions(),
             pricing_enabled: false,
             cost_per_fuel: None,
         }
@@ -212,6 +222,7 @@ impl ServerConfig {
             fuel_max: self.execution.fuel_max,
             memory_max_mb: self.execution.memory_max_mb,
             timeout_ms: self.execution.timeout_ms,
+            max_concurrent_executions: self.execution.max_concurrent_executions,
             host_id: self.host_id.clone(),
             pricing_enabled: self.execution.pricing_enabled,
             cost_per_fuel: self.execution.cost_per_fuel,
@@ -318,6 +329,12 @@ fn default_memory_max_mb() -> u32 {
 
 fn default_timeout_ms() -> u64 {
     250
+}
+
+/// Matches jig-runtime's own default, so the two agree unless an operator says
+/// otherwise.
+fn default_max_concurrent_executions() -> u32 {
+    16
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@
 //! /blocks HTTP routes stay alive for backward compat until Phase F+
 //! retires them.
 
+use crate::runtime::ExecutionConfig;
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use jig_config::v0_0_2_server::{IdentityMode, JigServerConfig};
@@ -46,12 +47,48 @@ pub struct AppState {
     pub bridge_router_mount: jig_bridge_core::RouterMount,
 }
 
+/// Translate the operator's server-level execution settings into the runtime's
+/// own config type.
+///
+/// Kept as a named function rather than inlined so the mapping is one visible
+/// place: a limit added on either side that is not wired here is the same class
+/// of silent divergence this exists to remove.
+fn runtime_config_from(execution: &ExecutionConfig) -> jig_runtime::RuntimeConfig {
+    jig_runtime::RuntimeConfig {
+        // Enumerated rather than assigned onto a default, and deliberately: a
+        // limit added to `ResourceLimits` should break this build so somebody
+        // decides whether operators can set it, instead of it silently taking a
+        // default here. Same reasoning as `BlockRuntime::new`.
+        limits: jig_runtime::config::ResourceLimits {
+            fuel_max: execution.fuel_max,
+            memory_max_mb: execution.memory_max_mb,
+            execution_timeout_ms: execution.timeout_ms,
+            // Per-execution instance cap, not a concurrency knob — no operator
+            // setting maps to it, and conflating the two is what once capped the
+            // engine at a single simultaneous execution.
+            max_instances: 1,
+            max_concurrent_instances: execution.max_concurrent_executions,
+        },
+        ..Default::default()
+    }
+}
+
 impl AppState {
     /// Build the AppState from a parsed JigServerConfig and a SQLite path.
     /// Generates the server signing key if the configured keyfile is absent;
     /// loads it otherwise. On Unix the keyfile is set to mode 0600 on
     /// generation.
-    pub fn new(config: JigServerConfig, db_path: PathBuf) -> Result<Self> {
+    ///
+    /// `execution` carries the operator's `[execution]` limits, which live on
+    /// `ServerConfig` rather than `JigServerConfig` under the hybrid config
+    /// split. Passing them explicitly is what makes the ingest render path honour
+    /// configured fuel, memory, timeout and concurrency instead of running on
+    /// library defaults.
+    pub fn new(
+        config: JigServerConfig,
+        db_path: PathBuf,
+        execution: ExecutionConfig,
+    ) -> Result<Self> {
         let store = Arc::new(SqliteStore::open(&db_path).context("opening SqliteStore")?);
         let signing_key = load_or_generate_server_key(&config.server.server_did_keyfile)
             .context("loading server signing key")?;
@@ -76,14 +113,20 @@ impl AppState {
         // one, so a module compile failure is reported through this function's
         // `Result` instead of aborting the process.
         //
-        // Limits are jig-runtime's defaults, NOT the operator's `[execution]`
-        // settings — those live on `ServerConfig`, a different type in the hybrid
-        // config split, and `AppState::new` only receives `JigServerConfig`.
-        // `BlockExecutor::with_config` exists for the day that is plumbed through;
-        // until then the ingest render path runs under library defaults, which is
-        // a real (if narrow) divergence from `BlockRuntime`.
-        let executor =
-            Arc::new(BlockExecutor::new().context("compiling the canonical text-render module")?);
+        // Limits come from the operator's `[execution]` settings, which live on
+        // `ServerConfig` — a different type in the hybrid config split, so they
+        // are passed in rather than read from `JigServerConfig`. Without this the
+        // ingest render path ran on library defaults and silently ignored every
+        // configured limit.
+        //
+        // Deliberately NOT solved by adding an `[execution]` section to
+        // `JigServerConfig`: both types would then parse the same TOML table under
+        // different key names (`timeout_ms` here, `execution_timeout_ms` in
+        // jig-config's own type), so one would silently fall back to its default.
+        let executor = Arc::new(
+            BlockExecutor::with_config(runtime_config_from(&execution))
+                .context("compiling the canonical text-render module")?,
+        );
 
         let ingest_ctx = Arc::new(IngestContext {
             store,
@@ -254,6 +297,51 @@ fn load_or_generate_server_key(path: &str) -> Result<SigningKey> {
 
 #[cfg(test)]
 mod tests {
+    /// Every operator-facing execution limit must reach the runtime config.
+    ///
+    /// Written with values that are all distinct from the defaults, so a field
+    /// that silently keeps its default fails here. That is the exact failure this
+    /// mapping exists to prevent: before it, the ingest render path ran on library
+    /// defaults and ignored `[execution]` entirely.
+    #[test]
+    fn operator_execution_limits_reach_the_runtime_config() {
+        let execution = crate::runtime::ExecutionConfig {
+            fuel_max: 1_234_567,
+            memory_max_mb: 111,
+            timeout_ms: 999,
+            host_id: "test-host".into(),
+            pricing_enabled: false,
+            cost_per_fuel: None,
+            max_concurrent_executions: 7,
+        };
+
+        let rc = super::runtime_config_from(&execution);
+
+        assert_eq!(rc.limits.fuel_max, 1_234_567);
+        assert_eq!(rc.limits.memory_max_mb, 111);
+        assert_eq!(rc.limits.execution_timeout_ms, 999);
+        assert_eq!(rc.limits.max_concurrent_instances, 7);
+
+        // Not an operator knob: this is the per-execution instance cap, and
+        // conflating it with concurrency is what capped the engine at one
+        // simultaneous execution.
+        assert_eq!(rc.limits.max_instances, 1);
+
+        // Each asserted value must differ from the default, or the assertion
+        // above would pass on an unwired field.
+        let default = jig_runtime::RuntimeConfig::default();
+        assert_ne!(rc.limits.fuel_max, default.limits.fuel_max);
+        assert_ne!(rc.limits.memory_max_mb, default.limits.memory_max_mb);
+        assert_ne!(
+            rc.limits.execution_timeout_ms,
+            default.limits.execution_timeout_ms
+        );
+        assert_ne!(
+            rc.limits.max_concurrent_instances,
+            default.limits.max_concurrent_instances
+        );
+    }
+
     use super::*;
     use tempfile::tempdir;
 

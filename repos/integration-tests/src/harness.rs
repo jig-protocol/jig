@@ -116,7 +116,11 @@ impl TestJigServer {
         // overwrite to make federation-peer URLs sensible.
         config.server.listen = "127.0.0.1:0".to_string();
 
-        let state = Arc::new(jig_server::v0_0_2::AppState::new(config, db_path)?);
+        let state = Arc::new(jig_server::v0_0_2::AppState::new(
+            config,
+            db_path,
+            Default::default(),
+        )?);
         let server_did_string = state.server_did.to_did_jig_string();
 
         // Bind ephemeral port BEFORE spawning so we can record it.

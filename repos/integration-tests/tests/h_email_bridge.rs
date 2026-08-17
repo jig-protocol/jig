@@ -153,7 +153,9 @@ async fn setup_with_toml(
     ];
 
     let db_path = tempdir.path().join("server.db");
-    let state = Arc::new(AppState::new(config.clone(), db_path).expect("AppState::new"));
+    let state = Arc::new(
+        AppState::new(config.clone(), db_path, Default::default()).expect("AppState::new"),
+    );
 
     let bridge = Box::new(EmailBridge::from_config_with_provider(email_cfg(), mock));
     state
