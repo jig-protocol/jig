@@ -81,11 +81,16 @@ ignore = [
     # --- unmaintained, no safe upgrade published ---
     "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained; jig-server TLS cert loading + rustls-native-certs. Thin wrapper over rustls-pki-types; migrate with the tokio-tungstenite 0.21 bump.
 
-    # --- fixable by a lockfile bump; deliberately NOT done in this change
-    #     because this lane may not touch Cargo.lock. Tracked as followups. ---
-    "RUSTSEC-2026-0009",  # time RFC-2822 parse stack exhaustion; via hickory-resolver + jig-core. We do not parse attacker-supplied RFC 2822 dates today; fix is time >=0.3.47.
-    "RUSTSEC-2025-0055",  # tracing-subscriber ANSI escape injection into logs; jig-server/jig-nameserver. Log poisoning only, no memory safety; fix is tracing-subscriber >=0.3.20.
-    "RUSTSEC-2026-0097",  # rand ThreadRng unsound with a custom log::Logger; our own workspace rand 0.8 dep. We install no custom logger that draws randomness; fix is rand >=0.8.6.
+    # The three "fixable by a lockfile bump" entries that used to sit here
+    # (RUSTSEC-2026-0009 time, RUSTSEC-2025-0055 tracing-subscriber,
+    # RUSTSEC-2026-0097 rand) are GONE, not moved: later lockfile changes carried
+    # the fixes and nobody pruned the notes. cargo-deny was already reporting all
+    # three as `advisory-not-detected`, and removing them leaves `advisories ok`.
+    #
+    # That warning is how to tell a live ignore from a dead one — the comments
+    # rot, the tool does not:
+    #   cargo deny --manifest-path repos/Cargo.toml check advisories \
+    #     2>&1 | grep -B6 "no crate matched"
 
     # --- rustls-webpki (both 0.102.8 via rustls 0.22 and 0.103.4 via rustls 0.23).
     #     All four need webpki >=0.103.12/0.103.13, i.e. rustls 0.23 everywhere —

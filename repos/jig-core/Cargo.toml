@@ -30,7 +30,6 @@ rand = { version = "0.10", optional = true }
 # Clears the seed buffer in `crypto::ed25519::generate_signing_key`. Already in
 # the tree via curve25519-dalek, so this adds a Cargo.toml line, not a build.
 zeroize = { version = "1", optional = true }
-sigstore = { version = "0.6", optional = true }
 
 [dev-dependencies]
 proptest = "1.0"
@@ -39,4 +38,3 @@ wat = "1.0"
 [features]
 default = []
 ed25519 = ["ed25519-dalek", "rand", "zeroize"]
-sigstore = ["dep:sigstore"]

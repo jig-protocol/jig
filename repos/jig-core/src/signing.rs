@@ -74,24 +74,26 @@ fn verify_ed25519(_public_key_b64: &str, _signature_b64: &str, _data: &[u8]) -> 
     ))
 }
 
-#[cfg(feature = "sigstore")]
-fn verify_sigstore(bundle_b64: &str, _data: &[u8]) -> Result<()> {
-    use sigstore::bundle::Bundle;
-
-    let bundle_bytes = STANDARD
-        .decode(bundle_b64)
-        .map_err(|e| JigError::Signing(format!("invalid base64 bundle: {e}")))?;
-    let _bundle = Bundle::from_bytes(&bundle_bytes)
-        .map_err(|e| JigError::Signing(format!("unable to parse sigstore bundle: {e}")))?;
-
-    // TODO: integrate with full sigstore verification (rekor + fulcio + TUF) once client wiring is in place.
-    // For now we only assert the bundle is well-formed.
-    Ok(())
-}
-
-#[cfg(not(feature = "sigstore"))]
+/// Sigstore verification is not implemented. Always an error.
+///
+/// There used to be a `sigstore`-feature arm here that decoded the bundle,
+/// checked it parsed, and returned `Ok(())` with a TODO about wiring up rekor,
+/// fulcio and TUF. Nothing enabled the feature, so every build already took the
+/// error path — but had anyone switched it on they would have got a function that
+/// *looked* like signature verification and in fact accepted any well-formed
+/// bundle. A verifier that returns `Ok` without verifying is worse than one that
+/// refuses.
+///
+/// The `sigstore` dependency is dropped with it (YAGNI): it was the sole source of
+/// `ring` 0.16 plus `openidconnect` 2.5.1, `picky` 7.0.0-rc.4, `tough` 0.12.5 and
+/// `x509-parser` 0.14.0 — none compiled into anything shipped, all scanned by
+/// `cargo deny`. Re-add it, deliberately and with real verification, when keyless
+/// signing is actually being built.
+///
+/// The [`BlockSignature::Sigstore`] variant stays: it is part of the wire format,
+/// and a block arriving with one must be rejected clearly rather than not parse.
 fn verify_sigstore(_bundle_b64: &str, _data: &[u8]) -> Result<()> {
     Err(JigError::Signing(
-        "sigstore verification requires the `sigstore` feature".into(),
+        "sigstore verification is not implemented in this build".into(),
     ))
 }
