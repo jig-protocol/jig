@@ -600,7 +600,9 @@ async fn spawn_one_peer_loop(state: Arc<jig_server::v0_0_2::AppState>, peer: Fed
             },
         });
         if sink
-            .send(Message::Text(serde_json::to_string(&sub_env).unwrap()))
+            .send(Message::Text(
+                serde_json::to_string(&sub_env).unwrap().into(),
+            ))
             .await
             .is_err()
         {
@@ -648,7 +650,7 @@ async fn spawn_one_peer_loop(state: Arc<jig_server::v0_0_2::AppState>, peer: Fed
                         delivery_cid: format!("delivery:{}", block.cid),
                     });
                     let json = serde_json::to_string(&frame).unwrap();
-                    if sink.send(Message::Text(json)).await.is_err() {
+                    if sink.send(Message::Text(json.into())).await.is_err() {
                         break;
                     }
                 }

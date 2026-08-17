@@ -106,7 +106,7 @@ async fn connect_and_relay(
         bundle_b64: base64::engine::general_purpose::STANDARD.encode(&hello_canonical),
         sig_b64: base64::engine::general_purpose::STANDARD.encode(&hello_sig),
     });
-    sink.send(Message::Text(serde_json::to_string(&hello_env)?))
+    sink.send(Message::Text(serde_json::to_string(&hello_env)?.into()))
         .await?;
 
     // 2. Subscribe federation scope so the peer pushes us their block stream.
@@ -115,7 +115,7 @@ async fn connect_and_relay(
             block_kinds: vec![],
         },
     });
-    sink.send(Message::Text(serde_json::to_string(&sub_env)?))
+    sink.send(Message::Text(serde_json::to_string(&sub_env)?.into()))
         .await?;
 
     // 3. Register a peer subscriber on our Fanout so OUR locally-ingested
@@ -393,7 +393,7 @@ async fn forward_outbound(
         delivery_cid: format!("delivery:{}", block.cid),
     });
     let json = serde_json::to_string(&frame)?;
-    sink.send(Message::Text(json)).await?;
+    sink.send(Message::Text(json.into())).await?;
     Ok(())
 }
 

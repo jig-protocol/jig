@@ -41,7 +41,11 @@ blake3 = { workspace = true }
 # that the field is populated — jig-runtime's payload tests pin this native
 # function to the Wasm module, which is what makes it a valid oracle here.
 text-block = { path = "../text-block" }
-tokio-tungstenite = "0.21"
+# Matches jig-client/jig-server so the tests drive the same stack as production.
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+    "connect",
+    "handshake",
+] }
 futures-util = "0.3"
 semver = "1.0"
 
@@ -50,6 +54,19 @@ wat = "1.0"
 # alpha.1c #4 (h_tls_verifier): drive a real TLS handshake against a
 # self-signed cert to verify dangerously_disable_federation_tls.
 rcgen = "0.13"
-tokio-rustls = "0.25"
-rustls = "0.22"
+# The last holder of the rustls 0.22 branch. h_tls_verifier stands up a real TLS
+# server, so it must speak the SAME rustls as jig-server/jig-client or it would be
+# testing a stack production does not run. Explicit `ring` for the same reason as
+# there: rustls 0.23 defaults to aws-lc-rs.
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "logging",
+    "ring",
+    "tls12",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "logging",
+    "std",
+    "tls12",
+] }
 rustls-pki-types = "1.0"

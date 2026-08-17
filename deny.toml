@@ -38,6 +38,20 @@ registries = ["gigue-internal"]
 multiple-versions = "warn"
 wildcards = "allow"
 
+# rustls 0.23's DEFAULT crypto provider is aws-lc-rs, which needs cmake and a C
+# toolchain. Every rustls/tokio-rustls dependency in this workspace therefore sets
+# `default-features = false` and selects `ring` explicitly — but that is a
+# convention, and a convention only holds until someone adds a dependency that
+# pulls rustls with defaults on.
+#
+# Two things go wrong when it slips, and neither is a compile error:
+#   - the one-line install and the Raspberry Pi target acquire a C build;
+#   - with BOTH providers enabled, `ClientConfig::builder()` panics at RUNTIME
+#     ("no process-level CryptoProvider available") rather than failing to build.
+#
+# Denying it makes the graph enforce what the comments ask for.
+deny = [{ name = "aws-lc-sys" }, { name = "aws-lc-rs" }]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
@@ -78,8 +92,6 @@ ignore = [
     "RUSTSEC-2021-0145",  # atty unaligned read (unsound); via jig-cli. Windows-only AND only under a custom global allocator, which we do not install.
     "RUSTSEC-2024-0375",  # atty unmaintained; same jig-cli dep. Superseded by std::io::IsTerminal — swap when jig-cli's arg parsing is next touched.
 
-    # --- unmaintained, no safe upgrade published ---
-    "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained; jig-server TLS cert loading + rustls-native-certs. Thin wrapper over rustls-pki-types; migrate with the tokio-tungstenite 0.21 bump.
 
     # The three "fixable by a lockfile bump" entries that used to sit here
     # (RUSTSEC-2026-0009 time, RUSTSEC-2025-0055 tracing-subscriber,
@@ -92,14 +104,13 @@ ignore = [
     #   cargo deny --manifest-path repos/Cargo.toml check advisories \
     #     2>&1 | grep -B6 "no crate matched"
 
-    # --- rustls-webpki (both 0.102.8 via rustls 0.22 and 0.103.4 via rustls 0.23).
-    #     All four need webpki >=0.103.12/0.103.13, i.e. rustls 0.23 everywhere —
-    #     blocked on the tokio-tungstenite 0.21 -> newer bump that removes the
-    #     rustls 0.22 branch. We do not use CRLs or name constraints today. ---
-    "RUSTSEC-2026-0049",  # CRL distributionPoint matching; we perform no CRL revocation checking.
-    "RUSTSEC-2026-0098",  # URI-name constraints wrongly accepted; we issue no name-constrained CAs.
-    "RUSTSEC-2026-0099",  # wildcard name constraints wrongly accepted; same, no name-constrained CAs.
-    "RUSTSEC-2026-0104",  # reachable panic parsing a CRL; unreachable while no CRLs are supplied.
+    # The five entries that used to sit here — RUSTSEC-2025-0134 (rustls-pemfile)
+    # and the four rustls-webpki ones (2026-0049/0098/0099/0104) — are gone,
+    # resolved rather than re-annotated. All five were blocked on the same thing:
+    # the tree carried rustls 0.22 (via tokio-tungstenite 0.21) alongside 0.23
+    # (via reqwest), and the 0.22 branch pulled rustls-webpki 0.102.x, which only
+    # a >=0.103.12 fixes. Unifying on rustls 0.23 removed the 0.102 copy, and
+    # rustls-pemfile went with it (rustls-pki-types parses PEM itself).
 
     # --- No wasmtime entries. jig-runtime + jig-server are on wasmtime 47.0.3,
     #     which carries fixes for every wasmtime advisory currently published

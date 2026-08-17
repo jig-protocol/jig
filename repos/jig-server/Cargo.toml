@@ -79,12 +79,29 @@ semver = "1.0"
 hickory-resolver = { version = "0.26", features = ["tokio"] }
 reqwest = { workspace = true }
 
-# WebSocket — rustls-tls-native-roots feature pulls in tokio-rustls 0.25 +
-# rustls 0.22 so we can install a custom rustls::ClientConfig at the
-# federation peer connect site (alpha.1c #4 — wires
-# `federation.dangerously_disable_federation_tls`).
-tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
-rustls = "0.22"
+# WebSocket + TLS, all pinned to ONE rustls major (0.23).
+#
+# Carrying both 0.22 (via tokio-tungstenite 0.21) and 0.23 (via reqwest) meant
+# two rustls-webpki copies, and the 0.102.x one carried four advisories that only
+# a >=0.103.12 webpki fixes. Removing the 0.22 branch removes them.
+#
+# `default-features = false` + explicit `ring` is NOT optional: rustls 0.23's
+# DEFAULT provider feature is `aws-lc-rs`, which is a C build (cmake/NASM) at odds
+# with the one-line-install and Raspberry Pi targets. Worse, if both providers end
+# up enabled, `ClientConfig::builder()` panics at runtime with no process-level
+# CryptoProvider rather than failing to compile. deny.toml bans aws-lc-sys so a
+# future bump cannot reintroduce it quietly.
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+    "connect",
+    "handshake",
+    "rustls-tls-native-roots",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "logging",
+    "std",
+    "tls12",
+] }
 rustls-pki-types = "1.0"
 dashmap = "5"
 jsonwebtoken = "10"
@@ -97,11 +114,18 @@ sha2 = "0.10"
 # Async traits (used by v0.0.2 bridge trait impls)
 async-trait = "0.1"
 
-# TLS serving — reuses the rustls 0.22 / tokio-rustls 0.25 already pulled by
-# tokio-tungstenite (federation WSS). Hand-wired over hyper-util to avoid
-# axum-server, which would drag in rustls 0.23 + aws-lc-rs (a heavy C build).
-tokio-rustls = "0.25"
-rustls-pemfile = "2"
+# TLS serving — reuses the rustls 0.23 / tokio-rustls 0.26 pulled by
+# tokio-tungstenite (federation WSS) and reqwest. Still hand-wired over hyper-util
+# rather than axum-server: that would pull rustls with DEFAULT features, i.e.
+# aws-lc-rs, reintroducing the C build this deliberately avoids.
+#
+# rustls-pemfile is gone (it was unmaintained, RUSTSEC-2025-0134). It was a thin
+# wrapper over rustls-pki-types, which parses PEM itself.
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "logging",
+    "ring",
+    "tls12",
+] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 

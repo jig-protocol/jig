@@ -1,13 +1,13 @@
 //! Main Jig server orchestration.
 
-use std::fs::File;
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
@@ -130,10 +130,11 @@ fn load_rustls_config(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
 ) -> Result<RustlsServerConfig> {
-    let cert_file = File::open(cert_path).map_err(|e| {
-        ServerError::Config(format!("opening TLS cert {}: {e}", cert_path.display()))
-    })?;
-    let certs = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+    // PEM parsing via rustls-pki-types rather than rustls-pemfile: the latter is
+    // unmaintained (RUSTSEC-2025-0134) and was only ever a thin wrapper over
+    // these same types. This also drops the manual File/BufReader dance.
+    let certs = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|e| ServerError::Config(format!("opening TLS cert {}: {e}", cert_path.display())))?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| ServerError::Config(format!("parsing TLS cert: {e}")))?;
     if certs.is_empty() {
@@ -142,11 +143,8 @@ fn load_rustls_config(
             cert_path.display()
         )));
     }
-    let key_file = File::open(key_path)
-        .map_err(|e| ServerError::Config(format!("opening TLS key {}: {e}", key_path.display())))?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-        .map_err(|e| ServerError::Config(format!("parsing TLS key: {e}")))?
-        .ok_or_else(|| ServerError::Config(format!("no private key in {}", key_path.display())))?;
+    let key = PrivateKeyDer::from_pem_file(key_path)
+        .map_err(|e| ServerError::Config(format!("reading TLS key {}: {e}", key_path.display())))?;
     let mut config = RustlsServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)

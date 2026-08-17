@@ -602,9 +602,11 @@ mod tests {
             bundle_b64: base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
             sig_b64: base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
         });
-        ws.send(TMessage::Text(serde_json::to_string(&submit).unwrap()))
-            .await
-            .unwrap();
+        ws.send(TMessage::Text(
+            serde_json::to_string(&submit).unwrap().into(),
+        ))
+        .await
+        .unwrap();
 
         let msg = tokio::time::timeout(Duration::from_secs(3), ws.next())
             .await
@@ -639,9 +641,11 @@ mod tests {
             bundle_b64: base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
             sig_b64: bad_sig_b64,
         });
-        ws.send(TMessage::Text(serde_json::to_string(&submit).unwrap()))
-            .await
-            .unwrap();
+        ws.send(TMessage::Text(
+            serde_json::to_string(&submit).unwrap().into(),
+        ))
+        .await
+        .unwrap();
 
         let msg = tokio::time::timeout(Duration::from_secs(3), ws.next())
             .await
@@ -673,9 +677,11 @@ mod tests {
             bundle_b64: base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
             sig_b64: base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
         });
-        ws.send(TMessage::Text(serde_json::to_string(&submit).unwrap()))
-            .await
-            .unwrap();
+        ws.send(TMessage::Text(
+            serde_json::to_string(&submit).unwrap().into(),
+        ))
+        .await
+        .unwrap();
 
         let msg = tokio::time::timeout(Duration::from_secs(3), ws.next())
             .await
@@ -723,7 +729,7 @@ mod tests {
                 block_kinds: vec![],
             },
         });
-        ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap()))
+        ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
             .await
             .unwrap();
 
@@ -738,9 +744,11 @@ mod tests {
             bundle_b64: base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
             sig_b64: base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
         });
-        ws.send(TMessage::Text(serde_json::to_string(&submit).unwrap()))
-            .await
-            .unwrap();
+        ws.send(TMessage::Text(
+            serde_json::to_string(&submit).unwrap().into(),
+        ))
+        .await
+        .unwrap();
 
         // 3. Expect both Ack and Block (order is non-deterministic).
         let mut got_ack = false;
@@ -823,9 +831,11 @@ mod tests {
             bundle_b64: base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
             sig_b64: base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
         });
-        ws.send(TMessage::Text(serde_json::to_string(&submit).unwrap()))
-            .await
-            .unwrap();
+        ws.send(TMessage::Text(
+            serde_json::to_string(&submit).unwrap().into(),
+        ))
+        .await
+        .unwrap();
 
         // Wait for the Ack so the counter bump has definitely happened.
         let msg = tokio::time::timeout(Duration::from_secs(3), ws.next())
@@ -865,7 +875,7 @@ mod tests {
         let (_state, url) = start_test_server().await;
         let (mut ws, _) = connect_async(&url).await.unwrap();
 
-        ws.send(TMessage::Text("not valid json at all".to_string()))
+        ws.send(TMessage::Text("not valid json at all".into()))
             .await
             .unwrap();
 
