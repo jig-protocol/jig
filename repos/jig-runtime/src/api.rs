@@ -28,6 +28,58 @@ pub struct Runtime {
     pub(crate) engine: WasmEngine,
 }
 
+/// How a guest stopped, as far as a receipt is concerned.
+///
+/// Three outcomes look alike in prose and must not be conflated in a receipt:
+/// the program exhausted its own budget, the HOST cut it short, or the program
+/// genuinely faulted. Only the last is the program's fault, and only the first
+/// two carry a `fuel_used` that is a partial count rather than a cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrapKind {
+    /// The program burned its fuel budget. `fuel_used` is meaningful and equals
+    /// the limit.
+    FuelExhausted,
+    /// The wall-clock deadline fired and the host interrupted a program that was
+    /// still running. `fuel_used` is a PARTIAL count of a truncated execution and
+    /// is NOT the program's cost — a slower or busier host would report a
+    /// different number for the same input.
+    DeadlineExceeded,
+    /// A genuine guest fault.
+    Fault,
+}
+
+/// Classify a trap, preferring wasmtime's typed `Trap` over its message.
+///
+/// The message text is not API: it has changed between wasmtime versions, and
+/// the previous string-matching classifier had no case for the deadline at all,
+/// so an interrupted run was recorded as a generic `RuntimeTrap` — making "the
+/// program failed" and "the host was slow" indistinguishable in a receipt, with
+/// the truncated fuel count recorded as though it were the program's cost.
+///
+/// The string checks remain only as a fallback for paths that surface a message
+/// without a typed trap.
+fn classify_trap(err: &wasmtime::Error) -> TrapKind {
+    if let Some(trap) = err.downcast_ref::<wasmtime::Trap>() {
+        match trap {
+            wasmtime::Trap::OutOfFuel => return TrapKind::FuelExhausted,
+            wasmtime::Trap::Interrupt => return TrapKind::DeadlineExceeded,
+            _ => {}
+        }
+    }
+
+    let msg = err.to_string();
+    if msg.contains("all fuel consumed")
+        || msg.contains("fuel exhausted")
+        || msg.contains("out of fuel")
+    {
+        TrapKind::FuelExhausted
+    } else if msg.contains("epoch deadline") || msg.contains("interrupt") {
+        TrapKind::DeadlineExceeded
+    } else {
+        TrapKind::Fault
+    }
+}
+
 impl Runtime {
     /// Create a new runtime with default configuration
     #[cfg_attr(feature = "tracing", instrument(name = "runtime_new"))]
@@ -289,6 +341,24 @@ impl Runtime {
 
                     #[cfg(feature = "tracing")]
                     info!(fuel_used, fuel_limit, "Fuel budget exhausted");
+                } else if matches!(classify_trap(&trap), TrapKind::DeadlineExceeded) {
+                    // Its own outcome, NOT a generic trap. The distinction is
+                    // load-bearing: a receipt must not present a host-side
+                    // interruption as a program fault, and the fuel below is a
+                    // partial count of a truncated run rather than a cost. Said
+                    // explicitly in the message so a reader of the receipt cannot
+                    // mistake it for the program's own consumption.
+                    outcome = Outcome::HardFailure {
+                        reason: ReasonCode::RuntimeTimeout,
+                    };
+                    legacy_outcome = ExecutionOutcome::LimitsExceeded;
+                    error_info = Some((
+                        "ERR_DEADLINE_EXCEEDED".to_string(),
+                        Some(format!(
+                            "execution exceeded the wall-clock deadline; fuel_used={fuel_used} \
+                             is a PARTIAL count of a truncated run, not the program's cost"
+                        )),
+                    ));
                 } else {
                     outcome = Outcome::HardFailure {
                         reason: ReasonCode::RuntimeTrap,
@@ -616,6 +686,24 @@ impl Runtime {
 
                     #[cfg(feature = "tracing")]
                     info!(fuel_used, fuel_limit, "Fuel budget exhausted");
+                } else if matches!(classify_trap(&trap), TrapKind::DeadlineExceeded) {
+                    // Its own outcome, NOT a generic trap. The distinction is
+                    // load-bearing: a receipt must not present a host-side
+                    // interruption as a program fault, and the fuel below is a
+                    // partial count of a truncated run rather than a cost. Said
+                    // explicitly in the message so a reader of the receipt cannot
+                    // mistake it for the program's own consumption.
+                    outcome = Outcome::HardFailure {
+                        reason: ReasonCode::RuntimeTimeout,
+                    };
+                    legacy_outcome = ExecutionOutcome::LimitsExceeded;
+                    error_info = Some((
+                        "ERR_DEADLINE_EXCEEDED".to_string(),
+                        Some(format!(
+                            "execution exceeded the wall-clock deadline; fuel_used={fuel_used} \
+                             is a PARTIAL count of a truncated run, not the program's cost"
+                        )),
+                    ));
                 } else {
                     outcome = Outcome::HardFailure {
                         reason: ReasonCode::RuntimeTrap,

@@ -194,3 +194,55 @@ fn a_deadline_never_fires_before_its_timeout() {
          early interrupt reports a partial fuel_used as the program's cost"
     );
 }
+
+/// A deadline-interrupted run must be its OWN outcome, not a generic trap.
+///
+/// Before this, trap classification string-matched only for fuel exhaustion and
+/// sent everything else — including a wall-clock interruption — to
+/// `ReasonCode::RuntimeTrap`. So a receipt could not distinguish "the program
+/// faulted" from "the host was slow", and the truncated `fuel_used` was recorded
+/// as though it were the program's cost. Both are wrong in ways that corrupt a
+/// receipt rather than merely losing detail.
+#[test]
+fn a_deadline_interruption_is_distinguishable_from_a_guest_fault() {
+    let wat = r#"(module (func (export "run") (loop $l br $l)))"#;
+    let wasm = wat::parse_str(wat).expect("wat parses");
+
+    let mut config = RuntimeConfig::default();
+    config.limits.execution_timeout_ms = 50;
+    // Fuel deliberately effectively unlimited: otherwise this would prove fuel
+    // exhaustion is classified, which was never the broken case.
+    config.limits.fuel_max = u64::MAX;
+    let runtime = Runtime::with_config(config).expect("runtime creation");
+
+    let (result, _elapsed) = run_bounded(runtime, wasm);
+    let receipt = result.expect("a deadline produces a receipt, not an Err");
+
+    let outcome = receipt
+        .block
+        .outcome
+        .as_ref()
+        .expect("receipt carries an outcome");
+
+    assert_eq!(
+        outcome.status,
+        jig_core::receipt::OutcomeStatus::HardFail,
+        "an interrupted run must not report success"
+    );
+    assert_eq!(
+        outcome.reason,
+        Some(jig_core::receipt::ReasonCode::RuntimeTimeout),
+        "a wall-clock interruption must be RuntimeTimeout, not RuntimeTrap — \
+         otherwise 'the host was slow' reads as 'the program faulted'"
+    );
+
+    // And the receipt must SAY the fuel is partial, so nobody bills it or
+    // compares it against another server's number.
+    let error = receipt.error.as_ref().expect("an error is recorded");
+    assert_eq!(error.code, "ERR_DEADLINE_EXCEEDED");
+    let msg = error.message.clone().unwrap_or_default();
+    assert!(
+        msg.contains("PARTIAL"),
+        "the message must flag fuel_used as partial, got: {msg}"
+    );
+}

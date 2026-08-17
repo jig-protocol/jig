@@ -182,10 +182,32 @@ fn test_wasi_matches_golden() {
         "Module hash must match golden"
     );
 
-    assert_eq!(
-        receipt.fuel_used(),
-        golden["fuel_used"].as_u64().unwrap(),
-        "WASI fuel usage must match golden (determinism regression)"
+    // Fuel is deliberately NOT compared against the golden for the WASI fixture.
+    //
+    // Measured on four hosts with identical module bytes and an ample budget:
+    // 1713 x86_64 Linux, 1713 aarch64 Linux, 9906 x86_64 Windows, 18098 aarch64
+    // macOS. It tracks the host OS — both Linux hosts agree exactly while the two
+    // aarch64 hosts differ by 10x — because a WASI guest's `_start` does different
+    // amounts of work depending on what the host's WASI surface returns. Pinning
+    // one host's number fails everywhere else, and this golden was generated on
+    // aarch64 macOS.
+    //
+    // Confined to WASI: the `deterministic` fixture imports nothing, is 2512 on
+    // all four hosts, and still asserts its exact fuel. That is the case jig
+    // actually executes, since the byte-payload convention refuses modules with
+    // imports. See docs/investigations/2026-08-11-fuel-portability.md.
+    //
+    // Bounded rather than pinned, so a runaway or a run that never happened is
+    // still caught:
+    let fuel = receipt.fuel_used();
+    assert!(
+        fuel > 0,
+        "WASI fixture consumed no fuel at all — it cannot have executed"
+    );
+    assert!(
+        fuel < 1_000_000,
+        "WASI fixture consumed {fuel} fuel, far outside every measured host \
+         (1713-18098) — something is looping"
     );
 
     assert_eq!(
@@ -196,10 +218,11 @@ fn test_wasi_matches_golden() {
 
     let counters = receipt.block.counters.as_ref().expect("counters");
     let golden_counters = golden["counters"].as_object().unwrap();
+    // Same host-dependent number as fuel_used, so bounded there rather than
+    // pinned here; what still matters is that the two agree with each other.
     assert_eq!(
-        counters.fuel_total,
-        golden_counters["fuel_total"].as_u64().unwrap(),
-        "fuel_total must match golden"
+        counters.fuel_total, fuel,
+        "fuel_total and fuel_used describe one execution and must agree"
     );
     assert_eq!(
         counters.bytes_tx,
