@@ -60,8 +60,14 @@ jobs:
             -p jig-bridge-core \
             -p jig-bridge-email
       - name: Clippy (v0.0.2 surface)
-        # All clippy lints enforced; alpha.1c #10 cleaned up the legacy
-        # v0.0.1 lint debt that the previous `-A` mute list was carrying.
+        # Every workspace crate, no allowlist gaps.
+        #
+        # jig-server, jig-nameserver and jig-cli were the last three missing, and
+        # their absence was self-perpetuating: debt accumulated precisely because
+        # nothing checked them (~24 findings by the time it was measured — 16
+        # field_reassign_with_default, a too_many_arguments, dead code, unused
+        # imports). That is cleared, so the gap closes here rather than being
+        # documented again.
         run: |
           cargo clippy \
             -p jig-core \
@@ -69,6 +75,9 @@ jobs:
             -p jig-pipeline \
             -p jig-client \
             -p jig-runtime \
+            -p jig-server \
+            -p jig-nameserver \
+            -p jig-cli \
             -p text-block \
             -p integration-tests \
             -p jig-bridge-core \

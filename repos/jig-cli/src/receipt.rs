@@ -4,6 +4,3 @@
 //! formatting and display helpers.
 
 pub mod v0_2;
-
-// Re-export for convenience
-pub use v0_2::*;

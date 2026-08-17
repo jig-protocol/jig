@@ -4,7 +4,6 @@ use crate::http_client::JigHttpClient;
 use crate::receipt::v0_2::{BlockReceipt, ReceiptExt};
 use anyhow::{Result, anyhow};
 use cid::Cid;
-use std::path::Path;
 
 /// View a receipt by block ID or from a file
 pub async fn view_receipt(
@@ -168,8 +167,7 @@ pub enum ReceiptSource {
     File(String),
 }
 
-async fn fetch_receipt_from_server(client: &JigHttpClient, cid: &Cid) -> Result<BlockReceipt> {
-    let url = format!("receipts/{}", cid);
+async fn fetch_receipt_from_server(_client: &JigHttpClient, _cid: &Cid) -> Result<BlockReceipt> {
     // Note: This assumes the server has a /receipts/{cid} endpoint
     // which needs to be implemented in jig-server
     // For now, return error with helpful message

@@ -7,19 +7,19 @@ use anyhow::Result;
 use std::fmt;
 
 // Re-export jig-core receipt types
-pub use jig_core::{BlockReceipt, Counters, Limits, Outcome, OutcomeStatus, Timings};
+pub use jig_core::BlockReceipt;
 
 /// CLI-specific extensions for BlockReceipt
 pub trait ReceiptExt {
     /// Pretty-print the receipt for terminal display
-    fn pretty(&self) -> PrettyReceipt;
+    fn pretty(&self) -> PrettyReceipt<'_>;
 
     /// Validate the receipt and return helpful error messages
     fn validate_cli(&self) -> Result<()>;
 }
 
 impl ReceiptExt for BlockReceipt {
-    fn pretty(&self) -> PrettyReceipt {
+    fn pretty(&self) -> PrettyReceipt<'_> {
         PrettyReceipt(self)
     }
 
@@ -123,7 +123,6 @@ mod tests {
     use super::*;
     use cid::Cid;
     use std::str::FromStr;
-    use time::OffsetDateTime;
 
     #[test]
     fn test_pretty_print_basic_receipt() {

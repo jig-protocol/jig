@@ -2442,7 +2442,7 @@ mod tests {
         };
         let block_id = bundle.block_cid().unwrap();
 
-        let receipt = BlockReceipt::builder(block_id.clone())
+        let receipt = BlockReceipt::builder(block_id)
             .host("did:jig:server:test")
             .executed_at(OffsetDateTime::now_utc())
             .render_hash("sha256:abcdef123")

@@ -161,8 +161,10 @@ mod tests {
 
     #[test]
     fn select_connector_returns_insecure_when_flag_on() {
-        let mut federation = jig_config::v0_0_2_server::FederationSection::default();
-        federation.dangerously_disable_federation_tls = true;
+        let federation = jig_config::v0_0_2_server::FederationSection {
+            dangerously_disable_federation_tls: true,
+            ..Default::default()
+        };
         let Some(connector) = select_connector(&federation) else {
             panic!("flag on must produce a custom connector");
         };

@@ -21,14 +21,6 @@ impl Template {
         }
     }
 
-    pub fn description(&self) -> &'static str {
-        match self {
-            Template::RustWasi => "Rust WASM with WASI support (recommended)",
-            Template::TinyGoWasi => "TinyGo WASM with WASI support",
-            Template::TextOnly => "Simple text-based block (no WASM)",
-        }
-    }
-
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "rust-wasi" | "rust" => Some(Template::RustWasi),
@@ -36,10 +28,6 @@ impl Template {
             "text-only" | "text" => Some(Template::TextOnly),
             _ => None,
         }
-    }
-
-    pub fn all() -> &'static [Template] {
-        &[Template::RustWasi, Template::TinyGoWasi, Template::TextOnly]
     }
 }
 

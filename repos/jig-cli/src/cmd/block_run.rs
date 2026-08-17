@@ -7,18 +7,33 @@ use std::path::Path;
 
 use crate::runtime::{ExecutionLimits, ExecutionSpec, LocalRuntime};
 
+/// Arguments for [`run_block`], grouped to keep the function signature small.
+pub struct RunBlockArgs<'a> {
+    pub wasm_path: &'a str,
+    pub seed: Option<u64>,
+    pub fuel: Option<u64>,
+    pub memory_mb: Option<u32>,
+    pub timeout_ms: Option<u64>,
+    pub capabilities: Vec<String>,
+    pub receipt_out: Option<&'a str>,
+    pub json_output: bool,
+    pub enable_pricing: bool,
+}
+
 /// Execute a WASM block locally and display the receipt
-pub fn run_block(
-    wasm_path: &str,
-    seed: Option<u64>,
-    fuel: Option<u64>,
-    memory_mb: Option<u32>,
-    timeout_ms: Option<u64>,
-    capabilities: Vec<String>,
-    receipt_out: Option<&str>,
-    json_output: bool,
-    enable_pricing: bool,
-) -> Result<()> {
+pub fn run_block(args: RunBlockArgs<'_>) -> Result<()> {
+    let RunBlockArgs {
+        wasm_path,
+        seed,
+        fuel,
+        memory_mb,
+        timeout_ms,
+        capabilities,
+        receipt_out,
+        json_output,
+        enable_pricing,
+    } = args;
+
     // 1. Load WASM bytes
     let wasm_bytes = std::fs::read(wasm_path)
         .with_context(|| format!("Failed to read WASM file: {}", wasm_path))?;
