@@ -16,7 +16,14 @@ tokio = { workspace = true }
 # TLS is declared here, not inherited: without an explicit feature a standalone
 # `cargo build -p jig-cli` yields a CLI that cannot dial wss://. It only appeared
 # to work inside the workspace because jig-server unified the feature in.
-tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
+# Pinned to the same rustls major as jig-server (0.23). jig-client was the second
+# holder of the rustls 0.22 branch, so bumping only the server would have left
+# rustls-webpki 0.102.x — and its four advisories — in the tree.
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+    "connect",
+    "handshake",
+    "rustls-tls-native-roots",
+] }
 futures-util = "0.3"
 ed25519-dalek = { workspace = true }
 blake3 = { workspace = true }

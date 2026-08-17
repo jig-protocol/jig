@@ -68,7 +68,7 @@ async fn two_server_federation_chat_with_receipt_parity() {
         },
     });
     bob_ws
-        .send(Message::Text(serde_json::to_string(&sub).unwrap()))
+        .send(Message::Text(serde_json::to_string(&sub).unwrap().into()))
         .await
         .expect("bob subscribe send");
 

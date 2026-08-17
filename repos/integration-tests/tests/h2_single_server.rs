@@ -51,7 +51,9 @@ async fn single_server_two_client_text_render_round_trip() {
         },
     });
     alice_ws
-        .send(Message::Text(serde_json::to_string(&sub_env).unwrap()))
+        .send(Message::Text(
+            serde_json::to_string(&sub_env).unwrap().into(),
+        ))
         .await
         .expect("alice subscribe send");
 

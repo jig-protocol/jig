@@ -285,7 +285,7 @@ impl Client {
             subs.insert(slug.to_string(), delivery_tx);
         }
 
-        if self.write_tx.send(Message::Text(json)).is_err() {
+        if self.write_tx.send(Message::Text(json.into())).is_err() {
             lock_subscriptions(&self.pending_subscriptions).remove(slug);
             return Err(ClientError::ConnectionClosed);
         }
@@ -312,7 +312,7 @@ impl Client {
         });
         let json = serde_json::to_string(&env)?;
         self.write_tx
-            .send(Message::Text(json))
+            .send(Message::Text(json.into()))
             .map_err(|_| ClientError::ConnectionClosed)?;
 
         // Await the first non-Block frame (Ack/Error).
@@ -411,7 +411,7 @@ mod tests {
                             let replies = on_recv(env).await;
                             for r in replies {
                                 let json = serde_json::to_string(&r).unwrap();
-                                let _ = sink.send(Message::Text(json)).await;
+                                let _ = sink.send(Message::Text(json.into())).await;
                             }
                         }
                     }
