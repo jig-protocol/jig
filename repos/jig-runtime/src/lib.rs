@@ -47,6 +47,7 @@ mod costs;
 mod engine;
 mod fuel;
 pub(crate) mod receipt;
+mod trap;
 
 // Re-export primary types
 pub use api::{BlockPackage, ExecutionContext, Limits, Outcome, Runtime};

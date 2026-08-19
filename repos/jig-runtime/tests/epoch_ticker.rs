@@ -246,3 +246,100 @@ fn a_deadline_interruption_is_distinguishable_from_a_guest_fault() {
         "the message must flag fuel_used as partial, got: {msg}"
     );
 }
+
+/// A deadline-interrupted run must not be priced.
+///
+/// The receipt already says `fuel_used` is a PARTIAL count of a truncated run,
+/// but pricing was computed from that same number, so a timed-out execution
+/// produced a bill. That bill is host-dependent by construction: the slower or
+/// busier the host, the further the guest gets before the interrupt, and the
+/// more it is charged for identical work. Charging for the host's own slowness
+/// is the one thing the fuel-portability investigation says fuel must never be
+/// used for — see docs/investigations/2026-08-11-fuel-portability.md.
+///
+/// Absent pricing, rather than a zero cost, is the honest encoding: the receipt
+/// schema already uses `pricing: None` to mean "not priced", while `0.0` would
+/// read as "free" and invite someone to sum it.
+///
+/// Measured while writing this, and deliberately NOT asserted: today the
+/// interrupt path reports `fuel_used = 0` no matter how long the guest ran
+/// (verified from a 1e8 budget up to `u64::MAX`, all zero at ~60ms of looping),
+/// while a guest fault on the same runtime reports millions. Wasmtime appears
+/// not to write consumed fuel back to the store when an epoch interrupt unwinds.
+/// So the bill this test forbids currently computes to 0.00 by accident — which
+/// is precisely why the fix belongs here rather than being waved off: the day
+/// that accounting is corrected, the partial count becomes a real, host-
+/// dependent charge. Asserting the zero would only pin the accounting bug in
+/// place.
+#[test]
+fn a_deadline_interrupted_run_is_not_priced() {
+    let wat = r#"(module (func (export "run") (loop $l br $l)))"#;
+    let wasm = wat::parse_str(wat).expect("wat parses");
+
+    let mut config = RuntimeConfig::default();
+    config.limits.execution_timeout_ms = 50;
+    config.limits.fuel_max = u64::MAX;
+    config.pricing.enabled = true;
+    config.pricing.cost_per_fuel_unit = 0.001;
+    config.pricing.currency = Some("credits".to_string());
+    let runtime = Runtime::with_config(config).expect("runtime creation");
+
+    let (result, _elapsed) = run_bounded(runtime, wasm);
+    let receipt = result.expect("a deadline produces a receipt, not an Err");
+
+    assert_eq!(
+        receipt
+            .block
+            .outcome
+            .as_ref()
+            .and_then(|o| o.reason.as_ref()),
+        Some(&jig_core::receipt::ReasonCode::RuntimeTimeout),
+        "precondition: this must be the deadline path, not some other trap"
+    );
+    assert!(
+        receipt.pricing.is_none(),
+        "a truncated run must carry no pricing; got {:?} — billing partial fuel \
+         charges the caller for how slow the host was",
+        receipt.pricing
+    );
+}
+
+/// The converse, so the fix above cannot quietly disable billing everywhere.
+///
+/// Fuel exhaustion is a truncated run too, but its fuel number is *not*
+/// host-dependent: the guest burned exactly the budget it was given, and every
+/// host would report the same figure for the same input. It stays billable.
+#[test]
+fn an_exhausted_fuel_budget_is_still_priced() {
+    let wat = r#"(module (func (export "run") (loop $l br $l)))"#;
+    let wasm = wat::parse_str(wat).expect("wat parses");
+
+    let mut config = RuntimeConfig::default();
+    // Generous wall clock, tiny fuel budget: fuel must be what runs out.
+    config.limits.execution_timeout_ms = 10_000;
+    config.limits.fuel_max = 10_000;
+    config.pricing.enabled = true;
+    config.pricing.cost_per_fuel_unit = 0.001;
+    let runtime = Runtime::with_config(config).expect("runtime creation");
+
+    let (result, _elapsed) = run_bounded(runtime, wasm);
+    let receipt = result.expect("fuel exhaustion produces a receipt, not an Err");
+
+    assert_eq!(
+        receipt
+            .block
+            .outcome
+            .as_ref()
+            .and_then(|o| o.reason.as_ref()),
+        Some(&jig_core::receipt::ReasonCode::FuelExhausted),
+        "precondition: this must be the fuel path, not the deadline"
+    );
+    let pricing = receipt
+        .pricing
+        .as_ref()
+        .expect("an exhausted budget is deterministic and must still be priced");
+    assert!(
+        pricing.total_cost > 0.0,
+        "a run that burned its whole budget must cost something"
+    );
+}
