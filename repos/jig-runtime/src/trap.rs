@@ -30,37 +30,45 @@ pub(crate) enum TrapKind {
     Fault,
 }
 
-/// Classify a trap, preferring wasmtime's typed `Trap` over its message.
+/// Classify a trap from wasmtime's typed `Trap`, and nothing else.
 ///
-/// The typed variant is the only reliable signal, and this is not theoretical:
-/// under wasmtime 47 a fuel-exhaustion trap renders as nothing but a wasm
-/// backtrace — the strings below appear in it nowhere. The message-matching
-/// classifier this replaced therefore sent every real fuel exhaustion to
-/// `Fault`, so a receipt reported "your program crashed" for what was actually
-/// "your program ran out of the budget you gave it".
+/// Measured against wasmtime 47.0.3, which is why there is no message fallback:
 ///
-/// The string checks are kept only as a fallback for paths that surface a
-/// message without a typed trap, and for engine versions that word things
-/// differently. They are insurance, not the mechanism.
+/// | what happened | `downcast_ref::<Trap>()` | `err.to_string()` |
+/// |---|---|---|
+/// | fuel budget burned | `Some(OutOfFuel)`  | a bare wasm backtrace |
+/// | epoch deadline fired | `Some(Interrupt)` | a bare wasm backtrace |
+/// | host function returned `Err` | `None`     | a bare wasm backtrace |
+///
+/// Two things follow. First, **the display text is worthless here** — all three
+/// render as the same backtrace, with the host's own message reachable only
+/// through the source chain (`{:#}`), never through `to_string()`. An earlier
+/// classifier matched on `"all fuel consumed"` / `"fuel exhausted"` / `"out of
+/// fuel"` and so recognised no real fuel exhaustion at all, reporting every one
+/// as a guest fault.
+///
+/// Second, the typed variant covers every case we can produce, so a text
+/// fallback could only ever add false positives. The removed one matched a bare
+/// `"interrupt"`, which would have claimed anything merely *containing* that
+/// word — an EINTR surfacing from a WASI syscall, say — was a deadline, and a
+/// deadline verdict suppresses billing. That is a data-integrity bug waiting on
+/// a wording change rather than a bug today, since `to_string()` does not carry
+/// host text in this version. It is deleted rather than narrowed because it has
+/// no demonstrated upside to trade against that risk.
+///
+/// A host error is a `Fault`: the guest did stop, and we know nothing more.
+/// `Fault` is also the right home for every other `Trap` variant — an
+/// out-of-bounds access or an `unreachable` is the program's own doing.
+///
+/// The end-to-end guard for this is
+/// `epoch_ticker::a_deadline_interruption_is_distinguishable_from_a_guest_fault`,
+/// which drives a real epoch interrupt. If wasmtime ever stops attaching the
+/// typed trap, that test fails rather than this silently degrading.
 pub(crate) fn classify_trap(err: &wasmtime::Error) -> TrapKind {
-    if let Some(trap) = err.downcast_ref::<wasmtime::Trap>() {
-        match trap {
-            wasmtime::Trap::OutOfFuel => return TrapKind::FuelExhausted,
-            wasmtime::Trap::Interrupt => return TrapKind::DeadlineExceeded,
-            _ => {}
-        }
-    }
-
-    let msg = err.to_string();
-    if msg.contains("all fuel consumed")
-        || msg.contains("fuel exhausted")
-        || msg.contains("out of fuel")
-    {
-        TrapKind::FuelExhausted
-    } else if msg.contains("epoch deadline") || msg.contains("interrupt") {
-        TrapKind::DeadlineExceeded
-    } else {
-        TrapKind::Fault
+    match err.downcast_ref::<wasmtime::Trap>() {
+        Some(wasmtime::Trap::OutOfFuel) => TrapKind::FuelExhausted,
+        Some(wasmtime::Trap::Interrupt) => TrapKind::DeadlineExceeded,
+        _ => TrapKind::Fault,
     }
 }
 
@@ -124,29 +132,59 @@ pub(crate) fn trap_verdict(err: &wasmtime::Error, fuel_used: u64, fuel_limit: u6
 mod tests {
     use super::*;
 
-    /// A trap carrying no recognisable signal must not be guessed at. Defaulting
-    /// to `FuelExhausted` or `DeadlineExceeded` would invent a limits breach out
-    /// of an unknown failure; `Fault` says only "the guest stopped".
+    /// The two classifications that carry consequences must come from the typed
+    /// trap, since that is the only signal wasmtime 47 actually provides.
     #[test]
-    fn an_unrecognised_trap_is_a_fault() {
-        let err = wasmtime::Error::msg("something entirely unexpected");
-        assert_eq!(classify_trap(&err), TrapKind::Fault);
+    fn the_typed_trap_drives_both_limit_classifications() {
+        assert_eq!(
+            classify_trap(&wasmtime::Error::from(wasmtime::Trap::OutOfFuel)),
+            TrapKind::FuelExhausted
+        );
+        assert_eq!(
+            classify_trap(&wasmtime::Error::from(wasmtime::Trap::Interrupt)),
+            TrapKind::DeadlineExceeded
+        );
     }
 
+    /// Regression: a host-originating error must never be read as a deadline.
+    ///
+    /// A WASI syscall surfacing EINTR is the realistic source of the word
+    /// "interrupted" in an error that is not a deadline at all. Classifying it
+    /// as one would both mislabel the failure and, because a deadline verdict is
+    /// unbillable, silently waive the charge for a run that really did fault.
     #[test]
-    fn the_message_fallback_still_recognises_both_limits() {
-        for msg in ["all fuel consumed", "fuel exhausted", "out of fuel"] {
+    fn a_host_error_mentioning_interruption_is_not_a_deadline() {
+        for msg in [
+            "Interrupted system call (os error 4)",
+            "request interrupted",
+            "epoch deadline reached",
+            "all fuel consumed",
+        ] {
+            let verdict = trap_verdict(&wasmtime::Error::msg(msg), 7, 100);
             assert_eq!(
                 classify_trap(&wasmtime::Error::msg(msg)),
-                TrapKind::FuelExhausted,
-                "message fallback failed for {msg:?}"
+                TrapKind::Fault,
+                "untyped error {msg:?} must be a Fault — text is not a signal"
+            );
+            assert!(
+                verdict.fuel_is_billable,
+                "untyped error {msg:?} must stay billable"
             );
         }
-        for msg in ["epoch deadline reached", "interrupt"] {
+    }
+
+    /// Every other `Trap` variant is the program's own doing, not a limit.
+    #[test]
+    fn other_trap_variants_are_faults() {
+        for trap in [
+            wasmtime::Trap::UnreachableCodeReached,
+            wasmtime::Trap::MemoryOutOfBounds,
+            wasmtime::Trap::IntegerDivisionByZero,
+        ] {
             assert_eq!(
-                classify_trap(&wasmtime::Error::msg(msg)),
-                TrapKind::DeadlineExceeded,
-                "message fallback failed for {msg:?}"
+                classify_trap(&wasmtime::Error::from(trap)),
+                TrapKind::Fault,
+                "{trap:?} must be a Fault"
             );
         }
     }
@@ -155,7 +193,7 @@ mod tests {
     /// deadline's fuel is host-dependent, so only the deadline is unbillable.
     #[test]
     fn only_a_deadline_is_unbillable() {
-        let deadline = trap_verdict(&wasmtime::Error::msg("epoch deadline reached"), 42, 100);
+        let deadline = trap_verdict(&wasmtime::Error::from(wasmtime::Trap::Interrupt), 42, 100);
         assert!(!deadline.fuel_is_billable);
         assert_eq!(deadline.error_code, "ERR_DEADLINE_EXCEEDED");
         assert!(
@@ -164,7 +202,7 @@ mod tests {
             deadline.error_message
         );
 
-        let fuel = trap_verdict(&wasmtime::Error::msg("all fuel consumed"), 100, 100);
+        let fuel = trap_verdict(&wasmtime::Error::from(wasmtime::Trap::OutOfFuel), 100, 100);
         assert!(fuel.fuel_is_billable);
         assert_eq!(fuel.error_code, "ERR_FUEL_EXHAUSTED");
 
