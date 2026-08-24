@@ -340,7 +340,7 @@ mod tests {
         let valid_until = body["valid_until"].as_i64().unwrap();
         assert_eq!(valid_until - valid_from, DEFAULT_TTL_SECONDS);
         assert_eq!(body["profile_ttl_seconds"], DEFAULT_TTL_SECONDS as u64);
-        assert!(body["sig"].as_str().unwrap().len() > 0);
+        assert!(!body["sig"].as_str().unwrap().is_empty());
     }
 
     #[tokio::test]

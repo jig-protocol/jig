@@ -389,9 +389,11 @@ mod tests {
         };
         let cid = bundle.block_cid().expect("cid");
 
-        let mut cfg = ExecutionConfig::default();
-        cfg.pricing_enabled = true;
-        cfg.cost_per_fuel = Some(0.0001);
+        let cfg = ExecutionConfig {
+            pricing_enabled: true,
+            cost_per_fuel: Some(0.0001),
+            ..Default::default()
+        };
         let runtime = BlockRuntime::new(cfg).expect("runtime");
         let receipt = runtime.execute(&cid, &manifest, &bundle).expect("receipt");
 
@@ -402,7 +404,7 @@ mod tests {
         assert!(timings.total >= timings.exec);
 
         // Pricing metadata present
-        assert!(receipt.metadata.get("pricing.cost_per_fuel_unit").is_some());
+        assert!(receipt.metadata.contains_key("pricing.cost_per_fuel_unit"));
 
         let counters = receipt.counters.expect("counters");
         assert_eq!(counters.fuel_total, receipt.fuel_used);
@@ -455,8 +457,10 @@ mod tests {
         };
         let cid = bundle.block_cid().expect("cid");
 
-        let mut config = ExecutionConfig::default();
-        config.fuel_max = 100;
+        let config = ExecutionConfig {
+            fuel_max: 100,
+            ..Default::default()
+        };
         let runtime = BlockRuntime::new(config).expect("runtime");
 
         let receipt = runtime.execute(&cid, &manifest, &bundle).expect("receipt");

@@ -507,17 +507,21 @@ mod tests {
 
     #[test]
     fn advertised_origin_is_http_when_tls_is_off() {
-        let mut cfg = ServerConfig::default();
-        cfg.bind_address = "100.74.254.110".into();
-        cfg.port = 7117;
+        let cfg = ServerConfig {
+            bind_address: "100.74.254.110".into(),
+            port: 7117,
+            ..Default::default()
+        };
         assert_eq!(advertised_http(cfg), "http://100.74.254.110:7117");
     }
 
     #[test]
     fn advertised_origin_is_https_when_tls_is_on() {
-        let mut cfg = ServerConfig::default();
-        cfg.bind_address = "100.74.254.110".into();
-        cfg.port = 7117;
+        let mut cfg = ServerConfig {
+            bind_address: "100.74.254.110".into(),
+            port: 7117,
+            ..Default::default()
+        };
         cfg.tls.enabled = true;
         assert_eq!(advertised_http(cfg), "https://100.74.254.110:7117");
     }
@@ -527,9 +531,11 @@ mod tests {
         // The bind address is an IP, but a TLS cert is issued for a hostname.
         // Peers must be told the name the cert actually covers, or they hit a
         // certificate-name mismatch.
-        let mut cfg = ServerConfig::default();
-        cfg.bind_address = "100.74.254.110".into();
-        cfg.port = 7117;
+        let mut cfg = ServerConfig {
+            bind_address: "100.74.254.110".into(),
+            port: 7117,
+            ..Default::default()
+        };
         cfg.tls.enabled = true;
         cfg.public_url = Some("https://jig-vps.tail323521.ts.net:7117".into());
         assert_eq!(
@@ -540,8 +546,10 @@ mod tests {
 
     #[test]
     fn public_url_trailing_slash_is_trimmed() {
-        let mut cfg = ServerConfig::default();
-        cfg.public_url = Some("https://jig.example:7117/".into());
+        let cfg = ServerConfig {
+            public_url: Some("https://jig.example:7117/".into()),
+            ..Default::default()
+        };
         assert_eq!(advertised_http(cfg), "https://jig.example:7117");
     }
 
@@ -555,9 +563,11 @@ mod tests {
     ) -> axum::http::StatusCode {
         use tower::ServiceExt;
         let dir = tempdir().unwrap();
-        let mut config = ServerConfig::default();
-        config.database_path = dir.path().join("gate.db");
-        config.dangerously_enable_v0_0_1_rest = enable_legacy;
+        let config = ServerConfig {
+            database_path: dir.path().join("gate.db"),
+            dangerously_enable_v0_0_1_rest: enable_legacy,
+            ..Default::default()
+        };
         let store = Arc::new(SqliteBlockStore::new(&config.database_path).unwrap());
         let runtime = Arc::new(BlockRuntime::new(config.execution_config()).unwrap());
         let app = build_router(AppState {
@@ -689,8 +699,10 @@ mod tests {
         use blake3::hash;
         use jig_core::manifest::{Author as MAuthor, RenderDescriptor};
         let dir = tempdir().unwrap();
-        let mut config = ServerConfig::default();
-        config.database_path = dir.path().join("test.db");
+        let config = ServerConfig {
+            database_path: dir.path().join("test.db"),
+            ..Default::default()
+        };
         let store = Arc::new(SqliteBlockStore::new(&config.database_path).unwrap());
         let runtime = Arc::new(BlockRuntime::new(config.execution_config()).unwrap());
         let state = AppState {
@@ -743,10 +755,12 @@ mod tests {
     #[tokio::test]
     async fn server_info_returns_basic_metadata() {
         let dir = tempdir().unwrap();
-        let mut config = ServerConfig::default();
-        config.database_path = dir.path().join("test.db");
-        config.bind_address = "127.0.0.1".into();
-        config.port = 7117;
+        let config = ServerConfig {
+            database_path: dir.path().join("test.db"),
+            bind_address: "127.0.0.1".into(),
+            port: 7117,
+            ..Default::default()
+        };
         let store = Arc::new(SqliteBlockStore::new(&config.database_path).unwrap());
         let runtime = Arc::new(BlockRuntime::new(config.execution_config()).unwrap());
         let state = AppState {
@@ -859,8 +873,10 @@ mod tests {
     #[tokio::test]
     async fn get_block_and_receipt_not_found_return_404() {
         let dir = tempdir().unwrap();
-        let mut config = ServerConfig::default();
-        config.database_path = dir.path().join("test.db");
+        let config = ServerConfig {
+            database_path: dir.path().join("test.db"),
+            ..Default::default()
+        };
         let store = Arc::new(SqliteBlockStore::new(&config.database_path).unwrap());
         let runtime = Arc::new(BlockRuntime::new(config.execution_config()).unwrap());
         let state = AppState {
@@ -889,8 +905,10 @@ mod tests {
     #[tokio::test]
     async fn ingest_block_rejects_invalid_manifest_and_base64() {
         let dir = tempdir().unwrap();
-        let mut config = ServerConfig::default();
-        config.database_path = dir.path().join("test.db");
+        let config = ServerConfig {
+            database_path: dir.path().join("test.db"),
+            ..Default::default()
+        };
         let store = Arc::new(SqliteBlockStore::new(&config.database_path).unwrap());
         let runtime = Arc::new(BlockRuntime::new(config.execution_config()).unwrap());
         let state = AppState {
@@ -960,8 +978,10 @@ mod tests {
     #[tokio::test]
     async fn list_blocks_applies_limit_and_formats_payload() {
         let dir = tempdir().unwrap();
-        let mut config = ServerConfig::default();
-        config.database_path = dir.path().join("test.db");
+        let config = ServerConfig {
+            database_path: dir.path().join("test.db"),
+            ..Default::default()
+        };
         let store = Arc::new(SqliteBlockStore::new(&config.database_path).unwrap());
         let runtime = Arc::new(BlockRuntime::new(config.execution_config()).unwrap());
         let state = AppState {
@@ -1052,8 +1072,10 @@ mod tests {
     #[tokio::test]
     async fn ingest_then_get_block_and_receipt_success() {
         let dir = tempdir().unwrap();
-        let mut config = ServerConfig::default();
-        config.database_path = dir.path().join("test.db");
+        let config = ServerConfig {
+            database_path: dir.path().join("test.db"),
+            ..Default::default()
+        };
         let store = Arc::new(SqliteBlockStore::new(&config.database_path).unwrap());
         let runtime = Arc::new(BlockRuntime::new(config.execution_config()).unwrap());
         let state = AppState {

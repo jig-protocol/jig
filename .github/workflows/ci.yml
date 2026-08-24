@@ -60,8 +60,14 @@ jobs:
             -p jig-bridge-core \
             -p jig-bridge-email
       - name: Clippy (v0.0.2 surface)
-        # All clippy lints enforced; alpha.1c #10 cleaned up the legacy
-        # v0.0.1 lint debt that the previous `-A` mute list was carrying.
+        # Every workspace crate, no allowlist gaps.
+        #
+        # jig-server, jig-nameserver and jig-cli were the last three missing, and
+        # their absence was self-perpetuating: debt accumulated precisely because
+        # nothing checked them (~24 findings by the time it was measured — 16
+        # field_reassign_with_default, a too_many_arguments, dead code, unused
+        # imports). That is cleared, so the gap closes here rather than being
+        # documented again.
         run: |
           cargo clippy \
             -p jig-core \
@@ -69,6 +75,9 @@ jobs:
             -p jig-pipeline \
             -p jig-client \
             -p jig-runtime \
+            -p jig-server \
+            -p jig-nameserver \
+            -p jig-cli \
             -p text-block \
             -p integration-tests \
             -p jig-bridge-core \
@@ -83,16 +92,16 @@ jobs:
         # test modules (provider/inbound/outbound/bridge) are linted too.
         run: cargo clippy -p jig-bridge-email --all-targets -- -D warnings
       - name: Nextest (v0.0.2 surface)
-        # The filter excludes exactly one test: jig-runtime's WASI fuel golden,
-        # which is host-architecture-dependent (18098 on aarch64 where it was
-        # generated, 1713 on this x86_64 runner — same module, same wasmtime).
-        # Tracked in #33. NOT refreshed to the x86_64 value on purpose: that
-        # would go green while asserting the other platform's number, hiding a
-        # real determinism finding. It still runs and passes on aarch64 locally.
+        # No exclusions. The WASI fuel golden used to be filtered out here because
+        # it pinned one host's fuel number (18098 on the aarch64 macOS where it was
+        # generated, 1713 on this x86_64 runner). #33 established that the spread
+        # tracks the host OS rather than the architecture, and is confined to WASI
+        # modules — which jig refuses to load anyway. That test now bounds WASI
+        # fuel instead of pinning it, so it runs everywhere; the no-imports
+        # fixture, whose fuel IS portable, still asserts its exact value.
         run: |
           cargo install cargo-nextest --locked
           cargo nextest run \
-            -E 'not (package(jig-runtime) and test(test_wasi_matches_golden))' \
             -p jig-core \
             -p jig-config \
             -p jig-pipeline \

@@ -509,7 +509,7 @@ mod tests {
             "fed-hello must carry server_url metadata"
         );
         assert!(
-            manifest.metadata.get("unsafe_options_active").is_some(),
+            manifest.metadata.contains_key("unsafe_options_active"),
             "fed-hello must carry unsafe_options_active metadata"
         );
     }

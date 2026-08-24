@@ -12,6 +12,7 @@ use crate::engine::WasmEngine;
 use crate::error::{Result, RuntimeError};
 use crate::fuel::CapabilityMeterHandle;
 use crate::receipt::{CapabilityCall, ExecutionOutcome, ModuleHash, Receipt, ReceiptPricing};
+use crate::trap::trap_verdict;
 use jig_core::CapabilityUsageKey;
 use jig_core::receipt::{HashAlgorithms, Limits as CoreLimits, Outcome as CoreOutcome, ReasonCode};
 use jig_core::wasm_validation::HostImportAllowlist;
@@ -252,6 +253,8 @@ impl Runtime {
         let mut outcome = Outcome::Success;
         let mut legacy_outcome = ExecutionOutcome::Success;
         let mut error_info: Option<(String, Option<String>)> = None;
+        // A completed run is always billable; only a trap can withdraw this.
+        let mut fuel_is_billable = true;
 
         match execution_result {
             Ok(_) => {
@@ -271,31 +274,11 @@ impl Runtime {
             Err(trap) => {
                 #[cfg(feature = "tracing")]
                 warn!(error = %trap, fuel_used, "Execution trapped");
-                let trap_msg = trap.to_string();
-                if trap_msg.contains("all fuel consumed")
-                    || trap_msg.contains("fuel exhausted")
-                    || trap_msg.contains("out of fuel")
-                {
-                    outcome = Outcome::HardFailure {
-                        reason: ReasonCode::FuelExhausted,
-                    };
-                    legacy_outcome = ExecutionOutcome::LimitsExceeded;
-                    error_info = Some((
-                        "ERR_FUEL_EXHAUSTED".to_string(),
-                        Some(format!(
-                            "Fuel exhausted: used {fuel_used} of {fuel_limit} limit"
-                        )),
-                    ));
-
-                    #[cfg(feature = "tracing")]
-                    info!(fuel_used, fuel_limit, "Fuel budget exhausted");
-                } else {
-                    outcome = Outcome::HardFailure {
-                        reason: ReasonCode::RuntimeTrap,
-                    };
-                    legacy_outcome = ExecutionOutcome::ExecutionFailed;
-                    error_info = Some(("ERR_TRAP".to_string(), Some(trap_msg)));
-                }
+                let verdict = trap_verdict(&trap, fuel_used, fuel_limit);
+                outcome = verdict.outcome;
+                legacy_outcome = verdict.legacy_outcome;
+                fuel_is_billable = verdict.fuel_is_billable;
+                error_info = Some((verdict.error_code.to_string(), Some(verdict.error_message)));
             }
         }
 
@@ -306,7 +289,12 @@ impl Runtime {
             builder = builder.error(code, message);
         }
 
-        if self.config.pricing.enabled {
+        // `fuel_is_billable` is false only for a deadline interruption, whose
+        // fuel counts the host's speed rather than the program's work. Omitting
+        // the block entirely — rather than pricing it at zero — matches the
+        // schema's existing meaning of absent pricing: not priced. A 0.0 would
+        // read as "free" and invite someone to sum it.
+        if self.config.pricing.enabled && fuel_is_billable {
             #[cfg(feature = "tracing")]
             debug!(
                 cost_per_fuel = self.config.pricing.cost_per_fuel_unit,
@@ -578,6 +566,8 @@ impl Runtime {
         let mut outcome = Outcome::Success;
         let mut legacy_outcome = ExecutionOutcome::Success;
         let mut error_info: Option<(String, Option<String>)> = None;
+        // A completed run is always billable; only a trap can withdraw this.
+        let mut fuel_is_billable = true;
 
         match execution_result {
             Ok(_) => {
@@ -598,31 +588,11 @@ impl Runtime {
                 #[cfg(feature = "tracing")]
                 warn!(error = %trap, fuel_used, "WASI execution trapped");
 
-                let trap_msg = trap.to_string();
-                if trap_msg.contains("all fuel consumed")
-                    || trap_msg.contains("fuel exhausted")
-                    || trap_msg.contains("out of fuel")
-                {
-                    outcome = Outcome::HardFailure {
-                        reason: ReasonCode::FuelExhausted,
-                    };
-                    legacy_outcome = ExecutionOutcome::LimitsExceeded;
-                    error_info = Some((
-                        "ERR_FUEL_EXHAUSTED".to_string(),
-                        Some(format!(
-                            "Fuel exhausted: used {fuel_used} of {fuel_limit} limit"
-                        )),
-                    ));
-
-                    #[cfg(feature = "tracing")]
-                    info!(fuel_used, fuel_limit, "Fuel budget exhausted");
-                } else {
-                    outcome = Outcome::HardFailure {
-                        reason: ReasonCode::RuntimeTrap,
-                    };
-                    legacy_outcome = ExecutionOutcome::ExecutionFailed;
-                    error_info = Some(("ERR_TRAP".to_string(), Some(trap_msg)));
-                }
+                let verdict = trap_verdict(&trap, fuel_used, fuel_limit);
+                outcome = verdict.outcome;
+                legacy_outcome = verdict.legacy_outcome;
+                fuel_is_billable = verdict.fuel_is_billable;
+                error_info = Some((verdict.error_code.to_string(), Some(verdict.error_message)));
             }
         }
 
@@ -633,7 +603,12 @@ impl Runtime {
             builder = builder.error(code, message);
         }
 
-        if self.config.pricing.enabled {
+        // `fuel_is_billable` is false only for a deadline interruption, whose
+        // fuel counts the host's speed rather than the program's work. Omitting
+        // the block entirely — rather than pricing it at zero — matches the
+        // schema's existing meaning of absent pricing: not priced. A 0.0 would
+        // read as "free" and invite someone to sum it.
+        if self.config.pricing.enabled && fuel_is_billable {
             #[cfg(feature = "tracing")]
             debug!(
                 cost_per_fuel = self.config.pricing.cost_per_fuel_unit,

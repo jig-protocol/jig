@@ -2221,8 +2221,10 @@ port = 9090
 
     #[test]
     fn capabilities_generates_text_format() {
-        let mut cfg = CapabilitiesConfig::default();
-        cfg.domain = Some("ns.example.com".into());
+        let cfg = CapabilitiesConfig {
+            domain: Some("ns.example.com".into()),
+            ..Default::default()
+        };
 
         let text = cfg.to_capabilities_text();
 

@@ -204,11 +204,12 @@ mod tests {
     #[tokio::test]
     async fn server_initializes() {
         let dir = tempdir().unwrap();
-        let mut config = ServerConfig::default();
-        config.database_path = dir.path().join("test.db");
-        config.bind_address = "127.0.0.1".into();
-
-        config.port = 0;
+        let config = ServerConfig {
+            database_path: dir.path().join("test.db"),
+            bind_address: "127.0.0.1".into(),
+            port: 0,
+            ..Default::default()
+        };
 
         let server = JigServer::new(config.clone()).expect("server");
 

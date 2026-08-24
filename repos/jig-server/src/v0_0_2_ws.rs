@@ -882,9 +882,9 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_millis(500), ws.next()).await;
         if let Ok(Some(Ok(TMessage::Text(text)))) = result {
             let env: Envelope = serde_json::from_str(&text).unwrap();
-            match env.frame {
-                Frame::Error { code, .. } => assert_eq!(code, "BAD_JSON"),
-                _ => {} // other frames are acceptable (e.g. if handler re-used the connection)
+            // other frames are acceptable (e.g. if handler re-used the connection)
+            if let Frame::Error { code, .. } = env.frame {
+                assert_eq!(code, "BAD_JSON");
             }
         }
         // Timeout is acceptable — primary assertion is the server didn't panic.

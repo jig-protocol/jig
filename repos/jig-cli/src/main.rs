@@ -602,18 +602,18 @@ async fn main() -> Result<()> {
                 json,
                 pricing,
             } => {
-                use cmd::block_run::run_block;
-                run_block(
-                    &wasm,
+                use cmd::block_run::{RunBlockArgs, run_block};
+                run_block(RunBlockArgs {
+                    wasm_path: &wasm,
                     seed,
                     fuel,
-                    memory,
-                    timeout,
+                    memory_mb: memory,
+                    timeout_ms: timeout,
                     capabilities,
-                    receipt.as_deref(),
-                    json || cli.json,
-                    pricing,
-                )?;
+                    receipt_out: receipt.as_deref(),
+                    json_output: json || cli.json,
+                    enable_pricing: pricing,
+                })?;
             }
             BlockAction::Lint { path } => {
                 eprintln!("error: 'jig block lint' is not yet implemented in v0.0.1");

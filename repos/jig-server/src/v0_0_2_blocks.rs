@@ -514,7 +514,7 @@ mod tests {
         assert_eq!(get_body["block_kind"], "text-render");
         assert_eq!(get_body["sender_did"], id.did_string());
         assert!(
-            get_body["receipts"].as_array().unwrap().len() >= 1,
+            !get_body["receipts"].as_array().unwrap().is_empty(),
             "must have at least one receipt"
         );
         assert!(!get_body["bundle_b64"].as_str().unwrap_or("").is_empty());
