@@ -327,8 +327,12 @@ async fn handle_client_frame(
         Ok(e) => e,
         Err(e) => {
             // Best-effort error reply; ignore send failure (client may have gone away).
+            // A malformed frame is the WS analogue of REST's 400 Bad Request:
+            // the envelope itself never parsed, so no IngestError was ever
+            // constructed for classify_ingest_error to classify.
             let _ = send_error(
                 socket,
+                Some(400),
                 "BAD_JSON",
                 None,
                 &format!("envelope parse failed: {e}"),
@@ -371,8 +375,11 @@ async fn handle_client_frame(
             let bundle_bytes = match base64::engine::general_purpose::STANDARD.decode(&bundle_b64) {
                 Ok(b) => b,
                 Err(_) => {
+                    // Malformed wire content, never reaches ingest — the WS
+                    // analogue of a REST 400.
                     let _ = send_error(
                         socket,
+                        Some(400),
                         "BAD_BUNDLE_B64",
                         None,
                         "bundle_b64 is not valid base64",
@@ -384,8 +391,14 @@ async fn handle_client_frame(
             let sig = match base64::engine::general_purpose::STANDARD.decode(&sig_b64) {
                 Ok(s) => s,
                 Err(_) => {
-                    let _ = send_error(socket, "BAD_SIG_B64", None, "sig_b64 is not valid base64")
-                        .await;
+                    let _ = send_error(
+                        socket,
+                        Some(400),
+                        "BAD_SIG_B64",
+                        None,
+                        "sig_b64 is not valid base64",
+                    )
+                    .await;
                     return Ok(());
                 }
             };
@@ -396,8 +409,14 @@ async fn handle_client_frame(
                 match serde_json::from_slice(&bundle_bytes) {
                     Ok(t) => t,
                     Err(e) => {
+                        // Malformed wire content, never reaches ingest —
+                        // the WS analogue of a REST 400 (kin to
+                        // IngestError::BundleMalformed, which classify_ingest_error
+                        // also maps to 400, but that variant is never
+                        // constructed on this pre-ingest path).
                         let _ = send_error(
                             socket,
+                            Some(400),
                             "BAD_BUNDLE",
                             None,
                             &format!("canonical-bytes tuple parse failed: {e}"),
@@ -432,23 +451,36 @@ async fn handle_client_frame(
                     };
                     let _ = socket.send(Message::Text(json)).await;
                 }
+                // Status matches classify_ingest_error's IngestError::InvalidSignature
+                // arm (StatusCode::UNAUTHORIZED) so both transports agree.
                 Err(IngestError::InvalidSignature) => {
-                    let _ =
-                        send_error(socket, "INVALID_SIG", None, "signature verification failed")
-                            .await;
+                    let _ = send_error(
+                        socket,
+                        Some(401),
+                        "INVALID_SIG",
+                        None,
+                        "signature verification failed",
+                    )
+                    .await;
                 }
+                // Status matches classify_ingest_error's IngestError::DisallowedBlockKind
+                // arm (StatusCode::FORBIDDEN).
                 Err(IngestError::DisallowedBlockKind { kind }) => {
                     let _ = send_error(
                         socket,
+                        Some(403),
                         "DISALLOWED_BLOCK_KIND",
                         None,
                         &format!("block kind not in allow list: {kind}"),
                     )
                     .await;
                 }
+                // Status matches classify_ingest_error's IngestError::KindRequired
+                // arm (StatusCode::BAD_REQUEST).
                 Err(IngestError::KindRequired) => {
                     let _ = send_error(
                         socket,
+                        Some(400),
                         "KIND_REQUIRED",
                         None,
                         "manifest must declare a block kind",
@@ -458,11 +490,21 @@ async fn handle_client_frame(
                 // Distinct code (not the generic INGEST_ERROR) because this is
                 // the one ingest failure an ordinary user causes by mistyping a
                 // channel name; the Display text is already actionable prose.
+                // Status matches classify_ingest_error's IngestError::UnknownChannel
+                // arm (StatusCode::NOT_FOUND).
                 Err(e @ IngestError::UnknownChannel { .. }) => {
-                    let _ = send_error(socket, "UNKNOWN_CHANNEL", None, &e.to_string()).await;
+                    let _ = send_error(socket, Some(404), "UNKNOWN_CHANNEL", None, &e.to_string())
+                        .await;
                 }
+                // Catch-all: this single generic code covers several distinct
+                // IngestError variants (BundleMalformed, MissingMetadata,
+                // NoExecutor, RenderFailed, Identity, Persist, Other) that
+                // classify_ingest_error maps to different statuses (400/500/401/500).
+                // Since this call site does not distinguish which one occurred,
+                // there is no single REST status it can honestly report — None,
+                // not a guess.
                 Err(e) => {
-                    let _ = send_error(socket, "INGEST_ERROR", None, &e.to_string()).await;
+                    let _ = send_error(socket, None, "INGEST_ERROR", None, &e.to_string()).await;
                 }
             }
             Ok(())
@@ -508,11 +550,13 @@ fn channel_slug_peek(manifest_bytes: &[u8]) -> Option<String> {
 
 async fn send_error(
     socket: &mut WebSocket,
+    status: Option<u16>,
     code: &str,
     ref_cid: Option<String>,
     message: &str,
 ) -> Result<(), axum::Error> {
     let frame = Envelope::new(Frame::Error {
+        status,
         code: code.to_string(),
         ref_cid,
         message: message.to_string(),

@@ -572,6 +572,7 @@ mod tests {
         let (url, _) = start_test_server(|env| async move {
             match env.frame {
                 Frame::Submit { .. } => vec![Envelope::new(Frame::Error {
+                    status: None,
                     code: "INVALID_SIG".to_string(),
                     ref_cid: None,
                     message: "signature verification failed".to_string(),
