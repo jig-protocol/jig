@@ -29,18 +29,39 @@
 
 - [ ] **Step 1: Prove nothing outside the module references it**
 
-Run:
+`jig-server` is a **library** crate, so `pub mod capability` is public API and
+integration tests in `tests/` link against it from outside. Grepping `src/`
+alone is NOT sufficient and will miss them — search the whole crate:
+
 ```bash
-grep -rn 'capability::' --include='*.rs' repos/jig-server/src/ | grep -v 'src/capability/'
+grep -rn 'capability::' --include='*.rs' repos/jig-server/ | grep -v 'src/capability/'
 ```
 
-Expected: no output. If there IS output, STOP — the premise of this task is wrong. Report the references and do not delete.
+Expected: matches ONLY in `repos/jig-server/tests/capability_enforcement.rs`
+and `repos/jig-server/tests/fuel_tracker_tests.rs`. Both import solely from the
+doomed module, so they are deleted with it in step 2. Any match outside those
+two files means the premise of this task is wrong — STOP, report it, do not
+delete.
+
+Sibling crates have their own unrelated `capability` concepts
+(`CapabilityMeter`, `CapabilityUsageKey`, `CapabilityCall`,
+`fuel_by_capability`) in jig-runtime and jig-core. Those are live and must not
+be touched.
 
 - [ ] **Step 2: Delete the module directory**
 
 ```bash
 git rm -r repos/jig-server/src/capability/
+git rm repos/jig-server/tests/capability_enforcement.rs \
+      repos/jig-server/tests/fuel_tracker_tests.rs
 ```
+
+Deleting test files is a destructive step beyond the module itself — get the
+user's explicit approval before running it, per the repo working agreement.
+
+Expect the suite to drop by **25** tests, not 15: 10 inline `#[cfg(test)]`
+tests inside the module (token.rs 3, registry.rs 4, fuel_tracker.rs 3) plus the
+15 integration tests. If the delta is anything else, stop and account for it.
 
 - [ ] **Step 3: Remove the module declaration**
 
