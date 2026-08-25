@@ -1,6 +1,5 @@
 //! Jig Server crate entry point.
 
-pub mod capability;
 pub mod config;
 pub mod error;
 pub mod handler;
