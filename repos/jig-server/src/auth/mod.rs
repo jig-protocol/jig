@@ -13,6 +13,8 @@
 //! Phase 1 establishes only the outcome and disclosure types. The gates
 //! themselves arrive in phases 2 and 3.
 
+pub mod disclosure;
 pub mod outcome;
 
+pub use disclosure::{DisclosurePolicy, audit_line};
 pub use outcome::{Gate, GateOutcome};
