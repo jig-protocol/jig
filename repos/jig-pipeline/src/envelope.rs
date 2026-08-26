@@ -13,7 +13,7 @@
 //! { "v": 1, "op": "ack", "block_cid": "bafy..." }
 //! { "v": 1, "op": "block", "bundle_b64": "...", "sig_b64": "...", "receipts": [...], "delivery_cid": "..." }
 //! { "v": 1, "op": "catch_up", "since_hlc": {"wall_ms":1234,"logical":5,"origin":"did:jig:..."} }
-//! { "v": 1, "op": "error", "status": 401, "code": "INVALID_SIG", "ref_cid": null, "message": "..." }
+//! { "v": 1, "op": "error", "status": 401, "code": "INVALID_SIG", "message": "..." }
 //! ```
 //!
 //! `sig_b64` on `Frame::Block` is `Option<String>` for v0.0.2 backward
@@ -68,10 +68,15 @@ pub enum Frame {
     /// Report an error in reply to a prior frame.
     ///
     /// `status` carries the HTTP-style status the REST surface would have
-    /// returned for the same condition, so a client sees one vocabulary
-    /// regardless of transport. `Option` for wire compatibility with peers
-    /// predating the field: absent means "this peer does not speak status
-    /// codes", which is not the same as any particular code.
+    /// returned for the same condition, so a client sees the same status and
+    /// error code regardless of transport. Deliberately not a claim about
+    /// `message`: a few WS messages word themselves differently from their REST
+    /// counterparts, and the WS submit path collapses several `IngestError`
+    /// variants into one code that REST reports distinctly.
+    ///
+    /// `Option` for wire compatibility with peers predating the field: absent
+    /// means "this peer does not speak status codes", which is not the same as
+    /// any particular code.
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<u16>,
@@ -270,9 +275,13 @@ mod tests {
             message: "nope".into(),
         });
         let json = serde_json::to_string(&env).unwrap();
+        // Parse rather than substring-scan the document: `!json.contains("status")`
+        // passes here only because this fixture's message happens not to contain
+        // the word, and would fail spuriously on one that did.
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(
-            !json.contains("status"),
-            "absent status must be omitted: {json}"
+            parsed.get("status").is_none(),
+            "absent status must be omitted, not serialized as null: {json}"
         );
     }
 }

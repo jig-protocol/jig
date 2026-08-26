@@ -570,6 +570,45 @@ async fn send_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four Submit-arm statuses are hand-copied from `classify_ingest_error`
+    /// rather than derived from it, because the WS arms word two of their
+    /// messages differently from REST and this phase may not change message
+    /// text. Comments on those arms assert the parity; this test enforces it, so
+    /// changing the classifier fails here instead of silently leaving the two
+    /// transports disagreeing.
+    ///
+    /// `v0_0_2_ingest_error.rs` exists precisely because two HTTP surfaces once
+    /// drifted apart this way. Fold these arms into the classifier when a later
+    /// phase touches them anyway and can absorb the two message changes
+    /// deliberately.
+    #[test]
+    fn ws_submit_statuses_match_the_rest_classifier() {
+        use crate::v0_0_2_ingest_error::classify_ingest_error;
+
+        for (err, ws_status) in [
+            (IngestError::InvalidSignature, 401u16),
+            (
+                IngestError::DisallowedBlockKind {
+                    kind: "widget".to_string(),
+                },
+                403,
+            ),
+            (IngestError::KindRequired, 400),
+            (
+                IngestError::UnknownChannel {
+                    slug: "#nope".to_string(),
+                },
+                404,
+            ),
+        ] {
+            assert_eq!(
+                classify_ingest_error(&err).0.as_u16(),
+                ws_status,
+                "WS hand-copied status disagrees with the REST classifier for {err}"
+            );
+        }
+    }
     use std::net::SocketAddr;
     use std::time::Duration;
 
@@ -701,7 +740,13 @@ mod tests {
         };
         let reply_env: Envelope = serde_json::from_str(&reply).unwrap();
         match reply_env.frame {
-            Frame::Error { code, .. } => assert_eq!(code, "INVALID_SIG"),
+            Frame::Error { status, code, .. } => {
+                assert_eq!(code, "INVALID_SIG");
+                // Pins the number actually on the wire. Both Frame::Error
+                // consumers currently drop `status`, so without this nothing in
+                // the system would notice a wrong value.
+                assert_eq!(status, Some(401));
+            }
             other => panic!("expected Error, got {other:?}"),
         }
     }
@@ -737,8 +782,14 @@ mod tests {
         };
         let reply_env: Envelope = serde_json::from_str(&reply).unwrap();
         match reply_env.frame {
-            Frame::Error { code, message, .. } => {
+            Frame::Error {
+                status,
+                code,
+                message,
+                ..
+            } => {
                 assert_eq!(code, "UNKNOWN_CHANNEL");
+                assert_eq!(status, Some(404));
                 assert!(message.contains("#gigeu"), "must name the slug: {message}");
                 assert!(
                     message.contains("jig channel create"),
