@@ -4,7 +4,9 @@
 
 **Goal:** Establish the error-disclosure types and the single classifier that phases 2 and 3 will hang authentication and authorization off, changing no server behaviour at all.
 
-**Architecture:** Two new types separate what happened (`GateOutcome`, internal truth) from what we say happened (`Disclosure`, a policy mapping to an HTTP-style triple). A `status` field is added to `Frame::Error` so WSS and REST speak one vocabulary. The dead `capability/` module is deleted so nobody mistakes it for the foundation of this work. Nothing in this phase alters a single response body or status code.
+**Architecture:** Two new types separate what happened (`GateOutcome`, internal truth) from what we say happened (`Disclosure`, a policy mapping to an HTTP-style triple). A `status` field is added to `Frame::Error` so WSS and REST speak one vocabulary. The dead `capability/` module is deleted so nobody mistakes it for the foundation of this work.
+
+**Compatibility, stated precisely:** REST responses are unchanged — no status, error code, or message text differs. WebSocket error frames **do** change: they gain an optional `status` field, and the server begins populating it on malformed input and on the ingest failures it can classify. Older clients ignore it via `serde(default)`. So this phase is inert in the sense that no existing value changes, not in the sense that no byte on the wire changes.
 
 **Tech Stack:** Rust 2024, axum 0.7, serde, `cargo nextest`, `cargo clippy`.
 
@@ -725,12 +727,21 @@ Expected: 6 tests pass (2 from Task 3, 4 here).
 
 - [ ] **Step 5: Verify the whole workspace is still green**
 
-Run:
+Crate-scoped first, for fast feedback:
 ```bash
-cd repos && cargo +stable fmt --all && cargo +stable clippy -p jig-server --all-targets -- -D warnings && cargo +stable nextest run -p jig-server
+cd repos && cargo +stable clippy -p jig-server --all-targets -- -D warnings
 ```
 
-Expected: fmt clean, clippy silent, all tests pass.
+Then the real gate — workspace-wide, matching what CI runs. A crate-scoped pass is NOT
+evidence the workspace is green, since a change here can break a dependent crate:
+```bash
+cd repos && cargo +stable fmt --all \
+  && cargo +stable build --workspace \
+  && cargo +stable clippy --workspace --all-targets -- -D warnings \
+  && cargo +stable nextest run
+```
+
+Expected: fmt clean, build clean, clippy silent, full suite passing.
 
 - [ ] **Step 6: Commit**
 
@@ -763,4 +774,5 @@ server."
 - [ ] `audit_line` records the truth under every policy.
 - [ ] `cargo +stable clippy --all-targets -- -D warnings` clean across the workspace's 11 crates.
 - [ ] Full suite green: `cargo +stable nextest run` with no exclusions.
-- [ ] **No response body or status code emitted by the server has changed.** This phase is inert by design; if a behavioural test needed updating, something is wrong.
+- [ ] **No existing status code, error code, or message text has changed value.** Verify by diffing for removed or altered assertions in surviving files: `git diff <base>..HEAD -- '*.rs' | grep -E '^-\s+' | grep assert`. Every hit must be an assertion that was *expanded*, or one belonging to a deleted module — never an expectation whose value changed.
+- [ ] **WebSocket error frames gain an optional `status` field, and that is the phase's one intended wire change.** Old clients ignore it via `serde(default)`. Do not describe this phase as "no wire change".

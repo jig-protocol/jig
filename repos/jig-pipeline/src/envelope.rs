@@ -74,9 +74,16 @@ pub enum Frame {
     /// counterparts, and the WS submit path collapses several `IngestError`
     /// variants into one code that REST reports distinctly.
     ///
-    /// `Option` for wire compatibility with peers predating the field: absent
-    /// means "this peer does not speak status codes", which is not the same as
-    /// any particular code.
+    /// `Option` because a status is not always available. Absent means exactly
+    /// that — **no status, for either of two reasons**: the peer predates the
+    /// field, or this server declined to classify the failure. The WS submit
+    /// path does the latter deliberately, sending `None` with `INGEST_ERROR`
+    /// where it cannot tell which underlying failure occurred and any single
+    /// code would be a guess.
+    ///
+    /// So absence is **not** a capability signal: a consumer must not infer
+    /// "this peer is old" from it. What it does guarantee is that a present
+    /// status is meaningful.
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<u16>,

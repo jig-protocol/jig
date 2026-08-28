@@ -10,7 +10,7 @@
 
 **Spec:** [`docs/superpowers/specs/2026-08-24-jig-server-authn-authz-design.md`](../specs/2026-08-24-jig-server-authn-authz-design.md)
 
-**Depends on:** Phases 1 and 2 must be merged first. This phase consumes the `Did` that phase 2's `authenticate_read` returns.
+**Depends on:** Phases 1 and 2 must be merged first. This phase consumes the `Did` that phase 2's `authenticate_read` returns for REST, and the connection-bound `Did` that phase 2's **Task 6 (Authenticate the WSS connection)** establishes for WebSocket subscriptions. Task 5 below cannot be done safely without Task 6 — see the note there.
 
 **Working directory:** All `cargo` commands run from `repos/`. Use `cargo +stable` for clippy.
 
@@ -758,7 +758,14 @@ where the arguments to `may_receive` are the subscriber's DID and the channel sl
 
 In `repos/jig-server/src/v0_0_2_ws.rs`, pass a closure that runs the same `authorize_read` decision used by the REST path, resolving visibility and membership from the store per delivery.
 
-Update the `Frame::Subscribe` arm to pass the authenticated DID into `subscribe_local`.
+Update the `Frame::Subscribe` arm to pass the connection's authenticated DID into `subscribe_local`.
+
+> **This depends on phase 2 Task 6 (Authenticate the WSS connection).** That task is what
+> puts a verified DID on the connection in the first place. If it has not landed, STOP —
+> do not substitute the DID from the frame payload or any other client-supplied field.
+> Authorizing against a DID the client merely claims is worse than no authorization: it
+> looks enforced while letting anyone subscribe as anyone. The only acceptable source is
+> the `Did` that `authenticate()` returned.
 
 - [ ] **Step 6: Run the tests to verify they pass**
 

@@ -92,18 +92,48 @@ mod tests {
         assert_ne!(a, b, "field boundaries must be unambiguous");
     }
 
-    /// A request signature must not be usable as a block signature. Different
-    /// domain labels are what guarantee it, and this test fails loudly if the
-    /// label is ever dropped.
+    /// A request signature must not be usable under any other jig protocol that
+    /// signs with the same key. The domain label is what guarantees it.
+    ///
+    /// Comparing against a bare `blake3_hash` of concatenated bytes would NOT
+    /// test this — that differs for trivial reasons (length prefixing alone)
+    /// and still passes if the domain label is deleted entirely. Instead,
+    /// reconstruct the identical labelled parts with the domain omitted, and
+    /// with a *different* domain, and require all three to differ. Deleting
+    /// `DOMAIN` from the implementation then fails the first assertion.
     #[test]
-    fn request_hash_is_domain_separated_from_raw_hashing() {
-        let payload = b"GET/api/v1/channels";
-        let request = canonical_request_hash("GET", "/api/v1/channels", b"", 0, 0, "");
-        let raw = crate::crypto::blake3_hash(payload);
+    fn the_domain_label_is_load_bearing() {
+        use crate::crypto::hash_labeled_parts;
+
+        let (method, path, body, wall, logical, nonce) =
+            ("GET", "/api/v1/channels", b"".as_slice(), 7u64, 0u32, "n1");
+
+        let with_domain =
+            canonical_request_hash(method, path, body, wall, logical, nonce);
+
+        let parts_without_domain = [
+            ("method", method.as_bytes()),
+            ("path", path.as_bytes()),
+            ("body", body),
+            ("hlc_wall_ms", &wall.to_le_bytes()[..]),
+            ("hlc_logical", &logical.to_le_bytes()[..]),
+            ("nonce", nonce.as_bytes()),
+        ];
         assert_ne!(
-            request.as_bytes(),
-            raw.as_bytes(),
-            "request hashing must be domain-separated, not a bare hash of concatenated fields"
+            with_domain,
+            hash_labeled_parts(&parts_without_domain),
+            "removing the domain label must change the hash — if this passes, \
+             DOMAIN is not actually being mixed in"
+        );
+
+        // A hypothetical sibling protocol signing the same fields under its own
+        // label must land somewhere else entirely.
+        let mut other = vec![("domain", "jig-some-other-protocol-v1".as_bytes())];
+        other.extend_from_slice(&parts_without_domain);
+        assert_ne!(
+            with_domain,
+            hash_labeled_parts(&other),
+            "a different domain must produce a different hash"
         );
     }
 }
@@ -210,7 +240,16 @@ artefact."
 
 Signature verification alone does not stop a captured request being sent again. Two defences together: an HLC acceptance window, and a record of nonces seen inside it.
 
-**The structure must be bounded independently of the window.** Bounding only by time means a flood at 100k req/s grows memory without limit until the window rolls. Bounding by capacity means memory is capped, and an eviction inside the window degrades to rejecting a replay-window miss — refusing a legitimate retry rather than accepting a replay. Refusing is the safe direction.
+**The structure must never evict an unexpired nonce.** An earlier draft of this plan bounded capacity with an LRU that evicted oldest-first, and claimed eviction "degrades to refusing a legitimate retry rather than accepting a replay". That was backwards, and it is the bug this task exists to avoid.
+
+Evicting a live nonce turns a replay into a cache **miss**. The signature still verifies, the HLC is still inside the window, so the replayed request is **accepted**. An attacker does not even need luck: flood unique nonces until the victim's entry is pushed out, then replay the captured request.
+
+Fail closed instead:
+
+1. Entries **outside** the window may be dropped freely — the HLC check refuses those requests anyway, so forgetting them costs nothing.
+2. If capacity is reached and every retained entry is still **inside** the window, refuse the incoming request rather than evicting one.
+
+That trades a denial of service for a replay, which is the correct direction: a refused legitimate request is recoverable by retrying, an accepted replay is not. Size capacity above the expected `rate × window` product so rule 2 is a safety net rather than routine behaviour.
 
 **Files:**
 - Create: `repos/jig-server/src/auth/replay.rs`
@@ -288,24 +327,48 @@ mod tests {
         );
     }
 
-    /// Eviction must drop the OLDEST nonce, so a replay of something recent is
-    /// still caught. Dropping the newest would make the guard useless exactly
-    /// when it is under pressure.
+    /// THE test this whole design turns on: a full guard must refuse new
+    /// requests, never forget an unexpired nonce to make room.
+    ///
+    /// Forgetting one turns a replay into a cache miss, and a miss is an
+    /// ACCEPT — the signature still verifies and the HLC is still in window.
+    /// An attacker floods unique nonces to force exactly that.
     #[test]
-    fn eviction_drops_the_oldest_nonce_first() {
-        let mut guard = ReplayGuard::new(1000, 2);
-        guard.check_and_record("first", 5_000, 5_000).unwrap();
-        guard.check_and_record("second", 5_000, 5_000).unwrap();
-        guard.check_and_record("third", 5_000, 5_000).unwrap();
+    fn a_full_guard_refuses_rather_than_forgetting_a_live_nonce() {
+        let mut guard = ReplayGuard::new(10_000, 2);
+        guard.check_and_record("victim", 5_000, 5_000).unwrap();
+        guard.check_and_record("filler", 5_000, 5_000).unwrap();
 
-        assert!(
-            guard.check_and_record("first", 5_000, 5_000).is_ok(),
-            "the oldest nonce should have been evicted"
-        );
+        // Guard is full and both entries are still inside the window.
         assert_eq!(
-            guard.check_and_record("third", 5_000, 5_000),
+            guard.check_and_record("attacker", 5_000, 5_000),
+            Err(ReplayRejection::CapacityExhausted),
+            "a full guard must refuse the new request, not evict to make room"
+        );
+
+        // And the victim's nonce must still be remembered, so replaying it fails.
+        assert_eq!(
+            guard.check_and_record("victim", 5_000, 5_000),
             Err(ReplayRejection::AlreadySeen),
-            "the newest nonce must still be remembered"
+            "the flood must not have opened a replay window on the victim"
+        );
+    }
+
+    /// Entries that have aged out of the window ARE reclaimable — the HLC check
+    /// refuses those requests regardless, so forgetting them is free. Without
+    /// this, a guard would wedge permanently after its first busy second.
+    #[test]
+    fn expired_entries_are_reclaimed_to_make_room() {
+        let window = 1_000;
+        let mut guard = ReplayGuard::new(window, 2);
+        guard.check_and_record("old-a", 5_000, 5_000).unwrap();
+        guard.check_and_record("old-b", 5_000, 5_000).unwrap();
+
+        // Advance well past the window: both entries are now unreplayable.
+        let later = 5_000 + window * 5;
+        assert!(
+            guard.check_and_record("fresh", later, later).is_ok(),
+            "expired entries must be reclaimed rather than wedging the guard"
         );
     }
 }
@@ -335,17 +398,22 @@ Prepend to `repos/jig-server/src/auth/replay.rs`:
 //! 2. A **record of nonces** seen inside that window, so a request cannot be
 //!    used twice while it is still fresh.
 //!
-//! # Why capacity-bounded rather than time-bounded
+//! # Never evict a live nonce
 //!
-//! Bounding only by the window means memory grows with traffic: at the
-//! protocol's 10,000 msg/s target a ±30s window implies retaining on the order
-//! of 300,000 nonces, and a flood is unbounded until the window rolls. That is
-//! hostile to the $5-VPS and Raspberry Pi deployment targets.
+//! Memory must be bounded, but **not** by evicting entries that are still
+//! inside the window. Evicting one turns a replay into a cache miss, and a miss
+//! is an accept: the signature still verifies and the HLC still passes. An
+//! attacker forces that by flooding unique nonces until the victim's entry is
+//! pushed out, then replaying the captured request.
 //!
-//! Capping capacity means memory is fixed. The cost is that under flood an
-//! entry can be evicted while its window is still open, so a legitimate retry
-//! of a very old in-window request may be refused. Refusing a legitimate
-//! request is the safe direction to fail; accepting a replay is not.
+//! So expired entries are reclaimed freely, and when everything retained is
+//! still live the guard refuses new requests instead. That trades a denial of
+//! service for a replay — the right direction, since a refused request is
+//! recoverable by retrying and an accepted replay is not.
+//!
+//! Size `capacity` above the expected `rate × window` product so refusal is a
+//! safety net rather than routine. At 10,000 msg/s with a ±30s window that is
+//! on the order of 300,000 nonces if every request is tier 0.
 //!
 //! Note that capability-authenticated (tier-1) requests need no nonce at all,
 //! which is an independent reason busy servers will want trusted connections.
@@ -360,6 +428,10 @@ pub enum ReplayRejection {
     /// The request's timestamp is outside the acceptance window, in either
     /// direction.
     OutsideWindow,
+    /// The guard is full of entries that are all still inside the window, so
+    /// accepting this request would mean forgetting one that can still be
+    /// replayed. Refusing is the safe direction; see the module docs.
+    CapacityExhausted,
 }
 
 /// Bounded record of recently-seen request nonces.
@@ -370,7 +442,9 @@ pub struct ReplayGuard {
     window_ms: u64,
     capacity: usize,
     seen: HashSet<String>,
-    order: VecDeque<String>,
+    /// Arrival order plus each entry's request timestamp, so expiry can be
+    /// evaluated without a second index.
+    order: VecDeque<(String, u64)>,
 }
 
 impl ReplayGuard {
@@ -416,21 +490,40 @@ impl ReplayGuard {
             return Err(ReplayRejection::AlreadySeen);
         }
 
-        // Evict oldest-first so a replay of something recent is still caught.
-        // Dropping the newest would make the guard useless exactly when it is
-        // under the most pressure.
-        while self.seen.len() >= self.capacity {
-            match self.order.pop_front() {
-                Some(oldest) => {
-                    self.seen.remove(&oldest);
-                }
-                None => break,
-            }
+        // Reclaim only entries that have aged out of the window. Those are free
+        // to forget: the OutsideWindow check above refuses them regardless, so
+        // they can no longer be replayed.
+        self.drop_expired(now_ms);
+
+        // Everything still retained is inside the window and therefore still
+        // replayable. Refuse rather than forget one — forgetting turns a replay
+        // into a cache miss, and a miss is an ACCEPT.
+        if self.seen.len() >= self.capacity {
+            return Err(ReplayRejection::CapacityExhausted);
         }
 
         self.seen.insert(nonce.to_string());
-        self.order.push_back(nonce.to_string());
+        self.order.push_back((nonce.to_string(), request_ms));
         Ok(())
+    }
+
+    /// Forget entries whose timestamps have left the acceptance window.
+    ///
+    /// `order` is append-only in arrival order, which is not perfectly sorted by
+    /// `request_ms` under clock skew — but skew is bounded by the window, so
+    /// stopping at the first live entry can retain a few expired ones. That is
+    /// harmless: retaining too long is the safe direction, and the capacity cap
+    /// still bounds memory.
+    fn drop_expired(&mut self, now_ms: u64) {
+        while let Some((nonce, stamped)) = self.order.front() {
+            if stamped.abs_diff(now_ms) > self.window_ms {
+                let nonce = nonce.clone();
+                self.order.pop_front();
+                self.seen.remove(&nonce);
+            } else {
+                break;
+            }
+        }
     }
 }
 ```
@@ -1184,6 +1277,219 @@ membership. Bound explicitly rather than discarded so the seam is visible."
 
 ---
 
+---
+
+### Task 6: Authenticate the WSS connection
+
+**Phase 3 cannot be implemented without this.** Its fanout task passes "the authenticated
+DID" into `subscribe_local`, and until this task exists there is no such thing on the
+WebSocket path — tasks 1-5 authenticate REST only. An implementer following phase 3
+literally would have to take the DID from somewhere unauthenticated, which is worse than no
+authorization at all: it would *look* enforced while letting any client claim any identity.
+
+**The rule this task exists to enforce: the DID must come from a verified proof, never from
+a field the client asserts.** `AuthProof.did` is a *claim* until `authenticate()` returns
+it; only the returned `Did` may be bound to a connection or passed onward.
+
+**Files:**
+- Modify: `repos/jig-pipeline/src/envelope.rs` (add an optional proof to `Frame::Subscribe`)
+- Modify: `repos/jig-server/src/v0_0_2_ws.rs` (verify it, bind the DID to the connection)
+- Test: `repos/jig-server/tests/ws_authenticated_subscribe.rs` (create)
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `repos/jig-server/tests/ws_authenticated_subscribe.rs`:
+
+```rust
+//! A subscription must prove who is subscribing.
+
+mod support;
+use support::TestServer;
+
+#[tokio::test]
+async fn an_unsigned_subscribe_is_refused() {
+    let server = TestServer::builder().require_authenticated_reads(true).build();
+    let err = server.subscribe_ws_unsigned("#hello").await.expect_err("must refuse");
+    assert_eq!(err.code, "AUTH_REQUIRED");
+    assert_eq!(err.status, Some(401));
+}
+
+#[tokio::test]
+async fn a_correctly_signed_subscribe_is_accepted() {
+    let server = TestServer::builder().require_authenticated_reads(true).build();
+    let owner = server.new_identity();
+    server.create_channel(&owner, "#hello", "open").await;
+
+    let sub = server.subscribe_ws(&owner, "#hello").await;
+    assert!(sub.is_ok(), "a valid proof must be accepted");
+}
+
+/// The attack this task exists to prevent: a client asserting a DID it does not
+/// hold. The frame names the victim; the signature is the attacker's own.
+#[tokio::test]
+async fn a_subscribe_claiming_another_did_is_refused() {
+    let server = TestServer::builder().require_authenticated_reads(true).build();
+    let victim = server.new_identity();
+    let attacker = server.new_identity();
+
+    let err = server
+        .subscribe_ws_claiming(&attacker, victim.did(), "#hello")
+        .await
+        .expect_err("a forged subscriber DID must be refused");
+
+    assert_eq!(
+        err.code, "INVALID_SIG",
+        "the server must verify the proof against the CLAIMED did, so a \
+         mismatch fails rather than binding the victim's identity"
+    );
+}
+
+/// A captured Subscribe frame must not be reusable, exactly as for REST.
+#[tokio::test]
+async fn a_replayed_subscribe_is_refused() {
+    let server = TestServer::builder().require_authenticated_reads(true).build();
+    let caller = server.new_identity();
+    let frame = server.build_subscribe_frame(&caller, "#hello");
+
+    assert!(server.send_subscribe_frame(&frame).await.is_ok());
+    let err = server.send_subscribe_frame(&frame).await.expect_err("replay must fail");
+    assert_eq!(err.code, "REPLAYED");
+}
+```
+
+- [ ] **Step 2: Run them to verify they fail**
+
+```bash
+cd repos && cargo +stable nextest run -p jig-server --test ws_authenticated_subscribe
+```
+
+Expected: all four fail — `Frame::Subscribe` carries no proof yet.
+
+- [ ] **Step 3: Carry the proof on the frame**
+
+In `repos/jig-pipeline/src/envelope.rs`, add an optional proof to `Frame::Subscribe`,
+following the same additive-`Option` convention the codec already uses for `ref_cid`,
+`sig_b64` and `status`:
+
+```rust
+    /// Subscribe to a scope (channel or federation).
+    ///
+    /// `auth` carries the same tier-0 proof of possession the REST path takes in
+    /// headers. `Option` for wire compatibility: absent means unauthenticated,
+    /// which a server running `require_authenticated_reads = true` refuses.
+    Subscribe {
+        scope: Scope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<SubscribeAuth>,
+    },
+```
+
+with
+
+```rust
+/// Tier-0 proof carried on a `Frame::Subscribe`.
+///
+/// The transport-specific envelope for the same four values REST sends as
+/// headers. Verification is shared; only the carriage differs, which is what
+/// keeps the design transport-agnostic.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SubscribeAuth {
+    /// The identity the caller CLAIMS. Untrusted until verified.
+    pub did: String,
+    pub hlc_wall_ms: u64,
+    pub hlc_logical: u32,
+    pub nonce: String,
+    /// base64 ed25519 signature over the canonical subscribe hash.
+    pub sig_b64: String,
+}
+```
+
+Update every `Frame::Subscribe` construction site — find them with
+`grep -rn 'Frame::Subscribe' --include='*.rs' repos/`.
+
+- [ ] **Step 4: Define the canonical bytes for a subscribe**
+
+A subscribe is not an HTTP request, so reuse `canonical_request_hash` with a synthetic
+method and path rather than inventing a second hashing scheme. In
+`repos/jig-server/src/auth/authenticate.rs`:
+
+```rust
+/// Canonical hash for a WSS subscribe.
+///
+/// Expressed through `canonical_request_hash` with a synthetic method/path so
+/// there is exactly ONE canonicalization in the system. A second scheme would be
+/// a second thing to keep in sync, and the first divergence would present as
+/// "every signature is invalid" with no clue which side is wrong.
+///
+/// The scope string is the path, so a proof for `#public` cannot authorize a
+/// subscription to `#private`.
+pub fn canonical_subscribe_hash(
+    scope: &str,
+    hlc_wall_ms: u64,
+    hlc_logical: u32,
+    nonce: &str,
+) -> blake3::Hash {
+    jig_core::request_auth::canonical_request_hash(
+        "SUBSCRIBE",
+        scope,
+        b"",
+        hlc_wall_ms,
+        hlc_logical,
+        nonce,
+    )
+}
+```
+
+- [ ] **Step 5: Verify at the Subscribe arm and bind the DID to the connection**
+
+In `repos/jig-server/src/v0_0_2_ws.rs`, in the `Frame::Subscribe` arm: refuse with
+`GateOutcome::AuthMissing` when `auth` is absent and the server requires authentication;
+otherwise verify the proof through the same replay guard REST uses, and store the
+**returned** `Did` on the connection state.
+
+Store it on the connection, not per frame: phase 3 re-checks authorization at delivery and
+needs the subscriber's identity long after the Subscribe frame is gone.
+
+```rust
+// The DID the frame CLAIMS is not the DID we bind. Only the verified one.
+let verified_did = crate::auth::authenticate(&proof, "SUBSCRIBE", &scope_str, b"", now_ms, &mut guard)?;
+connection_did = Some(verified_did);
+```
+
+- [ ] **Step 6: Run the tests**
+
+```bash
+cd repos && cargo +stable nextest run -p jig-server --test ws_authenticated_subscribe
+```
+
+Expected: all four pass.
+
+- [ ] **Step 7: Workspace verification and commit**
+
+```bash
+cd repos && cargo +stable fmt --all \
+  && cargo +stable build --workspace \
+  && cargo +stable clippy --workspace --all-targets -- -D warnings \
+  && cargo +stable nextest run
+```
+
+```bash
+git add -A
+git commit -m "feat(jig-server): authenticate WSS subscriptions
+
+Frame::Subscribe registered any scope for any connection with no identity
+involved. It now carries the same tier-0 proof the REST path takes in
+headers, verified through the same code and the same replay guard.
+
+The DID bound to the connection is the one authenticate() RETURNS, never the
+one the frame claims — a frame-supplied DID would let any client subscribe as
+anyone, which is worse than no authorization because it looks enforced.
+
+Phase 3 re-checks authorization at delivery and needs this identity, so it is
+stored on the connection rather than per frame."
+```
+
+
 ## Phase 2 exit criteria
 
 - [ ] `canonical_request_hash` covers every field, is length-prefixed, and is domain-separated from block signing.
@@ -1193,4 +1499,8 @@ membership. Bound explicitly rather than discarded so the seam is visible."
 - [ ] A malformed DID is refused, never panicked on.
 - [ ] Replay guard memory is capped by capacity under flood, evicting oldest-first.
 - [ ] `require_authenticated_reads` defaults to **true**.
+- [ ] A full replay guard **refuses** rather than forgetting a live nonce, and expired
+      entries are still reclaimed so it cannot wedge.
+- [ ] **WSS subscriptions authenticate**, and the DID bound to a connection is the one
+      `authenticate()` returned — never one the frame claimed. Phase 3 depends on this.
 - [ ] Full suite green; clippy clean across all 11 crates on stable.

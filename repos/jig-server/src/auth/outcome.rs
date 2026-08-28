@@ -88,14 +88,55 @@ mod tests {
     /// ordering property the design depends on — admission refusals must never
     /// surface as authorization refusals — is only checkable if the outcome
     /// itself says which gate produced it.
+    ///
+    /// Exhaustive by construction: the `match` below has no wildcard arm, so
+    /// adding a variant to `GateOutcome` fails to compile here until its gate is
+    /// declared. The hand-listed subset this replaced covered six of twelve, so
+    /// half the mappings could have regressed silently.
     #[test]
     fn every_outcome_names_its_gate() {
-        assert_eq!(GateOutcome::AuthSignatureInvalid.gate(), Gate::Authenticate);
-        assert_eq!(GateOutcome::AuthReplayed.gate(), Gate::Authenticate);
-        assert_eq!(GateOutcome::AdmissionUnknownDid.gate(), Gate::Admit);
-        assert_eq!(GateOutcome::AdmissionBanned.gate(), Gate::Admit);
-        assert_eq!(GateOutcome::AuthzNotMember.gate(), Gate::Authorize);
-        assert_eq!(GateOutcome::AuthzNotOwner.gate(), Gate::Authorize);
+        let all = [
+            GateOutcome::AuthSignatureInvalid,
+            GateOutcome::AuthReplayed,
+            GateOutcome::AuthStale,
+            GateOutcome::AuthCapabilityExpired,
+            GateOutcome::AuthCapabilitySubjectMismatch,
+            GateOutcome::AuthMissing,
+            GateOutcome::AdmissionUnknownDid,
+            GateOutcome::AdmissionBelowRuleset {
+                ruleset_key: "highsec.v1".to_string(),
+            },
+            GateOutcome::AdmissionBanned,
+            GateOutcome::AuthzNotMember,
+            GateOutcome::AuthzNotOwner,
+            GateOutcome::AuthzChannelUnknown,
+        ];
+
+        for outcome in &all {
+            // No wildcard: a new variant breaks this build rather than
+            // defaulting into some gate and being forgotten.
+            let expected = match outcome {
+                GateOutcome::AuthSignatureInvalid
+                | GateOutcome::AuthReplayed
+                | GateOutcome::AuthStale
+                | GateOutcome::AuthCapabilityExpired
+                | GateOutcome::AuthCapabilitySubjectMismatch
+                | GateOutcome::AuthMissing => Gate::Authenticate,
+                GateOutcome::AdmissionUnknownDid
+                | GateOutcome::AdmissionBelowRuleset { .. }
+                | GateOutcome::AdmissionBanned => Gate::Admit,
+                GateOutcome::AuthzNotMember
+                | GateOutcome::AuthzNotOwner
+                | GateOutcome::AuthzChannelUnknown => Gate::Authorize,
+            };
+            assert_eq!(outcome.gate(), expected, "wrong gate for {outcome:?}");
+        }
+
+        assert_eq!(
+            all.len(),
+            12,
+            "a variant was added without covering it here"
+        );
     }
 
     /// `unknown` and `below-threshold` are separate variants, not one variant

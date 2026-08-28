@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-24
 **Author:** DJ + Claude
-**Status:** Approved (design); implementation not yet planned
+**Status:** Approved. Phases 1-3 planned; phase 1 implemented (PR #42)
 **Closes:** [`docs/RELEASE_READINESS.md`](../../RELEASE_READINESS.md) blocker #1 — the last blocker gating external release.
 
 ## Goal
@@ -176,8 +176,10 @@ guideline:
 
 Changes to existing crates:
 
-- **`repos/jig-pipeline/src/envelope.rs`** — add `status: u16` to `Frame::Error`, with
-  `#[serde(default)]` so existing clients keep parsing. Today the frame carries
+- **`repos/jig-pipeline/src/envelope.rs`** — add `status: Option<u16>` to `Frame::Error`, with
+  `#[serde(default, skip_serializing_if = "Option::is_none")]` so existing clients keep
+  parsing and an absent status is omitted rather than serialized as null. `Option` and not
+  a bare `u16`: absence must stay distinguishable from any particular code. Today the frame carries
   `{ code, ref_cid, message }` and **no numeric status**, while the REST path already
   produces `(StatusCode, code, message)`. One vocabulary across transports requires this.
 - **`repos/jig-config/src/v0_0_2_server.rs`** — an `[auth]` section beside the existing
@@ -192,8 +194,14 @@ Changes to existing crates:
 ### Delete the existing `capability/` module
 
 `repos/jig-server/src/capability/` is 442 LOC of HMAC-signed capability tokens, declared
-`pub mod capability` in `lib.rs`, with **zero references from anywhere outside itself**. It
-is entirely unwired.
+`pub mod capability` in `lib.rs`, with **no production references anywhere**. The only
+consumers are two integration tests that exercise nothing else —
+`repos/jig-server/tests/capability_enforcement.rs` and
+`repos/jig-server/tests/fuel_tracker_tests.rs` — so they are deleted with it.
+
+Note that `jig-server` is a **library** crate: `pub mod capability` is public API, and
+`tests/` links against it from outside. Grepping `src/` alone does not prove a module
+unreferenced here.
 
 It should be deleted rather than built upon. It is symmetric-secret based, which cuts
 against the DID/ed25519 model the rest of the system uses, and leaving it in place invites a
@@ -220,9 +228,10 @@ Two existing patterns are extended rather than reinvented:
 **Separate what happened from what we say happened.** Two types, never one.
 
 - **`GateOutcome`** — the precise internal truth. Never crosses the wire.
-  `AuthSignatureInvalid`, `AuthReplayed`, `AuthCapabilityExpired`,
-  `AuthCapabilitySubjectMismatch`, `AdmissionUnknownDid`, `AdmissionBelowRuleset { key }`,
-  `AdmissionBanned`, `AuthzNotMember`, `AuthzNotOwner`, `AuthzChannelUnknown`.
+  All twelve: `AuthSignatureInvalid`, `AuthReplayed`, `AuthStale`,
+  `AuthCapabilityExpired`, `AuthCapabilitySubjectMismatch`, `AuthMissing`,
+  `AdmissionUnknownDid`, `AdmissionBelowRuleset { ruleset_key }`, `AdmissionBanned`,
+  `AuthzNotMember`, `AuthzNotOwner`, `AuthzChannelUnknown`.
 - **`Disclosure`** — server policy mapping `GateOutcome → (status, code, message)`.
 
 In v0.0.x the default is the **identity mapping**: truthful. An obfuscating policy — for
@@ -268,16 +277,33 @@ early-returning at different depths would foreclose it permanently.
 ### Replay defence
 
 Tier 0 must reject a replayed signed request, which means remembering something. The design
-uses an **HLC acceptance window** — default **±30 seconds**, configurable — plus a **bounded
-LRU of nonces seen within it**, so memory is bounded by `rate × window` rather than by
-history.
+uses an **HLC acceptance window** — default **±30 seconds**, configurable — plus a record of
+**every nonce seen within it**.
 
-The window length is a genuine tradeoff: wider tolerates clock skew, narrower costs less
-memory. At the 10,000 msg/s KPI a ±30s window implies retaining on the order of 300,000
-nonces if every request is tier 0 — which is itself an argument for tier 1 on busy servers,
-since capability-authenticated requests need no nonce at all. The LRU is bounded
-independently of the window so that memory is capped even under flood; eviction inside the
-window degrades to rejecting a replay-window miss rather than growing without limit.
+**The structure must never evict an unexpired nonce. This is a correctness requirement, not
+a tuning preference.** An earlier draft specified a capacity-bounded LRU evicting
+oldest-first, and claimed eviction "degrades to rejecting a replay rather than growing
+without limit". That was exactly backwards. Evicting a live nonce turns a replay into a
+cache *miss*: the signature still verifies and the HLC is still inside the window, so the
+replayed request is **accepted**. Worse, an attacker can force that state deliberately —
+flood unique nonces until the victim's entry is evicted, then replay the captured request.
+
+The correct behaviour is fail-closed:
+
+1. Entries **outside** the acceptance window may be dropped freely — the HLC check refuses
+   those requests anyway, so forgetting them costs nothing.
+2. If capacity is reached and every retained entry is still **inside** the window, reject
+   the incoming request rather than evicting one.
+
+That trades a denial of service for a replay, which is the right direction: a refused
+legitimate request is recoverable by retrying; an accepted replay is not.
+
+Capacity must therefore be sized above the expected `rate × window` product rather than
+chosen for memory convenience. At the 10,000 msg/s KPI a ±30s window implies retaining on
+the order of 300,000 nonces if every request is tier 0 — itself an argument for tier 1 on
+busy servers, since capability-authenticated requests need no nonce at all. The window
+length remains a genuine tradeoff: wider tolerates more clock skew and costs proportionally
+more memory.
 
 ### Capability contents
 
