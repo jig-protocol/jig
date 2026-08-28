@@ -13,7 +13,7 @@
 //! { "v": 1, "op": "ack", "block_cid": "bafy..." }
 //! { "v": 1, "op": "block", "bundle_b64": "...", "sig_b64": "...", "receipts": [...], "delivery_cid": "..." }
 //! { "v": 1, "op": "catch_up", "since_hlc": {"wall_ms":1234,"logical":5,"origin":"did:jig:..."} }
-//! { "v": 1, "op": "error", "code": "INVALID_SIG", "ref_cid": null, "message": "..." }
+//! { "v": 1, "op": "error", "status": 401, "code": "INVALID_SIG", "message": "..." }
 //! ```
 //!
 //! `sig_b64` on `Frame::Block` is `Option<String>` for v0.0.2 backward
@@ -66,7 +66,27 @@ pub enum Frame {
         delivery_cid: String,
     },
     /// Report an error in reply to a prior frame.
+    ///
+    /// `status` carries the HTTP-style status the REST surface would have
+    /// returned for the same condition, so a client sees the same status and
+    /// error code regardless of transport. Deliberately not a claim about
+    /// `message`: a few WS messages word themselves differently from their REST
+    /// counterparts, and the WS submit path collapses several `IngestError`
+    /// variants into one code that REST reports distinctly.
+    ///
+    /// `Option` because a status is not always available. Absent means exactly
+    /// that — **no status, for either of two reasons**: the peer predates the
+    /// field, or this server declined to classify the failure. The WS submit
+    /// path does the latter deliberately, sending `None` with `INGEST_ERROR`
+    /// where it cannot tell which underlying failure occurred and any single
+    /// code would be a guess.
+    ///
+    /// So absence is **not** a capability signal: a consumer must not infer
+    /// "this peer is old" from it. What it does guarantee is that a present
+    /// status is meaningful.
     Error {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
         code: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ref_cid: Option<String>,
@@ -197,6 +217,7 @@ mod tests {
     #[test]
     fn error_envelope_round_trips_with_optional_ref_cid() {
         let env = Envelope::new(Frame::Error {
+            status: None,
             code: "INVALID_SIG".into(),
             ref_cid: None,
             message: "signature verification failed".into(),
@@ -206,6 +227,7 @@ mod tests {
         assert_eq!(parsed, env);
 
         let env_with_ref = Envelope::new(Frame::Error {
+            status: None,
             code: "DISALLOWED_BLOCK_KIND".into(),
             ref_cid: Some("bafy123".into()),
             message: "block kind not in allow list".into(),
@@ -213,5 +235,60 @@ mod tests {
         let json2 = serde_json::to_string(&env_with_ref).unwrap();
         let parsed2: Envelope = serde_json::from_str(&json2).unwrap();
         assert_eq!(parsed2, env_with_ref);
+    }
+
+    /// A frame from an older peer carries no `status`. It must still parse,
+    /// with `status: None` meaning "this peer does not speak status codes"
+    /// rather than defaulting to a number that would be a lie.
+    #[test]
+    fn error_frame_without_status_still_parses() {
+        let json = r#"{"v":1,"op":"error","code":"INVALID_SIG","message":"nope"}"#;
+        let parsed: Envelope = serde_json::from_str(json).unwrap();
+        match parsed.frame {
+            Frame::Error { status, code, .. } => {
+                assert_eq!(status, None, "absent status must not invent a value");
+                assert_eq!(code, "INVALID_SIG");
+            }
+            other => panic!("expected Frame::Error, got {other:?}"),
+        }
+    }
+
+    /// A status, when present, round-trips and is emitted on the wire.
+    #[test]
+    fn error_frame_with_status_round_trips() {
+        let env = Envelope::new(Frame::Error {
+            status: Some(403),
+            code: "NOT_CHANNEL_OWNER".into(),
+            ref_cid: None,
+            message: "not the owner".into(),
+        });
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(
+            json.contains(r#""status":403"#),
+            "status must be emitted: {json}"
+        );
+        let parsed: Envelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, env);
+    }
+
+    /// An absent status must be omitted entirely, not serialized as null —
+    /// matching how `ref_cid` and `sig_b64` already behave in this codec.
+    #[test]
+    fn absent_status_is_omitted_not_null() {
+        let env = Envelope::new(Frame::Error {
+            status: None,
+            code: "INVALID_SIG".into(),
+            ref_cid: None,
+            message: "nope".into(),
+        });
+        let json = serde_json::to_string(&env).unwrap();
+        // Parse rather than substring-scan the document: `!json.contains("status")`
+        // passes here only because this fixture's message happens not to contain
+        // the word, and would fail spuriously on one that did.
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed.get("status").is_none(),
+            "absent status must be omitted, not serialized as null: {json}"
+        );
     }
 }
