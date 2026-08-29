@@ -160,6 +160,16 @@ Add to the `mod tests` block in `repos/jig-pipeline/src/envelope.rs`:
     }
 ```
 
+
+> **Declare the module in its parent BEFORE running the red-test step.** An `.rs` file that
+> no `mod` statement references is not compiled at all, so the run reports `0 tests run`
+> rather than a compile error — a false negative that looks like a passing check. Add the
+> `pub mod <name>;` line first, then run; the failure you want is
+> `cannot find type ... in this scope`, not silence.
+>
+> Same trap in a second form: nextest's filter is a **substring** match. Confirm the tests
+> it lists are actually yours.
+
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run:
@@ -307,6 +317,16 @@ mod tests {
     }
 }
 ```
+
+
+> **Declare the module in its parent BEFORE running the red-test step.** An `.rs` file that
+> no `mod` statement references is not compiled at all, so the run reports `0 tests run`
+> rather than a compile error — a false negative that looks like a passing check. Add the
+> `pub mod <name>;` line first, then run; the failure you want is
+> `cannot find type ... in this scope`, not silence.
+>
+> Same trap in a second form: nextest's filter is a **substring** match. Confirm the tests
+> it lists are actually yours.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -565,6 +585,16 @@ mod tests {
     }
 }
 ```
+
+
+> **Declare the module in its parent BEFORE running the red-test step.** An `.rs` file that
+> no `mod` statement references is not compiled at all, so the run reports `0 tests run`
+> rather than a compile error — a false negative that looks like a passing check. Add the
+> `pub mod <name>;` line first, then run; the failure you want is
+> `cannot find type ... in this scope`, not silence.
+>
+> Same trap in a second form: nextest's filter is a **substring** match. Confirm the tests
+> it lists are actually yours.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
