@@ -15,6 +15,8 @@
 
 pub mod disclosure;
 pub mod outcome;
+pub mod replay;
 
 pub use disclosure::{DisclosurePolicy, audit_line};
 pub use outcome::{Gate, GateOutcome};
+pub use replay::{ReplayGuard, ReplayRejection};
