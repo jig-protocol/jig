@@ -67,6 +67,14 @@ fn truthful(outcome: &GateOutcome) -> (u16, &'static str, String) {
             "STALE_REQUEST",
             "request timestamp is outside the acceptance window".to_string(),
         ),
+        // 503, not 401: nothing is wrong with the caller's credentials and
+        // re-authenticating cannot help. The server is out of replay-guard
+        // headroom, which is a availability problem and a retryable one.
+        GateOutcome::AuthCapacityExhausted => (
+            503,
+            "CAPACITY_EXHAUSTED",
+            "server is at replay-guard capacity; retry shortly".to_string(),
+        ),
         GateOutcome::AuthCapabilityExpired => (
             401,
             "CAPABILITY_EXPIRED",

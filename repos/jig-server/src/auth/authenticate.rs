@@ -81,10 +81,9 @@ pub fn authenticate(
         Ok(()) => Ok(proof.did.clone()),
         Err(ReplayRejection::AlreadySeen) => Err(GateOutcome::AuthReplayed),
         Err(ReplayRejection::OutsideWindow) => Err(GateOutcome::AuthStale),
-        // The guard is full of live nonces. This is a availability failure, not
-        // an authentication one, but the caller cannot be admitted: accepting
-        // without recording would leave the request replayable.
-        Err(ReplayRejection::CapacityExhausted) => Err(GateOutcome::AuthReplayed),
+        // Not a replay: the guard had no room to record this nonce, and
+        // accepting it unrecorded would leave the request replayable.
+        Err(ReplayRejection::CapacityExhausted) => Err(GateOutcome::AuthCapacityExhausted),
     }
 }
 
