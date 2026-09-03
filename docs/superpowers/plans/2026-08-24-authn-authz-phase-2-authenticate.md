@@ -835,11 +835,23 @@ pub fn authenticate(
 An earlier draft of this plan added a `KeyPair::verify_detached` helper to `jig-core`. That
 was wrong twice over:
 
-1. `jig-core`'s `KeyPair` lives behind its non-default `ed25519` feature, and **nothing in
-   the workspace enables it** — `jig-server` depends on `jig-core` with default features.
-   The helper would not have been reachable.
-2. The server holds only a *public* key recovered from a DID, and `jig-server` already
-   depends on `ed25519-dalek` directly.
+1. The server holds only a *public* key recovered from a DID, so a `KeyPair` method is the
+   wrong shape for it; `jig-server` already depends on `ed25519-dalek` directly.
+2. Reaching `jig-core`'s `KeyPair` from `jig-server` works only by **feature unification**,
+   which is too fragile to rest a security path on. `jig-core`'s `ed25519` module is behind
+   a non-default feature. The workspace dep enables it
+   (`repos/Cargo.toml`: `jig-core = { path = "jig-core", features = ["ed25519"] }`), but
+   `jig-server` does not use that — it declares `jig-core = { path = "../jig-core" }`
+   directly, which opts out. It compiles anyway *today* only because `jig-server` depends on
+   `jig-pipeline`, which does take the workspace dep, and Cargo unifies features across the
+   build.
+
+   That is a real dependency, invisible at the use site, on a sibling crate's dep
+   declaration. If `jig-pipeline` ever stopped taking `jig-core` from the workspace, the
+   authentication path would stop compiling for a reason nothing in `jig-server` explains.
+   (Verified empirically 2026-09-02: a probe calling `jig_core::crypto::ed25519::KeyPair`
+   from `jig-server` does compile. An earlier revision of this plan claimed it would not —
+   that claim was wrong.)
 
 Verify in place instead, mirroring the pattern the codebase already uses at
 `repos/jig-pipeline/src/ingest.rs:397-407`, where every failure maps to one refusal:
