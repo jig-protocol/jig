@@ -830,36 +830,39 @@ pub fn authenticate(
 }
 ```
 
-- [ ] **Step 4: Add the detached verify helper to `jig-core`**
+- [ ] **Step 4: (removed — verify in `jig-server`, not `jig-core`)**
 
-`KeyPair::verify` verifies against a keypair the server does not have — it only has the caller's public key. Add a free-standing verifier to `repos/jig-core/src/crypto.rs`, inside the `pub mod ed25519` block, next to the existing `KeyPair` impl:
+An earlier draft of this plan added a `KeyPair::verify_detached` helper to `jig-core`. That
+was wrong twice over:
+
+1. `jig-core`'s `KeyPair` lives behind its non-default `ed25519` feature, and **nothing in
+   the workspace enables it** — `jig-server` depends on `jig-core` with default features.
+   The helper would not have been reachable.
+2. The server holds only a *public* key recovered from a DID, and `jig-server` already
+   depends on `ed25519-dalek` directly.
+
+Verify in place instead, mirroring the pattern the codebase already uses at
+`repos/jig-pipeline/src/ingest.rs:397-407`, where every failure maps to one refusal:
 
 ```rust
-    /// Verify a signature against a raw public key.
-    ///
-    /// The server holds a caller's *public* key only, recovered from their DID,
-    /// so it cannot use [`KeyPair::verify`]. Separated out rather than
-    /// constructing a half-empty `KeyPair`, which would invite someone to sign
-    /// with it.
-    impl KeyPair {
-        pub fn verify_detached(
-            public_key: &[u8; 32],
-            data: &[u8],
-            signature: &[u8],
-        ) -> Result<()> {
-            use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
-            let vk = VerifyingKey::from_bytes(public_key)
-                .map_err(|e| JigError::Signing(format!("invalid ed25519 public key: {e}")))?;
-            let sig = Signature::from_slice(signature)
-                .map_err(|e| JigError::Signing(format!("invalid signature: {e}")))?;
-            vk.verify(data, &sig)
-                .map_err(|e| JigError::Signing(format!("ed25519 verification failed: {e}")))
-        }
-    }
+let pubkey_bytes = proof.did.as_bytes().map_err(|_| GateOutcome::AuthSignatureInvalid)?;
+let pubkey = VerifyingKey::from_bytes(&pubkey_bytes)
+    .map_err(|_| GateOutcome::AuthSignatureInvalid)?;
+let signature = Signature::from_slice(&proof.signature)
+    .map_err(|_| GateOutcome::AuthSignatureInvalid)?;
+pubkey
+    .verify(hash.as_bytes(), &signature)
+    .map_err(|_| GateOutcome::AuthSignatureInvalid)?;
 ```
 
-If the existing `impl KeyPair` block is in scope, add the method to that block instead of opening a second one — check the file first and follow whichever form is already there.
+Collapsing every failure to `AuthSignatureInvalid` is deliberate: a caller who cannot
+authenticate has not earned a breakdown of *which* part of their proof was malformed.
+
+Note this means the task's tests cannot use `jig_core::crypto::ed25519::KeyPair` either —
+build test identities with `ed25519_dalek::SigningKey` directly, and derive the DID with
+`Did::from_ed25519_pubkey(&signing.verifying_key().to_bytes())`.
 
 - [ ] **Step 5: Add `pub mod authenticate;` to `repos/jig-server/src/auth/mod.rs`**
 
