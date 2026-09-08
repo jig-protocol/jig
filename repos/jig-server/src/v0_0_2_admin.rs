@@ -413,6 +413,8 @@ mod tests {
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
+        // Built before the literal: `config` moves into it below.
+        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth));
 
         Arc::new(AppState {
             config,
@@ -421,6 +423,7 @@ mod tests {
             server_url,
             bridges,
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
+            auth,
         })
     }
 
