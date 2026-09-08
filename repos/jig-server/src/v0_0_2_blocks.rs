@@ -234,7 +234,14 @@ pub struct ChannelsResponse {
 /// visibility flag governs join semantics, not listing). Not debug-gated.
 pub async fn list_channels(
     State(state): State<Arc<AppState>>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<ChannelsResponse>, (StatusCode, Json<ErrorBody>)> {
+    let started = std::time::Instant::now();
+    // Phase 3 consumes this to filter restricted channels from the listing.
+    let caller_did = authenticate_read(&state, &headers, "GET", uri.path(), started)?;
+    let _ = &caller_did;
+
     let stored = state.ingest_ctx.store.list_channels().map_err(|e| {
         err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -301,11 +308,88 @@ fn persist_err(e: impl std::fmt::Display) -> (StatusCode, Json<ErrorBody>) {
 /// Blocks come back **oldest-first**, capped to the newest `limit` (see
 /// `SqliteStore::list_blocks_by_channel`), so a chat client renders the array
 /// straight down the pane. An unknown or silent channel is `200` with `[]`.
+/// Run gate 1 for a read, returning the authenticated caller.
+///
+/// `Ok(None)` means the server is running with `require_authenticated_reads =
+/// false` — the migration escape hatch — and no identity was established.
+///
+/// `path` must be the path the caller actually requested, taken from the
+/// request URI rather than rebuilt from extracted parameters. The signature
+/// covers the path as sent, so reconstructing it invites an encoding mismatch
+/// that would present as "every signature is invalid".
+fn authenticate_read(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    method: &str,
+    path: &str,
+    started: std::time::Instant,
+) -> Result<Option<jig_core::did::Did>, (StatusCode, Json<ErrorBody>)> {
+    if !state.config.auth.require_authenticated_reads {
+        return Ok(None);
+    }
+
+    let Some(proof) = crate::auth::authenticate::proof_from_headers(headers) else {
+        return Err(refuse(
+            state,
+            &crate::auth::GateOutcome::AuthMissing,
+            started,
+        ));
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let mut guard = state
+        .auth
+        .replay_guard
+        .lock()
+        .expect("replay guard mutex poisoned");
+
+    match crate::auth::authenticate(&proof, method, path, b"", now_ms, &mut guard) {
+        Ok(did) => Ok(Some(did)),
+        Err(outcome) => Err(refuse(state, &outcome, started)),
+    }
+}
+
+/// Map a gate outcome to a response through this server's disclosure policy,
+/// logging the true outcome regardless of what the policy emits.
+///
+/// **This is the single disclosure point for the read path.** Every refusal
+/// routes through here, which is what lets a concealing policy be added later
+/// without editing call sites — and what gives a timing mitigation somewhere to
+/// live.
+///
+/// `started` is unused today and deliberately so: gates refuse at different
+/// depths, so a future constant-time mitigation must know how long the request
+/// has already taken in order to pad to a fixed floor. Threading it now costs
+/// one parameter; adding it later would mean touching every call site again.
+fn refuse(
+    state: &AppState,
+    outcome: &crate::auth::GateOutcome,
+    started: std::time::Instant,
+) -> (StatusCode, Json<ErrorBody>) {
+    let _ = started; // reserved for timing normalization; see doc comment
+    tracing::info!(audit = %crate::auth::audit_line(outcome), "read refused");
+
+    let (status, code, message) = state.auth.disclosure.disclose(outcome);
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN);
+    err(status, code, message)
+}
+
 pub async fn get_channel_history(
     State(state): State<Arc<AppState>>,
     Path(slug): Path<String>,
     Query(query): Query<HistoryQuery>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<Vec<TimelineBlock>>, (StatusCode, Json<ErrorBody>)> {
+    let started = std::time::Instant::now();
+    // Phase 3 consumes this to enforce membership on restricted channels.
+    let caller_did = authenticate_read(&state, &headers, "GET", uri.path(), started)?;
+    let _ = &caller_did;
+
     let store = &state.ingest_ctx.store;
     let blocks = store
         .list_blocks_by_channel(&slug, query.limit.unwrap_or(MAX_HISTORY_LIMIT), None)
@@ -360,6 +444,20 @@ mod tests {
     use jig_core::HlcTimestamp;
     use tempfile::tempdir;
     use tower::ServiceExt; // for `oneshot`
+
+    /// State for tests about history/listing SEMANTICS rather than access
+    /// control.
+    ///
+    /// Read handlers now require a proof of possession by default. These tests
+    /// predate that and are not about it — making each one sign a request would
+    /// bury what they actually assert. They run with the documented migration
+    /// escape hatch instead; authentication itself is covered by
+    /// `tests/authenticated_reads.rs` and `auth::authenticate`.
+    fn unauthenticated_state() -> AppState {
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.auth.require_authenticated_reads = false;
+        AppState::for_test_with_config(config).unwrap()
+    }
 
     fn test_identity() -> Identity {
         let dir = tempdir().unwrap();
@@ -524,7 +622,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_channels_returns_empty_when_no_channels_exist() {
-        let state = Arc::new(AppState::for_test().unwrap());
+        let state = Arc::new(unauthenticated_state());
         let router = build_blocks_router(state);
 
         let (status, body) = get_path(router, "/api/v1/channels").await;
@@ -540,7 +638,7 @@ mod tests {
         // happy-path coverage the F4 spec asks for.
         use jig_client::blocks::build_channel_create;
 
-        let state = Arc::new(AppState::for_test().unwrap());
+        let state = Arc::new(unauthenticated_state());
 
         // Build a combined router with both blocks (list_channels) and
         // admin (create_channel) routes mounted on the same state.
@@ -578,7 +676,7 @@ mod tests {
         // that ordering so CLI output is stable across invocations.
         use jig_client::blocks::build_channel_create;
 
-        let state = Arc::new(AppState::for_test().unwrap());
+        let state = Arc::new(unauthenticated_state());
         let router = build_blocks_router(state.clone())
             .merge(crate::v0_0_2_admin::build_admin_router(state.clone()));
 
@@ -651,7 +749,7 @@ mod tests {
     async fn channel_history_deserializes_into_delivered_blocks() {
         // Cross-lane wire contract: the CLI decodes this response body with
         // `serde_json::from_str::<Vec<DeliveredBlock>>`.
-        let state = Arc::new(AppState::for_test().unwrap());
+        let state = Arc::new(unauthenticated_state());
         let router = build_blocks_router(state.clone());
         let id = test_identity();
         submit_texts(&state, &router, &id, "#hello", &["one", "two"]).await;
@@ -677,7 +775,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_history_percent_decodes_the_slug_and_scopes_to_it() {
-        let state = Arc::new(AppState::for_test().unwrap());
+        let state = Arc::new(unauthenticated_state());
         let router = build_blocks_router(state.clone());
         let id = test_identity();
         submit_texts(&state, &router, &id, "#hello", &["h1", "h2"]).await;
@@ -696,7 +794,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_history_honours_the_limit_query_param() {
-        let state = Arc::new(AppState::for_test().unwrap());
+        let state = Arc::new(unauthenticated_state());
         let router = build_blocks_router(state.clone());
         let id = test_identity();
         submit_texts(&state, &router, &id, "#hello", &["a", "b", "c"]).await;
@@ -715,7 +813,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_history_returns_empty_array_for_unknown_channel() {
-        let state = Arc::new(AppState::for_test().unwrap());
+        let state = Arc::new(unauthenticated_state());
         let router = build_blocks_router(state);
 
         let (status, body) = get_path(router, "/api/v1/channels/%23nope/blocks").await;
@@ -734,7 +832,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_history_carries_receipts_for_parity_checks() {
-        let state = Arc::new(AppState::for_test().unwrap());
+        let state = Arc::new(unauthenticated_state());
         let router = build_blocks_router(state.clone());
         let id = test_identity();
         submit_texts(&state, &router, &id, "#hello", &["only"]).await;

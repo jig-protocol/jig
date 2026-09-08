@@ -87,6 +87,44 @@ pub fn authenticate(
     }
 }
 
+/// Header names carrying a tier-0 proof over HTTP.
+///
+/// HTTP-specific by necessity; the *verification* is not, which is what keeps
+/// the design transport-agnostic. A future SSH or gRPC transport carries the
+/// same five values however it can and calls the same [`authenticate`].
+pub mod headers {
+    pub const DID: &str = "x-jig-did";
+    pub const HLC_WALL_MS: &str = "x-jig-hlc-wall-ms";
+    pub const HLC_LOGICAL: &str = "x-jig-hlc-logical";
+    pub const NONCE: &str = "x-jig-nonce";
+    pub const SIGNATURE: &str = "x-jig-signature";
+}
+
+/// Extract a proof from HTTP headers, if one is present and well-formed.
+///
+/// Returns `None` both when no proof was offered and when one was offered but
+/// malformed. The caller maps that to [`GateOutcome::AuthMissing`].
+///
+/// Deliberately not distinguishing the two: telling an unauthenticated caller
+/// precisely which header they got wrong is detail they have not earned, and
+/// the distinction is not one a legitimate client needs — a correct client
+/// sends all five correctly or has a bug it can find locally.
+pub fn proof_from_headers(headers: &axum::http::HeaderMap) -> Option<AuthProof> {
+    use base64::Engine as _;
+
+    let get = |name: &str| headers.get(name)?.to_str().ok();
+
+    Some(AuthProof {
+        did: Did::from_did_jig_string(get(headers::DID)?).ok()?,
+        hlc_wall_ms: get(headers::HLC_WALL_MS)?.parse().ok()?,
+        hlc_logical: get(headers::HLC_LOGICAL)?.parse().ok()?,
+        nonce: get(headers::NONCE)?.to_string(),
+        signature: base64::engine::general_purpose::STANDARD
+            .decode(get(headers::SIGNATURE)?)
+            .ok()?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +156,85 @@ mod tests {
             nonce: nonce.to_string(),
             signature: signing.sign(hash.as_bytes()).to_bytes().to_vec(),
         }
+    }
+
+    fn headers_for(proof: &AuthProof) -> axum::http::HeaderMap {
+        use base64::Engine as _;
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(headers::DID, proof.did.as_str().parse().unwrap());
+        h.insert(
+            headers::HLC_WALL_MS,
+            proof.hlc_wall_ms.to_string().parse().unwrap(),
+        );
+        h.insert(
+            headers::HLC_LOGICAL,
+            proof.hlc_logical.to_string().parse().unwrap(),
+        );
+        h.insert(headers::NONCE, proof.nonce.parse().unwrap());
+        h.insert(
+            headers::SIGNATURE,
+            base64::engine::general_purpose::STANDARD
+                .encode(&proof.signature)
+                .parse()
+                .unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn a_proof_round_trips_through_headers() {
+        let (signing, did) = identity(1);
+        let proof = proof_for(&signing, &did, "GET", "/api/v1/channels", b"", 5_000, "n1");
+        let parsed = proof_from_headers(&headers_for(&proof)).expect("round-trips");
+        assert_eq!(parsed, proof, "header carriage must not alter the proof");
+    }
+
+    #[test]
+    fn no_headers_yields_no_proof() {
+        assert!(proof_from_headers(&axum::http::HeaderMap::new()).is_none());
+    }
+
+    /// Every header is required. Dropping any one must yield no proof rather
+    /// than a partially-populated one that could verify against something.
+    #[test]
+    fn a_missing_header_yields_no_proof() {
+        let (signing, did) = identity(1);
+        let proof = proof_for(&signing, &did, "GET", "/api/v1/channels", b"", 5_000, "n1");
+
+        for name in [
+            headers::DID,
+            headers::HLC_WALL_MS,
+            headers::HLC_LOGICAL,
+            headers::NONCE,
+            headers::SIGNATURE,
+        ] {
+            let mut h = headers_for(&proof);
+            h.remove(name);
+            assert!(
+                proof_from_headers(&h).is_none(),
+                "dropping {name} must yield no proof"
+            );
+        }
+    }
+
+    /// Malformed values are refused the same way an absent header is — a caller
+    /// who cannot authenticate does not get a parse diagnosis.
+    #[test]
+    fn malformed_header_values_yield_no_proof() {
+        let (signing, did) = identity(1);
+        let proof = proof_for(&signing, &did, "GET", "/api/v1/channels", b"", 5_000, "n1");
+
+        let mut bad_ms = headers_for(&proof);
+        bad_ms.insert(headers::HLC_WALL_MS, "not-a-number".parse().unwrap());
+        assert!(proof_from_headers(&bad_ms).is_none());
+
+        let mut bad_sig = headers_for(&proof);
+        bad_sig.insert(headers::SIGNATURE, "!!!not-base64!!!".parse().unwrap());
+        assert!(proof_from_headers(&bad_sig).is_none());
+
+        let mut bad_did = headers_for(&proof);
+        bad_did.insert(headers::DID, "not-a-did".parse().unwrap());
+        assert!(proof_from_headers(&bad_did).is_none());
     }
 
     #[test]
