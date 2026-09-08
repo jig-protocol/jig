@@ -44,7 +44,15 @@ impl Envelope {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Frame {
     /// Subscribe to a scope (channel or federation).
-    Subscribe { scope: Scope },
+    ///
+    /// `auth` carries the same tier-0 proof of possession the REST path takes
+    /// in headers. `Option` for wire compatibility: absent means the caller
+    /// offered no proof, which a server requiring authentication refuses.
+    Subscribe {
+        scope: Scope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<SubscribeAuth>,
+    },
     /// Submit a signed block bundle for ingest.
     Submit { bundle_b64: String, sig_b64: String },
     /// Request a catch-up replay since a given HLC cursor.
@@ -94,6 +102,28 @@ pub enum Frame {
     },
 }
 
+/// Tier-0 proof of possession carried on a [`Frame::Subscribe`].
+///
+/// The transport-specific envelope for the same five values the REST path sends
+/// as headers. Only the carriage differs; verification is shared, which is what
+/// keeps the design transport-agnostic.
+///
+/// **`did` is what the caller CLAIMS.** It is not trustworthy until the server
+/// verifies the signature against it. A server must bind the DID its verifier
+/// returns, never this field as received — trusting it would let any client
+/// subscribe as anyone, which is worse than no authorization because it looks
+/// enforced.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SubscribeAuth {
+    /// The identity the caller claims. Untrusted until verified.
+    pub did: String,
+    pub hlc_wall_ms: u64,
+    pub hlc_logical: u32,
+    pub nonce: String,
+    /// base64 ed25519 signature over the canonical subscribe hash.
+    pub sig_b64: String,
+}
+
 /// Subscription scope: a single channel by slug or a federation-wide subscription
 /// filtered to specified block kinds.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -101,6 +131,30 @@ pub enum Frame {
 pub enum Scope {
     Channel { slug: String },
     Federation { block_kinds: Vec<String> },
+}
+
+impl Scope {
+    /// A stable string identifying this scope, for signing.
+    ///
+    /// Lives here rather than in the server so client and server cannot drift
+    /// into signing and verifying different strings — the same reasoning that
+    /// puts `canonical_request_hash` in `jig-core`. A drift would present as
+    /// "every subscribe signature is invalid" with no indication which side is
+    /// wrong.
+    ///
+    /// Block kinds are sorted so a client that lists them in a different order
+    /// still produces the same string. Without that, a signature would depend
+    /// on incidental ordering the wire format does not otherwise care about.
+    pub fn canonical_string(&self) -> String {
+        match self {
+            Scope::Channel { slug } => format!("channel:{slug}"),
+            Scope::Federation { block_kinds } => {
+                let mut kinds = block_kinds.clone();
+                kinds.sort();
+                format!("federation:{}", kinds.join(","))
+            }
+        }
+    }
 }
 
 /// A receipt summary suitable for cross-server fanout — carries the producing
@@ -132,6 +186,7 @@ mod tests {
             scope: Scope::Channel {
                 slug: "#hello".into(),
             },
+            auth: None,
         });
         let json = serde_json::to_string(&env).unwrap();
         assert!(json.contains("\"v\":1"));
@@ -212,6 +267,75 @@ mod tests {
             result.is_err(),
             "envelope deserialization should reject unknown op variant"
         );
+    }
+
+    #[test]
+    fn scope_canonical_string_distinguishes_scopes() {
+        let a = Scope::Channel {
+            slug: "#hello".into(),
+        };
+        let b = Scope::Channel {
+            slug: "#other".into(),
+        };
+        assert_ne!(a.canonical_string(), b.canonical_string());
+
+        let fed = Scope::Federation {
+            block_kinds: vec!["text-render".into()],
+        };
+        assert_ne!(
+            a.canonical_string(),
+            fed.canonical_string(),
+            "a channel named like a federation filter must not collide"
+        );
+    }
+
+    /// Block-kind order is incidental on the wire, so it must not change the
+    /// signed string — otherwise a client that reorders its filter list would
+    /// produce a signature the server rejects for no meaningful reason.
+    #[test]
+    fn federation_scope_is_order_independent() {
+        let a = Scope::Federation {
+            block_kinds: vec!["b".into(), "a".into()],
+        };
+        let b = Scope::Federation {
+            block_kinds: vec!["a".into(), "b".into()],
+        };
+        assert_eq!(a.canonical_string(), b.canonical_string());
+    }
+
+    #[test]
+    fn subscribe_frame_round_trips_with_and_without_auth() {
+        let unsigned = Envelope::new(Frame::Subscribe {
+            scope: Scope::Channel {
+                slug: "#hello".into(),
+            },
+            auth: None,
+        });
+        let json = serde_json::to_string(&unsigned).unwrap();
+        assert!(
+            !json.contains("auth"),
+            "absent auth must be omitted: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Envelope>(&json).unwrap(),
+            unsigned,
+            "an unsigned subscribe must round-trip"
+        );
+
+        let signed = Envelope::new(Frame::Subscribe {
+            scope: Scope::Channel {
+                slug: "#hello".into(),
+            },
+            auth: Some(SubscribeAuth {
+                did: "did:jig:zabc".into(),
+                hlc_wall_ms: 7,
+                hlc_logical: 0,
+                nonce: "n1".into(),
+                sig_b64: "c2ln".into(),
+            }),
+        });
+        let json = serde_json::to_string(&signed).unwrap();
+        assert_eq!(serde_json::from_str::<Envelope>(&json).unwrap(), signed);
     }
 
     #[test]

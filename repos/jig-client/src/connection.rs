@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use jig_pipeline::envelope::{Envelope, Frame, HlcCursor, ReceiptRef, Scope};
+use jig_pipeline::envelope::{Envelope, Frame, HlcCursor, ReceiptRef, Scope, SubscribeAuth};
 use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
@@ -50,6 +50,8 @@ pub enum ClientError {
 /// writer tasks; the public API is fully `async` and message-based.
 pub struct Client {
     identity: Arc<Identity>,
+    /// Monotonic source of unique subscribe nonces for this connection.
+    subscribe_nonce_seq: Arc<std::sync::atomic::AtomicU64>,
     write_tx: mpsc::UnboundedSender<Message>,
     inbound_rx: Mutex<mpsc::UnboundedReceiver<Frame>>,
     pending_subscriptions: SubscriptionMap,
@@ -251,6 +253,7 @@ impl Client {
 
         Ok(Self {
             identity: Arc::new(identity),
+            subscribe_nonce_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             write_tx,
             inbound_rx: Mutex::new(inbound_rx),
             pending_subscriptions,
@@ -261,16 +264,63 @@ impl Client {
         })
     }
 
+    /// Sign a subscription request with this client's identity.
+    ///
+    /// Servers requiring authentication refuse an unsigned `Subscribe`. The
+    /// signature covers the scope's canonical string, so a proof minted for one
+    /// channel cannot subscribe to another.
+    ///
+    /// The nonce is random per call rather than derived from anything: a server
+    /// refuses a nonce it has already seen inside its acceptance window, so two
+    /// subscriptions to the same channel must not collide.
+    fn sign_subscribe(&self, scope: &Scope) -> SubscribeAuth {
+        use base64::Engine as _;
+
+        let hlc_wall_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // A counter, not randomness. Nonces need only be UNIQUE inside the
+        // server's acceptance window, not unpredictable — the signature already
+        // provides unforgeability. This matters here: `jig-client` deliberately
+        // carries no `rand` dependency (see its Cargo.toml), and re-adding one
+        // for a nonce would undo that on purpose-built ground.
+        let seq = self
+            .subscribe_nonce_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nonce = format!("{hlc_wall_ms}-{seq}");
+
+        let hash = jig_core::request_auth::canonical_request_hash(
+            "SUBSCRIBE",
+            &scope.canonical_string(),
+            b"",
+            hlc_wall_ms,
+            0,
+            &nonce,
+        );
+
+        SubscribeAuth {
+            did: self.identity.did_string(),
+            hlc_wall_ms,
+            hlc_logical: 0,
+            nonce,
+            sig_b64: base64::engine::general_purpose::STANDARD
+                .encode(self.identity.sign(hash.as_bytes()).to_bytes()),
+        }
+    }
+
     /// Subscribe to a channel by slug. Returns a [`BlockStream`] that
     /// yields each delivered block.
     ///
     /// Returns [`ClientError::ConnectionClosed`] if the connection is already
     /// dead — better a loud error than a stream that can never yield or end.
     pub async fn subscribe_channel(&self, slug: &str) -> Result<BlockStream, ClientError> {
+        let scope = Scope::Channel {
+            slug: slug.to_string(),
+        };
         let env = Envelope::new(Frame::Subscribe {
-            scope: Scope::Channel {
-                slug: slug.to_string(),
-            },
+            auth: Some(self.sign_subscribe(&scope)),
+            scope,
         });
         // Serialize before registering so a serde failure can't leave a
         // half-registered subscription behind.
@@ -358,7 +408,9 @@ impl Client {
 // Re-export the envelope types through jig_client::envelope for callers
 // that don't want to depend on jig-pipeline directly.
 pub mod envelope {
-    pub use jig_pipeline::envelope::{Envelope, Frame, HlcCursor, ReceiptRef, Scope};
+    pub use jig_pipeline::envelope::{
+        Envelope, Frame, HlcCursor, ReceiptRef, Scope, SubscribeAuth,
+    };
 }
 
 #[cfg(test)]

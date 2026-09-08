@@ -45,11 +45,13 @@ async fn single_server_two_client_text_render_round_trip() {
     // uses. This is the path the product actually runs on.
     let ws_url = format!("{}/api/v1/ws", server.ws_url());
     let (mut alice_ws, _) = connect_async(&ws_url).await.expect("alice ws connect");
-    let sub_env = Envelope::new(Frame::Subscribe {
-        scope: Scope::Channel {
+    // Signed like any real caller: the server refuses an unsigned subscribe.
+    let sub_env = signed_subscribe(
+        &alice,
+        Scope::Channel {
             slug: "#hello".to_string(),
         },
-    });
+    );
     alice_ws
         .send(Message::Text(
             serde_json::to_string(&sub_env).unwrap().into(),

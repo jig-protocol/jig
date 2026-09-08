@@ -87,6 +87,56 @@ pub fn authenticate(
     }
 }
 
+/// Canonical hash a caller signs to subscribe.
+///
+/// Expressed through [`canonical_request_hash`] with a synthetic method so
+/// there is exactly ONE canonicalization in the system. A second scheme would
+/// be a second thing to keep in sync, and the first divergence would present as
+/// "every signature is invalid" with no clue which side is wrong.
+///
+/// The scope's canonical string is the path, so a proof for `#public` cannot
+/// authorize a subscription to `#private`.
+pub fn canonical_subscribe_hash(
+    scope: &str,
+    hlc_wall_ms: u64,
+    hlc_logical: u32,
+    nonce: &str,
+) -> blake3::Hash {
+    canonical_request_hash("SUBSCRIBE", scope, b"", hlc_wall_ms, hlc_logical, nonce)
+}
+
+/// Verify a subscribe proof, returning the DID the signature actually proves.
+///
+/// **The returned DID is the only trustworthy one.** `auth.did` is a claim; a
+/// caller can put anything there. Binding the claimed value instead of this
+/// return would let any client subscribe as anyone — worse than no
+/// authorization, because it looks enforced.
+pub fn authenticate_subscribe(
+    auth: &jig_pipeline::envelope::SubscribeAuth,
+    scope: &str,
+    now_ms: u64,
+    guard: &mut ReplayGuard,
+) -> Result<Did, GateOutcome> {
+    use base64::Engine as _;
+
+    let signature = base64::engine::general_purpose::STANDARD
+        .decode(&auth.sig_b64)
+        .map_err(|_| GateOutcome::AuthSignatureInvalid)?;
+    let did = Did::from_did_jig_string(&auth.did).map_err(|_| GateOutcome::AuthSignatureInvalid)?;
+
+    let proof = AuthProof {
+        did,
+        hlc_wall_ms: auth.hlc_wall_ms,
+        hlc_logical: auth.hlc_logical,
+        nonce: auth.nonce.clone(),
+        signature,
+    };
+
+    // Same verifier as REST: one code path, so the two transports cannot drift
+    // into enforcing different things.
+    authenticate(&proof, "SUBSCRIBE", scope, b"", now_ms, guard)
+}
+
 /// Header names carrying a tier-0 proof over HTTP.
 ///
 /// HTTP-specific by necessity; the *verification* is not, which is what keeps
