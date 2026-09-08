@@ -45,6 +45,13 @@ pub struct AppState {
     /// `BridgeContext::mount_router`. Empty until PR2 registers a real bridge
     /// in the boot path.
     pub bridge_router_mount: jig_bridge_core::RouterMount,
+    /// Authentication state, shared by every clone of this struct.
+    ///
+    /// `Arc` is load-bearing: the replay guard defends by remembering nonces,
+    /// so all clones must share ONE guard. If each clone owned its own, a
+    /// replayed request landing on a different clone would find an empty set
+    /// and be accepted. See `crate::auth::state`.
+    pub auth: Arc<crate::auth::AuthState>,
 }
 
 /// Translate the operator's server-level execution settings into the runtime's
@@ -142,6 +149,9 @@ impl AppState {
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
+        // Built before the struct literal: `config` is moved into it, so
+        // borrowing `config.auth` inside would be a use-after-move.
+        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth));
 
         Ok(Self {
             config,
@@ -150,6 +160,7 @@ impl AppState {
             server_url,
             bridges,
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
+            auth,
         })
     }
 
@@ -186,6 +197,9 @@ impl AppState {
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
+        // Built before the struct literal: `config` is moved into it, so
+        // borrowing `config.auth` inside would be a use-after-move.
+        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth));
 
         Ok(Self {
             config,
@@ -194,6 +208,7 @@ impl AppState {
             server_url,
             bridges,
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
+            auth,
         })
     }
 
@@ -229,6 +244,9 @@ impl AppState {
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
+        // Built before the struct literal: `config` is moved into it, so
+        // borrowing `config.auth` inside would be a use-after-move.
+        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth));
 
         Ok(Self {
             config,
@@ -237,6 +255,7 @@ impl AppState {
             server_url,
             bridges,
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
+            auth,
         })
     }
 }

@@ -19,6 +19,7 @@ pub mod manifest;
 #[cfg(test)]
 pub mod proptest_generators;
 pub mod receipt;
+pub mod request_auth;
 mod serde_helpers;
 pub mod signing;
 pub mod wasm_validation;

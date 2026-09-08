@@ -115,6 +115,16 @@ Add to the existing `mod tests` in `repos/jig-pipeline/src/persist.rs`:
 
 If `Store::open_in_memory`, `upsert_channel`, or the `StoredMembership` field names differ from the above, match whatever the existing tests in that file already use — do not invent a second convention.
 
+
+> **Declare the module in its parent BEFORE running the red-test step.** An `.rs` file that
+> no `mod` statement references is not compiled at all, so the run reports `0 tests run`
+> rather than a compile error — a false negative that looks like a passing check. Add the
+> `pub mod <name>;` line first, then run; the failure you want is
+> `cannot find type ... in this scope`, not silence.
+>
+> Same trap in a second form: nextest's filter is a **substring** match. Confirm the tests
+> it lists are actually yours.
+
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run:
@@ -272,6 +282,16 @@ mod tests {
     }
 }
 ```
+
+
+> **Declare the module in its parent BEFORE running the red-test step.** An `.rs` file that
+> no `mod` statement references is not compiled at all, so the run reports `0 tests run`
+> rather than a compile error — a false negative that looks like a passing check. Add the
+> `pub mod <name>;` line first, then run; the failure you want is
+> `cannot find type ... in this scope`, not silence.
+>
+> Same trap in a second form: nextest's filter is a **substring** match. Confirm the tests
+> it lists are actually yours.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -454,6 +474,16 @@ async fn an_open_channel_is_readable_by_any_authenticated_caller() {
 
 Extend `repos/jig-server/tests/support/mod.rs` (created in phase 2) with `create_channel` and `add_member`, built on the admin endpoints the way `v0_0_2_admin.rs`'s tests already do.
 
+
+> **Declare the module in its parent BEFORE running the red-test step.** An `.rs` file that
+> no `mod` statement references is not compiled at all, so the run reports `0 tests run`
+> rather than a compile error — a false negative that looks like a passing check. Add the
+> `pub mod <name>;` line first, then run; the failure you want is
+> `cannot find type ... in this scope`, not silence.
+>
+> Same trap in a second form: nextest's filter is a **substring** match. Confirm the tests
+> it lists are actually yours.
+
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run:
@@ -578,6 +608,16 @@ async fn the_channel_list_shows_restricted_channels_to_their_members() {
 
 Adjust `body["channels"]` to match whatever `ChannelsResponse` actually serializes — read the struct before writing the assertion.
 
+
+> **Declare the module in its parent BEFORE running the red-test step.** An `.rs` file that
+> no `mod` statement references is not compiled at all, so the run reports `0 tests run`
+> rather than a compile error — a false negative that looks like a passing check. Add the
+> `pub mod <name>;` line first, then run; the failure you want is
+> `cannot find type ... in this scope`, not silence.
+>
+> Same trap in a second form: nextest's filter is a **substring** match. Confirm the tests
+> it lists are actually yours.
+
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run:
@@ -701,6 +741,16 @@ async fn revoking_membership_stops_delivery_on_a_live_subscription() {
 ```
 
 Extend `tests/support/mod.rs` with `subscribe_ws` (returning a handle exposing `next_block` and a timeout variant), `post_text_block`, and `remove_member`. Build the WSS client on the existing pattern in `v0_0_2_ws.rs`'s own test module rather than a new one.
+
+
+> **Declare the module in its parent BEFORE running the red-test step.** An `.rs` file that
+> no `mod` statement references is not compiled at all, so the run reports `0 tests run`
+> rather than a compile error — a false negative that looks like a passing check. Add the
+> `pub mod <name>;` line first, then run; the failure you want is
+> `cannot find type ... in this scope`, not silence.
+>
+> Same trap in a second form: nextest's filter is a **substring** match. Confirm the tests
+> it lists are actually yours.
 
 - [ ] **Step 2: Run the test to verify it fails**
 

@@ -38,6 +38,15 @@ pub enum GateOutcome {
     AuthCapabilitySubjectMismatch,
     /// No proof of possession accompanied the request at all.
     AuthMissing,
+    /// The replay guard is full of nonces that are all still inside the
+    /// acceptance window, so this request could not be recorded — and accepting
+    /// it unrecorded would leave it replayable.
+    ///
+    /// Distinct from [`GateOutcome::AuthReplayed`] on purpose. This request was
+    /// **not** replayed; the server ran out of room. Collapsing the two would
+    /// tell an operator debugging a flood that they were under a replay attack
+    /// when in fact they need more capacity.
+    AuthCapacityExhausted,
 
     /// The server has no reputation entry for this DID under any ruleset it
     /// consults. **Not** the same as a bad score: this is a caller the server
@@ -67,7 +76,8 @@ impl GateOutcome {
             | GateOutcome::AuthStale
             | GateOutcome::AuthCapabilityExpired
             | GateOutcome::AuthCapabilitySubjectMismatch
-            | GateOutcome::AuthMissing => Gate::Authenticate,
+            | GateOutcome::AuthMissing
+            | GateOutcome::AuthCapacityExhausted => Gate::Authenticate,
 
             GateOutcome::AdmissionUnknownDid
             | GateOutcome::AdmissionBelowRuleset { .. }
@@ -102,6 +112,7 @@ mod tests {
             GateOutcome::AuthCapabilityExpired,
             GateOutcome::AuthCapabilitySubjectMismatch,
             GateOutcome::AuthMissing,
+            GateOutcome::AuthCapacityExhausted,
             GateOutcome::AdmissionUnknownDid,
             GateOutcome::AdmissionBelowRuleset {
                 ruleset_key: "highsec.v1".to_string(),
@@ -121,7 +132,8 @@ mod tests {
                 | GateOutcome::AuthStale
                 | GateOutcome::AuthCapabilityExpired
                 | GateOutcome::AuthCapabilitySubjectMismatch
-                | GateOutcome::AuthMissing => Gate::Authenticate,
+                | GateOutcome::AuthMissing
+                | GateOutcome::AuthCapacityExhausted => Gate::Authenticate,
                 GateOutcome::AdmissionUnknownDid
                 | GateOutcome::AdmissionBelowRuleset { .. }
                 | GateOutcome::AdmissionBanned => Gate::Admit,
@@ -134,7 +146,7 @@ mod tests {
 
         assert_eq!(
             all.len(),
-            12,
+            13,
             "a variant was added without covering it here"
         );
     }

@@ -38,6 +38,49 @@ use crate::v0_0_2_federation_tls::select_connector;
 /// Constant in v0.0.2; exponential backoff is a v0.0.3+ refinement.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
+/// Sign a federation subscribe with this server's own identity.
+///
+/// The server authenticates to its peer exactly as a client does — same
+/// canonical bytes, same verifier on the far side. Giving federation its own
+/// bypass would mean a second authentication path to keep correct, and the
+/// weaker of two paths is the one an attacker uses.
+pub fn sign_federation_subscribe(
+    state: &Arc<AppState>,
+    scope: &Scope,
+) -> jig_pipeline::envelope::SubscribeAuth {
+    use base64::Engine as _;
+
+    let hlc_wall_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    // Unique per attempt: a reconnect to the same peer inside the acceptance
+    // window must not reuse a nonce the peer has already recorded.
+    let seq = FED_SUBSCRIBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nonce = format!("fed-{hlc_wall_ms}-{seq}");
+
+    let hash = jig_core::request_auth::canonical_request_hash(
+        "SUBSCRIBE",
+        &scope.canonical_string(),
+        b"",
+        hlc_wall_ms,
+        0,
+        &nonce,
+    );
+
+    jig_pipeline::envelope::SubscribeAuth {
+        did: state.server_did.to_did_jig_string(),
+        hlc_wall_ms,
+        hlc_logical: 0,
+        nonce,
+        sig_b64: base64::engine::general_purpose::STANDARD
+            .encode(state.ingest_ctx.server_key.sign(hash.as_bytes()).to_bytes()),
+    }
+}
+
+/// Monotonic nonce source for federation subscribes.
+static FED_SUBSCRIBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Spawn one long-running task per configured peer. Each task owns its own
 /// reconnect loop and persists across the server's lifetime.
 pub fn spawn_federation_peers(state: Arc<AppState>) {
@@ -110,10 +153,17 @@ async fn connect_and_relay(
         .await?;
 
     // 2. Subscribe federation scope so the peer pushes us their block stream.
+    //
+    // Signed with this server's OWN identity. A peer that requires
+    // authentication refuses an unsigned subscribe, so federation between two
+    // authenticated servers only works because of this — the server is a
+    // first-class caller here, not an exception to the rule.
+    let sub_scope = Scope::Federation {
+        block_kinds: vec![],
+    };
     let sub_env = Envelope::new(Frame::Subscribe {
-        scope: Scope::Federation {
-            block_kinds: vec![],
-        },
+        auth: Some(sign_federation_subscribe(state, &sub_scope)),
+        scope: sub_scope,
     });
     sink.send(Message::Text(serde_json::to_string(&sub_env)?.into()))
         .await?;

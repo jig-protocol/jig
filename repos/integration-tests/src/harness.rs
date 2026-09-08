@@ -30,6 +30,51 @@ use tokio::task::JoinHandle;
 // TestJigServer
 // ---------------------------------------------------------------------------
 
+/// Build a signed `Frame::Subscribe`, as a real client would.
+///
+/// Servers require a proof of possession on subscribe by default, so a raw
+/// unsigned frame is refused. Tests that are about delivery rather than about
+/// authentication still need a valid one — this is the one place that knows how
+/// to mint it, so the ceremony is not copied into every test.
+pub fn signed_subscribe(
+    identity: &Identity,
+    scope: jig_pipeline::envelope::Scope,
+) -> jig_pipeline::envelope::Envelope {
+    use base64::Engine as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let hlc_wall_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    // Unique per call: a server refuses a nonce it has already seen inside its
+    // acceptance window, and one test may subscribe several times.
+    let nonce = format!("test-{hlc_wall_ms}-{}", SEQ.fetch_add(1, Ordering::Relaxed));
+
+    let hash = jig_core::request_auth::canonical_request_hash(
+        "SUBSCRIBE",
+        &scope.canonical_string(),
+        b"",
+        hlc_wall_ms,
+        0,
+        &nonce,
+    );
+
+    jig_pipeline::envelope::Envelope::new(jig_pipeline::envelope::Frame::Subscribe {
+        auth: Some(jig_pipeline::envelope::SubscribeAuth {
+            did: identity.did_string(),
+            hlc_wall_ms,
+            hlc_logical: 0,
+            nonce,
+            sig_b64: base64::engine::general_purpose::STANDARD
+                .encode(identity.sign(hash.as_bytes()).to_bytes()),
+        }),
+        scope,
+    })
+}
+
 /// A `jig-server` running on `127.0.0.1:<random>` for tests. Owns the
 /// tempdir holding the SQLite DB; drop the struct to tear everything down.
 pub struct TestJigServer {
@@ -594,10 +639,17 @@ async fn spawn_one_peer_loop(state: Arc<jig_server::v0_0_2::AppState>, peer: Fed
         let (mut sink, mut stream) = ws.split();
 
         // Subscribe federation scope so we receive their block stream.
+        // Signed like any other caller: the peer requires a proof.
+        // Uses the SAME helper production federation uses, so this harness
+        // cannot drift into signing something the real path does not.
+        let sub_scope = Scope::Federation {
+            block_kinds: vec![],
+        };
         let sub_env = Envelope::new(Frame::Subscribe {
-            scope: Scope::Federation {
-                block_kinds: vec![],
-            },
+            auth: Some(jig_server::v0_0_2_federation::sign_federation_subscribe(
+                &state, &sub_scope,
+            )),
+            scope: sub_scope,
         });
         if sink
             .send(Message::Text(

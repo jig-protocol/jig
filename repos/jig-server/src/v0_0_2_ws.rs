@@ -240,6 +240,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, conn_id: u64
     // Per-connection channel: fanout delivers (StoredBlock, StoredReceipt) here.
     let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
     let mut sub_id: Option<u64> = None;
+    // The identity this connection PROVED, set by a verified Subscribe. Phase 3
+    // re-checks authorization at delivery and needs it long after the Subscribe
+    // frame is gone, which is why it lives here rather than per frame.
+    let mut conn_did: Option<jig_core::did::Did> = None;
 
     loop {
         tokio::select! {
@@ -252,7 +256,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, conn_id: u64
                 match msg {
                     Message::Text(text) => {
                         if let Err(e) = handle_client_frame(
-                            &text, &state, &sub_tx, &mut sub_id, conn_id, &mut socket,
+                            &text, &state, &sub_tx, &mut sub_id, &mut conn_did, conn_id,
+                            &mut socket,
                         )
                         .await
                         {
@@ -320,6 +325,7 @@ async fn handle_client_frame(
         jig_pipeline::persist::StoredReceipt,
     )>,
     sub_id: &mut Option<u64>,
+    conn_did: &mut Option<jig_core::did::Did>,
     conn_id: u64,
     socket: &mut WebSocket,
 ) -> Result<(), String> {
@@ -344,7 +350,49 @@ async fn handle_client_frame(
 
     match env.frame {
         // ------------------------------------------------------------------ Subscribe
-        Frame::Subscribe { scope } => {
+        Frame::Subscribe { scope, auth } => {
+            // Gate 1 on the WSS path. The scope's canonical string is what was
+            // signed, so a proof for one channel cannot subscribe to another.
+            if state.config.auth.require_authenticated_reads {
+                let scope_str = scope.canonical_string();
+
+                let outcome = match auth {
+                    None => Some(crate::auth::GateOutcome::AuthMissing),
+                    Some(a) => {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let mut guard = state
+                            .auth
+                            .replay_guard
+                            .lock()
+                            .expect("replay guard mutex poisoned");
+                        match crate::auth::authenticate::authenticate_subscribe(
+                            &a, &scope_str, now_ms, &mut guard,
+                        ) {
+                            // Bind the VERIFIED did, never `a.did` as received.
+                            Ok(did) => {
+                                *conn_did = Some(did);
+                                None
+                            }
+                            Err(o) => Some(o),
+                        }
+                    }
+                };
+
+                if let Some(outcome) = outcome {
+                    tracing::info!(
+                        conn_id,
+                        audit = %crate::auth::audit_line(&outcome),
+                        "ws subscribe refused"
+                    );
+                    let (status, code, message) = state.auth.disclosure.disclose(&outcome);
+                    let _ = send_error(socket, Some(status), code, None, &message).await;
+                    return Ok(());
+                }
+            }
+
             let sub_scope = match scope {
                 Scope::Channel { slug } => SubscriptionScope::Channel(slug),
                 Scope::Federation { block_kinds } => SubscriptionScope::Federation { block_kinds },
@@ -638,6 +686,43 @@ mod tests {
         (state, url)
     }
 
+    /// Build a signed `Frame::Subscribe`, as a real client does.
+    ///
+    /// Subscriptions require a proof of possession; a raw frame is refused.
+    /// Tests about DELIVERY still need a valid one, so the ceremony lives here
+    /// rather than in each test.
+    fn signed_subscribe_frame(identity: &jig_client::Identity, scope: Scope) -> Envelope {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+
+        let hlc_wall_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let nonce = format!("t-{hlc_wall_ms}-{}", SEQ.fetch_add(1, Ordering::Relaxed));
+
+        let hash = jig_core::request_auth::canonical_request_hash(
+            "SUBSCRIBE",
+            &scope.canonical_string(),
+            b"",
+            hlc_wall_ms,
+            0,
+            &nonce,
+        );
+
+        Envelope::new(Frame::Subscribe {
+            auth: Some(jig_pipeline::envelope::SubscribeAuth {
+                did: identity.did_string(),
+                hlc_wall_ms,
+                hlc_logical: 0,
+                nonce,
+                sig_b64: base64::engine::general_purpose::STANDARD
+                    .encode(identity.sign(hash.as_bytes()).to_bytes()),
+            }),
+            scope,
+        })
+    }
+
     fn test_identity() -> jig_client::Identity {
         let dir = tempdir().unwrap();
         let path = dir.keep();
@@ -802,6 +887,129 @@ mod tests {
 
     // --- subscribe + submit → Block delivered to subscriber -----------------
 
+    /// Read one frame, or fail loudly rather than hanging.
+    async fn next_frame(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Envelope {
+        let msg = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .expect("timeout waiting for reply")
+            .expect("stream closed")
+            .expect("ws error");
+        let TMessage::Text(text) = msg else {
+            panic!("expected text, got {msg:?}");
+        };
+        serde_json::from_str(&text).expect("frame parses")
+    }
+
+    /// An unsigned subscribe must be refused. Before this, `Frame::Subscribe`
+    /// registered any scope for any connection with no identity involved.
+    #[tokio::test]
+    async fn ws_unsigned_subscribe_is_refused() {
+        let (_state, url) = start_test_server().await;
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+
+        let sub = Envelope::new(Frame::Subscribe {
+            scope: Scope::Federation {
+                block_kinds: vec![],
+            },
+            auth: None,
+        });
+        ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
+            .await
+            .unwrap();
+
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { status, code, .. } => {
+                assert_eq!(code, "AUTH_REQUIRED");
+                assert_eq!(status, Some(401));
+            }
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+    }
+
+    /// THE test this task exists for: a client may not subscribe as someone
+    /// else. The signature here is valid — it verifies against the ATTACKER's
+    /// key — but the frame claims the victim's DID.
+    ///
+    /// If the server bound the claimed DID rather than the verified one, this
+    /// would succeed and phase 3 would then authorize deliveries against an
+    /// identity the caller never proved.
+    #[tokio::test]
+    async fn ws_subscribe_claiming_another_did_is_refused() {
+        let (_state, url) = start_test_server().await;
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+
+        let attacker = test_identity();
+        let victim = test_identity();
+
+        let scope = Scope::Federation {
+            block_kinds: vec![],
+        };
+        let mut frame = signed_subscribe_frame(&attacker, scope);
+        if let Frame::Subscribe { auth: Some(a), .. } = &mut frame.frame {
+            a.did = victim.did_string();
+        } else {
+            panic!("expected a signed subscribe");
+        }
+
+        ws.send(TMessage::Text(
+            serde_json::to_string(&frame).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { status, code, .. } => {
+                assert_eq!(
+                    code, "INVALID_SIG",
+                    "a forged subscriber DID must be refused"
+                );
+                assert_eq!(status, Some(401));
+            }
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+    }
+
+    /// A captured Subscribe frame must not be reusable, exactly as for REST.
+    #[tokio::test]
+    async fn ws_replayed_subscribe_is_refused() {
+        let (_state, url) = start_test_server().await;
+        let subscriber = test_identity();
+        let frame = signed_subscribe_frame(
+            &subscriber,
+            Scope::Federation {
+                block_kinds: vec![],
+            },
+        );
+        let text = serde_json::to_string(&frame).unwrap();
+
+        // First use succeeds silently (a successful subscribe emits no frame),
+        // so prove it took by sending a second and expecting REPLAYED.
+        let (mut first, _) = connect_async(&url).await.unwrap();
+        first
+            .send(TMessage::Text(text.clone().into()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (mut second, _) = connect_async(&url).await.unwrap();
+        second.send(TMessage::Text(text.into())).await.unwrap();
+
+        match next_frame(&mut second).await.frame {
+            Frame::Error { status, code, .. } => {
+                assert_eq!(
+                    code, "REPLAYED",
+                    "the same signed frame must not work twice"
+                );
+                assert_eq!(status, Some(401));
+            }
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn ws_subscribe_then_submit_delivers_block_to_subscriber() {
         // Single client subscribes federation-scope (matches all blocks), then
@@ -818,12 +1026,15 @@ mod tests {
         seed_channel(&state, "#hello");
         let (mut ws, _) = connect_async(&url).await.unwrap();
 
-        // 1. Subscribe federation-scope (no kind filter = all kinds).
-        let sub = Envelope::new(Frame::Subscribe {
-            scope: Scope::Federation {
+        // 1. Subscribe federation-scope (no kind filter = all kinds), signed —
+        //    the server refuses an unsigned subscribe.
+        let subscriber = test_identity();
+        let sub = signed_subscribe_frame(
+            &subscriber,
+            Scope::Federation {
                 block_kinds: vec![],
             },
-        });
+        );
         ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
             .await
             .unwrap();

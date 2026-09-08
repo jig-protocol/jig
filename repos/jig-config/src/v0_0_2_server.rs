@@ -40,6 +40,8 @@ pub struct JigServerConfig {
     pub bridges: BridgesSection,
     #[serde(default)]
     pub nameserver: NameserverSection,
+    #[serde(default)]
+    pub auth: AuthSection,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -103,6 +105,51 @@ impl Default for IdentitySection {
             trusted_nameservers: vec![],
             cache_ttl_seconds: 300,
             naively_allow_unknown_handles_fallback: false,
+        }
+    }
+}
+
+/// Authentication policy for this server.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+// Container-level default, matching `ServerSection` and `IdentitySection`: a
+// partially-written `[auth]` block must keep the documented defaults for keys
+// the operator omitted. Per-field `#[serde(default)]` would give
+// `require_authenticated_reads` the *type* default of `false` — silently
+// turning authentication off for anyone who set only the window. Verified: with
+// per-field defaults, `a_partial_auth_section_keeps_the_safe_default` fails.
+#[serde(default)]
+pub struct AuthSection {
+    /// Require a valid proof of possession on read requests.
+    ///
+    /// Defaults to **true**. A server that boots without an `[auth]` block must
+    /// be safe on a public address, because the `curl | sh` install flow puts it
+    /// on one. Setting this false restores the pre-authentication behaviour
+    /// where any caller reads any channel, and exists only to migrate an
+    /// existing deployment.
+    pub require_authenticated_reads: bool,
+
+    /// Half-width of the request acceptance window, in milliseconds. A request
+    /// is fresh if its timestamp is within this of the server's clock in either
+    /// direction. Wider tolerates more clock skew and costs proportionally more
+    /// memory.
+    pub replay_window_ms: u64,
+
+    /// Hard cap on retained nonces.
+    ///
+    /// Size this above the expected `rate x window` product. The guard refuses
+    /// new requests rather than evicting a nonce that is still inside the
+    /// window — evicting one would turn a replay into a cache miss, and a miss
+    /// is an accept. So an undersized cap degrades to refusing legitimate
+    /// traffic, which is the safe direction but still a denial of service.
+    pub replay_capacity: usize,
+}
+
+impl Default for AuthSection {
+    fn default() -> Self {
+        Self {
+            require_authenticated_reads: true,
+            replay_window_ms: 30_000,
+            replay_capacity: 100_000,
         }
     }
 }
@@ -319,6 +366,56 @@ impl JigServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default must be the safe one. A server booting without an `[auth]`
+    /// block should require authentication, not skip it — the whole point of
+    /// this work is that a fresh install is safe on a public address.
+    #[test]
+    fn auth_defaults_to_requiring_authentication() {
+        let auth = AuthSection::default();
+        assert!(
+            auth.require_authenticated_reads,
+            "a default server must require authenticated reads"
+        );
+        assert_eq!(auth.replay_window_ms, 30_000);
+        assert_eq!(auth.replay_capacity, 100_000);
+    }
+
+    /// A config file with NO `[auth]` section at all must still authenticate.
+    /// This is the case a real fresh install hits.
+    #[test]
+    fn a_config_without_an_auth_section_still_requires_authentication() {
+        let cfg: JigServerConfig =
+            toml::from_str("[server]\nlisten = \"127.0.0.1:7117\"\n").expect("parses");
+        assert!(
+            cfg.auth.require_authenticated_reads,
+            "an absent [auth] section must not disable authentication"
+        );
+    }
+
+    /// A PARTIAL `[auth]` section must keep the safe default for keys the
+    /// operator did not mention. Setting only the window must not silently
+    /// switch authentication off — which is exactly what per-field
+    /// `#[serde(default)]` would do, since the bool's type default is false.
+    #[test]
+    fn a_partial_auth_section_keeps_the_safe_default() {
+        let cfg: JigServerConfig =
+            toml::from_str("[auth]\nreplay_window_ms = 5000\n").expect("parses");
+        assert!(
+            cfg.auth.require_authenticated_reads,
+            "omitting require_authenticated_reads must leave it true"
+        );
+        assert_eq!(cfg.auth.replay_window_ms, 5_000);
+        assert_eq!(cfg.auth.replay_capacity, 100_000);
+    }
+
+    /// The escape hatch works when asked for explicitly, and only then.
+    #[test]
+    fn authentication_can_be_disabled_explicitly() {
+        let cfg: JigServerConfig =
+            toml::from_str("[auth]\nrequire_authenticated_reads = false\n").expect("parses");
+        assert!(!cfg.auth.require_authenticated_reads);
+    }
 
     #[test]
     fn default_config_round_trips_through_toml() {

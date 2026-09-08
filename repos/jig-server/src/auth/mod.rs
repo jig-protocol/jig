@@ -13,8 +13,14 @@
 //! Phase 1 establishes only the outcome and disclosure types. The gates
 //! themselves arrive in phases 2 and 3.
 
+pub mod authenticate;
 pub mod disclosure;
 pub mod outcome;
+pub mod replay;
+pub mod state;
 
+pub use authenticate::{AuthProof, authenticate};
 pub use disclosure::{DisclosurePolicy, audit_line};
 pub use outcome::{Gate, GateOutcome};
+pub use replay::{ReplayGuard, ReplayRejection};
+pub use state::AuthState;
