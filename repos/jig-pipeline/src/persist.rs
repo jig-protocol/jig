@@ -624,6 +624,35 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Whether `member_did` is a member of the channel with this slug.
+    ///
+    /// Resolves the slug to the channel's **id (its CID)** first, because
+    /// memberships are keyed by CID and not by slug. Passing a slug straight to
+    /// the memberships table compiles, matches nothing, and silently denies
+    /// every real member — see the CID-keying regression at `ingest.rs:1076`.
+    ///
+    /// An archived or unknown channel yields `false`: `get_channel_by_slug`
+    /// excludes archived rows, so nobody is a member of a channel that is no
+    /// longer live. Failing closed is the right direction for an authorization
+    /// input.
+    pub fn is_member(&self, slug: &str, member_did: &str) -> Result<bool> {
+        // `get_channel_by_slug` takes and releases the lock before returning, so
+        // acquiring it below is safe. Do NOT inline its body here while holding
+        // the guard: `Mutex` is not reentrant and it would deadlock.
+        let Some(channel) = self.get_channel_by_slug(slug)? else {
+            return Ok(false);
+        };
+        let conn = self.conn.lock().expect("poisoned");
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM memberships WHERE channel_id = ? AND member_did = ? LIMIT 1",
+                [channel.id.as_str(), member_did],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     pub fn list_members(&self, channel_id: &str) -> Result<Vec<StoredMembership>> {
         let conn = self.conn.lock().expect("poisoned");
         let mut stmt = conn.prepare(
@@ -1098,6 +1127,82 @@ mod tests {
         store.upsert_channel(&ch).unwrap();
         let fetched = store.get_channel_by_slug("#hello").unwrap().unwrap();
         assert_eq!(fetched, ch);
+    }
+
+    fn sample_membership(channel_id: &str, member_did: &str) -> StoredMembership {
+        StoredMembership {
+            channel_id: channel_id.to_string(),
+            member_did: member_did.to_string(),
+            role: "member".to_string(),
+            joined_at: 0,
+            source_block_cid: "bafyseed".to_string(),
+        }
+    }
+
+    #[test]
+    fn is_member_finds_a_member_and_refuses_a_stranger() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_channel(&sample_channel("bafychannelcid", "#private"))
+            .unwrap();
+        store
+            .upsert_membership(&sample_membership("bafychannelcid", "did:jig:zMember"))
+            .unwrap();
+
+        assert!(store.is_member("#private", "did:jig:zMember").unwrap());
+        assert!(!store.is_member("#private", "did:jig:zStranger").unwrap());
+    }
+
+    /// The regression this method exists to prevent: memberships are keyed by
+    /// the channel's CID, not its slug. A lookup that forwards the slug straight
+    /// to the memberships table compiles, matches nothing, and denies every
+    /// legitimate member — a silent wrong answer, the worst kind.
+    #[test]
+    fn is_member_resolves_slug_to_channel_id_first() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        // The id and the slug are deliberately unequal, so a lookup that used
+        // the slug would find nothing.
+        store
+            .upsert_channel(&sample_channel("bafyrealcid", "#private"))
+            .unwrap();
+        store
+            .upsert_membership(&sample_membership("bafyrealcid", "did:jig:zMember"))
+            .unwrap();
+
+        assert!(
+            store.is_member("#private", "did:jig:zMember").unwrap(),
+            "is_member must resolve the slug to the channel id before querying \
+             memberships — see the CID-keying regression at ingest.rs:1076"
+        );
+    }
+
+    #[test]
+    fn is_member_is_false_for_an_unknown_channel() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(!store.is_member("#nope", "did:jig:zAnyone").unwrap());
+    }
+
+    /// An archived channel has no members. `get_channel_by_slug` excludes
+    /// archived rows, and failing closed is right for an authorization input.
+    #[test]
+    fn is_member_is_false_once_the_channel_is_archived() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_channel(&sample_channel("bafycid", "#doomed"))
+            .unwrap();
+        store
+            .upsert_membership(&sample_membership("bafycid", "did:jig:zMember"))
+            .unwrap();
+        assert!(
+            store.is_member("#doomed", "did:jig:zMember").unwrap(),
+            "precondition: membership holds while the channel is live"
+        );
+
+        store.archive_channel("#doomed", 1).unwrap();
+        assert!(
+            !store.is_member("#doomed", "did:jig:zMember").unwrap(),
+            "an archived channel must have no members"
+        );
     }
 
     fn sample_channel(id: &str, slug: &str) -> StoredChannel {
