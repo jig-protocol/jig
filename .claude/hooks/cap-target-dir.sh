@@ -29,9 +29,13 @@ fi
 dry=""
 [ -n "${JIG_TARGET_CAP_DRY_RUN:-}" ] && dry="--dry-run"
 out=$(cargo sweep --maxsize "$CAP" $dry "$ROOT/repos" 2>&1) || exit 0
-cleaned=$(printf '%s\n' "$out" | sed -n 's/.*\(Cleaned\|Would clean:\) \([0-9.]* [KMG]iB\).*/\2/p' | tail -1)
+# Two expressions, not `\|` alternation: BSD sed has none.
+cleaned=$(printf '%s\n' "$out" \
+  | sed -n -e 's/.*Cleaned \([0-9.]* [KMG]iB\).*/\1/p' -e 's/.*Would clean: \([0-9.]* [KMG]iB\).*/\1/p' \
+  | tail -1)
 case "$cleaned" in
   ""|"0 B"|"0.00 B") ;;
-  *) printf '{"systemMessage": "cap-target-dir: swept %s from repos/target (cap %s, %s GB free)"}\n' "$cleaned" "$CAP" "$free_gb" ;;
+  *) printf '{"systemMessage": "cap-target-dir: %s %s from repos/target (cap %s, %s GB free)"}\n' \
+       "$([ -n "$dry" ] && echo 'would sweep' || echo 'swept')" "$cleaned" "$CAP" "$free_gb" ;;
 esac
 exit 0

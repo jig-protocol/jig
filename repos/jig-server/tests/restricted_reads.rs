@@ -655,3 +655,19 @@ async fn archiving_a_restricted_channel_does_not_open_its_history() {
         "a former member after archive"
     );
 }
+
+/// Nothing new goes into an archived channel — not even from its owner, and
+/// with a code that says why rather than "create it".
+#[tokio::test]
+async fn an_archived_channel_accepts_no_new_blocks() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    server.create_channel(&owner, "#retired", "open").await;
+    server.archive_channel(&owner, "#retired").await;
+
+    let (status, body) = server
+        .try_submit(&text(&owner, "#retired", "one more"))
+        .await;
+    assert_eq!(status, StatusCode::GONE, "body={body}");
+    assert_eq!(body["code"], "CHANNEL_ARCHIVED");
+}

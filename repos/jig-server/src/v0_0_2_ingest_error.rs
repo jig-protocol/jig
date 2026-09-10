@@ -66,6 +66,11 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         IngestError::DuplicateBlock { .. } => {
             (StatusCode::CONFLICT, "DUPLICATE_BLOCK", e.to_string())
         }
+        // 410, not 404: the channel existed and was deliberately retired, and
+        // "create it" would be the wrong advice.
+        IngestError::ChannelArchived { .. } => {
+            (StatusCode::GONE, "CHANNEL_ARCHIVED", e.to_string())
+        }
         IngestError::NotChannelOwner { .. } => {
             (StatusCode::FORBIDDEN, "NOT_CHANNEL_OWNER", e.to_string())
         }
@@ -131,6 +136,9 @@ mod tests {
             },
             IngestError::DuplicateBlock {
                 cid: "bafy_twice".to_string(),
+            },
+            IngestError::ChannelArchived {
+                slug: "#retired".to_string(),
             },
         ]
     }

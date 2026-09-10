@@ -110,6 +110,10 @@ pub enum IngestError {
         slug: String,
         sender: String,
     },
+    /// The named channel was archived: retired, its history kept, nothing new
+    /// accepted into it — by any kind, from any source.
+    #[error("channel '{slug}' is archived and accepts no new blocks")]
+    ChannelArchived { slug: String },
     /// This exact block (by CID) was already ingested. Refused before any
     /// effect runs: an accepted control-plane block is otherwise a standing
     /// authorization anyone holding its bytes can replay — re-enrolling a
@@ -217,6 +221,23 @@ pub async fn ingest(
         Some(slug) => ctx.store.get_channel_by_slug(slug)?,
         None => None,
     };
+    // A live row is what writes need. No live row but an archived one means
+    // the channel was retired: nothing goes into it, from any source, of any
+    // kind — otherwise a kind the write gate does not know would resolve to
+    // "no channel", pass the gate, and land in the archived timeline the read
+    // gate still guards.
+    if let Some(slug) = channel_slug
+        && resolved_channel.is_none()
+        && kind != BlockKind::ChannelCreate
+        && ctx
+            .store
+            .get_channel_by_slug_including_archived(slug)?
+            .is_some()
+    {
+        return Err(IngestError::ChannelArchived {
+            slug: slug.to_string(),
+        });
+    }
     if let Some(slug) = channel_slug
         && resolved_channel.is_none()
         && requires_existing_channel(kind, &source)
@@ -1090,6 +1111,39 @@ mod tests {
             .expect("member-add by the owner against an existing channel must succeed");
         let members = ctx.store.list_members(&channel_id).unwrap();
         assert!(members.iter().any(|m| m.member_did == "did:jig:zDeji"));
+    }
+
+    /// An archived channel takes nothing new, whatever the kind. Without this
+    /// a kind the write gate has no rule for resolved to "no channel" and
+    /// landed in the archived — still restricted — timeline.
+    #[tokio::test]
+    async fn nothing_can_be_posted_into_an_archived_channel() {
+        let ctx = test_ctx_allowing(&["member-add", "fed-hello"]);
+        let owner_key = random_signing_key();
+        seed_channel_owned_by(&ctx, "#retired", &did_of(&owner_key));
+        assert!(ctx.store.archive_channel("#retired", 1).unwrap());
+
+        for (key, kind, meta) in [
+            (
+                &owner_key,
+                BlockKind::MemberAdd,
+                vec![("channel", "#retired"), ("member_did", "did:jig:zX")],
+            ),
+            (
+                &random_signing_key(),
+                BlockKind::FedHello,
+                vec![("channel", "#retired"), ("server_url", "ws://x")],
+            ),
+        ] {
+            let (mb, cb, sig) = build_bundle_parts_with_meta(key, kind, &meta);
+            let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+                .await
+                .expect_err("an archived channel must refuse");
+            assert!(
+                matches!(err, IngestError::ChannelArchived { .. }),
+                "{kind:?}: expected ChannelArchived, got {err:?}"
+            );
+        }
     }
 
     /// Replaying an accepted member-add must not re-enrol a member who has

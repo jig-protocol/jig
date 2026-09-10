@@ -304,6 +304,10 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         ref e @ IngestError::DuplicateBlock { .. } => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },
+        // The channel is gone for good; the bridge should bounce.
+        ref e @ IngestError::ChannelArchived { .. } => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
         // Unavailable, not PolicyBlocked: the block is fine and execution failed
         // on this host, so a retry may well succeed.
         IngestError::RenderFailed { .. } => SubmitDenied::Unavailable,
