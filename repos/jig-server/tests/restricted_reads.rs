@@ -314,3 +314,80 @@ async fn the_escape_hatch_lists_every_channel() {
     assert_eq!(status, StatusCode::OK, "body={body}");
     assert!(listed_slugs(&body).contains(&"#private".to_string()));
 }
+
+// ---- Posting ---------------------------------------------------------------------
+//
+// "Membership-gated" cuts both ways. A restricted channel whose members can be
+// messaged by anyone with a keypair is not a private club, it is a private
+// club with an open letterbox.
+
+use jig_client::blocks::build_text_render;
+
+fn text(who: &Identity, slug: &str, body: &str) -> jig_client::blocks::BuiltBlock {
+    let me = who.as_client();
+    build_text_render(&me, slug, body, HlcTimestamp::now_wall(me.did().clone()))
+}
+
+#[tokio::test]
+async fn a_stranger_cannot_post_to_a_restricted_channel() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let stranger = Identity::new(2);
+    server
+        .create_channel(&owner, "#private", "restricted")
+        .await;
+
+    // The timeline already holds the channel-create block; what matters is
+    // that the refused post adds nothing to it.
+    let timeline_len = |body: &serde_json::Value| body.as_array().map_or(0, Vec::len);
+    let (_, before) = server
+        .send(&server.sign_get(&owner, &history_path("#private")))
+        .await;
+
+    let (status, body) = server
+        .try_submit(&text(&stranger, "#private", "psst"))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
+    assert_eq!(body["code"], "NOT_A_MEMBER");
+
+    let (status, after) = server
+        .send(&server.sign_get(&owner, &history_path("#private")))
+        .await;
+    assert_eq!(status, StatusCode::OK, "body={after}");
+    assert_eq!(
+        timeline_len(&after),
+        timeline_len(&before),
+        "a refused block must not persist"
+    );
+}
+
+#[tokio::test]
+async fn members_and_the_owner_can_post_to_a_restricted_channel() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let member = Identity::new(2);
+    server
+        .create_channel(&owner, "#private", "restricted")
+        .await;
+    server.add_member(&owner, "#private", &member).await;
+
+    let (status, body) = server
+        .try_submit(&text(&owner, "#private", "welcome"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "owner: body={body}");
+    let (status, body) = server
+        .try_submit(&text(&member, "#private", "thanks"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "member: body={body}");
+}
+
+#[tokio::test]
+async fn anyone_can_post_to_an_open_channel() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let stranger = Identity::new(2);
+    server.create_channel(&owner, "#open", "open").await;
+
+    let (status, body) = server.try_submit(&text(&stranger, "#open", "hello")).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+}

@@ -110,6 +110,14 @@ pub enum IngestError {
         slug: String,
         sender: String,
     },
+    /// Content for a restricted channel from someone who is neither a member
+    /// nor its owner. See [`crate::authorize_write`].
+    #[error("`{kind}` on `{slug}` refused: `{sender}` is not a member of the channel")]
+    NotChannelMember {
+        kind: String,
+        slug: String,
+        sender: String,
+    },
     #[error(transparent)]
     Identity(#[from] crate::identity::IdentityError),
     #[error(transparent)]
@@ -209,20 +217,43 @@ pub async fn ingest(
         });
     }
 
-    // Step 3c: write authorization for control-plane kinds.
+    // Step 3c: write authorization — may this sender post to, or change,
+    // this channel?
     //
     // Here rather than in `apply_effect` so a refusal is a typed error every
     // surface classifies the same way, instead of an `anyhow` 500. Runs before
     // the receipt is built: a block this server will not apply must not carry
-    // this server's signature.
-    if let Err(refusal) =
-        crate::authorize_write::authorize_control_block(kind, &manifest, resolved_channel.as_ref())
-    {
-        let crate::authorize_write::WriteRefusal::NotChannelOwner { slug, sender } = refusal;
-        return Err(IngestError::NotChannelOwner {
-            kind: kind_str.to_string(),
-            slug,
-            sender,
+    // this server's signature. The membership query runs only when the
+    // decision can turn on it (content into a restricted channel).
+    let sender_is_member =
+        if crate::authorize_write::needs_membership(kind, resolved_channel.as_ref()) {
+            let sender = manifest
+                .authors
+                .first()
+                .map(|a| a.did.to_string())
+                .unwrap_or_default();
+            match channel_slug {
+                Some(slug) => ctx.store.is_member(slug, &sender)?,
+                None => false,
+            }
+        } else {
+            false
+        };
+    if let Err(refusal) = crate::authorize_write::authorize_block(
+        kind,
+        &manifest,
+        resolved_channel.as_ref(),
+        sender_is_member,
+    ) {
+        use crate::authorize_write::WriteRefusal;
+        let kind = kind_str.to_string();
+        return Err(match refusal {
+            WriteRefusal::NotChannelOwner { slug, sender } => {
+                IngestError::NotChannelOwner { kind, slug, sender }
+            }
+            WriteRefusal::NotChannelMember { slug, sender } => {
+                IngestError::NotChannelMember { kind, slug, sender }
+            }
         });
     }
 

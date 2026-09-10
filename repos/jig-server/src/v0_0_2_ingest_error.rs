@@ -66,6 +66,11 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         IngestError::NotChannelOwner { .. } => {
             (StatusCode::FORBIDDEN, "NOT_CHANNEL_OWNER", e.to_string())
         }
+        // Same code the read gate emits, so "not a member here" is one word
+        // whether the caller was reading or posting.
+        IngestError::NotChannelMember { .. } => {
+            (StatusCode::FORBIDDEN, "NOT_A_MEMBER", e.to_string())
+        }
         IngestError::Identity(ide) => (StatusCode::UNAUTHORIZED, "IDENTITY_ERROR", ide.to_string()),
         IngestError::Persist(pe) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -113,6 +118,11 @@ mod tests {
             },
             IngestError::NotChannelOwner {
                 kind: "member-add".to_string(),
+                slug: "#room".to_string(),
+                sender: "did:jig:zStranger".to_string(),
+            },
+            IngestError::NotChannelMember {
+                kind: "text-render".to_string(),
                 slug: "#room".to_string(),
                 sender: "did:jig:zStranger".to_string(),
             },
