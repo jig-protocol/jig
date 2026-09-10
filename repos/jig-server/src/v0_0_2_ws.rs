@@ -328,11 +328,13 @@ enum SubscribeRefusal {
 /// Gate 3 for a channel subscription: the same `authorize_read` decision the
 /// REST timeline runs, over the same store facts.
 ///
-/// `Ok` for a slug with no local row — see the call site for why.
+/// `Ok` for a slug with no row at all — see the call site for why. An
+/// archived channel still has a row and is still gated by it; the
+/// live-channel lookup would read it as absent and let anyone in.
 fn authorize_subscribe(state: &AppState, slug: &str, did: &str) -> Result<(), SubscribeRefusal> {
     let store = &state.ingest_ctx.store;
     let channel = store
-        .get_channel_by_slug(slug)
+        .get_channel_by_slug_including_archived(slug)
         .map_err(|e| SubscribeRefusal::Store(e.to_string()))?;
     let Some(channel) = channel else {
         return Ok(());
@@ -654,7 +656,10 @@ fn channel_slug_peek(manifest_bytes: &[u8]) -> Option<String> {
 fn channel_label(state: &AppState, manifest_bytes: &[u8]) -> Option<String> {
     let slug = channel_slug_peek(manifest_bytes)?;
     let open = matches!(
-        state.ingest_ctx.store.get_channel_by_slug(&slug),
+        state
+            .ingest_ctx
+            .store
+            .get_channel_by_slug_including_archived(&slug),
         Ok(Some(row)) if jig_pipeline::visibility::is_open(&row.visibility)
     );
     Some(if open {

@@ -597,3 +597,61 @@ async fn replaying_an_accepted_member_add_does_not_undo_a_revocation() {
         "the revocation must hold: {body}"
     );
 }
+
+// ---- Archived channels ----------------------------------------------------------
+//
+// Found in review: "no local row → allow" (there for federated channels)
+// read an ARCHIVED restricted channel as absent, because the live-channel
+// lookup filters archived rows out. Archiving is a soft delete that keeps
+// every block, so the row — and its visibility and owner — must keep
+// governing reads.
+
+#[tokio::test]
+async fn archiving_a_restricted_channel_does_not_open_its_history() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let member = Identity::new(2);
+    let stranger = Identity::new(3);
+    server
+        .create_channel(&owner, "#private", "restricted")
+        .await;
+    server.add_member(&owner, "#private", &member).await;
+    let cid = post_and_get_cid(&server, &owner, "#private").await;
+
+    server.archive_channel(&owner, "#private").await;
+
+    let (status, body) = server
+        .send(&server.sign_get(&stranger, &history_path("#private")))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "history after archive: {body}"
+    );
+    assert_eq!(body["code"], "NOT_A_MEMBER");
+
+    let (status, body) = server
+        .send(&server.sign_get(&stranger, &format!("/api/v1/blocks/{cid}")))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "fetch-by-CID after archive: {body}"
+    );
+
+    // The owner keeps their history; an archived channel has no members, so
+    // the member does not — retired means retired, and the owner is who
+    // "every block survives" is for.
+    let (status, body) = server
+        .send(&server.sign_get(&owner, &history_path("#private")))
+        .await;
+    assert_eq!(status, StatusCode::OK, "owner after archive: {body}");
+    let (status, _) = server
+        .send(&server.sign_get(&member, &history_path("#private")))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a former member after archive"
+    );
+}

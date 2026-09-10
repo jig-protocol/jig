@@ -826,7 +826,11 @@ async fn handle_inbound_test_frame(
     // so we don't relay back to peers. Mirrors the server relay: a local
     // channel row becomes the delivery policy; no row means scope alone.
     let policy = match stored_block.channel_id.as_deref() {
-        Some(slug) => match state.ingest_ctx.store.get_channel_by_slug(slug) {
+        Some(slug) => match state
+            .ingest_ctx
+            .store
+            .get_channel_by_slug_including_archived(slug)
+        {
             Ok(Some(chan)) => {
                 let member_dids = state
                     .ingest_ctx

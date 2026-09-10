@@ -16,7 +16,9 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
-use jig_client::blocks::{BuiltBlock, build_channel_create, build_member_add, build_text_render};
+use jig_client::blocks::{
+    BuiltBlock, build_channel_archive, build_channel_create, build_member_add, build_text_render,
+};
 use jig_config::v0_0_2_server::JigServerConfig;
 use jig_core::HlcTimestamp;
 use jig_core::did::Did;
@@ -174,6 +176,17 @@ impl TestServer {
         );
         let (status, body) = self.post_admin("/_admin_v0_0_2/channels", &block).await;
         assert_eq!(status, StatusCode::OK, "channel-create failed: {body}");
+    }
+
+    /// Archive `slug` as `owner` through the real admin endpoint — the
+    /// v0.0.2 channel delete, a soft delete that keeps every block.
+    pub async fn archive_channel(&self, owner: &Identity, slug: &str) {
+        let owner = owner.as_client();
+        let block =
+            build_channel_archive(&owner, slug, HlcTimestamp::now_wall(owner.did().clone()));
+        let path = format!("/_admin_v0_0_2/channels/{}/archive", encode_slug(slug));
+        let (status, body) = self.post_admin(&path, &block).await;
+        assert_eq!(status, StatusCode::OK, "channel-archive failed: {body}");
     }
 
     /// Add `member` to `slug`, the block signed by `by`. Asserts success; use

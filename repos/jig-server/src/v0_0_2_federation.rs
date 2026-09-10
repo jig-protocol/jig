@@ -398,7 +398,11 @@ async fn ingest_peer_block(
     // federation has always worked — but a store ERROR yields a policy naming
     // nobody, so a failing database narrows delivery rather than widening it.
     let policy = match stored_block.channel_id.as_deref() {
-        Some(slug) => match state.ingest_ctx.store.get_channel_by_slug(slug) {
+        Some(slug) => match state
+            .ingest_ctx
+            .store
+            .get_channel_by_slug_including_archived(slug)
+        {
             Ok(Some(chan)) => {
                 let member_dids = state
                     .ingest_ctx

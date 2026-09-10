@@ -217,3 +217,45 @@ async fn a_refused_post_over_wss_carries_the_rest_status_and_code() {
         other => panic!("expected an error frame, got {other:?}"),
     }
 }
+
+/// Archiving is a control-plane block that lands in the channel's own
+/// timeline. It must be delivered under the channel's policy — the archived
+/// row still says who may read — not fanned out to everyone because the
+/// live-channel lookup no longer finds a row.
+#[tokio::test]
+async fn the_archive_block_of_a_restricted_channel_reaches_only_its_readers() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let stranger = Identity::new(2);
+
+    let url = server.serve_ws().await;
+    let mut early = WsClient::connect(&url).await;
+    assert!(early.subscribe(&stranger, "#private").await.is_none());
+
+    server
+        .create_channel(&owner, "#private", "restricted")
+        .await;
+    let mut witness = WsClient::connect(&url).await;
+    assert!(witness.subscribe(&owner, "#private").await.is_none());
+
+    server.archive_channel(&owner, "#private").await;
+    assert!(
+        witness.next_block().await.is_some(),
+        "the owner sees their own archive block"
+    );
+    assert!(
+        early.no_block().await,
+        "a stranger must not learn of the channel from its archive block"
+    );
+
+    // And a fresh subscribe to the archived restricted channel is refused,
+    // exactly as it was while the channel was live.
+    let mut late = WsClient::connect(&url).await;
+    match late.subscribe(&stranger, "#private").await {
+        Some(Frame::Error { status, code, .. }) => {
+            assert_eq!(status, Some(403));
+            assert_eq!(code, "NOT_A_MEMBER");
+        }
+        other => panic!("expected a 403 error frame, got {other:?}"),
+    }
+}

@@ -376,7 +376,11 @@ pub async fn ingest(
     if (resolved_channel.is_none() || effect_may_have_changed_the_row)
         && let Some(slug) = stored_block.channel_id.as_deref()
     {
-        match ctx.store.get_channel_by_slug(slug) {
+        // Archived rows included: a channel-archive has just set
+        // `archived_at`, and its own block must still be delivered under the
+        // channel's policy rather than to everyone because the live lookup
+        // stopped finding it.
+        match ctx.store.get_channel_by_slug_including_archived(slug) {
             Ok(row) => resolved_channel = row,
             Err(e) => {
                 tracing::warn!(slug, error = %e, "channel lookup failed at fanout; denying");

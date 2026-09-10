@@ -383,9 +383,18 @@ fn authenticate_read(
 /// between federated servers, so a channel that lives on a peer routinely has
 /// blocks here and no row: refusing would break backfill for every federated
 /// conversation. Live WSS delivery makes the same call for the same reason,
-/// and a row that appears later is enforced from then on. The cost is that
-/// under a concealing disclosure policy an absent channel (empty 200) is
-/// distinguishable from a restricted one (404) — a known limitation.
+/// and a row that appears later is enforced from then on. Two costs, both
+/// deliberate: relayed blocks of a peer's channel are readable here by any
+/// authenticated caller (federation is trust-on-peer until its own gate
+/// lands), and under a concealing disclosure policy an absent channel (empty
+/// 200) is distinguishable from a restricted one (404).
+///
+/// "No local row" means no row at all. An ARCHIVED channel still has one —
+/// archiving is a soft delete that keeps every block — and its visibility and
+/// owner keep governing reads. The live-channel lookup filters archived rows
+/// out (so writes fail loudly), which is exactly why it must not be the
+/// lookup used here: with it, retiring a restricted channel published its
+/// history to anyone with a key.
 fn authorize_channel_read(
     state: &AppState,
     slug: &str,
@@ -393,7 +402,10 @@ fn authorize_channel_read(
     started: std::time::Instant,
 ) -> Result<(), (StatusCode, Json<ErrorBody>)> {
     let store = &state.ingest_ctx.store;
-    let Some(channel) = store.get_channel_by_slug(slug).map_err(persist_err)? else {
+    let Some(channel) = store
+        .get_channel_by_slug_including_archived(slug)
+        .map_err(persist_err)?
+    else {
         return Ok(());
     };
     let is_member = store
