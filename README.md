@@ -31,18 +31,22 @@ loopback and private tailnets.
 - **No encryption of message content.** Blocks are *signed*, never encrypted. There is no
   E2EE and no per-message confidentiality. Anything on the wire without an outer TLS
   tunnel is plaintext, and the server stores plaintext.
-- **No authentication and no authorization.** A WebSocket client may subscribe to any
-  channel scope without proving anything
-  ([`v0_0_2_ws.rs`](repos/jig-server/src/v0_0_2_ws.rs), the `Frame::Subscribe` arm).
-  Channel `visibility = "restricted"` is *recorded* but not
-  enforced on reads. The `/_admin_v0_0_2/*` endpoints that create channels and add members
-  are unauthenticated, which is why the shipped config binds loopback only.
+- **Authentication and channel authorization, but no admission policy.** Every read
+  carries a signed proof of possession of the caller's key, and `visibility = "restricted"`
+  is enforced on history, the listing, live delivery and posting
+  ([`jig-server/src/auth/`](repos/jig-server/src/auth/),
+  [`jig-pipeline/src/authorize_write.rs`](repos/jig-pipeline/src/authorize_write.rs)).
+  What is missing is any way to refuse a caller *before* those gates: any self-minted key
+  is admitted, there is no rate limiting, and blocks relayed by a federated peer are
+  trusted. The `/_admin_v0_0_2/*` channel-ops routes run the same gates but still mount
+  behind a `[debug]` flag.
 - **No graphical client.** `repos/jig-gui/` (Riverdance) is a Dioxus scaffold around a
   mocked chat UI. It depends on neither `jig-core` nor `jig-client` and never opens a
   connection — it is a design mock, not a client.
-- Network-level access control — a tailnet, a firewall — is currently the *only* access
-  control. That is a deliberate v0.0.x position, not an oversight, but it means the
-  security model is entirely outside this repo.
+- Network-level access control — a tailnet, a firewall — is still the recommended outer
+  layer, because the gates above are new and nothing sits in front of them. It is no
+  longer the *only* access control; see `deploy/README.md` for what the server enforces
+  on its own.
 
 ### What works, what does not
 

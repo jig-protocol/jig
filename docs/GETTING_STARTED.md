@@ -267,10 +267,11 @@ Read this before you type anything sensitive into it.
 - **Your messages are not encrypted.** They are *signed*, which proves who wrote them.
   That is a different thing. The server stores them in readable form and anyone who can
   read the server can read your messages.
-- **There are no permissions.** Anyone on the tailnet can read and write every channel.
-  That includes channels marked "restricted", which look membership-gated but are not
-  actually enforced yet. Assume everything you write is visible to everyone on the
-  tailnet.
+- **Permissions are per channel, and that is all.** Reads are signed with your key, so
+  nobody can read as you; `restricted` channels really are members-only — for reading,
+  listing and posting — and only the owner can add members. But any key can reach the
+  server, create channels, and post to `open` ones, and the operator can read everything.
+  Treat `open` channels as visible to everyone on the tailnet.
 - **No mobile app and no web page.** Terminal only, on a machine that is on the tailnet.
 - **No notifications.** If `jig chat` is not open, you will not know a message arrived.
   You will see it in the last-100 backlog next time you open the channel.
