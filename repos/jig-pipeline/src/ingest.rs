@@ -357,10 +357,11 @@ pub async fn ingest(
 
     // Channel membership for bridge-sink dispatch. `channel_id` here is the
     // channel SLUG (lifted from manifest metadata), but memberships are keyed
-    // by the channel's CID (its channel-create block CID). Step 3b already
-    // resolved slug -> row for kinds carrying metadata["channel"]; re-resolve
-    // only for channel-create, whose row is written by apply_effect above (and
-    // whose slug lives under metadata["slug"], not metadata["channel"]).
+    // by the channel's CID (its channel-create block CID). Step 3b resolved
+    // the row BEFORE `apply_effect`; a control-plane block has just changed
+    // that row (channel-create wrote it, channel-promote flipped its
+    // visibility), so it is resolved again for those kinds. Content kinds
+    // change nothing and keep the row already in hand.
     //
     // The same facts decide who may RECEIVE the block: they become the
     // `DeliveryPolicy` fanout checks per subscriber, so the delivery loop
@@ -368,7 +369,11 @@ pub async fn ingest(
     // widen it — a policy that names nobody is what "we could not find out"
     // looks like to an identified subscriber.
     let mut lookup_failed = false;
-    if resolved_channel.is_none()
+    let effect_may_have_changed_the_row = !matches!(
+        kind,
+        BlockKind::TextRender | BlockKind::EmailRender | BlockKind::EmailEncrypted
+    );
+    if (resolved_channel.is_none() || effect_may_have_changed_the_row)
         && let Some(slug) = stored_block.channel_id.as_deref()
     {
         match ctx.store.get_channel_by_slug(slug) {
