@@ -391,3 +391,79 @@ async fn anyone_can_post_to_an_open_channel() {
     let (status, body) = server.try_submit(&text(&stranger, "#open", "hello")).await;
     assert_eq!(status, StatusCode::OK, "body={body}");
 }
+
+// ---- Block by CID -------------------------------------------------------------
+//
+// A CID is a content hash, not a secret: it appears in acks, receipts,
+// delivery frames and logs. `GET /api/v1/blocks/:cid` must run the same gates
+// as the timeline the block lives in, or the timeline gate is a detour.
+
+async fn post_and_get_cid(server: &TestServer, who: &Identity, slug: &str) -> String {
+    let (status, body) = server.try_submit(&text(who, slug, "for the record")).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    body["block_cid"]
+        .as_str()
+        .expect("block_cid in ack")
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_block_in_a_restricted_channel_cannot_be_fetched_by_cid_by_a_non_member() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let stranger = Identity::new(2);
+    server
+        .create_channel(&owner, "#private", "restricted")
+        .await;
+    let cid = post_and_get_cid(&server, &owner, "#private").await;
+
+    let (status, body) = server
+        .send(&server.sign_get(&stranger, &format!("/api/v1/blocks/{cid}")))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
+    assert_eq!(body["code"], "NOT_A_MEMBER");
+}
+
+#[tokio::test]
+async fn a_block_in_a_restricted_channel_can_be_fetched_by_cid_by_a_member() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let member = Identity::new(2);
+    server
+        .create_channel(&owner, "#private", "restricted")
+        .await;
+    server.add_member(&owner, "#private", &member).await;
+    let cid = post_and_get_cid(&server, &owner, "#private").await;
+
+    let (status, body) = server
+        .send(&server.sign_get(&member, &format!("/api/v1/blocks/{cid}")))
+        .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["block_cid"], cid);
+}
+
+#[tokio::test]
+async fn fetching_a_block_by_cid_requires_a_proof() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    server.create_channel(&owner, "#open", "open").await;
+    let cid = post_and_get_cid(&server, &owner, "#open").await;
+
+    let (status, body) = server.send_unsigned(&format!("/api/v1/blocks/{cid}")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body={body}");
+    assert_eq!(body["code"], "AUTH_REQUIRED");
+}
+
+#[tokio::test]
+async fn a_block_in_an_open_channel_can_be_fetched_by_cid_by_anyone_authenticated() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let stranger = Identity::new(2);
+    server.create_channel(&owner, "#open", "open").await;
+    let cid = post_and_get_cid(&server, &owner, "#open").await;
+
+    let (status, body) = server
+        .send(&server.sign_get(&stranger, &format!("/api/v1/blocks/{cid}")))
+        .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+}

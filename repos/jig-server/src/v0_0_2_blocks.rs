@@ -152,22 +152,26 @@ pub struct ReceiptView {
 
 /// GET /api/v1/blocks/:cid — fetch a stored block and all known receipts.
 ///
+/// Runs the same gates as the timeline the block lives in. A CID is a content
+/// hash, not a secret — it appears in acks, receipts, delivery frames and
+/// logs — so an ungated fetch-by-CID would be a detour around the channel
+/// gate. A block with no channel (control-plane kinds) needs only a proof.
+///
 /// Returns 404 with `{ code: "NOT_FOUND" }` if the CID is absent.
 pub async fn get_block_by_cid(
     State(state): State<Arc<AppState>>,
     Path(cid): Path<String>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<BlockView>, (StatusCode, Json<ErrorBody>)> {
+    let started = std::time::Instant::now();
+    let caller_did = authenticate_read(&state, &headers, "GET", uri.path(), started)?;
+
     let stored = state
         .ingest_ctx
         .store
         .get_block(&cid)
-        .map_err(|e| {
-            err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "PERSIST_ERROR",
-                e.to_string(),
-            )
-        })?
+        .map_err(persist_err)?
         .ok_or_else(|| {
             err(
                 StatusCode::NOT_FOUND,
@@ -175,6 +179,10 @@ pub async fn get_block_by_cid(
                 format!("no block with cid {cid}"),
             )
         })?;
+
+    if let (Some(caller), Some(slug)) = (caller_did.as_ref(), stored.channel_id.as_deref()) {
+        authorize_channel_read(&state, slug, caller, started)?;
+    }
 
     let receipts = state
         .ingest_ctx
@@ -630,7 +638,9 @@ mod tests {
 
     #[tokio::test]
     async fn get_block_returns_404_for_unknown_cid() {
-        let state = Arc::new(AppState::for_test().unwrap());
+        // Unsigned GET, so the escape hatch; the proof requirement on this
+        // route is covered in tests/restricted_reads.rs.
+        let state = Arc::new(unauthenticated_state());
         let router = build_blocks_router(state);
 
         let (status, body) = get_path(router, "/api/v1/blocks/bafy_unknown").await;
@@ -640,7 +650,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_then_get_round_trips() {
-        let state = Arc::new(AppState::for_test().unwrap());
+        let state = Arc::new(unauthenticated_state());
         let router = build_blocks_router(state.clone());
         seed_channel(&state, "#hello");
 
