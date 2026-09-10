@@ -576,7 +576,7 @@ async fn handle_client_frame(
             .await
             {
                 Ok(block_cid) => {
-                    metrics::block_ingested(channel_slug_peek(&manifest_bytes).as_deref());
+                    metrics::block_ingested(channel_label(state, &manifest_bytes).as_deref());
                     let ack = Envelope::new(Frame::Ack { block_cid });
                     let Ok(json) = serde_json::to_string(&ack) else {
                         return Ok(());
@@ -661,24 +661,49 @@ async fn handle_client_frame(
 /// Read the channel slug out of manifest bytes for the per-channel metric,
 /// without paying for a full `BlockManifest` deserialization.
 ///
-/// Mirrors the lift in `jig_pipeline::ingest` — text-render / member-add put
-/// the slug under `metadata.channel`, channel-create under `metadata.slug`.
+/// Uses the same kind-keyed rule as `jig_pipeline::ingest::channel_slug_of`,
+/// so the metric counts the channel the block actually landed in.
 /// Metrics-only: nothing downstream reads this value.
 fn channel_slug_peek(manifest_bytes: &[u8]) -> Option<String> {
     #[derive(serde::Deserialize)]
-    struct MetadataOnly {
+    struct KindAndMetadata {
+        #[serde(default)]
+        kind: Option<jig_core::BlockKind>,
         #[serde(default)]
         metadata: serde_json::Map<String, serde_json::Value>,
     }
 
-    let peeked: MetadataOnly = serde_json::from_slice(manifest_bytes).ok()?;
+    let peeked: KindAndMetadata = serde_json::from_slice(manifest_bytes).ok()?;
+    let key = jig_pipeline::ingest::channel_metadata_key(peeked.kind?);
     peeked
         .metadata
-        .get("channel")
-        .or_else(|| peeked.metadata.get("slug"))
+        .get(key)
         .and_then(|v| v.as_str())
         .map(str::to_string)
 }
+
+/// The label the per-channel metric carries for a just-ingested block.
+///
+/// `/metrics` runs no gate — scrapers cannot sign — so it must not become the
+/// one endpoint that names restricted channels to whoever asks. Open
+/// channels are labelled by slug; everything else (restricted, unknown, or a
+/// store that would not answer) shares one `(restricted)` bucket. Totals
+/// stay exact; only the attribution is withheld.
+fn channel_label(state: &AppState, manifest_bytes: &[u8]) -> Option<String> {
+    let slug = channel_slug_peek(manifest_bytes)?;
+    let open = matches!(
+        state.ingest_ctx.store.get_channel_by_slug(&slug),
+        Ok(Some(row)) if jig_pipeline::visibility::is_open(&row.visibility)
+    );
+    Some(if open {
+        slug
+    } else {
+        RESTRICTED_LABEL.to_string()
+    })
+}
+
+/// The shared metrics label for channels whose slug is not disclosed.
+pub const RESTRICTED_LABEL: &str = "(restricted)";
 
 async fn send_error(
     socket: &mut WebSocket,
@@ -1198,12 +1223,62 @@ mod tests {
 
         // channel-create writes the slug under `slug`, not `channel`.
         let created = serde_json::to_vec(&serde_json::json!({
-            "metadata": { "slug": "#other" }
+            "kind": "channel-create",
+            "metadata": { "slug": "#other", "channel": "#decoy" }
         }))
         .unwrap();
         assert_eq!(channel_slug_peek(&created).as_deref(), Some("#other"));
 
+        // And a content block does not get to name a channel under `slug`:
+        // the key is chosen by kind, exactly as ingest chooses it.
+        let decoy = serde_json::to_vec(&serde_json::json!({
+            "kind": "text-render",
+            "metadata": { "slug": "#secret", "body": "hi" }
+        }))
+        .unwrap();
+        assert_eq!(channel_slug_peek(&decoy).as_deref(), None);
+
         assert_eq!(channel_slug_peek(b"not json").as_deref(), None);
+    }
+
+    /// `/metrics` is ungated, so a restricted channel must not appear in it
+    /// by name. Open channels keep their own label.
+    #[tokio::test]
+    async fn restricted_channels_share_one_metrics_label() {
+        let state = AppState::for_test().unwrap();
+        for (slug, visibility) in [("#open", "open"), ("#private", "restricted")] {
+            state
+                .ingest_ctx
+                .store
+                .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                    id: format!("bafySeed{slug}"),
+                    slug: slug.to_string(),
+                    visibility: visibility.to_string(),
+                    created_at: 0,
+                    owner_did: "did:jig:zSeedOwner".to_string(),
+                })
+                .unwrap();
+        }
+        let manifest = |slug: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "kind": "text-render",
+                "metadata": { "channel": slug, "body": "hi" }
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            channel_label(&state, &manifest("#open")).as_deref(),
+            Some("#open")
+        );
+        assert_eq!(
+            channel_label(&state, &manifest("#private")).as_deref(),
+            Some(RESTRICTED_LABEL)
+        );
+        assert_eq!(
+            channel_label(&state, &manifest("#nowhere")).as_deref(),
+            Some(RESTRICTED_LABEL),
+            "an unknown channel is not disclosed either"
+        );
     }
 
     #[tokio::test]

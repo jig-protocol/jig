@@ -202,8 +202,11 @@ pub async fn ingest(
     // Step 3b: channel-existence guard for channel-scoped kinds.
     //
     // Resolved once here and reused for the bridge-sink member lookup after
-    // persist, so the guard costs no extra query.
-    let channel_slug = manifest.metadata.get("channel").and_then(|v| v.as_str());
+    // persist, so the guard costs no extra query. `channel_slug_of` is the ONE
+    // rule for which metadata key names a block's channel; the persisted
+    // `channel_id` below uses the same call, so the channel that is gated is
+    // the channel the block lands in.
+    let channel_slug = channel_slug_of(kind, &manifest);
     let mut resolved_channel = match channel_slug {
         Some(slug) => ctx.store.get_channel_by_slug(slug)?,
         None => None,
@@ -300,15 +303,10 @@ pub async fn ingest(
     let stored_block = StoredBlock {
         cid: block_cid.clone(),
         // Lift the channel slug from manifest metadata into the first-class
-        // column so channel-scoped fanout + the bridge sink can find it.
-        // text-render / member-add use metadata["channel"]; channel-create
-        // uses metadata["slug"].
-        channel_id: manifest
-            .metadata
-            .get("channel")
-            .or_else(|| manifest.metadata.get("slug"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+        // column so channel-scoped fanout + the bridge sink can find it. Same
+        // rule as step 3b, by construction: a block is stored under exactly
+        // the channel the write gate examined.
+        channel_id: channel_slug.map(|s| s.to_string()),
         block_kind: kind_str.to_string(),
         sender_did: sender_did_str,
         sender_sig: sig,
@@ -402,6 +400,31 @@ pub async fn ingest(
     }
 
     Ok(block_cid)
+}
+
+/// The channel a block belongs to, from its manifest metadata — the one rule
+/// shared by the write gate, the persisted `channel_id` column, fanout and
+/// the metrics label.
+///
+/// `channel-create` names the channel it creates under `slug`; every other
+/// kind names the channel it acts on under `channel`. The key is chosen by
+/// KIND, never by "whichever is present": when the gate read one key and the
+/// store wrote another, a block could be authorized against no channel and
+/// then land in a restricted one.
+pub fn channel_slug_of(kind: BlockKind, manifest: &jig_core::BlockManifest) -> Option<&str> {
+    manifest
+        .metadata
+        .get(channel_metadata_key(kind))
+        .and_then(|v| v.as_str())
+}
+
+/// The metadata key under which a block of `kind` names its channel. See
+/// [`channel_slug_of`]; exposed for callers that peek at raw metadata.
+pub fn channel_metadata_key(kind: BlockKind) -> &'static str {
+    match kind {
+        BlockKind::ChannelCreate => "slug",
+        _ => "channel",
+    }
 }
 
 /// Whether a block of `kind` arriving from `source` must name a channel that

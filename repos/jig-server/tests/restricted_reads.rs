@@ -467,3 +467,89 @@ async fn a_block_in_an_open_channel_can_be_fetched_by_cid_by_anyone_authenticate
         .await;
     assert_eq!(status, StatusCode::OK, "body={body}");
 }
+
+// ---- The key that names the channel ------------------------------------------
+//
+// Found in review: the write gate read `metadata.channel` while the stored
+// `channel_id` fell back to `metadata.slug`, so a block could be authorized
+// against no channel and then land in a restricted one. The key is now chosen
+// by kind, and these pin it on the wire.
+
+fn text_with_metadata(
+    who: &Identity,
+    metadata: serde_json::Value,
+) -> jig_client::blocks::BuiltBlock {
+    let me = who.as_client();
+    jig_client::blocks::build_with_metadata(
+        &me,
+        jig_core::BlockKind::TextRender,
+        HlcTimestamp::now_wall(me.did().clone()),
+        metadata,
+    )
+}
+
+/// A `text-render` naming a restricted channel under `slug` instead of
+/// `channel` must not land in that channel's timeline.
+#[tokio::test]
+async fn a_stranger_cannot_smuggle_a_post_into_a_restricted_channel_under_the_slug_key() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let stranger = Identity::new(2);
+    server
+        .create_channel(&owner, "#private", "restricted")
+        .await;
+    let (_, before) = server
+        .send(&server.sign_get(&owner, &history_path("#private")))
+        .await;
+
+    let block = text_with_metadata(
+        &stranger,
+        serde_json::json!({"slug": "#private", "body": "psst"}),
+    );
+    let (status, body) = server.try_submit(&block).await;
+    // Whatever the server makes of a channel-less text-render, it must not
+    // be accepted INTO #private.
+    let (_, after) = server
+        .send(&server.sign_get(&owner, &history_path("#private")))
+        .await;
+    assert_eq!(
+        after.as_array().map_or(0, Vec::len),
+        before.as_array().map_or(0, Vec::len),
+        "a block naming the channel only under `slug` must not enter it: submit={status} {body}"
+    );
+}
+
+/// Both keys present: the gate and the store must agree on which one counts.
+#[tokio::test]
+async fn a_post_carrying_both_keys_is_gated_on_the_key_it_is_stored_under() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let stranger = Identity::new(2);
+    server
+        .create_channel(&owner, "#private", "restricted")
+        .await;
+    server.create_channel(&owner, "#open", "open").await;
+    let (_, before) = server
+        .send(&server.sign_get(&owner, &history_path("#private")))
+        .await;
+
+    let block = text_with_metadata(
+        &stranger,
+        serde_json::json!({"channel": "#open", "slug": "#private", "body": "psst"}),
+    );
+    let (status, body) = server.try_submit(&block).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "posting to #open is allowed: {body}"
+    );
+
+    let (_, after) = server
+        .send(&server.sign_get(&owner, &history_path("#private")))
+        .await;
+    assert_eq!(
+        after.as_array().map_or(0, Vec::len),
+        before.as_array().map_or(0, Vec::len),
+        "the block was gated as #open and must be stored as #open, not #private"
+    );
+}

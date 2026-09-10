@@ -340,14 +340,13 @@ async fn ingest_peer_block(
 
     let stored_block = StoredBlock {
         cid: block_cid.clone(),
-        // Lift the channel slug from manifest metadata (mirrors the ingest
-        // pipeline's B1 lift) so channel-scoped fanout + the bridge sink can
-        // match this federated block against a channel's members.
+        // Lift the channel slug from manifest metadata with the same
+        // kind-keyed rule ingest uses, so channel-scoped fanout + the bridge
+        // sink match this federated block against the channel it names. A
+        // block with no kind names no channel.
         channel_id: manifest
-            .metadata
-            .get("channel")
-            .or_else(|| manifest.metadata.get("slug"))
-            .and_then(|v| v.as_str())
+            .kind
+            .and_then(|kind| jig_pipeline::ingest::channel_slug_of(kind, &manifest))
             .map(|s| s.to_string()),
         block_kind: kind_str,
         sender_did: sender_did_str,
