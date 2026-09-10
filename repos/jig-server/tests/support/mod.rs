@@ -10,11 +10,13 @@
 // the helpers it needs; the rest would warn as dead code binary by binary.
 #![allow(dead_code)]
 
+pub mod ws;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
-use jig_client::blocks::{BuiltBlock, build_channel_create, build_member_add};
+use jig_client::blocks::{BuiltBlock, build_channel_create, build_member_add, build_text_render};
 use jig_config::v0_0_2_server::JigServerConfig;
 use jig_core::HlcTimestamp;
 use jig_core::did::Did;
@@ -32,7 +34,7 @@ use tower::ServiceExt as _;
 /// key you happened to draw, and these tests are about the protocol, not about
 /// key material.
 pub struct Identity {
-    signing: SigningKey,
+    pub(crate) signing: SigningKey,
     did: Did,
 }
 
@@ -200,6 +202,15 @@ impl TestServer {
         self.post_admin(&path, &block).await
     }
 
+    /// Post a `text-render` block to `slug` as `who` through the public
+    /// submit path, asserting it was accepted.
+    pub async fn post_text(&self, who: &Identity, slug: &str, body: &str) {
+        let who = who.as_client();
+        let block = build_text_render(&who, slug, body, HlcTimestamp::now_wall(who.did().clone()));
+        let (status, resp) = self.try_submit(&block).await;
+        assert_eq!(status, StatusCode::OK, "text-render failed: {resp}");
+    }
+
     /// Submit any signed block through the public, always-on
     /// `POST /api/v1/blocks` — the path a stranger with a keypair would use.
     pub async fn try_submit(&self, block: &BuiltBlock) -> (StatusCode, serde_json::Value) {
@@ -263,7 +274,7 @@ pub fn history_path(slug: &str) -> String {
     format!("/api/v1/channels/{}/blocks", encode_slug(slug))
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock is after the epoch")

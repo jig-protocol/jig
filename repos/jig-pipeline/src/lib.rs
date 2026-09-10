@@ -18,6 +18,7 @@ pub mod hlc;
 pub mod identity;
 pub mod ingest;
 pub mod persist;
+pub mod visibility;
 
 pub use effect::apply_effect;
 pub use envelope::{Envelope, Frame, HlcCursor, ReceiptRef, Scope};

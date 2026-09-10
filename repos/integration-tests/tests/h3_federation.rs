@@ -314,7 +314,7 @@ async fn federated_block_with_forged_author_did_is_rejected() {
         .state
         .ingest_ctx
         .fanout
-        .broadcast(&forged_block, &forged_receipt)
+        .broadcast(&forged_block, &forged_receipt, None)
         .await
         .expect("a fanout broadcast");
 
@@ -385,7 +385,7 @@ async fn naively_trust_peer_authored_blocks_accepts_forged_relay() {
         .state
         .ingest_ctx
         .fanout
-        .broadcast(&forged_block, &forged_receipt)
+        .broadcast(&forged_block, &forged_receipt, None)
         .await
         .expect("a fanout broadcast");
     tokio::time::sleep(Duration::from_millis(800)).await;

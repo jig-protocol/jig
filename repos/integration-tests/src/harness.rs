@@ -823,13 +823,33 @@ async fn handle_inbound_test_frame(
     }
 
     // Fanout the federated block to local subscribers — broadcast_local_only
-    // so we don't relay back to peers.
+    // so we don't relay back to peers. Mirrors the server relay: a local
+    // channel row becomes the delivery policy; no row means scope alone.
+    let policy = match stored_block.channel_id.as_deref() {
+        Some(slug) => match state.ingest_ctx.store.get_channel_by_slug(slug) {
+            Ok(Some(chan)) => {
+                let member_dids = state
+                    .ingest_ctx
+                    .store
+                    .list_members(&chan.id)
+                    .map(|ms| ms.into_iter().map(|m| m.member_did).collect())
+                    .unwrap_or_default();
+                Some(jig_pipeline::fanout::DeliveryPolicy::for_channel(
+                    &chan,
+                    member_dids,
+                ))
+            }
+            Ok(None) => None,
+            Err(_) => Some(jig_pipeline::fanout::DeliveryPolicy::default()),
+        },
+        None => None,
+    };
     let receipts_in_db = state.ingest_ctx.store.get_receipts_for_block(&block_cid)?;
     if let Some(rep_receipt) = receipts_in_db.into_iter().next() {
         let _ = state
             .ingest_ctx
             .fanout
-            .broadcast_local_only(&stored_block, &rep_receipt)
+            .broadcast_local_only(&stored_block, &rep_receipt, policy.as_ref())
             .await;
     }
     let _ = delivery_cid; // unused but kept for parity with server code

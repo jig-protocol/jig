@@ -32,6 +32,7 @@ use base64::Engine as _;
 use jig_core::BlockBundle;
 use jig_pipeline::{
     Envelope, Frame, ReceiptRef, Scope, SubscriptionScope,
+    fanout::SubscriberIdentity,
     ingest::{IngestError, IngestSource, ingest},
 };
 use tokio::sync::mpsc;
@@ -315,6 +316,39 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, conn_id: u64
     tracing::debug!(conn_id, "ws connection closed");
 }
 
+/// Why a channel subscription was not registered.
+enum SubscribeRefusal {
+    /// The gate said no; disclosed through the server's policy.
+    Gate(crate::auth::GateOutcome),
+    /// The store could not answer. Refuses — "could not look you up" is not
+    /// "come in" — but is reported as what it is, so the audit log stays true.
+    Store(String),
+}
+
+/// Gate 3 for a channel subscription: the same `authorize_read` decision the
+/// REST timeline runs, over the same store facts.
+///
+/// `Ok` for a slug with no local row — see the call site for why.
+fn authorize_subscribe(state: &AppState, slug: &str, did: &str) -> Result<(), SubscribeRefusal> {
+    let store = &state.ingest_ctx.store;
+    let channel = store
+        .get_channel_by_slug(slug)
+        .map_err(|e| SubscribeRefusal::Store(e.to_string()))?;
+    let Some(channel) = channel else {
+        return Ok(());
+    };
+    let is_member = store
+        .is_member(slug, did)
+        .map_err(|e| SubscribeRefusal::Store(e.to_string()))?;
+    let is_owner = channel.owner_did == did;
+    crate::auth::authorize_read(
+        crate::auth::Visibility::parse(&channel.visibility),
+        is_member,
+        is_owner,
+    )
+    .map_err(SubscribeRefusal::Gate)
+}
+
 // ---- Per-frame dispatch ----------------------------------------------------
 
 async fn handle_client_frame(
@@ -393,6 +427,56 @@ async fn handle_client_frame(
                 }
             }
 
+            // Who this subscription belongs to, for the per-delivery check.
+            // Only the identity `authenticate_subscribe` RETURNED is bound;
+            // `Unchecked` is reserved for a server that does not authenticate
+            // reads, and is the only way a subscription escapes filtering.
+            let who = match (
+                state.config.auth.require_authenticated_reads,
+                conn_did.as_ref(),
+            ) {
+                (false, _) => SubscriberIdentity::Unchecked,
+                (true, Some(did)) => SubscriberIdentity::Did(did.to_did_jig_string()),
+                (true, None) => {
+                    // Unreachable by construction (a refused proof returned
+                    // above), but a subscription with no DID on a server that
+                    // requires one must never be registered.
+                    let outcome = crate::auth::GateOutcome::AuthMissing;
+                    let (status, code, message) = state.auth.disclosure.disclose(&outcome);
+                    let _ = send_error(socket, Some(status), code, None, &message).await;
+                    return Ok(());
+                }
+            };
+
+            // Gate 3 at subscribe time, for a prompt and explicit refusal. The
+            // authoritative check is the one fanout runs on every delivery;
+            // this one only spares a caller an open connection that will never
+            // carry anything. A channel with no local row is NOT refused here
+            // — federated channels routinely have none — and is guarded at
+            // delivery once a row exists.
+            if let SubscriberIdentity::Did(did) = &who
+                && let Scope::Channel { slug } = &scope
+            {
+                match authorize_subscribe(state, slug, did) {
+                    Ok(()) => {}
+                    Err(SubscribeRefusal::Gate(outcome)) => {
+                        tracing::info!(
+                            conn_id,
+                            audit = %crate::auth::audit_line(&outcome),
+                            "ws subscribe refused"
+                        );
+                        let (status, code, message) = state.auth.disclosure.disclose(&outcome);
+                        let _ = send_error(socket, Some(status), code, None, &message).await;
+                        return Ok(());
+                    }
+                    Err(SubscribeRefusal::Store(detail)) => {
+                        // Same word the REST path uses for a failing store.
+                        let _ = send_error(socket, Some(500), "PERSIST_ERROR", None, &detail).await;
+                        return Ok(());
+                    }
+                }
+            }
+
             let sub_scope = match scope {
                 Scope::Channel { slug } => SubscriptionScope::Channel(slug),
                 Scope::Federation { block_kinds } => SubscriptionScope::Federation { block_kinds },
@@ -400,7 +484,7 @@ async fn handle_client_frame(
             let id = state
                 .ingest_ctx
                 .fanout
-                .subscribe_local(sub_scope, sub_tx.clone())
+                .subscribe_local(sub_scope, who, sub_tx.clone())
                 .await;
             // The gauge counts connections holding a subscription, matching the
             // single `sub_id` slot that the disconnect path decrements. A

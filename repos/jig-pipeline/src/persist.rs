@@ -673,6 +673,26 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// Remove `member_did` from the channel at `slug`. Returns whether a row
+    /// was removed.
+    ///
+    /// The primitive a `member-remove` block will need. There is no such
+    /// block kind yet, so today this is reached only by operators and tests —
+    /// but the delivery-time authorization check exists precisely so that
+    /// when a membership goes away, delivery stops with it.
+    pub fn remove_membership(&self, slug: &str, member_did: &str) -> Result<bool> {
+        // Same lock discipline as `is_member`: resolve the slug first, then
+        // take the connection.
+        let Some(channel) = self.get_channel_by_slug(slug)? else {
+            return Ok(false);
+        };
+        let removed = self.conn.lock().expect("poisoned").execute(
+            "DELETE FROM memberships WHERE channel_id = ? AND member_did = ?",
+            [channel.id.as_str(), member_did],
+        )?;
+        Ok(removed > 0)
+    }
+
     // --- peers ---
 
     pub fn upsert_peer(&self, p: &StoredPeer) -> Result<()> {
@@ -1157,6 +1177,36 @@ mod tests {
     /// the channel's CID, not its slug. A lookup that forwards the slug straight
     /// to the memberships table compiles, matches nothing, and denies every
     /// legitimate member — a silent wrong answer, the worst kind.
+    #[test]
+    fn remove_membership_deletes_the_row_and_reports_it() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_channel(&StoredChannel {
+            id: "bafy-c".into(),
+            slug: "#c".into(),
+            visibility: "restricted".into(),
+            created_at: 0,
+            owner_did: "did:jig:zOwner".into(),
+        })
+        .unwrap();
+        s.upsert_membership(&StoredMembership {
+            channel_id: "bafy-c".into(),
+            member_did: "did:jig:zM".into(),
+            role: "member".into(),
+            joined_at: 0,
+            source_block_cid: "bafy-add".into(),
+        })
+        .unwrap();
+        assert!(s.is_member("#c", "did:jig:zM").unwrap());
+
+        assert!(s.remove_membership("#c", "did:jig:zM").unwrap());
+        assert!(!s.is_member("#c", "did:jig:zM").unwrap());
+        assert!(
+            !s.remove_membership("#c", "did:jig:zM").unwrap(),
+            "removing twice reports that nothing was there"
+        );
+        assert!(!s.remove_membership("#nope", "did:jig:zM").unwrap());
+    }
+
     #[test]
     fn is_member_resolves_slug_to_channel_id_first() {
         let store = SqliteStore::open_in_memory().unwrap();

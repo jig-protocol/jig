@@ -9,7 +9,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use jig_core::{BlockBundle, BlockKind, Did};
 use std::sync::Arc;
 
-use crate::fanout::Fanout;
+use crate::fanout::{DeliveryPolicy, Fanout};
 use crate::hlc::HlcClock;
 use crate::identity::IdentityResolver;
 use crate::persist::{SqliteStore, StoredBlock, StoredReceipt};
@@ -315,18 +315,38 @@ pub async fn ingest(
     // resolved slug -> row for kinds carrying metadata["channel"]; re-resolve
     // only for channel-create, whose row is written by apply_effect above (and
     // whose slug lives under metadata["slug"], not metadata["channel"]).
+    //
+    // The same facts decide who may RECEIVE the block: they become the
+    // `DeliveryPolicy` fanout checks per subscriber, so the delivery loop
+    // itself does no I/O. A store error here must narrow delivery, never
+    // widen it — a policy that names nobody is what "we could not find out"
+    // looks like to an identified subscriber.
+    let mut lookup_failed = false;
     if resolved_channel.is_none()
         && let Some(slug) = stored_block.channel_id.as_deref()
     {
-        resolved_channel = ctx.store.get_channel_by_slug(slug).unwrap_or_default();
+        match ctx.store.get_channel_by_slug(slug) {
+            Ok(row) => resolved_channel = row,
+            Err(e) => {
+                tracing::warn!(slug, error = %e, "channel lookup failed at fanout; denying");
+                lookup_failed = true;
+            }
+        }
     }
-    let member_dids: Vec<String> = match &resolved_channel {
-        Some(chan) => ctx
-            .store
-            .list_members(&chan.id)
-            .map(|ms| ms.into_iter().map(|m| m.member_did).collect())
-            .unwrap_or_default(),
-        None => Vec::new(),
+    let policy = if lookup_failed {
+        Some(DeliveryPolicy::default())
+    } else {
+        resolved_channel.as_ref().map(|chan| {
+            let member_dids = ctx
+                .store
+                .list_members(&chan.id)
+                .map(|ms| ms.into_iter().map(|m| m.member_did).collect())
+                .unwrap_or_else(|e| {
+                    tracing::warn!(slug = %chan.slug, error = %e, "member lookup failed at fanout; denying members");
+                    Vec::new()
+                });
+            DeliveryPolicy::for_channel(chan, member_dids)
+        })
     };
 
     // Step 7: fanout — broadcast policy depends on source
@@ -335,16 +355,16 @@ pub async fn ingest(
             // Federated source: locals + bridge sinks, but NOT re-broadcast to
             // peers (would cause a relay loop).
             ctx.fanout
-                .broadcast_local_only(&stored_block, &stored_receipt)
+                .broadcast_local_only(&stored_block, &stored_receipt, policy.as_ref())
                 .await
                 .map_err(IngestError::Other)?;
             ctx.fanout
-                .dispatch_to_bridges_public(&stored_block, &stored_receipt, &member_dids)
+                .dispatch_to_bridges_public(&stored_block, &stored_receipt, policy.as_ref())
                 .await;
         }
         IngestSource::LocalClient { .. } | IngestSource::AdminEndpoint | IngestSource::Bridge => {
             ctx.fanout
-                .broadcast_with_members(&stored_block, &stored_receipt, &member_dids)
+                .broadcast_with_members(&stored_block, &stored_receipt, policy.as_ref())
                 .await
                 .map_err(IngestError::Other)?;
         }
@@ -1198,6 +1218,7 @@ mod tests {
         ctx.fanout
             .subscribe_local(
                 crate::fanout::SubscriptionScope::Channel("#dm/y".to_string()),
+                crate::fanout::SubscriberIdentity::Unchecked,
                 tx,
             )
             .await;

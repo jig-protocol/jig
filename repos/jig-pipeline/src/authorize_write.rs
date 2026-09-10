@@ -13,6 +13,7 @@
 use jig_core::{BlockKind, BlockManifest};
 
 use crate::persist::StoredChannel;
+use crate::visibility::is_open;
 
 /// Why a control-plane block was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,14 +63,6 @@ pub fn authorize_control_block(
         BlockKind::ChannelPromote => require_owner(channel, &sender),
         _ => Ok(()),
     }
-}
-
-/// Whether a stored visibility string means "open", **failing closed**: any
-/// value that is not exactly `open` is treated as restricted. Must agree with
-/// `jig_server::auth::Visibility::parse`; the server carries a test that holds
-/// the two to the same answers.
-pub fn is_open(visibility: &str) -> bool {
-    visibility == "open"
 }
 
 fn require_owner(channel: &StoredChannel, sender: &str) -> Result<(), WriteRefusal> {

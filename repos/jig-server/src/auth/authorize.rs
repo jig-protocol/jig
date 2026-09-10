@@ -77,7 +77,7 @@ mod tests {
         ] {
             assert_eq!(
                 Visibility::parse(raw) == Visibility::Open,
-                jig_pipeline::authorize_write::is_open(raw),
+                jig_pipeline::visibility::is_open(raw),
                 "read and write gates disagree on {raw:?}"
             );
         }
