@@ -77,9 +77,17 @@ pub fn authenticate(
         .verify(hash.as_bytes(), &signature)
         .map_err(|_| GateOutcome::AuthSignatureInvalid)?;
 
-    // Scoped by the DID the signature just verified — see `ReplayGuard`.
-    match guard.check_and_record(proof.did.as_str(), &proof.nonce, proof.hlc_wall_ms, now_ms) {
-        Ok(()) => Ok(proof.did.clone()),
+    // The identity this proof established is the KEY, not the string the
+    // caller spelled it with: a DID's base32 body decodes case-insensitively,
+    // so `zabc…` and `zABC…` are one key. Rebuild the DID from the verified
+    // pubkey and use that everywhere downstream — the replay record (or one
+    // captured proof would replay once per spelling) and the returned
+    // identity (or a re-cased caller would never match its own membership
+    // rows).
+    let did = Did::from_ed25519_pubkey(&pubkey_bytes);
+
+    match guard.check_and_record(did.as_str(), &proof.nonce, proof.hlc_wall_ms, now_ms) {
+        Ok(()) => Ok(did),
         Err(ReplayRejection::AlreadySeen) => Err(GateOutcome::AuthReplayed),
         Err(ReplayRejection::OutsideWindow) => Err(GateOutcome::AuthStale),
         // Not a replay: the guard had no room to record this nonce, and
@@ -379,6 +387,31 @@ mod tests {
         authenticate(&proof, "GET", "/api/v1/channels", b"", 5_000, &mut guard).unwrap();
         assert_eq!(
             authenticate(&proof, "GET", "/api/v1/channels", b"", 5_000, &mut guard),
+            Err(GateOutcome::AuthReplayed)
+        );
+    }
+
+    /// A proof that spells its DID with an upper-cased body verifies (the
+    /// key is the same) but must come back as the canonical DID, and must be
+    /// the same identity to the replay guard as the lower-cased spelling.
+    #[test]
+    fn a_recased_did_authenticates_as_its_canonical_self() {
+        let (signing, did) = identity(1);
+        let mut proof = proof_for(&signing, &did, "GET", "/api/v1/channels", b"", 5_000, "n1");
+        let (prefix, body) = did.as_str().split_at("did:jig:z".len());
+        let recased = Did::from_str_unchecked(format!("{prefix}{}", body.to_uppercase()));
+        assert_ne!(recased, did);
+        proof.did = recased;
+        let mut guard = ReplayGuard::new(30_000, 128);
+
+        let established =
+            authenticate(&proof, "GET", "/api/v1/channels", b"", 5_000, &mut guard).unwrap();
+        assert_eq!(established, did, "the canonical spelling, not the one sent");
+
+        // The lower-cased original is the same proof to the guard.
+        let original = proof_for(&signing, &did, "GET", "/api/v1/channels", b"", 5_000, "n1");
+        assert_eq!(
+            authenticate(&original, "GET", "/api/v1/channels", b"", 5_000, &mut guard),
             Err(GateOutcome::AuthReplayed)
         );
     }

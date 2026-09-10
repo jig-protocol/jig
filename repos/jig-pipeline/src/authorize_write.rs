@@ -28,36 +28,46 @@ pub enum WriteRefusal {
     NotChannelMember { slug: String, sender: String },
 }
 
-/// Kinds that carry content INTO a channel, as opposed to changing it.
-fn is_content(kind: BlockKind) -> bool {
+/// Kinds that CHANGE a channel, each with its own rule below. Every other
+/// kind that names a channel is treated as content going INTO it — including
+/// kinds this gate has never heard of. Enumerating content kinds instead
+/// would leave any newly allowed kind (a fed-hello carrying `channel`, say)
+/// free to land in a restricted timeline.
+fn changes_the_channel(kind: BlockKind) -> bool {
     matches!(
         kind,
-        BlockKind::TextRender | BlockKind::EmailRender | BlockKind::EmailEncrypted
+        BlockKind::MemberAdd
+            | BlockKind::ChannelPromote
+            | BlockKind::ChannelCreate
+            | BlockKind::ChannelArchive
     )
 }
 
 /// Whether [`authorize_block`] will need to know if the sender is a member —
 /// so the caller runs the membership query only when the answer can matter:
-/// content, into a restricted channel.
+/// something going into a restricted channel.
 pub fn needs_membership(kind: BlockKind, channel: Option<&StoredChannel>) -> bool {
-    is_content(kind) && channel.is_some_and(|c| !is_open(&c.visibility))
+    !changes_the_channel(kind) && channel.is_some_and(|c| !is_open(&c.visibility))
 }
 
 /// Decide whether the block described by `manifest` may be applied to `channel`.
 ///
 /// Rules:
-/// - Content (`text-render` and the email kinds) into a **restricted** channel
-///   is for members and the owner. Into an open channel, anyone.
+/// - Anything going INTO a **restricted** channel — `text-render`, the email
+///   kinds, and any other kind that names a channel — is for members and the
+///   owner. Into an open channel, anyone.
 /// - `member-add` where the sender adds **itself** to an **open** channel is
 ///   allowed — the IRC `/join`, and what `jig channel join` does.
 /// - Every other `member-add` — anyone onto a restricted channel, or someone
 ///   else onto any channel — is the owner's call. Membership drives delivery
 ///   (fanout and bridge dispatch), so letting strangers enrol third parties
 ///   would let them subscribe anyone to anything.
-/// - `channel-promote` (restricted → open) is the owner's call.
-/// - Every other kind is not this gate's concern. `channel-archive` keeps its
-///   own owner check in the effect layer; `channel-create` names a channel that
-///   does not exist yet.
+/// - `channel-promote` (restricted → open) and `channel-archive` are the
+///   owner's call. The archive effect re-checks ownership itself; the check
+///   here is what turns a stranger's attempt into a typed 403 rather than an
+///   effect-layer 500.
+/// - `channel-create` names a channel that does not exist yet; the store's
+///   unique slug refuses a duplicate.
 ///
 /// `channel` is `None` when the slug resolved to nothing; that is the effect
 /// layer's error to raise, not an authorization decision, so it passes here.
@@ -86,8 +96,9 @@ pub fn authorize_block(
             }
             require_owner(channel, &sender)
         }
-        BlockKind::ChannelPromote => require_owner(channel, &sender),
-        kind if is_content(kind) => {
+        BlockKind::ChannelPromote | BlockKind::ChannelArchive => require_owner(channel, &sender),
+        BlockKind::ChannelCreate => Ok(()),
+        _ => {
             if is_open(&channel.visibility) || is_owner(channel, &sender) || sender_is_member {
                 Ok(())
             } else {
@@ -97,7 +108,6 @@ pub fn authorize_block(
                 })
             }
         }
-        _ => Ok(()),
     }
 }
 
@@ -297,11 +307,44 @@ mod tests {
         );
     }
 
+    /// A kind this gate has no special rule for is content as far as a
+    /// restricted channel is concerned: the timeline it lands in is the
+    /// members' timeline, whatever the kind is called.
     #[test]
-    fn kinds_outside_this_gate_pass_through() {
+    fn an_unlisted_kind_naming_a_restricted_channel_is_gated_as_content() {
         let m = manifest_with(BlockKind::FedHello, STRANGER, json!({"channel": "#room"}));
         assert_eq!(
             authorize_block(BlockKind::FedHello, &m, Some(&channel("restricted")), false),
+            not_member(STRANGER)
+        );
+        assert_eq!(
+            authorize_block(BlockKind::FedHello, &m, Some(&channel("open")), false),
+            Ok(())
+        );
+        assert!(needs_membership(
+            BlockKind::FedHello,
+            Some(&channel("restricted"))
+        ));
+    }
+
+    #[test]
+    fn archive_is_owner_only_at_the_gate_too() {
+        let m = manifest_with(
+            BlockKind::ChannelArchive,
+            STRANGER,
+            json!({"channel": "#room"}),
+        );
+        assert_eq!(
+            authorize_block(BlockKind::ChannelArchive, &m, Some(&channel("open")), false),
+            refused(STRANGER)
+        );
+        let m = manifest_with(
+            BlockKind::ChannelArchive,
+            OWNER,
+            json!({"channel": "#room"}),
+        );
+        assert_eq!(
+            authorize_block(BlockKind::ChannelArchive, &m, Some(&channel("open")), false),
             Ok(())
         );
     }

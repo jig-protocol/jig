@@ -112,3 +112,33 @@ async fn unsigned_reads_still_work_when_the_escape_hatch_is_set() {
 
     assert_eq!(status, StatusCode::OK, "body={body}");
 }
+
+/// A DID's base32 body is case-insensitive to decode, so `did:jig:zabc…` and
+/// `did:jig:zABC…` verify against the same key. The replay record must not
+/// tell them apart, or one captured proof replays once per spelling.
+#[tokio::test]
+async fn a_replayed_read_is_refused_even_with_the_did_recased() {
+    let server = TestServer::authenticated();
+    let caller = Identity::new(1);
+    let req = server.sign_get(&caller, "/api/v1/channels");
+
+    let (first, body) = server.send(&req).await;
+    assert_eq!(first, StatusCode::OK, "precondition failed: body={body}");
+
+    let mut recased = server.sign_get(&caller, "/api/v1/channels");
+    recased.nonce = req.nonce.clone();
+    recased.hlc_wall_ms = req.hlc_wall_ms;
+    recased.sig_b64 = req.sig_b64.clone();
+    recased.did = {
+        let (prefix, body) = req.did.split_at("did:jig:z".len());
+        format!("{prefix}{}", body.to_uppercase())
+    };
+    assert_ne!(
+        recased.did, req.did,
+        "the test must actually change the spelling"
+    );
+
+    let (second, body) = server.send(&recased).await;
+    assert_eq!(second, StatusCode::UNAUTHORIZED, "body={body}");
+    assert_eq!(body["code"], "REPLAYED");
+}
