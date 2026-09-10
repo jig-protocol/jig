@@ -24,9 +24,10 @@
 database_path = "/var/lib/jig/jig.db"
 
 # THE REAL BIND ADDRESS. Set this to this host's Tailscale IP (`tailscale ip -4`).
-# NOT 0.0.0.0. The tailnet is the only authentication this server has — there is
-# no authn/authz layer behind it. Binding 0.0.0.0 on a public VPS publishes an
-# unauthenticated block store to the internet.
+# NOT 0.0.0.0. The server authenticates every read and enforces channel
+# membership on its own (see [auth] below), but nothing yet limits WHO may
+# reach the gates — any key is admitted, unthrottled — so the tailnet stays
+# the outer layer. See deploy/README.md "Security model".
 bind_address = "100.x.y.z"
 port = 7117
 
@@ -83,14 +84,23 @@ trusted_nameservers = []
 cache_ttl_seconds = 300
 naively_allow_unknown_handles_fallback = false
 
+[auth]
+# Every read (REST and WSS) carries a signed proof of possession, and
+# restricted channels are enforced against membership. `false` disables both
+# and exists only to migrate a deployment whose clients cannot sign yet; it is
+# advertised in unsafe_options_active while set.
+require_authenticated_reads = true
+replay_window_ms = 30000
+replay_capacity = 100000
+
 [debug]
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # REQUIRED FOR v0.0.2. `admin_endpoints = false` does not mount the
 # /_admin_v0_0_2/* router, and then `jig channel create` / `jig channel join`
 # fail with a bare 404 that looks like a wrong URL, a wrong port, or a broken
 # build. It is none of those — it is this line.
-# These endpoints are unauthenticated: they are only safe because the server is
-# bound to a tailnet address. Never enable them on a publicly-bound server.
+# These routes run the same signature and ownership checks as every other
+# submit path; the flag is a label, not a bypass.
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 admin_endpoints = true
 # Handle enumeration stays off — it dumps the registry to any caller.

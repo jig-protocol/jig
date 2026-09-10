@@ -143,7 +143,7 @@ enabling it.
 | Server liveness | `curl http://100.x.y.z:7117/healthz` | `200`, body `ok` |
 | Server identity | `curl http://100.x.y.z:7117/.well-known/jig` | `server_did` + `unsafe_options_active` |
 | Server counters | `curl http://100.x.y.z:7117/metrics` | Prometheus text |
-| Channel list | `curl http://100.x.y.z:7117/api/v1/channels` | JSON (`[]` before you create one) |
+| Channel list | `curl http://100.x.y.z:7117/api/v1/channels` | `401` `AUTH_REQUIRED` — reads are signed; use `jig channel list` instead |
 | Nameserver liveness | `curl http://100.x.y.z:7070/v1/health` | `{"status":"ok"}` |
 | Nameserver alias API | `curl http://100.x.y.z:7070/v1/challenge` | `{"challenge":"<64 hex>"}` |
 | Units | `systemctl status jig-server jig-nameserver` | both `active (running)` |
@@ -226,13 +226,19 @@ Three landmines, all called out in `config.example.toml`:
 
 ### Reading history
 
+Reads are signed, so a bare `curl` gets `401 AUTH_REQUIRED`. Let the CLI
+sign for you:
+
 ```bash
-curl 'http://100.x.y.z:7117/api/v1/channels/%23hello/blocks?limit=50'
+jig tail --channel '#hello'    # backfills the last 100 blocks, then follows
 ```
 
-Percent-encode the leading `#`. Blocks come back oldest-first as a JSON array
-(`bundle_b64`, `receipts`, `delivery_cid`); an unknown channel is `200` with
-`[]`. `limit` defaults to and is clamped at **200**.
+Under the hood that is `GET /api/v1/channels/%23hello/blocks?limit=100` with
+five `x-jig-*` headers carrying an ed25519 proof over the request (see
+`jig_client::ReadProof`). Blocks come back oldest-first as a JSON array
+(`bundle_b64`, `receipts`, `delivery_cid`). A restricted channel you are not
+a member of is `403 NOT_A_MEMBER`; a channel with no local row (federated, or
+mistyped) is `200` with `[]`. `limit` defaults to and is clamped at **200**.
 
 ---
 

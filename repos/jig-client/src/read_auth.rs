@@ -12,11 +12,28 @@ use jig_core::request_auth::{canonical_request_hash, headers};
 
 use crate::identity::Identity;
 
-/// Nonces need only be UNIQUE inside the server's acceptance window, not
-/// unpredictable — the signature already provides unforgeability. A process
+/// Nonces need only be UNIQUE among one DID's requests inside the server's
+/// acceptance window, not unpredictable — the signature already provides
+/// unforgeability, and the server records nonces per verified DID. A process
 /// counter does that without a `rand` dependency, which `jig-client`
-/// deliberately does not carry.
+/// deliberately does not carry; the process id keeps two processes signing as
+/// the same identity (a `jig chat` beside a `jig history`) from colliding in
+/// the same millisecond.
+///
+/// One counter for every proof this process signs — REST reads and WSS
+/// subscribes alike — so the two transports cannot hand the server the same
+/// nonce in the same millisecond.
 static NONCE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A nonce no other proof from this process, or from another process on this
+/// host, will repeat: wall-clock millisecond, process id, sequence number.
+pub(crate) fn fresh_nonce(hlc_wall_ms: u64) -> String {
+    format!(
+        "{hlc_wall_ms}-{}-{}",
+        std::process::id(),
+        NONCE_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 /// A signed proof for one request. Sending the same proof twice is a replay,
 /// and the server will refuse the second; sign every request afresh.
@@ -40,10 +57,7 @@ impl ReadProof {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let nonce = format!(
-            "{hlc_wall_ms}-{}",
-            NONCE_SEQ.fetch_add(1, Ordering::Relaxed)
-        );
+        let nonce = fresh_nonce(hlc_wall_ms);
         let hash = canonical_request_hash(method, path, b"", hlc_wall_ms, 0, &nonce);
         Self {
             did: identity.did_string(),
@@ -117,6 +131,17 @@ mod tests {
         let a = ReadProof::sign(&id, "GET", "/x");
         let b = ReadProof::sign(&id, "GET", "/x");
         assert_ne!(a.nonce, b.nonce);
+    }
+
+    /// Two processes on one host signing in the same millisecond must not
+    /// mint the same nonce, so the process id is part of it.
+    #[test]
+    fn a_nonce_carries_the_process_id() {
+        let nonce = fresh_nonce(1_000);
+        assert!(
+            nonce.starts_with(&format!("1000-{}-", std::process::id())),
+            "{nonce}"
+        );
     }
 
     #[test]

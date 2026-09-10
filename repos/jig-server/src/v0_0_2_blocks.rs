@@ -377,9 +377,15 @@ fn authenticate_read(
 /// Gate 3 for a single channel: may `caller` read `slug`?
 ///
 /// The decision itself is the pure `authorize_read`; this only gathers its
-/// inputs. An unknown slug is refused here as `AuthzChannelUnknown` rather
-/// than read back as an empty timeline — a mistyped slug used to be
-/// indistinguishable from a channel with no messages.
+/// inputs.
+///
+/// A slug with no local row is NOT refused. Channel state does not replicate
+/// between federated servers, so a channel that lives on a peer routinely has
+/// blocks here and no row: refusing would break backfill for every federated
+/// conversation. Live WSS delivery makes the same call for the same reason,
+/// and a row that appears later is enforced from then on. The cost is that
+/// under a concealing disclosure policy an absent channel (empty 200) is
+/// distinguishable from a restricted one (404) — a known limitation.
 fn authorize_channel_read(
     state: &AppState,
     slug: &str,
@@ -388,11 +394,7 @@ fn authorize_channel_read(
 ) -> Result<(), (StatusCode, Json<ErrorBody>)> {
     let store = &state.ingest_ctx.store;
     let Some(channel) = store.get_channel_by_slug(slug).map_err(persist_err)? else {
-        return Err(refuse(
-            state,
-            &crate::auth::GateOutcome::AuthzChannelUnknown,
-            started,
-        ));
+        return Ok(());
     };
     let is_member = store
         .is_member(slug, caller.as_str())

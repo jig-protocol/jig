@@ -43,6 +43,11 @@ async fn revoking_membership_stops_delivery_on_a_live_subscription() {
     let url = server.serve_ws().await;
     let mut sub = WsClient::connect(&url).await;
     assert!(sub.subscribe(&member, "#private").await.is_none());
+    // A second subscriber who IS allowed to receive: proof that the block
+    // after revocation was actually fanned out, so the member's silence is a
+    // refusal and not a delivery that never happened.
+    let mut witness = WsClient::connect(&url).await;
+    assert!(witness.subscribe(&owner, "#private").await.is_none());
 
     server
         .post_text(&owner, "#private", "before revocation")
@@ -51,11 +56,16 @@ async fn revoking_membership_stops_delivery_on_a_live_subscription() {
         sub.next_block().await.is_some(),
         "precondition: a member receives before revocation"
     );
+    assert!(witness.next_block().await.is_some());
 
     server.revoke_membership("#private", &member);
     server
         .post_text(&owner, "#private", "after revocation")
         .await;
+    assert!(
+        witness.next_block().await.is_some(),
+        "the block was fanned out"
+    );
     assert!(
         sub.no_block().await,
         "delivery must stop after revocation — a subscription authorized once at \
@@ -104,7 +114,13 @@ async fn a_stranger_who_subscribed_early_still_receives_nothing() {
     server
         .create_channel(&owner, "#private", "restricted")
         .await;
+    let mut witness = WsClient::connect(&url).await;
+    assert!(witness.subscribe(&owner, "#private").await.is_none());
     server.post_text(&owner, "#private", "secret").await;
+    assert!(
+        witness.next_block().await.is_some(),
+        "the block was fanned out"
+    );
     assert!(
         sub.no_block().await,
         "a stranger must not receive from a restricted channel however early \
@@ -143,4 +159,61 @@ async fn the_owner_receives_live_blocks_on_their_restricted_channel() {
 
     server.post_text(&member, "#private", "hi owner").await;
     assert!(sub.next_block().await.is_some());
+}
+
+/// A connection holds one subscription. Re-subscribing must replace it in
+/// the fanout map, not leave the old one delivering under its old scope and
+/// identity until the process exits.
+#[tokio::test]
+async fn re_subscribing_replaces_the_previous_subscription() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let member = Identity::new(2);
+    server
+        .create_channel(&owner, "#private", "restricted")
+        .await;
+    server.create_channel(&owner, "#open", "open").await;
+    server.add_member(&owner, "#private", &member).await;
+
+    let url = server.serve_ws().await;
+    let mut sub = WsClient::connect(&url).await;
+    assert!(sub.subscribe(&member, "#private").await.is_none());
+    assert!(sub.subscribe(&member, "#open").await.is_none());
+    assert_eq!(
+        server.fanout().local_subscription_count().await,
+        1,
+        "the first subscription must have been removed, not orphaned"
+    );
+
+    // The old scope no longer delivers on this socket…
+    server.post_text(&owner, "#private", "old scope").await;
+    assert!(
+        sub.no_block().await,
+        "#private must not reach a socket now on #open"
+    );
+    // …and the new one does.
+    server.post_text(&owner, "#open", "new scope").await;
+    assert!(sub.next_block().await.is_some());
+}
+
+/// A write-gate refusal over WSS carries the same status and code as over
+/// REST, so a client sees one word for "not a member here" on either pipe.
+#[tokio::test]
+async fn a_refused_post_over_wss_carries_the_rest_status_and_code() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let stranger = Identity::new(2);
+    server
+        .create_channel(&owner, "#private", "restricted")
+        .await;
+
+    let url = server.serve_ws().await;
+    let mut ws = WsClient::connect(&url).await;
+    match ws.submit_text(&stranger, "#private", "psst").await {
+        Frame::Error { status, code, .. } => {
+            assert_eq!(status, Some(403));
+            assert_eq!(code, "NOT_A_MEMBER");
+        }
+        other => panic!("expected an error frame, got {other:?}"),
+    }
 }

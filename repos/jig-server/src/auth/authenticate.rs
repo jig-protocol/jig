@@ -77,7 +77,8 @@ pub fn authenticate(
         .verify(hash.as_bytes(), &signature)
         .map_err(|_| GateOutcome::AuthSignatureInvalid)?;
 
-    match guard.check_and_record(&proof.nonce, proof.hlc_wall_ms, now_ms) {
+    // Scoped by the DID the signature just verified — see `ReplayGuard`.
+    match guard.check_and_record(proof.did.as_str(), &proof.nonce, proof.hlc_wall_ms, now_ms) {
         Ok(()) => Ok(proof.did.clone()),
         Err(ReplayRejection::AlreadySeen) => Err(GateOutcome::AuthReplayed),
         Err(ReplayRejection::OutsideWindow) => Err(GateOutcome::AuthStale),

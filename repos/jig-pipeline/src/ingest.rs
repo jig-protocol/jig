@@ -255,6 +255,9 @@ pub async fn ingest(
         sender_is_member,
     ) {
         use crate::authorize_write::WriteRefusal;
+        // The audit record of what actually happened, independent of what any
+        // surface tells the caller — the same rule the read gates follow.
+        tracing::info!(kind = kind_str, refusal = ?refusal, "write refused");
         let kind = kind_str.to_string();
         return Err(match refusal {
             WriteRefusal::NotChannelOwner { slug, sender } => {

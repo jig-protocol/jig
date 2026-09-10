@@ -98,7 +98,8 @@ async fn restricted_channels_are_gated_end_to_end() {
     assert_eq!(body["code"], "NOT_A_MEMBER");
 
     let listing = format!("{}/api/v1/channels", server.http_url());
-    let (_, body) = signed_get(&carol, &listing).await;
+    let (status, body) = signed_get(&carol, &listing).await;
+    assert_eq!(status, 200, "the listing itself succeeds: {body}");
     assert!(
         !body.to_string().contains("#private"),
         "carol's listing must not name the channel: {body}"

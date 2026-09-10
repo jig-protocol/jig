@@ -33,7 +33,7 @@ use jig_core::BlockBundle;
 use jig_pipeline::{
     Envelope, Frame, ReceiptRef, Scope, SubscriptionScope,
     fanout::SubscriberIdentity,
-    ingest::{IngestError, IngestSource, ingest},
+    ingest::{IngestSource, ingest},
 };
 use tokio::sync::mpsc;
 
@@ -442,6 +442,11 @@ async fn handle_client_frame(
                     // above), but a subscription with no DID on a server that
                     // requires one must never be registered.
                     let outcome = crate::auth::GateOutcome::AuthMissing;
+                    tracing::info!(
+                        conn_id,
+                        audit = %crate::auth::audit_line(&outcome),
+                        "ws subscribe refused"
+                    );
                     let (status, code, message) = state.auth.disclosure.disclose(&outcome);
                     let _ = send_error(socket, Some(status), code, None, &message).await;
                     return Ok(());
@@ -481,18 +486,22 @@ async fn handle_client_frame(
                 Scope::Channel { slug } => SubscriptionScope::Channel(slug),
                 Scope::Federation { block_kinds } => SubscriptionScope::Federation { block_kinds },
             };
+            // A connection holds ONE subscription. A re-Subscribe replaces it,
+            // and the old one must actually go: left in the fanout map it
+            // would keep delivering its old scope under its old identity for
+            // the life of the process, long after this socket forgot it.
+            if let Some(old) = sub_id.take() {
+                state.ingest_ctx.fanout.unsubscribe_local(old).await;
+            } else {
+                // The gauge counts connections holding a subscription; a
+                // replacement is not a second unit.
+                metrics::subscriber_added();
+            }
             let id = state
                 .ingest_ctx
                 .fanout
                 .subscribe_local(sub_scope, who, sub_tx.clone())
                 .await;
-            // The gauge counts connections holding a subscription, matching the
-            // single `sub_id` slot that the disconnect path decrements. A
-            // re-Subscribe on the same connection replaces that slot, so it
-            // must not add a second unit.
-            if sub_id.is_none() {
-                metrics::subscriber_added();
-            }
             *sub_id = Some(id);
             tracing::debug!(conn_id, sub_id = id, "ws subscription registered");
             Ok(())
@@ -583,60 +592,13 @@ async fn handle_client_frame(
                     };
                     let _ = socket.send(Message::Text(json)).await;
                 }
-                // Status matches classify_ingest_error's IngestError::InvalidSignature
-                // arm (StatusCode::UNAUTHORIZED) so both transports agree.
-                Err(IngestError::InvalidSignature) => {
-                    let _ = send_error(
-                        socket,
-                        Some(401),
-                        "INVALID_SIG",
-                        None,
-                        "signature verification failed",
-                    )
-                    .await;
-                }
-                // Status matches classify_ingest_error's IngestError::DisallowedBlockKind
-                // arm (StatusCode::FORBIDDEN).
-                Err(IngestError::DisallowedBlockKind { kind }) => {
-                    let _ = send_error(
-                        socket,
-                        Some(403),
-                        "DISALLOWED_BLOCK_KIND",
-                        None,
-                        &format!("block kind not in allow list: {kind}"),
-                    )
-                    .await;
-                }
-                // Status matches classify_ingest_error's IngestError::KindRequired
-                // arm (StatusCode::BAD_REQUEST).
-                Err(IngestError::KindRequired) => {
-                    let _ = send_error(
-                        socket,
-                        Some(400),
-                        "KIND_REQUIRED",
-                        None,
-                        "manifest must declare a block kind",
-                    )
-                    .await;
-                }
-                // Distinct code (not the generic INGEST_ERROR) because this is
-                // the one ingest failure an ordinary user causes by mistyping a
-                // channel name; the Display text is already actionable prose.
-                // Status matches classify_ingest_error's IngestError::UnknownChannel
-                // arm (StatusCode::NOT_FOUND).
-                Err(e @ IngestError::UnknownChannel { .. }) => {
-                    let _ = send_error(socket, Some(404), "UNKNOWN_CHANNEL", None, &e.to_string())
-                        .await;
-                }
-                // Catch-all: this single generic code covers several distinct
-                // IngestError variants (BundleMalformed, MissingMetadata,
-                // NoExecutor, RenderFailed, Identity, Persist, Other) that
-                // classify_ingest_error maps to different statuses (400/500/401/500).
-                // Since this call site does not distinguish which one occurred,
-                // there is no single REST status it can honestly report — None,
-                // not a guess.
+                // One classifier for every surface. `v0_0_2_ingest_error.rs`
+                // exists because two HTTP surfaces once drifted apart on the
+                // same variant; a hand-copied table here was the third copy.
                 Err(e) => {
-                    let _ = send_error(socket, None, "INGEST_ERROR", None, &e.to_string()).await;
+                    let (status, code, message) =
+                        crate::v0_0_2_ingest_error::classify_ingest_error(&e);
+                    let _ = send_error(socket, Some(status.as_u16()), code, None, &message).await;
                 }
             }
             Ok(())
@@ -728,44 +690,6 @@ async fn send_error(
 mod tests {
     use super::*;
 
-    /// The four Submit-arm statuses are hand-copied from `classify_ingest_error`
-    /// rather than derived from it, because the WS arms word two of their
-    /// messages differently from REST and this phase may not change message
-    /// text. Comments on those arms assert the parity; this test enforces it, so
-    /// changing the classifier fails here instead of silently leaving the two
-    /// transports disagreeing.
-    ///
-    /// `v0_0_2_ingest_error.rs` exists precisely because two HTTP surfaces once
-    /// drifted apart this way. Fold these arms into the classifier when a later
-    /// phase touches them anyway and can absorb the two message changes
-    /// deliberately.
-    #[test]
-    fn ws_submit_statuses_match_the_rest_classifier() {
-        use crate::v0_0_2_ingest_error::classify_ingest_error;
-
-        for (err, ws_status) in [
-            (IngestError::InvalidSignature, 401u16),
-            (
-                IngestError::DisallowedBlockKind {
-                    kind: "widget".to_string(),
-                },
-                403,
-            ),
-            (IngestError::KindRequired, 400),
-            (
-                IngestError::UnknownChannel {
-                    slug: "#nope".to_string(),
-                },
-                404,
-            ),
-        ] {
-            assert_eq!(
-                classify_ingest_error(&err).0.as_u16(),
-                ws_status,
-                "WS hand-copied status disagrees with the REST classifier for {err}"
-            );
-        }
-    }
     use std::net::SocketAddr;
     use std::time::Duration;
 

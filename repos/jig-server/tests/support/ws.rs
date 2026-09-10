@@ -24,6 +24,11 @@ const EXPECTED: Duration = Duration::from_secs(3);
 const SILENCE: Duration = Duration::from_millis(300);
 
 impl TestServer {
+    /// The server's fanout, for assertions about subscription bookkeeping.
+    pub fn fanout(&self) -> &jig_pipeline::fanout::Fanout {
+        &self.state.ingest_ctx.fanout
+    }
+
     /// Serve the WebSocket endpoint and return its `ws://` URL. The server task
     /// lives until the runtime is dropped at the end of the test.
     pub async fn serve_ws(&self) -> String {
@@ -91,6 +96,24 @@ impl WsClient {
         });
         self.send(&frame).await;
         self.next_frame(SILENCE).await
+    }
+
+    /// Submit a `text-render` over this socket and return the server's
+    /// answer frame (Ack or Error).
+    pub async fn submit_text(&mut self, who: &Identity, slug: &str, body: &str) -> Frame {
+        let me = who.as_client();
+        let block = jig_client::blocks::build_text_render(
+            &me,
+            slug,
+            body,
+            jig_core::HlcTimestamp::now_wall(me.did().clone()),
+        );
+        let frame = Envelope::new(Frame::Submit {
+            bundle_b64: base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
+            sig_b64: base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
+        });
+        self.send(&frame).await;
+        self.next_frame(EXPECTED).await.expect("a reply to Submit")
     }
 
     /// The next delivered block's `delivery_cid`, or `None` if nothing

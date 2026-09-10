@@ -129,6 +129,12 @@ impl Fanout {
         self.local.write().await.remove(&id);
     }
 
+    /// How many local subscriptions are registered. For tests and gauges; the
+    /// number a leak would grow.
+    pub async fn local_subscription_count(&self) -> usize {
+        self.local.read().await.len()
+    }
+
     /// Register an outbound federation peer. The caller is responsible for
     /// taking deliveries off `rx` and writing them onto the peer's WSS
     /// connection. Re-registering the same URL replaces the previous sender.

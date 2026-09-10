@@ -37,7 +37,10 @@ rest is preserved for its reasoning, not as a to-do list.
 
 ### Not done — know these before the first group session
 
-- **No authz beyond the tailnet.** No authn, no authz, no per-channel ACL enforcement on
+- ~~**No authz beyond the tailnet.**~~ *Superseded 2026-09-09 by the authn/authz work:
+  reads are signed and restricted channels are membership-gated; see
+  `deploy/README.md`. Left as written below for the record of what this dogfood ran.*
+  No authn, no authz, no per-channel ACL enforcement on
   reads or sends. Membership is derived state for bridge dispatch only. Tailnet membership
   *is* the access control; removing someone from the tailnet is how you revoke them.
 - **No reconnect with backoff.** `jig tail` and `jig chat` now *detect* a dropped connection

@@ -77,19 +77,20 @@ async fn an_open_channel_is_readable_by_any_authenticated_caller() {
     assert_eq!(status, StatusCode::OK, "body={body}");
 }
 
-/// Reading a channel that does not exist is a 404, not an empty 200. Before
-/// this gate a mistyped slug read back as a silent empty timeline.
+/// A channel with no local row reads as an empty timeline, not a refusal:
+/// federated channels live on a peer and have blocks here but no row, and
+/// their backfill must keep working. (The row, once it exists, is enforced.)
 #[tokio::test]
-async fn reading_an_unknown_channel_is_not_found() {
+async fn reading_a_channel_with_no_local_row_is_not_refused() {
     let server = TestServer::authenticated();
     let caller = Identity::new(1);
 
     let (status, body) = server
-        .send(&server.sign_get(&caller, &history_path("#nowhere")))
+        .send(&server.sign_get(&caller, &history_path("#remote-only")))
         .await;
 
-    assert_eq!(status, StatusCode::NOT_FOUND, "body={body}");
-    assert_eq!(body["code"], "NO_SUCH_CHANNEL");
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert!(body.as_array().is_some_and(Vec::is_empty), "body={body}");
 }
 
 /// The migration escape hatch disables the whole read pipeline, gate 3
