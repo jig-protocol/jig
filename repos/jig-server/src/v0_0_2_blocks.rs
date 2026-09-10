@@ -228,36 +228,49 @@ pub struct ChannelsResponse {
     pub channels: Vec<ChannelView>,
 }
 
-/// GET /api/v1/channels — list all channels known to this server.
+/// GET /api/v1/channels — list the channels the caller may read.
 ///
-/// Channels are public state in v0.0.2 (no per-channel ACL on listing — the
-/// visibility flag governs join semantics, not listing). Not debug-gated.
+/// Every channel runs the same `authorize_read` decision as a timeline read,
+/// so a restricted channel a caller could not read is not listed to them
+/// either. A 403 on the timeline conceals nothing if this endpoint still
+/// names every restricted channel — and its `owner_did` — to whoever asks.
+/// Not debug-gated.
 pub async fn list_channels(
     State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<ChannelsResponse>, (StatusCode, Json<ErrorBody>)> {
     let started = std::time::Instant::now();
-    // Phase 3 consumes this to filter restricted channels from the listing.
     let caller_did = authenticate_read(&state, &headers, "GET", uri.path(), started)?;
-    let _ = &caller_did;
+    let store = &state.ingest_ctx.store;
 
-    let stored = state.ingest_ctx.store.list_channels().map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "PERSIST_ERROR",
-            e.to_string(),
-        )
-    })?;
-    let channels = stored
-        .into_iter()
-        .map(|c| ChannelView {
+    let stored = store.list_channels().map_err(persist_err)?;
+    let mut channels = Vec::with_capacity(stored.len());
+    for c in stored {
+        // With no verified caller (the migration escape hatch) nobody is
+        // filtered: the pre-authentication listing, exactly as documented.
+        if let Some(caller) = caller_did.as_ref() {
+            let visibility = crate::auth::Visibility::parse(&c.visibility);
+            // Open channels need no membership query; the decision is the
+            // same whatever the answer would have been.
+            let is_member = match visibility {
+                crate::auth::Visibility::Open => false,
+                crate::auth::Visibility::Restricted => store
+                    .is_member(&c.slug, caller.as_str())
+                    .map_err(persist_err)?,
+            };
+            let is_owner = c.owner_did == caller.as_str();
+            if crate::auth::authorize_read(visibility, is_member, is_owner).is_err() {
+                continue;
+            }
+        }
+        channels.push(ChannelView {
             slug: c.slug,
             visibility: c.visibility,
             owner_did: c.owner_did,
             created_at: c.created_at,
-        })
-        .collect();
+        });
+    }
     Ok(Json(ChannelsResponse { channels }))
 }
 

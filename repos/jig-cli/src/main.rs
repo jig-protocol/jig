@@ -196,7 +196,8 @@ enum ChannelAction {
         yes: bool,
     },
 
-    /// List all channels known to the configured server.
+    /// List the channels on the configured server that you may read: every
+    /// `open` channel, plus the `restricted` ones you own or belong to.
     /// GETs `/api/v1/channels` and renders an aligned table.
     List,
 }

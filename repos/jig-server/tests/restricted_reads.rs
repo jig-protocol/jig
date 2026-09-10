@@ -210,3 +210,107 @@ async fn a_stranger_cannot_add_someone_else_to_an_open_channel() {
     assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
     assert_eq!(body["code"], "NOT_CHANNEL_OWNER");
 }
+
+// ---- The listing ---------------------------------------------------------------
+//
+// A 403 on the timeline conceals nothing if `GET /api/v1/channels` still names
+// every restricted channel — and its owner_did — to whoever asks.
+
+fn listed_slugs(body: &serde_json::Value) -> Vec<String> {
+    body["channels"]
+        .as_array()
+        .expect("channels array")
+        .iter()
+        .filter_map(|c| c["slug"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_channel_list_hides_restricted_channels_from_non_members() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let stranger = Identity::new(2);
+    let private_owner = Identity::new(3);
+    server.create_channel(&owner, "#open", "open").await;
+    server
+        .create_channel(&private_owner, "#private", "restricted")
+        .await;
+
+    let (status, body) = server
+        .send(&server.sign_get(&stranger, "/api/v1/channels"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+
+    let slugs = listed_slugs(&body);
+    assert!(
+        slugs.contains(&"#open".to_string()),
+        "open channels stay visible: {slugs:?}"
+    );
+    assert!(
+        !slugs.contains(&"#private".to_string()),
+        "a restricted channel must not be listed to a non-member — listing it \
+         leaks both its existence and its owner_did: {slugs:?}"
+    );
+    assert!(
+        !body
+            .to_string()
+            .contains(&private_owner.did().to_did_jig_string()),
+        "the restricted channel's owner_did must not appear anywhere in a \
+         stranger's listing: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_channel_list_shows_restricted_channels_to_their_members() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let member = Identity::new(2);
+    server
+        .create_channel(&owner, "#private", "restricted")
+        .await;
+    server.add_member(&owner, "#private", &member).await;
+
+    let (status, body) = server
+        .send(&server.sign_get(&member, "/api/v1/channels"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    let slugs = listed_slugs(&body);
+    assert!(
+        slugs.contains(&"#private".to_string()),
+        "members see their channels: {slugs:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_channel_list_shows_owners_their_own_restricted_channels() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    server
+        .create_channel(&owner, "#private", "restricted")
+        .await;
+
+    let (status, body) = server
+        .send(&server.sign_get(&owner, "/api/v1/channels"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    let slugs = listed_slugs(&body);
+    assert!(
+        slugs.contains(&"#private".to_string()),
+        "owners see their channels: {slugs:?}"
+    );
+}
+
+/// Under the escape hatch nobody is authenticated, so nobody is filtered —
+/// the pre-authentication listing, exactly as documented.
+#[tokio::test]
+async fn the_escape_hatch_lists_every_channel() {
+    let server = TestServer::unauthenticated();
+    let owner = Identity::new(1);
+    server
+        .create_channel(&owner, "#private", "restricted")
+        .await;
+
+    let (status, body) = server.send_unsigned("/api/v1/channels").await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert!(listed_slugs(&body).contains(&"#private".to_string()));
+}
