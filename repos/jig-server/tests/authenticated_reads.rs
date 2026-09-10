@@ -94,6 +94,7 @@ async fn channel_history_requires_a_proof() {
 async fn channel_history_accepts_a_correctly_signed_read() {
     let server = TestServer::authenticated();
     let caller = Identity::new(1);
+    server.create_channel(&caller, "#hello", "open").await;
 
     let (status, body) = server
         .send(&server.sign_get(&caller, "/api/v1/channels/%23hello/blocks"))

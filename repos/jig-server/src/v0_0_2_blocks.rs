@@ -353,6 +353,39 @@ fn authenticate_read(
     }
 }
 
+/// Gate 3 for a single channel: may `caller` read `slug`?
+///
+/// The decision itself is the pure `authorize_read`; this only gathers its
+/// inputs. An unknown slug is refused here as `AuthzChannelUnknown` rather
+/// than read back as an empty timeline — a mistyped slug used to be
+/// indistinguishable from a channel with no messages.
+fn authorize_channel_read(
+    state: &AppState,
+    slug: &str,
+    caller: &jig_core::did::Did,
+    started: std::time::Instant,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let store = &state.ingest_ctx.store;
+    let Some(channel) = store.get_channel_by_slug(slug).map_err(persist_err)? else {
+        return Err(refuse(
+            state,
+            &crate::auth::GateOutcome::AuthzChannelUnknown,
+            started,
+        ));
+    };
+    let is_member = store
+        .is_member(slug, caller.as_str())
+        .map_err(persist_err)?;
+    let is_owner = channel.owner_did == caller.as_str();
+
+    crate::auth::authorize_read(
+        crate::auth::Visibility::parse(&channel.visibility),
+        is_member,
+        is_owner,
+    )
+    .map_err(|outcome| refuse(state, &outcome, started))
+}
+
 /// Map a gate outcome to a response through this server's disclosure policy,
 /// logging the true outcome regardless of what the policy emits.
 ///
@@ -386,11 +419,15 @@ pub async fn get_channel_history(
     headers: axum::http::HeaderMap,
 ) -> Result<Json<Vec<TimelineBlock>>, (StatusCode, Json<ErrorBody>)> {
     let started = std::time::Instant::now();
-    // Phase 3 consumes this to enforce membership on restricted channels.
     let caller_did = authenticate_read(&state, &headers, "GET", uri.path(), started)?;
-    let _ = &caller_did;
-
     let store = &state.ingest_ctx.store;
+
+    // Gate 3, before any block is fetched: a refusal must not be
+    // distinguishable from an empty channel by how much work it took.
+    if let Some(caller) = caller_did.as_ref() {
+        authorize_channel_read(&state, &slug, caller, started)?;
+    }
+
     let blocks = store
         .list_blocks_by_channel(&slug, query.limit.unwrap_or(MAX_HISTORY_LIMIT), None)
         .map_err(persist_err)?;
