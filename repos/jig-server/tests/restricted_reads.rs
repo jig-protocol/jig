@@ -553,3 +553,46 @@ async fn a_post_carrying_both_keys_is_gated_on_the_key_it_is_stored_under() {
         "the block was gated as #open and must be stored as #open, not #private"
     );
 }
+
+// ---- Replay of an accepted control-plane block ---------------------------------
+
+/// The owner's member-add is genuine and stays genuine. What must not stay is
+/// its effect: once the owner has removed the member, re-submitting the
+/// captured block must not put them back.
+#[tokio::test]
+async fn replaying_an_accepted_member_add_does_not_undo_a_revocation() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let member = Identity::new(2);
+    server
+        .create_channel(&owner, "#private", "restricted")
+        .await;
+
+    let by = owner.as_client();
+    let block = build_member_add(
+        &by,
+        "#private",
+        &member.did().to_did_jig_string(),
+        HlcTimestamp::now_wall(by.did().clone()),
+    );
+    let (status, body) = server.try_submit(&block).await;
+    assert_eq!(status, StatusCode::OK, "owner enrols member: {body}");
+    let (status, _) = server
+        .send(&server.sign_get(&member, &history_path("#private")))
+        .await;
+    assert_eq!(status, StatusCode::OK, "precondition: member can read");
+
+    server.revoke_membership("#private", &member);
+
+    let (status, body) = server.try_submit(&block).await;
+    assert_eq!(status, StatusCode::CONFLICT, "replay: {body}");
+    assert_eq!(body["code"], "DUPLICATE_BLOCK");
+    let (status, body) = server
+        .send(&server.sign_get(&member, &history_path("#private")))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the revocation must hold: {body}"
+    );
+}

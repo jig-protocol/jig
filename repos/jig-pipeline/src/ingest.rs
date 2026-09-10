@@ -110,6 +110,12 @@ pub enum IngestError {
         slug: String,
         sender: String,
     },
+    /// This exact block (by CID) was already ingested. Refused before any
+    /// effect runs: an accepted control-plane block is otherwise a standing
+    /// authorization anyone holding its bytes can replay — re-enrolling a
+    /// member the owner has since removed, for instance.
+    #[error("block `{cid}` was already ingested")]
+    DuplicateBlock { cid: String },
     /// Content for a restricted channel from someone who is neither a member
     /// nor its owner. See [`crate::authorize_write`].
     #[error("`{kind}` on `{slug}` refused: `{sender}` is not a member of the channel")]
@@ -283,6 +289,14 @@ pub async fn ingest(
         .block_cid()
         .map(|c| c.to_string())
         .unwrap_or_else(|_| "bafy_invalid".to_string());
+
+    // Step 3d: a block is ingested once. The `blocks.cid` primary key would
+    // refuse the second insert anyway, but `apply_effect` runs BEFORE that
+    // insert, so without this check a replayed member-add had already
+    // re-created the membership by the time the insert failed.
+    if ctx.store.get_block(&block_cid)?.is_some() {
+        return Err(IngestError::DuplicateBlock { cid: block_cid });
+    }
     let (receipt_bytes, render_hash, is_synthetic) = match kind {
         BlockKind::TextRender => build_render_receipt(ctx, &manifest, &block_cid, kind_str).await?,
         _ => build_synth_receipt(&block_cid, &ctx.server_did, &ctx.server_key),
@@ -1064,6 +1078,50 @@ mod tests {
             .expect("member-add by the owner against an existing channel must succeed");
         let members = ctx.store.list_members(&channel_id).unwrap();
         assert!(members.iter().any(|m| m.member_did == "did:jig:zDeji"));
+    }
+
+    /// Replaying an accepted member-add must not re-enrol a member who has
+    /// since been removed. The bytes are genuine and owner-signed; what makes
+    /// them invalid the second time is that they were already applied.
+    #[tokio::test]
+    async fn a_replayed_member_add_does_not_re_enrol_a_removed_member() {
+        let ctx = test_ctx_allowing(&["member-add"]);
+        let owner_key = random_signing_key();
+        let channel_id = seed_channel_owned_by(&ctx, "#hello", &did_of(&owner_key));
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &owner_key,
+            BlockKind::MemberAdd,
+            &[("channel", "#hello"), ("member_did", "did:jig:zDeji")],
+        );
+
+        do_ingest(
+            &ctx,
+            mb.clone(),
+            cb.clone(),
+            sig.clone(),
+            IngestSource::LocalClient { conn_id: 1 },
+        )
+        .await
+        .expect("first ingest");
+        assert!(ctx.store.is_member("#hello", "did:jig:zDeji").unwrap());
+        assert!(
+            ctx.store
+                .remove_membership("#hello", "did:jig:zDeji")
+                .unwrap()
+        );
+
+        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .expect_err("the same block a second time must be refused");
+        assert!(
+            matches!(err, IngestError::DuplicateBlock { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            !ctx.store.is_member("#hello", "did:jig:zDeji").unwrap(),
+            "a refused replay must leave the revocation in place"
+        );
+        assert_eq!(ctx.store.list_members(&channel_id).unwrap().len(), 0);
     }
 
     /// Gate 3 for writes runs inside ingest, so every surface gets it. A validly

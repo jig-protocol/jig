@@ -63,6 +63,9 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         ),
         // Same code the admin archive path emits for its own owner check, so a
         // client sees one word for "not yours to change" whichever door it used.
+        IngestError::DuplicateBlock { .. } => {
+            (StatusCode::CONFLICT, "DUPLICATE_BLOCK", e.to_string())
+        }
         IngestError::NotChannelOwner { .. } => {
             (StatusCode::FORBIDDEN, "NOT_CHANNEL_OWNER", e.to_string())
         }
@@ -125,6 +128,9 @@ mod tests {
                 kind: "text-render".to_string(),
                 slug: "#room".to_string(),
                 sender: "did:jig:zStranger".to_string(),
+            },
+            IngestError::DuplicateBlock {
+                cid: "bafy_twice".to_string(),
             },
         ]
     }

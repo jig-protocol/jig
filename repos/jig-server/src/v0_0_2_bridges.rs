@@ -300,6 +300,10 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         ref e @ IngestError::NotChannelMember { .. } => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },
+        // Retrying sends the same bytes, which is what was refused.
+        ref e @ IngestError::DuplicateBlock { .. } => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
         // Unavailable, not PolicyBlocked: the block is fine and execution failed
         // on this host, so a retry may well succeed.
         IngestError::RenderFailed { .. } => SubmitDenied::Unavailable,
