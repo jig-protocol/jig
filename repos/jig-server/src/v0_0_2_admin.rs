@@ -211,11 +211,12 @@ pub async fn add_member(
 ///
 /// ## Authorization
 ///
-/// These endpoints are unauthenticated, and a delete is far more destructive
-/// than a create, so the sender DID must equal the channel's `owner_did`. The
-/// check below is what produces a precise 403/404/409; it reads the *claimed*
-/// sender from the manifest, which is only meaningful because `ingest()` then
-/// refuses the block unless that same DID actually signed it, and
+/// These routes carry no request-level proof of their own (the signed block IS
+/// the proof), and a delete is far more destructive than a create, so the
+/// sender DID must equal the channel's `owner_did`. The check below is what
+/// produces a precise 403/404/409; it reads the *claimed* sender from the
+/// manifest, which is only meaningful because `ingest()` then refuses the
+/// block unless that same DID actually signed it, and
 /// `apply_channel_archive` re-checks ownership after verification. Neither
 /// check alone is sufficient — together they are.
 ///
@@ -597,8 +598,8 @@ mod tests {
         );
     }
 
-    /// The security case: the admin endpoints are unauthenticated, so a delete
-    /// that only checked "is the signature valid" would let anyone with a DID
+    /// The security case: any key can reach these routes, so a delete that
+    /// only checked "is the signature valid" would let anyone with a DID
     /// destroy anyone's channel.
     #[tokio::test]
     async fn archive_channel_rejects_a_non_owner() {

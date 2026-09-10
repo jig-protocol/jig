@@ -3,7 +3,7 @@
 The gate between "we dogfood jig on our own tailnet" and "we tell strangers to
 run `curl -fsSL https://jig.onl/install.sh | bash`".
 
-jig is AGPL-licensed source in a public-shaped repo, but it has never been
+jig is MIT OR Apache-2.0 source in a public-shaped repo, but it has never been
 announced, never been deployed to a public address, and has never had a user
 outside the team. This document is the checklist for changing that. Every
 "current state" row below was checked against the code at merge commit

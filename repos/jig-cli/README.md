@@ -9,7 +9,10 @@ Command-line interface for the Jig executable internet.
 ## Features
 
 - **Block-native**: Sends canonical manifests with author DID and metadata.
-- **HTTP transport**: Uses the `/blocks` and `/receipts` endpoints exposed by `jig-server`.
+- **Transport**: WebSocket `/api/v1/ws` for live chat (signed `Subscribe`, `Submit`), signed
+  REST reads of `/api/v1/channels[/:slug/blocks]` for listing and backfill, and the
+  `/_admin_v0_0_2/*` routes for channel ops. (`jig read` still calls the legacy `/blocks`
+  route, which is off by default.)
 - **Pipeline friendly**: Works with stdin/stdout; no local SQLite dependency.
 - **Configurable**: `~/.jig/config.toml` stores server URL, author DID, and default channel.
 

@@ -53,7 +53,8 @@ gcloud config set project <PROJECT_ID>
 gcloud config set compute/zone us-west1-a
 gcloud services enable compute.googleapis.com
 
-# 1. a dedicated VPC with NO ingress rules (default-deny is the whole security model)
+# 1. a dedicated VPC with NO ingress rules (the server gates its own reads and
+#    channels, but admits any key — default-deny is what keeps strangers off it)
 gcloud compute networks create jig-net --subnet-mode=auto
 
 # 2. Cloud NAT — outbound only. MANDATORY, not optional: a VM with no external

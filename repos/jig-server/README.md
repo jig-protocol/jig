@@ -27,11 +27,35 @@ jig-server
 # Start using a specific config file
 jig-server --config jig-config.toml
 
-# Override a few fields on the CLI
-jig-server --db-path /tmp/jig.db --bind 0.0.0.0 --port 7117
+# Override a few fields on the CLI. Bind loopback or a tailnet address —
+# the server authenticates reads and gates channels, but nothing limits
+# who may reach it (see deploy/README.md, "Security model").
+jig-server --db-path /tmp/jig.db --bind 127.0.0.1 --port 7117
 ```
 
-## HTTP API (preview)
+## HTTP API
+
+The v0.0.2 surface, mounted by default:
+
+| Endpoint | Method | Description |
+| --- | --- | --- |
+| `/.well-known/jig` | GET | Server DID, version, `unsafe_options_active` |
+| `/healthz`, `/metrics` | GET | Liveness; Prometheus counters (restricted channels share one label) |
+| `/api/v1/ws` | WSS | `Subscribe` (signed), `Submit`, `Block`, `Ack`, `Error` frames |
+| `/api/v1/blocks` | POST | Submit a signed block bundle (`{bundle_b64, sig_b64}`) |
+| `/api/v1/blocks/{cid}` | GET | One block and its receipts — signed read, channel-gated |
+| `/api/v1/channels` | GET | Channels the caller may read — signed read |
+| `/api/v1/channels/{slug}/blocks` | GET | Channel timeline — signed read, membership-gated |
+| `/_admin_v0_0_2/channels[/{slug}/members\|archive]` | POST | Channel ops as signed blocks; mounted only with `[debug] admin_endpoints = true` |
+
+Reads carry five `x-jig-*` headers with an ed25519 proof over the request
+(`jig_client::ReadProof`); `jig channel list`, `jig chat` and `jig tail` sign
+for you. A bare `curl` gets `401 AUTH_REQUIRED`.
+
+## Legacy v0.0.1 API (off by default)
+
+Mounted only with `dangerously_enable_v0_0_1_rest = true`. Unsigned, with an
+attacker-chosen author DID — never enable it to make an example below work.
 
 | Endpoint                   | Method | Description                                                         |
 | -------------------------- | ------ | ------------------------------------------------------------------- |

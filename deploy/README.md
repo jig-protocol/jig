@@ -64,7 +64,9 @@ the default):
   channels reach any authenticated caller; `restricted` ones reach the owner
   and members only. The listing does not name restricted channels — or their
   owner — to non-members. Live delivery is re-checked on every block, so
-  removing a membership stops an already-open subscription.
+  removing a membership stops an already-open subscription. (There is no
+  `member-remove` block or CLI verb yet: today a removal is the operator
+  deleting the `memberships` row, or archiving the channel.)
 - **Membership is the owner's to grant.** `member-add` onto a restricted
   channel, or of anyone but yourself onto any channel, must be signed by the
   channel owner; `channel-promote` likewise. Self-join (`jig channel join`)
@@ -89,8 +91,9 @@ tailnet:
   self-minted key. Its config default `bind` is `127.0.0.1`, but the unit
   overrides it with `JIG_NS_BIND` — set that to the tailnet IP, not `0.0.0.0`.
 
-Removing someone from the tailnet still removes their access; it is no longer
-the only way to.
+Removing someone from the tailnet still removes their access, and until a
+`member-remove` block exists it is still the operator's only lever short of
+editing the database.
 
 ---
 

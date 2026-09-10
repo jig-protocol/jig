@@ -54,17 +54,17 @@ loopback and private tailnets.
 | --- | --- |
 | Local `jig-server` + `jig chat` / `jig tail` over WebSocket | Works |
 | Signed, content-addressed blocks (ed25519 signature, CID) | Works |
-| Channel create / join / list; membership records | Works, via unauthenticated admin endpoints |
+| Channel create / join / list; membership records | Works. Blocks are signature-verified and owner/membership-gated at ingest; the routes still mount behind a `[debug]` flag |
 | History backfill (last 100 blocks) on joining a channel | Works |
 | `GET /api/v1/channels/:slug/blocks`, `/healthz`, `/metrics` | Works |
 | Nameserver: alias register / resolve / rotate / renew | Works (`jig-nameserver`, `jig ns …`) |
 | Server-to-server federation over WSS | Implemented and covered by [`h3_federation.rs`](repos/integration-tests/tests/h3_federation.rs); never run between two hosts on the public internet |
 | Email bridge (Resend) | Implemented in-process; see [`bridges/email/README.md`](repos/bridges/email/README.md) |
-| Wasm block execution **on the server** | **Not wired.** Every receipt is server-signed and synthetic ([`jig-pipeline/src/ingest.rs`](repos/jig-pipeline/src/ingest.rs), step 4). The server never calls `jig-runtime` |
+| Wasm block execution **on the server** | `text-render` executes for real: the server runs its canonical module and signs the `render_hash` ([`jig-pipeline/src/ingest.rs`](repos/jig-pipeline/src/ingest.rs), step 4). Control-plane kinds still take a synthetic, server-signed receipt |
 | Wasm block execution in the CLI (`jig block run`) | Runs and emits a metered receipt for the runtime's own fixtures. It **rejects the workspace's own `text-block` build** with `MemoryMissingMaximum` from the determinism validator |
 | `jig block lint` / `sign` / `verify` / `capabilities` | Stubs; they print "not yet implemented" and exit 1 |
 | End-to-end encryption | None |
-| Authentication / authorization | None |
+| Authentication / authorization | Signed proof of possession on every read; `restricted` channels membership-gated for reading, listing, live delivery and posting; membership changes owner-signed. **No admission policy or rate limiting** — any key is admitted |
 | Graphical client | None |
 | `jig read` | Broken by default — it calls the v0.0.1 `GET /blocks` route, which is gated off behind `dangerously_enable_v0_0_1_rest`. Use `jig chat`, `jig tail`, or the history endpoint |
 | `jig --version` | Not implemented (`jig-server --version` is) |

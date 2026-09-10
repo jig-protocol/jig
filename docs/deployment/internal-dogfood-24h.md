@@ -2,8 +2,11 @@
 
 > **⚠️ SUPERSEDED** by [`internal-dogfood-3day.md`](./internal-dogfood-3day.md).
 > That plan reflects DJ's decisions of 2026-08-04: 3-day solo budget with parallel agents,
-> nameserver promoted over the GUI, macOS-only clients. This document is retained only for
-> its verified state-of-the-union findings, which remain accurate.
+> nameserver promoted over the GUI, macOS-only clients. This document is retained for its
+> verified state-of-the-union findings **as of 2026-08-04**. Finding #2 ("zero authz") is
+> no longer true: since the authn/authz work of 2026-09, reads are signed and restricted
+> channels are membership-gated for reading, listing, delivery and posting — the attack
+> described there is refused at three gates. See `deploy/README.md`, "Security model".
 
 **Status:** proposed, not executed. Verified against `main` @ `b04df60` on 2026-08-04 by
 running the real binaries, not by reading code.
