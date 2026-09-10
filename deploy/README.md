@@ -46,23 +46,51 @@ copy of a person's identity.
 
 ---
 
-## Security model: the tailnet IS the authentication
+## Security model: identity in the server, the tailnet as defence in depth
 
-There is no authn and no authz in the server. None. **Tailnet membership is the
-only authentication this deployment has.** What protects it is that
-`bind_address` is a Tailscale `100.x.y.z` address, so only devices in your
-tailnet can reach the socket at all.
+The server authenticates and authorizes on its own. Network placement is a
+second layer, not the only one — but it is still a layer you want, because the
+gates below are new and not everything is behind one yet.
 
-Consequences to internalise:
+What the server enforces (with `[auth] require_authenticated_reads = true`,
+the default):
 
-- **Never set `bind_address = "0.0.0.0"`.** That publishes an unauthenticated
-  block store to the internet.
-- `admin_endpoints = true` (required, below) exposes unauthenticated channel
-  creation and membership changes. Safe on a tailnet, catastrophic off it.
+- **Every read carries proof of possession.** REST reads and WSS subscribes
+  are signed by the caller's ed25519 key over a canonical hash of the request;
+  the server verifies the signature against the DID and refuses replays. A DID
+  without its key reads nothing.
+- **Restricted channels are membership-gated.** History, the channel listing,
+  live WSS delivery and posting are all decided by the same rule: `open`
+  channels reach any authenticated caller; `restricted` ones reach the owner
+  and members only. The listing does not name restricted channels — or their
+  owner — to non-members. Live delivery is re-checked on every block, so
+  removing a membership stops an already-open subscription.
+- **Membership is the owner's to grant.** `member-add` onto a restricted
+  channel, or of anyone but yourself onto any channel, must be signed by the
+  channel owner; `channel-promote` likewise. Self-join (`jig channel join`)
+  works on open channels only. Unknown `visibility` values fail closed.
+
+What it does not enforce yet — the reasons to keep `bind_address` on the
+tailnet:
+
+- **No admission policy.** Any self-minted key is admitted; there is no
+  reputation, rate limit or proof-of-work in front of the gates. Anyone who can
+  reach the port can create channels and post to open ones.
+- **Federated peers are trusted.** Blocks relayed from a peer are persisted
+  and delivered to local subscribers without running the write gate. Only
+  federate with servers you would let post on your behalf.
+- **Admin endpoints still live behind `[debug]`.** `admin_endpoints = true`
+  (required, below) mounts the channel-ops routes. They run the same gates as
+  everything else now, so the risk is the label, not the behaviour — but do
+  not read "debug" as "harmless".
+- **No end-to-end encryption.** The operator reads every message. See
+  `docs/RELEASE_READINESS.md` §1.3.
 - The nameserver's `/v1/register` has no auth beyond proof-of-control of a
-  self-minted key. Same rule. Its config default `bind` is `127.0.0.1`, but the
-  unit overrides it with `JIG_NS_BIND` — set that to the tailnet IP, not `0.0.0.0`.
-- Removing someone from the tailnet is how you remove their access.
+  self-minted key. Its config default `bind` is `127.0.0.1`, but the unit
+  overrides it with `JIG_NS_BIND` — set that to the tailnet IP, not `0.0.0.0`.
+
+Removing someone from the tailnet still removes their access; it is no longer
+the only way to.
 
 ---
 
