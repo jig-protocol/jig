@@ -16,7 +16,8 @@
 //!     client unusable.
 
 use anyhow::{Context, Result};
-use jig_client::DeliveredBlock;
+use jig_client::read_auth::{ReadProof, signable_path};
+use jig_client::{DeliveredBlock, Identity};
 
 use crate::cmd::blocks_decode::{DecodedBlock, decode};
 use crate::cmd::channel::{base_http_url, escape_slug_for_url};
@@ -63,24 +64,29 @@ pub fn decode_history(blocks: &[DeliveredBlock]) -> Vec<DecodedBlock> {
         .collect()
 }
 
-/// Fetch the last `limit` blocks of a channel.
+/// Fetch the last `limit` blocks of a channel, as `who`.
+///
+/// Signed: the server requires proof of possession on every read, and a
+/// restricted channel's history is only served to its members.
 pub async fn fetch_history(
+    who: &Identity,
     base_url: &str,
     channel: &str,
     limit: usize,
 ) -> Result<Vec<DeliveredBlock>> {
     let url = history_url(base_url, channel, limit);
+    let proof = ReadProof::sign(who, "GET", signable_path(&url));
     // Short timeout: this runs on the critical path to the first frame, and
     // a slow server should cost a warning, not a hung terminal.
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .context("building HTTP client for channel history")?;
-    let resp = http
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?;
+    let mut req = http.get(&url);
+    for (name, value) in proof.headers() {
+        req = req.header(name, value);
+    }
+    let resp = req.send().await.with_context(|| format!("GET {url}"))?;
     let status = resp.status();
     let body = resp
         .text()
@@ -99,8 +105,13 @@ pub async fn fetch_history(
 ///
 /// Call this before entering raw mode: the warning goes to stderr as plain
 /// text.
-pub async fn backfill(base_url: &str, channel: &str, limit: usize) -> Vec<DecodedBlock> {
-    match fetch_history(base_url, channel, limit).await {
+pub async fn backfill(
+    who: &Identity,
+    base_url: &str,
+    channel: &str,
+    limit: usize,
+) -> Vec<DecodedBlock> {
+    match fetch_history(who, base_url, channel, limit).await {
         Ok(blocks) => decode_history(&blocks),
         Err(e) => {
             eprintln!("warning: could not load history for {channel}: {e:#}");
@@ -223,7 +234,9 @@ mod tests {
     async fn backfill_degrades_to_empty_when_the_server_is_unreachable() {
         // Port 1 is refused immediately. A server that has not been upgraded
         // answers 404 here instead; either way the pane must still open.
-        let backlog = backfill("http://127.0.0.1:1", "#hello", 10).await;
+        let dir = tempdir().unwrap();
+        let id = Identity::generate_and_save(&dir.keep()).unwrap();
+        let backlog = backfill(&id, "http://127.0.0.1:1", "#hello", 10).await;
         assert!(
             backlog.is_empty(),
             "unreachable server must yield no backlog"

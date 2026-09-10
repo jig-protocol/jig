@@ -104,8 +104,13 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
     // Fetch history BEFORE the terminal goes into raw mode: any warning
     // from a server without the history endpoint has to print as ordinary
     // text, not into the alternate screen we would otherwise already own.
-    let backlog =
-        history::backfill(&server_url, &args.channel, history::DEFAULT_HISTORY_LIMIT).await;
+    let backlog = history::backfill(
+        &id,
+        &server_url,
+        &args.channel,
+        history::DEFAULT_HISTORY_LIMIT,
+    )
+    .await;
 
     let client = Client::connect(&server_url, id)
         .await

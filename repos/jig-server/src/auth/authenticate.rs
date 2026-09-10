@@ -137,18 +137,10 @@ pub fn authenticate_subscribe(
     authenticate(&proof, "SUBSCRIBE", scope, b"", now_ms, guard)
 }
 
-/// Header names carrying a tier-0 proof over HTTP.
-///
-/// HTTP-specific by necessity; the *verification* is not, which is what keeps
-/// the design transport-agnostic. A future SSH or gRPC transport carries the
-/// same five values however it can and calls the same [`authenticate`].
-pub mod headers {
-    pub const DID: &str = "x-jig-did";
-    pub const HLC_WALL_MS: &str = "x-jig-hlc-wall-ms";
-    pub const HLC_LOGICAL: &str = "x-jig-hlc-logical";
-    pub const NONCE: &str = "x-jig-nonce";
-    pub const SIGNATURE: &str = "x-jig-signature";
-}
+/// Header names carrying a tier-0 proof over HTTP. Defined in `jig-core` next
+/// to the canonical hash, so the client that signs and this verifier read the
+/// same names from one place; re-exported here for the server's own callers.
+pub use jig_core::request_auth::headers;
 
 /// Extract a proof from HTTP headers, if one is present and well-formed.
 ///

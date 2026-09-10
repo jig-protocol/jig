@@ -38,7 +38,8 @@ pub async fn run(ctx: &CliContext, channel: String) -> Result<()> {
     // Backfill first: a fresh tail on a busy channel used to sit silent
     // until the next live message. Failures here degrade to "no backlog"
     // (see `history::backfill`) rather than aborting the tail.
-    let backlog = history::backfill(&server_url, &channel, history::DEFAULT_HISTORY_LIMIT).await;
+    let backlog =
+        history::backfill(&id, &server_url, &channel, history::DEFAULT_HISTORY_LIMIT).await;
 
     let client = Client::connect(&server_url, id)
         .await
