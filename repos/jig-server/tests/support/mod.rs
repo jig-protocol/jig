@@ -6,6 +6,10 @@
 //! this module says is signed is signed, so a test asserting a 200 is asserting
 //! the server verified a real ed25519 signature.
 
+// Each integration-test binary compiles this module separately and uses only
+// the helpers it needs; the rest would warn as dead code binary by binary.
+#![allow(dead_code)]
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;

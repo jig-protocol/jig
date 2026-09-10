@@ -58,6 +58,31 @@ pub fn authorize_read(
 mod tests {
     use super::*;
 
+    /// The write gate in `jig-pipeline` parses the same stored column. If the
+    /// two ever disagree on a string, one side would let a self-join through
+    /// that the other side then honours as membership — so hold them to the
+    /// same answer on every shape that could plausibly land in the column.
+    #[test]
+    fn read_and_write_gates_agree_on_what_open_means() {
+        for raw in [
+            "open",
+            "restricted",
+            "",
+            "Open",
+            "OPEN",
+            " open",
+            "open ",
+            "public",
+            "\0",
+        ] {
+            assert_eq!(
+                Visibility::parse(raw) == Visibility::Open,
+                jig_pipeline::authorize_write::is_open(raw),
+                "read and write gates disagree on {raw:?}"
+            );
+        }
+    }
+
     #[test]
     fn an_open_channel_is_readable_by_any_admitted_caller() {
         assert_eq!(authorize_read(Visibility::Open, false, false), Ok(()));

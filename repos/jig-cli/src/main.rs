@@ -170,6 +170,9 @@ enum ChannelAction {
     /// Join an existing channel by adding the caller's DID as a member.
     /// Builds a signed member-add block and POSTs it to
     /// `/_admin_v0_0_2/channels/<slug>/members`.
+    ///
+    /// Only `open` channels can be joined this way. A `restricted` channel is
+    /// invite-only: its owner adds members, and a self-join is refused.
     Join {
         /// Channel slug to join (e.g. `#hello`).
         #[arg()]

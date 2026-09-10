@@ -102,6 +102,14 @@ pub enum IngestError {
     /// receipt.
     #[error("executing the `{kind}` module failed: {detail}")]
     RenderFailed { kind: String, detail: String },
+    /// A control-plane block was signed by someone the channel does not
+    /// answer to. See [`crate::authorize_write`] for the rules.
+    #[error("`{kind}` on `{slug}` refused: `{sender}` is not the channel owner")]
+    NotChannelOwner {
+        kind: String,
+        slug: String,
+        sender: String,
+    },
     #[error(transparent)]
     Identity(#[from] crate::identity::IdentityError),
     #[error(transparent)]
@@ -198,6 +206,23 @@ pub async fn ingest(
     {
         return Err(IngestError::UnknownChannel {
             slug: slug.to_string(),
+        });
+    }
+
+    // Step 3c: write authorization for control-plane kinds.
+    //
+    // Here rather than in `apply_effect` so a refusal is a typed error every
+    // surface classifies the same way, instead of an `anyhow` 500. Runs before
+    // the receipt is built: a block this server will not apply must not carry
+    // this server's signature.
+    if let Err(refusal) =
+        crate::authorize_write::authorize_control_block(kind, &manifest, resolved_channel.as_ref())
+    {
+        let crate::authorize_write::WriteRefusal::NotChannelOwner { slug, sender } = refusal;
+        return Err(IngestError::NotChannelOwner {
+            kind: kind_str.to_string(),
+            slug,
+            sender,
         });
     }
 
@@ -613,6 +638,10 @@ mod tests {
     /// Seed a channel row directly, standing in for a prior channel-create
     /// ingest. Returns the channel's id (its notional channel-create CID).
     fn seed_channel(ctx: &IngestContext, slug: &str) -> String {
+        seed_channel_owned_by(ctx, slug, "did:jig:zSeedOwner")
+    }
+
+    fn seed_channel_owned_by(ctx: &IngestContext, slug: &str, owner_did: &str) -> String {
         let id = format!("bafySeed_{}", slug.trim_start_matches('#'));
         ctx.store
             .upsert_channel(&crate::persist::StoredChannel {
@@ -620,10 +649,14 @@ mod tests {
                 slug: slug.to_string(),
                 visibility: "open".into(),
                 created_at: 0,
-                owner_did: "did:jig:zSeedOwner".into(),
+                owner_did: owner_did.into(),
             })
             .unwrap();
         id
+    }
+
+    fn did_of(key: &SigningKey) -> String {
+        Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string()
     }
 
     /// A body for helper-built blocks.
@@ -942,10 +975,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn member_add_against_existing_channel_still_ingests() {
+    async fn member_add_by_the_owner_against_existing_channel_still_ingests() {
         let ctx = test_ctx_allowing(&["member-add"]);
-        let channel_id = seed_channel(&ctx, "#hello");
         let owner_key = random_signing_key();
+        let channel_id = seed_channel_owned_by(&ctx, "#hello", &did_of(&owner_key));
         let (mb, cb, sig) = build_bundle_parts_with_meta(
             &owner_key,
             BlockKind::MemberAdd,
@@ -954,9 +987,36 @@ mod tests {
 
         do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
             .await
-            .expect("member-add against an existing channel must succeed");
+            .expect("member-add by the owner against an existing channel must succeed");
         let members = ctx.store.list_members(&channel_id).unwrap();
         assert!(members.iter().any(|m| m.member_did == "did:jig:zDeji"));
+    }
+
+    /// Gate 3 for writes runs inside ingest, so every surface gets it. A validly
+    /// signed member-add from a DID that does not own the channel is refused
+    /// with a typed error, and the memberships table is untouched.
+    #[tokio::test]
+    async fn member_add_by_a_non_owner_is_refused_at_ingest() {
+        let ctx = test_ctx_allowing(&["member-add"]);
+        let channel_id = seed_channel(&ctx, "#hello");
+        let stranger_key = random_signing_key();
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &stranger_key,
+            BlockKind::MemberAdd,
+            &[("channel", "#hello"), ("member_did", "did:jig:zDeji")],
+        );
+
+        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .expect_err("a non-owner must not enrol anyone");
+        assert!(
+            matches!(err, IngestError::NotChannelOwner { .. }),
+            "expected NotChannelOwner, got {err:?}"
+        );
+        assert!(
+            ctx.store.list_members(&channel_id).unwrap().is_empty(),
+            "a refused block must leave no membership behind"
+        );
     }
 
     #[tokio::test]

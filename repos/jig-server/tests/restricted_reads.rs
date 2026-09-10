@@ -106,3 +106,107 @@ async fn the_escape_hatch_reads_restricted_channels_unauthenticated() {
 
     assert_eq!(status, StatusCode::OK, "body={body}");
 }
+
+// ---- The write side of the same gate -----------------------------------------
+//
+// A read gate on memberships is only as strong as the write gate on
+// memberships. `member-add` is in the default allow-list, and the public
+// `POST /api/v1/blocks` accepts any well-signed block — so without a write-side
+// check, a stranger self-adds in one request and reads in the next.
+
+use jig_client::blocks::build_member_add;
+use jig_core::HlcTimestamp;
+
+fn self_join(who: &Identity, slug: &str) -> jig_client::blocks::BuiltBlock {
+    let me = who.as_client();
+    build_member_add(
+        &me,
+        slug,
+        &me.did_string(),
+        HlcTimestamp::now_wall(me.did().clone()),
+    )
+}
+
+#[tokio::test]
+async fn a_stranger_cannot_self_join_a_restricted_channel_through_the_public_submit_path() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let stranger = Identity::new(2);
+    server
+        .create_channel(&owner, "#private", "restricted")
+        .await;
+
+    let (status, body) = server.try_submit(&self_join(&stranger, "#private")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
+    assert_eq!(body["code"], "NOT_CHANNEL_OWNER");
+
+    // And the read that a successful self-join would have unlocked stays shut.
+    let (status, body) = server
+        .send(&server.sign_get(&stranger, &history_path("#private")))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
+}
+
+/// `jig channel join` goes through the admin endpoint; same rule, same answer.
+#[tokio::test]
+async fn a_stranger_cannot_self_join_a_restricted_channel_through_the_admin_endpoint() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let stranger = Identity::new(2);
+    server
+        .create_channel(&owner, "#private", "restricted")
+        .await;
+
+    let (status, body) = server
+        .try_add_member(&stranger, "#private", &stranger)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
+    assert_eq!(body["code"], "NOT_CHANNEL_OWNER");
+}
+
+/// Being a member is not being the owner: a member cannot invite others into a
+/// restricted channel.
+#[tokio::test]
+async fn a_member_cannot_add_others_to_a_restricted_channel() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let member = Identity::new(2);
+    let friend = Identity::new(3);
+    server
+        .create_channel(&owner, "#private", "restricted")
+        .await;
+    server.add_member(&owner, "#private", &member).await;
+
+    let (status, body) = server.try_add_member(&member, "#private", &friend).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
+    assert_eq!(body["code"], "NOT_CHANNEL_OWNER");
+}
+
+/// Open channels keep IRC `/join` semantics: anyone may add themselves.
+#[tokio::test]
+async fn anyone_can_self_join_an_open_channel() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let stranger = Identity::new(2);
+    server.create_channel(&owner, "#open", "open").await;
+
+    let (status, body) = server.try_submit(&self_join(&stranger, "#open")).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+}
+
+/// Self-join is the only thing a non-owner may do; adding *someone else* to an
+/// open channel is still the owner's call. Membership drives delivery (fanout
+/// and bridge dispatch), so letting strangers enrol third parties would let
+/// them subscribe anyone to anything.
+#[tokio::test]
+async fn a_stranger_cannot_add_someone_else_to_an_open_channel() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let stranger = Identity::new(2);
+    let victim = Identity::new(3);
+    server.create_channel(&owner, "#open", "open").await;
+
+    let (status, body) = server.try_add_member(&stranger, "#open", &victim).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
+    assert_eq!(body["code"], "NOT_CHANNEL_OWNER");
+}

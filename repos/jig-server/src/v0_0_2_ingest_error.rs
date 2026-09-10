@@ -61,6 +61,11 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
             "RENDER_FAILED",
             format!("{e} (may be transient; retry is reasonable)"),
         ),
+        // Same code the admin archive path emits for its own owner check, so a
+        // client sees one word for "not yours to change" whichever door it used.
+        IngestError::NotChannelOwner { .. } => {
+            (StatusCode::FORBIDDEN, "NOT_CHANNEL_OWNER", e.to_string())
+        }
         IngestError::Identity(ide) => (StatusCode::UNAUTHORIZED, "IDENTITY_ERROR", ide.to_string()),
         IngestError::Persist(pe) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -105,6 +110,11 @@ mod tests {
             IngestError::RenderFailed {
                 kind: "text-render".to_string(),
                 detail: "boom".to_string(),
+            },
+            IngestError::NotChannelOwner {
+                kind: "member-add".to_string(),
+                slug: "#room".to_string(),
+                sender: "did:jig:zStranger".to_string(),
             },
         ]
     }

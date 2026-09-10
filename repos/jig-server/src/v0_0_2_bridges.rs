@@ -292,6 +292,11 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         ref e @ IngestError::NoExecutor { .. } => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },
+        // The bridge's shadow identity tried to change a channel it does not
+        // own. A retry sends the same signature; bounce it.
+        ref e @ IngestError::NotChannelOwner { .. } => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
         // Unavailable, not PolicyBlocked: the block is fine and execution failed
         // on this host, so a retry may well succeed.
         IngestError::RenderFailed { .. } => SubmitDenied::Unavailable,

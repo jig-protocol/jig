@@ -9,6 +9,7 @@
 //! Modules are stubbed in this initial commit; subsequent Phase B tasks
 //! (B3 through B8) populate them.
 
+pub mod authorize_write;
 pub mod effect;
 pub mod envelope;
 pub mod executor;
