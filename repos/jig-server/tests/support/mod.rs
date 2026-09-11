@@ -138,7 +138,14 @@ impl TestServer {
     /// it so it lands inside the acceptance window.
     pub fn sign_get(&self, who: &Identity, path: &str) -> SignedRequest {
         let now_ms = now_ms();
-        let nonce = format!("nonce-{now_ms}-{}", path.len());
+        // A counter, not the path length: two requests in one millisecond to
+        // paths of equal length would otherwise share a nonce and the second
+        // would be refused as a replay — a flake that reads as a gate failure.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = format!(
+            "nonce-{now_ms}-{}",
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         let hash =
             jig_core::request_auth::canonical_request_hash("GET", path, b"", now_ms, 0, &nonce);
         SignedRequest {
