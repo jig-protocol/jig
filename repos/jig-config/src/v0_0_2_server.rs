@@ -452,11 +452,6 @@ mod tests {
         );
     }
 
-    /// A PARTIAL `[auth]` section must keep the safe default for keys the
-    /// operator did not mention. Setting only the window must not silently
-    /// switch authentication off — which is exactly what per-field
-    /// `#[serde(default)]` would do, since the bool's type default is false.
-    #[test]
     #[test]
     fn a_missing_admission_section_admits_everyone() {
         let cfg: JigServerConfig = toml::from_str("[auth]\n").expect("parses");
@@ -513,6 +508,10 @@ mod tests {
         );
     }
 
+    /// A PARTIAL `[auth]` section must keep the safe default for keys the
+    /// operator did not mention. Setting only the window must not silently
+    /// switch authentication off — which is exactly what per-field
+    /// `#[serde(default)]` would do, since the bool's type default is false.
     #[test]
     fn a_partial_auth_section_keeps_the_safe_default() {
         let cfg: JigServerConfig =
