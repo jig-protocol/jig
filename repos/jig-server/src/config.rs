@@ -308,6 +308,22 @@ require_authenticated_reads = {require_auth}
 replay_window_ms = {replay_window_ms}
 replay_capacity = {replay_capacity}
 
+# Gate 2: whom this server deals with at all, decided after a caller proves
+# their key and before anything is authorized. The default admits everyone.
+# Reputation is ruleset-scoped: a floor names its ruleset, and a DID with no
+# score under it is UNKNOWN for it — decided by `unknown_dids`, never by the
+# number. `unknown_dids = "refuse"` plus `records` is a members-only server.
+[auth.admission]
+unknown_dids = "admit"
+banned_dids = []
+# [[auth.admission.floors]]
+# ruleset_key = "gigue.highsec.v1"
+# minimum = 0
+# [[auth.admission.records]]
+# did = "did:jig:z..."
+# ruleset_key = "gigue.highsec.v1"
+# score = 5
+
 [debug]
 # Required: with admin_endpoints = false the /_admin_v0_0_2/* router is not
 # mounted and `jig channel create` fails with a bare 404 that looks like a

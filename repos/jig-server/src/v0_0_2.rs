@@ -135,9 +135,14 @@ impl AppState {
                 .context("compiling the canonical text-render module")?,
         );
 
+        // Built before the ingest context so gate 2 can be installed on it;
+        // `config` is moved into the struct literal below.
+        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth)?);
+
         let ingest_ctx = Arc::new(IngestContext {
             store,
             identity,
+            admission: auth.clone(),
             hlc_clock,
             allowed_block_kinds: config.server.allowed_block_kinds.clone(),
             server_did: server_did.clone(),
@@ -149,9 +154,6 @@ impl AppState {
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
-        // Built before the struct literal: `config` is moved into it, so
-        // borrowing `config.auth` inside would be a use-after-move.
-        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth));
 
         Ok(Self {
             config,
@@ -183,9 +185,14 @@ impl AppState {
         let naively_allow_unknown_handles_fallback =
             config.identity.naively_allow_unknown_handles_fallback;
 
+        // Built before the ingest context so gate 2 can be installed on it;
+        // `config` is moved into the struct literal below.
+        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth)?);
+
         let ingest_ctx = Arc::new(IngestContext {
             store,
             identity,
+            admission: auth.clone(),
             hlc_clock,
             allowed_block_kinds: config.server.allowed_block_kinds.clone(),
             server_did: server_did.clone(),
@@ -197,9 +204,6 @@ impl AppState {
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
-        // Built before the struct literal: `config` is moved into it, so
-        // borrowing `config.auth` inside would be a use-after-move.
-        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth));
 
         Ok(Self {
             config,
@@ -230,9 +234,14 @@ impl AppState {
         let naively_allow_unknown_handles_fallback =
             config.identity.naively_allow_unknown_handles_fallback;
 
+        // Built before the ingest context so gate 2 can be installed on it;
+        // `config` is moved into the struct literal below.
+        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth)?);
+
         let ingest_ctx = Arc::new(IngestContext {
             store,
             identity,
+            admission: auth.clone(),
             hlc_clock,
             allowed_block_kinds: config.server.allowed_block_kinds.clone(),
             server_did: server_did.clone(),
@@ -244,9 +253,6 @@ impl AppState {
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
-        // Built before the struct literal: `config` is moved into it, so
-        // borrowing `config.auth` inside would be a use-after-move.
-        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth));
 
         Ok(Self {
             config,

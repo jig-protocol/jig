@@ -213,10 +213,10 @@ pub async fn add_member(
 ///
 /// These routes carry no request-level proof of their own (the signed block IS
 /// the proof), and a delete is far more destructive than a create, so the
-/// sender DID must equal the channel's `owner_did`. The check below is what
-/// produces a precise 403/404/409; it reads the *claimed* sender from the
-/// manifest, which is only meaningful because `ingest()` then refuses the
-/// block unless that same DID actually signed it, and
+/// sender DID must equal the channel's `owner_did`. That check lives in the
+/// write gate inside `ingest()` (`authorize_write`), which runs only after the
+/// signature has verified and admission has passed — so a precise 403 is only
+/// ever given to a caller who proved the key and is admitted here, and
 /// `apply_channel_archive` re-checks ownership after verification. Neither
 /// check alone is sufficient — together they are.
 ///
@@ -258,63 +258,13 @@ pub async fn archive_channel(
         ));
     }
 
-    let channel = state
-        .ingest_ctx
-        .store
-        .get_channel_by_slug_including_archived(&slug)
-        .map_err(|e| {
-            err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "PERSIST_ERROR",
-                e.to_string(),
-            )
-        })?
-        .ok_or_else(|| {
-            // Explicit 404 rather than a cheerful 200: deleting a channel that
-            // isn't there is a typo, and reporting success teaches operators to
-            // trust a delete that never happened.
-            err(
-                StatusCode::NOT_FOUND,
-                "NO_SUCH_CHANNEL",
-                format!("no channel `{slug}` on this server"),
-            )
-        })?;
-
-    let sender_did = manifest
-        .authors
-        .first()
-        .map(|a| a.did.to_string())
-        .unwrap_or_default();
-    if channel.owner_did.is_empty() || channel.owner_did != sender_did {
-        return Err(err(
-            StatusCode::FORBIDDEN,
-            "NOT_CHANNEL_OWNER",
-            format!(
-                "`{slug}` is owned by `{}`; only its owner can archive it",
-                channel.owner_did
-            ),
-        ));
-    }
-
-    let already_archived = state
-        .ingest_ctx
-        .store
-        .channel_archived_at(&slug)
-        .map_err(|e| {
-            err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "PERSIST_ERROR",
-                e.to_string(),
-            )
-        })?;
-    if let Some(when) = already_archived {
-        return Err(err(
-            StatusCode::CONFLICT,
-            "ALREADY_ARCHIVED",
-            format!("`{slug}` was already archived at {when}"),
-        ));
-    }
-
+    // No pre-checks against the store here. Everything below the signature —
+    // does the channel exist, is it already archived, does the sender own it
+    // — is answered by `ingest` AFTER it has verified the signature and run
+    // admission (404 UNKNOWN_CHANNEL, 410 CHANNEL_ARCHIVED, 403
+    // NOT_CHANNEL_OWNER). Answering first turned this route into an oracle:
+    // anyone, with no signature at all, could learn whether a channel exists
+    // and who owns it.
     let bundle = BlockBundle {
         manifest_bytes: &manifest_bytes,
         code_bytes: &code_bytes,
@@ -401,6 +351,7 @@ mod tests {
         let server_url = format!("ws://{}", config.server.listen);
 
         let ingest_ctx = Arc::new(IngestContext {
+            admission: Arc::new(jig_pipeline::ingest::AdmitEveryone),
             store,
             identity,
             hlc_clock,
@@ -415,7 +366,7 @@ mod tests {
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
         // Built before the literal: `config` moves into it below.
-        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth));
+        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth).unwrap());
 
         Arc::new(AppState {
             config,
@@ -645,7 +596,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "body={body}");
-        assert_eq!(body["code"], "NO_SUCH_CHANNEL");
+        assert_eq!(body["code"], "UNKNOWN_CHANNEL");
     }
 
     #[tokio::test]
@@ -666,8 +617,8 @@ mod tests {
         let again = build_channel_archive(&owner, "#scratch", test_hlc(&owner));
         let (status, body) =
             post_json(router, &archive_path("#scratch"), submission_from(&again)).await;
-        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
-        assert_eq!(body["code"], "ALREADY_ARCHIVED");
+        assert_eq!(status, StatusCode::GONE, "body={body}");
+        assert_eq!(body["code"], "CHANNEL_ARCHIVED");
     }
 
     #[tokio::test]

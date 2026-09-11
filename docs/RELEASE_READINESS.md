@@ -32,13 +32,14 @@ phases 1–3) moved identity into the server; the tailnet is now defence in dept
 
 | | |
 | --- | --- |
-| **Current state** | Three gates, in order: authenticate, admit, authorize ([`jig-server/src/auth/`](../repos/jig-server/src/auth/)). **Authenticate** holds: every REST read and every WSS subscribe carries a per-request ed25519 proof over a canonical hash of the request (`jig-core::request_auth`), verified against the caller's DID, with a fail-closed replay guard; `[auth] require_authenticated_reads` defaults to `true`, and the documented escape hatch restores the old behaviour only when set explicitly. **Authorize** holds for channels: history, the listing, live WSS delivery (re-checked per block) and posting all run `authorize_read`/`authorize_block` against `visibility`, `owner_did` and the memberships table; membership changes and `channel-promote` are owner-signed. Refusals go through one disclosure point per surface (`GateOutcome` → `DisclosurePolicy`), truthful by default. **Admit** is a stub: every well-signed DID is admitted. |
+| **Current state** | Three gates, in order: authenticate, admit, authorize ([`jig-server/src/auth/`](../repos/jig-server/src/auth/)). **Authenticate** holds: every REST read and every WSS subscribe carries a per-request ed25519 proof over a canonical hash of the request (`jig-core::request_auth`), verified against the caller's DID, with a fail-closed replay guard; `[auth] require_authenticated_reads` defaults to `true`, and the documented escape hatch restores the old behaviour only when set explicitly. **Authorize** holds for channels: history, the listing, live WSS delivery (re-checked per block) and posting all run `authorize_read`/`authorize_block` against `visibility`, `owner_did` and the memberships table; membership changes and `channel-promote` are owner-signed. Refusals go through one disclosure point per surface (`GateOutcome` → `DisclosurePolicy`), truthful by default. **Admit** holds: `[auth.admission]` (`banned_dids`, ruleset-scoped `floors`, an explicit `unknown_dids` choice, operator-seeded `records`) runs on every read and every write — inside `ingest` for writes, so REST, WSS, admin and bridge paths agree — after gate 1 and before any channel lookup, as a pure function (`auth/admission.rs`) shaped to later run as a policy block. |
 | **Ready means** | A caller's identity is established per request, reads/writes are checked against channel membership before data leaves the process, and a server can refuse callers it does not want (reputation, bans, rate limits). |
-| **Gap** | Admission policy (phase 4) and tier-1 trusted connections (phase 5) are not built; there is no rate limiting or proof-of-work in front of the gates. Blocks relayed by a federated peer are persisted and delivered without running the write gate (`v0_0_2_federation.rs` does not go through `ingest`), so federation is trust-on-peer. There is no `member-remove` block yet; revocation is a store operation. |
+| **Gap** | Reputation is consumed, not computed: the view is what the operator wrote in config, there is no ledger and no exchange of scores. No rate limiting or proof-of-work in front of the gates. Tier-1 trusted connections (phase 5) are not built. Blocks relayed by a federated peer are persisted and delivered without running the write gate (`v0_0_2_federation.rs` does not go through `ingest`), so federation is trust-on-peer. There is no `member-remove` block yet; revocation is a store operation. |
 
 **Verdict: GAP** (was BLOCKER). The part that let strangers read and write every
-channel is closed and proven by fault injection at each gate; what remains is
-policy, not the absence of a model.
+channel is closed and proven by fault injection at each gate, and an operator can
+now refuse callers outright; what remains is scoring, throttling and the tier-1
+fast path, not the absence of a model.
 
 ### 1.2 `visibility = "restricted"` is enforced
 
@@ -97,7 +98,7 @@ documented in the handler). Keep it off; never document it as a workaround.
 
 | | |
 | --- | --- |
-| **Current state** | Tighter than the rest of the system. `build_wasi_context` ([`jig-runtime/src/engine.rs:293`](../repos/jig-runtime/src/engine.rs)) grants an empty stdin pipe and an in-memory stdout buffer — no host stdio, no preopened directories, no sockets. Store limits pin one instance, one memory, 10 tables, 10k table elements; fuel and an epoch deadline bound runtime. Server defaults: 5,000,000 fuel, 64 MB, plus a timeout ([`jig-server/src/config.rs:296-304`](../repos/jig-server/src/config.rs)). wasmtime is 47.0.3, which closed every wasmtime advisory previously carved out — including RUSTSEC-2026-0096 (aarch64 Cranelift guest-heap miscompile → sandbox escape). |
+| **Current state** | Tighter than the rest of the system. `build_wasi_context` ([`jig-runtime/src/engine.rs:293`](../repos/jig-runtime/src/engine.rs)) grants an empty stdin pipe and an in-memory stdout buffer — no host stdio, no preopened directories, no sockets. Store limits pin one instance, one memory, 10 tables, 10k table elements; fuel and an epoch deadline bound runtime. Server defaults: 5,000,000 fuel, 64 MB, plus a timeout ([`jig-server/src/config.rs:296-304`](../repos/jig-server/src/config.rs)). wasmtime is 47.0.4 (RUSTSEC-2026-0268/0269 closed by the patch bump, not suppressed; jig never enables WASI, so neither was reachable) — including RUSTSEC-2026-0096 (aarch64 Cranelift guest-heap miscompile → sandbox escape). |
 | **Gap** | None material for external use. This is the strongest part of the security story. |
 
 **Verdict: READY.**
@@ -293,7 +294,7 @@ strangers a footgun — a smaller one, with the safety on.
 
 | # | Blocker | Why it is in this position |
 | --- | --- | --- |
-| ~~1~~ | ~~**Authn + authz on `jig-server`**~~ | **Phases 1–3 DONE 2026-09-09** — per-request proof of possession on reads, `visibility`/membership enforced on history, listing, live delivery and posting, owner-signed membership changes. Still open from the same design: admission policy (phase 4) and trusted connections (phase 5); see §1.1. |
+| ~~1~~ | ~~**Authn + authz on `jig-server`**~~ | **Phases 1–4 DONE 2026-09-11** — per-request proof of possession on reads, `visibility`/membership enforced on history, listing, live delivery and posting, owner-signed membership changes, and an admission policy (bans, ruleset floors, explicit unknown-DID choice) on every read and write. Still open from the same design: trusted connections (phase 5); see §1.1. |
 | 2 | **Root `SECURITY.md` with an external reporting path** | Cheap, and blocker #1 guarantees findings. Without it the first report is public. |
 | ~~3~~ | ~~**Root `LICENSE` + consistent per-crate SPDX ids**~~ | **DONE 2026-08-06** — dual-licensed MIT OR Apache-2.0, root licence pair added, every protocol crate aligned. Only the `jig-spec` CC BY-SA question remains, and it does not gate release. |
 | 4 | **Fix the binary install path** | `install.sh` points at a host that serves nothing, unpacks the wrong paths, and verifies no checksum — while `release.yml` already publishes the `.sha256`. A `curl \| sh` KPI that does not work is worse than not having one. |

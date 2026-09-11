@@ -82,6 +82,7 @@ impl AppState {
             config.identity.naively_allow_unknown_handles_fallback;
 
         let ingest_ctx = Arc::new(IngestContext {
+            admission: Arc::new(jig_pipeline::ingest::AdmitEveryone),
             store,
             identity,
             hlc_clock,
@@ -156,6 +157,7 @@ impl AppState {
         ];
 
         let ingest_ctx = Arc::new(IngestContext {
+            admission: Arc::new(jig_pipeline::ingest::AdmitEveryone),
             store,
             identity,
             hlc_clock,

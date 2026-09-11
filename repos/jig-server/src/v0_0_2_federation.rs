@@ -322,11 +322,15 @@ async fn ingest_peer_block(
     }
 
     // Extract sender DID + HLC + kind from manifest (best-effort).
-    let sender_did_str = manifest
-        .authors
-        .first()
-        .map(|a| a.did.to_did_jig_string())
-        .unwrap_or_default();
+    // Canonical spelling, as ingest writes it — the relay bypasses ingest, so
+    // it must not be the one path that persists the peer's raw spelling.
+    let sender_did_str = jig_pipeline::effect::canonical_did_string(
+        &manifest
+            .authors
+            .first()
+            .map(|a| a.did.to_did_jig_string())
+            .unwrap_or_default(),
+    );
     let kind_str = manifest
         .kind
         .as_ref()

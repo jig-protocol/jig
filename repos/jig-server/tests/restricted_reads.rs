@@ -671,3 +671,103 @@ async fn an_archived_channel_accepts_no_new_blocks() {
     assert_eq!(status, StatusCode::GONE, "body={body}");
     assert_eq!(body["code"], "CHANNEL_ARCHIVED");
 }
+
+/// A DID's base32 body decodes case-insensitively, so the spelling a block
+/// carries is the author's choice. Rows are written in canonical form, so an
+/// owner who spelled their DID in upper case is still the owner the read
+/// gate recognises — and the spelling a stranger sees in a listing is the one
+/// an operator can copy into a ban.
+#[tokio::test]
+async fn an_owner_who_recased_their_did_still_owns_their_channel() {
+    use jig_core::{Author, BlockKind, BlockManifest};
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let me = owner.as_client();
+    let did_string = me.did_string();
+    let (prefix, body) = did_string.split_at("did:jig:z".len());
+    let recased = jig_core::Did::from_str_unchecked(format!("{prefix}{}", body.to_uppercase()));
+
+    let manifest = BlockManifest::builder()
+        .version(semver::Version::new(0, 1, 0))
+        .author(Author {
+            did: recased,
+            public_key: None,
+            roles: vec![],
+        })
+        .metadata_entry("slug", serde_json::json!("#mine"))
+        .metadata_entry("visibility", serde_json::json!("restricted"))
+        .build()
+        .unwrap()
+        .with_kind(BlockKind::ChannelCreate)
+        .with_hlc(HlcTimestamp::now_wall(me.did().clone()));
+    let manifest_bytes = manifest.to_canonical_bytes().unwrap();
+    let payload = serde_json::to_vec(&(manifest_bytes.clone(), Vec::<u8>::new())).unwrap();
+    let create = jig_client::blocks::BuiltBlock {
+        manifest_bytes,
+        code_bytes: vec![],
+        sender_sig: me.sign(&payload).to_bytes().to_vec(),
+    };
+    let (status, body) = server.try_submit(&create).await;
+    assert_eq!(status, StatusCode::OK, "create: {body}");
+
+    // The owner reads with a normally-signed (canonical) proof.
+    let (status, body) = server
+        .send(&server.sign_get(&owner, &history_path("#mine")))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "owner locked out of their own channel: {body}"
+    );
+
+    // And the listing shows the canonical spelling, not the recased one.
+    let (_, listing) = server
+        .send(&server.sign_get(&owner, "/api/v1/channels"))
+        .await;
+    assert!(
+        listing.to_string().contains(&did_string),
+        "listing must show the canonical DID: {listing}"
+    );
+}
+
+/// The write gate must see the same canonical sender the rows were written
+/// with: an owner who spells their DID in upper case in a control-plane
+/// block is still the owner who may change the channel.
+#[tokio::test]
+async fn an_owner_who_recased_their_did_can_still_archive_their_channel() {
+    use jig_core::{Author, BlockKind, BlockManifest};
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    server.create_channel(&owner, "#mine", "restricted").await;
+
+    let me = owner.as_client();
+    let did_string = me.did_string();
+    let (prefix, body) = did_string.split_at("did:jig:z".len());
+    let recased = jig_core::Did::from_str_unchecked(format!("{prefix}{}", body.to_uppercase()));
+    let manifest = BlockManifest::builder()
+        .version(semver::Version::new(0, 1, 0))
+        .author(Author {
+            did: recased,
+            public_key: None,
+            roles: vec![],
+        })
+        .metadata_entry("channel", serde_json::json!("#mine"))
+        .build()
+        .unwrap()
+        .with_kind(BlockKind::ChannelArchive)
+        .with_hlc(HlcTimestamp::now_wall(me.did().clone()));
+    let manifest_bytes = manifest.to_canonical_bytes().unwrap();
+    let payload = serde_json::to_vec(&(manifest_bytes.clone(), Vec::<u8>::new())).unwrap();
+    let archive = jig_client::blocks::BuiltBlock {
+        manifest_bytes,
+        code_bytes: vec![],
+        sender_sig: me.sign(&payload).to_bytes().to_vec(),
+    };
+
+    let (status, body) = server.try_submit(&archive).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the owner, however spelled, may archive: {body}"
+    );
+}

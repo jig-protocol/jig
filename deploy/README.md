@@ -71,13 +71,53 @@ the default):
   channel, or of anyone but yourself onto any channel, must be signed by the
   channel owner; `channel-promote` likewise. Self-join (`jig channel join`)
   works on open channels only. Unknown `visibility` values fail closed.
+- **The server can refuse a caller before asking what they want.**
+  `[auth.admission]` runs after a key is proven and before anything is
+  authorized, on every read and every write: `banned_dids`, ruleset-scoped
+  reputation `floors`, and an explicit `unknown_dids = "admit" | "refuse"`.
+  A refused caller gets `403 NOT_ADMITTED` and learns nothing about channels.
+  A members-only server is `unknown_dids = "refuse"` plus a `records` entry
+  per member:
+
+  ```toml
+  [auth.admission]
+  unknown_dids = "refuse"
+  [[auth.admission.records]]
+  did = "did:jig:z..."          # each member's DID — including the operator's own
+  ruleset_key = "club"
+  score = 1
+  ```
+
+  Reputation is ruleset-scoped, so a floor never refuses a DID that has no
+  score under its ruleset — that case is the `unknown_dids` choice, by
+  design, so a fresh key is not punished for being fresh. Three things to
+  know before switching a server to `refuse`:
+
+  - **Your own key needs a record.** `jig channel create`, `member-add` and
+    `archive` are signed writes, and admission runs on writes too. Without a
+    record for the operator's DID, the operator is a stranger.
+  - **Bridges cannot run on a members-only server.** The email bridge signs
+    inbound mail with a shadow DID minted per sender at runtime; those can
+    never be in `records`, so every inbound message is refused.
+  - **The policy is read at boot.** Editing `banned_dids` or `records` takes
+    effect on the next restart, not before — and an already-open WSS
+    subscription belongs to a DID that was admitted when it subscribed; it
+    keeps its channel-level checks per delivery, but is not re-admitted until
+    it reconnects.
+
+  Every configured DID is parsed and canonicalized at boot; one that could
+  never match a key (a typo, a legacy label) is a startup error, because a
+  ban that cannot match is worse than none. The read escape hatch
+  (`require_authenticated_reads = false`) skips admission for reads — there
+  is no proof to admit — but never for writes.
 
 What it does not enforce yet — the reasons to keep `bind_address` on the
 tailnet:
 
-- **No admission policy.** Any self-minted key is admitted; there is no
-  reputation, rate limit or proof-of-work in front of the gates. Anyone who can
-  reach the port can create channels and post to open ones.
+- **No rate limiting or proof-of-work, and no reputation scoring.** Admission
+  consumes scores the operator wrote down; nothing computes or exchanges them
+  yet. With the default `unknown_dids = "admit"`, anyone who can reach the
+  port can create channels and post to open ones, unthrottled.
 - **Federated peers are trusted.** Blocks relayed from a peer are persisted
   and delivered to local subscribers without running the write gate. Only
   federate with servers you would let post on your behalf.

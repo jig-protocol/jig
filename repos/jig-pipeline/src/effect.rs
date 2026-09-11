@@ -64,11 +64,32 @@ fn meta_i64(m: &BlockManifest, key: &str) -> Option<i64> {
     m.metadata.get(key).and_then(|v| v.as_i64())
 }
 
+/// The block's author, in canonical spelling.
+///
+/// A DID's base32 body decodes case-insensitively, so the spelling a manifest
+/// carries is the author's choice; rows written from it are what the gates
+/// later compare a caller's canonical DID against. Storing the author's
+/// spelling would let an owner who wrote `zABC…` be locked out of their own
+/// channel, and let an operator copy a spelling from a listing into a ban
+/// that never matches. Legacy, non-key-derived DIDs (`did:jig:alice`) have no
+/// canonical form and pass through unchanged.
 fn sender_did_string(m: &BlockManifest) -> String {
-    m.authors
-        .first()
-        .map(|a| a.did.to_string())
-        .unwrap_or_default()
+    canonical_did_string(
+        &m.authors
+            .first()
+            .map(|a| a.did.to_string())
+            .unwrap_or_default(),
+    )
+}
+
+/// See [`sender_did_string`]. Public so ingest persists `blocks.sender_did`
+/// in the same form the effect layer writes `owner_did` and `member_did`.
+pub fn canonical_did_string(raw: &str) -> String {
+    jig_core::Did::from_did_jig_string(raw)
+        .ok()
+        .and_then(|d| d.as_bytes().ok())
+        .map(|bytes| jig_core::Did::from_ed25519_pubkey(&bytes).to_did_jig_string())
+        .unwrap_or_else(|| raw.to_string())
 }
 
 fn apply_channel_create(
@@ -107,13 +128,14 @@ fn apply_member_add(
     let channel_slug = meta_str(m, "channel")
         .ok_or_else(|| anyhow::anyhow!("member-add missing `channel` in metadata"))?;
     let member_did = meta_str(m, "member_did")
+        .map(canonical_did_string)
         .ok_or_else(|| anyhow::anyhow!("member-add missing `member_did` in metadata"))?;
     let channel = store
         .get_channel_by_slug(channel_slug)?
         .ok_or_else(|| anyhow::anyhow!("member-add references unknown channel `{channel_slug}`"))?;
     store.upsert_membership(&StoredMembership {
         channel_id: channel.id,
-        member_did: member_did.to_string(),
+        member_did,
         role: "member".to_string(),
         joined_at: chrono::Utc::now().timestamp(),
         source_block_cid: block_cid.to_string(),

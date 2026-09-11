@@ -407,11 +407,16 @@ async fn handle_client_frame(
                         match crate::auth::authenticate::authenticate_subscribe(
                             &a, &scope_str, now_ms, &mut guard,
                         ) {
-                            // Bind the VERIFIED did, never `a.did` as received.
-                            Ok(did) => {
-                                *conn_did = Some(did);
-                                None
-                            }
+                            // Bind the VERIFIED did, never `a.did` as received —
+                            // and only once gate 2 has admitted it, so a refused
+                            // caller leaves no identity on the connection.
+                            Ok(did) => match state.auth.admit(did.as_str()) {
+                                Ok(()) => {
+                                    *conn_did = Some(did);
+                                    None
+                                }
+                                Err(o) => Some(o),
+                            },
                             Err(o) => Some(o),
                         }
                     }
@@ -653,8 +658,15 @@ fn channel_slug_peek(manifest_bytes: &[u8]) -> Option<String> {
 /// channels are labelled by slug; everything else (restricted, unknown, or a
 /// store that would not answer) shares one `(restricted)` bucket. Totals
 /// stay exact; only the attribution is withheld.
+///
+/// On a server whose admission policy turns anyone away, "open" means open
+/// to the admitted, and even open slugs are withheld: a banned or unknown
+/// caller can still scrape `/metrics`.
 fn channel_label(state: &AppState, manifest_bytes: &[u8]) -> Option<String> {
     let slug = channel_slug_peek(manifest_bytes)?;
+    if state.auth.admission.refuses_anyone() {
+        return Some(RESTRICTED_LABEL.to_string());
+    }
     let open = matches!(
         state
             .ingest_ctx
@@ -1207,6 +1219,35 @@ mod tests {
             channel_label(&state, &manifest("#nowhere")).as_deref(),
             Some(RESTRICTED_LABEL),
             "an unknown channel is not disclosed either"
+        );
+    }
+
+    /// A server that refuses anyone at admission withholds even open slugs
+    /// from the ungated metrics endpoint.
+    #[tokio::test]
+    async fn a_refusing_server_names_no_channel_in_metrics() {
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.auth.admission.unknown_dids = jig_config::v0_0_2_server::UnknownDidsPolicy::Refuse;
+        let state = AppState::for_test_with_config(config).unwrap();
+        state
+            .ingest_ctx
+            .store
+            .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                id: "bafySeed#open".to_string(),
+                slug: "#open".to_string(),
+                visibility: "open".to_string(),
+                created_at: 0,
+                owner_did: "did:jig:zSeedOwner".to_string(),
+            })
+            .unwrap();
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "kind": "text-render",
+            "metadata": { "channel": "#open", "body": "hi" }
+        }))
+        .unwrap();
+        assert_eq!(
+            channel_label(&state, &manifest).as_deref(),
+            Some(RESTRICTED_LABEL)
         );
     }
 

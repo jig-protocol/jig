@@ -69,12 +69,19 @@ pub fn needs_membership(kind: BlockKind, channel: Option<&StoredChannel>) -> boo
 /// - `channel-create` names a channel that does not exist yet; the store's
 ///   unique slug refuses a duplicate.
 ///
+/// `sender` must be the author DID the signature VERIFIED, in canonical form —
+/// never the spelling the manifest carries, which is the author's choice and
+/// decodes to the same key whatever its case. Rows are written canonical, so
+/// comparing the manifest's spelling would lock an owner who wrote `zABC…`
+/// out of changing their own channel.
+///
 /// `channel` is `None` when the slug resolved to nothing; that is the effect
 /// layer's error to raise, not an authorization decision, so it passes here.
 /// `sender_is_member` is consulted only where [`needs_membership`] says it
 /// matters; callers may pass `false` elsewhere.
 pub fn authorize_block(
     kind: BlockKind,
+    sender: &str,
     manifest: &BlockManifest,
     channel: Option<&StoredChannel>,
     sender_is_member: bool,
@@ -82,7 +89,7 @@ pub fn authorize_block(
     let Some(channel) = channel else {
         return Ok(());
     };
-    let sender = sender_did(manifest);
+    let sender = sender.to_string();
 
     match kind {
         BlockKind::MemberAdd => {
@@ -90,7 +97,7 @@ pub fn authorize_block(
                 .metadata
                 .get("member_did")
                 .and_then(|v| v.as_str())
-                .is_some_and(|member| member == sender);
+                .is_some_and(|member| crate::effect::canonical_did_string(member) == sender);
             if adding_self && is_open(&channel.visibility) {
                 return Ok(());
             }
@@ -127,13 +134,6 @@ fn require_owner(channel: &StoredChannel, sender: &str) -> Result<(), WriteRefus
             sender: sender.to_string(),
         })
     }
-}
-
-fn sender_did(m: &BlockManifest) -> String {
-    m.authors
-        .first()
-        .map(|a| a.did.to_string())
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -188,6 +188,12 @@ mod tests {
         )
     }
 
+    /// The sender as the gate receives it: what the signature verified,
+    /// which in these tests is the author the manifest was built with.
+    fn sender_of(m: &BlockManifest) -> String {
+        m.authors[0].did.to_string()
+    }
+
     fn refused(sender: &str) -> Result<(), WriteRefusal> {
         Err(WriteRefusal::NotChannelOwner {
             slug: "#room".to_string(),
@@ -199,7 +205,13 @@ mod tests {
     fn self_join_on_an_open_channel_is_allowed() {
         let m = member_add(STRANGER, STRANGER);
         assert_eq!(
-            authorize_block(BlockKind::MemberAdd, &m, Some(&channel("open")), false),
+            authorize_block(
+                BlockKind::MemberAdd,
+                &sender_of(&m),
+                &m,
+                Some(&channel("open")),
+                false
+            ),
             Ok(())
         );
     }
@@ -210,6 +222,7 @@ mod tests {
         assert_eq!(
             authorize_block(
                 BlockKind::MemberAdd,
+                &sender_of(&m),
                 &m,
                 Some(&channel("restricted")),
                 false
@@ -222,7 +235,13 @@ mod tests {
     fn a_stranger_cannot_add_someone_else_even_to_an_open_channel() {
         let m = member_add(STRANGER, "did:jig:zVictim");
         assert_eq!(
-            authorize_block(BlockKind::MemberAdd, &m, Some(&channel("open")), false),
+            authorize_block(
+                BlockKind::MemberAdd,
+                &sender_of(&m),
+                &m,
+                Some(&channel("open")),
+                false
+            ),
             refused(STRANGER)
         );
     }
@@ -233,6 +252,7 @@ mod tests {
         assert_eq!(
             authorize_block(
                 BlockKind::MemberAdd,
+                &sender_of(&m),
                 &m,
                 Some(&channel("restricted")),
                 false
@@ -247,7 +267,13 @@ mod tests {
     fn a_member_add_with_no_member_did_is_not_a_self_join() {
         let m = manifest_with(BlockKind::MemberAdd, STRANGER, json!({"channel": "#room"}));
         assert_eq!(
-            authorize_block(BlockKind::MemberAdd, &m, Some(&channel("open")), false),
+            authorize_block(
+                BlockKind::MemberAdd,
+                &sender_of(&m),
+                &m,
+                Some(&channel("open")),
+                false
+            ),
             refused(STRANGER)
         );
     }
@@ -257,7 +283,13 @@ mod tests {
     fn an_unrecognised_visibility_is_treated_as_restricted() {
         let m = member_add(STRANGER, STRANGER);
         assert_eq!(
-            authorize_block(BlockKind::MemberAdd, &m, Some(&channel("Open")), false),
+            authorize_block(
+                BlockKind::MemberAdd,
+                &sender_of(&m),
+                &m,
+                Some(&channel("Open")),
+                false
+            ),
             refused(STRANGER)
         );
     }
@@ -268,6 +300,7 @@ mod tests {
         assert_eq!(
             authorize_block(
                 BlockKind::ChannelPromote,
+                STRANGER,
                 &promote(STRANGER),
                 Some(&restricted),
                 false
@@ -277,6 +310,7 @@ mod tests {
         assert_eq!(
             authorize_block(
                 BlockKind::ChannelPromote,
+                OWNER,
                 &promote(OWNER),
                 Some(&restricted),
                 false
@@ -291,18 +325,18 @@ mod tests {
     fn an_empty_owner_did_grants_nobody() {
         let mut c = channel("restricted");
         c.owner_did.clear();
-        // The builder refuses an author-less manifest, but serde does not
-        // (`authors` is `#[serde(default)]`), so one can arrive on the wire.
-        let mut m = promote(STRANGER);
-        m.authors.clear();
-        assert!(authorize_block(BlockKind::ChannelPromote, &m, Some(&c), false).is_err());
+        // A verified sender is never empty (the signature needs a key), but
+        // an owner_did column can be: it must match nobody, not "".
+        let m = promote(STRANGER);
+        assert!(authorize_block(BlockKind::ChannelPromote, "", &m, Some(&c), false).is_err());
+        assert!(authorize_block(BlockKind::ChannelPromote, STRANGER, &m, Some(&c), false).is_err());
     }
 
     #[test]
     fn an_unresolved_channel_is_not_this_gates_decision() {
         let m = member_add(STRANGER, STRANGER);
         assert_eq!(
-            authorize_block(BlockKind::MemberAdd, &m, None, false),
+            authorize_block(BlockKind::MemberAdd, &sender_of(&m), &m, None, false),
             Ok(())
         );
     }
@@ -314,11 +348,23 @@ mod tests {
     fn an_unlisted_kind_naming_a_restricted_channel_is_gated_as_content() {
         let m = manifest_with(BlockKind::FedHello, STRANGER, json!({"channel": "#room"}));
         assert_eq!(
-            authorize_block(BlockKind::FedHello, &m, Some(&channel("restricted")), false),
+            authorize_block(
+                BlockKind::FedHello,
+                &sender_of(&m),
+                &m,
+                Some(&channel("restricted")),
+                false
+            ),
             not_member(STRANGER)
         );
         assert_eq!(
-            authorize_block(BlockKind::FedHello, &m, Some(&channel("open")), false),
+            authorize_block(
+                BlockKind::FedHello,
+                &sender_of(&m),
+                &m,
+                Some(&channel("open")),
+                false
+            ),
             Ok(())
         );
         assert!(needs_membership(
@@ -335,7 +381,13 @@ mod tests {
             json!({"channel": "#room"}),
         );
         assert_eq!(
-            authorize_block(BlockKind::ChannelArchive, &m, Some(&channel("open")), false),
+            authorize_block(
+                BlockKind::ChannelArchive,
+                &sender_of(&m),
+                &m,
+                Some(&channel("open")),
+                false
+            ),
             refused(STRANGER)
         );
         let m = manifest_with(
@@ -344,7 +396,13 @@ mod tests {
             json!({"channel": "#room"}),
         );
         assert_eq!(
-            authorize_block(BlockKind::ChannelArchive, &m, Some(&channel("open")), false),
+            authorize_block(
+                BlockKind::ChannelArchive,
+                &sender_of(&m),
+                &m,
+                Some(&channel("open")),
+                false
+            ),
             Ok(())
         );
     }
@@ -371,6 +429,7 @@ mod tests {
         assert_eq!(
             authorize_block(
                 BlockKind::TextRender,
+                STRANGER,
                 &post(STRANGER),
                 Some(&channel("open")),
                 false
@@ -384,6 +443,7 @@ mod tests {
         assert_eq!(
             authorize_block(
                 BlockKind::TextRender,
+                STRANGER,
                 &post(STRANGER),
                 Some(&channel("restricted")),
                 false
@@ -398,6 +458,7 @@ mod tests {
         assert_eq!(
             authorize_block(
                 BlockKind::TextRender,
+                OWNER,
                 &post(OWNER),
                 Some(&restricted),
                 false
@@ -408,6 +469,7 @@ mod tests {
         assert_eq!(
             authorize_block(
                 BlockKind::TextRender,
+                STRANGER,
                 &post(STRANGER),
                 Some(&restricted),
                 true

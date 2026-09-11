@@ -10,9 +10,7 @@
 //! admission outcome, never the authorization one, because "you are not a
 //! member" confirms the channel exists.
 //!
-//! Phase 1 establishes only the outcome and disclosure types. The gates
-//! themselves arrive in phases 2 and 3.
-
+pub mod admission;
 pub mod authenticate;
 pub mod authorize;
 pub mod disclosure;
@@ -20,6 +18,7 @@ pub mod outcome;
 pub mod replay;
 pub mod state;
 
+pub use admission::{AdmissionPolicy, ReputationSource, ReputationView, admit};
 pub use authenticate::{AuthProof, authenticate};
 pub use authorize::{Visibility, authorize_read};
 pub use disclosure::{DisclosurePolicy, audit_line};

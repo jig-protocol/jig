@@ -96,10 +96,26 @@ impl TestServer {
     }
 
     fn with_auth(require: bool) -> Self {
-        let tmp = tempfile::tempdir().expect("temp dir");
-
         let mut config = JigServerConfig::default();
         config.auth.require_authenticated_reads = require;
+        Self::with_config(config)
+    }
+
+    /// Build a server with authentication required and this `[auth.admission]`
+    /// section — the gate-2 tests' entry point.
+    pub fn with_admission(admission: jig_config::v0_0_2_server::AdmissionSection) -> Self {
+        let mut config = JigServerConfig::default();
+        config.auth.admission = admission;
+        Self::with_config(config)
+    }
+
+    /// Build a server from a complete config, for tests that combine knobs.
+    pub fn with_full_config(config: JigServerConfig) -> Self {
+        Self::with_config(config)
+    }
+
+    fn with_config(mut config: JigServerConfig) -> Self {
+        let tmp = tempfile::tempdir().expect("temp dir");
         config.server.server_did_keyfile =
             tmp.path().join("server.key").to_string_lossy().into_owned();
 
@@ -122,7 +138,14 @@ impl TestServer {
     /// it so it lands inside the acceptance window.
     pub fn sign_get(&self, who: &Identity, path: &str) -> SignedRequest {
         let now_ms = now_ms();
-        let nonce = format!("nonce-{now_ms}-{}", path.len());
+        // A counter, not the path length: two requests in one millisecond to
+        // paths of equal length would otherwise share a nonce and the second
+        // would be refused as a replay — a flake that reads as a gate failure.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = format!(
+            "nonce-{now_ms}-{}",
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         let hash =
             jig_core::request_auth::canonical_request_hash("GET", path, b"", now_ms, 0, &nonce);
         SignedRequest {
@@ -187,6 +210,17 @@ impl TestServer {
         let path = format!("/_admin_v0_0_2/channels/{}/archive", encode_slug(slug));
         let (status, body) = self.post_admin(&path, &block).await;
         assert_eq!(status, StatusCode::OK, "channel-archive failed: {body}");
+    }
+
+    /// Submit any `channel-archive` block through the admin route and return
+    /// whatever the server said.
+    pub async fn try_archive(
+        &self,
+        slug: &str,
+        block: &BuiltBlock,
+    ) -> (StatusCode, serde_json::Value) {
+        let path = format!("/_admin_v0_0_2/channels/{}/archive", encode_slug(slug));
+        self.post_admin(&path, block).await
     }
 
     /// Add `member` to `slug`, the block signed by `by`. Asserts success; use

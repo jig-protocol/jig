@@ -165,7 +165,7 @@ pub async fn get_block_by_cid(
     headers: axum::http::HeaderMap,
 ) -> Result<Json<BlockView>, (StatusCode, Json<ErrorBody>)> {
     let started = std::time::Instant::now();
-    let caller_did = authenticate_read(&state, &headers, "GET", uri.path(), started)?;
+    let caller_did = admit_caller(&state, &headers, "GET", uri.path(), started)?;
 
     let stored = state
         .ingest_ctx
@@ -249,7 +249,7 @@ pub async fn list_channels(
     headers: axum::http::HeaderMap,
 ) -> Result<Json<ChannelsResponse>, (StatusCode, Json<ErrorBody>)> {
     let started = std::time::Instant::now();
-    let caller_did = authenticate_read(&state, &headers, "GET", uri.path(), started)?;
+    let caller_did = admit_caller(&state, &headers, "GET", uri.path(), started)?;
     let store = &state.ingest_ctx.store;
 
     let stored = store.list_channels().map_err(persist_err)?;
@@ -329,16 +329,19 @@ fn persist_err(e: impl std::fmt::Display) -> (StatusCode, Json<ErrorBody>) {
 /// Blocks come back **oldest-first**, capped to the newest `limit` (see
 /// `SqliteStore::list_blocks_by_channel`), so a chat client renders the array
 /// straight down the pane. An unknown or silent channel is `200` with `[]`.
-/// Run gate 1 for a read, returning the authenticated caller.
+/// Run gates 1 and 2 for a read, returning the authenticated AND admitted
+/// caller. One function on purpose: every read surface calls it, so a route
+/// added later cannot authenticate without also admitting.
 ///
 /// `Ok(None)` means the server is running with `require_authenticated_reads =
-/// false` — the migration escape hatch — and no identity was established.
+/// false` — the migration escape hatch — and no identity was established, so
+/// there is nobody to admit either.
 ///
 /// `path` must be the path the caller actually requested, taken from the
 /// request URI rather than rebuilt from extracted parameters. The signature
 /// covers the path as sent, so reconstructing it invites an encoding mismatch
 /// that would present as "every signature is invalid".
-fn authenticate_read(
+fn admit_caller(
     state: &AppState,
     headers: &axum::http::HeaderMap,
     method: &str,
@@ -368,10 +371,18 @@ fn authenticate_read(
         .lock()
         .expect("replay guard mutex poisoned");
 
-    match crate::auth::authenticate(&proof, method, path, b"", now_ms, &mut guard) {
-        Ok(did) => Ok(Some(did)),
-        Err(outcome) => Err(refuse(state, &outcome, started)),
-    }
+    let did = crate::auth::authenticate(&proof, method, path, b"", now_ms, &mut guard)
+        .map_err(|outcome| refuse(state, &outcome, started))?;
+    drop(guard);
+
+    // Gate 2, on the identity gate 1 just VERIFIED. Before any channel is
+    // looked up: a refused caller must never learn from the answer whether the
+    // channel exists.
+    state
+        .auth
+        .admit(did.as_str())
+        .map_err(|outcome| refuse(state, &outcome, started))?;
+    Ok(Some(did))
 }
 
 /// Gate 3 for a single channel: may `caller` read `slug`?
@@ -454,7 +465,7 @@ pub async fn get_channel_history(
     headers: axum::http::HeaderMap,
 ) -> Result<Json<Vec<TimelineBlock>>, (StatusCode, Json<ErrorBody>)> {
     let started = std::time::Instant::now();
-    let caller_did = authenticate_read(&state, &headers, "GET", uri.path(), started)?;
+    let caller_did = admit_caller(&state, &headers, "GET", uri.path(), started)?;
     let store = &state.ingest_ctx.store;
 
     // Gate 3, before any block is fetched: a refusal must not be
