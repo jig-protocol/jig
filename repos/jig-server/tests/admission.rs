@@ -305,3 +305,49 @@ async fn a_recased_author_did_is_still_the_banned_key() {
     assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
     assert_eq!(body["code"], "NOT_ADMITTED");
 }
+
+/// Found in review: the admin archive route looked the channel up — and named
+/// its owner — before `ingest` verified anything. A refused caller (here:
+/// banned, but the pre-check ran before the signature too) must get one
+/// answer whatever they ask, and never the owner's DID.
+#[tokio::test]
+async fn the_archive_route_is_not_an_existence_or_owner_oracle() {
+    use jig_client::blocks::build_channel_archive;
+    let owner = Identity::new(1);
+    let banned = Identity::new(2);
+    let server = TestServer::with_admission(banning(&banned));
+    server.create_channel(&owner, "#board", "open").await;
+
+    let me = banned.as_client();
+    for slug in ["#board", "#nowhere"] {
+        let block = build_channel_archive(&me, slug, HlcTimestamp::now_wall(me.did().clone()));
+        let (status, body) = server.try_archive(slug, &block).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{slug}: {body}");
+        assert_eq!(body["code"], "NOT_ADMITTED", "{slug}: {body}");
+        assert!(
+            !body.to_string().contains(&owner.did().to_did_jig_string()),
+            "{slug}: the owner's DID must not appear: {body}"
+        );
+    }
+}
+
+/// And with NO valid signature at all — the route used to answer before
+/// checking one. An unsigned archive attempt gets INVALID_SIG for an
+/// existing and a nonexistent channel alike.
+#[tokio::test]
+async fn the_archive_route_verifies_the_signature_before_answering_anything() {
+    use jig_client::blocks::build_channel_archive;
+    let owner = Identity::new(1);
+    let forger = Identity::new(2);
+    let server = TestServer::authenticated();
+    server.create_channel(&owner, "#board", "open").await;
+
+    let me = forger.as_client();
+    for slug in ["#board", "#nowhere"] {
+        let mut block = build_channel_archive(&me, slug, HlcTimestamp::now_wall(me.did().clone()));
+        block.sender_sig[0] ^= 0xff; // no longer a valid signature
+        let (status, body) = server.try_archive(slug, &block).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{slug}: {body}");
+        assert_eq!(body["code"], "INVALID_SIG", "{slug}: {body}");
+    }
+}

@@ -560,14 +560,24 @@ pub fn channel_metadata_key(kind: BlockKind) -> &'static str {
 /// ensure step silently failed — worth surfacing loudly rather than writing an
 /// orphan block nobody will ever read.
 ///
-/// Other channel-scoped kinds need no check here: `channel-create` names the
-/// channel it is creating, and `member-add` / `channel-promote` resolve the
-/// channel inside `apply_effect`, which already errors on a miss.
+/// `channel-create` names the channel it is creating, so it is exempt. The
+/// membership and lifecycle kinds are NOT: they used to resolve the channel
+/// inside `apply_effect` and surface a miss as an untyped 500, and the admin
+/// archive route compensated with its own store lookup ahead of `ingest` —
+/// which made that route an oracle for channel existence and ownership to
+/// callers who had proved nothing. The typed 404 here is what lets every
+/// surface answer only after the signature and admission have passed.
 fn requires_existing_channel(kind: BlockKind, source: &IngestSource) -> bool {
     if matches!(source, IngestSource::FederatedPeer { .. }) {
         return false;
     }
-    matches!(kind, BlockKind::TextRender)
+    matches!(
+        kind,
+        BlockKind::TextRender
+            | BlockKind::MemberAdd
+            | BlockKind::ChannelPromote
+            | BlockKind::ChannelArchive
+    )
 }
 
 // ---- Bundle / manifest helpers --------------------------------------------

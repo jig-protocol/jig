@@ -212,6 +212,17 @@ impl TestServer {
         assert_eq!(status, StatusCode::OK, "channel-archive failed: {body}");
     }
 
+    /// Submit any `channel-archive` block through the admin route and return
+    /// whatever the server said.
+    pub async fn try_archive(
+        &self,
+        slug: &str,
+        block: &BuiltBlock,
+    ) -> (StatusCode, serde_json::Value) {
+        let path = format!("/_admin_v0_0_2/channels/{}/archive", encode_slug(slug));
+        self.post_admin(&path, block).await
+    }
+
     /// Add `member` to `slug`, the block signed by `by`. Asserts success; use
     /// [`try_add_member`](Self::try_add_member) to observe a refusal.
     pub async fn add_member(&self, by: &Identity, slug: &str, member: &Identity) {
