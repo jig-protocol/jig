@@ -93,6 +93,22 @@ require_authenticated_reads = true
 replay_window_ms = 30000
 replay_capacity = 100000
 
+# Gate 2: whom this server deals with at all, decided after a caller proves
+# their key and before anything is authorized. The default admits everyone.
+# Reputation is ruleset-scoped: a floor names its ruleset, and a DID with no
+# score under it is UNKNOWN for it — decided by `unknown_dids`, never by the
+# number. `unknown_dids = "refuse"` plus `records` is a members-only server.
+[auth.admission]
+unknown_dids = "admit"
+banned_dids = []
+# [[auth.admission.floors]]
+# ruleset_key = "gigue.highsec.v1"
+# minimum = 0
+# [[auth.admission.records]]
+# did = "did:jig:z..."
+# ruleset_key = "gigue.highsec.v1"
+# score = 5
+
 [debug]
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # REQUIRED FOR v0.0.2. `admin_endpoints = false` does not mount the

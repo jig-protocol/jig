@@ -142,6 +142,9 @@ pub struct AuthSection {
     /// is an accept. So an undersized cap degrades to refusing legitimate
     /// traffic, which is the safe direction but still a denial of service.
     pub replay_capacity: usize,
+
+    /// Gate 2: whom this server will deal with at all. See [`AdmissionSection`].
+    pub admission: AdmissionSection,
 }
 
 impl Default for AuthSection {
@@ -150,8 +153,58 @@ impl Default for AuthSection {
             require_authenticated_reads: true,
             replay_window_ms: 30_000,
             replay_capacity: 100_000,
+            admission: AdmissionSection::default(),
         }
     }
+}
+
+/// `[auth.admission]` — the operator's policy for who is admitted, evaluated
+/// after a caller has proved possession of their key and before anything is
+/// authorized. Refusing here narrows access, so nothing in this section is a
+/// `dangerously_` carve-out; the default admits everyone.
+///
+/// Reputation is ruleset-scoped, never a scalar: a floor names the ruleset it
+/// applies to, and a DID with no score under that ruleset is *unknown* for
+/// it — decided by `unknown_dids`, never by comparing an absent score against
+/// `minimum`.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AdmissionSection {
+    /// What to do with a DID this server has no relevant record for.
+    /// `"admit"` (the default) or `"refuse"`. `"refuse"` with a set of
+    /// `records` is a members-only server.
+    pub unknown_dids: UnknownDidsPolicy,
+    /// DIDs this server refuses outright, whatever their scores.
+    pub banned_dids: Vec<String>,
+    /// Reputation floors, evaluated in the order written.
+    pub floors: Vec<AdmissionFloor>,
+    /// Reputation this operator wrote down by hand — the server's whole view
+    /// until a ledger exists.
+    pub records: Vec<ReputationRecord>,
+}
+
+/// The explicit choice for an unknown DID. Not a bool: "admit" and "refuse"
+/// are both decisions, and neither is a type default that could be reached by
+/// omission.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UnknownDidsPolicy {
+    #[default]
+    Admit,
+    Refuse,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AdmissionFloor {
+    pub ruleset_key: String,
+    pub minimum: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReputationRecord {
+    pub did: String,
+    pub ruleset_key: String,
+    pub score: i64,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
@@ -403,6 +456,63 @@ mod tests {
     /// operator did not mention. Setting only the window must not silently
     /// switch authentication off — which is exactly what per-field
     /// `#[serde(default)]` would do, since the bool's type default is false.
+    #[test]
+    #[test]
+    fn a_missing_admission_section_admits_everyone() {
+        let cfg: JigServerConfig = toml::from_str("[auth]\n").expect("parses");
+        assert_eq!(cfg.auth.admission, AdmissionSection::default());
+        assert_eq!(cfg.auth.admission.unknown_dids, UnknownDidsPolicy::Admit);
+        assert!(cfg.auth.admission.floors.is_empty());
+        assert!(cfg.auth.admission.banned_dids.is_empty());
+    }
+
+    #[test]
+    fn a_full_admission_section_parses() {
+        let cfg: JigServerConfig = toml::from_str(
+            r#"
+            [auth.admission]
+            unknown_dids = "refuse"
+            banned_dids = ["did:jig:zBad"]
+
+            [[auth.admission.floors]]
+            ruleset_key = "gigue.highsec.v1"
+            minimum = 0
+
+            [[auth.admission.records]]
+            did = "did:jig:zGood"
+            ruleset_key = "gigue.highsec.v1"
+            score = 5
+            "#,
+        )
+        .expect("parses");
+        let a = &cfg.auth.admission;
+        assert_eq!(a.unknown_dids, UnknownDidsPolicy::Refuse);
+        assert_eq!(a.banned_dids, vec!["did:jig:zBad".to_string()]);
+        assert_eq!(a.floors[0].ruleset_key, "gigue.highsec.v1");
+        assert_eq!(a.floors[0].minimum, 0);
+        assert_eq!(a.records[0].did, "did:jig:zGood");
+        assert_eq!(a.records[0].score, 5);
+    }
+
+    /// A partial admission section keeps the admit-everyone defaults for what
+    /// it omits, and `[auth.admission]` on its own does not disturb `[auth]`'s
+    /// own safe defaults.
+    #[test]
+    fn a_partial_admission_section_keeps_the_defaults() {
+        let cfg: JigServerConfig =
+            toml::from_str("[auth.admission]\nbanned_dids = [\"did:jig:zBad\"]\n").expect("parses");
+        assert_eq!(cfg.auth.admission.unknown_dids, UnknownDidsPolicy::Admit);
+        assert!(cfg.auth.require_authenticated_reads);
+    }
+
+    #[test]
+    fn unknown_dids_accepts_only_the_two_choices() {
+        assert!(
+            toml::from_str::<JigServerConfig>("[auth.admission]\nunknown_dids = \"maybe\"\n")
+                .is_err()
+        );
+    }
+
     #[test]
     fn a_partial_auth_section_keeps_the_safe_default() {
         let cfg: JigServerConfig =
