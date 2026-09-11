@@ -71,13 +71,34 @@ the default):
   channel, or of anyone but yourself onto any channel, must be signed by the
   channel owner; `channel-promote` likewise. Self-join (`jig channel join`)
   works on open channels only. Unknown `visibility` values fail closed.
+- **The server can refuse a caller before asking what they want.**
+  `[auth.admission]` runs after a key is proven and before anything is
+  authorized, on every read and every write: `banned_dids`, ruleset-scoped
+  reputation `floors`, and an explicit `unknown_dids = "admit" | "refuse"`.
+  A refused caller gets `403 NOT_ADMITTED` and learns nothing about channels.
+  A members-only server is `unknown_dids = "refuse"` plus a `records` entry
+  per member:
+
+  ```toml
+  [auth.admission]
+  unknown_dids = "refuse"
+  [[auth.admission.records]]
+  did = "did:jig:z..."          # each member's DID
+  ruleset_key = "club"
+  score = 1
+  ```
+
+  Reputation is ruleset-scoped, so a floor never refuses a DID that has no
+  score under its ruleset — that case is the `unknown_dids` choice, by
+  design, so a fresh key is not punished for being fresh.
 
 What it does not enforce yet — the reasons to keep `bind_address` on the
 tailnet:
 
-- **No admission policy.** Any self-minted key is admitted; there is no
-  reputation, rate limit or proof-of-work in front of the gates. Anyone who can
-  reach the port can create channels and post to open ones.
+- **No rate limiting or proof-of-work, and no reputation scoring.** Admission
+  consumes scores the operator wrote down; nothing computes or exchanges them
+  yet. With the default `unknown_dids = "admit"`, anyone who can reach the
+  port can create channels and post to open ones, unthrottled.
 - **Federated peers are trusted.** Blocks relayed from a peer are persisted
   and delivered to local subscribers without running the write gate. Only
   federate with servers you would let post on your behalf.
