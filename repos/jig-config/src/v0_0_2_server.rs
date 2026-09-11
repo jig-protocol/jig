@@ -167,8 +167,14 @@ impl Default for AuthSection {
 /// applies to, and a DID with no score under that ruleset is *unknown* for
 /// it — decided by `unknown_dids`, never by comparing an absent score against
 /// `minimum`.
+// `deny_unknown_fields`, unlike the sections around it: the hybrid config
+// file tolerates unknown keys at the top level because two types read it, but
+// nothing else reads `[auth.admission]`, and a misspelled key in a section
+// whose whole job is to NARROW access would silently leave the permissive
+// default in place. A members-only server whose operator wrote `unknown_did`
+// (singular) must not boot as an open one.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AdmissionSection {
     /// What to do with a DID this server has no relevant record for.
     /// `"admit"` (the default) or `"refuse"`. `"refuse"` with a set of
@@ -195,12 +201,14 @@ pub enum UnknownDidsPolicy {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdmissionFloor {
     pub ruleset_key: String,
     pub minimum: i64,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReputationRecord {
     pub did: String,
     pub ruleset_key: String,
@@ -498,6 +506,23 @@ mod tests {
             toml::from_str("[auth.admission]\nbanned_dids = [\"did:jig:zBad\"]\n").expect("parses");
         assert_eq!(cfg.auth.admission.unknown_dids, UnknownDidsPolicy::Admit);
         assert!(cfg.auth.require_authenticated_reads);
+    }
+
+    /// A misspelled key in a section that narrows access must be an error,
+    /// not a silently permissive server.
+    #[test]
+    fn a_misspelled_admission_key_is_an_error() {
+        for bad in [
+            "[auth.admission]\nunknown_did = \"refuse\"\n",
+            "[auth.admission]\nbanned_did = [\"did:jig:zx\"]\n",
+            "[[auth.admission.floors]]\nruleset = \"r\"\nminimum = 0\n",
+            "[[auth.admission.records]]\ndid = \"did:jig:zx\"\nruleset_key = \"r\"\nscores = 1\n",
+        ] {
+            assert!(
+                toml::from_str::<JigServerConfig>(bad).is_err(),
+                "must not parse: {bad}"
+            );
+        }
     }
 
     #[test]

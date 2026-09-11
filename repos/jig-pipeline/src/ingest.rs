@@ -399,11 +399,8 @@ pub async fn ingest(
     crate::effect::apply_effect(&ctx.store, &bundle, &receipt_bytes, &block_cid).await?;
 
     // Step 6: persist block + receipt
-    let sender_did_str = manifest
-        .authors
-        .first()
-        .map(|a| a.did.to_string())
-        .unwrap_or_default();
+    // Canonical, from the verified key — the spelling every gate compares.
+    let sender_did_str = sender.to_did_jig_string();
     let hlc = manifest.hlc_ts.as_ref();
     let stored_block = StoredBlock {
         cid: block_cid.clone(),

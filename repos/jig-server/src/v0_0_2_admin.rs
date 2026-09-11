@@ -366,7 +366,7 @@ mod tests {
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
         // Built before the literal: `config` moves into it below.
-        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth));
+        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth).unwrap());
 
         Arc::new(AppState {
             config,
