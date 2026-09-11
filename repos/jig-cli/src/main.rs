@@ -170,6 +170,9 @@ enum ChannelAction {
     /// Join an existing channel by adding the caller's DID as a member.
     /// Builds a signed member-add block and POSTs it to
     /// `/_admin_v0_0_2/channels/<slug>/members`.
+    ///
+    /// Only `open` channels can be joined this way. A `restricted` channel is
+    /// invite-only: its owner adds members, and a self-join is refused.
     Join {
         /// Channel slug to join (e.g. `#hello`).
         #[arg()]
@@ -193,7 +196,8 @@ enum ChannelAction {
         yes: bool,
     },
 
-    /// List all channels known to the configured server.
+    /// List the channels on the configured server that you may read: every
+    /// `open` channel, plus the `restricted` ones you own or belong to.
     /// GETs `/api/v1/channels` and renders an aligned table.
     List,
 }

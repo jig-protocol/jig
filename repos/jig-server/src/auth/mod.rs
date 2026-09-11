@@ -14,12 +14,14 @@
 //! themselves arrive in phases 2 and 3.
 
 pub mod authenticate;
+pub mod authorize;
 pub mod disclosure;
 pub mod outcome;
 pub mod replay;
 pub mod state;
 
 pub use authenticate::{AuthProof, authenticate};
+pub use authorize::{Visibility, authorize_read};
 pub use disclosure::{DisclosurePolicy, audit_line};
 pub use outcome::{Gate, GateOutcome};
 pub use replay::{ReplayGuard, ReplayRejection};

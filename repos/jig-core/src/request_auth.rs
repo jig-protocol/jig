@@ -19,6 +19,22 @@ use crate::crypto::hash_labeled_parts;
 /// and never sign a request without it.
 const DOMAIN: &str = "jig-request-auth-v1";
 
+/// Header names carrying a proof over HTTP: the five values the server
+/// verifies, exactly as [`canonical_request_hash`] consumes them.
+///
+/// Defined here, beside the hash, so a client signing a request and a server
+/// verifying one read the same names from the same place. HTTP-specific by
+/// necessity; the verification is not, which is what keeps the design
+/// transport-agnostic — a future SSH or gRPC transport carries the same five
+/// values however it can.
+pub mod headers {
+    pub const DID: &str = "x-jig-did";
+    pub const HLC_WALL_MS: &str = "x-jig-hlc-wall-ms";
+    pub const HLC_LOGICAL: &str = "x-jig-hlc-logical";
+    pub const NONCE: &str = "x-jig-nonce";
+    pub const SIGNATURE: &str = "x-jig-signature";
+}
+
 /// Hash the canonical form of a request.
 ///
 /// Every parameter is covered, and `hash_labeled_parts` length-prefixes each

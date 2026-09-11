@@ -31,18 +31,22 @@ loopback and private tailnets.
 - **No encryption of message content.** Blocks are *signed*, never encrypted. There is no
   E2EE and no per-message confidentiality. Anything on the wire without an outer TLS
   tunnel is plaintext, and the server stores plaintext.
-- **No authentication and no authorization.** A WebSocket client may subscribe to any
-  channel scope without proving anything
-  ([`v0_0_2_ws.rs`](repos/jig-server/src/v0_0_2_ws.rs), the `Frame::Subscribe` arm).
-  Channel `visibility = "restricted"` is *recorded* but not
-  enforced on reads. The `/_admin_v0_0_2/*` endpoints that create channels and add members
-  are unauthenticated, which is why the shipped config binds loopback only.
+- **Authentication and channel authorization, but no admission policy.** Every read
+  carries a signed proof of possession of the caller's key, and `visibility = "restricted"`
+  is enforced on history, the listing, live delivery and posting
+  ([`jig-server/src/auth/`](repos/jig-server/src/auth/),
+  [`jig-pipeline/src/authorize_write.rs`](repos/jig-pipeline/src/authorize_write.rs)).
+  What is missing is any way to refuse a caller *before* those gates: any self-minted key
+  is admitted, there is no rate limiting, and blocks relayed by a federated peer are
+  trusted. The `/_admin_v0_0_2/*` channel-ops routes run the same gates but still mount
+  behind a `[debug]` flag.
 - **No graphical client.** `repos/jig-gui/` (Riverdance) is a Dioxus scaffold around a
   mocked chat UI. It depends on neither `jig-core` nor `jig-client` and never opens a
   connection — it is a design mock, not a client.
-- Network-level access control — a tailnet, a firewall — is currently the *only* access
-  control. That is a deliberate v0.0.x position, not an oversight, but it means the
-  security model is entirely outside this repo.
+- Network-level access control — a tailnet, a firewall — is still the recommended outer
+  layer, because the gates above are new and nothing sits in front of them. It is no
+  longer the *only* access control; see `deploy/README.md` for what the server enforces
+  on its own.
 
 ### What works, what does not
 
@@ -50,17 +54,17 @@ loopback and private tailnets.
 | --- | --- |
 | Local `jig-server` + `jig chat` / `jig tail` over WebSocket | Works |
 | Signed, content-addressed blocks (ed25519 signature, CID) | Works |
-| Channel create / join / list; membership records | Works, via unauthenticated admin endpoints |
+| Channel create / join / list; membership records | Works. Blocks are signature-verified and owner/membership-gated at ingest; the routes still mount behind a `[debug]` flag |
 | History backfill (last 100 blocks) on joining a channel | Works |
 | `GET /api/v1/channels/:slug/blocks`, `/healthz`, `/metrics` | Works |
 | Nameserver: alias register / resolve / rotate / renew | Works (`jig-nameserver`, `jig ns …`) |
 | Server-to-server federation over WSS | Implemented and covered by [`h3_federation.rs`](repos/integration-tests/tests/h3_federation.rs); never run between two hosts on the public internet |
 | Email bridge (Resend) | Implemented in-process; see [`bridges/email/README.md`](repos/bridges/email/README.md) |
-| Wasm block execution **on the server** | **Not wired.** Every receipt is server-signed and synthetic ([`jig-pipeline/src/ingest.rs`](repos/jig-pipeline/src/ingest.rs), step 4). The server never calls `jig-runtime` |
+| Wasm block execution **on the server** | `text-render` executes for real: the server runs its canonical module and signs the `render_hash` ([`jig-pipeline/src/ingest.rs`](repos/jig-pipeline/src/ingest.rs), step 4). Control-plane kinds still take a synthetic, server-signed receipt |
 | Wasm block execution in the CLI (`jig block run`) | Runs and emits a metered receipt for the runtime's own fixtures. It **rejects the workspace's own `text-block` build** with `MemoryMissingMaximum` from the determinism validator |
 | `jig block lint` / `sign` / `verify` / `capabilities` | Stubs; they print "not yet implemented" and exit 1 |
 | End-to-end encryption | None |
-| Authentication / authorization | None |
+| Authentication / authorization | Signed proof of possession on every read; `restricted` channels membership-gated for reading, listing, live delivery and posting; membership changes owner-signed. **No admission policy or rate limiting** — any key is admitted |
 | Graphical client | None |
 | `jig read` | Broken by default — it calls the v0.0.1 `GET /blocks` route, which is gated off behind `dangerously_enable_v0_0_1_rest`. Use `jig chat`, `jig tail`, or the history endpoint |
 | `jig --version` | Not implemented (`jig-server --version` is) |

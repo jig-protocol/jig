@@ -50,8 +50,6 @@ pub enum ClientError {
 /// writer tasks; the public API is fully `async` and message-based.
 pub struct Client {
     identity: Arc<Identity>,
-    /// Monotonic source of unique subscribe nonces for this connection.
-    subscribe_nonce_seq: Arc<std::sync::atomic::AtomicU64>,
     write_tx: mpsc::UnboundedSender<Message>,
     inbound_rx: Mutex<mpsc::UnboundedReceiver<Frame>>,
     pending_subscriptions: SubscriptionMap,
@@ -253,7 +251,6 @@ impl Client {
 
         Ok(Self {
             identity: Arc::new(identity),
-            subscribe_nonce_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             write_tx,
             inbound_rx: Mutex::new(inbound_rx),
             pending_subscriptions,
@@ -280,15 +277,11 @@ impl Client {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        // A counter, not randomness. Nonces need only be UNIQUE inside the
-        // server's acceptance window, not unpredictable — the signature already
-        // provides unforgeability. This matters here: `jig-client` deliberately
-        // carries no `rand` dependency (see its Cargo.toml), and re-adding one
-        // for a nonce would undo that on purpose-built ground.
-        let seq = self
-            .subscribe_nonce_seq
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let nonce = format!("{hlc_wall_ms}-{seq}");
+        // Shared with the REST read proofs: one nonce sequence per process,
+        // so a backfill and a subscribe in the same millisecond never carry
+        // the same nonce. See `read_auth::fresh_nonce` for why a counter and
+        // not randomness.
+        let nonce = crate::read_auth::fresh_nonce(hlc_wall_ms);
 
         let hash = jig_core::request_auth::canonical_request_hash(
             "SUBSCRIBE",

@@ -152,22 +152,26 @@ pub struct ReceiptView {
 
 /// GET /api/v1/blocks/:cid — fetch a stored block and all known receipts.
 ///
+/// Runs the same gates as the timeline the block lives in. A CID is a content
+/// hash, not a secret — it appears in acks, receipts, delivery frames and
+/// logs — so an ungated fetch-by-CID would be a detour around the channel
+/// gate. A block with no channel (control-plane kinds) needs only a proof.
+///
 /// Returns 404 with `{ code: "NOT_FOUND" }` if the CID is absent.
 pub async fn get_block_by_cid(
     State(state): State<Arc<AppState>>,
     Path(cid): Path<String>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<BlockView>, (StatusCode, Json<ErrorBody>)> {
+    let started = std::time::Instant::now();
+    let caller_did = authenticate_read(&state, &headers, "GET", uri.path(), started)?;
+
     let stored = state
         .ingest_ctx
         .store
         .get_block(&cid)
-        .map_err(|e| {
-            err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "PERSIST_ERROR",
-                e.to_string(),
-            )
-        })?
+        .map_err(persist_err)?
         .ok_or_else(|| {
             err(
                 StatusCode::NOT_FOUND,
@@ -175,6 +179,10 @@ pub async fn get_block_by_cid(
                 format!("no block with cid {cid}"),
             )
         })?;
+
+    if let (Some(caller), Some(slug)) = (caller_did.as_ref(), stored.channel_id.as_deref()) {
+        authorize_channel_read(&state, slug, caller, started)?;
+    }
 
     let receipts = state
         .ingest_ctx
@@ -228,36 +236,49 @@ pub struct ChannelsResponse {
     pub channels: Vec<ChannelView>,
 }
 
-/// GET /api/v1/channels — list all channels known to this server.
+/// GET /api/v1/channels — list the channels the caller may read.
 ///
-/// Channels are public state in v0.0.2 (no per-channel ACL on listing — the
-/// visibility flag governs join semantics, not listing). Not debug-gated.
+/// Every channel runs the same `authorize_read` decision as a timeline read,
+/// so a restricted channel a caller could not read is not listed to them
+/// either. A 403 on the timeline conceals nothing if this endpoint still
+/// names every restricted channel — and its `owner_did` — to whoever asks.
+/// Not debug-gated.
 pub async fn list_channels(
     State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<ChannelsResponse>, (StatusCode, Json<ErrorBody>)> {
     let started = std::time::Instant::now();
-    // Phase 3 consumes this to filter restricted channels from the listing.
     let caller_did = authenticate_read(&state, &headers, "GET", uri.path(), started)?;
-    let _ = &caller_did;
+    let store = &state.ingest_ctx.store;
 
-    let stored = state.ingest_ctx.store.list_channels().map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "PERSIST_ERROR",
-            e.to_string(),
-        )
-    })?;
-    let channels = stored
-        .into_iter()
-        .map(|c| ChannelView {
+    let stored = store.list_channels().map_err(persist_err)?;
+    let mut channels = Vec::with_capacity(stored.len());
+    for c in stored {
+        // With no verified caller (the migration escape hatch) nobody is
+        // filtered: the pre-authentication listing, exactly as documented.
+        if let Some(caller) = caller_did.as_ref() {
+            let visibility = crate::auth::Visibility::parse(&c.visibility);
+            // Open channels need no membership query; the decision is the
+            // same whatever the answer would have been.
+            let is_member = match visibility {
+                crate::auth::Visibility::Open => false,
+                crate::auth::Visibility::Restricted => store
+                    .is_member(&c.slug, caller.as_str())
+                    .map_err(persist_err)?,
+            };
+            let is_owner = c.owner_did == caller.as_str();
+            if crate::auth::authorize_read(visibility, is_member, is_owner).is_err() {
+                continue;
+            }
+        }
+        channels.push(ChannelView {
             slug: c.slug,
             visibility: c.visibility,
             owner_did: c.owner_did,
             created_at: c.created_at,
-        })
-        .collect();
+        });
+    }
     Ok(Json(ChannelsResponse { channels }))
 }
 
@@ -353,6 +374,53 @@ fn authenticate_read(
     }
 }
 
+/// Gate 3 for a single channel: may `caller` read `slug`?
+///
+/// The decision itself is the pure `authorize_read`; this only gathers its
+/// inputs.
+///
+/// A slug with no local row is NOT refused. Channel state does not replicate
+/// between federated servers, so a channel that lives on a peer routinely has
+/// blocks here and no row: refusing would break backfill for every federated
+/// conversation. Live WSS delivery makes the same call for the same reason,
+/// and a row that appears later is enforced from then on. Two costs, both
+/// deliberate: relayed blocks of a peer's channel are readable here by any
+/// authenticated caller (federation is trust-on-peer until its own gate
+/// lands), and under a concealing disclosure policy an absent channel (empty
+/// 200) is distinguishable from a restricted one (404).
+///
+/// "No local row" means no row at all. An ARCHIVED channel still has one —
+/// archiving is a soft delete that keeps every block — and its visibility and
+/// owner keep governing reads. The live-channel lookup filters archived rows
+/// out (so writes fail loudly), which is exactly why it must not be the
+/// lookup used here: with it, retiring a restricted channel published its
+/// history to anyone with a key.
+fn authorize_channel_read(
+    state: &AppState,
+    slug: &str,
+    caller: &jig_core::did::Did,
+    started: std::time::Instant,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let store = &state.ingest_ctx.store;
+    let Some(channel) = store
+        .get_channel_by_slug_including_archived(slug)
+        .map_err(persist_err)?
+    else {
+        return Ok(());
+    };
+    let is_member = store
+        .is_member(slug, caller.as_str())
+        .map_err(persist_err)?;
+    let is_owner = channel.owner_did == caller.as_str();
+
+    crate::auth::authorize_read(
+        crate::auth::Visibility::parse(&channel.visibility),
+        is_member,
+        is_owner,
+    )
+    .map_err(|outcome| refuse(state, &outcome, started))
+}
+
 /// Map a gate outcome to a response through this server's disclosure policy,
 /// logging the true outcome regardless of what the policy emits.
 ///
@@ -386,11 +454,15 @@ pub async fn get_channel_history(
     headers: axum::http::HeaderMap,
 ) -> Result<Json<Vec<TimelineBlock>>, (StatusCode, Json<ErrorBody>)> {
     let started = std::time::Instant::now();
-    // Phase 3 consumes this to enforce membership on restricted channels.
     let caller_did = authenticate_read(&state, &headers, "GET", uri.path(), started)?;
-    let _ = &caller_did;
-
     let store = &state.ingest_ctx.store;
+
+    // Gate 3, before any block is fetched: a refusal must not be
+    // distinguishable from an empty channel by how much work it took.
+    if let Some(caller) = caller_did.as_ref() {
+        authorize_channel_read(&state, &slug, caller, started)?;
+    }
+
     let blocks = store
         .list_blocks_by_channel(&slug, query.limit.unwrap_or(MAX_HISTORY_LIMIT), None)
         .map_err(persist_err)?;
@@ -580,7 +652,9 @@ mod tests {
 
     #[tokio::test]
     async fn get_block_returns_404_for_unknown_cid() {
-        let state = Arc::new(AppState::for_test().unwrap());
+        // Unsigned GET, so the escape hatch; the proof requirement on this
+        // route is covered in tests/restricted_reads.rs.
+        let state = Arc::new(unauthenticated_state());
         let router = build_blocks_router(state);
 
         let (status, body) = get_path(router, "/api/v1/blocks/bafy_unknown").await;
@@ -590,7 +664,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_then_get_round_trips() {
-        let state = Arc::new(AppState::for_test().unwrap());
+        let state = Arc::new(unauthenticated_state());
         let router = build_blocks_router(state.clone());
         seed_channel(&state, "#hello");
 

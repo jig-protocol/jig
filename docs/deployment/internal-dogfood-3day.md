@@ -1,8 +1,9 @@
 # Internal dogfooding: 3-day plan (solo + parallel agents)
 
 **Shape:** DJ solo, traveling. Coding agents run in parallel lanes; DJ reviews and owns
-every commit. Tailnet is the security boundary. macOS-only clients. Nameserver in scope,
-GUI out.
+every commit. Tailnet is the security boundary *(as of 2026-08-04; since 2026-09 the
+server authenticates reads and gates channels itself and the tailnet is defence in
+depth — see `deploy/README.md`)*. macOS-only clients. Nameserver in scope, GUI out.
 
 **Original status:** proposed, not executed. All forensics verified against the **main
 checkout** (`b04df60`) on 2026-08-04 by running real binaries. Most of the code below has
@@ -37,7 +38,10 @@ rest is preserved for its reasoning, not as a to-do list.
 
 ### Not done — know these before the first group session
 
-- **No authz beyond the tailnet.** No authn, no authz, no per-channel ACL enforcement on
+- ~~**No authz beyond the tailnet.**~~ *Superseded 2026-09-09 by the authn/authz work:
+  reads are signed and restricted channels are membership-gated; see
+  `deploy/README.md`. Left as written below for the record of what this dogfood ran.*
+  No authn, no authz, no per-channel ACL enforcement on
   reads or sends. Membership is derived state for bridge dispatch only. Tailnet membership
   *is* the access control; removing someone from the tailnet is how you revoke them.
 - **No reconnect with backoff.** `jig tail` and `jig chat` now *detect* a dropped connection
@@ -331,5 +335,7 @@ and **the master-plan doc refresh** (after, per DJ).
    DEBUG span under an INFO filter logs "started processing request" with no method or URI).
    `/healthz` and `/metrics` now exist and sit outside the v0.0.1 gate — a scrape target
    that vanishes when the operator locks the server down is not a scrape target.
-7. **The tailnet is doing 100% of your security.** The danger is six weeks of "it's been
-   fine" becoming the argument for port 443.
+7. **The tailnet is doing 100% of your security** *(no longer: reads are signed and
+   channels gated since 2026-09, but with no admission policy the tailnet is still what
+   keeps strangers off the port)*. The danger is six weeks of "it's been fine" becoming
+   the argument for port 443.

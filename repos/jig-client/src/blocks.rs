@@ -147,7 +147,12 @@ pub fn build_fed_hello(
     build_with_metadata(sender, BlockKind::FedHello, hlc, meta)
 }
 
-fn build_with_metadata(
+/// Build and sign a block of any `kind` with arbitrary metadata.
+///
+/// The typed builders above are thin wrappers over this. Public so tests can
+/// build exactly the shapes a hostile client would — the server must not
+/// depend on clients using the typed builders.
+pub fn build_with_metadata(
     sender: &Identity,
     kind: BlockKind,
     hlc: HlcTimestamp,

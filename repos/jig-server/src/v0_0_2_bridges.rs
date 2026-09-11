@@ -292,6 +292,22 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         ref e @ IngestError::NoExecutor { .. } => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },
+        // The bridge's shadow identity tried to change a channel it does not
+        // own. A retry sends the same signature; bounce it.
+        ref e @ IngestError::NotChannelOwner { .. } => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
+        ref e @ IngestError::NotChannelMember { .. } => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
+        // Retrying sends the same bytes, which is what was refused.
+        ref e @ IngestError::DuplicateBlock { .. } => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
+        // The channel is gone for good; the bridge should bounce.
+        ref e @ IngestError::ChannelArchived { .. } => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
         // Unavailable, not PolicyBlocked: the block is fine and execution failed
         // on this host, so a retry may well succeed.
         IngestError::RenderFailed { .. } => SubmitDenied::Unavailable,
@@ -589,9 +605,21 @@ mod tests {
             })
             .unwrap();
 
-        // Bob (NOT the shadow DID) posts a text-render block to "#dm/x".
+        // Bob (NOT the shadow DID) posts a text-render block to "#dm/x". He
+        // is the DM's other member, exactly as `ensure_dm_channel` would have
+        // enrolled him: the channel is restricted, and a non-member's post is
+        // refused at ingest before it reaches fanout.
         let dir = tempdir().unwrap();
         let bob = Identity::generate_and_save(&dir.keep()).unwrap();
+        store
+            .upsert_membership(&StoredMembership {
+                channel_id: "bafyDmX".to_string(),
+                member_did: bob.did_string(),
+                role: "member".to_string(),
+                joined_at: 0,
+                source_block_cid: "seed".to_string(),
+            })
+            .unwrap();
         let hlc = HlcTimestamp {
             wall_ms: 1_747_680_000_000,
             logical: 0,

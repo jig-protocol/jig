@@ -9,7 +9,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use jig_core::{BlockBundle, BlockKind, Did};
 use std::sync::Arc;
 
-use crate::fanout::Fanout;
+use crate::fanout::{DeliveryPolicy, Fanout};
 use crate::hlc::HlcClock;
 use crate::identity::IdentityResolver;
 use crate::persist::{SqliteStore, StoredBlock, StoredReceipt};
@@ -102,6 +102,32 @@ pub enum IngestError {
     /// receipt.
     #[error("executing the `{kind}` module failed: {detail}")]
     RenderFailed { kind: String, detail: String },
+    /// A control-plane block was signed by someone the channel does not
+    /// answer to. See [`crate::authorize_write`] for the rules.
+    #[error("`{kind}` on `{slug}` refused: `{sender}` is not the channel owner")]
+    NotChannelOwner {
+        kind: String,
+        slug: String,
+        sender: String,
+    },
+    /// The named channel was archived: retired, its history kept, nothing new
+    /// accepted into it — by any kind, from any source.
+    #[error("channel '{slug}' is archived and accepts no new blocks")]
+    ChannelArchived { slug: String },
+    /// This exact block (by CID) was already ingested. Refused before any
+    /// effect runs: an accepted control-plane block is otherwise a standing
+    /// authorization anyone holding its bytes can replay — re-enrolling a
+    /// member the owner has since removed, for instance.
+    #[error("block `{cid}` was already ingested")]
+    DuplicateBlock { cid: String },
+    /// Content for a restricted channel from someone who is neither a member
+    /// nor its owner. See [`crate::authorize_write`].
+    #[error("`{kind}` on `{slug}` refused: `{sender}` is not a member of the channel")]
+    NotChannelMember {
+        kind: String,
+        slug: String,
+        sender: String,
+    },
     #[error(transparent)]
     Identity(#[from] crate::identity::IdentityError),
     #[error(transparent)]
@@ -186,18 +212,81 @@ pub async fn ingest(
     // Step 3b: channel-existence guard for channel-scoped kinds.
     //
     // Resolved once here and reused for the bridge-sink member lookup after
-    // persist, so the guard costs no extra query.
-    let channel_slug = manifest.metadata.get("channel").and_then(|v| v.as_str());
+    // persist, so the guard costs no extra query. `channel_slug_of` is the ONE
+    // rule for which metadata key names a block's channel; the persisted
+    // `channel_id` below uses the same call, so the channel that is gated is
+    // the channel the block lands in.
+    let channel_slug = channel_slug_of(kind, &manifest);
     let mut resolved_channel = match channel_slug {
         Some(slug) => ctx.store.get_channel_by_slug(slug)?,
         None => None,
     };
+    // A live row is what writes need. No live row but an archived one means
+    // the channel was retired: nothing goes into it, from any source, of any
+    // kind — otherwise a kind the write gate does not know would resolve to
+    // "no channel", pass the gate, and land in the archived timeline the read
+    // gate still guards.
+    if let Some(slug) = channel_slug
+        && resolved_channel.is_none()
+        && kind != BlockKind::ChannelCreate
+        && ctx
+            .store
+            .get_channel_by_slug_including_archived(slug)?
+            .is_some()
+    {
+        return Err(IngestError::ChannelArchived {
+            slug: slug.to_string(),
+        });
+    }
     if let Some(slug) = channel_slug
         && resolved_channel.is_none()
         && requires_existing_channel(kind, &source)
     {
         return Err(IngestError::UnknownChannel {
             slug: slug.to_string(),
+        });
+    }
+
+    // Step 3c: write authorization — may this sender post to, or change,
+    // this channel?
+    //
+    // Here rather than in `apply_effect` so a refusal is a typed error every
+    // surface classifies the same way, instead of an `anyhow` 500. Runs before
+    // the receipt is built: a block this server will not apply must not carry
+    // this server's signature. The membership query runs only when the
+    // decision can turn on it (content into a restricted channel).
+    let sender_is_member =
+        if crate::authorize_write::needs_membership(kind, resolved_channel.as_ref()) {
+            let sender = manifest
+                .authors
+                .first()
+                .map(|a| a.did.to_string())
+                .unwrap_or_default();
+            match channel_slug {
+                Some(slug) => ctx.store.is_member(slug, &sender)?,
+                None => false,
+            }
+        } else {
+            false
+        };
+    if let Err(refusal) = crate::authorize_write::authorize_block(
+        kind,
+        &manifest,
+        resolved_channel.as_ref(),
+        sender_is_member,
+    ) {
+        use crate::authorize_write::WriteRefusal;
+        // The audit record of what actually happened, independent of what any
+        // surface tells the caller — the same rule the read gates follow.
+        tracing::info!(kind = kind_str, refusal = ?refusal, "write refused");
+        let kind = kind_str.to_string();
+        return Err(match refusal {
+            WriteRefusal::NotChannelOwner { slug, sender } => {
+                IngestError::NotChannelOwner { kind, slug, sender }
+            }
+            WriteRefusal::NotChannelMember { slug, sender } => {
+                IngestError::NotChannelMember { kind, slug, sender }
+            }
         });
     }
 
@@ -224,6 +313,14 @@ pub async fn ingest(
         .block_cid()
         .map(|c| c.to_string())
         .unwrap_or_else(|_| "bafy_invalid".to_string());
+
+    // Step 3d: a block is ingested once. The `blocks.cid` primary key would
+    // refuse the second insert anyway, but `apply_effect` runs BEFORE that
+    // insert, so without this check a replayed member-add had already
+    // re-created the membership by the time the insert failed.
+    if ctx.store.get_block(&block_cid)?.is_some() {
+        return Err(IngestError::DuplicateBlock { cid: block_cid });
+    }
     let (receipt_bytes, render_hash, is_synthetic) = match kind {
         BlockKind::TextRender => build_render_receipt(ctx, &manifest, &block_cid, kind_str).await?,
         _ => build_synth_receipt(&block_cid, &ctx.server_did, &ctx.server_key),
@@ -244,15 +341,10 @@ pub async fn ingest(
     let stored_block = StoredBlock {
         cid: block_cid.clone(),
         // Lift the channel slug from manifest metadata into the first-class
-        // column so channel-scoped fanout + the bridge sink can find it.
-        // text-render / member-add use metadata["channel"]; channel-create
-        // uses metadata["slug"].
-        channel_id: manifest
-            .metadata
-            .get("channel")
-            .or_else(|| manifest.metadata.get("slug"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+        // column so channel-scoped fanout + the bridge sink can find it. Same
+        // rule as step 3b, by construction: a block is stored under exactly
+        // the channel the write gate examined.
+        channel_id: channel_slug.map(|s| s.to_string()),
         block_kind: kind_str.to_string(),
         sender_did: sender_did_str,
         sender_sig: sig,
@@ -286,22 +378,51 @@ pub async fn ingest(
 
     // Channel membership for bridge-sink dispatch. `channel_id` here is the
     // channel SLUG (lifted from manifest metadata), but memberships are keyed
-    // by the channel's CID (its channel-create block CID). Step 3b already
-    // resolved slug -> row for kinds carrying metadata["channel"]; re-resolve
-    // only for channel-create, whose row is written by apply_effect above (and
-    // whose slug lives under metadata["slug"], not metadata["channel"]).
-    if resolved_channel.is_none()
+    // by the channel's CID (its channel-create block CID). Step 3b resolved
+    // the row BEFORE `apply_effect`; a control-plane block has just changed
+    // that row (channel-create wrote it, channel-promote flipped its
+    // visibility), so it is resolved again for those kinds. Content kinds
+    // change nothing and keep the row already in hand.
+    //
+    // The same facts decide who may RECEIVE the block: they become the
+    // `DeliveryPolicy` fanout checks per subscriber, so the delivery loop
+    // itself does no I/O. A store error here must narrow delivery, never
+    // widen it — a policy that names nobody is what "we could not find out"
+    // looks like to an identified subscriber.
+    let mut lookup_failed = false;
+    let effect_may_have_changed_the_row = !matches!(
+        kind,
+        BlockKind::TextRender | BlockKind::EmailRender | BlockKind::EmailEncrypted
+    );
+    if (resolved_channel.is_none() || effect_may_have_changed_the_row)
         && let Some(slug) = stored_block.channel_id.as_deref()
     {
-        resolved_channel = ctx.store.get_channel_by_slug(slug).unwrap_or_default();
+        // Archived rows included: a channel-archive has just set
+        // `archived_at`, and its own block must still be delivered under the
+        // channel's policy rather than to everyone because the live lookup
+        // stopped finding it.
+        match ctx.store.get_channel_by_slug_including_archived(slug) {
+            Ok(row) => resolved_channel = row,
+            Err(e) => {
+                tracing::warn!(slug, error = %e, "channel lookup failed at fanout; denying");
+                lookup_failed = true;
+            }
+        }
     }
-    let member_dids: Vec<String> = match &resolved_channel {
-        Some(chan) => ctx
-            .store
-            .list_members(&chan.id)
-            .map(|ms| ms.into_iter().map(|m| m.member_did).collect())
-            .unwrap_or_default(),
-        None => Vec::new(),
+    let policy = if lookup_failed {
+        Some(DeliveryPolicy::default())
+    } else {
+        resolved_channel.as_ref().map(|chan| {
+            let member_dids = ctx
+                .store
+                .list_members(&chan.id)
+                .map(|ms| ms.into_iter().map(|m| m.member_did).collect())
+                .unwrap_or_else(|e| {
+                    tracing::warn!(slug = %chan.slug, error = %e, "member lookup failed at fanout; denying members");
+                    Vec::new()
+                });
+            DeliveryPolicy::for_channel(chan, member_dids)
+        })
     };
 
     // Step 7: fanout — broadcast policy depends on source
@@ -310,22 +431,47 @@ pub async fn ingest(
             // Federated source: locals + bridge sinks, but NOT re-broadcast to
             // peers (would cause a relay loop).
             ctx.fanout
-                .broadcast_local_only(&stored_block, &stored_receipt)
+                .broadcast_local_only(&stored_block, &stored_receipt, policy.as_ref())
                 .await
                 .map_err(IngestError::Other)?;
             ctx.fanout
-                .dispatch_to_bridges_public(&stored_block, &stored_receipt, &member_dids)
+                .dispatch_to_bridges_public(&stored_block, &stored_receipt, policy.as_ref())
                 .await;
         }
         IngestSource::LocalClient { .. } | IngestSource::AdminEndpoint | IngestSource::Bridge => {
             ctx.fanout
-                .broadcast_with_members(&stored_block, &stored_receipt, &member_dids)
+                .broadcast_with_members(&stored_block, &stored_receipt, policy.as_ref())
                 .await
                 .map_err(IngestError::Other)?;
         }
     }
 
     Ok(block_cid)
+}
+
+/// The channel a block belongs to, from its manifest metadata — the one rule
+/// shared by the write gate, the persisted `channel_id` column, fanout and
+/// the metrics label.
+///
+/// `channel-create` names the channel it creates under `slug`; every other
+/// kind names the channel it acts on under `channel`. The key is chosen by
+/// KIND, never by "whichever is present": when the gate read one key and the
+/// store wrote another, a block could be authorized against no channel and
+/// then land in a restricted one.
+pub fn channel_slug_of(kind: BlockKind, manifest: &jig_core::BlockManifest) -> Option<&str> {
+    manifest
+        .metadata
+        .get(channel_metadata_key(kind))
+        .and_then(|v| v.as_str())
+}
+
+/// The metadata key under which a block of `kind` names its channel. See
+/// [`channel_slug_of`]; exposed for callers that peek at raw metadata.
+pub fn channel_metadata_key(kind: BlockKind) -> &'static str {
+    match kind {
+        BlockKind::ChannelCreate => "slug",
+        _ => "channel",
+    }
 }
 
 /// Whether a block of `kind` arriving from `source` must name a channel that
@@ -613,6 +759,10 @@ mod tests {
     /// Seed a channel row directly, standing in for a prior channel-create
     /// ingest. Returns the channel's id (its notional channel-create CID).
     fn seed_channel(ctx: &IngestContext, slug: &str) -> String {
+        seed_channel_owned_by(ctx, slug, "did:jig:zSeedOwner")
+    }
+
+    fn seed_channel_owned_by(ctx: &IngestContext, slug: &str, owner_did: &str) -> String {
         let id = format!("bafySeed_{}", slug.trim_start_matches('#'));
         ctx.store
             .upsert_channel(&crate::persist::StoredChannel {
@@ -620,10 +770,14 @@ mod tests {
                 slug: slug.to_string(),
                 visibility: "open".into(),
                 created_at: 0,
-                owner_did: "did:jig:zSeedOwner".into(),
+                owner_did: owner_did.into(),
             })
             .unwrap();
         id
+    }
+
+    fn did_of(key: &SigningKey) -> String {
+        Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string()
     }
 
     /// A body for helper-built blocks.
@@ -942,10 +1096,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn member_add_against_existing_channel_still_ingests() {
+    async fn member_add_by_the_owner_against_existing_channel_still_ingests() {
         let ctx = test_ctx_allowing(&["member-add"]);
-        let channel_id = seed_channel(&ctx, "#hello");
         let owner_key = random_signing_key();
+        let channel_id = seed_channel_owned_by(&ctx, "#hello", &did_of(&owner_key));
         let (mb, cb, sig) = build_bundle_parts_with_meta(
             &owner_key,
             BlockKind::MemberAdd,
@@ -954,9 +1108,113 @@ mod tests {
 
         do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
             .await
-            .expect("member-add against an existing channel must succeed");
+            .expect("member-add by the owner against an existing channel must succeed");
         let members = ctx.store.list_members(&channel_id).unwrap();
         assert!(members.iter().any(|m| m.member_did == "did:jig:zDeji"));
+    }
+
+    /// An archived channel takes nothing new, whatever the kind. Without this
+    /// a kind the write gate has no rule for resolved to "no channel" and
+    /// landed in the archived — still restricted — timeline.
+    #[tokio::test]
+    async fn nothing_can_be_posted_into_an_archived_channel() {
+        let ctx = test_ctx_allowing(&["member-add", "fed-hello"]);
+        let owner_key = random_signing_key();
+        seed_channel_owned_by(&ctx, "#retired", &did_of(&owner_key));
+        assert!(ctx.store.archive_channel("#retired", 1).unwrap());
+
+        for (key, kind, meta) in [
+            (
+                &owner_key,
+                BlockKind::MemberAdd,
+                vec![("channel", "#retired"), ("member_did", "did:jig:zX")],
+            ),
+            (
+                &random_signing_key(),
+                BlockKind::FedHello,
+                vec![("channel", "#retired"), ("server_url", "ws://x")],
+            ),
+        ] {
+            let (mb, cb, sig) = build_bundle_parts_with_meta(key, kind, &meta);
+            let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+                .await
+                .expect_err("an archived channel must refuse");
+            assert!(
+                matches!(err, IngestError::ChannelArchived { .. }),
+                "{kind:?}: expected ChannelArchived, got {err:?}"
+            );
+        }
+    }
+
+    /// Replaying an accepted member-add must not re-enrol a member who has
+    /// since been removed. The bytes are genuine and owner-signed; what makes
+    /// them invalid the second time is that they were already applied.
+    #[tokio::test]
+    async fn a_replayed_member_add_does_not_re_enrol_a_removed_member() {
+        let ctx = test_ctx_allowing(&["member-add"]);
+        let owner_key = random_signing_key();
+        let channel_id = seed_channel_owned_by(&ctx, "#hello", &did_of(&owner_key));
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &owner_key,
+            BlockKind::MemberAdd,
+            &[("channel", "#hello"), ("member_did", "did:jig:zDeji")],
+        );
+
+        do_ingest(
+            &ctx,
+            mb.clone(),
+            cb.clone(),
+            sig.clone(),
+            IngestSource::LocalClient { conn_id: 1 },
+        )
+        .await
+        .expect("first ingest");
+        assert!(ctx.store.is_member("#hello", "did:jig:zDeji").unwrap());
+        assert!(
+            ctx.store
+                .remove_membership("#hello", "did:jig:zDeji")
+                .unwrap()
+        );
+
+        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .expect_err("the same block a second time must be refused");
+        assert!(
+            matches!(err, IngestError::DuplicateBlock { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            !ctx.store.is_member("#hello", "did:jig:zDeji").unwrap(),
+            "a refused replay must leave the revocation in place"
+        );
+        assert_eq!(ctx.store.list_members(&channel_id).unwrap().len(), 0);
+    }
+
+    /// Gate 3 for writes runs inside ingest, so every surface gets it. A validly
+    /// signed member-add from a DID that does not own the channel is refused
+    /// with a typed error, and the memberships table is untouched.
+    #[tokio::test]
+    async fn member_add_by_a_non_owner_is_refused_at_ingest() {
+        let ctx = test_ctx_allowing(&["member-add"]);
+        let channel_id = seed_channel(&ctx, "#hello");
+        let stranger_key = random_signing_key();
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &stranger_key,
+            BlockKind::MemberAdd,
+            &[("channel", "#hello"), ("member_did", "did:jig:zDeji")],
+        );
+
+        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .expect_err("a non-owner must not enrol anyone");
+        assert!(
+            matches!(err, IngestError::NotChannelOwner { .. }),
+            "expected NotChannelOwner, got {err:?}"
+        );
+        assert!(
+            ctx.store.list_members(&channel_id).unwrap().is_empty(),
+            "a refused block must leave no membership behind"
+        );
     }
 
     #[tokio::test]
@@ -1138,6 +1396,7 @@ mod tests {
         ctx.fanout
             .subscribe_local(
                 crate::fanout::SubscriptionScope::Channel("#dm/y".to_string()),
+                crate::fanout::SubscriberIdentity::Unchecked,
                 tx,
             )
             .await;

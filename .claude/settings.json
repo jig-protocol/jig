@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cap-target-dir.sh",
+            "timeout": 120,
+            "statusMessage": "Capping repos/target"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cap-target-dir.sh",
+            "timeout": 120,
+            "statusMessage": "Capping repos/target"
+          }
+        ]
+      }
+    ]
+  }
+}

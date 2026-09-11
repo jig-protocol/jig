@@ -61,6 +61,24 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
             "RENDER_FAILED",
             format!("{e} (may be transient; retry is reasonable)"),
         ),
+        // Same code the admin archive path emits for its own owner check, so a
+        // client sees one word for "not yours to change" whichever door it used.
+        IngestError::DuplicateBlock { .. } => {
+            (StatusCode::CONFLICT, "DUPLICATE_BLOCK", e.to_string())
+        }
+        // 410, not 404: the channel existed and was deliberately retired, and
+        // "create it" would be the wrong advice.
+        IngestError::ChannelArchived { .. } => {
+            (StatusCode::GONE, "CHANNEL_ARCHIVED", e.to_string())
+        }
+        IngestError::NotChannelOwner { .. } => {
+            (StatusCode::FORBIDDEN, "NOT_CHANNEL_OWNER", e.to_string())
+        }
+        // Same code the read gate emits, so "not a member here" is one word
+        // whether the caller was reading or posting.
+        IngestError::NotChannelMember { .. } => {
+            (StatusCode::FORBIDDEN, "NOT_A_MEMBER", e.to_string())
+        }
         IngestError::Identity(ide) => (StatusCode::UNAUTHORIZED, "IDENTITY_ERROR", ide.to_string()),
         IngestError::Persist(pe) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -105,6 +123,22 @@ mod tests {
             IngestError::RenderFailed {
                 kind: "text-render".to_string(),
                 detail: "boom".to_string(),
+            },
+            IngestError::NotChannelOwner {
+                kind: "member-add".to_string(),
+                slug: "#room".to_string(),
+                sender: "did:jig:zStranger".to_string(),
+            },
+            IngestError::NotChannelMember {
+                kind: "text-render".to_string(),
+                slug: "#room".to_string(),
+                sender: "did:jig:zStranger".to_string(),
+            },
+            IngestError::DuplicateBlock {
+                cid: "bafy_twice".to_string(),
+            },
+            IngestError::ChannelArchived {
+                slug: "#retired".to_string(),
             },
         ]
     }

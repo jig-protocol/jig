@@ -32,7 +32,8 @@ use base64::Engine as _;
 use jig_core::BlockBundle;
 use jig_pipeline::{
     Envelope, Frame, ReceiptRef, Scope, SubscriptionScope,
-    ingest::{IngestError, IngestSource, ingest},
+    fanout::SubscriberIdentity,
+    ingest::{IngestSource, ingest},
 };
 use tokio::sync::mpsc;
 
@@ -315,6 +316,41 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, conn_id: u64
     tracing::debug!(conn_id, "ws connection closed");
 }
 
+/// Why a channel subscription was not registered.
+enum SubscribeRefusal {
+    /// The gate said no; disclosed through the server's policy.
+    Gate(crate::auth::GateOutcome),
+    /// The store could not answer. Refuses — "could not look you up" is not
+    /// "come in" — but is reported as what it is, so the audit log stays true.
+    Store(String),
+}
+
+/// Gate 3 for a channel subscription: the same `authorize_read` decision the
+/// REST timeline runs, over the same store facts.
+///
+/// `Ok` for a slug with no row at all — see the call site for why. An
+/// archived channel still has a row and is still gated by it; the
+/// live-channel lookup would read it as absent and let anyone in.
+fn authorize_subscribe(state: &AppState, slug: &str, did: &str) -> Result<(), SubscribeRefusal> {
+    let store = &state.ingest_ctx.store;
+    let channel = store
+        .get_channel_by_slug_including_archived(slug)
+        .map_err(|e| SubscribeRefusal::Store(e.to_string()))?;
+    let Some(channel) = channel else {
+        return Ok(());
+    };
+    let is_member = store
+        .is_member(slug, did)
+        .map_err(|e| SubscribeRefusal::Store(e.to_string()))?;
+    let is_owner = channel.owner_did == did;
+    crate::auth::authorize_read(
+        crate::auth::Visibility::parse(&channel.visibility),
+        is_member,
+        is_owner,
+    )
+    .map_err(SubscribeRefusal::Gate)
+}
+
 // ---- Per-frame dispatch ----------------------------------------------------
 
 async fn handle_client_frame(
@@ -393,22 +429,81 @@ async fn handle_client_frame(
                 }
             }
 
+            // Who this subscription belongs to, for the per-delivery check.
+            // Only the identity `authenticate_subscribe` RETURNED is bound;
+            // `Unchecked` is reserved for a server that does not authenticate
+            // reads, and is the only way a subscription escapes filtering.
+            let who = match (
+                state.config.auth.require_authenticated_reads,
+                conn_did.as_ref(),
+            ) {
+                (false, _) => SubscriberIdentity::Unchecked,
+                (true, Some(did)) => SubscriberIdentity::Did(did.to_did_jig_string()),
+                (true, None) => {
+                    // Unreachable by construction (a refused proof returned
+                    // above), but a subscription with no DID on a server that
+                    // requires one must never be registered.
+                    let outcome = crate::auth::GateOutcome::AuthMissing;
+                    tracing::info!(
+                        conn_id,
+                        audit = %crate::auth::audit_line(&outcome),
+                        "ws subscribe refused"
+                    );
+                    let (status, code, message) = state.auth.disclosure.disclose(&outcome);
+                    let _ = send_error(socket, Some(status), code, None, &message).await;
+                    return Ok(());
+                }
+            };
+
+            // Gate 3 at subscribe time, for a prompt and explicit refusal. The
+            // authoritative check is the one fanout runs on every delivery;
+            // this one only spares a caller an open connection that will never
+            // carry anything. A channel with no local row is NOT refused here
+            // — federated channels routinely have none — and is guarded at
+            // delivery once a row exists.
+            if let SubscriberIdentity::Did(did) = &who
+                && let Scope::Channel { slug } = &scope
+            {
+                match authorize_subscribe(state, slug, did) {
+                    Ok(()) => {}
+                    Err(SubscribeRefusal::Gate(outcome)) => {
+                        tracing::info!(
+                            conn_id,
+                            audit = %crate::auth::audit_line(&outcome),
+                            "ws subscribe refused"
+                        );
+                        let (status, code, message) = state.auth.disclosure.disclose(&outcome);
+                        let _ = send_error(socket, Some(status), code, None, &message).await;
+                        return Ok(());
+                    }
+                    Err(SubscribeRefusal::Store(detail)) => {
+                        // Same word the REST path uses for a failing store.
+                        let _ = send_error(socket, Some(500), "PERSIST_ERROR", None, &detail).await;
+                        return Ok(());
+                    }
+                }
+            }
+
             let sub_scope = match scope {
                 Scope::Channel { slug } => SubscriptionScope::Channel(slug),
                 Scope::Federation { block_kinds } => SubscriptionScope::Federation { block_kinds },
             };
+            // A connection holds ONE subscription. A re-Subscribe replaces it,
+            // and the old one must actually go: left in the fanout map it
+            // would keep delivering its old scope under its old identity for
+            // the life of the process, long after this socket forgot it.
+            if let Some(old) = sub_id.take() {
+                state.ingest_ctx.fanout.unsubscribe_local(old).await;
+            } else {
+                // The gauge counts connections holding a subscription; a
+                // replacement is not a second unit.
+                metrics::subscriber_added();
+            }
             let id = state
                 .ingest_ctx
                 .fanout
-                .subscribe_local(sub_scope, sub_tx.clone())
+                .subscribe_local(sub_scope, who, sub_tx.clone())
                 .await;
-            // The gauge counts connections holding a subscription, matching the
-            // single `sub_id` slot that the disconnect path decrements. A
-            // re-Subscribe on the same connection replaces that slot, so it
-            // must not add a second unit.
-            if sub_id.is_none() {
-                metrics::subscriber_added();
-            }
             *sub_id = Some(id);
             tracing::debug!(conn_id, sub_id = id, "ws subscription registered");
             Ok(())
@@ -492,67 +587,20 @@ async fn handle_client_frame(
             .await
             {
                 Ok(block_cid) => {
-                    metrics::block_ingested(channel_slug_peek(&manifest_bytes).as_deref());
+                    metrics::block_ingested(channel_label(state, &manifest_bytes).as_deref());
                     let ack = Envelope::new(Frame::Ack { block_cid });
                     let Ok(json) = serde_json::to_string(&ack) else {
                         return Ok(());
                     };
                     let _ = socket.send(Message::Text(json)).await;
                 }
-                // Status matches classify_ingest_error's IngestError::InvalidSignature
-                // arm (StatusCode::UNAUTHORIZED) so both transports agree.
-                Err(IngestError::InvalidSignature) => {
-                    let _ = send_error(
-                        socket,
-                        Some(401),
-                        "INVALID_SIG",
-                        None,
-                        "signature verification failed",
-                    )
-                    .await;
-                }
-                // Status matches classify_ingest_error's IngestError::DisallowedBlockKind
-                // arm (StatusCode::FORBIDDEN).
-                Err(IngestError::DisallowedBlockKind { kind }) => {
-                    let _ = send_error(
-                        socket,
-                        Some(403),
-                        "DISALLOWED_BLOCK_KIND",
-                        None,
-                        &format!("block kind not in allow list: {kind}"),
-                    )
-                    .await;
-                }
-                // Status matches classify_ingest_error's IngestError::KindRequired
-                // arm (StatusCode::BAD_REQUEST).
-                Err(IngestError::KindRequired) => {
-                    let _ = send_error(
-                        socket,
-                        Some(400),
-                        "KIND_REQUIRED",
-                        None,
-                        "manifest must declare a block kind",
-                    )
-                    .await;
-                }
-                // Distinct code (not the generic INGEST_ERROR) because this is
-                // the one ingest failure an ordinary user causes by mistyping a
-                // channel name; the Display text is already actionable prose.
-                // Status matches classify_ingest_error's IngestError::UnknownChannel
-                // arm (StatusCode::NOT_FOUND).
-                Err(e @ IngestError::UnknownChannel { .. }) => {
-                    let _ = send_error(socket, Some(404), "UNKNOWN_CHANNEL", None, &e.to_string())
-                        .await;
-                }
-                // Catch-all: this single generic code covers several distinct
-                // IngestError variants (BundleMalformed, MissingMetadata,
-                // NoExecutor, RenderFailed, Identity, Persist, Other) that
-                // classify_ingest_error maps to different statuses (400/500/401/500).
-                // Since this call site does not distinguish which one occurred,
-                // there is no single REST status it can honestly report — None,
-                // not a guess.
+                // One classifier for every surface. `v0_0_2_ingest_error.rs`
+                // exists because two HTTP surfaces once drifted apart on the
+                // same variant; a hand-copied table here was the third copy.
                 Err(e) => {
-                    let _ = send_error(socket, None, "INGEST_ERROR", None, &e.to_string()).await;
+                    let (status, code, message) =
+                        crate::v0_0_2_ingest_error::classify_ingest_error(&e);
+                    let _ = send_error(socket, Some(status.as_u16()), code, None, &message).await;
                 }
             }
             Ok(())
@@ -577,24 +625,52 @@ async fn handle_client_frame(
 /// Read the channel slug out of manifest bytes for the per-channel metric,
 /// without paying for a full `BlockManifest` deserialization.
 ///
-/// Mirrors the lift in `jig_pipeline::ingest` — text-render / member-add put
-/// the slug under `metadata.channel`, channel-create under `metadata.slug`.
+/// Uses the same kind-keyed rule as `jig_pipeline::ingest::channel_slug_of`,
+/// so the metric counts the channel the block actually landed in.
 /// Metrics-only: nothing downstream reads this value.
 fn channel_slug_peek(manifest_bytes: &[u8]) -> Option<String> {
     #[derive(serde::Deserialize)]
-    struct MetadataOnly {
+    struct KindAndMetadata {
+        #[serde(default)]
+        kind: Option<jig_core::BlockKind>,
         #[serde(default)]
         metadata: serde_json::Map<String, serde_json::Value>,
     }
 
-    let peeked: MetadataOnly = serde_json::from_slice(manifest_bytes).ok()?;
+    let peeked: KindAndMetadata = serde_json::from_slice(manifest_bytes).ok()?;
+    let key = jig_pipeline::ingest::channel_metadata_key(peeked.kind?);
     peeked
         .metadata
-        .get("channel")
-        .or_else(|| peeked.metadata.get("slug"))
+        .get(key)
         .and_then(|v| v.as_str())
         .map(str::to_string)
 }
+
+/// The label the per-channel metric carries for a just-ingested block.
+///
+/// `/metrics` runs no gate — scrapers cannot sign — so it must not become the
+/// one endpoint that names restricted channels to whoever asks. Open
+/// channels are labelled by slug; everything else (restricted, unknown, or a
+/// store that would not answer) shares one `(restricted)` bucket. Totals
+/// stay exact; only the attribution is withheld.
+fn channel_label(state: &AppState, manifest_bytes: &[u8]) -> Option<String> {
+    let slug = channel_slug_peek(manifest_bytes)?;
+    let open = matches!(
+        state
+            .ingest_ctx
+            .store
+            .get_channel_by_slug_including_archived(&slug),
+        Ok(Some(row)) if jig_pipeline::visibility::is_open(&row.visibility)
+    );
+    Some(if open {
+        slug
+    } else {
+        RESTRICTED_LABEL.to_string()
+    })
+}
+
+/// The shared metrics label for channels whose slug is not disclosed.
+pub const RESTRICTED_LABEL: &str = "(restricted)";
 
 async fn send_error(
     socket: &mut WebSocket,
@@ -619,44 +695,6 @@ async fn send_error(
 mod tests {
     use super::*;
 
-    /// The four Submit-arm statuses are hand-copied from `classify_ingest_error`
-    /// rather than derived from it, because the WS arms word two of their
-    /// messages differently from REST and this phase may not change message
-    /// text. Comments on those arms assert the parity; this test enforces it, so
-    /// changing the classifier fails here instead of silently leaving the two
-    /// transports disagreeing.
-    ///
-    /// `v0_0_2_ingest_error.rs` exists precisely because two HTTP surfaces once
-    /// drifted apart this way. Fold these arms into the classifier when a later
-    /// phase touches them anyway and can absorb the two message changes
-    /// deliberately.
-    #[test]
-    fn ws_submit_statuses_match_the_rest_classifier() {
-        use crate::v0_0_2_ingest_error::classify_ingest_error;
-
-        for (err, ws_status) in [
-            (IngestError::InvalidSignature, 401u16),
-            (
-                IngestError::DisallowedBlockKind {
-                    kind: "widget".to_string(),
-                },
-                403,
-            ),
-            (IngestError::KindRequired, 400),
-            (
-                IngestError::UnknownChannel {
-                    slug: "#nope".to_string(),
-                },
-                404,
-            ),
-        ] {
-            assert_eq!(
-                classify_ingest_error(&err).0.as_u16(),
-                ws_status,
-                "WS hand-copied status disagrees with the REST classifier for {err}"
-            );
-        }
-    }
     use std::net::SocketAddr;
     use std::time::Duration;
 
@@ -1114,12 +1152,62 @@ mod tests {
 
         // channel-create writes the slug under `slug`, not `channel`.
         let created = serde_json::to_vec(&serde_json::json!({
-            "metadata": { "slug": "#other" }
+            "kind": "channel-create",
+            "metadata": { "slug": "#other", "channel": "#decoy" }
         }))
         .unwrap();
         assert_eq!(channel_slug_peek(&created).as_deref(), Some("#other"));
 
+        // And a content block does not get to name a channel under `slug`:
+        // the key is chosen by kind, exactly as ingest chooses it.
+        let decoy = serde_json::to_vec(&serde_json::json!({
+            "kind": "text-render",
+            "metadata": { "slug": "#secret", "body": "hi" }
+        }))
+        .unwrap();
+        assert_eq!(channel_slug_peek(&decoy).as_deref(), None);
+
         assert_eq!(channel_slug_peek(b"not json").as_deref(), None);
+    }
+
+    /// `/metrics` is ungated, so a restricted channel must not appear in it
+    /// by name. Open channels keep their own label.
+    #[tokio::test]
+    async fn restricted_channels_share_one_metrics_label() {
+        let state = AppState::for_test().unwrap();
+        for (slug, visibility) in [("#open", "open"), ("#private", "restricted")] {
+            state
+                .ingest_ctx
+                .store
+                .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                    id: format!("bafySeed{slug}"),
+                    slug: slug.to_string(),
+                    visibility: visibility.to_string(),
+                    created_at: 0,
+                    owner_did: "did:jig:zSeedOwner".to_string(),
+                })
+                .unwrap();
+        }
+        let manifest = |slug: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "kind": "text-render",
+                "metadata": { "channel": slug, "body": "hi" }
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            channel_label(&state, &manifest("#open")).as_deref(),
+            Some("#open")
+        );
+        assert_eq!(
+            channel_label(&state, &manifest("#private")).as_deref(),
+            Some(RESTRICTED_LABEL)
+        );
+        assert_eq!(
+            channel_label(&state, &manifest("#nowhere")).as_deref(),
+            Some(RESTRICTED_LABEL),
+            "an unknown channel is not disclosed either"
+        );
     }
 
     #[tokio::test]

@@ -25,6 +25,7 @@ use jig_core::{Author, BlockKind, BlockManifest};
 use jig_pipeline::{
     Envelope, Frame, Scope,
     envelope::ReceiptRef,
+    fanout::DeliveryPolicy,
     persist::{StoredBlock, StoredReceipt},
 };
 use tokio::sync::mpsc;
@@ -339,14 +340,13 @@ async fn ingest_peer_block(
 
     let stored_block = StoredBlock {
         cid: block_cid.clone(),
-        // Lift the channel slug from manifest metadata (mirrors the ingest
-        // pipeline's B1 lift) so channel-scoped fanout + the bridge sink can
-        // match this federated block against a channel's members.
+        // Lift the channel slug from manifest metadata with the same
+        // kind-keyed rule ingest uses, so channel-scoped fanout + the bridge
+        // sink match this federated block against the channel it names. A
+        // block with no kind names no channel.
         channel_id: manifest
-            .metadata
-            .get("channel")
-            .or_else(|| manifest.metadata.get("slug"))
-            .and_then(|v| v.as_str())
+            .kind
+            .and_then(|kind| jig_pipeline::ingest::channel_slug_of(kind, &manifest))
             .map(|s| s.to_string()),
         block_kind: kind_str,
         sender_did: sender_did_str,
@@ -391,31 +391,46 @@ async fn ingest_peer_block(
     // peer fanout and prevents relay loops between federated servers. Then also
     // dispatch to bridge sinks for any managed-DID member of the block's
     // channel, so a federated message posted to a bridged channel reaches
-    // Bridge::outbound (mirrors ingest's FederatedPeer-source path). Resolve the
-    // channel slug -> CID before listing members (memberships key by CID).
-    let member_dids: Vec<String> = match stored_block.channel_id.as_deref() {
-        Some(slug) => match state.ingest_ctx.store.get_channel_by_slug(slug) {
-            Ok(Some(chan)) => state
-                .ingest_ctx
-                .store
-                .list_members(&chan.id)
-                .map(|ms| ms.into_iter().map(|m| m.member_did).collect())
-                .unwrap_or_default(),
-            _ => Vec::new(),
+    // Bridge::outbound (mirrors ingest's FederatedPeer-source path).
+    //
+    // The same resolved facts become the delivery policy. A channel this
+    // server has no row for yields no policy — scope alone decides, as
+    // federation has always worked — but a store ERROR yields a policy naming
+    // nobody, so a failing database narrows delivery rather than widening it.
+    let policy = match stored_block.channel_id.as_deref() {
+        Some(slug) => match state
+            .ingest_ctx
+            .store
+            .get_channel_by_slug_including_archived(slug)
+        {
+            Ok(Some(chan)) => {
+                let member_dids = state
+                    .ingest_ctx
+                    .store
+                    .list_members(&chan.id)
+                    .map(|ms| ms.into_iter().map(|m| m.member_did).collect())
+                    .unwrap_or_default();
+                Some(DeliveryPolicy::for_channel(&chan, member_dids))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(slug, error = %e, "channel lookup failed at relay fanout; denying");
+                Some(DeliveryPolicy::default())
+            }
         },
-        None => Vec::new(),
+        None => None,
     };
     let receipts_in_db = state.ingest_ctx.store.get_receipts_for_block(&block_cid)?;
     if let Some(rep_receipt) = receipts_in_db.into_iter().next() {
         state
             .ingest_ctx
             .fanout
-            .broadcast_local_only(&stored_block, &rep_receipt)
+            .broadcast_local_only(&stored_block, &rep_receipt, policy.as_ref())
             .await?;
         state
             .ingest_ctx
             .fanout
-            .dispatch_to_bridges_public(&stored_block, &rep_receipt, &member_dids)
+            .dispatch_to_bridges_public(&stored_block, &rep_receipt, policy.as_ref())
             .await;
     }
 

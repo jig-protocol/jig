@@ -6,15 +6,26 @@
 //! this module says is signed is signed, so a test asserting a 200 is asserting
 //! the server verified a real ed25519 signature.
 
+// Each integration-test binary compiles this module separately and uses only
+// the helpers it needs; the rest would warn as dead code binary by binary.
+#![allow(dead_code)]
+
+pub mod ws;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
+use jig_client::blocks::{
+    BuiltBlock, build_channel_archive, build_channel_create, build_member_add, build_text_render,
+};
 use jig_config::v0_0_2_server::JigServerConfig;
+use jig_core::HlcTimestamp;
 use jig_core::did::Did;
 use jig_server::auth::authenticate::headers;
 use jig_server::runtime::ExecutionConfig;
 use jig_server::v0_0_2::AppState;
+use jig_server::v0_0_2_admin::build_admin_router;
 use jig_server::v0_0_2_blocks::build_blocks_router;
 use std::sync::Arc;
 use tower::ServiceExt as _;
@@ -25,7 +36,7 @@ use tower::ServiceExt as _;
 /// key you happened to draw, and these tests are about the protocol, not about
 /// key material.
 pub struct Identity {
-    signing: SigningKey,
+    pub(crate) signing: SigningKey,
     did: Did,
 }
 
@@ -38,6 +49,12 @@ impl Identity {
 
     pub fn did(&self) -> &Did {
         &self.did
+    }
+
+    /// The same key as a `jig_client::Identity`, so control-plane blocks are
+    /// built by the real client builders rather than a test-only imitation.
+    pub fn as_client(&self) -> jig_client::Identity {
+        jig_client::Identity::from_signing_key(self.signing.clone())
     }
 }
 
@@ -146,6 +163,96 @@ impl TestServer {
         self.dispatch(http).await
     }
 
+    /// Create `slug` owned by `owner` through the real admin endpoint, so the
+    /// channel row and the owner's membership are written by the same effect
+    /// code production runs — not seeded into the store by hand.
+    pub async fn create_channel(&self, owner: &Identity, slug: &str, visibility: &str) {
+        let owner = owner.as_client();
+        let block = build_channel_create(
+            &owner,
+            slug,
+            visibility,
+            HlcTimestamp::now_wall(owner.did().clone()),
+        );
+        let (status, body) = self.post_admin("/_admin_v0_0_2/channels", &block).await;
+        assert_eq!(status, StatusCode::OK, "channel-create failed: {body}");
+    }
+
+    /// Archive `slug` as `owner` through the real admin endpoint — the
+    /// v0.0.2 channel delete, a soft delete that keeps every block.
+    pub async fn archive_channel(&self, owner: &Identity, slug: &str) {
+        let owner = owner.as_client();
+        let block =
+            build_channel_archive(&owner, slug, HlcTimestamp::now_wall(owner.did().clone()));
+        let path = format!("/_admin_v0_0_2/channels/{}/archive", encode_slug(slug));
+        let (status, body) = self.post_admin(&path, &block).await;
+        assert_eq!(status, StatusCode::OK, "channel-archive failed: {body}");
+    }
+
+    /// Add `member` to `slug`, the block signed by `by`. Asserts success; use
+    /// [`try_add_member`](Self::try_add_member) to observe a refusal.
+    pub async fn add_member(&self, by: &Identity, slug: &str, member: &Identity) {
+        let (status, body) = self.try_add_member(by, slug, member).await;
+        assert_eq!(status, StatusCode::OK, "member-add failed: {body}");
+    }
+
+    /// Submit a `member-add` for `member` on `slug`, signed by `by`, through
+    /// the admin endpoint. Returns whatever the server said.
+    pub async fn try_add_member(
+        &self,
+        by: &Identity,
+        slug: &str,
+        member: &Identity,
+    ) -> (StatusCode, serde_json::Value) {
+        let by = by.as_client();
+        let block = build_member_add(
+            &by,
+            slug,
+            &member.did().to_did_jig_string(),
+            HlcTimestamp::now_wall(by.did().clone()),
+        );
+        let path = format!("/_admin_v0_0_2/channels/{}/members", encode_slug(slug));
+        self.post_admin(&path, &block).await
+    }
+
+    /// Post a `text-render` block to `slug` as `who` through the public
+    /// submit path, asserting it was accepted.
+    pub async fn post_text(&self, who: &Identity, slug: &str, body: &str) {
+        let who = who.as_client();
+        let block = build_text_render(&who, slug, body, HlcTimestamp::now_wall(who.did().clone()));
+        let (status, resp) = self.try_submit(&block).await;
+        assert_eq!(status, StatusCode::OK, "text-render failed: {resp}");
+    }
+
+    /// Submit any signed block through the public, always-on
+    /// `POST /api/v1/blocks` — the path a stranger with a keypair would use.
+    pub async fn try_submit(&self, block: &BuiltBlock) -> (StatusCode, serde_json::Value) {
+        let http = Request::builder()
+            .method("POST")
+            .uri("/api/v1/blocks")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&submission(block)).unwrap()))
+            .unwrap();
+        self.dispatch(http).await
+    }
+
+    async fn post_admin(&self, path: &str, block: &BuiltBlock) -> (StatusCode, serde_json::Value) {
+        let http = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&submission(block)).unwrap()))
+            .unwrap();
+        let router = build_admin_router(self.state.clone());
+        let resp = router.oneshot(http).await.expect("admin router responds");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
     async fn dispatch(&self, req: Request<Body>) -> (StatusCode, serde_json::Value) {
         // A fresh router per call, over the SAME state — so the replay guard
         // and store persist across requests, which is what makes the replay
@@ -161,7 +268,26 @@ impl TestServer {
     }
 }
 
-fn now_ms() -> u64 {
+/// The `{ bundle_b64, sig_b64 }` body every submit-style endpoint takes.
+fn submission(block: &BuiltBlock) -> serde_json::Value {
+    serde_json::json!({
+        "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
+        "sig_b64": base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
+    })
+}
+
+/// `#private` as it appears in a URL path. Also the form that gets signed: the
+/// canonical hash covers the path as sent, so tests must sign this exact form.
+pub fn encode_slug(slug: &str) -> String {
+    slug.replace('#', "%23")
+}
+
+/// The history path for `slug`, in its signable form.
+pub fn history_path(slug: &str) -> String {
+    format!("/api/v1/channels/{}/blocks", encode_slug(slug))
+}
+
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock is after the epoch")

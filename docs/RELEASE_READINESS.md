@@ -3,7 +3,7 @@
 The gate between "we dogfood jig on our own tailnet" and "we tell strangers to
 run `curl -fsSL https://jig.onl/install.sh | bash`".
 
-jig is AGPL-licensed source in a public-shaped repo, but it has never been
+jig is MIT OR Apache-2.0 source in a public-shaped repo, but it has never been
 announced, never been deployed to a public address, and has never had a user
 outside the team. This document is the checklist for changing that. Every
 "current state" row below was checked against the code at merge commit
@@ -22,35 +22,36 @@ outside the team. This document is the checklist for changing that. Every
 ## 1. Security
 
 This is the heaviest section and the honest reason the answer at the bottom is
-"no". jig's current security model is *network placement*: it assumes the
-listener is only reachable by people you already trust.
-`deploy/README.md` states this outright — "the tailnet IS the authentication".
+"no". Until 2026-09 jig's security model was *network placement*: it assumed the
+listener was only reachable by people you already trust, and
+`deploy/README.md` said so outright — "the tailnet IS the authentication". The
+authn/authz work (`docs/superpowers/specs/2026-08-24-jig-server-authn-authz-design.md`,
+phases 1–3) moved identity into the server; the tailnet is now defence in depth.
 
 ### 1.1 Authentication and authorization
 
 | | |
 | --- | --- |
-| **Current state** | There is no authn and no authz anywhere in `jig-server`. No token, no session, no capability check, no per-request identity. the `Frame::Subscribe` arm of `handle_client_frame` ([`v0_0_2_ws.rs`](../repos/jig-server/src/v0_0_2_ws.rs)) registers any scope for any connection with no check; `Scope::Federation { block_kinds: [] }` matches every block on the server. `GET /api/v1/channels/:slug/blocks` ([`v0_0_2_blocks.rs:329`](../repos/jig-server/src/v0_0_2_blocks.rs)) returns a channel's full timeline with no caller identity involved at all. |
-| **Ready means** | A caller's identity is established per connection, and reads/writes are checked against channel membership before data leaves the process. |
-| **Gap** | Total. Anyone who can open a TCP connection to the port reads and writes every channel on the server. |
+| **Current state** | Three gates, in order: authenticate, admit, authorize ([`jig-server/src/auth/`](../repos/jig-server/src/auth/)). **Authenticate** holds: every REST read and every WSS subscribe carries a per-request ed25519 proof over a canonical hash of the request (`jig-core::request_auth`), verified against the caller's DID, with a fail-closed replay guard; `[auth] require_authenticated_reads` defaults to `true`, and the documented escape hatch restores the old behaviour only when set explicitly. **Authorize** holds for channels: history, the listing, live WSS delivery (re-checked per block) and posting all run `authorize_read`/`authorize_block` against `visibility`, `owner_did` and the memberships table; membership changes and `channel-promote` are owner-signed. Refusals go through one disclosure point per surface (`GateOutcome` → `DisclosurePolicy`), truthful by default. **Admit** is a stub: every well-signed DID is admitted. |
+| **Ready means** | A caller's identity is established per request, reads/writes are checked against channel membership before data leaves the process, and a server can refuse callers it does not want (reputation, bans, rate limits). |
+| **Gap** | Admission policy (phase 4) and tier-1 trusted connections (phase 5) are not built; there is no rate limiting or proof-of-work in front of the gates. Blocks relayed by a federated peer are persisted and delivered without running the write gate (`v0_0_2_federation.rs` does not go through `ingest`), so federation is trust-on-peer. There is no `member-remove` block yet; revocation is a store operation. |
 
-**Verdict: BLOCKER.**
+**Verdict: GAP** (was BLOCKER). The part that let strangers read and write every
+channel is closed and proven by fault injection at each gate; what remains is
+policy, not the absence of a model.
 
-### 1.2 `visibility = "restricted"` is stored, not enforced
+### 1.2 `visibility = "restricted"` is enforced
 
 | | |
 | --- | --- |
-| **Current state** | `channel-create` persists a `visibility` string and an `owner_did`, and `member-add` persists rows into a `memberships` table ([`effect.rs:73-121`](../repos/jig-pipeline/src/effect.rs), schema at [`persist.rs:242`](../repos/jig-pipeline/src/persist.rs)). Nothing reads either one for an access decision. `grep` for `visibility` across `jig-server/src` returns only the field definition, the JSON serializer for `GET /api/v1/channels`, and tests. Memberships are read only for bridge-sink dispatch. |
+| **Current state** | `restricted` gates history (`403 NOT_A_MEMBER`), the listing (restricted channels and their `owner_did` are not shown to non-members), live WSS delivery (per block, so removing a membership stops an open subscription) and posting (`403 NOT_A_MEMBER` at ingest, on every surface). Self-join works on open channels only; on restricted ones only the owner adds members. Unknown visibility strings and store errors fail closed. |
 | **Ready means** | `restricted` gates reads (history, WSS delivery) and writes to non-members. |
-| **Gap** | The flag is decorative. A restricted channel is exactly as readable as an open one. |
+| **Gap** | Peer-relayed blocks bypass the posting gate (see §1.1). Timing still distinguishes a refused read from an unknown channel under a concealing disclosure policy — a stated limitation of the design, and the default policy conceals nothing. |
 
-This is worse than merely missing, because the CLI advertises the feature.
-`jig channel create --visibility restricted` has help text reading
-`restricted (membership-gated reads)`
-([`jig-cli/src/main.rs:161`](../repos/jig-cli/src/main.rs)). A user reading
-`--help` is told they got a protection they did not get.
+The CLI's `restricted (membership-gated reads)` help text is now true, and
+`jig channel join` says which channels it can join.
 
-**Verdict: BLOCKER.** Enforce it or delete the flag and the help text.
+**Verdict: READY.**
 
 ### 1.3 No end-to-end encryption
 
@@ -74,13 +75,13 @@ positioning and the spec say so plainly.
 | | |
 | --- | --- |
 | **Current state** | `/_admin_v0_0_2/channels` and `/_admin_v0_0_2/channels/:slug/members` mount only when `[debug] admin_endpoints = true` (`build_v0_0_2_router` in [`v0_0_2_ws.rs`](../repos/jig-server/src/v0_0_2_ws.rs)). `JigServerConfig::default()` has it `false`, but the config template `jig-server` writes sets it `true` with a comment explaining it is not optional: `jig channel create` and `jig channel join` POST to exactly these routes ([`config.rs:273-279`](../repos/jig-server/src/config.rs), [`jig-cli/src/cmd/channel.rs`](../repos/jig-cli/src/cmd/channel.rs)). |
-| **Authentication** | Partial. Both handlers run the bundle through `jig_pipeline::ingest`, which verifies the ed25519 signature and rejects `INVALID_SIG`. So the *author DID is authenticated* — you cannot forge someone else's DID here. |
-| **Authorization** | None. `apply_member_add` does not check that the signer owns or belongs to the channel. `apply_channel_promote` does not check ownership before flipping a channel's `visibility` to `open`. Any self-minted keypair — and minting one is free and unlogged — can create channels and add arbitrary DIDs to arbitrary channels. |
+| **Authentication** | Both handlers run the bundle through `jig_pipeline::ingest`, which verifies the ed25519 signature and rejects `INVALID_SIG`. The *author DID is authenticated* — you cannot forge someone else's DID here. |
+| **Authorization** | Owner checks on channel mutation now run inside `ingest` (`jig-pipeline/src/authorize_write.rs`), so they hold on the admin routes, the public `POST /api/v1/blocks`, WSS `Submit` and the bridge path alike: `member-add` of anyone but yourself, or onto a restricted channel, and `channel-promote` must be signed by the channel owner (`403 NOT_CHANNEL_OWNER`); `channel-archive` keeps its own owner check. Any self-minted keypair can still *create* channels, which is by design. |
 | **Ready means** | Ownership/role checks on channel mutation, and a channel-ops path that does not live behind a `[debug]` flag. |
 
-**Verdict: BLOCKER.** The shape of the problem is that the only working
-channel-management path is explicitly labelled debug-only in the code and is
-unauthorized by design.
+**Verdict: GAP** (was BLOCKER). The mutation is authorized; the remaining
+problem is the label — the only working channel-management path is still
+mounted by a `[debug]` flag, and "debug" reads as "harmless" to an operator.
 
 ### 1.5 v0.0.1 unsigned REST ingest
 
@@ -279,18 +280,20 @@ precise number goes in a README, re-measure it there.
 
 **No. jig is not ready for external users today.** Not close.
 
-The single sentence that decides it: **a jig server has no authentication and
-no authorization, so anyone who can reach the port can read and write every
-channel on it, including the ones the CLI told the user were "membership-gated".**
-Every current deployment is safe only because it is bound to a tailnet address.
-Publishing an install script that stands up that server on a public address
-would be handing strangers a footgun with our name on it.
+The sentence that used to decide it — *a jig server has no authentication and
+no authorization* — is no longer true: reads require proof of possession,
+restricted channels are membership-gated on every surface, and membership
+changes are owner-signed. What decides it now is the rest of this document:
+no admission policy or rate limiting in front of those gates, federation on
+trust, no E2EE, a broken install path, and no disclosure channel. Publishing an
+install script that stands up a server on a public address is still handing
+strangers a footgun — a smaller one, with the safety on.
 
 ### Minimum credible blocker set, ordered
 
 | # | Blocker | Why it is in this position |
 | --- | --- | --- |
-| 1 | **Authn + authz on `jig-server`** | Everything else is cosmetic while the port is open to the world. Includes enforcing `visibility`/membership on reads, or removing the flag and its `--help` text. |
+| ~~1~~ | ~~**Authn + authz on `jig-server`**~~ | **Phases 1–3 DONE 2026-09-09** — per-request proof of possession on reads, `visibility`/membership enforced on history, listing, live delivery and posting, owner-signed membership changes. Still open from the same design: admission policy (phase 4) and trusted connections (phase 5); see §1.1. |
 | 2 | **Root `SECURITY.md` with an external reporting path** | Cheap, and blocker #1 guarantees findings. Without it the first report is public. |
 | ~~3~~ | ~~**Root `LICENSE` + consistent per-crate SPDX ids**~~ | **DONE 2026-08-06** — dual-licensed MIT OR Apache-2.0, root licence pair added, every protocol crate aligned. Only the `jig-spec` CC BY-SA question remains, and it does not gate release. |
 | 4 | **Fix the binary install path** | `install.sh` points at a host that serves nothing, unpacks the wrong paths, and verifies no checksum — while `release.yml` already publishes the `.sha256`. A `curl \| sh` KPI that does not work is worse than not having one. |
@@ -299,10 +302,12 @@ would be handing strangers a footgun with our name on it.
 | 7 | **Clear the reachable advisory suppressions** | Three lockfile bumps (`time`, `tracing-subscriber`, `rand`) plus the rustls 0.22 → 0.23 dedup that retires the four `rustls-webpki` ignores. |
 | 8 | **Name a triage owner and publish a support channel** | Not technical. Determines whether the first outside contributor comes back. |
 
-Items 2–8 are days of work. Item 1 is the real project.
+Items 2–8 are days of work. Item 1 was the real project; its first three
+phases have landed, and what remains of it (admission, trusted connections) is
+policy on top of a model rather than the absence of one.
 
-Until item 1 lands, the honest external posture is: **source-available for
-reading and auditing, not for running.** That is a defensible thing to announce —
-"here is a protocol implementation, here is what works, here is the security
-model, do not put it on the internet yet" — and it is far better than shipping
-an install script that implies otherwise.
+Until the rest lands, the honest external posture is still: **source-available
+for reading and auditing, not for running on a public address.** That is a
+defensible thing to announce — "here is a protocol implementation, here is what
+works, here is the security model, do not put it on the internet yet" — and it
+is far better than shipping an install script that implies otherwise.

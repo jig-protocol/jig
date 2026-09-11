@@ -9,6 +9,7 @@
 //! Modules are stubbed in this initial commit; subsequent Phase B tasks
 //! (B3 through B8) populate them.
 
+pub mod authorize_write;
 pub mod effect;
 pub mod envelope;
 pub mod executor;
@@ -17,6 +18,7 @@ pub mod hlc;
 pub mod identity;
 pub mod ingest;
 pub mod persist;
+pub mod visibility;
 
 pub use effect::apply_effect;
 pub use envelope::{Envelope, Frame, HlcCursor, ReceiptRef, Scope};

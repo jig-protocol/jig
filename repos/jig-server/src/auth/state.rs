@@ -63,17 +63,21 @@ mod tests {
         // Capacity 7: the eighth distinct nonce in-window must be refused.
         for i in 0..7 {
             guard
-                .check_and_record(&format!("n{i}"), 5_000, 5_000)
+                .check_and_record("did:jig:zA", &format!("n{i}"), 5_000, 5_000)
                 .expect("within capacity");
         }
         assert!(
-            guard.check_and_record("n7", 5_000, 5_000).is_err(),
+            guard
+                .check_and_record("did:jig:zA", "n7", 5_000, 5_000)
+                .is_err(),
             "capacity from config must actually bound the guard"
         );
 
         // Window 1234ms: a request 2s old must be outside it.
         assert!(
-            guard.check_and_record("late", 5_000, 7_000).is_err(),
+            guard
+                .check_and_record("did:jig:zA", "late", 5_000, 7_000)
+                .is_err(),
             "window from config must actually bound freshness"
         );
     }

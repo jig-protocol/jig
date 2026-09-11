@@ -9,7 +9,9 @@
 pub mod blocks;
 pub mod connection;
 pub mod identity;
+pub mod read_auth;
 
 pub use connection::envelope;
 pub use connection::{BlockStream, Client, ClientError, DeliveredBlock};
 pub use identity::{Identity, IdentityError};
+pub use read_auth::ReadProof;

@@ -53,7 +53,8 @@ gcloud config set project <PROJECT_ID>
 gcloud config set compute/zone us-west1-a
 gcloud services enable compute.googleapis.com
 
-# 1. a dedicated VPC with NO ingress rules (default-deny is the whole security model)
+# 1. a dedicated VPC with NO ingress rules (the server gates its own reads and
+#    channels, but admits any key — default-deny is what keeps strangers off it)
 gcloud compute networks create jig-net --subnet-mode=auto
 
 # 2. Cloud NAT — outbound only. MANDATORY, not optional: a VM with no external
@@ -403,12 +404,12 @@ ingress configuration is the empty set.**
 
 Concretely:
 
-- **Never** create a rule for `tcp:7117` or `tcp:7070`. The server has **zero
-  authn and zero authz** — `[debug] admin_endpoints = true` is required for
-  `jig channel create` to work at all, and it exposes unauthenticated channel
-  creation and membership changes. The nameserver's `/v1/register` has no auth
-  beyond proof-of-control of a self-minted key. Publishing either of these is
-  catastrophic, not merely untidy.
+- **Never** create a rule for `tcp:7117` or `tcp:7070`. The server now
+  authenticates reads and enforces channel membership (see `deploy/README.md`,
+  "Security model"), but it has **no admission policy**: any self-minted key
+  is admitted, unthrottled, and can create channels and post to open ones. The
+  nameserver's `/v1/register` has no auth beyond proof-of-control of a
+  self-minted key. Publishing either of these is a footgun, not merely untidy.
 - **Never** set `bind_address = "0.0.0.0"`. Bind the `100.x` address.
 - The dedicated `jig-net` VPC exists precisely so that a rule someone adds to the
   `default` network later cannot reach this box. This is why the runbook creates

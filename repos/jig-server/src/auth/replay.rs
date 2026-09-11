@@ -81,11 +81,18 @@ impl ReplayGuard {
 
     /// Check a request's freshness and uniqueness, recording it if it passes.
     ///
+    /// `did` must be the identity the signature VERIFIED for, never a claimed
+    /// one. Nonces are recorded per DID: a nonce only ever collides with the
+    /// same caller's own earlier nonce. Keyed on the bare nonce, two clients
+    /// that happened to mint the same string would refuse each other — and one
+    /// key could pre-burn every plausible nonce and deny reads to everyone.
+    ///
     /// `now_ms` is supplied by the caller rather than read from the clock here,
     /// so this type stays a pure function of its inputs and is testable without
     /// sleeping.
     pub fn check_and_record(
         &mut self,
+        did: &str,
         nonce: &str,
         request_ms: u64,
         now_ms: u64,
@@ -95,7 +102,9 @@ impl ReplayGuard {
             return Err(ReplayRejection::OutsideWindow);
         }
 
-        if self.seen.contains(nonce) {
+        // NUL cannot appear in a DID, so the key is unambiguous.
+        let key = format!("{did}\0{nonce}");
+        if self.seen.contains(&key) {
             return Err(ReplayRejection::AlreadySeen);
         }
 
@@ -111,8 +120,8 @@ impl ReplayGuard {
             return Err(ReplayRejection::CapacityExhausted);
         }
 
-        self.seen.insert(nonce.to_string());
-        self.order.push_back((nonce.to_string(), request_ms));
+        self.seen.insert(key.clone());
+        self.order.push_back((key, request_ms));
         Ok(())
     }
 
@@ -140,18 +149,48 @@ impl ReplayGuard {
 mod tests {
     use super::*;
 
+    /// Two callers may legitimately mint the same nonce string (a clock
+    /// millisecond plus a counter). Neither is replaying the other, and
+    /// neither may deny the other by using a nonce first.
+    #[test]
+    fn the_same_nonce_from_two_dids_is_two_requests() {
+        let mut guard = ReplayGuard::new(30_000, 100);
+        assert!(
+            guard
+                .check_and_record("did:jig:zA", "1000-0", 5_000, 5_000)
+                .is_ok()
+        );
+        assert!(
+            guard
+                .check_and_record("did:jig:zB", "1000-0", 5_000, 5_000)
+                .is_ok(),
+            "another DID's nonce must not be counted as this one's replay"
+        );
+        assert_eq!(
+            guard.check_and_record("did:jig:zA", "1000-0", 5_000, 5_000),
+            Err(ReplayRejection::AlreadySeen),
+            "the same DID reusing its own nonce is still a replay"
+        );
+    }
+
     #[test]
     fn a_fresh_nonce_is_accepted_once() {
         let mut guard = ReplayGuard::new(1000, 100);
-        assert!(guard.check_and_record("nonce-a", 5_000, 5_000).is_ok());
+        assert!(
+            guard
+                .check_and_record("did:jig:zA", "nonce-a", 5_000, 5_000)
+                .is_ok()
+        );
     }
 
     #[test]
     fn the_same_nonce_twice_is_a_replay() {
         let mut guard = ReplayGuard::new(1000, 100);
-        guard.check_and_record("nonce-a", 5_000, 5_000).unwrap();
+        guard
+            .check_and_record("did:jig:zA", "nonce-a", 5_000, 5_000)
+            .unwrap();
         assert_eq!(
-            guard.check_and_record("nonce-a", 5_000, 5_000),
+            guard.check_and_record("did:jig:zA", "nonce-a", 5_000, 5_000),
             Err(ReplayRejection::AlreadySeen)
         );
     }
@@ -162,7 +201,7 @@ mod tests {
     fn a_timestamp_before_the_window_is_stale() {
         let mut guard = ReplayGuard::new(1000, 100);
         assert_eq!(
-            guard.check_and_record("nonce-a", 1_000, 5_000),
+            guard.check_and_record("did:jig:zA", "nonce-a", 1_000, 5_000),
             Err(ReplayRejection::OutsideWindow)
         );
     }
@@ -174,7 +213,7 @@ mod tests {
     fn a_timestamp_after_the_window_is_stale() {
         let mut guard = ReplayGuard::new(1000, 100);
         assert_eq!(
-            guard.check_and_record("nonce-a", 9_000, 5_000),
+            guard.check_and_record("did:jig:zA", "nonce-a", 9_000, 5_000),
             Err(ReplayRejection::OutsideWindow)
         );
     }
@@ -182,8 +221,16 @@ mod tests {
     #[test]
     fn a_timestamp_at_the_window_edge_is_accepted() {
         let mut guard = ReplayGuard::new(1000, 100);
-        assert!(guard.check_and_record("edge-early", 4_000, 5_000).is_ok());
-        assert!(guard.check_and_record("edge-late", 6_000, 5_000).is_ok());
+        assert!(
+            guard
+                .check_and_record("did:jig:zA", "edge-early", 4_000, 5_000)
+                .is_ok()
+        );
+        assert!(
+            guard
+                .check_and_record("did:jig:zA", "edge-late", 6_000, 5_000)
+                .is_ok()
+        );
     }
 
     /// Memory is capped by capacity, not by traffic. This is the property that
@@ -193,7 +240,7 @@ mod tests {
         let capacity = 50;
         let mut guard = ReplayGuard::new(1000, capacity);
         for i in 0..10_000 {
-            let _ = guard.check_and_record(&format!("nonce-{i}"), 5_000, 5_000);
+            let _ = guard.check_and_record("did:jig:zA", &format!("nonce-{i}"), 5_000, 5_000);
         }
         assert!(
             guard.len() <= capacity,
@@ -211,19 +258,23 @@ mod tests {
     #[test]
     fn a_full_guard_refuses_rather_than_forgetting_a_live_nonce() {
         let mut guard = ReplayGuard::new(10_000, 2);
-        guard.check_and_record("victim", 5_000, 5_000).unwrap();
-        guard.check_and_record("filler", 5_000, 5_000).unwrap();
+        guard
+            .check_and_record("did:jig:zA", "victim", 5_000, 5_000)
+            .unwrap();
+        guard
+            .check_and_record("did:jig:zA", "filler", 5_000, 5_000)
+            .unwrap();
 
         // Guard is full and both entries are still inside the window.
         assert_eq!(
-            guard.check_and_record("attacker", 5_000, 5_000),
+            guard.check_and_record("did:jig:zA", "attacker", 5_000, 5_000),
             Err(ReplayRejection::CapacityExhausted),
             "a full guard must refuse the new request, not evict to make room"
         );
 
         // And the victim's nonce must still be remembered, so replaying it fails.
         assert_eq!(
-            guard.check_and_record("victim", 5_000, 5_000),
+            guard.check_and_record("did:jig:zA", "victim", 5_000, 5_000),
             Err(ReplayRejection::AlreadySeen),
             "the flood must not have opened a replay window on the victim"
         );
@@ -237,13 +288,19 @@ mod tests {
     fn expired_entries_are_reclaimed_to_make_room() {
         let window = 1_000;
         let mut guard = ReplayGuard::new(window, 2);
-        guard.check_and_record("old-a", 5_000, 5_000).unwrap();
-        guard.check_and_record("old-b", 5_000, 5_000).unwrap();
+        guard
+            .check_and_record("did:jig:zA", "old-a", 5_000, 5_000)
+            .unwrap();
+        guard
+            .check_and_record("did:jig:zA", "old-b", 5_000, 5_000)
+            .unwrap();
 
         // Advance well past the window: both entries are now unreplayable.
         let later = 5_000 + window * 5;
         assert!(
-            guard.check_and_record("fresh", later, later).is_ok(),
+            guard
+                .check_and_record("did:jig:zA", "fresh", later, later)
+                .is_ok(),
             "expired entries must be reclaimed rather than wedging the guard"
         );
     }

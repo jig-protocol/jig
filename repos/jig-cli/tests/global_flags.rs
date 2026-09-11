@@ -117,16 +117,33 @@ fn init_identity(home: &Path) {
     assert!(ok, "jig init failed. stdout={stdout} stderr={stderr}");
 }
 
+/// The DID `jig init` bound in `~/.jig/cli.toml`.
+fn initialized_did(home: &Path) -> String {
+    let body = std::fs::read_to_string(home.join(".jig").join("cli.toml")).unwrap();
+    body.lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("did = \"")?
+                .strip_suffix('"')
+                .map(str::to_owned)
+        })
+        .expect("cli.toml binds a did")
+}
+
 // ---- --server ---------------------------------------------------------------
 
 #[test]
 fn server_flag_overrides_config_for_channel_list() {
+    // `channel list` signs its request, so like `send` it loads the identity
+    // before it dials and needs a real keyfile to get as far as the URL.
     let tmp = tempfile::tempdir().unwrap();
-    write_cli_toml(
+    init_identity(tmp.path());
+    let (ok, out, err) = run_jig(
         tmp.path(),
-        &format!("http://127.0.0.1:{CONFIG_PORT}"),
-        "did:jig:zfake",
+        &["server", "set", &format!("http://127.0.0.1:{CONFIG_PORT}")],
+        short(),
     );
+    assert!(ok, "server set failed. stdout={out} stderr={err}");
 
     let args = ["--server", CLOSED_PORT_URL, "channel", "list"];
     let (ok, out, err) = run_jig(tmp.path(), &args, short());
@@ -278,19 +295,26 @@ fn explicit_config_path_that_does_not_exist_is_a_hard_error() {
 #[test]
 fn explicit_config_path_is_actually_read() {
     // Positive half of the pair above: a real `--config` file must win over
-    // `~/.jig/cli.toml`.
+    // `~/.jig/cli.toml`. `channel list` signs as the configured DID, so the
+    // alt config names the identity `init` minted rather than a fake one.
     let tmp = tempfile::tempdir().unwrap();
-    write_cli_toml(
+    init_identity(tmp.path());
+    let (ok, out, err) = run_jig(
         tmp.path(),
-        &format!("http://127.0.0.1:{CONFIG_PORT}"),
-        "did:jig:zfake",
+        &["server", "set", &format!("http://127.0.0.1:{CONFIG_PORT}")],
+        short(),
     );
+    assert!(ok, "server set failed. stdout={out} stderr={err}");
+    let did = initialized_did(tmp.path());
+
     let alt = tmp.path().join("alt.toml");
     std::fs::write(
         &alt,
-        "[server]\nbase_url = \"http://127.0.0.1:1\"\n\n\
-         [user]\ndid = \"did:jig:zfake\"\ndisplay_name = \"alt\"\n\
-         default_channel = \"#general\"\n",
+        format!(
+            "[server]\nbase_url = \"http://127.0.0.1:1\"\n\n\
+             [user]\ndid = \"{did}\"\ndisplay_name = \"alt\"\n\
+             default_channel = \"#general\"\n"
+        ),
     )
     .unwrap();
 
@@ -344,9 +368,10 @@ fn init_writes_the_explicit_config_path_and_records_the_server_override() {
 fn missing_implicit_config_still_falls_back_to_defaults() {
     // The flip side of the hard error: a first run with no `~/.jig/cli.toml`
     // must still work off `Config::default()` (base_url 127.0.0.1:7117),
-    // not refuse to start.
+    // not refuse to start. `server info` dials without an identity, so it
+    // reaches the URL with no keyfile in the way.
     let tmp = tempfile::tempdir().unwrap();
-    let (ok, out, err) = run_jig(tmp.path(), &["channel", "list"], short());
+    let (ok, out, err) = run_jig(tmp.path(), &["server", "info"], short());
     let combined = format!("{out}{err}");
     assert!(
         !ok,

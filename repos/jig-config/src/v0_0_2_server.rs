@@ -324,6 +324,12 @@ impl JigServerConfig {
         if self.debug.list_handles {
             active.push("debug.list_handles".to_string());
         }
+        // Switching authentication off also switches authorization off on
+        // every surface: with no verified caller there is nobody to
+        // authorize, so restricted channels read as open. Advertise it.
+        if !self.auth.require_authenticated_reads {
+            active.push("auth.require_authenticated_reads=false".to_string());
+        }
         // v0.0.3 (alpha.email): only the SQLite BridgeStorage backend ships;
         // the abstraction is unproven against Postgres/CockroachDB. Advertise
         // the limitation whenever any bridge would load, so federated peers +
@@ -505,7 +511,9 @@ mod tests {
         cfg.federation.naively_trust_peer_authored_blocks = true;
         cfg.identity.naively_allow_unknown_handles_fallback = true;
         cfg.debug.list_handles = true;
+        cfg.auth.require_authenticated_reads = false;
         let active = cfg.unsafe_options_active();
+        assert!(active.contains(&"auth.require_authenticated_reads=false".to_string()));
         assert!(active.contains(&"debug.admin_endpoints".to_string()));
         assert!(active.contains(&"federation.dangerously_disable_federation_tls".to_string()));
         assert!(active.contains(&"federation.naively_trust_peer_authored_blocks".to_string()));

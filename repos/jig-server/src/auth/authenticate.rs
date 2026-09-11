@@ -77,8 +77,17 @@ pub fn authenticate(
         .verify(hash.as_bytes(), &signature)
         .map_err(|_| GateOutcome::AuthSignatureInvalid)?;
 
-    match guard.check_and_record(&proof.nonce, proof.hlc_wall_ms, now_ms) {
-        Ok(()) => Ok(proof.did.clone()),
+    // The identity this proof established is the KEY, not the string the
+    // caller spelled it with: a DID's base32 body decodes case-insensitively,
+    // so `zabc…` and `zABC…` are one key. Rebuild the DID from the verified
+    // pubkey and use that everywhere downstream — the replay record (or one
+    // captured proof would replay once per spelling) and the returned
+    // identity (or a re-cased caller would never match its own membership
+    // rows).
+    let did = Did::from_ed25519_pubkey(&pubkey_bytes);
+
+    match guard.check_and_record(did.as_str(), &proof.nonce, proof.hlc_wall_ms, now_ms) {
+        Ok(()) => Ok(did),
         Err(ReplayRejection::AlreadySeen) => Err(GateOutcome::AuthReplayed),
         Err(ReplayRejection::OutsideWindow) => Err(GateOutcome::AuthStale),
         // Not a replay: the guard had no room to record this nonce, and
@@ -137,18 +146,10 @@ pub fn authenticate_subscribe(
     authenticate(&proof, "SUBSCRIBE", scope, b"", now_ms, guard)
 }
 
-/// Header names carrying a tier-0 proof over HTTP.
-///
-/// HTTP-specific by necessity; the *verification* is not, which is what keeps
-/// the design transport-agnostic. A future SSH or gRPC transport carries the
-/// same five values however it can and calls the same [`authenticate`].
-pub mod headers {
-    pub const DID: &str = "x-jig-did";
-    pub const HLC_WALL_MS: &str = "x-jig-hlc-wall-ms";
-    pub const HLC_LOGICAL: &str = "x-jig-hlc-logical";
-    pub const NONCE: &str = "x-jig-nonce";
-    pub const SIGNATURE: &str = "x-jig-signature";
-}
+/// Header names carrying a tier-0 proof over HTTP. Defined in `jig-core` next
+/// to the canonical hash, so the client that signs and this verifier read the
+/// same names from one place; re-exported here for the server's own callers.
+pub use jig_core::request_auth::headers;
 
 /// Extract a proof from HTTP headers, if one is present and well-formed.
 ///
@@ -386,6 +387,31 @@ mod tests {
         authenticate(&proof, "GET", "/api/v1/channels", b"", 5_000, &mut guard).unwrap();
         assert_eq!(
             authenticate(&proof, "GET", "/api/v1/channels", b"", 5_000, &mut guard),
+            Err(GateOutcome::AuthReplayed)
+        );
+    }
+
+    /// A proof that spells its DID with an upper-cased body verifies (the
+    /// key is the same) but must come back as the canonical DID, and must be
+    /// the same identity to the replay guard as the lower-cased spelling.
+    #[test]
+    fn a_recased_did_authenticates_as_its_canonical_self() {
+        let (signing, did) = identity(1);
+        let mut proof = proof_for(&signing, &did, "GET", "/api/v1/channels", b"", 5_000, "n1");
+        let (prefix, body) = did.as_str().split_at("did:jig:z".len());
+        let recased = Did::from_str_unchecked(format!("{prefix}{}", body.to_uppercase()));
+        assert_ne!(recased, did);
+        proof.did = recased;
+        let mut guard = ReplayGuard::new(30_000, 128);
+
+        let established =
+            authenticate(&proof, "GET", "/api/v1/channels", b"", 5_000, &mut guard).unwrap();
+        assert_eq!(established, did, "the canonical spelling, not the one sent");
+
+        // The lower-cased original is the same proof to the guard.
+        let original = proof_for(&signing, &did, "GET", "/api/v1/channels", b"", 5_000, "n1");
+        assert_eq!(
+            authenticate(&original, "GET", "/api/v1/channels", b"", 5_000, &mut guard),
             Err(GateOutcome::AuthReplayed)
         );
     }

@@ -296,18 +296,32 @@ trusted_nameservers = []
 cache_ttl_seconds = {cache_ttl}
 naively_allow_unknown_handles_fallback = {unknown_handles}
 
+[auth]
+# Every read (REST and WSS) must carry a proof of possession of the caller's
+# key; restricted channels are then enforced against membership. Setting this
+# to false disables BOTH — there is nobody to authorize — and exists only to
+# migrate a deployment whose clients cannot sign yet. It is advertised in
+# unsafe_options_active while set.
+require_authenticated_reads = {require_auth}
+# Half-width of the request acceptance window, and the cap on remembered
+# nonces. A full guard refuses new requests rather than forget a live nonce.
+replay_window_ms = {replay_window_ms}
+replay_capacity = {replay_capacity}
+
 [debug]
 # Required: with admin_endpoints = false the /_admin_v0_0_2/* router is not
 # mounted and `jig channel create` fails with a bare 404 that looks like a
-# wrong URL or a broken build. These endpoints are UNAUTHENTICATED — they are
-# only safe because bind_address above is loopback. Never enable them on a
-# publicly-bound server.
+# wrong URL or a broken build. These routes run the same signature and
+# ownership checks as everything else; the flag is a label, not a bypass.
 admin_endpoints = true
 # Handle enumeration stays off — it dumps the registry to any caller.
 list_handles = {list_handles}
 "#,
         listen = listen,
         keyfile = defaults.server.server_did_keyfile,
+        require_auth = defaults.auth.require_authenticated_reads,
+        replay_window_ms = defaults.auth.replay_window_ms,
+        replay_capacity = defaults.auth.replay_capacity,
         kinds = kinds,
         cache_ttl = defaults.identity.cache_ttl_seconds,
         unknown_handles = defaults.identity.naively_allow_unknown_handles_fallback,
