@@ -35,9 +35,57 @@ pub enum IngestSource {
 
 /// All resources the ingest pipeline needs. Constructed once at server
 /// boot from `JigServerConfig` (jig-config v0_0_2_server module).
+/// Gate 2 for writes: will this server deal with `sender_did` at all?
+///
+/// The decision lives with the server (it owns the policy and the reputation
+/// view); the pipeline only asks. Called on the author DID **after** the
+/// block's signature has verified against it — so the DID is established,
+/// never merely claimed — and before anything is looked up, applied or
+/// signed.
+pub trait Admission: Send + Sync {
+    fn admit(&self, sender_did: &str) -> Result<(), AdmissionRefusal>;
+}
+
+/// Why admission said no. Mirrors the server's admission outcomes without
+/// the pipeline depending on the server's types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionRefusal {
+    /// This server does not admit identities it has no record of.
+    Unknown,
+    /// The sender's score under `ruleset_key` is below this server's floor.
+    BelowRuleset { ruleset_key: String },
+    /// This server refuses the sender outright.
+    Banned,
+}
+
+impl std::fmt::Display for AdmissionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown => f.write_str("this server does not admit unknown identities"),
+            Self::BelowRuleset { ruleset_key } => write!(
+                f,
+                "reputation under ruleset {ruleset_key} is below this server's floor"
+            ),
+            Self::Banned => f.write_str("this identity is refused by this server"),
+        }
+    }
+}
+
+/// The admission policy of a context that has none: everyone is admitted.
+/// The nameserver and tests use it; the server installs its own.
+pub struct AdmitEveryone;
+
+impl Admission for AdmitEveryone {
+    fn admit(&self, _sender_did: &str) -> Result<(), AdmissionRefusal> {
+        Ok(())
+    }
+}
+
 pub struct IngestContext {
     pub store: Arc<SqliteStore>,
     pub identity: Arc<dyn IdentityResolver>,
+    /// Gate 2 for every write, whichever surface it arrived on.
+    pub admission: Arc<dyn Admission>,
     pub hlc_clock: Arc<HlcClock>,
     pub allowed_block_kinds: Vec<String>,
     pub server_did: Did,
@@ -110,6 +158,13 @@ pub enum IngestError {
         slug: String,
         sender: String,
     },
+    /// Gate 2 refused the block's author. Precedes every other check but
+    /// the signature: a refused caller learns nothing about channels here.
+    #[error("`{sender}` is not admitted: {refusal}")]
+    NotAdmitted {
+        sender: String,
+        refusal: AdmissionRefusal,
+    },
     /// The named channel was archived: retired, its history kept, nothing new
     /// accepted into it — by any kind, from any source.
     #[error("channel '{slug}' is archived and accepts no new blocks")]
@@ -166,7 +221,19 @@ pub async fn ingest(
     let manifest = parse_manifest(bundle.manifest_bytes)?;
 
     // Step 1: signature verification
-    verify_sig(bundle.manifest_bytes, bundle.code_bytes, &manifest, &sig)?;
+    let sender = verify_sig(bundle.manifest_bytes, bundle.code_bytes, &manifest, &sig)?;
+
+    // Step 1b: admission, on the DID the signature just established. Before
+    // the identity resolver, the kind whitelist and every channel lookup: a
+    // caller this server will not deal with gets exactly one answer, whatever
+    // they asked.
+    if let Err(refusal) = ctx.admission.admit(sender.as_str()) {
+        tracing::info!(sender = %sender, refusal = %refusal, "write refused at admission");
+        return Err(IngestError::NotAdmitted {
+            sender: sender.to_did_jig_string(),
+            refusal,
+        });
+    }
 
     // Step 2: identity resolution (TOFU lock / nameserver verify).
     //
@@ -528,12 +595,16 @@ fn bundle_canonical_bytes(manifest_bytes: &[u8], code_bytes: &[u8]) -> Result<Ve
 /// canonical `did:jig:z<base32>` form (e.g. a legacy test DID), decoding
 /// fails and we return `InvalidSignature` — no opaque-label fallback,
 /// because the ingest pipeline must never accept an unverifiable signature.
+/// Verify the author's signature and return the author's DID in canonical
+/// form — rebuilt from the key the signature verified against, not the
+/// spelling the manifest carried, so every downstream comparison sees one
+/// form.
 fn verify_sig(
     manifest_bytes: &[u8],
     code_bytes: &[u8],
     manifest: &jig_core::BlockManifest,
     sig: &[u8],
-) -> Result<(), IngestError> {
+) -> Result<Did, IngestError> {
     let sender_did = manifest
         .authors
         .first()
@@ -551,7 +622,7 @@ fn verify_sig(
     pubkey
         .verify(&canonical, &signature)
         .map_err(|_| IngestError::InvalidSignature)?;
-    Ok(())
+    Ok(Did::from_ed25519_pubkey(&pubkey_bytes))
 }
 
 /// Execute the canonical text-render module and build a server-signed receipt
@@ -742,6 +813,7 @@ mod tests {
         let server_did = Did::from_ed25519_pubkey(server_key.verifying_key().as_bytes());
         IngestContext {
             store: store.clone(),
+            admission: Arc::new(AdmitEveryone),
             identity: Arc::new(crate::identity::TofuResolver::new(store)),
             hlc_clock: Arc::new(HlcClock::new(server_did.clone())),
             allowed_block_kinds: kinds.iter().map(|k| k.to_string()).collect(),
@@ -1111,6 +1183,65 @@ mod tests {
             .expect("member-add by the owner against an existing channel must succeed");
         let members = ctx.store.list_members(&channel_id).unwrap();
         assert!(members.iter().any(|m| m.member_did == "did:jig:zDeji"));
+    }
+
+    /// Gate 2 on writes: a validly signed block from a sender this server
+    /// refuses is turned away before the kind whitelist, the channel lookup
+    /// or the receipt — and nothing is persisted.
+    #[tokio::test]
+    async fn a_refused_sender_is_turned_away_before_anything_else() {
+        struct BanOne(String);
+        impl Admission for BanOne {
+            fn admit(&self, did: &str) -> Result<(), AdmissionRefusal> {
+                if did == self.0 {
+                    Err(AdmissionRefusal::Banned)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let banned_key = random_signing_key();
+        let mut ctx = test_ctx();
+        ctx.admission = Arc::new(BanOne(did_of(&banned_key)));
+        // The channel does NOT exist: a caller admission refuses must get
+        // NotAdmitted, never UnknownChannel — order is a security property.
+        let (mb, cb, sig) =
+            build_bundle_parts_with_channel(&banned_key, BlockKind::TextRender, "#nowhere");
+
+        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .expect_err("a banned sender must be refused");
+        assert!(
+            matches!(
+                &err,
+                IngestError::NotAdmitted {
+                    refusal: AdmissionRefusal::Banned,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            ctx.store
+                .list_blocks_by_channel("#nowhere", 10, None)
+                .unwrap()
+                .is_empty(),
+            "a refused block must not persist"
+        );
+
+        // Someone else is admitted by the same policy (and then hits the
+        // existence guard, proving admission ran first and only for the ban).
+        let other = random_signing_key();
+        let (mb, cb, sig) =
+            build_bundle_parts_with_channel(&other, BlockKind::TextRender, "#nowhere");
+        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .expect_err("unknown channel");
+        assert!(
+            matches!(err, IngestError::UnknownChannel { .. }),
+            "got {err:?}"
+        );
     }
 
     /// An archived channel takes nothing new, whatever the kind. Without this

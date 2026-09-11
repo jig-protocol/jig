@@ -66,6 +66,11 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         IngestError::DuplicateBlock { .. } => {
             (StatusCode::CONFLICT, "DUPLICATE_BLOCK", e.to_string())
         }
+        // 403 and the same word the read gates use: the caller authenticated
+        // fine, this server simply will not deal with them.
+        IngestError::NotAdmitted { refusal, .. } => {
+            (StatusCode::FORBIDDEN, "NOT_ADMITTED", refusal.to_string())
+        }
         // 410, not 404: the channel existed and was deliberately retired, and
         // "create it" would be the wrong advice.
         IngestError::ChannelArchived { .. } => {
@@ -139,6 +144,10 @@ mod tests {
             },
             IngestError::ChannelArchived {
                 slug: "#retired".to_string(),
+            },
+            IngestError::NotAdmitted {
+                sender: "did:jig:zBad".to_string(),
+                refusal: jig_pipeline::ingest::AdmissionRefusal::Banned,
             },
         ]
     }

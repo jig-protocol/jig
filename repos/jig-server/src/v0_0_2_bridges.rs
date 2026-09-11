@@ -308,6 +308,10 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         ref e @ IngestError::ChannelArchived { .. } => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },
+        // This server refuses the block's author; a retry changes nothing.
+        ref e @ IngestError::NotAdmitted { .. } => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
         // Unavailable, not PolicyBlocked: the block is fine and execution failed
         // on this host, so a retry may well succeed.
         IngestError::RenderFailed { .. } => SubmitDenied::Unavailable,
@@ -412,6 +416,7 @@ mod tests {
         let hlc_clock = Arc::new(HlcClock::new(server_did.clone()));
         let fanout = Arc::new(Fanout::new());
         let ingest_ctx = Arc::new(IngestContext {
+            admission: Arc::new(jig_pipeline::ingest::AdmitEveryone),
             store: store.clone(),
             identity,
             hlc_clock,

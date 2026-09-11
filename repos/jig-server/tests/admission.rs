@@ -161,17 +161,147 @@ async fn a_floor_refuses_low_scores_and_leaves_unknowns_to_the_unknown_choice() 
     );
 }
 
-/// With reads unauthenticated there is nobody to admit: the escape hatch
-/// disables gate 2 along with the rest, exactly as documented.
+/// The read escape hatch is about READS: with no proof there is nobody to
+/// admit, so gate 2 is skipped there along with the rest. Writes always
+/// carry a signature, so admission still applies to them — the hatch does
+/// not turn a members-only server into an open letterbox.
 #[tokio::test]
-async fn the_escape_hatch_skips_admission() {
+async fn the_read_escape_hatch_skips_admission_for_reads_only() {
     let owner = Identity::new(1);
+    let stranger = Identity::new(2);
     let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
     config.auth.require_authenticated_reads = false;
     config.auth.admission.unknown_dids = UnknownDidsPolicy::Refuse;
+    config.auth.admission.records = vec![record(&owner, "club", 1)];
     let server = TestServer::with_full_config(config);
     server.create_channel(&owner, "#open", "open").await;
 
     let (status, body) = server.send_unsigned(&history_path("#open")).await;
-    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unsigned read under the hatch: {body}"
+    );
+
+    let me = stranger.as_client();
+    let block = build_text_render(&me, "#open", "hi", HlcTimestamp::now_wall(me.did().clone()));
+    let (status, body) = server.try_submit(&block).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a stranger's write is still refused: {body}"
+    );
+    assert_eq!(body["code"], "NOT_ADMITTED");
+}
+
+// ---- Writes ------------------------------------------------------------------
+//
+// "Blocks authenticating their own request … need to be refusable based on
+// server preference." Admission runs inside ingest, so every write surface
+// gets it: the public submit, WSS Submit, and the admin channel routes.
+
+use jig_client::blocks::{build_channel_create, build_text_render};
+use jig_core::HlcTimestamp;
+
+#[tokio::test]
+async fn a_banned_did_cannot_post_over_rest() {
+    let owner = Identity::new(1);
+    let banned = Identity::new(2);
+    let server = TestServer::with_admission(banning(&banned));
+    server.create_channel(&owner, "#open", "open").await;
+
+    let me = banned.as_client();
+    let block = build_text_render(&me, "#open", "hi", HlcTimestamp::now_wall(me.did().clone()));
+    let (status, body) = server.try_submit(&block).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
+    assert_eq!(body["code"], "NOT_ADMITTED");
+
+    // Nothing landed.
+    let (_, timeline) = server
+        .send(&server.sign_get(&owner, &history_path("#open")))
+        .await;
+    assert_eq!(
+        timeline.as_array().map_or(0, Vec::len),
+        1,
+        "only the channel-create block: {timeline}"
+    );
+}
+
+#[tokio::test]
+async fn a_banned_did_cannot_post_over_wss() {
+    let owner = Identity::new(1);
+    let banned = Identity::new(2);
+    let server = TestServer::with_admission(banning(&banned));
+    server.create_channel(&owner, "#open", "open").await;
+
+    let url = server.serve_ws().await;
+    let mut ws = WsClient::connect(&url).await;
+    match ws.submit_text(&banned, "#open", "hi").await {
+        jig_pipeline::Frame::Error { status, code, .. } => {
+            assert_eq!(status, Some(403));
+            assert_eq!(code, "NOT_ADMITTED");
+        }
+        other => panic!("expected an error frame, got {other:?}"),
+    }
+}
+
+/// The admin routes are a write surface like any other. A refused key
+/// cannot create a channel — and admission precedes ownership, so a banned
+/// OWNER cannot even archive their own.
+#[tokio::test]
+async fn a_banned_did_cannot_use_the_admin_routes_even_as_an_owner() {
+    let owner = Identity::new(1);
+    let server = TestServer::with_admission(banning(&owner));
+
+    let me = owner.as_client();
+    let create = build_channel_create(
+        &me,
+        "#mine",
+        "open",
+        HlcTimestamp::now_wall(me.did().clone()),
+    );
+    let (status, body) = server.try_submit(&create).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "create: {body}");
+    assert_eq!(body["code"], "NOT_ADMITTED");
+}
+
+/// Admission is decided on the DID the signature ESTABLISHED, not on the
+/// spelling in the manifest: a banned key cannot slip past its ban by
+/// re-casing its DID.
+#[tokio::test]
+async fn a_recased_author_did_is_still_the_banned_key() {
+    use jig_core::{Author, BlockKind, BlockManifest};
+    let owner = Identity::new(1);
+    let banned = Identity::new(2);
+    let server = TestServer::with_admission(banning(&banned));
+    server.create_channel(&owner, "#open", "open").await;
+
+    let me = banned.as_client();
+    let did_string = me.did_string();
+    let (prefix, body) = did_string.split_at("did:jig:z".len());
+    let recased = jig_core::Did::from_str_unchecked(format!("{prefix}{}", body.to_uppercase()));
+    let manifest = BlockManifest::builder()
+        .version(semver::Version::new(0, 1, 0))
+        .author(Author {
+            did: recased,
+            public_key: None,
+            roles: vec![],
+        })
+        .metadata_entry("channel", serde_json::json!("#open"))
+        .metadata_entry("body", serde_json::json!("hi"))
+        .build()
+        .unwrap()
+        .with_kind(BlockKind::TextRender)
+        .with_hlc(HlcTimestamp::now_wall(me.did().clone()));
+    let manifest_bytes = manifest.to_canonical_bytes().unwrap();
+    let payload = serde_json::to_vec(&(manifest_bytes.clone(), Vec::<u8>::new())).unwrap();
+    let block = jig_client::blocks::BuiltBlock {
+        manifest_bytes,
+        code_bytes: vec![],
+        sender_sig: me.sign(&payload).to_bytes().to_vec(),
+    };
+
+    let (status, body) = server.try_submit(&block).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
+    assert_eq!(body["code"], "NOT_ADMITTED");
 }

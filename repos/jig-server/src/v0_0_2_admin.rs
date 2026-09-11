@@ -401,6 +401,7 @@ mod tests {
         let server_url = format!("ws://{}", config.server.listen);
 
         let ingest_ctx = Arc::new(IngestContext {
+            admission: Arc::new(jig_pipeline::ingest::AdmitEveryone),
             store,
             identity,
             hlc_clock,

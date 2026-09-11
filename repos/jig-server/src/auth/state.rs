@@ -65,6 +65,32 @@ impl AuthState {
     }
 }
 
+/// The pipeline asks the server whether to admit a block's author; the
+/// answer is the same gate 2 the read surfaces run, over the same policy and
+/// view. Mapped to the pipeline's own refusal type so jig-pipeline never
+/// depends on this crate's outcomes.
+impl jig_pipeline::ingest::Admission for AuthState {
+    fn admit(&self, sender_did: &str) -> Result<(), jig_pipeline::ingest::AdmissionRefusal> {
+        use jig_pipeline::ingest::AdmissionRefusal;
+        match AuthState::admit(self, sender_did) {
+            Ok(()) => Ok(()),
+            Err(outcome) => {
+                // The audit record of what actually happened, whatever the
+                // write surface tells the caller.
+                tracing::info!(audit = %crate::auth::audit_line(&outcome), "write refused");
+                Err(match outcome {
+                    GateOutcome::AdmissionBanned => AdmissionRefusal::Banned,
+                    GateOutcome::AdmissionBelowRuleset { ruleset_key } => {
+                        AdmissionRefusal::BelowRuleset { ruleset_key }
+                    }
+                    // `admit` only ever returns admission outcomes.
+                    _ => AdmissionRefusal::Unknown,
+                })
+            }
+        }
+    }
+}
+
 fn admission_policy(section: &AdmissionSection) -> AdmissionPolicy {
     AdmissionPolicy {
         unknown_dids: Some(match section.unknown_dids {
