@@ -64,6 +64,15 @@ pub struct AdmissionPolicy {
 }
 
 impl AdmissionPolicy {
+    /// Whether this policy turns anyone away at all. A server that does is
+    /// one where "open channel" means open to the admitted, and ungated
+    /// surfaces (`/metrics`) must stop naming even open channels.
+    pub fn refuses_anyone(&self) -> bool {
+        self.unknown_dids() == UnknownDids::Refuse
+            || !self.floors.is_empty()
+            || !self.banned_dids.is_empty()
+    }
+
     fn unknown_dids(&self) -> UnknownDids {
         // An unset choice admits: a server that never wrote an
         // `[auth.admission]` section has not decided to turn anyone away.
@@ -257,6 +266,15 @@ mod tests {
                 ruleset_key: "b".to_string()
             })
         );
+    }
+
+    #[test]
+    fn refuses_anyone_is_false_only_for_the_admit_everyone_policy() {
+        assert!(!AdmissionPolicy::default().refuses_anyone());
+        assert!(!policy(UnknownDids::Admit, vec![], &[]).refuses_anyone());
+        assert!(policy(UnknownDids::Refuse, vec![], &[]).refuses_anyone());
+        assert!(policy(UnknownDids::Admit, vec![floor("r", 0)], &[]).refuses_anyone());
+        assert!(policy(UnknownDids::Admit, vec![], &[DID]).refuses_anyone());
     }
 
     #[test]

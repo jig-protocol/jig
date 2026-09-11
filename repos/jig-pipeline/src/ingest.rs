@@ -1236,6 +1236,10 @@ mod tests {
                 .is_empty(),
             "a refused block must not persist"
         );
+        assert!(
+            ctx.store.get_tofu_key("banned-nick").unwrap().is_none(),
+            "a refused block must not leave a TOFU pin behind"
+        );
 
         // Someone else is admitted by the same policy (and then hits the
         // existence guard, proving admission ran first and only for the ban).

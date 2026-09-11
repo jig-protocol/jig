@@ -351,3 +351,28 @@ async fn the_archive_route_verifies_the_signature_before_answering_anything() {
         assert_eq!(body["code"], "INVALID_SIG", "{slug}: {body}");
     }
 }
+
+/// Gate 1 before gate 2: admission runs on the DID the signature VERIFIED,
+/// never on the one in the header. A banned DID presented with a signature
+/// that does not verify is refused as a bad signature, not as banned —
+/// proving the claim alone never reaches the admission decision.
+#[tokio::test]
+async fn admission_never_runs_on_a_merely_claimed_did() {
+    let banned = Identity::new(2);
+    let server = TestServer::with_admission(banning(&banned));
+
+    let mut req = server.sign_get(&banned, "/api/v1/channels");
+    req.sig_b64 = base64_flip(&req.sig_b64);
+    let (status, body) = server.send(&req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body={body}");
+    assert_eq!(body["code"], "INVALID_SIG");
+}
+
+fn base64_flip(sig_b64: &str) -> String {
+    use base64::Engine as _;
+    let mut bytes = base64::engine::general_purpose::STANDARD
+        .decode(sig_b64)
+        .unwrap();
+    bytes[0] ^= 0xff;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}

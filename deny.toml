@@ -69,9 +69,11 @@ unknown-git = "deny"
 # landing against our dep graph still fails CI and forces a deliberate call.
 # Each entry carries the crate it suppresses and why it is acceptable today.
 #
-# Last audited against the graph: 2026-08-05 (post cid 0.10 -> 0.11 /
-# multihash 0.18 -> 0.19, which dropped core2 and proc-macro-error from the
-# graph; before that, post wasmtime 24.0.12 -> 47.0.3, which closed the six
+# Last audited against the graph: 2026-09-11 (post wasmtime 47.0.3 -> 47.0.4
+# for RUSTSEC-2026-0268/0269 and the chacha20 0.10.0 yank; before that,
+# 2026-08-05, post cid 0.10 -> 0.11 / multihash 0.18 -> 0.19, which dropped
+# core2 and proc-macro-error from the graph; before that, post wasmtime
+# 24.0.12 -> 47.0.3, which closed the six
 # wasmtime advisories outright and — via the transitive minimums that bump
 # forced — also retired the fxhash and bytes entries).
 [advisories]
@@ -112,7 +114,7 @@ ignore = [
     # a >=0.103.12 fixes. Unifying on rustls 0.23 removed the 0.102 copy, and
     # rustls-pemfile went with it (rustls-pki-types parses PEM itself).
 
-    # --- No wasmtime entries. jig-runtime + jig-server are on wasmtime 47.0.3,
+    # --- No wasmtime entries. jig-runtime + jig-server are on wasmtime 47.0.4,
     #     which carries fixes for every wasmtime advisory currently published
     #     against our graph — including RUSTSEC-2026-0096 (aarch64 Cranelift
     #     miscompiled guest heap access -> sandbox escape), which had no fix on

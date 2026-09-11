@@ -105,7 +105,7 @@ rustls = { version = "0.23", default-features = false, features = [
 rustls-pki-types = "1.0"
 dashmap = "5"
 jsonwebtoken = "10"
-wasmtime = { version = "47.0.3", features = ["async"] }
+wasmtime = { version = "47.0.4", features = ["async"] }
 
 # Capability enforcement (Phase 1)
 hmac = "0.12"

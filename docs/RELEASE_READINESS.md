@@ -98,7 +98,7 @@ documented in the handler). Keep it off; never document it as a workaround.
 
 | | |
 | --- | --- |
-| **Current state** | Tighter than the rest of the system. `build_wasi_context` ([`jig-runtime/src/engine.rs:293`](../repos/jig-runtime/src/engine.rs)) grants an empty stdin pipe and an in-memory stdout buffer — no host stdio, no preopened directories, no sockets. Store limits pin one instance, one memory, 10 tables, 10k table elements; fuel and an epoch deadline bound runtime. Server defaults: 5,000,000 fuel, 64 MB, plus a timeout ([`jig-server/src/config.rs:296-304`](../repos/jig-server/src/config.rs)). wasmtime is 47.0.3, which closed every wasmtime advisory previously carved out — including RUSTSEC-2026-0096 (aarch64 Cranelift guest-heap miscompile → sandbox escape). |
+| **Current state** | Tighter than the rest of the system. `build_wasi_context` ([`jig-runtime/src/engine.rs:293`](../repos/jig-runtime/src/engine.rs)) grants an empty stdin pipe and an in-memory stdout buffer — no host stdio, no preopened directories, no sockets. Store limits pin one instance, one memory, 10 tables, 10k table elements; fuel and an epoch deadline bound runtime. Server defaults: 5,000,000 fuel, 64 MB, plus a timeout ([`jig-server/src/config.rs:296-304`](../repos/jig-server/src/config.rs)). wasmtime is 47.0.4 (RUSTSEC-2026-0268/0269 closed by the patch bump, not suppressed; jig never enables WASI, so neither was reachable) — including RUSTSEC-2026-0096 (aarch64 Cranelift guest-heap miscompile → sandbox escape). |
 | **Gap** | None material for external use. This is the strongest part of the security story. |
 
 **Verdict: READY.**
