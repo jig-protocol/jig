@@ -243,11 +243,9 @@ pub async fn ingest(
     // is documented in the H5 integration test. v0.0.3+ promotes channel/
     // membership blocks to carry the identifier explicitly.
     if let Some(nickname) = manifest.metadata.get("nickname").and_then(|v| v.as_str()) {
-        let sender_did = manifest
-            .authors
-            .first()
-            .map(|a| a.did.to_string())
-            .unwrap_or_default();
+        // The canonical DID the signature established — so a pin is written
+        // and compared in one spelling, whatever the manifest carried.
+        let sender_did = sender.to_did_jig_string();
         match ctx.identity.verify(nickname, &sender_did).await {
             Ok(()) => {}
             Err(err) => {
@@ -324,13 +322,8 @@ pub async fn ingest(
     // decision can turn on it (content into a restricted channel).
     let sender_is_member =
         if crate::authorize_write::needs_membership(kind, resolved_channel.as_ref()) {
-            let sender = manifest
-                .authors
-                .first()
-                .map(|a| a.did.to_string())
-                .unwrap_or_default();
             match channel_slug {
-                Some(slug) => ctx.store.is_member(slug, &sender)?,
+                Some(slug) => ctx.store.is_member(slug, sender.as_str())?,
                 None => false,
             }
         } else {
@@ -338,6 +331,7 @@ pub async fn ingest(
         };
     if let Err(refusal) = crate::authorize_write::authorize_block(
         kind,
+        sender.as_str(),
         &manifest,
         resolved_channel.as_ref(),
         sender_is_member,
@@ -1213,8 +1207,15 @@ mod tests {
         ctx.admission = Arc::new(BanOne(did_of(&banned_key)));
         // The channel does NOT exist: a caller admission refuses must get
         // NotAdmitted, never UnknownChannel — order is a security property.
-        let (mb, cb, sig) =
-            build_bundle_parts_with_channel(&banned_key, BlockKind::TextRender, "#nowhere");
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &banned_key,
+            BlockKind::TextRender,
+            &[
+                ("channel", "#nowhere"),
+                ("nickname", "banned-nick"),
+                ("body", "hi"),
+            ],
+        );
 
         let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
             .await

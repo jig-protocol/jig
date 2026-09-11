@@ -729,3 +729,45 @@ async fn an_owner_who_recased_their_did_still_owns_their_channel() {
         "listing must show the canonical DID: {listing}"
     );
 }
+
+/// The write gate must see the same canonical sender the rows were written
+/// with: an owner who spells their DID in upper case in a control-plane
+/// block is still the owner who may change the channel.
+#[tokio::test]
+async fn an_owner_who_recased_their_did_can_still_archive_their_channel() {
+    use jig_core::{Author, BlockKind, BlockManifest};
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    server.create_channel(&owner, "#mine", "restricted").await;
+
+    let me = owner.as_client();
+    let did_string = me.did_string();
+    let (prefix, body) = did_string.split_at("did:jig:z".len());
+    let recased = jig_core::Did::from_str_unchecked(format!("{prefix}{}", body.to_uppercase()));
+    let manifest = BlockManifest::builder()
+        .version(semver::Version::new(0, 1, 0))
+        .author(Author {
+            did: recased,
+            public_key: None,
+            roles: vec![],
+        })
+        .metadata_entry("channel", serde_json::json!("#mine"))
+        .build()
+        .unwrap()
+        .with_kind(BlockKind::ChannelArchive)
+        .with_hlc(HlcTimestamp::now_wall(me.did().clone()));
+    let manifest_bytes = manifest.to_canonical_bytes().unwrap();
+    let payload = serde_json::to_vec(&(manifest_bytes.clone(), Vec::<u8>::new())).unwrap();
+    let archive = jig_client::blocks::BuiltBlock {
+        manifest_bytes,
+        code_bytes: vec![],
+        sender_sig: me.sign(&payload).to_bytes().to_vec(),
+    };
+
+    let (status, body) = server.try_submit(&archive).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the owner, however spelled, may archive: {body}"
+    );
+}

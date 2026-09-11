@@ -117,7 +117,11 @@ impl Default for IdentitySection {
 // `require_authenticated_reads` the *type* default of `false` — silently
 // turning authentication off for anyone who set only the window. Verified: with
 // per-field defaults, `a_partial_auth_section_keeps_the_safe_default` fails.
-#[serde(default)]
+//
+// `deny_unknown_fields` for the same reason `[auth.admission]` has it: nothing
+// else reads `[auth]`, and a misspelled sub-table (`[auth.admision]`) must not
+// silently leave the permissive defaults in place.
+#[serde(default, deny_unknown_fields)]
 pub struct AuthSection {
     /// Require a valid proof of possession on read requests.
     ///
@@ -513,6 +517,8 @@ mod tests {
     #[test]
     fn a_misspelled_admission_key_is_an_error() {
         for bad in [
+            "[auth.admision]\nunknown_dids = \"refuse\"\n",
+            "[auth]\nrequire_authenticated_read = false\n",
             "[auth.admission]\nunknown_did = \"refuse\"\n",
             "[auth.admission]\nbanned_did = [\"did:jig:zx\"]\n",
             "[[auth.admission.floors]]\nruleset = \"r\"\nminimum = 0\n",
