@@ -407,11 +407,16 @@ async fn handle_client_frame(
                         match crate::auth::authenticate::authenticate_subscribe(
                             &a, &scope_str, now_ms, &mut guard,
                         ) {
-                            // Bind the VERIFIED did, never `a.did` as received.
-                            Ok(did) => {
-                                *conn_did = Some(did);
-                                None
-                            }
+                            // Bind the VERIFIED did, never `a.did` as received —
+                            // and only once gate 2 has admitted it, so a refused
+                            // caller leaves no identity on the connection.
+                            Ok(did) => match state.auth.admit(did.as_str()) {
+                                Ok(()) => {
+                                    *conn_did = Some(did);
+                                    None
+                                }
+                                Err(o) => Some(o),
+                            },
                             Err(o) => Some(o),
                         }
                     }

@@ -96,10 +96,26 @@ impl TestServer {
     }
 
     fn with_auth(require: bool) -> Self {
-        let tmp = tempfile::tempdir().expect("temp dir");
-
         let mut config = JigServerConfig::default();
         config.auth.require_authenticated_reads = require;
+        Self::with_config(config)
+    }
+
+    /// Build a server with authentication required and this `[auth.admission]`
+    /// section — the gate-2 tests' entry point.
+    pub fn with_admission(admission: jig_config::v0_0_2_server::AdmissionSection) -> Self {
+        let mut config = JigServerConfig::default();
+        config.auth.admission = admission;
+        Self::with_config(config)
+    }
+
+    /// Build a server from a complete config, for tests that combine knobs.
+    pub fn with_full_config(config: JigServerConfig) -> Self {
+        Self::with_config(config)
+    }
+
+    fn with_config(mut config: JigServerConfig) -> Self {
+        let tmp = tempfile::tempdir().expect("temp dir");
         config.server.server_did_keyfile =
             tmp.path().join("server.key").to_string_lossy().into_owned();
 
