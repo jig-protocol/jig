@@ -10,8 +10,8 @@ on:
   # happened once). Run the dependency-policy job on its own cadence against the
   # default branch so drift is attributed to the advisory DB, not a contributor.
   # NOTE: GitHub disables scheduled workflows after 60 days of repo inactivity.
-  schedule:
-    - cron: '17 7 * * *'  # daily 07:17 UTC; off-the-hour to dodge cron peak queueing
+  #schedule:
+    #- cron: '17 7 * * *'  # daily 07:17 UTC; off-the-hour to dodge cron peak queueing
 
 # All cargo invocations expect to be run from the `repos/` workspace root.
 # The dependency-policy job is the exception — `deny.toml` lives at the repo root.
