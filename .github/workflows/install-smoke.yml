@@ -1,0 +1,113 @@
+name: Install smoke
+
+# Fails if `curl … install.sh | bash` takes more than 60s to reach
+# "hello, world" in #hello on a local jig-server.
+#
+# * tag given (release.yml after publish, or manual dispatch): installs the
+#   published GitHub Release on Linux x86_64 and Apple Silicon macOS — the
+#   real end-user path, CDN included.
+# * pull_request touching the installer: builds the PR's binaries, signs them
+#   with a throwaway key, and installs from a local mirror with the PR's
+#   install.sh.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to install
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to install ("latest" = newest, prereleases included)
+        required: true
+        default: latest
+  pull_request:
+    paths:
+      - install.sh
+      - scripts/install-smoke.sh
+      - scripts/package-release.sh
+      - .github/workflows/install-smoke.yml
+      - .github/workflows/release.yml
+      - repos/jig-cli/src/cmd/channel.rs
+      - repos/jig-server/src/v0_0_2_admin.rs
+      - repos/jig-server/src/v0_0_2_ws.rs
+
+permissions:
+  contents: read
+
+jobs:
+  published:
+    name: published ${{ inputs.tag }} on ${{ matrix.runs_on }}
+    if: inputs.tag != ''
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        runs_on: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+      - name: curl | bash → hello-world (budget 60s)
+        shell: bash
+        env:
+          JIG_VERSION: ${{ inputs.tag }}
+          # The repo is private: install.sh and the assets come through the
+          # API with this token. Once public, no token is needed.
+          JIG_GITHUB_TOKEN: ${{ github.token }}
+          JIG_VERIFY_SIGNATURE: '1'
+        run: scripts/install-smoke.sh 60
+
+  pr:
+    name: PR build on ubuntu-24.04
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        shell: bash
+        working-directory: repos
+        run: |
+          set -euo pipefail
+          if [ -f ../rust-toolchain.toml ] || [ -f rust-toolchain.toml ]; then
+            rustup toolchain install --profile minimal
+          else
+            rustup toolchain install stable --profile minimal
+            rustup default stable
+          fi
+          rustup target add wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: repos
+          key: install-smoke
+      - name: Build
+        working-directory: repos
+        run: |
+          cargo build --release --locked -p jig-server -p jig-cli -p jig-nameserver
+          cargo build --release --locked --target wasm32-wasip1 -p text-block
+      - name: Package, checksum, sign with a throwaway key, serve
+        id: mirror
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/package-release.sh x86_64-unknown-linux-gnu jig-linux-x86_64 dist
+          cp install.sh dist/
+          key="$RUNNER_TEMP/k"
+          ssh-keygen -q -t ed25519 -N '' -C jig-release -f "$key"
+          (cd dist && sha256sum jig-*.tar.gz install.sh > SHA256SUMS && ssh-keygen -Y sign -q -f "$key" -n jig-release SHA256SUMS)
+          echo "signer=jig-release namespaces=\"jig-release\" $(cut -d' ' -f1,2 "$key.pub")" >> "$GITHUB_OUTPUT"
+          (cd dist && nohup python3 -m http.server 47391 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          for _ in $(seq 1 50); do curl -fsS -o /dev/null http://127.0.0.1:47391/SHA256SUMS && exit 0; sleep 0.1; done
+          exit 1
+      - name: curl | bash → hello-world (budget 60s)
+        shell: bash
+        env:
+          JIG_INSTALL_SH_URL: http://127.0.0.1:47391/install.sh
+          JIG_RELEASES_BASE: http://127.0.0.1:47391
+          JIG_VERIFY_SIGNATURE: '1'
+          JIG_RELEASE_SIGNER: ${{ steps.mirror.outputs.signer }}
+        run: scripts/install-smoke.sh 60
