@@ -27,7 +27,8 @@ edition = "2024"
 # Floor set by wasmtime 48.x. Inherited by jig-runtime and jig-server via
 # `rust-version.workspace = true`; other members do not opt in, so this is not
 # a workspace-wide assertion. The toolchain itself is pinned in
-# rust-toolchain.toml, which is comfortably above it. Cargo still reports the offending transitive crates
+# rust-toolchain.toml, which is comfortably above it. Cargo still reports the
+# offending transitive crates
 # rather than this floor when a toolchain is too old, so the value here is the
 # declaration itself, not a friendlier error.
 rust-version = "1.95"

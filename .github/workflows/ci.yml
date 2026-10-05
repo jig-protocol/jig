@@ -32,9 +32,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-wasip1
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        # Channel, components and targets all come from rust-toolchain.toml at
+        # the repo root, so CI builds with exactly what a contributor gets.
+        run: rustup toolchain install && rustc --version && cargo --version
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: repos
@@ -123,13 +124,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          # NOT wasm32-wasip1. text-block is a pure function; the
-          # unknown-unknown target emits a module with no imports, which is what
-          # lets jig-runtime instantiate it under a no-imports policy. A wasip1
-          # build imports wasi_snapshot_preview1 and gets rejected at load.
-          targets: wasm32-unknown-unknown
+      # Builds for wasm32-unknown-unknown (listed in rust-toolchain.toml), NOT
+      # wasm32-wasip1. text-block is a pure function; the unknown-unknown target
+      # emits a module with no imports, which is what lets jig-runtime
+      # instantiate it under a no-imports policy. A wasip1 build imports
+      # wasi_snapshot_preview1 and gets rejected at load.
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        # Channel, components and targets all come from rust-toolchain.toml at
+        # the repo root, so CI builds with exactly what a contributor gets.
+        run: rustup toolchain install && rustc --version && cargo --version
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: repos
@@ -176,7 +179,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        # Channel, components and targets all come from rust-toolchain.toml at
+        # the repo root, so CI builds with exactly what a contributor gets.
+        run: rustup toolchain install && rustc --version && cargo --version
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
       - name: cargo deny check (advisories, bans, licenses, sources)
