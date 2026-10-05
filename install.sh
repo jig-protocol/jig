@@ -198,9 +198,8 @@ peers = []
 dangerously_disable_federation_tls = false
 
 [debug]
-# Required for v0.0.2 channel-create / member-add CLI flows to work
-# (jig channel create POSTs to /_admin_v0_0_2/channels).
-admin_endpoints = true
+# Channel ops are on /api/v1/channels and always mounted.
+admin_endpoints = false
 list_handles = false
 EOF
   log "wrote $cfg"

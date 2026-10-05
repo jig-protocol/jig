@@ -38,8 +38,8 @@ loopback and private tailnets.
   [`jig-pipeline/src/authorize_write.rs`](repos/jig-pipeline/src/authorize_write.rs)).
   What is missing is any way to refuse a caller *before* those gates: any self-minted key
   is admitted, there is no rate limiting, and blocks relayed by a federated peer are
-  trusted. The `/_admin_v0_0_2/*` channel-ops routes run the same gates but still mount
-  behind a `[debug]` flag.
+  trusted. Channel ops (`POST /api/v1/channels*`) run the same gates and need no
+  `[debug]` flag.
 - **No graphical client.** `repos/jig-gui/` (Riverdance) is a Dioxus scaffold around a
   mocked chat UI. It depends on neither `jig-core` nor `jig-client` and never opens a
   connection — it is a design mock, not a client.

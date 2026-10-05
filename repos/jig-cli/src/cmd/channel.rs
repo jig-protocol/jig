@@ -3,14 +3,18 @@
 //!
 //! `create #hello [--visibility open|restricted]` builds a signed
 //! `channel-create` block via `jig_client::blocks::build_channel_create`,
-//! POSTs it to `/_admin_v0_0_2/channels`, and prints the new slug + CID.
+//! POSTs it to `/api/v1/channels`, and prints the new slug + CID.
 //!
 //! `join #hello` builds a signed `member-add` block that adds the caller's
-//! own DID and POSTs it to `/_admin_v0_0_2/channels/<url-escaped slug>/members`.
+//! own DID and POSTs it to `/api/v1/channels/<url-escaped slug>/members`.
 //!
 //! `delete #hello [--yes]` builds a signed `channel-archive` block and POSTs it
-//! to `/_admin_v0_0_2/channels/<url-escaped slug>/archive`. Owner-only, and a
+//! to `/api/v1/channels/<url-escaped slug>/archive`. Owner-only, and a
 //! soft delete: the server retires the channel and keeps its history.
+//!
+//! Servers that predate `/api/v1/channels*` only expose the same handlers
+//! under `/_admin_v0_0_2/*` (behind `[debug] admin_endpoints`), so a 404 on the
+//! stable path is retried once against the legacy one.
 //!
 //! `list` GETs `/api/v1/channels` and pretty-prints a column-aligned table.
 //!
@@ -73,6 +77,48 @@ struct AdminResult {
     block_cid: String,
 }
 
+const CHANNEL_OPS_PREFIX: &str = "/api/v1/channels";
+const LEGACY_CHANNEL_OPS_PREFIX: &str = "/_admin_v0_0_2/channels";
+
+/// POST a signed channel-op block to `<base><prefix><suffix>`, where `suffix`
+/// is `""`, `/<slug>/members` or `/<slug>/archive`.
+async fn post_channel_op(base: &str, suffix: &str, block: &BuiltBlock) -> Result<AdminResult> {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .context("building HTTP client for channel endpoint")?;
+    let submission = submission_for(block);
+
+    let mut url = format!("{base}{CHANNEL_OPS_PREFIX}{suffix}");
+    let mut resp = http
+        .post(&url)
+        .json(&submission)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND
+        || resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
+    {
+        url = format!("{base}{LEGACY_CHANNEL_OPS_PREFIX}{suffix}");
+        resp = http
+            .post(&url)
+            .json(&submission)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+    }
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "POST {url} returned {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        );
+    }
+    resp.json()
+        .await
+        .with_context(|| format!("decoding {url} response"))
+}
+
 // ============================================================================
 // create
 // ============================================================================
@@ -80,7 +126,7 @@ struct AdminResult {
 /// Apply `jig channel create <slug> [--visibility ...]`.
 ///
 /// Builds a signed channel-create block, POSTs it to
-/// `/_admin_v0_0_2/channels`, and prints the new channel slug + block CID
+/// `/api/v1/channels`, and prints the new channel slug + block CID
 /// on success.
 pub async fn create(ctx: &CliContext, slug: String, visibility: String) -> Result<()> {
     let visibility = visibility.trim().to_lowercase();
@@ -93,28 +139,7 @@ pub async fn create(ctx: &CliContext, slug: String, visibility: String) -> Resul
     let block = build_channel_create(&id, &slug, &visibility, hlc);
 
     let base = base_http_url(&ctx.server_url()?);
-    let url = format!("{base}/_admin_v0_0_2/channels");
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .context("building HTTP client for admin endpoint")?;
-    let resp = http
-        .post(&url)
-        .json(&submission_for(&block))
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
-    if !resp.status().is_success() {
-        anyhow::bail!(
-            "POST {url} returned {}: {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        );
-    }
-    let result: AdminResult = resp
-        .json()
-        .await
-        .context("decoding /_admin_v0_0_2/channels response")?;
+    let result = post_channel_op(&base, "", &block).await?;
     println!("channel created: {slug} ({visibility})");
     println!("  block_cid: {}", result.block_cid);
 
@@ -146,7 +171,7 @@ fn remember_default_channel(ctx: &CliContext, slug: &str) -> Result<()> {
 /// Apply `jig channel join <slug>`.
 ///
 /// Builds a signed member-add block that adds the caller's own DID, then
-/// POSTs it to `/_admin_v0_0_2/channels/<url-escaped slug>/members`.
+/// POSTs it to `/api/v1/channels/<url-escaped slug>/members`.
 pub async fn join(ctx: &CliContext, slug: String) -> Result<()> {
     let id = ctx.identity()?;
     let hlc = HlcTimestamp::now_wall(id.did().clone());
@@ -155,25 +180,7 @@ pub async fn join(ctx: &CliContext, slug: String) -> Result<()> {
 
     let base = base_http_url(&ctx.server_url()?);
     let escaped = escape_slug_for_url(&slug);
-    let url = format!("{base}/_admin_v0_0_2/channels/{escaped}/members");
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .context("building HTTP client for admin endpoint")?;
-    let resp = http
-        .post(&url)
-        .json(&submission_for(&block))
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
-    if !resp.status().is_success() {
-        anyhow::bail!(
-            "POST {url} returned {}: {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        );
-    }
-    let result: AdminResult = resp.json().await.context("decoding member-add response")?;
+    let result = post_channel_op(&base, &format!("/{escaped}/members"), &block).await?;
     println!("joined {slug} as {my_did}");
     println!("  block_cid: {}", result.block_cid);
 
@@ -250,7 +257,7 @@ fn confirmation_matches(input: &str, slug: &str) -> bool {
 /// Apply `jig channel delete <slug> [--yes]`.
 ///
 /// Builds a signed `channel-archive` block and POSTs it to
-/// `/_admin_v0_0_2/channels/<url-escaped slug>/archive`. The server accepts it
+/// `/api/v1/channels/<url-escaped slug>/archive`. The server accepts it
 /// only from the channel's owner DID.
 ///
 /// This is a soft delete: the channel stops appearing in `jig channel list` and
@@ -281,28 +288,7 @@ pub async fn delete(ctx: &CliContext, slug: String, yes: bool) -> Result<()> {
 
     let base = base_http_url(&ctx.server_url()?);
     let escaped = escape_slug_for_url(&slug);
-    let url = format!("{base}/_admin_v0_0_2/channels/{escaped}/archive");
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .context("building HTTP client for admin endpoint")?;
-    let resp = http
-        .post(&url)
-        .json(&submission_for(&block))
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
-    if !resp.status().is_success() {
-        anyhow::bail!(
-            "POST {url} returned {}: {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        );
-    }
-    let result: AdminResult = resp
-        .json()
-        .await
-        .context("decoding channel-archive response")?;
+    let result = post_channel_op(&base, &format!("/{escaped}/archive"), &block).await?;
     println!("channel deleted: {slug}");
     println!("  block_cid: {}", result.block_cid);
     println!("  history is retained server-side; the channel is no longer listed");
