@@ -129,9 +129,9 @@ enum Commands {
         action: ServerAction,
     },
 
-    /// Create, join, delete, or list channels on the configured server. Uses the
-    /// `/_admin_v0_0_2/*` admin endpoints in v0.0.2 (server must have
-    /// `[debug] admin_endpoints = true`); the list endpoint is public.
+    /// Create, join, delete, or list channels on the configured server via
+    /// `/api/v1/channels*` (falls back to the legacy `/_admin_v0_0_2/*` aliases
+    /// on servers that predate them).
     Channel {
         #[command(subcommand)]
         action: ChannelAction,
@@ -155,7 +155,7 @@ enum Commands {
 #[derive(Subcommand, Debug)]
 enum ChannelAction {
     /// Create a new channel. Builds a signed channel-create block and
-    /// POSTs it to `/_admin_v0_0_2/channels` on the configured server.
+    /// POSTs it to `/api/v1/channels` on the configured server.
     Create {
         /// Channel slug (e.g. `#hello`).
         #[arg()]
@@ -165,11 +165,15 @@ enum ChannelAction {
         /// `restricted` (membership-gated reads).
         #[arg(long, default_value = "open")]
         visibility: String,
+
+        /// Succeed (exit 0) if the channel already exists instead of failing.
+        #[arg(long)]
+        exist_ok: bool,
     },
 
     /// Join an existing channel by adding the caller's DID as a member.
     /// Builds a signed member-add block and POSTs it to
-    /// `/_admin_v0_0_2/channels/<slug>/members`.
+    /// `/api/v1/channels/<slug>/members`.
     ///
     /// Only `open` channels can be joined this way. A `restricted` channel is
     /// invite-only: its owner adds members, and a self-join is refused.
@@ -180,7 +184,7 @@ enum ChannelAction {
     },
 
     /// Delete (archive) a channel you own. Builds a signed channel-archive
-    /// block and POSTs it to `/_admin_v0_0_2/channels/<slug>/archive`.
+    /// block and POSTs it to `/api/v1/channels/<slug>/archive`.
     ///
     /// Soft delete: the server stops listing the channel but keeps its
     /// history, and only the channel's owner DID may do it.
@@ -475,12 +479,15 @@ async fn main() -> Result<()> {
     }
 
     // Handle channel subcommands early — they don't touch the legacy
-    // messaging HTTP client; they go straight to `/_admin_v0_0_2/*` or
-    // `/api/v1/channels` via reqwest.
+    // messaging HTTP client; they go straight to `/api/v1/channels*` via reqwest.
     if let Some(Commands::Channel { action }) = cli.command {
         match action {
-            ChannelAction::Create { slug, visibility } => {
-                cmd::channel::create(&ctx, slug, visibility).await?;
+            ChannelAction::Create {
+                slug,
+                visibility,
+                exist_ok,
+            } => {
+                cmd::channel::create(&ctx, slug, visibility, exist_ok).await?;
             }
             ChannelAction::Join { slug } => {
                 cmd::channel::join(&ctx, slug).await?;

@@ -22,8 +22,8 @@ anyhow = "1.0"
 thiserror = "1.0"
 
 # WASM Runtime
-wasmtime = { version = "47.0.4", features = ["cranelift", "pooling-allocator"] }
-wasmtime-wasi = { version = "47.0.4", optional = true }
+wasmtime = { version = "48.0.5", features = ["cranelift", "pooling-allocator"] }
+wasmtime-wasi = { version = "48.0.5", optional = true }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

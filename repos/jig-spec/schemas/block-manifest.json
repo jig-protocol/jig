@@ -239,8 +239,8 @@
       "properties": {
         "encryption": {
           "type": "string",
-          "enum": ["age+x25519", "none"],
-          "description": "Encryption scheme"
+          "enum": ["none", "mls"],
+          "description": "Encryption suite (src/encryption.md). v0.1 implementations refuse `mls` and anything unregistered with UNSUPPORTED_SUITE."
         },
         "recipients": {
           "type": "array",

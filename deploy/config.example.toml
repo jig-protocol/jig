@@ -110,15 +110,10 @@ banned_dids = []
 # score = 5
 
 [debug]
-# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-# REQUIRED FOR v0.0.2. `admin_endpoints = false` does not mount the
-# /_admin_v0_0_2/* router, and then `jig channel create` / `jig channel join`
-# fail with a bare 404 that looks like a wrong URL, a wrong port, or a broken
-# build. It is none of those — it is this line.
-# These routes run the same signature and ownership checks as every other
-# submit path; the flag is a label, not a bypass.
-# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-admin_endpoints = true
+# Channel ops (`jig channel create/join/delete`) live on /api/v1/channels and
+# are always mounted. This flag only adds the legacy /_admin_v0_0_2/* aliases
+# that pre-v0.1 `jig` CLIs POST to; turn it on while such clients remain.
+admin_endpoints = false
 # Handle enumeration stays off — it dumps the registry to any caller.
 list_handles = false
 

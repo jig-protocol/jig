@@ -236,16 +236,14 @@ The manifest is a JSON file describing the block. Here's what's in it:
 ```json
 {
   "privacy": {
-    "encryption": "age+x25519",
+    "encryption": "none",
     "recipients": ["did:jig:alice", "did:jig:bob"],
     "metadata_visibility": "public"
   }
 }
 ```
 
-**What this means:** The block content is encrypted using `age` (encryption tool) with X25519 keys. Only Alice and Bob can decrypt it. Metadata (who sent it, when, how much fuel it used) is public.
-
-**For developers:** Use this for E2EE workflows. Even the server executing the block can't see the plaintext—it runs on encrypted data and emits encrypted outputs.
+**What this means:** `encryption` names the block's [encryption suite](encryption.md#registry). It MUST be a registered suite this implementation implements; anything else is refused. v0.1 implements only `none`. MLS (`mls`) is reserved for v0.2. Metadata (who sent it, when, how much fuel it used) is visible to the server under every suite.
 
 ## Execution Lifecycle
 

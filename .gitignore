@@ -8,8 +8,27 @@ target/
 
 # Local config / secrets
 .env
-.env.local
-.claude/settings.local.json
+.env.*
+!.env.example
+*.pem
+*.key
+server.key
+
+# Agent and tracker tooling (local only; this repo is public)
+.claude/
+.cursor/
+CLAUDE.local.md
+.linear-bridge.json
+
+# Backups, patch leftovers, logs
+*.bak
+*.orig
+*.rej
+*.log
+
+# Test and benchmark output
+bakeoff_results.json
+repos/jig-nameserver/perf/results/
 
 # OS noise
 .DS_Store
@@ -20,7 +39,3 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
-
-# Internal / closed-source — kept in sibling jig-protocol-internal/, do NOT track here
-executable-internet-master-plan/
-gigue-ai/

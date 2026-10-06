@@ -568,7 +568,7 @@ tailscale ip -4
 sudoedit /etc/jig/config.toml
 #   set root-level  bind_address = "<the 100.x address>"   <- this is what binds
 #   set [server]    listen = "<the 100.x address>:7117"    <- decorative, but keep in sync
-#   leave [debug]   admin_endpoints = true                 <- REQUIRED or channel create 404s
+#   [debug] admin_endpoints = true only while pre-v0.1 jig CLIs still connect
 
 # 4. nameserver secret — MANDATORY, it panics at startup without one
 printf 'JIG_NS_SECRET=%s\n' "$(openssl rand -hex 32)" \

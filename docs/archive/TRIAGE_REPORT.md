@@ -138,37 +138,13 @@ The server:
 
 ## 4. Documentation Summary
 
-### `executable-internet-master-plan/00-README.md`
-
-The master plan index. Establishes four core pillars: executable-by-default blocks (Wasm), E2EE reputation/governance, curl-to-hello-world in 60s, and federated + integration-first architecture. Directs readers through five tiers of docs (vision → architecture → security → implementation → ecosystem). Working agreements require updating Tier docs before architecture-impacting code changes. **Status: Well-written, authoritative, current.**
-
-### `vision/EXECUTABLE_INTERNET_OVERVIEW.md`
-
-The manifesto. Argues browsers ossified around HTML/HTTP, AI-native workflows need provenance + deterministic replay, and Jig's innovation is "executable-by-default blocks" — Wasm modules carrying their own manifest, code, data, and proofs. Key open questions: which capability primitives ship in v1, how to encode privacy-preserving provenance for AI-generated blocks, what minimum tribunal interface is needed. **Status: Strategy is clear; open questions unresolved and not tracked elsewhere.**
-
-### `vision/GO_TO_MARKET_AND_DISTRIBUTION.md`
-
-Four growth loops: (1) domain onboarding Trojan Horse ("professional email" → DNS autoconfig → Jig block-backed mail), (2) CLI/hacker channels, (3) integration hub embedding (Linear, GitHub, PagerDuty connectors as blocks), (4) bridge-led expansion (email viral signature "Secured by Jig Block"). Rollout plan has five phases ending at AI/LLM lineage tracking. **Status: Strategy is sound; all dependencies are un-built (email bridge, DNS discovery, capability marketplace).**
-
-### `vision/PRODUCT_PILLARS_AND_METRICS.md`
-
-Five measurable pillars with specific KPIs: ≥90% block traffic share, ≥99.9% deterministic render rate, 95% curl-install success, bridge latency <200ms p95, <10min block authoring time. Instrumentation requirements call for anonymized telemetry schema across server/CLI/bridges feeding ClickHouse/Parquet. **Status: Good KPI spec; none of the measurement infrastructure exists yet.**
-
-### `vision/INTEGRATION_AND_PARTNERSHIPS.md`
-
-Priority integration categories: incident/DevOps (PagerDuty, Linear, GitHub), messaging bridges (IRC, Matrix, ActivityPub, ATProto), productivity (Cal, Notion, Slack migrator), email providers (Resend, Postmark, SendGrid). Roadmap: foundational alliances → developer toolchain → federated protocols → enterprise security. **Status: Aspirational; no connectors implemented.**
-
-### `executable-internet-master-plan/implementation/IMPL_PLAN.md`
-
-Repo-by-repo program plan. M0-M5 milestones (workspace reset through agent/GUI enablement). Per-crate checklists with ✅/☐ status. `jig-core` block schema ✅; Wasm validation utilities ☐. `jig-server` Wasmtime scaffold ✅, full execution/capability enforcement ☐, integration bus ☐, analytics ClickHouse sink PARTIAL. **Status: Useful tracking document; M1 mostly done, M2-M5 largely unstarted.**
-
 ### `IMPLEMENTATION_PLAN.md` (repo root)
 
 Cross-binary protocol alignment plan dated 2025-11-09. 50-task matrix covering Receipt v0.2 integration, analytics layer (ClickHouse + DuckDB/Parquet), server integration, pricing/metering, CLI parity, runtime symmetry, config alignment, nameserver integration, federation, testing. **All 50 tasks are "Not Started."** This is the clearest picture of the work queue; it's comprehensive but completely unexecuted.
 
 ### What Are NORAD Chats?
 
-**NORAD** stands for **Network Operations Redaction And Deletion** — a zero-trust cryptographic redaction protocol specified in `ADR-005` (archived under `executable-internet-master-plan/archive/legacy-block-plan/`). 
+**NORAD** stands for **Network Operations Redaction And Deletion** — a zero-trust cryptographic redaction protocol from an early design record. 
 
 NORAD chats are messages that carry a built-in cryptographic deletion capability: when all parties agree to redact a message, a threshold ceremony (requiring M-of-N participant signatures) reconstructs the encryption key, performs cryptographic deletion, and produces a verifiable proof of destruction. The protocol uses Shamir secret sharing, zero-knowledge proofs, and optionally hardware attestation (Intel SGX). 
 

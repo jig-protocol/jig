@@ -29,7 +29,7 @@ rest is preserved for its reasoning, not as a to-do list.
 | Nameserver alias API | Binary serves `GET /v1/challenge`, `POST /v1/register`, `GET /v1/resolve/:alias`, `/v1/rotate`, `/v1/renew`; `/v1/handles` gated behind `[debug] list_handles` | `jig-nameserver/src/server.rs` (merge at ~L1509) |
 | v0.0.1 REST gated off | `GET`/`POST /blocks`, `/blocks/:cid`, `/receipts/:cid` mount only under `dangerously_enable_v0_0_1_rest` (default false) | `jig-server/src/handler.rs::build_router` |
 | wasmtime | 47.0.3. The aarch64 sandbox-escape advisory is closed **by upgrade, not by suppression**. `pricing.schedule_version` is `0.2.0` because bulk memory ops are now billed per byte | `repos/Cargo.toml`, `jig-runtime/src/config.rs` |
-| MSRV | **1.94**, set by wasmtime 47 and inherited by `jig-runtime` + `jig-server` | `repos/Cargo.toml` |
+| MSRV | **1.95**, set by wasmtime 48 and inherited by `jig-runtime` + `jig-server` | `repos/Cargo.toml` |
 | Deploy assets | systemd units, hybrid config template, `VACUUM INTO` backup timer | `deploy/`, `deploy/README.md` |
 | History prefetch | `jig chat` and `jig tail` backfill the last 100 blocks before streaming; a failed fetch warns and opens empty rather than aborting | `jig-cli/src/cmd/history.rs`, `chat.rs` |
 | Readable output | `HH:MM` timestamps, a local `[contacts]` DID→name map in `cli.toml`, shortened DIDs when unknown, inbound bell | `jig-cli/src/cmd/display.rs`, `config.rs` |
@@ -316,9 +316,8 @@ alias registers and resolves across a restart; `jig chat '#hello'` opens with hi
 Unchanged from the 24h plan, plus: **the GUI entirely**, **`Frame::CatchUp` cursor replay**
 (REST "last 100" gets 95% of the value), **real in-client reconnect** (stream-close plus
 `scripts/jig-room.sh`'s `until` loop is indistinguishable at this scale, now that the
-clients exit non-zero), **flipping `[identity] mode` to nameserver** (a
-literal no-op today, and a live enforcement path the moment builders stamp nicknames — 12–20h),
-and **the master-plan doc refresh** (after, per DJ).
+clients exit non-zero), and **flipping `[identity] mode` to nameserver** (a
+literal no-op today, and a live enforcement path the moment builders stamp nicknames — 12–20h).
 
 ## Risks
 

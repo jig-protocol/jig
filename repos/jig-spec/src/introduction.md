@@ -6,6 +6,12 @@
 
 Welcome to the Jig Protocol spec!
 
+> **Status (v0.1).** Messages are signed, **not encrypted**: end-to-end encryption (MLS) is
+> specified in [Encryption](encryption.md) and ships in v0.2. Chapters describing unbuilt
+> features say so in a banner. v0.x makes **no compatibility guarantee**; see
+> [Versioning](versioning.md). Server operators are treated as untrusted; see the
+> [Threat Register](threat-register.md).
+
 Jig is a modern messaging protocol that brings IRC's simplicity into the 2025 era—with end-to-end encryption, executable blocks, and federation built in from day one.
 
 **Why another messaging protocol?** Good question. We love IRC's minimalism and scriptability, but it lacks modern privacy guarantees. We love Slack's UX, but it's a walled garden. Jig bridges that gap: it's IRC-compatible where it matters, but extends the model with cryptographic security, capability-based sandboxing, and cross-server federation.
@@ -64,11 +70,14 @@ This document is the **authoritative, implementation-agnostic** specification fo
 - **[Message Format](message-format.md)** – The envelope structure and content types
 - **[Block Execution Model](block-execution.md)** – How WebAssembly blocks run in sandboxes with fuel metering
 - **[Receipts](receipts.md)** – Deterministic proof of execution with outcome-based pricing
-- **[Crypto Primitives](crypto.md)** – Signatures, encryption, and key management
+- **[Versioning](versioning.md)** – Version gates and the v0.x compatibility policy
+- **[Crypto Primitives](crypto.md)** – Signatures, hashing, and key management
+- **[Encryption](encryption.md)** – Pluggable suites, MLS by default, DMs as locked channels
 - **[Federation](federation.md)** – Server-to-server protocol and receipt exchange
 - **[Transports](transports.md)** – IRC, WebSocket, Email, SSH adapters
 - **[Zero-Trust Model](zero-trust.md)** – Threat model and security requirements
 - **[Security Considerations](security.md)** – Mitigations, best practices, and known risks
+- **[Threat Register](threat-register.md)** – Decisions against malicious server operators
 - **[Appendix](appendix.md)** – Test vectors, affordances registry, analytics schemas
 
 ### Normative Language

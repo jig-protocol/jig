@@ -7,6 +7,7 @@ use crate::serde_helpers::{
     deserialize_cid, deserialize_cid_vec, deserialize_opt_cid, serialize_cid, serialize_cid_vec,
     serialize_opt_cid, to_canonical_json_bytes,
 };
+use crate::suite::{EncryptionSuite, SuiteNotImplemented};
 use cid::Cid;
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,19 @@ pub type HashHex = String;
 
 /// Default schema URI for Jig manifests.
 pub const DEFAULT_SCHEMA: &str = "https://jig.dev/schema/block-manifest/v0.1";
+
+/// Manifest schemas this implementation accepts. Anything else is refused by
+/// [`BlockManifest::check_gates`].
+pub const SUPPORTED_SCHEMAS: &[&str] = &[DEFAULT_SCHEMA];
+
+/// A manifest this implementation must refuse before reading any other field.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ManifestGateError {
+    #[error("unsupported manifest schema `{0}`")]
+    UnsupportedSchema(String),
+    #[error(transparent)]
+    SuiteNotImplemented(#[from] SuiteNotImplemented),
+}
 
 /// Visibility modes for metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -116,7 +130,7 @@ pub struct Attestation {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Privacy {
-    pub encryption: String,
+    pub encryption: EncryptionSuite,
     #[serde(default)]
     pub recipients: Vec<Did>,
     #[serde(default)]
@@ -208,8 +222,22 @@ impl BlockManifest {
         to_canonical_json_bytes(self)
     }
 
+    /// Refuse a manifest whose schema or encryption suite this implementation
+    /// does not speak. Callers run this before acting on any other field.
+    pub fn check_gates(&self) -> std::result::Result<(), ManifestGateError> {
+        if !SUPPORTED_SCHEMAS.contains(&self.schema.as_str()) {
+            return Err(ManifestGateError::UnsupportedSchema(self.schema.clone()));
+        }
+        if let Some(privacy) = &self.privacy {
+            privacy.encryption.ensure_implemented()?;
+        }
+        Ok(())
+    }
+
     /// Validate structural invariants.
     pub fn validate(&self) -> Result<()> {
+        self.check_gates()
+            .map_err(|e| JigError::Validation(e.to_string()))?;
         if self.authors.is_empty() {
             return Err(JigError::Validation(
                 "manifest must contain at least one author".into(),
@@ -552,6 +580,71 @@ mod tests {
             parsed.kind.is_none(),
             "legacy fixture should default kind to None (no kind key in fixture JSON)"
         );
+    }
+
+    fn privacy(encryption: EncryptionSuite) -> Privacy {
+        Privacy {
+            encryption,
+            recipients: vec![],
+            metadata_visibility: MetadataVisibility::Public,
+        }
+    }
+
+    #[test]
+    fn gates_accept_the_supported_schema_and_suite() {
+        let mut m = minimal_manifest();
+        assert_eq!(m.check_gates(), Ok(()));
+        m.privacy = Some(privacy(EncryptionSuite::Unencrypted));
+        assert_eq!(m.check_gates(), Ok(()));
+    }
+
+    #[test]
+    fn gates_refuse_an_unsupported_schema() {
+        let mut m = minimal_manifest();
+        m.schema = "https://jig.dev/schema/block-manifest/v0.2".into();
+        assert_eq!(
+            m.check_gates(),
+            Err(ManifestGateError::UnsupportedSchema(m.schema.clone()))
+        );
+        assert!(m.validate().is_err(), "validate must run the gates");
+        assert!(
+            BlockManifest::builder()
+                .schema("https://example.com/other")
+                .version(semver::Version::new(0, 1, 0))
+                .author(test_author())
+                .build()
+                .is_err(),
+            "the builder must not produce a manifest the gates refuse"
+        );
+    }
+
+    #[test]
+    fn gates_refuse_a_registered_but_unimplemented_suite() {
+        let mut m = minimal_manifest();
+        m.privacy = Some(privacy(EncryptionSuite::Mls));
+        assert_eq!(
+            m.check_gates(),
+            Err(ManifestGateError::SuiteNotImplemented(SuiteNotImplemented(
+                EncryptionSuite::Mls
+            )))
+        );
+    }
+
+    #[test]
+    fn unknown_privacy_suite_does_not_parse() {
+        let mut value = serde_json::to_value(minimal_manifest()).unwrap();
+        value["privacy"] = serde_json::json!({ "encryption": "age+x25519" });
+        assert!(serde_json::from_value::<BlockManifest>(value).is_err());
+    }
+
+    /// `none` was already the only sensible string value, so typing the field
+    /// must not move the canonical bytes, and with them the CID.
+    #[test]
+    fn typed_none_suite_serializes_as_the_former_string() {
+        let mut m = minimal_manifest();
+        m.privacy = Some(privacy(EncryptionSuite::Unencrypted));
+        let json = String::from_utf8(m.to_canonical_bytes().unwrap()).unwrap();
+        assert!(json.contains(r#""encryption":"none""#), "json={json}");
     }
 
     #[test]

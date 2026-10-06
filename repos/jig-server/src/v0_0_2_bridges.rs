@@ -273,6 +273,9 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         IngestError::BundleMalformed(m) => SubmitDenied::PolicyBlocked {
             reason: format!("bundle malformed: {m}"),
         },
+        ref e @ IngestError::ManifestGate(_) => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
         // PolicyBlocked, not Unavailable: retrying will not conjure the
         // channel. The bridge should bounce, and the operator should look at
         // why its ensure-channel step didn't run.
@@ -306,6 +309,10 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         },
         // The channel is gone for good; the bridge should bounce.
         ref e @ IngestError::ChannelArchived { .. } => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
+        // The slug is taken; retrying cannot change that.
+        ref e @ IngestError::ChannelExists { .. } => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },
         // This server refuses the block's author; a retry changes nothing.

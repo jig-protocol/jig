@@ -29,7 +29,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub dangerously_enable_v0_0_1_rest: bool,
     /// The origin to advertise at `/.well-known/jig`, e.g.
-    /// `https://jig-vps.tail323521.ts.net:7117`.
+    /// `https://jig-vps.example.ts.net:7117`.
     ///
     /// When unset, the origin is derived as `{scheme}://{bind_address}:{port}`
     /// with the scheme following `[tls] enabled`. That derivation is right for a
@@ -206,8 +206,8 @@ impl ServerConfig {
     ///
     /// `jig-server --config <file>` loads the same file into two unrelated
     /// types, so a template with only `ServerConfig` keys leaves
-    /// `JigServerConfig` on `::default()` — which means `admin_endpoints =
-    /// false` and a bare 404 from `jig channel create`.
+    /// `JigServerConfig` on `::default()` and gives the operator nothing to
+    /// edit for identity, auth or admission.
     pub fn write_template(path: impl AsRef<Path>) -> std::io::Result<()> {
         let defaults = Self::default();
         let mut template = toml::to_string_pretty(&defaults).map_err(std::io::Error::other)?;
@@ -251,8 +251,7 @@ impl ServerConfig {
 
 /// The `[server]`/`[identity]`/`[debug]` half of the hybrid config file, as
 /// commented TOML. Values track `JigServerConfig`'s own defaults so the
-/// template can't drift from them; `admin_endpoints` is the one deliberate
-/// departure (see the comment it emits).
+/// template can't drift from them.
 fn v0_0_2_template_sections(server: &ServerConfig) -> String {
     let defaults = jig_config::v0_0_2_server::JigServerConfig::default();
     let kinds = defaults
@@ -325,11 +324,9 @@ banned_dids = []
 # score = 5
 
 [debug]
-# Required: with admin_endpoints = false the /_admin_v0_0_2/* router is not
-# mounted and `jig channel create` fails with a bare 404 that looks like a
-# wrong URL or a broken build. These routes run the same signature and
-# ownership checks as everything else; the flag is a label, not a bypass.
-admin_endpoints = true
+# Channel ops live on /api/v1/channels and are always mounted. This flag only
+# adds the legacy /_admin_v0_0_2/* aliases that pre-v0.1 `jig` CLIs POST to.
+admin_endpoints = {admin_endpoints}
 # Handle enumeration stays off — it dumps the registry to any caller.
 list_handles = {list_handles}
 "#,
@@ -341,6 +338,7 @@ list_handles = {list_handles}
         kinds = kinds,
         cache_ttl = defaults.identity.cache_ttl_seconds,
         unknown_handles = defaults.identity.naively_allow_unknown_handles_fallback,
+        admin_endpoints = defaults.debug.admin_endpoints,
         list_handles = defaults.debug.list_handles,
     )
 }
@@ -497,12 +495,12 @@ connection_string = "{db}"
         // Half 1: the socket-opening half.
         let server = ServerConfig::load(&path).unwrap();
 
-        // Half 2: the v0.0.2 half. `--init-config` that omits it leaves
-        // admin_endpoints = false, and `jig channel create` 404s.
+        // Half 2: the v0.0.2 half. Channel ops are not debug-gated, so the
+        // template must not need (or switch on) the debug flag.
         let v002 = JigServerConfig::load(&path).unwrap();
         assert!(
-            v002.debug.admin_endpoints,
-            "template must enable admin_endpoints; without it `jig channel create` 404s"
+            !v002.debug.admin_endpoints,
+            "template must not enable the legacy admin aliases"
         );
         assert_eq!(
             v002.server.listen,
@@ -572,8 +570,14 @@ connection_string = "{db}"
 
         let v002: JigServerConfig = toml::from_str(&rendered).unwrap();
         assert!(
-            v002.debug.admin_endpoints,
-            "install.sh must enable admin_endpoints or the first-run `jig channel create` 404s"
+            !v002.debug.admin_endpoints,
+            "install.sh's default path must not depend on a [debug] flag"
+        );
+        assert!(
+            v002.unsafe_options_active()
+                .iter()
+                .all(|o| o != "debug.admin_endpoints"),
+            "install.sh must not advertise debug options"
         );
         assert_eq!(v002.server.listen, "127.0.0.1:7117");
         assert_eq!(

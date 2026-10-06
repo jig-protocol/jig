@@ -22,6 +22,7 @@ pub mod receipt;
 pub mod request_auth;
 mod serde_helpers;
 pub mod signing;
+pub mod suite;
 pub mod wasm_validation;
 
 pub use block_kind::{BlockKind, BlockKindError};
@@ -41,13 +42,14 @@ pub use hlc::HlcTimestamp;
 pub use lint::{BlockLintResult, allowlist_from_manifest, lint_block};
 pub use manifest::{
     Attestation, Author, BlockManifest, BlockManifestBuilder, Capability, Constraints,
-    MetadataVisibility, Privacy, Provenance, RenderDescriptor, Resource,
+    ManifestGateError, MetadataVisibility, Privacy, Provenance, RenderDescriptor, Resource,
 };
 pub use receipt::{
     BlockReceipt, BlockReceiptBuilder, Counters, CountersBuilder, HashAlgorithms, Limits, Outcome,
     OutcomeStatus, RECEIPT_METADATA_CLOCK_SOURCE, RECEIPT_SCHEMA_VERSION, ReasonCode, Timings,
 };
 pub use signing::BlockSignature;
+pub use suite::{EncryptionSuite, SuiteNotImplemented, UnknownSuite};
 pub use wasm_validation::{
     DeterminismPolicy, DeterminismReport, DeterminismViolation, HostImportAllowlist, check_imports,
     infer_limits, validate_determinism, verify_determinism,

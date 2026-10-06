@@ -107,11 +107,12 @@ pub mod metrics {
     /// Saturating decrement — a gauge that underflows to u64::MAX is worse
     /// than one that is briefly wrong.
     ///
-    /// Recent nightlies deprecate `fetch_update` in favour of `try_update` and
-    /// will suggest the rename. DO NOT APPLY IT: `try_update` is still gated
-    /// behind the unstable `atomic_try_update` feature on our MSRV (1.94), so
-    /// taking the suggestion breaks the build on the minimum toolchain we
-    /// declare. Revisit once `try_update` is stable at or below the MSRV.
+    /// Rust 1.99 deprecates `fetch_update` in favour of `try_update` and will
+    /// suggest the rename. DO NOT APPLY IT: `try_update` is not stable on our
+    /// MSRV (`rust-version` in repos/Cargo.toml), so taking the suggestion
+    /// breaks the build on the minimum toolchain we declare. Revisit, and drop
+    /// the `allow`, once `try_update` is stable at or below the MSRV.
+    #[allow(deprecated)]
     fn decrement(counter: &AtomicU64) {
         let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             Some(v.saturating_sub(1))
@@ -202,15 +203,18 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>
 /// Build a router that mounts the WSS endpoint on the v0.0.2 `AppState`.
 /// Mount this alongside (not instead of) the v0.0.1 `build_router`.
 ///
-/// When `state.config.debug.admin_endpoints` is true, the admin-only
-/// `/_admin_v0_0_2/*` routes are merged in. Otherwise those paths return 404.
+/// Channel ops (`POST /api/v1/channels*`) are always mounted. When
+/// `state.config.debug.admin_endpoints` is true, the legacy
+/// `/_admin_v0_0_2/*` aliases are merged in too; otherwise those paths 404.
 pub fn build_v0_0_2_router(state: Arc<AppState>) -> Router {
     let ws_router = Router::new()
         .route("/api/v1/ws", get(ws_handler))
         .with_state(state.clone());
 
-    // REST block endpoints are always active (not debug-gated).
-    let router = ws_router.merge(crate::v0_0_2_blocks::build_blocks_router(state.clone()));
+    // REST block and channel-op endpoints are always active (not debug-gated).
+    let router = ws_router
+        .merge(crate::v0_0_2_blocks::build_blocks_router(state.clone()))
+        .merge(crate::v0_0_2_admin::build_channel_ops_router(state.clone()));
 
     let mut router = if state.config.debug.admin_endpoints {
         router.merge(crate::v0_0_2_admin::build_admin_router(state.clone()))
@@ -365,21 +369,18 @@ async fn handle_client_frame(
     conn_id: u64,
     socket: &mut WebSocket,
 ) -> Result<(), String> {
-    let env: Envelope = match serde_json::from_str(text) {
+    let env: Envelope = match Envelope::parse(text) {
         Ok(e) => e,
         Err(e) => {
             // Best-effort error reply; ignore send failure (client may have gone away).
             // A malformed frame is the WS analogue of REST's 400 Bad Request:
             // the envelope itself never parsed, so no IngestError was ever
             // constructed for classify_ingest_error to classify.
-            let _ = send_error(
-                socket,
-                Some(400),
-                "BAD_JSON",
-                None,
-                &format!("envelope parse failed: {e}"),
-            )
-            .await;
+            let code = match &e {
+                jig_pipeline::envelope::EnvelopeParseError::Gate(gate) => gate.code(),
+                jig_pipeline::envelope::EnvelopeParseError::Malformed(_) => "BAD_JSON",
+            };
+            let _ = send_error(socket, Some(400), code, None, &e.to_string()).await;
             return Err(e.to_string());
         }
     };
@@ -1323,5 +1324,46 @@ mod tests {
             }
         }
         // Timeout is acceptable — primary assertion is the server didn't panic.
+    }
+
+    /// A well-formed frame at a version or suite this server does not speak is
+    /// refused with a code that says so, never processed and never reported as
+    /// garbage.
+    #[tokio::test]
+    async fn ws_refuses_unsupported_version_and_suite_by_code() {
+        let (_state, url) = start_test_server().await;
+        for (frame, expected) in [
+            (
+                r##"{"v":2,"op":"subscribe","scope":{"kind":"channel","slug":"#hello"}}"##,
+                "UNSUPPORTED_VERSION",
+            ),
+            (
+                r##"{"v":1,"suite":"mls","op":"subscribe","scope":{"kind":"channel","slug":"#hello"}}"##,
+                "UNSUPPORTED_SUITE",
+            ),
+            (
+                r##"{"v":1,"suite":"rot13","op":"subscribe","scope":{"kind":"channel","slug":"#hello"}}"##,
+                "UNSUPPORTED_SUITE",
+            ),
+        ] {
+            let (mut ws, _) = connect_async(&url).await.unwrap();
+            ws.send(TMessage::Text(frame.into())).await.unwrap();
+            let msg = tokio::time::timeout(Duration::from_secs(3), ws.next())
+                .await
+                .expect("timeout waiting for the refusal")
+                .expect("stream closed")
+                .expect("ws error");
+            let TMessage::Text(reply) = msg else {
+                panic!("expected text frame, got {msg:?}");
+            };
+            let env: Envelope = serde_json::from_str(&reply).unwrap();
+            match env.frame {
+                Frame::Error { status, code, .. } => {
+                    assert_eq!(code, expected, "frame: {frame}");
+                    assert_eq!(status, Some(400));
+                }
+                other => panic!("expected Error for {frame}, got {other:?}"),
+            }
+        }
     }
 }

@@ -19,14 +19,23 @@ sequence and the things that are not visible from inside a single file.
 
 ## 🔴 BACK UP `/var/lib/jig/server.key` OFFSITE. TODAY.
 
-**LOSING `/var/lib/jig/server.key` CHANGES THE SERVER DID AND BREAKS TOFU
-PINNING FOR EVERY CLIENT.**
+**LOSING `/var/lib/jig/server.key` CHANGES THE SERVER DID.**
 
-The server DID is derived from that 32-byte ed25519 seed. Every client that has
-talked to this server has pinned the resulting DID on first contact (TOFU). If
-the key is gone, the server comes back up with a **different identity**, and
-every client sees what is indistinguishable from a man-in-the-middle. Restoring
-a database without the key restores nothing useful.
+The server DID is derived from that 32-byte ed25519 seed. If the key is gone, the
+server comes back up with a **different identity**:
+
+- every receipt it signs from then on is under a new key, unlinkable to its
+  earlier receipts;
+- federation peers that list this server by `expected_did` now hold a stale value;
+- once clients pin the server DID on first contact (the mandatory handshake,
+  JEP-0002), every client will see what is indistinguishable from a
+  man-in-the-middle. Clients do not pin it yet, so today this is the next
+  release's problem, not an excuse to skip the backup.
+
+Restoring a database without the key restores nothing useful.
+
+User nickname pins (the server-side TOFU lock that binds a nickname to a user's
+DID) live in the database, not in the key, and survive a key loss.
 
 ```bash
 sudo base64 /var/lib/jig/server.key   # paste into 1Password, then forget it exists
@@ -121,10 +130,10 @@ tailnet:
 - **Federated peers are trusted.** Blocks relayed from a peer are persisted
   and delivered to local subscribers without running the write gate. Only
   federate with servers you would let post on your behalf.
-- **Admin endpoints still live behind `[debug]`.** `admin_endpoints = true`
-  (required, below) mounts the channel-ops routes. They run the same gates as
-  everything else now, so the risk is the label, not the behaviour — but do
-  not read "debug" as "harmless".
+- **Channel ops are on by default.** `POST /api/v1/channels*` is always
+  mounted and runs the same gates as every other write: anyone who can reach
+  the port can create an open channel. `[debug] admin_endpoints = true` only
+  adds the legacy `/_admin_v0_0_2/*` aliases for pre-v0.1 CLIs.
 - **No end-to-end encryption.** The operator reads every message. See
   `docs/RELEASE_READINESS.md` §1.3.
 - The nameserver's `/v1/register` has no auth beyond proof-of-control of a
@@ -177,7 +186,7 @@ enabling it.
 
 `jig-server --init-config <path>` writes a template equivalent to
 `config.example.toml` if you would rather generate it than copy it. It emits
-**both halves** of the hybrid file, including `[debug] admin_endpoints = true`.
+**both halves** of the hybrid file.
 
 ### Verify the deploy
 
@@ -248,7 +257,7 @@ which is exactly why editing the wrong half produces no error and no effect.
 **An explicitly-passed `--config` that fails to parse is now FATAL.** The server
 logs `[jig-server] FATAL: v0.0.2 config load from … failed` to both tracing and
 stderr and exits `1`. It no longer falls back to defaults, which used to mint a
-fresh server DID and break TOFU for everyone. A missing `--config` still means
+fresh server DID (see the top of this file). A missing `--config` still means
 "use defaults" — that path is legitimate and unchanged.
 
 Three landmines, all called out in `config.example.toml`:
@@ -256,9 +265,10 @@ Three landmines, all called out in `config.example.toml`:
 - **`[server] listen` is DECORATIVE.** It only builds the `ws://…` origin-tag
   string. It does **not** control the bind address. The server now logs a
   startup `WARN` when `listen` disagrees with the effective `bind_address:port`.
-- **`[debug] admin_endpoints = true` is REQUIRED.** With it false, the
-  `/_admin_v0_0_2/*` router is never mounted and `jig channel create` returns a
-  bare **404** that looks like a wrong URL, wrong port, or a bad build.
+- **`[debug] admin_endpoints` is no longer required.** Current CLIs use
+  `/api/v1/channels*`, which is always mounted. Set it to `true` only while
+  pre-v0.1 `jig` binaries (which POST to `/_admin_v0_0_2/*`) still talk to this
+  server.
 - **`dangerously_enable_v0_0_1_rest` defaults to `false`, and should stay false.**
   It gates the unsigned v0.0.1 REST surface (`GET`/`POST /blocks`,
   `/blocks/:cid`, `/receipts/:cid`), which takes an attacker-chosen author DID
@@ -517,6 +527,6 @@ publicly — `.jig` is not an IANA TLD.
   separate blast radius.
 - **Building on the VPS needs a toolchain first.** A fresh box has no rustup, no
   C compiler, and no pkg-config; `ring` needs a C compiler. The workspace MSRV
-  is **1.94** (`jig-runtime` and `jig-server` inherit it), set by wasmtime 47.
+  is **1.95** (`jig-runtime` and `jig-server` inherit it), set by wasmtime 48.
   A 1 vCPU box wants ~2 GB of swap and 45–90 minutes. Cross-building on your Mac
   and copying the binary over is usually the better trade.

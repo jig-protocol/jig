@@ -1,7 +1,7 @@
 # Receipt v0.2 Implementation — COMPLETE ✅
 
 **Completed:** 2025-11-02  
-**Spec:** `../../executable-internet-master-plan/architecture/BLOCK_RUNTIME_SPEC.md` (lines 115-162)  
+**Spec:** [`repos/jig-spec/src/receipts.md`](../../jig-spec/src/receipts.md)  
 **Status:** Fully backwards-compatible, ready for outcome-based pricing
 
 ## Summary
@@ -325,7 +325,7 @@ assert_eq!(local_receipt.render_hash, server_receipt.render_hash);
 **Schema mapping:**
 - `receipts` table gets new columns for counters/timings/limits/outcome
 - `receipt_capability_counters` table for fuel attribution
-- See `20251102_REVIEW.md` lines 76-143 for full schema
+- See [`ANALYTICS_SCHEMA.md`](../analytics/ANALYTICS_SCHEMA.md) for the full schema
 
 ## Files Changed
 
@@ -340,8 +340,7 @@ assert_eq!(local_receipt.render_hash, server_receipt.render_hash);
 
 ## Spec Alignment
 
-✅ **BLOCK_RUNTIME_SPEC.md** - Receipt schema matches lines 115-162  
-✅ **20251102_REVIEW.md** - All punch-list items for jig-core complete  
+✅ **`jig-spec/src/receipts.md`** - Receipt schema matches  
 ✅ **Backwards compatible** - v0.1 receipts parse correctly  
 ✅ **Ready for server integration** - Types exported and tested  
 

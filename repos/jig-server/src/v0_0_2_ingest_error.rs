@@ -37,6 +37,14 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
             "manifest must declare block kind".to_string(),
         ),
         IngestError::BundleMalformed(m) => (StatusCode::BAD_REQUEST, "BUNDLE_MALFORMED", m.clone()),
+        IngestError::ManifestGate(gate) => (
+            StatusCode::BAD_REQUEST,
+            match gate {
+                jig_core::ManifestGateError::UnsupportedSchema(_) => "UNSUPPORTED_SCHEMA",
+                jig_core::ManifestGateError::SuiteNotImplemented(_) => "UNSUPPORTED_SUITE",
+            },
+            gate.to_string(),
+        ),
         // 404, not 400: the request is well-formed, the named channel isn't here.
         IngestError::UnknownChannel { .. } => {
             (StatusCode::NOT_FOUND, "UNKNOWN_CHANNEL", e.to_string())
@@ -65,6 +73,11 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         // client sees one word for "not yours to change" whichever door it used.
         IngestError::DuplicateBlock { .. } => {
             (StatusCode::CONFLICT, "DUPLICATE_BLOCK", e.to_string())
+        }
+        // 409: the request is fine, the slug is taken. Clients treat it as
+        // "already there" (install.sh re-runs rely on that).
+        IngestError::ChannelExists { .. } => {
+            (StatusCode::CONFLICT, "CHANNEL_EXISTS", e.to_string())
         }
         // 403 and the same word the read gates use: the caller authenticated
         // fine, this server simply will not deal with them.
@@ -115,6 +128,12 @@ mod tests {
             },
             IngestError::KindRequired,
             IngestError::BundleMalformed("bad tuple".to_string()),
+            IngestError::ManifestGate(jig_core::ManifestGateError::UnsupportedSchema(
+                "https://example.com/v9".to_string(),
+            )),
+            IngestError::ManifestGate(jig_core::ManifestGateError::SuiteNotImplemented(
+                jig_core::SuiteNotImplemented(jig_core::EncryptionSuite::Mls),
+            )),
             IngestError::UnknownChannel {
                 slug: "#nope".to_string(),
             },
@@ -144,6 +163,9 @@ mod tests {
             },
             IngestError::ChannelArchived {
                 slug: "#retired".to_string(),
+            },
+            IngestError::ChannelExists {
+                slug: "#taken".to_string(),
             },
             IngestError::NotAdmitted {
                 sender: "did:jig:zBad".to_string(),

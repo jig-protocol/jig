@@ -81,7 +81,7 @@ let caps = capabilities![
 See also:
 
 - `repos/jig-docs/core/RECEIPT_V0_2.md` for receipt structure, counters, timings, and validation rules.
-- `executable-internet-master-plan/architecture/BLOCK_RUNTIME_SPEC.md` for runtime semantics and on-wire examples.
+- `repos/jig-spec/src/block-execution.md` for runtime semantics and on-wire examples.
 
 ## Quick Start
 

@@ -55,15 +55,7 @@
 
 - No pricing policy (policy left to implementations)
 - No deployment profiles (that's in jig-config)
-- No confidential strategy
-
-### What Stays in executable-internet-master-plan (CONFIDENTIAL)
-
-📁 **Strategic Planning:**
-
-- BLOCK_RUNTIME_SPEC.md (includes pricing examples - moved to jig-spec)
-- 20251102_REVIEW.md (internal review)
-- Implementation sequencing decisions
+- No product strategy
 
 ### What's in jig-docs (TRANSIENT)
 
@@ -78,10 +70,10 @@
 ## Data Flow Summary
 
 ```
-CONFIDENTIAL (master-plan)              PUBLIC (jig-spec)              TRANSIENT (jig-docs)
-└─ Strategic decisions           →      └─ Protocol spec        ←      └─ Implementation notes
-   └─ Pricing strategy examples          └─ Schema definitions          └─ Task checklists
-   └─ Sequencing plans                   └─ Affordances                 └─ Integration guides
+PUBLIC (jig-spec)              TRANSIENT (jig-docs)
+└─ Protocol spec        ←      └─ Implementation notes
+   └─ Schema definitions          └─ Task checklists
+   └─ Affordances                 └─ Integration guides
 ```
 
 ---
@@ -206,23 +198,20 @@ CONFIDENTIAL (master-plan)              PUBLIC (jig-spec)              TRANSIENT
 
 ## File Locations Reference
 
-| Content               | Location (PUBLIC)                 | Location (CONFIDENTIAL)                                    | Location (TRANSIENT)                     |
-| --------------------- | --------------------------------- | ---------------------------------------------------------- | ---------------------------------------- |
-| Block execution spec  | `jig-spec/src/block-execution.md` | `master-plan/architecture/BLOCK_RUNTIME_SPEC.md`           | -                                        |
-| Receipt v0.2 spec     | `jig-spec/src/receipts.md`        | (embedded in BLOCK_RUNTIME_SPEC)                           | `jig-docs/core/RECEIPT_V0_2.md`          |
-| Canonical affordances | `jig-spec/src/appendix.md`        | (embedded in BLOCK_RUNTIME_SPEC)                           | -                                        |
-| Analytics schema      | `jig-spec/src/appendix.md`        | (embedded in 20251102_REVIEW)                              | `jig-docs/analytics/ANALYTICS_SCHEMA.md` |
-| Pricing examples      | -                                 | `master-plan/architecture/BLOCK_RUNTIME_SPEC.md` (sec 4.2) | -                                        |
-| Implementation plan   | -                                 | -                                                          | `IMPLEMENTATION_PLAN.md`                 |
-
-**Note:** Confidential files may reference public spec but public spec must never reference confidential content.
+| Content               | Location (PUBLIC)                 | Location (TRANSIENT)                     |
+| --------------------- | --------------------------------- | ---------------------------------------- |
+| Block execution spec  | `jig-spec/src/block-execution.md` | -                                        |
+| Receipt v0.2 spec     | `jig-spec/src/receipts.md`        | `jig-docs/core/RECEIPT_V0_2.md`          |
+| Canonical affordances | `jig-spec/src/appendix.md`        | -                                        |
+| Analytics schema      | `jig-spec/src/appendix.md`        | `jig-docs/analytics/ANALYTICS_SCHEMA.md` |
+| Implementation plan   | -                                 | `IMPLEMENTATION_PLAN.md`                 |
 
 ---
 
 ## Success Metrics
 
 ✅ **Spec Completeness:** Block execution + receipts now fully documented
-✅ **Public Readiness:** No confidential content in public repo
+✅ **Public Readiness:** No product-strategy content in the spec
 ✅ **Implementation Alignment:** Spec matches jig-core v0.2.0 exactly
 ✅ **Cross-Team Utility:** All teams can reference authoritative public spec
 

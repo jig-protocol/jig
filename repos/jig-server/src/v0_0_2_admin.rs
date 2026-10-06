@@ -1,12 +1,16 @@
-//! `/_admin_v0_0_2/*` debug-gated REST endpoints — synthetic-block
-//! factories for v0.0.2 channel ops. Clients sign a channel-create or
-//! member-add bundle locally and POST it here; the server runs it
-//! through the v0.0.2 ingest pipeline as if it had arrived via WSS.
+//! Channel-op REST endpoints — synthetic-block factories for channel
+//! create / member-add / archive. Clients sign the bundle locally and POST
+//! it here; the server runs it through the shared ingest pipeline as if it
+//! had arrived via WSS (signature, admission, write gate, ownership).
 //!
-//! These endpoints exist because v0.0.2 doesn't yet have Wasm-executed
-//! channel ops (that lands in v0.0.3+). They're an admin-only short
-//! path to mutate channel + membership state. Mounting is gated on
-//! `[debug] admin_endpoints = true` in the server config.
+//! Two mounts of the same handlers:
+//! * `/api/v1/channels*` — always mounted ([`build_channel_ops_router`]).
+//!   The signed block is the authorization, so there is nothing for a
+//!   config flag to protect, and the default install must be able to
+//!   create `#hello`.
+//! * `/_admin_v0_0_2/channels*` — the legacy aliases older CLIs POST to,
+//!   still gated on `[debug] admin_endpoints = true`
+//!   ([`build_admin_router`]).
 
 use std::sync::Arc;
 
@@ -278,8 +282,19 @@ pub async fn archive_channel(
     Ok(Json(AdminResult { block_cid: cid }))
 }
 
-/// Build the admin-only sub-router. Caller is responsible for gating this
-/// on `state.config.debug.admin_endpoints`.
+/// The channel-op routes on the stable API surface. Always mounted.
+/// `POST /api/v1/channels` shares its path with the `GET` list route in
+/// `v0_0_2_blocks`; axum merges the two method routers.
+pub fn build_channel_ops_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/api/v1/channels", post(create_channel))
+        .route("/api/v1/channels/:slug/members", post(add_member))
+        .route("/api/v1/channels/:slug/archive", post(archive_channel))
+        .with_state(state)
+}
+
+/// The legacy `/_admin_v0_0_2/*` aliases. Caller is responsible for gating
+/// this on `state.config.debug.admin_endpoints`.
 pub fn build_admin_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/_admin_v0_0_2/channels", post(create_channel))

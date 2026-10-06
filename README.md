@@ -28,6 +28,12 @@ loopback and private tailnets.
 
 **Read this before running it anywhere reachable:**
 
+- **v0.x makes no compatibility guarantee.** Any v0.x release may change the wire format,
+  manifests, receipts or configuration without a migration path. What v0.x does promise is
+  that a mismatch is refused, not misread: the envelope version, manifest schema and
+  encryption suite are checked, and anything unsupported is rejected
+  ([`repos/jig-spec/src/versioning.md`](repos/jig-spec/src/versioning.md)).
+
 - **No encryption of message content.** Blocks are *signed*, never encrypted. There is no
   E2EE and no per-message confidentiality. Anything on the wire without an outer TLS
   tunnel is plaintext, and the server stores plaintext.
@@ -38,8 +44,8 @@ loopback and private tailnets.
   [`jig-pipeline/src/authorize_write.rs`](repos/jig-pipeline/src/authorize_write.rs)).
   What is missing is any way to refuse a caller *before* those gates: any self-minted key
   is admitted, there is no rate limiting, and blocks relayed by a federated peer are
-  trusted. The `/_admin_v0_0_2/*` channel-ops routes run the same gates but still mount
-  behind a `[debug]` flag.
+  trusted. Channel ops (`POST /api/v1/channels*`) run the same gates and need no
+  `[debug]` flag.
 - **No graphical client.** `repos/jig-gui/` (Riverdance) is a Dioxus scaffold around a
   mocked chat UI. It depends on neither `jig-core` nor `jig-client` and never opens a
   connection — it is a design mock, not a client.
@@ -63,24 +69,26 @@ loopback and private tailnets.
 | Wasm block execution **on the server** | `text-render` executes for real: the server runs its canonical module and signs the `render_hash` ([`jig-pipeline/src/ingest.rs`](repos/jig-pipeline/src/ingest.rs), step 4). Control-plane kinds still take a synthetic, server-signed receipt |
 | Wasm block execution in the CLI (`jig block run`) | Runs and emits a metered receipt for the runtime's own fixtures. It **rejects the workspace's own `text-block` build** with `MemoryMissingMaximum` from the determinism validator |
 | `jig block lint` / `sign` / `verify` / `capabilities` | Stubs; they print "not yet implemented" and exit 1 |
-| End-to-end encryption | None |
+| End-to-end encryption | None. MLS is planned for v0.2. Every frame and manifest already names its encryption suite; `none` is the only one accepted ([spec](repos/jig-spec/src/encryption.md)) |
 | Authentication / authorization | Signed proof of possession on every read; `restricted` channels membership-gated for reading, listing, live delivery and posting; membership changes owner-signed. **No admission policy or rate limiting** — any key is admitted |
 | Graphical client | None |
 | `jig read` | Broken by default — it calls the v0.0.1 `GET /blocks` route, which is gated off behind `dangerously_enable_v0_0_1_rest`. Use `jig chat`, `jig tail`, or the history endpoint |
 | `jig --version` | Not implemented (`jig-server --version` is) |
-| Prebuilt release binaries | None published. `install.sh`'s download path targets `releases.jig.onl`, which does not serve anything |
+| Prebuilt release binaries | `release.yml` builds static musl Linux (x86_64, aarch64) and Apple Silicon macOS tarballs with a signed `SHA256SUMS`, gated on the install smoke test. No real tag has been cut with it yet; the repo is private, so anonymous downloads don't work |
 
-Design targets that have **not been measured** and should not be read as results: 10,000
-messages/second on a $5 VPS, and a 60-second `curl … | sh` install. The benchmark
-procedure for the second is written down in
-[`docs/deployment/install-benchmark.md`](docs/deployment/install-benchmark.md) and has not
-been run.
+A design target that has **not been measured** and should not be read as a result: 10,000
+messages/second on a $5 VPS.
+
+The 60-second `curl … | bash` install **is** measured: on 2026-10-05, installing a published
+test release took 3.5s on Linux x86_64 and 3.2s on Apple Silicon (GitHub-hosted runners),
+from `curl` to "hello, world" accepted in `#hello`. CI fails above 60s; see
+[`docs/deployment/install-benchmark.md`](docs/deployment/install-benchmark.md).
 
 ---
 
 ## Quickstart
 
-Requires Rust **1.94+** (MSRV is set by wasmtime 47). Build the two binaries:
+Requires Rust **1.95+** (MSRV is set by wasmtime 48); `rust-toolchain.toml` pins the exact toolchain CI uses, and rustup picks it up automatically. Build the two binaries:
 
 ```bash
 git clone https://github.com/jig-protocol/jig
@@ -119,12 +127,20 @@ stand-in.
 
 ### About `install.sh`
 
-[`install.sh`](install.sh) at the repo root automates the above and hands off to
-`jig chat`. Its **download path is dead** — no release tarballs have been published, and
-`releases.jig.onl` does not serve — so only its source-checkout branch works. That branch
-does work end to end, but it runs the same `cargo build --release` you can run yourself,
-so it takes minutes rather than the 60 seconds the KPI comment at the top of the file
-describes. Treat the manual quickstart above as the supported path.
+[`install.sh`](install.sh) at the repo root automates the above with no `[debug]` flag
+and no prompts:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jig-protocol/jig/main/install.sh | bash
+# private repo: JIG_GITHUB_TOKEN=$(gh auth token) bash install.sh
+```
+
+It downloads `jig-<os>-<arch>.tar.gz` from the newest GitHub Release (`JIG_VERSION=<tag>` to
+pin), verifies `SHA256SUMS.sig` with `ssh-keygen -Y` against the pinned release key and the
+tarball against `SHA256SUMS`, and installs into `~/.jig/bin`. It then starts `jig-server` on
+`127.0.0.1:7117`, creates `#hello`, posts "hello, world", and opens `jig chat` if a terminal
+is attached. `JIG_INSTALL_FROM=source` builds from a checkout instead (minutes, not seconds).
+The knobs are listed at the top of the script.
 
 ---
 
@@ -151,7 +167,7 @@ and lives at the repo root.
 | [`jig-gui`](repos/jig-gui/) | Riverdance — a Dioxus scaffold with a mocked chat UI, wired to no jig crate. **Not a working client** |
 
 Not Cargo members: [`repos/jig-spec/`](repos/jig-spec/) — an mdBook protocol spec, still
-draft scaffolding, licensed CC BY-SA 4.0 — and [`repos/jig-docs/`](repos/jig-docs/), a
+draft scaffolding, licensed CC-BY-4.0 — and [`repos/jig-docs/`](repos/jig-docs/), a
 holding area of per-milestone working notes.
 
 ## Building and testing
@@ -187,14 +203,17 @@ CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs three jobs: `wo
 | Know exactly what shipped and what did not | the STATUS section of [`docs/deployment/internal-dogfood-3day.md`](docs/deployment/internal-dogfood-3day.md) |
 | Find any doc in the repo, with a currency label | [`docs/README.md`](docs/README.md) |
 | Understand why something is shaped the way it is | [`docs/superpowers/`](docs/superpowers/) |
-| Work on the code with an agent | [`CLAUDE.md`](CLAUDE.md) / [`AGENTS.md`](AGENTS.md) |
+| Report a vulnerability | [`SECURITY.md`](SECURITY.md) (security@jig.onl) |
+| Know what a hostile server operator can and cannot do | the [threat register](repos/jig-spec/src/threat-register.md) and [`docs/security/`](docs/security/operator-threat-model.md) |
 
-Back up `server.key` before you do anything else — losing it changes the server's DID and
-breaks TOFU pinning for every client that has ever connected. `deploy/README.md` opens with
-this for a reason.
+Back up `server.key` before you do anything else. Losing it changes the server's DID, so
+the server comes back as a different identity: its receipts are signed by a new key, and
+federation peers that list it by `expected_did` hold a stale value. Clients do not pin the
+server's DID yet. Once they do (the handshake in JEP-0002 and threat-register OP-08), a
+lost key will look like a man-in-the-middle to every client. `deploy/README.md` opens
+with this for a reason.
 
-There is no `CONTRIBUTING.md` for the implementation yet;
-[`repos/jig-spec/CONTRIBUTING.md`](repos/jig-spec/CONTRIBUTING.md) covers the spec only.
+[`CONTRIBUTING.md`](CONTRIBUTING.md) covers the implementation, the DAG rule, and how to send a change. [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) is the community standard. [`repos/jig-spec/CONTRIBUTING.md`](repos/jig-spec/CONTRIBUTING.md) is the spec-only guide.
 
 ## License
 
@@ -214,7 +233,7 @@ Two deliberate exceptions:
 | Scope | Licence | Why |
 | --- | --- | --- |
 | [`repos/jig-gui/`](repos/jig-gui/NOTICE.md) (Riverdance) | **None granted yet** | A client application, not protocol surface. Copyleft or source-available may be the right answer; the call has not been made. Default copyright applies until it is. |
-| [`repos/jig-spec/`](repos/jig-spec/) | CC BY-SA 4.0 | The written specification, not code. Under review — share-alike on a spec can impede the implementations the permissive code licence is meant to encourage. |
+| [`repos/jig-spec/`](repos/jig-spec/) | CC-BY-4.0 | The written specification, not code. Attribution only, no share-alike, so implementation guides and second implementations can reuse the text freely. |
 
 ### Contribution
 

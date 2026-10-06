@@ -790,6 +790,68 @@ mod tests {
         assert_eq!(slugs, vec!["#alpha", "#mike", "#zulu"]);
     }
 
+    /// The default config (no `[debug]` section) must carry the whole
+    /// install.sh hello-world: create `#hello`, list it, post to it. The
+    /// legacy `/_admin_v0_0_2/*` aliases stay behind the debug flag.
+    #[tokio::test]
+    async fn channel_ops_work_without_the_debug_flag() {
+        use jig_client::blocks::build_channel_create;
+
+        let state = Arc::new(unauthenticated_state());
+        assert!(!state.config.debug.admin_endpoints);
+        let router = crate::v0_0_2_ws::build_v0_0_2_router(state.clone());
+
+        let id = test_identity();
+        let block = build_channel_create(&id, "#hello", "open", test_hlc(&id));
+        let submission = serde_json::json!({
+            "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
+            "sig_b64":    base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
+        });
+
+        let (status, _) = post_json(
+            router.clone(),
+            "/_admin_v0_0_2/channels",
+            submission.clone(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "legacy alias must stay debug-gated"
+        );
+
+        let (status, body) = post_json(router.clone(), "/api/v1/channels", submission).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "create via /api/v1/channels: {body}"
+        );
+        assert!(body["block_cid"].is_string());
+
+        let (status, body) = get_path(router.clone(), "/api/v1/channels").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["channels"][0]["slug"], "#hello");
+
+        let mut hlc = test_hlc(&id);
+        hlc.logical = 1;
+        let again = build_channel_create(&id, "#hello", "open", hlc);
+        let submission = serde_json::json!({
+            "bundle_b64": base64::engine::general_purpose::STANDARD.encode(again.canonical_bytes()),
+            "sig_b64":    base64::engine::general_purpose::STANDARD.encode(&again.sender_sig),
+        });
+        let (status, body) = post_json(router.clone(), "/api/v1/channels", submission).await;
+        assert_eq!(status, StatusCode::CONFLICT, "re-create: {body}");
+        assert_eq!(body["code"], "CHANNEL_EXISTS");
+
+        let msg = build_text_render(&id, "#hello", "hello, world", test_hlc(&id));
+        let submission = serde_json::json!({
+            "bundle_b64": base64::engine::general_purpose::STANDARD.encode(msg.canonical_bytes()),
+            "sig_b64":    base64::engine::general_purpose::STANDARD.encode(&msg.sender_sig),
+        });
+        let (status, body) = post_json(router, "/api/v1/blocks", submission).await;
+        assert_eq!(status, StatusCode::OK, "hello, world: {body}");
+    }
+
     // ---- channel history tests ------------------------------------------
 
     /// Submit `texts` to `slug` in order, each with a distinct HLC logical

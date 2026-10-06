@@ -139,6 +139,5 @@ WasiCtxBuilder::new()
 
 ## See Also
 
-- `architecture/EXECUTION_ENVIRONMENT.md` - Runtime requirements
-- `architecture/BLOCK_RUNTIME_SPEC.md` - Block manifest and capabilities
+- `repos/jig-spec/src/block-execution.md` - Runtime requirements, block manifest and capabilities
 - `src/capabilities.rs` - Capability implementation

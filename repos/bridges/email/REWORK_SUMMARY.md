@@ -141,11 +141,7 @@ Emails are converted to blocks with semantic metadata:
 - `src/resend_client.rs` - Updated to use EmailMessage
 - `Cargo.toml` - Added uuid and semver dependencies
 
-## Alignment with Master Plan
-
-This rework directly implements recommendations from:
-- `executable-internet-master-plan/archive/working-docs/EMAIL_BRIDGE_STATUS_AND_NEXT_STEPS.md`
-- `executable-internet-master-plan/archive/working-docs/EMAIL_BRIDGE_IMPLEMENTATION_SUMMARY.md`
+## Outcomes
 
 ### Key Achievements
 ✅ Removed dependency on non-existent `jig_core::JigMessage`
@@ -155,7 +151,7 @@ This rework directly implements recommendations from:
 ✅ Preserved thread tracking capabilities
 ✅ Maintained viral signature support
 
-### Master Plan Compliance
+### Design Alignment
 - **Core Pillar #1**: Email messages are now "executable-by-default blocks" with embedded metadata
 - **Core Pillar #3**: Maintains "potato-friendly" approach with SQLite and minimal deps
 - **Core Pillar #4**: Bridges email as integration-first transport alongside IRC/SSH/WebSockets

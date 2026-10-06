@@ -2,9 +2,9 @@
 # Real Integration Test for jig-bridge-email
 #
 # This test spins up actual jig-servers and tests the full three-pronged flow:
-# 1. Jig <> Jig: dj@gigue.ai <-> dev@jig.onl via native protocol
-# 2. Email -> Jig: supabase@gigue.app -> dev@jig.onl (manual email send + verification)
-# 3. Jig -> Email: dev@jig.onl -> supabase@gigue.app via Resend API
+# 1. Jig <> Jig: bridge@jig.onl <-> dev@jig.onl via native protocol
+# 2. Email -> Jig: you@example.com -> dev@jig.onl (manual email send + verification)
+# 3. Jig -> Email: dev@jig.onl -> you@example.com via Resend API
 #
 # Requirements:
 # - .env.local with RESEND_API_KEY and email addresses
@@ -21,10 +21,10 @@ BUILD_DIR="$PROJECT_ROOT/target/debug"
 if [ ! -f "$SCRIPT_DIR/.env.local" ]; then
     echo "❌ Error: .env.local not found in $SCRIPT_DIR"
     echo "Please create .env.local with:"
-    echo "  JIG_SENDER_EMAIL=dj@gigue.ai"
+    echo "  JIG_SENDER_EMAIL=bridge@jig.onl"
     echo "  JIG_RECIPIENT_EMAIL=dev@jig.onl"
-    echo "  FOREIGN_SENDER_EMAIL=supabase@gigue.app"
-    echo "  FOREIGN_RECIPIENT_EMAIL=supabase@gigue.app"
+    echo "  FOREIGN_SENDER_EMAIL=you@example.com"
+    echo "  FOREIGN_RECIPIENT_EMAIL=you@example.com"
     echo "  RESEND_API_KEY=re_..."
     exit 1
 fi
@@ -103,8 +103,8 @@ fi
 log_success "Build complete"
 echo ""
 
-# Start jig-server #1 (for dj@gigue.ai)
-log_step "Step 1: Starting jig-server #1 (dj@gigue.ai) on port 7117..."
+# Start jig-server #1 (for bridge@jig.onl)
+log_step "Step 1: Starting jig-server #1 (bridge@jig.onl) on port 7117..."
 "$BUILD_DIR/jig-server" \
     --database "$SERVER1_DB" \
     --http-port 7117 \
@@ -176,7 +176,7 @@ EOF
 log_success "Bridge configuration created"
 echo ""
 
-# TEST 1: Jig <> Jig routing (dj@gigue.ai -> dev@jig.onl)
+# TEST 1: Jig <> Jig routing (bridge@jig.onl -> dev@jig.onl)
 log_step "═══════════════════════════════════════════════════════"
 log_step "TEST 1: Jig <> Jig Routing (Native Protocol)"
 log_step "═══════════════════════════════════════════════════════"
@@ -193,7 +193,7 @@ log_info "Posting block to server 2 (simulating DNS discovery result)..."
 BLOCK_DATA=$(cat <<'JSONEOF'
 {
   "version": "0.1.0",
-  "authors": [{"did": "did:jig:dj@gigue.ai", "roles": ["sender"]}],
+  "authors": [{"did": "did:jig:bridge@jig.onl", "roles": ["sender"]}],
   "metadata": {
     "type": "email",
     "from": "'$JIG_SENDER_EMAIL'",
@@ -237,7 +237,7 @@ else
 fi
 echo ""
 
-# TEST 2: Email -> Jig (supabase@gigue.app -> dev@jig.onl)
+# TEST 2: Email -> Jig (you@example.com -> dev@jig.onl)
 log_step "═══════════════════════════════════════════════════════"
 log_step "TEST 2: Email -> Jig (Inbound Email Processing)"
 log_step "═══════════════════════════════════════════════════════"
@@ -258,7 +258,7 @@ cat > "$BRIDGE_DIR/test_email.eml" << EOF
 From: $FOREIGN_SENDER_EMAIL
 To: $JIG_RECIPIENT_EMAIL
 Subject: Test Email to Jig
-Message-ID: <test-$(date +%s)@gigue.app>
+Message-ID: <test-$(date +%s)@jig.onl>
 Date: $(date -R)
 
 This is a test email that should be converted to a Jig block.
@@ -326,7 +326,7 @@ else
 fi
 echo ""
 
-# TEST 3: Jig -> Email (dev@jig.onl -> supabase@gigue.app via Resend)
+# TEST 3: Jig -> Email (dev@jig.onl -> you@example.com via Resend)
 log_step "═══════════════════════════════════════════════════════"
 log_step "TEST 3: Jig -> Email (Outbound via Resend API)"
 log_step "═══════════════════════════════════════════════════════"
