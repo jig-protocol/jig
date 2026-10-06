@@ -68,13 +68,15 @@ loopback and private tailnets.
 | Graphical client | None |
 | `jig read` | Broken by default — it calls the v0.0.1 `GET /blocks` route, which is gated off behind `dangerously_enable_v0_0_1_rest`. Use `jig chat`, `jig tail`, or the history endpoint |
 | `jig --version` | Not implemented (`jig-server --version` is) |
-| Prebuilt release binaries | None published. `install.sh`'s download path targets `releases.jig.onl`, which does not serve anything |
+| Prebuilt release binaries | `release.yml` builds static musl Linux (x86_64, aarch64) and Apple Silicon macOS tarballs with a signed `SHA256SUMS`, gated on the install smoke test. No real tag has been cut with it yet; the repo is private, so anonymous downloads don't work |
 
-Design targets that have **not been measured** and should not be read as results: 10,000
-messages/second on a $5 VPS, and a 60-second `curl … | sh` install. The benchmark
-procedure for the second is written down in
-[`docs/deployment/install-benchmark.md`](docs/deployment/install-benchmark.md) and has not
-been run.
+A design target that has **not been measured** and should not be read as a result: 10,000
+messages/second on a $5 VPS.
+
+The 60-second `curl … | bash` install **is** measured: on 2026-10-05, installing a published
+test release took 3.5s on Linux x86_64 and 3.2s on Apple Silicon (GitHub-hosted runners),
+from `curl` to "hello, world" accepted in `#hello`. CI fails above 60s; see
+[`docs/deployment/install-benchmark.md`](docs/deployment/install-benchmark.md).
 
 ---
 
@@ -119,12 +121,20 @@ stand-in.
 
 ### About `install.sh`
 
-[`install.sh`](install.sh) at the repo root automates the above and hands off to
-`jig chat`. Its **download path is dead** — no release tarballs have been published, and
-`releases.jig.onl` does not serve — so only its source-checkout branch works. That branch
-does work end to end, but it runs the same `cargo build --release` you can run yourself,
-so it takes minutes rather than the 60 seconds the KPI comment at the top of the file
-describes. Treat the manual quickstart above as the supported path.
+[`install.sh`](install.sh) at the repo root automates the above with no `[debug]` flag
+and no prompts:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jig-protocol/jig/main/install.sh | bash
+# private repo: JIG_GITHUB_TOKEN=$(gh auth token) bash install.sh
+```
+
+It downloads `jig-<os>-<arch>.tar.gz` from the newest GitHub Release (`JIG_VERSION=<tag>` to
+pin), verifies `SHA256SUMS.sig` with `ssh-keygen -Y` against the pinned release key and the
+tarball against `SHA256SUMS`, and installs into `~/.jig/bin`. It then starts `jig-server` on
+`127.0.0.1:7117`, creates `#hello`, posts "hello, world", and opens `jig chat` if a terminal
+is attached. `JIG_INSTALL_FROM=source` builds from a checkout instead (minutes, not seconds).
+The knobs are listed at the top of the script.
 
 ---
 
