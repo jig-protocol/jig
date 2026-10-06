@@ -121,6 +121,11 @@ pub enum IngestError {
     BundleMalformed(String),
     #[error("manifest missing kind field — v0.0.2 blocks must declare kind")]
     KindRequired,
+    /// The manifest's schema or encryption suite is one this server does not
+    /// speak. Checked before the signature: what the signature covers is
+    /// defined by the schema.
+    #[error(transparent)]
+    ManifestGate(#[from] jig_core::ManifestGateError),
     /// A channel-scoped block named a channel this server has no row for.
     /// The message is user-facing: it is what a mistyped `jig send` prints.
     #[error(
@@ -595,8 +600,10 @@ fn requires_existing_channel(kind: BlockKind, source: &IngestSource) -> bool {
 /// Parse the manifest from raw bytes. The manifest_bytes field of BlockBundle
 /// is the canonical JSON serialisation of BlockManifest.
 fn parse_manifest(manifest_bytes: &[u8]) -> Result<jig_core::BlockManifest, IngestError> {
-    serde_json::from_slice(manifest_bytes)
-        .map_err(|e| IngestError::BundleMalformed(format!("manifest parse: {e}")))
+    let manifest: jig_core::BlockManifest = serde_json::from_slice(manifest_bytes)
+        .map_err(|e| IngestError::BundleMalformed(format!("manifest parse: {e}")))?;
+    manifest.check_gates()?;
+    Ok(manifest)
 }
 
 /// Canonical bytes over which signatures and CIDs are computed.
@@ -1115,6 +1122,47 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, IngestError::InvalidSignature));
+    }
+
+    /// Correctly signed, but at a schema or suite this server does not speak:
+    /// refused at the gate, never persisted.
+    #[tokio::test]
+    async fn ingest_refuses_manifests_failing_the_gates() {
+        let ctx = test_ctx();
+        let sender_key = random_signing_key();
+        let (mb, _, _) = build_bundle_parts(&sender_key, BlockKind::TextRender);
+        let base: serde_json::Value = serde_json::from_slice(&mb).unwrap();
+
+        let mut future_schema = base.clone();
+        future_schema["schema"] = "https://jig.dev/schema/block-manifest/v0.2".into();
+        let mut mls = base;
+        mls["privacy"] = serde_json::json!({ "encryption": "mls" });
+
+        for (manifest, expect_schema) in [(future_schema, true), (mls, false)] {
+            let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+            let code_bytes: Vec<u8> = vec![];
+            let canonical = serde_json::to_vec(&(&manifest_bytes, &code_bytes)).unwrap();
+            let sig = sender_key.sign(&canonical).to_bytes().to_vec();
+
+            let err = do_ingest(
+                &ctx,
+                manifest_bytes,
+                code_bytes,
+                sig,
+                IngestSource::LocalClient { conn_id: 1 },
+            )
+            .await
+            .unwrap_err();
+            match err {
+                IngestError::ManifestGate(jig_core::ManifestGateError::UnsupportedSchema(_)) => {
+                    assert!(expect_schema)
+                }
+                IngestError::ManifestGate(jig_core::ManifestGateError::SuiteNotImplemented(_)) => {
+                    assert!(!expect_schema)
+                }
+                other => panic!("expected a gate refusal, got {other:?}"),
+            }
+        }
     }
 
     // ---- Channel-existence guard -----------------------------------------

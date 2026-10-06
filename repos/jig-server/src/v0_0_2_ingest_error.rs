@@ -37,6 +37,14 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
             "manifest must declare block kind".to_string(),
         ),
         IngestError::BundleMalformed(m) => (StatusCode::BAD_REQUEST, "BUNDLE_MALFORMED", m.clone()),
+        IngestError::ManifestGate(gate) => (
+            StatusCode::BAD_REQUEST,
+            match gate {
+                jig_core::ManifestGateError::UnsupportedSchema(_) => "UNSUPPORTED_SCHEMA",
+                jig_core::ManifestGateError::SuiteNotImplemented(_) => "UNSUPPORTED_SUITE",
+            },
+            gate.to_string(),
+        ),
         // 404, not 400: the request is well-formed, the named channel isn't here.
         IngestError::UnknownChannel { .. } => {
             (StatusCode::NOT_FOUND, "UNKNOWN_CHANNEL", e.to_string())
@@ -120,6 +128,12 @@ mod tests {
             },
             IngestError::KindRequired,
             IngestError::BundleMalformed("bad tuple".to_string()),
+            IngestError::ManifestGate(jig_core::ManifestGateError::UnsupportedSchema(
+                "https://example.com/v9".to_string(),
+            )),
+            IngestError::ManifestGate(jig_core::ManifestGateError::SuiteNotImplemented(
+                jig_core::SuiteNotImplemented(jig_core::EncryptionSuite::Mls),
+            )),
             IngestError::UnknownChannel {
                 slug: "#nope".to_string(),
             },
