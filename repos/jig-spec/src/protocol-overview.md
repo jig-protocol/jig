@@ -1,5 +1,8 @@
 # Protocol Overview
 
+> **v0.1 status:** E2EE, the handshake and every transport except WebSocket and the email
+> bridge are not implemented. Content is signed, not encrypted. See [Encryption](encryption.md).
+
 **Audience:** This chapter is for **developers** and **protocol implementers** who need to understand Jig's architecture. **Server operators** might find the scaling and transport sections useful. **End users** can skip this—it's pretty technical.
 
 ---
@@ -109,7 +112,7 @@ When a client connects, the [Handshake](handshake.md) negotiates:
 : Things like E2EE, block execution, federation support. Client asks, server grants or denies. Example: An IRC-only server might disable block execution entirely (no Wasm runtime needed).
 
 **Cryptographic suites**
-: Agree on signature algorithms (Ed25519), encryption (age+x25519), and hashing (BLAKE3). If the client only supports weak crypto, fail closed—no connection.
+: Agree on signature algorithms (Ed25519), hashing (BLAKE3) and the [encryption suites](encryption.md) each side implements (MLS by default from v0.2; v0.1 implements only `none`). Unknown or unimplemented suites fail closed.
 
 **Capability grants**
 : Server tells client what it's allowed to do (send messages, execute blocks, join channels). This is where reputation tiers kick in—`low_sec` users might have stricter rate limits than `verified` users.

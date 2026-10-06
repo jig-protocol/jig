@@ -387,7 +387,7 @@ Messages form a tree via `reply_to` pointers.
 {
   "id": "msg-2",
   "routing": { "to": "#general", "reply_to": "msg-1" },
-  "content": { "type": "text", "text": "E2EE by default!" }
+  "content": { "type": "text", "text": "Signed blocks!" }
 }
 
 // Reply to msg-2 (nested)
@@ -467,54 +467,11 @@ Messages include a timestamp and a unique ID. Servers use these to prevent repla
 
 ## Encryption
 
-Content can be encrypted while leaving routing metadata in plaintext.
+> **Not implemented in v0.1.** Content is signed, never encrypted.
 
-### Encrypted Message Example
-
-```json
-{
-  "id": "01932f9a-b123-7abc-9def-0123456789ab",
-  "version": 1,
-  "routing": {
-    "from": "did:jig:alice",
-    "to": "did:jig:bob",
-    "timestamp": "2025-11-09T12:34:56Z"
-  },
-  "content": {
-    "type": "encrypted",
-    "recipients": [
-      {
-        "did": "did:jig:bob",
-        "ephemeral_key": "x25519:v1:aBcDeF1234567890aBcDeF1234567890aBcDeF12",
-        "encrypted_session_key": "base64..."
-      }
-    ],
-    "ciphertext": "base64...",
-    "nonce": "base64..."
-  },
-  "signatures": [
-    {
-      "key": "ed25519:v1:PkQx7TfHJ...",
-      "signature": "ed25519:v1:9f86d081..."
-    }
-  ]
-}
-```
-
-**How it works:**
-
-1. Alice generates an ephemeral X25519 keypair (used only for this message).
-2. Alice derives a shared secret with Bob's public key: `shared_secret = X25519(alice_ephemeral_private, bob_public)`.
-3. Alice derives a session key via HKDF-BLAKE3 (see [Crypto Primitives § Key Derivation](crypto.md#key-derivation)).
-4. Alice encrypts the actual message content with the session key (using age+x25519).
-5. Alice encrypts the session key for each recipient (Bob in this case) so they can decrypt.
-6. Alice signs the entire message (routing + encrypted content) so Bob knows it's authentic.
-
-**Why encrypt the session key per recipient:** So Alice can send the same encrypted message to multiple recipients without re-encrypting the content for each one. Each recipient gets their own encrypted copy of the session key.
-
-**For developers:** Use the `age` encryption library or similar. Don't roll your own encryption—use vetted implementations.
-
-**Trade-off:** E2EE means the server can't index content for search. If you need searchable history, use plaintext mode (or wait for homomorphic encryption support—see [Crypto Primitives § Future: Homomorphic](crypto.md#future-homomorphicmls)).
+Encryption is specified in [Encryption](encryption.md): the suite (MLS by default) is
+named on every frame and in the manifest, and is fixed per channel. Routing metadata stays
+visible to the server.
 
 ## Extensions (Top-Level)
 
@@ -607,7 +564,6 @@ For binary transports or size-constrained environments (e.g., IoT devices), CBOR
 - Use Markdown for text formatting (for human readability).
 - Provide fallback rendering for unknown block types.
 - Set timestamp windows based on clock sync tolerance (±5 to ±10 minutes).
-- Use `age` or similar vetted encryption libraries for E2EE.
 
 **MAY:**
 

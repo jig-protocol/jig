@@ -1,5 +1,9 @@
 # Transports
 
+> **Mostly not implemented in v0.1.** Only WebSocket and the email bridge exist, and
+> neither matches this chapter in every detail. IRC and SSH are design only. No transport
+> carries encrypted content in v0.1.
+
 **Audience:** This chapter is for **protocol implementers** building clients or servers that need to support multiple transports, and **server operators** deciding which transports to enable. **End users** might care about which transports their favorite clients support. **Developers** building integrations (IRC bots, email gateways) will want to understand transport-specific constraints.
 
 ---
@@ -274,7 +278,7 @@ WebSocket communication SHOULD use a JSON-RPC-like request/response pattern for 
 
 ### Security Properties
 
-**Full E2EE support:** Messages can be encrypted (see [Message Format § Encryption](message-format.md#encryption)).
+**E2EE (v0.2):** Messages will be encryptable under the channel's suite (see [Encryption](encryption.md)).
 
 **Replay protection:** UUIDv7 message IDs and timestamp windows prevent replay attacks.
 

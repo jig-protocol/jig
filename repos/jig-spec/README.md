@@ -3,7 +3,7 @@
 This repository contains the official specification for the Jig protocol.
 
 - License: CC-BY-4.0 (see LICENSE)
-- Status: Draft scaffolding
+- Status: Draft. v0.1 implements signing, not encryption; chapters describing unbuilt features carry a banner.
 - Build: mdBook
 
 ## Goals
@@ -61,13 +61,19 @@ This specification is written under a strict zero-trust model. See `src/zero-tru
   - `introduction.md`
   - `protocol-overview.md`
   - `message-format.md`
+  - `versioning.md`
   - `crypto.md`
+  - `encryption.md`
   - `federation.md`
   - `transports.md`
   - `zero-trust.md`
   - `security.md`
+  - `threat-register.md`
+- `jep/` — Jig Enhancement Proposals
   - `appendix.md`
 
 ## Versioning
 
 The spec tracks the protocol version implemented by `jig-core` and `jig-server`. Each release will tag a corresponding spec version, with change notes in the appendix.
+
+v0.x makes **no compatibility guarantee** for the wire format, manifests or receipts. See `src/versioning.md`.

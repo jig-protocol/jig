@@ -511,6 +511,8 @@ def calculate_cost(receipt):
 
 ### E2EE Compatibility
 
+> **Not implemented in v0.1.** Content is signed, not encrypted. See [Encryption](encryption.md).
+
 Receipts are designed to work with end-to-end encryption:
 
 **What receipts reveal:**

@@ -6,7 +6,7 @@
 
 Security isn't a feature you add at the end—it's a design constraint that informs every decision. This chapter summarizes the threats Jig is designed to resist and the mitigations to employ when running a production system.
 
-**Foundation:** This entire chapter builds on the [Zero-Trust Model](zero-trust.md). If you haven't read that yet, start there—it defines the security assumptions for the entire protocol.
+**Foundation:** This entire chapter builds on the [Zero-Trust Model](zero-trust.md). Attacks by server operators, and the decisions that answer them, are in the [Threat Register](threat-register.md). If you haven't read that yet, start there—it defines the security assumptions for the entire protocol.
 
 ## Threat Model Overview
 
@@ -124,10 +124,10 @@ def is_timestamp_valid(timestamp):
 
 **Crypto suites:**
 
-- Client declares supported suites (`ed25519+x25519+blake3`).
-- Server picks one suite.
-- Unknown suites are ignored (don't error—just skip).
-- If no suites overlap, reject connection.
+- Client declares the [encryption suites](encryption.md) it implements.
+- Unknown entries in an offered list are skipped. If nothing remains, reject the connection.
+- A suite *carried* on a frame or manifest that is unknown or unimplemented is refused, never treated as `none` ([rejection rules](encryption.md#rejection-rules)).
+- A channel's suite is fixed at creation; nothing may be posted under another.
 
 **Downgrade detection:**
 
@@ -247,7 +247,7 @@ Even if message content is encrypted, metadata reveals:
 
 **What's ephemeral:**
 
-- Session keys (X25519 Diffie-Hellman transcripts)
+- Encryption keys a suite marks as ephemeral (for MLS, per-epoch secrets)
 - Nonces
 - Temporary decryption keys
 
