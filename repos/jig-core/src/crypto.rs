@@ -104,6 +104,22 @@ pub mod ed25519 {
         signing
     }
 
+    /// Fill `buf` from the OS CSPRNG, the same source as [`generate_signing_key`].
+    ///
+    /// A handshake nonce is not an identity key, but it is the replay guard on a
+    /// signed welcome, so it does not get a second entropy policy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS CSPRNG is unavailable. Same contract as
+    /// [`generate_signing_key`]: a nonce from a degraded source is worse than
+    /// failing the handshake.
+    pub fn fill_random(buf: &mut [u8]) {
+        SysRng
+            .try_fill_bytes(buf)
+            .expect("OS CSPRNG must be available");
+    }
+
     /// Convenience wrapper around an ed25519 keypair.
     #[derive(Clone)]
     pub struct KeyPair {

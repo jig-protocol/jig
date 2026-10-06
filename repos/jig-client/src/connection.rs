@@ -37,6 +37,17 @@ pub enum ClientError {
     ConnectionClosed,
     #[error("submit ack timed out after {0}s")]
     AckTimeout(u64),
+    /// The welcome was missing, malformed, or contradicted itself. The socket
+    /// is closed and nothing further was sent.
+    #[error("handshake failed closed: {reason}")]
+    HandshakeFailed {
+        reason: String,
+        /// The frame that failed, when one arrived.
+        evidence: Option<String>,
+    },
+    /// The server refused the version or suite and left the socket open.
+    #[error("handshake refused ({code}): {message}")]
+    HandshakeRefused { code: String, message: String },
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -60,6 +71,17 @@ pub struct Client {
     closed: Arc<AtomicBool>,
     server_url: String,
     submit_ack_timeout_seconds: u64,
+    welcome: Option<jig_pipeline::handshake::VerifiedWelcome>,
+    /// Set when the server refused the offered version or suite. The socket
+    /// is still open; application frames are not sent.
+    refusal: Option<HandshakeRefusal>,
+}
+
+/// A version or suite refusal that did not close the socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandshakeRefusal {
+    pub code: String,
+    pub message: String,
 }
 
 /// Per-channel delivery senders, keyed by channel slug.
@@ -147,6 +169,22 @@ impl Client {
     /// or `wss://dj.jig.onl`). Identity is used to sign outbound `Submit`
     /// frames.
     pub async fn connect(server_url: &str, identity: Identity) -> Result<Self, ClientError> {
+        Self::connect_with(
+            server_url,
+            identity,
+            jig_pipeline::handshake::ClientOffer::default(),
+        )
+        .await
+    }
+
+    /// [`Client::connect`] with an explicit offer. A pinned server DID that
+    /// does not match the welcome fails closed. A version or suite the server
+    /// refuses leaves the socket open; [`Client::handshake_refusal`] reports it.
+    pub async fn connect_with(
+        server_url: &str,
+        identity: Identity,
+        offer: jig_pipeline::handshake::ClientOffer,
+    ) -> Result<Self, ClientError> {
         let url = Url::parse(server_url).map_err(|e| ClientError::BadUrl(e.to_string()))?;
         // Map http(s) → ws(s) if user gave HTTP scheme; otherwise leave alone.
         let scheme = match url.scheme() {
@@ -164,6 +202,14 @@ impl Client {
             .await
             .map_err(|e| ClientError::Connect(e.to_string()))?;
         let (mut sink, mut stream) = ws.split();
+
+        let (welcome, refusal) = match drive_handshake(&mut sink, &mut stream, &offer).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                let _ = sink.close().await;
+                return Err(err);
+            }
+        };
 
         let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Message>();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<Frame>();
@@ -258,7 +304,38 @@ impl Client {
             closed,
             server_url: server_url.to_string(),
             submit_ack_timeout_seconds: 5,
+            welcome,
+            refusal,
         })
+    }
+
+    /// The signed welcome, once the handshake has succeeded.
+    pub fn welcome(&self) -> Option<&jig_pipeline::handshake::VerifiedWelcome> {
+        self.welcome.as_ref()
+    }
+
+    /// Set when the server refused the version or suite without closing.
+    pub fn handshake_refusal(&self) -> Option<&HandshakeRefusal> {
+        self.refusal.as_ref()
+    }
+
+    fn require_welcome(&self) -> Result<(), ClientError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(ClientError::ConnectionClosed);
+        }
+        if let Some(refusal) = &self.refusal {
+            return Err(ClientError::HandshakeRefused {
+                code: refusal.code.clone(),
+                message: refusal.message.clone(),
+            });
+        }
+        if self.welcome.is_none() {
+            return Err(ClientError::HandshakeFailed {
+                reason: "no welcome".to_string(),
+                evidence: None,
+            });
+        }
+        Ok(())
     }
 
     /// Sign a subscription request with this client's identity.
@@ -308,6 +385,7 @@ impl Client {
     /// Returns [`ClientError::ConnectionClosed`] if the connection is already
     /// dead — better a loud error than a stream that can never yield or end.
     pub async fn subscribe_channel(&self, slug: &str) -> Result<BlockStream, ClientError> {
+        self.require_welcome()?;
         let scope = Scope::Channel {
             slug: slug.to_string(),
         };
@@ -344,9 +422,7 @@ impl Client {
     /// an answer that can never arrive.
     pub async fn submit(&self, block: BuiltBlock) -> Result<String, ClientError> {
         use base64::Engine;
-        if self.closed.load(Ordering::SeqCst) {
-            return Err(ClientError::ConnectionClosed);
-        }
+        self.require_welcome()?;
         let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes());
         let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&block.sender_sig);
         let env = Envelope::new(Frame::Submit {
@@ -398,6 +474,82 @@ impl Client {
     }
 }
 
+/// Send hello and read the first frame. `Err` means fail closed: the caller
+/// closes the socket and sends nothing else. `Ok` is either a verified welcome
+/// or a version/suite refusal, and in both of those the socket stays open.
+async fn drive_handshake(
+    sink: &mut (impl futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+    stream: &mut (
+             impl futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+             + Unpin
+         ),
+    offer: &jig_pipeline::handshake::ClientOffer,
+) -> Result<
+    (
+        Option<jig_pipeline::handshake::VerifiedWelcome>,
+        Option<HandshakeRefusal>,
+    ),
+    ClientError,
+> {
+    use futures_util::SinkExt;
+
+    let (hello, pending) = jig_pipeline::handshake::begin(offer);
+    let json = serde_json::to_string(&hello)?;
+    sink.send(Message::Text(json.into()))
+        .await
+        .map_err(|err| ClientError::Connect(err.to_string()))?;
+
+    loop {
+        let next = tokio::time::timeout(jig_pipeline::handshake::WELCOME_WAIT, stream.next()).await;
+        let message = match next {
+            Err(_) => {
+                return Err(ClientError::HandshakeFailed {
+                    reason: "timed out waiting for a welcome".to_string(),
+                    evidence: None,
+                });
+            }
+            Ok(None) => {
+                return Err(ClientError::HandshakeFailed {
+                    reason: "connection closed before a welcome".to_string(),
+                    evidence: None,
+                });
+            }
+            Ok(Some(Err(err))) => {
+                return Err(ClientError::Connect(err.to_string()));
+            }
+            Ok(Some(Ok(message))) => message,
+        };
+        match message {
+            Message::Text(text) => {
+                return match pending.interpret(&text) {
+                    jig_pipeline::handshake::HandshakeResult::Established(welcome) => {
+                        Ok((Some(welcome), None))
+                    }
+                    jig_pipeline::handshake::HandshakeResult::LeaveOpen { code, message } => {
+                        Ok((None, Some(HandshakeRefusal { code, message })))
+                    }
+                    jig_pipeline::handshake::HandshakeResult::FailClosed { reason, evidence } => {
+                        Err(ClientError::HandshakeFailed { reason, evidence })
+                    }
+                };
+            }
+            Message::Ping(_) | Message::Pong(_) => continue,
+            Message::Close(_) => {
+                return Err(ClientError::HandshakeFailed {
+                    reason: "connection closed before a welcome".to_string(),
+                    evidence: None,
+                });
+            }
+            _ => {
+                return Err(ClientError::HandshakeFailed {
+                    reason: "first frame is not a welcome".to_string(),
+                    evidence: None,
+                });
+            }
+        }
+    }
+}
+
 // Re-export the envelope types through jig_client::envelope for callers
 // that don't want to depend on jig-pipeline directly.
 pub mod envelope {
@@ -409,8 +561,50 @@ pub mod envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio_tungstenite::accept_async;
+
+    fn test_signing_key() -> ed25519_dalek::SigningKey {
+        jig_core::crypto::ed25519::generate_signing_key()
+    }
+
+    /// A correct welcome for a hello frame, or `None` when `text` is not a hello.
+    fn welcome_reply(text: &str, key: &ed25519_dalek::SigningKey) -> Option<String> {
+        let env: Envelope = serde_json::from_str(text).ok()?;
+        let Frame::Hello {
+            versions,
+            suites,
+            capabilities,
+            nonce,
+        } = env.frame
+        else {
+            return None;
+        };
+        let reply = match jig_pipeline::handshake::negotiate(
+            &jig_pipeline::handshake::HelloView {
+                versions,
+                suites,
+                capabilities,
+                nonce,
+            },
+            &jig_pipeline::handshake::ServerOffer {
+                capabilities: jig_pipeline::handshake::Capabilities {
+                    block_kinds: vec!["text-render".to_string()],
+                    execution: true,
+                    federation: false,
+                },
+            },
+        ) {
+            Ok(statement) => jig_pipeline::handshake::seal(key, statement),
+            Err(refusal) => Envelope::new(Frame::Error {
+                status: Some(400),
+                code: refusal.code().to_string(),
+                ref_cid: None,
+                message: refusal.message().to_string(),
+            }),
+        };
+        Some(serde_json::to_string(&reply).unwrap())
+    }
 
     fn test_identity() -> Identity {
         let dir = tempfile::tempdir().unwrap();
@@ -446,10 +640,15 @@ mod tests {
                     let Ok(ws) = accept_async(stream).await else {
                         return;
                     };
+                    let key = test_signing_key();
                     let (mut sink, mut stream) = ws.split();
                     while let Some(Ok(msg)) = stream.next().await {
                         if let Message::Text(text) = msg {
                             counter.fetch_add(1, Ordering::SeqCst);
+                            if let Some(reply) = welcome_reply(&text, &key) {
+                                let _ = sink.send(Message::Text(reply.into())).await;
+                                continue;
+                            }
                             let Ok(env) = serde_json::from_str::<Envelope>(&text) else {
                                 continue;
                             };
@@ -467,9 +666,11 @@ mod tests {
         (url, frame_counter)
     }
 
-    /// Accepts one WS connection, consumes `frames_before_close` text frames,
-    /// then closes and drops the socket — simulating a server restart or a
-    /// dead link while the client believes it is still subscribed.
+    /// Accepts one WS connection, answers hello with a signed welcome, then
+    /// consumes `frames_before_close` further text frames and closes.
+    ///
+    /// `0` is "the link dies as soon as the handshake finishes", which is what
+    /// the submit-after-close tests need: `connect` itself has to succeed.
     async fn start_closing_test_server(frames_before_close: usize) -> String {
         use tokio::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -483,6 +684,19 @@ mod tests {
             let Ok(mut ws) = accept_async(stream).await else {
                 return;
             };
+            let key = test_signing_key();
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Some(reply) = welcome_reply(&text, &key) {
+                            let _ = ws.send(Message::Text(reply.into())).await;
+                            break;
+                        }
+                    }
+                    Some(Ok(_)) => continue,
+                    _ => return,
+                }
+            }
             let mut seen = 0;
             while seen < frames_before_close {
                 match ws.next().await {
@@ -496,6 +710,55 @@ mod tests {
         });
 
         url
+    }
+
+    /// One connection. The closure builds the reply to the first text frame.
+    /// `texts` counts text frames received; `closed` flips when the socket ends.
+    async fn start_probe_server<F>(reply: F) -> (String, Arc<AtomicUsize>, Arc<AtomicBool>)
+    where
+        F: Fn(&str) -> String + Send + Sync + 'static,
+    {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}");
+        let texts = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
+        let texts_for_server = texts.clone();
+        let closed_for_server = closed.clone();
+        let reply = Arc::new(reply);
+
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                closed_for_server.store(true, Ordering::SeqCst);
+                return;
+            };
+            let Ok(mut ws) = accept_async(stream).await else {
+                closed_for_server.store(true, Ordering::SeqCst);
+                return;
+            };
+            let mut answered = false;
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        texts_for_server.fetch_add(1, Ordering::SeqCst);
+                        if !answered {
+                            answered = true;
+                            let body = reply(&text);
+                            if ws.send(Message::Text(body.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) => break,
+                }
+            }
+            closed_for_server.store(true, Ordering::SeqCst);
+        });
+
+        (url, texts, closed)
     }
 
     /// Regression guard for the "silent zombie" bug: when the server goes
@@ -725,5 +988,126 @@ mod tests {
         let client = Client::connect(&url, id).await.unwrap();
         assert_eq!(client.identity_did(), expected_did);
         assert!(client.identity_did().starts_with("did:jig:z"));
+    }
+
+    #[tokio::test]
+    async fn connect_keeps_a_signed_welcome() {
+        let (url, _) = start_test_server(|_| async { vec![] }).await;
+        let client = Client::connect(&url, test_identity()).await.unwrap();
+        let welcome = client.welcome().expect("a verified welcome");
+        assert_eq!(welcome.version, 1);
+        assert_eq!(welcome.suites, vec!["none".to_string()]);
+        assert!(welcome.reputation.is_null());
+        assert_eq!(
+            welcome.capabilities.block_kinds,
+            vec!["text-render".to_string()]
+        );
+        assert!(welcome.capabilities.execution);
+        assert!(!welcome.capabilities.federation);
+        assert!(welcome.server_did.starts_with("did:jig:z"));
+        assert!(client.handshake_refusal().is_none());
+    }
+
+    #[tokio::test]
+    async fn connect_fails_closed_when_the_welcome_is_missing() {
+        let (url, texts, closed) = start_probe_server(|_hello| {
+            serde_json::to_string(&Envelope::new(Frame::Ack {
+                block_cid: "bafy".to_string(),
+            }))
+            .unwrap()
+        })
+        .await;
+        let err = Client::connect(&url, test_identity()).await.unwrap_err();
+        match err {
+            ClientError::HandshakeFailed { reason, evidence } => {
+                assert!(reason.contains("not a welcome"), "{reason}");
+                assert!(evidence.is_some());
+            }
+            other => panic!("expected fail closed, got {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            texts.load(Ordering::SeqCst),
+            1,
+            "a failed handshake must not send another frame"
+        );
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "a missing welcome must close the connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_fails_closed_when_the_welcome_contradicts_itself() {
+        let (url, texts, closed) = start_probe_server(|hello| {
+            let key = test_signing_key();
+            let env: Envelope = serde_json::from_str(hello).unwrap();
+            let Frame::Hello { nonce, .. } = env.frame else {
+                panic!("client's first frame must be hello");
+            };
+            let mut statement = jig_pipeline::handshake::negotiate(
+                &jig_pipeline::handshake::HelloView {
+                    versions: vec![1],
+                    suites: vec!["none".to_string()],
+                    capabilities: jig_pipeline::handshake::Capabilities::default(),
+                    nonce,
+                },
+                &jig_pipeline::handshake::ServerOffer {
+                    capabilities: jig_pipeline::handshake::Capabilities::default(),
+                },
+            )
+            .unwrap();
+            // Signed, but the frame is carried as `none` while the advertisement
+            // says the server only implements `mls`.
+            statement.suites = vec!["mls".to_string()];
+            serde_json::to_string(&jig_pipeline::handshake::seal(&key, statement)).unwrap()
+        })
+        .await;
+        let err = Client::connect(&url, test_identity()).await.unwrap_err();
+        match err {
+            ClientError::HandshakeFailed { reason, evidence } => {
+                assert!(reason.contains("contradicts itself"), "{reason}");
+                assert!(evidence.is_some());
+            }
+            other => panic!("expected fail closed, got {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(texts.load(Ordering::SeqCst), 1);
+        assert!(closed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn version_refusal_leaves_the_connection_open() {
+        let (url, texts, closed) = start_probe_server(|_| {
+            serde_json::to_string(&Envelope::new(Frame::Error {
+                status: Some(400),
+                code: "UNSUPPORTED_VERSION".to_string(),
+                ref_cid: None,
+                message: "server speaks envelope v1".to_string(),
+            }))
+            .unwrap()
+        })
+        .await;
+        let client = Client::connect(&url, test_identity()).await.unwrap();
+        let refusal = client.handshake_refusal().expect("refusal is not a close");
+        assert_eq!(refusal.code, "UNSUPPORTED_VERSION");
+        assert!(client.welcome().is_none());
+        match client.subscribe_channel("#hello").await {
+            Err(ClientError::HandshakeRefused { code, .. }) => {
+                assert_eq!(code, "UNSUPPORTED_VERSION");
+            }
+            Err(other) => panic!("expected the refusal to block subscribe, got {other:?}"),
+            Ok(_) => panic!("expected the refusal to block subscribe, got a stream"),
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            texts.load(Ordering::SeqCst),
+            1,
+            "a version refusal must not be followed by an application frame"
+        );
+        assert!(
+            !closed.load(Ordering::SeqCst),
+            "a version refusal must leave the connection open"
+        );
     }
 }

@@ -1,9 +1,10 @@
 # Handshake
 
-> **Not implemented in v0.1.** No handshake exists today. This chapter predates
-> [JEP-0002](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0002-handshake.md),
-> which makes the handshake mandatory, signed by the server and fail-closed. Where they
-> differ, JEP-0002 is the direction. Encryption suites are specified in
+> **Not the v0.1 wire format.** The implemented handshake is the JEP-0002 subset:
+> client `hello`, server-signed `welcome` (version, capabilities, suite `none`,
+> reputation `null`). This chapter predates
+> [JEP-0002](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0002-handshake.md).
+> Where they differ, JEP-0002 is the direction. Encryption suites are specified in
 > [Encryption](encryption.md), not by the `crypto_suites` strings below.
 
 **Audience:** This chapter is for **protocol implementers** and **developers** building clients or servers. **End users** don't need to understand handshakes—your client handles this automatically. **Server operators** might care about the features and crypto suites their servers advertise.

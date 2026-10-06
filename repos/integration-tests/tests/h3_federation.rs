@@ -62,6 +62,9 @@ async fn two_server_federation_chat_with_receipt_parity() {
     // text-render regardless of channel_id).
     let ws_url_b = format!("{}/api/v1/ws", server_b.ws_url());
     let (mut bob_ws, _) = connect_async(&ws_url_b).await.expect("bob ws connect");
+    jig_server::v0_0_2_federation::complete_client_handshake(&mut bob_ws)
+        .await
+        .expect("bob handshake");
     // Signed like any real caller: the server refuses an unsigned subscribe.
     let sub = signed_subscribe(
         &alice,

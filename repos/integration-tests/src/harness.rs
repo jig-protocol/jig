@@ -632,10 +632,19 @@ async fn spawn_one_peer_loop(state: Arc<jig_server::v0_0_2::AppState>, peer: Fed
     loop {
         let ws_url = format!("{}/api/v1/ws", peer.url.trim_end_matches('/'));
         let connect_result = tokio_tungstenite::connect_async(&ws_url).await;
-        let Ok((ws, _resp)) = connect_result else {
+        let Ok((mut ws, _resp)) = connect_result else {
             tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         };
+        // The production dialer does this too. A peer that has not welcomed
+        // us will refuse the subscribe below.
+        if jig_server::v0_0_2_federation::complete_client_handshake(&mut ws)
+            .await
+            .is_err()
+        {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
         let (mut sink, mut stream) = ws.split();
 
         // Subscribe federation scope so we receive their block stream.
