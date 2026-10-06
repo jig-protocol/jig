@@ -145,15 +145,6 @@ receipt.validate_against_manifest(&manifest)?; // Ensures capability declared
 ✅ **Zero warnings:** Clean build  
 ✅ **Precise naming:** `check_manifest_capabilities`, `validate_against_manifest`
 
-## Architecture Alignment
-
-Reviewed and implemented per master plan:
-- `architecture/BLOCK_RUNTIME_SPEC.md` — Capability model (lines 53-60, 120)
-- `architecture/EXECUTION_ENVIRONMENT.md` — Capability-secure host API (lines 21-37)
-- `implementation/repos/jig-core.md` — P0 capability DSL task (line 30)
-
-**All requirements for capability-driven billing and enforcement satisfied.**
-
 ## Key Security Properties
 
 ✅ **Least privilege** — Code cannot use more imports than declared  

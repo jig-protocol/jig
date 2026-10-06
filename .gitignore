@@ -39,7 +39,3 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
-
-# Internal / closed-source — kept in sibling jig-protocol-internal/, do NOT track here
-executable-internet-master-plan/
-gigue-ai/

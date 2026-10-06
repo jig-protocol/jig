@@ -1,7 +1,7 @@
 # jig-cli Cross-Binary Alignment Implementation Plan
 
 **Created:** 2025-11-11
-**Based on:** `executable-internet-master-plan/20251102_REVIEW.md`, `IMPLEMENTATION_PLAN.md`, and current jig-cli state
+**Based on:** `IMPLEMENTATION_PLAN.md` and current jig-cli state
 **Current Status:** Phase 1 & 2 ✅ Complete, Phase 3-7 🔄 Pending
 **Scope:** Align jig-cli with Receipt v0.2, cross-binary parity, analytics integration, and deterministic execution
 

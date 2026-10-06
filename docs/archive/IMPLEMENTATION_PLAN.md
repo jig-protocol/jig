@@ -8,7 +8,7 @@
 # Cross-Binary Protocol Implementation Plan
 
 **Created:** 2025-11-09
-**Based on:** `executable-internet-master-plan/20251102_REVIEW.md` and current repo state
+**Based on:** current repo state
 **Scope:** Align jig-core, jig-runtime, jig-nameserver, jig-config, jig-server, jig-cli on Receipt v0.2 and cross-binary contracts
 
 ---
@@ -32,7 +32,7 @@ This plan synchronizes the cross-binary protocol after Receipt v0.2 completion i
 | #                                    | Task                                                     | Component      | Priority | Size       | Dependencies          | Status      |
 | ------------------------------------ | -------------------------------------------------------- | -------------- | -------- | ---------- | --------------------- | ----------- |
 | **Phase A: Spec & Documentation**    |
-| 1                                    | ☐ Update BLOCK_RUNTIME_SPEC.md with Receipt v0.2 details | jig-docs       | P0       | M (1h)     | Receipt v0.2 complete | Not Started |
+| 1                                    | ☐ Update jig-spec block-execution.md with Receipt v0.2 details | jig-docs       | P0       | M (1h)     | Receipt v0.2 complete | Not Started |
 | 2                                    | ☐ Add outcome-based pricing examples to spec             | jig-docs       | P1       | S (0.5h)   | Task 1                | Not Started |
 | 3                                    | ☐ Document canonical affordances (3-5 types)             | jig-docs       | P1       | M (1h)     | Task 1                | Not Started |
 | 4                                    | ☐ Create analytics schema reference doc                  | jig-docs       | P1       | M (1h)     | Task 1                | Not Started |
@@ -157,7 +157,7 @@ Testing & Validation (46-50)
 
 ### Phase A: Spec & Documentation
 
-- [ ] BLOCK_RUNTIME_SPEC.md includes Receipt v0.2 JSON schema
+- [ ] jig-spec block-execution.md includes Receipt v0.2 JSON schema
 - [ ] Canonical affordances documented (email.delivered, net.http_2xx, etc.)
 - [ ] Analytics schema tables documented with field descriptions
 - [ ] All docs pass markdown linting

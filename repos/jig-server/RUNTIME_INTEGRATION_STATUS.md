@@ -42,5 +42,4 @@
 - `repos/jig-server/src/runtime/mod.rs`
 - `repos/jig-server/src/handler.rs`
 - `repos/jig-runtime/src/api.rs`, `src/receipt.rs`, `src/config.rs`
-- `executable-internet-master-plan/20251102_REVIEW.md`
 - `repos/jig-server/IMPLEMENTATION_PLAN_FINAL.md`

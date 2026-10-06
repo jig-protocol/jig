@@ -15,7 +15,7 @@
 
 ## Executive Summary
 
-Integrates original gap analysis + 20251102_REVIEW.md to deliver:
+Integrates the original gap analysis to deliver:
 
 1. Capability enforcement with fuel-by-capability pricing
 2. Receipt v0.2 with outcome-based metering
@@ -319,10 +319,7 @@ All files under 250 LOC per ROE.
 ## References
 
 - **Gap Analysis**: Original issue
-- **Review**: `executable-internet-master-plan/20251102_REVIEW.md`
-- **Architecture**: `executable-internet-master-plan/architecture/EXECUTION_ENVIRONMENT.md`
-- **ROE**: `.claude/CLAUDE.md`
-- **Guidelines**: `repos/jig-server/AGENTS.md`
+- **Architecture**: `repos/jig-spec/src/block-execution.md`
 
 ---
 

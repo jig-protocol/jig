@@ -226,9 +226,7 @@ Outcome:      Success
 
 ---
 
-## Alignment with Handoff Document
-
-Per `/jig-protocol/executable-internet-master-plan/implementation/repos/jig-cli-PROGRESS.md`:
+## jig-cli Handoff Prerequisites
 
 ### ✅ Prerequisites Met
 

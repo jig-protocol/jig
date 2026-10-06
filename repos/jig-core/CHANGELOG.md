@@ -20,5 +20,4 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ### Documentation
 - Updated `repos/jig-docs/core/RECEIPT_V0_2.md` with `ReasonCode`, `status_by_capability`, canonical `capability|scope` keys, and expanded validation rules.
-- Updated `executable-internet-master-plan/architecture/BLOCK_RUNTIME_SPEC.md` receipt example and notes to use canonical usage keys and uppercase status bins.
 - Updated `repos/jig-core/README.md` with Determinism & Wasm Validation guidance and examples.

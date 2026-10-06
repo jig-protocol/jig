@@ -862,6 +862,5 @@ DELETE FROM receipts WHERE executed_at < NOW() - INTERVAL 30 DAY;
 - **[Receipts](receipts.md)**: v0.2 receipt schema that analytics stores.
 - **[Block Execution](block-execution.md)**: How fuel metering works (feeds into analytics).
 - **[Security Considerations](security.md)**: Privacy best practices for analytics data.
-- **[Configuration](../executable-internet-master-plan/architecture/CONFIGURATION.md)**: Profile configuration (potato/standard/hyperscale).
 
-**Next:** For detailed configuration examples, see the master-plan's `CONFIGURATION.md`. For query examples in production environments, check the ClickHouse or DuckDB documentation. For compliance-specific retention policies, consult your legal team (requirements vary by jurisdiction).
+**Next:** For detailed configuration examples, see the `jig-config` crate's profile examples. For query examples in production environments, check the ClickHouse or DuckDB documentation. For compliance-specific retention policies, consult your legal team (requirements vary by jurisdiction).

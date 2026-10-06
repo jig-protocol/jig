@@ -102,15 +102,6 @@ bundle.validate_code(&manifest.constraints)?;
 ✅ **Zero clippy warnings** in new code  
 ✅ **Precise test names:** `float_operations_violate_determinism` etc.
 
-## Architecture Alignment
-
-Reviewed master plan docs:
-- `architecture/BLOCK_RUNTIME_SPEC.md` — ✅ Validation phase specified (lines 98-103)
-- `architecture/EXECUTION_ENVIRONMENT.md` — ✅ Deterministic Wasm requirement (line 16)
-- `implementation/repos/jig-core.md` — ✅ P0 Wasm validation task (line 29)
-
-**All references to wasmparser, import allowlists, and determinism enforcement now satisfied.**
-
 ## Performance
 
 Validation overhead (estimated, not yet profiled):
