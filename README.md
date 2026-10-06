@@ -213,8 +213,7 @@ server's DID yet. Once they do (the handshake in JEP-0002 and threat-register OP
 lost key will look like a man-in-the-middle to every client. `deploy/README.md` opens
 with this for a reason.
 
-There is no `CONTRIBUTING.md` for the implementation yet;
-[`repos/jig-spec/CONTRIBUTING.md`](repos/jig-spec/CONTRIBUTING.md) covers the spec only.
+[`CONTRIBUTING.md`](CONTRIBUTING.md) covers the implementation, the DAG rule, and how to send a change. [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) is the community standard. [`repos/jig-spec/CONTRIBUTING.md`](repos/jig-spec/CONTRIBUTING.md) is the spec-only guide.
 
 ## License
 
