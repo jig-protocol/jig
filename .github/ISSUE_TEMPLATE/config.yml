@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a vulnerability
+    url: https://github.com/jig-protocol/jig/security/advisories/new
+    about: Report a security vulnerability in private. Email security@jig.onl if you cannot use GitHub.
+  - name: Support
+    url: mailto:dev@jig.onl
+    about: Questions about running jig. This is not the channel for vulnerabilities.

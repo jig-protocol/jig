@@ -140,6 +140,11 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # Tag pushes wait in `release` (v* tags only, a maintainer must approve)
+    # before the signing key is used. workflow_dispatch dry-runs use
+    # `release-dry-run`, which has no secret and no approval gate, and sign
+    # with a throwaway key when JIG_RELEASE_SIGNING_KEY is not available.
+    environment: ${{ github.ref_type == 'tag' && 'release' || 'release-dry-run' }}
     outputs:
       signer: ${{ steps.sign.outputs.signer }}
     steps:

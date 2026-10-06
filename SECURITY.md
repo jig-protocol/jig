@@ -6,12 +6,12 @@ use jig for anything confidential yet.
 
 ## Reporting a vulnerability
 
-Email **security@jig.onl**. Please do not open a public issue, pull request or discussion
-for a vulnerability.
+Report it in private. Either channel reaches the same place:
 
-<!-- TODO(public): GitHub private vulnerability reporting can only be enabled once
-jig-protocol/jig is public. Enable it then (Settings → Security → Private vulnerability
-reporting) and list it here as a second channel alongside security@jig.onl. -->
+- [GitHub private vulnerability reporting](https://github.com/jig-protocol/jig/security/advisories/new)
+- Email **security@jig.onl**
+
+Please do not open a public issue, pull request or discussion for a vulnerability.
 
 Include what you found, how to reproduce it, the version or commit, and the impact as you
 understand it. If you want to encrypt the report, say so in a first short email and we will
