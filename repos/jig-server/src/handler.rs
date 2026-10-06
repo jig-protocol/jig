@@ -538,10 +538,7 @@ mod tests {
         };
         cfg.tls.enabled = true;
         cfg.public_url = Some("https://jig-vps.example.ts.net:7117".into());
-        assert_eq!(
-            advertised_http(cfg),
-            "https://jig-vps.example.ts.net:7117"
-        );
+        assert_eq!(advertised_http(cfg), "https://jig-vps.example.ts.net:7117");
     }
 
     #[test]
