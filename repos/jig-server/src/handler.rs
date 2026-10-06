@@ -508,22 +508,22 @@ mod tests {
     #[test]
     fn advertised_origin_is_http_when_tls_is_off() {
         let cfg = ServerConfig {
-            bind_address: "100.74.254.110".into(),
+            bind_address: "100.64.0.10".into(),
             port: 7117,
             ..Default::default()
         };
-        assert_eq!(advertised_http(cfg), "http://100.74.254.110:7117");
+        assert_eq!(advertised_http(cfg), "http://100.64.0.10:7117");
     }
 
     #[test]
     fn advertised_origin_is_https_when_tls_is_on() {
         let mut cfg = ServerConfig {
-            bind_address: "100.74.254.110".into(),
+            bind_address: "100.64.0.10".into(),
             port: 7117,
             ..Default::default()
         };
         cfg.tls.enabled = true;
-        assert_eq!(advertised_http(cfg), "https://100.74.254.110:7117");
+        assert_eq!(advertised_http(cfg), "https://100.64.0.10:7117");
     }
 
     #[test]
@@ -532,15 +532,15 @@ mod tests {
         // Peers must be told the name the cert actually covers, or they hit a
         // certificate-name mismatch.
         let mut cfg = ServerConfig {
-            bind_address: "100.74.254.110".into(),
+            bind_address: "100.64.0.10".into(),
             port: 7117,
             ..Default::default()
         };
         cfg.tls.enabled = true;
-        cfg.public_url = Some("https://jig-vps.tail323521.ts.net:7117".into());
+        cfg.public_url = Some("https://jig-vps.example.ts.net:7117".into());
         assert_eq!(
             advertised_http(cfg),
-            "https://jig-vps.tail323521.ts.net:7117"
+            "https://jig-vps.example.ts.net:7117"
         );
     }
 

@@ -29,7 +29,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub dangerously_enable_v0_0_1_rest: bool,
     /// The origin to advertise at `/.well-known/jig`, e.g.
-    /// `https://jig-vps.tail323521.ts.net:7117`.
+    /// `https://jig-vps.example.ts.net:7117`.
     ///
     /// When unset, the origin is derived as `{scheme}://{bind_address}:{port}`
     /// with the scheme following `[tls] enabled`. That derivation is right for a
