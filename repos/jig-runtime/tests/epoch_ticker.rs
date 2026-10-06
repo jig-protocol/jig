@@ -89,13 +89,27 @@ fn executions_do_not_accumulate_threads() {
 
 /// A ticker that outlived its engine would leak a thread per `Runtime`, which
 /// tests construct freely. Build and drop several, then confirm the count
-/// returned to roughly where it started.
+/// returned to where it was after the runtime's one-time threads existed.
+///
+/// The first engine starts wasmtime's process-global rayon pool — one worker
+/// per CPU, and it lives until process exit. Sampling before that pool exists
+/// counts those workers as leaked tickers. On a 4-CPU cgroup that is exactly
+/// the old `+ 4` budget, so it passes; on a 5-CPU cgroup the same joined
+/// tickers fail with "grew from 2 to 7". The budget has to be measured after
+/// the pool is up, or the assertion is about the host's CPU count.
 #[test]
 fn dropping_a_runtime_reclaims_its_ticker_thread() {
-    let Some(before) = thread_count() else {
+    let Some(_) = thread_count() else {
         eprintln!("skipping: no portable thread count on this platform");
         return;
     };
+
+    {
+        let runtime = Runtime::new().expect("runtime creation");
+        run_once(&runtime);
+        drop(runtime);
+    }
+    let before = thread_count().expect("thread count");
 
     for _ in 0..20 {
         let runtime = Runtime::new().expect("runtime creation");
@@ -103,12 +117,25 @@ fn dropping_a_runtime_reclaims_its_ticker_thread() {
         drop(runtime);
     }
 
-    let after = thread_count().expect("thread count");
+    // Join can return while `/proc` still lists the thread. A leaked ticker
+    // stays; a reaped one leaves within a few milliseconds.
+    let after = settled_thread_count(before);
     assert!(
-        after <= before + 4,
+        after <= before,
         "thread count grew from {before} to {after} after building and dropping \
          20 runtimes — ticker threads are outliving their engines"
     );
+}
+
+/// Re-read the thread count until it falls back to `target`, or 50ms passes.
+fn settled_thread_count(target: usize) -> usize {
+    let mut last = thread_count().expect("thread count");
+    let start = Instant::now();
+    while last > target && start.elapsed() < Duration::from_millis(50) {
+        std::thread::sleep(Duration::from_millis(1));
+        last = thread_count().expect("thread count");
+    }
+    last
 }
 
 /// Execute on a worker thread, failing the test if nothing comes back in time.
