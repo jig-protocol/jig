@@ -197,7 +197,6 @@ CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs three jobs: `wo
 | Know exactly what shipped and what did not | the STATUS section of [`docs/deployment/internal-dogfood-3day.md`](docs/deployment/internal-dogfood-3day.md) |
 | Find any doc in the repo, with a currency label | [`docs/README.md`](docs/README.md) |
 | Understand why something is shaped the way it is | [`docs/superpowers/`](docs/superpowers/) |
-| Work on the code with an agent | [`CLAUDE.md`](CLAUDE.md) / [`AGENTS.md`](AGENTS.md) |
 
 Back up `server.key` before you do anything else — losing it changes the server's DID and
 breaks TOFU pinning for every client that has ever connected. `deploy/README.md` opens with
