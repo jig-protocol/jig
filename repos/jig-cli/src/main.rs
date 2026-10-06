@@ -165,6 +165,10 @@ enum ChannelAction {
         /// `restricted` (membership-gated reads).
         #[arg(long, default_value = "open")]
         visibility: String,
+
+        /// Succeed (exit 0) if the channel already exists instead of failing.
+        #[arg(long)]
+        exist_ok: bool,
     },
 
     /// Join an existing channel by adding the caller's DID as a member.
@@ -478,8 +482,12 @@ async fn main() -> Result<()> {
     // messaging HTTP client; they go straight to `/api/v1/channels*` via reqwest.
     if let Some(Commands::Channel { action }) = cli.command {
         match action {
-            ChannelAction::Create { slug, visibility } => {
-                cmd::channel::create(&ctx, slug, visibility).await?;
+            ChannelAction::Create {
+                slug,
+                visibility,
+                exist_ok,
+            } => {
+                cmd::channel::create(&ctx, slug, visibility, exist_ok).await?;
             }
             ChannelAction::Join { slug } => {
                 cmd::channel::join(&ctx, slug).await?;

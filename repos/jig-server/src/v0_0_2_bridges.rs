@@ -308,6 +308,10 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         ref e @ IngestError::ChannelArchived { .. } => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },
+        // The slug is taken; retrying cannot change that.
+        ref e @ IngestError::ChannelExists { .. } => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
         // This server refuses the block's author; a retry changes nothing.
         ref e @ IngestError::NotAdmitted { .. } => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),

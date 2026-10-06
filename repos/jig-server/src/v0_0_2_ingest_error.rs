@@ -66,6 +66,11 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         IngestError::DuplicateBlock { .. } => {
             (StatusCode::CONFLICT, "DUPLICATE_BLOCK", e.to_string())
         }
+        // 409: the request is fine, the slug is taken. Clients treat it as
+        // "already there" (install.sh re-runs rely on that).
+        IngestError::ChannelExists { .. } => {
+            (StatusCode::CONFLICT, "CHANNEL_EXISTS", e.to_string())
+        }
         // 403 and the same word the read gates use: the caller authenticated
         // fine, this server simply will not deal with them.
         IngestError::NotAdmitted { refusal, .. } => {
@@ -144,6 +149,9 @@ mod tests {
             },
             IngestError::ChannelArchived {
                 slug: "#retired".to_string(),
+            },
+            IngestError::ChannelExists {
+                slug: "#taken".to_string(),
             },
             IngestError::NotAdmitted {
                 sender: "did:jig:zBad".to_string(),

@@ -73,6 +73,11 @@ if ! grep -q "hello, world" "$sandbox/tail.out"; then
   exit 1
 fi
 
+# Idempotency: a second run over the same HOME, with the server still up and
+# #hello already there, must succeed too (untimed).
+echo "== re-running install.sh over the existing install"
+curl "${curl_args[@]}" "$JIG_INSTALL_SH_URL" | bash
+
 [ -n "${JIG_SMOKE_RESULT:-}" ] && echo "$elapsed" > "$JIG_SMOKE_RESULT"
 verdict=$(awk -v e="$elapsed" -v b="$budget" 'BEGIN { print (e <= b) ? "PASS" : "FAIL" }')
 line="install → hello-world: ${elapsed}s (budget ${budget}s) on $(uname -s)/$(uname -m): $verdict"

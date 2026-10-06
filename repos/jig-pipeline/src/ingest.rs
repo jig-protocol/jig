@@ -175,6 +175,10 @@ pub enum IngestError {
     /// member the owner has since removed, for instance.
     #[error("block `{cid}` was already ingested")]
     DuplicateBlock { cid: String },
+    /// A channel-create for a slug this server already has, live or archived.
+    /// Archived slugs stay taken: the old timeline still lives under them.
+    #[error("channel '{slug}' already exists")]
+    ChannelExists { slug: String },
     /// Content for a restricted channel from someone who is neither a member
     /// nor its owner. See [`crate::authorize_write`].
     #[error("`{kind}` on `{slug}` refused: `{sender}` is not a member of the channel")]
@@ -381,6 +385,21 @@ pub async fn ingest(
     // re-created the membership by the time the insert failed.
     if ctx.store.get_block(&block_cid)?.is_some() {
         return Err(IngestError::DuplicateBlock { cid: block_cid });
+    }
+    // Step 3e: a slug names one channel. Without this, `apply_effect` hits the
+    // `channels.slug` UNIQUE constraint and the caller gets an opaque 500.
+    // After the signature, admission and write gates, so an unauthenticated
+    // caller cannot use it to probe which slugs exist.
+    if kind == BlockKind::ChannelCreate
+        && let Some(slug) = channel_slug
+        && ctx
+            .store
+            .get_channel_by_slug_including_archived(slug)?
+            .is_some()
+    {
+        return Err(IngestError::ChannelExists {
+            slug: slug.to_string(),
+        });
     }
     let (receipt_bytes, render_hash, is_synthetic) = match kind {
         BlockKind::TextRender => build_render_receipt(ctx, &manifest, &block_cid, kind_str).await?,
@@ -1287,6 +1306,56 @@ mod tests {
                 "{kind:?}: expected ChannelArchived, got {err:?}"
             );
         }
+    }
+
+    /// A second channel-create for a taken slug — a fresh block, not a replay —
+    /// is a typed `ChannelExists`, not a UNIQUE-constraint `Other`, and the
+    /// original owner keeps the channel. Archived slugs stay taken.
+    #[tokio::test]
+    async fn channel_create_for_a_taken_slug_is_channel_exists() {
+        let ctx = test_ctx_allowing(&["channel-create"]);
+        let owner = random_signing_key();
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &owner,
+            BlockKind::ChannelCreate,
+            &[("slug", "#hello"), ("visibility", "open")],
+        );
+        do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .expect("first create");
+
+        for key in [random_signing_key(), owner.clone()] {
+            let (mb, cb, sig) = build_bundle_parts_with_meta(
+                &key,
+                BlockKind::ChannelCreate,
+                &[("slug", "#hello"), ("visibility", "restricted")],
+            );
+            let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+                .await
+                .expect_err("slug is taken");
+            assert!(
+                matches!(&err, IngestError::ChannelExists { slug } if slug == "#hello"),
+                "got {err:?}"
+            );
+        }
+        let row = ctx.store.get_channel_by_slug("#hello").unwrap().unwrap();
+        assert_eq!(row.owner_did, did_of(&owner));
+        assert_eq!(row.visibility, "open");
+
+        seed_channel_owned_by(&ctx, "#retired", &did_of(&owner));
+        assert!(ctx.store.archive_channel("#retired", 1).unwrap());
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &owner,
+            BlockKind::ChannelCreate,
+            &[("slug", "#retired"), ("visibility", "open")],
+        );
+        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .expect_err("an archived slug stays taken");
+        assert!(
+            matches!(err, IngestError::ChannelExists { .. }),
+            "got {err:?}"
+        );
     }
 
     /// Replaying an accepted member-add must not re-enrol a member who has

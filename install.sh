@@ -321,14 +321,9 @@ hello_world() {
     log "reusing identity in ~/.jig/cli.toml"
   fi
   "$jig" server set "ws://${JIG_SERVER_LISTEN}" >/dev/null
-  # The server answers a duplicate channel-create with a 500 (UNIQUE
-  # constraint), so look before creating.
-  if "$jig" channel list 2>/dev/null | grep -qF -- "$JIG_DEFAULT_CHANNEL"; then
-    log "$JIG_DEFAULT_CHANNEL already exists"
-  elif ! "$jig" channel create "$JIG_DEFAULT_CHANNEL" >/dev/null 2>"$JIG_HOME/logs/channel-create.err"; then
-    cat "$JIG_HOME/logs/channel-create.err" >&2
-    die "could not create $JIG_DEFAULT_CHANNEL"
-  fi
+  # --exist-ok: a re-run (or a server someone already set up) keeps its #hello.
+  "$jig" channel create "$JIG_DEFAULT_CHANNEL" --exist-ok >/dev/null \
+    || die "could not create $JIG_DEFAULT_CHANNEL"
   "$jig" send --channel "$JIG_DEFAULT_CHANNEL" "hello, world" >/dev/null
   log "posted \"hello, world\" to $JIG_DEFAULT_CHANNEL (${SECONDS}s since start)"
 }

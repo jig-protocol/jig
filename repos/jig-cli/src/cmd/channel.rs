@@ -77,6 +77,48 @@ struct AdminResult {
     block_cid: String,
 }
 
+/// A channel-op POST the server answered with a non-2xx status.
+#[derive(Debug)]
+struct ChannelOpError {
+    url: String,
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+impl std::fmt::Display for ChannelOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "POST {} returned {}: {}",
+            self.url, self.status, self.body
+        )
+    }
+}
+
+impl std::error::Error for ChannelOpError {}
+
+impl ChannelOpError {
+    fn is_channel_exists(&self) -> bool {
+        is_channel_exists(self.status, &self.body)
+    }
+}
+
+/// Whether a channel-create refusal means "that slug is already taken".
+/// Servers before the `CHANNEL_EXISTS` code answered with a 500 carrying the
+/// SQLite constraint text, so that exact shape counts too.
+fn is_channel_exists(status: reqwest::StatusCode, body: &str) -> bool {
+    let code = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["code"].as_str().map(str::to_string));
+    match status {
+        reqwest::StatusCode::CONFLICT => code.as_deref() == Some("CHANNEL_EXISTS"),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR => {
+            body.contains("UNIQUE constraint failed: channels.slug")
+        }
+        _ => false,
+    }
+}
+
 const CHANNEL_OPS_PREFIX: &str = "/api/v1/channels";
 const LEGACY_CHANNEL_OPS_PREFIX: &str = "/_admin_v0_0_2/channels";
 
@@ -108,11 +150,9 @@ async fn post_channel_op(base: &str, suffix: &str, block: &BuiltBlock) -> Result
             .with_context(|| format!("POST {url}"))?;
     }
     if !resp.status().is_success() {
-        anyhow::bail!(
-            "POST {url} returned {}: {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        );
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ChannelOpError { url, status, body }.into());
     }
     resp.json()
         .await
@@ -123,12 +163,19 @@ async fn post_channel_op(base: &str, suffix: &str, block: &BuiltBlock) -> Result
 // create
 // ============================================================================
 
-/// Apply `jig channel create <slug> [--visibility ...]`.
+/// Apply `jig channel create <slug> [--visibility ...] [--exist-ok]`.
 ///
 /// Builds a signed channel-create block, POSTs it to
 /// `/api/v1/channels`, and prints the new channel slug + block CID
-/// on success.
-pub async fn create(ctx: &CliContext, slug: String, visibility: String) -> Result<()> {
+/// on success. A taken slug is an error unless `exist_ok`, in which case it
+/// is reported and treated as success (the channel's existing visibility and
+/// owner are left as they are).
+pub async fn create(
+    ctx: &CliContext,
+    slug: String,
+    visibility: String,
+    exist_ok: bool,
+) -> Result<()> {
     let visibility = visibility.trim().to_lowercase();
     if !matches!(visibility.as_str(), "open" | "restricted") {
         anyhow::bail!("--visibility must be `open` or `restricted` (got `{visibility}`)");
@@ -139,9 +186,24 @@ pub async fn create(ctx: &CliContext, slug: String, visibility: String) -> Resul
     let block = build_channel_create(&id, &slug, &visibility, hlc);
 
     let base = base_http_url(&ctx.server_url()?);
-    let result = post_channel_op(&base, "", &block).await?;
-    println!("channel created: {slug} ({visibility})");
-    println!("  block_cid: {}", result.block_cid);
+    match post_channel_op(&base, "", &block).await {
+        Ok(result) => {
+            println!("channel created: {slug} ({visibility})");
+            println!("  block_cid: {}", result.block_cid);
+        }
+        Err(e)
+            if e.downcast_ref::<ChannelOpError>()
+                .is_some_and(ChannelOpError::is_channel_exists) =>
+        {
+            if !exist_ok {
+                anyhow::bail!(
+                    "channel {slug} already exists on this server (pass --exist-ok to treat that as success)"
+                );
+            }
+            println!("channel already exists: {slug}");
+        }
+        Err(e) => return Err(e),
+    }
 
     // A freshly created channel is almost always the one the operator wants
     // to talk in next; without this, a bare `jig send hi` still goes to
@@ -394,6 +456,24 @@ fn print_channels(channels: &[ChannelView]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_exists_is_recognised_from_new_and_old_servers() {
+        use reqwest::StatusCode;
+        let new = r##"{"code":"CHANNEL_EXISTS","message":"channel '#hello' already exists"}"##;
+        assert!(is_channel_exists(StatusCode::CONFLICT, new));
+        let old = r#"{"code":"INGEST_ERROR","message":"UNIQUE constraint failed: channels.slug"}"#;
+        assert!(is_channel_exists(StatusCode::INTERNAL_SERVER_ERROR, old));
+
+        let replay = r#"{"code":"DUPLICATE_BLOCK","message":"block `x` was already ingested"}"#;
+        assert!(!is_channel_exists(StatusCode::CONFLICT, replay));
+        let other_500 = r#"{"code":"PERSIST_ERROR","message":"disk full"}"#;
+        assert!(!is_channel_exists(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            other_500
+        ));
+        assert!(!is_channel_exists(StatusCode::NOT_FOUND, new));
+    }
 
     #[test]
     fn base_http_url_transposes_ws_and_strips_trailing_slash() {

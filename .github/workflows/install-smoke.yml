@@ -33,6 +33,8 @@ on:
       - repos/jig-cli/src/cmd/channel.rs
       - repos/jig-server/src/v0_0_2_admin.rs
       - repos/jig-server/src/v0_0_2_ws.rs
+      - repos/jig-server/src/v0_0_2_ingest_error.rs
+      - repos/jig-pipeline/src/ingest.rs
 
 permissions:
   contents: read
