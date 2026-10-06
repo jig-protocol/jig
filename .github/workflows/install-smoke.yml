@@ -50,7 +50,7 @@ jobs:
       matrix:
         runs_on: [ubuntu-24.04, macos-15]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           sparse-checkout: scripts
       - name: curl | bash → hello-world (budget 60s)
@@ -69,7 +69,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         shell: bash
         working-directory: repos
