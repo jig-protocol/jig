@@ -31,7 +31,7 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install pinned toolchain (rust-toolchain.toml)
         # Channel, components and targets all come from rust-toolchain.toml at
         # the repo root, so CI builds with exactly what a contributor gets.
@@ -123,7 +123,7 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Builds for wasm32-unknown-unknown (listed in rust-toolchain.toml), NOT
       # wasm32-wasip1. text-block is a pure function; the unknown-unknown target
       # emits a module with no imports, which is what lets jig-runtime
@@ -178,7 +178,7 @@ jobs:
     name: dependency-policy (cargo-deny)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install pinned toolchain (rust-toolchain.toml)
         # Channel, components and targets all come from rust-toolchain.toml at
         # the repo root, so CI builds with exactly what a contributor gets.
