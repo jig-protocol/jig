@@ -115,14 +115,15 @@ cp -R ~/.jig ~/Desktop/jig-backup
 ```
 
 Next, point jig at our server. **It must be `https://`.** Plain `http://` fails with a
-confusing parser error, not "wrong protocol".
+confusing parser error, not "wrong protocol". Replace `<tailnet>` with our tailnet name,
+which DJ sends you when he approves your device.
 
 ```bash
-jig server set https://jig-vps.tail323521.ts.net:7117
+jig server set https://jig-vps.<tailnet>.ts.net:7117
 ```
 
 ```
-server set: https://jig-vps.tail323521.ts.net:7117
+server set: https://jig-vps.<tailnet>.ts.net:7117
 ```
 
 Now join the room:
@@ -207,7 +208,7 @@ an error rather than a guess.)
 ```
 14:22  did:jig:z4rhh3…: first real message on the VPS
 14:22  dj: alice sees you, bob
-Tailing #gigue on https://jig-vps.tail323521.ts.net:7117... (Ctrl-C to exit)
+Tailing #gigue on https://jig-vps.<tailnet>.ts.net:7117... (Ctrl-C to exit)
 ```
 
 See what channels exist:
@@ -249,7 +250,7 @@ Errors I reproduced while writing this guide, unless marked otherwise.
 | What you see | What it means | Fix |
 |---|---|---|
 | `failed to connect: IO error: failed to lookup address information: nodename nor servname provided, or not known` | Your Mac cannot even resolve the server's name. Tailscale is off, or your device is not approved. | Start Tailscale; run `tailscale status` and look for `jig-vps`. If it is missing, ask DJ to approve you. |
-| `failed to connect: WebSocket protocol error: httparse error: invalid HTTP version` | You used `http://` instead of `https://`. | `jig server set https://jig-vps.tail323521.ts.net:7117` |
+| `failed to connect: WebSocket protocol error: httparse error: invalid HTTP version` | You used `http://` instead of `https://`. | `jig server set https://jig-vps.<tailnet>.ts.net:7117` |
 | `invalid HTTP version parsed` on `jig channel list` | Same cause: `http://` instead of `https://`. | As above. |
 | `Error: connection lost while subscribed to #gigue — the server closed the stream` | The server restarted or the network blipped. **jig does not reconnect by itself** — it exits and you are out of the room. | Re-run `jig chat '#gigue'`. To have it come back automatically, run `scripts/jig-room.sh '#gigue'` from the repo instead; it just re-launches chat every time the connection drops. |
 | `Connection refused (os error 61)` | Something is listening at that address but not jig, or nothing is. Usually a wrong URL or port. | Check `jig server set` used the exact URL above. |
@@ -258,7 +259,7 @@ Errors I reproduced while writing this guide, unless marked otherwise.
 | `404 Not Found for url (.../blocks?limit=50)` | You ran `jig read`. It is broken. | Use `jig chat` or `jig tail`. |
 | `cli config already exists at ~/.jig/cli.toml. Pass --force to overwrite.` | You ran `jig init` a second time. It is refusing to throw away your existing key. | Nothing — you are already set up. Only use `--force` if you genuinely want a brand-new identity. |
 | Nothing happens. `jig send` prints an ID, nobody replies. | **Most likely a typo in the channel name.** jig does not check that a channel exists — it happily accepts messages into `#gigeu` and nobody is watching there. | `jig channel list` and copy the name exactly. |
-| Tailscale is running and approved, but jig hangs then times out | Not reproduced — inferred. Probably the server itself is down. | Ask DJ; `curl https://jig-vps.tail323521.ts.net:7117/healthz` should print `ok`. |
+| Tailscale is running and approved, but jig hangs then times out | Not reproduced — inferred. Probably the server itself is down. | Ask DJ; `curl https://jig-vps.<tailnet>.ts.net:7117/healthz` should print `ok`. |
 
 ## What jig is NOT, yet
 
