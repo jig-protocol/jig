@@ -133,8 +133,11 @@ where
         jig_pipeline::handshake::begin(&jig_pipeline::handshake::ClientOffer::default());
     ws.send(Message::Text(serde_json::to_string(&hello)?.into()))
         .await?;
+    // Same absolute deadline as the client. Control frames must not restart it,
+    // or the peer loop never reaches its reconnect delay.
+    let deadline = tokio::time::Instant::now() + jig_pipeline::handshake::WELCOME_WAIT;
     let text = loop {
-        let next = tokio::time::timeout(jig_pipeline::handshake::WELCOME_WAIT, ws.next()).await;
+        let next = tokio::time::timeout_at(deadline, ws.next()).await;
         match next {
             Err(_) => anyhow::bail!("timed out waiting for a welcome"),
             Ok(None) => anyhow::bail!("connection closed before a welcome"),

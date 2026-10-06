@@ -499,8 +499,11 @@ async fn drive_handshake(
         .await
         .map_err(|err| ClientError::Connect(err.to_string()))?;
 
+    // One deadline for the whole wait. A Ping or Pong must not start it over,
+    // or a peer can hold the connection open past WELCOME_WAIT.
+    let deadline = tokio::time::Instant::now() + jig_pipeline::handshake::WELCOME_WAIT;
     loop {
-        let next = tokio::time::timeout(jig_pipeline::handshake::WELCOME_WAIT, stream.next()).await;
+        let next = tokio::time::timeout_at(deadline, stream.next()).await;
         let message = match next {
             Err(_) => {
                 return Err(ClientError::HandshakeFailed {
