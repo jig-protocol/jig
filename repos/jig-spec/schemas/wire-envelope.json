@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "JigWireEnvelope",
+  "description": "Header fields every v0.1 wire frame carries. Frame-specific fields sit alongside them, selected by `op`. See src/versioning.md.",
+  "type": "object",
+  "required": ["v", "op"],
+  "properties": {
+    "v": {
+      "const": 1,
+      "description": "Envelope version. Any other value is refused with UNSUPPORTED_VERSION."
+    },
+    "suite": {
+      "type": "string",
+      "enum": ["none", "mls"],
+      "default": "none",
+      "description": "Encryption suite of the frame's payload (src/encryption.md). Absent means `none`. v0.1 implementations refuse `mls` and anything unregistered with UNSUPPORTED_SUITE."
+    },
+    "op": {
+      "type": "string",
+      "enum": ["subscribe", "submit", "catch_up", "ack", "block", "error"]
+    }
+  },
+  "additionalProperties": true
+}

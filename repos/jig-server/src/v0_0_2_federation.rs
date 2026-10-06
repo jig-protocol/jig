@@ -272,6 +272,13 @@ async fn ingest_peer_block(
     let bundle_bytes = base64::engine::general_purpose::STANDARD.decode(bundle_b64)?;
     let (manifest_bytes, _code_bytes): (Vec<u8>, Vec<u8>) = serde_json::from_slice(&bundle_bytes)?;
     let manifest: BlockManifest = serde_json::from_slice(&manifest_bytes)?;
+    // This path bypasses `ingest`, so it must run the same gates itself, and
+    // before the signature, whose coverage the schema defines. Dropped like a
+    // bad signature: one unreadable block is no reason to drop the peer.
+    if let Err(e) = manifest.check_gates() {
+        warn!(peer_url = %peer.url, %delivery_cid, "rejecting peer block: {e}");
+        return Ok(());
+    }
 
     // Derive block_cid the same way ingest does (blake3 over bundle bytes).
     let block_cid = format!(
@@ -902,6 +909,64 @@ mod tests {
                 .is_none(),
             "peer block without sig must be rejected under default policy"
         );
+    }
+
+    #[tokio::test]
+    async fn ingest_peer_block_refuses_manifests_failing_the_gates() {
+        use ed25519_dalek::SigningKey;
+        use jig_core::{Author, BlockKind, BlockManifest, Did};
+
+        let state = Arc::new(AppState::for_test().unwrap());
+        let peer = jig_config::v0_0_2_server::FederationPeer {
+            url: "wss://test-peer".to_string(),
+            expected_did: "did:jig:zPeer".to_string(),
+            alias: None,
+        };
+        let secret: [u8; 32] = rand::random();
+        let key = SigningKey::from_bytes(&secret);
+        let did = Did::from_ed25519_pubkey(key.verifying_key().as_bytes());
+        let manifest = BlockManifest::builder()
+            .version(semver::Version::new(0, 1, 0))
+            .author(Author {
+                did,
+                public_key: None,
+                roles: vec![],
+            })
+            .build()
+            .unwrap()
+            .with_kind(BlockKind::TextRender);
+        let base = serde_json::to_value(&manifest).unwrap();
+
+        let mut future_schema = base.clone();
+        future_schema["schema"] = "https://jig.dev/schema/block-manifest/v0.2".into();
+        let mut mls = base;
+        mls["privacy"] = serde_json::json!({ "encryption": "mls" });
+
+        for manifest in [future_schema, mls] {
+            let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+            let bundle_bytes = serde_json::to_vec(&(manifest_bytes, Vec::<u8>::new())).unwrap();
+            let sig = key.sign(&bundle_bytes).to_bytes().to_vec();
+            let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(&bundle_bytes);
+            let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&sig);
+
+            ingest_peer_block(&state, &peer, &bundle_b64, Some(&sig_b64), &[], "d:gate")
+                .await
+                .unwrap();
+
+            let block_cid = format!(
+                "bafy_{}",
+                hex::encode(blake3::hash(&bundle_bytes).as_bytes())
+            );
+            assert!(
+                state
+                    .ingest_ctx
+                    .store
+                    .get_block(&block_cid)
+                    .unwrap()
+                    .is_none(),
+                "a correctly signed peer block failing the gates must not be persisted: {manifest}"
+            );
+        }
     }
 
     #[tokio::test]

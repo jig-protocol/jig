@@ -369,21 +369,18 @@ async fn handle_client_frame(
     conn_id: u64,
     socket: &mut WebSocket,
 ) -> Result<(), String> {
-    let env: Envelope = match serde_json::from_str(text) {
+    let env: Envelope = match Envelope::parse(text) {
         Ok(e) => e,
         Err(e) => {
             // Best-effort error reply; ignore send failure (client may have gone away).
             // A malformed frame is the WS analogue of REST's 400 Bad Request:
             // the envelope itself never parsed, so no IngestError was ever
             // constructed for classify_ingest_error to classify.
-            let _ = send_error(
-                socket,
-                Some(400),
-                "BAD_JSON",
-                None,
-                &format!("envelope parse failed: {e}"),
-            )
-            .await;
+            let code = match &e {
+                jig_pipeline::envelope::EnvelopeParseError::Gate(gate) => gate.code(),
+                jig_pipeline::envelope::EnvelopeParseError::Malformed(_) => "BAD_JSON",
+            };
+            let _ = send_error(socket, Some(400), code, None, &e.to_string()).await;
             return Err(e.to_string());
         }
     };
@@ -1327,5 +1324,46 @@ mod tests {
             }
         }
         // Timeout is acceptable — primary assertion is the server didn't panic.
+    }
+
+    /// A well-formed frame at a version or suite this server does not speak is
+    /// refused with a code that says so, never processed and never reported as
+    /// garbage.
+    #[tokio::test]
+    async fn ws_refuses_unsupported_version_and_suite_by_code() {
+        let (_state, url) = start_test_server().await;
+        for (frame, expected) in [
+            (
+                r##"{"v":2,"op":"subscribe","scope":{"kind":"channel","slug":"#hello"}}"##,
+                "UNSUPPORTED_VERSION",
+            ),
+            (
+                r##"{"v":1,"suite":"mls","op":"subscribe","scope":{"kind":"channel","slug":"#hello"}}"##,
+                "UNSUPPORTED_SUITE",
+            ),
+            (
+                r##"{"v":1,"suite":"rot13","op":"subscribe","scope":{"kind":"channel","slug":"#hello"}}"##,
+                "UNSUPPORTED_SUITE",
+            ),
+        ] {
+            let (mut ws, _) = connect_async(&url).await.unwrap();
+            ws.send(TMessage::Text(frame.into())).await.unwrap();
+            let msg = tokio::time::timeout(Duration::from_secs(3), ws.next())
+                .await
+                .expect("timeout waiting for the refusal")
+                .expect("stream closed")
+                .expect("ws error");
+            let TMessage::Text(reply) = msg else {
+                panic!("expected text frame, got {msg:?}");
+            };
+            let env: Envelope = serde_json::from_str(&reply).unwrap();
+            match env.frame {
+                Frame::Error { status, code, .. } => {
+                    assert_eq!(code, expected, "frame: {frame}");
+                    assert_eq!(status, Some(400));
+                }
+                other => panic!("expected Error for {frame}, got {other:?}"),
+            }
+        }
     }
 }

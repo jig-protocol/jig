@@ -32,6 +32,14 @@ should not be read as a status page.
 | [`superpowers/plans/`](superpowers/plans/) | HISTORICAL | Dated implementation plans derived from those specs, task by task. Useful for reconstructing intent; not maintained after a plan ships. |
 | [`archive/`](archive/) | HISTORICAL | Root-level docs that went stale. Each carries a header saying what it described and when. |
 
+## Security
+
+| Doc | Status | What it is |
+| --- | --- | --- |
+| [`../SECURITY.md`](../SECURITY.md) | CURRENT | How to report a vulnerability, response targets, disclosure policy and scope. |
+| [`security/operator-threat-model.md`](security/operator-threat-model.md) | CURRENT | The model and evidence behind the spec's operator [threat register](../repos/jig-spec/src/threat-register.md). |
+| [`security/encryption.md`](security/encryption.md) | CURRENT | Why the v0.1 encryption groundwork is shaped as it is: suite field, refusals, MLS, DMs as locked channels. |
+
 ## Crate documentation
 
 Per-crate READMEs live next to the code under [`repos/`](../repos/):

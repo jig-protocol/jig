@@ -8,13 +8,15 @@
 //! ## Wire format
 //!
 //! ```json
-//! { "v": 1, "op": "subscribe", "scope": {"kind": "channel", "slug": "#hello"} }
-//! { "v": 1, "op": "submit", "bundle_b64": "...", "sig_b64": "..." }
+//! { "v": 1, "suite": "none", "op": "subscribe", "scope": {"kind": "channel", "slug": "#hello"} }
+//! { "v": 1, "suite": "none", "op": "submit", "bundle_b64": "...", "sig_b64": "..." }
 //! { "v": 1, "op": "ack", "block_cid": "bafy..." }
 //! { "v": 1, "op": "block", "bundle_b64": "...", "sig_b64": "...", "receipts": [...], "delivery_cid": "..." }
 //! { "v": 1, "op": "catch_up", "since_hlc": {"wall_ms":1234,"logical":5,"origin":"did:jig:..."} }
 //! { "v": 1, "op": "error", "status": 401, "code": "INVALID_SIG", "message": "..." }
 //! ```
+//!
+//! Every frame carries `suite`; the remaining examples omit it for brevity.
 //!
 //! `sig_b64` on `Frame::Block` is `Option<String>` for v0.0.2 backward
 //! compatibility (older peers don't carry it). v0.0.3 servers re-verify
@@ -22,20 +24,122 @@
 //! is present; the `naively_trust_peer_authored_blocks` antipattern flag
 //! bypasses that check (see `jig-config::v0_0_2_server::FederationSection`).
 
+use jig_core::{EncryptionSuite, SuiteNotImplemented};
 use serde::{Deserialize, Serialize};
 
-/// Wire envelope: every frame is wrapped with a protocol version field.
+/// The only envelope version this implementation speaks. A frame with any
+/// other `v` does not deserialize.
+pub const ENVELOPE_VERSION: u8 = 1;
+
+/// Wire envelope: every frame carries a protocol version and the encryption
+/// suite applied to its payload.
+///
+/// Deserialization is the gate: an unsupported `v`, an unregistered `suite`,
+/// or a registered suite this version does not implement is a parse error, so
+/// no caller can act on a frame it cannot interpret. An absent `suite` means
+/// `none`, which is what every frame before the field existed was.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "UncheckedEnvelope")]
 pub struct Envelope {
     pub v: u8,
+    pub suite: EncryptionSuite,
     #[serde(flatten)]
     pub frame: Frame,
 }
 
 impl Envelope {
-    /// Build an envelope at protocol version 1 (the v0.0.2 default).
+    /// Build an unencrypted envelope at [`ENVELOPE_VERSION`].
     pub fn new(frame: Frame) -> Self {
-        Self { v: 1, frame }
+        Self {
+            v: ENVELOPE_VERSION,
+            suite: EncryptionSuite::Unencrypted,
+            frame,
+        }
+    }
+
+    /// Parse a frame, telling a gate refusal apart from malformed input so
+    /// the reply can say "unsupported" rather than "bad JSON".
+    pub fn parse(text: &str) -> Result<Self, EnvelopeParseError> {
+        serde_json::from_str(text).map_err(|e| {
+            #[derive(Deserialize)]
+            struct Probe {
+                v: Option<u64>,
+                suite: Option<String>,
+            }
+            match serde_json::from_str::<Probe>(text) {
+                Ok(probe) => match gate(probe.v, probe.suite.as_deref()) {
+                    Err(refusal) => EnvelopeParseError::Gate(refusal),
+                    Ok(()) => EnvelopeParseError::Malformed(e),
+                },
+                Err(_) => EnvelopeParseError::Malformed(e),
+            }
+        })
+    }
+}
+
+/// Why an envelope did not parse.
+#[derive(Debug, thiserror::Error)]
+pub enum EnvelopeParseError {
+    #[error(transparent)]
+    Gate(EnvelopeGateError),
+    #[error("envelope parse failed: {0}")]
+    Malformed(serde_json::Error),
+}
+
+/// A well-formed envelope this implementation refuses to interpret.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EnvelopeGateError {
+    #[error("unsupported envelope version {0}; this implementation speaks v{ENVELOPE_VERSION}")]
+    UnsupportedVersion(u64),
+    #[error(transparent)]
+    UnknownSuite(#[from] jig_core::UnknownSuite),
+    #[error(transparent)]
+    SuiteNotImplemented(#[from] SuiteNotImplemented),
+}
+
+impl EnvelopeGateError {
+    /// The error code a server replies with.
+    pub fn code(&self) -> &'static str {
+        match self {
+            EnvelopeGateError::UnsupportedVersion(_) => "UNSUPPORTED_VERSION",
+            EnvelopeGateError::UnknownSuite(_) | EnvelopeGateError::SuiteNotImplemented(_) => {
+                "UNSUPPORTED_SUITE"
+            }
+        }
+    }
+}
+
+fn gate(v: Option<u64>, suite: Option<&str>) -> Result<(), EnvelopeGateError> {
+    if let Some(v) = v
+        && v != u64::from(ENVELOPE_VERSION)
+    {
+        return Err(EnvelopeGateError::UnsupportedVersion(v));
+    }
+    if let Some(suite) = suite {
+        suite.parse::<EncryptionSuite>()?.ensure_implemented()?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct UncheckedEnvelope {
+    v: u8,
+    #[serde(default)]
+    suite: EncryptionSuite,
+    #[serde(flatten)]
+    frame: Frame,
+}
+
+impl TryFrom<UncheckedEnvelope> for Envelope {
+    type Error = EnvelopeGateError;
+
+    fn try_from(raw: UncheckedEnvelope) -> Result<Self, Self::Error> {
+        gate(Some(u64::from(raw.v)), Some(raw.suite.as_str()))?;
+        Ok(Envelope {
+            v: raw.v,
+            suite: raw.suite,
+            frame: raw.frame,
+        })
     }
 }
 
@@ -257,6 +361,72 @@ mod tests {
         let json = serde_json::to_string(&env).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["v"], 1);
+    }
+
+    #[test]
+    fn suite_is_emitted_and_defaults_to_none_when_absent() {
+        let env = Envelope::new(Frame::Ack {
+            block_cid: "bafy".into(),
+        });
+        let json: serde_json::Value = serde_json::to_value(&env).unwrap();
+        assert_eq!(json["suite"], "none");
+
+        let legacy = r#"{"v":1,"op":"ack","block_cid":"bafy"}"#;
+        assert_eq!(Envelope::parse(legacy).unwrap(), env);
+    }
+
+    #[test]
+    fn unsupported_version_is_refused_by_every_parse_path() {
+        let json = r#"{"v":2,"op":"ack","block_cid":"bafy"}"#;
+        assert!(serde_json::from_str::<Envelope>(json).is_err());
+        assert!(matches!(
+            Envelope::parse(json),
+            Err(EnvelopeParseError::Gate(
+                EnvelopeGateError::UnsupportedVersion(2)
+            ))
+        ));
+    }
+
+    #[test]
+    fn unimplemented_suite_is_refused() {
+        let json = r#"{"v":1,"suite":"mls","op":"ack","block_cid":"bafy"}"#;
+        assert!(serde_json::from_str::<Envelope>(json).is_err());
+        let err = Envelope::parse(json).unwrap_err();
+        match err {
+            EnvelopeParseError::Gate(gate) => {
+                assert_eq!(
+                    gate,
+                    EnvelopeGateError::SuiteNotImplemented(SuiteNotImplemented(
+                        EncryptionSuite::Mls
+                    ))
+                );
+                assert_eq!(gate.code(), "UNSUPPORTED_SUITE");
+            }
+            other => panic!("expected a gate refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_suite_is_refused_not_ignored() {
+        let json = r#"{"v":1,"suite":"rot13","op":"ack","block_cid":"bafy"}"#;
+        assert!(serde_json::from_str::<Envelope>(json).is_err());
+        assert!(matches!(
+            Envelope::parse(json),
+            Err(EnvelopeParseError::Gate(EnvelopeGateError::UnknownSuite(_)))
+        ));
+    }
+
+    #[test]
+    fn malformed_frame_with_supported_gates_is_reported_as_malformed() {
+        let json = r#"{"v":1,"suite":"none","op":"teleport"}"#;
+        assert!(matches!(
+            Envelope::parse(json),
+            Err(EnvelopeParseError::Malformed(_))
+        ));
+        assert!(matches!(
+            Envelope::parse("not json"),
+            Err(EnvelopeParseError::Malformed(_))
+        ));
     }
 
     #[test]

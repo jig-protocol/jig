@@ -126,10 +126,12 @@ See [Message Format § Replay Protection](message-format.md#replay-protection) f
 
 ### End-to-End Verification
 
+> **Encryption is not implemented in v0.1.** Signatures are. See [Encryption](encryption.md).
+
 **MUST ensure authenticity and integrity end-to-end. Transport security alone is insufficient.**
 
 - Messages are signed by the sender's keypair (Ed25519)
-- Content can be encrypted (age+x25519) before signing
+- Content can be encrypted under the channel's [encryption suite](encryption.md) (MLS by default; not implemented in v0.1) before signing
 - Relays and servers see routing metadata but can't forge or tamper with content
 
 **Why:** TLS protects you from network attackers but not malicious servers. E2E signatures and encryption mean even the server operator can't forge messages or read encrypted content.
