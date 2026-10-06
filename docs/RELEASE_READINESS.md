@@ -128,7 +128,7 @@ categories are genuinely reachable once the listener is public.
 
 | | |
 | --- | --- |
-| **Current state** | No `SECURITY.md` at the repo root. GitHub only surfaces a policy from the root, `.github/`, or `docs/` — so today the repo shows no security policy at all. Seven per-crate `SECURITY.md` files exist (`repos/jig-{cli,config,core,gui,nameserver,runtime,server}/SECURITY.md`, 17 lines each, plus a 30-line one in `jig-spec`). Their contents are **internal-facing**: they route reporters to `security@gigue.ai // #alert-security`, tell them not to DM engineers because it hurts SLAs, and tell them not to open tickets without coordinating with security engineering first. |
+| **Current state** | No `SECURITY.md` at the repo root. GitHub only surfaces a policy from the root, `.github/`, or `docs/` — so today the repo shows no security policy at all. Seven per-crate `SECURITY.md` files exist (`repos/jig-{cli,config,core,gui,nameserver,runtime,server}/SECURITY.md`, 17 lines each, plus a 30-line one in `jig-spec`). Their contents are **internal-facing**: they route reporters to an internal security mailbox and an internal chat channel, tell them not to DM engineers because it hurts SLAs, and tell them not to open tickets without coordinating with security engineering first. |
 | **Ready means** | One root `SECURITY.md` written for an outside reporter: what's in scope, how to report, expected acknowledgement window, disclosure timeline, and whether GitHub private vulnerability reporting is enabled. |
 | **Gap** | The file is missing where it counts, and the text that does exist reads as an internal runbook. "#alert-security" is a channel a stranger cannot join. |
 
