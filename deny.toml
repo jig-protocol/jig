@@ -92,9 +92,9 @@ ignore = [
     # --- build-time only: proc macros, never linked into a shipped binary ---
     "RUSTSEC-2024-0436",  # paste unmaintained; via ratatui -> jig-cli. Build-time only, no runtime surface.
 
-    # --- jig-cli-local, non-network ---
-    "RUSTSEC-2021-0145",  # atty unaligned read (unsound); via jig-cli. Windows-only AND only under a custom global allocator, which we do not install.
-    "RUSTSEC-2024-0375",  # atty unmaintained; same jig-cli dep. Superseded by std::io::IsTerminal — swap when jig-cli's arg parsing is next touched.
+    # atty (RUSTSEC-2021-0145, RUSTSEC-2024-0375) left with the unused jig-cli
+    # dependency. Nothing in the crate called it; terminal detection is
+    # std::io::IsTerminal when a caller actually needs it.
 
 
     # The three "fixable by a lockfile bump" entries that used to sit here

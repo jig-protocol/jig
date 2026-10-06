@@ -53,9 +53,6 @@ base64 = "0.22"
 # URL parsing (validates `jig server set <url>` input)
 url = "2"
 
-# Terminal detection
-atty = "0.2"
-
 # Core helpers
 cid.workspace = true
 semver = "1.0"

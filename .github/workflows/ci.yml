@@ -30,6 +30,10 @@ jobs:
     # expensive build/test matrix on that trigger.
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Swatinem/rust-cache saves to the Actions cache API.
+      actions: write
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
@@ -122,6 +126,10 @@ jobs:
     name: wasm-build (text-block, wasm32-unknown-unknown)
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Swatinem/rust-cache saves to the Actions cache API.
+      actions: write
     steps:
       - uses: actions/checkout@v4
       # Builds for wasm32-unknown-unknown (listed in rust-toolchain.toml), NOT
@@ -177,6 +185,8 @@ jobs:
   dependency-policy:
     name: dependency-policy (cargo-deny)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
