@@ -207,9 +207,12 @@ CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs three jobs: `wo
 | Know what a hostile server operator can and cannot do | the [threat register](repos/jig-spec/src/threat-register.md) and [`docs/security/`](docs/security/operator-threat-model.md) |
 | Work on the code with an agent | [`CLAUDE.md`](CLAUDE.md) / [`AGENTS.md`](AGENTS.md) |
 
-Back up `server.key` before you do anything else — losing it changes the server's DID and
-breaks TOFU pinning for every client that has ever connected. `deploy/README.md` opens with
-this for a reason.
+Back up `server.key` before you do anything else. Losing it changes the server's DID, so
+the server comes back as a different identity: its receipts are signed by a new key, and
+federation peers that list it by `expected_did` hold a stale value. Clients do not pin the
+server's DID yet. Once they do (the handshake in JEP-0002 and threat-register OP-08), a
+lost key will look like a man-in-the-middle to every client. `deploy/README.md` opens
+with this for a reason.
 
 There is no `CONTRIBUTING.md` for the implementation yet;
 [`repos/jig-spec/CONTRIBUTING.md`](repos/jig-spec/CONTRIBUTING.md) covers the spec only.

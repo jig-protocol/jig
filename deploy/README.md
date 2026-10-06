@@ -19,14 +19,23 @@ sequence and the things that are not visible from inside a single file.
 
 ## 🔴 BACK UP `/var/lib/jig/server.key` OFFSITE. TODAY.
 
-**LOSING `/var/lib/jig/server.key` CHANGES THE SERVER DID AND BREAKS TOFU
-PINNING FOR EVERY CLIENT.**
+**LOSING `/var/lib/jig/server.key` CHANGES THE SERVER DID.**
 
-The server DID is derived from that 32-byte ed25519 seed. Every client that has
-talked to this server has pinned the resulting DID on first contact (TOFU). If
-the key is gone, the server comes back up with a **different identity**, and
-every client sees what is indistinguishable from a man-in-the-middle. Restoring
-a database without the key restores nothing useful.
+The server DID is derived from that 32-byte ed25519 seed. If the key is gone, the
+server comes back up with a **different identity**:
+
+- every receipt it signs from then on is under a new key, unlinkable to its
+  earlier receipts;
+- federation peers that list this server by `expected_did` now hold a stale value;
+- once clients pin the server DID on first contact (the mandatory handshake,
+  JEP-0002), every client will see what is indistinguishable from a
+  man-in-the-middle. Clients do not pin it yet, so today this is the next
+  release's problem, not an excuse to skip the backup.
+
+Restoring a database without the key restores nothing useful.
+
+User nickname pins (the server-side TOFU lock that binds a nickname to a user's
+DID) live in the database, not in the key, and survive a key loss.
 
 ```bash
 sudo base64 /var/lib/jig/server.key   # paste into 1Password, then forget it exists
@@ -248,7 +257,7 @@ which is exactly why editing the wrong half produces no error and no effect.
 **An explicitly-passed `--config` that fails to parse is now FATAL.** The server
 logs `[jig-server] FATAL: v0.0.2 config load from … failed` to both tracing and
 stderr and exits `1`. It no longer falls back to defaults, which used to mint a
-fresh server DID and break TOFU for everyone. A missing `--config` still means
+fresh server DID (see the top of this file). A missing `--config` still means
 "use defaults" — that path is legitimate and unchanged.
 
 Three landmines, all called out in `config.example.toml`:

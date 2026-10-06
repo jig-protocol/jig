@@ -70,6 +70,13 @@ suites follow in v0.2.
 3. Signed mid-session capability updates.
 4. Binding the handshake transcript into MLS group joins.
 5. How a client reports a contradiction to the user, and to anyone else.
+6. **When to close the connection.** This JEP needs an explicit protocol for which
+   failures end a connection and which leave it open, and who closes it. "Close on any
+   failure" is not that protocol: it turns every refusal into a disconnect, which makes
+   ordinary errors indistinguishable from attacks and lets a single bad frame drop a
+   session. Until this is settled, version and suite refusals (`UNSUPPORTED_VERSION`,
+   `UNSUPPORTED_SUITE`) leave the connection open, and the close requirements in the
+   Specification above are provisional.
 
 # Security Considerations (Zero-Trust)
 

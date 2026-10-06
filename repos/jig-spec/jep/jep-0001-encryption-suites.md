@@ -52,11 +52,16 @@ Proposed for v0.2:
   handshake from the same DID advertising fewer or weaker suites is surfaced to the user,
   and a channel created under an encrypted suite never accepts `none`.
 - **MLS mapping.** One channel is one MLS group; membership blocks drive MLS commits.
+- **One `mls` registry entry.** The MLS cipher suite (RFC 9420 §17.1) is negotiated
+  inside the group, not named in the jig registry. Per-cipher-suite entries (for example
+  a PQ-hybrid MLS suite) MAY be added later as new registry entries, the same way any
+  pluggable suite is: a registry row, a JEP and conformance vectors, with no wire
+  change.
 
 # Open questions
 
-1. Identifier granularity: `mls` with the MLS cipher suite negotiated inside the group,
-   or one registry entry per MLS cipher suite (for example a PQ-hybrid one)?
+1. ~~Identifier granularity.~~ Resolved: a single `mls` entry for now; see
+   Specification.
 2. D13: does a non-MLS scheme such as Signal's post-quantum protocol fit as a suite with
    its own group semantics, or only as PQ-hybrid MLS?
 3. Key-package distribution: nameserver, home server, or both?
