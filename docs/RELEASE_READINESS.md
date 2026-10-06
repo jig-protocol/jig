@@ -233,15 +233,12 @@ correct; that decision is open. Until then default copyright applies, all five c
 explicitly so the silence is not read as an oversight. Nothing in the protocol crates
 depends on this subtree, so its status cannot contaminate them.
 
-**`repos/jig-spec/` — still CC BY-SA 4.0, and this needs a decision.** Share-alike on a
-written specification can impede exactly the independent implementations the permissive
-code licence exists to encourage: a derived implementation guide inherits the share-alike
-obligation. Most protocol specs that want wide adoption use CC-BY-4.0 or the same terms as
-the code. Recommend aligning it; flagged rather than changed, because spec licensing has
-different norms from code licensing and this is a judgement call, not a cleanup.
+**`repos/jig-spec/` — CC-BY-4.0 (decided 2026-10-05).** It was CC BY-SA 4.0. Share-alike
+on a written specification impedes exactly the independent implementations the permissive
+code licence exists to encourage, because a derived implementation guide inherits the
+share-alike obligation. Attribution-only matches what most widely adopted protocol specs use.
 
-**Verdict: no longer a blocker.** Downgraded from BLOCKER to the open `jig-spec` question
-above.
+**Verdict: resolved.**
 
 ### The DAG rule (external contributors must know this)
 
@@ -296,7 +293,7 @@ strangers a footgun — a smaller one, with the safety on.
 | --- | --- | --- |
 | ~~1~~ | ~~**Authn + authz on `jig-server`**~~ | **Phases 1–4 DONE 2026-09-11** — per-request proof of possession on reads, `visibility`/membership enforced on history, listing, live delivery and posting, owner-signed membership changes, and an admission policy (bans, ruleset floors, explicit unknown-DID choice) on every read and write. Still open from the same design: trusted connections (phase 5); see §1.1. |
 | 2 | **Root `SECURITY.md` with an external reporting path** | Cheap, and blocker #1 guarantees findings. Without it the first report is public. |
-| ~~3~~ | ~~**Root `LICENSE` + consistent per-crate SPDX ids**~~ | **DONE 2026-08-06** — dual-licensed MIT OR Apache-2.0, root licence pair added, every protocol crate aligned. Only the `jig-spec` CC BY-SA question remains, and it does not gate release. |
+| ~~3~~ | ~~**Root `LICENSE` + consistent per-crate SPDX ids**~~ | **DONE 2026-08-06** — dual-licensed MIT OR Apache-2.0, root licence pair added, every protocol crate aligned. `jig-spec` moved to CC-BY-4.0 on 2026-10-05. |
 | 4 | **Fix the binary install path** | `install.sh` points at a host that serves nothing, unpacks the wrong paths, and verifies no checksum — while `release.yml` already publishes the `.sha256`. A `curl \| sh` KPI that does not work is worse than not having one. |
 | 5 | **Say plainly that v0.0.x has no compatibility guarantee** | README + release notes. Every version field in the system is a label, not a gate; users must not infer stability from their presence. |
 | 6 | **Implementation-status banner on `jig-spec`** | It documents E2EE we have not written, in the present tense. Shipping that unqualified is a claim about privacy we cannot back. |

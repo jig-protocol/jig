@@ -2,7 +2,7 @@
 
 This repository contains the official specification for the Jig protocol.
 
-- License: CC BY-SA 4.0 (see LICENSE)
+- License: CC-BY-4.0 (see LICENSE)
 - Status: Draft scaffolding
 - Build: mdBook
 

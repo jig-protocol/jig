@@ -55,4 +55,4 @@ A short (~200 words) description of the proposal and its intent.
 
 # Copyright
 
-This document is licensed under CC BY-SA 4.0.
+This document is licensed under CC-BY-4.0.

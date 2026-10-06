@@ -161,7 +161,7 @@ and lives at the repo root.
 | [`jig-gui`](repos/jig-gui/) | Riverdance — a Dioxus scaffold with a mocked chat UI, wired to no jig crate. **Not a working client** |
 
 Not Cargo members: [`repos/jig-spec/`](repos/jig-spec/) — an mdBook protocol spec, still
-draft scaffolding, licensed CC BY-SA 4.0 — and [`repos/jig-docs/`](repos/jig-docs/), a
+draft scaffolding, licensed CC-BY-4.0 — and [`repos/jig-docs/`](repos/jig-docs/), a
 holding area of per-milestone working notes.
 
 ## Building and testing
@@ -224,7 +224,7 @@ Two deliberate exceptions:
 | Scope | Licence | Why |
 | --- | --- | --- |
 | [`repos/jig-gui/`](repos/jig-gui/NOTICE.md) (Riverdance) | **None granted yet** | A client application, not protocol surface. Copyleft or source-available may be the right answer; the call has not been made. Default copyright applies until it is. |
-| [`repos/jig-spec/`](repos/jig-spec/) | CC BY-SA 4.0 | The written specification, not code. Under review — share-alike on a spec can impede the implementations the permissive code licence is meant to encourage. |
+| [`repos/jig-spec/`](repos/jig-spec/) | CC-BY-4.0 | The written specification, not code. Attribution only, no share-alike, so implementation guides and second implementations can reuse the text freely. |
 
 ### Contribution
 
