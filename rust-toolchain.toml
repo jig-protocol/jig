@@ -1,0 +1,12 @@
+# Pinned so a new stable release cannot turn main red with fresh lints (1.99's
+# clippy::double_must_use did exactly that). Bump deliberately, in its own PR,
+# and fix whatever the new clippy reports in the same change.
+#
+# Must stay >= `rust-version` in repos/Cargo.toml (the wasmtime floor).
+# wasm32-wasip1 is listed because release.yml builds it alongside each host
+# target; wasm32-unknown-unknown is what text-block's canonical artifact uses.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-wasip1", "wasm32-unknown-unknown"]
+profile = "minimal"

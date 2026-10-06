@@ -80,7 +80,7 @@ been run.
 
 ## Quickstart
 
-Requires Rust **1.94+** (MSRV is set by wasmtime 47). Build the two binaries:
+Requires Rust **1.95+** (MSRV is set by wasmtime 48); `rust-toolchain.toml` pins the exact toolchain CI uses, and rustup picks it up automatically. Build the two binaries:
 
 ```bash
 git clone https://github.com/jig-protocol/jig

@@ -65,7 +65,7 @@ cargo +stable build -p jig-cli
 
 The binary lands at **`repos/target/debug/jig`** — the *workspace* target directory. Copy
 it somewhere on your `PATH` (e.g. `~/bin/jig`) so you can type `jig` instead of the full
-path. jig needs Rust 1.94 or newer; `+stable` makes sure you get a new enough one.
+path. jig needs Rust 1.95 or newer; `rust-toolchain.toml` at the repo root pins the toolchain CI uses, and rustup installs it on first build.
 
 > **Run the right binary.** Older checkouts may have a stale per-crate build at
 > `repos/jig-cli/target/release/jig`. That path is **not** the current CLI and can be a

@@ -107,11 +107,12 @@ pub mod metrics {
     /// Saturating decrement — a gauge that underflows to u64::MAX is worse
     /// than one that is briefly wrong.
     ///
-    /// Recent nightlies deprecate `fetch_update` in favour of `try_update` and
-    /// will suggest the rename. DO NOT APPLY IT: `try_update` is still gated
-    /// behind the unstable `atomic_try_update` feature on our MSRV (1.94), so
-    /// taking the suggestion breaks the build on the minimum toolchain we
-    /// declare. Revisit once `try_update` is stable at or below the MSRV.
+    /// Rust 1.99 deprecates `fetch_update` in favour of `try_update` and will
+    /// suggest the rename. DO NOT APPLY IT: `try_update` is not stable on our
+    /// MSRV (`rust-version` in repos/Cargo.toml), so taking the suggestion
+    /// breaks the build on the minimum toolchain we declare. Revisit, and drop
+    /// the `allow`, once `try_update` is stable at or below the MSRV.
+    #[allow(deprecated)]
     fn decrement(counter: &AtomicU64) {
         let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             Some(v.saturating_sub(1))
