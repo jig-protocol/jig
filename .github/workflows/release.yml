@@ -58,7 +58,7 @@ jobs:
             runs_on: macos-15
             zigbuild: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Honors rust-toolchain.toml when the repo pins one; stable otherwise.
       - name: Install Rust toolchain
@@ -128,7 +128,7 @@ jobs:
         shell: bash
         run: scripts/package-release.sh ${{ matrix.target }} ${{ matrix.name }} dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
           path: dist/${{ matrix.name }}.tar.gz
@@ -148,8 +148,8 @@ jobs:
     outputs:
       signer: ${{ steps.sign.outputs.signer }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: jig-*
@@ -193,7 +193,7 @@ jobs:
           cat SHA256SUMS
           echo "signer=$(cat "$signers")" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-dist
           path: dist/
@@ -226,8 +226,8 @@ jobs:
             budget: 300
             qemu: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: release-dist
           path: dist
@@ -237,7 +237,7 @@ jobs:
           (cd dist && nohup python3 -m http.server 47391 --bind 127.0.0.1 >/dev/null 2>&1 &)
           for _ in $(seq 1 50); do curl -fsS -o /dev/null http://127.0.0.1:47391/SHA256SUMS && exit 0; sleep 0.1; done
           exit 1
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
         if: matrix.qemu
         with:
           platforms: arm64
@@ -268,7 +268,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: release-dist
           path: dist
