@@ -74,27 +74,20 @@ step needs investigation. Common culprits historically:
 - Wall-clock exceeds 60s on a fast VM in normal network conditions.
 - Post-install `jig chat` doesn't open or can't send blocks locally.
 
-## Why this isn't automated
+## Automated (2026-10-05)
 
-A reasonable automated test would spin up a fresh container, run the
-install, and benchmark. v0.0.2 doesn't ship CI for that for three reasons:
+[`scripts/install-smoke.sh`](../../scripts/install-smoke.sh) runs install.sh in a throwaway
+`$HOME`, times `curl … | bash` to "hello, world" accepted in `#hello`, reads it back over
+`jig tail`, and fails above 60s. It runs in
+[`release.yml`](../../.github/workflows/release.yml) before publishing (Linux x86_64, Apple
+Silicon, aarch64 under qemu), against the published release after, and on PRs touching the
+installer ([`install-smoke.yml`](../../.github/workflows/install-smoke.yml)).
 
-1. **Release tarballs need to exist.** They're produced by the Phase G2
-   GitHub Actions workflow; until they're consistently published and DNS
-   points at them, an automated install would be testing against a moving
-   target.
-2. **The "potato VM" is not Docker.** Docker runtimes are faster than a
-   real $5 VM in most ways (kernel, network, disk). The benchmark is
-   inherently about real-world VPS performance — automating that requires
-   spinning up real cloud instances, which is a separate operational
-   concern.
-3. **One-off acceptance, not regression.** This is a release-gating
-   benchmark, not a per-commit assertion. Adding it to CI before the
-   release pipeline exists is premature.
+First measurement (throwaway prerelease `v0.0.0-relpipe.1`, GitHub-hosted runners, assets
+downloaded from GitHub Releases): **3.5s** Linux x86_64 (`ubuntu-24.04`), **3.2s** macOS
+arm64 (`macos-15`). From a local mirror: 1.0s / 0.9s, and 7.7s for aarch64 under qemu.
 
-When v0.1.0 ships the per-platform release pipeline matures, this will
-move into an opt-in CI job that boots a fresh VM and records the install
-wall-clock — gating tagged releases, not main-branch commits.
+A hosted runner is not a $5 VM. The manual procedure above still applies for that number.
 
 ## Related tests
 

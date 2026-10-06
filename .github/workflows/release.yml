@@ -1,189 +1,312 @@
 name: Release
 
-# Tag-triggered: cuts per-platform tarballs containing jig-server, jig,
-# jig-nameserver + text_block.wasm and publishes them as a GitHub Release.
-# install.sh fetches from these URLs at first run.
+# Tag push (v*) → build → sign → install smoke (gate) → publish prerelease →
+# install smoke against the published release.
 #
-# Matrix scope (F0): every internal client is a Mac, and the only server we
-# run is the x86_64 Linux VPS. Linux->macOS cross-compilation is not viable in
-# either direction, so darwin builds must run on macOS runners. Windows, musl
-# and aarch64-linux were dropped — nobody on the team consumes them and each
-# one costs CI minutes plus a cross-toolchain to maintain. Re-add a row here
-# when a real consumer appears; install.sh's os/arch detection already covers
-# linux+darwin x x86_64+aarch64.
+# Targets: static musl Linux (x86_64, aarch64 — the VPS and Pi/ARM-VPS
+# "potato" class) and Apple Silicon macOS. Intel macOS and Windows are not
+# built: the macos-13 runner they needed never picked up a job on this repo,
+# which is what left every earlier run queued until GitHub's 24h cap.
 #
-# macOS Gatekeeper: these darwin binaries are unsigned and unnotarized, so a
-# copy that arrives via download or AirDrop carries com.apple.quarantine and
-# is refused on launch. The removal command is published in the release body
-# and shipped inside each darwin tarball as QUARANTINE-README.txt.
+# Every job has a timeout and only uses standard GitHub-hosted labels
+# (ubuntu-24.04, macos-15). timeout-minutes does not cover time spent queued,
+# so a label nobody serves would still hang for 24h — don't add one.
+#
+# Integrity: SHA256SUMS lists every tarball and is signed with an ed25519 SSH
+# key (`ssh-keygen -Y sign`, namespace "jig-release"). The private key is the
+# JIG_RELEASE_SIGNING_KEY secret; the public key is pinned in install.sh and
+# .github/release/allowed_signers. install.sh verifies both on download.
+#
+# workflow_dispatch runs everything up to (not including) publish, so the
+# pipeline can be exercised without cutting a tag.
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
-# Reduce duplicate runs if a tag push races with a branch push.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   build:
-    name: build ${{ matrix.platform.tarball_name }}
-    runs-on: ${{ matrix.platform.runs_on }}
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 60
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
-        platform:
-          # Primary client: DJ's Mac and most teammates.
-          - tarball_name: jig-darwin-aarch64
+        include:
+          - name: jig-linux-x86_64
+            target: x86_64-unknown-linux-musl
+            runs_on: ubuntu-24.04
+            zigbuild: true
+          - name: jig-linux-aarch64
+            target: aarch64-unknown-linux-musl
+            runs_on: ubuntu-24.04
+            zigbuild: true
+          - name: jig-darwin-aarch64
             target: aarch64-apple-darwin
-            runs_on: macos-14
-          # Secondary client: any Intel Mac still on the team.
-          - tarball_name: jig-darwin-x86_64
-            target: x86_64-apple-darwin
-            runs_on: macos-13
-          # Server: the VPS jig-server runs on.
-          - tarball_name: jig-linux-x86_64
-            target: x86_64-unknown-linux-gnu
-            runs_on: ubuntu-latest
+            runs_on: macos-15
+            zigbuild: false
     steps:
       - uses: actions/checkout@v4
 
+      # Honors rust-toolchain.toml when the repo pins one; stable otherwise.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        shell: bash
+        working-directory: repos
+        run: |
+          set -euo pipefail
+          if [ -f ../rust-toolchain.toml ] || [ -f rust-toolchain.toml ]; then
+            rustup toolchain install --profile minimal
+          else
+            rustup toolchain install stable --profile minimal
+            rustup default stable
+          fi
+          rustup target add ${{ matrix.target }} wasm32-wasip1
+          rustc -V
+
+      # musl targets cross-link with zig: no musl-gcc or aarch64 sysroot to
+      # maintain, and ring/sqlite/zstd's C code builds with zig cc.
+      - name: Install zig + cargo-zigbuild
+        if: matrix.zigbuild
+        uses: mlugg/setup-zig@v2
         with:
-          targets: ${{ matrix.platform.target }},wasm32-wasip1
+          version: 0.13.0
+      - if: matrix.zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: repos
-          key: release-${{ matrix.platform.target }}
+          key: release-${{ matrix.target }}
 
-      # All three binaries ship in every tarball: install.sh copies bin/jig-server
-      # and bin/jig unconditionally out of whatever tarball it fetched, so trimming
-      # the darwin rows down to jig-cli alone would break `curl | sh` on a Mac.
-      - name: Build native binaries (jig-server, jig, jig-nameserver)
+      - name: Build jig-server, jig, jig-nameserver
         working-directory: repos
         shell: bash
         run: |
-          cargo build --release --target ${{ matrix.platform.target }} \
-            -p jig-server -p jig-cli -p jig-nameserver
+          cargo ${{ matrix.zigbuild && 'zigbuild' || 'build' }} --release --locked \
+            --target ${{ matrix.target }} -p jig-server -p jig-cli -p jig-nameserver
 
       - name: Build text-block (wasm32-wasip1)
         working-directory: repos
         shell: bash
-        run: |
-          cargo build --release --target wasm32-wasip1 -p text-block
+        run: cargo build --release --locked --target wasm32-wasip1 -p text-block
 
-      - name: Stage tarball contents
+      - name: Check binaries
         shell: bash
         run: |
           set -euo pipefail
-          STAGE="dist/${{ matrix.platform.tarball_name }}"
-          mkdir -p "$STAGE/bin" "$STAGE/blocks"
-          BIN_DIR="repos/target/${{ matrix.platform.target }}/release"
-          cp "$BIN_DIR/jig-server"     "$STAGE/bin/jig-server"
-          cp "$BIN_DIR/jig"            "$STAGE/bin/jig"
-          cp "$BIN_DIR/jig-nameserver" "$STAGE/bin/jig-nameserver"
-          cp "repos/target/wasm32-wasip1/release/text_block.wasm" \
-             "$STAGE/blocks/text_block.wasm"
-          cp install.sh README.md LICENSE "$STAGE/" 2>/dev/null || true
+          bin="repos/target/${{ matrix.target }}/release"
+          file "$bin/jig" "$bin/jig-server" "$bin/jig-nameserver"
+          case "${{ matrix.target }}" in
+            *-linux-musl)
+              for b in jig jig-server jig-nameserver; do
+                file "$bin/$b" | grep -qE 'statically linked|static-pie linked' \
+                  || { echo "$b is not statically linked" >&2; exit 1; }
+              done ;;
+          esac
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl|aarch64-apple-darwin)
+              "$bin/jig" --help >/dev/null
+              "$bin/jig-server" --help >/dev/null ;;
+          esac
+          ls -lh "$bin/jig" "$bin/jig-server" "$bin/jig-nameserver"
 
-      # Ships next to the binaries so the caveat survives being AirDropped or
-      # re-zipped, not just read on the release page.
-      - name: Add macOS Gatekeeper note (darwin only)
-        if: contains(matrix.platform.target, 'apple-darwin')
+      - name: Package
         shell: bash
-        run: |
-          set -euo pipefail
-          cat > "dist/${{ matrix.platform.tarball_name }}/QUARANTINE-README.txt" <<'EOF'
-          macOS Gatekeeper
-          ================
+        run: scripts/package-release.sh ${{ matrix.target }} ${{ matrix.name }} dist
 
-          These binaries are unsigned and unnotarized. Anything you download or
-          AirDrop gets tagged with com.apple.quarantine, and macOS refuses to
-          launch it ("cannot be opened because the developer cannot be verified").
-
-          Strip the quarantine flag before first run:
-
-              xattr -d com.apple.quarantine ./jig
-
-          Do the same for ./jig-server and ./jig-nameserver if you run those.
-          If xattr reports "No such xattr", the flag was never set — you are fine.
-          EOF
-
-      - name: Package tarball
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd dist
-          tar -czf "${{ matrix.platform.tarball_name }}.tar.gz" "${{ matrix.platform.tarball_name }}"
-          (command -v sha256sum >/dev/null && sha256sum "${{ matrix.platform.tarball_name }}.tar.gz" > "${{ matrix.platform.tarball_name }}.tar.gz.sha256") \
-            || shasum -a 256 "${{ matrix.platform.tarball_name }}.tar.gz" > "${{ matrix.platform.tarball_name }}.tar.gz.sha256"
-
-      # NOTE for whoever downloads this artifact: the darwin binaries are
-      # unsigned/unnotarized. Run `xattr -d com.apple.quarantine ./jig` after
-      # unpacking or macOS will refuse to launch it. See QUARANTINE-README.txt
-      # inside the tarball.
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.platform.tarball_name }}
-          path: |
-            dist/${{ matrix.platform.tarball_name }}.tar.gz
-            dist/${{ matrix.platform.tarball_name }}.tar.gz.sha256
+          name: ${{ matrix.name }}
+          path: dist/${{ matrix.name }}.tar.gz
           if-no-files-found: error
           retention-days: 7
 
-  publish:
-    name: publish GitHub release
+  sign:
+    name: checksums + signature
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      signer: ${{ steps.sign.outputs.signer }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: jig-*
           merge-multiple: true
 
-      - name: List artifacts
-        run: ls -la dist/
+      - name: Pinned key in install.sh matches .github/release/allowed_signers
+        shell: bash
+        run: |
+          set -euo pipefail
+          pinned=$(bash -c "$(grep '^JIG_RELEASE_SIGNER=' install.sh); printf '%s' \"\$JIG_RELEASE_SIGNER\"")
+          [ "$pinned" = "$(cat .github/release/allowed_signers)" ] \
+            || { echo "install.sh JIG_RELEASE_SIGNER drifted from .github/release/allowed_signers" >&2; exit 1; }
 
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
+      - name: Write and sign SHA256SUMS
+        id: sign
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.JIG_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key="$RUNNER_TEMP/jig-release.key"
+          signers="$PWD/.github/release/allowed_signers"
+          if [ -n "$SIGNING_KEY" ]; then
+            printf '%s\n' "$SIGNING_KEY" > "$key"
+          elif [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            echo "JIG_RELEASE_SIGNING_KEY is not set; refusing to publish unsigned binaries" >&2
+            exit 1
+          else
+            echo "::warning::JIG_RELEASE_SIGNING_KEY unavailable; dry run signs with a throwaway key"
+            ssh-keygen -q -t ed25519 -N '' -C jig-release -f "$key"
+            signers="$RUNNER_TEMP/allowed_signers"
+            printf 'jig-release namespaces="jig-release" %s\n' "$(cut -d' ' -f1,2 "$key.pub")" > "$signers"
+          fi
+          cp install.sh dist/install.sh
+          cd dist
+          sha256sum jig-*.tar.gz install.sh > SHA256SUMS
+          ssh-keygen -Y sign -q -f "$key" -n jig-release SHA256SUMS
+          rm -f "$key" "$key.pub"
+          ssh-keygen -Y verify -f "$signers" -I jig-release -n jig-release -s SHA256SUMS.sig < SHA256SUMS
+          cat SHA256SUMS
+          echo "signer=$(cat "$signers")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
         with:
-          # Mark v0.0.x as a prerelease while we're still on hello-world.
-          prerelease: ${{ startsWith(github.ref_name, 'v0.0.') }}
-          fail_on_unmatched_files: true
-          generate_release_notes: true
-          # Prepended to the auto-generated notes, so it is the first thing
-          # anyone sees on the page they download the tarball from.
-          body: |
-            ### macOS: clear the quarantine flag before first run
+          name: release-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
 
-            The darwin binaries below are **unsigned and unnotarized**. macOS tags
-            anything downloaded or AirDropped with `com.apple.quarantine` and refuses
-            to launch it. After unpacking:
+  # Gate: the exact files about to be published must install to hello-world
+  # in under 60s. Served from a local mirror, so this measures install.sh +
+  # the binaries, not GitHub's CDN (the post-publish job covers that).
+  smoke:
+    name: install smoke ${{ matrix.name }}
+    needs: sign
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runs_on: ubuntu-24.04
+            budget: 60
+          - name: darwin-aarch64
+            runs_on: macos-15
+            budget: 60
+          # Emulated under qemu in an alpine container: proves the static
+          # aarch64 build runs on a bare musl userland. Emulation is slow, so
+          # this checks function with a looser budget, not the 60s KPI.
+          - name: linux-aarch64-qemu
+            runs_on: ubuntu-24.04
+            budget: 300
+            qemu: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+      - name: Serve dist/ as a release mirror
+        shell: bash
+        run: |
+          (cd dist && nohup python3 -m http.server 47391 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          for _ in $(seq 1 50); do curl -fsS -o /dev/null http://127.0.0.1:47391/SHA256SUMS && exit 0; sleep 0.1; done
+          exit 1
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.qemu
+        with:
+          platforms: arm64
+      - name: curl | bash → hello-world
+        shell: bash
+        env:
+          JIG_INSTALL_SH_URL: http://127.0.0.1:47391/install.sh
+          JIG_RELEASES_BASE: http://127.0.0.1:47391
+          JIG_VERIFY_SIGNATURE: '1'
+          JIG_RELEASE_SIGNER: ${{ needs.sign.outputs.signer }}
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.qemu }}" = "true" ]; then
+            docker run --rm --platform linux/arm64 --network host -v "$PWD:/w" -w /w \
+              -e JIG_INSTALL_SH_URL -e JIG_RELEASES_BASE -e JIG_VERIFY_SIGNATURE -e JIG_RELEASE_SIGNER \
+              alpine:3.20 sh -c 'apk add --no-cache bash curl perl openssh-keygen >/dev/null && bash scripts/install-smoke.sh ${{ matrix.budget }}' \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            scripts/install-smoke.sh ${{ matrix.budget }}
+          fi
 
-            ```sh
-            xattr -d com.apple.quarantine ./jig
-            ```
+  publish:
+    name: publish GitHub prerelease
+    needs: smoke
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+      - name: Create prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          Pre-1.0: no wire or receipt compatibility guarantee between releases.
 
-            Repeat for `./jig-server` and `./jig-nameserver` if you run those.
+          ### Install
 
-            ### Artifacts
+          \`\`\`sh
+          curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${TAG}/install.sh | JIG_VERSION=${TAG} bash
+          \`\`\`
 
-            | file | for |
-            | --- | --- |
-            | `jig-darwin-aarch64.tar.gz` | Apple Silicon Mac (primary client) |
-            | `jig-darwin-x86_64.tar.gz` | Intel Mac |
-            | `jig-linux-x86_64.tar.gz` | the Linux server / VPS |
-          files: |
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
+          ### Artifacts
+
+          | file | for |
+          | --- | --- |
+          | \`jig-linux-x86_64.tar.gz\` | Linux x86_64, static musl (any distro) |
+          | \`jig-linux-aarch64.tar.gz\` | Linux aarch64, static musl (Pi 4/5, ARM VPS) |
+          | \`jig-darwin-aarch64.tar.gz\` | Apple Silicon macOS (ad-hoc signed, not notarized) |
+          | \`SHA256SUMS\`, \`SHA256SUMS.sig\` | checksums + ed25519 SSH signature over them |
+
+          ### Verify by hand
+
+          \`\`\`sh
+          curl -fsSLO https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${TAG}/.github/release/allowed_signers
+          ssh-keygen -Y verify -f allowed_signers -I jig-release -n jig-release -s SHA256SUMS.sig < SHA256SUMS
+          sha256sum -c --ignore-missing SHA256SUMS   # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
+          \`\`\`
+          EOF
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
+            --title "$TAG" --notes-file notes.md --generate-notes
+
+  smoke-published:
+    name: install smoke (published release)
+    needs: publish
+    uses: ./.github/workflows/install-smoke.yml
+    with:
+      tag: ${{ github.ref_name }}

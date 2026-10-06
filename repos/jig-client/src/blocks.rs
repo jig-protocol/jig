@@ -77,7 +77,7 @@ pub fn build_text_render_with_nickname(
 }
 
 /// Build a signed `channel-create` block. v0.0.2 sends this through the
-/// `/_admin_v0_0_2/channels` REST endpoint (debug-gated). v0.0.3 makes
+/// `/api/v1/channels` REST endpoint. v0.0.3 makes
 /// channel-create a real Wasm block submitted via `submit`.
 pub fn build_channel_create(
     sender: &Identity,

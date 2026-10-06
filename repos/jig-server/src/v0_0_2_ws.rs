@@ -203,15 +203,18 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>
 /// Build a router that mounts the WSS endpoint on the v0.0.2 `AppState`.
 /// Mount this alongside (not instead of) the v0.0.1 `build_router`.
 ///
-/// When `state.config.debug.admin_endpoints` is true, the admin-only
-/// `/_admin_v0_0_2/*` routes are merged in. Otherwise those paths return 404.
+/// Channel ops (`POST /api/v1/channels*`) are always mounted. When
+/// `state.config.debug.admin_endpoints` is true, the legacy
+/// `/_admin_v0_0_2/*` aliases are merged in too; otherwise those paths 404.
 pub fn build_v0_0_2_router(state: Arc<AppState>) -> Router {
     let ws_router = Router::new()
         .route("/api/v1/ws", get(ws_handler))
         .with_state(state.clone());
 
-    // REST block endpoints are always active (not debug-gated).
-    let router = ws_router.merge(crate::v0_0_2_blocks::build_blocks_router(state.clone()));
+    // REST block and channel-op endpoints are always active (not debug-gated).
+    let router = ws_router
+        .merge(crate::v0_0_2_blocks::build_blocks_router(state.clone()))
+        .merge(crate::v0_0_2_admin::build_channel_ops_router(state.clone()));
 
     let mut router = if state.config.debug.admin_endpoints {
         router.merge(crate::v0_0_2_admin::build_admin_router(state.clone()))

@@ -121,10 +121,10 @@ tailnet:
 - **Federated peers are trusted.** Blocks relayed from a peer are persisted
   and delivered to local subscribers without running the write gate. Only
   federate with servers you would let post on your behalf.
-- **Admin endpoints still live behind `[debug]`.** `admin_endpoints = true`
-  (required, below) mounts the channel-ops routes. They run the same gates as
-  everything else now, so the risk is the label, not the behaviour — but do
-  not read "debug" as "harmless".
+- **Channel ops are on by default.** `POST /api/v1/channels*` is always
+  mounted and runs the same gates as every other write: anyone who can reach
+  the port can create an open channel. `[debug] admin_endpoints = true` only
+  adds the legacy `/_admin_v0_0_2/*` aliases for pre-v0.1 CLIs.
 - **No end-to-end encryption.** The operator reads every message. See
   `docs/RELEASE_READINESS.md` §1.3.
 - The nameserver's `/v1/register` has no auth beyond proof-of-control of a
@@ -177,7 +177,7 @@ enabling it.
 
 `jig-server --init-config <path>` writes a template equivalent to
 `config.example.toml` if you would rather generate it than copy it. It emits
-**both halves** of the hybrid file, including `[debug] admin_endpoints = true`.
+**both halves** of the hybrid file.
 
 ### Verify the deploy
 
@@ -256,9 +256,10 @@ Three landmines, all called out in `config.example.toml`:
 - **`[server] listen` is DECORATIVE.** It only builds the `ws://…` origin-tag
   string. It does **not** control the bind address. The server now logs a
   startup `WARN` when `listen` disagrees with the effective `bind_address:port`.
-- **`[debug] admin_endpoints = true` is REQUIRED.** With it false, the
-  `/_admin_v0_0_2/*` router is never mounted and `jig channel create` returns a
-  bare **404** that looks like a wrong URL, wrong port, or a bad build.
+- **`[debug] admin_endpoints` is no longer required.** Current CLIs use
+  `/api/v1/channels*`, which is always mounted. Set it to `true` only while
+  pre-v0.1 `jig` binaries (which POST to `/_admin_v0_0_2/*`) still talk to this
+  server.
 - **`dangerously_enable_v0_0_1_rest` defaults to `false`, and should stay false.**
   It gates the unsigned v0.0.1 REST surface (`GET`/`POST /blocks`,
   `/blocks/:cid`, `/receipts/:cid`), which takes an attacker-chosen author DID
