@@ -1,0 +1,27 @@
+name: Feature request
+description: Propose a change that is not a specification JEP
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Protocol and specification changes belong in a JEP proposal, not here.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is hard or missing today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should change, and what should stay the same?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Other approaches you considered.

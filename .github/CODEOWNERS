@@ -1,0 +1,9 @@
+# Last matching pattern wins. The default owner is repeated on the
+# sensitive paths so a later, narrower rule cannot drop them silently.
+* @the-jig-is-up
+
+/SECURITY.md @the-jig-is-up
+/.github/ @the-jig-is-up
+/deny.toml @the-jig-is-up
+/install.sh @the-jig-is-up
+/repos/jig-spec/ @the-jig-is-up
