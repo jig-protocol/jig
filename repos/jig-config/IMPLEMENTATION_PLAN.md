@@ -11,11 +11,7 @@ Owner: config + runtime teams
 
 **References**
 
-- `executable-internet-master-plan/20251102_REVIEW.md` - Receipt v0.2 and pricing requirements
-- `executable-internet-master-plan/architecture/CONFIGURATION.md` - Canonical config spec
-- `executable-internet-master-plan/architecture/EXECUTION_ENVIRONMENT.md` - Runtime constraints
-- `executable-internet-master-plan/architecture/DATA_FLOW_AND_STORAGE.md` - Storage tier architecture
-- `executable-internet-master-plan/architecture/IDENTITY_AND_REPUTATION.md` - Reputation tiers and governance
+- `repos/jig-spec/src/block-execution.md` - Execution model, capabilities and receipts
 - `repos/jig-core/IMPLEMENTATION_PLAN.md` - Core types status (Receipt v0.2, Capability DSL complete)
 
 ---
@@ -146,7 +142,7 @@ Build the configuration foundation that enables:
 
 ### Phase 1: Execution & Runtime Configuration (Week 1-2)
 
-**Goal:** Support symmetric execution constraints across server/CLI/GUI per the EXECUTION_ENVIRONMENT spec.
+**Goal:** Support symmetric execution constraints across server/CLI/GUI per the jig-spec block-execution.md spec.
 
 | Task | File(s)                   | Description                             | Acceptance Criteria                                                     |
 | ---- | ------------------------- | --------------------------------------- | ----------------------------------------------------------------------- |
@@ -167,7 +163,7 @@ Build the configuration foundation that enables:
 
 ### Phase 2: Storage Tier Separation (Week 2-3)
 
-**Goal:** Support layered storage architecture (truth/speed/intelligence/archive) per DATA_FLOW_AND_STORAGE spec.
+**Goal:** Support layered storage architecture (truth/speed/intelligence/archive) per the storage-tier design.
 
 | Task | File(s)                   | Description                                                  | Acceptance Criteria                                                                       |
 | ---- | ------------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------------------------- |
@@ -201,7 +197,7 @@ Build the configuration foundation that enables:
 | 3.7  | `tests/receipt_config.rs` | Test receipt schema version parsing               | Default to v0.2                                                  |
 | 3.8  | `tests/receipt_config.rs` | Test canonicalization rules                       | JCS with stable field order                                      |
 | 3.9  | Example TOML              | Add receipt configuration to all profile examples | Show v0.2 settings                                               |
-| 3.10 | Docs                      | Document receipt configuration in README          | Link to BLOCK_RUNTIME_SPEC                                       |
+| 3.10 | Docs                      | Document receipt configuration in README          | Link to jig-spec block-execution.md                                       |
 
 **Exit Criteria:** Receipt v0.2 config types defined; canonicalization rules configurable; examples complete.
 
@@ -253,7 +249,7 @@ Runtime/server/CLI teams should map host errors onto these codes until spec docs
 
 ### Phase 5: Governance & Identity Integration (Week 5-6)
 
-**Goal:** Wire nameserver, tribunal, and reputation tier configuration per IDENTITY_AND_REPUTATION spec.
+**Goal:** Wire nameserver, tribunal, and reputation tier configuration per `jig-spec/src/identity-and-reputation.md`.
 
 | Task | File(s)                      | Description                                    | Acceptance Criteria                                                |
 | ---- | ---------------------------- | ---------------------------------------------- | ------------------------------------------------------------------ |
@@ -267,7 +263,7 @@ Runtime/server/CLI teams should map host errors onto these codes until spec docs
 | 5.8  | `tests/governance_config.rs` | Test reputation tier parsing                   | NullSec/LowSec/HighSec configs                                     |
 | 5.9  | `tests/governance_config.rs` | Test progressive cost function                 | Higher tier = lower PoW                                            |
 | 5.10 | Example TOML                 | Add governance config to all profiles          | Nameserver URLs and tribunal settings                              |
-| 5.11 | Docs                         | Document governance integration                | Link to IDENTITY_AND_REPUTATION doc                                |
+| 5.11 | Docs                         | Document governance integration                | Link to `jig-spec/src/identity-and-reputation.md`                                |
 
 **Exit Criteria:** Governance config types complete; reputation tiers map to costs; tribunal settings validated.
 
@@ -288,7 +284,7 @@ Runtime/server/CLI teams should map host errors onto these codes until spec docs
 | 6.7  | `tests/analytics_config.rs` | Test analytics backend selection              | Profile determines backend                                         |
 | 6.8  | `tests/analytics_config.rs` | Test telemetry sampling rates                 | Different per profile                                              |
 | 6.9  | Example TOML                | Add analytics config to all profiles          | DuckDB (potato), ClickHouse (hyperscale)                           |
-| 6.10 | Docs                        | Document analytics pipeline in README         | Link to DATA_FLOW_AND_STORAGE doc                                  |
+| 6.10 | Docs                        | Document analytics pipeline in README         | Explain the storage tiers                                  |
 
 **Exit Criteria:** Analytics backend configurable per profile; telemetry settings validated; examples complete.
 
@@ -753,7 +749,7 @@ Implementation verified in `repos/jig-core/src/`:
 
 **Spec Status:**
 
-- ⚠️ `jig-spec` - BLOCK_RUNTIME_SPEC docs in progress (code complete, docs following)
+- ⚠️ `jig-spec` - jig-spec block-execution.md docs in progress (code complete, docs following)
 
 ### Downstream (Blocked by This Work)
 

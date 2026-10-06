@@ -69,25 +69,6 @@ Everything below was proven by execution.
 
 ---
 
-## Plan vs. the executable-internet-master-plan
-
-`implementation/IMPL_PLAN.md` is dated **2025-10-24** — ~9 months stale.
-
-- It is a 16-week M0→M5 protocol-completeness program terminating at a release candidate.
-  **There is no dogfooding or MVP milestone anywhere in it.** `grep dogfood` hits only
-  `archive/`.
-- Its KPIs are population-scale ratios (≥90% Wasm-backed blocks, ≥95% nameserver identity
-  coverage, tribunal median <48h). None is measurable at 5–10 users.
-- It has **internal version skew**: `repos/jig-cli.md` claims "no nameserver identity" as
-  open work, but its own linked `jig-cli-PROGRESS.md` (2025-11-03) supersedes it, and the
-  shipped binary is ahead of both.
-- `repos/jig-core.md:42` admits tests were never run. Treat every `[x]` as a claim.
-- The 10,000 msg/s potato KPI in `CLAUDE.md` appears **nowhere** in the master plan.
-
-**Recommendation:** do not follow it for this work; re-baseline it on day 3.
-
----
-
 ## Recommended path
 
 **One jig-server bound to a Tailscale interface IP, plaintext `ws://`, one shared open
@@ -320,7 +301,6 @@ list exists.
    checks with `#[cfg(unix)]` (:111,128,182,241), so a Windows build writes private keys
    **with no permission enforcement at all**. Either declare macOS/Linux-only for the week,
    or budget the fix.
-6. **Re-baseline the master plan?** → *Recommend:* after, but block an hour on day 3.
 
 ---
 

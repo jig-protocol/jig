@@ -1,6 +1,5 @@
 # jig-runtime Implementation Plan (Executable Internet + Fuel v0.2)
 
-**Location:** executable-internet-master-plan/implementation/repos/jig-runtime.md  
 **Owners:** jig-runtime maintainers  
 **Last-reviewed:** 2025-11-03  
 **Scope:** Upgrade jig-runtime to a full, shared WASM runtime crate with deterministic execution, capability sandboxing, instrumentable and pricing-compatible fuel (receipt v0.2), and standardized integrations with jig-server, jig-cli, and jig-gui.  
@@ -8,11 +7,8 @@
 
 ## References
 
-- executable-internet-master-plan/00-README.md
-- executable-internet-master-plan/20251102_REVIEW.md
-- architecture/BLOCK_RUNTIME_SPEC.md
-- architecture/EXECUTION_ENVIRONMENT.md
-- implementation/IMPL_PLAN.md
+- repos/jig-spec/src/block-execution.md
+- repos/jig-spec/src/receipts.md
 
 ## Notes
 
@@ -86,9 +82,9 @@
 
 | Priority | Status | Description                                                                                                      | Dependencies             | Notes                                                    |
 | -------- | ------ | ---------------------------------------------------------------------------------------------------------------- | ------------------------ | -------------------------------------------------------- |
-| P0       | ☐      | Create unified crate structure crates/jig-runtime with modules: engine, capabilities, fuel, receipt, api, config | BLOCK_RUNTIME_SPEC.md    | Replace trait-only façade with full implementation crate |
-| P0       | ☐      | Define public Runner API: Runtime, ExecutionContext, BlockPackage, Limits, Outcome                               | EXECUTION_ENVIRONMENT.md | Stable API for jig-server/cli/gui                        |
-| P0       | ☐      | Config struct + builder covering limits, capabilities, fuel budgets, pricing schedule ref                        | EXECUTION_ENVIRONMENT.md | Serialize from TOML/JSON; environment overrides          |
+| P0       | ☐      | Create unified crate structure crates/jig-runtime with modules: engine, capabilities, fuel, receipt, api, config | jig-spec block-execution.md    | Replace trait-only façade with full implementation crate |
+| P0       | ☐      | Define public Runner API: Runtime, ExecutionContext, BlockPackage, Limits, Outcome                               | jig-spec block-execution.md | Stable API for jig-server/cli/gui                        |
+| P0       | ☐      | Config struct + builder covering limits, capabilities, fuel budgets, pricing schedule ref                        | jig-spec block-execution.md | Serialize from TOML/JSON; environment overrides          |
 | P0       | ☐      | Strongly-typed error model (RuntimeError taxonomy)                                                               |                          | Map to receipt outcomes                                  |
 | P0       | ☐      | Feature flags: component-model, wasi-preview2, deterministic, tracing, receipt-signing                           |                          | Keep default minimal and deterministic                   |
 | P0       | ☐      | Structured tracing/logging via tracing crate with span taxonomy                                                  |                          | Toggle via feature and env                               |
@@ -104,7 +100,7 @@
 | Priority | Status | Description                                                                       | Dependencies             | Notes                                     |
 | -------- | ------ | --------------------------------------------------------------------------------- | ------------------------ | ----------------------------------------- |
 | P0       | ☐      | Pin Wasmtime version and strategy; enable consume_fuel(true)                      |                          | Choose latest stable with component model |
-| P0       | ☐      | Initialize engine/store with deterministic config (canonicalize NaNs, no threads) | EXECUTION_ENVIRONMENT.md | Lock down non-determinism                 |
+| P0       | ☐      | Initialize engine/store with deterministic config (canonicalize NaNs, no threads) | jig-spec block-execution.md | Lock down non-determinism                 |
 | P0       | ☐      | Support Component Model (WIT) and fallback to core wasm modules                   | 20251102 review          | Prefer components for capabilities        |
 | P0       | ☐      | WASI preview2 setup with minimal surfaces                                         |                          | No direct wall clock or random            |
 | P0       | ☐      | Epoch-based interruption or fuel-only timeouts                                    |                          | Evaluate epoch if needed                  |
@@ -122,7 +118,7 @@
 | -------- | ------ | ------------------------------------------------------------ | --------------------- | ------------------------------------- |
 | P0       | ☐      | Enable Wasmtime instruction fuel with per-run budget         | Engine                | Budget in ExecutionContext            |
 | P0       | ☐      | Synthetic fuel for hostcalls per capability                  | Capability layer      | Wrap hostcalls with counters          |
-| P0       | ☐      | Versioned cost schedule file (e.g., TOML) mapping units→fuel | BLOCK_RUNTIME_SPEC.md | Checked into repo with semver         |
+| P0       | ☐      | Versioned cost schedule file (e.g., TOML) mapping units→fuel | jig-spec block-execution.md | Checked into repo with semver         |
 | P0       | ☐      | Budget enforcement: overall and per-capability quotas        | Engine, Capability    | Errors map to receipt limits_exceeded |
 | P0       | ☐      | Pricing mapping: fuel units→cost (configurable)              | Receipt               | Provide price field optional          |
 | P0       | ☐      | Counters: calls, bytes_in/out, time_ns, wasm_fuel_in_calls   | Receipt v0.2          | Deterministic where possible          |
@@ -154,7 +150,7 @@
 
 | Priority | Status | Description                                                              | Dependencies          | Notes                           |
 | -------- | ------ | ------------------------------------------------------------------------ | --------------------- | ------------------------------- |
-| P0       | ✅      | Receipt v0.2 schema: ids, module hash, env fingerprint, limits, outcomes | BLOCK_RUNTIME_SPEC.md | Rust struct and docs            |
+| P0       | ✅      | Receipt v0.2 schema: ids, module hash, env fingerprint, limits, outcomes | jig-spec block-execution.md | Rust struct and docs            |
 | P0       | ✅      | Canonical serialization (JSON with sorted keys)                          |                       | Optionally CBOR canonical later |
 | P0       | ✅      | Include fuel totals: wasm_fuel_total, per-capability fuel                | Fuel                  | Deterministic increments        |
 | P0       | ✅      | Include counters: calls, bytes_in/out, time_ns, errors                   | Capability            |                                 |

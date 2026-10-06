@@ -316,9 +316,8 @@ alias registers and resolves across a restart; `jig chat '#hello'` opens with hi
 Unchanged from the 24h plan, plus: **the GUI entirely**, **`Frame::CatchUp` cursor replay**
 (REST "last 100" gets 95% of the value), **real in-client reconnect** (stream-close plus
 `scripts/jig-room.sh`'s `until` loop is indistinguishable at this scale, now that the
-clients exit non-zero), **flipping `[identity] mode` to nameserver** (a
-literal no-op today, and a live enforcement path the moment builders stamp nicknames — 12–20h),
-and **the master-plan doc refresh** (after, per DJ).
+clients exit non-zero), and **flipping `[identity] mode` to nameserver** (a
+literal no-op today, and a live enforcement path the moment builders stamp nicknames — 12–20h).
 
 ## Risks
 

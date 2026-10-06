@@ -1,8 +1,9 @@
 //! Execution constraints and runtime configuration for symmetric block execution.
 //!
 //! These settings ensure identical runtime behavior across server, CLI, and GUI
-//! per the EXECUTION_ENVIRONMENT spec. All runtimes must honor these constraints
-//! to maintain deterministic execution and reproducible receipts.
+//! per the block execution model in `jig-spec` (`block-execution.md`). All
+//! runtimes must honor these constraints to maintain deterministic execution
+//! and reproducible receipts.
 //!
 //! ## Design Principles
 //!

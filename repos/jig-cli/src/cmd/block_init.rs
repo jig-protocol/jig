@@ -281,9 +281,9 @@ jig send --block .
 
 ## Learn More
 
-- [Jig Protocol Docs](https://github.com/jig-protocol/jig-protocol)
-- [Block Runtime Spec](https://github.com/jig-protocol/jig-protocol/blob/main/architecture/BLOCK_RUNTIME_SPEC.md)
-- [Capability Model](https://github.com/jig-protocol/jig-protocol/blob/main/architecture/EXECUTION_ENVIRONMENT.md)
+- [Jig Protocol Docs](https://github.com/jig-protocol/jig)
+- [Block Execution Model](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/src/block-execution.md)
+- [Capabilities](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/src/block-execution.md#capabilities)
 "#,
         name = name,
         template = template.name(),

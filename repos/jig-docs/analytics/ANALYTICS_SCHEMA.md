@@ -614,6 +614,5 @@ Set retention via profile configuration or ClickHouse TTL.
 ---
 
 **See Also:**
-- `BLOCK_RUNTIME_SPEC.md` - Receipt v0.2 schema specification
+- `jig-spec/src/receipts.md` - Receipt v0.2 schema specification
 - `jig-config/README.md` - Analytics backend configuration
-- `20251102_REVIEW.md` - Analytics design decisions

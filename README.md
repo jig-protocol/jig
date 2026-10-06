@@ -205,7 +205,6 @@ CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs three jobs: `wo
 | Understand why something is shaped the way it is | [`docs/superpowers/`](docs/superpowers/) |
 | Report a vulnerability | [`SECURITY.md`](SECURITY.md) (security@jig.onl) |
 | Know what a hostile server operator can and cannot do | the [threat register](repos/jig-spec/src/threat-register.md) and [`docs/security/`](docs/security/operator-threat-model.md) |
-| Work on the code with an agent | [`CLAUDE.md`](CLAUDE.md) / [`AGENTS.md`](AGENTS.md) |
 
 Back up `server.key` before you do anything else. Losing it changes the server's DID, so
 the server comes back as a different identity: its receipts are signed by a new key, and

@@ -497,5 +497,4 @@ Integration tests under `src/server.rs` cover alias minting, reputation flow, an
 
 - [`examples/requests/`](examples/requests/) – interactive payloads for reputation + tribunal APIs.
 - [`src/config.rs`](src/config.rs) – loader that merges profiles + env.
-- [`executable-internet-master-plan/implementation/repos/jig-nameserver.md`](../executable-internet-master-plan/implementation/repos/jig-nameserver.md) – roadmap/tasks.
 - [`QUICK_NOTE_ON_REPUTATION_COMPATIBILITY.md`](QUICK_NOTE_ON_REPUTATION_COMPATIBILITY.md) – design principles for decentralized reputation.
