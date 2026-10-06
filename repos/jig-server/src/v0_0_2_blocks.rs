@@ -832,6 +832,17 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["channels"][0]["slug"], "#hello");
 
+        let mut hlc = test_hlc(&id);
+        hlc.logical = 1;
+        let again = build_channel_create(&id, "#hello", "open", hlc);
+        let submission = serde_json::json!({
+            "bundle_b64": base64::engine::general_purpose::STANDARD.encode(again.canonical_bytes()),
+            "sig_b64":    base64::engine::general_purpose::STANDARD.encode(&again.sender_sig),
+        });
+        let (status, body) = post_json(router.clone(), "/api/v1/channels", submission).await;
+        assert_eq!(status, StatusCode::CONFLICT, "re-create: {body}");
+        assert_eq!(body["code"], "CHANNEL_EXISTS");
+
         let msg = build_text_render(&id, "#hello", "hello, world", test_hlc(&id));
         let submission = serde_json::json!({
             "bundle_b64": base64::engine::general_purpose::STANDARD.encode(msg.canonical_bytes()),

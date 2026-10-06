@@ -58,14 +58,13 @@ The CLI's `restricted (membership-gated reads)` help text is now true, and
 
 | | |
 | --- | --- |
-| **Current state** | Blocks are **signed, not encrypted**. Signing is ed25519 over canonical bundle bytes; hashing is BLAKE3/SHA-256. `BlockManifest.privacy.encryption` ([`manifest.rs:117`](../repos/jig-core/src/manifest.rs)) is a free-form `String` with no crypto behind it — no crate in the workspace performs any AEAD or key agreement. `x25519-dalek` is declared in `repos/Cargo.toml` but no crate depends on it and no source file calls it. Block bodies are cleartext in the SQLite store and cleartext on the wire unless TLS terminates the hop. |
+| **Current state** | Blocks are **signed, not encrypted**. Signing is ed25519 over canonical bundle bytes; hashing is BLAKE3/SHA-256. `BlockManifest.privacy.encryption` and the envelope's `suite` are a typed `EncryptionSuite` ([`suite.rs`](../repos/jig-core/src/suite.rs)) that accepts only `none`; there is no crypto behind them — no crate in the workspace performs any AEAD or key agreement. `x25519-dalek` is declared in `repos/Cargo.toml` but no crate depends on it and no source file calls it. Block bodies are cleartext in the SQLite store and cleartext on the wire unless TLS terminates the hop. |
 | **Ready means** | Message bodies are encrypted to recipient keys; the server stores ciphertext it cannot read. |
 | **Gap** | Everything. The `[tls]` section ([`config.rs:41`](../repos/jig-server/src/config.rs), off by default) gives transport confidentiality only; the server operator reads every message. |
 
-`repos/jig-spec/` documents `age+x25519` E2EE in detail
-(`src/crypto.md`, `src/blocks.md`, `src/zero-trust.md`). None of it is
-implemented. Publishing that spec next to the code without a prominent
-"not implemented" banner is itself a security-communication problem.
+`repos/jig-spec/` used to document `age+x25519` E2EE in the present tense. Since
+2026-10-05 it specifies MLS by default, suite-pluggable, in `src/encryption.md`, bannered
+as not implemented in v0.1.
 
 **Verdict: BLOCKER** for any claim of privacy. Not a blocker for a
 narrowly-scoped "federated IRC with signed messages" pitch — *if* the
@@ -201,7 +200,7 @@ match.
 | `SECURITY.md` (root) | No | See §1.8. |
 | Deployment docs | Yes, strong | `deploy/README.md` (426 lines: install, tailnet security model, TLS via `tailscale cert`, teammate onboarding, backups, restore, gotchas), `docs/deployment/gcp-vps-runbook.md` (940 lines), plus dogfood runbooks and an install benchmark. |
 | Per-crate rustdoc | Partial | Module- and item-level doc comments are dense and unusually good (the `//!` headers carry real rationale). But **no crate sets `#![warn(missing_docs)]`** and none carries `[package.metadata.docs.rs]`, so there is no rendered API reference anywhere. Only `integration-tests` sets `publish = false`; the rest are publishable-by-accident, including five `jig-gui/riverdance` crates named `ui`, `api`, `web`, `desktop`, and `mobile`. |
-| `jig-spec` book | Yes | mdbook under `repos/jig-spec/`. **Describes unshipped behaviour in the present tense** — E2EE (`age+x25519`), crypto-suite negotiation, SSH/gRPC transports. Needs an implementation-status banner before anyone outside reads it. |
+| `jig-spec` book | Yes | mdbook under `repos/jig-spec/`. Describes much unshipped behaviour. E2EE (now MLS), the handshake and the transports carry not-implemented banners as of 2026-10-05; other chapters (receipts, analytics, identity and reputation) are still aspirational in places. |
 | `jig-gui` (riverdance) | Scaffold | `repos/jig-gui/riverdance/README.md` is verbatim Dioxus template boilerplate ("your_project"). It is a design mock, not a working client, and nothing in the repo says so where a newcomer would look. |
 
 **Verdict: GAP**, trending to READY once the README lands — with the caveat
@@ -233,15 +232,12 @@ correct; that decision is open. Until then default copyright applies, all five c
 explicitly so the silence is not read as an oversight. Nothing in the protocol crates
 depends on this subtree, so its status cannot contaminate them.
 
-**`repos/jig-spec/` — still CC BY-SA 4.0, and this needs a decision.** Share-alike on a
-written specification can impede exactly the independent implementations the permissive
-code licence exists to encourage: a derived implementation guide inherits the share-alike
-obligation. Most protocol specs that want wide adoption use CC-BY-4.0 or the same terms as
-the code. Recommend aligning it; flagged rather than changed, because spec licensing has
-different norms from code licensing and this is a judgement call, not a cleanup.
+**`repos/jig-spec/` — CC-BY-4.0 (decided 2026-10-05).** It was CC BY-SA 4.0. Share-alike
+on a written specification impedes exactly the independent implementations the permissive
+code licence exists to encourage, because a derived implementation guide inherits the
+share-alike obligation. Attribution-only matches what most widely adopted protocol specs use.
 
-**Verdict: no longer a blocker.** Downgraded from BLOCKER to the open `jig-spec` question
-above.
+**Verdict: resolved.**
 
 ### The DAG rule (external contributors must know this)
 
@@ -295,11 +291,11 @@ strangers a footgun — a smaller one, with the safety on.
 | # | Blocker | Why it is in this position |
 | --- | --- | --- |
 | ~~1~~ | ~~**Authn + authz on `jig-server`**~~ | **Phases 1–4 DONE 2026-09-11** — per-request proof of possession on reads, `visibility`/membership enforced on history, listing, live delivery and posting, owner-signed membership changes, and an admission policy (bans, ruleset floors, explicit unknown-DID choice) on every read and write. Still open from the same design: trusted connections (phase 5); see §1.1. |
-| 2 | **Root `SECURITY.md` with an external reporting path** | Cheap, and blocker #1 guarantees findings. Without it the first report is public. |
-| ~~3~~ | ~~**Root `LICENSE` + consistent per-crate SPDX ids**~~ | **DONE 2026-08-06** — dual-licensed MIT OR Apache-2.0, root licence pair added, every protocol crate aligned. Only the `jig-spec` CC BY-SA question remains, and it does not gate release. |
+| ~~2~~ | ~~**Root `SECURITY.md` with an external reporting path**~~ | **DONE 2026-10-05** — `SECURITY.md`: security@jig.onl, 1/7/28-day targets, 90-day disclosure, malicious operators in scope. |
+| ~~3~~ | ~~**Root `LICENSE` + consistent per-crate SPDX ids**~~ | **DONE 2026-08-06** — dual-licensed MIT OR Apache-2.0, root licence pair added, every protocol crate aligned. `jig-spec` moved to CC-BY-4.0 on 2026-10-05. |
 | 4 | **Fix the binary install path** | `install.sh` points at a host that serves nothing, unpacks the wrong paths, and verifies no checksum — while `release.yml` already publishes the `.sha256`. A `curl \| sh` KPI that does not work is worse than not having one. |
-| 5 | **Say plainly that v0.0.x has no compatibility guarantee** | README + release notes. Every version field in the system is a label, not a gate; users must not infer stability from their presence. |
-| 6 | **Implementation-status banner on `jig-spec`** | It documents E2EE we have not written, in the present tense. Shipping that unqualified is a claim about privacy we cannot back. |
+| 5 | **Say plainly that v0.x has no compatibility guarantee** | README and spec done 2026-10-05; release notes still to do. `Envelope.v`, the manifest `schema` and the encryption suite are now gates, not labels. |
+| ~~6~~ | ~~**Implementation-status banner on `jig-spec`**~~ | **DONE 2026-10-05** — E2EE rewritten from `age+x25519` to MLS and bannered as not implemented; handshake and transports bannered. |
 | 7 | **Clear the reachable advisory suppressions** | Three lockfile bumps (`time`, `tracing-subscriber`, `rand`) plus the rustls 0.22 → 0.23 dedup that retires the four `rustls-webpki` ignores. |
 | 8 | **Name a triage owner and publish a support channel** | Not technical. Determines whether the first outside contributor comes back. |
 

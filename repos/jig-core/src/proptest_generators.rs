@@ -218,7 +218,7 @@ impl Arbitrary for Privacy {
 
     fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
         (
-            prop::string::string_regex("(age|x25519|aes256)").unwrap(),
+            prop::sample::select(crate::EncryptionSuite::REGISTERED),
             prop::collection::vec(did_strategy(), 1..5),
             any::<MetadataVisibility>(),
         )
