@@ -1,0 +1,51 @@
+name: Bug report
+description: Something in jig behaves wrongly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting this. Do not file a security vulnerability here.
+        Use "Report a vulnerability" in the sidebar, or email security@jig.onl.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Commands, requests, or a minimal config. Redact keys and hostnames.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: A release tag, or the commit on main.
+      placeholder: v0.0.3-beta
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - server
+        - client or CLI
+        - specification
+        - runtime or Wasm
+        - nameserver
+        - install or release
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant log lines. Do not include secrets.
+      render: text
