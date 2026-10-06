@@ -3,6 +3,8 @@
 //! This module provides a deterministic WebAssembly execution engine using Wasmtime.
 //! All execution is fuel-metered, with canonicalized NaNs, and no non-deterministic features.
 
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -120,16 +122,29 @@ struct EpochTicker {
     /// is immediate rather than waiting out the current tick.
     stop: Arc<(Mutex<bool>, Condvar)>,
     handle: Option<thread::JoinHandle<()>>,
+    /// Linux tid of the ticker thread. `0` until the thread publishes it.
+    /// `pthread_join` can return while `/proc/self/task/<tid>` still lists the
+    /// thread, which is what the thread-count test observes.
+    #[cfg(target_os = "linux")]
+    tid: Arc<AtomicU64>,
 }
 
 impl EpochTicker {
     fn start(engine: Engine, cadence: Duration) -> Result<Self> {
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let stop_for_thread = Arc::clone(&stop);
+        #[cfg(target_os = "linux")]
+        let tid = Arc::new(AtomicU64::new(0));
+        #[cfg(target_os = "linux")]
+        let tid_for_thread = Arc::clone(&tid);
 
         let handle = thread::Builder::new()
             .name("jig-epoch-ticker".into())
             .spawn(move || {
+                #[cfg(target_os = "linux")]
+                if let Some(published) = linux_tid() {
+                    tid_for_thread.store(published, Ordering::Release);
+                }
                 let (lock, cvar) = &*stop_for_thread;
                 // A monotonic deadline, NOT a fresh `cadence` wait each pass.
                 // `wait_timeout` may return early for reasons other than the stop
@@ -141,12 +156,22 @@ impl EpochTicker {
                 let mut next_tick = Instant::now() + cadence;
                 loop {
                     let remaining = next_tick.saturating_duration_since(Instant::now());
-                    let stopping = lock.lock().expect("epoch ticker mutex poisoned");
-                    let (stopping, _) = cvar
-                        .wait_timeout(stopping, remaining)
-                        .expect("epoch ticker mutex poisoned");
+                    let mut stopping = lock.lock().expect("epoch ticker mutex poisoned");
+                    // The flag is the predicate. Checking it before waiting means a
+                    // stop that landed before this iteration — including one whose
+                    // notify was delivered to nobody — does not sleep out the rest
+                    // of the tick while `Drop` is blocked in `join`.
                     if *stopping {
                         break;
+                    }
+                    if !remaining.is_zero() {
+                        let (guard, _) = cvar
+                            .wait_timeout(stopping, remaining)
+                            .expect("epoch ticker mutex poisoned");
+                        stopping = guard;
+                        if *stopping {
+                            break;
+                        }
                     }
                     drop(stopping);
 
@@ -170,8 +195,17 @@ impl EpochTicker {
         Ok(Self {
             stop,
             handle: Some(handle),
+            #[cfg(target_os = "linux")]
+            tid,
         })
     }
+}
+
+/// tid of the calling thread, from `/proc/thread-self`.
+#[cfg(target_os = "linux")]
+fn linux_tid() -> Option<u64> {
+    let path = std::fs::read_link("/proc/thread-self").ok()?;
+    path.file_name()?.to_str()?.parse().ok()
 }
 
 impl Drop for EpochTicker {
@@ -184,9 +218,28 @@ impl Drop for EpochTicker {
             }
         }
         if let Some(handle) = self.handle.take() {
-            // Joining keeps the thread from outliving the `Engine` it holds, and
-            // makes "engine dropped" mean "ticker gone" for the thread-count test.
+            // Joining keeps the thread from outliving the `Engine` it holds.
             let _ = handle.join();
+        }
+        // `pthread_join` can return while the kernel still counts the thread.
+        // The thread-count test reads `/proc/self/status` the moment `Drop`
+        // returns, so wait until that entry is actually gone.
+        #[cfg(target_os = "linux")]
+        self.wait_until_reaped();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl EpochTicker {
+    fn wait_until_reaped(&self) {
+        let tid = self.tid.load(Ordering::Acquire);
+        if tid == 0 {
+            return;
+        }
+        let path = format!("/proc/self/task/{tid}");
+        let deadline = Instant::now() + Duration::from_millis(50);
+        while std::path::Path::new(&path).exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
         }
     }
 }
