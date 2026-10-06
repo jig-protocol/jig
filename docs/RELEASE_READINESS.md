@@ -292,11 +292,11 @@ strangers a footgun — a smaller one, with the safety on.
 | # | Blocker | Why it is in this position |
 | --- | --- | --- |
 | ~~1~~ | ~~**Authn + authz on `jig-server`**~~ | **Phases 1–4 DONE 2026-09-11** — per-request proof of possession on reads, `visibility`/membership enforced on history, listing, live delivery and posting, owner-signed membership changes, and an admission policy (bans, ruleset floors, explicit unknown-DID choice) on every read and write. Still open from the same design: trusted connections (phase 5); see §1.1. |
-| 2 | **Root `SECURITY.md` with an external reporting path** | Cheap, and blocker #1 guarantees findings. Without it the first report is public. |
+| ~~2~~ | ~~**Root `SECURITY.md` with an external reporting path**~~ | **DONE 2026-10-05** — `SECURITY.md`: security@jig.onl, 1/7/28-day targets, 90-day disclosure, malicious operators in scope. |
 | ~~3~~ | ~~**Root `LICENSE` + consistent per-crate SPDX ids**~~ | **DONE 2026-08-06** — dual-licensed MIT OR Apache-2.0, root licence pair added, every protocol crate aligned. `jig-spec` moved to CC-BY-4.0 on 2026-10-05. |
 | 4 | **Fix the binary install path** | `install.sh` points at a host that serves nothing, unpacks the wrong paths, and verifies no checksum — while `release.yml` already publishes the `.sha256`. A `curl \| sh` KPI that does not work is worse than not having one. |
-| 5 | **Say plainly that v0.0.x has no compatibility guarantee** | README + release notes. Every version field in the system is a label, not a gate; users must not infer stability from their presence. |
-| 6 | **Implementation-status banner on `jig-spec`** | It documents E2EE we have not written, in the present tense. Shipping that unqualified is a claim about privacy we cannot back. |
+| 5 | **Say plainly that v0.x has no compatibility guarantee** | README and spec done 2026-10-05; release notes still to do. `Envelope.v`, the manifest `schema` and the encryption suite are now gates, not labels. |
+| ~~6~~ | ~~**Implementation-status banner on `jig-spec`**~~ | **DONE 2026-10-05** — E2EE rewritten from `age+x25519` to MLS and bannered as not implemented; handshake and transports bannered. |
 | 7 | **Clear the reachable advisory suppressions** | Three lockfile bumps (`time`, `tracing-subscriber`, `rand`) plus the rustls 0.22 → 0.23 dedup that retires the four `rustls-webpki` ignores. |
 | 8 | **Name a triage owner and publish a support channel** | Not technical. Determines whether the first outside contributor comes back. |
 

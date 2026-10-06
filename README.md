@@ -28,6 +28,12 @@ loopback and private tailnets.
 
 **Read this before running it anywhere reachable:**
 
+- **v0.x makes no compatibility guarantee.** Any v0.x release may change the wire format,
+  manifests, receipts or configuration without a migration path. What v0.x does promise is
+  that a mismatch is refused, not misread: the envelope version, manifest schema and
+  encryption suite are checked, and anything unsupported is rejected
+  ([`repos/jig-spec/src/versioning.md`](repos/jig-spec/src/versioning.md)).
+
 - **No encryption of message content.** Blocks are *signed*, never encrypted. There is no
   E2EE and no per-message confidentiality. Anything on the wire without an outer TLS
   tunnel is plaintext, and the server stores plaintext.
@@ -63,7 +69,7 @@ loopback and private tailnets.
 | Wasm block execution **on the server** | `text-render` executes for real: the server runs its canonical module and signs the `render_hash` ([`jig-pipeline/src/ingest.rs`](repos/jig-pipeline/src/ingest.rs), step 4). Control-plane kinds still take a synthetic, server-signed receipt |
 | Wasm block execution in the CLI (`jig block run`) | Runs and emits a metered receipt for the runtime's own fixtures. It **rejects the workspace's own `text-block` build** with `MemoryMissingMaximum` from the determinism validator |
 | `jig block lint` / `sign` / `verify` / `capabilities` | Stubs; they print "not yet implemented" and exit 1 |
-| End-to-end encryption | None |
+| End-to-end encryption | None. MLS is planned for v0.2. Every frame and manifest already names its encryption suite; `none` is the only one accepted ([spec](repos/jig-spec/src/encryption.md)) |
 | Authentication / authorization | Signed proof of possession on every read; `restricted` channels membership-gated for reading, listing, live delivery and posting; membership changes owner-signed. **No admission policy or rate limiting** — any key is admitted |
 | Graphical client | None |
 | `jig read` | Broken by default — it calls the v0.0.1 `GET /blocks` route, which is gated off behind `dangerously_enable_v0_0_1_rest`. Use `jig chat`, `jig tail`, or the history endpoint |
@@ -197,6 +203,8 @@ CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs three jobs: `wo
 | Know exactly what shipped and what did not | the STATUS section of [`docs/deployment/internal-dogfood-3day.md`](docs/deployment/internal-dogfood-3day.md) |
 | Find any doc in the repo, with a currency label | [`docs/README.md`](docs/README.md) |
 | Understand why something is shaped the way it is | [`docs/superpowers/`](docs/superpowers/) |
+| Report a vulnerability | [`SECURITY.md`](SECURITY.md) (security@jig.onl) |
+| Know what a hostile server operator can and cannot do | the [threat register](repos/jig-spec/src/threat-register.md) and [`docs/security/`](docs/security/operator-threat-model.md) |
 | Work on the code with an agent | [`CLAUDE.md`](CLAUDE.md) / [`AGENTS.md`](AGENTS.md) |
 
 Back up `server.key` before you do anything else — losing it changes the server's DID and
