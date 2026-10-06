@@ -58,14 +58,13 @@ The CLI's `restricted (membership-gated reads)` help text is now true, and
 
 | | |
 | --- | --- |
-| **Current state** | Blocks are **signed, not encrypted**. Signing is ed25519 over canonical bundle bytes; hashing is BLAKE3/SHA-256. `BlockManifest.privacy.encryption` ([`manifest.rs:117`](../repos/jig-core/src/manifest.rs)) is a free-form `String` with no crypto behind it — no crate in the workspace performs any AEAD or key agreement. `x25519-dalek` is declared in `repos/Cargo.toml` but no crate depends on it and no source file calls it. Block bodies are cleartext in the SQLite store and cleartext on the wire unless TLS terminates the hop. |
+| **Current state** | Blocks are **signed, not encrypted**. Signing is ed25519 over canonical bundle bytes; hashing is BLAKE3/SHA-256. `BlockManifest.privacy.encryption` and the envelope's `suite` are a typed `EncryptionSuite` ([`suite.rs`](../repos/jig-core/src/suite.rs)) that accepts only `none`; there is no crypto behind them — no crate in the workspace performs any AEAD or key agreement. `x25519-dalek` is declared in `repos/Cargo.toml` but no crate depends on it and no source file calls it. Block bodies are cleartext in the SQLite store and cleartext on the wire unless TLS terminates the hop. |
 | **Ready means** | Message bodies are encrypted to recipient keys; the server stores ciphertext it cannot read. |
 | **Gap** | Everything. The `[tls]` section ([`config.rs:41`](../repos/jig-server/src/config.rs), off by default) gives transport confidentiality only; the server operator reads every message. |
 
-`repos/jig-spec/` documents `age+x25519` E2EE in detail
-(`src/crypto.md`, `src/blocks.md`, `src/zero-trust.md`). None of it is
-implemented. Publishing that spec next to the code without a prominent
-"not implemented" banner is itself a security-communication problem.
+`repos/jig-spec/` used to document `age+x25519` E2EE in the present tense. Since
+2026-10-05 it specifies MLS by default, suite-pluggable, in `src/encryption.md`, bannered
+as not implemented in v0.1.
 
 **Verdict: BLOCKER** for any claim of privacy. Not a blocker for a
 narrowly-scoped "federated IRC with signed messages" pitch — *if* the
@@ -201,7 +200,7 @@ match.
 | `SECURITY.md` (root) | No | See §1.8. |
 | Deployment docs | Yes, strong | `deploy/README.md` (426 lines: install, tailnet security model, TLS via `tailscale cert`, teammate onboarding, backups, restore, gotchas), `docs/deployment/gcp-vps-runbook.md` (940 lines), plus dogfood runbooks and an install benchmark. |
 | Per-crate rustdoc | Partial | Module- and item-level doc comments are dense and unusually good (the `//!` headers carry real rationale). But **no crate sets `#![warn(missing_docs)]`** and none carries `[package.metadata.docs.rs]`, so there is no rendered API reference anywhere. Only `integration-tests` sets `publish = false`; the rest are publishable-by-accident, including five `jig-gui/riverdance` crates named `ui`, `api`, `web`, `desktop`, and `mobile`. |
-| `jig-spec` book | Yes | mdbook under `repos/jig-spec/`. **Describes unshipped behaviour in the present tense** — E2EE (`age+x25519`), crypto-suite negotiation, SSH/gRPC transports. Needs an implementation-status banner before anyone outside reads it. |
+| `jig-spec` book | Yes | mdbook under `repos/jig-spec/`. Describes much unshipped behaviour. E2EE (now MLS), the handshake and the transports carry not-implemented banners as of 2026-10-05; other chapters (receipts, analytics, identity and reputation) are still aspirational in places. |
 | `jig-gui` (riverdance) | Scaffold | `repos/jig-gui/riverdance/README.md` is verbatim Dioxus template boilerplate ("your_project"). It is a design mock, not a working client, and nothing in the repo says so where a newcomer would look. |
 
 **Verdict: GAP**, trending to READY once the README lands — with the caveat
