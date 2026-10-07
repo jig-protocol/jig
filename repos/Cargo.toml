@@ -85,7 +85,9 @@ cid = { version = "0.11", features = ["serde"] }
 multihash-codetable = { version = "0.2", default-features = false, features = ["blake3"] }
 
 # Storage
-rusqlite = { version = "0.31", features = ["bundled"] }
+# 0.32 pairs with libsqlite3-sys 0.30, which is what sqlx 0.8.1+ (GHSA-xmrp-424f-vfpx)
+# resolves. 0.31 cannot share a process with that sqlx line: both crates `links = "sqlite3"`.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # CLI
 clap = { version = "4.0", features = ["derive", "env"] }

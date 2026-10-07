@@ -69,6 +69,7 @@ jobs:
   select-platforms:
     name: select platforms
     runs-on: ubuntu-latest
+    permissions: {}
     outputs:
       include: ${{ steps.pick.outputs.include }}
     steps:
@@ -104,6 +105,10 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.select-platforms.outputs.include) }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      # Swatinem/rust-cache saves to the Actions cache API.
+      actions: write
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -135,6 +140,7 @@ jobs:
     needs: profile
     if: always()
     runs-on: ubuntu-latest
+    permissions: {}
     steps:
       - name: Summary
         run: |
