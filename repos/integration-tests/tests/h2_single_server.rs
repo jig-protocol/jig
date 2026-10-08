@@ -45,6 +45,9 @@ async fn single_server_two_client_text_render_round_trip() {
     // uses. This is the path the product actually runs on.
     let ws_url = format!("{}/api/v1/ws", server.ws_url());
     let (mut alice_ws, _) = connect_async(&ws_url).await.expect("alice ws connect");
+    jig_server::v0_0_2_federation::complete_client_handshake(&mut alice_ws)
+        .await
+        .expect("alice handshake");
     // Signed like any real caller: the server refuses an unsigned subscribe.
     let sub_env = signed_subscribe(
         &alice,

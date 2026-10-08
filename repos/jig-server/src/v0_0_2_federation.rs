@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use jig_core::{Author, BlockKind, BlockManifest};
 use jig_pipeline::{
     Envelope, Frame, Scope,
@@ -115,6 +115,51 @@ async fn run_peer_loop(state: Arc<AppState>, peer: jig_config::v0_0_2_server::Fe
     }
 }
 
+/// Speak JEP-0002 as the dialer: hello, then require a signed welcome.
+///
+/// A version or suite refusal is an error from this function so the reconnect
+/// loop can try again. The server side does not close on those codes; dropping
+/// the dialer's socket here ends the attempt. A missing or self-contradictory
+/// welcome is fail-closed: this sends a close frame before returning.
+pub async fn complete_client_handshake<S>(
+    ws: &mut S,
+) -> anyhow::Result<jig_pipeline::handshake::VerifiedWelcome>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    let (hello, pending) =
+        jig_pipeline::handshake::begin(&jig_pipeline::handshake::ClientOffer::default());
+    ws.send(Message::Text(serde_json::to_string(&hello)?.into()))
+        .await?;
+    // Same absolute deadline as the client. Control frames must not restart it,
+    // or the peer loop never reaches its reconnect delay.
+    let deadline = tokio::time::Instant::now() + jig_pipeline::handshake::WELCOME_WAIT;
+    let text = loop {
+        let next = tokio::time::timeout_at(deadline, ws.next()).await;
+        match next {
+            Err(_) => anyhow::bail!("timed out waiting for a welcome"),
+            Ok(None) => anyhow::bail!("connection closed before a welcome"),
+            Ok(Some(Err(err))) => return Err(err.into()),
+            Ok(Some(Ok(Message::Text(text)))) => break text,
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
+            Ok(Some(Ok(Message::Close(_)))) => anyhow::bail!("connection closed before a welcome"),
+            Ok(Some(Ok(_))) => anyhow::bail!("first frame is not a welcome"),
+        }
+    };
+    match pending.interpret(&text) {
+        jig_pipeline::handshake::HandshakeResult::Established(welcome) => Ok(welcome),
+        jig_pipeline::handshake::HandshakeResult::LeaveOpen { code, message } => {
+            anyhow::bail!("peer refused the handshake ({code}): {message}")
+        }
+        jig_pipeline::handshake::HandshakeResult::FailClosed { reason, .. } => {
+            let _ = ws.send(Message::Close(None)).await;
+            anyhow::bail!("handshake failed closed: {reason}")
+        }
+    }
+}
+
 async fn connect_and_relay(
     state: &Arc<AppState>,
     peer: &jig_config::v0_0_2_server::FederationPeer,
@@ -136,10 +181,13 @@ async fn connect_and_relay(
              no-op cert verifier for this peer; TLS server identity is NOT being checked"
         );
     }
-    let (ws, _resp) = match connector {
+    let (mut ws, _resp) = match connector {
         Some(c) => connect_async_tls_with_config(&ws_url, None, false, Some(c)).await?,
         None => connect_async(&ws_url).await?,
     };
+    // Same hello/welcome a CLI client speaks. The fed-hello bundle below is a
+    // block, not this handshake, and the server now refuses it until welcome.
+    complete_client_handshake(&mut ws).await?;
     let (mut sink, mut stream) = ws.split();
     info!(peer_url = %peer.url, "federation peer connected");
 

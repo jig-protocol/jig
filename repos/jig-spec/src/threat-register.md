@@ -15,8 +15,8 @@ implemented. *Accepted*: a known limit this version does not try to close.
 
 | ID | Threat | Decision | v0.1 |
 | --- | --- | --- | --- |
-| OP-01 | Operator disables or strips the handshake | Every connection completes the handshake before any other frame. A client MUST close a connection with no handshake, or a malformed one ([JEP-0002]). | Open |
-| OP-02 | False handshake answers (version, capabilities, suites, reputation) | Handshake answers are signed by the server key. A client MUST treat later behaviour that contradicts a signed answer as a handshake failure, and SHOULD keep the signed answer as evidence ([JEP-0002]). | Open |
+| OP-01 | Operator disables or strips the handshake | Every connection completes the handshake before any other frame. A client MUST close a connection with no handshake, or a malformed one ([JEP-0002]). | Partial: WSS refuses a frame before `hello`; the client closes when the welcome is missing or malformed. Version and suite refusals leave the socket open |
+| OP-02 | False handshake answers (version, capabilities, suites, reputation) | Handshake answers are signed by the server key. A client MUST treat later behaviour that contradicts a signed answer as a handshake failure, and SHOULD keep the signed answer as evidence ([JEP-0002]). | Partial: the welcome is signed; a bad signature or a self-contradiction closes the client. Later frames are not yet checked against it |
 | OP-03 | Suite downgrade: advertising only weak suites, or `none` | Unknown or unimplemented suites are refused, never treated as `none`. A channel's suite is fixed at creation; a client MUST NOT post under any other ([Encryption], [JEP-0001]). | Partial: the field and refusals ship; `none` is the only suite |
 | OP-04 | Metadata harvesting: who talks to whom, when, how much | The server sees routing metadata. v0.x makes no metadata-privacy claim. | Accepted |
 | OP-05 | Content disclosure: operator reads messages | Content confidentiality comes from end-to-end encryption, MLS by default ([Encryption]). | Accepted: v0.1 is unencrypted |

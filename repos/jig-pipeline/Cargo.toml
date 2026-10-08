@@ -27,6 +27,7 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 rusqlite = { workspace = true }
 ed25519-dalek = { workspace = true }
+base64 = "0.22"
 blake3 = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }

@@ -55,8 +55,9 @@ checks, what the server claims to support.
 every server. **Alternative rejected:** an optional handshake, because the attacker
 chooses to omit it.
 
-**Status evidence.** No handshake exists in `jig-server` or `jig-client`. Roadmap P1
-item 11 adds the version, capabilities and suite parts.
+**Status evidence.** `jig-server` answers `hello` with a signed `welcome` and
+refuses any earlier frame. `jig-client` closes when that welcome is missing or
+malformed. Version and suite refusals leave the socket open.
 
 ### OP-02: false handshake answers
 
@@ -68,7 +69,10 @@ The server signs its answer, and the client treats contradicting behaviour as a 
 A signed false claim is evidence a user or a reputation system can act on. **Alternative
 rejected:** unsigned answers, which leave nothing to show anyone.
 
-**Status evidence.** Nothing to sign yet (no handshake).
+**Status evidence.** The welcome is signed over version, suites, capabilities,
+reputation (`null`), and the client's nonce. The client keeps the frame when
+the signature fails or the welcome contradicts itself. Checking a later frame
+against that signature is still open.
 
 ### OP-03: suite downgrade
 
