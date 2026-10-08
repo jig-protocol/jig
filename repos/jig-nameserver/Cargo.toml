@@ -62,8 +62,10 @@ redis = { version = "0.27", features = ["tokio-comp", "connection-manager"], opt
 
 # Tier 2 Analytics: DuckDB and Parquet backends
 duckdb = { version = "1.0", features = ["bundled"], optional = true }
-arrow = { version = "53", optional = true }
-parquet = { version = "53", optional = true }
+# 59 drops the thrift crate (GHSA-2f9f-gq7v-9h6m). Keep arrow and parquet
+# on the same major; they are semver-locked to each other.
+arrow = { version = "59", optional = true }
+parquet = { version = "59", optional = true }
 csv = { version = "1.3", optional = true }
 
 # Tier 3 Hot: ScyllaDB backend (using latest stable version)
