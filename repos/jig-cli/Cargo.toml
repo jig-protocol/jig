@@ -38,17 +38,17 @@ tokio = { workspace = true }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
+toml = "0.9"
 
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 
 # HTTP client
 reqwest = { workspace = true }
 
 # Base64 for alias-registration proof-of-control signatures
-base64 = "0.22"
+base64 = "0.23"
 
 # URL parsing (validates `jig server set <url>` input)
 url = "2"
@@ -58,17 +58,17 @@ cid.workspace = true
 semver = "1.0"
 
 # Utils
-dirs = "5.0"
+dirs = "6.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-whoami = "1.4"
+whoami = "2.1"
 
 # Terminal UI (Phase F6 — `jig chat` ratatui TUI). Pinned to the
 # versions called out in the v0.0.2 plan; the API surface used
 # here is identical across 0.27 and the current 0.28/0.29 lines
 # (Layout/Block/List/Paragraph + crossterm event/poll), so
 # upgrading later is a one-line bump.
-ratatui = "0.27"
-crossterm = "0.27"
+ratatui = "0.30"
+crossterm = "0.29"
 
 # Config (planned integration)
 jig-config = { path = "../jig-config", optional = true }

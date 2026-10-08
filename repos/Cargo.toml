@@ -45,14 +45,14 @@ jig-core = { path = "jig-core", features = ["ed25519"] }
 jig-config = { path = "jig-config" }
 jig-runtime = { path = "jig-runtime" }
 # Riverdance GUI
-dioxus = "0.6.0"
+dioxus = "0.7.2"
 ui = { path = "jig-gui/riverdance/ui" }
 api = { path = "jig-gui/riverdance/api" }
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util"] }
 async-trait = "0.1"
-thiserror = "1.0"
+thiserror = "2.0"
 anyhow = "1.0"
-toml = "0.8"
+toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -96,9 +96,9 @@ clap = { version = "4.0", features = ["derive", "env"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Networking
-axum = "0.7"
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 hyper = "1.0"
 http-body-util = "0.1"
 

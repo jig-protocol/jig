@@ -31,7 +31,7 @@ serde_json = { workspace = true }
 tempfile = "3"
 anyhow = { workspace = true }
 chrono = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
@@ -53,7 +53,7 @@ semver = "1.0"
 wat = "1.0"
 # alpha.1c #4 (h_tls_verifier): drive a real TLS handshake against a
 # self-signed cert to verify dangerously_disable_federation_tls.
-rcgen = "0.13"
+rcgen = "0.14"
 # The last holder of the rustls 0.22 branch. h_tls_verifier stands up a real TLS
 # server, so it must speak the SAME rustls as jig-server/jig-client or it would be
 # testing a stack production does not run. Explicit `ring` for the same reason as
