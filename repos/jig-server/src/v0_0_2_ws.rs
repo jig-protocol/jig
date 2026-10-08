@@ -7,10 +7,12 @@
 //!
 //! # Frame flow
 //! ```text
-//! Client → Frame::Subscribe  → register with Fanout
+//! Client → Frame::Hello      → server signs Frame::Welcome (JEP-0002)
+//! Client → Frame::Subscribe  → register with Fanout (only after welcome)
 //! Client → Frame::Submit     → base64-decode, reconstruct BlockBundle,
 //!                              call ingest(), reply Ack or Error
 //! Client → Frame::CatchUp    → v0.0.2 stub; cursor replay deferred (Plan §D6/F)
+//! Server → Frame::Welcome    → signed version, suites, capabilities, reputation
 //! Server → Frame::Block      → deliver ingested blocks to subscribed clients
 //! Server → Frame::Ack        → confirm a submitted block was persisted
 //! Server → Frame::Error      → report a protocol or ingest error
@@ -244,11 +246,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, conn_id: u64
     metrics::connection_opened();
     // Per-connection channel: fanout delivers (StoredBlock, StoredReceipt) here.
     let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
-    let mut sub_id: Option<u64> = None;
-    // The identity this connection PROVED, set by a verified Subscribe. Phase 3
-    // re-checks authorization at delivery and needs it long after the Subscribe
-    // frame is gone, which is why it lives here rather than per frame.
-    let mut conn_did: Option<jig_core::did::Did> = None;
+    let mut session = ConnState::default();
 
     loop {
         tokio::select! {
@@ -261,7 +259,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, conn_id: u64
                 match msg {
                     Message::Text(text) => {
                         if let Err(e) = handle_client_frame(
-                            &text, &state, &sub_tx, &mut sub_id, &mut conn_did, conn_id,
+                            &text,
+                            &state,
+                            &sub_tx,
+                            &mut session,
+                            conn_id,
                             &mut socket,
                         )
                         .await
@@ -312,12 +314,27 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, conn_id: u64
     }
 
     // Clean up the subscription so the Fanout map doesn't grow without bound.
-    if let Some(id) = sub_id {
+    if let Some(id) = session.sub_id {
         state.ingest_ctx.fanout.unsubscribe_local(id).await;
         metrics::subscriber_removed();
     }
     metrics::connection_closed();
     tracing::debug!(conn_id, "ws connection closed");
+}
+
+/// Mutable facts about one socket: the subscription it holds, the identity
+/// it proved, and whether a welcome has been sent.
+///
+/// The identity is set by a verified Subscribe. Delivery re-checks
+/// authorization long after that frame is gone, which is why it lives here
+/// rather than per frame. `handshaken` flips once a welcome has been sent.
+/// Frames before that are refused with `HANDSHAKE_REQUIRED` and the socket
+/// stays up, so the client can still hello.
+#[derive(Default)]
+struct ConnState {
+    sub_id: Option<u64>,
+    did: Option<jig_core::did::Did>,
+    handshaken: bool,
 }
 
 /// Why a channel subscription was not registered.
@@ -364,8 +381,7 @@ async fn handle_client_frame(
         jig_pipeline::persist::StoredBlock,
         jig_pipeline::persist::StoredReceipt,
     )>,
-    sub_id: &mut Option<u64>,
-    conn_did: &mut Option<jig_core::did::Did>,
+    session: &mut ConnState,
     conn_id: u64,
     socket: &mut WebSocket,
 ) -> Result<(), String> {
@@ -385,7 +401,48 @@ async fn handle_client_frame(
         }
     };
 
-    match env.frame {
+    // Hello is taken first, including a repeat hello, which re-signs a welcome.
+    // A failed `if let` would drop `frame`, so this match rebinds it.
+    let frame = match env.frame {
+        Frame::Hello {
+            versions,
+            suites,
+            capabilities,
+            nonce,
+        } => {
+            return complete_hello(
+                state,
+                socket,
+                &mut session.handshaken,
+                jig_pipeline::handshake::HelloView {
+                    versions,
+                    suites,
+                    capabilities,
+                    nonce,
+                },
+            )
+            .await;
+        }
+        other => other,
+    };
+    // A parsed frame that is not hello, before the welcome, is refused. The
+    // socket stays open. Version and suite gate failures never reach here:
+    // they are answered above, from Envelope::parse, and also leave it open.
+    if !session.handshaken {
+        let _ = send_error(
+            socket,
+            Some(400),
+            "HANDSHAKE_REQUIRED",
+            None,
+            "send hello before any other frame",
+        )
+        .await;
+        return Ok(());
+    }
+
+    match frame {
+        // Unreachable: Hello returned above. Kept so this match is exhaustive.
+        Frame::Hello { .. } => Ok(()),
         // ------------------------------------------------------------------ Subscribe
         Frame::Subscribe { scope, auth } => {
             // Gate 1 on the WSS path. The scope's canonical string is what was
@@ -413,7 +470,7 @@ async fn handle_client_frame(
                             // caller leaves no identity on the connection.
                             Ok(did) => match state.auth.admit(did.as_str()) {
                                 Ok(()) => {
-                                    *conn_did = Some(did);
+                                    session.did = Some(did);
                                     None
                                 }
                                 Err(o) => Some(o),
@@ -441,7 +498,7 @@ async fn handle_client_frame(
             // reads, and is the only way a subscription escapes filtering.
             let who = match (
                 state.config.auth.require_authenticated_reads,
-                conn_did.as_ref(),
+                session.did.as_ref(),
             ) {
                 (false, _) => SubscriberIdentity::Unchecked,
                 (true, Some(did)) => SubscriberIdentity::Did(did.to_did_jig_string()),
@@ -498,7 +555,7 @@ async fn handle_client_frame(
             // and the old one must actually go: left in the fanout map it
             // would keep delivering its old scope under its old identity for
             // the life of the process, long after this socket forgot it.
-            if let Some(old) = sub_id.take() {
+            if let Some(old) = session.sub_id.take() {
                 state.ingest_ctx.fanout.unsubscribe_local(old).await;
             } else {
                 // The gauge counts connections holding a subscription; a
@@ -510,7 +567,7 @@ async fn handle_client_frame(
                 .fanout
                 .subscribe_local(sub_scope, who, sub_tx.clone())
                 .await;
-            *sub_id = Some(id);
+            session.sub_id = Some(id);
             tracing::debug!(conn_id, sub_id = id, "ws subscription registered");
             Ok(())
         }
@@ -622,7 +679,50 @@ async fn handle_client_frame(
 
         // ------------------------------------------------------------------ Server-only frames
         // These are server→client frames; ignore them when received from a client.
-        Frame::Ack { .. } | Frame::Block { .. } | Frame::Error { .. } => Ok(()),
+        Frame::Ack { .. } | Frame::Block { .. } | Frame::Error { .. } | Frame::Welcome { .. } => {
+            Ok(())
+        }
+    }
+}
+
+/// Capabilities the welcome may honestly claim. Block kinds and execution come
+/// from the running server. Federation is on because this process accepts
+/// peer relays on the same socket; MLS is not a capability and is not listed.
+fn handshake_capabilities(state: &AppState) -> jig_pipeline::handshake::Capabilities {
+    jig_pipeline::handshake::Capabilities {
+        block_kinds: state.config.server.allowed_block_kinds.clone(),
+        execution: state.ingest_ctx.executor.is_some(),
+        federation: true,
+    }
+}
+
+/// Sign a welcome, or refuse the hello without closing the socket.
+async fn complete_hello(
+    state: &AppState,
+    socket: &mut WebSocket,
+    handshaken: &mut bool,
+    hello: jig_pipeline::handshake::HelloView,
+) -> Result<(), String> {
+    let offer = jig_pipeline::handshake::ServerOffer {
+        capabilities: handshake_capabilities(state),
+    };
+    match jig_pipeline::handshake::negotiate(&hello, &offer) {
+        Ok(statement) => {
+            let welcome = jig_pipeline::handshake::seal(&state.ingest_ctx.server_key, statement);
+            let json = serde_json::to_string(&welcome).map_err(|err| err.to_string())?;
+            socket
+                .send(Message::Text(json))
+                .await
+                .map_err(|err| err.to_string())?;
+            *handshaken = true;
+            Ok(())
+        }
+        Err(refusal) => {
+            // Version and suite refusals leave the connection open so the
+            // client can offer something this server speaks.
+            let _ = send_error(socket, Some(400), refusal.code(), None, refusal.message()).await;
+            Ok(())
+        }
     }
 }
 
@@ -737,6 +837,34 @@ mod tests {
         (state, url)
     }
 
+    /// Connect and finish the handshake. Tests that are about a later frame
+    /// start here; tests about the handshake itself do not.
+    async fn established(
+        url: &str,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        let (mut ws, _) = connect_async(url).await.unwrap();
+        let (hello, pending) =
+            jig_pipeline::handshake::begin(&jig_pipeline::handshake::ClientOffer::default());
+        ws.send(TMessage::Text(
+            serde_json::to_string(&hello).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+        let msg = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .expect("welcome timeout")
+            .expect("stream closed")
+            .expect("ws error");
+        let TMessage::Text(text) = msg else {
+            panic!("expected a text welcome, got {msg:?}");
+        };
+        match pending.interpret(&text) {
+            jig_pipeline::handshake::HandshakeResult::Established(_) => ws,
+            other => panic!("handshake failed: {other:?}"),
+        }
+    }
+
     /// Build a signed `Frame::Subscribe`, as a real client does.
     ///
     /// Subscriptions require a proof of possession; a raw frame is refused.
@@ -811,7 +939,7 @@ mod tests {
     async fn ws_submit_returns_ack() {
         let (state, url) = start_test_server().await;
         seed_channel(&state, "#hello");
-        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let mut ws = established(&url).await;
 
         let id = test_identity();
         let hlc = test_hlc(&id);
@@ -849,7 +977,7 @@ mod tests {
     #[tokio::test]
     async fn ws_rejects_invalid_sig_with_error_frame() {
         let (_state, url) = start_test_server().await;
-        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let mut ws = established(&url).await;
 
         let id = test_identity();
         let hlc = test_hlc(&id);
@@ -893,7 +1021,7 @@ mod tests {
         // mistyped slug must come back as prose naming the slug, not an Ack
         // carrying a CID for a block nobody will ever read.
         let (_state, url) = start_test_server().await; // no channels seeded
-        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let mut ws = established(&url).await;
 
         let id = test_identity();
         let hlc = test_hlc(&id);
@@ -960,7 +1088,7 @@ mod tests {
     #[tokio::test]
     async fn ws_unsigned_subscribe_is_refused() {
         let (_state, url) = start_test_server().await;
-        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let mut ws = established(&url).await;
 
         let sub = Envelope::new(Frame::Subscribe {
             scope: Scope::Federation {
@@ -991,7 +1119,7 @@ mod tests {
     #[tokio::test]
     async fn ws_subscribe_claiming_another_did_is_refused() {
         let (_state, url) = start_test_server().await;
-        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let mut ws = established(&url).await;
 
         let attacker = test_identity();
         let victim = test_identity();
@@ -1039,14 +1167,14 @@ mod tests {
 
         // First use succeeds silently (a successful subscribe emits no frame),
         // so prove it took by sending a second and expecting REPLAYED.
-        let (mut first, _) = connect_async(&url).await.unwrap();
+        let mut first = established(&url).await;
         first
             .send(TMessage::Text(text.clone().into()))
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let (mut second, _) = connect_async(&url).await.unwrap();
+        let mut second = established(&url).await;
         second.send(TMessage::Text(text.into())).await.unwrap();
 
         match next_frame(&mut second).await.frame {
@@ -1075,7 +1203,7 @@ mod tests {
         // obsolete.)
         let (state, url) = start_test_server().await;
         seed_channel(&state, "#hello");
-        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let mut ws = established(&url).await;
 
         // 1. Subscribe federation-scope (no kind filter = all kinds), signed —
         //    the server refuses an unsigned subscribe.
@@ -1258,7 +1386,7 @@ mod tests {
 
         let (state, url) = start_test_server().await;
         seed_channel(&state, "#metrics-probe");
-        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let mut ws = established(&url).await;
 
         let id = test_identity();
         let hlc = test_hlc(&id);
@@ -1364,6 +1492,126 @@ mod tests {
                 }
                 other => panic!("expected Error for {frame}, got {other:?}"),
             }
+        }
+    }
+
+    async fn recv_text(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> String {
+        let msg = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .expect("timeout")
+            .expect("stream closed")
+            .expect("ws error");
+        let TMessage::Text(text) = msg else {
+            panic!("expected text, got {msg:?}");
+        };
+        text.to_string()
+    }
+
+    #[tokio::test]
+    async fn client_receives_a_signed_welcome() {
+        let (state, url) = start_test_server().await;
+        let client = jig_client::Client::connect(&url, test_identity())
+            .await
+            .unwrap();
+        let welcome = client.welcome().expect("welcome");
+        assert_eq!(welcome.version, 1);
+        assert_eq!(welcome.suites, vec!["none".to_string()]);
+        assert!(welcome.reputation.is_null());
+        assert_eq!(welcome.server_did, state.server_did.to_did_jig_string());
+        assert_eq!(
+            welcome.capabilities.block_kinds,
+            state.config.server.allowed_block_kinds
+        );
+        assert!(welcome.capabilities.execution);
+        assert!(welcome.capabilities.federation);
+    }
+
+    #[tokio::test]
+    async fn frame_before_hello_is_refused_and_the_socket_stays_open() {
+        let (state, url) = start_test_server().await;
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let sub = Envelope::new(Frame::Subscribe {
+            scope: Scope::Channel {
+                slug: "#hello".to_string(),
+            },
+            auth: None,
+        });
+        ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
+            .await
+            .unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { code, .. } => assert_eq!(code, "HANDSHAKE_REQUIRED"),
+            other => panic!("expected HANDSHAKE_REQUIRED, got {other:?}"),
+        }
+
+        let (hello, pending) =
+            jig_pipeline::handshake::begin(&jig_pipeline::handshake::ClientOffer::default());
+        ws.send(TMessage::Text(
+            serde_json::to_string(&hello).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+        match pending.interpret(&recv_text(&mut ws).await) {
+            jig_pipeline::handshake::HandshakeResult::Established(welcome) => {
+                assert_eq!(welcome.server_did, state.server_did.to_did_jig_string());
+            }
+            other => panic!("hello after a refusal must still be welcomed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn version_and_suite_refusals_leave_the_socket_open() {
+        let (_state, url) = start_test_server().await;
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+
+        let (hello, _) = jig_pipeline::handshake::begin(&jig_pipeline::handshake::ClientOffer {
+            versions: vec![2],
+            ..jig_pipeline::handshake::ClientOffer::default()
+        });
+        ws.send(TMessage::Text(
+            serde_json::to_string(&hello).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { code, .. } => {
+                assert_eq!(code, "UNSUPPORTED_VERSION");
+            }
+            other => panic!("expected UNSUPPORTED_VERSION, got {other:?}"),
+        }
+
+        let (hello, _) = jig_pipeline::handshake::begin(&jig_pipeline::handshake::ClientOffer {
+            suites: vec!["mls".to_string()],
+            ..jig_pipeline::handshake::ClientOffer::default()
+        });
+        ws.send(TMessage::Text(
+            serde_json::to_string(&hello).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { code, .. } => assert_eq!(code, "UNSUPPORTED_SUITE"),
+            other => panic!("expected UNSUPPORTED_SUITE, got {other:?}"),
+        }
+
+        let (hello, pending) =
+            jig_pipeline::handshake::begin(&jig_pipeline::handshake::ClientOffer::default());
+        ws.send(TMessage::Text(
+            serde_json::to_string(&hello).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+        match pending.interpret(&recv_text(&mut ws).await) {
+            jig_pipeline::handshake::HandshakeResult::Established(welcome) => {
+                assert_eq!(welcome.suites, vec!["none".to_string()]);
+                assert!(welcome.reputation.is_null());
+                assert_eq!(welcome.version, 1);
+            }
+            other => panic!("a later hello must still be welcomed, got {other:?}"),
         }
     }
 }

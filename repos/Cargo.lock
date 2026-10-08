@@ -4902,6 +4902,7 @@ version = "0.0.2"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "blake3",
  "chrono",
  "ed25519-dalek",

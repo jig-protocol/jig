@@ -98,12 +98,17 @@ pub enum EnvelopeGateError {
 }
 
 impl EnvelopeGateError {
+    /// Reply code when `v` is not the version this implementation speaks.
+    pub const UNSUPPORTED_VERSION_CODE: &'static str = "UNSUPPORTED_VERSION";
+    /// Reply code when `suite` is unknown or registered but not implemented.
+    pub const UNSUPPORTED_SUITE_CODE: &'static str = "UNSUPPORTED_SUITE";
+
     /// The error code a server replies with.
     pub fn code(&self) -> &'static str {
         match self {
-            EnvelopeGateError::UnsupportedVersion(_) => "UNSUPPORTED_VERSION",
+            EnvelopeGateError::UnsupportedVersion(_) => Self::UNSUPPORTED_VERSION_CODE,
             EnvelopeGateError::UnknownSuite(_) | EnvelopeGateError::SuiteNotImplemented(_) => {
-                "UNSUPPORTED_SUITE"
+                Self::UNSUPPORTED_SUITE_CODE
             }
         }
     }
@@ -147,6 +152,29 @@ impl TryFrom<UncheckedEnvelope> for Envelope {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Frame {
+    /// Client's first frame. See [`crate::handshake`].
+    ///
+    /// `versions` is a list, not the envelope's `v`: the envelope `v` is the
+    /// version of this frame, and the list is what the client is willing to
+    /// speak. Those collide if they share a JSON key.
+    Hello {
+        versions: Vec<u64>,
+        suites: Vec<String>,
+        capabilities: crate::handshake::Capabilities,
+        nonce: String,
+    },
+    /// Server's signed answer to [`Frame::Hello`]. The envelope's `v` is the
+    /// chosen version; `suite` is the suite this frame is carried under.
+    /// `reputation` is null until JEP-0003.
+    Welcome {
+        server_did: String,
+        suites: Vec<String>,
+        capabilities: crate::handshake::Capabilities,
+        reputation: crate::handshake::Reputation,
+        nonce: String,
+        /// base64 ed25519 over [`crate::handshake::WelcomeStatement::canonical_bytes`].
+        sig: String,
+    },
     /// Subscribe to a scope (channel or federation).
     ///
     /// `auth` carries the same tier-0 proof of possession the REST path takes

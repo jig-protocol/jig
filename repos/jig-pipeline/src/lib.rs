@@ -14,6 +14,7 @@ pub mod effect;
 pub mod envelope;
 pub mod executor;
 pub mod fanout;
+pub mod handshake;
 pub mod hlc;
 pub mod identity;
 pub mod ingest;
