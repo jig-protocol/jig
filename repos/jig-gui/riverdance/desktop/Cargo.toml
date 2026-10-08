@@ -5,10 +5,4 @@ edition = "2021"
 publish = false
 
 [dependencies]
-dioxus = { workspace = true, features = ["router"] }
 ui = { workspace = true }
-
-[features]
-default = []
-desktop = ["dioxus/desktop"]
-server = ["dioxus/server"]
