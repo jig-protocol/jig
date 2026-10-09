@@ -174,7 +174,17 @@ jobs:
           key="$RUNNER_TEMP/jig-release.key"
           signers="$PWD/.github/release/allowed_signers"
           if [ -n "$SIGNING_KEY" ]; then
-            printf '%s\n' "$SIGNING_KEY" > "$key"
+            scripts/prepare-release-signing-key.sh "$key"
+            # Refuse to sign with a key that install.sh will not accept.
+            # On mismatch print only the public key, never the secret.
+            derived=$(awk '{print $1, $2}' "$key.pub")
+            pinned=$(awk '{print $(NF-1), $NF}' "$signers")
+            if [ "$derived" != "$pinned" ]; then
+              echo "signing key does not match the pinned jig-release public key" >&2
+              echo "derived public key: $derived" >&2
+              ssh-keygen -l -f "$key.pub" >&2
+              exit 1
+            fi
           elif [ "$GITHUB_EVENT_NAME" = "push" ]; then
             echo "JIG_RELEASE_SIGNING_KEY is not set; refusing to publish unsigned binaries" >&2
             exit 1
