@@ -175,6 +175,10 @@ jobs:
           signers="$PWD/.github/release/allowed_signers"
           if [ -n "$SIGNING_KEY" ]; then
             printf '%s\n' "$SIGNING_KEY" > "$key"
+            # ssh-keygen -Y sign needs the public half alongside a private
+            # key restored from a secret. Unlike ssh-keygen -t, writing the
+            # private key alone does not create "$key.pub".
+            ssh-keygen -y -f "$key" > "$key.pub"
           elif [ "$GITHUB_EVENT_NAME" = "push" ]; then
             echo "JIG_RELEASE_SIGNING_KEY is not set; refusing to publish unsigned binaries" >&2
             exit 1
