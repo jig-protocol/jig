@@ -44,8 +44,8 @@ jobs:
         with:
           workspaces: repos
       - name: Format (v0.0.2 surface)
-        # Scoped to v0.0.2-touched crates. jig-spec and jig-gui/* may still have
-        # upstream formatting drift and are not gated. jig-bridge-email is
+        # Scoped to v0.0.2-touched crates. jig-spec may still have
+        # upstream formatting drift and is not gated. jig-bridge-email is
         # first-class (alpha.email rewrote it as an in-process library), and
         # jig-runtime joined the gate when the byte-payload convention landed
         # there — it is verified clean, and it is no longer a crate we can afford

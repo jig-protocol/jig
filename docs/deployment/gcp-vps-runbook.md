@@ -305,8 +305,8 @@ Measured just now on this checkout (`du -sh repos/target`):
 232M    target/debug/build
 ```
 
-That is the **debug** profile with all workspace members (including the
-riverdance GUI crates and `integration-tests`) and incremental artifacts. A
+That is the **debug** profile with all workspace members (including
+`integration-tests`) and incremental artifacts. A
 `--release` build of only `-p jig-server -p jig-cli -p jig-nameserver` is much
 smaller — no incremental, no GUI, fewer dev-deps — but with cranelift in the
 graph I would still budget **4-6 GB** for `target/release` (estimate; I could

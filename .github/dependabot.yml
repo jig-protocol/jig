@@ -17,12 +17,3 @@ updates:
       github-actions:
         patterns:
           - "*"
-
-  - package-ecosystem: npm
-    directory: /repos/jig-gui/riverdance
-    schedule:
-      interval: weekly
-    groups:
-      npm:
-        patterns:
-          - "*"

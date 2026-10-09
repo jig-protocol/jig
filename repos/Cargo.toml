@@ -9,11 +9,6 @@ members = [
     "hello-wasm",
     "jig-config",
     "integration-tests",
-    "jig-gui/riverdance/ui",
-    "jig-gui/riverdance/web",
-    "jig-gui/riverdance/desktop",
-    "jig-gui/riverdance/mobile",
-    "jig-gui/riverdance/api",
     "text-block",
     "jig-pipeline",
     "jig-client",
@@ -44,12 +39,6 @@ serde_json = "1.0"
 jig-core = { path = "jig-core", features = ["ed25519"] }
 jig-config = { path = "jig-config" }
 jig-runtime = { path = "jig-runtime" }
-# Riverdance GUI. Dioxus is intentionally not a dependency: 0.7 still
-# locks dioxus-desktop, and wry/tao still require gtk 0.18 (glib
-# GHSA-wrw7-89jp-8q8g and rand 0.7 via kuchikiki). Do not re-add it
-# until that stack depends on glib >= 0.20.
-ui = { path = "jig-gui/riverdance/ui" }
-api = { path = "jig-gui/riverdance/api" }
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util"] }
 async-trait = "0.1"
 thiserror = "1.0"
