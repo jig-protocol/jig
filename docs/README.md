@@ -44,7 +44,7 @@ should not be read as a status page.
 
 Per-crate READMEs live next to the code under [`repos/`](../repos/):
 `jig-core`, `jig-server`, `jig-cli`, `jig-config`, `jig-runtime`, `jig-nameserver`,
-`jig-gui`, `bridges/email`.
+`bridges/email`.
 
 Two directories under `repos/` are documentation rather than crates and are not
 workspace members:

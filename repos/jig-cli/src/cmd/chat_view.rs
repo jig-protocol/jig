@@ -156,9 +156,9 @@ pub fn render(f: &mut Frame, state: &ChatState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(3)])
-        .split(f.size());
+        .split(f.area());
 
-    // `f.size()` is whole-terminal; the history pane is `chunks[0]`.
+    // `f.area()` is whole-terminal; the history pane is `chunks[0]`.
     // Inner height = pane height minus the 2 rows of border. Saturating
     // sub keeps us safe on a 1-row terminal.
     let visible_rows = (chunks[0].height as usize).saturating_sub(2);
@@ -225,7 +225,7 @@ mod tests {
         for y in 0..height {
             let mut line = String::with_capacity(width);
             for x in 0..width {
-                let cell = buf.get(x as u16, y as u16);
+                let cell = &buf[(x as u16, y as u16)];
                 line.push_str(cell.symbol());
             }
             lines.push(line);

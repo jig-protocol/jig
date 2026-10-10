@@ -69,7 +69,6 @@ If you find a cheaper or wider way to exploit one of these, please do report it.
 
 Out of scope:
 
-- `repos/jig-gui/` (Riverdance), which is a mock wired to nothing.
 - The configuration of a particular deployment. Report that to its operator. A protocol or
   implementation weakness that lets *any* operator attack their users stays in scope.
 - Volume denial of service against servers you do not run, and social engineering.

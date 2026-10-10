@@ -199,9 +199,9 @@ match.
 | `CODE_OF_CONDUCT.md` | No | Nowhere in the tree. |
 | `SECURITY.md` (root) | No | See §1.8. |
 | Deployment docs | Yes, strong | `deploy/README.md` (426 lines: install, tailnet security model, TLS via `tailscale cert`, teammate onboarding, backups, restore, gotchas), `docs/deployment/gcp-vps-runbook.md` (940 lines), plus dogfood runbooks and an install benchmark. |
-| Per-crate rustdoc | Partial | Module- and item-level doc comments are dense and unusually good (the `//!` headers carry real rationale). But **no crate sets `#![warn(missing_docs)]`** and none carries `[package.metadata.docs.rs]`, so there is no rendered API reference anywhere. Only `integration-tests` sets `publish = false`; the rest are publishable-by-accident, including five `jig-gui/riverdance` crates named `ui`, `api`, `web`, `desktop`, and `mobile`. |
+| Per-crate rustdoc | Partial | Module- and item-level doc comments are dense and unusually good (the `//!` headers carry real rationale). But **no crate sets `#![warn(missing_docs)]`** and none carries `[package.metadata.docs.rs]`, so there is no rendered API reference anywhere. Only `integration-tests` sets `publish = false`; the rest are publishable-by-accident. |
 | `jig-spec` book | Yes | mdbook under `repos/jig-spec/`. Describes much unshipped behaviour. E2EE (now MLS), the handshake and the transports carry not-implemented banners as of 2026-10-05; other chapters (receipts, analytics, identity and reputation) are still aspirational in places. |
-| `jig-gui` (riverdance) | Scaffold | `repos/jig-gui/riverdance/README.md` is verbatim Dioxus template boilerplate ("your_project"). It is a design mock, not a working client, and nothing in the repo says so where a newcomer would look. |
+| Riverdance | Not in this repo | The unfinished GUI is not part of this repository. Its licence is undecided, and it is not a working client. |
 
 **Verdict: GAP**, trending to READY once the README lands — with the caveat
 that `jig-spec` shipping unimplemented crypto in the present tense is closer to
@@ -223,14 +223,12 @@ it isn't reusable by everyone for everything."*
 | `deny.toml` | The `AGPL-3.0-only` allowance is removed — no dependency needed it, and cargo-deny reported it as an unmatched allowance. |
 | Contribution terms | The standard Apache-2.0 §5 inbound=outbound paragraph is in the README. No CLA. |
 
-### Two deliberate carve-outs
+### Carve-outs
 
-**`repos/jig-gui/` (Riverdance) — no licence granted.** A client application is not
-protocol surface, and the reusability argument does not transfer to it. AGPL or BSL may be
-correct; that decision is open. Until then default copyright applies, all five crates are
-`publish = false`, and [`repos/jig-gui/NOTICE.md`](../repos/jig-gui/NOTICE.md) states this
-explicitly so the silence is not read as an oversight. Nothing in the protocol crates
-depends on this subtree, so its status cannot contaminate them.
+**Riverdance is not in this repository.** A client application is not protocol surface,
+and the reusability argument does not transfer to it. Its licence is undecided, and the
+client is not functional. It lives outside this tree, so its status cannot contaminate
+the protocol crates.
 
 **`repos/jig-spec/` — CC-BY-4.0 (decided 2026-10-05).** It was CC BY-SA 4.0. Share-alike
 on a written specification impedes exactly the independent implementations the permissive
@@ -264,7 +262,7 @@ registry, or copied code may appear anywhere under `repos/`. This belongs in
 | Discussion / support channel | None public. Per-crate `SECURITY.md` points at `#alert-security`, an internal channel. | GAP |
 | Triage owner | Undefined. No rotation, no SLA, nothing written down. | BLOCKER-adjacent — an unowned inbox is how a project acquires a reputation for ignoring people. |
 | Release cadence | Undefined. `release.yml` is tag-triggered and marks `v0.0.*` as prerelease; no schedule or policy exists. | GAP |
-| CI coverage | 3 jobs: `workspace`, `wasm-build`, `dependency-policy` (the last also runs daily at 07:17 UTC against `main` so advisory-DB drift is not blamed on a contributor's PR — good practice). **Caveats an external contributor will hit:** clippy runs on 7 crates only — `jig-server`, `jig-nameserver`, and `jig-cli` are formatted and tested but **not linted**; `jig-runtime`, `hello-wasm`, and all `jig-gui/*` crates are neither built nor tested; the matrix is `ubuntu-latest` only, so macOS and Windows are untested despite `release.yml` shipping darwin binaries. | GAP |
+| CI coverage | 3 jobs: `workspace`, `wasm-build`, `dependency-policy` (the last also runs daily at 07:17 UTC against `main` so advisory-DB drift is not blamed on a contributor's PR — good practice). **Caveats an external contributor will hit:** clippy runs on 7 crates only — `jig-server`, `jig-nameserver`, and `jig-cli` are formatted and tested but **not linted**; `jig-runtime` and `hello-wasm` are neither built nor tested; the matrix is `ubuntu-latest` only, so macOS and Windows are untested despite `release.yml` shipping darwin binaries. | GAP |
 
 **Test counts, measured** (`cargo nextest list`, stable 1.97.1): 1,054 tests in
 the CI-gated package set, plus 87 in `jig-runtime` + `hello-wasm` = **1,141**.

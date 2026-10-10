@@ -46,9 +46,9 @@ loopback and private tailnets.
   is admitted, there is no rate limiting, and blocks relayed by a federated peer are
   trusted. Channel ops (`POST /api/v1/channels*`) run the same gates and need no
   `[debug]` flag.
-- **No graphical client.** `repos/jig-gui/` (Riverdance) is a Dioxus scaffold around a
-  mocked chat UI. It depends on neither `jig-core` nor `jig-client` and never opens a
-  connection — it is a design mock, not a client.
+- **No graphical client.** Riverdance, the unfinished GUI, is not in this repository.
+  Its licence is undecided, and it is not a working client. The terminal client is
+  `jig chat`.
 - Network-level access control — a tailnet, a firewall — is still the recommended outer
   layer, because the gates above are new and nothing sits in front of them. It is no
   longer the *only* access control; see `deploy/README.md` for what the server enforces
@@ -164,7 +164,6 @@ and lives at the repo root.
 | [`text-block`](repos/text-block/) | The canonical `text-render` Wasm block (`wasm32-wasip1`) |
 | [`hello-wasm`](repos/hello-wasm/) | Minimal WASI hello-world used for runtime measurements |
 | [`integration-tests`](repos/integration-tests/) | Cross-component scenario tests: federation, TOFU mismatch, nameserver modes, persistence across restart, email bridge, TLS |
-| [`jig-gui`](repos/jig-gui/) | Riverdance — a Dioxus scaffold with a mocked chat UI, wired to no jig crate. **Not a working client** |
 
 Not Cargo members: [`repos/jig-spec/`](repos/jig-spec/) — an mdBook protocol spec, still
 draft scaffolding, licensed CC-BY-4.0 — and [`repos/jig-docs/`](repos/jig-docs/), a
@@ -228,19 +227,19 @@ that cannot be embedded is not a protocol, so every crate you would need to spea
 `jig-config`, `jig-cli`, the bridges, and the sample blocks — is permissively licensed for
 any use, commercial included.
 
-Two deliberate exceptions:
+One deliberate exception:
 
 | Scope | Licence | Why |
 | --- | --- | --- |
-| [`repos/jig-gui/`](repos/jig-gui/NOTICE.md) (Riverdance) | **None granted yet** | A client application, not protocol surface. Copyleft or source-available may be the right answer; the call has not been made. Default copyright applies until it is. |
 | [`repos/jig-spec/`](repos/jig-spec/) | CC-BY-4.0 | The written specification, not code. Attribution only, no share-alike, so implementation guides and second implementations can reuse the text freely. |
+
+Riverdance, the unfinished GUI, is not part of this repository. Its licence is undecided.
 
 ### Contribution
 
 Unless you state otherwise, any contribution you intentionally submit for inclusion in the
 work, as defined in the Apache-2.0 licence, shall be dual-licensed as above, without any
-additional terms or conditions. Contributions to `repos/jig-gui/` are the exception — see
-its [`NOTICE.md`](repos/jig-gui/NOTICE.md).
+additional terms or conditions.
 
 ## Relationship to gigue
 

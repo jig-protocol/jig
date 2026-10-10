@@ -47,4 +47,4 @@ CI is [`.github/workflows/ci.yml`](.github/workflows/ci.yml). `workspace` runs f
 
 ## License
 
-Unless you say otherwise, a contribution you submit for inclusion is dual-licensed under Apache-2.0 or MIT, the same as the code. Contributions to `repos/jig-spec/` are CC-BY-4.0. `repos/jig-gui/` (Riverdance) has no licence grant yet; see its `NOTICE.md`.
+Unless you say otherwise, a contribution you submit for inclusion is dual-licensed under Apache-2.0 or MIT, the same as the code. Contributions to `repos/jig-spec/` are CC-BY-4.0.

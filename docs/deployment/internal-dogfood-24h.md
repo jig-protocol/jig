@@ -63,8 +63,8 @@ Everything below was proven by execution.
    `jig chat` stay alive, print nothing, accept typed input, and never receive another
    message. The user believes they are still in the room.
 
-5. **No graphical client exists.** `riverdance` has zero network code and zero dependency
-   on any jig crate. `jig-client` cannot compile to wasm32. Terminal-only is the only
+5. **No graphical client exists.** Riverdance is not in this repository, and it is not
+   a working client. `jig-client` cannot compile to wasm32. Terminal-only is the only
    option, so **binary distribution is a real task**.
 
 ---
@@ -273,7 +273,7 @@ list exists.
 |---|---|
 | Public exposure, DNS, certbot, port 443, jig.onl | Tailnet gives the same reachability for 10 people |
 | All authn/authz (16–30h+) | WireGuard device identity does the job for a closed team. **Loan against the future** |
-| Any GUI (1–2 weeks) | riverdance has zero network code; jig-client can't reach wasm32 |
+| Any GUI (1–2 weeks) | no graphical client is in this repository; jig-client can't reach wasm32 |
 | Email bridge as team channel | `dm_channel_slug()` hashes a DID *pair* — structurally 1:1 |
 | Nameserver aliases (`dj@dj.jig`) | Alias routers are never mounted by `run_http_server()`; its SQLite migration fails on a fresh DB and silently degrades to in-memory |
 | `Frame::CatchUp` cursor replay | "last 100 over REST" delivers 95% of the value |

@@ -62,13 +62,12 @@ dirs = "5.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 whoami = "1.4"
 
-# Terminal UI (Phase F6 — `jig chat` ratatui TUI). Pinned to the
-# versions called out in the v0.0.2 plan; the API surface used
-# here is identical across 0.27 and the current 0.28/0.29 lines
-# (Layout/Block/List/Paragraph + crossterm event/poll), so
-# upgrading later is a one-line bump.
-ratatui = "0.27"
-crossterm = "0.27"
+# Terminal UI (`jig chat`). ratatui 0.29 still depends on lru 0.12
+# (GHSA-rhfx-m35p-ff5j, fixed in lru 0.16.3). 0.30 dropped lru.
+# Its default crossterm backend is crossterm 0.29, so the direct
+# dependency has to match or the event types diverge.
+ratatui = "0.30"
+crossterm = "0.29"
 
 # Config (planned integration)
 jig-config = { path = "../jig-config", optional = true }

@@ -102,7 +102,7 @@ a dropped connection is silent.
 ### On the nameserver, plainly
 
 You promoted it over the GUI, and that ranking is right — a working naming layer is
-load-bearing for the protocol in a way riverdance isn't. But **it lands end of Day 3 and it
+load-bearing for the protocol in a way a GUI client isn't. But **it lands end of Day 3 and it
 does not move the dogfood needle.** Readable names in `jig chat` do *not* require it (see
 Lane F). Treat the nameserver as protocol debt you're paying down while the team is already
 chatting, not as a prerequisite. If Day 3 slips, this is what slips.
