@@ -15,7 +15,6 @@ Jig Protocol has adopted **WebAssembly (WASM) as the single unified runtime** fo
 - **jig-server** - Reference server implementation
 - **jig-cli** - Command-line client
 - **jig-bridge-email** - Email gateway
-- **jig-gui** - Dioxus-based UI (Riverdance)
 - **jig-nameserver** - DNS/discovery service
 - **jig-config** - Shared configuration
 - **integration-tests** - Cross-component tests
@@ -86,7 +85,6 @@ jig-server --config server.toml
 
 - Rust 1.75+ (edition 2024)
 - WASM target: `rustup target add wasm32-wasi`
-- For GUI: `dx` CLI tool
 
 ### Workspace Structure
 
@@ -96,7 +94,6 @@ repos/
 ├── jig-runtime/        # WASM execution engine
 ├── jig-server/         # Server implementation
 ├── jig-cli/            # CLI client
-├── jig-gui/            # Dioxus UI
 ├── jig-bridge-email/   # Email gateway
 ├── jig-nameserver/     # DNS/discovery
 ├── jig-config/         # Shared config

@@ -1,6 +1,6 @@
 //! Block bundle builders for the canonical v0.0.2 block kinds.
 //!
-//! Used by `jig-cli`, future email-bridge, future riverdance — anywhere
+//! Used by `jig-cli` and the email bridge — anywhere
 //! a signed block needs to be constructed before submission. Each helper
 //! returns a `(manifest_bytes, code_bytes)` pair plus the signed sig over
 //! canonical bytes. Callers can submit via WSS or REST as appropriate.

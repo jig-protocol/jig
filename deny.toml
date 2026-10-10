@@ -89,8 +89,8 @@ version = 2
 # feature -> picky, and are not yanked.)
 yanked = "deny"
 ignore = [
-    # --- build-time only: proc macros, never linked into a shipped binary ---
-    "RUSTSEC-2024-0436",  # paste unmaintained; via ratatui -> jig-cli. Build-time only, no runtime surface.
+    # RUSTSEC-2024-0436 (paste, unmaintained) left with ratatui 0.27. ratatui
+    # 0.30 uses pastey instead, so the advisory no longer matches a crate.
 
     # atty (RUSTSEC-2021-0145, RUSTSEC-2024-0375) left with the unused jig-cli
     # dependency. Nothing in the crate called it; terminal detection is
