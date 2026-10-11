@@ -13,6 +13,7 @@ jig-runtime = { workspace = true }
 jig-server = { path = "../jig-server" }
 jig-nameserver = { path = "../jig-nameserver" }
 jig-client = { path = "../jig-client" }
+jig-mls = { workspace = true }
 jig-pipeline = { path = "../jig-pipeline" }
 jig-core = { workspace = true }
 jig-config = { workspace = true }

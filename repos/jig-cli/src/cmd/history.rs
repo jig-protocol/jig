@@ -34,11 +34,8 @@ pub fn history_url(base_url: &str, channel: &str, limit: usize) -> String {
     format!("{base}/api/v1/channels/{slug}/blocks?limit={limit}")
 }
 
-/// Parse a history response body into delivered blocks.
-///
-/// The server also sends `sig_b64`, which `DeliveredBlock` does not carry;
-/// serde ignores it. That asymmetry is deliberate on the server side, so
-/// this is the client half of that contract.
+/// Parse a history response body into delivered blocks, signatures
+/// included — every block is verified before it is shown.
 pub fn parse_history(body: &str) -> Result<Vec<DeliveredBlock>> {
     serde_json::from_str(body).context("decoding channel history response")
 }
@@ -130,17 +127,23 @@ mod tests {
     use jig_core::HlcTimestamp;
     use tempfile::tempdir;
 
-    fn text_bundle_b64(body: &str) -> String {
+    /// A text block as a v0.2 server delivers it, signature included.
+    fn signed_text(body: &str, delivery: &str) -> DeliveredBlock {
         let dir = tempdir().unwrap();
         let id = Identity::generate_and_save(&dir.keep()).unwrap();
-        let hlc = HlcTimestamp {
-            wall_ms: 1_747_680_000_000,
-            logical: 0,
-            server_did: id.did().clone(),
-        };
-        let block = build_text_render(&id, "#hello", body, hlc);
-        base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes())
+        let block = build_text_render(&id, "#hello", body, HlcTimestamp::now_wall(id.did().clone()));
+        signed(&block, delivery)
     }
+
+    fn signed(block: &jig_client::blocks::BuiltBlock, delivery: &str) -> DeliveredBlock {
+        DeliveredBlock {
+            bundle_b64: base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
+            sig_b64: Some(base64::engine::general_purpose::STANDARD.encode(&block.sender_sig)),
+            receipts: vec![],
+            delivery_cid: delivery.into(),
+        }
+    }
+
 
     #[test]
     fn history_url_escapes_the_slug_and_carries_the_limit() {
@@ -153,15 +156,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_history_ignores_the_servers_extra_sig_field() {
-        // The server emits `sig_b64`; `DeliveredBlock` has no such field.
-        // If serde ever became strict here, every history fetch would fail.
+    fn parse_history_keeps_the_servers_signature() {
+        // Without it the client could not tell a block the server rewrote
+        // from one its author sent.
         let body = r#"[
-            {"bundle_b64":"YQ==","sig_b64":"c2ln","receipts":[],"delivery_cid":"delivery:bafy1"}
+            {"bundle_b64":"YQ==","sig_b64":"c2ln","receipts":[],"delivery_cid":"delivery:bafy1"},
+            {"bundle_b64":"YQ==","receipts":[],"delivery_cid":"delivery:bafy2"}
         ]"#;
         let blocks = parse_history(body).unwrap();
-        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].delivery_cid, "delivery:bafy1");
+        assert_eq!(blocks[0].sig_b64.as_deref(), Some("c2ln"));
+        assert_eq!(blocks[1].sig_b64, None);
     }
 
     #[test]
@@ -172,21 +178,14 @@ mod tests {
     #[test]
     fn decode_history_skips_undecodable_entries() {
         let blocks = vec![
+            signed_text("first", "delivery:1"),
             DeliveredBlock {
-                bundle_b64: text_bundle_b64("first"),
-                receipts: vec![],
-                delivery_cid: "delivery:1".into(),
-            },
-            DeliveredBlock {
+                sig_b64: None,
                 bundle_b64: "not_base64_!!!".into(),
                 receipts: vec![],
                 delivery_cid: "delivery:2".into(),
             },
-            DeliveredBlock {
-                bundle_b64: text_bundle_b64("third"),
-                receipts: vec![],
-                delivery_cid: "delivery:3".into(),
-            },
+            signed_text("third", "delivery:3"),
         ];
         let decoded = decode_history(&blocks);
         assert_eq!(decoded.len(), 2, "one bad block must not drop the backlog");
@@ -211,18 +210,8 @@ mod tests {
         let text = build_text_render(&id, "#hello", "hello team", hlc);
 
         let blocks = vec![
-            DeliveredBlock {
-                bundle_b64: base64::engine::general_purpose::STANDARD
-                    .encode(create.canonical_bytes()),
-                receipts: vec![],
-                delivery_cid: "delivery:create".into(),
-            },
-            DeliveredBlock {
-                bundle_b64: base64::engine::general_purpose::STANDARD
-                    .encode(text.canonical_bytes()),
-                receipts: vec![],
-                delivery_cid: "delivery:text".into(),
-            },
+            signed(&create, "delivery:create"),
+            signed(&text, "delivery:text"),
         ];
 
         let decoded = decode_history(&blocks);

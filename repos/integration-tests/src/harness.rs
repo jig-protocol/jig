@@ -207,6 +207,13 @@ impl TestJigServer {
         })
     }
 
+    /// The directory holding this server's on-disk state (`server.db` and
+    /// its WAL sidecars, `server.key`). For tests that inspect what the
+    /// server actually wrote.
+    pub fn data_dir(&self) -> &std::path::Path {
+        self._tempdir.path()
+    }
+
     pub fn ws_url(&self) -> String {
         format!("ws://{}", self.bound_addr)
     }

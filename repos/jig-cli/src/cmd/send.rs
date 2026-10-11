@@ -4,11 +4,9 @@
 //! builds a signed `text-render` block, submits it, and prints the CID on
 //! success. One-shot — no interactive loop, no persistent connection.
 //!
-//! The v0.0.1 path (`commands::send_text` → HTTP POST `/api/v1/blocks`) is
-//! preserved for `pipe_mode`, `interactive_mode`, and the no-subcommand
-//! fallback in `main.rs`; only the `jig send` subcommand routes here. Phase H
-//! end-to-end tests exercise the live WSS path; this module's unit tests
-//! cover the wiring shape (block construction + identity loading).
+//! The no-subcommand forms (`jig hello`, `echo hi | jig`) route here too; the
+//! v0.0.1 `POST /blocks` path they used is gone. On an encrypted channel the
+//! message is encrypted by the MLS session (`cmd::secure`) and sent over REST.
 
 use anyhow::{Context, Result};
 use jig_client::{Client, blocks::build_text_render};
@@ -28,6 +26,19 @@ use crate::cmd::common::CliContext;
 ///   4. Build + submit a signed `text-render` block.
 ///   5. Print the assigned block CID. Exit.
 pub async fn run(ctx: &CliContext, channel: String, body: String) -> Result<()> {
+    // An encrypted channel's message is encrypted by the MLS session and
+    // goes over REST, after catching up on the channel so it is encrypted
+    // for the group as it is now.
+    if let Ok(secure) = crate::cmd::secure::Secure::open(ctx)
+        && let Ok(Some(info)) = secure.channel(&channel).await
+        && info.encrypted()
+    {
+        secure.sync(&channel).await?;
+        let cid = secure.send(&channel, &body).await?;
+        println!("{cid}");
+        return Ok(());
+    }
+
     let id = ctx.identity()?;
     let server_url = ctx.server_url()?;
 

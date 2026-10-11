@@ -128,13 +128,14 @@ impl Drop for ReaderCleanup {
 /// JSON array that deserializes into `Vec<DeliveredBlock>`. Renaming or
 /// reordering these fields is a breaking wire change for both sides.
 ///
-/// The server's response carries an extra `sig_b64` that this struct does not
-/// model, because the reader task already discards it when decoding
-/// `Frame::Block`. Serde ignores it. Adding the field here later is therefore
-/// a one-sided, non-breaking change.
+/// `sig_b64` is the author's signature over the bundle. Clients verify it
+/// before showing anything ([`crate::open::open`]): a server relays blocks,
+/// and without the check it could rewrite one in transit undetected.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeliveredBlock {
     pub bundle_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig_b64: Option<String>,
     pub receipts: Vec<ReceiptRef>,
     pub delivery_cid: String,
 }
@@ -248,7 +249,7 @@ impl Client {
                     match env.frame {
                         Frame::Block {
                             bundle_b64,
-                            sig_b64: _,
+                            sig_b64,
                             receipts,
                             delivery_cid,
                         } => {
@@ -260,6 +261,7 @@ impl Client {
                             // emits explicit cursor advances.
                             let delivered = DeliveredBlock {
                                 bundle_b64,
+                                sig_b64,
                                 receipts,
                                 delivery_cid: delivery_cid.clone(),
                             };
@@ -941,6 +943,7 @@ mod tests {
     #[test]
     fn delivered_block_round_trips_through_json() {
         let original = DeliveredBlock {
+            sig_b64: None,
             bundle_b64: "dGVzdC1ibG9jaw==".to_string(),
             receipts: vec![ReceiptRef {
                 server_did: "did:jig:zServer".to_string(),
@@ -966,11 +969,13 @@ mod tests {
     fn delivered_block_vec_round_trips_as_json_array() {
         let blocks = vec![
             DeliveredBlock {
+                sig_b64: None,
                 bundle_b64: "YQ==".to_string(),
                 receipts: vec![],
                 delivery_cid: "bafy_a".to_string(),
             },
             DeliveredBlock {
+                sig_b64: None,
                 bundle_b64: "Yg==".to_string(),
                 receipts: vec![],
                 delivery_cid: "bafy_b".to_string(),
@@ -999,7 +1004,7 @@ mod tests {
         let client = Client::connect(&url, test_identity()).await.unwrap();
         let welcome = client.welcome().expect("a verified welcome");
         assert_eq!(welcome.version, 1);
-        assert_eq!(welcome.suites, vec!["none".to_string()]);
+        assert_eq!(welcome.suites, vec!["none".to_string(), "mls".to_string()]);
         assert!(welcome.reputation.is_null());
         assert_eq!(
             welcome.capabilities.block_kinds,

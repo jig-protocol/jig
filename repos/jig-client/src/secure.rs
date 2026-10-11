@@ -1,0 +1,762 @@
+//! Encrypted channels on the client: MLS group state, and the plaintext a
+//! member has read.
+//!
+//! # Where state lives
+//!
+//! `~/.jig/mls/<did>/` (mode 0700):
+//!
+//! - `state.bin` — every group and unused key package this DID holds
+//!   (`jig_mls::snapshot` bytes);
+//! - `groups.json` — which group backs which channel, keyed by server and slug;
+//! - `plaintext.jsonl` — messages already read, by block CID.
+//!
+//! The plaintext file exists because MLS deletes a message key once it is
+//! used: a message decrypts exactly once, and a sender can never decrypt its
+//! own. Without it, history would be unreadable the second time a channel is
+//! opened.
+//!
+//! # Concurrency
+//!
+//! `jig chat` and `jig send` can run for the same DID at once. Every operation
+//! takes an exclusive lock on the directory, loads the state, applies itself
+//! and saves, so two processes never fork a group by each advancing a stale
+//! copy of it.
+
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead as _, Write as _};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use jig_core::{BlockKind, EncryptionSuite};
+use jig_mls::member::{Commit, CommitOutcome, CreatedGroup, Member};
+use serde::{Deserialize, Serialize};
+
+use crate::Identity;
+use crate::open::OpenedBlock;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SecureError {
+    #[error(transparent)]
+    Mls(#[from] jig_mls::MlsError),
+    #[error("MLS state at {path:?}: {source}")]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("no MLS group for {0} on this device; join or be added first")]
+    NoGroup(String),
+    #[error("malformed MLS field `{0}` in block")]
+    Field(&'static str),
+}
+
+pub type Result<T> = std::result::Result<T, SecureError>;
+
+/// What a delivered block meant for this member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Seen {
+    /// Not encrypted-channel content: display it as it is.
+    Plain,
+    /// A control block with nothing to show.
+    Control,
+    /// Encrypted text this member can read.
+    Text { sender: String, text: String },
+    /// Encrypted text this member cannot read, and why.
+    Sealed { reason: String },
+    /// This member is now in the channel's group.
+    Joined,
+    /// Someone was added; the local group has followed.
+    Added { member: String },
+    /// Someone was removed, or a departed member's leaf was cleared.
+    Removed { member: String },
+    /// Someone left. When `tidy` is set, their leaf is still in this member's
+    /// copy of the tree and this member should commit its removal.
+    Left { member: String, tidy: bool },
+    /// This member was removed, or left; its copy of the group is gone.
+    Gone,
+    /// A membership change this member could not follow.
+    Broken { reason: String },
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Groups {
+    /// `server|slug` → hex group id.
+    groups: HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Read {
+    cid: String,
+    sender: String,
+    text: String,
+}
+
+/// One DID's MLS state on this device.
+pub struct Session {
+    identity: Identity,
+    did: String,
+    dir: PathBuf,
+    /// Plaintext already read, by block CID. A cache of `plaintext.jsonl`,
+    /// re-read from disk on a miss in case another process wrote it.
+    read: Mutex<HashMap<String, (String, String)>>,
+}
+
+/// Default root for MLS state: `~/.jig/mls/`.
+pub fn default_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".jig")
+        .join("mls")
+}
+
+/// The key a channel's group is filed under: its server and slug. A slug
+/// alone would collide between servers that both have a `#general`.
+pub fn group_key(server: &str, slug: &str) -> String {
+    let server = server
+        .trim()
+        .trim_end_matches('/')
+        .replacen("wss://", "https://", 1)
+        .replacen("ws://", "http://", 1)
+        .to_ascii_lowercase();
+    format!("{server}|{slug}")
+}
+
+impl Session {
+    /// Open (creating if needed) the MLS state for `identity` under `root`.
+    pub fn open(root: &Path, identity: Identity) -> Result<Self> {
+        let did = identity.did_string();
+        let dir = root.join(&did);
+        std::fs::create_dir_all(&dir).map_err(|source| SecureError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(
+                |source| SecureError::Io {
+                    path: dir.clone(),
+                    source,
+                },
+            )?;
+        }
+        let session = Self {
+            identity,
+            did,
+            dir,
+            read: Mutex::new(HashMap::new()),
+        };
+        session.reload_read()?;
+        Ok(session)
+    }
+
+    pub fn did(&self) -> &str {
+        &self.did
+    }
+
+    /// Fresh key packages to publish; their private halves are saved here.
+    pub fn key_packages(&self, count: usize, last_resort: bool) -> Result<Vec<Vec<u8>>> {
+        self.with_member(|m, _| Ok(m.key_packages(count, last_resort)?))
+    }
+
+    /// Whether this device holds the group for `server`/`slug`.
+    pub fn has_group(&self, server: &str, slug: &str) -> Result<bool> {
+        let key = group_key(server, slug);
+        self.with_member(|m, g| Ok(group_of(g, &key).is_some_and(|gid| m.has_group(&gid))))
+    }
+
+    /// DIDs in this device's copy of the channel's tree.
+    pub fn group_members(&self, server: &str, slug: &str) -> Result<Vec<String>> {
+        let key = group_key(server, slug);
+        self.with_member(|m, g| {
+            let gid = group_of(g, &key).ok_or_else(|| SecureError::NoGroup(key.clone()))?;
+            Ok(m.members(&gid)?)
+        })
+    }
+
+    /// Start the group for a channel about to be created.
+    pub fn create_group(&self, server: &str, slug: &str) -> Result<CreatedGroup> {
+        let key = group_key(server, slug);
+        self.with_member(|m, g| {
+            let created = m.create_group()?;
+            g.groups.insert(key, hex::encode(&created.group_id));
+            Ok(created)
+        })
+    }
+
+    /// Drop a channel's group: a create or join the server refused, or a
+    /// channel this member left.
+    pub fn discard_group(&self, server: &str, slug: &str) -> Result<()> {
+        let key = group_key(server, slug);
+        self.with_member(|m, g| {
+            if let Some(gid) = group_of(g, &key) {
+                m.forget(&gid)?;
+            }
+            g.groups.remove(&key);
+            Ok(())
+        })
+    }
+
+    pub fn prepare_add(
+        &self,
+        server: &str,
+        slug: &str,
+        key_package: &[u8],
+        did: &str,
+    ) -> Result<Commit> {
+        self.with_group(server, slug, |m, gid| Ok(m.add(gid, key_package, did)?))
+    }
+
+    pub fn prepare_remove(&self, server: &str, slug: &str, did: &str) -> Result<Commit> {
+        self.with_group(server, slug, |m, gid| Ok(m.remove(gid, did)?))
+    }
+
+    /// Join by external commit from the channel's published group info.
+    pub fn prepare_join(&self, server: &str, slug: &str, group_info: &[u8]) -> Result<Commit> {
+        let key = group_key(server, slug);
+        self.with_member(|m, g| {
+            let (gid, commit) = m.join_external(group_info)?;
+            g.groups.insert(key, hex::encode(gid));
+            Ok(commit)
+        })
+    }
+
+    /// The server accepted this member's commit.
+    pub fn confirm(&self, server: &str, slug: &str) -> Result<()> {
+        self.with_group(server, slug, |m, gid| Ok(m.confirm(gid)?))
+    }
+
+    /// The server refused this member's commit.
+    pub fn abandon(&self, server: &str, slug: &str) -> Result<()> {
+        self.with_group(server, slug, |m, gid| Ok(m.abandon(gid)?))
+    }
+
+    /// Encrypt `text` for the channel. Returns the MLS message and its epoch.
+    pub fn encrypt(&self, server: &str, slug: &str, text: &str) -> Result<(Vec<u8>, u64)> {
+        self.with_group(server, slug, |m, gid| Ok(m.encrypt(gid, text.as_bytes())?))
+    }
+
+    /// File the plaintext of a block this member sent or read.
+    pub fn remember(&self, cid: &str, sender: &str, text: &str) -> Result<()> {
+        let path = self.dir.join("plaintext.jsonl");
+        let _lock = self.lock()?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|source| SecureError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        let line = serde_json::to_string(&Read {
+            cid: cid.to_string(),
+            sender: sender.to_string(),
+            text: text.to_string(),
+        })
+        .expect("plaintext record serializes");
+        writeln!(f, "{line}").map_err(|source| SecureError::Io { path, source })?;
+        self.read
+            .lock()
+            .expect("plaintext cache poisoned")
+            .insert(cid.to_string(), (sender.to_string(), text.to_string()));
+        Ok(())
+    }
+
+    /// Apply a delivered block to this member's state and say what it meant.
+    ///
+    /// Blocks must come in the channel's order — history first, sorted with
+    /// [`replay_order`], then the live stream. A block from a channel this
+    /// member has no group for is not an error: it reads as [`Seen::Sealed`]
+    /// or [`Seen::Control`].
+    pub fn observe(&self, server: &str, block: &OpenedBlock) -> Seen {
+        match self.try_observe(server, block) {
+            Ok(seen) => seen,
+            Err(e) => match block.manifest.kind {
+                Some(BlockKind::MemberAdd | BlockKind::MemberRemove) => Seen::Broken {
+                    reason: e.to_string(),
+                },
+                _ => Seen::Sealed {
+                    reason: e.to_string(),
+                },
+            },
+        }
+    }
+
+    fn try_observe(&self, server: &str, block: &OpenedBlock) -> Result<Seen> {
+        let Some(kind) = block.manifest.kind else {
+            return Ok(Seen::Plain);
+        };
+        let slug = jig_pipeline::ingest::channel_slug_of(kind, &block.manifest)
+            .unwrap_or_default()
+            .to_string();
+        let key = group_key(server, &slug);
+        let me = self.did.clone();
+        let commit = block.meta_str("mls_commit");
+        let member = block
+            .meta_str("member_did")
+            .map(jig_pipeline::effect::canonical_did_string)
+            .unwrap_or_default();
+
+        match kind {
+            BlockKind::ChannelCreate | BlockKind::ChannelPromote | BlockKind::ChannelArchive => {
+                Ok(Seen::Control)
+            }
+            BlockKind::MemberAdd => {
+                let Some(commit) = commit else {
+                    return Ok(Seen::Control);
+                };
+                let commit = b64(commit, "mls_commit")?;
+                self.with_member(|m, g| {
+                    let gid = group_of(g, &key).filter(|gid| m.has_group(gid));
+                    if member == me {
+                        if block.sender == me {
+                            // My external join: built and merged locally.
+                            return Ok(Seen::Joined);
+                        }
+                        if gid.is_some() {
+                            return Ok(Seen::Control);
+                        }
+                        let welcome = block
+                            .meta_str("mls_welcome")
+                            .ok_or(SecureError::Field("mls_welcome"))?;
+                        let gid = m.join_welcome(&b64(welcome, "mls_welcome")?)?;
+                        g.groups.insert(key.clone(), hex::encode(gid));
+                        return Ok(Seen::Joined);
+                    }
+                    let Some(gid) = gid else {
+                        return Ok(Seen::Control);
+                    };
+                    follow(m, g, &key, &gid, block, &me, &commit, Seen::Added { member })
+                })
+            }
+            BlockKind::MemberRemove => {
+                let Some(commit) = commit else {
+                    // A leave: membership is gone, the leaf is not.
+                    return self.with_member(|m, g| {
+                        let Some(gid) = group_of(g, &key).filter(|gid| m.has_group(gid)) else {
+                            return Ok(Seen::Left {
+                                member,
+                                tidy: false,
+                            });
+                        };
+                        if member == me {
+                            m.forget(&gid)?;
+                            g.groups.remove(&key);
+                            return Ok(Seen::Gone);
+                        }
+                        let tidy = m.members(&gid)?.contains(&member);
+                        Ok(Seen::Left { member, tidy })
+                    });
+                };
+                let commit = b64(commit, "mls_commit")?;
+                self.with_member(|m, g| {
+                    let Some(gid) = group_of(g, &key).filter(|gid| m.has_group(gid)) else {
+                        return Ok(Seen::Control);
+                    };
+                    follow(m, g, &key, &gid, block, &me, &commit, Seen::Removed { member })
+                })
+            }
+            _ => {
+                if block.manifest.content_suite() != EncryptionSuite::Mls {
+                    return Ok(Seen::Plain);
+                }
+                if let Some((sender, text)) = self.recall(&block.cid)? {
+                    return Ok(Seen::Text { sender, text });
+                }
+                let message = block
+                    .meta_str("mls_message")
+                    .ok_or(SecureError::Field("mls_message"))?;
+                let message = b64(message, "mls_message")?;
+                let decrypted = self.with_member(|m, g| {
+                    let gid = group_of(g, &key)
+                        .filter(|gid| m.has_group(gid))
+                        .ok_or_else(|| SecureError::NoGroup(slug.clone()))?;
+                    Ok(m.decrypt(&gid, &message)?)
+                })?;
+                if decrypted.sender != block.sender {
+                    return Ok(Seen::Sealed {
+                        reason: format!(
+                            "MLS sender {} is not the block's author",
+                            decrypted.sender
+                        ),
+                    });
+                }
+                let text = String::from_utf8_lossy(&decrypted.plaintext).into_owned();
+                self.remember(&block.cid, &block.sender, &text)?;
+                Ok(Seen::Text {
+                    sender: block.sender.clone(),
+                    text,
+                })
+            }
+        }
+    }
+
+    fn recall(&self, cid: &str) -> Result<Option<(String, String)>> {
+        if let Some(hit) = self.read.lock().expect("plaintext cache poisoned").get(cid) {
+            return Ok(Some(hit.clone()));
+        }
+        self.reload_read()?;
+        Ok(self
+            .read
+            .lock()
+            .expect("plaintext cache poisoned")
+            .get(cid)
+            .cloned())
+    }
+
+    fn reload_read(&self) -> Result<()> {
+        let path = self.dir.join("plaintext.jsonl");
+        let Ok(f) = File::open(&path) else {
+            return Ok(());
+        };
+        let mut read = self.read.lock().expect("plaintext cache poisoned");
+        for line in std::io::BufReader::new(f).lines() {
+            let line = line.map_err(|source| SecureError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if let Ok(r) = serde_json::from_str::<Read>(&line) {
+                read.insert(r.cid, (r.sender, r.text));
+            }
+        }
+        Ok(())
+    }
+
+    fn with_group<T>(
+        &self,
+        server: &str,
+        slug: &str,
+        f: impl FnOnce(&Member, &[u8]) -> Result<T>,
+    ) -> Result<T> {
+        let key = group_key(server, slug);
+        self.with_member(|m, g| {
+            let gid = group_of(g, &key)
+                .filter(|gid| m.has_group(gid))
+                .ok_or_else(|| SecureError::NoGroup(slug.to_string()))?;
+            f(m, &gid)
+        })
+    }
+
+    /// Lock, load, apply `f`, save. The one way state changes.
+    fn with_member<T>(&self, f: impl FnOnce(&Member, &mut Groups) -> Result<T>) -> Result<T> {
+        let _lock = self.lock()?;
+        let state_path = self.dir.join("state.bin");
+        let groups_path = self.dir.join("groups.json");
+        let member = match std::fs::read(&state_path) {
+            Ok(bytes) => self.identity.restore_mls_member(&bytes)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.identity.mls_member()?,
+            Err(source) => {
+                return Err(SecureError::Io {
+                    path: state_path,
+                    source,
+                });
+            }
+        };
+        let mut groups: Groups = match std::fs::read(&groups_path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            Err(_) => Groups::default(),
+        };
+        let out = f(&member, &mut groups);
+        // Save even when `f` failed: openmls may have written state (a staged
+        // commit, a consumed key package) before the failure.
+        write_atomic(&state_path, &member.snapshot())?;
+        write_atomic(
+            &groups_path,
+            &serde_json::to_vec_pretty(&groups).expect("groups serialize"),
+        )?;
+        out
+    }
+
+    fn lock(&self) -> Result<File> {
+        let path = self.dir.join("lock");
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|source| SecureError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        f.lock().map_err(|source| SecureError::Io { path, source })?;
+        Ok(f)
+    }
+}
+
+/// Apply a commit someone sent, or confirm one this member sent.
+#[allow(clippy::too_many_arguments)]
+fn follow(
+    m: &Member,
+    g: &mut Groups,
+    key: &str,
+    gid: &[u8],
+    block: &OpenedBlock,
+    me: &str,
+    commit: &[u8],
+    done: Seen,
+) -> Result<Seen> {
+    if block.sender == me {
+        // My own commit, echoed back. Merging here as well as after the
+        // submit covers a client that exited between the two.
+        if m.has_pending_commit(gid)
+            && jig_mls::member::message_epoch(commit) == Some(m.epoch(gid)?)
+        {
+            m.confirm(gid)?;
+        }
+        return Ok(done);
+    }
+    match m.apply_commit(gid, commit)? {
+        CommitOutcome::Applied { .. } | CommitOutcome::AlreadyApplied => Ok(done),
+        CommitOutcome::Removed => {
+            g.groups.remove(key);
+            Ok(Seen::Gone)
+        }
+    }
+}
+
+fn group_of(g: &Groups, key: &str) -> Option<Vec<u8>> {
+    g.groups.get(key).and_then(|h| hex::decode(h).ok())
+}
+
+fn b64(s: &str, field: &'static str) -> Result<Vec<u8>> {
+    STANDARD.decode(s).map_err(|_| SecureError::Field(field))
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    let io = |source| SecureError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    std::fs::write(&tmp, bytes).map_err(io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(io)?;
+    }
+    std::fs::rename(&tmp, path).map_err(io)
+}
+
+/// Order a channel's history for an MLS member.
+///
+/// History comes back in the order of each block's HLC, which its *author*
+/// stamped. MLS needs commits in epoch order and a message after the commit
+/// that created its epoch, so blocks carrying MLS data are ordered by the
+/// epoch in their framing — read without decrypting — with messages before
+/// the commit that leaves their epoch. A block with no MLS data takes the
+/// position of the epoch it was posted in — it sorts among that epoch's
+/// messages, ahead of the commit that ends it — so it keeps its place
+/// relative to its neighbours.
+pub fn replay_order(blocks: Vec<OpenedBlock>) -> Vec<OpenedBlock> {
+    let mut current = 0u64;
+    let mut keyed: Vec<((u64, u8), usize, OpenedBlock)> = blocks
+        .into_iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let mls = |field| {
+                b.meta_str(field)
+                    .and_then(|s| STANDARD.decode(s).ok())
+                    .and_then(|bytes| jig_mls::member::message_epoch(&bytes))
+            };
+            let key = if let Some(e) = mls("mls_message") {
+                current = current.max(e);
+                (e, 0)
+            } else if let Some(e) = mls("mls_commit") {
+                current = current.max(e + 1);
+                (e, 1)
+            } else {
+                (current, 0)
+            };
+            (key, i, b)
+        })
+        .collect();
+    keyed.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    keyed.into_iter().map(|(_, _, b)| b).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DeliveredBlock;
+    use crate::blocks::{BuiltBlock, build_sealed_text, build_with_metadata};
+    use jig_core::HlcTimestamp;
+    use serde_json::json;
+
+    const SERVER: &str = "http://127.0.0.1:7117";
+
+    fn session(root: &Path) -> Session {
+        let keys = tempfile::tempdir().unwrap();
+        let id = Identity::generate_and_save(&keys.keep()).unwrap();
+        Session::open(root, id).unwrap()
+    }
+
+    fn identity_of(s: &Session) -> &Identity {
+        &s.identity
+    }
+
+    fn deliver(b: &BuiltBlock) -> OpenedBlock {
+        crate::open::open(&DeliveredBlock {
+            bundle_b64: STANDARD.encode(b.canonical_bytes()),
+            sig_b64: Some(STANDARD.encode(&b.sender_sig)),
+            receipts: vec![],
+            delivery_cid: format!("delivery:{}", b.cid()),
+        })
+        .unwrap()
+    }
+
+    fn hlc(s: &Session) -> HlcTimestamp {
+        HlcTimestamp::now_wall(identity_of(s).did().clone())
+    }
+
+    fn add_block(owner: &Session, slug: &str, who: &Session) -> BuiltBlock {
+        let kp = who.key_packages(1, false).unwrap().remove(0);
+        let c = owner.prepare_add(SERVER, slug, &kp, who.did()).unwrap();
+        owner.confirm(SERVER, slug).unwrap();
+        build_with_metadata(
+            identity_of(owner),
+            BlockKind::MemberAdd,
+            hlc(owner),
+            json!({"channel": slug, "member_did": who.did(),
+                "mls_commit": STANDARD.encode(&c.commit),
+                "mls_welcome": STANDARD.encode(c.welcome.unwrap()),
+                "mls_epoch": c.epoch}),
+        )
+    }
+
+    fn say(from: &Session, slug: &str, text: &str) -> BuiltBlock {
+        let (msg, epoch) = from.encrypt(SERVER, slug, text).unwrap();
+        let b = build_sealed_text(identity_of(from), slug, &msg, epoch, hlc(from));
+        from.remember(&b.cid(), from.did(), text).unwrap();
+        b
+    }
+
+    #[test]
+    fn a_member_reads_what_the_owner_sends_and_rereads_it_from_the_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        alice.create_group(SERVER, "#sealed").unwrap();
+
+        let add = add_block(&alice, "#sealed", &bob);
+        assert_eq!(bob.observe(SERVER, &deliver(&add)), Seen::Joined);
+        assert_eq!(
+            alice.observe(SERVER, &deliver(&add)),
+            Seen::Added {
+                member: bob.did().to_string()
+            },
+            "the owner's own commit, echoed back, is already applied"
+        );
+
+        let msg = deliver(&say(&alice, "#sealed", "hello bob"));
+        let read = Seen::Text {
+            sender: alice.did().to_string(),
+            text: "hello bob".to_string(),
+        };
+        assert_eq!(bob.observe(SERVER, &msg), read);
+        assert_eq!(bob.observe(SERVER, &msg), read, "second read comes from the cache");
+        assert_eq!(alice.observe(SERVER, &msg), read, "the sender reads its own from the cache");
+
+        // A fresh session over the same directory — the next `jig chat` —
+        // still has both the group and the plaintext.
+        let bob_again = Session::open(
+            root.path(),
+            Identity::from_signing_key(ed25519_dalek::SigningKey::from_bytes(
+                &bob.identity.signing_bytes_for_test(),
+            )),
+        )
+        .unwrap();
+        assert_eq!(bob_again.observe(SERVER, &msg), read);
+        assert!(bob_again.has_group(SERVER, "#sealed").unwrap());
+    }
+
+    #[test]
+    fn a_non_member_sees_sealed_text() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let eve = session(root.path());
+        alice.create_group(SERVER, "#sealed").unwrap();
+        let msg = deliver(&say(&alice, "#sealed", "secret"));
+        assert!(matches!(eve.observe(SERVER, &msg), Seen::Sealed { .. }));
+    }
+
+    #[test]
+    fn a_kicked_member_loses_the_group() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        alice.create_group(SERVER, "#sealed").unwrap();
+        bob.observe(SERVER, &deliver(&add_block(&alice, "#sealed", &bob)));
+
+        let c = alice.prepare_remove(SERVER, "#sealed", bob.did()).unwrap();
+        alice.confirm(SERVER, "#sealed").unwrap();
+        let kick = build_with_metadata(
+            identity_of(&alice),
+            BlockKind::MemberRemove,
+            hlc(&alice),
+            json!({"channel": "#sealed", "member_did": bob.did(),
+                "mls_commit": STANDARD.encode(&c.commit)}),
+        );
+        assert_eq!(bob.observe(SERVER, &deliver(&kick)), Seen::Gone);
+        assert!(!bob.has_group(SERVER, "#sealed").unwrap());
+        let after = deliver(&say(&alice, "#sealed", "bob is gone"));
+        assert!(matches!(bob.observe(SERVER, &after), Seen::Sealed { .. }));
+    }
+
+    #[test]
+    fn a_leave_asks_remaining_members_to_tidy_up() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        alice.create_group(SERVER, "#sealed").unwrap();
+        bob.observe(SERVER, &deliver(&add_block(&alice, "#sealed", &bob)));
+        let leave = build_with_metadata(
+            identity_of(&bob),
+            BlockKind::MemberRemove,
+            hlc(&bob),
+            json!({"channel": "#sealed", "member_did": bob.did()}),
+        );
+        assert_eq!(
+            alice.observe(SERVER, &deliver(&leave)),
+            Seen::Left {
+                member: bob.did().to_string(),
+                tidy: true
+            }
+        );
+        assert_eq!(bob.observe(SERVER, &deliver(&leave)), Seen::Gone);
+    }
+
+    #[test]
+    fn replay_puts_commits_before_the_messages_that_need_them() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        let carol = session(root.path());
+        alice.create_group(SERVER, "#sealed").unwrap();
+        let add_bob = add_block(&alice, "#sealed", &bob);
+        let m1 = say(&alice, "#sealed", "one");
+        let add_carol = add_block(&alice, "#sealed", &carol);
+        let m2 = say(&alice, "#sealed", "two");
+        // History as a skewed author clock might order it.
+        let shuffled = vec![
+            deliver(&m2),
+            deliver(&add_carol),
+            deliver(&m1),
+            deliver(&add_bob),
+        ];
+        let ordered: Vec<String> = replay_order(shuffled).into_iter().map(|b| b.cid).collect();
+        assert_eq!(
+            ordered,
+            vec![add_bob.cid(), m1.cid(), add_carol.cid(), m2.cid()]
+        );
+    }
+
+    #[test]
+    fn group_keys_ignore_scheme_spelling_but_not_server() {
+        assert_eq!(
+            group_key("ws://Host:7117/", "#a"),
+            group_key("http://host:7117", "#a")
+        );
+        assert_ne!(group_key("http://a", "#x"), group_key("http://b", "#x"));
+    }
+}

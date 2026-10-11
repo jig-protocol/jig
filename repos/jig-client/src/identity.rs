@@ -111,6 +111,25 @@ impl Identity {
         self.signing.sign(msg)
     }
 
+    /// The DID's own key as an MLS group member. The same key signs blocks
+    /// and MLS messages — see `jig_mls::credential`. Crate-private so the
+    /// seed never leaves this crate.
+    pub(crate) fn mls_member(&self) -> Result<jig_mls::member::Member, jig_mls::MlsError> {
+        jig_mls::member::Member::new(&self.signing.to_bytes(), &self.did)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn signing_bytes_for_test(&self) -> [u8; 32] {
+        self.signing.to_bytes()
+    }
+
+    pub(crate) fn restore_mls_member(
+        &self,
+        snapshot: &[u8],
+    ) -> Result<jig_mls::member::Member, jig_mls::MlsError> {
+        jig_mls::member::Member::restore(&self.signing.to_bytes(), &self.did, snapshot)
+    }
+
     #[cfg(unix)]
     fn enforce_secure_permissions(path: &Path) -> Result<(), IdentityError> {
         use std::os::unix::fs::PermissionsExt;

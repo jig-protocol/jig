@@ -417,6 +417,16 @@ impl Member {
     }
 }
 
+/// The epoch an MLS commit or application message was built in, read from
+/// its framing without decrypting anything. `None` for anything else.
+pub fn message_epoch(bytes: &[u8]) -> Option<u64> {
+    let message: ProtocolMessage = MlsMessageIn::tls_deserialize_exact(bytes)
+        .ok()?
+        .try_into_protocol_message()
+        .ok()?;
+    Some(message.epoch().as_u64())
+}
+
 fn serialize_group_info(info: openmls::messages::group_info::GroupInfo) -> Result<Vec<u8>> {
     MlsMessageOut::from(info)
         .tls_serialize_detached()
