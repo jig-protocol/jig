@@ -279,8 +279,8 @@ async fn an_encrypted_channel_round_trip_leaves_no_plaintext_on_the_server() {
         "joined from the welcome"
     );
 
-    let secret = "the launch code is 0451";
-    say(&api, &alice, slug, secret).await;
+    let before = "the launch code is 0451";
+    say(&api, &alice, slug, before).await;
     let live = loop {
         let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
             .await
@@ -311,7 +311,7 @@ async fn an_encrypted_channel_round_trip_leaves_no_plaintext_on_the_server() {
         bob.session.observe(&host, &opened),
         Seen::Text {
             sender: alice.did(),
-            text: secret.to_string()
+            text: before.to_string()
         }
     );
     assert!(
@@ -371,12 +371,12 @@ async fn an_encrypted_channel_round_trip_leaves_no_plaintext_on_the_server() {
     // Alice's own history replays from her plaintext cache.
     assert_eq!(
         texts(&catch_up(&api, &alice, slug).await),
-        vec![secret, after]
+        vec![before, after]
     );
 
     // The point of all this.
     let disk = disk_bytes(server.data_dir());
-    for said in [secret, after] {
+    for said in [before, after] {
         assert!(!contains(&disk, said), "`{said}` is on the server's disk");
     }
     let _ = &carol.keys;
@@ -438,7 +438,7 @@ async fn an_open_encrypted_channel_is_joined_by_external_commit_and_tidied_on_le
     assert_eq!(
         texts(&dave_view),
         vec!["hi dave"],
-        "nothing from before he joined"
+        "nothing from before they joined"
     );
     assert!(dave_view.iter().any(|s| matches!(s, Seen::Sealed { .. })));
 

@@ -86,7 +86,7 @@ pub async fn publish_key_packages(
             format!("publish between 1 and {MAX_BATCH} key packages at a time"),
         ));
     }
-    let mut validated = Vec::with_capacity(body.key_packages_b64.len());
+    let mut validated = Vec::new();
     for (i, b64) in body.key_packages_b64.iter().enumerate() {
         let bytes = STANDARD
             .decode(b64)
@@ -108,19 +108,29 @@ pub async fn publish_key_packages(
         .map_err(|outcome| refuse(&state, &outcome, started))?;
 
     let store = &state.ingest_ctx.store;
-    let (mut available, _) = store.key_package_stock(&did).map_err(persist_err)?;
+    let (mut available, mut has_last_resort) =
+        store.key_package_stock(&did).map_err(persist_err)?;
     let now = chrono::Utc::now().timestamp();
     let mut accepted = 0;
     for (bytes, info) in validated {
-        if !info.last_resort && available >= MAX_STOCK {
-            break;
+        // One last-resort package per DID is all it needs, and each carries a
+        // fresh reference, so without this a DID could store unboundedly
+        // many of them past `MAX_STOCK`.
+        if info.last_resort {
+            if has_last_resort {
+                continue;
+            }
+        } else if available >= MAX_STOCK {
+            continue;
         }
         if store
             .insert_key_package(&info.reference, &did, &bytes, info.last_resort, now)
             .map_err(persist_err)?
         {
             accepted += 1;
-            if !info.last_resort {
+            if info.last_resort {
+                has_last_resort = true;
+            } else {
                 available += 1;
             }
         }
@@ -236,4 +246,69 @@ pub fn build_mls_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/channels/:slug/mls/group-info", get(group_info))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member(seed: u8) -> (jig_mls::member::Member, String) {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let did = jig_core::Did::from_ed25519_pubkey(&key.verifying_key().to_bytes());
+        (
+            jig_mls::member::Member::new(&[seed; 32], &did).unwrap(),
+            did.to_did_jig_string(),
+        )
+    }
+
+    async fn publish(state: &Arc<AppState>, packages: &[Vec<u8>]) -> PublishResult {
+        let Json(result) = publish_key_packages(
+            State(state.clone()),
+            Json(PublishBody {
+                key_packages_b64: packages.iter().map(|p| STANDARD.encode(p)).collect(),
+            }),
+        )
+        .await
+        .unwrap();
+        result
+    }
+
+    /// Each last-resort package has a fresh reference, so without a cap one
+    /// DID could store as many as it liked.
+    #[tokio::test]
+    async fn a_did_keeps_one_last_resort_package() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let (m, did) = member(7);
+        let mut batch = m.key_packages(2, false).unwrap();
+        batch.extend(m.key_packages(3, true).unwrap());
+        let first = publish(&state, &batch).await;
+        assert_eq!(first.did, did);
+        assert_eq!(
+            (first.accepted, first.available, first.last_resort),
+            (3, 2, true)
+        );
+
+        let again = publish(&state, &m.key_packages(2, true).unwrap()).await;
+        assert_eq!(
+            again.accepted, 0,
+            "a second last-resort package is not stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_must_belong_to_one_did() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let (a, _) = member(1);
+        let (b, _) = member(2);
+        let mut batch = a.key_packages(1, false).unwrap();
+        batch.extend(b.key_packages(1, false).unwrap());
+        let refused = publish_key_packages(
+            State(state),
+            Json(PublishBody {
+                key_packages_b64: batch.iter().map(|p| STANDARD.encode(p)).collect(),
+            }),
+        )
+        .await;
+        assert!(matches!(refused, Err((StatusCode::BAD_REQUEST, _))));
+    }
 }

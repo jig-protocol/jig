@@ -45,8 +45,9 @@ defines what the signature covers.
 | `UNSUPPORTED_SCHEMA` | Manifest `schema` not implemented |
 | `SUITE_MISMATCH` | A block's suite is not its channel's |
 | `MLS_REJECTED` | The MLS payload of a block on an `mls` channel is invalid, or does not do what the block says |
-| `STALE_EPOCH` | A commit built on an epoch the channel has left (`409`) |
+| `STALE_EPOCH` | A commit built on an epoch the channel has left (`409` on both transports) |
 
-On the WebSocket transport a server replies with an `error` frame carrying the code and
-`status: 400`. Over REST, which carries no envelope, manifest refusals come back as HTTP
-`400` with the same codes.
+On the WebSocket transport a server replies with an `error` frame carrying the code. Envelope
+and pre-ingest refusals carry `status: 400`; a refusal from ingest carries that refusal's own
+status, the same one REST returns. Over REST, which carries no envelope, manifest refusals
+come back as HTTP `400` with the same codes.

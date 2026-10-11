@@ -70,18 +70,17 @@ as not implemented in v0.1.
 single-server use; "private by default" is not yet a true claim, and nothing
 here has had an outside review.
 
-### 1.4 Admin endpoints are required and unauthorized
+### 1.4 Channel-ops endpoints
 
 | | |
 | --- | --- |
-| **Current state** | `/_admin_v0_0_2/channels` and `/_admin_v0_0_2/channels/:slug/members` mount only when `[debug] admin_endpoints = true` (`build_v0_0_2_router` in [`v0_0_2_ws.rs`](../repos/jig-server/src/v0_0_2_ws.rs)). `JigServerConfig::default()` has it `false`, but the config template `jig-server` writes sets it `true` with a comment explaining it is not optional: `jig channel create` and `jig channel join` POST to exactly these routes ([`config.rs:273-279`](../repos/jig-server/src/config.rs), [`jig-cli/src/cmd/channel.rs`](../repos/jig-cli/src/cmd/channel.rs)). |
-| **Authentication** | Both handlers run the bundle through `jig_pipeline::ingest`, which verifies the ed25519 signature and rejects `INVALID_SIG`. The *author DID is authenticated* — you cannot forge someone else's DID here. |
-| **Authorization** | Owner checks on channel mutation now run inside `ingest` (`jig-pipeline/src/authorize_write.rs`), so they hold on the admin routes, the public `POST /api/v1/blocks`, WSS `Submit` and the bridge path alike: `member-add` of anyone but yourself, or onto a restricted channel, and `channel-promote` must be signed by the channel owner (`403 NOT_CHANNEL_OWNER`); `channel-archive` keeps its own owner check. Any self-minted keypair can still *create* channels, which is by design. |
+| **Current state** | Channel ops live on `POST /api/v1/channels`, `/api/v1/channels/:slug/members` and `/api/v1/channels/:slug/archive`, mounted unconditionally ([`v0_0_2_admin.rs`](../repos/jig-server/src/v0_0_2_admin.rs)). `[debug] admin_endpoints` now only adds the legacy `/_admin_v0_0_2/*` aliases that pre-v0.1 CLIs POST to; it defaults to `false` in `JigServerConfig::default()`, in the template `jig-server --init-config` writes, and in `install.sh`, and unit tests pin all three ([`config.rs`](../repos/jig-server/src/config.rs)). `jig channel …` posts to `/api/v1/channels` and falls back to the legacy path only on a `404`/`405` from an older server ([`jig-cli/src/cmd/channel.rs`](../repos/jig-cli/src/cmd/channel.rs)). |
+| **Authentication** | Every route runs the bundle through `jig_pipeline::ingest`, which verifies the ed25519 signature and rejects `INVALID_SIG`. The *author DID is authenticated* — you cannot forge someone else's DID here. |
+| **Authorization** | Owner checks on channel mutation run inside `ingest` (`jig-pipeline/src/authorize_write.rs`), so they hold on these routes, the public `POST /api/v1/blocks`, WSS `Submit` and the bridge path alike: `member-add` of anyone but yourself, or onto a restricted channel, `member-remove` of anyone but yourself (unless tidying up a member who already left), and `channel-promote` must be signed by the channel owner (`403 NOT_CHANNEL_OWNER`); `channel-archive` keeps its own owner check. Any self-minted keypair can still *create* channels, which is by design. |
 | **Ready means** | Ownership/role checks on channel mutation, and a channel-ops path that does not live behind a `[debug]` flag. |
 
-**Verdict: GAP** (was BLOCKER). The mutation is authorized; the remaining
-problem is the label — the only working channel-management path is still
-mounted by a `[debug]` flag, and "debug" reads as "harmless" to an operator.
+**Verdict: READY** (was GAP). Both conditions hold: mutation is authorized at
+ingest, and the working path needs no `[debug]` flag.
 
 ### 1.5 v0.0.1 unsigned REST ingest
 

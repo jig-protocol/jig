@@ -176,8 +176,9 @@ scheme, so one block had two identities.
 
 ## Known limitations
 
-- History backfill is the last 200 blocks. A client offline across more than 200 blocks
-  that include commits cannot catch up and must be re-added.
+- History backfill: the client asks for the last 100 blocks, and the server caps any request
+  at 200. A client offline across more than 100 blocks that include commits cannot catch up
+  and must be re-added.
 - Key-package exhaustion: anyone admitted can fetch (and so consume) a DID's key packages.
   The last-resort package keeps the DID reachable; rate limiting is the admission work's.
 - Decision 4's window.

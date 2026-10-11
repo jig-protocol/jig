@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::cmd::common::CliContext;
-use crate::cmd::secure::{ChannelInfo, Secure, mls_fields};
+use crate::cmd::secure::{ChannelInfo, Refused, Secure, mls_fields, refused};
 
 // ============================================================================
 // Helpers
@@ -219,11 +219,15 @@ pub(crate) async fn create_with(
     let secure = if encrypted {
         let secure = Secure::open(ctx)?;
         if secure.session.has_group(secure.server(), slug)? {
-            if exist_ok {
-                println!("channel already exists: {slug}");
-                return Ok(false);
+            if secure.channel(slug).await?.is_some() {
+                if exist_ok {
+                    println!("channel already exists: {slug}");
+                    return Ok(false);
+                }
+                anyhow::bail!("this device already holds the group for {slug}");
             }
-            anyhow::bail!("this device already holds the group for {slug}");
+            // Left over from a create the server never answered and never took.
+            secure.session.discard_group(secure.server(), slug)?;
         }
         let created = secure.session.create_group(secure.server(), slug)?;
         merge(
@@ -244,11 +248,27 @@ pub(crate) async fn create_with(
     let block = build_with_metadata(&id, BlockKind::ChannelCreate, hlc, meta);
 
     let base = base_http_url(&ctx.server_url()?);
-    let outcome = post_channel_op(&base, "", &block).await;
-    if outcome.is_err()
-        && let Some(secure) = &secure
-    {
-        secure.session.discard_group(secure.server(), slug)?;
+    let mut outcome = post_channel_op(&base, "", &block).await;
+    if let (Err(e), Some(secure)) = (&outcome, &secure) {
+        if e.downcast_ref::<ChannelOpError>()
+            .is_some_and(|c| c.status.is_client_error())
+        {
+            secure.session.discard_group(secure.server(), slug)?;
+        } else {
+            // No answer, or none to trust: the server may have created it
+            // anyway, and then the group is the only copy of the channel's
+            // keys. Keep it unless the server says the channel is not ours;
+            // if it cannot say, the next create tidies up.
+            match member_role(secure, slug, &id.did_string()).await {
+                Ok(Some(role)) if role == "owner" => {
+                    outcome = Ok(AdminResult {
+                        block_cid: block.cid(),
+                    })
+                }
+                Ok(_) => secure.session.discard_group(secure.server(), slug)?,
+                Err(_) => {}
+            }
+        }
     }
     let label = if encrypted {
         format!("{visibility}, end-to-end encrypted")
@@ -325,7 +345,8 @@ pub async fn add(ctx: &CliContext, slug: String, who: String) -> Result<()> {
     let cid = if info.encrypted() {
         let kp = secure.take_key_package(&did).await.with_context(|| {
             format!(
-                "fetching a key package for {did} — they need to have run `jig chat` or                  `jig init` against this server at least once"
+                "fetching a key package for {did} — they need to have run `jig chat` or \
+                 `jig init` against this server at least once"
             )
         })?;
         let server = secure.server().to_string();
@@ -434,6 +455,32 @@ pub async fn members(ctx: &CliContext, slug: String) -> Result<()> {
     Ok(())
 }
 
+/// `did`'s role in the channel, as the server has it: `None` when it is not
+/// a member, or the channel is not there for the caller to see. An error only
+/// when the server could not be asked.
+async fn member_role(secure: &Secure, slug: &str, did: &str) -> Result<Option<String>> {
+    match secure
+        .get_json::<MembersResponse>(&format!(
+            "/api/v1/channels/{}/members",
+            escape_slug_for_url(slug)
+        ))
+        .await
+    {
+        Ok(body) => Ok(body
+            .members
+            .into_iter()
+            .find(|m| m.did == did)
+            .map(|m| m.role)),
+        Err(e)
+            if e.downcast_ref::<Refused>()
+                .is_some_and(|r| matches!(r.status, 403 | 404)) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn now(id: &jig_client::Identity) -> HlcTimestamp {
     HlcTimestamp::now_wall(id.did().clone())
 }
@@ -489,36 +536,55 @@ async fn join_encrypted(ctx: &CliContext, secure: &Secure, slug: &str) -> Result
     let id = secure.identity();
     let me = id.did_string();
     let server = secure.server().to_string();
+    // A join whose answer never came may have landed: then the group held
+    // here is the one that works, and joining again would replace it.
+    if secure.session.has_group(&server, slug)? && member_role(secure, slug, &me).await?.is_some() {
+        println!("already in {slug}");
+        return Ok(());
+    }
+    let joined = |cid: &str| {
+        println!("joined {slug} as {me} (end-to-end encrypted)");
+        println!("  block_cid: {cid}");
+        if let Err(e) = remember_joiner(ctx, &me) {
+            eprintln!("warning: joined but contact name not saved: {e:#}");
+        }
+    };
     for attempt in 0..2 {
         let info = secure.group_info(slug).await?;
         let commit = secure.session.prepare_join(&server, slug, &info)?;
         let mut meta = json!({"channel": slug, "member_did": me});
         merge(&mut meta, mls_fields(&commit));
-        match secure
-            .submit(&build_with_metadata(
-                id,
-                BlockKind::MemberAdd,
-                now(id),
-                meta,
-            ))
-            .await
-        {
+        let block = build_with_metadata(id, BlockKind::MemberAdd, now(id), meta);
+        match secure.submit(&block).await {
             Ok(cid) => {
-                println!("joined {slug} as {me} (end-to-end encrypted)");
-                println!("  block_cid: {cid}");
-                if let Err(e) = remember_joiner(ctx, &me) {
-                    eprintln!("warning: joined but contact name not saved: {e:#}");
-                }
+                joined(&cid);
                 return Ok(());
             }
-            Err(e) => {
+            Err(e) if refused(&e) => {
                 secure.session.discard_group(&server, slug)?;
                 let stale = e
-                    .downcast_ref::<crate::cmd::secure::Refused>()
+                    .downcast_ref::<Refused>()
                     .is_some_and(|r| r.code == "STALE_EPOCH");
                 if !(stale && attempt == 0) {
                     return Err(e);
                 }
+            }
+            // No answer, or none to trust: keep the group unless the server
+            // says the join did not land.
+            Err(e) => {
+                return match member_role(secure, slug, &me).await {
+                    Ok(Some(_)) => {
+                        joined(&block.cid());
+                        Ok(())
+                    }
+                    Ok(None) => {
+                        secure.session.discard_group(&server, slug)?;
+                        Err(e)
+                    }
+                    Err(_) => Err(e.context(format!(
+                        "no answer from the server; run `jig channel join {slug}` again to settle it"
+                    ))),
+                };
             }
         }
     }

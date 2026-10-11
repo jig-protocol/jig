@@ -195,8 +195,8 @@ If a key is compromised and you don't have the private key anymore (e.g., hardwa
 
 ## Encryption Modes
 
-A channel is either unencrypted (suite `none`) or encrypted under its channel's suite
-(MLS by default). DMs are channels with locked membership, not a separate mode. See
+A channel is either unencrypted (suite `none`, the default) or encrypted under the suite
+chosen when it was created (`mls`). DMs are channels with locked membership, not a separate mode. See
 [Encryption](encryption.md).
 
 ## Wire Format Examples

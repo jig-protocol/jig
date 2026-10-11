@@ -75,8 +75,8 @@ A server cannot execute Wasm over ciphertext. On a plaintext channel `text-rende
 executes server-side to produce the `render_hash` a receipt signs. On an encrypted channel
 the server executes nothing and says so: its receipt is marked `"content": "sealed"` and
 attests only to what it checked — the author's signature, the suite, that the payload is an
-application message for the channel's group at a current epoch — and that it persisted the
-block. Moving execution of decrypted content to clients is still open in JEP-0001.
+application message for the channel's group at the current epoch or one of the three before
+it — and that it persisted the block. Moving execution of decrypted content to clients is still open in JEP-0001.
 
 ## Why the DID key is the MLS signature key (v0.2)
 

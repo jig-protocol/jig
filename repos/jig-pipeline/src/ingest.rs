@@ -469,45 +469,8 @@ pub async fn ingest(
         _ => build_synth_receipt(&block_cid, &ctx.server_did, &ctx.server_key),
     };
 
-    // Step 4b: commit the channel's MLS state. Before the effect, so a commit
-    // that lost the race to another one changes nothing at all.
-    match mls_plan {
-        crate::mls_gate::MlsPlan::Genesis(group) => ctx.store.put_mls_group(&group)?,
-        crate::mls_gate::MlsPlan::Advance {
-            slug,
-            from_epoch,
-            state,
-            to_epoch,
-            group_info,
-        } => {
-            if !ctx.store.advance_mls_group(
-                &slug,
-                from_epoch,
-                &state,
-                to_epoch,
-                group_info.as_deref(),
-            )? {
-                let current = ctx
-                    .store
-                    .get_mls_group(&slug)?
-                    .map(|g| g.epoch)
-                    .unwrap_or_default();
-                return Err(IngestError::StaleEpoch {
-                    slug,
-                    current,
-                    got: from_epoch,
-                });
-            }
-        }
-        crate::mls_gate::MlsPlan::Nothing | crate::mls_gate::MlsPlan::Sealed => {}
-    }
-
-    // Step 5: apply effect
     let canonical = bundle_canonical_bytes(bundle.manifest_bytes, bundle.code_bytes)
         .map_err(IngestError::BundleMalformed)?;
-    crate::effect::apply_effect(&ctx.store, &bundle, &receipt_bytes, &block_cid).await?;
-
-    // Step 6: persist block + receipt
     // Canonical, from the verified key — the spelling every gate compares.
     let sender_did_str = sender.to_did_jig_string();
     let hlc = manifest.hlc_ts.as_ref();
@@ -536,8 +499,6 @@ pub async fn ingest(
             _ => None,
         },
     };
-    ctx.store.insert_block(&stored_block)?;
-
     let receipt_cid = format!("r_{}", &block_cid[..16.min(block_cid.len())]);
     let stored_receipt = StoredReceipt {
         cid: receipt_cid,
@@ -547,7 +508,62 @@ pub async fn ingest(
         render_hash,
         produced_at: chrono::Utc::now().timestamp(),
     };
-    ctx.store.insert_receipt(&stored_receipt)?;
+
+    match mls_plan {
+        // Step 5/6 for a commit on an encrypted channel: the group's advance,
+        // the membership change and the block land in one transaction (see
+        // `SqliteStore::land_mls_commit` for why nothing less will do). A
+        // commit that lost the race to another one writes nothing.
+        crate::mls_gate::MlsPlan::Advance {
+            slug,
+            from_epoch,
+            state,
+            to_epoch,
+            group_info,
+        } => {
+            let membership =
+                membership_change(kind, &manifest, resolved_channel.as_ref(), &block_cid);
+            if !ctx.store.land_mls_commit(
+                &slug,
+                from_epoch,
+                &state,
+                to_epoch,
+                group_info.as_deref(),
+                &membership,
+                &stored_block,
+                &stored_receipt,
+            )? {
+                let current = ctx
+                    .store
+                    .get_mls_group(&slug)?
+                    .map(|g| g.epoch)
+                    .unwrap_or_default();
+                return Err(IngestError::StaleEpoch {
+                    slug,
+                    current,
+                    got: from_epoch,
+                });
+            }
+        }
+        plan => {
+            if let crate::mls_gate::MlsPlan::Genesis(group) = plan {
+                // A channel-create that fails after this leaves a row its
+                // retry overwrites (`put_mls_group` replaces).
+                ctx.store.put_mls_group(&group)?;
+            }
+            // Step 5: apply effect
+            crate::effect::apply_effect(
+                &ctx.store,
+                &bundle,
+                &stored_receipt.receipt_bytes,
+                &block_cid,
+            )
+            .await?;
+            // Step 6: persist block + receipt
+            ctx.store.insert_block(&stored_block)?;
+            ctx.store.insert_receipt(&stored_receipt)?;
+        }
+    }
 
     // Channel membership for bridge-sink dispatch. `channel_id` here is the
     // channel SLUG (lifted from manifest metadata), but memberships are keyed
@@ -697,6 +713,39 @@ fn requires_existing_channel(kind: BlockKind, source: &IngestSource) -> bool {
             | BlockKind::ChannelPromote
             | BlockKind::ChannelArchive
     )
+}
+
+/// The membership change a commit-carrying block makes — what
+/// `apply_effect` would do for it, as data, so it can share the commit's
+/// transaction.
+fn membership_change(
+    kind: BlockKind,
+    manifest: &jig_core::BlockManifest,
+    channel: Option<&crate::persist::StoredChannel>,
+    block_cid: &str,
+) -> crate::persist::MembershipChange {
+    use crate::persist::{MembershipChange, StoredMembership};
+    let (Some(channel), Some(member)) = (
+        channel,
+        manifest.metadata.get("member_did").and_then(|v| v.as_str()),
+    ) else {
+        return MembershipChange::None;
+    };
+    let member_did = crate::effect::canonical_did_string(member);
+    match kind {
+        BlockKind::MemberAdd => MembershipChange::Upsert(StoredMembership {
+            channel_id: channel.id.clone(),
+            member_did,
+            role: "member".to_string(),
+            joined_at: chrono::Utc::now().timestamp(),
+            source_block_cid: block_cid.to_string(),
+        }),
+        BlockKind::MemberRemove => MembershipChange::Remove {
+            channel_id: channel.id.clone(),
+            member_did,
+        },
+        _ => MembershipChange::None,
+    }
 }
 
 /// Map a suite-gate refusal onto the typed ingest error every surface

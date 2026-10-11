@@ -11,7 +11,8 @@
 ## Suites
 
 An **encryption suite** names the scheme that protects a payload. Suites are pluggable:
-the default is MLS, and an operator MAY run another registered suite. Adding a suite is a
+a channel created without one is `none` (signed, not encrypted), and MLS is selected per
+channel at creation. An operator MAY run another registered suite. Adding a suite is a
 registry entry plus a JEP and conformance vectors. It MUST NOT need a wire-format change.
 
 ### Registry

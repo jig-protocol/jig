@@ -34,7 +34,7 @@ use jig_mls::member::{Commit, CommitOutcome, CreatedGroup, Member};
 use serde::{Deserialize, Serialize};
 
 use crate::Identity;
-use crate::open::OpenedBlock;
+use crate::open::{Authenticity, OpenedBlock};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SecureError {
@@ -54,7 +54,7 @@ pub enum SecureError {
 pub type Result<T> = std::result::Result<T, SecureError>;
 
 /// What a delivered block meant for this member.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Seen {
     /// Not encrypted-channel content: display it as it is.
     Plain,
@@ -83,6 +83,11 @@ pub enum Seen {
 struct Groups {
     /// `server|slug` → hex group id.
     groups: HashMap<String, String>,
+    /// Membership blocks already applied to a group, by CID, and what each
+    /// meant. History is replayed on every read, and a server can deliver an
+    /// old block again on purpose: neither may act twice.
+    #[serde(default)]
+    seen: HashMap<String, Seen>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -172,6 +177,18 @@ impl Session {
         self.with_member(|m, g| {
             let gid = group_of(g, &key).ok_or_else(|| SecureError::NoGroup(key.clone()))?;
             Ok(m.members(&gid)?)
+        })
+    }
+
+    /// Whether this member has a commit for the channel that the server has
+    /// neither confirmed nor refused.
+    pub fn has_pending_commit(&self, server: &str, slug: &str) -> Result<bool> {
+        let key = group_key(server, slug);
+        self.with_member(|m, g| {
+            Ok(
+                group_of(g, &key)
+                    .is_some_and(|gid| m.has_group(&gid) && m.has_pending_commit(&gid)),
+            )
         })
     }
 
@@ -287,6 +304,18 @@ impl Session {
         let Some(kind) = block.manifest.kind else {
             return Ok(Seen::Plain);
         };
+        // Nothing vouches for an unsigned block's author, so it must not move
+        // group state: a server could otherwise forge a leave and have this
+        // member commit someone's removal with its own key.
+        if block.authenticity != Authenticity::Verified {
+            let reason = "unsigned block; ignored".to_string();
+            if matches!(kind, BlockKind::MemberAdd | BlockKind::MemberRemove) {
+                return Ok(Seen::Broken { reason });
+            }
+            if block.manifest.content_suite() == EncryptionSuite::Mls {
+                return Ok(Seen::Sealed { reason });
+            }
+        }
         let slug = jig_pipeline::ingest::channel_slug_of(kind, &block.manifest)
             .unwrap_or_default()
             .to_string();
@@ -307,7 +336,7 @@ impl Session {
                     return Ok(Seen::Control);
                 };
                 let commit = b64(commit, "mls_commit")?;
-                self.with_member(|m, g| {
+                self.once(block, &key, |m, g| {
                     let gid = group_of(g, &key).filter(|gid| m.has_group(gid));
                     if member == me {
                         if block.sender == me {
@@ -342,7 +371,7 @@ impl Session {
             BlockKind::MemberRemove => {
                 let Some(commit) = commit else {
                     // A leave: membership is gone, the leaf is not.
-                    return self.with_member(|m, g| {
+                    return self.once(block, &key, |m, g| {
                         let Some(gid) = group_of(g, &key).filter(|gid| m.has_group(gid)) else {
                             return Ok(Seen::Left {
                                 member,
@@ -359,7 +388,7 @@ impl Session {
                     });
                 };
                 let commit = b64(commit, "mls_commit")?;
-                self.with_member(|m, g| {
+                self.once(block, &key, |m, g| {
                     let Some(gid) = group_of(g, &key).filter(|gid| m.has_group(gid)) else {
                         return Ok(Seen::Control);
                     };
@@ -408,6 +437,37 @@ impl Session {
                 })
             }
         }
+    }
+
+    /// Apply a membership block at most once. A block already applied gets
+    /// back what it meant the first time, minus any action it asked for: a
+    /// replayed leave never asks for a tidy-up, since the member may have
+    /// been re-added since. Only blocks that touched a group this member
+    /// holds, before or after, are remembered.
+    fn once(
+        &self,
+        block: &OpenedBlock,
+        key: &str,
+        f: impl FnOnce(&Member, &mut Groups) -> Result<Seen>,
+    ) -> Result<Seen> {
+        self.with_member(|m, g| {
+            if let Some(seen) = g.seen.get(&block.cid) {
+                return Ok(match seen.clone() {
+                    Seen::Left { member, .. } => Seen::Left {
+                        member,
+                        tidy: false,
+                    },
+                    other => other,
+                });
+            }
+            let held = |g: &Groups| group_of(g, key).is_some_and(|gid| m.has_group(&gid));
+            let before = held(g);
+            let seen = f(m, g)?;
+            if before || held(g) {
+                g.seen.insert(block.cid.clone(), seen.clone());
+            }
+            Ok(seen)
+        })
     }
 
     fn recall(&self, cid: &str) -> Result<Option<(String, String)>> {
@@ -471,9 +531,20 @@ impl Session {
                 });
             }
         };
+        // Only a missing file means "no groups yet". Anything else would be
+        // saved back over the real mapping below, orphaning every group.
         let mut groups: Groups = match std::fs::read(&groups_path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Err(_) => Groups::default(),
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| SecureError::Io {
+                path: groups_path.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Groups::default(),
+            Err(source) => {
+                return Err(SecureError::Io {
+                    path: groups_path,
+                    source,
+                });
+            }
         };
         let out = f(&member, &mut groups);
         // Save even when `f` failed: openmls may have written state (a staged
@@ -751,6 +822,92 @@ mod tests {
             }
         );
         assert_eq!(bob.observe(SERVER, &deliver(&leave)), Seen::Gone);
+    }
+
+    fn unsigned(b: &BuiltBlock) -> OpenedBlock {
+        crate::open::open(&DeliveredBlock {
+            bundle_b64: STANDARD.encode(b.canonical_bytes()),
+            sig_b64: None,
+            receipts: vec![],
+            delivery_cid: format!("delivery:{}", b.cid()),
+        })
+        .unwrap()
+    }
+
+    fn leave_block(who: &Session, slug: &str) -> BuiltBlock {
+        build_with_metadata(
+            identity_of(who),
+            BlockKind::MemberRemove,
+            hlc(who),
+            json!({"channel": slug, "member_did": who.did()}),
+        )
+    }
+
+    #[test]
+    fn unsigned_blocks_do_not_move_group_state() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        alice.create_group(SERVER, "#sealed").unwrap();
+        bob.observe(SERVER, &deliver(&add_block(&alice, "#sealed", &bob)));
+
+        // A server inventing bob's leave cannot get alice to tidy him out.
+        let forged = unsigned(&leave_block(&bob, "#sealed"));
+        assert!(matches!(
+            alice.observe(SERVER, &forged),
+            Seen::Broken { .. }
+        ));
+        let msg = unsigned(&say(&alice, "#sealed", "hi"));
+        assert!(matches!(bob.observe(SERVER, &msg), Seen::Sealed { .. }));
+        assert!(
+            alice
+                .group_members(SERVER, "#sealed")
+                .unwrap()
+                .contains(&bob.did().to_string())
+        );
+    }
+
+    #[test]
+    fn a_replayed_leave_does_not_ask_for_a_tidy_up_again() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        alice.create_group(SERVER, "#sealed").unwrap();
+        bob.observe(SERVER, &deliver(&add_block(&alice, "#sealed", &bob)));
+        let leave = deliver(&leave_block(&bob, "#sealed"));
+        let left = |tidy| Seen::Left {
+            member: bob.did().to_string(),
+            tidy,
+        };
+        assert_eq!(alice.observe(SERVER, &leave), left(true));
+        assert_eq!(bob.observe(SERVER, &leave), Seen::Gone);
+        alice.prepare_remove(SERVER, "#sealed", bob.did()).unwrap();
+        alice.confirm(SERVER, "#sealed").unwrap();
+
+        // Bob is added back; the old leave, delivered again, is history.
+        bob.observe(SERVER, &deliver(&add_block(&alice, "#sealed", &bob)));
+        assert_eq!(alice.observe(SERVER, &leave), left(false));
+        assert_eq!(
+            bob.observe(SERVER, &leave),
+            Seen::Gone,
+            "what it meant then, without acting on it now"
+        );
+        assert!(bob.has_group(SERVER, "#sealed").unwrap());
+    }
+
+    #[test]
+    fn a_corrupt_group_map_is_an_error_not_an_empty_map() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        alice.create_group(SERVER, "#sealed").unwrap();
+        let path = root.path().join(alice.did()).join("groups.json");
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(alice.has_group(SERVER, "#sealed").is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{not json",
+            "left as it was"
+        );
     }
 
     #[test]

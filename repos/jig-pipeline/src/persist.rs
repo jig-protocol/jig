@@ -224,6 +224,79 @@ fn row_to_stored_channel(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChanne
 
 const CHANNEL_COLUMNS: &str = "id, slug, visibility, created_at, owner_did, suite";
 
+/// The membership change a commit-carrying block makes, applied inside
+/// [`SqliteStore::land_mls_commit`]'s transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MembershipChange {
+    None,
+    Upsert(StoredMembership),
+    Remove {
+        channel_id: String,
+        member_did: String,
+    },
+}
+
+fn insert_block_on(conn: &Connection, b: &StoredBlock) -> Result<()> {
+    conn.execute(
+        "INSERT INTO blocks
+         (cid, channel_id, block_kind, sender_did, sender_sig, bundle_bytes,
+          is_synthetic, hlc_wall_ms, hlc_logical, hlc_origin, posted_at,
+          origin_server, federated_from)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        params![
+            b.cid,
+            b.channel_id,
+            b.block_kind,
+            b.sender_did,
+            b.sender_sig,
+            b.bundle_bytes,
+            b.is_synthetic as i64,
+            b.hlc_wall_ms as i64,
+            b.hlc_logical as i64,
+            b.hlc_origin,
+            b.posted_at,
+            b.origin_server,
+            b.federated_from,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_receipt_on(conn: &Connection, r: &StoredReceipt) -> Result<()> {
+    conn.execute(
+        "INSERT INTO receipts (cid, block_cid, server_id, receipt_bytes, render_hash, produced_at)
+         VALUES (?,?,?,?,?,?)",
+        params![
+            r.cid,
+            r.block_cid,
+            r.server_id,
+            r.receipt_bytes,
+            r.render_hash,
+            r.produced_at
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_membership_on(conn: &Connection, m: &StoredMembership) -> Result<()> {
+    conn.execute(
+        "INSERT INTO memberships (channel_id, member_did, role, joined_at, source_block_cid)
+         VALUES (?,?,?,?,?)
+         ON CONFLICT(channel_id, member_did) DO UPDATE SET
+            role = excluded.role,
+            joined_at = excluded.joined_at,
+            source_block_cid = excluded.source_block_cid",
+        params![
+            m.channel_id,
+            m.member_did,
+            m.role,
+            m.joined_at,
+            m.source_block_cid
+        ],
+    )?;
+    Ok(())
+}
+
 fn row_to_stored_mls_group(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMlsGroup> {
     Ok(StoredMlsGroup {
         slug: r.get(0)?,
@@ -413,29 +486,7 @@ impl SqliteStore {
     // --- blocks ---
 
     pub fn insert_block(&self, b: &StoredBlock) -> Result<()> {
-        self.conn.lock().expect("poisoned").execute(
-            "INSERT INTO blocks
-             (cid, channel_id, block_kind, sender_did, sender_sig, bundle_bytes,
-              is_synthetic, hlc_wall_ms, hlc_logical, hlc_origin, posted_at,
-              origin_server, federated_from)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![
-                b.cid,
-                b.channel_id,
-                b.block_kind,
-                b.sender_did,
-                b.sender_sig,
-                b.bundle_bytes,
-                b.is_synthetic as i64,
-                b.hlc_wall_ms as i64,
-                b.hlc_logical as i64,
-                b.hlc_origin,
-                b.posted_at,
-                b.origin_server,
-                b.federated_from,
-            ],
-        )?;
-        Ok(())
+        insert_block_on(&self.conn.lock().expect("poisoned"), b)
     }
 
     pub fn get_block(&self, cid: &str) -> Result<Option<StoredBlock>> {
@@ -501,19 +552,7 @@ impl SqliteStore {
     // --- receipts ---
 
     pub fn insert_receipt(&self, r: &StoredReceipt) -> Result<()> {
-        self.conn.lock().expect("poisoned").execute(
-            "INSERT INTO receipts (cid, block_cid, server_id, receipt_bytes, render_hash, produced_at)
-             VALUES (?,?,?,?,?,?)",
-            params![
-                r.cid,
-                r.block_cid,
-                r.server_id,
-                r.receipt_bytes,
-                r.render_hash,
-                r.produced_at
-            ],
-        )?;
-        Ok(())
+        insert_receipt_on(&self.conn.lock().expect("poisoned"), r)
     }
 
     pub fn get_receipts_for_block(&self, block_cid: &str) -> Result<Vec<StoredReceipt>> {
@@ -669,22 +708,7 @@ impl SqliteStore {
     // --- memberships ---
 
     pub fn upsert_membership(&self, m: &StoredMembership) -> Result<()> {
-        self.conn.lock().expect("poisoned").execute(
-            "INSERT INTO memberships (channel_id, member_did, role, joined_at, source_block_cid)
-             VALUES (?,?,?,?,?)
-             ON CONFLICT(channel_id, member_did) DO UPDATE SET
-                role = excluded.role,
-                joined_at = excluded.joined_at,
-                source_block_cid = excluded.source_block_cid",
-            params![
-                m.channel_id,
-                m.member_did,
-                m.role,
-                m.joined_at,
-                m.source_block_cid
-            ],
-        )?;
-        Ok(())
+        upsert_membership_on(&self.conn.lock().expect("poisoned"), m)
     }
 
     /// Whether `member_did` is a member of the channel with this slug.
@@ -782,25 +806,60 @@ impl SqliteStore {
         .map_err(Into::into)
     }
 
-    /// Advance a channel's MLS state from `from_epoch` — only if it is still
-    /// there. Returns `false` when another commit got in first, which the
-    /// caller reports as a stale epoch. This compare-and-swap is what keeps a
-    /// channel's commit history linear under concurrent submits.
-    pub fn advance_mls_group(
+    /// Land a commit-carrying block on an encrypted channel: advance the
+    /// group from `from_epoch`, apply the membership change, and store the
+    /// block and its receipt — all in one transaction, or none of it.
+    ///
+    /// One transaction because clients learn of a commit only from the stored
+    /// block. A group advanced without its block (a write failing in between)
+    /// is at an epoch no member can reach, and every later commit is refused
+    /// as stale; a block stored without the advance is a commit members apply
+    /// and the server never did. Either wedges the channel for good.
+    ///
+    /// Returns `false` — with nothing written — when another commit moved the
+    /// group off `from_epoch` first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn land_mls_commit(
         &self,
         slug: &str,
         from_epoch: u64,
         state: &[u8],
         to_epoch: u64,
         group_info: Option<&[u8]>,
+        membership: &MembershipChange,
+        block: &StoredBlock,
+        receipt: &StoredReceipt,
     ) -> Result<bool> {
-        let changed = self.conn.lock().expect("poisoned").execute(
-            "UPDATE mls_groups
-                SET state = ?3, epoch = ?4, group_info = COALESCE(?5, group_info)
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        // `group_info` replaces the stored one even when `None`: a group info
+        // describes one epoch, and serving the previous epoch's under the new
+        // one would send every external joiner into a stale commit.
+        let advanced = tx.execute(
+            "UPDATE mls_groups SET state = ?3, epoch = ?4, group_info = ?5
               WHERE slug = ?1 AND epoch = ?2",
             params![slug, from_epoch as i64, state, to_epoch as i64, group_info],
         )?;
-        Ok(changed > 0)
+        if advanced == 0 {
+            return Ok(false);
+        }
+        match membership {
+            MembershipChange::None => {}
+            MembershipChange::Upsert(m) => upsert_membership_on(&tx, m)?,
+            MembershipChange::Remove {
+                channel_id,
+                member_did,
+            } => {
+                tx.execute(
+                    "DELETE FROM memberships WHERE channel_id = ? AND member_did = ?",
+                    [channel_id.as_str(), member_did.as_str()],
+                )?;
+            }
+        }
+        insert_block_on(&tx, block)?;
+        insert_receipt_on(&tx, receipt)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Store a validated key package. Returns `false` if this package (by
@@ -1239,8 +1298,10 @@ mod tests {
         );
     }
 
+    /// A commit that cannot be stored must not advance the group either —
+    /// otherwise the server sits at an epoch no member can reach.
     #[test]
-    fn mls_group_advances_only_from_the_epoch_it_is_at() {
+    fn a_commit_lands_whole_or_not_at_all() {
         let store = SqliteStore::open_in_memory().unwrap();
         store
             .put_mls_group(&StoredMlsGroup {
@@ -1251,37 +1312,60 @@ mod tests {
                 group_info: Some(b"i0".to_vec()),
             })
             .unwrap();
+        let block = sample_block("bafy_commit", Some("#sealed"));
+        let receipt = StoredReceipt {
+            cid: "r_commit".to_string(),
+            block_cid: block.cid.clone(),
+            server_id: "did:jig:zServer".to_string(),
+            receipt_bytes: b"{}".to_vec(),
+            render_hash: None,
+            produced_at: 0,
+        };
+        let add = MembershipChange::Upsert(StoredMembership {
+            channel_id: "ch".to_string(),
+            member_did: "did:jig:zBob".to_string(),
+            role: "member".to_string(),
+            joined_at: 0,
+            source_block_cid: block.cid.clone(),
+        });
+        // The block is already stored, so the insert fails part-way through.
+        store.insert_block(&block).unwrap();
         assert!(
             store
-                .advance_mls_group("#sealed", 0, b"s1", 1, None)
-                .unwrap()
-        );
-        assert!(
-            !store
-                .advance_mls_group("#sealed", 0, b"sX", 1, None)
-                .unwrap(),
-            "a second commit from epoch 0 lost the race"
+                .land_mls_commit("#sealed", 0, b"s1", 1, None, &add, &block, &receipt)
+                .is_err()
         );
         let g = store.get_mls_group("#sealed").unwrap().unwrap();
-        assert_eq!((g.state.as_slice(), g.epoch), (&b"s1"[..], 1));
         assert_eq!(
-            g.group_info.as_deref(),
-            Some(&b"i0"[..]),
-            "kept when not replaced"
+            (g.epoch, g.state.as_slice()),
+            (0, &b"s0"[..]),
+            "rolled back"
         );
+        assert!(store.list_members("ch").unwrap().is_empty(), "rolled back");
+
+        let fresh = sample_block("bafy_commit2", Some("#sealed"));
+        let receipt = StoredReceipt {
+            cid: "r_commit2".to_string(),
+            block_cid: fresh.cid.clone(),
+            ..receipt
+        };
         assert!(
             store
-                .advance_mls_group("#sealed", 1, b"s2", 2, Some(b"i2"))
+                .land_mls_commit("#sealed", 0, b"s1", 1, None, &add, &fresh, &receipt)
                 .unwrap()
         );
+        let g = store.get_mls_group("#sealed").unwrap().unwrap();
+        assert_eq!(g.epoch, 1);
         assert_eq!(
-            store
-                .get_mls_group("#sealed")
-                .unwrap()
-                .unwrap()
-                .group_info
-                .as_deref(),
-            Some(&b"i2"[..])
+            g.group_info, None,
+            "an epoch-0 group info is not served as epoch 1's"
+        );
+        assert_eq!(store.list_members("ch").unwrap().len(), 1);
+        assert!(
+            !store
+                .land_mls_commit("#sealed", 0, b"sX", 1, None, &add, &fresh, &receipt)
+                .unwrap(),
+            "a commit from a passed epoch writes nothing"
         );
     }
 

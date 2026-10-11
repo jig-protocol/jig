@@ -45,6 +45,21 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
+impl Refused {
+    /// The server looked at the request and turned it down. A 5xx — perhaps
+    /// from a proxy that gave up waiting — says nothing about whether the
+    /// server acted on it.
+    pub fn is_definite(&self) -> bool {
+        (400..500).contains(&self.status)
+    }
+}
+
+/// Whether `e` is the server definitely turning a request down.
+pub fn refused(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<Refused>()
+        .is_some_and(Refused::is_definite)
+}
+
 /// A channel as the server lists it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChannelInfo {
@@ -69,6 +84,8 @@ pub struct Synced {
     pub lines: Vec<DecodedBlock>,
     /// Departed members still in this member's copy of the tree.
     pub tidy: Vec<String>,
+    /// Every block the history held, by CID.
+    pub cids: std::collections::HashSet<String>,
 }
 
 /// One identity's encrypted-channel state, bound to one server.
@@ -79,6 +96,9 @@ pub struct Secure {
     server: String,
     /// The same server as an `http(s)://` base for REST.
     base: String,
+    /// One commit in flight at a time: a second, prepared while the first
+    /// waits on the server, would find it pending and drop it.
+    committing: tokio::sync::Mutex<()>,
 }
 
 impl Secure {
@@ -91,6 +111,7 @@ impl Secure {
             identity: ctx.identity()?,
             base: base_http_url(&server),
             server,
+            committing: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -261,6 +282,7 @@ impl Secure {
                 Err(e) => eprintln!("[dropped history block {}: {e}]", d.delivery_cid),
             }
         }
+        let cids = opened.iter().map(|o| o.cid.clone()).collect();
         let mut lines = Vec::new();
         let mut left = Vec::new();
         let mut slug = None;
@@ -272,8 +294,11 @@ impl Secure {
                     .and_then(|k| jig_pipeline_slug(k, &o.manifest));
             }
             let seen = self.session.observe(&self.server, &o);
-            if let Seen::Left { member, tidy: true } = &seen {
-                left.push(member.clone());
+            match &seen {
+                Seen::Left { member, tidy: true } => left.push(member.clone()),
+                // Back again since they left: nothing to tidy.
+                Seen::Added { member } => left.retain(|d| d != member),
+                _ => {}
             }
             let r = receipts.get(&o.cid).cloned().unwrap_or_default();
             if let Some(line) = present(&o, &r, &seen) {
@@ -292,27 +317,40 @@ impl Secure {
             }
             None => Vec::new(),
         };
-        Synced { lines, tidy }
+        Synced { lines, tidy, cids }
     }
 
     /// Build a commit, submit the block carrying it, and merge it once the
     /// server accepts. On `STALE_EPOCH` — someone committed first — catch up
     /// and try once more.
+    ///
+    /// A commit is dropped only when the server refuses it. When no answer
+    /// comes, the server may have taken it, and dropping it would leave this
+    /// member an epoch behind with no way back; history settles it instead.
     pub async fn commit(
         &self,
         slug: &str,
         prepare: impl Fn(&Session) -> Result<Commit>,
         block_for: impl Fn(&Commit) -> BuiltBlock,
     ) -> Result<String> {
+        let _one_at_a_time = self.committing.lock().await;
         for attempt in 0..2 {
             self.sync(slug).await?;
+            // Still pending after a sync: an earlier commit whose answer never
+            // came, and which did not land (had it, its echo would have
+            // merged it). It would block this one.
+            if self.session.has_pending_commit(&self.server, slug)? {
+                self.session.abandon(&self.server, slug)?;
+            }
             let commit = prepare(&self.session)?;
-            match self.submit(&block_for(&commit)).await {
+            let block = block_for(&commit);
+            match self.submit(&block).await {
                 Ok(cid) => {
                     self.session.confirm(&self.server, slug)?;
                     return Ok(cid);
                 }
-                Err(e) => {
+                Err(e) if refused(&e) => {
+                    // Best effort: the refusal is the error worth reporting.
                     self.session.abandon(&self.server, slug).ok();
                     let stale = e
                         .downcast_ref::<Refused>()
@@ -321,9 +359,27 @@ impl Secure {
                         return Err(e);
                     }
                 }
+                Err(e) => return self.settle(slug, &block, e).await,
             }
         }
         unreachable!("the loop returns on its second attempt")
+    }
+
+    /// A commit was sent and no answer came. Its echo in history means it
+    /// landed (the sync merges it); none means it did not.
+    async fn settle(&self, slug: &str, block: &BuiltBlock, sent: anyhow::Error) -> Result<String> {
+        let Ok(synced) = self.sync(slug).await else {
+            return Err(sent.context(
+                "no answer from the server; the commit is kept until the next sync shows whether it landed",
+            ));
+        };
+        if synced.cids.contains(&block.cid()) {
+            self.session.confirm(&self.server, slug)?;
+            return Ok(block.cid());
+        }
+        // Best effort: a commit still pending is dropped by the next one.
+        self.session.abandon(&self.server, slug).ok();
+        Err(sent)
     }
 
     /// Commit the removal of a member who left. Losing the race to another
