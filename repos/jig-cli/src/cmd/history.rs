@@ -131,7 +131,12 @@ mod tests {
     fn signed_text(body: &str, delivery: &str) -> DeliveredBlock {
         let dir = tempdir().unwrap();
         let id = Identity::generate_and_save(&dir.keep()).unwrap();
-        let block = build_text_render(&id, "#hello", body, HlcTimestamp::now_wall(id.did().clone()));
+        let block = build_text_render(
+            &id,
+            "#hello",
+            body,
+            HlcTimestamp::now_wall(id.did().clone()),
+        );
         signed(&block, delivery)
     }
 
@@ -143,7 +148,6 @@ mod tests {
             delivery_cid: delivery.into(),
         }
     }
-
 
     #[test]
     fn history_url_escapes_the_slug_and_carries_the_limit() {

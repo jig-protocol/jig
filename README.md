@@ -22,7 +22,8 @@ off is not settled.
 
 ## Status: pre-alpha. Do not put this on a public IP.
 
-Workspace version is `0.0.1`; the newest tag is `v0.0.2`. This has never been deployed
+Workspace version is `0.0.1`; the newest tag is `v0.1.0-alpha.1`, and the tree carries the
+v0.2 (M2) work on top of it. Crate versions have not been bumped to match the tags. This has never been deployed
 publicly — `jig.onl` is registered but serves nothing — and it has been exercised only on
 loopback and private tailnets.
 
@@ -34,18 +35,22 @@ loopback and private tailnets.
   encryption suite are checked, and anything unsupported is rejected
   ([`repos/jig-spec/src/versioning.md`](repos/jig-spec/src/versioning.md)).
 
-- **No encryption of message content.** Blocks are *signed*, never encrypted. There is no
-  E2EE and no per-message confidentiality. Anything on the wire without an outer TLS
-  tunnel is plaintext, and the server stores plaintext.
-- **Authentication and channel authorization, but no admission policy.** Every read
+- **End-to-end encryption is per channel, and off by default.** A channel created with
+  `--encrypted` (and every DM) is one MLS group (RFC 9420): the server stores and relays
+  ciphertext it cannot read, and validates every membership change without holding any
+  group secret. Every *other* channel is signed, not encrypted — the server stores its
+  plaintext. Encrypted channels do not federate yet. Metadata (who, when, how much, who
+  joined) is visible to the server either way. See
+  [`docs/security/encryption.md`](docs/security/encryption.md).
+- **Authentication, authorization and admission, but no rate limiting.** Every read
   carries a signed proof of possession of the caller's key, and `visibility = "restricted"`
   is enforced on history, the listing, live delivery and posting
   ([`jig-server/src/auth/`](repos/jig-server/src/auth/),
   [`jig-pipeline/src/authorize_write.rs`](repos/jig-pipeline/src/authorize_write.rs)).
-  What is missing is any way to refuse a caller *before* those gates: any self-minted key
-  is admitted, there is no rate limiting, and blocks relayed by a federated peer are
-  trusted. Channel ops (`POST /api/v1/channels*`) run the same gates and need no
-  `[debug]` flag.
+  `[auth.admission]` lets an operator refuse callers outright (bans, ruleset floors,
+  unknown DIDs). There is no rate limiting or proof-of-work, and blocks relayed by a
+  federated peer skip the write gate — so only open, unencrypted channels federate.
+  Channel ops (`POST /api/v1/channels*`) run the same gates and need no `[debug]` flag.
 - **No graphical client.** Riverdance, the unfinished GUI, is not in this repository.
   Its licence is undecided, and it is not a working client. The terminal client is
   `jig chat`.
@@ -60,20 +65,21 @@ loopback and private tailnets.
 | --- | --- |
 | Local `jig-server` + `jig chat` / `jig tail` over WebSocket | Works |
 | Signed, content-addressed blocks (ed25519 signature, CID) | Works |
-| Channel create / join / list; membership records | Works. Blocks are signature-verified and owner/membership-gated at ingest; the routes still mount behind a `[debug]` flag |
-| History backfill (last 100 blocks) on joining a channel | Works |
+| Channel create / join / list / delete; add, kick, leave, promote, members | Works. Blocks are signature-verified and owner/membership-gated at ingest, on `/api/v1/*` with no `[debug]` flag |
+| End-to-end encrypted channels (`--encrypted`) and DMs (`jig dm`) | Works on one server: MLS (RFC 9420, `openmls`), the DID's key is the MLS signing key, the server validates commits and stores ciphertext only ([spec](repos/jig-spec/src/encryption.md), [`scripts/demo-e2ee.sh`](scripts/demo-e2ee.sh)). Not federated; one device per DID |
+| Clients verify every delivered block's author signature | Works: a block a server altered is refused, not shown |
+| History backfill (last 100 blocks) on joining a channel | Works. On an encrypted channel, only messages sent after you joined decrypt |
 | `GET /api/v1/channels/:slug/blocks`, `/healthz`, `/metrics` | Works |
 | Nameserver: alias register / resolve / rotate / renew | Works (`jig-nameserver`, `jig ns …`) |
-| Server-to-server federation over WSS | Implemented and covered by [`h3_federation.rs`](repos/integration-tests/tests/h3_federation.rs); never run between two hosts on the public internet |
+| Server-to-server federation over WSS | Implemented for open, unencrypted channels and covered by [`h3_federation.rs`](repos/integration-tests/tests/h3_federation.rs); never run between two hosts on the public internet |
 | Email bridge (Resend) | Implemented in-process; see [`bridges/email/README.md`](repos/bridges/email/README.md) |
-| Wasm block execution **on the server** | `text-render` executes for real: the server runs its canonical module and signs the `render_hash` ([`jig-pipeline/src/ingest.rs`](repos/jig-pipeline/src/ingest.rs), step 4). Control-plane kinds still take a synthetic, server-signed receipt |
+| Wasm block execution **on the server** | `text-render` executes for real on plaintext channels: the server runs its canonical module and signs the `render_hash` ([`jig-pipeline/src/ingest.rs`](repos/jig-pipeline/src/ingest.rs), step 4). Encrypted content is never executed and gets a `sealed` receipt; control-plane kinds take a synthetic one |
 | Wasm block execution in the CLI (`jig block run`) | Runs and emits a metered receipt for the runtime's own fixtures. It **rejects the workspace's own `text-block` build** with `MemoryMissingMaximum` from the determinism validator |
 | `jig block lint` / `sign` / `verify` / `capabilities` | Stubs; they print "not yet implemented" and exit 1 |
-| End-to-end encryption | None. MLS is planned for v0.2. Every frame and manifest already names its encryption suite; `none` is the only one accepted ([spec](repos/jig-spec/src/encryption.md)) |
-| Authentication / authorization | Signed proof of possession on every read; `restricted` channels membership-gated for reading, listing, live delivery and posting; membership changes owner-signed. **No admission policy or rate limiting** — any key is admitted |
+| Authentication / authorization | Signed proof of possession on every read; `restricted` channels membership-gated for reading, listing, live delivery and posting; membership changes owner-signed; operator admission policy. **No rate limiting** |
 | Graphical client | None |
-| `jig read` | Broken by default — it calls the v0.0.1 `GET /blocks` route, which is gated off behind `dangerously_enable_v0_0_1_rest`. Use `jig chat`, `jig tail`, or the history endpoint |
-| `jig --version` | Not implemented (`jig-server --version` is) |
+| `jig read` | Works: the signed history endpoint, decrypting encrypted channels you belong to |
+| `jig --version` | Works (prints the crate version, which still says `0.0.1`; see below) |
 | Prebuilt release binaries | `release.yml` builds static musl Linux (x86_64, aarch64) and Apple Silicon macOS tarballs with a signed `SHA256SUMS`, gated on the install smoke test. No real tag has been cut with it yet; the repo is private, so anonymous downloads don't work |
 
 A design target that has **not been measured** and should not be read as a result: 10,000
@@ -116,7 +122,7 @@ jig chat '#hello'                   # Enter sends; Ctrl+Q or Esc quits
 ```
 
 `jig send "text" --channel '#hello'` and `jig tail '#hello'` are the
-non-interactive equivalents. `chat`, `tail`, and `read` each take the channel
+non-interactive equivalents, and `jig read '#hello'` prints the backlog and exits. `chat`, `tail`, and `read` each take the channel
 either positionally or as `--channel`; `send` is flag-only, since its positional
 slot is the message body. `jig server info` prints the server's advertised
 `/.well-known/jig` capabilities, including any unsafe options it has enabled.
@@ -124,6 +130,26 @@ slot is the message body. `jig server info` prints the server's advertised
 `jig chat` and `jig tail` exit non-zero when the connection drops but do not reconnect on
 their own; [`scripts/jig-room.sh`](scripts/jig-room.sh) is the deliberate `until`-loop
 stand-in.
+
+### Encrypted channels and DMs
+
+Each person runs `jig init` and `jig server set` once; `server set` publishes the MLS key
+packages others need to add you while you are offline.
+
+```bash
+jig channel create '#ops' --visibility restricted --encrypted
+jig channel add '#ops' <did-or-contact-name>      # owner only; commits them into the MLS group
+jig send --channel '#ops' "rotate the keys"       # the server stores ciphertext
+jig channel kick '#ops' <did-or-contact-name>     # they cannot read what follows
+jig channel leave '#ops'                          # anyone but the owner
+jig channel members '#ops'
+jig dm <did-or-contact-name> "just us"            # a locked, encrypted channel for two
+```
+
+An open encrypted channel (`--visibility open --encrypted`) can be joined with
+`jig channel join`, by MLS external commit; history from before you joined stays sealed.
+[`scripts/demo-e2ee.sh`](scripts/demo-e2ee.sh) runs all of this against a throwaway server
+with three users and then searches the server's files for what they said.
 
 ### About `install.sh`
 
@@ -154,8 +180,9 @@ and lives at the repo root.
 | [`jig-core`](repos/jig-core/) | Protocol primitives: DIDs, manifests, bundles, CIDs, receipts, signing, capability DSL |
 | [`jig-pipeline`](repos/jig-pipeline/) | Shared ingest → effect → persist → fanout pipeline used by both servers |
 | [`jig-server`](repos/jig-server/) | Reference server: WebSocket + HTTP, SQLite storage, federation, bridge hosting |
-| [`jig-client`](repos/jig-client/) | Client library: WSS connection, identity loading, bundle construction |
-| [`jig-cli`](repos/jig-cli/) | The `jig` binary — init, send, tail, chat, channel, keys, ns, block |
+| [`jig-client`](repos/jig-client/) | Client library: WSS connection, identity loading, bundle construction, block verification, encrypted-channel state |
+| [`jig-mls`](repos/jig-mls/) | MLS (RFC 9420) via `openmls`: the server's validating delivery service and the client's group member |
+| [`jig-cli`](repos/jig-cli/) | The `jig` binary — init, send, read, tail, chat, dm, channel, keys, ns, block |
 | [`jig-config`](repos/jig-config/) | Shared TOML config types and loader |
 | [`jig-nameserver`](repos/jig-nameserver/) | DID/alias registry: register, resolve, rotate, renew |
 | [`jig-runtime`](repos/jig-runtime/) | Wasmtime-based Wasm runtime: deterministic execution, fuel metering, receipts |
@@ -163,7 +190,7 @@ and lives at the repo root.
 | [`bridges/email`](repos/bridges/email/) | In-process email bridge (Resend provider) |
 | [`text-block`](repos/text-block/) | The canonical `text-render` Wasm block (`wasm32-wasip1`) |
 | [`hello-wasm`](repos/hello-wasm/) | Minimal WASI hello-world used for runtime measurements |
-| [`integration-tests`](repos/integration-tests/) | Cross-component scenario tests: federation, TOFU mismatch, nameserver modes, persistence across restart, email bridge, TLS |
+| [`integration-tests`](repos/integration-tests/) | Cross-component scenario tests: federation, TOFU mismatch, nameserver modes, persistence across restart, email bridge, TLS, encrypted channels |
 
 Not Cargo members: [`repos/jig-spec/`](repos/jig-spec/) — an mdBook protocol spec, still
 draft scaffolding, licensed CC-BY-4.0 — and [`repos/jig-docs/`](repos/jig-docs/), a

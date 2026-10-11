@@ -147,7 +147,11 @@ pub fn build_member_remove(
 }
 
 /// Build a signed `channel-promote` block: restricted → open. Owner only.
-pub fn build_channel_promote(sender: &Identity, channel_slug: &str, hlc: HlcTimestamp) -> BuiltBlock {
+pub fn build_channel_promote(
+    sender: &Identity,
+    channel_slug: &str,
+    hlc: HlcTimestamp,
+) -> BuiltBlock {
     build_with_metadata(
         sender,
         BlockKind::ChannelPromote,

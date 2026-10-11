@@ -158,7 +158,9 @@ pub async fn take_key_package(
         None => Err(err(
             StatusCode::NOT_FOUND,
             "NO_KEY_PACKAGE",
-            format!("{did} has published no MLS key packages here; they need to run a jig client against this server once"),
+            format!(
+                "{did} has published no MLS key packages here; they need to run a jig client against this server once"
+            ),
         )),
     }
 }
@@ -228,7 +230,10 @@ pub fn build_mls_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/v1/mls/key-packages", post(publish_key_packages))
         .route("/api/v1/mls/key-packages/:did", get(take_key_package))
-        .route("/api/v1/mls/key-packages/:did/stock", get(key_package_stock))
+        .route(
+            "/api/v1/mls/key-packages/:did/stock",
+            get(key_package_stock),
+        )
         .route("/api/v1/channels/:slug/mls/group-info", get(group_info))
         .with_state(state)
 }

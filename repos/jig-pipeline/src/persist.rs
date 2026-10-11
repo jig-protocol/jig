@@ -1251,17 +1251,36 @@ mod tests {
                 group_info: Some(b"i0".to_vec()),
             })
             .unwrap();
-        assert!(store.advance_mls_group("#sealed", 0, b"s1", 1, None).unwrap());
         assert!(
-            !store.advance_mls_group("#sealed", 0, b"sX", 1, None).unwrap(),
+            store
+                .advance_mls_group("#sealed", 0, b"s1", 1, None)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .advance_mls_group("#sealed", 0, b"sX", 1, None)
+                .unwrap(),
             "a second commit from epoch 0 lost the race"
         );
         let g = store.get_mls_group("#sealed").unwrap().unwrap();
         assert_eq!((g.state.as_slice(), g.epoch), (&b"s1"[..], 1));
-        assert_eq!(g.group_info.as_deref(), Some(&b"i0"[..]), "kept when not replaced");
-        assert!(store.advance_mls_group("#sealed", 1, b"s2", 2, Some(b"i2")).unwrap());
         assert_eq!(
-            store.get_mls_group("#sealed").unwrap().unwrap().group_info.as_deref(),
+            g.group_info.as_deref(),
+            Some(&b"i0"[..]),
+            "kept when not replaced"
+        );
+        assert!(
+            store
+                .advance_mls_group("#sealed", 1, b"s2", 2, Some(b"i2"))
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_mls_group("#sealed")
+                .unwrap()
+                .unwrap()
+                .group_info
+                .as_deref(),
             Some(&b"i2"[..])
         );
     }
@@ -1270,11 +1289,25 @@ mod tests {
     fn key_packages_are_consumed_once_and_last_resort_never() {
         let store = SqliteStore::open_in_memory().unwrap();
         let did = "did:jig:zBob";
-        assert!(store.insert_key_package(b"r1", did, b"kp1", false, 1).unwrap());
-        assert!(store.insert_key_package(b"r2", did, b"kp2", false, 2).unwrap());
-        assert!(store.insert_key_package(b"lr", did, b"kpL", true, 3).unwrap());
         assert!(
-            !store.insert_key_package(b"r1", did, b"kp1", false, 9).unwrap(),
+            store
+                .insert_key_package(b"r1", did, b"kp1", false, 1)
+                .unwrap()
+        );
+        assert!(
+            store
+                .insert_key_package(b"r2", did, b"kp2", false, 2)
+                .unwrap()
+        );
+        assert!(
+            store
+                .insert_key_package(b"lr", did, b"kpL", true, 3)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .insert_key_package(b"r1", did, b"kp1", false, 9)
+                .unwrap(),
             "a package is stored once"
         );
         assert_eq!(store.key_package_stock(did).unwrap(), (2, true));
@@ -1284,10 +1317,17 @@ mod tests {
         assert_eq!(store.take_key_package(did, 13).unwrap().unwrap(), b"kpL");
         assert_eq!(store.key_package_stock(did).unwrap(), (0, true));
         assert!(
-            !store.insert_key_package(b"r1", did, b"kp1", false, 14).unwrap(),
+            !store
+                .insert_key_package(b"r1", did, b"kp1", false, 14)
+                .unwrap(),
             "a consumed package cannot be uploaded again"
         );
-        assert!(store.take_key_package("did:jig:zNobody", 15).unwrap().is_none());
+        assert!(
+            store
+                .take_key_package("did:jig:zNobody", 15)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

@@ -212,7 +212,11 @@ pub enum IngestError {
     /// A commit built on an epoch the channel has left — someone else
     /// committed first. The sender catches up and rebuilds it.
     #[error("channel '{slug}' is at MLS epoch {current}; this block is for epoch {got}")]
-    StaleEpoch { slug: String, current: u64, got: u64 },
+    StaleEpoch {
+        slug: String,
+        current: u64,
+        got: u64,
+    },
     #[error(transparent)]
     Identity(#[from] crate::identity::IdentityError),
     #[error(transparent)]
@@ -350,24 +354,22 @@ pub async fn ingest(
     // the receipt is built: a block this server will not apply must not carry
     // this server's signature. The membership query runs only when the
     // decision can turn on it (content into a restricted channel).
-    let membership =
-        if crate::authorize_write::needs_membership(kind, resolved_channel.as_ref()) {
-            match channel_slug {
-                Some(slug) => crate::authorize_write::Membership {
-                    sender: ctx.store.is_member(slug, sender.as_str())?,
-                    target: match manifest.metadata.get("member_did").and_then(|v| v.as_str()) {
-                        Some(target) if kind == BlockKind::MemberRemove => ctx.store.is_member(
-                            slug,
-                            &crate::effect::canonical_did_string(target),
-                        )?,
-                        _ => false,
-                    },
+    let membership = if crate::authorize_write::needs_membership(kind, resolved_channel.as_ref()) {
+        match channel_slug {
+            Some(slug) => crate::authorize_write::Membership {
+                sender: ctx.store.is_member(slug, sender.as_str())?,
+                target: match manifest.metadata.get("member_did").and_then(|v| v.as_str()) {
+                    Some(target) if kind == BlockKind::MemberRemove => ctx
+                        .store
+                        .is_member(slug, &crate::effect::canonical_did_string(target))?,
+                    _ => false,
                 },
-                None => Default::default(),
-            }
-        } else {
-            Default::default()
-        };
+            },
+            None => Default::default(),
+        }
+    } else {
+        Default::default()
+    };
     if let Err(refusal) = crate::authorize_write::authorize_block(
         kind,
         sender.as_str(),
@@ -1471,11 +1473,17 @@ mod tests {
         let gid = create_sealed(&ctx, &alice).await;
         let chan = ctx.store.get_channel_by_slug("#sealed").unwrap().unwrap();
         assert_eq!(chan.suite, "mls");
-        assert_eq!(ctx.store.get_mls_group("#sealed").unwrap().unwrap().epoch, 0);
+        assert_eq!(
+            ctx.store.get_mls_group("#sealed").unwrap().unwrap().epoch,
+            0
+        );
 
         add_to_sealed(&ctx, &alice, &bob, &gid).await;
         assert!(ctx.store.is_member("#sealed", &bob.did).unwrap());
-        assert_eq!(ctx.store.get_mls_group("#sealed").unwrap().unwrap().epoch, 1);
+        assert_eq!(
+            ctx.store.get_mls_group("#sealed").unwrap().unwrap().epoch,
+            1
+        );
 
         let (msg, _) = alice.mls.encrypt(&gid, b"the plan").unwrap();
         let cid = submit(
@@ -1527,12 +1535,32 @@ mod tests {
         let c = alice.mls.add(&gid, &kp, &bob.did).unwrap();
         let meta = serde_json::json!({"channel": "#sealed", "member_did": bob.did,
             "mls_commit": b64(&c.commit), "mls_welcome": b64(c.welcome.as_ref().unwrap())});
-        submit(&ctx, &alice, BlockKind::MemberAdd, jig_core::EncryptionSuite::Unencrypted, meta.clone())
-            .await
-            .unwrap();
-        let replay = submit(&ctx, &alice, BlockKind::MemberAdd, jig_core::EncryptionSuite::Unencrypted, meta).await;
+        submit(
+            &ctx,
+            &alice,
+            BlockKind::MemberAdd,
+            jig_core::EncryptionSuite::Unencrypted,
+            meta.clone(),
+        )
+        .await
+        .unwrap();
+        let replay = submit(
+            &ctx,
+            &alice,
+            BlockKind::MemberAdd,
+            jig_core::EncryptionSuite::Unencrypted,
+            meta,
+        )
+        .await;
         assert!(
-            matches!(replay, Err(IngestError::StaleEpoch { current: 1, got: 0, .. })),
+            matches!(
+                replay,
+                Err(IngestError::StaleEpoch {
+                    current: 1,
+                    got: 0,
+                    ..
+                })
+            ),
             "{replay:?}"
         );
         // An add that names someone other than whom the commit adds.
@@ -1548,7 +1576,10 @@ mod tests {
                 "mls_commit": b64(&c.commit), "mls_welcome": b64(c.welcome.as_ref().unwrap())}),
         )
         .await;
-        assert!(matches!(lie, Err(IngestError::MlsRejected { .. })), "{lie:?}");
+        assert!(
+            matches!(lie, Err(IngestError::MlsRejected { .. })),
+            "{lie:?}"
+        );
         assert!(!ctx.store.is_member("#sealed", &carol.did).unwrap());
     }
 
@@ -1563,7 +1594,10 @@ mod tests {
         let carol_added = add_to_sealed(&ctx, &alice, &carol, &gid).await;
         // Bob catches up on Carol's add, as his client would from history.
         bob.mls.apply_commit(&gid, &carol_added.commit).unwrap();
-        assert_eq!(ctx.store.get_mls_group("#sealed").unwrap().unwrap().epoch, 2);
+        assert_eq!(
+            ctx.store.get_mls_group("#sealed").unwrap().unwrap().epoch,
+            2
+        );
 
         // Carol leaves: no commit, membership gone at once.
         submit(
@@ -1589,7 +1623,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(ctx.store.get_mls_group("#sealed").unwrap().unwrap().epoch, 3);
+        assert_eq!(
+            ctx.store.get_mls_group("#sealed").unwrap().unwrap().epoch,
+            3
+        );
 
         // But Bob may not kick a current member, and the owner may not leave.
         bob.mls.confirm(&gid).unwrap();
@@ -1603,7 +1640,10 @@ mod tests {
                 "mls_commit": b64(&c.commit)}),
         )
         .await;
-        assert!(matches!(kick, Err(IngestError::NotChannelOwner { .. })), "{kick:?}");
+        assert!(
+            matches!(kick, Err(IngestError::NotChannelOwner { .. })),
+            "{kick:?}"
+        );
         let leave = submit(
             &ctx,
             &alice,
@@ -1612,7 +1652,10 @@ mod tests {
             serde_json::json!({"channel": "#sealed", "member_did": alice.did}),
         )
         .await;
-        assert!(matches!(leave, Err(IngestError::OwnerCannotLeave { .. })), "{leave:?}");
+        assert!(
+            matches!(leave, Err(IngestError::OwnerCannotLeave { .. })),
+            "{leave:?}"
+        );
     }
 
     // ---- Channel-existence guard -----------------------------------------

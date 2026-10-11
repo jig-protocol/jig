@@ -14,9 +14,9 @@
 use jig_core::Did;
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::{
-    Capabilities, CredentialWithKey, ExtensionType, GroupId, KeyPackage, KeyPackageIn, MlsGroup, MlsMessageBodyIn, MlsMessageIn,
-    MlsMessageOut, ProcessedMessageContent, ProtocolMessage, ProtocolVersion, Sender,
-    StagedCommit, StagedWelcome,
+    Capabilities, CredentialWithKey, ExtensionType, GroupId, KeyPackage, KeyPackageIn, MlsGroup,
+    MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProcessedMessageContent, ProtocolMessage,
+    ProtocolVersion, Sender, StagedCommit, StagedWelcome,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -300,13 +300,9 @@ impl Member {
         else {
             return Err(MlsError::Malformed("not an MLS welcome".to_string()));
         };
-        let staged = StagedWelcome::new_from_welcome(
-            &self.provider,
-            &crate::join_config(),
-            welcome,
-            None,
-        )
-        .map_err(rejected)?;
+        let staged =
+            StagedWelcome::new_from_welcome(&self.provider, &crate::join_config(), welcome, None)
+                .map_err(rejected)?;
         for m in staged.members() {
             bound_did(&m.credential, &m.signature_key)?;
         }
@@ -389,9 +385,7 @@ impl Member {
                 plaintext: m.into_bytes(),
                 sender,
             }),
-            _ => Err(MlsError::Rejected(
-                "not an application message".to_string(),
-            )),
+            _ => Err(MlsError::Rejected("not an application message".to_string())),
         }
     }
 

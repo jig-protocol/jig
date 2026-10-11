@@ -567,10 +567,7 @@ mod tests {
             HandshakeResult::Established(verified) => {
                 assert_eq!(verified.version, ENVELOPE_VERSION);
                 // v0.2 hosts encrypted channels; frames stay `none`.
-                assert_eq!(
-                    verified.suites,
-                    vec!["none".to_string(), "mls".to_string()]
-                );
+                assert_eq!(verified.suites, vec!["none".to_string(), "mls".to_string()]);
                 assert!(verified.reputation.is_null());
                 assert_eq!(
                     verified.capabilities.block_kinds,

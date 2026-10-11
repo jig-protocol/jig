@@ -732,15 +732,15 @@ async fn spawn_one_peer_loop(state: Arc<jig_server::v0_0_2::AppState>, peer: Fed
     }
 }
 
-/// Test-side mirror of `jig_server::v0_0_2_federation::handle_inbound_frame`.
-/// Inbound `Block` frames from a peer get persisted locally so the receiving
-/// server's store has the federated block and its receipt.
+/// Inbound `Block` frames from a peer go through the server's own relay
+/// path, `jig_server::v0_0_2_federation::ingest_peer_block`. This used to be a
+/// line-by-line copy, and the copy drifted (it kept an old CID scheme after
+/// the server's changed), so the federation tests were testing the copy.
 async fn handle_inbound_test_frame(
     state: &Arc<jig_server::v0_0_2::AppState>,
     peer: &FederationPeer,
     text: &str,
 ) -> anyhow::Result<()> {
-    use jig_core::BlockManifest;
     use jig_pipeline::{Envelope, Frame};
 
     let env: Envelope = serde_json::from_str(text)?;
@@ -753,129 +753,13 @@ async fn handle_inbound_test_frame(
     else {
         return Ok(());
     };
-    let bundle_bytes = base64::engine::general_purpose::STANDARD.decode(&bundle_b64)?;
-    let (manifest_bytes, _code_bytes): (Vec<u8>, Vec<u8>) = serde_json::from_slice(&bundle_bytes)?;
-    let manifest: BlockManifest = serde_json::from_slice(&manifest_bytes)?;
-
-    let block_cid = format!(
-        "bafy_{}",
-        hex::encode(blake3::hash(&bundle_bytes).as_bytes())
-    );
-    if state.ingest_ctx.store.get_block(&block_cid)?.is_some() {
-        return Ok(());
-    }
-
-    // Mirror the production peer-block sig-verify path. The harness shares
-    // semantics with v0_0_2_federation::ingest_peer_block so integration
-    // tests exercise the same enforcement.
-    let sig_bytes = match sig_b64.as_deref() {
-        Some(s) => base64::engine::general_purpose::STANDARD
-            .decode(s)
-            .unwrap_or_default(),
-        None => vec![],
-    };
-    if !state.config.federation.naively_trust_peer_authored_blocks
-        && let Err(e) = jig_server::v0_0_2_federation::verify_peer_block_sig(
-            &bundle_bytes,
-            &manifest,
-            &sig_bytes,
-        )
-    {
-        eprintln!(
-            "harness rejecting peer block from {} (cid {block_cid}): {e}",
-            peer.url
-        );
-        return Ok(());
-    }
-
-    let sender_did_str = manifest
-        .authors
-        .first()
-        .map(|a| a.did.to_did_jig_string())
-        .unwrap_or_default();
-    let kind_str = manifest
-        .kind
-        .as_ref()
-        .map(|k| k.as_str().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let (hlc_wall_ms, hlc_logical, hlc_origin) = manifest
-        .hlc_ts
-        .as_ref()
-        .map(|h| (h.wall_ms, h.logical, h.server_did.to_did_jig_string()))
-        .unwrap_or((0, 0, String::new()));
-
-    let stored_block = StoredBlock {
-        cid: block_cid.clone(),
-        channel_id: None,
-        block_kind: kind_str,
-        sender_did: sender_did_str,
-        sender_sig: sig_bytes,
-        bundle_bytes: bundle_bytes.clone(),
-        is_synthetic: false,
-        hlc_wall_ms,
-        hlc_logical,
-        hlc_origin,
-        posted_at: chrono::Utc::now().timestamp(),
-        origin_server: peer.url.clone(),
-        federated_from: Some(peer.url.clone()),
-    };
-    state.ingest_ctx.store.insert_block(&stored_block)?;
-
-    for r in &receipts {
-        let receipt_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&r.receipt_bytes_b64)
-            .unwrap_or_default();
-        let receipt_cid = format!(
-            "r_{}_{}",
-            &block_cid[..16.min(block_cid.len())],
-            &r.server_did[..16.min(r.server_did.len())]
-        );
-        let stored_receipt = StoredReceipt {
-            cid: receipt_cid,
-            block_cid: block_cid.clone(),
-            server_id: r.server_did.clone(),
-            receipt_bytes,
-            render_hash: r.render_hash.clone(),
-            produced_at: chrono::Utc::now().timestamp(),
-        };
-        let _ = state.ingest_ctx.store.insert_receipt(&stored_receipt);
-    }
-
-    // Fanout the federated block to local subscribers — broadcast_local_only
-    // so we don't relay back to peers. Mirrors the server relay: a local
-    // channel row becomes the delivery policy; no row means scope alone.
-    let policy = match stored_block.channel_id.as_deref() {
-        Some(slug) => match state
-            .ingest_ctx
-            .store
-            .get_channel_by_slug_including_archived(slug)
-        {
-            Ok(Some(chan)) => {
-                let member_dids = state
-                    .ingest_ctx
-                    .store
-                    .list_members(&chan.id)
-                    .map(|ms| ms.into_iter().map(|m| m.member_did).collect())
-                    .unwrap_or_default();
-                Some(jig_pipeline::fanout::DeliveryPolicy::for_channel(
-                    &chan,
-                    member_dids,
-                ))
-            }
-            Ok(None) => None,
-            Err(_) => Some(jig_pipeline::fanout::DeliveryPolicy::default()),
-        },
-        None => None,
-    };
-    let receipts_in_db = state.ingest_ctx.store.get_receipts_for_block(&block_cid)?;
-    if let Some(rep_receipt) = receipts_in_db.into_iter().next() {
-        let _ = state
-            .ingest_ctx
-            .fanout
-            .broadcast_local_only(&stored_block, &rep_receipt, policy.as_ref())
-            .await;
-    }
-    let _ = delivery_cid; // unused but kept for parity with server code
-    let _ = receipts;
-    Ok(())
+    jig_server::v0_0_2_federation::ingest_peer_block(
+        state,
+        peer,
+        &bundle_b64,
+        sig_b64.as_deref(),
+        &receipts,
+        &delivery_cid,
+    )
+    .await
 }

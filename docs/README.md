@@ -11,7 +11,8 @@ should not be read as a status page.
 | Stand up a server on a box I already have | [`deploy/README.md`](../deploy/README.md) |
 | Get the box first, on GCP | [`docs/deployment/gcp-vps-runbook.md`](deployment/gcp-vps-runbook.md) |
 | Know what actually works today | the STATUS section of [`internal-dogfood-3day.md`](deployment/internal-dogfood-3day.md) |
-| Know what is left before a public release | `docs/RELEASE_READINESS.md` (arriving in this batch) |
+| Know what is left before a public release | [`RELEASE_READINESS.md`](RELEASE_READINESS.md) |
+| See end-to-end encryption work, on a throwaway server | [`scripts/demo-e2ee.sh`](../scripts/demo-e2ee.sh) |
 | Understand why something was built the way it was | [`docs/superpowers/`](superpowers/) |
 
 ## Deployment and operations
@@ -28,7 +29,7 @@ should not be read as a status page.
 
 | Path | Status | What it is |
 | --- | --- | --- |
-| [`superpowers/specs/`](superpowers/specs/) | HISTORICAL | Dated design documents — the shape of a change and why, written before implementation. |
+| [`superpowers/specs/`](superpowers/specs/) | HISTORICAL | Dated design documents — the shape of a change and why, written before implementation. The newest, [`2026-10-11-m2-mls-and-channel-dynamics-design.md`](superpowers/specs/2026-10-11-m2-mls-and-channel-dynamics-design.md), is the M2 plan: MLS, channel dynamics, M1 cleanup. |
 | [`superpowers/plans/`](superpowers/plans/) | HISTORICAL | Dated implementation plans derived from those specs, task by task. Useful for reconstructing intent; not maintained after a plan ships. |
 | [`archive/`](archive/) | HISTORICAL | Root-level docs that went stale. Each carries a header saying what it described and when. |
 
@@ -38,13 +39,13 @@ should not be read as a status page.
 | --- | --- | --- |
 | [`../SECURITY.md`](../SECURITY.md) | CURRENT | How to report a vulnerability, response targets, disclosure policy and scope. |
 | [`security/operator-threat-model.md`](security/operator-threat-model.md) | CURRENT | The model and evidence behind the spec's operator [threat register](../repos/jig-spec/src/threat-register.md). |
-| [`security/encryption.md`](security/encryption.md) | CURRENT | Why the v0.1 encryption groundwork is shaped as it is: suite field, refusals, MLS, DMs as locked channels. |
+| [`security/encryption.md`](security/encryption.md) | CURRENT | Why encryption is shaped as it is: suite field, refusals, MLS, DMs as locked channels, the DID key as MLS signer, a validating delivery service, the client plaintext cache. |
 
 ## Crate documentation
 
 Per-crate READMEs live next to the code under [`repos/`](../repos/):
 `jig-core`, `jig-server`, `jig-cli`, `jig-config`, `jig-runtime`, `jig-nameserver`,
-`bridges/email`.
+`bridges/email`. `jig-mls` documents itself in its crate docs (`src/lib.rs`).
 
 Two directories under `repos/` are documentation rather than crates and are not
 workspace members:

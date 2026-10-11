@@ -323,7 +323,9 @@ pub fn peer_block_cid(bundle_bytes: &[u8]) -> anyhow::Result<String> {
     Ok(bundle.block_cid()?.to_string())
 }
 
-async fn ingest_peer_block(
+/// Persist and fan out one block a federation peer relayed. Public so the
+/// integration-test harness drives this exact path rather than a copy of it.
+pub async fn ingest_peer_block(
     state: &Arc<AppState>,
     peer: &jig_config::v0_0_2_server::FederationPeer,
     bundle_b64: &str,

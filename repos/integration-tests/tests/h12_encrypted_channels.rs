@@ -158,22 +158,33 @@ async fn create_encrypted(api: &Api<'_>, owner: &Person, slug: &str, visibility:
                "mls_group_info": STANDARD.encode(&created.group_info),
                "mls_ratchet_tree": STANDARD.encode(&created.ratchet_tree)}),
     );
-    let (status, body) = api.post("/api/v1/channels", &json!({
-        "bundle_b64": STANDARD.encode(block.canonical_bytes()),
-        "sig_b64": STANDARD.encode(&block.sender_sig),
-    })).await;
+    let (status, body) = api
+        .post(
+            "/api/v1/channels",
+            &json!({
+                "bundle_b64": STANDARD.encode(block.canonical_bytes()),
+                "sig_b64": STANDARD.encode(&block.sender_sig),
+            }),
+        )
+        .await;
     assert_eq!(status, 200, "{body}");
 }
 
 async fn add(api: &Api<'_>, owner: &Person, slug: &str, who: &Person) {
     let server = api.server.http_url();
     let kp = api.key_package(&owner.id, &who.did()).await;
-    let c = owner.session.prepare_add(&server, slug, &kp, &who.did()).unwrap();
+    let c = owner
+        .session
+        .prepare_add(&server, slug, &kp, &who.did())
+        .unwrap();
     let block = build_with_metadata(
         &owner.id,
         BlockKind::MemberAdd,
         owner.hlc(),
-        with(json!({"channel": slug, "member_did": who.did()}), mls_meta(&c)),
+        with(
+            json!({"channel": slug, "member_did": who.did()}),
+            mls_meta(&c),
+        ),
     );
     let (status, body) = api.submit(&block).await;
     assert_eq!(status, 200, "{body}");
@@ -192,7 +203,10 @@ async fn catch_up(api: &Api<'_>, p: &Person, slug: &str) -> Vec<Seen> {
 }
 
 async fn say(api: &Api<'_>, p: &Person, slug: &str, text: &str) -> String {
-    let (msg, epoch) = p.session.encrypt(&api.server.http_url(), slug, text).unwrap();
+    let (msg, epoch) = p
+        .session
+        .encrypt(&api.server.http_url(), slug, text)
+        .unwrap();
     let block = build_sealed_text(&p.id, slug, &msg, epoch, p.hlc());
     p.session.remember(&block.cid(), &p.did(), text).unwrap();
     let (status, body) = api.submit(&block).await;
@@ -256,8 +270,14 @@ async fn an_encrypted_channel_round_trip_leaves_no_plaintext_on_the_server() {
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(catch_up(&api, &bob, slug).await.first(), Some(&Seen::Control));
-    assert!(bob.session.has_group(&host, slug).unwrap(), "joined from the welcome");
+    assert_eq!(
+        catch_up(&api, &bob, slug).await.first(),
+        Some(&Seen::Control)
+    );
+    assert!(
+        bob.session.has_group(&host, slug).unwrap(),
+        "joined from the welcome"
+    );
 
     let secret = "the launch code is 0451";
     say(&api, &alice, slug, secret).await;
@@ -268,15 +288,31 @@ async fn an_encrypted_channel_round_trip_leaves_no_plaintext_on_the_server() {
             .unwrap()
             .unwrap();
         let Message::Text(text) = msg else { continue };
-        let Ok(env) = serde_json::from_str::<Envelope>(&text) else { continue };
-        if let Frame::Block { bundle_b64, sig_b64, receipts, delivery_cid } = env.frame {
-            break DeliveredBlock { bundle_b64, sig_b64, receipts, delivery_cid };
+        let Ok(env) = serde_json::from_str::<Envelope>(&text) else {
+            continue;
+        };
+        if let Frame::Block {
+            bundle_b64,
+            sig_b64,
+            receipts,
+            delivery_cid,
+        } = env.frame
+        {
+            break DeliveredBlock {
+                bundle_b64,
+                sig_b64,
+                receipts,
+                delivery_cid,
+            };
         }
     };
     let opened = open(&live).unwrap();
     assert_eq!(
         bob.session.observe(&host, &opened),
-        Seen::Text { sender: alice.did(), text: secret.to_string() }
+        Seen::Text {
+            sender: alice.did(),
+            text: secret.to_string()
+        }
     );
     assert!(
         live.receipts[0].render_hash.is_none(),
@@ -287,16 +323,27 @@ async fn an_encrypted_channel_round_trip_leaves_no_plaintext_on_the_server() {
     // not decrypt it if she could.
     let (status, _) = api.history(&carol.id, slug).await;
     assert_eq!(status, 403);
-    assert!(matches!(carol.session.observe(&host, &opened), Seen::Sealed { .. }));
+    assert!(matches!(
+        carol.session.observe(&host, &opened),
+        Seen::Sealed { .. }
+    ));
 
     // Plaintext into the encrypted channel is refused, not stored.
-    let leak = jig_client::blocks::build_text_render(&alice.id, slug, "oops, plaintext", alice.hlc());
+    let leak =
+        jig_client::blocks::build_text_render(&alice.id, slug, "oops, plaintext", alice.hlc());
     let (status, body) = api.submit(&leak).await;
-    assert_eq!((status, body["code"].as_str()), (400, Some("SUITE_MISMATCH")), "{body}");
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("SUITE_MISMATCH")),
+        "{body}"
+    );
 
     // Alice removes Bob. What she says next, Bob cannot read — even handed
     // the ciphertext directly.
-    let c = alice.session.prepare_remove(&host, slug, &bob.did()).unwrap();
+    let c = alice
+        .session
+        .prepare_remove(&host, slug, &bob.did())
+        .unwrap();
     let kick = build_member_remove(&alice.id, slug, &bob.did(), mls_meta(&c), alice.hlc());
     let (status, body) = api.submit(&kick).await;
     assert_eq!(status, 200, "{body}");
@@ -312,7 +359,9 @@ async fn an_encrypted_channel_round_trip_leaves_no_plaintext_on_the_server() {
         receipts: vec![],
         delivery_cid: cid.clone(),
     };
-    let seen_kick = bob.session.observe(&host, &open(&build_delivered(&kick)).unwrap());
+    let seen_kick = bob
+        .session
+        .observe(&host, &open(&build_delivered(&kick)).unwrap());
     assert_eq!(seen_kick, Seen::Gone);
     assert!(matches!(
         bob.session.observe(&host, &open(&handed).unwrap()),
@@ -320,7 +369,10 @@ async fn an_encrypted_channel_round_trip_leaves_no_plaintext_on_the_server() {
     ));
 
     // Alice's own history replays from her plaintext cache.
-    assert_eq!(texts(&catch_up(&api, &alice, slug).await), vec![secret, after]);
+    assert_eq!(
+        texts(&catch_up(&api, &alice, slug).await),
+        vec![secret, after]
+    );
 
     // The point of all this.
     let disk = disk_bytes(server.data_dir());
@@ -353,26 +405,41 @@ async fn an_open_encrypted_channel_is_joined_by_external_commit_and_tidied_on_le
 
     // Dave joins on his own, from the group info the server holds.
     let (status, body) = api
-        .get(&dave.id, &format!("/api/v1/channels/{}/mls/group-info", enc(slug)))
+        .get(
+            &dave.id,
+            &format!("/api/v1/channels/{}/mls/group-info", enc(slug)),
+        )
         .await;
     assert_eq!(status, 200, "{body}");
-    let info = STANDARD.decode(body["group_info_b64"].as_str().unwrap()).unwrap();
+    let info = STANDARD
+        .decode(body["group_info_b64"].as_str().unwrap())
+        .unwrap();
     let c = dave.session.prepare_join(&host, slug, &info).unwrap();
     let join = build_with_metadata(
         &dave.id,
         BlockKind::MemberAdd,
         dave.hlc(),
-        with(json!({"channel": slug, "member_did": dave.did()}), mls_meta(&c)),
+        with(
+            json!({"channel": slug, "member_did": dave.did()}),
+            mls_meta(&c),
+        ),
     );
     let (status, body) = api.submit(&join).await;
     assert_eq!(status, 200, "{body}");
 
     // Alice follows the join, then they talk.
     let seen = catch_up(&api, &alice, slug).await;
-    assert!(seen.contains(&Seen::Added { member: dave.did() }), "{seen:?}");
+    assert!(
+        seen.contains(&Seen::Added { member: dave.did() }),
+        "{seen:?}"
+    );
     say(&api, &alice, slug, "hi dave").await;
     let dave_view = catch_up(&api, &dave, slug).await;
-    assert_eq!(texts(&dave_view), vec!["hi dave"], "nothing from before he joined");
+    assert_eq!(
+        texts(&dave_view),
+        vec!["hi dave"],
+        "nothing from before he joined"
+    );
     assert!(dave_view.iter().any(|s| matches!(s, Seen::Sealed { .. })));
 
     // Dave leaves: no commit from him, and Alice — online next — tidies his
@@ -381,17 +448,32 @@ async fn an_open_encrypted_channel_is_joined_by_external_commit_and_tidied_on_le
     let (status, body) = api.submit(&leave).await;
     assert_eq!(status, 200, "{body}");
     let seen = catch_up(&api, &alice, slug).await;
-    assert!(seen.contains(&Seen::Left { member: dave.did(), tidy: true }), "{seen:?}");
-    let c = alice.session.prepare_remove(&host, slug, &dave.did()).unwrap();
+    assert!(
+        seen.contains(&Seen::Left {
+            member: dave.did(),
+            tidy: true
+        }),
+        "{seen:?}"
+    );
+    let c = alice
+        .session
+        .prepare_remove(&host, slug, &dave.did())
+        .unwrap();
     let tidy = build_member_remove(&alice.id, slug, &dave.did(), mls_meta(&c), alice.hlc());
     let (status, body) = api.submit(&tidy).await;
     assert_eq!(status, 200, "{body}");
     alice.session.confirm(&host, slug).unwrap();
-    assert_eq!(alice.session.group_members(&host, slug).unwrap(), vec![alice.did()]);
+    assert_eq!(
+        alice.session.group_members(&host, slug).unwrap(),
+        vec![alice.did()]
+    );
 
     // The membership list says the same as the tree.
     let (status, body) = api
-        .get(&alice.id, &format!("/api/v1/channels/{}/members", enc(slug)))
+        .get(
+            &alice.id,
+            &format!("/api/v1/channels/{}/members", enc(slug)),
+        )
         .await;
     assert_eq!(status, 200);
     let dids: Vec<&str> = body["members"]
@@ -421,25 +503,45 @@ async fn racing_commits_land_one_at_a_time() {
     // Two commits built on epoch 0. The first to land wins; the second is
     // refused as stale and changes nothing.
     let kp_b = api.key_package(&alice.id, &bob.did()).await;
-    let first = alice.session.prepare_add(&host, slug, &kp_b, &bob.did()).unwrap();
+    let first = alice
+        .session
+        .prepare_add(&host, slug, &kp_b, &bob.did())
+        .unwrap();
     alice.session.abandon(&host, slug).unwrap();
     let kp_c = api.key_package(&alice.id, &carol.did()).await;
-    let second = alice.session.prepare_add(&host, slug, &kp_c, &carol.did()).unwrap();
+    let second = alice
+        .session
+        .prepare_add(&host, slug, &kp_c, &carol.did())
+        .unwrap();
     let block = |c: &Commit, who: &Person| {
         build_with_metadata(
             &alice.id,
             BlockKind::MemberAdd,
             alice.hlc(),
-            with(json!({"channel": slug, "member_did": who.did()}), mls_meta(c)),
+            with(
+                json!({"channel": slug, "member_did": who.did()}),
+                mls_meta(c),
+            ),
         )
     };
     let (s1, _) = api.submit(&block(&first, &bob)).await;
     let (s2, body) = api.submit(&block(&second, &carol)).await;
     assert_eq!(s1, 200);
-    assert_eq!((s2, body["code"].as_str()), (409, Some("STALE_EPOCH")), "{body}");
+    assert_eq!(
+        (s2, body["code"].as_str()),
+        (409, Some("STALE_EPOCH")),
+        "{body}"
+    );
     let (status, members) = api
-        .get(&alice.id, &format!("/api/v1/channels/{}/members", enc(slug)))
+        .get(
+            &alice.id,
+            &format!("/api/v1/channels/{}/members", enc(slug)),
+        )
         .await;
     assert_eq!(status, 200);
-    assert_eq!(members["members"].as_array().unwrap().len(), 2, "owner + bob only");
+    assert_eq!(
+        members["members"].as_array().unwrap().len(),
+        2,
+        "owner + bob only"
+    );
 }

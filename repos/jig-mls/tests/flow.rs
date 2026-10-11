@@ -55,7 +55,11 @@ impl Channel {
     fn epoch(&self) -> u64 {
         delivery::epoch(&self.state, &self.group_id).unwrap()
     }
-    fn accept(&mut self, commit: &jig_mls::member::Commit, intent: Intent<'_>) -> Result<(), MlsError> {
+    fn accept(
+        &mut self,
+        commit: &jig_mls::member::Commit,
+        intent: Intent<'_>,
+    ) -> Result<(), MlsError> {
         let applied = delivery::apply_commit(&self.state, &self.group_id, &commit.commit, intent)?;
         self.state = applied.state;
         if let Some(info) = &commit.group_info {
@@ -68,18 +72,33 @@ impl Channel {
 }
 
 fn add(ch: &mut Channel, owner: &Person, who: &Person) -> jig_mls::member::Commit {
-    let commit = owner.member.add(&ch.group_id, &who.kp(), &who.id()).unwrap();
-    ch.accept(&commit, Intent::Add { committer: &owner.id(), member: &who.id() })
+    let commit = owner
+        .member
+        .add(&ch.group_id, &who.kp(), &who.id())
         .unwrap();
+    ch.accept(
+        &commit,
+        Intent::Add {
+            committer: &owner.id(),
+            member: &who.id(),
+        },
+    )
+    .unwrap();
     owner.member.confirm(&ch.group_id).unwrap();
-    let joined = who.member.join_welcome(commit.welcome.as_ref().unwrap()).unwrap();
+    let joined = who
+        .member
+        .join_welcome(commit.welcome.as_ref().unwrap())
+        .unwrap();
     assert_eq!(joined, ch.group_id);
     commit
 }
 
 fn say(ch: &Channel, from: &Person, text: &str) -> Vec<u8> {
     let (msg, epoch) = from.member.encrypt(&ch.group_id, text.as_bytes()).unwrap();
-    assert_eq!(delivery::check_application(&ch.state, &ch.group_id, &msg).unwrap(), epoch);
+    assert_eq!(
+        delivery::check_application(&ch.state, &ch.group_id, &msg).unwrap(),
+        epoch
+    );
     msg
 }
 
@@ -112,7 +131,13 @@ fn a_channel_lives_its_whole_life() {
     let (gid, join) = carol.member.join_external(&ch.info).unwrap();
     assert_eq!(gid, ch.group_id);
     assert_eq!(join.epoch, 1);
-    ch.accept(&join, Intent::Join { joiner: &carol.id() }).unwrap();
+    ch.accept(
+        &join,
+        Intent::Join {
+            joiner: &carol.id(),
+        },
+    )
+    .unwrap();
     for p in [&alice, &bob] {
         assert_eq!(
             p.member.apply_commit(&ch.group_id, &join.commit).unwrap(),
@@ -124,11 +149,20 @@ fn a_channel_lives_its_whole_life() {
 
     // Alice removes Bob.
     let kick = alice.member.remove(&ch.group_id, &bob.id()).unwrap();
-    ch.accept(&kick, Intent::Remove { committer: &alice.id(), member: &bob.id() })
-        .unwrap();
+    ch.accept(
+        &kick,
+        Intent::Remove {
+            committer: &alice.id(),
+            member: &bob.id(),
+        },
+    )
+    .unwrap();
     alice.member.confirm(&ch.group_id).unwrap();
     assert_eq!(
-        carol.member.apply_commit(&ch.group_id, &kick.commit).unwrap(),
+        carol
+            .member
+            .apply_commit(&ch.group_id, &kick.commit)
+            .unwrap(),
         CommitOutcome::Applied { epoch: 3 }
     );
     assert_eq!(
@@ -138,14 +172,14 @@ fn a_channel_lives_its_whole_life() {
     assert!(!bob.member.has_group(&ch.group_id));
     let m = say(&ch, &alice, "bob is gone");
     assert_eq!(hear(&ch, &carol, &m).0, "bob is gone");
-    assert_eq!(
-        delivery::members(&ch.state, &ch.group_id).unwrap().len(),
-        2
-    );
+    assert_eq!(delivery::members(&ch.state, &ch.group_id).unwrap().len(), 2);
 
     // The committer's own commit, echoed back, is recognised as applied.
     assert_eq!(
-        alice.member.apply_commit(&ch.group_id, &kick.commit).unwrap(),
+        alice
+            .member
+            .apply_commit(&ch.group_id, &kick.commit)
+            .unwrap(),
         CommitOutcome::AlreadyApplied
     );
 }
@@ -167,18 +201,42 @@ fn a_stale_commit_is_refused_by_epoch() {
     let bob = Person::new(2);
     let carol = Person::new(3);
     let mut ch = Channel::create(&alice);
-    let first = alice.member.add(&ch.group_id, &bob.kp(), &bob.id()).unwrap();
-    ch.accept(&first, Intent::Add { committer: &alice.id(), member: &bob.id() })
+    let first = alice
+        .member
+        .add(&ch.group_id, &bob.kp(), &bob.id())
         .unwrap();
+    ch.accept(
+        &first,
+        Intent::Add {
+            committer: &alice.id(),
+            member: &bob.id(),
+        },
+    )
+    .unwrap();
     // Alice never merged, so her next commit is built on epoch 0 again.
     alice.member.abandon(&ch.group_id).unwrap();
-    let second = alice.member.add(&ch.group_id, &carol.kp(), &carol.id()).unwrap();
+    let second = alice
+        .member
+        .add(&ch.group_id, &carol.kp(), &carol.id())
+        .unwrap();
     assert_eq!(
-        ch.accept(&second, Intent::Add { committer: &alice.id(), member: &carol.id() }),
+        ch.accept(
+            &second,
+            Intent::Add {
+                committer: &alice.id(),
+                member: &carol.id()
+            }
+        ),
         Err(MlsError::StaleEpoch { current: 1, got: 0 })
     );
     assert_eq!(
-        ch.accept(&first, Intent::Add { committer: &alice.id(), member: &bob.id() }),
+        ch.accept(
+            &first,
+            Intent::Add {
+                committer: &alice.id(),
+                member: &bob.id()
+            }
+        ),
         Err(MlsError::StaleEpoch { current: 1, got: 0 }),
         "a replayed commit is stale"
     );
@@ -191,20 +249,61 @@ fn a_commit_must_do_what_its_block_says() {
     let carol = Person::new(3);
     let mallory = Person::new(9);
     let mut ch = Channel::create(&alice);
-    let commit = alice.member.add(&ch.group_id, &bob.kp(), &bob.id()).unwrap();
+    let commit = alice
+        .member
+        .add(&ch.group_id, &bob.kp(), &bob.id())
+        .unwrap();
 
-    let wrong_member = ch.accept(&commit, Intent::Add { committer: &alice.id(), member: &carol.id() });
-    assert!(matches!(wrong_member, Err(MlsError::Rejected(_))), "{wrong_member:?}");
-    let wrong_signer = ch.accept(&commit, Intent::Add { committer: &mallory.id(), member: &bob.id() });
-    assert!(matches!(wrong_signer, Err(MlsError::Rejected(_))), "{wrong_signer:?}");
-    let wrong_kind = ch.accept(&commit, Intent::Remove { committer: &alice.id(), member: &bob.id() });
-    assert!(matches!(wrong_kind, Err(MlsError::Rejected(_))), "{wrong_kind:?}");
-    let as_join = ch.accept(&commit, Intent::Join { joiner: &alice.id() });
+    let wrong_member = ch.accept(
+        &commit,
+        Intent::Add {
+            committer: &alice.id(),
+            member: &carol.id(),
+        },
+    );
+    assert!(
+        matches!(wrong_member, Err(MlsError::Rejected(_))),
+        "{wrong_member:?}"
+    );
+    let wrong_signer = ch.accept(
+        &commit,
+        Intent::Add {
+            committer: &mallory.id(),
+            member: &bob.id(),
+        },
+    );
+    assert!(
+        matches!(wrong_signer, Err(MlsError::Rejected(_))),
+        "{wrong_signer:?}"
+    );
+    let wrong_kind = ch.accept(
+        &commit,
+        Intent::Remove {
+            committer: &alice.id(),
+            member: &bob.id(),
+        },
+    );
+    assert!(
+        matches!(wrong_kind, Err(MlsError::Rejected(_))),
+        "{wrong_kind:?}"
+    );
+    let as_join = ch.accept(
+        &commit,
+        Intent::Join {
+            joiner: &alice.id(),
+        },
+    );
     assert!(matches!(as_join, Err(MlsError::Rejected(_))), "{as_join:?}");
 
     // Refusals leave the state alone; the honest reading still applies.
-    ch.accept(&commit, Intent::Add { committer: &alice.id(), member: &bob.id() })
-        .unwrap();
+    ch.accept(
+        &commit,
+        Intent::Add {
+            committer: &alice.id(),
+            member: &bob.id(),
+        },
+    )
+    .unwrap();
 }
 
 #[test]
@@ -215,7 +314,12 @@ fn an_external_join_must_be_the_block_signer() {
     let mut ch = Channel::create(&alice);
     let (_, join) = carol.member.join_external(&ch.info).unwrap();
     assert!(matches!(
-        ch.accept(&join, Intent::Join { joiner: &mallory.id() }),
+        ch.accept(
+            &join,
+            Intent::Join {
+                joiner: &mallory.id()
+            }
+        ),
         Err(MlsError::Rejected(_))
     ));
 }
@@ -229,7 +333,9 @@ fn garbage_is_refused_without_moving_the_epoch() {
             &ch.state,
             &ch.group_id,
             junk,
-            Intent::Join { joiner: &alice.id() },
+            Intent::Join {
+                joiner: &alice.id(),
+            },
         );
         assert!(r.is_err(), "{junk:?}");
     }
@@ -252,11 +358,14 @@ fn application_messages_must_be_this_groups_and_recent() {
         Err(MlsError::Rejected(_))
     ));
     // One epoch back is within the window.
-    assert_eq!(delivery::check_application(&ch.state, &ch.group_id, &old).unwrap(), 0);
+    assert_eq!(
+        delivery::check_application(&ch.state, &ch.group_id, &old).unwrap(),
+        0
+    );
     // A commit smuggled as content is refused.
     let commit = alice.member.remove(&ch.group_id, &bob.id()).unwrap();
     assert!(delivery::check_application(&ch.state, &ch.group_id, &commit.commit).is_err());
-    assert!(PAST_EPOCHS >= 1);
+    const { assert!(PAST_EPOCHS >= 1) };
 }
 
 #[test]

@@ -34,7 +34,7 @@ phases 1–3) moved identity into the server; the tailnet is now defence in dept
 | --- | --- |
 | **Current state** | Three gates, in order: authenticate, admit, authorize ([`jig-server/src/auth/`](../repos/jig-server/src/auth/)). **Authenticate** holds: every REST read and every WSS subscribe carries a per-request ed25519 proof over a canonical hash of the request (`jig-core::request_auth`), verified against the caller's DID, with a fail-closed replay guard; `[auth] require_authenticated_reads` defaults to `true`, and the documented escape hatch restores the old behaviour only when set explicitly. **Authorize** holds for channels: history, the listing, live WSS delivery (re-checked per block) and posting all run `authorize_read`/`authorize_block` against `visibility`, `owner_did` and the memberships table; membership changes and `channel-promote` are owner-signed. Refusals go through one disclosure point per surface (`GateOutcome` → `DisclosurePolicy`), truthful by default. **Admit** holds: `[auth.admission]` (`banned_dids`, ruleset-scoped `floors`, an explicit `unknown_dids` choice, operator-seeded `records`) runs on every read and every write — inside `ingest` for writes, so REST, WSS, admin and bridge paths agree — after gate 1 and before any channel lookup, as a pure function (`auth/admission.rs`) shaped to later run as a policy block. |
 | **Ready means** | A caller's identity is established per request, reads/writes are checked against channel membership before data leaves the process, and a server can refuse callers it does not want (reputation, bans, rate limits). |
-| **Gap** | Reputation is consumed, not computed: the view is what the operator wrote in config, there is no ledger and no exchange of scores. No rate limiting or proof-of-work in front of the gates. Tier-1 trusted connections (phase 5) are not built. Blocks relayed by a federated peer are persisted and delivered without running the write gate (`v0_0_2_federation.rs` does not go through `ingest`), so federation is trust-on-peer. There is no `member-remove` block yet; revocation is a store operation. |
+| **Gap** | Reputation is consumed, not computed: the view is what the operator wrote in config, there is no ledger and no exchange of scores. No rate limiting or proof-of-work in front of the gates. Tier-1 trusted connections (phase 5) are not built. Blocks relayed by a federated peer are persisted and delivered without running the write gate (`v0_0_2_federation.rs` does not go through `ingest`), so federation is trust-on-peer; since v0.2 only open, unencrypted channels federate, which keeps that trust away from restricted and encrypted channels. Revocation is a signed `member-remove` block (owner kick or self-leave) since v0.2. |
 
 **Verdict: GAP** (was BLOCKER). The part that let strangers read and write every
 channel is closed and proven by fault injection at each gate, and an operator can
@@ -58,17 +58,17 @@ The CLI's `restricted (membership-gated reads)` help text is now true, and
 
 | | |
 | --- | --- |
-| **Current state** | Blocks are **signed, not encrypted**. Signing is ed25519 over canonical bundle bytes; hashing is BLAKE3/SHA-256. `BlockManifest.privacy.encryption` and the envelope's `suite` are a typed `EncryptionSuite` ([`suite.rs`](../repos/jig-core/src/suite.rs)) that accepts only `none`; there is no crypto behind them — no crate in the workspace performs any AEAD or key agreement. `x25519-dalek` is declared in `repos/Cargo.toml` but no crate depends on it and no source file calls it. Block bodies are cleartext in the SQLite store and cleartext on the wire unless TLS terminates the hop. |
+| **Current state** | **Per channel, since v0.2.** A channel created with `suite = "mls"` (`jig channel create --encrypted`, and every `jig dm`) is one MLS group ([`jig-mls`](../repos/jig-mls/), `openmls` 0.9): content is an MLS `PrivateMessage`, the server validates every commit through a public-state `PublicGroup` and holds no group secret, and plaintext into such a channel is refused (`SUITE_MISMATCH`). `integration-tests/tests/h12_encrypted_channels.rs` searches the server's files after a conversation and finds none of it. Channels created without a suite are still signed-not-encrypted and stored in cleartext. |
 | **Ready means** | Message bodies are encrypted to recipient keys; the server stores ciphertext it cannot read. |
-| **Gap** | Everything. The `[tls]` section ([`config.rs:41`](../repos/jig-server/src/config.rs), off by default) gives transport confidentiality only; the server operator reads every message. |
+| **Gap** | Encryption is opt-in, not the default for new channels. Encrypted channels do not federate. One device per DID. The client's plaintext cache (`~/.jig/mls/`) is as sensitive as the identity key and is not encrypted at rest. No independent review of the MLS integration. |
 
 `repos/jig-spec/` used to document `age+x25519` E2EE in the present tense. Since
 2026-10-05 it specifies MLS by default, suite-pluggable, in `src/encryption.md`, bannered
 as not implemented in v0.1.
 
-**Verdict: BLOCKER** for any claim of privacy. Not a blocker for a
-narrowly-scoped "federated IRC with signed messages" pitch — *if* the
-positioning and the spec say so plainly.
+**Verdict: GAP** (was BLOCKER). Encrypted channels and DMs are real for
+single-server use; "private by default" is not yet a true claim, and nothing
+here has had an outside review.
 
 ### 1.4 Admin endpoints are required and unauthorized
 

@@ -56,6 +56,7 @@ jobs:
             -p jig-config \
             -p jig-pipeline \
             -p jig-client \
+            -p jig-mls \
             -p jig-server \
             -p jig-nameserver \
             -p jig-cli \
@@ -79,6 +80,7 @@ jobs:
             -p jig-config \
             -p jig-pipeline \
             -p jig-client \
+            -p jig-mls \
             -p jig-runtime \
             -p jig-server \
             -p jig-nameserver \
@@ -111,6 +113,7 @@ jobs:
             -p jig-config \
             -p jig-pipeline \
             -p jig-client \
+            -p jig-mls \
             -p jig-server \
             -p jig-nameserver \
             -p jig-cli \

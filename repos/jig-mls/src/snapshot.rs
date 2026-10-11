@@ -57,7 +57,9 @@ pub fn decode(bytes: &[u8]) -> Result<MemoryStorage> {
 
 fn take<'a>(rest: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
     if rest.len() < n {
-        return Err(MlsError::Malformed("truncated MLS state snapshot".to_string()));
+        return Err(MlsError::Malformed(
+            "truncated MLS state snapshot".to_string(),
+        ));
     }
     let (head, tail) = rest.split_at(n);
     *rest = tail;
@@ -90,7 +92,10 @@ mod tests {
     #[test]
     fn truncated_snapshots_are_refused() {
         let s = MemoryStorage::default();
-        s.values.write().unwrap().insert(b"k".to_vec(), b"v".to_vec());
+        s.values
+            .write()
+            .unwrap()
+            .insert(b"k".to_vec(), b"v".to_vec());
         let bytes = encode(&s);
         assert!(decode(&bytes[..bytes.len() - 1]).is_err());
         assert!(decode(b"nope").is_err());

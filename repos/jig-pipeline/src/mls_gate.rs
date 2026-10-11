@@ -288,7 +288,12 @@ mod tests {
         }
     }
 
-    fn manifest(kind: BlockKind, sender: &str, suite: EncryptionSuite, meta: Value) -> BlockManifest {
+    fn manifest(
+        kind: BlockKind,
+        sender: &str,
+        suite: EncryptionSuite,
+        meta: Value,
+    ) -> BlockManifest {
         let mut b = BlockManifest::builder()
             .version(Version::new(0, 1, 0))
             .author(Author {
@@ -420,7 +425,13 @@ mod tests {
             json!({"channel": "#sealed", "body": "oops"}),
         );
         assert!(matches!(
-            plan(BlockKind::TextRender, &a.did, &text, Some(&sealed), Some(&g)),
+            plan(
+                BlockKind::TextRender,
+                &a.did,
+                &text,
+                Some(&sealed),
+                Some(&g)
+            ),
             Err(SuiteRefusal::Mismatch { .. })
         ));
         assert_eq!(
@@ -436,11 +447,23 @@ mod tests {
             json!({"channel": "#sealed", "mls_message": b64(&msg)}),
         );
         assert_eq!(
-            plan(BlockKind::TextRender, &a.did, &sealed_text, Some(&sealed), Some(&g)),
+            plan(
+                BlockKind::TextRender,
+                &a.did,
+                &sealed_text,
+                Some(&sealed),
+                Some(&g)
+            ),
             Ok(MlsPlan::Sealed)
         );
         assert!(matches!(
-            plan(BlockKind::TextRender, &a.did, &sealed_text, Some(&plain), None),
+            plan(
+                BlockKind::TextRender,
+                &a.did,
+                &sealed_text,
+                Some(&plain),
+                None
+            ),
             Err(SuiteRefusal::Mismatch { .. })
         ));
 
@@ -451,7 +474,13 @@ mod tests {
             json!({"channel": "#sealed", "mls_message": b64(&msg), "body": "hi"}),
         );
         assert_eq!(
-            plan(BlockKind::TextRender, &a.did, &leaky, Some(&sealed), Some(&g)),
+            plan(
+                BlockKind::TextRender,
+                &a.did,
+                &leaky,
+                Some(&sealed),
+                Some(&g)
+            ),
             Err(SuiteRefusal::Plaintext {
                 slug: "#sealed".to_string()
             })
@@ -474,7 +503,13 @@ mod tests {
             json!({"channel": "#sealed", "member_did": b.did, "mls_commit": b64(&commit.commit)}),
         );
         assert_eq!(
-            plan(BlockKind::MemberAdd, &a.did, &no_welcome, Some(&sealed), Some(&g)),
+            plan(
+                BlockKind::MemberAdd,
+                &a.did,
+                &no_welcome,
+                Some(&sealed),
+                Some(&g)
+            ),
             Err(SuiteRefusal::Missing {
                 field: keys::WELCOME
             })
@@ -516,7 +551,13 @@ mod tests {
             json!({"channel": "#sealed", "member_did": b.did}),
         );
         assert_eq!(
-            plan(BlockKind::MemberRemove, &b.did, &leave, Some(&sealed), Some(&g)),
+            plan(
+                BlockKind::MemberRemove,
+                &b.did,
+                &leave,
+                Some(&sealed),
+                Some(&g)
+            ),
             Ok(MlsPlan::Nothing)
         );
         let kick_without_commit = manifest(
@@ -526,7 +567,13 @@ mod tests {
             json!({"channel": "#sealed", "member_did": b.did}),
         );
         assert_eq!(
-            plan(BlockKind::MemberRemove, &a.did, &kick_without_commit, Some(&sealed), Some(&g)),
+            plan(
+                BlockKind::MemberRemove,
+                &a.did,
+                &kick_without_commit,
+                Some(&sealed),
+                Some(&g)
+            ),
             Err(SuiteRefusal::Missing {
                 field: keys::COMMIT
             })

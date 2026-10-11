@@ -8,13 +8,13 @@
 //! membership table cannot drift apart, and no member can wedge the channel
 //! with a commit nobody else can process.
 
+use openmls::messages::group_info::VerifiableGroupInfo;
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::{
     GroupId, KeyPackageIn, MlsMessageBodyIn, MlsMessageIn, ProcessedMessageContent, ProposalStore,
     ProposalType, ProtocolMessage, ProtocolVersion, PublicGroup, RatchetTreeIn, Sender,
     StagedCommit,
 };
-use openmls::messages::group_info::VerifiableGroupInfo;
 use openmls_memory_storage::MemoryStorage;
 use openmls_rust_crypto::RustCrypto;
 

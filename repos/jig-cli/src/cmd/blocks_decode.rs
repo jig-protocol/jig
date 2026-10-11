@@ -103,12 +103,16 @@ pub fn present(opened: &OpenedBlock, receipts: &[ReceiptRef], seen: &Seen) -> Op
             d.body = format!("🔒 [cannot decrypt: {reason}]");
             Some(d)
         }
-        Seen::Joined => system("you joined — messages from here on are end-to-end encrypted".into()),
+        Seen::Joined => {
+            system("you joined — messages from here on are end-to-end encrypted".into())
+        }
         Seen::Added { member } => system(format!("{} was added", shorten_did(member))),
         Seen::Removed { member } => system(format!("{} was removed", shorten_did(member))),
         Seen::Left { member, .. } => system(format!("{} left", shorten_did(member))),
         Seen::Gone => system("you are no longer in this channel".into()),
-        Seen::Broken { reason } => system(format!("could not follow a membership change: {reason}")),
+        Seen::Broken { reason } => {
+            system(format!("could not follow a membership change: {reason}"))
+        }
     }
 }
 
@@ -250,7 +254,12 @@ mod tests {
     #[test]
     fn decode_marks_an_unsigned_delivery() {
         let id = test_identity();
-        let block = build_text_render(&id, "#hello", "hi", HlcTimestamp::now_wall(id.did().clone()));
+        let block = build_text_render(
+            &id,
+            "#hello",
+            "hi",
+            HlcTimestamp::now_wall(id.did().clone()),
+        );
         let mut d = signed(&block, vec![]);
         d.sig_b64 = None;
         assert_eq!(decode(&d).unwrap().body, "hi  [unsigned]");

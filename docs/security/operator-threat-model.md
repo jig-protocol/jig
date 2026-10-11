@@ -92,11 +92,13 @@ offer, or relabels encrypted content as plaintext.
   could ever be offered to an old peer.
 
 **Status evidence.** `jig_core::EncryptionSuite` has no catch-all variant, so an
-unregistered identifier does not deserialize. `Envelope` refuses `v != 1` and any suite
-except `none` at deserialization, on every path (WebSocket handler, federation, client).
-`BlockManifest::check_gates` refuses an unsupported schema or suite in `ingest` and on
-federation inbound. With `none` the only suite, there is nothing to downgrade *from* yet;
-pinning advertised suites is JEP-0001.
+unregistered identifier does not deserialize. `Envelope` refuses `v != 1` and any frame
+suite except `none` at deserialization, on every path (WebSocket handler, federation,
+client). `BlockManifest::check_gates` refuses an unsupported schema or suite in `ingest`
+and on federation inbound. Since v0.2 a channel records its suite at creation
+(`channels.suite`) and `jig_pipeline::mls_gate` refuses any post under another suite,
+including plaintext on an `mls` channel (`SUITE_MISMATCH`). Pinning the suites a server
+advertised is still JEP-0001.
 
 ### OP-04: metadata harvesting
 
@@ -111,9 +113,14 @@ one. Revisit after v0.2.
 
 **Attack.** The operator reads messages.
 
-**Decision rationale.** Only end-to-end encryption answers this. v0.1 ships unencrypted
-(D1), so the register marks it Accepted and every release says so. See
+**Decision rationale.** Only end-to-end encryption answers this. See
 [encryption.md](encryption.md).
+
+**Status evidence.** v0.2 channels created under `mls` store only MLS ciphertext; the
+server holds no group secret (`jig_mls::delivery` tracks public state only).
+`integration-tests/tests/h12_encrypted_channels.rs` searches every file the server wrote
+after a conversation and finds none of it. Channels created without a suite remain
+plaintext, and encrypted channels do not federate.
 
 ### OP-06: dropping, reordering, delaying, replaying, selective censorship
 
@@ -161,11 +168,16 @@ peer.
 
 **Decision rationale.** A relayed block is re-verified like a submitted one; a peer is a
 transport, not a source of authority. The remaining gap is that relayed blocks bypass the
-write gate (membership, ownership), which roadmap item 18 closes.
+write gate (membership, ownership), which roadmap item 18 closes. Until it does, v0.2
+federates only open, unencrypted channels: a peer cannot be given a restricted channel's
+content it has no way to gate, nor post into a local restricted or encrypted channel.
 
 **Status evidence.** `ingest_peer_block` re-verifies the author signature unless the
 `naively_trust_peer_authored_blocks` antipattern flag is set, and now runs the manifest
-gates. It does not go through `ingest`, so the write gate does not run.
+gates. It does not go through `ingest`, so the write gate does not run; it drops blocks for
+local channels that do not federate, and `DeliveryPolicy::federates` keeps restricted and
+encrypted channels' blocks off outbound links. It derives block CIDs the way `ingest` does
+(before v0.2 it used a different scheme, so one block had two identities).
 
 ### OP-10: discovery and reputation gaming
 

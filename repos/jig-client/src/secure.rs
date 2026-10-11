@@ -327,7 +327,16 @@ impl Session {
                     let Some(gid) = gid else {
                         return Ok(Seen::Control);
                     };
-                    follow(m, g, &key, &gid, block, &me, &commit, Seen::Added { member })
+                    follow(
+                        m,
+                        g,
+                        &key,
+                        &gid,
+                        block,
+                        &me,
+                        &commit,
+                        Seen::Added { member },
+                    )
                 })
             }
             BlockKind::MemberRemove => {
@@ -354,7 +363,16 @@ impl Session {
                     let Some(gid) = group_of(g, &key).filter(|gid| m.has_group(gid)) else {
                         return Ok(Seen::Control);
                     };
-                    follow(m, g, &key, &gid, block, &me, &commit, Seen::Removed { member })
+                    follow(
+                        m,
+                        g,
+                        &key,
+                        &gid,
+                        block,
+                        &me,
+                        &commit,
+                        Seen::Removed { member },
+                    )
                 })
             }
             _ => {
@@ -479,7 +497,8 @@ impl Session {
                 path: path.clone(),
                 source,
             })?;
-        f.lock().map_err(|source| SecureError::Io { path, source })?;
+        f.lock()
+            .map_err(|source| SecureError::Io { path, source })?;
         Ok(f)
     }
 }
@@ -571,7 +590,7 @@ pub fn replay_order(blocks: Vec<OpenedBlock>) -> Vec<OpenedBlock> {
             (key, i, b)
         })
         .collect();
-    keyed.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    keyed.sort_by_key(|a| (a.0, a.1));
     keyed.into_iter().map(|(_, _, b)| b).collect()
 }
 
@@ -654,8 +673,16 @@ mod tests {
             text: "hello bob".to_string(),
         };
         assert_eq!(bob.observe(SERVER, &msg), read);
-        assert_eq!(bob.observe(SERVER, &msg), read, "second read comes from the cache");
-        assert_eq!(alice.observe(SERVER, &msg), read, "the sender reads its own from the cache");
+        assert_eq!(
+            bob.observe(SERVER, &msg),
+            read,
+            "second read comes from the cache"
+        );
+        assert_eq!(
+            alice.observe(SERVER, &msg),
+            read,
+            "the sender reads its own from the cache"
+        );
 
         // A fresh session over the same directory — the next `jig chat` —
         // still has both the group and the plaintext.

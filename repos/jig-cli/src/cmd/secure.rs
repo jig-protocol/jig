@@ -242,10 +242,7 @@ impl Secure {
     /// so it is built on the channel's current epoch.
     pub async fn sync(&self, slug: &str) -> Result<Synced> {
         let url = history_url(&self.server, slug, DEFAULT_HISTORY_LIMIT);
-        let path = url
-            .strip_prefix(&self.base)
-            .unwrap_or(&url)
-            .to_string();
+        let path = url.strip_prefix(&self.base).unwrap_or(&url).to_string();
         let body: serde_json::Value = self.get_json(&path).await?;
         let delivered = parse_history(&body.to_string())?;
         Ok(self.replay(&delivered))
@@ -392,5 +389,8 @@ fn jig_pipeline_slug(kind: jig_core::BlockKind, m: &jig_core::BlockManifest) -> 
     } else {
         "channel"
     };
-    m.metadata.get(key).and_then(|v| v.as_str()).map(str::to_string)
+    m.metadata
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }

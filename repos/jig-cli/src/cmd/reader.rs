@@ -74,7 +74,11 @@ impl Reader {
 
     /// The channel's recent history, read. Departed members still in the
     /// tree come back for tidying.
-    pub async fn backlog(&self, who: &Identity, server_url: &str) -> (Vec<DecodedBlock>, Vec<String>) {
+    pub async fn backlog(
+        &self,
+        who: &Identity,
+        server_url: &str,
+    ) -> (Vec<DecodedBlock>, Vec<String>) {
         let Some(secure) = &self.secure else {
             return (
                 history::backfill(who, server_url, &self.slug, history::DEFAULT_HISTORY_LIMIT)
@@ -84,7 +88,11 @@ impl Reader {
         };
         match secure.sync(&self.slug).await {
             Ok(synced) => (
-                synced.lines.into_iter().filter(|d| d.is_message()).collect(),
+                synced
+                    .lines
+                    .into_iter()
+                    .filter(|d| d.is_message())
+                    .collect(),
                 synced.tidy,
             ),
             Err(e) => {

@@ -297,9 +297,7 @@ pub(crate) fn resolve_who(ctx: &CliContext, who: &str) -> Result<String> {
         .collect();
     match matches.as_slice() {
         [did] => Ok((*did).clone()),
-        [] => anyhow::bail!(
-            "`{who}` is neither a did:jig nor a name in [contacts]; pass the DID"
-        ),
+        [] => anyhow::bail!("`{who}` is neither a did:jig nor a name in [contacts]; pass the DID"),
         _ => anyhow::bail!("more than one contact is called `{who}`; pass the DID"),
     }
 }
@@ -310,9 +308,10 @@ pub(crate) fn resolve_who(ctx: &CliContext, who: &str) -> Result<String> {
 
 /// The channel as the caller sees it, or an error saying why not.
 async fn visible_channel(secure: &Secure, slug: &str) -> Result<ChannelInfo> {
-    secure.channel(slug).await?.ok_or_else(|| {
-        anyhow::anyhow!("no channel {slug} that you can see on this server")
-    })
+    secure
+        .channel(slug)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no channel {slug} that you can see on this server"))
 }
 
 /// Apply `jig channel add <slug> <who>`. Owner only. On an encrypted channel
@@ -496,7 +495,12 @@ async fn join_encrypted(ctx: &CliContext, secure: &Secure, slug: &str) -> Result
         let mut meta = json!({"channel": slug, "member_did": me});
         merge(&mut meta, mls_fields(&commit));
         match secure
-            .submit(&build_with_metadata(id, BlockKind::MemberAdd, now(id), meta))
+            .submit(&build_with_metadata(
+                id,
+                BlockKind::MemberAdd,
+                now(id),
+                meta,
+            ))
             .await
         {
             Ok(cid) => {

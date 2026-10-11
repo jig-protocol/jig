@@ -20,8 +20,9 @@ Every wire frame is a JSON object with:
 | `op` | string | the frame type |
 
 A receiver MUST refuse a frame whose `v` it does not implement (`UNSUPPORTED_VERSION`) or
-whose `suite` fails the [rejection rules](encryption.md#rejection-rules)
-(`UNSUPPORTED_SUITE`), before acting on any other field. Both refusals are distinct from
+whose `suite` fails the [rejection rules](encryption.md#rejection-rules) or is not `none`
+(`UNSUPPORTED_SUITE`; frames are never encrypted as a unit), before acting on any other
+field. Both refusals are distinct from
 a malformed frame (`BAD_JSON`). Schema:
 [`schemas/wire-envelope.json`](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/schemas/wire-envelope.json).
 
@@ -42,6 +43,9 @@ defines what the signature covers.
 | `UNSUPPORTED_VERSION` | Envelope `v` not implemented |
 | `UNSUPPORTED_SUITE` | Suite unregistered or not implemented |
 | `UNSUPPORTED_SCHEMA` | Manifest `schema` not implemented |
+| `SUITE_MISMATCH` | A block's suite is not its channel's |
+| `MLS_REJECTED` | The MLS payload of a block on an `mls` channel is invalid, or does not do what the block says |
+| `STALE_EPOCH` | A commit built on an epoch the channel has left (`409`) |
 
 On the WebSocket transport a server replies with an `error` frame carrying the code and
 `status: 400`. Over REST, which carries no envelope, manifest refusals come back as HTTP

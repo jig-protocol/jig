@@ -519,7 +519,9 @@ async fn main() -> Result<()> {
                 if let Ok(secure) = cmd::secure::Secure::open(&ctx)
                     && secure.ensure_key_packages().await.is_ok()
                 {
-                    println!("published MLS key packages (others can now add you to encrypted channels)");
+                    println!(
+                        "published MLS key packages (others can now add you to encrypted channels)"
+                    );
                 }
             }
             ServerAction::Info { url } => {

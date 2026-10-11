@@ -54,4 +54,3 @@ pub struct BlockResource {
     pub mime: String,
     pub data_b64: String,
 }
-

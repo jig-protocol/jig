@@ -42,10 +42,28 @@ pub async fn run(ctx: &CliContext, who: String, message: String) -> Result<()> {
         Some(_) => anyhow::bail!("{slug} exists but is not encrypted; not using it as a DM"),
         None => {
             create_with(ctx, &slug, "restricted", true, true, json!({"dm": true})).await?;
-            crate::cmd::channel::add(ctx, slug.clone(), peer.clone())
-                .await
-                .with_context(|| format!("adding {peer} to {slug}"))?;
         }
+    }
+    // Add the other side if they are not in yet — on first use, or when an
+    // earlier add failed (they had published no key packages, say).
+    #[derive(serde::Deserialize)]
+    struct Members {
+        members: Vec<Member>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Member {
+        did: String,
+    }
+    let members: Members = secure
+        .get_json(&format!(
+            "/api/v1/channels/{}/members",
+            crate::cmd::channel::escape_slug_for_url(&slug)
+        ))
+        .await?;
+    if !members.members.iter().any(|m| m.did == peer) {
+        crate::cmd::channel::add(ctx, slug.clone(), peer.clone())
+            .await
+            .with_context(|| format!("adding {peer} to {slug}"))?;
     }
 
     if message.trim().is_empty() {

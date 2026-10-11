@@ -467,7 +467,8 @@ Messages include a timestamp and a unique ID. Servers use these to prevent repla
 
 ## Encryption
 
-> **Not implemented in v0.1.** Content is signed, never encrypted.
+> **v0.2:** content on a channel created under `mls` is encrypted; on any other channel
+> it is signed, not encrypted.
 
 Encryption is specified in [Encryption](encryption.md): the suite (MLS by default) is
 named on every frame and in the manifest, and is fixed per channel. Routing metadata stays

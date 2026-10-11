@@ -46,7 +46,13 @@ The v0.0.2 surface, mounted by default:
 | `/api/v1/blocks/{cid}` | GET | One block and its receipts — signed read, channel-gated |
 | `/api/v1/channels` | GET | Channels the caller may read — signed read |
 | `/api/v1/channels/{slug}/blocks` | GET | Channel timeline — signed read, membership-gated |
-| `/_admin_v0_0_2/channels[/{slug}/members\|archive]` | POST | Channel ops as signed blocks; mounted only with `[debug] admin_endpoints = true` |
+| `/api/v1/channels/{slug}/members` | GET | Channel members and roles — signed read, same gate as the timeline |
+| `/api/v1/channels[/{slug}/members\|archive]` | POST | Channel ops as signed blocks (create, add/join, archive). Other ops (`member-remove`, `channel-promote`) go through `POST /api/v1/blocks` |
+| `/api/v1/mls/key-packages` | POST | Publish MLS key packages (`{key_packages_b64: [..]}`); each must be signed by, and name, its DID |
+| `/api/v1/mls/key-packages/{did}` | GET | Take one of a DID's key packages (consumed unless last-resort) — signed read |
+| `/api/v1/mls/key-packages/{did}/stock` | GET | How many a DID has left — signed read |
+| `/api/v1/channels/{slug}/mls/group-info` | GET | Newest MLS group info of an encrypted channel, for joining by external commit — signed read, channel-gated |
+| `/_admin_v0_0_2/channels[/{slug}/members\|archive]` | POST | Legacy aliases of the channel ops; mounted only with `[debug] admin_endpoints = true` |
 
 Reads carry five `x-jig-*` headers with an ed25519 proof over the request
 (`jig_client::ReadProof`); `jig channel list`, `jig chat` and `jig tail` sign

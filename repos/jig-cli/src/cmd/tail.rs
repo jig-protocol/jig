@@ -21,11 +21,11 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use jig_client::{Client, DeliveredBlock};
 
-#[cfg(test)]
-use crate::cmd::blocks_decode::distinct_render_hashes;
 use crate::cmd::blocks_decode::DecodedBlock;
 #[cfg(test)]
 use crate::cmd::blocks_decode::decode;
+#[cfg(test)]
+use crate::cmd::blocks_decode::distinct_render_hashes;
 use crate::cmd::common::CliContext;
 use crate::cmd::display::{bell_on_inbound, connection_lost, display_sender, format_hhmm};
 use crate::cmd::history;
@@ -76,7 +76,11 @@ pub async fn read(ctx: &CliContext, channel: String, limit: usize, json: bool) -
         for did in &synced.tidy {
             let _ = secure.tidy(&channel, did).await;
         }
-        synced.lines.into_iter().filter(|d| d.is_message()).collect()
+        synced
+            .lines
+            .into_iter()
+            .filter(|d| d.is_message())
+            .collect()
     } else {
         let blocks = history::fetch_history(&id, &server_url, &channel, limit).await?;
         history::decode_history(&blocks)
@@ -401,9 +405,14 @@ mod tests {
         let mut source = FiniteSource {
             items: [one_text_block()].into(),
         };
-        let err = pump(&mut source, "#hello", &BTreeMap::new(), &Reader::plain("#hello"))
-            .await
-            .unwrap_err();
+        let err = pump(
+            &mut source,
+            "#hello",
+            &BTreeMap::new(),
+            &Reader::plain("#hello"),
+        )
+        .await
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("connection lost"),
@@ -426,9 +435,14 @@ mod tests {
             ]
             .into(),
         };
-        let err = pump(&mut source, "#hello", &BTreeMap::new(), &Reader::plain("#hello"))
-            .await
-            .unwrap_err();
+        let err = pump(
+            &mut source,
+            "#hello",
+            &BTreeMap::new(),
+            &Reader::plain("#hello"),
+        )
+        .await
+        .unwrap_err();
         assert!(format!("{err:#}").contains("connection lost"));
         assert!(
             source.items.is_empty(),
