@@ -216,7 +216,8 @@ pub fn build_v0_0_2_router(state: Arc<AppState>) -> Router {
     // REST block and channel-op endpoints are always active (not debug-gated).
     let router = ws_router
         .merge(crate::v0_0_2_blocks::build_blocks_router(state.clone()))
-        .merge(crate::v0_0_2_admin::build_channel_ops_router(state.clone()));
+        .merge(crate::v0_0_2_admin::build_channel_ops_router(state.clone()))
+        .merge(crate::v0_0_2_mls::build_mls_router(state.clone()));
 
     let mut router = if state.config.debug.admin_endpoints {
         router.merge(crate::v0_0_2_admin::build_admin_router(state.clone()))
@@ -929,6 +930,7 @@ mod tests {
                 visibility: "open".to_string(),
                 created_at: 0,
                 owner_did: "did:jig:zSeedOwner".to_string(),
+                suite: "none".to_string(),
             })
             .unwrap();
     }
@@ -1326,6 +1328,7 @@ mod tests {
                     visibility: visibility.to_string(),
                     created_at: 0,
                     owner_did: "did:jig:zSeedOwner".to_string(),
+                    suite: "none".to_string(),
                 })
                 .unwrap();
         }
@@ -1367,6 +1370,7 @@ mod tests {
                 visibility: "open".to_string(),
                 created_at: 0,
                 owner_did: "did:jig:zSeedOwner".to_string(),
+                suite: "none".to_string(),
             })
             .unwrap();
         let manifest = serde_json::to_vec(&serde_json::json!({
@@ -1519,7 +1523,7 @@ mod tests {
             .unwrap();
         let welcome = client.welcome().expect("welcome");
         assert_eq!(welcome.version, 1);
-        assert_eq!(welcome.suites, vec!["none".to_string()]);
+        assert_eq!(welcome.suites, vec!["none".to_string(), "mls".to_string()]);
         assert!(welcome.reputation.is_null());
         assert_eq!(welcome.server_did, state.server_did.to_did_jig_string());
         assert_eq!(
@@ -1607,7 +1611,7 @@ mod tests {
         .unwrap();
         match pending.interpret(&recv_text(&mut ws).await) {
             jig_pipeline::handshake::HandshakeResult::Established(welcome) => {
-                assert_eq!(welcome.suites, vec!["none".to_string()]);
+                assert_eq!(welcome.suites, vec!["none".to_string(), "mls".to_string()]);
                 assert!(welcome.reputation.is_null());
                 assert_eq!(welcome.version, 1);
             }

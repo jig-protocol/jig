@@ -261,6 +261,7 @@ impl TestJigServer {
                 visibility: "open".to_string(),
                 created_at: chrono::Utc::now().timestamp_millis(),
                 owner_did: owner.did().to_did_jig_string(),
+                suite: "none".to_string(),
             })?;
         Ok(id)
     }
@@ -547,6 +548,8 @@ fn base_config() -> Result<JigServerConfig> {
                 "text-render".to_string(),
                 "channel-create".to_string(),
                 "member-add".to_string(),
+                "member-remove".to_string(),
+                "channel-promote".to_string(),
                 "fed-hello".to_string(),
             ],
         },

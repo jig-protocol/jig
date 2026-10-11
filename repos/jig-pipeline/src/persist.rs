@@ -63,6 +63,21 @@ pub struct StoredChannel {
     pub visibility: String,
     pub created_at: i64,
     pub owner_did: String,
+    /// The encryption suite fixed at creation (`none` or `mls`). Every post
+    /// is checked against it; see `jig_pipeline::mls_gate`.
+    pub suite: String,
+}
+
+/// An encrypted channel's MLS public state, as the delivery service tracks it.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StoredMlsGroup {
+    pub slug: String,
+    pub group_id: Vec<u8>,
+    /// `jig_mls::snapshot` bytes of the channel's `PublicGroup`.
+    pub state: Vec<u8>,
+    pub epoch: u64,
+    /// The newest group info a committer published, for external joiners.
+    pub group_info: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -203,10 +218,21 @@ fn row_to_stored_channel(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChanne
         visibility: r.get(2)?,
         created_at: r.get(3)?,
         owner_did: r.get(4)?,
+        suite: r.get(5)?,
     })
 }
 
-const CHANNEL_COLUMNS: &str = "id, slug, visibility, created_at, owner_did";
+const CHANNEL_COLUMNS: &str = "id, slug, visibility, created_at, owner_did, suite";
+
+fn row_to_stored_mls_group(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMlsGroup> {
+    Ok(StoredMlsGroup {
+        slug: r.get(0)?,
+        group_id: r.get(1)?,
+        state: r.get(2)?,
+        epoch: r.get::<_, i64>(3)? as u64,
+        group_info: r.get(4)?,
+    })
+}
 
 impl SqliteStore {
     /// Open (or create) a SQLite file at `path` and run migrations.
@@ -280,8 +306,35 @@ impl SqliteStore {
                 -- NULL = live. Set by the channel-archive effect (soft delete);
                 -- see `add_column_if_missing` below for why it is also applied
                 -- as an ALTER for databases created before this column existed.
-                archived_at INTEGER
+                archived_at INTEGER,
+                -- Encryption suite fixed at creation. Same ALTER story.
+                suite       TEXT NOT NULL DEFAULT 'none'
             );
+
+            -- One row per encrypted channel: the delivery service's view of
+            -- its MLS group. `epoch` is duplicated out of `state` so a commit
+            -- can be applied with a compare-and-swap on it.
+            CREATE TABLE IF NOT EXISTS mls_groups (
+                slug        TEXT PRIMARY KEY,
+                group_id    BLOB NOT NULL,
+                state       BLOB NOT NULL,
+                epoch       INTEGER NOT NULL,
+                group_info  BLOB
+            );
+
+            -- Published MLS key packages. Consumed rows are kept (with
+            -- `consumed_at`) so the same package cannot be uploaded again
+            -- after it was handed out.
+            CREATE TABLE IF NOT EXISTS mls_key_packages (
+                reference     BLOB PRIMARY KEY,
+                did           TEXT NOT NULL,
+                package       BLOB NOT NULL,
+                last_resort   INTEGER NOT NULL,
+                published_at  INTEGER NOT NULL,
+                consumed_at   INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS mls_key_packages_did
+                ON mls_key_packages(did, consumed_at, last_resort);
 
             CREATE TABLE IF NOT EXISTS memberships (
                 channel_id        TEXT NOT NULL,
@@ -341,6 +394,8 @@ impl SqliteStore {
         // ALTERed in. Every already-deployed server has a `channels` table
         // without `archived_at`.
         add_column_if_missing(conn, "channels", "archived_at", "INTEGER")?;
+        // Every channel created before v0.2 was unencrypted.
+        add_column_if_missing(conn, "channels", "suite", "TEXT NOT NULL DEFAULT 'none'")?;
         Ok(())
     }
 
@@ -503,12 +558,20 @@ impl SqliteStore {
     /// restart catch-up) must never resurrect a channel an owner archived.
     pub fn upsert_channel(&self, c: &StoredChannel) -> Result<()> {
         self.conn.lock().expect("poisoned").execute(
-            "INSERT INTO channels (id, slug, visibility, created_at, owner_did) VALUES (?,?,?,?,?)
+            "INSERT INTO channels (id, slug, visibility, created_at, owner_did, suite)
+             VALUES (?,?,?,?,?,?)
              ON CONFLICT(id) DO UPDATE SET
                 slug = excluded.slug,
                 visibility = excluded.visibility,
                 owner_did = excluded.owner_did",
-            params![c.id, c.slug, c.visibility, c.created_at, c.owner_did],
+            params![
+                c.id,
+                c.slug,
+                c.visibility,
+                c.created_at,
+                c.owner_did,
+                c.suite
+            ],
         )?;
         Ok(())
     }
@@ -691,6 +754,121 @@ impl SqliteStore {
             [channel.id.as_str(), member_did],
         )?;
         Ok(removed > 0)
+    }
+
+    // --- MLS delivery service ---
+
+    /// Record an encrypted channel's epoch-0 public state. Replaces any row
+    /// for the slug: a channel-create that failed after this write leaves a
+    /// row the retry must be able to overwrite, and the `channels` slug check
+    /// has already refused a second live channel.
+    pub fn put_mls_group(&self, g: &StoredMlsGroup) -> Result<()> {
+        self.conn.lock().expect("poisoned").execute(
+            "INSERT OR REPLACE INTO mls_groups (slug, group_id, state, epoch, group_info)
+             VALUES (?,?,?,?,?)",
+            params![g.slug, g.group_id, g.state, g.epoch as i64, g.group_info],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_mls_group(&self, slug: &str) -> Result<Option<StoredMlsGroup>> {
+        let conn = self.conn.lock().expect("poisoned");
+        conn.query_row(
+            "SELECT slug, group_id, state, epoch, group_info FROM mls_groups WHERE slug = ?",
+            [slug],
+            row_to_stored_mls_group,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Advance a channel's MLS state from `from_epoch` — only if it is still
+    /// there. Returns `false` when another commit got in first, which the
+    /// caller reports as a stale epoch. This compare-and-swap is what keeps a
+    /// channel's commit history linear under concurrent submits.
+    pub fn advance_mls_group(
+        &self,
+        slug: &str,
+        from_epoch: u64,
+        state: &[u8],
+        to_epoch: u64,
+        group_info: Option<&[u8]>,
+    ) -> Result<bool> {
+        let changed = self.conn.lock().expect("poisoned").execute(
+            "UPDATE mls_groups
+                SET state = ?3, epoch = ?4, group_info = COALESCE(?5, group_info)
+              WHERE slug = ?1 AND epoch = ?2",
+            params![slug, from_epoch as i64, state, to_epoch as i64, group_info],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Store a validated key package. Returns `false` if this package (by
+    /// reference) was ever stored before, consumed or not.
+    pub fn insert_key_package(
+        &self,
+        reference: &[u8],
+        did: &str,
+        package: &[u8],
+        last_resort: bool,
+        published_at: i64,
+    ) -> Result<bool> {
+        let inserted = self.conn.lock().expect("poisoned").execute(
+            "INSERT OR IGNORE INTO mls_key_packages
+                (reference, did, package, last_resort, published_at)
+             VALUES (?,?,?,?,?)",
+            params![reference, did, package, last_resort, published_at],
+        )?;
+        Ok(inserted > 0)
+    }
+
+    /// Hand out one of `did`'s key packages: the oldest ordinary one, which is
+    /// consumed, or failing that the newest last-resort one, which is not.
+    pub fn take_key_package(&self, did: &str, now: i64) -> Result<Option<Vec<u8>>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let ordinary: Option<(Vec<u8>, Vec<u8>)> = conn
+            .query_row(
+                "SELECT reference, package FROM mls_key_packages
+                  WHERE did = ? AND consumed_at IS NULL AND last_resort = 0
+                  ORDER BY published_at ASC, reference ASC LIMIT 1",
+                [did],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((reference, package)) = ordinary {
+            conn.execute(
+                "UPDATE mls_key_packages SET consumed_at = ? WHERE reference = ?",
+                params![now, reference],
+            )?;
+            return Ok(Some(package));
+        }
+        conn.query_row(
+            "SELECT package FROM mls_key_packages
+              WHERE did = ? AND last_resort = 1
+              ORDER BY published_at DESC, reference DESC LIMIT 1",
+            [did],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// How many ordinary (consumable) key packages `did` has left, and whether
+    /// it has a last-resort one.
+    pub fn key_package_stock(&self, did: &str) -> Result<(u64, bool)> {
+        let conn = self.conn.lock().expect("poisoned");
+        let ordinary: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM mls_key_packages
+              WHERE did = ? AND consumed_at IS NULL AND last_resort = 0",
+            [did],
+            |r| r.get(0),
+        )?;
+        let last_resort: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mls_key_packages WHERE did = ? AND last_resort = 1)",
+            [did],
+            |r| r.get(0),
+        )?;
+        Ok((ordinary as u64, last_resort))
     }
 
     // --- peers ---
@@ -1054,6 +1232,62 @@ mod tests {
             1,
             "pre-existing rows must read as un-archived"
         );
+        assert_eq!(
+            store.list_channels().unwrap()[0].suite,
+            "none",
+            "channels created before v0.2 were unencrypted"
+        );
+    }
+
+    #[test]
+    fn mls_group_advances_only_from_the_epoch_it_is_at() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .put_mls_group(&StoredMlsGroup {
+                slug: "#sealed".to_string(),
+                group_id: b"g".to_vec(),
+                state: b"s0".to_vec(),
+                epoch: 0,
+                group_info: Some(b"i0".to_vec()),
+            })
+            .unwrap();
+        assert!(store.advance_mls_group("#sealed", 0, b"s1", 1, None).unwrap());
+        assert!(
+            !store.advance_mls_group("#sealed", 0, b"sX", 1, None).unwrap(),
+            "a second commit from epoch 0 lost the race"
+        );
+        let g = store.get_mls_group("#sealed").unwrap().unwrap();
+        assert_eq!((g.state.as_slice(), g.epoch), (&b"s1"[..], 1));
+        assert_eq!(g.group_info.as_deref(), Some(&b"i0"[..]), "kept when not replaced");
+        assert!(store.advance_mls_group("#sealed", 1, b"s2", 2, Some(b"i2")).unwrap());
+        assert_eq!(
+            store.get_mls_group("#sealed").unwrap().unwrap().group_info.as_deref(),
+            Some(&b"i2"[..])
+        );
+    }
+
+    #[test]
+    fn key_packages_are_consumed_once_and_last_resort_never() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zBob";
+        assert!(store.insert_key_package(b"r1", did, b"kp1", false, 1).unwrap());
+        assert!(store.insert_key_package(b"r2", did, b"kp2", false, 2).unwrap());
+        assert!(store.insert_key_package(b"lr", did, b"kpL", true, 3).unwrap());
+        assert!(
+            !store.insert_key_package(b"r1", did, b"kp1", false, 9).unwrap(),
+            "a package is stored once"
+        );
+        assert_eq!(store.key_package_stock(did).unwrap(), (2, true));
+        assert_eq!(store.take_key_package(did, 10).unwrap().unwrap(), b"kp1");
+        assert_eq!(store.take_key_package(did, 11).unwrap().unwrap(), b"kp2");
+        assert_eq!(store.take_key_package(did, 12).unwrap().unwrap(), b"kpL");
+        assert_eq!(store.take_key_package(did, 13).unwrap().unwrap(), b"kpL");
+        assert_eq!(store.key_package_stock(did).unwrap(), (0, true));
+        assert!(
+            !store.insert_key_package(b"r1", did, b"kp1", false, 14).unwrap(),
+            "a consumed package cannot be uploaded again"
+        );
+        assert!(store.take_key_package("did:jig:zNobody", 15).unwrap().is_none());
     }
 
     #[test]
@@ -1143,6 +1377,7 @@ mod tests {
             visibility: "open".to_string(),
             created_at: 0,
             owner_did: "did:jig:zOwner".to_string(),
+            suite: "none".to_string(),
         };
         store.upsert_channel(&ch).unwrap();
         let fetched = store.get_channel_by_slug("#hello").unwrap().unwrap();
@@ -1186,6 +1421,7 @@ mod tests {
             visibility: "restricted".into(),
             created_at: 0,
             owner_did: "did:jig:zOwner".into(),
+            suite: "none".to_string(),
         })
         .unwrap();
         s.upsert_membership(&StoredMembership {
@@ -1262,6 +1498,7 @@ mod tests {
             visibility: "open".to_string(),
             created_at: 0,
             owner_did: "did:jig:zOwner".to_string(),
+            suite: "none".to_string(),
         }
     }
 

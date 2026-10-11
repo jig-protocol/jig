@@ -26,6 +26,30 @@ pub enum WriteRefusal {
     /// The sender is neither a member nor the owner of the restricted channel
     /// it tried to post to.
     NotChannelMember { slug: String, sender: String },
+    /// The owner tried to leave. A channel always has its owner; retiring it
+    /// is `channel-archive`.
+    OwnerCannotLeave { slug: String },
+}
+
+/// The membership facts a decision can turn on, resolved by the caller.
+///
+/// A bare `bool` converts to the sender's membership with no target — what
+/// every kind but `member-remove` needs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Membership {
+    /// The sender is a member of the channel.
+    pub sender: bool,
+    /// `member_did` (the member being removed) is a member of the channel.
+    pub target: bool,
+}
+
+impl From<bool> for Membership {
+    fn from(sender: bool) -> Self {
+        Self {
+            sender,
+            target: false,
+        }
+    }
 }
 
 /// Kinds that CHANGE a channel, each with its own rule below. Every other
@@ -37,17 +61,20 @@ fn changes_the_channel(kind: BlockKind) -> bool {
     matches!(
         kind,
         BlockKind::MemberAdd
+            | BlockKind::MemberRemove
             | BlockKind::ChannelPromote
             | BlockKind::ChannelCreate
             | BlockKind::ChannelArchive
     )
 }
 
-/// Whether [`authorize_block`] will need to know if the sender is a member —
-/// so the caller runs the membership query only when the answer can matter:
-/// something going into a restricted channel.
+/// Whether [`authorize_block`] will need to know who is a member — so the
+/// caller runs the membership queries only when the answer can matter:
+/// something going into a restricted channel, or any removal.
 pub fn needs_membership(kind: BlockKind, channel: Option<&StoredChannel>) -> bool {
-    !changes_the_channel(kind) && channel.is_some_and(|c| !is_open(&c.visibility))
+    channel.is_some()
+        && (kind == BlockKind::MemberRemove
+            || (!changes_the_channel(kind) && channel.is_some_and(|c| !is_open(&c.visibility))))
 }
 
 /// Decide whether the block described by `manifest` may be applied to `channel`.
@@ -68,6 +95,12 @@ pub fn needs_membership(kind: BlockKind, channel: Option<&StoredChannel>) -> boo
 ///   effect-layer 500.
 /// - `channel-create` names a channel that does not exist yet; the store's
 ///   unique slug refuses a duplicate.
+/// - `member-remove`: a member may remove **itself** (leave), except the
+///   owner, who archives instead. The owner may remove anyone else. Nobody
+///   removes the owner. On an encrypted channel, any member may also remove
+///   someone who is **no longer** a member: that block only carries the MLS
+///   commit dropping a departed member's leaf, which the departed member
+///   cannot send themselves (RFC 9420 forbids committing your own removal).
 ///
 /// `sender` must be the author DID the signature VERIFIED, in canonical form —
 /// never the spelling the manifest carries, which is the author's choice and
@@ -84,11 +117,13 @@ pub fn authorize_block(
     sender: &str,
     manifest: &BlockManifest,
     channel: Option<&StoredChannel>,
-    sender_is_member: bool,
+    membership: impl Into<Membership>,
 ) -> Result<(), WriteRefusal> {
     let Some(channel) = channel else {
         return Ok(());
     };
+    let membership = membership.into();
+    let sender_is_member = membership.sender;
     let sender = sender.to_string();
 
     match kind {
@@ -102,6 +137,56 @@ pub fn authorize_block(
                 return Ok(());
             }
             require_owner(channel, &sender)
+        }
+        BlockKind::MemberRemove => {
+            let target = manifest
+                .metadata
+                .get("member_did")
+                .and_then(|v| v.as_str())
+                .map(crate::effect::canonical_did_string);
+            // No `member_did` removes nobody; refuse rather than let the
+            // effect layer fail on it.
+            let Some(target) = target else {
+                return Err(WriteRefusal::NotChannelOwner {
+                    slug: channel.slug.clone(),
+                    sender,
+                });
+            };
+            if target == sender {
+                if is_owner(channel, &sender) {
+                    return Err(WriteRefusal::OwnerCannotLeave {
+                        slug: channel.slug.clone(),
+                    });
+                }
+                return if sender_is_member {
+                    Ok(())
+                } else {
+                    Err(WriteRefusal::NotChannelMember {
+                        slug: channel.slug.clone(),
+                        sender,
+                    })
+                };
+            }
+            if is_owner(channel, &target) {
+                return Err(WriteRefusal::NotChannelOwner {
+                    slug: channel.slug.clone(),
+                    sender,
+                });
+            }
+            if is_owner(channel, &sender) {
+                return Ok(());
+            }
+            let tidy_up = !membership.target
+                && sender_is_member
+                && channel.suite == jig_core::EncryptionSuite::Mls.as_str();
+            if tidy_up {
+                Ok(())
+            } else {
+                Err(WriteRefusal::NotChannelOwner {
+                    slug: channel.slug.clone(),
+                    sender,
+                })
+            }
         }
         BlockKind::ChannelPromote | BlockKind::ChannelArchive => require_owner(channel, &sender),
         BlockKind::ChannelCreate => Ok(()),
@@ -153,6 +238,7 @@ mod tests {
             visibility: visibility.to_string(),
             created_at: 0,
             owner_did: OWNER.to_string(),
+            suite: "none".to_string(),
         }
     }
 
@@ -317,6 +403,99 @@ mod tests {
             ),
             Ok(())
         );
+    }
+
+    fn member_remove(sender: &str, member: &str) -> BlockManifest {
+        manifest_with(
+            BlockKind::MemberRemove,
+            sender,
+            json!({"channel": "#room", "member_did": member}),
+        )
+    }
+
+    fn remove(
+        sender: &str,
+        member: &str,
+        chan: &StoredChannel,
+        sender_is_member: bool,
+        target_is_member: bool,
+    ) -> Result<(), WriteRefusal> {
+        authorize_block(
+            BlockKind::MemberRemove,
+            sender,
+            &member_remove(sender, member),
+            Some(chan),
+            Membership {
+                sender: sender_is_member,
+                target: target_is_member,
+            },
+        )
+    }
+
+    const MEMBER: &str = "did:jig:zMember";
+    const OTHER: &str = "did:jig:zOther";
+
+    #[test]
+    fn a_member_may_leave_but_a_stranger_cannot_leave_what_it_never_joined() {
+        let c = channel("restricted");
+        assert_eq!(remove(MEMBER, MEMBER, &c, true, true), Ok(()));
+        assert_eq!(
+            remove(STRANGER, STRANGER, &c, false, false),
+            Err(WriteRefusal::NotChannelMember {
+                slug: "#room".to_string(),
+                sender: STRANGER.to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn the_owner_cannot_leave_or_be_removed() {
+        let c = channel("open");
+        assert_eq!(
+            remove(OWNER, OWNER, &c, true, true),
+            Err(WriteRefusal::OwnerCannotLeave {
+                slug: "#room".to_string()
+            })
+        );
+        assert_eq!(remove(MEMBER, OWNER, &c, true, true), refused(MEMBER));
+    }
+
+    #[test]
+    fn only_the_owner_removes_a_member() {
+        let c = channel("open");
+        assert_eq!(remove(OWNER, MEMBER, &c, true, true), Ok(()));
+        assert_eq!(remove(OTHER, MEMBER, &c, true, true), refused(OTHER));
+        assert_eq!(remove(STRANGER, MEMBER, &c, false, true), refused(STRANGER));
+    }
+
+    /// On an encrypted channel a departed member's leaf has to be removed by
+    /// someone still in the group; any member may send that commit. Never on
+    /// an unencrypted channel, where there is nothing to tidy.
+    #[test]
+    fn any_member_may_tidy_up_a_departed_member_of_an_encrypted_channel() {
+        let mut c = channel("restricted");
+        assert_eq!(remove(OTHER, MEMBER, &c, true, false), refused(OTHER));
+        c.suite = "mls".to_string();
+        assert_eq!(remove(OTHER, MEMBER, &c, true, false), Ok(()));
+        assert_eq!(
+            remove(STRANGER, MEMBER, &c, false, false),
+            refused(STRANGER),
+            "a non-member cannot commit to the group"
+        );
+        assert_eq!(
+            remove(OTHER, MEMBER, &c, true, true),
+            refused(OTHER),
+            "a current member is the owner's call"
+        );
+    }
+
+    #[test]
+    fn member_remove_needs_membership_facts_on_any_channel() {
+        assert!(needs_membership(
+            BlockKind::MemberRemove,
+            Some(&channel("open"))
+        ));
+        assert!(!needs_membership(BlockKind::MemberRemove, None));
     }
 
     /// A channel row with no owner recorded must not match an author-less

@@ -67,11 +67,15 @@ impl Default for ServerSection {
             // opt-in) for v0.0.2 because there's no other way to bootstrap or
             // retire a channel until v0.0.3+ ships Wasm-executed channel ops.
             // channel-archive is owner-gated server-side, so allowing it by
-            // default does not widen who can change what.
+            // default does not widen who can change what. member-remove (kick
+            // and leave) and channel-promote (opening a restricted channel or
+            // DM up) are v0.2 channel dynamics, gated the same way.
             allowed_block_kinds: vec![
                 "text-render".to_string(),
                 "channel-create".to_string(),
                 "member-add".to_string(),
+                "member-remove".to_string(),
+                "channel-promote".to_string(),
                 "channel-archive".to_string(),
             ],
         }
@@ -597,6 +601,8 @@ mod tests {
             "text-render",
             "channel-create",
             "member-add",
+            "member-remove",
+            "channel-promote",
             "channel-archive",
         ] {
             assert!(

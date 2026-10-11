@@ -10,7 +10,13 @@
 //!   catch-all variant, so an unknown suite can never be carried along and
 //!   treated as plaintext by a later step.
 //! - A registered suite this implementation cannot speak parses, then fails
-//!   [`EncryptionSuite::ensure_implemented`]. v0.1 implements only `none`.
+//!   [`EncryptionSuite::ensure_implemented`].
+//!
+//! v0.2 implements `none` and `mls` as **content** suites: what protects a
+//! block's payload, fixed per channel. A wire *frame* is never encrypted as a
+//! unit — it carries blocks, and an encrypted block is encrypted inside its
+//! manifest — so the only frame suite is `none`
+//! ([`EncryptionSuite::ensure_frame_suite`]).
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -19,11 +25,12 @@ use std::str::FromStr;
 /// A registered encryption suite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum EncryptionSuite {
-    /// Content is not encrypted. The only suite v0.1 implements.
+    /// Content is not encrypted. Signatures still apply.
     #[default]
     #[serde(rename = "none")]
     Unencrypted,
-    /// MLS (RFC 9420). Registered as the v0.2 default; not implemented.
+    /// MLS (RFC 9420). One channel is one MLS group; content is an MLS
+    /// `PrivateMessage` the server cannot read.
     #[serde(rename = "mls")]
     Mls,
 }
@@ -41,9 +48,26 @@ impl EncryptionSuite {
         }
     }
 
-    /// Whether this implementation can produce and consume the suite.
+    /// Whether this implementation can carry content under the suite.
     pub const fn is_implemented(self) -> bool {
+        matches!(self, EncryptionSuite::Unencrypted | EncryptionSuite::Mls)
+    }
+
+    /// Whether a wire frame may declare this suite. Frames are never
+    /// encrypted as a unit, so only `none`.
+    pub const fn is_frame_suite(self) -> bool {
         matches!(self, EncryptionSuite::Unencrypted)
+    }
+
+    /// Refuse a suite a wire frame may not declare. A registered content suite
+    /// on a frame is refused the same way as an unimplemented one: reading it
+    /// as `none` is the downgrade the refusal exists to prevent.
+    pub fn ensure_frame_suite(self) -> Result<Self, SuiteNotImplemented> {
+        if self.is_frame_suite() {
+            Ok(self)
+        } else {
+            Err(SuiteNotImplemented(self))
+        }
     }
 
     /// Refuse a registered suite this implementation cannot speak.
@@ -116,11 +140,17 @@ mod tests {
     }
 
     #[test]
-    fn only_none_is_implemented() {
+    fn none_and_mls_are_content_suites() {
         assert_eq!(EncryptionSuite::default(), EncryptionSuite::Unencrypted);
         assert!(EncryptionSuite::Unencrypted.ensure_implemented().is_ok());
+        assert!(EncryptionSuite::Mls.ensure_implemented().is_ok());
+    }
+
+    #[test]
+    fn only_none_is_a_frame_suite() {
+        assert!(EncryptionSuite::Unencrypted.ensure_frame_suite().is_ok());
         assert_eq!(
-            EncryptionSuite::Mls.ensure_implemented(),
+            EncryptionSuite::Mls.ensure_frame_suite(),
             Err(SuiteNotImplemented(EncryptionSuite::Mls))
         );
     }

@@ -121,7 +121,7 @@ fn gate(v: Option<u64>, suite: Option<&str>) -> Result<(), EnvelopeGateError> {
         return Err(EnvelopeGateError::UnsupportedVersion(v));
     }
     if let Some(suite) = suite {
-        suite.parse::<EncryptionSuite>()?.ensure_implemented()?;
+        suite.parse::<EncryptionSuite>()?.ensure_frame_suite()?;
     }
     Ok(())
 }

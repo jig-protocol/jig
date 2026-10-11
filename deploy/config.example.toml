@@ -72,8 +72,10 @@ server_did_keyfile = "/var/lib/jig/server.key"
 # exactly these kinds, and a channel cannot be bootstrapped or retired any
 # other way until v0.0.3+ ships Wasm-executed channel ops. channel-archive is
 # owner-gated against channels.owner_did, so listing it does not let anyone
-# else retire your channels.
-allowed_block_kinds = ["text-render", "channel-create", "member-add", "channel-archive"]
+# else retire your channels. member-remove (`jig channel kick` / `leave`) and
+# channel-promote (`jig channel promote`) are the v0.2 channel dynamics, gated
+# the same way.
+allowed_block_kinds = ["text-render", "channel-create", "member-add", "member-remove", "channel-promote", "channel-archive"]
 
 [identity]
 # tofu = trust the first key seen for a DID and pin it. No nameserver required.

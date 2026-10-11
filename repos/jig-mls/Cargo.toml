@@ -1,0 +1,24 @@
+[package]
+name = "jig-mls"
+version = "0.0.2"
+edition.workspace = true
+authors.workspace = true
+license = "MIT OR Apache-2.0"
+description = "MLS (RFC 9420) for jig-protocol: the server's validating delivery service and the client's group member, over one openmls integration"
+
+[dependencies]
+jig-core = { workspace = true }
+# openmls is the maintained Rust MLS implementation the encryption design names
+# (docs/security/encryption.md). Kept in this one crate so the server's commit
+# validation and the client's group operations cannot disagree about
+# configuration — a wire-format or ciphersuite mismatch between them would
+# present as "every commit is refused" with nothing pointing at the cause.
+openmls = "0.9.1"
+openmls_traits = "0.6"
+openmls_rust_crypto = "0.6"
+openmls_basic_credential = "0.6"
+openmls_memory_storage = "0.6"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }

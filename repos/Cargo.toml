@@ -12,6 +12,7 @@ members = [
     "text-block",
     "jig-pipeline",
     "jig-client",
+    "jig-mls",
     "bridges/*",
 ]
 resolver = "2"
@@ -39,6 +40,7 @@ serde_json = "1.0"
 jig-core = { path = "jig-core", features = ["ed25519"] }
 jig-config = { path = "jig-config" }
 jig-runtime = { path = "jig-runtime" }
+jig-mls = { path = "jig-mls" }
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util"] }
 async-trait = "0.1"
 thiserror = "1.0"

@@ -192,6 +192,27 @@ pub enum IngestError {
         slug: String,
         sender: String,
     },
+    /// The owner tried to leave its own channel; it archives it instead.
+    #[error("the owner cannot leave '{slug}'; archive the channel instead")]
+    OwnerCannotLeave { slug: String },
+    /// A `channel-create` named a suite that is not in the registry.
+    #[error("unknown encryption suite `{suite}`")]
+    UnknownSuite { suite: String },
+    /// The block's encryption suite is not the channel's. Includes plaintext
+    /// into an encrypted channel, which is refused rather than stored.
+    #[error("channel '{slug}' is `{channel}`; a `{block}` block cannot be posted to it")]
+    SuiteMismatch {
+        slug: String,
+        channel: String,
+        block: String,
+    },
+    /// The MLS payload of a block on an encrypted channel failed validation.
+    #[error("MLS payload refused: {detail}")]
+    MlsRejected { detail: String },
+    /// A commit built on an epoch the channel has left — someone else
+    /// committed first. The sender catches up and rebuilds it.
+    #[error("channel '{slug}' is at MLS epoch {current}; this block is for epoch {got}")]
+    StaleEpoch { slug: String, current: u64, got: u64 },
     #[error(transparent)]
     Identity(#[from] crate::identity::IdentityError),
     #[error(transparent)]
@@ -329,21 +350,30 @@ pub async fn ingest(
     // the receipt is built: a block this server will not apply must not carry
     // this server's signature. The membership query runs only when the
     // decision can turn on it (content into a restricted channel).
-    let sender_is_member =
+    let membership =
         if crate::authorize_write::needs_membership(kind, resolved_channel.as_ref()) {
             match channel_slug {
-                Some(slug) => ctx.store.is_member(slug, sender.as_str())?,
-                None => false,
+                Some(slug) => crate::authorize_write::Membership {
+                    sender: ctx.store.is_member(slug, sender.as_str())?,
+                    target: match manifest.metadata.get("member_did").and_then(|v| v.as_str()) {
+                        Some(target) if kind == BlockKind::MemberRemove => ctx.store.is_member(
+                            slug,
+                            &crate::effect::canonical_did_string(target),
+                        )?,
+                        _ => false,
+                    },
+                },
+                None => Default::default(),
             }
         } else {
-            false
+            Default::default()
         };
     if let Err(refusal) = crate::authorize_write::authorize_block(
         kind,
         sender.as_str(),
         &manifest,
         resolved_channel.as_ref(),
-        sender_is_member,
+        membership,
     ) {
         use crate::authorize_write::WriteRefusal;
         // The audit record of what actually happened, independent of what any
@@ -357,6 +387,7 @@ pub async fn ingest(
             WriteRefusal::NotChannelMember { slug, sender } => {
                 IngestError::NotChannelMember { kind, slug, sender }
             }
+            WriteRefusal::OwnerCannotLeave { slug } => IngestError::OwnerCannotLeave { slug },
         });
     }
 
@@ -406,12 +437,70 @@ pub async fn ingest(
             slug: slug.to_string(),
         });
     }
-    let (receipt_bytes, render_hash, is_synthetic) = match kind {
-        BlockKind::TextRender => build_render_receipt(ctx, &manifest, &block_cid, kind_str).await?,
+    // Step 3f: the channel's suite, and on an encrypted channel the MLS
+    // payload. After every authorization gate, so validating a commit is work
+    // done only for a sender who may make the change; before the receipt, so
+    // a refused block never carries this server's signature.
+    let mls_group = match (&resolved_channel, channel_slug) {
+        (Some(chan), Some(slug)) if chan.suite == jig_core::EncryptionSuite::Mls.as_str() => {
+            ctx.store.get_mls_group(slug)?
+        }
+        _ => None,
+    };
+    let mls_plan = crate::mls_gate::plan(
+        kind,
+        &sender.to_did_jig_string(),
+        &manifest,
+        resolved_channel.as_ref(),
+        mls_group.as_ref(),
+    )
+    .map_err(|refusal| suite_refusal(refusal, channel_slug.unwrap_or_default()))?;
+
+    let (receipt_bytes, render_hash, is_synthetic) = match (&mls_plan, kind) {
+        // Ciphertext cannot be executed, and the server does not pretend to.
+        (crate::mls_gate::MlsPlan::Sealed, _) => {
+            build_sealed_receipt(&block_cid, &ctx.server_did, &ctx.server_key)
+        }
+        (_, BlockKind::TextRender) => {
+            build_render_receipt(ctx, &manifest, &block_cid, kind_str).await?
+        }
         _ => build_synth_receipt(&block_cid, &ctx.server_did, &ctx.server_key),
     };
 
-    // Step 5: apply effect (B7 stub returns Ok)
+    // Step 4b: commit the channel's MLS state. Before the effect, so a commit
+    // that lost the race to another one changes nothing at all.
+    match mls_plan {
+        crate::mls_gate::MlsPlan::Genesis(group) => ctx.store.put_mls_group(&group)?,
+        crate::mls_gate::MlsPlan::Advance {
+            slug,
+            from_epoch,
+            state,
+            to_epoch,
+            group_info,
+        } => {
+            if !ctx.store.advance_mls_group(
+                &slug,
+                from_epoch,
+                &state,
+                to_epoch,
+                group_info.as_deref(),
+            )? {
+                let current = ctx
+                    .store
+                    .get_mls_group(&slug)?
+                    .map(|g| g.epoch)
+                    .unwrap_or_default();
+                return Err(IngestError::StaleEpoch {
+                    slug,
+                    current,
+                    got: from_epoch,
+                });
+            }
+        }
+        crate::mls_gate::MlsPlan::Nothing | crate::mls_gate::MlsPlan::Sealed => {}
+    }
+
+    // Step 5: apply effect
     let canonical = bundle_canonical_bytes(bundle.manifest_bytes, bundle.code_bytes)
         .map_err(IngestError::BundleMalformed)?;
     crate::effect::apply_effect(&ctx.store, &bundle, &receipt_bytes, &block_cid).await?;
@@ -491,7 +580,7 @@ pub async fn ingest(
             }
         }
     }
-    let policy = if lookup_failed {
+    let mut policy = if lookup_failed {
         Some(DeliveryPolicy::default())
     } else {
         resolved_channel.as_ref().map(|chan| {
@@ -506,6 +595,18 @@ pub async fn ingest(
             DeliveryPolicy::for_channel(chan, member_dids)
         })
     };
+    // A removed member still receives its own removal: on an encrypted channel
+    // that block carries the commit telling its client the group is gone.
+    if kind == BlockKind::MemberRemove
+        && let (Some(policy), Some(target)) = (
+            policy.as_mut(),
+            manifest.metadata.get("member_did").and_then(|v| v.as_str()),
+        )
+    {
+        policy
+            .member_dids
+            .push(crate::effect::canonical_did_string(target));
+    }
 
     // Step 7: fanout — broadcast policy depends on source
     match source {
@@ -590,9 +691,47 @@ fn requires_existing_channel(kind: BlockKind, source: &IngestSource) -> bool {
         kind,
         BlockKind::TextRender
             | BlockKind::MemberAdd
+            | BlockKind::MemberRemove
             | BlockKind::ChannelPromote
             | BlockKind::ChannelArchive
     )
+}
+
+/// Map a suite-gate refusal onto the typed ingest error every surface
+/// classifies.
+fn suite_refusal(refusal: crate::mls_gate::SuiteRefusal, slug: &str) -> IngestError {
+    use crate::mls_gate::SuiteRefusal;
+    match refusal {
+        SuiteRefusal::UnknownSuite(suite) => IngestError::UnknownSuite { suite },
+        SuiteRefusal::Mismatch {
+            slug,
+            channel,
+            block,
+        } => IngestError::SuiteMismatch {
+            slug,
+            channel,
+            block,
+        },
+        SuiteRefusal::Plaintext { slug } => IngestError::SuiteMismatch {
+            slug,
+            channel: "mls".to_string(),
+            block: "plaintext body".to_string(),
+        },
+        SuiteRefusal::Missing { field } => IngestError::MissingMetadata {
+            kind: "encrypted-channel block".to_string(),
+            field: field.to_string(),
+        },
+        SuiteRefusal::Mls(jig_mls::MlsError::StaleEpoch { current, got }) => {
+            IngestError::StaleEpoch {
+                slug: slug.to_string(),
+                current,
+                got,
+            }
+        }
+        SuiteRefusal::Mls(e) => IngestError::MlsRejected {
+            detail: e.to_string(),
+        },
+    }
 }
 
 // ---- Bundle / manifest helpers --------------------------------------------
@@ -813,6 +952,38 @@ fn build_synth_receipt(
     (bytes, None, true)
 }
 
+/// Build a server-signed receipt for encrypted content.
+///
+/// Attests what the server actually checked — the author's signature, that
+/// the payload is an MLS application message for the channel's group at a
+/// current epoch, and that the block was persisted — and says plainly that
+/// nothing was executed. No `render_hash`: the server never saw the text.
+fn build_sealed_receipt(
+    block_cid: &str,
+    server_did: &Did,
+    server_key: &ed25519_dalek::SigningKey,
+) -> (Vec<u8>, Option<String>, bool) {
+    use ed25519_dalek::Signer;
+
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "v": "0.3-sealed",
+        "block_cid": block_cid,
+        "server_did": server_did.to_string(),
+        "synthetic": true,
+        "content": "sealed",
+        "suite": "mls",
+        "produced_at": chrono::Utc::now().timestamp(),
+    }))
+    .expect("sealed receipt JSON is always valid");
+    let sig = server_key.sign(&canonical);
+    let wrapped = serde_json::json!({
+        "canonical_hex": hex::encode(&canonical),
+        "sig_hex": hex::encode(sig.to_bytes()),
+    });
+    let bytes = serde_json::to_vec(&wrapped).expect("sealed receipt wrap is always valid");
+    (bytes, None, true)
+}
+
 // ---- Tests ----------------------------------------------------------------
 
 #[cfg(test)]
@@ -870,6 +1041,7 @@ mod tests {
                 visibility: "open".into(),
                 created_at: 0,
                 owner_did: owner_did.into(),
+                suite: "none".to_string(),
             })
             .unwrap();
         id
@@ -1157,12 +1329,290 @@ mod tests {
                 IngestError::ManifestGate(jig_core::ManifestGateError::UnsupportedSchema(_)) => {
                     assert!(expect_schema)
                 }
-                IngestError::ManifestGate(jig_core::ManifestGateError::SuiteNotImplemented(_)) => {
-                    assert!(!expect_schema)
-                }
+                // `mls` is a content suite v0.2 carries, so it passes the
+                // manifest gate; with no channel to check it against, the
+                // suite gate refuses it rather than carrying it on trust.
+                IngestError::SuiteMismatch { .. } => assert!(!expect_schema),
                 other => panic!("expected a gate refusal, got {other:?}"),
             }
         }
+    }
+
+    // ---- Encrypted channels ------------------------------------------------
+
+    /// Sign a block with arbitrary metadata and suite, as a client would.
+    fn signed_parts(
+        key: &SigningKey,
+        kind: BlockKind,
+        suite: jig_core::EncryptionSuite,
+        meta: serde_json::Value,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let did = Did::from_ed25519_pubkey(key.verifying_key().as_bytes());
+        let mut builder = BlockManifest::builder()
+            .version(Version::new(0, 1, 0))
+            .author(Author {
+                did,
+                public_key: None,
+                roles: vec![],
+            });
+        if suite != jig_core::EncryptionSuite::Unencrypted {
+            builder = builder.privacy(jig_core::Privacy {
+                encryption: suite,
+                recipients: vec![],
+                metadata_visibility: Default::default(),
+            });
+        }
+        let mut manifest = builder.build().unwrap().with_kind(kind);
+        if let serde_json::Value::Object(map) = meta {
+            manifest.metadata.extend(map);
+        }
+        // A fresh HLC per block, so two blocks with the same payload (a
+        // replayed commit) are different blocks rather than one duplicate.
+        manifest.hlc_ts = Some(jig_core::HlcTimestamp {
+            wall_ms: rand::random::<u32>() as u64,
+            logical: 0,
+            server_did: Did::from_str_unchecked("did:jig:client"),
+        });
+        let manifest_bytes = manifest.to_canonical_bytes().unwrap();
+        let code_bytes: Vec<u8> = vec![];
+        let canonical = serde_json::to_vec(&(&manifest_bytes, &code_bytes)).unwrap();
+        let sig = key.sign(&canonical).to_bytes().to_vec();
+        (manifest_bytes, code_bytes, sig)
+    }
+
+    struct Person {
+        key: SigningKey,
+        did: String,
+        mls: jig_mls::member::Member,
+    }
+
+    fn person() -> Person {
+        let key = random_signing_key();
+        let did = Did::from_ed25519_pubkey(key.verifying_key().as_bytes());
+        let mls = jig_mls::member::Member::new(&key.to_bytes(), &did).unwrap();
+        Person {
+            key,
+            did: did.to_did_jig_string(),
+            mls,
+        }
+    }
+
+    async fn submit(
+        ctx: &IngestContext,
+        who: &Person,
+        kind: BlockKind,
+        suite: jig_core::EncryptionSuite,
+        meta: serde_json::Value,
+    ) -> Result<String, IngestError> {
+        let (mb, cb, sig) = signed_parts(&who.key, kind, suite, meta);
+        do_ingest(ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 }).await
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn all_channel_kinds() -> IngestContext {
+        test_ctx_allowing(&[
+            "text-render",
+            "channel-create",
+            "member-add",
+            "member-remove",
+        ])
+    }
+
+    /// Create `#sealed` owned by `owner` and return its MLS group id.
+    async fn create_sealed(ctx: &IngestContext, owner: &Person) -> Vec<u8> {
+        let created = owner.mls.create_group().unwrap();
+        submit(
+            ctx,
+            owner,
+            BlockKind::ChannelCreate,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"slug": "#sealed", "visibility": "restricted", "suite": "mls",
+                "mls_group_info": b64(&created.group_info),
+                "mls_ratchet_tree": b64(&created.ratchet_tree)}),
+        )
+        .await
+        .unwrap();
+        created.group_id
+    }
+
+    async fn add_to_sealed(
+        ctx: &IngestContext,
+        owner: &Person,
+        who: &Person,
+        gid: &[u8],
+    ) -> jig_mls::member::Commit {
+        let kp = who.mls.key_packages(1, false).unwrap().remove(0);
+        let c = owner.mls.add(gid, &kp, &who.did).unwrap();
+        submit(
+            ctx,
+            owner,
+            BlockKind::MemberAdd,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel": "#sealed", "member_did": who.did,
+                "mls_commit": b64(&c.commit), "mls_welcome": b64(c.welcome.as_ref().unwrap()),
+                "mls_group_info": b64(c.group_info.as_ref().unwrap()), "mls_epoch": c.epoch}),
+        )
+        .await
+        .unwrap();
+        owner.mls.confirm(gid).unwrap();
+        who.mls.join_welcome(c.welcome.as_ref().unwrap()).unwrap();
+        c
+    }
+
+    #[tokio::test]
+    async fn an_encrypted_channel_stores_ciphertext_and_never_executes_it() {
+        let ctx = all_channel_kinds();
+        let alice = person();
+        let bob = person();
+        let gid = create_sealed(&ctx, &alice).await;
+        let chan = ctx.store.get_channel_by_slug("#sealed").unwrap().unwrap();
+        assert_eq!(chan.suite, "mls");
+        assert_eq!(ctx.store.get_mls_group("#sealed").unwrap().unwrap().epoch, 0);
+
+        add_to_sealed(&ctx, &alice, &bob, &gid).await;
+        assert!(ctx.store.is_member("#sealed", &bob.did).unwrap());
+        assert_eq!(ctx.store.get_mls_group("#sealed").unwrap().unwrap().epoch, 1);
+
+        let (msg, _) = alice.mls.encrypt(&gid, b"the plan").unwrap();
+        let cid = submit(
+            &ctx,
+            &alice,
+            BlockKind::TextRender,
+            jig_core::EncryptionSuite::Mls,
+            serde_json::json!({"channel": "#sealed", "mls_message": b64(&msg)}),
+        )
+        .await
+        .unwrap();
+        let stored = ctx.store.get_block(&cid).unwrap().unwrap();
+        assert!(
+            !String::from_utf8_lossy(&stored.bundle_bytes).contains("the plan"),
+            "the server stores no plaintext"
+        );
+        let receipt = ctx.store.get_receipts_for_block(&cid).unwrap().remove(0);
+        assert_eq!(receipt.render_hash, None, "nothing was executed");
+        assert!(String::from_utf8_lossy(&receipt.receipt_bytes).contains(&hex::encode("sealed")));
+        // Bob reads what the server cannot.
+        let (_, bundle_msg) = (stored, msg);
+        assert_eq!(
+            bob.mls.decrypt(&gid, &bundle_msg).unwrap().plaintext,
+            b"the plan"
+        );
+
+        let plaintext = submit(
+            &ctx,
+            &alice,
+            BlockKind::TextRender,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel": "#sealed", "body": "in the clear"}),
+        )
+        .await;
+        assert!(
+            matches!(plaintext, Err(IngestError::SuiteMismatch { .. })),
+            "{plaintext:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commit_built_on_a_passed_epoch_is_stale() {
+        let ctx = all_channel_kinds();
+        let alice = person();
+        let bob = person();
+        let carol = person();
+        let gid = create_sealed(&ctx, &alice).await;
+        let kp = bob.mls.key_packages(1, false).unwrap().remove(0);
+        let c = alice.mls.add(&gid, &kp, &bob.did).unwrap();
+        let meta = serde_json::json!({"channel": "#sealed", "member_did": bob.did,
+            "mls_commit": b64(&c.commit), "mls_welcome": b64(c.welcome.as_ref().unwrap())});
+        submit(&ctx, &alice, BlockKind::MemberAdd, jig_core::EncryptionSuite::Unencrypted, meta.clone())
+            .await
+            .unwrap();
+        let replay = submit(&ctx, &alice, BlockKind::MemberAdd, jig_core::EncryptionSuite::Unencrypted, meta).await;
+        assert!(
+            matches!(replay, Err(IngestError::StaleEpoch { current: 1, got: 0, .. })),
+            "{replay:?}"
+        );
+        // An add that names someone other than whom the commit adds.
+        alice.mls.confirm(&gid).unwrap();
+        let kp = carol.mls.key_packages(1, false).unwrap().remove(0);
+        let c = alice.mls.add(&gid, &kp, &carol.did).unwrap();
+        let lie = submit(
+            &ctx,
+            &alice,
+            BlockKind::MemberAdd,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel": "#sealed", "member_did": bob.did,
+                "mls_commit": b64(&c.commit), "mls_welcome": b64(c.welcome.as_ref().unwrap())}),
+        )
+        .await;
+        assert!(matches!(lie, Err(IngestError::MlsRejected { .. })), "{lie:?}");
+        assert!(!ctx.store.is_member("#sealed", &carol.did).unwrap());
+    }
+
+    #[tokio::test]
+    async fn leaving_drops_membership_and_a_member_commits_the_removal() {
+        let ctx = all_channel_kinds();
+        let alice = person();
+        let bob = person();
+        let carol = person();
+        let gid = create_sealed(&ctx, &alice).await;
+        add_to_sealed(&ctx, &alice, &bob, &gid).await;
+        let carol_added = add_to_sealed(&ctx, &alice, &carol, &gid).await;
+        // Bob catches up on Carol's add, as his client would from history.
+        bob.mls.apply_commit(&gid, &carol_added.commit).unwrap();
+        assert_eq!(ctx.store.get_mls_group("#sealed").unwrap().unwrap().epoch, 2);
+
+        // Carol leaves: no commit, membership gone at once.
+        submit(
+            &ctx,
+            &carol,
+            BlockKind::MemberRemove,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel": "#sealed", "member_did": carol.did}),
+        )
+        .await
+        .unwrap();
+        assert!(!ctx.store.is_member("#sealed", &carol.did).unwrap());
+
+        // Bob — not the owner — commits her leaf out.
+        let c = bob.mls.remove(&gid, &carol.did).unwrap();
+        submit(
+            &ctx,
+            &bob,
+            BlockKind::MemberRemove,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel": "#sealed", "member_did": carol.did,
+                "mls_commit": b64(&c.commit)}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ctx.store.get_mls_group("#sealed").unwrap().unwrap().epoch, 3);
+
+        // But Bob may not kick a current member, and the owner may not leave.
+        bob.mls.confirm(&gid).unwrap();
+        let c = bob.mls.remove(&gid, &alice.did).unwrap();
+        let kick = submit(
+            &ctx,
+            &bob,
+            BlockKind::MemberRemove,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel": "#sealed", "member_did": alice.did,
+                "mls_commit": b64(&c.commit)}),
+        )
+        .await;
+        assert!(matches!(kick, Err(IngestError::NotChannelOwner { .. })), "{kick:?}");
+        let leave = submit(
+            &ctx,
+            &alice,
+            BlockKind::MemberRemove,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel": "#sealed", "member_did": alice.did}),
+        )
+        .await;
+        assert!(matches!(leave, Err(IngestError::OwnerCannotLeave { .. })), "{leave:?}");
     }
 
     // ---- Channel-existence guard -----------------------------------------
@@ -1560,6 +2010,7 @@ mod tests {
                 visibility: "restricted".into(),
                 created_at: 0,
                 owner_did: bob_did.clone(),
+                suite: "none".to_string(),
             })
             .unwrap();
         for did in [bob_did.clone(), shadow.clone()] {
@@ -1616,6 +2067,7 @@ mod tests {
                 visibility: "restricted".into(),
                 created_at: 0,
                 owner_did: bob_did.clone(),
+                suite: "none".to_string(),
             })
             .unwrap();
         // Memberships are keyed by the CID, not the slug.

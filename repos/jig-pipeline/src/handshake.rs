@@ -267,7 +267,8 @@ impl PendingHello {
     }
 }
 
-/// Suites this implementation can actually speak. MLS is registered and omitted.
+/// Content suites this implementation can carry: what a channel may be
+/// created under. v0.2 advertises `none` and `mls`.
 pub fn implemented_suite_names() -> Vec<String> {
     EncryptionSuite::REGISTERED
         .iter()
@@ -320,13 +321,14 @@ pub fn negotiate(
         )));
     }
     let suites = implemented_suite_names();
-    let overlap = hello
-        .suites
-        .iter()
-        .any(|offered| suites.iter().any(|spoken| spoken == offered));
-    if !overlap {
+    // Frames themselves are always `none` (an encrypted block is encrypted
+    // inside its manifest), so the offer must include it. A client offering
+    // only `mls` is asking for frame-level encryption nobody implements, and
+    // answering it under `none` would put the welcome outside its offer.
+    let frame_suite = EncryptionSuite::Unencrypted.as_str();
+    if !hello.suites.iter().any(|offered| offered == frame_suite) {
         return Err(HelloRefusal::UnsupportedSuite(format!(
-            "server implements {}",
+            "frames are carried under `{frame_suite}`; server implements {}",
             suites.join(", ")
         )));
     }
@@ -564,7 +566,11 @@ mod tests {
         match pending.interpret(&text) {
             HandshakeResult::Established(verified) => {
                 assert_eq!(verified.version, ENVELOPE_VERSION);
-                assert_eq!(verified.suites, vec!["none".to_string()]);
+                // v0.2 hosts encrypted channels; frames stay `none`.
+                assert_eq!(
+                    verified.suites,
+                    vec!["none".to_string(), "mls".to_string()]
+                );
                 assert!(verified.reputation.is_null());
                 assert_eq!(
                     verified.capabilities.block_kinds,
