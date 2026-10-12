@@ -36,11 +36,11 @@ futures = "0.3"
 rusqlite = { workspace = true }
 
 # Web framework
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.8", features = ["ws"] }
 # tower 0.5 to match the dev-deps entry below; having both 0.4 and 0.5 in the
 # same crate confuses rustc's crate resolution (E0464 multiple candidates).
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -51,7 +51,7 @@ cid.workspace = true
 
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 
 # Logging
 tracing = "0.1"
@@ -59,7 +59,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Configuration
 clap = { version = "4.4", features = ["derive"] }
-toml = "0.8"
+toml = "0.9"
 
 # Time
 chrono = "0.4"
@@ -71,7 +71,7 @@ uuid = { version = "1.6", features = ["v7", "serde"] }
 # Federation
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
-base64 = "0.21"
+base64 = "0.23"
 blake3 = { workspace = true }
 hex = { workspace = true }
 futures-util = "0.3"
@@ -103,13 +103,13 @@ rustls = { version = "0.23", default-features = false, features = [
     "tls12",
 ] }
 rustls-pki-types = "1.0"
-dashmap = "5"
-jsonwebtoken = "10"
-wasmtime = { version = "48.0.5", features = ["async"] }
+dashmap = "6"
+jsonwebtoken = "11"
+wasmtime = { version = "49.0.2", features = ["async"] }
 
 # Capability enforcement (Phase 1)
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 
 # Async traits (used by v0.0.2 bridge trait impls)
 async-trait = "0.1"
@@ -131,7 +131,7 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 
 [dev-dependencies]
 tempfile = "3.8"
-rcgen = "0.13"
+rcgen = "0.14"
 
 [features]
 default = ["sqlite"]

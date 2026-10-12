@@ -33,12 +33,12 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 url = "2"
-dirs = "5"
+dirs = "6"
 # No `rand` dependency, deliberately. Identity keygen goes through
 # `jig_core::crypto::ed25519::generate_signing_key`, and this crate previously
 # minted long-lived keyfiles from its own `rand::rng()`. Leaving the dep out
 # makes that regression a compile error rather than a review catch.
-base64 = "0.22"
+base64 = "0.23"
 semver = { version = "1.0", features = ["serde"] }
 
 [dev-dependencies]
