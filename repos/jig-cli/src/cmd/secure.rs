@@ -13,7 +13,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use jig_client::blocks::BuiltBlock;
 use jig_client::open::open;
 use jig_client::read_auth::{ReadProof, signable_path};
-use jig_client::secure::{Seen, Session, replay_order};
+use jig_client::secure::{CommitLock, Seen, Session, replay_order};
 use jig_client::{DeliveredBlock, Identity};
 use jig_mls::member::Commit;
 use serde::Deserialize;
@@ -96,9 +96,6 @@ pub struct Secure {
     server: String,
     /// The same server as an `http(s)://` base for REST.
     base: String,
-    /// One commit in flight at a time: a second, prepared while the first
-    /// waits on the server, would find it pending and drop it.
-    committing: tokio::sync::Mutex<()>,
 }
 
 impl Secure {
@@ -111,12 +108,23 @@ impl Secure {
             identity: ctx.identity()?,
             base: base_http_url(&server),
             server,
-            committing: tokio::sync::Mutex::new(()),
         })
     }
 
     pub fn server(&self) -> &str {
         &self.server
+    }
+
+    /// Wait for the channel's commit lock, in this process or any other for
+    /// this DID ([`Session::commit_lock`]). Hold it from before a commit,
+    /// create or join is prepared until its outcome is settled.
+    pub async fn hold(&self, slug: &str) -> Result<CommitLock> {
+        let session = Arc::clone(&self.session);
+        let (server, slug) = (self.server.clone(), slug.to_string());
+        tokio::task::spawn_blocking(move || session.commit_lock(&server, &slug))
+            .await
+            .context("waiting for the channel's commit lock")?
+            .context("taking the channel's commit lock")
     }
 
     pub fn identity(&self) -> &Identity {
@@ -333,7 +341,7 @@ impl Secure {
         prepare: impl Fn(&Session) -> Result<Commit>,
         block_for: impl Fn(&Commit) -> BuiltBlock,
     ) -> Result<String> {
-        let _one_at_a_time = self.committing.lock().await;
+        let _held = self.hold(slug).await?;
         for attempt in 0..2 {
             self.sync(slug).await?;
             // Still pending after a sync: an earlier commit whose answer never
