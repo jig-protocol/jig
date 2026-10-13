@@ -100,7 +100,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
     );
 
     // 3. Persist nickname + DID binding to ~/.jig/cli.toml.
-    let nickname = args.nickname.clone().unwrap_or_else(whoami::username);
+    let nickname = args.nickname.clone().unwrap_or_else(crate::config::os_username);
     write_cli_config(&id, &nickname, &cfg_path, args.server_url.as_deref())?;
     println!("wrote {} (nickname: {nickname})", cfg_path.display());
 

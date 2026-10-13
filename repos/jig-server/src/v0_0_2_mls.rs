@@ -239,12 +239,12 @@ pub async fn group_info(
 pub fn build_mls_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/v1/mls/key-packages", post(publish_key_packages))
-        .route("/api/v1/mls/key-packages/:did", get(take_key_package))
+        .route("/api/v1/mls/key-packages/{did}", get(take_key_package))
         .route(
-            "/api/v1/mls/key-packages/:did/stock",
+            "/api/v1/mls/key-packages/{did}/stock",
             get(key_package_stock),
         )
-        .route("/api/v1/channels/:slug/mls/group-info", get(group_info))
+        .route("/api/v1/channels/{slug}/mls/group-info", get(group_info))
         .with_state(state)
 }
 

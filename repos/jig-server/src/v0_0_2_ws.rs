@@ -307,7 +307,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, conn_id: u64
                 let Ok(json) = serde_json::to_string(&frame) else {
                     continue;
                 };
-                if socket.send(Message::Text(json)).await.is_err() {
+                if socket.send(Message::Text(json.into())).await.is_err() {
                     break;
                 }
             }
@@ -656,7 +656,7 @@ async fn handle_client_frame(
                     let Ok(json) = serde_json::to_string(&ack) else {
                         return Ok(());
                     };
-                    let _ = socket.send(Message::Text(json)).await;
+                    let _ = socket.send(Message::Text(json.into())).await;
                 }
                 // One classifier for every surface. `v0_0_2_ingest_error.rs`
                 // exists because two HTTP surfaces once drifted apart on the
@@ -712,7 +712,7 @@ async fn complete_hello(
             let welcome = jig_pipeline::handshake::seal(&state.ingest_ctx.server_key, statement);
             let json = serde_json::to_string(&welcome).map_err(|err| err.to_string())?;
             socket
-                .send(Message::Text(json))
+                .send(Message::Text(json.into()))
                 .await
                 .map_err(|err| err.to_string())?;
             *handshaken = true;
@@ -800,7 +800,7 @@ async fn send_error(
         message: message.to_string(),
     });
     let json = serde_json::to_string(&frame).map_err(axum::Error::new)?;
-    socket.send(Message::Text(json)).await
+    socket.send(Message::Text(json.into())).await
 }
 
 // ---- Tests -----------------------------------------------------------------
