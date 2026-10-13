@@ -137,7 +137,9 @@ used (forward secrecy), so a message decrypts exactly once, and a sender can nev
 its own ciphertext. The client therefore keeps a local plaintext cache keyed by block CID,
 written when it sends or first decrypts. History replays read from it. MLS state and the
 cache live under `~/.jig/mls/<did>/`, `0700`, guarded by an exclusive file lock so `jig chat`
-and `jig send` cannot fork the group state.
+and `jig send` cannot fork the group state. A commit (and an encrypted create or join) also
+holds a per-channel lock from prepare to confirm, so two processes for one DID cannot
+interleave commits on a channel.
 
 ---
 

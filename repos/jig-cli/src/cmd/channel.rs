@@ -216,8 +216,11 @@ pub(crate) async fn create_with(
 
     // An encrypted channel is one MLS group, started here with the creator
     // alone in it; its epoch-0 public state rides the creation block.
-    let secure = if encrypted {
+    let (secure, _held) = if encrypted {
         let secure = Secure::open(ctx)?;
+        // Held until the create is settled, so a second `create` racing this
+        // one cannot discard the group this one is about to publish.
+        let held = secure.hold(slug).await?;
         if secure.session.has_group(secure.server(), slug)? {
             if secure.channel(slug).await?.is_some() {
                 if exist_ok {
@@ -241,9 +244,9 @@ pub(crate) async fn create_with(
         if let Err(e) = secure.ensure_key_packages().await {
             eprintln!("warning: MLS key packages not published: {e:#}");
         }
-        Some(secure)
+        (Some(secure), Some(held))
     } else {
-        None
+        (None, None)
     };
     let block = build_with_metadata(&id, BlockKind::ChannelCreate, hlc, meta);
 
@@ -536,6 +539,7 @@ async fn join_encrypted(ctx: &CliContext, secure: &Secure, slug: &str) -> Result
     let id = secure.identity();
     let me = id.did_string();
     let server = secure.server().to_string();
+    let _held = secure.hold(slug).await?;
     // A join whose answer never came may have landed: then the group held
     // here is the one that works, and joining again would replace it.
     if secure.session.has_group(&server, slug)? && member_role(secure, slug, &me).await?.is_some() {
