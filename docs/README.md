@@ -12,6 +12,7 @@ should not be read as a status page.
 | Get the box first, on GCP | [`docs/deployment/gcp-vps-runbook.md`](deployment/gcp-vps-runbook.md) |
 | Know what actually works today | the STATUS section of [`internal-dogfood-3day.md`](deployment/internal-dogfood-3day.md) |
 | Know what is left before a public release | [`RELEASE_READINESS.md`](RELEASE_READINESS.md) |
+| See where the project is headed, phase by phase | [`ROADMAP.md`](ROADMAP.md) |
 | See end-to-end encryption work, on a throwaway server | [`scripts/demo-e2ee.sh`](../scripts/demo-e2ee.sh) |
 | Understand why something was built the way it was | [`docs/superpowers/`](superpowers/) |
 
