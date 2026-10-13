@@ -56,8 +56,8 @@ pub fn build_router(state: AppState) -> Router {
         router = router
             .route("/blocks", get(list_blocks))
             .route("/blocks", post(ingest_block))
-            .route("/blocks/:cid", get(get_block))
-            .route("/receipts/:cid", get(get_receipt));
+            .route("/blocks/{cid}", get(get_block))
+            .route("/receipts/{cid}", get(get_receipt));
     }
 
     router.with_state(state).layer(http_trace_layer())

@@ -288,8 +288,8 @@ pub async fn archive_channel(
 pub fn build_channel_ops_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/v1/channels", post(create_channel))
-        .route("/api/v1/channels/:slug/members", post(add_member))
-        .route("/api/v1/channels/:slug/archive", post(archive_channel))
+        .route("/api/v1/channels/{slug}/members", post(add_member))
+        .route("/api/v1/channels/{slug}/archive", post(archive_channel))
         .with_state(state)
 }
 
@@ -298,9 +298,9 @@ pub fn build_channel_ops_router(state: Arc<AppState>) -> Router {
 pub fn build_admin_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/_admin_v0_0_2/channels", post(create_channel))
-        .route("/_admin_v0_0_2/channels/:slug/members", post(add_member))
+        .route("/_admin_v0_0_2/channels/{slug}/members", post(add_member))
         .route(
-            "/_admin_v0_0_2/channels/:slug/archive",
+            "/_admin_v0_0_2/channels/{slug}/archive",
             post(archive_channel),
         )
         .with_state(state)

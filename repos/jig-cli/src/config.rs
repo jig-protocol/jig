@@ -47,8 +47,8 @@ impl Default for Config {
                 nameserver_url: None,
             },
             user: UserSection {
-                did: format!("did:jig:{}", whoami::username()),
-                display_name: whoami::username(),
+                did: format!("did:jig:{}", os_username()),
+                display_name: os_username(),
                 default_channel: "#general".to_string(),
             },
             contacts: BTreeMap::new(),
@@ -61,6 +61,12 @@ impl Default for Config {
 ///
 /// Blank inputs are ignored: an empty name renders as an empty sender
 /// column, which is worse than the truncated DID it would replace.
+/// The OS account name, the default nickname. `whoami` can fail to read it
+/// (no passwd entry in a minimal container); fall back to a fixed name.
+pub fn os_username() -> String {
+    whoami::username().unwrap_or_else(|_| "user".to_string())
+}
+
 pub fn remember_contact(cfg: &mut Config, did: &str, display_name: &str) {
     let did = did.trim();
     let name = display_name.trim();

@@ -129,7 +129,7 @@ impl NamesStorage for PostgresStorage {
         .bind(handle_str)
         .bind(key_bytes)
         .bind(&record.display_name)
-        .bind(&record.updated_at)
+        .bind(record.updated_at)
         .execute(&self.pool)
         .await
         .map_err(|e| NameServerError::Other(anyhow::anyhow!("Failed to upsert identity: {}", e)))?;
@@ -182,8 +182,8 @@ impl NamesStorage for PostgresStorage {
         .bind(&alias.alias)
         .bind(&alias.scope)
         .bind(subject_handle)
-        .bind(&alias.issued_at)
-        .bind(&alias.expires_at)
+        .bind(alias.issued_at)
+        .bind(alias.expires_at)
         .execute(&self.pool)
         .await
         .map_err(|e| NameServerError::Other(anyhow::anyhow!("Failed to put alias: {}", e)))?;
@@ -214,7 +214,7 @@ impl NamesStorage for PostgresStorage {
     async fn reap_expired(&self) -> Result<()> {
         let now = chrono::Utc::now();
         sqlx::query("DELETE FROM aliases WHERE expires_at < $1")
-            .bind(&now)
+            .bind(now)
             .execute(&self.pool)
             .await
             .map_err(|e| {
@@ -237,8 +237,8 @@ impl NamesStorage for PostgresStorage {
         .bind(subject_handle)
         .bind(&ch.scope)
         .bind(ch.difficulty as i16)
-        .bind(&ch.issued_at)
-        .bind(&ch.expires_at)
+        .bind(ch.issued_at)
+        .bind(ch.expires_at)
         .bind(ch.used)
         .execute(&self.pool)
         .await
