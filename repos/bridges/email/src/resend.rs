@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use axum::http::HeaderMap;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 use crate::provider::{

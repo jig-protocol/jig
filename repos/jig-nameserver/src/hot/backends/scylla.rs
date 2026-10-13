@@ -22,7 +22,9 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 
 #[cfg(feature = "tier3-hot")]
-use scylla::{Session, SessionBuilder};
+use scylla::client::session::Session;
+#[cfg(feature = "tier3-hot")]
+use scylla::client::session_builder::SessionBuilder;
 
 #[cfg(feature = "tier3-hot")]
 /// ScyllaDB hot backend - uses scylla-rust-driver
@@ -313,11 +315,11 @@ impl HotBackend for ScyllaHot {
 
         let mut map = HashMap::new();
 
-        let mut rows_iter = rows_result.rows::<(String, Vec<u8>)>().map_err(|e| {
+        let rows_iter = rows_result.rows::<(String, Vec<u8>)>().map_err(|e| {
             NameServerError::Other(anyhow::anyhow!("Failed to create rows iterator: {}", e))
         })?;
 
-        while let Some(row_result) = rows_iter.next() {
+        for row_result in rows_iter {
             let (field, value) = row_result.map_err(|e| {
                 NameServerError::Other(anyhow::anyhow!("Failed to parse hash row: {}", e))
             })?;

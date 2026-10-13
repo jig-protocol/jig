@@ -53,7 +53,7 @@ pub enum DeterminismViolation {
     MemoryMissingMaximum,
     Memory64NotSupported,
     SharedMemoryNotSupported,
-    TableMaximumExceedsLimit { declared: u32, limit: u32 },
+    TableMaximumExceedsLimit { declared: u64, limit: u32 },
     TableMissingMaximum,
 }
 
@@ -336,7 +336,7 @@ pub fn verify_determinism(
 
         match payload {
             Payload::ImportSection(reader) => {
-                for import in reader {
+                for import in reader.into_imports() {
                     let import = import
                         .map_err(|e| JigError::Validation(format!("import section error: {e}")))?;
 
@@ -548,7 +548,7 @@ fn check_table_type(
     }
 
     if let (Some(limit), Some(max)) = (policy.max_table_elements, table.maximum)
-        && max > limit
+        && max > u64::from(limit)
     {
         report
             .violations

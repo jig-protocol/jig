@@ -45,7 +45,7 @@ async fn spawn_one_shot_tls_server() -> u16 {
     let cert =
         generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen self-signed cert");
     let cert_der = CertificateDer::from(cert.cert.der().to_vec());
-    let key_pkcs8 = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let key_pkcs8 = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
     let key_der: PrivateKeyDer<'static> = PrivateKeyDer::Pkcs8(key_pkcs8);
 
     // 2. rustls server config that presents that cert.
