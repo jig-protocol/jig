@@ -642,31 +642,50 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Whether `blocks` — a channel's history from some point up to now — reach
 /// back far enough for a member to follow every commit since.
 ///
-/// A member at `epoch` needs the commit built on that epoch and every one
-/// after. Commits and messages are ordered by epoch, so once the history holds
-/// any MLS data at or below `epoch`, everything this member is missing is
-/// newer and already in hand. A member with no group yet (`epoch` is `None`)
-/// needs the welcome that adds `me`. The channel's creation block is the start
-/// of history: there is nothing further back to fetch.
+/// A member at epoch `e` needs every commit from the one built on `e` to the
+/// newest epoch the history shows. History is ordered by the HLC each author
+/// stamped, not by epoch, so one block at or below `e` proves nothing: a
+/// commit whose author's clock runs slow can sort behind messages sent after
+/// it. The chain itself is the test — a commit built on each epoch from `e` up
+/// to the newest. A member with no group yet (`epoch` is `None`) starts from
+/// the welcome that adds `me`. The channel's creation block is the start of
+/// history: there is nothing further back to fetch.
 pub fn history_reaches(blocks: &[OpenedBlock], epoch: Option<u64>, me: &str) -> bool {
-    blocks.iter().any(|b| {
-        if b.manifest.kind == Some(BlockKind::ChannelCreate) {
-            return true;
-        }
-        let Some(epoch) = epoch else {
-            return b.manifest.kind == Some(BlockKind::MemberAdd)
+    if blocks
+        .iter()
+        .any(|b| b.manifest.kind == Some(BlockKind::ChannelCreate))
+    {
+        return true;
+    }
+    let epoch_in = |b: &OpenedBlock, field| {
+        b.meta_str(field)
+            .and_then(|s| STANDARD.decode(s).ok())
+            .and_then(|bytes| jig_mls::member::message_epoch(&bytes))
+    };
+    let mut commits = std::collections::HashSet::new();
+    let mut newest = None;
+    let mut welcomed_at = None;
+    for b in blocks {
+        if let Some(e) = epoch_in(b, "mls_commit") {
+            commits.insert(e);
+            newest = newest.max(Some(e + 1));
+            let welcomes_me = b.manifest.kind == Some(BlockKind::MemberAdd)
                 && b.meta_str("mls_welcome").is_some()
                 && b.meta_str("member_did")
                     .map(jig_pipeline::effect::canonical_did_string)
                     .is_some_and(|d| d == me);
-        };
-        ["mls_commit", "mls_message"].iter().any(|field| {
-            b.meta_str(field)
-                .and_then(|s| STANDARD.decode(s).ok())
-                .and_then(|bytes| jig_mls::member::message_epoch(&bytes))
-                .is_some_and(|e| e <= epoch)
-        })
-    })
+            if welcomes_me {
+                welcomed_at = welcomed_at.max(Some(e + 1));
+            }
+        }
+        if let Some(e) = epoch_in(b, "mls_message") {
+            newest = newest.max(Some(e));
+        }
+    }
+    let Some(from) = epoch.or(welcomed_at) else {
+        return false;
+    };
+    (from..newest.unwrap_or(from)).all(|e| commits.contains(&e))
 }
 
 /// Order a channel's history for an MLS member.
@@ -998,15 +1017,30 @@ mod tests {
             "missing the commit that left epoch 1"
         );
         assert!(history_reaches(
-            &[m1, add_carol.clone(), m2.clone()],
+            &[m1.clone(), add_carol.clone(), m2.clone()],
             Some(1),
             alice.did()
         ));
 
+        // A slow clock put the commit that left epoch 1 behind a message sent
+        // after it: holding a message at epoch 1 is not enough.
+        assert!(
+            !history_reaches(&[m1.clone(), m2.clone()], Some(1), alice.did()),
+            "the commit at 1 is still missing"
+        );
+
         // Not in the group yet: the welcome that adds us is what is needed.
         assert!(history_reaches(&tail, None, carol.did()));
         assert!(!history_reaches(&tail, None, bob.did()));
-        assert!(history_reaches(&[add_bob], None, bob.did()));
+        assert!(history_reaches(
+            std::slice::from_ref(&add_bob),
+            None,
+            bob.did()
+        ));
+        assert!(
+            !history_reaches(&[add_bob, m2], None, bob.did()),
+            "welcomed at 1, but the commit at 1 is missing"
+        );
     }
 
     #[test]

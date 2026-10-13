@@ -613,3 +613,73 @@ async fn a_member_away_for_more_than_a_page_catches_up_by_paging_back() {
     assert_eq!(read.len(), PAGE + 5, "every message decrypts");
     assert_eq!(read.last().map(String::as_str), Some("m104"));
 }
+
+#[tokio::test]
+async fn a_commit_stamped_by_a_slow_clock_is_still_found() {
+    const PAGE: usize = 100;
+    let server = TestJigServer::start_with_full_kinds().await.unwrap();
+    let api = Api { server: &server };
+    let root = tempfile::tempdir().unwrap();
+    let alice = Person::new(root.path());
+    let bob = Person::new(root.path());
+    let carol = Person::new(root.path());
+    let slug = "#skew";
+    let host = server.http_url();
+    for p in [&bob, &carol] {
+        api.publish_key_packages(p).await;
+    }
+    create_encrypted(&api, &alice, slug, "restricted").await;
+    add(&api, &alice, slug, &bob).await;
+    catch_up(&api, &bob, slug).await;
+    let bobs_epoch = bob.session.epoch(&host, slug).unwrap();
+
+    // A page of messages in bob's epoch, then carol's addition from a clock an
+    // hour slow — so it sorts behind all of them — then a few messages after.
+    for i in 0..PAGE {
+        say(&api, &alice, slug, &format!("before {i}")).await;
+    }
+    let kp = api.key_package(&alice.id, &carol.did()).await;
+    let c = alice
+        .session
+        .prepare_add(&host, slug, &kp, &carol.did())
+        .unwrap();
+    let mut slow = alice.hlc();
+    slow.wall_ms -= 3_600_000;
+    let block = build_with_metadata(
+        &alice.id,
+        BlockKind::MemberAdd,
+        slow,
+        with(
+            json!({"channel": slug, "member_did": carol.did()}),
+            mls_meta(&c),
+        ),
+    );
+    let (status, body) = api.submit(&block).await;
+    assert_eq!(status, 200, "{body}");
+    alice.session.confirm(&host, slug).unwrap();
+    for i in 0..5 {
+        say(&api, &alice, slug, &format!("after {i}")).await;
+    }
+
+    // The newest page holds messages from bob's own epoch, but not the commit
+    // that ended it: that is not enough.
+    let opened =
+        |blocks: &[DeliveredBlock]| -> Vec<_> { blocks.iter().map(|b| open(b).unwrap()).collect() };
+    let (_, newest) = api.history_page(&bob.id, slug, PAGE, None).await;
+    assert!(!history_reaches(&opened(&newest), bobs_epoch, &bob.did()));
+
+    let before = open(&newest[0]).unwrap().cid;
+    let (_, mut history) = api.history_page(&bob.id, slug, 200, Some(&before)).await;
+    history.extend(newest);
+    let history = opened(&history);
+    assert!(history_reaches(&history, bobs_epoch, &bob.did()));
+    let seen: Vec<Seen> = replay_order(history)
+        .iter()
+        .map(|o| bob.session.observe(&host, o))
+        .collect();
+    assert_eq!(
+        texts(&seen).last().map(String::as_str),
+        Some("after 4"),
+        "bob follows the slow commit and reads what came after it"
+    );
+}
