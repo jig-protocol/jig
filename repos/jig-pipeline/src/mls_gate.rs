@@ -103,7 +103,10 @@ pub fn plan(
         require_plaintext_block(manifest, block_suite)?;
         let suite = requested_suite(manifest)?;
         let slug = meta_str(manifest, "slug").unwrap_or_default().to_string();
-        if slug.starts_with(jig_core::dm::DM_PREFIX) {
+        // The email bridge opens plaintext `#dm/` channels for mail threads
+        // under its own derivation, naming no peer; those pass.
+        let is_dm = suite == EncryptionSuite::Mls || manifest.metadata.contains_key("dm_peer");
+        if slug.starts_with(jig_core::dm::DM_PREFIX) && is_dm {
             check_dm_create(sender, manifest, &slug, suite)?;
         }
         if suite != EncryptionSuite::Mls {
@@ -259,11 +262,16 @@ fn require_plaintext_block(
     }
 }
 
-/// A `#dm/` slug belongs to the pair whose DIDs derive it
+/// An encrypted `#dm/` slug belongs to the pair whose DIDs derive it
 /// ([`jig_core::dm::dm_slug`]). Only one of the two may create it, and only as
 /// what a DM is: restricted and encrypted. Otherwise anyone could take a
 /// pair's slug first, and since the client refuses a DM channel with anyone
 /// else in it, the two could then never DM on this server.
+///
+/// Plaintext `#dm/` creates that name no peer are the email bridge's and are
+/// not checked, so a plaintext squat on a pair's slug still blocks `jig dm`
+/// between them (the client refuses an unencrypted DM). Closing that needs
+/// the bridge's threads under their own prefix.
 fn check_dm_create(
     sender: &str,
     manifest: &BlockManifest,
@@ -495,10 +503,21 @@ mod tests {
         let mut plain = with_peer(&b.did);
         plain["suite"] = "none".into();
         assert!(refused(create(&a, plain)));
-        // No peer named at all.
+        // Encrypted, but no peer named.
         assert_eq!(
             create(&a, dm.clone()),
             Err(SuiteRefusal::Missing { field: "dm_peer" })
+        );
+        // The email bridge's plaintext thread channel: no peer, no suite.
+        let bridge = manifest(
+            BlockKind::ChannelCreate,
+            &m.did,
+            EncryptionSuite::Unencrypted,
+            json!({"slug": "#dm/0011223344556677", "visibility": "restricted"}),
+        );
+        assert_eq!(
+            plan(BlockKind::ChannelCreate, &m.did, &bridge, None, None),
+            Ok(MlsPlan::Nothing)
         );
     }
 
