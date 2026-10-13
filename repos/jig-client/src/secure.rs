@@ -171,6 +171,17 @@ impl Session {
         self.with_member(|m, g| Ok(group_of(g, &key).is_some_and(|gid| m.has_group(&gid))))
     }
 
+    /// This device's epoch in the channel's group; `None` with no group here.
+    pub fn epoch(&self, server: &str, slug: &str) -> Result<Option<u64>> {
+        let key = group_key(server, slug);
+        self.with_member(
+            |m, g| match group_of(g, &key).filter(|gid| m.has_group(gid)) {
+                Some(gid) => Ok(Some(m.epoch(&gid)?)),
+                None => Ok(None),
+            },
+        )
+    }
+
     /// DIDs in this device's copy of the channel's tree.
     pub fn group_members(&self, server: &str, slug: &str) -> Result<Vec<String>> {
         let key = group_key(server, slug);
@@ -628,6 +639,36 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::rename(&tmp, path).map_err(io)
 }
 
+/// Whether `blocks` — a channel's history from some point up to now — reach
+/// back far enough for a member to follow every commit since.
+///
+/// A member at `epoch` needs the commit built on that epoch and every one
+/// after. Commits and messages are ordered by epoch, so once the history holds
+/// any MLS data at or below `epoch`, everything this member is missing is
+/// newer and already in hand. A member with no group yet (`epoch` is `None`)
+/// needs the welcome that adds `me`. The channel's creation block is the start
+/// of history: there is nothing further back to fetch.
+pub fn history_reaches(blocks: &[OpenedBlock], epoch: Option<u64>, me: &str) -> bool {
+    blocks.iter().any(|b| {
+        if b.manifest.kind == Some(BlockKind::ChannelCreate) {
+            return true;
+        }
+        let Some(epoch) = epoch else {
+            return b.manifest.kind == Some(BlockKind::MemberAdd)
+                && b.meta_str("mls_welcome").is_some()
+                && b.meta_str("member_did")
+                    .map(jig_pipeline::effect::canonical_did_string)
+                    .is_some_and(|d| d == me);
+        };
+        ["mls_commit", "mls_message"].iter().any(|field| {
+            b.meta_str(field)
+                .and_then(|s| STANDARD.decode(s).ok())
+                .and_then(|bytes| jig_mls::member::message_epoch(&bytes))
+                .is_some_and(|e| e <= epoch)
+        })
+    })
+}
+
 /// Order a channel's history for an MLS member.
 ///
 /// History comes back in the order of each block's HLC, which its *author*
@@ -933,6 +974,39 @@ mod tests {
             ordered,
             vec![add_bob.cid(), m1.cid(), add_carol.cid(), m2.cid()]
         );
+    }
+
+    #[test]
+    fn history_reaches_back_to_this_members_epoch() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        let carol = session(root.path());
+        alice.create_group(SERVER, "#sealed").unwrap();
+        let add_bob = deliver(&add_block(&alice, "#sealed", &bob)); // commit at 0
+        let m1 = deliver(&say(&alice, "#sealed", "one")); // epoch 1
+        let add_carol = deliver(&add_block(&alice, "#sealed", &carol)); // commit at 1
+        let m2 = deliver(&say(&alice, "#sealed", "two")); // epoch 2
+
+        let tail = [add_carol.clone(), m2.clone()];
+        assert!(
+            history_reaches(&tail, Some(1), alice.did()),
+            "has the commit at 1"
+        );
+        assert!(
+            !history_reaches(std::slice::from_ref(&m2), Some(1), alice.did()),
+            "missing the commit that left epoch 1"
+        );
+        assert!(history_reaches(
+            &[m1, add_carol.clone(), m2.clone()],
+            Some(1),
+            alice.did()
+        ));
+
+        // Not in the group yet: the welcome that adds us is what is needed.
+        assert!(history_reaches(&tail, None, carol.did()));
+        assert!(!history_reaches(&tail, None, bob.did()));
+        assert!(history_reaches(&[add_bob], None, bob.did()));
     }
 
     #[test]

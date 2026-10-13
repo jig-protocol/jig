@@ -13,7 +13,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use jig_client::blocks::BuiltBlock;
 use jig_client::open::open;
 use jig_client::read_auth::{ReadProof, signable_path};
-use jig_client::secure::{Seen, Session, replay_order};
+use jig_client::secure::{Seen, Session, history_reaches, replay_order};
 use jig_client::{DeliveredBlock, Identity};
 use jig_mls::member::Commit;
 use serde::Deserialize;
@@ -23,6 +23,11 @@ use crate::cmd::blocks_decode::{DecodedBlock, present};
 use crate::cmd::channel::{base_http_url, escape_slug_for_url};
 use crate::cmd::common::CliContext;
 use crate::cmd::history::{DEFAULT_HISTORY_LIMIT, history_url, parse_history};
+
+/// The most a server returns per history request.
+const MAX_HISTORY_PAGE: usize = 200;
+/// Pages of older history to fetch before giving up on catching up.
+const MAX_CATCH_UP_PAGES: usize = 50;
 
 /// Packages a DID keeps published, so it can be added while offline.
 const KEY_PACKAGE_TARGET: u64 = 10;
@@ -261,12 +266,55 @@ impl Secure {
     /// Replay the channel's history through the session: join from a
     /// welcome, follow commits, read messages. Run before building a commit
     /// so it is built on the channel's current epoch.
+    ///
+    /// The newest page usually holds everything this device is missing. When
+    /// it has been away for longer — more than a page of blocks, commits among
+    /// them — older pages are fetched until history reaches back to this
+    /// device's epoch ([`history_reaches`]), or to the start of the channel.
     pub async fn sync(&self, slug: &str) -> Result<Synced> {
-        let url = history_url(&self.server, slug, DEFAULT_HISTORY_LIMIT);
+        let mut delivered = self.history_page(slug, DEFAULT_HISTORY_LIMIT, None).await?;
+        let mut more = delivered.len() >= DEFAULT_HISTORY_LIMIT;
+        let epoch = self.session.epoch(&self.server, slug)?;
+        let me = self.session.did().to_string();
+        let mut pages = 1;
+        while more && !history_reaches(&opened(&delivered), epoch, &me) {
+            if pages == MAX_CATCH_UP_PAGES {
+                eprintln!(
+                    "warning: {slug} has moved on more than {} blocks since this device \
+                     last followed it; ask its owner to re-add you",
+                    pages * MAX_HISTORY_PAGE
+                );
+                break;
+            }
+            let Some(oldest) = delivered.first().and_then(|d| open(d).ok()) else {
+                break;
+            };
+            let mut older = self
+                .history_page(slug, MAX_HISTORY_PAGE, Some(&oldest.cid))
+                .await?;
+            more = older.len() >= MAX_HISTORY_PAGE;
+            older.append(&mut delivered);
+            delivered = older;
+            pages += 1;
+        }
+        Ok(self.replay(&delivered))
+    }
+
+    /// One page of the channel's history, oldest first: the newest `limit`
+    /// blocks, or those just older than the block `before`.
+    async fn history_page(
+        &self,
+        slug: &str,
+        limit: usize,
+        before: Option<&str>,
+    ) -> Result<Vec<DeliveredBlock>> {
+        let mut url = history_url(&self.server, slug, limit);
+        if let Some(cid) = before {
+            url.push_str(&format!("&before={cid}"));
+        }
         let path = url.strip_prefix(&self.base).unwrap_or(&url).to_string();
         let body: serde_json::Value = self.get_json(&path).await?;
-        let delivered = parse_history(&body.to_string())?;
-        Ok(self.replay(&delivered))
+        parse_history(&body.to_string())
     }
 
     /// [`Secure::sync`] over blocks already fetched.
@@ -422,6 +470,11 @@ impl Secure {
             .remember(&block.cid(), self.session.did(), text)?;
         self.submit(&block).await
     }
+}
+
+/// The blocks that open; the rest are dropped (and reported) by `replay`.
+fn opened(delivered: &[DeliveredBlock]) -> Vec<jig_client::open::OpenedBlock> {
+    delivered.iter().filter_map(|d| open(d).ok()).collect()
 }
 
 /// The MLS fields a commit-carrying block adds to its metadata.

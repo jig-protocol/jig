@@ -549,6 +549,52 @@ impl SqliteStore {
         Ok(blocks)
     }
 
+    /// The newest `limit` blocks of `slug` strictly older than the block
+    /// `before`, oldest first: one page further back than a window that starts
+    /// at `before`. `None` when `before` is not a block of `slug` — whether it
+    /// is unknown or belongs to another channel, so a caller cannot use the
+    /// cursor to learn where a CID lives.
+    ///
+    /// Older and newer are history order — (HLC wall, logical, origin) — the
+    /// same order [`Self::list_blocks_by_channel`] returns, so pages join up
+    /// with no gap and no overlap.
+    pub fn list_blocks_before(
+        &self,
+        slug: &str,
+        limit: usize,
+        before: &str,
+    ) -> Result<Option<Vec<StoredBlock>>> {
+        let Some(cursor) = self.get_block(before)? else {
+            return Ok(None);
+        };
+        if cursor.channel_id.as_deref() != Some(slug) {
+            return Ok(None);
+        }
+        let limit = limit.min(MAX_HISTORY_LIMIT) as i64;
+        let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {BLOCK_COLUMNS} FROM blocks \
+             WHERE channel_id = ?1 \
+               AND (hlc_wall_ms, hlc_logical, hlc_origin) < (?2, ?3, ?4) \
+             ORDER BY hlc_wall_ms DESC, hlc_logical DESC, hlc_origin DESC \
+             LIMIT ?5"
+        ))?;
+        let mut newest_first = stmt
+            .query_map(
+                params![
+                    slug,
+                    cursor.hlc_wall_ms as i64,
+                    cursor.hlc_logical as i64,
+                    cursor.hlc_origin,
+                    limit
+                ],
+                row_to_stored_block,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        newest_first.reverse();
+        Ok(Some(newest_first))
+    }
+
     // --- receipts ---
 
     pub fn insert_receipt(&self, r: &StoredReceipt) -> Result<()> {
@@ -2103,6 +2149,26 @@ mod tests {
             .map(|b| b.cid)
             .collect();
         assert_eq!(cids, vec!["bafy_h2", "bafy_h3"], "cursor is exclusive");
+    }
+
+    #[test]
+    fn list_blocks_before_pages_backwards_without_gaps_or_overlap() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        seed_two_channel_timeline(&store);
+        let page = |before: &str, limit| -> Option<Vec<String>> {
+            store
+                .list_blocks_before("#hello", limit, before)
+                .unwrap()
+                .map(|blocks| blocks.into_iter().map(|b| b.cid).collect())
+        };
+        assert_eq!(page("bafy_h3", 1), Some(vec!["bafy_h2".to_string()]));
+        assert_eq!(
+            page("bafy_h3", 50),
+            Some(vec!["bafy_h1".to_string(), "bafy_h2".to_string()])
+        );
+        assert_eq!(page("bafy_h1", 50), Some(vec![]), "the start of history");
+        assert_eq!(page("bafy_o2", 50), None, "another channel's block");
+        assert_eq!(page("bafy_nope", 50), None, "an unknown block");
     }
 
     #[test]

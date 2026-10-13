@@ -289,7 +289,8 @@ jig tail --channel '#hello'    # backfills the last 100 blocks, then follows
 Under the hood that is `GET /api/v1/channels/%23hello/blocks?limit=100` with
 five `x-jig-*` headers carrying an ed25519 proof over the request (see
 `jig_client::ReadProof`). Blocks come back oldest-first as a JSON array
-(`bundle_b64`, `receipts`, `delivery_cid`). A restricted channel you are not
+(`bundle_b64`, `receipts`, `delivery_cid`); add `&before=<block cid>` for the page
+just older than that block. A restricted channel you are not
 a member of is `403 NOT_A_MEMBER`; a channel with no local row (federated, or
 mistyped) is `200` with `[]`. `limit` defaults to and is clamped at **200**.
 
