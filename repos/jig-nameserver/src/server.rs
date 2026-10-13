@@ -93,7 +93,10 @@ pub fn app_router(state: AppState) -> Router {
             "/v1/tribunal/cases/{id}/decision",
             post(record_tribunal_decision),
         )
-        .route("/v1/tribunal/blocks/{cid}", get(get_tribunal_decision_block)) // Phase C
+        .route(
+            "/v1/tribunal/blocks/{cid}",
+            get(get_tribunal_decision_block),
+        ) // Phase C
         .route("/v1/work/enqueue", post(enqueue_useful_work))
         .route("/v1/work/assign", post(claim_useful_work))
         .route("/v1/work/{id}/result", post(submit_useful_work_result))
