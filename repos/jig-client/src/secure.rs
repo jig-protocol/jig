@@ -20,7 +20,8 @@
 //! `jig chat` and `jig send` can run for the same DID at once. Every operation
 //! takes an exclusive lock on the directory, loads the state, applies itself
 //! and saves, so two processes never fork a group by each advancing a stale
-//! copy of it.
+//! copy of it. A commit spans several operations and a network round trip, so
+//! it also holds a per-channel commit lock throughout ([`Session::commit_lock`]).
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -96,6 +97,10 @@ struct Read {
     sender: String,
     text: String,
 }
+
+/// A channel's commit lock, held until dropped. See [`Session::commit_lock`].
+#[derive(Debug)]
+pub struct CommitLock(#[allow(dead_code)] File);
 
 /// One DID's MLS state on this device.
 pub struct Session {
@@ -566,6 +571,50 @@ impl Session {
             &serde_json::to_vec_pretty(&groups).expect("groups serialize"),
         )?;
         out
+    }
+
+    /// Hold the channel's commit lock until the returned guard drops.
+    ///
+    /// A commit is a round trip: prepare it here, submit it, then confirm or
+    /// abandon it on the answer. Each step locks the state only for itself,
+    /// so two processes for this DID could otherwise interleave — one drops
+    /// as stale a commit the other is still waiting on, the server takes it
+    /// anyway, and this device is left an epoch behind for good, since MLS
+    /// never applies a member's own commit from the wire. Hold this across the
+    /// whole trip. Blocks until it is free.
+    pub fn commit_lock(&self, server: &str, slug: &str) -> Result<CommitLock> {
+        let (path, f) = self.commit_lock_file(server, slug)?;
+        f.lock()
+            .map_err(|source| SecureError::Io { path, source })?;
+        Ok(CommitLock(f))
+    }
+
+    /// [`Session::commit_lock`] without waiting: `None` while another holder
+    /// has it.
+    pub fn try_commit_lock(&self, server: &str, slug: &str) -> Result<Option<CommitLock>> {
+        let (path, f) = self.commit_lock_file(server, slug)?;
+        match f.try_lock() {
+            Ok(()) => Ok(Some(CommitLock(f))),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(source)) => Err(SecureError::Io { path, source }),
+        }
+    }
+
+    fn commit_lock_file(&self, server: &str, slug: &str) -> Result<(PathBuf, File)> {
+        // One file per channel, named by a hash: the key holds a URL and a
+        // slug, neither of which is a safe file name.
+        let name = blake3::hash(group_key(server, slug).as_bytes()).to_hex();
+        let path = self.dir.join(format!("commit-{}.lock", &name[..16]));
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|source| SecureError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        Ok((path, f))
     }
 
     fn lock(&self) -> Result<File> {
@@ -1041,6 +1090,29 @@ mod tests {
             !history_reaches(&[add_bob, m2], None, bob.did()),
             "welcomed at 1, but the commit at 1 is missing"
         );
+    }
+
+    #[test]
+    fn one_commit_at_a_time_per_channel_across_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let first = session(root.path());
+        // A second process for the same DID: same directory, its own handles.
+        let second = Session::open(
+            root.path(),
+            Identity::from_signing_key(ed25519_dalek::SigningKey::from_bytes(
+                &first.identity.signing_bytes_for_test(),
+            )),
+        )
+        .unwrap();
+
+        let held = first.commit_lock(SERVER, "#a").unwrap();
+        assert!(second.try_commit_lock(SERVER, "#a").unwrap().is_none());
+        assert!(
+            second.try_commit_lock(SERVER, "#b").unwrap().is_some(),
+            "another channel is not held up"
+        );
+        drop(held);
+        assert!(second.try_commit_lock(SERVER, "#a").unwrap().is_some());
     }
 
     #[test]
