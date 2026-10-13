@@ -68,7 +68,7 @@ loopback and private tailnets.
 | Channel create / join / list / delete; add, kick, leave, promote, members | Works. Blocks are signature-verified and owner/membership-gated at ingest, on `/api/v1/*` with no `[debug]` flag |
 | End-to-end encrypted channels (`--encrypted`) and DMs (`jig dm`) | Works on one server: MLS (RFC 9420, `openmls`), the DID's key is the MLS signing key, the server validates commits and stores ciphertext only ([spec](repos/jig-spec/src/encryption.md), [`scripts/demo-e2ee.sh`](scripts/demo-e2ee.sh)). Not federated; one device per DID |
 | Clients verify every delivered block's author signature | Works: a block a server altered is refused, not shown |
-| History backfill on joining a channel (the client asks for the last 100 blocks; the server caps a request at 200) | Works. On an encrypted channel, only messages sent after you joined decrypt |
+| History backfill on joining a channel (the client asks for the last 100 blocks; the server caps a request at 200; `?before=<cid>` pages further back) | Works. On an encrypted channel, only messages sent after you joined decrypt; a member who was away pages back to where it left off |
 | `GET /api/v1/channels/:slug/blocks`, `/healthz`, `/metrics` | Works |
 | Nameserver: alias register / resolve / rotate / renew | Works (`jig-nameserver`, `jig ns …`) |
 | Server-to-server federation over WSS | Implemented for open, unencrypted channels and covered by [`h3_federation.rs`](repos/integration-tests/tests/h3_federation.rs); never run between two hosts on the public internet |

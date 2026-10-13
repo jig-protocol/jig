@@ -16,7 +16,7 @@ use integration_tests::harness::*;
 use jig_client::blocks::{BuiltBlock, build_member_remove, build_sealed_text, build_with_metadata};
 use jig_client::open::open;
 use jig_client::read_auth::{ReadProof, signable_path};
-use jig_client::secure::{Seen, Session};
+use jig_client::secure::{Seen, Session, history_reaches, replay_order};
 use jig_client::{DeliveredBlock, Identity};
 use jig_core::{BlockKind, HlcTimestamp};
 use jig_mls::member::Commit;
@@ -122,6 +122,24 @@ impl Api<'_> {
             Vec::new()
         };
         (status, blocks)
+    }
+
+    /// One page of history: the newest `limit` blocks, or those just older
+    /// than the block `before`.
+    async fn history_page(
+        &self,
+        who: &Identity,
+        slug: &str,
+        limit: usize,
+        before: Option<&str>,
+    ) -> (u16, Vec<DeliveredBlock>) {
+        let mut path = format!("/api/v1/channels/{}/blocks?limit={limit}", enc(slug));
+        if let Some(cid) = before {
+            path.push_str(&format!("&before={cid}"));
+        }
+        let (status, body) = self.get(who, &path).await;
+        assert_eq!(status, 200, "{body}");
+        (status, serde_json::from_value(body).unwrap())
     }
 }
 
@@ -543,5 +561,125 @@ async fn racing_commits_land_one_at_a_time() {
         members["members"].as_array().unwrap().len(),
         2,
         "owner + bob only"
+    );
+}
+
+#[tokio::test]
+async fn a_member_away_for_more_than_a_page_catches_up_by_paging_back() {
+    const PAGE: usize = 100;
+    let server = TestJigServer::start_with_full_kinds().await.unwrap();
+    let api = Api { server: &server };
+    let root = tempfile::tempdir().unwrap();
+    let alice = Person::new(root.path());
+    let bob = Person::new(root.path());
+    let carol = Person::new(root.path());
+    let slug = "#away";
+    let host = server.http_url();
+    for p in [&bob, &carol] {
+        api.publish_key_packages(p).await;
+    }
+    create_encrypted(&api, &alice, slug, "restricted").await;
+    add(&api, &alice, slug, &bob).await;
+    catch_up(&api, &bob, slug).await;
+    let bobs_epoch = bob.session.epoch(&host, slug).unwrap();
+    assert!(bobs_epoch.is_some(), "bob joined");
+
+    // While bob is away, carol is added — a commit bob must follow — and then
+    // more than a page of messages pushes that commit out of the newest page.
+    add(&api, &alice, slug, &carol).await;
+    for i in 0..PAGE + 5 {
+        say(&api, &alice, slug, &format!("m{i}")).await;
+    }
+    let opened =
+        |blocks: &[DeliveredBlock]| -> Vec<_> { blocks.iter().map(|b| open(b).unwrap()).collect() };
+
+    let (_, newest) = api.history_page(&bob.id, slug, PAGE, None).await;
+    assert!(
+        !history_reaches(&opened(&newest), bobs_epoch, &bob.did()),
+        "the newest page alone misses the commit that added carol"
+    );
+
+    let before = open(&newest[0]).unwrap().cid;
+    let (_, mut history) = api.history_page(&bob.id, slug, 200, Some(&before)).await;
+    history.extend(newest);
+    let history = opened(&history);
+    assert!(history_reaches(&history, bobs_epoch, &bob.did()));
+
+    let seen: Vec<Seen> = replay_order(history)
+        .iter()
+        .map(|o| bob.session.observe(&host, o))
+        .collect();
+    let read = texts(&seen);
+    assert_eq!(read.len(), PAGE + 5, "every message decrypts");
+    assert_eq!(read.last().map(String::as_str), Some("m104"));
+}
+
+#[tokio::test]
+async fn a_commit_stamped_by_a_slow_clock_is_still_found() {
+    const PAGE: usize = 100;
+    let server = TestJigServer::start_with_full_kinds().await.unwrap();
+    let api = Api { server: &server };
+    let root = tempfile::tempdir().unwrap();
+    let alice = Person::new(root.path());
+    let bob = Person::new(root.path());
+    let carol = Person::new(root.path());
+    let slug = "#skew";
+    let host = server.http_url();
+    for p in [&bob, &carol] {
+        api.publish_key_packages(p).await;
+    }
+    create_encrypted(&api, &alice, slug, "restricted").await;
+    add(&api, &alice, slug, &bob).await;
+    catch_up(&api, &bob, slug).await;
+    let bobs_epoch = bob.session.epoch(&host, slug).unwrap();
+
+    // A page of messages in bob's epoch, then carol's addition from a clock an
+    // hour slow — so it sorts behind all of them — then a few messages after.
+    for i in 0..PAGE {
+        say(&api, &alice, slug, &format!("before {i}")).await;
+    }
+    let kp = api.key_package(&alice.id, &carol.did()).await;
+    let c = alice
+        .session
+        .prepare_add(&host, slug, &kp, &carol.did())
+        .unwrap();
+    let mut slow = alice.hlc();
+    slow.wall_ms -= 3_600_000;
+    let block = build_with_metadata(
+        &alice.id,
+        BlockKind::MemberAdd,
+        slow,
+        with(
+            json!({"channel": slug, "member_did": carol.did()}),
+            mls_meta(&c),
+        ),
+    );
+    let (status, body) = api.submit(&block).await;
+    assert_eq!(status, 200, "{body}");
+    alice.session.confirm(&host, slug).unwrap();
+    for i in 0..5 {
+        say(&api, &alice, slug, &format!("after {i}")).await;
+    }
+
+    // The newest page holds messages from bob's own epoch, but not the commit
+    // that ended it: that is not enough.
+    let opened =
+        |blocks: &[DeliveredBlock]| -> Vec<_> { blocks.iter().map(|b| open(b).unwrap()).collect() };
+    let (_, newest) = api.history_page(&bob.id, slug, PAGE, None).await;
+    assert!(!history_reaches(&opened(&newest), bobs_epoch, &bob.did()));
+
+    let before = open(&newest[0]).unwrap().cid;
+    let (_, mut history) = api.history_page(&bob.id, slug, 200, Some(&before)).await;
+    history.extend(newest);
+    let history = opened(&history);
+    assert!(history_reaches(&history, bobs_epoch, &bob.did()));
+    let seen: Vec<Seen> = replay_order(history)
+        .iter()
+        .map(|o| bob.session.observe(&host, o))
+        .collect();
+    assert_eq!(
+        texts(&seen).last().map(String::as_str),
+        Some("after 4"),
+        "bob follows the slow commit and reads what came after it"
     );
 }

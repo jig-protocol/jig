@@ -256,7 +256,6 @@ Errors I reproduced while writing this guide, unless marked otherwise.
 | `Connection refused (os error 61)` | Something is listening at that address but not jig, or nothing is. Usually a wrong URL or port. | Check `jig server set` used the exact URL above. |
 | Any error mentioning `127.0.0.1:7117` | You never ran `jig server set`, so jig is still looking for a server on your own laptop. | Run the `jig server set` command. |
 | `zsh: killed: ./jig`, or the command produces no output at all | macOS quarantine on a binary DJ sent you. | `xattr -d com.apple.quarantine ./jig` |
-| `404 Not Found for url (.../blocks?limit=50)` | You ran `jig read`. It is broken. | Use `jig chat` or `jig tail`. |
 | `cli config already exists at ~/.jig/cli.toml. Pass --force to overwrite.` | You ran `jig init` a second time. It is refusing to throw away your existing key. | Nothing — you are already set up. Only use `--force` if you genuinely want a brand-new identity. |
 | Nothing happens. `jig send` prints an ID, nobody replies. | **Most likely a typo in the channel name.** jig does not check that a channel exists — it happily accepts messages into `#gigeu` and nobody is watching there. | `jig channel list` and copy the name exactly. |
 | Tailscale is running and approved, but jig hangs then times out | Not reproduced — inferred. Probably the server itself is down. | Ask DJ; `curl https://jig-vps.<tailnet>.ts.net:7117/healthz` should print `ok`. |

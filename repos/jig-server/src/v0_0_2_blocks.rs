@@ -342,6 +342,9 @@ pub struct HistoryQuery {
     /// Omitted means "as much as the store will give" — the store clamps to
     /// `MAX_HISTORY_LIMIT` either way, so this is never unbounded.
     pub limit: Option<usize>,
+    /// A block CID: return the page of blocks just older than it, for paging
+    /// back through history. Omitted means the newest page.
+    pub before: Option<String>,
 }
 
 /// One entry of a channel timeline.
@@ -527,9 +530,22 @@ pub async fn get_channel_history(
         authorize_channel_read(&state, &slug, caller, started)?;
     }
 
-    let blocks = store
-        .list_blocks_by_channel(&slug, query.limit.unwrap_or(MAX_HISTORY_LIMIT), None)
-        .map_err(persist_err)?;
+    let limit = query.limit.unwrap_or(MAX_HISTORY_LIMIT);
+    let blocks = match query.before.as_deref() {
+        None => store
+            .list_blocks_by_channel(&slug, limit, None)
+            .map_err(persist_err)?,
+        Some(before) => store
+            .list_blocks_before(&slug, limit, before)
+            .map_err(persist_err)?
+            .ok_or_else(|| {
+                err(
+                    StatusCode::BAD_REQUEST,
+                    "BAD_CURSOR",
+                    format!("`before` is not a block of {slug}"),
+                )
+            })?,
+    };
 
     let mut timeline = Vec::with_capacity(blocks.len());
     for block in blocks {
@@ -1011,6 +1027,55 @@ mod tests {
             .map(|b| text_of(b["bundle_b64"].as_str().unwrap()))
             .collect();
         assert_eq!(texts, vec!["b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn channel_history_pages_back_from_a_before_cursor() {
+        let state = Arc::new(unauthenticated_state());
+        let router = build_blocks_router(state.clone());
+        let id = test_identity();
+        submit_texts(&state, &router, &id, "#hello", &["a", "b", "c"]).await;
+        submit_texts(&state, &router, &id, "#other", &["elsewhere"]).await;
+
+        let page = |body: &serde_json::Value| -> Vec<String> {
+            body.as_array()
+                .unwrap()
+                .iter()
+                .map(|b| text_of(b["bundle_b64"].as_str().unwrap()))
+                .collect()
+        };
+        let (_, newest) =
+            get_path(router.clone(), "/api/v1/channels/%23hello/blocks?limit=1").await;
+        assert_eq!(page(&newest), vec!["c"]);
+        let cid_of = |b: &serde_json::Value| {
+            b["delivery_cid"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("delivery:")
+                .to_string()
+        };
+        let c = cid_of(&newest[0]);
+
+        let (status, older) = get_path(
+            router.clone(),
+            &format!("/api/v1/channels/%23hello/blocks?limit=5&before={c}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page(&older), vec!["a", "b"]);
+
+        // A cursor from another channel is refused, the same as an unknown one.
+        let (_, other) = get_path(router.clone(), "/api/v1/channels/%23other/blocks").await;
+        let foreign = cid_of(&other[0]);
+        for cursor in [foreign.as_str(), "bafy-unknown"] {
+            let (status, body) = get_path(
+                router.clone(),
+                &format!("/api/v1/channels/%23hello/blocks?before={cursor}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["code"], "BAD_CURSOR");
+        }
     }
 
     #[tokio::test]

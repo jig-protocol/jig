@@ -178,9 +178,9 @@ scheme, so one block had two identities.
 
 ## Known limitations
 
-- History backfill: the client asks for the last 100 blocks, and the server caps any request
-  at 200. A client offline across more than 100 blocks that include commits cannot catch up
-  and must be re-added.
+- History catch-up: the client reads the newest 100 blocks, and a member who has been away
+  longer pages back (`?before=<cid>`, up to 200 blocks a page) until history reaches its
+  epoch. Past 50 pages — 10,000 blocks — it gives up and must be re-added.
 - Key-package exhaustion: anyone admitted can fetch (and so consume) a DID's key packages.
   The last-resort package keeps the DID reachable; rate limiting is the admission work's.
 - Decision 4's window.

@@ -169,26 +169,42 @@ fn row_to_stored_block(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredBlock> {
 /// so the `EXPLAIN QUERY PLAN` test asserts against the exact SQL that runs
 /// and cannot drift away from it.
 ///
-/// Both variants are shaped to ride the `blocks_channel_hlc` index end to end:
-/// equality on the leading `channel_id`, then an ordered walk of the trailing
-/// HLC columns (backwards for the no-cursor case) so SQLite never materialises
-/// a sort.
+/// Both variants are shaped to ride the `blocks_channel_hlc_cid` index end to
+/// end: equality on the leading `channel_id`, then an ordered walk of the
+/// trailing columns (backwards for the no-cursor case) so SQLite never
+/// materialises a sort.
+///
+/// History order is (HLC wall, logical, origin, CID). The CID makes it total:
+/// one author's blocks in the same millisecond share the rest, and without it
+/// a page boundary between two of them could skip one.
 fn history_sql(with_cursor: bool) -> String {
     if with_cursor {
         format!(
             "SELECT {BLOCK_COLUMNS} FROM blocks \
              WHERE channel_id = ?1 AND (hlc_wall_ms, hlc_logical) > (?2, ?3) \
-             ORDER BY hlc_wall_ms ASC, hlc_logical ASC, hlc_origin ASC \
+             ORDER BY hlc_wall_ms ASC, hlc_logical ASC, hlc_origin ASC, cid ASC \
              LIMIT ?4"
         )
     } else {
         format!(
             "SELECT {BLOCK_COLUMNS} FROM blocks \
              WHERE channel_id = ?1 \
-             ORDER BY hlc_wall_ms DESC, hlc_logical DESC, hlc_origin DESC \
+             ORDER BY hlc_wall_ms DESC, hlc_logical DESC, hlc_origin DESC, cid DESC \
              LIMIT ?2"
         )
     }
+}
+
+/// The statement behind [`SqliteStore::list_blocks_before`]: the page just
+/// older than a cursor block, newest first, on the same index and order.
+fn history_before_sql() -> String {
+    format!(
+        "SELECT {BLOCK_COLUMNS} FROM blocks \
+         WHERE channel_id = ?1 \
+           AND (hlc_wall_ms, hlc_logical, hlc_origin, cid) < (?2, ?3, ?4, ?5) \
+         ORDER BY hlc_wall_ms DESC, hlc_logical DESC, hlc_origin DESC, cid DESC \
+         LIMIT ?6"
+    )
 }
 
 /// Additively add `column` to `table` when an older database predates it.
@@ -355,8 +371,9 @@ impl SqliteStore {
                 origin_server  TEXT NOT NULL,
                 federated_from TEXT
             );
-            CREATE INDEX IF NOT EXISTS blocks_channel_hlc
-                ON blocks(channel_id, hlc_wall_ms, hlc_logical, hlc_origin);
+            DROP INDEX IF EXISTS blocks_channel_hlc;
+            CREATE INDEX IF NOT EXISTS blocks_channel_hlc_cid
+                ON blocks(channel_id, hlc_wall_ms, hlc_logical, hlc_origin, cid);
 
             CREATE TABLE IF NOT EXISTS receipts (
                 cid            TEXT PRIMARY KEY,
@@ -547,6 +564,47 @@ impl SqliteStore {
             }
         };
         Ok(blocks)
+    }
+
+    /// The newest `limit` blocks of `slug` strictly older than the block
+    /// `before`, oldest first: one page further back than a window that starts
+    /// at `before`. `None` when `before` is not a block of `slug` — whether it
+    /// is unknown or belongs to another channel, so a caller cannot use the
+    /// cursor to learn where a CID lives.
+    ///
+    /// Older and newer are history order — (HLC wall, logical, origin, CID) —
+    /// the same total order [`Self::list_blocks_by_channel`] returns, so pages
+    /// join up with no gap and no overlap.
+    pub fn list_blocks_before(
+        &self,
+        slug: &str,
+        limit: usize,
+        before: &str,
+    ) -> Result<Option<Vec<StoredBlock>>> {
+        let Some(cursor) = self.get_block(before)? else {
+            return Ok(None);
+        };
+        if cursor.channel_id.as_deref() != Some(slug) {
+            return Ok(None);
+        }
+        let limit = limit.min(MAX_HISTORY_LIMIT) as i64;
+        let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
+        let mut stmt = conn.prepare(&history_before_sql())?;
+        let mut newest_first = stmt
+            .query_map(
+                params![
+                    slug,
+                    cursor.hlc_wall_ms as i64,
+                    cursor.hlc_logical as i64,
+                    cursor.hlc_origin,
+                    cursor.cid,
+                    limit
+                ],
+                row_to_stored_block,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        newest_first.reverse();
+        Ok(Some(newest_first))
     }
 
     // --- receipts ---
@@ -2007,7 +2065,7 @@ mod tests {
     // ---- list_blocks_by_channel ------------------------------------------
 
     /// Blocks share a wall clock so ordering is decided by `hlc_logical` —
-    /// exactly the tie-break the `blocks_channel_hlc` index encodes.
+    /// exactly the tie-break the `blocks_channel_hlc_cid` index encodes.
     fn timeline_block(cid: &str, channel: &str, logical: u32) -> StoredBlock {
         StoredBlock {
             hlc_logical: logical,
@@ -2106,6 +2164,57 @@ mod tests {
     }
 
     #[test]
+    fn list_blocks_before_pages_backwards_without_gaps_or_overlap() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        seed_two_channel_timeline(&store);
+        let page = |before: &str, limit| -> Option<Vec<String>> {
+            store
+                .list_blocks_before("#hello", limit, before)
+                .unwrap()
+                .map(|blocks| blocks.into_iter().map(|b| b.cid).collect())
+        };
+        assert_eq!(page("bafy_h3", 1), Some(vec!["bafy_h2".to_string()]));
+        assert_eq!(
+            page("bafy_h3", 50),
+            Some(vec!["bafy_h1".to_string(), "bafy_h2".to_string()])
+        );
+        assert_eq!(page("bafy_h1", 50), Some(vec![]), "the start of history");
+        assert_eq!(page("bafy_o2", 50), None, "another channel's block");
+        assert_eq!(page("bafy_nope", 50), None, "an unknown block");
+    }
+
+    #[test]
+    fn a_page_boundary_between_identical_hlcs_skips_nothing() {
+        // One author, one millisecond: every block shares (wall, logical,
+        // origin), and only the CID orders them.
+        let store = SqliteStore::open_in_memory().unwrap();
+        for cid in ["bafy_t1", "bafy_t2", "bafy_t3", "bafy_t4", "bafy_t5"] {
+            store.insert_block(&timeline_block(cid, "#tie", 0)).unwrap();
+        }
+        let cids = |blocks: Vec<StoredBlock>| -> Vec<String> {
+            blocks.into_iter().map(|b| b.cid).collect()
+        };
+        let mut seen = cids(store.list_blocks_by_channel("#tie", 2, None).unwrap());
+        assert_eq!(seen, vec!["bafy_t4", "bafy_t5"]);
+        loop {
+            let older = cids(
+                store
+                    .list_blocks_before("#tie", 2, &seen[0])
+                    .unwrap()
+                    .unwrap(),
+            );
+            if older.is_empty() {
+                break;
+            }
+            seen.splice(0..0, older);
+        }
+        assert_eq!(
+            seen,
+            vec!["bafy_t1", "bafy_t2", "bafy_t3", "bafy_t4", "bafy_t5"]
+        );
+    }
+
+    #[test]
     fn list_blocks_by_channel_since_hlc_takes_the_oldest_page_after_the_cursor() {
         let store = SqliteStore::open_in_memory().unwrap();
         seed_two_channel_timeline(&store);
@@ -2131,9 +2240,10 @@ mod tests {
 
         // EXPLAIN QUERY PLAN keeps the statement's bound parameters, so each
         // variant has to be given its full arity before it will step.
-        let variants: [(String, Vec<i64>); 2] = [
+        let variants: [(String, Vec<i64>); 3] = [
             (history_sql(false), vec![0, 50]),
             (history_sql(true), vec![0, 0, 0, 50]),
+            (history_before_sql(), vec![0, 0, 0, 0, 0, 50]),
         ];
         for (sql, args) in variants {
             let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();

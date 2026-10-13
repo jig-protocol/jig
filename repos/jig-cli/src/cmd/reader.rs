@@ -87,14 +87,16 @@ impl Reader {
             );
         };
         match secure.sync(&self.slug).await {
-            Ok(synced) => (
-                synced
+            Ok(synced) => {
+                // A catch-up can replay many pages; the pane shows the tail.
+                let mut lines: Vec<DecodedBlock> = synced
                     .lines
                     .into_iter()
                     .filter(|d| d.is_message())
-                    .collect(),
-                synced.tidy,
-            ),
+                    .collect();
+                lines.drain(..lines.len().saturating_sub(history::DEFAULT_HISTORY_LIMIT));
+                (lines, synced.tidy)
+            }
             Err(e) => {
                 eprintln!("warning: could not load history for {}: {e:#}", self.slug);
                 (Vec::new(), Vec::new())
