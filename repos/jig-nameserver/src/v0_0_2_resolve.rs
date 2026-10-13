@@ -77,7 +77,7 @@ pub async fn resolve(
 
 pub fn build_resolve_router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/v1/resolve/:alias", get(resolve))
+        .route("/v1/resolve/{alias}", get(resolve))
         .with_state(state)
 }
 

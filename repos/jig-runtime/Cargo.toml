@@ -19,16 +19,16 @@ receipt-signing = ["dep:ed25519-dalek"]
 [dependencies]
 # Core
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 
 # WASM Runtime
-wasmtime = { version = "48.0.5", features = ["cranelift", "pooling-allocator"] }
-wasmtime-wasi = { version = "48.0.5", optional = true }
+wasmtime = { version = "49.0.2", features = ["cranelift", "pooling-allocator"] }
+wasmtime-wasi = { version = "49.0.2", optional = true }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
+toml = "0.9"
 
 # Cryptography
 blake3 = "1.5"

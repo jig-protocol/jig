@@ -243,7 +243,7 @@ mod tests {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
             .expect("self-signed cert");
         let cert_pem = ck.cert.pem();
-        let key_pem = ck.key_pair.serialize_pem();
+        let key_pem = ck.signing_key.serialize_pem();
         let dir = tempdir().unwrap();
         let cert_path = dir.path().join("cert.pem");
         let key_path = dir.path().join("key.pem");

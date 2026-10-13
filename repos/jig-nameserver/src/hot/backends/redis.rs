@@ -140,7 +140,7 @@ impl HotBackend for RedisHot {
 
     async fn mget(&self, keys: &[&str]) -> Result<Vec<Option<Vec<u8>>>> {
         let mut conn = self.manager.clone();
-        conn.get(keys).await.map_err(Self::map_redis_err)
+        conn.mget(keys).await.map_err(Self::map_redis_err)
     }
 
     async fn mset(&self, pairs: &[(&str, Vec<u8>)]) -> Result<()> {

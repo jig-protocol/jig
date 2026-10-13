@@ -16,7 +16,7 @@ use crate::types::{
 };
 use axum::http::HeaderMap;
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{ConnectInfo, Path, Query, State},
     routing::{get, post},
 };
@@ -79,24 +79,27 @@ pub fn app_router(state: AppState) -> Router {
             "/v1/reputation/observe",
             post(record_reputation_observation),
         )
-        .route("/v1/reputation/:subject/:id", get(get_reputation_summary))
+        .route("/v1/reputation/{subject}/{id}", get(get_reputation_summary))
         .route(
-            "/v1/reputation/:subject/:id/observations",
+            "/v1/reputation/{subject}/{id}/observations",
             get(list_reputation_observations),
         )
         .route(
             "/v1/tribunal/cases",
             get(list_tribunal_cases).post(create_tribunal_case),
         )
-        .route("/v1/tribunal/cases/:id", get(get_tribunal_case))
+        .route("/v1/tribunal/cases/{id}", get(get_tribunal_case))
         .route(
-            "/v1/tribunal/cases/:id/decision",
+            "/v1/tribunal/cases/{id}/decision",
             post(record_tribunal_decision),
         )
-        .route("/v1/tribunal/blocks/:cid", get(get_tribunal_decision_block)) // Phase C
+        .route(
+            "/v1/tribunal/blocks/{cid}",
+            get(get_tribunal_decision_block),
+        ) // Phase C
         .route("/v1/work/enqueue", post(enqueue_useful_work))
         .route("/v1/work/assign", post(claim_useful_work))
-        .route("/v1/work/:id/result", post(submit_useful_work_result))
+        .route("/v1/work/{id}/result", post(submit_useful_work_result))
         .route("/v1/transparency/entries", get(list_transparency_entries))
         .route("/v1/transparency/hashes", get(list_transparency_hashes))
         .route("/v1/transparency/verify", get(verify_transparency_chain))
@@ -105,13 +108,13 @@ pub fn app_router(state: AppState) -> Router {
         .route("/v1/federation/policy", get(list_policy_hashes))
         .route("/v1/federation/runtime", get(get_runtime_config)) // Phase C
         .route("/v1/receipts/submit", post(submit_receipt))
-        .route("/v1/receipts/:block_id", get(get_receipt))
+        .route("/v1/receipts/{block_id}", get(get_receipt))
         .route("/v1/receipts", get(list_receipts))
         .route("/v1/attestations/submit", post(submit_attestation))
         .route("/v1/attestations", get(list_attestations_handler))
-        .route("/v1/anomalies/:block_id", get(get_anomalies_for_block)) // Phase D
-        .route("/v1/hosts/:did/anomalies", get(get_anomalies_for_host)) // Phase D
-        .route("/v1/hosts/:did/penalties", get(get_host_penalties)) // Phase D
+        .route("/v1/anomalies/{block_id}", get(get_anomalies_for_block)) // Phase D
+        .route("/v1/hosts/{did}/anomalies", get(get_anomalies_for_host)) // Phase D
+        .route("/v1/hosts/{did}/penalties", get(get_host_penalties)) // Phase D
         .with_state(state)
 }
 
@@ -701,7 +704,7 @@ struct ChallengeResponse {
 }
 
 async fn issue_challenge(
-    connect: Option<ConnectInfo<std::net::SocketAddr>>,
+    connect: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<ChallengeRequest>,
@@ -742,7 +745,7 @@ async fn issue_challenge(
     } else {
         None
     }
-    .or_else(|| connect.map(|c| c.0.ip()))
+    .or_else(|| connect.map(|Extension(ConnectInfo(addr))| addr.ip()))
     .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
     let ip_key = format!("ip:{client_ip}");
     if !state

@@ -580,10 +580,10 @@ pub async fn get_channel_history(
 pub fn build_blocks_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/v1/blocks", post(submit_block))
-        .route("/api/v1/blocks/:cid", get(get_block_by_cid))
+        .route("/api/v1/blocks/{cid}", get(get_block_by_cid))
         .route("/api/v1/channels", get(list_channels))
-        .route("/api/v1/channels/:slug/blocks", get(get_channel_history))
-        .route("/api/v1/channels/:slug/members", get(list_members))
+        .route("/api/v1/channels/{slug}/blocks", get(get_channel_history))
+        .route("/api/v1/channels/{slug}/members", get(list_members))
         .with_state(state)
 }
 
