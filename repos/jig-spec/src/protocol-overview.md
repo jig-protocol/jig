@@ -1,7 +1,7 @@
 # Protocol Overview
 
 > **v0.1 status:** E2EE, the handshake and every transport except WebSocket and the email
-> bridge are not implemented. Content is signed, not encrypted. See [Encryption](encryption.md).
+> bridge are not implemented. Content is signed, and end-to-end encrypted on channels created under `mls`. See [Encryption](encryption.md).
 
 **Audience:** This chapter is for **developers** and **protocol implementers** who need to understand Jig's architecture. **Server operators** might find the scaling and transport sections useful. **End users** can skip this—it's pretty technical.
 

@@ -23,6 +23,9 @@ pub enum BlockKind {
     ChannelCreate,
     /// Synthetic in v0.0.2; real Wasm in v0.0.3+.
     MemberAdd,
+    /// Removes a member: the owner removing someone, or a member leaving.
+    /// On an encrypted channel it carries the MLS commit removing the leaf.
+    MemberRemove,
     /// Synthetic in v0.0.2; real Wasm in v0.0.3+.
     ChannelPromote,
     /// Synthetic in v0.0.2; real Wasm in v0.0.3+. Retires a channel by
@@ -56,6 +59,7 @@ impl BlockKind {
             Self::TextRender => "text-render",
             Self::ChannelCreate => "channel-create",
             Self::MemberAdd => "member-add",
+            Self::MemberRemove => "member-remove",
             Self::ChannelPromote => "channel-promote",
             Self::ChannelArchive => "channel-archive",
             Self::FedHello => "fed-hello",
@@ -85,6 +89,7 @@ impl std::str::FromStr for BlockKind {
             "text-render" => Ok(Self::TextRender),
             "channel-create" => Ok(Self::ChannelCreate),
             "member-add" => Ok(Self::MemberAdd),
+            "member-remove" => Ok(Self::MemberRemove),
             "channel-promote" => Ok(Self::ChannelPromote),
             "channel-archive" => Ok(Self::ChannelArchive),
             "fed-hello" => Ok(Self::FedHello),
@@ -118,6 +123,7 @@ mod tests {
             ("text-render", BlockKind::TextRender),
             ("channel-create", BlockKind::ChannelCreate),
             ("member-add", BlockKind::MemberAdd),
+            ("member-remove", BlockKind::MemberRemove),
             ("channel-promote", BlockKind::ChannelPromote),
             ("channel-archive", BlockKind::ChannelArchive),
             ("fed-hello", BlockKind::FedHello),
@@ -141,6 +147,7 @@ mod tests {
         assert!(BlockKind::TextRender.is_wasm_executable());
         assert!(!BlockKind::ChannelCreate.is_wasm_executable());
         assert!(!BlockKind::MemberAdd.is_wasm_executable());
+        assert!(!BlockKind::MemberRemove.is_wasm_executable());
         assert!(!BlockKind::ChannelPromote.is_wasm_executable());
         assert!(!BlockKind::ChannelArchive.is_wasm_executable());
         assert!(!BlockKind::FedHello.is_wasm_executable());

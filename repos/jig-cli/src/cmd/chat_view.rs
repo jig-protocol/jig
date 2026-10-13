@@ -169,6 +169,9 @@ pub fn render(f: &mut Frame, state: &ChatState) {
         .iter()
         .map(|m| {
             let warning = if m.parity_warning { "  ⚠" } else { "" };
+            if m.sender == crate::cmd::blocks_decode::SYSTEM {
+                return ListItem::new(format!("{}  * {}", format_hhmm(m.ts), m.body));
+            }
             ListItem::new(format!(
                 "{}  {}: {}{}",
                 format_hhmm(m.ts),

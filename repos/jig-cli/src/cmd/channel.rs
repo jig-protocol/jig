@@ -32,13 +32,16 @@
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use jig_client::blocks::{
-    BuiltBlock, build_channel_archive, build_channel_create, build_member_add,
+    BuiltBlock, build_channel_archive, build_channel_promote, build_member_add,
+    build_member_remove, build_with_metadata, merge,
 };
 use jig_client::read_auth::{ReadProof, signable_path};
-use jig_core::HlcTimestamp;
+use jig_core::{BlockKind, HlcTimestamp};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::cmd::common::CliContext;
+use crate::cmd::secure::{ChannelInfo, Refused, Secure, mls_fields, refused};
 
 // ============================================================================
 // Helpers
@@ -175,7 +178,32 @@ pub async fn create(
     slug: String,
     visibility: String,
     exist_ok: bool,
+    encrypted: bool,
 ) -> Result<()> {
+    create_with(ctx, &slug, &visibility, exist_ok, encrypted, json!({})).await?;
+
+    // A freshly created channel is almost always the one the operator wants
+    // to talk in next; without this, a bare `jig send hi` still goes to
+    // `#general` and the message appears to vanish.
+    if let Err(e) = remember_default_channel(ctx, &slug) {
+        eprintln!("warning: channel created but default_channel not saved: {e:#}");
+    } else {
+        println!("  default channel is now {slug}");
+    }
+    Ok(())
+}
+
+/// Create a channel; `extra` is merged into the creation block's metadata.
+/// Returns whether this call created it (`false`: it already existed and
+/// `exist_ok` was set).
+pub(crate) async fn create_with(
+    ctx: &CliContext,
+    slug: &str,
+    visibility: &str,
+    exist_ok: bool,
+    encrypted: bool,
+    extra: serde_json::Value,
+) -> Result<bool> {
     let visibility = visibility.trim().to_lowercase();
     if !matches!(visibility.as_str(), "open" | "restricted") {
         anyhow::bail!("--visibility must be `open` or `restricted` (got `{visibility}`)");
@@ -183,13 +211,75 @@ pub async fn create(
 
     let id = ctx.identity()?;
     let hlc = HlcTimestamp::now_wall(id.did().clone());
-    let block = build_channel_create(&id, &slug, &visibility, hlc);
+    let mut meta = json!({"slug": slug, "visibility": visibility});
+    merge(&mut meta, extra);
+
+    // An encrypted channel is one MLS group, started here with the creator
+    // alone in it; its epoch-0 public state rides the creation block.
+    let secure = if encrypted {
+        let secure = Secure::open(ctx)?;
+        if secure.session.has_group(secure.server(), slug)? {
+            if secure.channel(slug).await?.is_some() {
+                if exist_ok {
+                    println!("channel already exists: {slug}");
+                    return Ok(false);
+                }
+                anyhow::bail!("this device already holds the group for {slug}");
+            }
+            // Left over from a create the server never answered and never took.
+            secure.session.discard_group(secure.server(), slug)?;
+        }
+        let created = secure.session.create_group(secure.server(), slug)?;
+        merge(
+            &mut meta,
+            json!({
+                "suite": "mls",
+                "mls_group_info": base64::engine::general_purpose::STANDARD.encode(&created.group_info),
+                "mls_ratchet_tree": base64::engine::general_purpose::STANDARD.encode(&created.ratchet_tree),
+            }),
+        );
+        if let Err(e) = secure.ensure_key_packages().await {
+            eprintln!("warning: MLS key packages not published: {e:#}");
+        }
+        Some(secure)
+    } else {
+        None
+    };
+    let block = build_with_metadata(&id, BlockKind::ChannelCreate, hlc, meta);
 
     let base = base_http_url(&ctx.server_url()?);
-    match post_channel_op(&base, "", &block).await {
+    let mut outcome = post_channel_op(&base, "", &block).await;
+    if let (Err(e), Some(secure)) = (&outcome, &secure) {
+        if e.downcast_ref::<ChannelOpError>()
+            .is_some_and(|c| c.status.is_client_error())
+        {
+            secure.session.discard_group(secure.server(), slug)?;
+        } else {
+            // No answer, or none to trust: the server may have created it
+            // anyway, and then the group is the only copy of the channel's
+            // keys. Keep it unless the server says the channel is not ours;
+            // if it cannot say, the next create tidies up.
+            match member_role(secure, slug, &id.did_string()).await {
+                Ok(Some(role)) if role == "owner" => {
+                    outcome = Ok(AdminResult {
+                        block_cid: block.cid(),
+                    })
+                }
+                Ok(_) => secure.session.discard_group(secure.server(), slug)?,
+                Err(_) => {}
+            }
+        }
+    }
+    let label = if encrypted {
+        format!("{visibility}, end-to-end encrypted")
+    } else {
+        visibility.clone()
+    };
+    match outcome {
         Ok(result) => {
-            println!("channel created: {slug} ({visibility})");
+            println!("channel created: {slug} ({label})");
             println!("  block_cid: {}", result.block_cid);
+            Ok(true)
         }
         Err(e)
             if e.downcast_ref::<ChannelOpError>()
@@ -201,19 +291,198 @@ pub async fn create(
                 );
             }
             println!("channel already exists: {slug}");
+            Ok(false)
         }
-        Err(e) => return Err(e),
+        Err(e) => Err(e),
     }
+}
 
-    // A freshly created channel is almost always the one the operator wants
-    // to talk in next; without this, a bare `jig send hi` still goes to
-    // `#general` and the message appears to vanish.
-    if let Err(e) = remember_default_channel(ctx, &slug) {
-        eprintln!("warning: channel created but default_channel not saved: {e:#}");
+/// Resolve a DID or a `[contacts]` name to a canonical DID.
+pub(crate) fn resolve_who(ctx: &CliContext, who: &str) -> Result<String> {
+    let who = who.trim();
+    if who.starts_with("did:jig:") {
+        let did = jig_core::Did::from_did_jig_string(who)
+            .ok()
+            .and_then(|d| d.as_bytes().ok())
+            .map(|k| jig_core::Did::from_ed25519_pubkey(&k).to_did_jig_string())
+            .ok_or_else(|| anyhow::anyhow!("`{who}` is not a valid did:jig"))?;
+        return Ok(did);
+    }
+    let matches: Vec<&String> = ctx
+        .effective()
+        .contacts
+        .iter()
+        .filter(|(_, name)| name.eq_ignore_ascii_case(who))
+        .map(|(did, _)| did)
+        .collect();
+    match matches.as_slice() {
+        [did] => Ok((*did).clone()),
+        [] => anyhow::bail!("`{who}` is neither a did:jig nor a name in [contacts]; pass the DID"),
+        _ => anyhow::bail!("more than one contact is called `{who}`; pass the DID"),
+    }
+}
+
+// ============================================================================
+// add / kick / leave / promote / members
+// ============================================================================
+
+/// The channel as the caller sees it, or an error saying why not.
+async fn visible_channel(secure: &Secure, slug: &str) -> Result<ChannelInfo> {
+    secure
+        .channel(slug)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no channel {slug} that you can see on this server"))
+}
+
+/// Apply `jig channel add <slug> <who>`. Owner only. On an encrypted channel
+/// this fetches one of the member's key packages and commits their addition;
+/// the welcome rides the same block.
+pub async fn add(ctx: &CliContext, slug: String, who: String) -> Result<()> {
+    let did = resolve_who(ctx, &who)?;
+    let secure = Secure::open(ctx)?;
+    let info = visible_channel(&secure, &slug).await?;
+    let id = secure.identity();
+    let cid = if info.encrypted() {
+        let kp = secure.take_key_package(&did).await.with_context(|| {
+            format!(
+                "fetching a key package for {did} — they need to have run `jig chat` or \
+                 `jig init` against this server at least once"
+            )
+        })?;
+        let server = secure.server().to_string();
+        secure
+            .commit(
+                &slug,
+                |s| Ok(s.prepare_add(&server, &slug, &kp, &did)?),
+                |c| {
+                    let mut meta = json!({"channel": slug, "member_did": did});
+                    merge(&mut meta, mls_fields(c));
+                    build_with_metadata(id, BlockKind::MemberAdd, now(id), meta)
+                },
+            )
+            .await?
     } else {
-        println!("  default channel is now {slug}");
+        let block = build_member_add(id, &slug, &did, now(id));
+        secure.submit(&block).await?
+    };
+    println!("added {did} to {slug}");
+    println!("  block_cid: {cid}");
+    Ok(())
+}
+
+/// Apply `jig channel kick <slug> <who>`. Owner only.
+pub async fn kick(ctx: &CliContext, slug: String, who: String) -> Result<()> {
+    let did = resolve_who(ctx, &who)?;
+    let secure = Secure::open(ctx)?;
+    let info = visible_channel(&secure, &slug).await?;
+    let id = secure.identity();
+    let cid = if info.encrypted() {
+        let server = secure.server().to_string();
+        secure
+            .commit(
+                &slug,
+                |s| Ok(s.prepare_remove(&server, &slug, &did)?),
+                |c| build_member_remove(id, &slug, &did, mls_fields(c), now(id)),
+            )
+            .await?
+    } else {
+        secure
+            .submit(&build_member_remove(id, &slug, &did, json!({}), now(id)))
+            .await?
+    };
+    println!("removed {did} from {slug}");
+    println!("  block_cid: {cid}");
+    Ok(())
+}
+
+/// Apply `jig channel leave <slug>`. The owner archives instead.
+///
+/// On an encrypted channel this device drops its copy of the group at once,
+/// and the server stops delivering to it; the next member online commits the
+/// leaf out of the tree (a member cannot commit its own removal in MLS).
+pub async fn leave(ctx: &CliContext, slug: String) -> Result<()> {
+    let secure = Secure::open(ctx)?;
+    let id = secure.identity();
+    let me = id.did_string();
+    let cid = secure
+        .submit(&build_member_remove(id, &slug, &me, json!({}), now(id)))
+        .await?;
+    secure.session.discard_group(secure.server(), &slug)?;
+    println!("left {slug}");
+    println!("  block_cid: {cid}");
+    Ok(())
+}
+
+/// Apply `jig channel promote <slug>`: restricted → open. Owner only. On an
+/// encrypted channel, newcomers then join by external commit — the content
+/// stays end-to-end encrypted, only who may join changes.
+pub async fn promote(ctx: &CliContext, slug: String) -> Result<()> {
+    let secure = Secure::open(ctx)?;
+    let id = secure.identity();
+    let cid = secure
+        .submit(&build_channel_promote(id, &slug, now(id)))
+        .await?;
+    println!("{slug} is now open");
+    println!("  block_cid: {cid}");
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct MemberView {
+    did: String,
+    role: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MembersResponse {
+    members: Vec<MemberView>,
+}
+
+/// Apply `jig channel members <slug>`.
+pub async fn members(ctx: &CliContext, slug: String) -> Result<()> {
+    let secure = Secure::open(ctx)?;
+    let body: MembersResponse = secure
+        .get_json(&format!(
+            "/api/v1/channels/{}/members",
+            escape_slug_for_url(&slug)
+        ))
+        .await?;
+    let contacts = &ctx.effective().contacts;
+    for m in body.members {
+        let name = contacts.get(&m.did).map(String::as_str).unwrap_or("");
+        println!("{:<6}  {:<16}  {}", m.role, name, m.did);
     }
     Ok(())
+}
+
+/// `did`'s role in the channel, as the server has it: `None` when it is not
+/// a member, or the channel is not there for the caller to see. An error only
+/// when the server could not be asked.
+async fn member_role(secure: &Secure, slug: &str, did: &str) -> Result<Option<String>> {
+    match secure
+        .get_json::<MembersResponse>(&format!(
+            "/api/v1/channels/{}/members",
+            escape_slug_for_url(slug)
+        ))
+        .await
+    {
+        Ok(body) => Ok(body
+            .members
+            .into_iter()
+            .find(|m| m.did == did)
+            .map(|m| m.role)),
+        Err(e)
+            if e.downcast_ref::<Refused>()
+                .is_some_and(|r| matches!(r.status, 403 | 404)) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn now(id: &jig_client::Identity) -> HlcTimestamp {
+    HlcTimestamp::now_wall(id.did().clone())
 }
 
 /// Persist `slug` as `[user] default_channel`.
@@ -235,6 +504,14 @@ fn remember_default_channel(ctx: &CliContext, slug: &str) -> Result<()> {
 /// Builds a signed member-add block that adds the caller's own DID, then
 /// POSTs it to `/api/v1/channels/<url-escaped slug>/members`.
 pub async fn join(ctx: &CliContext, slug: String) -> Result<()> {
+    // An open encrypted channel is joined by external commit, from the group
+    // info its last committer published.
+    if let Ok(secure) = Secure::open(ctx)
+        && let Ok(Some(info)) = secure.channel(&slug).await
+        && info.encrypted()
+    {
+        return join_encrypted(ctx, &secure, &slug).await;
+    }
     let id = ctx.identity()?;
     let hlc = HlcTimestamp::now_wall(id.did().clone());
     let my_did = id.did_string();
@@ -253,6 +530,65 @@ pub async fn join(ctx: &CliContext, slug: String) -> Result<()> {
         eprintln!("warning: joined but contact name not saved: {e:#}");
     }
     Ok(())
+}
+
+async fn join_encrypted(ctx: &CliContext, secure: &Secure, slug: &str) -> Result<()> {
+    let id = secure.identity();
+    let me = id.did_string();
+    let server = secure.server().to_string();
+    // A join whose answer never came may have landed: then the group held
+    // here is the one that works, and joining again would replace it.
+    if secure.session.has_group(&server, slug)? && member_role(secure, slug, &me).await?.is_some() {
+        println!("already in {slug}");
+        return Ok(());
+    }
+    let joined = |cid: &str| {
+        println!("joined {slug} as {me} (end-to-end encrypted)");
+        println!("  block_cid: {cid}");
+        if let Err(e) = remember_joiner(ctx, &me) {
+            eprintln!("warning: joined but contact name not saved: {e:#}");
+        }
+    };
+    for attempt in 0..2 {
+        let info = secure.group_info(slug).await?;
+        let commit = secure.session.prepare_join(&server, slug, &info)?;
+        let mut meta = json!({"channel": slug, "member_did": me});
+        merge(&mut meta, mls_fields(&commit));
+        let block = build_with_metadata(id, BlockKind::MemberAdd, now(id), meta);
+        match secure.submit(&block).await {
+            Ok(cid) => {
+                joined(&cid);
+                return Ok(());
+            }
+            Err(e) if refused(&e) => {
+                secure.session.discard_group(&server, slug)?;
+                let stale = e
+                    .downcast_ref::<Refused>()
+                    .is_some_and(|r| r.code == "STALE_EPOCH");
+                if !(stale && attempt == 0) {
+                    return Err(e);
+                }
+            }
+            // No answer, or none to trust: keep the group unless the server
+            // says the join did not land.
+            Err(e) => {
+                return match member_role(secure, slug, &me).await {
+                    Ok(Some(_)) => {
+                        joined(&block.cid());
+                        Ok(())
+                    }
+                    Ok(None) => {
+                        secure.session.discard_group(&server, slug)?;
+                        Err(e)
+                    }
+                    Err(_) => Err(e.context(format!(
+                        "no answer from the server; run `jig channel join {slug}` again to settle it"
+                    ))),
+                };
+            }
+        }
+    }
+    unreachable!("the loop returns on its second attempt")
 }
 
 /// Record the joining DID under the configured display name.
@@ -373,6 +709,9 @@ struct ChannelView {
     #[serde(default)]
     #[allow(dead_code)]
     created_at: i64,
+    /// `none` or `mls`. Absent from servers before v0.2.
+    #[serde(default)]
+    suite: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -386,6 +725,10 @@ struct ChannelsResponse {
 /// ones this identity owns or belongs to, and nothing at all to an unsigned
 /// request.
 pub async fn list(ctx: &CliContext) -> Result<()> {
+    // Cheap moment to stay reachable for encrypted channels; best effort.
+    if let Ok(secure) = Secure::open(ctx) {
+        let _ = secure.ensure_key_packages().await;
+    }
     let id = ctx.identity()?;
     let base = base_http_url(&ctx.server_url()?);
     let url = format!("{base}/api/v1/channels");
@@ -442,8 +785,9 @@ fn print_channels(channels: &[ChannelView]) {
         .unwrap_or(0)
         .max(10);
     for c in channels {
+        let sealed = if c.suite == "mls" { "🔒" } else { "  " };
         println!(
-            "{:<slug_w$}  {:<vis_w$}  {}",
+            "{:<slug_w$}  {:<vis_w$}  {sealed}  {}",
             c.slug,
             c.visibility,
             c.owner_did,
@@ -635,12 +979,14 @@ mod tests {
                 visibility: "open".into(),
                 owner_did: "did:jig:zAlice".into(),
                 created_at: 0,
+                suite: "none".into(),
             },
             ChannelView {
                 slug: "#devops".into(),
                 visibility: "restricted".into(),
                 owner_did: "did:jig:zBob".into(),
                 created_at: 0,
+                suite: "mls".into(),
             },
         ]);
     }

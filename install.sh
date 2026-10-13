@@ -265,7 +265,7 @@ port = ${JIG_SERVER_LISTEN##*:}
 # a WARN at startup when they disagree).
 listen = "$JIG_SERVER_LISTEN"
 server_did_keyfile = "$JIG_HOME/server/server.key"
-allowed_block_kinds = ["text-render", "channel-create", "member-add", "channel-archive"]
+allowed_block_kinds = ["text-render", "channel-create", "member-add", "member-remove", "channel-promote", "channel-archive"]
 
 [identity]
 # TOFU mode: this server trusts whatever DID first claims an alias and pins it.

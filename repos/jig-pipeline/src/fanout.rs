@@ -57,14 +57,21 @@ pub struct DeliveryPolicy {
     pub open: bool,
     pub owner_did: String,
     pub member_dids: Vec<String>,
+    /// Whether federation peers may receive the channel's blocks. In v0.2
+    /// only open, unencrypted channels federate: membership does not
+    /// replicate, so a peer cannot gate a restricted channel's readers, and an
+    /// encrypted channel's commits are validated only by its home server.
+    pub federates: bool,
 }
 
 impl DeliveryPolicy {
     pub fn for_channel(channel: &StoredChannel, member_dids: Vec<String>) -> Self {
+        let open = crate::visibility::is_open(&channel.visibility);
         Self {
-            open: crate::visibility::is_open(&channel.visibility),
+            open,
             owner_did: channel.owner_did.clone(),
             member_dids,
+            federates: open && channel.suite == jig_core::EncryptionSuite::Unencrypted.as_str(),
         }
     }
 
@@ -173,7 +180,9 @@ impl Fanout {
         policy: Option<&DeliveryPolicy>,
     ) -> anyhow::Result<()> {
         self.broadcast_to_locals(block, receipt, policy).await;
-        self.broadcast_to_peers(block, receipt).await;
+        if policy.is_none_or(|p| p.federates) {
+            self.broadcast_to_peers(block, receipt).await;
+        }
         self.dispatch_to_bridges(block, receipt, policy);
         Ok(())
     }
@@ -225,7 +234,9 @@ impl Fanout {
         policy: Option<&DeliveryPolicy>,
     ) -> anyhow::Result<()> {
         self.broadcast_to_locals(block, receipt, policy).await;
-        self.broadcast_to_peers(block, receipt).await;
+        if policy.is_none_or(|p| p.federates) {
+            self.broadcast_to_peers(block, receipt).await;
+        }
         Ok(())
     }
 
@@ -323,6 +334,7 @@ mod tests {
             open: true,
             owner_did: "did:jig:zOwner".to_string(),
             member_dids: members.iter().map(|m| m.to_string()).collect(),
+            federates: true,
         }
     }
 
@@ -331,6 +343,7 @@ mod tests {
             open: false,
             owner_did: owner.to_string(),
             member_dids: members.iter().map(|m| m.to_string()).collect(),
+            federates: false,
         }
     }
 
@@ -390,6 +403,7 @@ mod tests {
             visibility: visibility.to_string(),
             created_at: 0,
             owner_did: "did:jig:zOwner".to_string(),
+            suite: "none".to_string(),
         };
         assert!(DeliveryPolicy::for_channel(&row("open"), vec![]).open);
         assert!(!DeliveryPolicy::for_channel(&row("restricted"), vec![]).open);
@@ -501,10 +515,12 @@ mod tests {
         assert!(received(&mut rx).await);
     }
 
-    /// Peers are servers, not readers; the local policy does not apply to
-    /// them. (Federation trust is its own gate, not this one.)
+    /// Peers are servers, not readers, and membership does not replicate to
+    /// them — so a peer handed a restricted channel's block could not gate who
+    /// reads it. Until it can, only open, unencrypted channels federate. (Up
+    /// to v0.1 restricted content went to every peer.)
     #[tokio::test]
-    async fn peers_are_not_filtered_by_the_local_policy() {
+    async fn only_open_unencrypted_channels_reach_peers() {
         let f = Fanout::new();
         let (tx, mut rx) = mpsc::unbounded_channel();
         f.register_peer("wss://peer-a".to_string(), tx).await;
@@ -515,7 +531,42 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(received(&mut rx).await);
+        assert!(!received(&mut rx).await, "restricted content stays home");
+
+        let mut sealed = open_with_members(&[]);
+        sealed.federates = false;
+        f.broadcast_with_members(
+            &sample_block(Some("#sealed"), "text-render"),
+            &sample_receipt(),
+            Some(&sealed),
+        )
+        .await
+        .unwrap();
+        assert!(!received(&mut rx).await, "encrypted channels stay home");
+
+        f.broadcast(
+            &sample_block(Some("#public"), "text-render"),
+            &sample_receipt(),
+            Some(&open_with_members(&[])),
+        )
+        .await
+        .unwrap();
+        assert!(received(&mut rx).await, "open plaintext channels federate");
+    }
+
+    #[test]
+    fn a_channel_federates_only_if_open_and_unencrypted() {
+        let row = |visibility: &str, suite: &str| StoredChannel {
+            id: "c".to_string(),
+            slug: "#c".to_string(),
+            visibility: visibility.to_string(),
+            created_at: 0,
+            owner_did: "did:jig:zOwner".to_string(),
+            suite: suite.to_string(),
+        };
+        assert!(DeliveryPolicy::for_channel(&row("open", "none"), vec![]).federates);
+        assert!(!DeliveryPolicy::for_channel(&row("restricted", "none"), vec![]).federates);
+        assert!(!DeliveryPolicy::for_channel(&row("open", "mls"), vec![]).federates);
     }
 
     // ---- scope matching ----------------------------------------------------

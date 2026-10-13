@@ -60,16 +60,23 @@ Proposed for v0.2:
 
 # Open questions
 
+Answers marked *v0.2* are the defaults the implementation ships with
+([M2 design](../../../docs/superpowers/specs/2026-10-11-m2-mls-and-channel-dynamics-design.md));
+each says what would change it.
+
 1. ~~Identifier granularity.~~ Resolved: a single `mls` entry for now; see
    Specification.
 2. D13: does a non-MLS scheme such as Signal's post-quantum protocol fit as a suite with
    its own group semantics, or only as PQ-hybrid MLS?
-3. Key-package distribution: nameserver, home server, or both?
-4. Multi-device membership and key rotation.
-5. Who may sign a membership change on a locked channel with no owner (a DM)?
-6. Can a channel move to a new suite, or is that always a new channel?
-7. Execution: a server cannot run Wasm over ciphertext. Which block kinds execute
-   client-side under an encrypted suite, and what does a receipt then attest?
+3. ~~Key-package distribution~~ *v0.2*: the home server, which validates each package's
+   binding to its DID. Nameserver distribution is deferred.
+4. Multi-device membership and key rotation. *v0.2*: one DID is one MLS client, and the
+   DID's key is the MLS signature key, so rotating it means rejoining.
+5. ~~Who signs membership changes on a DM?~~ *v0.2*: there is no ownerless DM; whoever
+   opens it owns it.
+6. ~~Suite migration~~ *v0.2*: a new suite is a new channel.
+7. Execution: *v0.2*: a server executes nothing under an encrypted suite, and its receipt
+   says `"content": "sealed"`. Client-side execution of decrypted content is open.
 8. A conformance test suite per registered suite.
 
 # Security Considerations (Zero-Trust)
@@ -85,7 +92,9 @@ v0.x makes no compatibility guarantee. Frames without `suite` are read as `none`
 # Reference Implementation
 
 `jig_core::EncryptionSuite` (registry and refusals), `jig_pipeline::envelope` (envelope
-gate), `BlockManifest::check_gates` (manifest gate).
+gate), `BlockManifest::check_gates` (manifest gate), `jig_pipeline::mls_gate` (per-channel
+suite and MLS validation), `jig_mls` (delivery service and member), `jig_client::secure`
+(client state).
 
 # Rejected Alternatives
 

@@ -21,12 +21,15 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use jig_client::{Client, DeliveredBlock};
 
+use crate::cmd::blocks_decode::DecodedBlock;
+#[cfg(test)]
+use crate::cmd::blocks_decode::decode;
 #[cfg(test)]
 use crate::cmd::blocks_decode::distinct_render_hashes;
-use crate::cmd::blocks_decode::{DecodedBlock, decode};
 use crate::cmd::common::CliContext;
 use crate::cmd::display::{bell_on_inbound, connection_lost, display_sender, format_hhmm};
 use crate::cmd::history;
+use crate::cmd::reader::Reader;
 
 /// Apply `jig tail <channel>`.
 pub async fn run(ctx: &CliContext, channel: String) -> Result<()> {
@@ -37,9 +40,11 @@ pub async fn run(ctx: &CliContext, channel: String) -> Result<()> {
 
     // Backfill first: a fresh tail on a busy channel used to sit silent
     // until the next live message. Failures here degrade to "no backlog"
-    // (see `history::backfill`) rather than aborting the tail.
-    let backlog =
-        history::backfill(&id, &server_url, &channel, history::DEFAULT_HISTORY_LIMIT).await;
+    // (see `history::backfill`) rather than aborting the tail. An encrypted
+    // channel replays through the MLS session.
+    let reader = Reader::open(ctx, &channel).await?;
+    let (backlog, tidy) = reader.backlog(&id, &server_url).await;
+    reader.tidy(tidy);
 
     let client = Client::connect(&server_url, id)
         .await
@@ -55,7 +60,49 @@ pub async fn run(ctx: &CliContext, channel: String) -> Result<()> {
     }
     // No bell for replayed history — the operator was not present for it.
     println!("Tailing {channel} on {server_url}... (Ctrl-C to exit)");
-    pump(&mut stream, &channel, &contacts).await
+    pump(&mut stream, &channel, &contacts, &reader).await
+}
+
+/// Apply `jig read <channel>`: print the channel's recent messages and exit.
+pub async fn read(ctx: &CliContext, channel: String, limit: usize, json: bool) -> Result<()> {
+    let id = ctx.identity()?;
+    let server_url = ctx.server_url()?;
+    let reader = Reader::open(ctx, &channel).await?;
+    // Unlike chat and tail, a failed fetch is this command's failure, not
+    // something to degrade around.
+    let lines = if let Some(secure) = reader.secure() {
+        let synced = secure.sync(&channel).await?;
+        // Awaited, not spawned: this process exits as soon as it has printed.
+        for did in &synced.tidy {
+            let _ = secure.tidy(&channel, did).await;
+        }
+        synced
+            .lines
+            .into_iter()
+            .filter(|d| d.is_message())
+            .collect()
+    } else {
+        let blocks = history::fetch_history(&id, &server_url, &channel, limit).await?;
+        history::decode_history(&blocks)
+    };
+    let skip = lines.len().saturating_sub(limit);
+    let contacts = ctx.effective().contacts.clone();
+    for d in &lines[skip..] {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "sender": d.sender,
+                    "body": d.body,
+                    "ts": d.ts,
+                    "kind": d.kind.map(|k| k.as_str()),
+                })
+            );
+        } else {
+            println!("{}", format_decoded(d, &contacts));
+        }
+    }
+    Ok(())
 }
 
 /// Anything that yields delivered blocks until it ends.
@@ -82,11 +129,18 @@ async fn pump(
     source: &mut impl BlockSource,
     channel: &str,
     contacts: &BTreeMap<String, String>,
+    reader: &Reader,
 ) -> Result<()> {
     while let Some(delivered) = source.next_block().await {
-        match decode_and_format(&delivered, contacts) {
-            Ok(line) => {
-                println!("{line}");
+        match reader.read(&delivered) {
+            Ok(read) => {
+                if let Some(did) = read.tidy {
+                    reader.tidy(vec![did]);
+                }
+                let Some(decoded) = read.line else {
+                    continue;
+                };
+                println!("{}", format_decoded(&decoded, contacts));
                 bell_on_inbound(1, &mut std::io::stderr());
             }
             // Best-effort: skip blocks we can't decode rather than panicking
@@ -107,6 +161,7 @@ async fn pump(
 ///
 /// `contacts` is the local `[contacts]` address book; senders with no entry
 /// fall back to a truncated DID.
+#[cfg(test)]
 fn decode_and_format(d: &DeliveredBlock, contacts: &BTreeMap<String, String>) -> Result<String> {
     Ok(format_decoded(&decode(d)?, contacts))
 }
@@ -115,6 +170,9 @@ fn decode_and_format(d: &DeliveredBlock, contacts: &BTreeMap<String, String>) ->
 /// replayed backlog so history and live traffic look identical.
 fn format_decoded(decoded: &DecodedBlock, contacts: &BTreeMap<String, String>) -> String {
     let parity = render_parity_marker_from_count(decoded.parity_hash_count);
+    if decoded.sender == crate::cmd::blocks_decode::SYSTEM {
+        return format!("{}  * {}", format_hhmm(decoded.ts), decoded.body);
+    }
     format!(
         "{ts}  {sender}: {body}{parity}",
         ts = format_hhmm(decoded.ts),
@@ -168,6 +226,7 @@ mod tests {
 
     fn delivered_for(bundle_b64: String, receipts: Vec<ReceiptRef>) -> DeliveredBlock {
         DeliveredBlock {
+            sig_b64: None,
             bundle_b64,
             receipts,
             delivery_cid: "bafy_test_delivery".into(),
@@ -270,10 +329,7 @@ mod tests {
         let d = delivered_for("not_base64_!!!".into(), vec![]);
         let err = decode_and_format(&d, &BTreeMap::new()).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(
-            msg.contains("decoding bundle_b64"),
-            "expected b64 context: {msg}"
-        );
+        assert!(msg.contains("bundle_b64"), "expected b64 context: {msg}");
     }
 
     fn rr(server: &str, render_hash: Option<&str>) -> ReceiptRef {
@@ -349,9 +405,14 @@ mod tests {
         let mut source = FiniteSource {
             items: [one_text_block()].into(),
         };
-        let err = pump(&mut source, "#hello", &BTreeMap::new())
-            .await
-            .unwrap_err();
+        let err = pump(
+            &mut source,
+            "#hello",
+            &BTreeMap::new(),
+            &Reader::plain("#hello"),
+        )
+        .await
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("connection lost"),
@@ -374,9 +435,14 @@ mod tests {
             ]
             .into(),
         };
-        let err = pump(&mut source, "#hello", &BTreeMap::new())
-            .await
-            .unwrap_err();
+        let err = pump(
+            &mut source,
+            "#hello",
+            &BTreeMap::new(),
+            &Reader::plain("#hello"),
+        )
+        .await
+        .unwrap_err();
         assert!(format!("{err:#}").contains("connection lost"));
         assert!(
             source.items.is_empty(),

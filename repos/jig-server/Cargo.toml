@@ -24,6 +24,8 @@ jig-bridge-email = { path = "../bridges/email" }
 
 # v0.0.2 hello-world milestone — pipeline + client + new config sections
 jig-pipeline = { path = "../jig-pipeline" }
+# Validates published MLS key packages (`v0_0_2_mls`).
+jig-mls = { workspace = true }
 jig-client   = { path = "../jig-client" }
 shellexpand  = "3"
 

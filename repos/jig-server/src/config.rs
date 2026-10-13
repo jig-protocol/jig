@@ -285,7 +285,8 @@ listen = "{listen}"
 server_did_keyfile = "{keyfile}"
 
 # channel-create and member-add are not optional extras — `jig channel create`
-# and `jig channel join` submit exactly these kinds.
+# and `jig channel join` submit exactly these kinds. member-remove and
+# channel-promote back `jig channel kick/leave/promote`.
 allowed_block_kinds = [{kinds}]
 
 [identity]

@@ -36,11 +36,10 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-use crate::cmd::blocks_decode::decode;
 use crate::cmd::chat_view::{ChatState, Message, drain_inbound, render, submit_failure_status};
 use crate::cmd::common::CliContext;
 use crate::cmd::display::{bell_on_inbound, connection_lost};
-use crate::cmd::history;
+use crate::cmd::reader::Reader;
 
 /// Args struct for `jig chat <channel>`. Lives here (rather than in
 /// `main.rs`) so the run loop stays self-contained — the clap layer
@@ -104,13 +103,10 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
     // Fetch history BEFORE the terminal goes into raw mode: any warning
     // from a server without the history endpoint has to print as ordinary
     // text, not into the alternate screen we would otherwise already own.
-    let backlog = history::backfill(
-        &id,
-        &server_url,
-        &args.channel,
-        history::DEFAULT_HISTORY_LIMIT,
-    )
-    .await;
+    // On an encrypted channel the reader replays it through the MLS session.
+    let reader = Arc::new(Reader::open(&ctx, &args.channel).await?);
+    let (backlog, tidy) = reader.backlog(&id, &server_url).await;
+    reader.tidy(tidy);
 
     let client = Client::connect(&server_url, id)
         .await
@@ -127,10 +123,17 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
     // server can't starve user input. Unbounded is fine here — chat
     // volume is small and the channel is dropped on exit.
     let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<Message>();
+    let reader_for_stream = reader.clone();
     tokio::spawn(async move {
         while let Some(block) = stream.next().await {
-            match decode(&block) {
-                Ok(decoded) => {
+            match reader_for_stream.read(&block) {
+                Ok(read) => {
+                    if let Some(did) = read.tidy {
+                        reader_for_stream.tidy(vec![did]);
+                    }
+                    let Some(decoded) = read.line else {
+                        continue;
+                    };
                     if msg_tx.send(decoded.into()).is_err() {
                         break;
                     }
@@ -176,6 +179,7 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
         &status_tx,
         &client,
         &ctx,
+        &reader,
     )
     .await;
 
@@ -188,6 +192,7 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
 
 /// Inner event loop. Extracted so we can keep the `?` ergonomics in
 /// `run` while ensuring `TerminalGuard::leave` is always called.
+#[allow(clippy::too_many_arguments)]
 async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &mut ChatState,
@@ -196,6 +201,7 @@ async fn event_loop(
     status_tx: &mpsc::UnboundedSender<String>,
     client: &Arc<Client>,
     ctx: &Arc<CliContext>,
+    reader: &Arc<Reader>,
 ) -> Result<()> {
     loop {
         // Drain any inbound messages before redrawing so we paint the
@@ -236,7 +242,7 @@ async fn event_loop(
                 KeyCode::Esc => return Ok(()),
                 KeyCode::Char('q') | KeyCode::Char('c') if ctrl => return Ok(()),
                 KeyCode::Enter => {
-                    handle_submit(state, client, ctx, status_tx);
+                    handle_submit(state, client, ctx, reader, status_tx);
                 }
                 KeyCode::Backspace => {
                     delete_before_cursor(state);
@@ -265,6 +271,7 @@ fn handle_submit(
     state: &mut ChatState,
     client: &Arc<Client>,
     ctx: &Arc<CliContext>,
+    reader: &Arc<Reader>,
     status_tx: &mpsc::UnboundedSender<String>,
 ) {
     if state.input.is_empty() {
@@ -277,6 +284,16 @@ fn handle_submit(
     let client = client.clone();
     let ctx = ctx.clone();
     let status_tx = status_tx.clone();
+    if let Some(secure) = reader.secure().cloned() {
+        // Encrypted channel: the session encrypts, and the block goes over
+        // REST so a refusal comes back with its code.
+        tokio::spawn(async move {
+            if let Err(e) = secure.send(&channel, &body).await {
+                let _ = status_tx.send(submit_failure_status(&body, &format!("{e:#}")));
+            }
+        });
+        return;
+    }
     tokio::spawn(async move {
         // We need an Identity to derive the HLC stamp + sign the block.
         // The Client owns the original Identity by Arc, but doesn't

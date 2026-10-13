@@ -69,7 +69,8 @@ unknown-git = "deny"
 # landing against our dep graph still fails CI and forces a deliberate call.
 # Each entry carries the crate it suppresses and why it is acceptable today.
 #
-# Last audited against the graph: 2026-10-05 (post wasmtime 47.0.4 -> 48.0.5
+# Last audited against the graph: 2026-10-11 (jig-mls / openmls 0.9 added;
+# one build-time unmaintained entry, RUSTSEC-2026-0173); before that, 2026-10-05 (post wasmtime 47.0.4 -> 48.0.5
 # for RUSTSEC-2026-0314/0315/0316 and 0321-0327, and rustls 0.23.31 -> 0.23.45+
 # for RUSTSEC-2026-0285; before that, 2026-09-11, post wasmtime 47.0.3 -> 47.0.4
 # for RUSTSEC-2026-0268/0269 and the chacha20 0.10.0 yank; before that,
@@ -89,6 +90,16 @@ version = 2
 # feature -> picky, and are not yanked.)
 yanked = "deny"
 ignore = [
+    # RUSTSEC-2026-0173: proc-macro-error2 is unmaintained (no vulnerability).
+    # Build-time only — a proc-macro dependency of hax-lib-macros, reached via
+    # jig-mls -> openmls_rust_crypto 0.6 -> hpke-rs 0.7 -> libcrux-sha3 ->
+    # libcrux-intrinsics -> core-models -> hax-lib. hpke-rs depends on
+    # libcrux-sha3 unconditionally, so no feature selection drops it; it is
+    # never linked into a shipped binary. Same reasoning, and same category,
+    # as the RUSTSEC-2024-0370 (proc-macro-error) entry this file once held.
+    # Drop when hax-lib moves off it or openmls_rust_crypto off hpke-rs 0.7.
+    "RUSTSEC-2026-0173",
+
     # RUSTSEC-2024-0436 (paste, unmaintained) left with ratatui 0.27. ratatui
     # 0.30 uses pastey instead, so the advisory no longer matches a crate.
 

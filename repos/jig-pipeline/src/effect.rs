@@ -46,6 +46,7 @@ pub async fn apply_effect(
 
         BlockKind::ChannelCreate => apply_channel_create(store, &manifest, block_cid),
         BlockKind::MemberAdd => apply_member_add(store, &manifest, block_cid),
+        BlockKind::MemberRemove => apply_member_remove(store, &manifest),
         BlockKind::ChannelPromote => apply_channel_promote(store, &manifest),
         BlockKind::ChannelArchive => apply_channel_archive(store, &manifest),
         BlockKind::FedHello => apply_fed_hello(store, &manifest, block_cid),
@@ -100,6 +101,10 @@ fn apply_channel_create(
     let slug = meta_str(m, "slug")
         .ok_or_else(|| anyhow::anyhow!("channel-create missing `slug` in metadata"))?;
     let visibility = meta_str(m, "visibility").unwrap_or("open");
+    // Validated by the suite gate before any effect runs; parsed again here so
+    // an unknown suite can never be written even if a caller skipped it.
+    let suite = crate::mls_gate::requested_suite(m)
+        .map_err(|_| anyhow::anyhow!("channel-create names an unknown suite"))?;
     let now = chrono::Utc::now().timestamp();
     let owner_did = sender_did_string(m);
 
@@ -109,6 +114,7 @@ fn apply_channel_create(
         visibility: visibility.to_string(),
         created_at: now,
         owner_did: owner_did.clone(),
+        suite: suite.as_str().to_string(),
     })?;
     store.upsert_membership(&StoredMembership {
         channel_id: block_cid.to_string(),
@@ -140,6 +146,19 @@ fn apply_member_add(
         joined_at: chrono::Utc::now().timestamp(),
         source_block_cid: block_cid.to_string(),
     })?;
+    Ok(())
+}
+
+/// Drop a membership. Authorization (owner, self, or tidy-up) was decided by
+/// the write gate; removing someone who is already gone is a no-op, which is
+/// exactly the tidy-up case on an encrypted channel.
+fn apply_member_remove(store: &Arc<SqliteStore>, m: &BlockManifest) -> anyhow::Result<()> {
+    let channel_slug = meta_str(m, "channel")
+        .ok_or_else(|| anyhow::anyhow!("member-remove missing `channel` in metadata"))?;
+    let member_did = meta_str(m, "member_did")
+        .map(canonical_did_string)
+        .ok_or_else(|| anyhow::anyhow!("member-remove missing `member_did` in metadata"))?;
+    store.remove_membership(channel_slug, &member_did)?;
     Ok(())
 }
 

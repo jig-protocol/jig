@@ -101,10 +101,8 @@ async fn two_server_federation_chat_with_receipt_parity() {
             let bundle_bytes =
                 base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &bundle_b64)
                     .expect("bundle b64");
-            let derived_cid = format!(
-                "bafy_{}",
-                hex::encode(blake3::hash(&bundle_bytes).as_bytes())
-            );
+            let derived_cid = jig_server::v0_0_2_federation::peer_block_cid(&bundle_bytes)
+                .expect("relayed bundle has a CID");
             // Confirm the body content matches
             let (manifest_bytes, _): (Vec<u8>, Vec<u8>) =
                 serde_json::from_slice(&bundle_bytes).expect("tuple");
@@ -127,35 +125,20 @@ async fn two_server_federation_chat_with_receipt_parity() {
         "Bob must receive alice's federated text-render block via server_b"
     );
 
-    // Confirm BOTH servers have the block + a receipt for it.
-    // Server_a stores under its ingest-computed CID. Server_b stores under
-    // the federation-receive-computed CID (also blake3 over the bundle).
+    // Confirm BOTH servers have the block + a receipt for it, under ONE CID:
+    // the relay derives it the way ingest does, so the block server_b
+    // delivered is the block server_a accepted, by identity.
     let receipts_a = server_a.receipts_for(&cid_a).expect("receipts on a");
     assert!(!receipts_a.is_empty(), "server_a must have a receipt");
-
-    // Server_b's CID for the same block: derived via blake3 over canonical
-    // bytes. The federation module uses the same blake3 hash for the CID.
-    // Both should produce the same hash since canonical bytes are identical;
-    // the format prefix is identical too ("bafy_<hex>" for the federation
-    // path; the local ingest may use just blake3 hex without the prefix).
-    let receipts_b_with_b_cid = server_b
-        .receipts_for(&bob_received_cid.clone().unwrap())
-        .expect("receipts on b");
-    let receipts_b_with_a_cid = server_b
-        .receipts_for(&cid_a)
-        .expect("receipts on b via a-cid");
-
-    let receipts_b = if !receipts_b_with_b_cid.is_empty() {
-        receipts_b_with_b_cid
-    } else {
-        receipts_b_with_a_cid
-    };
-
+    assert_eq!(
+        bob_received_cid.as_deref(),
+        Some(cid_a.as_str()),
+        "a federated block keeps its CID across servers"
+    );
+    let receipts_b = server_b.receipts_for(&cid_a).expect("receipts on b");
     assert!(
         !receipts_b.is_empty(),
-        "server_b must have a receipt for the federated block (looked up under both \
-         locally-derived CID `{}` and sender-side CID `{cid_a}`)",
-        bob_received_cid.unwrap_or_default()
+        "server_b must have a receipt for the federated block under `{cid_a}`"
     );
 
     // Cross-server receipt parity: render_hash agreement.
@@ -234,10 +217,7 @@ fn inject_forged_block_into_a(
     forged_sig: &[u8],
     claimed_did_str: &str,
 ) -> (StoredBlock, StoredReceipt) {
-    let block_cid = format!(
-        "bafy_{}",
-        hex::encode(blake3::hash(bundle_bytes).as_bytes())
-    );
+    let block_cid = jig_server::v0_0_2_federation::peer_block_cid(bundle_bytes).unwrap();
     let stored_block = StoredBlock {
         cid: block_cid.clone(),
         channel_id: None,
@@ -299,10 +279,7 @@ async fn federated_block_with_forged_author_did_is_rejected() {
     // Forged block: alice signs, manifest claims bob.
     let (forged_bundle, forged_sig) =
         build_forged_block(&alice_key, &bob_did, "#hello", "I am bob (forged)");
-    let forged_cid = format!(
-        "bafy_{}",
-        hex::encode(blake3::hash(&forged_bundle).as_bytes())
-    );
+    let forged_cid = jig_server::v0_0_2_federation::peer_block_cid(&forged_bundle).unwrap();
 
     // Inject straight into srv_a's store + receipt table, then broadcast through
     // srv_a's Fanout. The outbound peer-tx delivers the relayed block to srv_b's
@@ -374,10 +351,7 @@ async fn naively_trust_peer_authored_blocks_accepts_forged_relay() {
 
     let (forged_bundle, forged_sig) =
         build_forged_block(&alice_key, &bob_did, "#hello", "trusted relay");
-    let forged_cid = format!(
-        "bafy_{}",
-        hex::encode(blake3::hash(&forged_bundle).as_bytes())
-    );
+    let forged_cid = jig_server::v0_0_2_federation::peer_block_cid(&forged_bundle).unwrap();
     let (forged_block, forged_receipt) = inject_forged_block_into_a(
         &srv_a.state,
         &forged_bundle,

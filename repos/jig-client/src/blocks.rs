@@ -27,6 +27,20 @@ impl BuiltBlock {
         let payload = (self.manifest_bytes.clone(), self.code_bytes.clone());
         serde_json::to_vec(&payload).expect("canonical bytes serialize")
     }
+
+    /// The block's CID, computed as the server will compute it. Known before
+    /// submission, which is what lets a sender file the plaintext of its own
+    /// encrypted message under the CID it will come back with.
+    pub fn cid(&self) -> String {
+        jig_core::BlockBundle {
+            manifest_bytes: &self.manifest_bytes,
+            code_bytes: &self.code_bytes,
+            resources: vec![],
+        }
+        .block_cid()
+        .map(|c| c.to_string())
+        .expect("a built block always has a CID")
+    }
 }
 
 /// Build a signed `text-render` block: the v0.0.2 chat-message block.
@@ -114,6 +128,69 @@ pub fn build_member_add(
     )
 }
 
+/// Build a signed `member-remove` block: the owner removing `member_did`, or
+/// a member leaving when `member_did` is its own DID. `extra` carries the MLS
+/// fields on an encrypted channel (see `jig_pipeline::mls_gate`).
+pub fn build_member_remove(
+    sender: &Identity,
+    channel_slug: &str,
+    member_did: &str,
+    extra: Value,
+    hlc: HlcTimestamp,
+) -> BuiltBlock {
+    let mut meta = json!({
+        "channel": channel_slug,
+        "member_did": member_did,
+    });
+    merge(&mut meta, extra);
+    build_with_metadata(sender, BlockKind::MemberRemove, hlc, meta)
+}
+
+/// Build a signed `channel-promote` block: restricted → open. Owner only.
+pub fn build_channel_promote(
+    sender: &Identity,
+    channel_slug: &str,
+    hlc: HlcTimestamp,
+) -> BuiltBlock {
+    build_with_metadata(
+        sender,
+        BlockKind::ChannelPromote,
+        hlc,
+        json!({ "channel": channel_slug }),
+    )
+}
+
+/// Build an encrypted chat message: a `text-render` whose content is an MLS
+/// application message for the channel's group. No `body` — a server
+/// refuses plaintext on an encrypted channel.
+pub fn build_sealed_text(
+    sender: &Identity,
+    channel_slug: &str,
+    mls_message: &[u8],
+    epoch: u64,
+    hlc: HlcTimestamp,
+) -> BuiltBlock {
+    use base64::Engine as _;
+    build_with_suite(
+        sender,
+        BlockKind::TextRender,
+        hlc,
+        json!({
+            "channel": channel_slug,
+            "mls_message": base64::engine::general_purpose::STANDARD.encode(mls_message),
+            "mls_epoch": epoch,
+        }),
+        jig_core::EncryptionSuite::Mls,
+    )
+}
+
+/// Merge the keys of `extra` (an object, or null) into `meta`.
+pub fn merge(meta: &mut Value, extra: Value) {
+    if let (Value::Object(m), Value::Object(e)) = (meta, extra) {
+        m.extend(e);
+    }
+}
+
 /// Build a signed `channel-archive` block — the v0.0.2 channel delete.
 ///
 /// Archiving is a soft delete: the server hides the channel but keeps every
@@ -158,6 +235,25 @@ pub fn build_with_metadata(
     hlc: HlcTimestamp,
     metadata: Value,
 ) -> BuiltBlock {
+    build_with_suite(
+        sender,
+        kind,
+        hlc,
+        metadata,
+        jig_core::EncryptionSuite::Unencrypted,
+    )
+}
+
+/// [`build_with_metadata`] with the content suite declared in
+/// `privacy.encryption`. `none` leaves `privacy` out, so plaintext blocks
+/// keep the exact bytes (and CIDs) they always had.
+pub fn build_with_suite(
+    sender: &Identity,
+    kind: BlockKind,
+    hlc: HlcTimestamp,
+    metadata: Value,
+    suite: jig_core::EncryptionSuite,
+) -> BuiltBlock {
     let mut builder = BlockManifest::builder()
         .version(semver::Version::new(0, 1, 0))
         .author(Author {
@@ -165,6 +261,13 @@ pub fn build_with_metadata(
             public_key: None,
             roles: vec![],
         });
+    if suite != jig_core::EncryptionSuite::Unencrypted {
+        builder = builder.privacy(jig_core::Privacy {
+            encryption: suite,
+            recipients: vec![],
+            metadata_visibility: Default::default(),
+        });
+    }
     if let Value::Object(map) = metadata {
         for (k, v) in map {
             builder = builder.metadata_entry(&k, v);

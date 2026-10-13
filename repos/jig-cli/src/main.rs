@@ -2,7 +2,6 @@
 
 mod channel_arg;
 mod cmd;
-mod commands;
 mod config;
 mod http_client;
 mod receipt;
@@ -18,7 +17,7 @@ use std::path::PathBuf;
 use std::{io, io::IsTerminal};
 
 #[derive(Parser, Debug)]
-#[command(name = "jig", about = "Command-line client for Jig blocks")]
+#[command(name = "jig", version, about = "Command-line client for Jig blocks")]
 struct Cli {
     /// Config file to use instead of ~/.jig/cli.toml (must exist)
     #[arg(long)]
@@ -88,7 +87,19 @@ enum Commands {
         channel: Option<String>,
     },
 
-    /// List recent blocks
+    /// Direct-message someone: a locked, end-to-end encrypted channel with
+    /// the two of you in it, created on first use. With a message, sends it
+    /// and exits; without, opens the chat.
+    Dm {
+        /// A did:jig, or a name from `[contacts]` in cli.toml.
+        #[arg()]
+        who: String,
+        #[arg()]
+        message: Vec<String>,
+    },
+
+    /// Print a channel's recent messages and exit (decrypting an encrypted
+    /// channel you belong to).
     Read {
         #[command(flatten)]
         channel: ChannelArg,
@@ -169,6 +180,51 @@ enum ChannelAction {
         /// Succeed (exit 0) if the channel already exists instead of failing.
         #[arg(long)]
         exist_ok: bool,
+
+        /// End-to-end encrypt the channel with MLS: the server stores and
+        /// relays ciphertext it cannot read. Fixed at creation.
+        #[arg(long)]
+        encrypted: bool,
+    },
+
+    /// Add someone to a channel you own. On an encrypted channel this also
+    /// adds them to its MLS group.
+    Add {
+        #[arg()]
+        slug: String,
+        /// A did:jig, or a name from `[contacts]`.
+        #[arg()]
+        who: String,
+    },
+
+    /// Remove someone from a channel you own. On an encrypted channel they
+    /// can read nothing sent after this.
+    #[command(alias = "remove")]
+    Kick {
+        #[arg()]
+        slug: String,
+        /// A did:jig, or a name from `[contacts]`.
+        #[arg()]
+        who: String,
+    },
+
+    /// Leave a channel. The owner cannot leave; it deletes the channel instead.
+    Leave {
+        #[arg()]
+        slug: String,
+    },
+
+    /// Open a restricted channel (or DM) you own to anyone: `restricted` →
+    /// `open`. An encrypted channel stays encrypted.
+    Promote {
+        #[arg()]
+        slug: String,
+    },
+
+    /// List a channel's members.
+    Members {
+        #[arg()]
+        slug: String,
     },
 
     /// Join an existing channel by adding the caller's DID as a member.
@@ -456,6 +512,17 @@ async fn main() -> Result<()> {
         match action {
             ServerAction::Set { url } => {
                 cmd::server::set(&ctx, &url)?;
+                // Publish MLS key packages to the new server so others can
+                // add this identity to encrypted channels and DMs straight
+                // away. Best effort: the server may be down, or predate v0.2.
+                let ctx = cmd::common::CliContext::resolve(&overrides)?;
+                if let Ok(secure) = cmd::secure::Secure::open(&ctx)
+                    && secure.ensure_key_packages().await.is_ok()
+                {
+                    println!(
+                        "published MLS key packages (others can now add you to encrypted channels)"
+                    );
+                }
             }
             ServerAction::Info { url } => {
                 cmd::server::info(&ctx, url.as_deref()).await?;
@@ -486,9 +553,15 @@ async fn main() -> Result<()> {
                 slug,
                 visibility,
                 exist_ok,
+                encrypted,
             } => {
-                cmd::channel::create(&ctx, slug, visibility, exist_ok).await?;
+                cmd::channel::create(&ctx, slug, visibility, exist_ok, encrypted).await?;
             }
+            ChannelAction::Add { slug, who } => cmd::channel::add(&ctx, slug, who).await?,
+            ChannelAction::Kick { slug, who } => cmd::channel::kick(&ctx, slug, who).await?,
+            ChannelAction::Leave { slug } => cmd::channel::leave(&ctx, slug).await?,
+            ChannelAction::Promote { slug } => cmd::channel::promote(&ctx, slug).await?,
+            ChannelAction::Members { slug } => cmd::channel::members(&ctx, slug).await?,
             ChannelAction::Join { slug } => {
                 cmd::channel::join(&ctx, slug).await?;
             }
@@ -528,9 +601,15 @@ async fn main() -> Result<()> {
             let channel = channel.unwrap_or(default_channel.clone());
             cmd::send::run(&ctx, channel, body).await?;
         }
+        Some(Commands::Dm { who, message }) => {
+            cmd::dm::run(&ctx, who, message.join(" ")).await?;
+        }
         Some(Commands::Read { channel, limit }) => {
+            // The signed history endpoint. The v0.0.1 `GET /blocks` this used
+            // to call is gated off on every default server, so `jig read`
+            // 404'd out of the box.
             let channel = channel.resolve(&default_channel);
-            commands::read_messages(&client, &channel, limit, cli.json).await?;
+            cmd::tail::read(&ctx, channel, limit, cli.json).await?;
         }
         Some(Commands::Tail { channel }) => {
             // F5: route through jig-client WSS subscribe. v0.0.1's HTTP-
@@ -659,18 +738,30 @@ async fn main() -> Result<()> {
         Some(Commands::Server { .. }) => unreachable!("server handled earlier"),
         Some(Commands::Channel { .. }) => unreachable!("channel handled earlier"),
         Some(Commands::Ns { .. }) => unreachable!("ns handled earlier"),
+        // No subcommand. These used to post through the v0.0.1 `POST /blocks`
+        // route, which every default server has gated off, so all three
+        // failed out of the box; they now take the same path as `jig send`
+        // and `jig chat`.
         None => {
             if !direct_message.is_empty() {
                 let msg = direct_message.join(" ");
-                let cid =
-                    commands::send_text(&client, &config, &default_channel, msg.trim()).await?;
-                if !cli.quiet {
-                    println!("Block published: {}", cid);
-                }
+                cmd::send::run(&ctx, default_channel, msg.trim().to_string()).await?;
             } else if stdin_pipe {
-                commands::pipe_mode(&client, &config, &default_channel).await?;
+                use std::io::BufRead as _;
+                for line in io::stdin().lock().lines() {
+                    let line = line?;
+                    if !line.trim().is_empty() {
+                        cmd::send::run(&ctx, default_channel.clone(), line).await?;
+                    }
+                }
             } else {
-                commands::interactive_mode(&client, &config, &default_channel).await?;
+                cmd::chat::run(
+                    &ctx,
+                    cmd::chat::ChatArgs {
+                        channel: default_channel,
+                    },
+                )
+                .await?;
             }
         }
     }

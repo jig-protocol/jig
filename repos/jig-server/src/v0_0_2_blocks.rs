@@ -36,13 +36,13 @@ pub struct SubmitResult {
     pub block_cid: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
 }
 
-fn err(
+pub(crate) fn err(
     status: StatusCode,
     code: &'static str,
     msg: impl Into<String>,
@@ -229,6 +229,8 @@ pub struct ChannelView {
     pub visibility: String,
     pub owner_did: String,
     pub created_at: i64,
+    /// `none` or `mls`, fixed at creation.
+    pub suite: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -277,9 +279,60 @@ pub async fn list_channels(
             visibility: c.visibility,
             owner_did: c.owner_did,
             created_at: c.created_at,
+            suite: c.suite,
         });
     }
     Ok(Json(ChannelsResponse { channels }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct MemberView {
+    pub did: String,
+    pub role: String,
+    pub joined_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MembersResponse {
+    pub slug: String,
+    pub members: Vec<MemberView>,
+}
+
+/// GET /api/v1/channels/:slug/members — who is in a channel.
+///
+/// Whoever may read the channel may see its members: on an open channel that
+/// is anyone admitted, on a restricted one its members and owner. The same
+/// gates, in the same order, as the timeline.
+pub async fn list_members(
+    State(state): State<Arc<AppState>>,
+    Path(slug): Path<String>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<MembersResponse>, (StatusCode, Json<ErrorBody>)> {
+    let started = std::time::Instant::now();
+    let caller_did = admit_caller(&state, &headers, "GET", uri.path(), started)?;
+    if let Some(caller) = caller_did.as_ref() {
+        authorize_channel_read(&state, &slug, caller, started)?;
+    }
+    let store = &state.ingest_ctx.store;
+    let Some(channel) = store.get_channel_by_slug(&slug).map_err(persist_err)? else {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            "UNKNOWN_CHANNEL",
+            format!("no live channel '{slug}' on this server"),
+        ));
+    };
+    let members = store
+        .list_members(&channel.id)
+        .map_err(persist_err)?
+        .into_iter()
+        .map(|m| MemberView {
+            did: m.member_did,
+            role: m.role,
+            joined_at: m.joined_at,
+        })
+        .collect();
+    Ok(Json(MembersResponse { slug, members }))
 }
 
 // ---- Channel history endpoint -----------------------------------------------
@@ -313,7 +366,7 @@ pub struct TimelineBlock {
     pub delivery_cid: String,
 }
 
-fn persist_err(e: impl std::fmt::Display) -> (StatusCode, Json<ErrorBody>) {
+pub(crate) fn persist_err(e: impl std::fmt::Display) -> (StatusCode, Json<ErrorBody>) {
     err(
         StatusCode::INTERNAL_SERVER_ERROR,
         "PERSIST_ERROR",
@@ -341,7 +394,7 @@ fn persist_err(e: impl std::fmt::Display) -> (StatusCode, Json<ErrorBody>) {
 /// request URI rather than rebuilt from extracted parameters. The signature
 /// covers the path as sent, so reconstructing it invites an encoding mismatch
 /// that would present as "every signature is invalid".
-fn admit_caller(
+pub(crate) fn admit_caller(
     state: &AppState,
     headers: &axum::http::HeaderMap,
     method: &str,
@@ -406,7 +459,7 @@ fn admit_caller(
 /// out (so writes fail loudly), which is exactly why it must not be the
 /// lookup used here: with it, retiring a restricted channel published its
 /// history to anyone with a key.
-fn authorize_channel_read(
+pub(crate) fn authorize_channel_read(
     state: &AppState,
     slug: &str,
     caller: &jig_core::did::Did,
@@ -444,7 +497,7 @@ fn authorize_channel_read(
 /// depths, so a future constant-time mitigation must know how long the request
 /// has already taken in order to pad to a fixed floor. Threading it now costs
 /// one parameter; adding it later would mean touching every call site again.
-fn refuse(
+pub(crate) fn refuse(
     state: &AppState,
     outcome: &crate::auth::GateOutcome,
     started: std::time::Instant,
@@ -514,6 +567,7 @@ pub fn build_blocks_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/blocks/:cid", get(get_block_by_cid))
         .route("/api/v1/channels", get(list_channels))
         .route("/api/v1/channels/:slug/blocks", get(get_channel_history))
+        .route("/api/v1/channels/:slug/members", get(list_members))
         .with_state(state)
 }
 
@@ -569,6 +623,7 @@ mod tests {
                 visibility: "open".to_string(),
                 created_at: 0,
                 owner_did: "did:jig:zSeedOwner".to_string(),
+                suite: "none".to_string(),
             })
             .unwrap();
     }

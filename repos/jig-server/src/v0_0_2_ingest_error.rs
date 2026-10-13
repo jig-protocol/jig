@@ -97,6 +97,21 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         IngestError::NotChannelMember { .. } => {
             (StatusCode::FORBIDDEN, "NOT_A_MEMBER", e.to_string())
         }
+        // 409: the request is well-formed, but a channel keeps its owner.
+        IngestError::OwnerCannotLeave { .. } => {
+            (StatusCode::CONFLICT, "OWNER_CANNOT_LEAVE", e.to_string())
+        }
+        // Same code as the envelope and manifest gates: a suite nobody speaks.
+        IngestError::UnknownSuite { .. } => {
+            (StatusCode::BAD_REQUEST, "UNSUPPORTED_SUITE", e.to_string())
+        }
+        IngestError::SuiteMismatch { .. } => {
+            (StatusCode::BAD_REQUEST, "SUITE_MISMATCH", e.to_string())
+        }
+        IngestError::MlsRejected { .. } => (StatusCode::BAD_REQUEST, "MLS_REJECTED", e.to_string()),
+        // 409: someone else committed first. The client catches up and
+        // rebuilds; nothing about the request itself was wrong.
+        IngestError::StaleEpoch { .. } => (StatusCode::CONFLICT, "STALE_EPOCH", e.to_string()),
         IngestError::Identity(ide) => (StatusCode::UNAUTHORIZED, "IDENTITY_ERROR", ide.to_string()),
         IngestError::Persist(pe) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -170,6 +185,25 @@ mod tests {
             IngestError::NotAdmitted {
                 sender: "did:jig:zBad".to_string(),
                 refusal: jig_pipeline::ingest::AdmissionRefusal::Banned,
+            },
+            IngestError::OwnerCannotLeave {
+                slug: "#mine".to_string(),
+            },
+            IngestError::UnknownSuite {
+                suite: "rot13".to_string(),
+            },
+            IngestError::SuiteMismatch {
+                slug: "#sealed".to_string(),
+                channel: "mls".to_string(),
+                block: "none".to_string(),
+            },
+            IngestError::MlsRejected {
+                detail: "not a commit".to_string(),
+            },
+            IngestError::StaleEpoch {
+                slug: "#sealed".to_string(),
+                current: 2,
+                got: 1,
             },
         ]
     }

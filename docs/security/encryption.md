@@ -71,7 +71,37 @@ contract, and a server that cannot speak it is refused.
 
 ## Execution under encryption
 
-A server cannot execute Wasm over ciphertext. Today `text-render` executes server-side to
-produce the `render_hash` a receipt signs. Under MLS, execution of content blocks has to
-move to clients, and what a server receipt attests changes. This is the largest design
-consequence of encryption for jig, and it is open in JEP-0001.
+A server cannot execute Wasm over ciphertext. On a plaintext channel `text-render` still
+executes server-side to produce the `render_hash` a receipt signs. On an encrypted channel
+the server executes nothing and says so: its receipt is marked `"content": "sealed"` and
+attests only to what it checked — the author's signature, the suite, that the payload is an
+application message for the channel's group at the current epoch or one of the three before
+it — and that it persisted the block. Moving execution of decrypted content to clients is still open in JEP-0001.
+
+## Why the DID key is the MLS signature key (v0.2)
+
+The MLS cipher suite jig uses signs with Ed25519, and a `did:jig` *is* an Ed25519 key. So a
+leaf's credential names the DID and its signature key is that DID's key, and both the
+server and every member refuse a leaf where the two disagree. The alternative — a separate
+MLS key certified by the DID — adds a certificate format and a revocation story for no gain
+while one DID is one device. The cost: rotating a DID key means rejoining every group,
+which is already true of everything else that key signs.
+
+## Why the server validates commits (v0.2)
+
+A delivery service that only relays and counts epochs can order commits, but cannot tell a
+valid one from garbage. On an open encrypted channel anyone can send an external commit, so
+one bad commit would move the server's epoch past every member's and wedge the channel for
+good. The server therefore keeps the channel's public MLS state and accepts a
+commit-carrying block only if the commit is valid for the current epoch and does exactly
+what the block says. That also keeps jig's membership table and the MLS tree from drifting
+apart: an owner cannot add one DID in the block and a different key in the tree. The price
+is that commits are MLS `PublicMessage`s, so the server sees adds and removes — which it
+already did, from the membership blocks.
+
+## Why members keep plaintext (v0.2)
+
+MLS deletes a message key once used, so a message decrypts exactly once and a sender can
+never decrypt its own. A client that replays history needs what it already read, so it
+keeps a local plaintext cache keyed by block CID. That cache is the most sensitive file on
+the client; it lives beside the identity key under `~/.jig/`, mode 0700.

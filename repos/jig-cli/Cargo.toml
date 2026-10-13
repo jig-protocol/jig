@@ -28,6 +28,9 @@ jig-runtime = { workspace = true, optional = true }
 # paths (e.g., src/http_client.rs) stay as legacy until Phase F replaces
 # them with jig-client-backed equivalents.
 jig-client = { path = "../jig-client" }
+# MLS commit type, carried between jig-client's session and the blocks the CLI
+# submits for it.
+jig-mls = { workspace = true }
 
 # CLI
 clap = { version = "4.4", features = ["derive"] }

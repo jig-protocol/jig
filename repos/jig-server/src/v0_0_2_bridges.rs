@@ -319,6 +319,17 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         ref e @ IngestError::NotAdmitted { .. } => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },
+        // Bridges post plaintext; an encrypted channel will never take it, and
+        // the same bytes will be refused the same way again.
+        ref e @ (IngestError::OwnerCannotLeave { .. }
+        | IngestError::UnknownSuite { .. }
+        | IngestError::SuiteMismatch { .. }
+        | IngestError::MlsRejected { .. }) => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
+        // Someone else committed first; rebuilding against the new epoch may
+        // well succeed.
+        IngestError::StaleEpoch { .. } => SubmitDenied::Unavailable,
         // Unavailable, not PolicyBlocked: the block is fine and execution failed
         // on this host, so a retry may well succeed.
         IngestError::RenderFailed { .. } => SubmitDenied::Unavailable,
@@ -605,6 +616,7 @@ mod tests {
                 visibility: "restricted".to_string(),
                 created_at: 0,
                 owner_did: shadow_did.clone(),
+                suite: "none".to_string(),
             })
             .unwrap();
         store

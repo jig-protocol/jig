@@ -10,6 +10,8 @@ description = "Shared block ingest/effect/persist pipeline for jig-server and ji
 jig-core = { workspace = true }
 jig-config = { workspace = true }
 jig-runtime = { workspace = true }
+# Validates the MLS payload of blocks on encrypted channels (`mls_gate`).
+jig-mls = { workspace = true }
 # The canonical text-render block: its embedded Wasm artifact, its module
 # identity, and the Input/Output types that define the ABI. Depending on the
 # crate rather than re-declaring the types keeps one definition of the wire

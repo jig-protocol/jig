@@ -309,7 +309,23 @@ async fn handle_inbound_frame(
     }
 }
 
-async fn ingest_peer_block(
+/// A relayed block's CID, derived exactly as `ingest` derives it — a CIDv1
+/// over the bundle root — so one block has one identity on every server.
+/// (Up to v0.1 this relay used `bafy_<blake3 of the tuple bytes>`, so a
+/// federated block was stored under a different CID than its origin's.)
+pub fn peer_block_cid(bundle_bytes: &[u8]) -> anyhow::Result<String> {
+    let (manifest_bytes, code_bytes): (Vec<u8>, Vec<u8>) = serde_json::from_slice(bundle_bytes)?;
+    let bundle = jig_core::BlockBundle {
+        manifest_bytes: &manifest_bytes,
+        code_bytes: &code_bytes,
+        resources: vec![],
+    };
+    Ok(bundle.block_cid()?.to_string())
+}
+
+/// Persist and fan out one block a federation peer relayed. Public so the
+/// integration-test harness drives this exact path rather than a copy of it.
+pub async fn ingest_peer_block(
     state: &Arc<AppState>,
     peer: &jig_config::v0_0_2_server::FederationPeer,
     bundle_b64: &str,
@@ -328,11 +344,7 @@ async fn ingest_peer_block(
         return Ok(());
     }
 
-    // Derive block_cid the same way ingest does (blake3 over bundle bytes).
-    let block_cid = format!(
-        "bafy_{}",
-        hex::encode(blake3::hash(&bundle_bytes).as_bytes())
-    );
+    let block_cid = peer_block_cid(&bundle_bytes)?;
 
     // Already have this block? Avoid duplicate insert.
     if state.ingest_ctx.store.get_block(&block_cid)?.is_some() {
@@ -373,6 +385,28 @@ async fn ingest_peer_block(
             %claimed_did,
             "rejecting peer block: sender_sig verification failed ({e})"
         );
+        return Ok(());
+    }
+
+    // v0.2 federates only open, unencrypted channels (see
+    // `DeliveryPolicy::federates`). This relay does not run the write gate or
+    // the MLS delivery service, so a block for a local channel that does not
+    // federate — or one claiming an encrypted suite this server cannot
+    // validate — is dropped rather than carried on the peer's word.
+    if manifest.content_suite() != jig_core::EncryptionSuite::Unencrypted {
+        warn!(peer_url = %peer.url, %block_cid, "rejecting peer block: encrypted content does not federate");
+        return Ok(());
+    }
+    if let Some(slug) = manifest
+        .kind
+        .and_then(|kind| jig_pipeline::ingest::channel_slug_of(kind, &manifest))
+        && let Some(chan) = state
+            .ingest_ctx
+            .store
+            .get_channel_by_slug_including_archived(slug)?
+        && !DeliveryPolicy::for_channel(&chan, vec![]).federates
+    {
+        warn!(peer_url = %peer.url, %block_cid, slug, "rejecting peer block: the local channel does not federate");
         return Ok(());
     }
 
@@ -710,10 +744,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let block_cid = format!(
-            "bafy_{}",
-            hex::encode(blake3::hash(&bundle_bytes).as_bytes())
-        );
+        let block_cid = peer_block_cid(&bundle_bytes).unwrap();
         let stored = state.ingest_ctx.store.get_block(&block_cid).unwrap();
         assert!(
             stored.is_some(),
@@ -762,7 +793,7 @@ mod tests {
             alias: None,
         };
 
-        // A managed (bridge-owned) DID is a member of channel "#dm/x". Channels
+        // A managed (bridge-owned) DID is a member of open channel "#dm/x". Channels
         // key by their channel-create CID (distinct from the slug); register the
         // membership under that CID, and wire a bridge sink for the managed DID.
         let managed_did = "did:jig:zManagedShadow".to_string();
@@ -772,9 +803,12 @@ mod tests {
             .upsert_channel(&StoredChannel {
                 id: "bafyChanX".into(),
                 slug: "#dm/x".into(),
-                visibility: "restricted".into(),
+                // Open: in v0.2 only open, unencrypted channels federate; see
+                // `peer_blocks_for_channels_that_do_not_federate_are_dropped`.
+                visibility: "open".into(),
                 created_at: 0,
                 owner_did: managed_did.clone(),
+                suite: "none".to_string(),
             })
             .unwrap();
         state
@@ -848,6 +882,80 @@ mod tests {
         assert_eq!(got.0.sender_did, sender_did.to_did_jig_string());
     }
 
+    /// v0.2 federates only open, unencrypted channels. A peer block naming a
+    /// local restricted or encrypted channel is dropped: this relay runs
+    /// neither the write gate nor the MLS delivery service, so carrying it
+    /// would let a peer post into a channel its author could not post to.
+    #[tokio::test]
+    async fn peer_blocks_for_channels_that_do_not_federate_are_dropped() {
+        use ed25519_dalek::SigningKey;
+        use jig_core::{Author, BlockKind, BlockManifest, Did, HlcTimestamp};
+        use jig_pipeline::persist::StoredChannel;
+
+        let state = Arc::new(AppState::for_test().unwrap());
+        let peer = jig_config::v0_0_2_server::FederationPeer {
+            url: "wss://test-peer".to_string(),
+            expected_did: "did:jig:zPeer".to_string(),
+            alias: None,
+        };
+        for (slug, visibility, suite) in [
+            ("#private", "restricted", "none"),
+            ("#sealed", "open", "mls"),
+        ] {
+            state
+                .ingest_ctx
+                .store
+                .upsert_channel(&StoredChannel {
+                    id: format!("bafy{slug}"),
+                    slug: slug.into(),
+                    visibility: visibility.into(),
+                    created_at: 0,
+                    owner_did: "did:jig:zOwner".into(),
+                    suite: suite.into(),
+                })
+                .unwrap();
+            let secret: [u8; 32] = rand::random();
+            let key = SigningKey::from_bytes(&secret);
+            let did = Did::from_ed25519_pubkey(key.verifying_key().as_bytes());
+            let manifest = BlockManifest::builder()
+                .version(semver::Version::new(0, 1, 0))
+                .author(Author {
+                    did: did.clone(),
+                    public_key: None,
+                    roles: vec![],
+                })
+                .metadata_entry("channel", serde_json::json!(slug))
+                .metadata_entry("body", serde_json::json!("from a peer"))
+                .build()
+                .unwrap()
+                .with_kind(BlockKind::TextRender)
+                .with_hlc(HlcTimestamp {
+                    wall_ms: 1_747_680_000_000,
+                    logical: 0,
+                    server_did: did,
+                });
+            let bundle_bytes =
+                serde_json::to_vec(&(manifest.to_canonical_bytes().unwrap(), Vec::<u8>::new()))
+                    .unwrap();
+            let sig = key.sign(&bundle_bytes).to_bytes().to_vec();
+            ingest_peer_block(
+                &state,
+                &peer,
+                &base64::engine::general_purpose::STANDARD.encode(&bundle_bytes),
+                Some(&base64::engine::general_purpose::STANDARD.encode(&sig)),
+                &[],
+                "delivery:refused",
+            )
+            .await
+            .unwrap();
+            let cid = peer_block_cid(&bundle_bytes).unwrap();
+            assert!(
+                state.ingest_ctx.store.get_block(&cid).unwrap().is_none(),
+                "a peer block for {slug} ({visibility}, {suite}) must not be stored"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn ingest_peer_block_rejects_forged_sender_did() {
         use ed25519_dalek::SigningKey;
@@ -895,10 +1003,7 @@ mod tests {
             .await
             .unwrap();
 
-        let block_cid = format!(
-            "bafy_{}",
-            hex::encode(blake3::hash(&bundle_bytes).as_bytes())
-        );
+        let block_cid = peer_block_cid(&bundle_bytes).unwrap();
         assert!(
             state
                 .ingest_ctx
@@ -944,10 +1049,7 @@ mod tests {
             .await
             .unwrap();
 
-        let block_cid = format!(
-            "bafy_{}",
-            hex::encode(blake3::hash(&bundle_bytes).as_bytes())
-        );
+        let block_cid = peer_block_cid(&bundle_bytes).unwrap();
         assert!(
             state
                 .ingest_ctx
@@ -1001,10 +1103,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let block_cid = format!(
-                "bafy_{}",
-                hex::encode(blake3::hash(&bundle_bytes).as_bytes())
-            );
+            let block_cid = peer_block_cid(&bundle_bytes).unwrap();
             assert!(
                 state
                     .ingest_ctx
@@ -1060,10 +1159,7 @@ mod tests {
             .await
             .unwrap();
 
-        let block_cid = format!(
-            "bafy_{}",
-            hex::encode(blake3::hash(&bundle_bytes).as_bytes())
-        );
+        let block_cid = peer_block_cid(&bundle_bytes).unwrap();
         assert!(
             state
                 .ingest_ctx

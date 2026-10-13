@@ -1,8 +1,9 @@
 # Crypto Primitives
 
-> **Encryption is not implemented in v0.1.** This chapter's signature, hashing and key
+> **Encryption is per channel since v0.2.** This chapter's signature, hashing and key
 > management sections describe the protocol. Confidentiality is specified in
-> [Encryption](encryption.md): MLS by default, suite-pluggable, v0.2.
+> [Encryption](encryption.md): channels created under `mls` are end-to-end encrypted;
+> others are signed, not encrypted.
 
 **Audience:** This chapter is primarily for **protocol implementers** and **developers building on Jig**. If you're an **end user** or **server operator**, you don't need to understand the cryptographic details—just know that Jig uses modern, audited crypto that's the same stuff Signal, SSH, and WireGuard use.
 
@@ -194,8 +195,8 @@ If a key is compromised and you don't have the private key anymore (e.g., hardwa
 
 ## Encryption Modes
 
-A channel is either unencrypted (suite `none`) or encrypted under its channel's suite
-(MLS by default). DMs are channels with locked membership, not a separate mode. See
+A channel is either unencrypted (suite `none`, the default) or encrypted under the suite
+chosen when it was created (`mls`). DMs are channels with locked membership, not a separate mode. See
 [Encryption](encryption.md).
 
 ## Wire Format Examples

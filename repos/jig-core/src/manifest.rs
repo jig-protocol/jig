@@ -234,6 +234,15 @@ impl BlockManifest {
         Ok(())
     }
 
+    /// The suite protecting this block's content. An absent `privacy` means
+    /// `none`, as on the wire.
+    pub fn content_suite(&self) -> EncryptionSuite {
+        self.privacy
+            .as_ref()
+            .map(|p| p.encryption)
+            .unwrap_or_default()
+    }
+
     /// Validate structural invariants.
     pub fn validate(&self) -> Result<()> {
         self.check_gates()
@@ -618,15 +627,22 @@ mod tests {
         );
     }
 
+    /// v0.2 carries MLS content. Whether a given channel accepts it is the
+    /// channel's call, made at ingest — the manifest gate only refuses what no
+    /// channel could accept.
     #[test]
-    fn gates_refuse_a_registered_but_unimplemented_suite() {
+    fn gates_accept_mls_content() {
         let mut m = minimal_manifest();
         m.privacy = Some(privacy(EncryptionSuite::Mls));
+        assert_eq!(m.check_gates(), Ok(()));
+        assert_eq!(m.content_suite(), EncryptionSuite::Mls);
+    }
+
+    #[test]
+    fn absent_privacy_is_unencrypted_content() {
         assert_eq!(
-            m.check_gates(),
-            Err(ManifestGateError::SuiteNotImplemented(SuiteNotImplemented(
-                EncryptionSuite::Mls
-            )))
+            minimal_manifest().content_suite(),
+            EncryptionSuite::Unencrypted
         );
     }
 

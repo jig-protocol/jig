@@ -511,7 +511,9 @@ def calculate_cost(receipt):
 
 ### E2EE Compatibility
 
-> **Not implemented in v0.1.** Content is signed, not encrypted. See [Encryption](encryption.md).
+> **v0.2:** a server executes nothing on an encrypted channel; its receipt for such a
+> block is marked `"content": "sealed"` and carries no `render_hash`. See
+> [Encryption](encryption.md#server-obligations).
 
 Receipts are designed to work with end-to-end encryption:
 
