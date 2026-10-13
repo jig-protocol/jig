@@ -227,6 +227,7 @@ CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs three jobs: `wo
 | Run a server on a box you already have | [`deploy/README.md`](deploy/README.md) |
 | Provision that box on GCP | [`docs/deployment/gcp-vps-runbook.md`](docs/deployment/gcp-vps-runbook.md) |
 | Know exactly what shipped and what did not | the STATUS section of [`docs/deployment/internal-dogfood-3day.md`](docs/deployment/internal-dogfood-3day.md) |
+| See where the project is headed, phase by phase | [`docs/ROADMAP.md`](docs/ROADMAP.md) |
 | Find any doc in the repo, with a currency label | [`docs/README.md`](docs/README.md) |
 | Understand why something is shaped the way it is | [`docs/superpowers/`](docs/superpowers/) |
 | Report a vulnerability | [`SECURITY.md`](SECURITY.md) (security@jig.onl) |
