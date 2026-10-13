@@ -57,6 +57,11 @@ network is the machine: Alan Kay's "objects all the way down".
 - **Servers are findable from inside the protocol.** Discovery runs through nameservers, with
   proof-of-work and reputation designed in rather than bolted on
   ([JEP-0003](../repos/jig-spec/jep/jep-0003-server-discovery.md)).
+- **Anchor nameservers coordinate; they don't rule.** A nameserver can anchor a high-security zone,
+  giving it a starting point for coordination (default proof-of-work, address conventions, dispute
+  handling) so nobody has to bootstrap one from scratch. Joining is opt-in. Anyone can run their own
+  zones at any security level, with their own anchors, or just connect to servers without hosting
+  anything.
 - **Keep the spec small.** `jig-spec` holds final decisions, normative and terse. Modelling,
   alternatives and justifications go in `docs/` and link to the spec.
 
@@ -217,6 +222,7 @@ Settled on 2026-10-05 unless noted. Open items follow the table.
 | D13 | Signal's post-quantum protocol vs MLS as the plug-in shape? | **Open:** settled in the v0.2 crypto design. |
 | D15 | Discovery design? | A design project of its own, with proof-of-work and reputation built in. Only the JEP stub is in v0.1. |
 | D18 | Where does the threat register live? | Decisions in `jig-spec`, normative and terse; analysis in `docs/`. |
+| D19 | Does an anchor nameserver set rules for the network? | No. An anchor gives a high-security zone initial coordination, and joining it is opt-in. Users can run their own zones at any security level, or just connect to servers. Settled 2026-10-13. |
 
 D3, D14, D16 and D17 concern the Riverdance GUI's licence and internal hosting and are tracked
 outside this repo.
