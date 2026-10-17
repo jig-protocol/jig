@@ -229,7 +229,7 @@ fn synth_from(author_did: &str, bridge_domain: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channel::dm_channel_slug;
+    use crate::channel::thread_slug;
     use crate::provider::{InboundEmail, InboundNotification, OutboundEmail, ProviderMessageId};
     use async_trait::async_trait;
     use jig_bridge_core::{ManagedDidRegistrar, RouterMount, SubmitHandle, SubscribeHandle};
@@ -377,7 +377,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let author = jig_client::Identity::generate_and_save(dir.path()).unwrap();
         let shadow = "did:jig:zShadowAlice";
-        let slug = dm_channel_slug(&author.did().to_string(), shadow);
+        let slug = thread_slug(&author.did().to_string(), shadow);
         let hlc = jig_core::HlcTimestamp::now_wall(author.did().clone());
         let blk = jig_client::blocks::build_text_render(&author, &slug, "reply body", hlc);
         let delivered = DeliveredBlock {
@@ -420,7 +420,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let author = jig_client::Identity::generate_and_save(dir.path()).unwrap();
         let hlc = jig_core::HlcTimestamp::now_wall(author.did().clone());
-        let blk = jig_client::blocks::build_text_render(&author, "#dm/unmapped", "x", hlc);
+        let blk = jig_client::blocks::build_text_render(&author, "#email/unmapped", "x", hlc);
         let delivered = DeliveredBlock {
             bundle_b64: base64::engine::general_purpose::STANDARD.encode(blk.canonical_bytes()),
             receipts: vec![],

@@ -4,7 +4,7 @@
 //! `AppState` + ingest pipeline + mounted webhook route without live Resend:
 //!
 //! * `inbound_webhook_creates_channel_and_lands_block` — one POST to
-//!   `/_bridge/email/inbound` creates the shadow-DID DM channel + two members.
+//!   `/_bridge/email/inbound` creates the shadow-DID thread channel + two members.
 //! * `round_trip_reply_emails_original_sender` — after an inbound webhook, the
 //!   other channel member posts a block; the dispatch task calls
 //!   `outbound()` → `MockProvider::send()` → the sent email is routed back to
@@ -21,7 +21,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use jig_bridge_email::{
     EmailBridge, EmailBridgeConfig, EmailProvider, InboundEmail, InboundNotification,
-    OutboundEmail, ProviderMessageId, dm_channel_slug, shadow_did, shadow_signing_key,
+    OutboundEmail, ProviderMessageId, shadow_did, shadow_signing_key, thread_slug,
 };
 use jig_config::v0_0_2_server::JigServerConfig;
 use jig_server::v0_0_2::AppState;
@@ -203,12 +203,12 @@ async fn post_inbound(router: &axum::Router) -> StatusCode {
         .status()
 }
 
-/// The expected DM channel slug for the alice↔dj conversation (both shadows,
+/// The expected thread channel slug for the alice↔dj conversation (both shadows,
 /// nameserver_url=None so recipient resolves to shadow-dj).
 fn convo_slug() -> String {
     let alice = shadow_did(SECRET, "alice@example.com", false).to_did_jig_string();
     let dj = shadow_did(SECRET, "dj@jig.onl", false).to_did_jig_string();
-    dm_channel_slug(&alice, &dj)
+    thread_slug(&alice, &dj)
 }
 
 /// Poll `cond` every 20ms until it is true or `secs` elapse (then panic).
@@ -230,7 +230,7 @@ async fn wait_until<F: FnMut() -> bool>(mut cond: F, secs: u64, what: &str) {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Posting one inbound webhook creates the DM channel + shadow members in the
+/// Posting one inbound webhook creates the thread channel + shadow members in the
 /// server's SQLite store.
 #[tokio::test]
 async fn inbound_webhook_creates_channel_and_lands_block() {
@@ -248,7 +248,7 @@ async fn inbound_webhook_creates_channel_and_lands_block() {
         .store
         .get_channel_by_slug(&slug)
         .unwrap()
-        .expect("DM channel must be created on first inbound");
+        .expect("thread channel must be created on first inbound");
 
     let members = state
         .ingest_ctx
@@ -287,7 +287,7 @@ async fn round_trip_reply_emails_original_sender() {
     // The other channel member (shadow-dj) replies. `shadow_signing_key`
     // derives the same key that the inbound handler resolved for dj@jig.onl
     // (nameserver_url=None → shadow resolution). We use that key to author
-    // a text-render block on the DM channel, then ingest it directly.
+    // a text-render block on the thread channel, then ingest it directly.
     let slug = convo_slug();
     let dj_sk = shadow_signing_key(SECRET, "dj@jig.onl", false);
     let dj = jig_client::Identity::from_signing_key(dj_sk);

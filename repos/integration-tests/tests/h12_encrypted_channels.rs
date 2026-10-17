@@ -710,6 +710,13 @@ async fn only_the_pair_can_open_their_dm() {
         assert_eq!(status, 400, "{body}");
         assert!(body.to_string().contains("direct-message"), "{body}");
     }
+    // Nor plaintext, naming nobody: the client refuses an unencrypted DM, so
+    // that squat alone would keep the pair from ever DMing here.
+    let plain = json!({"visibility": "restricted", "suite": "none"});
+    let (status, body) = try_create(&api, &mallory, &slug, plain).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.to_string().contains("dm_peer"), "{body}");
+
     let (status, body) = try_create(&api, &alice, &slug, dm(&bob)).await;
     assert_eq!(status, 200, "{body}");
 }
