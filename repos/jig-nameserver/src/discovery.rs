@@ -1,5 +1,5 @@
 // jig-nameserver/src/discovery.rs
-// License: AGPL-3.0 (core infrastructure)
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Purpose: Auto-discover Jig endpoints via DNS before falling back to email
 
 use anyhow::Result;

@@ -28,10 +28,12 @@ allow = [
 ]
 confidence-threshold = 0.8
 
-# Allow internal gigue private crates and workspace crates
+# Skip licence checks for this workspace's own unpublished crates (all
+# MIT OR Apache-2.0). No private registries: jig never depends on gigue or
+# any other closed package (CONTRIBUTING.md), and [sources] denies unknown
+# registries anyway.
 [licenses.private]
 ignore = true
-registries = ["gigue-internal"]
 
 
 [bans]
