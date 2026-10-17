@@ -553,4 +553,4 @@ jig-config v0.2.0 is **feature-complete** and ready for integration. The system 
 
 **Report issues**: https://github.com/jig-protocol/jig-config/issues
 
-**License**: AGPL-3.0
+**License**: MIT OR Apache-2.0
