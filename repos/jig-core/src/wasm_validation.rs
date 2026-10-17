@@ -5,6 +5,8 @@
 //! - Clocks, randomness, sockets, and other ambient authority are denied.
 //! - Linear memory/table growth stays within pre-agreed policy limits.
 //! - Floating point ops are rejected unless a caller explicitly opts-in for testing.
+//! - Only the features in [`DETERMINISTIC_FEATURES`] (WebAssembly 2.0 without
+//!   SIMD) are accepted, whatever the engine that later runs the module enables.
 //!
 //! Even with strict init, we guardrail at runtime to catch any violations.
 //! Hosts should call [`verify_determinism`] prior to instantiation and fail fast
@@ -14,10 +16,24 @@ use crate::error::{JigError, Result};
 use crate::manifest::Constraints;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use wasmparser::{MemoryType, Operator, Parser, Payload, TableType, TypeRef};
+use wasmparser::{
+    MemoryType, Operator, Parser, Payload, TableType, TypeRef, Validator, WasmFeatures,
+};
 
 const DEFAULT_MEMORY_LIMIT_PAGES: u32 = 512; // 32 MiB
 const DEFAULT_TABLE_LIMIT_ELEMENTS: u32 = 1_024;
+
+/// The WebAssembly features a deterministic module may use: the 2.0 core
+/// specification without SIMD.
+///
+/// This is an allowlist. The float check in [`verify_determinism`] names the
+/// scalar float operators one by one, so a proposal it does not know about
+/// (SIMD's float lanes, relaxed SIMD, whatever a later `wasmparser` learns to
+/// decode) would otherwise pass it silently. Relaxed SIMD is non-deterministic
+/// by definition. Threads, memory64, multi-memory, GC, exceptions, tail calls
+/// and the component model stay out until the deterministic host needs them
+/// and they are added here on purpose.
+pub const DETERMINISTIC_FEATURES: WasmFeatures = WasmFeatures::WASM2.difference(WasmFeatures::SIMD);
 
 /// Validation report summarizing determinism analysis.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +71,7 @@ pub enum DeterminismViolation {
     SharedMemoryNotSupported,
     TableMaximumExceedsLimit { declared: u64, limit: u32 },
     TableMissingMaximum,
+    OutsideFeatureSet(String),
 }
 
 impl fmt::Display for DeterminismViolation {
@@ -92,6 +109,12 @@ impl fmt::Display for DeterminismViolation {
             }
             DeterminismViolation::TableMissingMaximum => {
                 write!(f, "table definition missing maximum bound")
+            }
+            DeterminismViolation::OutsideFeatureSet(reason) => {
+                write!(
+                    f,
+                    "module does not validate as WebAssembly 2.0 without SIMD: {reason}"
+                )
             }
         }
     }
@@ -405,6 +428,12 @@ pub fn verify_determinism(
             }
             _ => {}
         }
+    }
+
+    if let Err(e) = Validator::new_with_features(DETERMINISTIC_FEATURES).validate_all(code_bytes) {
+        report
+            .violations
+            .push(DeterminismViolation::OutsideFeatureSet(e.to_string()));
     }
 
     Ok(report)
@@ -724,6 +753,91 @@ mod tests {
                 .iter()
                 .any(|v| matches!(v, DeterminismViolation::FloatInstruction(_)))
         );
+    }
+
+    fn outside_feature_set(wasm: &[u8]) -> bool {
+        verify_determinism(wasm, &DeterminismPolicy::strict())
+            .unwrap()
+            .violations
+            .iter()
+            .any(|v| matches!(v, DeterminismViolation::OutsideFeatureSet(_)))
+    }
+
+    #[test]
+    fn simd_float_lanes_are_refused() {
+        // The scalar float list never names f32x4.add, so before the feature
+        // set this module passed as deterministic.
+        let wasm = wat::parse_str(
+            r#"(module
+                (func (export "add") (param v128 v128) (result v128)
+                    local.get 0
+                    local.get 1
+                    f32x4.add))
+            "#,
+        )
+        .unwrap();
+
+        let report = verify_determinism(&wasm, &DeterminismPolicy::strict()).unwrap();
+        assert!(!report.is_compliant());
+        assert!(outside_feature_set(&wasm));
+    }
+
+    #[test]
+    fn every_proposal_outside_the_feature_set_is_refused() {
+        let outside = [
+            (
+                "relaxed simd",
+                r#"(module (func (param v128 v128 v128) (result v128)
+                    local.get 0 local.get 1 local.get 2 f32x4.relaxed_madd))"#,
+            ),
+            (
+                "threads",
+                r#"(module (memory 1 1 shared)
+                    (func (result i32) i32.const 0 i32.atomic.load))"#,
+            ),
+            ("memory64", r#"(module (memory i64 1 1))"#),
+            ("multi-memory", r#"(module (memory 1 1) (memory 1 1))"#),
+            (
+                "tail calls",
+                r#"(module (func $f (result i32) i32.const 0)
+                    (func (result i32) return_call $f))"#,
+            ),
+            ("exceptions", r#"(module (tag))"#),
+            ("gc", r#"(module (type (struct (field i32))))"#),
+            (
+                "extended const",
+                r#"(module (global i32 (i32.add (i32.const 1) (i32.const 2))))"#,
+            ),
+        ];
+        for (proposal, text) in outside {
+            let wasm = wat::parse_str(text).unwrap();
+            assert!(outside_feature_set(&wasm), "{proposal} was accepted");
+        }
+    }
+
+    #[test]
+    fn webassembly_2_without_simd_passes() {
+        let wasm = wat::parse_str(
+            r#"(module
+                (memory 1 1)
+                (table 1 1 funcref)
+                (func $pair (result i32 i32) i32.const 1 i32.const 2)
+                (func (export "main") (result i32)
+                    call $pair
+                    i32.add
+                    i32.extend8_s
+                    i32.const 0
+                    i32.const 0
+                    i32.const 0
+                    memory.fill
+                    ref.null func
+                    drop))
+            "#,
+        )
+        .unwrap();
+
+        let report = verify_determinism(&wasm, &DeterminismPolicy::strict()).unwrap();
+        assert!(report.is_compliant(), "{:?}", report.violations);
     }
 
     #[test]
