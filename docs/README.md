@@ -41,7 +41,7 @@ should not be read as a status page.
 | [`../SECURITY.md`](../SECURITY.md) | CURRENT | How to report a vulnerability, response targets, disclosure policy and scope. |
 | [`security/operator-threat-model.md`](security/operator-threat-model.md) | CURRENT | The model and evidence behind the spec's operator [threat register](../repos/jig-spec/src/threat-register.md). |
 | [`security/encryption.md`](security/encryption.md) | CURRENT | Why encryption is shaped as it is: suite field, refusals, MLS, DMs as locked channels, the DID key as MLS signer, a validating delivery service, the client plaintext cache. |
-| [`whitepaper/trust-federation-identity.md`](whitepaper/trust-federation-identity.md) | CURRENT | Whitepaper (non-normative): identity, reputation, security zones, anchor nameservers, federation as a data contract, and the threat families beyond operators. Labels every claim built, decided or proposed. |
+| [`whitepaper/trust-federation-identity.md`](whitepaper/trust-federation-identity.md) | CURRENT | Whitepaper (non-normative): identity, `--anon`, reputation, security levels and ruleset groups, anchor nameservers, federation as a data contract, and the threat families beyond operators. Separates, for each topic, what jig must guarantee, what v0.2 does today, and what is still to design. |
 
 ## Crate documentation
 

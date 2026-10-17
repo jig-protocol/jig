@@ -207,8 +207,9 @@ industrial sites, and LTS releases.
 - **Discovery design project (D15):** discovery, exposure, activation, search, reputation and
   proof-of-work, and nameserver governance (delisting bad actors without central control). It runs
   alongside phases 1–4 with its own milestones. The
-  [whitepaper](whitepaper/trust-federation-identity.md) explains the zone, anchor and reputation
-  model, marking what is decided and what is proposed.
+  [whitepaper](whitepaper/trust-federation-identity.md) sets out what security levels, ruleset
+  groups, anchors and reputation must guarantee, what v0.2 does today, and what is still to
+  design.
 - **Bridges as onboarding:** email first, then IRC, then ActivityPub/ATProto.
 - **The dependency rule:** jig never depends on downstream or proprietary code. Products built on
   jig depend on it, never the reverse ([`CONTRIBUTING.md`](../CONTRIBUTING.md)).

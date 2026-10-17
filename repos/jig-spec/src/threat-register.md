@@ -8,7 +8,11 @@ Operators are not the only adversary. The families after OP cover abuse and Sybi
 (AB), the supply chain (SC), privacy (PV), malicious nameservers (NS), governance (GV) and
 time (TM). The same rule holds for each: a party the protocol cannot vet is assumed hostile.
 
-Each entry records the decision that binds implementations and its status in v0.2.
+Each entry records the decision that binds implementations and its status in v0.2. The
+decision is the obligation, whether or not anything implements it yet; the status says what
+v0.2 does, and a prototype does not meet a decision because it exists. A *ruleset group* is
+one concrete group of servers and nameservers that share a ruleset; a *security level*
+(high-sec, low-sec, null-sec) is a category of ruleset, and nothing is shared across one.
 Modelling and justifications: for OP,
 [`docs/security/operator-threat-model.md`](https://github.com/jig-protocol/jig/blob/main/docs/security/operator-threat-model.md);
 for the other families, the
@@ -17,7 +21,8 @@ Every JEP MUST name the entries it affects, and every release MUST state which e
 mitigates.
 
 **Status:** *Open*: no mitigation shipped. *Partial*: some of the decision is
-implemented. *Accepted*: a known limit this version does not try to close.
+implemented. *Accepted*: a known limit this version does not try to close. *By design*: a
+property the decisions choose deliberately, with its cost stated.
 
 ## Server operators (OP)
 
@@ -39,9 +44,11 @@ implemented. *Accepted*: a known limit this version does not try to close.
 | ID | Threat | Decision | v0.2 |
 | --- | --- | --- | --- |
 | AB-01 | Challenge replay: reusing an issued or solved challenge | A challenge is single-use and short-lived; the issuer MUST consume it on first use and refuse it after expiry. A proof answering a challenge MUST cover the action, the alias and every DID involved, not the bare challenge. | Partial: nameserver challenges are consumed once and expire after 60 s, but proofs are not bound to an action or DID; read proofs carry a nonce and an acceptance window |
-| AB-02 | Botnet proof-of-work: distributed solving makes PoW cheap for an attacker with many machines | PoW is a rate cost, not a Sybil defence. It MUST NOT be the only admission gate. Difficulty is a zone parameter and MAY scale with reputation. | Open: servers have no PoW or rate limiting |
+| AB-02 | Botnet proof-of-work: distributed solving makes PoW cheap for an attacker with many machines | A ruleset group's nameservers MUST apply PoW at registration, and servers apply it where their ruleset sets it, as a rate cost. PoW is not, alone, a Sybil defence (AB-05) and MUST NOT be the only admission gate. Difficulty is a ruleset parameter and MAY scale with reputation. | Open: servers have no PoW or rate limiting; alias registration has no PoW; the nameserver's experimental PoW prototype is unused by the alias flow |
 | AB-03 | Relay and bridge quota abuse: amplifying traffic from unidentified sources | A bridge or relay is an ingress point and MUST apply its own limits to what it admits. A relayed block MUST stay attributable to its author and SHOULD be attributable to the relaying server's DID. | Partial: authors are attributable by signature; relayed blocks are recorded against the peer's URL; no ingress applies a rate limit |
 | AB-04 | Over-broad capability requests by blocks | A block receives only the capabilities its manifest names, attenuated at each nesting level. A host MUST refuse a capability the manifest does not declare. There is no ambient authority. | Partial: the server executes only its own canonical `text-render` module, so no third-party block holds a capability; the capability DSL is validated in `jig-core` |
+| AB-05 | Identity farming: a per-identity cost grows only linearly with the number of identities | Sybil resistance MUST hold against identity farming and the other known attack classes, not only raise their price linearly. A fresh DID starts unknown; standing is earned under the ruleset, over time the ruleset group measures; many cheap identities MUST NOT add up to the standing of one costly one. | Open: no mechanism; the nameserver's experimental PoW and reputation prototype prices identities linearly and is unused |
+| AB-06 | Unprovable abuse in encrypted channels, or abuse policed through a backdoor | A participant in an incident MUST be able to prove abuse in an encrypted channel to a tribunal, by delegating its key or view or by another effective proof, with no backdoor, escrow or client-side scanning. Only a participant can produce such a report. | Open: the DID-key content signature that makes proof possible exists; no report format, delegation or tribunal intake exists |
 
 ## Supply chain (SC)
 
@@ -55,26 +62,26 @@ implemented. *Accepted*: a known limit this version does not try to close.
 
 | ID | Threat | Decision | v0.2 |
 | --- | --- | --- | --- |
-| PV-01 | Federation timing correlation: linking identities or zones by when blocks appear on several servers | v0.x makes no unlinkability claim against an observer of several servers (see OP-04). Identities a holder keeps apart are unlinkable only as distinct DIDs. | Accepted |
+| PV-01 | Federation timing correlation: linking identities across servers by when blocks appear on each | v0.x makes no unlinkability claim against an observer of several servers (see OP-04). Identities a holder keeps apart are unlinkable only as distinct DIDs. | Accepted |
 | PV-02 | Receipt linkage: receipts revealing who executed what, where and when | A receipt carries only the block's CID, the server's identity, time and execution facts. A receipt for encrypted content MUST NOT carry a render hash or any content-derived value. | Partial: `sealed` receipts carry no `render_hash`; receipts still link a CID to every server that handled it |
-| PV-03 | Identity cross-linking by the protocol or the client | No protocol message links two DIDs. A session SHOULD be bound to one DID. Clients SHOULD keep identities used in different zones in separate key stores and never use two of them from one session. | Partial: no message links DIDs; a socket rebinds its read identity per subscription; the CLI keeps every identity under `~/.jig/` |
-| PV-04 | Non-deniability: signed content is attributable to its author by anyone it is disclosed to | Every block is signed by its author's DID, and on an encrypted channel the MLS content signature uses the same key. v0.x makes no deniability claim. | Accepted |
+| PV-03 | Identity cross-linking by the protocol or the client | No protocol message links two DIDs, and none links an `--anon` session key to any DID. A session SHOULD be bound to one DID. Clients SHOULD keep identities used in different ruleset groups in separate key stores and never use two of them from one session. | Partial: no message links DIDs; there is no `--anon` mode; a socket rebinds its read identity per subscription; the CLI keeps every identity under `~/.jig/` |
+| PV-04 | Non-deniability: signed content is attributable to its author by anyone it is disclosed to | Every block is signed by its author's DID, and on an encrypted channel the MLS content signature uses the same key. This is deliberate: it makes abuse provable (AB-06). jig makes no deniability claim for content signed by a DID. | By design |
 
 ## Malicious nameservers (NS)
 
 | ID | Threat | Decision | v0.2 |
 | --- | --- | --- | --- |
 | NS-01 | False or poisoned resolution: a nameserver, cache or network attacker maps an alias to the wrong DID | An alias resolution is an attestation signed by the nameserver. A resolver MUST accept it only from a nameserver authoritative for the alias's suffix, MUST verify its signature against that nameserver's DID, and MUST NOT cache it past its validity. Clients SHOULD pin (OP-08). | Partial: attestations are signed and expire; the server's resolver does not verify them, does not bind suffixes to nameservers, and takes the first nameserver that answers |
-| NS-02 | Equivocation: a nameserver gives different answers to different askers | Two validly signed attestations binding one alias to different DIDs in overlapping validity windows are proof of misbehaviour. Resolvers SHOULD retain the attestations they act on. | Open |
-| NS-03 | Cross-nameserver collusion on clock or state (account age, registrations, reputation) | No single nameserver, anchor included, decides a zone-wide claim. A zone SHOULD require agreement among nameservers run by independent operators. | Open: nameservers do not coordinate |
+| NS-02 | Equivocation: a nameserver gives different answers to different askers | Two validly signed attestations binding one alias to different DIDs in overlapping validity windows are proof of misbehaviour. A ruleset group's nameservers MUST append registrations, rotations, penalties and verdicts to a transparency log every member can audit. Resolvers SHOULD retain the attestations they act on. | Open: nothing retains attestations; the alias flow writes to no log; the nameserver's experimental log is a single-nameserver prototype |
+| NS-03 | Cross-nameserver collusion on clock or state (account age, registrations, reputation) | No single nameserver, anchor included, decides a claim for its ruleset group. A ruleset group SHOULD require agreement among nameservers run by independent operators. | Open: nameservers do not coordinate |
 
 ## Governance (GV)
 
 | ID | Threat | Decision | v0.2 |
 | --- | --- | --- | --- |
-| GV-01 | Tribunal capture: one party controls a zone's verdicts | Tribunals are per zone. No zone is bound by another zone's verdict; any zone MAY ignore it. A verdict SHOULD be a signed block that cites its evidence. | Open: no tribunal protocol |
+| GV-01 | Tribunal capture: one party controls a ruleset group's verdicts | Every ruleset group that shares penalties MUST have a tribunal process. Tribunals are per ruleset group. No group is bound by another group's verdict; any group MAY ignore it. A verdict SHOULD be a signed block that cites its evidence. | Open: no tribunal protocol; the nameserver's experimental case records are a prototype nothing consumes |
 | GV-02 | Sybil panels or voters | Eligibility to judge or vote MUST NOT rest on the number of identities a party holds. | Open |
-| GV-03 | Penalty propagation without consent or evidence | An entity MUST NOT lose reputation under a ruleset it has not acknowledged. A penalty SHOULD propagate only between servers that adopted the ruleset, and SHOULD cite a verdict or evidence. | Open: admission bans and floors are local operator configuration |
+| GV-03 | Penalty propagation without consent or evidence | An entity MUST NOT lose reputation under a ruleset it has not acknowledged. Reputation is one number per ruleset; a penalty MUST NOT propagate beyond the ruleset group that adopted the ruleset, never across a security level, and SHOULD cite a verdict or evidence. | Open: admission bans and floors are local operator configuration |
 
 ## Time (TM)
 
