@@ -109,6 +109,17 @@ from its own MLS state first (`jig-cli` `must_encrypt`): holding the group means
 whatever the listing says, and a contradiction is printed as a warning. A channel the device
 has no group for is still taken on the listing's word, which is what suite pinning closes.
 
+Suite pinning: the listing now names each channel's creation block (`id`), and
+`GET /api/v1/blocks/{cid}` serves it with its author's signature. `jig-client`'s
+`pins::prove_channel` checks the block hashes to that id, is a `channel-create` for the
+slug and is signed by its author, and the CLI reads the suite from it, never from the
+listing. The block is pinned in `~/.jig/pins.json` on first sight; a different creation
+block under the same slug is refused (`ChannelReplaced`). The welcome's advertised suites
+are pinned per server too, and a welcome that drops one is refused (`SuiteDropped`). What
+remains: a device's very first look at a channel can be answered with a channel the server
+made up and signed under its own key; the pin turns that into one lie that is then caught,
+not one that is silently repeated.
+
 ### OP-04: metadata harvesting
 
 **Attack.** The operator records who talks to whom, when, how often and how much.
@@ -169,6 +180,13 @@ the mapping from a human name to a DID can. Today's TOFU pin lives on the server
 identity resolver, which protects users from each other but not from the operator who
 controls it. The decision moves pinning to clients. A key-transparency log would turn
 pins into something verifiable; that is future work.
+
+**Status evidence.** The CLI pins each server's DID on its first signed welcome
+(`jig_client::pins`, `~/.jig/pins.json`). A later welcome signed by another key fails
+closed with an explanation, for every WebSocket connection and once per process before
+`Secure`'s first REST request (REST has no handshake of its own). `jig server forget`
+drops a server's pins. Name→DID mappings are not yet pinned client-side, and a REST
+response is tied to the pinned server only once TLS binds the two.
 
 ### OP-09: federation abuse
 

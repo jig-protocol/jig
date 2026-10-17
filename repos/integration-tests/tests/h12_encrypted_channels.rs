@@ -713,3 +713,55 @@ async fn only_the_pair_can_open_their_dm() {
     let (status, body) = try_create(&api, &alice, &slug, dm(&bob)).await;
     assert_eq!(status, 200, "{body}");
 }
+
+/// OP-03 for a device that holds no group for a channel: the server can
+/// relabel the channel in its own store, but not the block its owner signed.
+/// The listing names the creation block; that block, served with its
+/// signature, still proves `mls`.
+#[tokio::test]
+async fn a_relabelled_channel_is_still_what_its_owner_signed() {
+    use jig_client::pins::prove_channel;
+
+    let server = TestJigServer::start_with_full_kinds().await.unwrap();
+    let api = Api { server: &server };
+    let root = tempfile::tempdir().unwrap();
+    let alice = Person::new(root.path());
+    let carol = Person::new(root.path());
+    create_encrypted(&api, &alice, "#town", "open").await;
+
+    // The operator rewrites its own row.
+    rusqlite::Connection::open(server.data_dir().join("server.db"))
+        .unwrap()
+        .execute(
+            "UPDATE channels SET suite = 'none' WHERE slug = '#town'",
+            [],
+        )
+        .unwrap();
+
+    let (status, listing) = api.get(&carol.id, "/api/v1/channels").await;
+    assert_eq!(status, 200, "{listing}");
+    let town = listing["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["slug"] == "#town")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        town["suite"], "none",
+        "the listing says what the server says"
+    );
+
+    let id = town["id"].as_str().unwrap();
+    let (status, block) = api.get(&carol.id, &format!("/api/v1/blocks/{id}")).await;
+    assert_eq!(status, 200, "{block}");
+    let proven = prove_channel(
+        "#town",
+        id,
+        block["bundle_b64"].as_str().unwrap(),
+        block["sig_b64"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert!(proven.encrypted(), "the owner created #town `mls`");
+    assert_eq!(proven.owner_did, alice.did());
+}

@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use jig_client::{Client, DeliveredBlock};
+use jig_client::DeliveredBlock;
 
 use crate::cmd::blocks_decode::DecodedBlock;
 #[cfg(test)]
@@ -46,7 +46,7 @@ pub async fn run(ctx: &CliContext, channel: String) -> Result<()> {
     let (backlog, tidy) = reader.backlog(&id, &server_url).await;
     reader.tidy(tidy);
 
-    let client = Client::connect(&server_url, id)
+    let client = crate::cmd::secure::connect_pinned(&server_url, id)
         .await
         .with_context(|| format!("connecting to {server_url}"))?;
 
