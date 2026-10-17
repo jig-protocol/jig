@@ -12,7 +12,7 @@
 
 ## Notes
 
-- Follow licensing constraints from deny.toml (prefer permissive; avoid AGPL/GPL; internal gigue packages are closed-source and must not error).
+- Follow licensing constraints from the root `deny.toml` (permissive only; no copyleft). jig never depends on closed or downstream packages; see `CONTRIBUTING.md`.
 - docker/podman repos and runtime-select are to be archived as part of cleanup; WASM is the one true core runtime path.
 
 ---
@@ -88,7 +88,7 @@
 | P0       | ☐      | Strongly-typed error model (RuntimeError taxonomy)                                                               |                          | Map to receipt outcomes                                  |
 | P0       | ☐      | Feature flags: component-model, wasi-preview2, deterministic, tracing, receipt-signing                           |                          | Keep default minimal and deterministic                   |
 | P0       | ☐      | Structured tracing/logging via tracing crate with span taxonomy                                                  |                          | Toggle via feature and env                               |
-| P0       | ☐      | Deny.toml and cargo-deny integration for licenses and bans                                                       | Licensing rule           | Avoid AGPL/GPL; allow internal gigue                     |
+| P0       | ☐      | Deny.toml and cargo-deny integration for licenses and bans                                                       | Licensing rule           | Permissive only; no private registries                     |
 | P1       | ☐      | Crate-level docs and examples; README with quickstart                                                            |                          | Include example block and run snippet                    |
 | P1       | ☐      | CI: build, test, fmt, clippy, cargo-deny                                                                         |                          | Matrix for macOS/Linux                                   |
 | P1       | ☐      | Versioning strategy and CHANGELOG from 0.x→0.y release                                                           |                          | Tag milestones                                           |
