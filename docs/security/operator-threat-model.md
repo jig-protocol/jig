@@ -189,7 +189,10 @@ and receipt. Relayed receipts are not kept. Only a federated `text-render` may n
 channel the server has no row for; a relayed member-add, member-remove, promote or archive
 for an unknown channel is refused, since there is no owner to authorize it against. The
 dialer pins each peer's `expected_did` in the handshake, and a federation-scope subscribe
-must come from a listed peer's DID, authenticated even where reads are not. The
+must come from a listed peer's DID, authenticated even where reads are not. A `ws://`
+peer is a boot error, and is never dialed, unless `dangerously_allow_plaintext_federation`
+is set (advertised in `unsafe_options_active`): the pin covers the handshake, not what
+follows it on an unprotected link. The
 `naively_trust_peer_authored_blocks` flag is gone. The relay still drops blocks for local
 channels that do not federate, and `DeliveryPolicy::federates` keeps restricted and
 encrypted channels' blocks off outbound links. Peers actually receive a server's blocks

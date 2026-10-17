@@ -12,6 +12,11 @@
 //! key but its `expected_did`, so blocks arrive only over a connection to a
 //! server it chose. Only a listed DID may subscribe to this server's
 //! federation stream (see `v0_0_2_ws`).
+//!
+//! A `ws://` (plaintext) peer is refused — at boot and at every dial — unless
+//! `[federation] dangerously_allow_plaintext_federation` is set
+//! ([`check_peer_transport`]). The welcome pins the peer's DID either way, but
+//! on a plaintext link nothing after the welcome is protected.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +42,53 @@ use crate::v0_0_2_federation_tls::select_connector;
 /// Reconnect delay after a peer connection drops or fails to establish.
 /// Constant in v0.0.2; exponential backoff is a v0.0.3+ refinement.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+
+/// Whether `url` names a plaintext WebSocket. Scheme comparison is
+/// case-insensitive, as URL schemes are.
+fn is_plaintext_url(url: &str) -> bool {
+    url.trim()
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("ws://"))
+}
+
+/// Refuse a peer this server must not dial over plaintext: a `ws://` URL is
+/// accepted only with `[federation] dangerously_allow_plaintext_federation`.
+pub fn check_peer_transport(
+    peer: &jig_config::v0_0_2_server::FederationPeer,
+    federation: &jig_config::v0_0_2_server::FederationSection,
+) -> Result<(), String> {
+    if is_plaintext_url(&peer.url) && !federation.dangerously_allow_plaintext_federation {
+        return Err(format!(
+            "federation peer {} is plaintext ws://; use wss://, or set [federation] \
+             dangerously_allow_plaintext_federation = true to accept an unprotected link",
+            peer.url
+        ));
+    }
+    Ok(())
+}
+
+/// Every configured peer's transport, checked. Called while building
+/// `AppState`, so a plaintext peer nobody opted into is a boot error, like an
+/// unparseable `expected_did`.
+pub fn check_federation_transport(
+    federation: &jig_config::v0_0_2_server::FederationSection,
+) -> anyhow::Result<()> {
+    for (i, peer) in federation.peers.iter().enumerate() {
+        check_peer_transport(peer, federation)
+            .map_err(|reason| anyhow::anyhow!("[federation] peers[{i}]: {reason}"))?;
+    }
+    Ok(())
+}
+
+/// The warning logged whenever a plaintext peer is dialed under the flag.
+fn warn_plaintext_peer(peer_url: &str) {
+    warn!(
+        peer_url,
+        "federation.dangerously_allow_plaintext_federation=true — dialing this peer over \
+         plaintext ws://; its DID is checked at the handshake, but the relayed stream is \
+         NOT protected"
+    );
+}
 
 /// Sign a federation subscribe with this server's own identity.
 ///
@@ -86,6 +138,15 @@ static FED_SUBSCRIBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 pub fn spawn_federation_peers(state: Arc<AppState>) {
     let peers = state.config.federation.peers.clone();
     for peer in peers {
+        // `AppState` refuses this at boot; repeated so no caller can spawn
+        // a plaintext dialer the operator did not opt into.
+        if let Err(reason) = check_peer_transport(&peer, &state.config.federation) {
+            tracing::error!(peer_url = %peer.url, "refusing federation peer: {reason}");
+            continue;
+        }
+        if is_plaintext_url(&peer.url) {
+            warn_plaintext_peer(&peer.url);
+        }
         let state = state.clone();
         tokio::spawn(async move {
             run_peer_loop(state, peer).await;
@@ -170,6 +231,12 @@ async fn connect_and_relay(
     state: &Arc<AppState>,
     peer: &jig_config::v0_0_2_server::FederationPeer,
 ) -> anyhow::Result<()> {
+    // This function dials, so it is the one that must refuse.
+    check_peer_transport(peer, &state.config.federation)
+        .map_err(|reason| anyhow::anyhow!(reason))?;
+    if is_plaintext_url(&peer.url) {
+        warn_plaintext_peer(&peer.url);
+    }
     let ws_url = format!("{}/api/v1/ws", peer.url.trim_end_matches('/'));
 
     // alpha.1c #4: honor the `federation.dangerously_disable_federation_tls`
@@ -486,6 +553,91 @@ fn sign_synthetic_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plaintext_peer() -> jig_config::v0_0_2_server::FederationPeer {
+        jig_config::v0_0_2_server::FederationPeer {
+            // Port 1 on loopback: a dial attempt fails fast with a connection
+            // error, so an error that names the flag proves no dial happened.
+            url: "ws://127.0.0.1:1".to_string(),
+            expected_did: jig_core::Did::from_ed25519_pubkey(&[9u8; 32]).to_did_jig_string(),
+            alias: None,
+        }
+    }
+
+    #[test]
+    fn check_peer_transport_refuses_plaintext_unless_opted_in() {
+        let mut federation = jig_config::v0_0_2_server::FederationSection::default();
+        let mut peer = plaintext_peer();
+        for url in [
+            "ws://peer.example",
+            "WS://peer.example",
+            "  ws://peer.example",
+        ] {
+            peer.url = url.to_string();
+            let err = check_peer_transport(&peer, &federation).unwrap_err();
+            assert!(
+                err.contains("dangerously_allow_plaintext_federation"),
+                "{url}: {err}"
+            );
+        }
+        peer.url = "wss://peer.example".to_string();
+        assert!(check_peer_transport(&peer, &federation).is_ok());
+
+        federation.dangerously_allow_plaintext_federation = true;
+        peer.url = "ws://peer.example".to_string();
+        assert!(check_peer_transport(&peer, &federation).is_ok());
+    }
+
+    /// A configured plaintext peer is a boot error without the flag, and boots
+    /// with it.
+    #[test]
+    fn a_plaintext_peer_in_config_is_refused_at_boot() {
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.federation.peers = vec![plaintext_peer()];
+        let err = AppState::for_test_with_config(config.clone())
+            .err()
+            .expect("a plaintext peer must not boot")
+            .to_string();
+        assert!(
+            err.contains("dangerously_allow_plaintext_federation"),
+            "{err}"
+        );
+        assert!(err.contains("peers[0]"), "{err}");
+
+        config.federation.dangerously_allow_plaintext_federation = true;
+        assert!(AppState::for_test_with_config(config).is_ok());
+    }
+
+    /// The dialer refuses a plaintext peer before connecting, whoever hands
+    /// it the peer.
+    #[tokio::test]
+    async fn dialer_refuses_plaintext_without_the_flag() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let err = connect_and_relay(&state, &plaintext_peer())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("dangerously_allow_plaintext_federation"),
+            "{err}"
+        );
+    }
+
+    /// With the flag, the dialer goes ahead (and fails only on the network).
+    #[tokio::test]
+    async fn dialer_dials_plaintext_with_the_flag() {
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.federation.dangerously_allow_plaintext_federation = true;
+        let state = Arc::new(AppState::for_test_with_config(config).unwrap());
+        let err = connect_and_relay(&state, &plaintext_peer())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("dangerously_allow_plaintext_federation"),
+            "the flag must let the dial proceed: {err}"
+        );
+    }
 
     #[tokio::test]
     async fn spawn_federation_peers_with_no_peers_is_noop() {
