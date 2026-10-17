@@ -146,7 +146,7 @@ means the first finding arrives as a tweet.
 | Restore | Documented in `deploy/README.md` ("Restore"), including the `chmod 600` on `server.key` and a post-restore `server_did` check. | Same. | READY |
 | Observability | `/healthz` (static 200, deliberately does not touch the store) and `/metrics` (Prometheus text). Both mounted unconditionally, outside the v0.0.1 gate. Counters are hand-rolled atomics in `v0_0_2_ws::metrics`; **federation and bridge ingest are not counted**. | Metrics cover every ingest path, not just WSS. | GAP |
 | Server key loss | `deploy/README.md` opens with a red-flagged section: losing `/var/lib/jig/server.key` changes the server DID and breaks TOFU pinning for every client that ever connected. There is no key-rotation or re-pin flow — recovery is "restore the key from backup". | A documented rotation ceremony, or an identity that survives key change. | GAP |
-| Public exposure | `[tls]` exists but defaults off; `bind_address` defaults to loopback. `deploy/README.md` says never set `0.0.0.0`. | n/a — see §1. | See §1 |
+| Public exposure | `[tls]` is on by default: with no certificate configured the server makes a self-signed one on first start, and its DID vouches for it at `/.well-known/jig` (`tls_binding`). The CLI and federation peers accept that certificate only when the DID they pinned or were configured with vouches for it, or a certificate a CA issued; the first contact is trust on first use. `bind_address` defaults to loopback, and `deploy/README.md` says never set `0.0.0.0`. The nameserver (`:7070`) still serves plaintext. | n/a — see §1. | See §1 |
 
 ---
 

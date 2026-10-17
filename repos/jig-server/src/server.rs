@@ -98,12 +98,26 @@ impl JigServer {
             .map_err(|e| ServerError::Server(format!("binding {addr}: {e}")))?;
 
         if self.config.tls.enabled {
+            let data_dir = self
+                .config
+                .database_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("."));
             let (cert, key) = self
                 .config
                 .tls
-                .resolved_paths()
+                .material(data_dir, &self.config.tls_names())
                 .map_err(ServerError::Config)?;
-            let rustls_config = load_rustls_config(cert, key)?;
+            let (rustls_config, leaf) = load_rustls_config(&cert, &key)?;
+            match &self.v0_0_2 {
+                Some(v0_0_2) => v0_0_2.bind_tls_certificate(leaf.as_ref()),
+                None => tracing::warn!(
+                    "no v0.0.2 module, so no server DID vouches for {}: jig clients will \
+                     accept it only if a CA issued it",
+                    cert.display()
+                ),
+            }
             tracing::info!(
                 "HTTPS (rustls) listening on https://{}",
                 listener.local_addr()?
@@ -132,7 +146,7 @@ impl JigServer {
 fn load_rustls_config(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
-) -> Result<RustlsServerConfig> {
+) -> Result<(RustlsServerConfig, CertificateDer<'static>)> {
     // PEM parsing via rustls-pki-types rather than rustls-pemfile: the latter is
     // unmaintained (RUSTSEC-2025-0134) and was only ever a thin wrapper over
     // these same types. This also drops the manual File/BufReader dance.
@@ -146,16 +160,18 @@ fn load_rustls_config(
             cert_path.display()
         )));
     }
+    let leaf = certs[0].clone();
     let key = PrivateKeyDer::from_pem_file(key_path)
         .map_err(|e| ServerError::Config(format!("reading TLS key {}: {e}", key_path.display())))?;
-    let mut config = RustlsServerConfig::builder()
+    // TLS 1.3 only (transports.md, "TLS 1.3 Only").
+    let mut config = RustlsServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| ServerError::Config(format!("building rustls config: {e}")))?;
     // http/1.1 only: it carries the webhook POST and the WSS upgrades, so
     // HTTP/2 multiplexing isn't needed for the MVP edge (deferred).
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(config)
+    Ok((config, leaf))
 }
 
 /// Serve `router` over rustls on an already-bound TcpListener. Each accepted
@@ -258,7 +274,7 @@ mod tests {
         std::fs::write(&cert_path, &cert_pem).unwrap();
         std::fs::write(&key_path, &key_pem).unwrap();
 
-        let rustls_config = load_rustls_config(&cert_path, &key_path).expect("rustls config");
+        let (rustls_config, _) = load_rustls_config(&cert_path, &key_path).expect("rustls config");
         let router: Router = Router::new().route("/.well-known/jig", get(|| async { "ok" }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bound = listener.local_addr().unwrap();

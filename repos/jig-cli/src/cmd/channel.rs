@@ -128,10 +128,7 @@ const LEGACY_CHANNEL_OPS_PREFIX: &str = "/_admin_v0_0_2/channels";
 /// POST a signed channel-op block to `<base><prefix><suffix>`, where `suffix`
 /// is `""`, `/<slug>/members` or `/<slug>/archive`.
 async fn post_channel_op(base: &str, suffix: &str, block: &BuiltBlock) -> Result<AdminResult> {
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .context("building HTTP client for channel endpoint")?;
+    let http = crate::cmd::trust::http(base, std::time::Duration::from_secs(15)).await?;
     let submission = submission_for(block);
 
     let mut url = format!("{base}{CHANNEL_OPS_PREFIX}{suffix}");
@@ -516,9 +513,12 @@ fn remember_default_channel(ctx: &CliContext, slug: &str) -> Result<()> {
 pub async fn join(ctx: &CliContext, slug: String) -> Result<()> {
     // An open encrypted channel is joined by external commit, from the group
     // info its last committer published.
-    if let Ok(secure) = Secure::open(ctx)
-        && let Ok(Some(info)) = secure.channel(&slug).await
-        && info.encrypted()
+    // Failing to find out is an error, never a plaintext join.
+    let secure = Secure::open(ctx)?;
+    if secure
+        .channel(&slug)
+        .await?
+        .is_some_and(|info| info.encrypted())
     {
         return join_encrypted(ctx, &secure, &slug).await;
     }
@@ -744,10 +744,7 @@ pub async fn list(ctx: &CliContext) -> Result<()> {
     let base = base_http_url(&ctx.server_url()?);
     let url = format!("{base}/api/v1/channels");
     let proof = ReadProof::sign(&id, "GET", signable_path(&url));
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .context("building HTTP client for /api/v1/channels")?;
+    let http = crate::cmd::trust::http(&base, std::time::Duration::from_secs(10)).await?;
     let mut req = http.get(&url);
     for (name, value) in proof.headers() {
         req = req.header(name, value);

@@ -18,6 +18,7 @@ pub mod secure;
 pub mod send;
 pub mod server;
 pub mod tail;
+pub mod trust;
 
 #[cfg(feature = "local-runtime")]
 pub mod block_run;

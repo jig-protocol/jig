@@ -9,7 +9,7 @@
 //! message is encrypted by the MLS session (`cmd::secure`) and sent over REST.
 
 use anyhow::{Context, Result};
-use jig_client::{Client, blocks::build_text_render};
+use jig_client::blocks::build_text_render;
 use jig_core::HlcTimestamp;
 
 use crate::cmd::common::CliContext;
@@ -41,7 +41,7 @@ pub async fn run(ctx: &CliContext, channel: String, body: String) -> Result<()> 
     let id = ctx.identity()?;
     let server_url = ctx.server_url()?;
 
-    let client = Client::connect(&server_url, id)
+    let client = crate::cmd::secure::connect_pinned(&server_url, id)
         .await
         .with_context(|| format!("connecting to {server_url}"))?;
 

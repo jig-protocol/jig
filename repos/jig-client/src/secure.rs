@@ -120,16 +120,31 @@ pub fn default_dir() -> PathBuf {
         .join("mls")
 }
 
+/// A server URL as local state files it: `ws(s)` and `http(s)` spellings,
+/// case and a trailing slash all name the same server.
+pub fn server_key(server: &str) -> String {
+    // The scheme is not part of which server it is: a server that moves from
+    // `http://` to `https://` keeps its groups and pins.
+    let server = server.trim().trim_end_matches('/').to_ascii_lowercase();
+    ["https://", "http://", "wss://", "ws://"]
+        .iter()
+        .find_map(|scheme| server.strip_prefix(scheme))
+        .unwrap_or(&server)
+        .to_string()
+}
+
+/// A `server|slug` key written under an older [`server_key`], as it is now.
+fn rekey(key: &str) -> String {
+    match key.split_once('|') {
+        Some((server, slug)) => format!("{}|{slug}", server_key(server)),
+        None => key.to_string(),
+    }
+}
+
 /// The key a channel's group is filed under: its server and slug. A slug
 /// alone would collide between servers that both have a `#general`.
 pub fn group_key(server: &str, slug: &str) -> String {
-    let server = server
-        .trim()
-        .trim_end_matches('/')
-        .replacen("wss://", "https://", 1)
-        .replacen("ws://", "http://", 1)
-        .to_ascii_lowercase();
-    format!("{server}|{slug}")
+    format!("{}|{slug}", server_key(server))
 }
 
 impl Session {
@@ -562,6 +577,11 @@ impl Session {
                 });
             }
         };
+        // Keys written while the scheme was part of them.
+        groups.groups = std::mem::take(&mut groups.groups)
+            .into_iter()
+            .map(|(key, gid)| (rekey(&key), gid))
+            .collect();
         let out = f(&member, &mut groups);
         // Save even when `f` failed: openmls may have written state (a staged
         // commit, a consumed key package) before the failure.
@@ -1122,5 +1142,22 @@ mod tests {
             group_key("http://host:7117", "#a")
         );
         assert_ne!(group_key("http://a", "#x"), group_key("http://b", "#x"));
+        assert_eq!(
+            group_key("https://host:7117", "#a"),
+            group_key("http://host:7117", "#a"),
+            "a server that turns TLS on is the same server"
+        );
+    }
+
+    /// Group mappings written while the scheme was part of the key are read
+    /// back under today's key, so turning TLS on does not orphan a group.
+    #[test]
+    fn keys_written_with_a_scheme_are_rekeyed() {
+        assert_eq!(
+            rekey("http://host:7117|#a"),
+            group_key("https://host:7117", "#a")
+        );
+        assert_eq!(rekey("wss://host|#dm/x|y"), "host|#dm/x|y");
+        assert_eq!(rekey("host:7117|#a"), "host:7117|#a");
     }
 }

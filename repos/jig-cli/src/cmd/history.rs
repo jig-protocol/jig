@@ -75,10 +75,7 @@ pub async fn fetch_history(
     let proof = ReadProof::sign(who, "GET", signable_path(&url));
     // Short timeout: this runs on the critical path to the first frame, and
     // a slow server should cost a warning, not a hung terminal.
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .context("building HTTP client for channel history")?;
+    let http = crate::cmd::trust::http(base_url, std::time::Duration::from_secs(10)).await?;
     let mut req = http.get(&url);
     for (name, value) in proof.headers() {
         req = req.header(name, value);

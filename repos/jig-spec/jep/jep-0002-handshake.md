@@ -57,6 +57,10 @@ Draft. Field names are provisional.
    failure. Examples: refusing an advertised capability, or sending a frame at an
    unadvertised version or suite. It SHOULD keep the `welcome` as evidence.
 6. Server-to-server connections use the same exchange in both directions.
+7. A client SHOULD pin, on its first verified `welcome` from a server, the `server_did`
+   and the suites it advertised. It MUST then close on a `welcome` from another
+   `server_did` (rule 4), and MUST treat a `welcome` that no longer advertises a pinned
+   suite as a downgrade and refuse it. A server adding a suite is not a downgrade.
 
 v0.1 scope (roadmap P1): version, capabilities and suite (`none`) in `jig-server` and
 `jig-client`; the client refuses to proceed without a valid `welcome`. Reputation and real
