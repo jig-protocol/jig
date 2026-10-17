@@ -36,4 +36,20 @@ mod tests {
         assert!(dm_slug(a, b).starts_with(DM_PREFIX));
         assert_eq!(dm_slug(a, b).len(), DM_PREFIX.len() + 16);
     }
+
+    /// The derivation the spec states (Encryption → Channels), built here from
+    /// raw BLAKE3 so the two cannot drift apart, plus one pinned vector.
+    #[test]
+    fn the_slug_is_the_specified_derivation() {
+        let (lo, hi) = ("did:jig:zaaaa", "did:jig:zbbbb");
+        let mut h = blake3::Hasher::new();
+        for (label, value) in [("domain", "jig-dm-v1"), ("a", lo), ("b", hi)] {
+            h.update(label.as_bytes());
+            h.update(&(value.len() as u64).to_le_bytes());
+            h.update(value.as_bytes());
+        }
+        let expected = format!("#dm/{}", &h.finalize().to_hex()[..16]);
+        assert_eq!(dm_slug(hi, lo), expected);
+        assert_eq!(dm_slug(lo, hi), expected);
+    }
 }
