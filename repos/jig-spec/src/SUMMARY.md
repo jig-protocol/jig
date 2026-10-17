@@ -16,5 +16,5 @@
 - [Transports](transports.md)
 - [Federation](federation.md)
 - [Security Considerations](security.md)
-- [Threat Register: Server Operators](threat-register.md)
+- [Threat Register](threat-register.md)
 - [Appendix](appendix.md)
