@@ -300,14 +300,18 @@ label's UTF-8 bytes, the value's length as a little-endian u64, then the value.
   and one DID, so it cannot be reused for another. A server MUST NOT ask for more than 28
   bits, and a client SHOULD refuse to do more.
 - **Proof.** The client posts `{did, nonce, sig_b64}` to `POST /api/v1/admission`.
-  `sig_b64` is the DID's Ed25519 signature over the hash of (`domain`,
+  `nonce` is a JSON string; its UTF-8 bytes are what both hashes take, and there MUST be
+  no more than 64 of them. `sig_b64` is the DID's Ed25519 signature over the hash of (`domain`,
   `jig-admission-v1`), (`server`), (`did`) and (`nonce`), so nobody can admit a key they do
   not hold. The server MUST verify the signature and the work, and MUST refuse a banned
   DID. It then records the DID as proven. A DID stays proven if the server later raises
   `bits`.
 - **Standing.** A signed `GET /api/v1/admission` returns the caller's own `did`, `proven`
-  and `pow_bits`. It runs authentication only, not admission, so a DID that owes work can
-  ask, and it never answers for any DID but the signer's.
+  and `pow_bits`. `proven` is true when admission lets the DID in without (more) work: it
+  did the work, or the server has a record of it, or asks for none. Owing work is not a
+  refusal here, so a DID that owes it can ask; any other admission refusal is returned as
+  itself. It does not charge the caller's rate, and it never answers for any DID but the
+  signer's.
 - **Refusal.** Until the DID is proven, admission refuses it on every read, subscription
   and write with `403 PROOF_OF_WORK_REQUIRED`.
 - **Relayed authors.** The author of a block relayed by a federated peer or submitted by a
@@ -622,7 +626,8 @@ not yet meet.
   yet implemented)*.
 - Compute and enforce net reputation changes from every member server's reports, and
   enforce servers' good behaviour (nameservers) *(not yet implemented)*.
-- Enforce proof-of-work on the clients a server serves (servers) *(not yet implemented)*.
+- Enforce proof-of-work on the clients a server serves (servers) *(partial: admission
+  proof-of-work, which the reference server offers but does not turn on by default)*.
 - Require proof-of-work, solvable from public information, on every request that creates a
   binding (nameservers) *(partial)*.
 - Scale proof-of-work by reputation under an adopted ruleset, within its bounds

@@ -33,10 +33,10 @@ pub struct AdmissionStatus {
     pub pow_bits: Option<u8>,
 }
 
-/// `GET /api/v1/admission`, signed: the caller's own standing. Gate 1 only,
-/// not gate 2 — a DID that owes work must be able to ask whether it does —
-/// and only ever about the DID that signed, so it is no oracle for who else
-/// uses this server.
+/// `GET /api/v1/admission`, signed: the caller's own standing. Gate 1, then
+/// gate 2 without charging the rate — a DID that owes work must be able to
+/// ask whether it does — and only ever about the DID that signed, so it is no
+/// oracle for who else uses this server.
 async fn status(
     State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
@@ -66,8 +66,16 @@ async fn status(
             .map_err(|outcome| disclose(&outcome))?
     }
     .to_did_jig_string();
+    // Owing work is the one refusal answered with a status; any other is the
+    // refusal itself. A DID admitted without a proof (a configured record, a
+    // floor it meets, an open server) owes nothing.
+    let proven = match state.auth.admit(&did) {
+        Ok(()) => true,
+        Err(crate::auth::GateOutcome::AdmissionProofRequired { .. }) => false,
+        Err(outcome) => return Err(disclose(&outcome)),
+    };
     Ok(Json(AdmissionStatus {
-        proven: state.auth.proven(&did),
+        proven,
         pow_bits: state.auth.pow_bits(),
         did,
     }))

@@ -129,9 +129,10 @@ tailnet:
   and post to open ones, within `[auth.rate_limit]`. `unknown_dids =
   "proof-of-work"` makes each new key do some hashing first, which slows an
   identity flood but does not stop one.
-- **Federated peers are trusted.** Blocks relayed from a peer are persisted
-  and delivered to local subscribers without running the write gate. Only
-  federate with servers you would let post on your behalf.
+- **Federated peers vouch for their authors.** Blocks relayed from a peer run
+  the same admission, write and suite gates as local ones, except that their
+  authors are not asked for proof-of-work: they never spoke to this server.
+  Only federate with servers you would let post on your behalf.
 - **Channel ops are on by default.** `POST /api/v1/channels*` is always
   mounted and runs the same gates as every other write: anyone who can reach
   the port can create an open channel. `[debug] admin_endpoints = true` only

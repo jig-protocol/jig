@@ -6,7 +6,7 @@ mod support;
 use axum::http::StatusCode;
 use jig_client::admission::AdmissionProof;
 use jig_client::blocks::build_text_render;
-use jig_config::v0_0_2_server::{AdmissionSection, UnknownDidsPolicy};
+use jig_config::v0_0_2_server::{AdmissionSection, ReputationRecord, UnknownDidsPolicy};
 use jig_core::{HlcTimestamp, admission_pow};
 use support::ws::WsClient;
 use support::{Identity, TestServer};
@@ -56,7 +56,7 @@ async fn a_new_did_owes_the_work_and_is_known_once_it_has_done_it() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["code"], "PROOF_OF_WORK_REQUIRED");
 
-    // Gate 1 only: a DID that owes work can ask whether it does.
+    // Not refused for owing work: a DID that owes it can ask whether it does.
     let (status, body) = server
         .send_full(&server.sign_get(&alice, "/api/v1/admission"))
         .await;
@@ -182,7 +182,8 @@ async fn an_oversized_nonce_is_refused_before_it_is_hashed() {
     assert_eq!(body["code"], "BAD_NONCE");
 }
 
-/// A server that asks for no work does not record any, and says so.
+/// A server that asks for no work does not record any, and says the caller
+/// owes none.
 #[tokio::test]
 async fn an_open_server_asks_for_nothing() {
     let server = TestServer::authenticated();
@@ -192,5 +193,43 @@ async fn an_open_server_asks_for_nothing() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.get("pow_bits").is_none(), "{body}");
-    assert_eq!(body["proven"], false);
+    assert_eq!(body["proven"], true);
+}
+
+/// A DID the operator has a record for is known, so it owes no work, and
+/// the status says so rather than sending the client off to do it.
+#[tokio::test]
+async fn a_did_with_a_record_owes_no_work() {
+    let alice = Identity::new(1);
+    let server = TestServer::with_admission(AdmissionSection {
+        unknown_dids: UnknownDidsPolicy::ProofOfWork,
+        pow_bits: BITS,
+        records: vec![ReputationRecord {
+            did: alice.did().to_did_jig_string(),
+            ruleset_key: "r".to_string(),
+            score: 1,
+        }],
+        ..AdmissionSection::default()
+    });
+    let (status, body) = server
+        .send_full(&server.sign_get(&alice, "/api/v1/admission"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["proven"], true);
+    let (status, body) = server
+        .send(&server.sign_get(&alice, "/api/v1/channels"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A banned DID asking its standing gets the refusal, not "owes work".
+#[tokio::test]
+async fn a_banned_did_is_told_it_is_refused() {
+    let banned = Identity::new(1);
+    let server = pow_server(&[&banned]);
+    let (status, body) = server
+        .send_full(&server.sign_get(&banned, "/api/v1/admission"))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "NOT_ADMITTED");
 }

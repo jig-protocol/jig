@@ -602,10 +602,13 @@ async fn main() -> Result<()> {
     let direct_message = cli.message;
 
     // Every command below but the local ones talks to the server.
-    if !matches!(
-        cli.command,
-        Some(Commands::Receipt { .. } | Commands::Block { .. })
-    ) {
+    let local = match &cli.command {
+        Some(Commands::Receipt { .. }) => true,
+        #[cfg(feature = "local-runtime")]
+        Some(Commands::Block { .. }) => true,
+        _ => false,
+    };
+    if !local {
         cmd::admission::ensure(&ctx).await?;
     }
 
