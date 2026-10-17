@@ -8,6 +8,7 @@
 //! | Kind | On an `mls` channel |
 //! | --- | --- |
 //! | `channel-create` | `mls_group_info` + `mls_ratchet_tree`: the creator alone, at epoch 0 |
+//! | `channel-create` of a `#dm/` slug | also `dm_peer`, and the slug must be the sender's and that peer's |
 //! | `member-add` | `mls_commit` adding `member_did` (+ `mls_welcome`), or the sender's external commit |
 //! | `member-remove` | `mls_commit` removing `member_did`; none when the sender leaves |
 //! | content | `mls_message`, an application `PrivateMessage` for this group; no `body` |
@@ -101,10 +102,16 @@ pub fn plan(
         // the channel's content will be.
         require_plaintext_block(manifest, block_suite)?;
         let suite = requested_suite(manifest)?;
+        let slug = meta_str(manifest, "slug").unwrap_or_default().to_string();
+        // The email bridge opens plaintext `#dm/` channels for mail threads
+        // under its own derivation, naming no peer; those pass.
+        let is_dm = suite == EncryptionSuite::Mls || manifest.metadata.contains_key("dm_peer");
+        if slug.starts_with(jig_core::dm::DM_PREFIX) && is_dm {
+            check_dm_create(sender, manifest, &slug, suite)?;
+        }
         if suite != EncryptionSuite::Mls {
             return Ok(MlsPlan::Nothing);
         }
-        let slug = meta_str(manifest, "slug").unwrap_or_default().to_string();
         let info = meta_bytes(manifest, keys::GROUP_INFO)?;
         let tree = meta_bytes(manifest, keys::RATCHET_TREE)?;
         let genesis = delivery::genesis(&info, &tree, sender).map_err(SuiteRefusal::Mls)?;
@@ -253,6 +260,43 @@ fn require_plaintext_block(
             block: suite.to_string(),
         })
     }
+}
+
+/// An encrypted `#dm/` slug belongs to the pair whose DIDs derive it
+/// ([`jig_core::dm::dm_slug`]). Only one of the two may create it, and only as
+/// what a DM is: restricted and encrypted. Otherwise anyone could take a
+/// pair's slug first, and since the client refuses a DM channel with anyone
+/// else in it, the two could then never DM on this server.
+///
+/// Plaintext `#dm/` creates that name no peer are the email bridge's and are
+/// not checked, so a plaintext squat on a pair's slug still blocks `jig dm`
+/// between them (the client refuses an unencrypted DM). Closing that needs
+/// the bridge's threads under their own prefix.
+fn check_dm_create(
+    sender: &str,
+    manifest: &BlockManifest,
+    slug: &str,
+    suite: EncryptionSuite,
+) -> Result<(), SuiteRefusal> {
+    let peer = meta_str(manifest, "dm_peer").ok_or(SuiteRefusal::Missing { field: "dm_peer" })?;
+    let peer = crate::effect::canonical_did_string(peer);
+    let restricted =
+        !crate::visibility::is_open(meta_str(manifest, "visibility").unwrap_or("open"));
+    let refuse = |why: &str| {
+        Err(SuiteRefusal::Mls(jig_mls::MlsError::Rejected(format!(
+            "{slug} is a direct-message slug: {why}"
+        ))))
+    };
+    if peer == sender {
+        return refuse("dm_peer is the sender");
+    }
+    if jig_core::dm::dm_slug(sender, &peer) != slug {
+        return refuse("it is not the sender's and dm_peer's");
+    }
+    if suite != EncryptionSuite::Mls || !restricted {
+        return refuse("a direct message is restricted and encrypted");
+    }
+    Ok(())
 }
 
 fn meta_str<'a>(m: &'a BlockManifest, key: &str) -> Option<&'a str> {
@@ -408,6 +452,72 @@ mod tests {
             Err(SuiteRefusal::Missing {
                 field: keys::GROUP_INFO
             })
+        );
+    }
+
+    /// Only one of a pair may create the pair's `#dm/` slug, and only as a
+    /// restricted, encrypted channel. Anyone else taking it first would leave
+    /// the two unable to DM here (the client refuses a DM with a third member).
+    #[test]
+    fn a_dm_slug_is_the_pairs_to_create() {
+        let (a, b, m) = (who(1), who(2), who(3));
+        let slug = jig_core::dm::dm_slug(&a.did, &b.did);
+        let create = |sender: &Who, meta: Value| {
+            let created = sender.member.create_group().unwrap();
+            let mut meta = meta;
+            meta["slug"] = slug.clone().into();
+            meta["mls_group_info"] = b64(&created.group_info).into();
+            meta["mls_ratchet_tree"] = b64(&created.ratchet_tree).into();
+            let man = manifest(
+                BlockKind::ChannelCreate,
+                &sender.did,
+                EncryptionSuite::Unencrypted,
+                meta,
+            );
+            plan(BlockKind::ChannelCreate, &sender.did, &man, None, None)
+        };
+        let dm = json!({"suite": "mls", "visibility": "restricted", "dm": true});
+        let with_peer = |peer: &str| {
+            let mut v = dm.clone();
+            v["dm_peer"] = peer.into();
+            v
+        };
+
+        assert!(matches!(
+            create(&a, with_peer(&b.did)),
+            Ok(MlsPlan::Genesis(_))
+        ));
+        assert!(matches!(
+            create(&b, with_peer(&a.did)),
+            Ok(MlsPlan::Genesis(_))
+        ));
+
+        let refused = |r: Result<MlsPlan, SuiteRefusal>| matches!(r, Err(SuiteRefusal::Mls(_)));
+        // A third party, whoever it names as the peer.
+        assert!(refused(create(&m, with_peer(&a.did))));
+        assert!(refused(create(&m, with_peer(&b.did))));
+        // One of the pair, but not as a DM: open, or unencrypted.
+        let mut open = with_peer(&b.did);
+        open["visibility"] = "open".into();
+        assert!(refused(create(&a, open)));
+        let mut plain = with_peer(&b.did);
+        plain["suite"] = "none".into();
+        assert!(refused(create(&a, plain)));
+        // Encrypted, but no peer named.
+        assert_eq!(
+            create(&a, dm.clone()),
+            Err(SuiteRefusal::Missing { field: "dm_peer" })
+        );
+        // The email bridge's plaintext thread channel: no peer, no suite.
+        let bridge = manifest(
+            BlockKind::ChannelCreate,
+            &m.did,
+            EncryptionSuite::Unencrypted,
+            json!({"slug": "#dm/0011223344556677", "visibility": "restricted"}),
+        );
+        assert_eq!(
+            plan(BlockKind::ChannelCreate, &m.did, &bridge, None, None),
+            Ok(MlsPlan::Nothing)
         );
     }
 

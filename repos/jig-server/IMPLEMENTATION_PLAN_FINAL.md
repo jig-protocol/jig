@@ -86,7 +86,6 @@ deny = ["AGPL-3.0", "GPL-2.0", "GPL-3.0"]
 
 [licenses.private]
 ignore = true
-registries = ["gigue-internal"]
 ```
 
 **Validation**: `cargo check --all-features && cargo deny check`
@@ -275,7 +274,7 @@ All files under 250 LOC per ROE.
 | duckdb       | 0.10    | MIT            | standard+  |
 | clickhouse   | 0.11    | MIT/Apache-2   | hyperscale |
 
-**Validation**: `cargo deny check` enforces no AGPL/GPL; internal gigue crates allowed.
+**Validation**: `cargo deny check` enforces no AGPL/GPL and no private registries.
 
 ---
 

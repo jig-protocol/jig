@@ -53,12 +53,25 @@ Every conversation is a channel. An encrypted channel is one MLS group.
   block. It is fixed at creation.
 - A **DM** is a channel with two members and **locked membership**. A group DM is a
   locked channel with more members. There is no separate DM scheme.
+- A DM's slug is derived from the pair's DIDs, so either side finds it. Write each DID in
+  canonical form: `did:jig:z` followed by the unpadded, lowercase RFC 4648 base32 of the
+  32-byte Ed25519 key. Call the bytewise-lesser one A and the other B. The slug is `#dm/`
+  followed by the first 16 lowercase hex digits of the BLAKE3 hash of three parts, in this
+  order: (`domain`, `jig-dm-v1`), (`a`, A), (`b`, B). Each part is hashed as its label's
+  UTF-8 bytes, then the value's length in bytes as an 8-byte little-endian integer, then
+  the value's UTF-8 bytes.
+- A server MUST refuse to create an `mls` `#dm/` channel, or any `#dm/` channel naming a
+  `dm_peer`, unless the creator and that `dm_peer` derive its slug and it is locked and
+  `mls`. A client MUST NOT treat a channel as a DM with a peer while the channel's MLS
+  group holds anyone else.
 - **Locked membership** means nobody joins on their own: the member set changes only
   through an explicit, signed membership block.
 - Growing a conversation (DM → group DM → channel) is a membership change on the same
   channel: adding members, or unlocking membership. It is never a migration to another
   scheme.
-- A client MUST NOT post to a channel under a suite other than the channel's.
+- A client MUST NOT post to a channel under a suite other than the channel's. A client
+  that holds a channel's MLS group MUST treat the channel as `mls` whatever a server says
+  about it.
 
 ## MLS mapping
 
