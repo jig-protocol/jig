@@ -12,9 +12,10 @@ use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use jig_client::blocks::BuiltBlock;
 use jig_client::open::open;
+use jig_client::pins::{ChannelPin, Pins, prove_channel};
 use jig_client::read_auth::{ReadProof, signable_path};
 use jig_client::secure::{CommitLock, Seen, Session, history_reaches, replay_order};
-use jig_client::{DeliveredBlock, Identity};
+use jig_client::{Client, ClientError, DeliveredBlock, Identity};
 use jig_mls::member::Commit;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -65,9 +66,13 @@ pub fn refused(e: &anyhow::Error) -> bool {
         .is_some_and(Refused::is_definite)
 }
 
-/// A channel as the server lists it.
+/// A channel as the server lists it. [`Secure::channel`] replaces `suite`
+/// with the one its owner signed into the creation block `id`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChannelInfo {
+    /// The CID of the block that created the channel.
+    #[serde(default)]
+    pub id: String,
     pub slug: String,
     #[serde(default = "none_suite")]
     pub suite: String,
@@ -96,6 +101,27 @@ pub fn must_encrypt(held: bool, listed: Option<bool>) -> bool {
     held || listed.unwrap_or(false)
 }
 
+/// Connect over WSS to `server`, holding it to what this device pinned:
+/// its welcome must be signed by the pinned DID and still advertise every
+/// pinned suite. The first welcome from a server is pinned.
+pub async fn connect_pinned(server: &str, identity: Identity) -> Result<Client> {
+    let mut pins = Pins::load(&Pins::default_path())?;
+    let pinned = pins.offer(server).pinned_server_did;
+    let client = Client::connect_with(server, identity, pins.offer(server))
+        .await
+        .map_err(|e| match (e, pinned) {
+            (ClientError::HandshakeFailed { reason, .. }, Some(did)) => anyhow::anyhow!(
+                "{server} did not prove it is the server this device pinned ({did}): {reason}. \
+                 If its key really changed, `jig server forget` drops the pin."
+            ),
+            (e, _) => e.into(),
+        })?;
+    if let Some(welcome) = client.welcome() {
+        pins.check_welcome(server, welcome)?;
+    }
+    Ok(client)
+}
+
 /// History replayed through the session.
 pub struct Synced {
     /// What to show, oldest first.
@@ -114,6 +140,12 @@ pub struct Secure {
     server: String,
     /// The same server as an `http(s)://` base for REST.
     base: String,
+    /// Set once this process has held the server to its pin
+    /// ([`Self::ensure_pinned`]).
+    pinned: tokio::sync::OnceCell<()>,
+    /// Where `identity` was loaded from, to load it again for that handshake,
+    /// which takes it by value.
+    identity_dir: std::path::PathBuf,
 }
 
 impl Secure {
@@ -126,7 +158,27 @@ impl Secure {
             identity: ctx.identity()?,
             base: base_http_url(&server),
             server,
+            pinned: tokio::sync::OnceCell::new(),
+            identity_dir: jig_client::identity::default_keys_dir(),
         })
+    }
+
+    /// Hold the server to its pin before this process's first request. REST
+    /// carries no handshake, so without this an encrypted send, a key-package
+    /// fetch or a channel proof would go to whatever answers at the URL. One
+    /// signed welcome per process ties them to the server this device pinned,
+    /// and pins it on first use. (Binding each REST response to that server
+    /// is TLS's job.)
+    async fn ensure_pinned(&self) -> Result<()> {
+        self.pinned
+            .get_or_try_init(|| async {
+                let identity =
+                    Identity::load_from_dir(&self.identity_dir, &self.identity.did_string())?;
+                connect_pinned(&self.server, identity).await.map(drop)
+            })
+            .await
+            .map(|_| ())
+            .with_context(|| format!("connecting to {}", self.server))
     }
 
     pub fn server(&self) -> &str {
@@ -169,6 +221,7 @@ impl Secure {
 
     /// A signed GET returning JSON.
     pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        self.ensure_pinned().await?;
         let url = format!("{}{path}", self.base);
         let proof = ReadProof::sign(&self.identity, "GET", signable_path(&url));
         let mut req = Self::http()?.get(&url);
@@ -185,6 +238,7 @@ impl Secure {
     /// Submit a signed block through `POST /api/v1/blocks`. A refusal comes
     /// back as a [`Refused`] the caller can branch on.
     pub async fn submit(&self, block: &BuiltBlock) -> Result<String> {
+        self.ensure_pinned().await?;
         let url = format!("{}/api/v1/blocks", self.base);
         let body = serde_json::json!({
             "bundle_b64": STANDARD.encode(block.canonical_bytes()),
@@ -205,21 +259,76 @@ impl Secure {
 
     /// The channel as this identity may see it, or `None` if it is not listed
     /// to us (unknown, or restricted and we are not in it).
+    ///
+    /// Its `suite` is the one the owner signed into the creation block, not
+    /// the listing's: a server relabelling a channel would otherwise be taken
+    /// at its word by any device that holds no group for it (OP-03). The
+    /// creation block is pinned on first sight, so a channel re-created
+    /// under the same name is refused rather than silently trusted.
     pub async fn channel(&self, slug: &str) -> Result<Option<ChannelInfo>> {
         #[derive(Deserialize)]
         struct Listing {
             channels: Vec<ChannelInfo>,
         }
         let listing: Listing = self.get_json("/api/v1/channels").await?;
-        Ok(listing.channels.into_iter().find(|c| c.slug == slug))
+        let Some(mut info) = listing.channels.into_iter().find(|c| c.slug == slug) else {
+            return Ok(None);
+        };
+        let pin = self.proven(&info).await?;
+        if pin.suite != info.suite {
+            eprintln!(
+                "warning: the server lists {slug} as `{}`, but its owner created it `{}`; \
+                 going by the owner",
+                info.suite, pin.suite
+            );
+        }
+        info.suite = pin.suite;
+        Ok(Some(info))
+    }
+
+    /// What `info`'s creation block proves, from the pin when it names the
+    /// same block, else fetched, verified and pinned.
+    async fn proven(&self, info: &ChannelInfo) -> Result<ChannelPin> {
+        let mut pins = Pins::load(&Pins::default_path())?;
+        if let Some(pin) = pins.channel(&self.server, &info.slug)
+            && pin.create_cid == info.id
+        {
+            return Ok(pin.clone());
+        }
+        if info.id.is_empty() {
+            anyhow::bail!(
+                "the server does not say which block created {}, so whether it is encrypted \
+                 cannot be checked",
+                info.slug
+            );
+        }
+        #[derive(Deserialize)]
+        struct Served {
+            bundle_b64: String,
+            sig_b64: Option<String>,
+        }
+        let served: Served = self
+            .get_json(&format!("/api/v1/blocks/{}", info.id))
+            .await
+            .with_context(|| format!("fetching the block that created {}", info.slug))?;
+        let sig = served.sig_b64.with_context(|| {
+            format!("the server serves {}'s creation block unsigned", info.slug)
+        })?;
+        let proven = prove_channel(&info.slug, &info.id, &served.bundle_b64, &sig)?;
+        Ok(pins.check_channel(&self.server, &info.slug, proven)?)
     }
 
     /// Whether what is sent to `slug` must be encrypted. This device's own
-    /// MLS state outranks the server's listing ([`must_encrypt`]). Failing to
-    /// find out is an error, never a reason to send in the clear.
+    /// MLS state outranks the server's listing ([`must_encrypt`]), and the
+    /// listing's suite is the owner's signed one ([`Self::channel`]). A
+    /// channel no longer listed to us is still what this device pinned.
+    /// Failing to find out is an error, never a reason to send in the clear.
     pub async fn encrypted(&self, slug: &str) -> Result<bool> {
         let held = self.session.has_group(&self.server, slug)?;
-        let listed = self.channel(slug).await?.map(|c| c.encrypted());
+        let pinned = Pins::load(&Pins::default_path())?
+            .channel(&self.server, slug)
+            .map(ChannelPin::encrypted);
+        let listed = self.channel(slug).await?.map(|c| c.encrypted()).or(pinned);
         if held && listed == Some(false) {
             eprintln!(
                 "warning: the server lists {slug} as unencrypted, but this device holds its \
@@ -254,6 +363,7 @@ impl Secure {
         if packages.is_empty() {
             return Ok(());
         }
+        self.ensure_pinned().await?;
         let url = format!("{}/api/v1/mls/key-packages", self.base);
         let body = serde_json::json!({
             "key_packages_b64": packages.iter().map(|p| STANDARD.encode(p)).collect::<Vec<_>>(),

@@ -108,7 +108,7 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
     let (backlog, tidy) = reader.backlog(&id, &server_url).await;
     reader.tidy(tidy);
 
-    let client = Client::connect(&server_url, id)
+    let client = crate::cmd::secure::connect_pinned(&server_url, id)
         .await
         .with_context(|| format!("connecting to {server_url}"))?;
     let client = Arc::new(client);

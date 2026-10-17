@@ -120,16 +120,21 @@ pub fn default_dir() -> PathBuf {
         .join("mls")
 }
 
-/// The key a channel's group is filed under: its server and slug. A slug
-/// alone would collide between servers that both have a `#general`.
-pub fn group_key(server: &str, slug: &str) -> String {
-    let server = server
+/// A server URL as local state files it: `ws(s)` and `http(s)` spellings,
+/// case and a trailing slash all name the same server.
+pub fn server_key(server: &str) -> String {
+    server
         .trim()
         .trim_end_matches('/')
         .replacen("wss://", "https://", 1)
         .replacen("ws://", "http://", 1)
-        .to_ascii_lowercase();
-    format!("{server}|{slug}")
+        .to_ascii_lowercase()
+}
+
+/// The key a channel's group is filed under: its server and slug. A slug
+/// alone would collide between servers that both have a `#general`.
+pub fn group_key(server: &str, slug: &str) -> String {
+    format!("{}|{slug}", server_key(server))
 }
 
 impl Session {

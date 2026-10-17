@@ -129,6 +129,11 @@ pub struct BlockView {
     pub sender_did: String,
     pub block_kind: String,
     pub bundle_b64: String,
+    /// The author's signature over the bundle, so a reader can check the
+    /// block is the author's and not this server's. Absent only for blocks
+    /// stored without one (server-synthesized).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sig_b64: Option<String>,
     pub is_synthetic: bool,
     pub posted_at: i64,
     pub hlc_wall_ms: u64,
@@ -210,6 +215,8 @@ pub async fn get_block_by_cid(
         sender_did: stored.sender_did,
         block_kind: stored.block_kind,
         bundle_b64: base64::engine::general_purpose::STANDARD.encode(&stored.bundle_bytes),
+        sig_b64: (!stored.sender_sig.is_empty())
+            .then(|| base64::engine::general_purpose::STANDARD.encode(&stored.sender_sig)),
         is_synthetic: stored.is_synthetic,
         posted_at: stored.posted_at,
         hlc_wall_ms: stored.hlc_wall_ms,
@@ -225,6 +232,10 @@ pub async fn get_block_by_cid(
 
 #[derive(Debug, Serialize)]
 pub struct ChannelView {
+    /// The CID of the block that created the channel. A client reads the
+    /// channel's suite and owner from that signed block, not from the
+    /// unsigned fields below.
+    pub id: String,
     pub slug: String,
     pub visibility: String,
     pub owner_did: String,
@@ -275,6 +286,7 @@ pub async fn list_channels(
             }
         }
         channels.push(ChannelView {
+            id: c.id,
             slug: c.slug,
             visibility: c.visibility,
             owner_did: c.owner_did,

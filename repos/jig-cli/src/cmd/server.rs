@@ -18,6 +18,7 @@
 //! has no other reason to pull it in.
 
 use anyhow::{Context, Result};
+use jig_client::pins::Pins;
 use serde::Deserialize;
 
 use crate::cmd::common::CliContext;
@@ -196,6 +197,26 @@ fn print_server_info(base_url: &str, info: &ServerInfoResponse) {
             info.unsafe_options_active.join(", ")
         );
     }
+}
+
+// ============================================================================
+// forget
+// ============================================================================
+
+/// Apply `jig server forget` — drop every pin this device holds for the
+/// configured server, or `url` when given.
+pub fn forget(ctx: &CliContext, url: Option<&str>) -> Result<()> {
+    let server = match url {
+        Some(url) => url.to_string(),
+        None => ctx.server_url()?,
+    };
+    let mut pins = Pins::load(&Pins::default_path())?;
+    if pins.forget(&server)? {
+        println!("forgot {server}: its next welcome and channels are pinned afresh");
+    } else {
+        println!("nothing pinned for {server}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

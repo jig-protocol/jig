@@ -72,6 +72,10 @@ Every conversation is a channel. An encrypted channel is one MLS group.
 - A client MUST NOT post to a channel under a suite other than the channel's. A client
   that holds a channel's MLS group MUST treat the channel as `mls` whatever a server says
   about it.
+- A client MUST learn a channel's suite from the signed creation block, not from a
+  server's description of the channel: the block must hash to the channel's id, be a
+  `channel-create` for that slug, and carry its author's signature. A client SHOULD pin
+  that block on first sight and refuse a different creation block under the same slug.
 
 ## MLS mapping
 

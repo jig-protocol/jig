@@ -516,9 +516,12 @@ fn remember_default_channel(ctx: &CliContext, slug: &str) -> Result<()> {
 pub async fn join(ctx: &CliContext, slug: String) -> Result<()> {
     // An open encrypted channel is joined by external commit, from the group
     // info its last committer published.
-    if let Ok(secure) = Secure::open(ctx)
-        && let Ok(Some(info)) = secure.channel(&slug).await
-        && info.encrypted()
+    // Failing to find out is an error, never a plaintext join.
+    let secure = Secure::open(ctx)?;
+    if secure
+        .channel(&slug)
+        .await?
+        .is_some_and(|info| info.encrypted())
     {
         return join_encrypted(ctx, &secure, &slug).await;
     }

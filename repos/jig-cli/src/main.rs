@@ -305,6 +305,15 @@ enum ServerAction {
         #[arg(long)]
         url: Option<String>,
     },
+
+    /// Drop what this device pinned for the configured server (or
+    /// `--url <server>`): the DID that signs its welcome, the suites it
+    /// advertised, and the channels seen there. Do this only when you know
+    /// why the server changed; the next contact pins it afresh.
+    Forget {
+        #[arg(long)]
+        url: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -526,6 +535,9 @@ async fn main() -> Result<()> {
             }
             ServerAction::Info { url } => {
                 cmd::server::info(&ctx, url.as_deref()).await?;
+            }
+            ServerAction::Forget { url } => {
+                cmd::server::forget(&ctx, url.as_deref())?;
             }
         }
         return Ok(());
