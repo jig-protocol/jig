@@ -43,6 +43,7 @@ should not be read as a status page.
 | [`security/operator-threat-model.md`](security/operator-threat-model.md) | CURRENT | The model and evidence behind the spec's operator [threat register](../repos/jig-spec/src/threat-register.md). |
 | [`security/encryption.md`](security/encryption.md) | CURRENT | Why encryption is shaped as it is: suite field, refusals, MLS, DMs as locked channels, the DID key as MLS signer, a validating delivery service, the client plaintext cache. |
 | [`security/nameserver-abuse-economics.md`](security/nameserver-abuse-economics.md) | CURRENT | Why nameserver proof-of-work, rate limits and penalties are shaped as they are: Sybil and spam cost models, decay, griefing, federation, tribunals per ruleset group, and the known weaknesses the design must close. Rationale for the spec's [Identity and Reputation](../repos/jig-spec/src/identity-and-reputation.md) chapter. |
+| [`whitepaper/trust-federation-identity.md`](whitepaper/trust-federation-identity.md) | CURRENT | Whitepaper (non-normative): identity, `--anon`, reputation, security levels and ruleset groups, anchor nameservers, federation as a data contract, and the threat families beyond operators. Separates, for each topic, what jig must guarantee, what v0.2 does today, and what is still to design. |
 
 ## Crate documentation
 

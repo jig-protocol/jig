@@ -3,7 +3,8 @@
 The reasoning behind the spec's
 [threat register](../../repos/jig-spec/src/threat-register.md). The register holds the
 decisions; this document holds the model, the alternatives and the evidence for each
-status. Update both together.
+status. Update both together. This document covers the OP entries; the other families are
+analysed in the [trust, federation and identity whitepaper](../whitepaper/trust-federation-identity.md#14-threat-analysis-beyond-operators).
 
 Last reviewed 2026-10-05, against `main` at the v0.1 groundwork branch.
 

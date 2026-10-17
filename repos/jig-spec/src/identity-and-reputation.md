@@ -6,11 +6,17 @@
 > - **Implemented:** `did:jig` identities, nameserver-attested aliases, TOFU and nameserver
 >   resolution in servers, per-ruleset reputation scores, proof-of-work with penalties on
 >   the nameserver's claim and alias challenges, and tribunal case records.
-> - **Required, not yet implemented or partial:** proof-of-work on every binding endpoint,
->   reputation shared within a ruleset group, cross-registration within a high-sec ruleset
->   group, tribunals, the transparency log, abuse reporting from encrypted channels, and
->   Sybil resistance beyond linear cost.
+> - **Required, not yet implemented or partial:** proof-of-work enforced by servers and on
+>   every nameserver binding endpoint, reputation reports from servers to nameservers and
+>   net reputation computed by nameservers, reputation shared within a ruleset group,
+>   cross-registration within a high-sec ruleset group, tribunals held by nameservers,
+>   transparency logs at servers and nameservers, abuse reporting from encrypted channels,
+>   and Sybil resistance beyond linear cost.
 > - **Proposed:** anchor nameservers, soul validation and useful-work rewards.
+>
+> Decisions D19 to D24 in the roadmap's
+> [decisions log](https://github.com/jig-protocol/jig/blob/main/docs/ROADMAP.md#decisions-log)
+> settle the model this chapter specifies.
 >
 > Reputation is not a protocol gate until
 > [JEP-0003](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0003-server-discovery.md)
@@ -29,13 +35,32 @@
 - **Reputation** is one number per subject **per ruleset**. A user, a server and a
   nameserver can each have one. Behaviour raises or lowers it. It has no tiers.
 - A **ruleset** is a named, versioned scoring policy.
-- A **ruleset group** is a concrete set of servers and nameservers that have adopted the
-  same ruleset and agreed to share reputation, penalties and tribunal outcomes under it.
+- A **ruleset group** is a concrete set of servers, clients and nameservers that have all
+  agreed to be rated by the same ruleset, whose rules produce the same reputation maths for
+  every member, and to share reputation, penalties and tribunal outcomes under it (D21).
 - A **security level** (high-sec, low-sec or null-sec) is a category that describes a
   server's or a ruleset group's policy. It is not a group, and nothing is shared across
   it: two high-sec ruleset groups share nothing unless they agree to.
 
 A security level is never a property of a user.
+
+## Servers and nameservers
+
+Servers are the execution and enforcement boundary. A server looks clients up by DID and
+deals with them under policies it presets and the client agrees to. Nameservers sit behind
+servers: they judge and net out, and they hold servers to account (D23).
+
+| Party | Obligations |
+| --- | --- |
+| **Server** | Enforces [proof-of-work](#proof-of-work) on the clients it serves. Decides about a client by reputation, using a ruleset recorded in its nameserver network, a ruleset it holds privately, or none. Reports reputation changes for the clients it works with to the nameservers it belongs to, as part of its data contract with them. Keeps its own [transparency log](#transparency-log). |
+| **Nameserver** | Holds the ruleset group's [tribunals](#tribunals). Computes and enforces *net* reputation changes from every member server's reports, not one server's marginal observation. Enforces servers' good behaviour through servers' own scores and penalties. Keeps a transparency log of bindings, net reputation changes, penalties and decisions. |
+
+A server with no nameserver sets its own policy for all of this.
+
+**Status:** not yet implemented. Servers enforce no proof-of-work, report nothing to
+nameservers and keep no transparency log; the reference nameserver computes a
+per-nameserver aggregate from its own observations (see
+[Reputation is a number](#reputation-is-a-number)).
 
 ## Identity
 
@@ -91,7 +116,7 @@ attestation signature before it uses the binding. **Status:** not yet implemente
 
 ### Anonymous identities
 
-An **anonymous** (`--anon`) identity is a fresh, unregistered session key. The client mints
+An **anonymous** (`--anon`) identity is a fresh, unregistered session key (D20). The client mints
 it for one session, registers it with no nameserver, and discards it afterwards. It still
 signs and still proves possession of its key: it is unregistered, not unauthenticated. Any
 reputation it earns lasts at most for the session.
@@ -150,17 +175,22 @@ Reputation is a score for a **user**, a **server** or a **nameserver**, under on
 stage gate a subject "transitions" through.
 
 - A score MUST be scoped to one ruleset. There is no global score.
-- Members of a [ruleset group](#security-levels-and-ruleset-groups-server-policy) share the
-  observations, penalties and tribunal outcomes recorded under the group's ruleset. Each
-  member computes its own score from them, and MUST treat what a peer sends as a claim by
-  that peer, not as a fact.
+- The priority is a **shared ruleset**: every member of a
+  [ruleset group](#security-levels-and-ruleset-groups-server-policy) is rated by the same
+  rules, which produce the same reputation maths, so a score means the same thing wherever
+  the group uses it (D21).
+- A server MUST report reputation changes for the clients it works with to the nameservers
+  of its ruleset group. The nameservers MUST compute the net change from every member
+  server's reports and enforce it across the group (D23). A nameserver MUST treat a server's
+  report as a claim by that server, not as a fact, and MUST NOT let one server's marginal
+  observation stand for the net change.
 - Scores MUST NOT be pooled across a security level. A score moves to a different ruleset
   only through a [translation contract](#rulesets-and-translation-contracts) both parties
   agreed to.
 - A subject with no score under a ruleset is **unknown** for that ruleset, not low. What a
   server does with unknown subjects is its own policy.
 
-Each nameserver computes its own scores. A score is the weighted mean of the unexpired
+The reference nameserver computes a score as the weighted mean of the unexpired
 observations recorded for that subject and ruleset (at most 1024 are read). An observation
 carries `score`, `weight` (default 1.0), `observer`, optional `evidence` and optional
 `expires_at`.
@@ -173,9 +203,10 @@ carries `score`, `weight` (default 1.0), `observer`, optional `evidence` and opt
 
 `{subject}` is `user`, `server` or `nameserver`.
 
-**Status:** partial. The nameserver keeps scores per subject and ruleset. Servers keep
-operator-seeded scores per ruleset for admission floors (`[auth.admission] records`).
-Sharing within a ruleset group is not implemented: reputation gossip is received and
+**Status:** partial. The nameserver keeps scores per subject and ruleset, each computed
+from its own observations only. Servers keep operator-seeded scores per ruleset for
+admission floors (`[auth.admission] records`) and report nothing to nameservers. Net
+computation across a ruleset group is not implemented: reputation gossip is received and
 stored, not applied.
 
 ### Rulesets and translation contracts
@@ -188,7 +219,8 @@ adopt the same ruleset key agree on what its scores mean.
 Parties with different rulesets MAY map scores between them with a **translation
 contract**: `from`, `to`, `weight`, and a `linear` (`slope`, `intercept`, optional clamps)
 or `table` transform. A contract is a data contract between the two parties. Neither side
-is bound by the other's ruleset without one.
+is bound by the other's ruleset without one. Interop between ruleset groups this way is
+possible but not a first priority; the priority is a shared ruleset within a group (D21).
 
 **Status:** rulesets and contracts are parsed and published in `/.well-known/jig-ns`.
 Only `pow_policy.multiplier` is applied (see [Proof-of-work](#proof-of-work)). Contracts
@@ -257,9 +289,9 @@ being minted.
 
 Nameservers in a high-sec ruleset group MUST cross-register identities: they share their
 alias-to-DID mappings, penalties and tribunal outcomes, so an alias resolves to the same DID
-on every member and a user is cross-validated across handles and servers. A reputation
-change on one member is applied by the others under the group's ruleset. This shared
-registry is what makes a group high-sec.
+on every member and a user is cross-validated across handles and servers. The nameservers
+compute the net reputation change from the group's servers' reports and apply it on every
+member under the group's ruleset. This shared registry is what makes a group high-sec.
 
 A nameserver MUST NOT resolve another nameserver's aliases as its own unless that
 nameserver agrees to federate.
@@ -322,9 +354,12 @@ MUST refuse a used, expired or mismatched challenge.
 
 ### Proof-of-work
 
-Proof-of-work is required, not optional. A nameserver MUST require a solved challenge on
-every request that creates a binding, and a client MUST be able to solve a challenge from
-public information alone.
+Proof-of-work is required, not optional (D23). A server MUST enforce proof-of-work on the
+clients it serves, at the cost its ruleset sets. A nameserver MUST require a solved
+challenge on every request that creates a binding. A client MUST be able to solve a
+challenge from public information alone.
+
+**Status:** servers enforce no proof-of-work.
 
 A solution is valid when `BLAKE3(challenge_id|action|subject|scope|nonce)` has at least
 `difficulty` leading zero bits. Expected work is about 2^`difficulty` hashes.
@@ -445,8 +480,11 @@ treat gossip as claims by the sending peer, not as facts.
 
 ## Transparency log
 
-A nameserver MUST keep an append-only transparency log and publish it, so members of its
-ruleset group and anyone else can check what it enforced. The log:
+Servers and nameservers each keep a transparency log (D23). A server MUST keep an
+append-only log of what it enforced and the reputation reports it sent, under the same
+evidence and redaction rules as below. A nameserver MUST keep an append-only transparency
+log and publish it, so members of its ruleset group and anyone else can check what it
+enforced. The nameserver's log:
 
 - MUST record tribunal decisions, penalty and reputation changes made by a decision or
   received from the ruleset group, and identity bindings it creates;
@@ -456,9 +494,10 @@ ruleset group and anyone else can check what it enforced. The log:
   data;
 - MUST NOT record anything that links an anonymous identity to a DID.
 
-**Status:** partial. The log's storage, a hash-chain verifier and the read endpoints
-(`GET /v1/transparency/entries`, `/hashes`, `/verify`) exist. The running service writes no
-entries and does not compute periodic chain hashes.
+**Status:** partial. Servers keep no log. On the nameserver, the log's storage, a
+hash-chain verifier and the read endpoints (`GET /v1/transparency/entries`, `/hashes`,
+`/verify`) exist; the running service writes no entries and does not compute periodic chain
+hashes.
 
 ## Useful work
 
@@ -475,9 +514,10 @@ useful work.
 
 ## Tribunals
 
-Tribunals are required. Automatic penalties handle volume; tribunals handle judgement:
-harassment, coordinated campaigns, appeals against a penalty, and a federated instance that
-lies. Each ruleset group judges disputes under its own ruleset, and recognition across
+Tribunals are required, and a ruleset group's nameservers hold them (D23). Automatic
+penalties handle volume; tribunals handle judgement: harassment, coordinated campaigns,
+appeals against a penalty, and a federated instance that lies. Servers bring cases and
+evidence. Each ruleset group judges disputes under its own ruleset, and recognition across
 groups is voluntary. There is no tribunal above the groups.
 
 - A high-sec ruleset group MUST provide a tribunal. A low-sec group MAY keep tribunals
@@ -488,8 +528,9 @@ groups is voluntary. There is no tribunal above the groups.
   decision.
 - A decision MUST be signed by the panelists who made it and appended to the
   [transparency log](#transparency-log).
-- A decision's outcome MUST be applied by the members of the ruleset group, under its
-  ruleset, and by no one else unless they choose to recognise it.
+- The nameservers MUST enforce a decision's outcome as a net reputation change, and the
+  group's servers apply it under the ruleset; no one else is bound unless they choose to
+  recognise it.
 - A subject SHOULD be able to appeal once, to a panel with no members of the first.
 - A ruleset group MAY set panel size, appeal limits and penalty ranges in its ruleset.
 - A tribunal never has a path to unmask an anonymous identity
@@ -507,8 +548,8 @@ implemented.
 
 ### Reporting abuse in encrypted channels
 
-A tribunal MUST be able to act on abuse that happened in an encrypted channel. Abuse
-happens in channels, and a channel has exactly one owning server, but neither that server
+A tribunal MUST be able to act on abuse that happened in an encrypted channel (D22). Abuse
+happens in channels, and a channel has exactly one owning server (D24), but neither that server
 nor any nameserver can read an encrypted channel's content. The evidence must therefore
 come from a participant who received it.
 
@@ -539,8 +580,13 @@ not yet meet.
   implemented)*.
 - Scope every reputation score to one ruleset; share it only within the ruleset group, and
   treat what peers send as claims *(partial)*.
+- Report reputation changes for clients to the ruleset group's nameservers (servers) *(not
+  yet implemented)*.
+- Compute and enforce net reputation changes from every member server's reports, and
+  enforce servers' good behaviour (nameservers) *(not yet implemented)*.
+- Enforce proof-of-work on the clients a server serves (servers) *(not yet implemented)*.
 - Require proof-of-work, solvable from public information, on every request that creates a
-  binding *(partial)*.
+  binding (nameservers) *(partial)*.
 - Scale proof-of-work by reputation under an adopted ruleset, within its bounds
   *(partial)*.
 - Refuse used, expired or mismatched proof-of-work challenges.
@@ -551,9 +597,10 @@ not yet meet.
 - Cross-register identities within a high-sec ruleset group, and resolve another
   nameserver's aliases only with its agreement *(not yet implemented)*.
 - Keep and publish a hash-chained transparency log of decisions, enforcement changes and
-  bindings *(partial)*.
-- Provide a tribunal in a high-sec ruleset group; sign decisions, log them, and apply them
-  within the group *(partial)*.
+  bindings (nameservers) *(partial)*, and a log of what a server enforced and reported
+  (servers) *(not yet implemented)*.
+- Provide a tribunal, held by the nameservers, in a high-sec ruleset group; sign decisions,
+  log them, and apply them within the group *(partial)*.
 - Let a recipient report abuse in an encrypted channel to a tribunal with effective proof
   *(not yet implemented)*.
 - Publish policy at `/.well-known/jig-ns`, `/.well-known/jig-ns/capabilities` and
