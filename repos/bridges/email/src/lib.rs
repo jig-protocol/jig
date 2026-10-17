@@ -23,7 +23,7 @@ pub mod resend;
 
 pub use address_book::{AddressBook, Resolution};
 pub use bridge::EmailBridge;
-pub use channel::dm_channel_slug;
+pub use channel::{THREAD_PREFIX, thread_slug};
 pub use config::EmailBridgeConfig;
 pub use identity::{normalize_email, shadow_did, shadow_signing_key};
 pub use inbound::{InboundState, handle_inbound};

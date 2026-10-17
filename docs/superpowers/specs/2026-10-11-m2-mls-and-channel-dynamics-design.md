@@ -124,6 +124,12 @@ tell from a squat, so a plaintext squat on a pair's slug can still block `jig dm
 them — a denial of service, not a disclosure. Moving bridge threads to their own prefix
 closes it.
 
+*Amended again.* Bridge threads now live under `#email/`, and the server reserves the
+whole `#dm/` prefix: every `#dm/` create must name a `dm_peer` that derives the slug with
+the sender, and be restricted and `mls`. A thread the bridge already opened under `#dm/`
+keeps its history, and replies posted there are still mailed out; the next inbound mail in
+that conversation opens a new `#email/` channel, so the conversation splits in two.
+
 **7. A channel's suite is fixed at creation and enforced on every post** (JEP-0001
 "Proposed"). The `channels` row records `suite`. Content into an `mls` channel must declare
 `privacy.encryption = "mls"` and carry its payload as `metadata.mls_message` (an MLS

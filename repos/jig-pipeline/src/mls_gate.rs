@@ -103,10 +103,7 @@ pub fn plan(
         require_plaintext_block(manifest, block_suite)?;
         let suite = requested_suite(manifest)?;
         let slug = meta_str(manifest, "slug").unwrap_or_default().to_string();
-        // The email bridge opens plaintext `#dm/` channels for mail threads
-        // under its own derivation, naming no peer; those pass.
-        let is_dm = suite == EncryptionSuite::Mls || manifest.metadata.contains_key("dm_peer");
-        if slug.starts_with(jig_core::dm::DM_PREFIX) && is_dm {
+        if slug.starts_with(jig_core::dm::DM_PREFIX) {
             check_dm_create(sender, manifest, &slug, suite)?;
         }
         if suite != EncryptionSuite::Mls {
@@ -262,16 +259,13 @@ fn require_plaintext_block(
     }
 }
 
-/// An encrypted `#dm/` slug belongs to the pair whose DIDs derive it
+/// A `#dm/` slug belongs to the pair whose DIDs derive it
 /// ([`jig_core::dm::dm_slug`]). Only one of the two may create it, and only as
 /// what a DM is: restricted and encrypted. Otherwise anyone could take a
-/// pair's slug first, and since the client refuses a DM channel with anyone
-/// else in it, the two could then never DM on this server.
-///
-/// Plaintext `#dm/` creates that name no peer are the email bridge's and are
-/// not checked, so a plaintext squat on a pair's slug still blocks `jig dm`
-/// between them (the client refuses an unencrypted DM). Closing that needs
-/// the bridge's threads under their own prefix.
+/// pair's slug first, encrypted or not, and since the client refuses a DM
+/// channel that is unencrypted or has anyone else in it, the two could then
+/// never DM on this server. The whole prefix is reserved: the email bridge
+/// opens its mail threads under `#email/`.
 fn check_dm_create(
     sender: &str,
     manifest: &BlockManifest,
@@ -508,17 +502,26 @@ mod tests {
             create(&a, dm.clone()),
             Err(SuiteRefusal::Missing { field: "dm_peer" })
         );
-        // The email bridge's plaintext thread channel: no peer, no suite.
-        let bridge = manifest(
-            BlockKind::ChannelCreate,
-            &m.did,
-            EncryptionSuite::Unencrypted,
-            json!({"slug": "#dm/0011223344556677", "visibility": "restricted"}),
+        // A plaintext squat naming no peer, on the pair's slug or any other.
+        let squat = |slug: &str| {
+            let man = manifest(
+                BlockKind::ChannelCreate,
+                &m.did,
+                EncryptionSuite::Unencrypted,
+                json!({"slug": slug, "visibility": "restricted"}),
+            );
+            plan(BlockKind::ChannelCreate, &m.did, &man, None, None)
+        };
+        assert_eq!(
+            squat(&slug),
+            Err(SuiteRefusal::Missing { field: "dm_peer" })
         );
         assert_eq!(
-            plan(BlockKind::ChannelCreate, &m.did, &bridge, None, None),
-            Ok(MlsPlan::Nothing)
+            squat("#dm/0011223344556677"),
+            Err(SuiteRefusal::Missing { field: "dm_peer" })
         );
+        // The rest of the namespace is untouched.
+        assert_eq!(squat("#email/0011223344556677"), Ok(MlsPlan::Nothing));
     }
 
     #[test]

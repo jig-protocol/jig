@@ -2,11 +2,18 @@
 //!
 //! The slug is a hash of the sorted DID pair, so it's identical regardless of
 //! which DID is "sender" — inbound and outbound both resolve to one channel.
+//!
+//! Mail threads live under [`THREAD_PREFIX`], not `#dm/`: that prefix is
+//! reserved for encrypted direct messages between the two DIDs that derive
+//! the slug, and the server refuses any other `#dm/` create.
 
 use sha2::{Digest, Sha256};
 
-/// Deterministic DM channel slug for a DID pair (order-independent).
-pub fn dm_channel_slug(did_a: &str, did_b: &str) -> String {
+/// The prefix of every mail-thread channel the bridge opens.
+pub const THREAD_PREFIX: &str = "#email/";
+
+/// Deterministic mail-thread channel slug for a DID pair (order-independent).
+pub fn thread_slug(did_a: &str, did_b: &str) -> String {
     let mut pair = [did_a, did_b];
     pair.sort_unstable();
     let mut h = Sha256::new();
@@ -14,7 +21,7 @@ pub fn dm_channel_slug(did_a: &str, did_b: &str) -> String {
     h.update(b"|");
     h.update(pair[1].as_bytes());
     let digest = h.finalize();
-    format!("#dm/{}", hex::encode(&digest[..8]))
+    format!("{THREAD_PREFIX}{}", hex::encode(&digest[..8]))
 }
 
 use jig_bridge_core::{SubmitDenied, SubmitHandle};
@@ -33,12 +40,12 @@ pub(crate) async fn submit_built_block(
     submit.submit(payload).await
 }
 
-/// Ensure the 1:1 DM channel `slug` exists with both members, creating it on
+/// Ensure the 1:1 thread channel `slug` exists with both members, creating it on
 /// first contact. Idempotent via a BridgeStorage marker so repeat inbound mail
 /// on an existing conversation doesn't re-create the channel. `creator` is the
 /// bridge's shadow identity (it authors the channel-create — which auto-adds it
 /// as owner — and the member-add for the real recipient DID).
-pub(crate) async fn ensure_dm_channel(
+pub(crate) async fn ensure_thread_channel(
     submit: &SubmitHandle,
     storage: &dyn jig_bridge_core::BridgeStorage,
     creator: &Identity,
@@ -77,21 +84,23 @@ mod tests {
     #[test]
     fn slug_is_order_independent() {
         assert_eq!(
-            dm_channel_slug("did:jig:zA", "did:jig:zB"),
-            dm_channel_slug("did:jig:zB", "did:jig:zA")
+            thread_slug("did:jig:zA", "did:jig:zB"),
+            thread_slug("did:jig:zB", "did:jig:zA")
         );
     }
 
     #[test]
     fn distinct_pairs_distinct_slugs() {
         assert_ne!(
-            dm_channel_slug("did:jig:zA", "did:jig:zB"),
-            dm_channel_slug("did:jig:zA", "did:jig:zC")
+            thread_slug("did:jig:zA", "did:jig:zB"),
+            thread_slug("did:jig:zA", "did:jig:zC")
         );
     }
 
     #[test]
-    fn slug_has_dm_prefix() {
-        assert!(dm_channel_slug("did:jig:zA", "did:jig:zB").starts_with("#dm/"));
+    fn slug_is_a_thread_and_never_a_dm() {
+        let slug = thread_slug("did:jig:zA", "did:jig:zB");
+        assert!(slug.starts_with(THREAD_PREFIX));
+        assert!(!slug.starts_with(jig_core::dm::DM_PREFIX));
     }
 }
