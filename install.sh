@@ -253,6 +253,8 @@ write_server_config() {
 database_path = "$JIG_HOME/jig.db"
 bind_address = "${JIG_SERVER_LISTEN%%:*}"
 port = ${JIG_SERVER_LISTEN##*:}
+# TLS is on by default: with no [tls] section the server makes its own
+# certificate in $JIG_HOME/tls/ on first start, and its DID vouches for it.
 
 # ---------------------------------------------------------------------------
 # JigServerConfig — the v0.0.2 half.
@@ -289,8 +291,22 @@ EOF
   log "wrote $cfg"
 }
 
+# The scheme a jig-server on $JIG_SERVER_LISTEN answers on, if one does: https
+# by default (its own certificate, which jig trusts through the server's DID,
+# hence -k here), http for a server that predates that default or turned it off.
+server_scheme() {
+  local scheme
+  for scheme in https http; do
+    if curl -kfsS -o /dev/null --max-time 1 "$scheme://${JIG_SERVER_LISTEN}/healthz" 2>/dev/null; then
+      echo "$scheme"
+      return 0
+    fi
+  done
+  return 1
+}
+
 server_healthy() {
-  curl -fsS -o /dev/null --max-time 1 "http://${JIG_SERVER_LISTEN}/healthz" 2>/dev/null
+  server_scheme >/dev/null
 }
 
 start_server_background() {
@@ -320,7 +336,9 @@ hello_world() {
   else
     log "reusing identity in ~/.jig/cli.toml"
   fi
-  "$jig" server set "ws://${JIG_SERVER_LISTEN}" >/dev/null
+  local scheme
+  scheme="$(server_scheme)" || die "jig-server stopped answering on $JIG_SERVER_LISTEN"
+  "$jig" server set "$scheme://${JIG_SERVER_LISTEN}" >/dev/null
   # --exist-ok: a re-run (or a server someone already set up) keeps its #hello.
   "$jig" channel create "$JIG_DEFAULT_CHANNEL" --exist-ok >/dev/null \
     || die "could not create $JIG_DEFAULT_CHANNEL"

@@ -105,7 +105,8 @@ export PATH="$PWD/target/release:$PATH"
 ```
 
 Generate a config, then start the server. `--init-config` writes a commented template that
-binds `127.0.0.1:7117`; the channel commands need nothing beyond it:
+binds `127.0.0.1:7117` and serves TLS with a certificate the server makes itself on first
+start; the channel commands need nothing beyond it:
 
 ```bash
 jig-server --init-config ~/.jig/config.toml
@@ -117,7 +118,7 @@ open the TUI:
 
 ```bash
 jig init <nickname>                 # writes ~/.jig/cli.toml + ~/.jig/keys/<did>.key
-jig server set http://127.0.0.1:7117
+jig server set https://127.0.0.1:7117   # pins the server's DID, which vouches for its certificate
 jig channel create '#hello'
 jig chat '#hello'                   # Enter sends; Ctrl+Q or Esc quits
 ```

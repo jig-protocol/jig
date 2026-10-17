@@ -52,6 +52,10 @@ pub struct AppState {
     /// replayed request landing on a different clone would find an empty set
     /// and be accepted. See `crate::auth::state`.
     pub auth: Arc<crate::auth::AuthState>,
+    /// The server DID's word for the TLS certificate this server serves, set
+    /// once the listener has its certificate ([`Self::bind_tls_certificate`])
+    /// and published at `/.well-known/jig`. Shared by every clone.
+    pub tls_binding: Arc<std::sync::OnceLock<jig_core::tls_binding::TlsBinding>>,
 }
 
 /// Gates 1 and 2 from `[auth]`, plus the federation peers from `[federation]`:
@@ -97,6 +101,15 @@ fn runtime_config_from(execution: &ExecutionConfig) -> jig_runtime::RuntimeConfi
 }
 
 impl AppState {
+    /// Vouch, with the server DID's key, for the certificate the listener
+    /// serves (DER), so clients can trust it without a CA. The first call
+    /// wins; the certificate does not change while the server runs.
+    pub fn bind_tls_certificate(&self, cert_der: &[u8]) {
+        let _ = self.tls_binding.get_or_init(|| {
+            jig_core::tls_binding::TlsBinding::sign(&self.ingest_ctx.server_key, cert_der)
+        });
+    }
+
     /// Build the AppState from a parsed JigServerConfig and a SQLite path.
     /// Generates the server signing key if the configured keyfile is absent;
     /// loads it otherwise. On Unix the keyfile is set to mode 0600 on
@@ -179,6 +192,7 @@ impl AppState {
             bridges,
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
+            tls_binding: Default::default(),
         })
     }
 
@@ -229,6 +243,7 @@ impl AppState {
             bridges,
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
+            tls_binding: Default::default(),
         })
     }
 
@@ -278,6 +293,7 @@ impl AppState {
             bridges,
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
+            tls_binding: Default::default(),
         })
     }
 }

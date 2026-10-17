@@ -39,6 +39,41 @@ Before diving into transport-specific details, here are rules that apply to **al
 
 **For implementers:** Configure your TLS library to reject TLS 1.2 and older. Use OpenSSL 1.1.1+ or BoringSSL.
 
+### Server Certificates
+
+A server MAY serve a certificate no CA issued. It then vouches for it with its DID key, so
+a client that knows the server's DID can trust the certificate without a CA.
+
+- **Binding.** `/.well-known/jig` carries `tls_binding: {cert_blake3, sig_b64}`.
+  `cert_blake3` is the hex BLAKE3 hash, over labelled parts, of (`domain`,
+  `jig-tls-cert-v1`) and (`cert`, the end-entity certificate's DER bytes). Labelled parts
+  hash each label's UTF-8 bytes, the value's length as a little-endian u64, then the
+  value. `sig_b64` is the server DID key's Ed25519 signature over the hash of (`domain`,
+  `jig-tls-binding-v1`), (`server`, the server's DID) and (`cert`, that hash). A server
+  that serves TLS SHOULD publish a binding for whatever certificate it serves, CA-issued
+  or not.
+- **Probe.** On first connection, a client fetches `/.well-known/jig`. It accepts any
+  certificate for this one request, but MUST still verify the handshake signature, and
+  MUST remember the certificate it was shown. It then MUST refuse to continue unless:
+  - the DID the document names is the one the client expects (a pin, or a peer's
+    configured DID), and
+  - the presented certificate is CA-valid for the host, or the binding names it and
+    verifies under that DID.
+- **After the probe.** Every later connection MUST accept only a CA-valid certificate or
+  the certificate the probe accepted.
+- **First contact.** A client with no DID to expect takes the DID the server names and
+  SHOULD pin it. This is trust on first use, the same as the signed welcome
+  ([Handshake](handshake.md)).
+
+The DID is the anchor, not the certificate. A server can rotate its certificate freely,
+because the same DID vouches for the new one. A certificate presented without the DID's
+signature is refused.
+
+**Status:** the reference server serves TLS by default, with a self-signed certificate it
+makes on first start unless one is configured, and publishes the binding. The CLI and
+the federation dialer (against a peer's `expected_did`) probe as above. Both sides speak
+TLS 1.3 only. The nameserver still serves plaintext.
+
 ### Minimize Metadata
 
 **MUST omit unnecessary headers and identifiers.**

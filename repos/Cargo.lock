@@ -3718,6 +3718,9 @@ dependencies = [
  "jig-core",
  "jig-mls",
  "jig-pipeline",
+ "reqwest",
+ "rustls",
+ "rustls-native-certs",
  "semver",
  "serde",
  "serde_json",
@@ -3943,6 +3946,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "wasmtime",
 ]

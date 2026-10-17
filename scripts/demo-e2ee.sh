@@ -40,7 +40,7 @@ cleanup() {
 trap cleanup EXIT
 
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
-URL="http://127.0.0.1:$PORT"
+URL="https://127.0.0.1:$PORT"
 
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 as() { # as <user> <jig args...>
@@ -56,10 +56,11 @@ sed -i.bak -e "s/^port = 7117/port = $PORT/" -e "s/127.0.0.1:7117/127.0.0.1:$POR
 HOME="$WORK/server" RUST_LOG=warn "$SERVER" --config "$WORK/server/config.toml" >"$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 100); do
-	curl -fsS "$URL/healthz" >/dev/null 2>&1 && break
+	curl -kfsS "$URL/healthz" >/dev/null 2>&1 && break
 	sleep 0.1
 done
-curl -fsS "$URL/healthz" >/dev/null || { cat "$WORK/server.log"; exit 1; }
+# -k: the server's own certificate, which jig trusts through the server DID.
+curl -kfsS "$URL/healthz" >/dev/null || { cat "$WORK/server.log"; exit 1; }
 
 for who in alice bob carol; do
 	mkdir -p "$WORK/$who"
