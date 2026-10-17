@@ -324,6 +324,19 @@ banned_dids = []
 # ruleset_key = "gigue.highsec.v1"
 # score = 5
 
+# Token buckets in front of the gates: per verified DID (reads, subscriptions,
+# and every write it authors) and per remote address (every request and every
+# WebSocket frame). A bucket holds `*_burst` and refills at `*_per_second`;
+# a rate of 0 turns that limit off. Behind a reverse proxy every request has
+# the proxy's address: raise the per-IP limit or turn it off there.
+[auth.rate_limit]
+per_did_burst = {per_did_burst}
+per_did_per_second = {per_did_per_second}
+per_ip_burst = {per_ip_burst}
+per_ip_per_second = {per_ip_per_second}
+replay_per_did = {replay_per_did}
+max_tracked = {max_tracked}
+
 [debug]
 # Channel ops live on /api/v1/channels and are always mounted. This flag only
 # adds the legacy /_admin_v0_0_2/* aliases that pre-v0.1 `jig` CLIs POST to.
@@ -336,6 +349,12 @@ list_handles = {list_handles}
         require_auth = defaults.auth.require_authenticated_reads,
         replay_window_ms = defaults.auth.replay_window_ms,
         replay_capacity = defaults.auth.replay_capacity,
+        per_did_burst = defaults.auth.rate_limit.per_did_burst,
+        per_did_per_second = defaults.auth.rate_limit.per_did_per_second,
+        per_ip_burst = defaults.auth.rate_limit.per_ip_burst,
+        per_ip_per_second = defaults.auth.rate_limit.per_ip_per_second,
+        replay_per_did = defaults.auth.rate_limit.replay_per_did,
+        max_tracked = defaults.auth.rate_limit.max_tracked,
         kinds = kinds,
         cache_ttl = defaults.identity.cache_ttl_seconds,
         unknown_handles = defaults.identity.naively_allow_unknown_handles_fallback,

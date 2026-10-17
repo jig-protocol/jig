@@ -104,7 +104,7 @@ pub async fn publish_key_packages(
     }
     state
         .auth
-        .admit(&did)
+        .admit_and_charge(&did)
         .map_err(|outcome| refuse(&state, &outcome, started))?;
 
     let store = &state.ingest_ctx.store;

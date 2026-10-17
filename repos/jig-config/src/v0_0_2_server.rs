@@ -153,6 +153,10 @@ pub struct AuthSection {
 
     /// Gate 2: whom this server will deal with at all. See [`AdmissionSection`].
     pub admission: AdmissionSection,
+
+    /// How fast one identity, or one address, may use this server. See
+    /// [`RateLimitSection`].
+    pub rate_limit: RateLimitSection,
 }
 
 impl Default for AuthSection {
@@ -162,6 +166,49 @@ impl Default for AuthSection {
             replay_window_ms: 30_000,
             replay_capacity: 100_000,
             admission: AdmissionSection::default(),
+            rate_limit: RateLimitSection::default(),
+        }
+    }
+}
+
+/// `[auth.rate_limit]` — token buckets in front of the gates. On by default:
+/// without them one identity can spend the replay guard's capacity, and so
+/// refuse everyone, and one address can sign requests under as many throwaway
+/// identities as it likes.
+///
+/// Each bucket holds up to `*_burst` requests and refills at `*_per_second`.
+/// A rate of 0 turns that limit off.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RateLimitSection {
+    /// Per verified DID: authenticated reads, subscriptions, and every write
+    /// it authors, whichever surface (REST, WebSocket, federation, bridge)
+    /// carried it.
+    pub per_did_burst: u32,
+    pub per_did_per_second: u32,
+    /// Per remote address: every HTTP request and every WebSocket frame,
+    /// signed or not. Behind a reverse proxy every request comes from the
+    /// proxy's address, so raise this or turn it off there.
+    pub per_ip_burst: u32,
+    pub per_ip_per_second: u32,
+    /// Nonces one DID may hold in the replay guard at once. Keeps one
+    /// identity from filling the guard's shared `replay_capacity`.
+    pub replay_per_did: usize,
+    /// Most identities or addresses tracked at once. When full, an idle
+    /// bucket is forgotten to make room; with none idle, a newcomer is
+    /// refused rather than an old bucket reset.
+    pub max_tracked: usize,
+}
+
+impl Default for RateLimitSection {
+    fn default() -> Self {
+        Self {
+            per_did_burst: 300,
+            per_did_per_second: 50,
+            per_ip_burst: 600,
+            per_ip_per_second: 100,
+            replay_per_did: 2_000,
+            max_tracked: 100_000,
         }
     }
 }

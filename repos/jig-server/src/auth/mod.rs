@@ -15,6 +15,7 @@ pub mod authenticate;
 pub mod authorize;
 pub mod disclosure;
 pub mod outcome;
+pub mod rate;
 pub mod replay;
 pub mod state;
 

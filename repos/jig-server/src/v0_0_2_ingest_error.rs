@@ -81,6 +81,11 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         }
         // 403 and the same word the read gates use: the caller authenticated
         // fine, this server simply will not deal with them.
+        // 429, unlike the other refusals: waiting changes the answer.
+        IngestError::NotAdmitted {
+            refusal: jig_pipeline::ingest::AdmissionRefusal::RateLimited,
+            ..
+        } => (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED", e.to_string()),
         IngestError::NotAdmitted { refusal, .. } => {
             (StatusCode::FORBIDDEN, "NOT_ADMITTED", refusal.to_string())
         }

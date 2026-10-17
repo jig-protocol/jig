@@ -56,6 +56,8 @@ pub enum AdmissionRefusal {
     BelowRuleset { ruleset_key: String },
     /// This server refuses the sender outright.
     Banned,
+    /// The sender is over its rate; a later retry may succeed.
+    RateLimited,
 }
 
 impl std::fmt::Display for AdmissionRefusal {
@@ -67,6 +69,7 @@ impl std::fmt::Display for AdmissionRefusal {
                 "reputation under ruleset {ruleset_key} is below this server's floor"
             ),
             Self::Banned => f.write_str("this identity is refused by this server"),
+            Self::RateLimited => f.write_str("too many requests from this identity; slow down"),
         }
     }
 }
