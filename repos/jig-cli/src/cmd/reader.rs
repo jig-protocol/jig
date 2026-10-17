@@ -29,7 +29,8 @@ pub struct Read {
 }
 
 impl Reader {
-    /// A reader that never decrypts — for plain channels and tests.
+    /// A reader that never decrypts.
+    #[cfg(test)]
     pub fn plain(slug: &str) -> Self {
         Self {
             slug: slug.to_string(),
@@ -38,13 +39,10 @@ impl Reader {
     }
 
     pub async fn open(ctx: &CliContext, slug: &str) -> Result<Self> {
-        let secure = match Secure::open(ctx) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("warning: encrypted channels unavailable: {e:#}");
-                return Ok(Self::plain(slug));
-            }
-        };
+        // Without local MLS state there is no telling an encrypted channel
+        // from one the server relabelled, and a plain reader sends in the
+        // clear; so it is an error, not a fallback.
+        let secure = Secure::open(ctx)?;
         // Keep this identity reachable for DMs and adds. Best effort: a server
         // that predates v0.2 has no key-package endpoint (404), which is not
         // worth a warning; anything else is. Printed before any TUI starts.
@@ -55,13 +53,7 @@ impl Reader {
         {
             eprintln!("warning: MLS key packages not published: {e:#}");
         }
-        let encrypted = match secure.channel(slug).await {
-            Ok(Some(c)) => c.encrypted(),
-            _ => secure
-                .session
-                .has_group(secure.server(), slug)
-                .unwrap_or(false),
-        };
+        let encrypted = secure.encrypted(slug).await?;
         Ok(Self {
             slug: slug.to_string(),
             secure: encrypted.then(|| Arc::new(secure)),

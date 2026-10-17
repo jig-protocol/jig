@@ -1,79 +1,107 @@
 # Identity and Reputation
 
-**Audience:** This chapter is for **server operators** (configuring nameservers, tribunal policies), **protocol implementers** (building identity systems), and **developers** (understanding reputation tiers and useful work). **End users** might care about how reputation affects their message costs and what happens if they're reported to a tribunal.
+> **Status.** Implemented: `did:jig` identities, nameserver-attested aliases, TOFU and
+> nameserver resolution in servers, proof-of-work with penalties on the nameserver's claim
+> and alias challenges, per-ruleset reputation scores, and tribunal case records.
+> Proposed: security zones as configuration, cross-registration between nameservers,
+> anchor nameservers, soul validation, useful-work rewards, and tribunal panels. Each
+> section says which applies. Reputation is not a protocol gate until
+> [JEP-0003](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0003-server-discovery.md)
+> defines it ([OP-10](threat-register.md)). Rationale and cost model:
+> [`docs/security/nameserver-abuse-economics.md`](https://github.com/jig-protocol/jig/blob/main/docs/security/nameserver-abuse-economics.md).
 
----
+**Audience:** protocol implementers, nameserver and server operators. End users need only
+[Identity](#identity) and [Security zones](#security-zones-server-policy).
 
-Identity in Jig isn't just usernames and passwords. It's a reputation system that adapts based on behavior: spammers pay more to send messages, trusted contributors get discounts, and bad actors get ejected by community tribunals. It's like credit scores for messaging, but transparent, federated, and built into the protocol.
+## Overview
 
-## Why Reputation Matters
+- An **identity** is a `did:jig`: a self-certifying Ed25519 key the user mints locally.
+- An **alias** (`alice@example.com`) is a nameserver's signed claim that a name maps to a
+  DID. It is never the sender.
+- **Reputation** is a number a nameserver or server keeps about a user, a server or a
+  nameserver. Behaviour raises or lowers it. It is local, and it has no tiers.
+- A **security zone** is a policy of a server or a nameserver federation. It is not a
+  property of a user.
 
-Here's the problem with most messaging systems: either everyone can spam freely (chaos), or you need a central authority to ban people (censorship risk). Jig takes a third path: **adaptive costs** based on reputation.
+## Identity
 
-**How it works:**
+### DIDs
 
-- **New users** pay a high cost (proof-of-work) to send messages. This prevents spam bots from flooding the network.
-- **Good users** build reputation by contributing useful work (validating signatures, relaying messages, participating in governance). Their costs drop.
-- **Bad users** accumulate penalties (sent spam, violated community rules). Their costs rise exponentially until they're priced out or get tribunal-banned.
+A `did:jig` is derived from an Ed25519 public key and proves itself: whoever signs with the
+key is the DID. No authority issues or revokes one.
 
-**Real-world example:**
+- A block's sender MUST be a DID. Aliases are display and lookup aids only.
+- A sender has one canonical DID per identity. A user MAY hold different identities, for
+  example in different zones.
+- A new keypair is a new identity with no reputation. The protocol has no mechanism that
+  links two DIDs, except [alias rotation](#aliases), which both keys must sign.
+- Losing the private key loses the identity. Clients SHOULD make key backup explicit.
 
-Alice joins Jig (new account, null-sec zone). She wants to send a message. Her client solves a 24-bit proof-of-work puzzle (takes ~10 seconds on her laptop). Message sent.
+### Aliases
 
-Over the next month, Alice contributes useful work (validates 50 messages, relays blocks for her community). She graduates to low-sec zone. Now her PoW drops to 16-bit (~1 second).
+A nameserver attests aliases under the suffix it is authoritative for (`alias_suffix`).
 
-Bob joins Jig and immediately sends 1000 spam messages. Servers detect the pattern, add penalties to his account. His PoW jumps to 32-bit (~2 minutes per message). He gives up and leaves.
+1. `GET /v1/challenge` returns a 32-byte hex nonce.
+2. The client signs the nonce with its DID key and sends `POST /v1/register` with `did`,
+   `requested_alias`, `challenge` and `proof_of_control`.
+3. The nameserver returns an attestation (`did`, `alias`, `ns_did`, `valid_from`,
+   `valid_until`, `profile_ttl_seconds`, `sig`) signed with its own key. The default
+   validity is 90 days.
 
-// woof fix, not how this works
+`POST /v1/renew` extends an attestation. `POST /v1/rotate` moves an alias from one DID to
+another and requires signatures from both keys, so the nameserver can link the two DIDs.
+`GET /v1/resolve/{alias}` returns the current binding.
 
-**Trade-offs:**
+The local part is 1 to 24 characters from `[A-Za-z0-9_-]`. An alias is a claim by the
+nameserver, not proof ([OP-08](threat-register.md)): a client SHOULD pin the DID it first
+saw for a name and surface any change.
 
-- **More complex:** Plain usernames are simpler. Reputation requires scoring, useful work allocation, and tribunal governance.
-- **More resilient:** No single point of failure. Spammers are priced out economically, not by central ban lists.
-- **More fair:** Good behavior is rewarded (lower costs), bad behavior is punished (higher costs), and appeals are handled by community tribunals (not corporate overlords).
+**Status:** this path has no proof-of-work and no rate limit. Proof-of-work and penalties
+apply to the older claim and alias endpoints described under
+[Nameserver mechanics](#nameserver-mechanics).
 
-**For end users:** Your reputation tier determines how much it costs (in time or money) to send messages. Build reputation by being a good community member.
+### Resolution by servers
 
-**For server operators:** You configure reputation policies (PoW difficulty, penalty decay rates, tribunal escalation thresholds) in `jig-config.toml`.
+A server resolves the alias on an incoming block in one of two modes
+(`[identity] mode`):
 
-**For developers:** Reputation tiers affect rate limits, capability grants, and fuel costs. Design your apps to handle users across all tiers gracefully.
+| Mode | Behaviour |
+| --- | --- |
+| `tofu` (default) | The first DID seen for a nickname is locked; a later block with a different DID is refused. |
+| `nameserver` | The server queries each URL in `trusted_nameservers` in order and refuses the block if the alias resolves to a different DID. Results are cached for `cache_ttl_seconds` (default 300). |
 
-## Identity Stack
+A server MAY trust more than one nameserver. **Status:** the server reads the `did` field
+from the resolve response and does not yet verify the attestation signature.
 
-Jig's identity system has four layers:
+### Anonymous identities
 
-### 1. DIDs (Decentralized Identifiers)
+A server that permits it MAY admit an **anonymous** (`--anon`) identity: no DID is presented
+at login, and any reputation lasts only for the session. Usually only
+[null-sec](#security-zones-server-policy) servers admit them.
 
-**What they are:** Cryptographically-verifiable IDs like `did:jig:5HpG9w8EBLe9vNqvdcXtUNJRaWHhTjdxYWdBqNpmQBZG`.
+- The protocol MUST NOT define any mechanism that links an anonymous identity to a DID.
+  There is no warrant, escrow or tribunal path that unmasks one.
+- A nameserver or server MUST NOT require a DID, or a proof derived from a DID key, to
+  admit an anonymous identity.
+- Clients SHOULD keep anonymous keypairs apart from DID keypairs: separate storage, no
+  derivation from a DID seed, no reuse across identities, and no shared device
+  identifiers in requests made under different identities.
+- Clients SHOULD show which kind of identity is active (for example `~` for anonymous,
+  `@` for an alias).
 
-**How they work:** Your DID is derived from your public key (Ed25519). You prove ownership by signing messages with your private key.
+The nameserver mints anonymous aliases (`anon-` plus 12 hex characters) through
+`POST /v1/alias`. An alias minted **with** a `subject` is a pseudonym, not an anonymous
+identity: the nameserver stores the link to the subject. It MUST NOT be presented to users
+as anonymous.
 
-**Why they matter:** No central authority can revoke your DID. If you lose trust with one server, move to another server with the same DID (your reputation travels with you) or create a new DID with a new keypair. Note that your reputation restarts at zero on all nameservers with a new identity. There's no way to associate the two, and that's a good thing!
+**Status:** servers and the CLI have no `--anon` login yet. Anonymous aliases exist only on
+the nameserver.
 
-**For end users:** Your DID is your identity. Back up your private key: if you lose it, you lose your identity and reputation.
+### Capability tokens
 
-### 2. Nameserver
-
-**What it is:** A federated service mapping human-readable handles (like `alice@example.com`) to DIDs.
-
-**How it works:**
-
-1. You register `alice` on nameserver `example.com`.
-2. The nameserver links `alice@example.com` → `did:jig:5HpG9w...`.
-3. Other users can message `alice@example.com` (easy to remember) instead of `did:jig:5HpG9w...` (hard to remember).
-
-**Why it's federated:** No single nameserver controls all names. If `example.com` goes down, use a different nameserver. Your DID stays the same.
-
-**For server operators:** Run a nameserver if you want to offer human-readable handles for your community. See the nameserver chapter for setup details.
-
-// also - you can associate with another nameserver to pick up _their_ handles, if they agree to it (federate).
-// nameservers can share identity registries / mapping (this is what constitutes "high-sec:" cross-validation of users across handles and servers + permutation of reputation rewards & penalties across all linked servers/nameservers as a result)
-
-### 3. Capability Tokens
-
-**What they are:** Signed grants that bind identities to specific permissions (like "alice can fetch from api.weather.gov" or ~~"bob can vote in tribunals"~~). // don't think we've implemented non-automated tribunals
-
-**How they work:**
+Capability tokens are signed grants that bind an identity to a specific permission (for
+example "alice can fetch from `api.weather.gov`"). They carry no ambient authority: each
+action needs an explicit token.
 
 ```json
 {
@@ -86,565 +114,325 @@ Jig's identity system has four layers:
 }
 ```
 
-The server signs this token and gives it to Alice. Alice includes it when executing blocks that need `net.fetch`. The server verifies the signature and checks expiry before granting access.
+The server verifies the signature and expiry before granting access. Blocks request
+capabilities in their manifest ([Block Execution Model](block-execution.md)).
 
-**Why tokens:** Zero ambient authority. Just because you're logged in doesn't mean you can do anything. You need explicit capability tokens for each action.
+## Reputation
 
-**For developers:** Request capabilities in your block manifest. The runtime provides capability tokens at execution time.
+### Reputation is a number
 
-### 4. Reputation Graph
+Reputation is a score for a **user**, a **server** or a **nameserver**, per ruleset.
+Behaviours raise or lower it. It is not a tier, and nothing about it is a stage gate a
+subject "transitions" through.
 
-**What it is:** A weighted graph where nodes are DIDs and edges are reputation flows (useful work validations, tribunal verdicts, federated attestations).
+Each nameserver computes its own scores. A score is the weighted mean of the unexpired
+observations recorded for that subject and ruleset (at most 1024 are read). An observation
+carries `score`, `weight` (default 1.0), `observer`, optional `evidence` and optional
+`expires_at`.
 
-**How it works:**
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /v1/reputation/observe` | Record an observation and return the new aggregate |
+| `GET /v1/reputation/{subject}/{id}` | Aggregates for every ruleset the subject has |
+| `GET /v1/reputation/{subject}/{id}/observations` | Raw observations (`ruleset`, `limit` ≤ 1000) |
 
-Jig uses a PageRank-like algorithm with damping factor 0.85:
+`{subject}` is `user`, `server` or `nameserver`.
+
+### Rulesets and translation contracts
+
+A **ruleset** is a named, versioned scoring policy: `key`, `version`, `authority`,
+`weight`, a PoW policy (`min_bits`, `max_bits`, `multiplier`) and a tribunal policy
+(`quorum`, `auto_escalate_score`, `evidence_window_secs`). Nameservers that use the same
+ruleset key agree on what its scores mean.
+
+Nameservers with different rulesets MAY map scores between them with a **translation
+contract**: `from`, `to`, `weight`, and a `linear` (`slope`, `intercept`, optional clamps)
+or `table` transform. A contract is a data contract between the two parties. Neither side
+is bound by the other's ruleset without one.
+
+**Status:** rulesets and contracts are parsed and published in `/.well-known/jig-ns`.
+Only `pow_policy.multiplier` is applied (see [Proof-of-work](#proof-of-work)). Contracts
+are not yet applied to incoming scores.
+
+### Reputation is not a protocol gate
+
+Until JEP-0003 defines reputation:
+
+- Reputation is not a protocol security input: no protocol step requires or refuses
+  anything because of a score, and handshake reputation fields are informational
+  ([OP-10](threat-register.md)).
+- A nameserver MAY use its own scores to scale proof-of-work, and a server MAY use its own
+  scores in its admission policy. Both are local policy, not protocol.
+
+### Proposed: soul validation
+
+*Not implemented.* Real humans vouch that another identity is a real human by staking
+their own reputation on it. While the vouch stands, the vouchee's reputation gains are
+boosted. The vouchee's reputation losses also propagate to every voucher, the vouchee's
+**soulnet**. Open questions for a JEP: the boost and propagation factors, how far losses
+propagate, how a voucher withdraws, and how to resist rings that vouch for each other.
+
+## Security zones (server policy)
+
+A zone is a property of a **server** or a **nameserver federation**. It states what user
+behaviour and how much anonymity the server permits, and how enforcement spreads. Any user
+MAY try to join any server. A user MAY hold different identities in different zones, and
+the protocol MUST NOT link them.
+
+| Zone | Nameservers | Identities | Proof-of-work | Enforcement |
+| --- | --- | --- | --- | --- |
+| **High-sec** | Several, coordinated: they cross-register identities | DIDs registered across the federation | Scales with reputation | Penalties and tribunal outcomes propagate across linked servers |
+| **Low-sec** | A local nameserver | DIDs, optionally aliased | Local defaults | Local penalties; few or no tribunals |
+| **Null-sec** | Optional | `--anon` allowed; identities may be unregistered and unprotected | Highest floor | Minimal; reputation is transient |
+
+High-sec servers are more likely to require a higher local reputation to join. Null-sec
+servers are usually the only ones that admit `--anon` identities.
+
+**Status:** zones are not yet a configuration setting. The nameserver applies the anonymous
+floor (`JIG_NS_ANON_MIN_POW`) to alias challenges without a subject, unless
+`JIG_NS_ANON_ENABLED` is false, and treats every other challenge as low-sec. Turning the
+setting off removes the floor; it does not stop anonymous aliases being minted.
+
+### Cross-registration (high-sec)
+
+*Proposed.* Nameservers in a high-sec federation share identity registries: their
+alias-to-DID mappings, plus penalties and tribunal outcomes. Sharing registries is what
+makes a federation high-sec: a user is cross-validated across handles and servers, and a
+reputation change on one linked nameserver is applied by the others under their
+translation contracts.
+
+A nameserver MAY resolve another nameserver's aliases when that nameserver agrees to
+federate. **Status:** the nameserver resolves remote handles through `_jig-ns._tcp` SRV
+discovery, gated by `JIG_NS_ALLOW_DOMAINS` and `JIG_NS_DENY_DOMAINS` and cached for
+`JIG_NS_CACHE_TTL` seconds. It does not ask for agreement, and it does not verify remote
+records. Reputation and tribunal gossip is received and stored, not applied.
+
+### Anchor nameservers
+
+*Proposed.* A nameserver MAY **anchor** a high-sec zone, so members do not bootstrap from
+scratch. An anchor publishes initial coordination:
+
+- default proof-of-work parameters,
+- address and handle conventions,
+- tribunal coordination.
+
+Rules:
+
+- Joining an anchored zone is opt-in.
+- An anchor's defaults are advisory. A member MAY override any of them and MAY leave.
+- No nameserver, anchor included, holds a veto over another nameserver, server or zone, or
+  can control the network.
+- Anyone MAY run zones at any level with their own anchors, or none, or connect to servers
+  without joining a zone. A zone MAY have more than one anchor.
+
+## Nameserver mechanics
+
+### Endpoints
+
+| Path | Method | Purpose |
+| --- | --- | --- |
+| `/.well-known/jig-ns` | GET | Discovery document (JSON) |
+| `/.well-known/jig-ns/capabilities` | GET | Capability document (plain text) |
+| `/v1/policy` | GET | Policy snapshot (JSON) |
+| `/v1/health` | GET | Liveness |
+| `/v1/challenge` | GET | Alias registration nonce ([Aliases](#aliases)) |
+| `/v1/register`, `/v1/renew`, `/v1/rotate` | POST | Alias attestations |
+| `/v1/resolve/{alias}` | GET | Alias attestation lookup |
+| `/v1/challenge` | POST | Proof-of-work challenge for `claim` or `alias` |
+| `/v1/claim` | POST | Bind a handle to a key, with proof-of-work |
+| `/v1/alias` | POST | Mint a scoped or anonymous alias, with proof-of-work |
+| `/v1/resolve?name=` | GET | Handle lookup: local, then cache, then federated |
+| `/v1/admin/penalties`, `/v1/admin/rate` | GET, POST | Inspect or reset a penalty or rate key |
+
+### Challenge flow
+
+1. `POST /v1/challenge` with `action` (`claim` or `alias`), `subject` and, for `alias`,
+   `scope`. The response is `challenge_id`, `difficulty` and `expires_at` (Unix seconds;
+   default lifetime 600 s).
+2. The client finds a `nonce` that meets `difficulty`.
+3. `POST /v1/claim` with the signed claim and `pow: {challenge_id, nonce}`, or
+   `POST /v1/alias` with `scope`, optional `subject`, optional `ttl_seconds` (default 3600)
+   and `pow`.
+
+A challenge is bound to its action, subject and scope, and is single-use. The nameserver
+MUST refuse a used, expired or mismatched challenge.
+
+### Proof-of-work
+
+A solution is valid when `BLAKE3(challenge_id|action|subject|scope|nonce)` has at least
+`difficulty` leading zero bits. Expected work is about 2^`difficulty` hashes.
+
+**Status:** the reference nameserver keys this hash with `BLAKE3(server_secret)`, which
+clients do not hold, so only a holder of the secret can solve a challenge today. The
+key must become public, or be removed, before third-party clients can use these
+endpoints.
+
+The difficulty for a challenge is computed per rate key:
 
 ```
-reputation(Alice) = base_score
-                  + 0.85 × Σ(reputation(Validator) / out_degree(Validator))
-                  + penalty_adjustments
+p      = min(penalty_points(key), max_points)
+bits   = base_difficulty + step_bits × p
+m_rep  = reputation multiplier       (1.0 without a default ruleset or a score)
+m_auto = 1 + p^power_law_alpha × pile_on_factor, clamped to [1, max_multiplier]
+                                     (1.0 when automation is disabled)
+d      = round(bits × m_rep × m_auto)
+d      = max(d, zone_floor)          (anonymous_min for an alias with no subject,
+                                      otherwise min_difficulty)
+d      = clamp(d, min_difficulty, max_difficulty)
 ```
 
-If high-reputation users vouch for you (by validating your useful work), your reputation rises. If you accumulate penalties (spam, rule violations), your reputation falls.
+`m_rep` is the ruleset `multiplier` times `1 − 0.25 × score` (score clamped to [−1, 1]),
+pulled towards 1.0 when the score's weight is below 1, and clamped to [0.1, 8]. With a
+ruleset multiplier of 1.0, a good score lowers difficulty by at most a quarter and a bad
+one raises it by at most a quarter.
 
-**Why graph-based:** Sybil-resistant. An attacker can't just create 1000 fake accounts to vouch for themselves—they'd need to earn reputation on each account first (expensive).
+With the default parameters and no reputation score, a single penalty point raises `d` to
+`max_difficulty` (see
+[Penalties](#penalties)).
 
-**For server operators:** Reputation graphs are local (each server computes its own). Federated servers gossip reputation summaries (signed attestations), but you decide how much to trust them. // rulesets - shared or data contract
+### Rate limiting
 
-## Account Zones
+Challenge issuance is limited per client IP and per rate key, in fixed one-minute windows.
 
-Jig has three reputation zones. ~~Your zone determines your costs, capabilities, and trust level.~~ // nope - zones are for servers, reflect what kind of user behaviors + anonymity are permitted. Any user can try to join any server; high-sec servers are more likely to require higher reputation scores to join, and null-sec servers are usually the only ones that permit --anon accounts to join (where no did is proffered at login and reputation is transient with session).
+| Limit | Default | Key |
+| --- | --- | --- |
+| Per IP | 120 per minute (`JIG_NS_RATE_PER_IP_PER_MIN`) | `ip:<address>` |
+| Per key | 60 per minute (`JIG_NS_RATE_PER_MIN`) | `claim:subject:<handle>` or `alias:scope:<scope>:subject:<subject>` |
 
-| Zone         | Requirements                                                                    | Capabilities                                                      | Notes                                                                 |
-| ------------ | ------------------------------------------------------------------------------- | ----------------------------------------------------------------- | --------------------------------------------------------------------- |
-| **Null-sec** | None (anonymous, no registration)                                               | Post-only, no federation, no reputation accrual                   | High PoW (24-bit), short-lived tokens. For cold starts and anonymity. |
-| **Low-sec**  | Nameserver registration, adaptive PoW                                           | Normal messaging, limited useful work, local federation           | Default community tier. Lower PoW (16-bit adaptive).                  |
-| **High-sec** | Soul validation (≥2 validators), 90-day age, useful work streak, optional stake | Tribunal voting, governance actions, block marketplace publishing | Lowest PoW (8-bit or none). Trusted operators and orgs.               |
+The client IP is the socket address, or the first entry of `JIG_NS_PROXY_IP_HEADER`
+(default `x-forwarded-for`) when `JIG_NS_TRUST_PROXY` is set. A refused request gets
+HTTP 429 and adds one penalty point to the key that refused it, so retrying raises the next
+difficulty.
 
-// fix this
-
-### Zone Transitions
-
-// ok, this is thematically right but off because reputation is a number for users (and servers and nameservs, for that matter)
-// so users don't "transition" like this. these items influence user reputation gains/losses, but aren't stage-gates
-
-**Null-sec → Low-sec:**
-
-1. Register a handle with a nameserver (proves you control an email or domain).
-2. Wait for adaptive PoW to adjust based on your behavior (usually a few messages).
-3. Automatically promoted once thresholds are met.
-
-**Low-sec → High-sec:**
-
-1. Get soul validation: At least 2 existing high-sec users vouch for you (signed attestations).
-   // soul validation is a cool concept! we haven't implemented it yet, but if real humans validate that you're a real human - and stake their reputation on yours - you can boost your reputation gain. but if you lose reputation, your entire soulnet loses reputation. skin-in-the-game and all that.
-2. Maintain 90-day account age (prevents fresh accounts from gaining power).
-3. Complete useful work streak (e.g., validate 100 signatures without errors).
-4. Optionally stake reputation or tokens (proves skin-in-the-game).
-
-**Downgrade (High-sec → Low-sec):**
-
-- Accumulate too many penalties (tribunal censures, spam reports, failed useful work).
-- Can appeal via tribunal (see below).
-
-**Cost scaling (triangulation):**
-
-Zone transitions use exponential cost scaling to prevent gaming:
-
-```
-cost_to_promote = base_cost × 3^(current_tier)
-```
-
-Moving from null-sec to low-sec is cheap. Moving from low-sec to high-sec is expensive. This prevents attackers from cheaply flooding the high-sec tier.
-
-## Identity Modes
-
-Users can choose how they're identified:
-
-### Anonymous (`~hash`)
-
-**What it is:** Default null-sec persona backed by ephemeral keys + PoW. No linkage across sessions.
-
-**Use case:** Whistleblowers, privacy-conscious users, quick experiments.
-
-**Example:** `~4f3a8b2c` (hash of ephemeral key).
-
-**Trade-offs:** High PoW cost, no reputation accrual, no federation. Pure privacy.
-
-### Verified (`@user.domain`)
-
-**What it is:** High-sec persona anchored to enterprise attestations (SAML/OIDC, hardware tokens). Meets compliance requirements. Cross-linked to networked servers shared across (that server's) high-sec space.
-
-**Use case:** Corporate accounts, verified journalists, government officials. Banking, purchases, signing contracts, doing business.
-
-**Example:** `@alice.acme.com` (verified by Acme Corp's identity provider).
-
-**Trade-offs:** No anonymity, but trusted and low-cost. Required for regulated industries (finance, healthcare).
-
-### Dual (`±selector`)
-
-// I think this is probably really dangerous. It probably makes sense to have _no way in protocol_ to link an --anon account to a live did, and maybe see if we can help block on-machine cross-links of keypairs too.
-
-**What it is:** Linked identities allowing operators to maintain anonymous + verified personas simultaneously. Active mode selected per conversation while provenance is auditable under tribunal warrant.
-
-**Use case:** Investigative journalists (anonymous when interviewing sources, verified when publishing), corporate whistleblowers (anonymous when reporting, verified when providing evidence).
-
-**Example:** `±alice` (could be `~4f3a8b2c` in one conversation, `@alice.news.com` in another).
-
-**Trade-offs:** Complex UX, but flexible. Tribunals can unmask dual identities under warrant (prevents abuse).
-
-**For developers:** Render identity prefixes accordingly so users know which persona is active (`~` = anonymous, `@` = verified, `±` = dual).
-
-## Adaptive Proof-of-Work
-
-Instead of flat rate limiting (everyone gets 10 messages/minute), Jig uses **adaptive PoW**: your cost adjusts based on reputation.
-
-### Cost Function
-
-```rust
-fn message_cost(tier: ReputationTier) -> ProofOfWork {
-    match tier {
-        ReputationTier::New => ProofOfWork::difficulty(24),       // ~10 sec
-        ReputationTier::Basic => ProofOfWork::difficulty(16),     // ~1 sec
-        ReputationTier::Trusted => ProofOfWork::difficulty(8),    // ~0.1 sec
-        ReputationTier::Verified => ProofOfWork::none(),          // instant
-        ReputationTier::Suspicious => ProofOfWork::difficulty(32), // ~2 min
-        ReputationTier::Blocked => ProofOfWork::infinite(),       // impossible
-    }
-}
-```
-
-**How it works:**
-
-- **New senders** (null-sec, no reputation): 24-bit PoW (~10 seconds to compute).
-- **Basic senders** (low-sec, some reputation): 16-bit PoW (~1 second).
-- **Trusted senders** (high-sec, good reputation): 8-bit PoW (~0.1 seconds).
-- **Verified senders** (enterprise SSO, hardware tokens): No PoW (instant).
-- **Suspicious senders** (penalties accumulated): 32-bit PoW (~2 minutes).
-- **Blocked senders** (tribunal-banned): Infinite PoW (can't send messages).
-
-**Proof-of-work algorithm:**
-
-```python
-def solve_pow(challenge, difficulty):
-    nonce = 0
-    while True:
-        hash = BLAKE3(challenge + str(nonce))
-        if hash.startswith('0' * difficulty):  # e.g., 24 leading zeros
-            return nonce
-        nonce += 1
-```
-
-The server issues a challenge (random bytes). Your client finds a nonce such that `BLAKE3(challenge + nonce)` has `difficulty` leading zero bits. More bits = exponentially harder.
-
-**For end users:** PoW happens in the background (your client does it automatically). You'll notice messages send instantly (verified) or take a few seconds (new account), but you don't have to do anything manually.
-
-**For server operators:** Configure PoW difficulty curves in `jig-config.toml`. Lower difficulty = easier spam (but better UX). Higher difficulty = harder spam (but worse UX for new users).
-
-## Proof-of-Useful-Work
-
-Instead of wasting CPU on arbitrary puzzles (like Bitcoin mining), Jig's PoW is **useful work**: tasks that benefit the network.
-
-### Work Types
-
-- **Validation**: Verify message signatures, check block manifests, validate receipts.
-- **Spam filtering**: Apply heuristics to detect spam (stylometry, rate patterns).
-- **Gossip relay**: Forward blocks across federation boundaries.
-- **Storage proofs**: Prove you're storing historical blocks (help with archival).
-- **Governance tasks**: Participate in tribunals, review appeals, vote on policy changes.
-
-### Allocation
-
-**How assignments work:**
-
-1. Server picks users randomly, weighted by reputation (high-sec users validate more than null-sec users).
-2. Server issues an assignment block:
-
-```json
-{
-  "assignment_id": "work_abc123",
-  "user": "did:jig:alice",
-  "tier": "low_sec",
-  "task": {
-    "type": "validate_signatures",
-    "messages": ["cid:msg1", "cid:msg2", "cid:msg3"]
-  },
-  "validators": ["did:jig:bob", "did:jig:carol"],
-  "expires_at": "2025-11-09T13:00:00Z"
-}
-```
-
-3. Alice validates the signatures for `msg1`, `msg2`, `msg3` and submits a proof block:
-
-```json
-{
-  "assignment_id": "work_abc123",
-  "results": [
-    { "message": "cid:msg1", "valid": true },
-    { "message": "cid:msg2", "valid": true },
-    { "message": "cid:msg3", "valid": false, "reason": "signature_mismatch" }
-  ],
-  "signature": "ed25519:aliceSig..."
-}
-```
-
-4. Validators (Bob and Carol) check Alice's work. If ≥2/3 agree, Alice gets reputation credits and lower PoW cost.
-
-### Rewards
-
-- **Reputation credits**: Your reputation score increases (lowers future PoW cost).
-- **Capability discounts**: Get reduced fuel costs for blocks you execute.
-- **Relay quota top-ups**: If you're a federation relay, get more bandwidth quota.
+**Status:** `global_per_min` is published in policy documents but not enforced.
 
 ### Penalties
 
-- **Incorrect work**: If Alice claims a signature is valid but it's not (and validators catch it), she gets penalty points.
-- **Timeouts**: If Alice doesn't complete the assignment before expiry, minor penalty.
-- **Disagreements**: If validators disagree on Alice's work, tribunal review is triggered (see below).
+A nameserver keeps penalty points per rate key. One point is added for each of:
 
-**Penalty effect:** Penalty points raise PoW difficulty and reduce capability quotas. They decay over time (e.g., halve every 30 days) so reformed spammers can recover.
+- an invalid proof-of-work on `/v1/claim` or `/v1/alias`;
+- a refused challenge request (per-key or per-IP rate limit).
 
-**For developers:** Useful work assignments are blocks like any other. You can build clients that auto-complete assignments in the background (helps the network, builds your reputation).
+Points raise difficulty by `step_bits` each, at most `max_points` of them count, and the
+result is clamped to `[min_difficulty, max_difficulty]` (formula above).
 
-## Nameserver Mechanics
+**Decay is linear.** On each read, one point is removed for every full `decay_secs` since
+the key last changed, floored at 0. A new penalty resets that clock, so a key that keeps
+misbehaving does not decay.
 
-The nameserver maps human-readable handles to DIDs and enforces reputation-based rate limiting.
+| Parameter | Default | Setting |
+| --- | --- | --- |
+| `base_difficulty` | 18 | `JIG_NS_POW_DIFFICULTY` |
+| `min_difficulty` / `max_difficulty` | 8 / 28 | `JIG_NS_POW_MIN` / `JIG_NS_POW_MAX` |
+| `anonymous_min` | 12 | `JIG_NS_ANON_MIN_POW` |
+| `step_bits` | 2 per point | `JIG_NS_PENALTY_STEP_BITS` |
+| `max_points` | 64 | `[penalties] max_points` |
+| `decay_secs` | 300 | `JIG_NS_PENALTY_DECAY` |
+| `power_law_alpha` / `pile_on_factor` / `max_multiplier` | 1.4 / 0.5 / 8.0 | `JIG_NS_AUTOMATION_ALPHA` / `_PILE_ON` / `_MAX` |
 
-### Challenge Flow
+A nameserver MUST raise difficulty monotonically with penalty points up to its maximum, and
+MUST let points decay to zero when no new penalties arrive.
 
-**Step 1: Request challenge**
+**Status:** points on `ip:` keys are recorded but do not affect difficulty, which is read
+from the action key only. A tribunal decision's `penalty_delta` is stored, not applied.
+Penalties for misbehaving hosts (receipt anomalies: 2, 4 or 8 bits by severity) are a
+separate ledger at `GET /v1/hosts/{did}/penalties` and do not decay.
 
-```http
-GET https://ns.example.com/challenge?handle=alice
-```
+### Policy and discovery documents
 
-**Response:**
+A nameserver publishes its policy at three paths:
 
-```json
-{
-  "challenge": "01932f9a-b123-7abc-9def-0123456789ab",
-  "difficulty": 16,
-  "expires_at": "2025-11-09T12:40:00Z"
-}
-```
+- **`GET /.well-known/jig-ns`** (JSON): `version`, `ns_id` (BLAKE3 of the nameserver's
+  public key, hex), `endpoints`, and `policy` with `pow` (`base`, `min`, `max`,
+  `anonymous_min`), `rate_limit` (`per_key_per_min`, `per_ip_per_min`, `global_per_min`),
+  `automation`, `allow_domains`, `deny_domains`, `cache_ttl_secs`, `reputation` and
+  `public_key`.
+- **`GET /.well-known/jig-ns/capabilities`** (plain text): `version`, optional `domain`,
+  one `work:` line per useful-work type, `tribunal:`, `transparency:` and `federation:`
+  (`enabled` or `disabled`), and optional `affordance:` lines.
+- **`GET /v1/policy`** (JSON): `pow` (`base_difficulty`, `min_difficulty`,
+  `max_difficulty`, `anonymous_min_difficulty`), `rate_limits`, `automation` and
+  `reputation`.
 
-**Step 2: Solve PoW**
-
-Client computes:
-
-```python
-nonce = solve_pow(challenge="01932f9a-b123-...", difficulty=16)
-```
-
-**Step 3: Submit solution**
-
-```http
-POST https://ns.example.com/register
-{
-  "handle": "alice",
-  "did": "did:jig:5HpG9w...",
-  "challenge": "01932f9a-b123-...",
-  "nonce": 42387,
-  "signature": "ed25519:aliceSig..."
-}
-```
-
-**Response (success):**
-
-```json
-{
-  "status": "registered",
-  "handle": "alice@example.com",
-  "did": "did:jig:5HpG9w...",
-  "tier": "low_sec"
-}
-```
-
-**Response (failure):**
-
-```json
-{
-  "status": "error",
-  "reason": "POW_INVALID",
-  "retry_after_seconds": 300
-}
-```
-
-### Rate Limiting
-
-Nameservers use **token buckets** per handle/scope:
-
-- **Global limit**: 1000 registrations/minute across all users (prevents DoS).
-- **Per-handle limit**: 1 registration per handle per hour (prevents name squatting).
-- **Per-IP limit**: 10 registrations/minute per IP (prevents bot swarms).
-
-**Circuit breakers:** If a user exceeds limits repeatedly, exponential backoff is enforced:
+DNS SRV records advertise nameserver endpoints:
 
 ```
-retry_after = base_delay × 2^(consecutive_failures)
+_jig-ns._tcp.example.com. 3600 IN SRV 10 5 7070 ns1.example.com.
 ```
 
-After 3 failures, you wait 8× the base delay. After 10 failures, you're effectively rate-limited out.
+Without an SRV record, a resolver falls back to the domain's addresses on port 7070.
 
-### Penalties
+### Federation between nameservers
 
-Nameservers track penalty scores:
+A nameserver chooses its peers. Deny takes precedence over allow, and an empty allow list
+admits every domain not denied. With `[federation] enabled`, peers exchange policy hashes (`GET /v1/federation/policy`) and gossip (`POST /v1/federation/gossip`). A
+nameserver MUST treat gossip as claims by the sending peer, not as facts.
 
-- **Invalid PoW submission**: +5 penalty points.
-- **Spam reports** (from other users): +10 penalty points.
-- **Tribunal censure**: +50 penalty points.
+## Useful work
 
-Penalty points adjust PoW difficulty:
+*Partial.* An operator queues work (`POST /v1/work/enqueue`, admin), workers claim it
+(`POST /v1/work/assign`) and submit results (`POST /v1/work/{id}/result`). Kinds:
+`validate_block`, `verify_observation`, `audit_ruleset`, `custom`,
+`process_executable_block`, `validate_fuel_counts`, `cross_validate_receipt`,
+`resolve_receipt_dispute`.
 
-```
-effective_difficulty = base_difficulty + (penalty_points / 10)
-```
+*Proposed:* results checked by independent validators, with concurrence earning reputation
+and wrong or late results losing it. Until then, results do not change reputation or
+proof-of-work. The proof-of-work in [Proof-of-work](#proof-of-work) is plain hashing, not
+useful work.
 
-If your penalty score is 100, your PoW difficulty increases by 10 bits (1024× harder).
+## Tribunals
 
-**Decay:** Penalty points halve every 30 days (floor of 0). So even heavily penalized users can recover if they clean up their behavior.
+*Implemented:* case records. `POST /v1/tribunal/cases` opens a case (`subject`,
+`subject_id`, `ruleset`, `reason`, optional `reporter`, `severity`, `metadata`).
+`POST /v1/tribunal/cases/{id}/decision` records an outcome (`sustain`, `modify`,
+`overturn`, `dismiss` or `escalate`) with optional `penalty_delta` and `notes`. The anomaly
+detector opens cases automatically for high and critical receipt anomalies.
 
-### Federation
+*Proposed:* tribunals are per zone. In high-sec, panels of members from several linked
+servers decide cases, decisions are signed and logged, and outcomes propagate across the
+federation. In low-sec, tribunals are rare and local. Null-sec has none. A tribunal never
+has a path to unmask an anonymous identity ([Anonymous identities](#anonymous-identities)).
+Panel selection, evidence handling and appeals need a JEP before any of this is normative.
 
-Nameservers publish their policies via `/.well-known/jig-ns.json`:
-
-```json
-{
-  "nameserver_did": "did:jig:ns:example.com",
-  "base_difficulty": 16,
-  "rate_limits": {
-    "global_per_minute": 1000,
-    "per_handle_per_hour": 1,
-    "per_ip_per_minute": 10
-  },
-  "federation_peers": ["did:jig:ns:friendly.org", "did:jig:ns:trusted.net"],
-  "deny_list": ["did:jig:ns:spammy.biz"]
-}
-```
-
-Nameservers choose which peers to trust (share reputation signals with). They can also denylist known-bad nameservers.
-
-**DNS SRV records** advertise nameserver endpoints:
-
-```
-_jig-ns._tcp.example.com. 3600 IN SRV 0 5 8443 ns1.example.com.
-```
-
-**For server operators:** Run a nameserver if you want to offer handles for your community. See the nameserver setup guide (implementation docs) for installation steps.
-
-## Tribunal System
-
-When automated penalties aren't enough (or when users want to appeal), cases escalate to **tribunals**: community-run dispute resolution.
-
-### When Tribunals Trigger
-
-**Automated triggers:**
-
-- High penalty accumulation (e.g., >200 penalty points in 7 days).
-- Useful work disagreement (validators don't concur on someone's work).
-- Multiple spam reports from high-sec users.
-
-**Human triggers:**
-
-- User submits appeal ("I was falsely flagged as spam").
-- Community member files a report ("This user is doxxing people").
-
-### Tribunal Workflow
-
-**Step 1: Intake**
-
-Reporter submits a tribunal block:
-
-```json
-{
-  "type": "tribunal_case",
-  "case_id": "case_abc123",
-  "subject": "did:jig:bob",
-  "reason": "spam",
-  "evidence": ["cid:msg1", "cid:msg2", "cid:chatLog"],
-  "reporter": "did:jig:alice",
-  "reporter_signature": "ed25519:..."
-}
-```
-
-**Step 2: Panel Selection**
-
-Random selection of high-sec members:
-
-- **Size**: 3–7 panelists (configurable per community).
-- **Diversity**: Cross-instance when possible (prevents collusion).
-- **Recusal**: Panelists can't judge cases involving themselves or close contacts.
-
-**Step 3: Deliberation**
-
-Panelists fetch evidence blocks, review chat logs, and may request sealed content via zero-knowledge proofs (for E2EE messages).
-
-They discuss privately (tribunal channel) and vote:
-
-- **Sustain**: Penalties upheld or increased.
-- **Modify**: Reduce penalties, issue warning.
-- **Overturn**: Remove penalties, compensate reporter if false claim.
-
-**Step 4: Decision Block**
-
-Tribunal publishes outcome:
-
-```json
-{
-  "type": "tribunal_decision",
-  "case_id": "case_abc123",
-  "outcome": "sustain",
-  "reasoning": "Evidence shows pattern of unsolicited DMs (50+ in 1 hour). Penalties upheld.",
-  "penalty_adjustment": +100,
-  "reputation_adjustment": -500,
-  "panelists": [
-    {"did": "did:jig:judge1", "vote": "sustain"},
-    {"did": "did:jig:judge2", "vote": "sustain"},
-    {"did": "did:jig:judge3", "vote": "modify"}
-  ],
-  "transparency_hash": "blake3:decisionHash...",
-  "signatures": [...]
-}
-```
-
-Panelists sign the decision. It's appended to the transparency log (minus private payloads).
-
-**Step 5: Appeal**
-
-Subjects can appeal once:
-
-- **Cost**: Stake additional reputation or useful work credits (prevents frivolous appeals).
-- **New panel**: Different panelists (randomly selected, no overlap with original panel).
-- **Finality**: After second tribunal, decision is final (no more appeals).
-
-### Privacy Considerations
-
-**Public data:**
-
-- Case ID, subject DID (anonymized as hash in public logs), outcome, penalty adjustments.
-
-**Private data:**
-
-- Evidence content (only panelists see it), deliberation transcripts, reporter identity (if they request anonymity).
-
-**Zero-knowledge proofs:** For E2EE evidence, blocks can include ZK proofs asserting properties (e.g., "this message contains a doxxing address") without revealing plaintext. Panelists verify the proof.
-
-**For server operators:** Configure tribunal policies in `jig-config.toml` (panel size, appeal limits, penalty ranges). Tribunals can be community-specific or federated.
-
-## Reputation Propagation
-
-Reputation is **local** (each server computes its own scores) but **gossip-enabled** (servers can share summaries).
-
-### Local Computation
-
-Each server tracks:
-
-- **Useful work ledger**: Who validated what, outcomes.
-- **Penalty log**: Spam reports, tribunal censures, failed PoW.
-- **Interaction graph**: Who messages whom (edge weights).
-
-PageRank algorithm:
-
-```python
-def compute_reputation(users, edges, penalties):
-    scores = {user: 1.0 for user in users}
-    for iteration in range(100):  # Converge after ~100 iterations
-        new_scores = {}
-        for user in users:
-            incoming = [edge for edge in edges if edge.to == user]
-            new_scores[user] = (1 - 0.85) + 0.85 * sum(
-                scores[edge.from_user] / out_degree(edge.from_user)
-                for edge in incoming
-            )
-            new_scores[user] -= penalties[user] * 0.1  # Penalty adjustment
-        scores = new_scores
-    return scores
-```
-
-### Federated Gossip
-
-Servers exchange **signed reputation summaries**:
-
-```json
-{
-  "from_server": "did:jig:server:example.com",
-  "subject": "did:jig:bob",
-  "reputation_score": 0.75,
-  "tier": "low_sec",
-  "useful_work_count": 42,
-  "penalty_points": 5,
-  "last_updated": "2025-11-09T12:00:00Z",
-  "signature": "ed25519:serverSig..."
-}
-```
-
-Receiving servers decide how much to trust the gossip:
-
-- **Trusted peer** (high-sec federation partner): Weight 0.8.
-- **Untrusted peer** (new or low-reputation): Weight 0.2.
-
-Combined reputation:
-
-```python
-def combine_reputation(local_score, remote_summaries):
-    weighted_sum = local_score
-    weight_total = 1.0
-    for summary in remote_summaries:
-        trust = trust_weight(summary.from_server)
-        weighted_sum += summary.reputation_score * trust
-        weight_total += trust
-    return weighted_sum / weight_total
-```
-
-**Sybil resistance:**
-
-- **Triangulation cost**: Creating N fake accounts costs 3^N (exponential).
-- **Aging requirement**: High-sec tier requires 90-day account age (can't instant-spawn high-reputation accounts).
-- **Stylometry detection**: Servers analyze writing patterns (if 100 accounts all write identically, flag them as Sybil cluster).
-
-**For server operators:** Decide which peers to trust for reputation gossip. Configure in `jig-config.toml` with per-peer trust weights.
-
-## Normative Requirements Summary
+## Normative requirements summary
 
 **MUST:**
 
-- Support DIDs as primary identifiers (Ed25519-derived).
-- Enforce adaptive PoW based on reputation tier (difficulty scales with penalties).
-- Track penalty points and decay them over time (halving every 30 days by default).
-- Verify PoW solutions before accepting registrations or messages.
-- Randomly assign useful work tasks weighted by reputation.
-- Require ≥2/3 validator concurrence for useful work acceptance.
-- Trigger tribunal review on high penalty accumulation or validator disagreement.
-- Support at least anonymous (`~hash`) and verified (`@user.domain`) identity modes.
-- Publish nameserver policies via `/.well-known/jig-ns.json`.
-- Use DNS SRV records for nameserver discovery (`_jig-ns._tcp`).
-- Sign tribunal decisions with panelist signatures and log to transparency log.
+- Use a DID as the sender of every block; treat aliases as nameserver claims.
+- Refuse used, expired or mismatched proof-of-work challenges.
+- Raise difficulty monotonically with penalty points, clamped to the configured maximum,
+  and let points decay to zero without new penalties.
+- Publish policy at `/.well-known/jig-ns`, `/.well-known/jig-ns/capabilities` and
+  `/v1/policy`.
+- Treat federated gossip as claims by the sending peer.
+
+**MUST NOT:**
+
+- Define or implement any link between an anonymous identity and a DID.
+- Present a pseudonymous alias (one minted with a subject) as anonymous.
+- Treat reputation as a protocol gate before JEP-0003.
 
 **SHOULD:**
 
-- Support dual identity mode (`±selector`) for privacy-flexibility balance.
-- Use PageRank-style reputation scoring with damping factor 0.85.
-- Enable federated reputation gossip with trust-weighted scoring.
-- Implement circuit breakers for rate limiting (exponential backoff on repeated failures).
-- Allow tribunal appeals with staking requirement (prevents frivolous appeals).
-- Use zero-knowledge proofs for E2EE evidence in tribunal cases.
-- Apply stylometry and aging heuristics for Sybil detection.
+- Pin the DID first seen for a name and surface changes (clients).
+- Keep anonymous keypairs separate from DID keypairs (clients).
+- Advertise nameservers with `_jig-ns._tcp` SRV records.
 
 **MAY:**
 
-- Customize tribunal policies (panel size, penalty ranges, appeal limits) per community.
-- Integrate enterprise SSO (SAML/OIDC) for verified identity mode.
-- Offer hardware token support (YubiKey, etc.) for high-sec accounts.
-- Implement custom useful work types beyond the canonical set.
+- Trust more than one nameserver (servers).
+- Scale proof-of-work by local reputation (nameservers); use local reputation in admission
+  policy (servers).
+- Anchor a high-sec zone, join one, override its defaults, or run without one.
+- Map reputation between rulesets with translation contracts.
 
 ---
 
 **Related chapters:**
 
-- **[Zero-Trust Model](zero-trust.md)**: Fail-closed semantics, adversarial assumptions (foundation for reputation system).
-- **[Crypto Primitives](crypto.md)**: Ed25519 for DIDs, BLAKE3 for PoW hashing, key transparency.
-- **[Federation](federation.md)**: Cross-server reputation gossip, federation peer trust.
-- **[Security Considerations](security.md)**: Sybil resistance, abuse mitigation, operational security for nameservers.
-
-**Next:** Now that you understand identity and reputation, check out [Federation](federation.md) to see how reputation scores influence cross-server trust and rate limiting. Or dive into [Security Considerations](security.md) for operational best practices (nameserver hardening, tribunal privacy, incident response).
+- **[Zero-Trust Model](zero-trust.md)**: fail-closed semantics and adversarial assumptions.
+- **[Crypto Primitives](crypto.md)**: Ed25519 for DIDs, BLAKE3 for proof-of-work.
+- **[Federation](federation.md)**: server-to-server trust.
+- **[Threat Register](threat-register.md)**: OP-08 (key substitution) and OP-10
+  (reputation gaming).

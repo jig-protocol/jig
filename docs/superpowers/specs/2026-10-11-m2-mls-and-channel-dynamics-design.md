@@ -112,6 +112,18 @@ membership change (`jig channel add`), and opening it up is `channel-promote` â€
 migration. The question "who signs membership changes in an ownerless DM" is answered by
 there being no ownerless DMs: the opener owns it.
 
+*Amended after merge.* The slug is derivable by anyone, and `jig dm` first used whatever
+encrypted channel sat at it: anyone (or the operator) could open a pair's DM first, add
+both, and read it. Now the creation block names `dm_peer`, the server refuses an
+encrypted `#dm/` create unless sender and `dm_peer` derive the slug
+(`mls_gate::check_dm_create`), and `jig dm` refuses a channel whose MLS tree holds anyone
+but the two of them. A DM grown into a group DM is therefore reached by
+`jig chat`/`jig send --channel`, not `jig dm`. The email bridge opens plaintext `#dm/`
+channels for mail threads (its own derivation, no peer named), which the server cannot
+tell from a squat, so a plaintext squat on a pair's slug can still block `jig dm` between
+them â€” a denial of service, not a disclosure. Moving bridge threads to their own prefix
+closes it.
+
 **7. A channel's suite is fixed at creation and enforced on every post** (JEP-0001
 "Proposed"). The `channels` row records `suite`. Content into an `mls` channel must declare
 `privacy.encryption = "mls"` and carry its payload as `metadata.mls_message` (an MLS

@@ -28,11 +28,10 @@ use crate::cmd::common::CliContext;
 pub async fn run(ctx: &CliContext, channel: String, body: String) -> Result<()> {
     // An encrypted channel's message is encrypted by the MLS session and
     // goes over REST, after catching up on the channel so it is encrypted
-    // for the group as it is now.
-    if let Ok(secure) = crate::cmd::secure::Secure::open(ctx)
-        && let Ok(Some(info)) = secure.channel(&channel).await
-        && info.encrypted()
-    {
+    // for the group as it is now. Deciding which kind of channel this is can
+    // fail; that stops the send rather than falling back to plaintext.
+    let secure = crate::cmd::secure::Secure::open(ctx)?;
+    if secure.encrypted(&channel).await? {
         secure.sync(&channel).await?;
         let cid = secure.send(&channel, &body).await?;
         println!("{cid}");

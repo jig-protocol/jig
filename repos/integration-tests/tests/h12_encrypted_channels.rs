@@ -166,26 +166,32 @@ fn with(mut base: Value, extra: Value) -> Value {
 }
 
 async fn create_encrypted(api: &Api<'_>, owner: &Person, slug: &str, visibility: &str) {
+    let (status, body) = try_create(api, owner, slug, json!({"visibility": visibility})).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+async fn try_create(api: &Api<'_>, owner: &Person, slug: &str, meta: Value) -> (u16, Value) {
     let server = api.server.http_url();
     let created = owner.session.create_group(&server, slug).unwrap();
     let block = build_with_metadata(
         &owner.id,
         BlockKind::ChannelCreate,
         owner.hlc(),
-        json!({"slug": slug, "visibility": visibility, "suite": "mls",
-               "mls_group_info": STANDARD.encode(&created.group_info),
-               "mls_ratchet_tree": STANDARD.encode(&created.ratchet_tree)}),
+        with(
+            json!({"slug": slug, "suite": "mls",
+                   "mls_group_info": STANDARD.encode(&created.group_info),
+                   "mls_ratchet_tree": STANDARD.encode(&created.ratchet_tree)}),
+            meta,
+        ),
     );
-    let (status, body) = api
-        .post(
-            "/api/v1/channels",
-            &json!({
-                "bundle_b64": STANDARD.encode(block.canonical_bytes()),
-                "sig_b64": STANDARD.encode(&block.sender_sig),
-            }),
-        )
-        .await;
-    assert_eq!(status, 200, "{body}");
+    api.post(
+        "/api/v1/channels",
+        &json!({
+            "bundle_b64": STANDARD.encode(block.canonical_bytes()),
+            "sig_b64": STANDARD.encode(&block.sender_sig),
+        }),
+    )
+    .await
 }
 
 async fn add(api: &Api<'_>, owner: &Person, slug: &str, who: &Person) {
@@ -682,4 +688,28 @@ async fn a_commit_stamped_by_a_slow_clock_is_still_found() {
         Some("after 4"),
         "bob follows the slow commit and reads what came after it"
     );
+}
+
+/// Anyone can derive a pair's DM slug. If anyone could also create it,
+/// Mallory could open Alice and Bob's DM first, add them both, and read it.
+/// Only one of the pair may create it (and `jig dm` separately refuses a DM
+/// with anyone else in its MLS tree).
+#[tokio::test]
+async fn only_the_pair_can_open_their_dm() {
+    let server = TestJigServer::start_with_full_kinds().await.unwrap();
+    let api = Api { server: &server };
+    let root = tempfile::tempdir().unwrap();
+    let alice = Person::new(root.path());
+    let bob = Person::new(root.path());
+    let mallory = Person::new(root.path());
+    let slug = jig_core::dm::dm_slug(&alice.did(), &bob.did());
+    let dm = |peer: &Person| json!({"visibility": "restricted", "dm": true, "dm_peer": peer.did()});
+
+    for peer in [&alice, &bob] {
+        let (status, body) = try_create(&api, &mallory, &slug, dm(peer)).await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body.to_string().contains("direct-message"), "{body}");
+    }
+    let (status, body) = try_create(&api, &alice, &slug, dm(&bob)).await;
+    assert_eq!(status, 200, "{body}");
 }

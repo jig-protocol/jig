@@ -25,6 +25,7 @@ should not be read as a status page.
 | [`deployment/internal-dogfood-3day.md`](deployment/internal-dogfood-3day.md) | CURRENT | The internal-MVP plan. Opens with a STATUS section listing what shipped and where to check it; the plan body below that predates the implementation and is kept for its reasoning. |
 | [`deployment/internal-dogfood-24h.md`](deployment/internal-dogfood-24h.md) | HISTORICAL | Superseded by the 3-day plan. Retained for its verified state-of-the-union table, which was proven by running binaries rather than reading code. |
 | [`deployment/install-benchmark.md`](deployment/install-benchmark.md) | CURRENT | Manual procedure for the 60-second `curl \| bash` install acceptance gate. Not yet run: it needs `jig.onl` serving `install.sh` and release tarballs at `releases.jig.onl`, neither of which exists. |
+| [`operations/nameserver-abuse-runbook.md`](operations/nameserver-abuse-runbook.md) | CURRENT | Nameserver incident runbooks: harassment reports, registration and relay abuse, a compromised nameserver, a rogue federated instance. Uses the shipped parameters and endpoints; tribunal steps are marked future. |
 
 ## Design and implementation records
 
@@ -41,6 +42,7 @@ should not be read as a status page.
 | [`../SECURITY.md`](../SECURITY.md) | CURRENT | How to report a vulnerability, response targets, disclosure policy and scope. |
 | [`security/operator-threat-model.md`](security/operator-threat-model.md) | CURRENT | The model and evidence behind the spec's operator [threat register](../repos/jig-spec/src/threat-register.md). |
 | [`security/encryption.md`](security/encryption.md) | CURRENT | Why encryption is shaped as it is: suite field, refusals, MLS, DMs as locked channels, the DID key as MLS signer, a validating delivery service, the client plaintext cache. |
+| [`security/nameserver-abuse-economics.md`](security/nameserver-abuse-economics.md) | CURRENT | Why nameserver proof-of-work, rate limits and penalties are shaped as they are: Sybil and spam cost models, decay, griefing, federation, and per-zone tribunals as future work. Rationale for the spec's [Identity and Reputation](../repos/jig-spec/src/identity-and-reputation.md) chapter. |
 
 ## Crate documentation
 

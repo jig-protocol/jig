@@ -83,6 +83,19 @@ impl ChannelInfo {
     }
 }
 
+/// Whether a channel must be encrypted, given whether this device holds its
+/// MLS group (`held`) and what the server's unsigned listing says (`listed`;
+/// `None` when the channel is not listed to us).
+///
+/// A device that holds the group knows the channel is encrypted, whatever the
+/// listing says: a server relabelling a channel `none` is asking for
+/// plaintext (OP-03), and a channel hidden from a removed member is still
+/// encrypted. Only a channel this device holds no group for is taken on the
+/// listing's word: there is nothing local to check it against.
+pub fn must_encrypt(held: bool, listed: Option<bool>) -> bool {
+    held || listed.unwrap_or(false)
+}
+
 /// History replayed through the session.
 pub struct Synced {
     /// What to show, oldest first.
@@ -199,6 +212,21 @@ impl Secure {
         }
         let listing: Listing = self.get_json("/api/v1/channels").await?;
         Ok(listing.channels.into_iter().find(|c| c.slug == slug))
+    }
+
+    /// Whether what is sent to `slug` must be encrypted. This device's own
+    /// MLS state outranks the server's listing ([`must_encrypt`]). Failing to
+    /// find out is an error, never a reason to send in the clear.
+    pub async fn encrypted(&self, slug: &str) -> Result<bool> {
+        let held = self.session.has_group(&self.server, slug)?;
+        let listed = self.channel(slug).await?.map(|c| c.encrypted());
+        if held && listed == Some(false) {
+            eprintln!(
+                "warning: the server lists {slug} as unencrypted, but this device holds its \
+                 MLS group; treating it as encrypted"
+            );
+        }
+        Ok(must_encrypt(held, listed))
     }
 
     /// Keep enough key packages published that others can add us while we
@@ -510,4 +538,22 @@ fn jig_pipeline_slug(kind: jig_core::BlockKind, m: &jig_core::BlockManifest) -> 
         .get(key)
         .and_then(|v| v.as_str())
         .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::must_encrypt;
+
+    /// A server can say anything about a channel's suite. A device that
+    /// holds the group never takes its word for "unencrypted" (OP-03).
+    #[test]
+    fn local_mls_state_outranks_the_servers_listing() {
+        assert!(must_encrypt(true, Some(true)));
+        assert!(must_encrypt(true, Some(false)), "relabelled");
+        assert!(must_encrypt(true, None), "hidden, or we were removed");
+        // Nothing local to check against: the listing decides.
+        assert!(must_encrypt(false, Some(true)));
+        assert!(!must_encrypt(false, Some(false)));
+        assert!(!must_encrypt(false, None));
+    }
 }
