@@ -1,7 +1,9 @@
 # Nameserver abuse economics
 
 Why the nameserver prices abuse the way it does, what an attacker pays, and where the model
-is still thin. This is reasoning, not specification. The rules are in the spec's
+is still thin. This is reasoning, not specification. It separates what the design must do
+from what the reference nameserver does today. Where today's behaviour falls short, that is
+a gap the design must close, not a property to accept. The rules are in the spec's
 [Identity and Reputation](../../repos/jig-spec/src/identity-and-reputation.md) chapter, and
 reputation gaming is threat [OP-10](../../repos/jig-spec/src/threat-register.md). Operator
 responses are in the
@@ -16,7 +18,7 @@ unless stated.
 - Keep the cost of ordinary use close to the floor.
 - Let every nameserver set its own prices. Nothing here depends on a central registry or
   a global ledger: each nameserver keeps its own penalties and scores, and shares them only
-  with peers it chooses.
+  within the ruleset group it chose to join.
 
 The model prices abuse in computation and time. Nothing in it lets an identity buy a lower
 difficulty.
@@ -41,7 +43,9 @@ nameserver a price range of about a million to one, which is what makes penaltie
 
 ## Why difficulty scales with reputation, but only a little
 
-Reputation is a number per subject and ruleset, built from observations. A nameserver with
+Reputation is one number per subject and ruleset, built from observations. It is shared
+within the ruleset group that adopted the ruleset, never across a whole security level:
+two high-sec groups keep separate numbers for the same DID. A nameserver with
 a default ruleset multiplies difficulty by `1 − 0.25 × score`, so a subject with the best
 possible score pays three quarters of the bits and one with the worst pays five quarters.
 
@@ -57,8 +61,8 @@ The effect is deliberately small:
   [Griefing](#griefing-a-target-key)).
 
 A larger reputation effect needs inputs an attacker cannot cheaply mint. Cross-registration
-between nameservers and soul validation (both proposed in the spec) are candidates.
-JEP-0003 decides.
+within a ruleset group (required for high-sec, not yet built) and soul validation
+(proposed) are candidates. JEP-0003 decides how far reputation may move the price.
 
 ## Cost of a Sybil attack
 
@@ -69,8 +73,10 @@ penalties, so each costs one base-difficulty solution:
 cost(N handles) ≈ N × 2^base_difficulty hashes
 ```
 
-The cost is **linear in N**. Earlier drafts claimed exponential cost for Sybils. Nothing in
-the design produces that, and the claim was removed.
+The cost is **linear in N**. That is a known weakness, and the spec requires the nameserver
+design to close it in full: a ruleset group must not rest Sybil resistance on proof-of-work
+alone. Earlier drafts claimed exponential cost for Sybils through "triangulation". Nothing
+produced that, and the claim is gone; the obligation to do better than linear stays.
 
 What limits a Sybil attacker today:
 
@@ -87,13 +93,16 @@ What does not limit one:
 - Penalties, which only accrue to keys that misbehave. A careful Sybil attacker never
   misbehaves on any one key.
 - Reputation, as above.
-- The alias registration path the CLI uses (`POST /v1/register`). It needs only a signature
-  from a self-minted key: no proof-of-work, no rate limit. Until that changes, Sybil
+- The alias registration path the CLI uses (`POST /v1/register`). The spec requires
+  proof-of-work and rate limits there; the code has neither yet. Until it does, Sybil
   resistance for aliases rests on the reverse proxy in front of the nameserver.
 
-The honest summary: proof-of-work turns Sybils from free into linearly priced. Making them
-expensive needs an identity input that costs more than hashing, which is the open design
-question OP-10 records.
+Summary: proof-of-work turns Sybils from free into linearly priced, and linear is not
+enough. Fresh keys must stay cheap, because `--anon` depends on them. What must stop being
+linearly cheap is standing: aliases, and reputation under a ruleset. That needs an
+admission input that costs an attacker more per identity than hashing and does not link
+identities. Designing it is part of the nameserver work, not an optional follow-up
+(OP-10, JEP-0003).
 
 ## Cost of spam against one key
 
@@ -135,8 +144,9 @@ Two properties follow:
   points only fall once the abuse stops.
 
 Linear decay is simple and predictable. Its weakness is that a chronic abuser who stops
-for a few hours is fully forgiven. Slower decay for repeat offenders is future work. Today
-an operator gets that effect by raising `decay_secs` for the whole nameserver.
+for a few hours is fully forgiven. The design must close that with decay that remembers
+repeat offenders. Until then, an operator approximates it by raising `decay_secs` for the
+whole nameserver, which also slows forgiveness for false positives.
 
 ## Griefing a target key
 
@@ -148,9 +158,10 @@ The cost is that a third party can raise a victim's price. Anyone can request ch
 for `claim:subject:victim@example.com` past the per-key limit and push the key to the
 maximum. The victim then pays 28 bits for a legitimate claim until the points decay.
 
-Today's mitigations are operational: reset the key (`POST /v1/admin/penalties`), and raise
-the per-key limit if a key is under sustained griefing. A structural fix would key
-penalties on the pair (target, requester), which needs signed challenge requests.
+This is a known weakness the design must close. Today's mitigations are operational:
+reset the key (`POST /v1/admin/penalties`), and raise the per-key limit if a key is under
+sustained griefing. A structural fix keys penalties on the pair (target, requester), which
+needs signed challenge requests.
 
 Points on `ip:` keys are recorded when the per-IP limit refuses a request, but difficulty is
 read from the action key only, so an abusive address is throttled, not priced.
@@ -165,48 +176,74 @@ globally.
   (300 s). The cache bounds the load a hostile peer can cause. It also means a poisoned
   answer lives for one TTL.
 - **Gossip.** Peers exchange policy hashes, reputation summaries and tribunal decisions.
-  Today the receiver stores summaries and decisions without applying them. When they are
-  applied, they arrive as claims by the sender, weighted by the receiver's translation
-  contract, never as facts.
-- **High-sec federations** (proposed) share identity registries and propagate penalties by
-  agreement. That raises the price of abuse across the federation, because a key penalised
-  on one member is penalised on all, and it is the only kind of propagation the design
-  intends. There is no global blocklist and no nameserver whose decisions others must
-  accept.
+  Within a ruleset group, members must apply what they receive under the group's ruleset,
+  as claims by the sender, never as facts. Across groups, a summary counts only through a
+  translation contract both sides agreed to. Today the receiver stores summaries and
+  decisions without applying them.
+- **High-sec ruleset groups** must cross-register identities and propagate penalties and
+  tribunal outcomes among their members. That raises the price of abuse across the group,
+  because a key penalised on one member is penalised on all. Propagation stops at the edge
+  of the group: it never spreads across a security level, there is no global blocklist,
+  and no nameserver's decisions bind anyone outside its group. Not yet built.
 
-## Tribunals, per zone (future work)
+## Tribunals, per ruleset group (required, not yet built)
 
 Automatic penalties handle volume. They do not handle judgement: harassment, coordinated
-campaigns, appeals against a penalty, or a federated instance that lies. That is the job
-proposed for tribunals.
+campaigns, appeals against a penalty, or a federated instance that lies. Tribunals do that,
+and the spec makes them an obligation of the nameserver design, not an experiment.
 
 What exists is the record-keeping. A nameserver stores cases and decisions, and the anomaly
 detector opens cases for high and critical receipt anomalies. A decision's `penalty_delta`
-is stored, not applied.
+is stored, not applied, and decisions are not signed or logged.
 
-What is proposed:
+What the design must provide:
 
-- **Tribunals belong to zones.** In high-sec, panels draw on members of several linked
-  servers, decisions are signed and logged, and outcomes propagate across the federation
-  under its agreements. In low-sec they are rare and local. Null-sec has none.
+- **Tribunals belong to ruleset groups.** A high-sec group must have one: panels draw on
+  members of several linked servers, decisions are signed and written to the transparency
+  log, and outcomes propagate across the group under its ruleset. In low-sec they are rare
+  and local. Null-sec need not have one. Other groups may recognise a decision or ignore it.
 - **Inputs** are what the nameserver already records: penalty history per key, rate data,
   reputation observations, anomaly records, and evidence block CIDs supplied by the
   reporter. Content stays with the parties. A tribunal sees what they choose to show it.
+- **Reports from encrypted channels.** Much abuse will happen in encrypted channels that no
+  server can read. The spec requires a reporting path anyway: a recipient gives the
+  tribunal effective proof, scoped to the reported messages, that the accused's key sent
+  them (victim-key delegation). It must not need escrow, server-held keys or content
+  scanning, and it must work for every suite a group admits, MLS by default. The mechanism
+  is not designed yet. Without it, tribunals cannot judge much of the abuse they exist for.
 - **Outputs** are adjustments a nameserver already understands: penalty changes, reputation
   observations, and allow or deny entries for federated peers.
+- **Transparency.** Every decision, and every enforcement change it causes, goes into the
+  nameserver's hash-chained transparency log, with evidence cited by CID and personal data
+  redacted. The log's storage and read endpoints exist; nothing writes to it yet.
 - **Limits.** A tribunal cannot unmask an anonymous identity, because the protocol has no
-  link to unmask. It cannot bind a nameserver outside its zone. An anchor nameserver may
-  coordinate a zone's tribunals, but holds no veto over their outcomes or over anyone
-  else's.
+  link to unmask. It cannot bind a nameserver outside its ruleset group. An anchor
+  nameserver may coordinate a group's tribunals, but holds no veto over their outcomes or
+  over anyone else's.
 
-Panel selection, evidence handling and appeals need a JEP before any of this is normative.
+Panel selection and appeal mechanics need a JEP.
+
+## Known weaknesses the design must close
+
+Each of these is a gap in today's design or code, not an accepted property:
+
+- **Linear Sybil cost.** Standing (aliases, reputation under a ruleset) must cost an
+  attacker more per identity than hashing, without linking identities (OP-10, JEP-0003).
+- **No proof-of-work or rate limit on alias registration** (`POST /v1/register`).
+- **Griefing.** Penalties keyed on the target alone let a third party raise a victim's
+  price. Key them on (target, requester).
+- **Forgetful decay.** A chronic abuser is fully forgiven after a few quiet hours. Decay
+  must remember repeat offenders.
+- **Unpriced addresses.** Points on `ip:` keys throttle but do not raise difficulty.
+- **No tribunal outcomes, propagation or transparency entries.** Decisions are stored and
+  go nowhere.
+- **No path for reporting abuse from encrypted channels.**
 
 ## Open questions
 
-- An identity input that costs more than hashing, for real Sybil resistance (OP-10,
-  JEP-0003).
-- Proof-of-work and rate limits on the alias registration path.
-- Penalties keyed on (target, requester), to close griefing.
-- Decay that remembers repeat offenders.
-- Whether reputation summaries from peers should ever move difficulty by more than the
-  local quarter-of-the-bits bound.
+- Which admission input closes linear Sybil cost: cross-registration within a ruleset
+  group, soul validation, or something else.
+- How victim-key delegation works for each encryption suite, and what a tribunal may accept
+  as effective proof.
+- Whether reputation summaries from members of a ruleset group should ever move difficulty
+  by more than the local quarter-of-the-bits bound.
