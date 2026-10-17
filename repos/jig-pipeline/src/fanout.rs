@@ -255,7 +255,9 @@ impl Fanout {
     /// Deliver to every local subscriber whose scope matches AND whom
     /// `policy` permits. Both filters apply whatever the scope: a
     /// federation-scope subscription is a kind filter, not a licence to read
-    /// every channel.
+    /// every channel. A federation-scope subscriber is a peer server — the
+    /// stream it subscribes to is how peers actually receive our blocks — so
+    /// it also gets only channels that federate.
     ///
     /// `None` policy means the block is not scoped to a channel this server
     /// knows (control-plane blocks, or a federated block for a channel with no
@@ -274,7 +276,8 @@ impl Fanout {
                     block.channel_id.as_deref() == Some(slug.as_str())
                 }
                 SubscriptionScope::Federation { block_kinds } => {
-                    block_kinds.is_empty() || block_kinds.iter().any(|k| k == &block.block_kind)
+                    (block_kinds.is_empty() || block_kinds.iter().any(|k| k == &block.block_kind))
+                        && policy.is_none_or(|p| p.federates)
                 }
             };
             let permitted = policy.is_none_or(|p| p.permits(&sub.who));
@@ -537,6 +540,46 @@ mod tests {
         sealed.federates = false;
         f.broadcast_with_members(
             &sample_block(Some("#sealed"), "text-render"),
+            &sample_receipt(),
+            Some(&sealed),
+        )
+        .await
+        .unwrap();
+        assert!(!received(&mut rx).await, "encrypted channels stay home");
+
+        f.broadcast(
+            &sample_block(Some("#public"), "text-render"),
+            &sample_receipt(),
+            Some(&open_with_members(&[])),
+        )
+        .await
+        .unwrap();
+        assert!(received(&mut rx).await, "open plaintext channels federate");
+    }
+
+    /// Peers receive our blocks through a federation-scope subscription on
+    /// their connection to us, not through `register_peer` (the receiving
+    /// side ignores block frames pushed down its own dial). The `federates`
+    /// gate has to hold on that path too, or an open encrypted channel's
+    /// commits, welcomes and ciphertext reach every peer.
+    #[tokio::test]
+    async fn a_peer_subscription_gets_only_channels_that_federate() {
+        let f = Fanout::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _ = f
+            .subscribe_local(
+                SubscriptionScope::Federation {
+                    block_kinds: vec![],
+                },
+                SubscriberIdentity::Did("did:jig:zPeer".to_string()),
+                tx,
+            )
+            .await;
+
+        let mut sealed = open_with_members(&[]);
+        sealed.federates = false;
+        f.broadcast_with_members(
+            &sample_block(Some("#sealed"), "member-add"),
             &sample_receipt(),
             Some(&sealed),
         )
