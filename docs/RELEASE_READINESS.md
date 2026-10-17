@@ -47,7 +47,7 @@ fast path, not the absence of a model.
 | --- | --- |
 | **Current state** | `restricted` gates history (`403 NOT_A_MEMBER`), the listing (restricted channels and their `owner_did` are not shown to non-members), live WSS delivery (per block, so removing a membership stops an open subscription) and posting (`403 NOT_A_MEMBER` at ingest, on every surface). Self-join works on open channels only; on restricted ones only the owner adds members. Unknown visibility strings and store errors fail closed. |
 | **Ready means** | `restricted` gates reads (history, WSS delivery) and writes to non-members. |
-| **Gap** | Peer-relayed blocks bypass the posting gate (see §1.1). Timing still distinguishes a refused read from an unknown channel under a concealing disclosure policy — a stated limitation of the design, and the default policy conceals nothing. |
+| **Gap** | Restricted channels do not federate yet: a relayed block runs the same posting gate, but there is no way to carry membership across servers (see §1.1). Timing still distinguishes a refused read from an unknown channel under a concealing disclosure policy — a stated limitation of the design, and the default policy conceals nothing. |
 
 The CLI's `restricted (membership-gated reads)` help text is now true, and
 `jig channel join` says which channels it can join.
