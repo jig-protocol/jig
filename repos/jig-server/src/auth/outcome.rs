@@ -69,6 +69,9 @@ pub enum GateOutcome {
     AuthzNotOwner,
     /// The named channel does not exist.
     AuthzChannelUnknown,
+    /// The caller asked for this server's federation stream and is not one of
+    /// its configured peers.
+    AuthzNotFederationPeer,
 }
 
 impl GateOutcome {
@@ -91,7 +94,8 @@ impl GateOutcome {
 
             GateOutcome::AuthzNotMember
             | GateOutcome::AuthzNotOwner
-            | GateOutcome::AuthzChannelUnknown => Gate::Authorize,
+            | GateOutcome::AuthzChannelUnknown
+            | GateOutcome::AuthzNotFederationPeer => Gate::Authorize,
         }
     }
 }
@@ -129,6 +133,7 @@ mod tests {
             GateOutcome::AuthzNotMember,
             GateOutcome::AuthzNotOwner,
             GateOutcome::AuthzChannelUnknown,
+            GateOutcome::AuthzNotFederationPeer,
         ];
 
         for outcome in &all {
@@ -149,14 +154,15 @@ mod tests {
                 | GateOutcome::RateLimited => Gate::Admit,
                 GateOutcome::AuthzNotMember
                 | GateOutcome::AuthzNotOwner
-                | GateOutcome::AuthzChannelUnknown => Gate::Authorize,
+                | GateOutcome::AuthzChannelUnknown
+                | GateOutcome::AuthzNotFederationPeer => Gate::Authorize,
             };
             assert_eq!(outcome.gate(), expected, "wrong gate for {outcome:?}");
         }
 
         assert_eq!(
             all.len(),
-            15,
+            16,
             "a variant was added without covering it here"
         );
     }

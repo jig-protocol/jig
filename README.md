@@ -49,8 +49,9 @@ loopback and private tailnets.
   [`jig-pipeline/src/authorize_write.rs`](repos/jig-pipeline/src/authorize_write.rs)).
   `[auth.admission]` lets an operator refuse callers outright (bans, ruleset floors,
   unknown DIDs, or proof-of-work from DIDs it has not seen), and `[auth.rate_limit]`
-  meters each DID and each address. Proof-of-work is off by default, and blocks relayed by a
-  federated peer skip the write gate — so only open, unencrypted channels federate.
+  meters each DID and each address. Proof-of-work is off by default. Blocks relayed by a
+  federated peer run the same gates as local ones, but only open, unencrypted channels
+  federate.
   Channel ops (`POST /api/v1/channels*`) run the same gates and need no `[debug]` flag.
 - **No graphical client.** Riverdance, the unfinished GUI, is not in this repository.
   Its licence is undecided, and it is not a working client. The terminal client is
