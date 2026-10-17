@@ -12,7 +12,7 @@
 - Validated existing `deny.toml` configuration
 - Confirmed feature flags in `Cargo.toml` (telemetry_v0_2, analytics_duckdb, analytics_clickhouse)
 - Expanded allowed licenses: BSL-1.0, ISC, 0BSD, Unicode-3.0, Unicode-DFS-2016, CDDL-1.0, CDLA-Permissive-2.0
-- Configured AGPL-3.0 exemption for internal jig-protocol workspace crates
+- Configured an AGPL-3.0 exemption for internal jig-protocol workspace crates (superseded: every crate is MIT OR Apache-2.0 and the root `deny.toml` allows no AGPL)
 
 ### ✅ Phase 0.1: Receipt v0.2 Types (Verified in jig-core)
 - Confirmed `BlockReceipt` in jig-core has all v0.2 fields

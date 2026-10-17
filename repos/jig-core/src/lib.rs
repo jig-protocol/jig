@@ -12,6 +12,7 @@ pub mod capability_scope;
 pub mod capability_validation;
 pub mod crypto;
 pub mod did;
+pub mod dm;
 pub mod error;
 pub mod hlc;
 pub mod lint;

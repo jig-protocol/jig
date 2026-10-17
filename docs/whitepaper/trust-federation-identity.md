@@ -51,8 +51,8 @@ three parts, always in this order:
 | **To be designed** | The open problems between the two, including known weaknesses that must be fixed before the obligation can be claimed. |
 
 - In **Obligations**, each item ends with where it is settled:
-  - a numbered decision in the roadmap's [decisions log](../ROADMAP.md#decisions-log) (D1, D11, D12, …);
-  - **D19**, the anchor decision, which is not yet in that log;
+  - a numbered decision in the roadmap's [decisions log](../ROADMAP.md#decisions-log) (D1,
+    D11, D12, D19, …);
   - **decided 2026-10-16**, the maintainer's decisions on `--anon`, reputation scope,
     encrypted abuse reports, nameserver obligations and channel ownership (listed in
     [section 16.1](#161-decisions-recorded));
@@ -370,6 +370,9 @@ a network layer jig does not provide.
 
 - **None.** There is no `--anon` mode. `jig init` mints a persistent key and stores it under
   `~/.jig/keys/`; it registers an alias only when asked (`--request-alias`).
+- **Prototype.** The nameserver's experimental surface mints `anon-` aliases. A minted alias
+  is a registration, so it is not `--anon` as decided; it is a prototype of the anonymity
+  obligations, not their design.
 - **Built.** The server's admission policy admits unknown DIDs by default; refusing them is
   an explicit operator choice
   ([`jig-server/src/auth/admission.rs`](../../repos/jig-server/src/auth/admission.rs)).
@@ -481,9 +484,10 @@ a network layer jig does not provide.
   such as proof-of-work at registration, makes *n* identities cost *n* times one. An attacker
   with a botnet pays that price at a fraction of a legitimate user's marginal cost (AB-02),
   so per-identity cost alone does not hold. The nameserver prototype's penalty-adjusted
-  proof-of-work is of this kind. The design must make *standing* costly, not just
-  *existence*, and must ensure that many cheap identities never add up to the standing of
-  one costly one (AB-05).
+  proof-of-work is of this kind; the cost model behind its parameters is in
+  [`docs/security/nameserver-abuse-economics.md`](../security/nameserver-abuse-economics.md).
+  The design must make *standing* costly, not just *existence*, and must ensure that many
+  cheap identities never add up to the standing of one costly one (AB-05).
 - **Known attack classes the design must answer in full** (decided 2026-10-16), each tied to
   a register entry: identity farming (AB-05); distributed solving of proof-of-work (AB-02);
   challenge replay and theft of solved challenges (AB-01); vouching rings and collusion
@@ -648,7 +652,9 @@ a high-sec ruleset group, cross-checked.
 - **Built.** The alias flow (challenge, register, resolve, renew, rotate) in section 4.2.
 - **None.** Nameservers do not coordinate or cross-register. There are no group-wide claims,
   no ruleset groups and no anchors.
-- **None.** Alias registration has no proof-of-work and no rate limit.
+- **None.** Registration through the alias flow (`/v1/register`, which `jig init` and
+  `jig ns` use) has no proof-of-work and no rate limit. The experimental surface's own
+  `claim` and `alias` endpoints, below, do apply them.
 - **Prototype.** The nameserver binary also carries an earlier, experimental surface beside
   the alias routes
   ([`jig-nameserver/src/server.rs`](../../repos/jig-nameserver/src/server.rs)):
@@ -1261,8 +1267,7 @@ Settled before this paper and cited throughout:
 - **D12:** federation is a data contract that fixes the channel's suite; trusted subnets may
   share a nameserver-led contract.
 - **D19:** anchor nameservers give a high-sec ruleset group initial coordination; joining is
-  opt-in, no nameserver has a veto, and anyone can run their own. Not yet in the roadmap's
-  decisions log.
+  opt-in, no nameserver has a veto, and anyone can run their own.
 
 Decided by the maintainer on 2026-10-16:
 
@@ -1322,5 +1327,8 @@ Each item names what it must satisfy and the register entries it closes.
     obligations stay whatever happens to the code.
 16. **Housekeeping.** Confirm the obligations marked *derived* (among them the scope of the
     four nameserver mechanisms in section 8.1, and that two ruleset groups never share a
-    number even under identical rulesets), and decide whether D19 and the 2026-10-16
-    decisions get numbers in the roadmap's decisions log.
+    number even under identical rulesets); decide whether the 2026-10-16 decisions get
+    numbers in the roadmap's decisions log; and bring the spec's
+    [Identity and Reputation](../../repos/jig-spec/src/identity-and-reputation.md) chapter
+    in line with them, since it still describes `--anon` as presenting no key and uses
+    "zone" for security levels.

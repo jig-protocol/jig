@@ -13,12 +13,13 @@ pub fn blake3_hash(data: &[u8]) -> Hash {
 /// Compute a domain-separated BLAKE3 hash over a sequence of labelled byte slices.
 ///
 /// Each entry is hashed as: `label || len || bytes`. Length is encoded as little-endian `u64`
-/// to make the construction unambiguous.
+/// to make the construction unambiguous — always eight bytes, so a 32-bit build (wasm32,
+/// armv7) derives the same hashes, and so the same CIDs, as a 64-bit one.
 pub fn hash_labeled_parts(parts: &[(&str, &[u8])]) -> Hash {
     let mut hasher = Hasher::new();
     for (label, bytes) in parts {
         hasher.update(label.as_bytes());
-        hasher.update(&bytes.len().to_le_bytes());
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
     }
     hasher.finalize()
