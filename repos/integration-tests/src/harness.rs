@@ -232,6 +232,10 @@ impl TestJigServer {
             alias: None,
         };
 
+        // Listing a peer is what trusts it: `other` may now subscribe to our
+        // federation stream, as a `[federation] peers` entry would allow.
+        self.state.auth.trust_federation_peer(&peer.expected_did)?;
+
         // We can't mutate `state.config` after boot (it's behind an Arc),
         // so instead we drive the run_peer_loop entry point manually.
         // Inline the spawn_federation_peers logic with just our one peer.
@@ -648,9 +652,12 @@ async fn spawn_one_peer_loop(state: Arc<jig_server::v0_0_2::AppState>, peer: Fed
         };
         // The production dialer does this too. A peer that has not welcomed
         // us will refuse the subscribe below.
-        if jig_server::v0_0_2_federation::complete_client_handshake(&mut ws)
-            .await
-            .is_err()
+        if jig_server::v0_0_2_federation::complete_client_handshake(
+            &mut ws,
+            Some(&peer.expected_did),
+        )
+        .await
+        .is_err()
         {
             tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
@@ -696,6 +703,11 @@ async fn spawn_one_peer_loop(state: Arc<jig_server::v0_0_2::AppState>, peer: Fed
                 msg = stream.next() => {
                     let Some(Ok(m)) = msg else { break };
                     if let Message::Text(text) = m {
+                        // The peer has not listed us (yet): reconnect and
+                        // ask again, as the production loop does.
+                        if jig_server::v0_0_2_federation::subscription_refusal(&text).is_some() {
+                            break;
+                        }
                         let _ = handle_inbound_test_frame(&state, &peer, &text).await;
                     }
                 }
@@ -747,8 +759,8 @@ async fn handle_inbound_test_frame(
     let Frame::Block {
         bundle_b64,
         sig_b64,
-        receipts,
         delivery_cid,
+        ..
     } = env.frame
     else {
         return Ok(());
@@ -758,7 +770,6 @@ async fn handle_inbound_test_frame(
         peer,
         &bundle_b64,
         sig_b64.as_deref(),
-        &receipts,
         &delivery_cid,
     )
     .await

@@ -64,7 +64,7 @@ impl WsClient {
     pub async fn connect(url: &str) -> Self {
         let (mut ws, _) = connect_async(url).await.expect("ws connect");
         // The server refuses every frame until this welcome is in hand.
-        jig_server::v0_0_2_federation::complete_client_handshake(&mut ws)
+        jig_server::v0_0_2_federation::complete_client_handshake(&mut ws, None)
             .await
             .expect("handshake");
         Self { ws }

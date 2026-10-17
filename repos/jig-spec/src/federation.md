@@ -144,6 +144,24 @@ Even though TLS 1.3 encrypts the connection, federation messages are **also sign
 
 **For implementers:** Sign the entire message (minus the `signature` field) and verify every incoming federation message.
 
+### Relayed Blocks
+
+A peer is a transport, not an authority. A block a peer relays is the author's claim, not
+the peer's, and the receiving server judges it by its own rules.
+
+- A server **MUST** process a relayed block through the same checks as a block a local
+  client submits: the author's signature, the version and suite gates, admission, the
+  write gate (membership and ownership), and its own execution and receipt. It **MUST NOT**
+  persist a block on a peer's word.
+- A server **MUST NOT** keep a receipt a peer relays as its own. A relayed receipt is
+  evidence about the peer, to verify by replay (see [Receipt Exchange](#receipt-exchange)),
+  not a record of this server's work.
+- A server **MUST** accept relayed blocks only from a peer it is configured to federate
+  with, over a connection whose handshake the peer signed with the DID the server pinned for
+  it.
+- A server **SHOULD** let only its configured peers subscribe to its federation stream,
+  authenticated whether or not it authenticates other reads.
+
 ### Replay Protection
 
 **MUST use nonces and strict timestamp windows** to prevent replay attacks.
@@ -335,6 +353,8 @@ If a federation message includes a field you don't recognize and it's not in an 
 - Publish public keys via `/.well-known/jig`.
 - Use mutual TLS 1.3 for all federation connections.
 - Sign all federation payloads with server keypair (E2E signatures).
+- Process relayed blocks through the same checks as local submissions, and accept them only
+  from configured, pinned peers.
 - Perform replay detection (nonces + strict timestamp windows).
 - Negotiate protocol versions explicitly (no silent downgrades).
 - Enforce rate limiting at ingress.

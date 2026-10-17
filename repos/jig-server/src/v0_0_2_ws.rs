@@ -448,7 +448,10 @@ async fn handle_client_frame(
         Frame::Subscribe { scope, auth } => {
             // Gate 1 on the WSS path. The scope's canonical string is what was
             // signed, so a proof for one channel cannot subscribe to another.
-            if state.config.auth.require_authenticated_reads {
+            // The federation stream is for configured peers only, so it is
+            // authenticated whatever `require_authenticated_reads` says.
+            let federation = matches!(scope, Scope::Federation { .. });
+            if state.config.auth.require_authenticated_reads || federation {
                 let scope_str = scope.canonical_string();
 
                 let outcome = match auth {
@@ -481,6 +484,14 @@ async fn handle_client_frame(
                     }
                 };
 
+                let outcome = outcome.or_else(|| {
+                    let peer = session
+                        .did
+                        .as_ref()
+                        .is_some_and(|did| state.auth.is_federation_peer(did.as_str()));
+                    (federation && !peer)
+                        .then_some(crate::auth::GateOutcome::AuthzNotFederationPeer)
+                });
                 if let Some(outcome) = outcome {
                     tracing::info!(
                         conn_id,
@@ -822,7 +833,11 @@ mod tests {
 
     /// Spin up the WSS handler on an ephemeral port and return the ws:// URL.
     async fn start_test_server() -> (Arc<AppState>, String) {
-        let state = Arc::new(AppState::for_test().unwrap());
+        start_test_server_with(AppState::for_test().unwrap()).await
+    }
+
+    async fn start_test_server_with(state: AppState) -> (Arc<AppState>, String) {
+        let state = Arc::new(state);
         let app = Router::new()
             .route("/api/v1/ws", get(ws_handler))
             .with_state(state.clone());
@@ -1154,15 +1169,94 @@ mod tests {
         }
     }
 
+    /// The federation stream is for listed peers. A stranger with a valid
+    /// proof is refused, and on a server that does not authenticate reads an
+    /// unsigned federation subscribe is still refused.
+    #[tokio::test]
+    async fn only_a_listed_peer_may_subscribe_to_the_federation_stream() {
+        let federation = || Scope::Federation {
+            block_kinds: vec![],
+        };
+        let (state, url) = start_test_server().await;
+
+        let stranger = test_identity();
+        let mut ws = established(&url).await;
+        let sub = signed_subscribe_frame(&stranger, federation());
+        ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
+            .await
+            .unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { status, code, .. } => {
+                assert_eq!((status, code.as_str()), (Some(403), "NOT_A_PEER"));
+            }
+            other => panic!("expected NOT_A_PEER, got {other:?}"),
+        }
+
+        // Listed, the same caller's next subscribe registers and delivers.
+        state
+            .auth
+            .trust_federation_peer(&stranger.did_string())
+            .unwrap();
+        seed_channel(&state, "#hello");
+        let sub = signed_subscribe_frame(&stranger, federation());
+        ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let author = test_identity();
+        let block = build_text_render(&author, "#hello", "hi", test_hlc(&author));
+        let submit = Envelope::new(Frame::Submit {
+            bundle_b64: base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
+            sig_b64: base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
+        });
+        ws.send(TMessage::Text(
+            serde_json::to_string(&submit).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+        let mut got_block = false;
+        for _ in 0..2 {
+            match next_frame(&mut ws).await.frame {
+                Frame::Block { .. } => got_block = true,
+                Frame::Ack { .. } => {}
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+        assert!(
+            got_block,
+            "a listed peer's federation subscription delivers"
+        );
+
+        let mut open_reads = jig_config::v0_0_2_server::JigServerConfig::default();
+        open_reads.auth.require_authenticated_reads = false;
+        let (_state, url) =
+            start_test_server_with(AppState::for_test_with_config(open_reads).unwrap()).await;
+        let mut ws = established(&url).await;
+        let unsigned = Envelope::new(Frame::Subscribe {
+            scope: federation(),
+            auth: None,
+        });
+        ws.send(TMessage::Text(
+            serde_json::to_string(&unsigned).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { code, .. } => assert_eq!(code, "AUTH_REQUIRED"),
+            other => panic!("expected AUTH_REQUIRED, got {other:?}"),
+        }
+    }
+
     /// A captured Subscribe frame must not be reusable, exactly as for REST.
     #[tokio::test]
     async fn ws_replayed_subscribe_is_refused() {
         let (_state, url) = start_test_server().await;
         let subscriber = test_identity();
+        // A channel with no local row: subscribing to it is not refused.
         let frame = signed_subscribe_frame(
             &subscriber,
-            Scope::Federation {
-                block_kinds: vec![],
+            Scope::Channel {
+                slug: "#anywhere".to_string(),
             },
         );
         let text = serde_json::to_string(&frame).unwrap();
@@ -1208,8 +1302,12 @@ mod tests {
         let mut ws = established(&url).await;
 
         // 1. Subscribe federation-scope (no kind filter = all kinds), signed —
-        //    the server refuses an unsigned subscribe.
+        //    the server refuses an unsigned subscribe — as a listed peer.
         let subscriber = test_identity();
+        state
+            .auth
+            .trust_federation_peer(&subscriber.did_string())
+            .unwrap();
         let sub = signed_subscribe_frame(
             &subscriber,
             Scope::Federation {
