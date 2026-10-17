@@ -202,10 +202,13 @@ industrial sites, and LTS releases.
 - **Encryption-suite registry:** suites are spec-level identifiers with their own JEP and
   conformance vectors. Adding a suite never needs a wire-format change.
 - **Threat register:** every JEP adds or updates its entries, and each release notes which entries
-  it mitigates.
+  it mitigates. The analysis behind the non-operator families (AB, SC, PV, NS, GV, TM) is in the
+  [trust, federation and identity whitepaper](whitepaper/trust-federation-identity.md).
 - **Discovery design project (D15):** discovery, exposure, activation, search, reputation and
   proof-of-work, and nameserver governance (delisting bad actors without central control). It runs
-  alongside phases 1–4 with its own milestones.
+  alongside phases 1–4 with its own milestones. The
+  [whitepaper](whitepaper/trust-federation-identity.md) explains the zone, anchor and reputation
+  model, marking what is decided and what is proposed.
 - **Bridges as onboarding:** email first, then IRC, then ActivityPub/ATProto.
 - **The dependency rule:** jig never depends on downstream or proprietary code. Products built on
   jig depend on it, never the reverse ([`CONTRIBUTING.md`](../CONTRIBUTING.md)).
