@@ -673,6 +673,10 @@ connection_string = "{db}"
         assert_eq!(server.bind_address, "127.0.0.1");
         assert_eq!(server.port, 7117);
         assert!(
+            server.tls.enabled,
+            "the installer's server serves TLS, and install.sh points the client at https"
+        );
+        assert!(
             server.database_path.starts_with("/opt/jig-home"),
             "database_path must live under JIG_HOME, got {}",
             server.database_path.display()
