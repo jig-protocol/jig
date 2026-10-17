@@ -1,7 +1,7 @@
 # jig roadmap
 
 Where jig is going, in phases from a public alpha (`v0.1`) to a distributed OS (`v1+`), and the
-decisions that shape the path. Last updated 2026-10-13.
+decisions that shape the path. Last updated 2026-10-17.
 
 **Status in one line:** v0.1 groundwork is tagged (`v0.1.0-alpha.1`, no published release yet),
 and v0.2's per-channel MLS encryption is merged on `main`. For what works today, gate by gate, see
@@ -209,10 +209,14 @@ industrial sites, and LTS releases.
 - **Encryption-suite registry:** suites are spec-level identifiers with their own JEP and
   conformance vectors. Adding a suite never needs a wire-format change.
 - **Threat register:** every JEP adds or updates its entries, and each release notes which entries
-  it mitigates.
+  it mitigates. The analysis behind the non-operator families (AB, SC, PV, NS, GV, TM) is in the
+  [trust, federation and identity whitepaper](whitepaper/trust-federation-identity.md).
 - **Discovery design project (D15):** discovery, exposure, activation, search, reputation and
   proof-of-work, and nameserver governance (delisting bad actors without central control). It runs
-  alongside phases 1–4 with its own milestones.
+  alongside phases 1–4 with its own milestones. The
+  [whitepaper](whitepaper/trust-federation-identity.md) sets out what security levels, ruleset
+  groups, anchors and reputation must guarantee, what v0.2 does today, and what is still to
+  design.
 - **Bridges as onboarding:** email first, then IRC, then ActivityPub/ATProto.
 - **The dependency rule:** jig never depends on downstream or proprietary code. Products built on
   jig depend on it, never the reverse ([`CONTRIBUTING.md`](../CONTRIBUTING.md)).
@@ -240,6 +244,11 @@ Settled on 2026-10-05 unless noted. Open items follow the table.
 | D15 | Discovery design? | A design project of its own, with proof-of-work and reputation built in. Only the JEP stub is in v0.1. |
 | D18 | Where does the threat register live? | Decisions in `jig-spec`, normative and terse; analysis in `docs/`. |
 | D19 | Does an anchor nameserver set rules for the network? | No. An anchor gives a high-security zone initial coordination, and joining it is opt-in. Users can run their own zones at any security level, or just connect to servers. Settled 2026-10-13. |
+| D20 | What is an `--anon` identity? | A fresh, unregistered session key: minted for one session, registered nowhere, discarded afterwards, still proving possession. Whether a server looks it up against a nameserver, and what it does with the result, is server policy. The protocol has no link between an `--anon` identity and a DID. Settled 2026-10-16. |
+| D21 | How is reputation scoped? | One number per ruleset. The servers, clients and nameservers of a ruleset group agree to be rated by the same rules, which produce the same reputation maths. Never pooled across a security level. Interop between groups, by translation under a data contract, comes later. Settled 2026-10-16/17. |
+| D22 | Can abuse in an encrypted channel reach a tribunal? | Yes, and it must: by victim-key delegation or another effective proof, scoped to the incident, with no backdoor, escrow or scanning. The MLS content signature by the DID key makes authorship provable, at the cost of deniability. Mechanism to be designed. Settled 2026-10-16. |
+| D23 | Are proof-of-work, reputation, tribunals and transparency logs optional? | No, they are obligations, and their known weaknesses (linear Sybil cost and other known attack classes) must be closed in full. Servers are the enforcement boundary: they enforce proof-of-work, decide on clients by reputation (a ruleset in their nameserver network, a private one, or none), report clients' reputation changes to their nameservers under the data contract, and keep their own transparency log. Nameservers hold tribunals, compute and enforce net reputation changes, and enforce servers' good behaviour. A server with no nameserver sets its own policy. Settled 2026-10-16/17. |
+| D24 | Who owns a channel? | Exactly one owning server. How members on other servers write to it is to be designed from prior art (XMPP MUC, IRC, Matrix, ActivityPub groups). Settled 2026-10-16. |
 
 D3, D14, D16 and D17 concern the Riverdance GUI's licence and internal hosting and are tracked
 outside this repo.
