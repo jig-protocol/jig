@@ -6,11 +6,15 @@ are the reference implementation's. Settings and defaults are listed in the
 [operator guide](../../repos/jig-nameserver/OPERATOR_GUIDE.md); the reasoning behind them is
 in [nameserver abuse economics](../security/nameserver-abuse-economics.md).
 
-Every step marked **(future)** depends on tribunals or cross-registration, which the spec
-proposes but the code does not implement. Skip those steps today.
+Every step marked **(not yet implemented)** depends on tribunals, cross-registration within
+a ruleset group, the transparency log or encrypted-abuse reporting. The spec requires all
+four; the code does not have them yet. Skip those steps today, and do not treat their
+absence as the intended design.
 
 There is no global ledger and no central blocklist. Every decision below is yours, for your
-nameserver. Tell your peers what you did; they decide for themselves.
+nameserver. Tell your peers what you did; they decide for themselves. If you belong to a
+ruleset group, its members apply shared outcomes under the group's ruleset; nothing
+spreads further than the group.
 
 ## Before an incident
 
@@ -58,13 +62,16 @@ Rate keys: `claim:subject:<handle>`, `alias:scope:<scope>:subject:<subject-or-em
 ## 1. Harassment report
 
 Harassment happens in channels, which the nameserver never sees. Its part is the identities:
-the DIDs that sent the blocks and the aliases that name them.
+the DIDs that sent the blocks and the aliases that name them. Each channel has exactly one
+owning server.
 
 1. **Collect evidence as references.** Ask the reporter for block CIDs and the channel. Every
    block's sender is a DID, so the DID is the subject, whatever alias was displayed. Do not
    copy message content into the nameserver.
-2. **Act where the content is.** The server operator for the channel removes the sender or
-   the blocks. The nameserver cannot.
+2. **Act where the content is.** The operator of the channel's owning server removes the
+   sender or the blocks. The nameserver cannot. If the channel is encrypted, neither that
+   server nor you can read it: the evidence is whatever the reporter, as a recipient,
+   chooses to disclose. Record it by reference. Never ask a reporter for their keys.
 3. **Record the case:**
 
    ```bash
@@ -95,9 +102,11 @@ the DIDs that sent the blocks and the aliases that name them.
    devices to build one.
 7. **Close the case** with `POST /v1/tribunal/cases/<id>/decision`
    (`{"outcome":"sustain","notes":"..."}`, or `dismiss`). A `penalty_delta` is stored, not
-   applied.
-8. **(future)** In a high-sec zone, refer the case to the zone's tribunal and apply its
-   outcome under your federation agreement.
+   applied yet; the spec requires decisions to be applied and logged.
+8. **(not yet implemented)** In a high-sec ruleset group, refer the case to the group's
+   tribunal and apply its outcome under the group's ruleset. For an encrypted channel, the
+   reporter submits effective proof of the reported messages through the victim-key
+   delegation path the spec requires.
 
 ## 2. Registration and relay abuse
 
@@ -171,8 +180,9 @@ issue attestations, and read or change everything in its databases.
    peers directly. Clients that pinned DIDs will have flagged changed aliases; tell users
    to trust those warnings.
 7. **Write it up**: timeline, cause, what was exposed, what changed.
-8. **(future)** In a high-sec zone, open an incident case with the zone's tribunal so linked
-   nameservers can quarantine cross-registered records from the window of compromise.
+8. **(not yet implemented)** In a high-sec ruleset group, open an incident case with the
+   group's tribunal so the other members can quarantine cross-registered records from the
+   window of compromise, and check your transparency log against their copies.
 
 ## 4. Rogue federated instance
 
@@ -193,5 +203,7 @@ changing often, junk gossip, or reports that names from one domain are unreliabl
    nameserver, an anchor included, can defederate an instance on anyone else's behalf.
 6. **Reinstate deliberately.** Remove the domain from the deny list once the other operator
    explains and fixes the problem, and watch its answers for a while.
-7. **(future)** In a high-sec zone, take the evidence to the zone's tribunal. Members apply
-   its outcome under their own agreements; an anchor coordinates, it does not decide.
+7. **(not yet implemented)** If the instance is in your ruleset group, take the evidence to
+   the group's tribunal. Members apply its outcome under the group's ruleset; an anchor
+   coordinates, it does not decide. A rogue instance outside your group is yours alone to
+   cut off.

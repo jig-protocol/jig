@@ -1,27 +1,41 @@
 # Identity and Reputation
 
-> **Status.** Implemented: `did:jig` identities, nameserver-attested aliases, TOFU and
-> nameserver resolution in servers, proof-of-work with penalties on the nameserver's claim
-> and alias challenges, per-ruleset reputation scores, and tribunal case records.
-> Proposed: security zones as configuration, cross-registration between nameservers,
-> anchor nameservers, soul validation, useful-work rewards, and tribunal panels. Each
-> section says which applies. Reputation is not a protocol gate until
+> **Status.** This chapter states what the system must do. Where the reference code is
+> behind, a **Status** line says so; the code's current behaviour is not the intent.
+>
+> - **Implemented:** `did:jig` identities, nameserver-attested aliases, TOFU and nameserver
+>   resolution in servers, per-ruleset reputation scores, proof-of-work with penalties on
+>   the nameserver's claim and alias challenges, and tribunal case records.
+> - **Required, not yet implemented or partial:** proof-of-work on every binding endpoint,
+>   reputation shared within a ruleset group, cross-registration within a high-sec ruleset
+>   group, tribunals, the transparency log, abuse reporting from encrypted channels, and
+>   Sybil resistance beyond linear cost.
+> - **Proposed:** anchor nameservers, soul validation and useful-work rewards.
+>
+> Reputation is not a protocol gate until
 > [JEP-0003](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0003-server-discovery.md)
 > defines it ([OP-10](threat-register.md)). Rationale and cost model:
 > [`docs/security/nameserver-abuse-economics.md`](https://github.com/jig-protocol/jig/blob/main/docs/security/nameserver-abuse-economics.md).
 
 **Audience:** protocol implementers, nameserver and server operators. End users need only
-[Identity](#identity) and [Security zones](#security-zones-server-policy).
+[Identity](#identity) and
+[Security levels and ruleset groups](#security-levels-and-ruleset-groups-server-policy).
 
 ## Overview
 
 - An **identity** is a `did:jig`: a self-certifying Ed25519 key the user mints locally.
 - An **alias** (`alice@example.com`) is a nameserver's signed claim that a name maps to a
   DID. It is never the sender.
-- **Reputation** is a number a nameserver or server keeps about a user, a server or a
-  nameserver. Behaviour raises or lowers it. It is local, and it has no tiers.
-- A **security zone** is a policy of a server or a nameserver federation. It is not a
-  property of a user.
+- **Reputation** is one number per subject **per ruleset**. A user, a server and a
+  nameserver can each have one. Behaviour raises or lowers it. It has no tiers.
+- A **ruleset** is a named, versioned scoring policy.
+- A **ruleset group** is a concrete set of servers and nameservers that have adopted the
+  same ruleset and agreed to share reputation, penalties and tribunal outcomes under it.
+- A **security level** (high-sec, low-sec or null-sec) is a category that describes a
+  server's or a ruleset group's policy. It is not a group, and nothing is shared across
+  it: two high-sec ruleset groups share nothing unless they agree to.
+
+A security level is never a property of a user.
 
 ## Identity
 
@@ -32,7 +46,7 @@ key is the DID. No authority issues or revokes one.
 
 - A block's sender MUST be a DID. Aliases are display and lookup aids only.
 - A sender has one canonical DID per identity. A user MAY hold different identities, for
-  example in different zones.
+  example in different ruleset groups.
 - A new keypair is a new identity with no reputation. The protocol has no mechanism that
   links two DIDs, except [alias rotation](#aliases), which both keys must sign.
 - Losing the private key loses the identity. Clients SHOULD make key backup explicit.
@@ -56,8 +70,10 @@ The local part is 1 to 24 characters from `[A-Za-z0-9_-]`. An alias is a claim b
 nameserver, not proof ([OP-08](threat-register.md)): a client SHOULD pin the DID it first
 saw for a name and surface any change.
 
-**Status:** this path has no proof-of-work and no rate limit. Proof-of-work and penalties
-apply to the older claim and alias endpoints described under
+Registering an alias creates a binding, so it MUST carry
+[proof-of-work](#proof-of-work) and be rate-limited like any other binding endpoint.
+**Status:** not yet implemented. This path has neither; proof-of-work and penalties apply
+only to the older claim and alias endpoints described under
 [Nameserver mechanics](#nameserver-mechanics).
 
 ### Resolution by servers
@@ -70,14 +86,21 @@ A server resolves the alias on an incoming block in one of two modes
 | `tofu` (default) | The first DID seen for a nickname is locked; a later block with a different DID is refused. |
 | `nameserver` | The server queries each URL in `trusted_nameservers` in order and refuses the block if the alias resolves to a different DID. Results are cached for `cache_ttl_seconds` (default 300). |
 
-A server MAY trust more than one nameserver. **Status:** the server reads the `did` field
-from the resolve response and does not yet verify the attestation signature.
+A server MAY trust more than one nameserver. A server in `nameserver` mode MUST verify the
+attestation signature before it uses the binding. **Status:** not yet implemented.
 
 ### Anonymous identities
 
-A server that permits it MAY admit an **anonymous** (`--anon`) identity: no DID is presented
-at login, and any reputation lasts only for the session. Usually only
-[null-sec](#security-zones-server-policy) servers admit them.
+An **anonymous** (`--anon`) identity is a fresh, unregistered session key. The client mints
+it for one session, registers it with no nameserver, and discards it afterwards. It still
+signs and still proves possession of its key: it is unregistered, not unauthenticated. Any
+reputation it earns lasts at most for the session.
+
+Whether a server looks an `--anon` key up against a nameserver, and what it does with the
+result, is that server's policy. A lookup finds nothing, so the key is unknown under every
+ruleset (see [Reputation is a number](#reputation-is-a-number)). Usually only
+[null-sec](#security-levels-and-ruleset-groups-server-policy) servers admit `--anon`
+identities.
 
 - The protocol MUST NOT define any mechanism that links an anonymous identity to a DID.
   There is no warrant, escrow or tribunal path that unmasks one.
@@ -89,13 +112,14 @@ at login, and any reputation lasts only for the session. Usually only
 - Clients SHOULD show which kind of identity is active (for example `~` for anonymous,
   `@` for an alias).
 
-The nameserver mints anonymous aliases (`anon-` plus 12 hex characters) through
-`POST /v1/alias`. An alias minted **with** a `subject` is a pseudonym, not an anonymous
-identity: the nameserver stores the link to the subject. It MUST NOT be presented to users
-as anonymous.
+`--anon` needs no alias. Separately, the nameserver can mint short-lived anonymous aliases
+(`anon-` plus 12 hex characters) through `POST /v1/alias`. An alias minted **with** a
+`subject` is a pseudonym, not an anonymous identity: the nameserver stores the link to the
+subject. It MUST NOT be presented to users as anonymous.
 
-**Status:** servers and the CLI have no `--anon` login yet. Anonymous aliases exist only on
-the nameserver.
+**Status:** servers and the CLI have no `--anon` login yet. Server admission admits DIDs it
+has no score for unless the operator sets `unknown_dids` to refuse, which is how an `--anon`
+key would be treated today.
 
 ### Capability tokens
 
@@ -121,9 +145,20 @@ capabilities in their manifest ([Block Execution Model](block-execution.md)).
 
 ### Reputation is a number
 
-Reputation is a score for a **user**, a **server** or a **nameserver**, per ruleset.
-Behaviours raise or lower it. It is not a tier, and nothing about it is a stage gate a
-subject "transitions" through.
+Reputation is a score for a **user**, a **server** or a **nameserver**, under one
+**ruleset**. Behaviours raise or lower it. It is not a tier, and nothing about it is a
+stage gate a subject "transitions" through.
+
+- A score MUST be scoped to one ruleset. There is no global score.
+- Members of a [ruleset group](#security-levels-and-ruleset-groups-server-policy) share the
+  observations, penalties and tribunal outcomes recorded under the group's ruleset. Each
+  member computes its own score from them, and MUST treat what a peer sends as a claim by
+  that peer, not as a fact.
+- Scores MUST NOT be pooled across a security level. A score moves to a different ruleset
+  only through a [translation contract](#rulesets-and-translation-contracts) both parties
+  agreed to.
+- A subject with no score under a ruleset is **unknown** for that ruleset, not low. What a
+  server does with unknown subjects is its own policy.
 
 Each nameserver computes its own scores. A score is the weighted mean of the unexpired
 observations recorded for that subject and ruleset (at most 1024 are read). An observation
@@ -138,14 +173,19 @@ carries `score`, `weight` (default 1.0), `observer`, optional `evidence` and opt
 
 `{subject}` is `user`, `server` or `nameserver`.
 
+**Status:** partial. The nameserver keeps scores per subject and ruleset. Servers keep
+operator-seeded scores per ruleset for admission floors (`[auth.admission] records`).
+Sharing within a ruleset group is not implemented: reputation gossip is received and
+stored, not applied.
+
 ### Rulesets and translation contracts
 
 A **ruleset** is a named, versioned scoring policy: `key`, `version`, `authority`,
 `weight`, a PoW policy (`min_bits`, `max_bits`, `multiplier`) and a tribunal policy
-(`quorum`, `auto_escalate_score`, `evidence_window_secs`). Nameservers that use the same
-ruleset key agree on what its scores mean.
+(`quorum`, `auto_escalate_score`, `evidence_window_secs`). Servers and nameservers that
+adopt the same ruleset key agree on what its scores mean.
 
-Nameservers with different rulesets MAY map scores between them with a **translation
+Parties with different rulesets MAY map scores between them with a **translation
 contract**: `from`, `to`, `weight`, and a `linear` (`slope`, `intercept`, optional clamps)
 or `table` transform. A contract is a data contract between the two parties. Neither side
 is bound by the other's ruleset without one.
@@ -161,8 +201,23 @@ Until JEP-0003 defines reputation:
 - Reputation is not a protocol security input: no protocol step requires or refuses
   anything because of a score, and handshake reputation fields are informational
   ([OP-10](threat-register.md)).
-- A nameserver MAY use its own scores to scale proof-of-work, and a server MAY use its own
+- A nameserver uses its own scores to scale proof-of-work, and a server MAY use its own
   scores in its admission policy. Both are local policy, not protocol.
+
+### Sybil resistance
+
+Proof-of-work prices each new identity at one solution, so N identities cost N times one.
+That linear cost is a **known weakness the nameserver design must close**, not an
+accepted property. Fresh keys stay cheap on purpose, because `--anon` depends on them; what
+must not stay linearly cheap is standing: aliases, and reputation under a ruleset.
+
+- A ruleset group MUST NOT rest its Sybil resistance on proof-of-work alone.
+- Before the nameserver design is complete, a ruleset group MUST have an admission input
+  for standing that costs an attacker more per identity than hashing does. Candidates are
+  cross-registration within the group and [soul validation](#proposed-soul-validation).
+- That input MUST NOT link identities to each other or to a person.
+
+**Status:** not yet designed. Today Sybil cost is linear.
 
 ### Proposed: soul validation
 
@@ -172,45 +227,52 @@ boosted. The vouchee's reputation losses also propagate to every voucher, the vo
 **soulnet**. Open questions for a JEP: the boost and propagation factors, how far losses
 propagate, how a voucher withdraws, and how to resist rings that vouch for each other.
 
-## Security zones (server policy)
+## Security levels and ruleset groups (server policy)
 
-A zone is a property of a **server** or a **nameserver federation**. It states what user
-behaviour and how much anonymity the server permits, and how enforcement spreads. Any user
-MAY try to join any server. A user MAY hold different identities in different zones, and
-the protocol MUST NOT link them.
+A security level describes what user behaviour and how much anonymity a server or a
+ruleset group permits, and how enforcement spreads. Any user MAY try to join any server.
+A user MAY hold different identities in different ruleset groups, and the protocol MUST
+NOT link them.
 
-| Zone | Nameservers | Identities | Proof-of-work | Enforcement |
+| Security level | Nameservers | Identities | Proof-of-work | Enforcement |
 | --- | --- | --- | --- | --- |
-| **High-sec** | Several, coordinated: they cross-register identities | DIDs registered across the federation | Scales with reputation | Penalties and tribunal outcomes propagate across linked servers |
+| **High-sec** | Several, in one ruleset group: they cross-register identities | DIDs registered across the group | Scales with reputation under the group's ruleset | Penalties and tribunal outcomes propagate across the group |
 | **Low-sec** | A local nameserver | DIDs, optionally aliased | Local defaults | Local penalties; few or no tribunals |
 | **Null-sec** | Optional | `--anon` allowed; identities may be unregistered and unprotected | Highest floor | Minimal; reputation is transient |
+
+Everything shared is shared within one ruleset group. Two ruleset groups at the same
+security level are independent: reputation, penalties and tribunal outcomes do not cross
+between them, except under a translation contract they both agreed to.
 
 High-sec servers are more likely to require a higher local reputation to join. Null-sec
 servers are usually the only ones that admit `--anon` identities.
 
-**Status:** zones are not yet a configuration setting. The nameserver applies the anonymous
-floor (`JIG_NS_ANON_MIN_POW`) to alias challenges without a subject, unless
-`JIG_NS_ANON_ENABLED` is false, and treats every other challenge as low-sec. Turning the
-setting off removes the floor; it does not stop anonymous aliases being minted.
+**Status:** security levels and ruleset groups are not yet configuration settings. The
+nameserver applies the anonymous floor (`JIG_NS_ANON_MIN_POW`) to alias challenges without
+a subject, unless `JIG_NS_ANON_ENABLED` is false, and treats every other challenge as
+low-sec. Turning the setting off removes the floor; it does not stop anonymous aliases
+being minted.
 
-### Cross-registration (high-sec)
+### Cross-registration within a ruleset group
 
-*Proposed.* Nameservers in a high-sec federation share identity registries: their
-alias-to-DID mappings, plus penalties and tribunal outcomes. Sharing registries is what
-makes a federation high-sec: a user is cross-validated across handles and servers, and a
-reputation change on one linked nameserver is applied by the others under their
-translation contracts.
+Nameservers in a high-sec ruleset group MUST cross-register identities: they share their
+alias-to-DID mappings, penalties and tribunal outcomes, so an alias resolves to the same DID
+on every member and a user is cross-validated across handles and servers. A reputation
+change on one member is applied by the others under the group's ruleset. This shared
+registry is what makes a group high-sec.
 
-A nameserver MAY resolve another nameserver's aliases when that nameserver agrees to
-federate. **Status:** the nameserver resolves remote handles through `_jig-ns._tcp` SRV
-discovery, gated by `JIG_NS_ALLOW_DOMAINS` and `JIG_NS_DENY_DOMAINS` and cached for
-`JIG_NS_CACHE_TTL` seconds. It does not ask for agreement, and it does not verify remote
-records. Reputation and tribunal gossip is received and stored, not applied.
+A nameserver MUST NOT resolve another nameserver's aliases as its own unless that
+nameserver agrees to federate.
+
+**Status:** not yet implemented. The nameserver resolves remote handles through
+`_jig-ns._tcp` SRV discovery, gated by `JIG_NS_ALLOW_DOMAINS` and `JIG_NS_DENY_DOMAINS` and
+cached for `JIG_NS_CACHE_TTL` seconds, without asking for agreement and without verifying
+remote records. Reputation and tribunal gossip is received and stored, not applied.
 
 ### Anchor nameservers
 
-*Proposed.* A nameserver MAY **anchor** a high-sec zone, so members do not bootstrap from
-scratch. An anchor publishes initial coordination:
+*Proposed.* A nameserver MAY **anchor** a ruleset group, usually a high-sec one, so members
+do not bootstrap from scratch. An anchor publishes initial coordination:
 
 - default proof-of-work parameters,
 - address and handle conventions,
@@ -218,12 +280,12 @@ scratch. An anchor publishes initial coordination:
 
 Rules:
 
-- Joining an anchored zone is opt-in.
+- Joining an anchored ruleset group is opt-in.
 - An anchor's defaults are advisory. A member MAY override any of them and MAY leave.
-- No nameserver, anchor included, holds a veto over another nameserver, server or zone, or
-  can control the network.
-- Anyone MAY run zones at any level with their own anchors, or none, or connect to servers
-  without joining a zone. A zone MAY have more than one anchor.
+- No nameserver, anchor included, holds a veto over another nameserver, server or ruleset
+  group, or can control the network.
+- Anyone MAY run ruleset groups at any security level with their own anchors, or none, or
+  connect to servers without joining one. A group MAY have more than one anchor.
 
 ## Nameserver mechanics
 
@@ -242,6 +304,7 @@ Rules:
 | `/v1/claim` | POST | Bind a handle to a key, with proof-of-work |
 | `/v1/alias` | POST | Mint a scoped or anonymous alias, with proof-of-work |
 | `/v1/resolve?name=` | GET | Handle lookup: local, then cache, then federated |
+| `/v1/transparency/entries`, `/hashes`, `/verify` | GET | [Transparency log](#transparency-log) |
 | `/v1/admin/penalties`, `/v1/admin/rate` | GET, POST | Inspect or reset a penalty or rate key |
 
 ### Challenge flow
@@ -259,13 +322,17 @@ MUST refuse a used, expired or mismatched challenge.
 
 ### Proof-of-work
 
+Proof-of-work is required, not optional. A nameserver MUST require a solved challenge on
+every request that creates a binding, and a client MUST be able to solve a challenge from
+public information alone.
+
 A solution is valid when `BLAKE3(challenge_id|action|subject|scope|nonce)` has at least
 `difficulty` leading zero bits. Expected work is about 2^`difficulty` hashes.
 
-**Status:** the reference nameserver keys this hash with `BLAKE3(server_secret)`, which
-clients do not hold, so only a holder of the secret can solve a challenge today. The
-key must become public, or be removed, before third-party clients can use these
-endpoints.
+**Status:** partial. Only `/v1/claim` and `/v1/alias` require it (not `/v1/register`). The
+reference nameserver keys this hash with `BLAKE3(server_secret)`, which clients do not
+hold, so only a holder of the secret can solve a challenge today. The key must become
+public, or be removed, before third-party clients can use these endpoints.
 
 The difficulty for a challenge is computed per rate key:
 
@@ -276,19 +343,25 @@ m_rep  = reputation multiplier       (1.0 without a default ruleset or a score)
 m_auto = 1 + p^power_law_alpha × pile_on_factor, clamped to [1, max_multiplier]
                                      (1.0 when automation is disabled)
 d      = round(bits × m_rep × m_auto)
-d      = max(d, zone_floor)          (anonymous_min for an alias with no subject,
+d      = max(d, floor)               (anonymous_min for an alias with no subject,
                                       otherwise min_difficulty)
 d      = clamp(d, min_difficulty, max_difficulty)
 ```
+
+A nameserver that adopts a ruleset MUST scale difficulty by the subject's reputation under
+that ruleset, within the ruleset's `pow_policy` bounds, so that reputation lowers or raises
+the price of acting but never becomes a gate.
 
 `m_rep` is the ruleset `multiplier` times `1 − 0.25 × score` (score clamped to [−1, 1]),
 pulled towards 1.0 when the score's weight is below 1, and clamped to [0.1, 8]. With a
 ruleset multiplier of 1.0, a good score lowers difficulty by at most a quarter and a bad
 one raises it by at most a quarter.
 
+**Status:** partial. Only `pow_policy.multiplier` is applied; `min_bits` and `max_bits` are
+not.
+
 With the default parameters and no reputation score, a single penalty point raises `d` to
-`max_difficulty` (see
-[Penalties](#penalties)).
+`max_difficulty` (see [Penalties](#penalties)).
 
 ### Rate limiting
 
@@ -334,9 +407,10 @@ A nameserver MUST raise difficulty monotonically with penalty points up to its m
 MUST let points decay to zero when no new penalties arrive.
 
 **Status:** points on `ip:` keys are recorded but do not affect difficulty, which is read
-from the action key only. A tribunal decision's `penalty_delta` is stored, not applied.
-Penalties for misbehaving hosts (receipt anomalies: 2, 4 or 8 bits by severity) are a
-separate ledger at `GET /v1/hosts/{did}/penalties` and do not decay.
+from the action key only. Penalties for misbehaving hosts (receipt anomalies: 2, 4 or 8
+bits by severity) are a separate ledger at `GET /v1/hosts/{did}/penalties` and do not
+decay. Known weaknesses the design must close are listed in the
+[abuse economics](https://github.com/jig-protocol/jig/blob/main/docs/security/nameserver-abuse-economics.md#known-weaknesses-the-design-must-close).
 
 ### Policy and discovery documents
 
@@ -365,8 +439,26 @@ Without an SRV record, a resolver falls back to the domain's addresses on port 7
 ### Federation between nameservers
 
 A nameserver chooses its peers. Deny takes precedence over allow, and an empty allow list
-admits every domain not denied. With `[federation] enabled`, peers exchange policy hashes (`GET /v1/federation/policy`) and gossip (`POST /v1/federation/gossip`). A
-nameserver MUST treat gossip as claims by the sending peer, not as facts.
+admits every domain not denied. With `[federation] enabled`, peers exchange policy hashes
+(`GET /v1/federation/policy`) and gossip (`POST /v1/federation/gossip`). A nameserver MUST
+treat gossip as claims by the sending peer, not as facts.
+
+## Transparency log
+
+A nameserver MUST keep an append-only transparency log and publish it, so members of its
+ruleset group and anyone else can check what it enforced. The log:
+
+- MUST record tribunal decisions, penalty and reputation changes made by a decision or
+  received from the ruleset group, and identity bindings it creates;
+- MUST chain entries by hash, publish the chain head periodically, and let anyone verify
+  the chain;
+- MUST cite evidence by reference (block CIDs), never by content, and MUST redact personal
+  data;
+- MUST NOT record anything that links an anonymous identity to a DID.
+
+**Status:** partial. The log's storage, a hash-chain verifier and the read endpoints
+(`GET /v1/transparency/entries`, `/hashes`, `/verify`) exist. The running service writes no
+entries and does not compute periodic chain hashes.
 
 ## Useful work
 
@@ -383,26 +475,87 @@ useful work.
 
 ## Tribunals
 
-*Implemented:* case records. `POST /v1/tribunal/cases` opens a case (`subject`,
+Tribunals are required. Automatic penalties handle volume; tribunals handle judgement:
+harassment, coordinated campaigns, appeals against a penalty, and a federated instance that
+lies. Each ruleset group judges disputes under its own ruleset, and recognition across
+groups is voluntary. There is no tribunal above the groups.
+
+- A high-sec ruleset group MUST provide a tribunal. A low-sec group MAY keep tribunals
+  local and rare. A null-sec group need not provide one.
+- A case MUST be openable both by automated triggers (for example high penalty
+  accumulation or a high-severity anomaly) and by a report from a participant.
+- A case MUST cite its evidence by reference. A decision that cites no evidence is not a
+  decision.
+- A decision MUST be signed by the panelists who made it and appended to the
+  [transparency log](#transparency-log).
+- A decision's outcome MUST be applied by the members of the ruleset group, under its
+  ruleset, and by no one else unless they choose to recognise it.
+- A subject SHOULD be able to appeal once, to a panel with no members of the first.
+- A ruleset group MAY set panel size, appeal limits and penalty ranges in its ruleset.
+- A tribunal never has a path to unmask an anonymous identity
+  ([Anonymous identities](#anonymous-identities)).
+
+Panel selection and appeal mechanics need a JEP.
+
+**Status:** partial. Case records exist. `POST /v1/tribunal/cases` opens a case (`subject`,
 `subject_id`, `ruleset`, `reason`, optional `reporter`, `severity`, `metadata`).
 `POST /v1/tribunal/cases/{id}/decision` records an outcome (`sustain`, `modify`,
 `overturn`, `dismiss` or `escalate`) with optional `penalty_delta` and `notes`. The anomaly
-detector opens cases automatically for high and critical receipt anomalies.
+detector opens cases automatically for high and critical receipt anomalies. Panels,
+signatures, appeals, application of `penalty_delta`, logging and propagation are not
+implemented.
 
-*Proposed:* tribunals are per zone. In high-sec, panels of members from several linked
-servers decide cases, decisions are signed and logged, and outcomes propagate across the
-federation. In low-sec, tribunals are rare and local. Null-sec has none. A tribunal never
-has a path to unmask an anonymous identity ([Anonymous identities](#anonymous-identities)).
-Panel selection, evidence handling and appeals need a JEP before any of this is normative.
+### Reporting abuse in encrypted channels
+
+A tribunal MUST be able to act on abuse that happened in an encrypted channel. Abuse
+happens in channels, and a channel has exactly one owning server, but neither that server
+nor any nameserver can read an encrypted channel's content. The evidence must therefore
+come from a participant who received it.
+
+The mechanism is **victim-key delegation**, or another form of effective proof: the
+recipient gives the tribunal, for the reported messages only, what it needs to verify that
+the accused's key sent that content in that channel. Requirements:
+
+- Only a recipient of the content can start a report.
+- The proof MUST be scoped to the reported messages and MUST NOT give the tribunal or any
+  server standing access to the channel.
+- It MUST NOT require key escrow, server-held decryption keys or content scanning.
+- It attributes content to the sending key. For an `--anon` sender that is a session key,
+  and the report MUST NOT reveal anything more.
+- It MUST work for every encryption suite a ruleset group admits. Suites are pluggable;
+  MLS is the default ([Encryption](encryption.md)).
+
+**Status:** not yet designed. Nothing implements it.
 
 ## Normative requirements summary
+
+Items marked *(not yet implemented)* or *(partial)* are obligations the reference code does
+not yet meet.
 
 **MUST:**
 
 - Use a DID as the sender of every block; treat aliases as nameserver claims.
+- Verify an alias attestation's signature before using it (servers) *(not yet
+  implemented)*.
+- Scope every reputation score to one ruleset; share it only within the ruleset group, and
+  treat what peers send as claims *(partial)*.
+- Require proof-of-work, solvable from public information, on every request that creates a
+  binding *(partial)*.
+- Scale proof-of-work by reputation under an adopted ruleset, within its bounds
+  *(partial)*.
 - Refuse used, expired or mismatched proof-of-work challenges.
 - Raise difficulty monotonically with penalty points, clamped to the configured maximum,
   and let points decay to zero without new penalties.
+- Close linear Sybil cost with an admission input for standing that costs more than
+  hashing, without linking identities *(not yet implemented)*.
+- Cross-register identities within a high-sec ruleset group, and resolve another
+  nameserver's aliases only with its agreement *(not yet implemented)*.
+- Keep and publish a hash-chained transparency log of decisions, enforcement changes and
+  bindings *(partial)*.
+- Provide a tribunal in a high-sec ruleset group; sign decisions, log them, and apply them
+  within the group *(partial)*.
+- Let a recipient report abuse in an encrypted channel to a tribunal with effective proof
+  *(not yet implemented)*.
 - Publish policy at `/.well-known/jig-ns`, `/.well-known/jig-ns/capabilities` and
   `/v1/policy`.
 - Treat federated gossip as claims by the sending peer.
@@ -411,21 +564,23 @@ Panel selection, evidence handling and appeals need a JEP before any of this is 
 
 - Define or implement any link between an anonymous identity and a DID.
 - Present a pseudonymous alias (one minted with a subject) as anonymous.
+- Pool reputation across a security level.
 - Treat reputation as a protocol gate before JEP-0003.
 
 **SHOULD:**
 
 - Pin the DID first seen for a name and surface changes (clients).
 - Keep anonymous keypairs separate from DID keypairs (clients).
+- Allow one appeal against a tribunal decision.
 - Advertise nameservers with `_jig-ns._tcp` SRV records.
 
 **MAY:**
 
 - Trust more than one nameserver (servers).
-- Scale proof-of-work by local reputation (nameservers); use local reputation in admission
-  policy (servers).
-- Anchor a high-sec zone, join one, override its defaults, or run without one.
+- Use local reputation in admission policy (servers).
+- Anchor a ruleset group, join one, override its defaults, or run without one.
 - Map reputation between rulesets with translation contracts.
+- Set tribunal panel size, appeal limits and penalty ranges in a ruleset.
 
 ---
 
@@ -433,6 +588,7 @@ Panel selection, evidence handling and appeals need a JEP before any of this is 
 
 - **[Zero-Trust Model](zero-trust.md)**: fail-closed semantics and adversarial assumptions.
 - **[Crypto Primitives](crypto.md)**: Ed25519 for DIDs, BLAKE3 for proof-of-work.
+- **[Encryption](encryption.md)**: suites and the MLS default.
 - **[Federation](federation.md)**: server-to-server trust.
 - **[Threat Register](threat-register.md)**: OP-08 (key substitution) and OP-10
   (reputation gaming).
