@@ -186,8 +186,12 @@ pins into something verifiable; that is future work.
 (`jig_client::pins`, `~/.jig/pins.json`). A later welcome signed by another key fails
 closed with an explanation, for every WebSocket connection and once per process before
 `Secure`'s first REST request (REST has no handshake of its own). `jig server forget`
-drops a server's pins. Name→DID mappings are not yet pinned client-side, and a REST
-response is tied to the pinned server only once TLS binds the two.
+drops a server's pins. Over TLS, the default since TLS on by default landed, every REST
+and WebSocket connection is tied to the pinned DID as well: once per process the CLI
+fetches `/.well-known/jig`, requires the DID it names to be the pinned one, and then
+accepts only the certificate that DID vouches for there (`tls_binding`), or one a CA
+issued (`jig_client::tls`). Over plaintext a REST response is still not tied to the
+pinned server. Name→DID mappings are not yet pinned client-side.
 
 ### OP-09: federation abuse
 

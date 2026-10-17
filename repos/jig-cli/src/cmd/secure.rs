@@ -107,7 +107,8 @@ pub fn must_encrypt(held: bool, listed: Option<bool>) -> bool {
 pub async fn connect_pinned(server: &str, identity: Identity) -> Result<Client> {
     let mut pins = Pins::load(&Pins::default_path())?;
     let pinned = pins.offer(server).pinned_server_did;
-    let client = Client::connect_with(server, identity, pins.offer(server))
+    let tls = crate::cmd::trust::server_tls(server).await?;
+    let client = Client::connect_with_tls(server, identity, pins.offer(server), tls)
         .await
         .map_err(|e| match (e, pinned) {
             (ClientError::HandshakeFailed { reason, .. }, Some(did)) => anyhow::anyhow!(
@@ -201,11 +202,8 @@ impl Secure {
         &self.identity
     }
 
-    fn http() -> Result<reqwest::Client> {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .context("building HTTP client")
+    async fn http(&self) -> Result<reqwest::Client> {
+        crate::cmd::trust::http(&self.server, std::time::Duration::from_secs(15)).await
     }
 
     async fn refusal(resp: reqwest::Response) -> Refused {
@@ -224,7 +222,7 @@ impl Secure {
         self.ensure_pinned().await?;
         let url = format!("{}{path}", self.base);
         let proof = ReadProof::sign(&self.identity, "GET", signable_path(&url));
-        let mut req = Self::http()?.get(&url);
+        let mut req = self.http().await?.get(&url);
         for (name, value) in proof.headers() {
             req = req.header(name, value);
         }
@@ -244,7 +242,9 @@ impl Secure {
             "bundle_b64": STANDARD.encode(block.canonical_bytes()),
             "sig_b64": STANDARD.encode(&block.sender_sig),
         });
-        let resp = Self::http()?
+        let resp = self
+            .http()
+            .await?
             .post(&url)
             .json(&body)
             .send()
@@ -368,7 +368,9 @@ impl Secure {
         let body = serde_json::json!({
             "key_packages_b64": packages.iter().map(|p| STANDARD.encode(p)).collect::<Vec<_>>(),
         });
-        let resp = Self::http()?
+        let resp = self
+            .http()
+            .await?
             .post(&url)
             .json(&body)
             .send()

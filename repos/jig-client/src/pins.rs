@@ -49,6 +49,15 @@ pub enum PinError {
         pinned: String,
         presented: String,
     },
+    #[error(
+        "{server} names itself {presented}, but this device pinned it as {pinned} (if its key \
+         really changed, `jig server forget` drops the pin)"
+    )]
+    ServerReplaced {
+        server: String,
+        pinned: String,
+        presented: String,
+    },
     #[error("the creation block for {slug} does not prove its suite: {reason}")]
     Unproven { slug: String, reason: String },
     #[error("pin store {path}: {source}")]
@@ -126,10 +135,26 @@ impl Pins {
                 });
             }
         };
-        Ok(Self {
+        let mut pins = Self {
             path: path.to_path_buf(),
             file,
-        })
+        };
+        // Servers pinned while the scheme was part of the key.
+        let legacy: Vec<String> = pins
+            .file
+            .servers
+            .keys()
+            .filter(|key| server_key(key) != **key)
+            .cloned()
+            .collect();
+        if !legacy.is_empty() {
+            for key in legacy {
+                let pin = pins.file.servers.remove(&key).expect("listed above");
+                pins.file.servers.entry(server_key(&key)).or_insert(pin);
+            }
+            pins.save()?;
+        }
+        Ok(pins)
     }
 
     pub fn server(&self, server: &str) -> Option<&ServerPin> {
@@ -176,6 +201,25 @@ impl Pins {
             pin.suites = advertised;
             pin.server_did.clone_from(&welcome.server_did);
             self.save()?;
+        }
+        Ok(())
+    }
+
+    /// Check the DID `server` names against the pin, and pin it on first
+    /// sight. Used where no signed welcome is at hand, as when a TLS probe
+    /// takes the DID a certificate is bound to.
+    pub fn check_server_did(&mut self, server: &str, did: &str) -> Result<(), PinError> {
+        let pin = self.file.servers.entry(server_key(server)).or_default();
+        if pin.server_did.is_empty() {
+            pin.server_did = did.to_string();
+            return self.save();
+        }
+        if pin.server_did != did {
+            return Err(PinError::ServerReplaced {
+                server: server.to_string(),
+                pinned: pin.server_did.clone(),
+                presented: did.to_string(),
+            });
         }
         Ok(())
     }
@@ -464,6 +508,50 @@ mod tests {
 
         assert!(pins.forget(server).unwrap());
         assert!(Pins::load(&path).unwrap().server(server).is_none());
+    }
+
+    /// A TLS probe pins the DID a certificate is bound to; a different DID
+    /// for the same server later is refused, under any scheme.
+    #[test]
+    fn a_probed_did_is_pinned_and_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let mut pins = Pins::load(&path).unwrap();
+        pins.check_server_did("https://host:7117", "did:jig:zA")
+            .unwrap();
+        let mut pins = Pins::load(&path).unwrap();
+        assert_eq!(
+            pins.offer("http://host:7117").pinned_server_did.as_deref(),
+            Some("did:jig:zA"),
+            "turning TLS on does not lose the pin"
+        );
+        pins.check_server_did("wss://host:7117", "did:jig:zA")
+            .unwrap();
+        assert!(matches!(
+            pins.check_server_did("https://host:7117", "did:jig:zB"),
+            Err(PinError::ServerReplaced { .. })
+        ));
+    }
+
+    /// Stores written while the scheme was part of the key are rekeyed when
+    /// they are loaded.
+    #[test]
+    fn pins_written_with_a_scheme_are_rekeyed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        std::fs::write(
+            &path,
+            br#"{"servers":{"http://host:7117":{"server_did":"did:jig:zA","suites":["mls"]}}}"#,
+        )
+        .unwrap();
+        let pins = Pins::load(&path).unwrap();
+        assert_eq!(
+            pins.server("https://host:7117")
+                .map(|p| p.server_did.as_str()),
+            Some("did:jig:zA")
+        );
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("http://"), "{on_disk}");
     }
 
     #[test]

@@ -28,7 +28,7 @@ jig init
 jig send "Hello, Jig!"
 
 # Override channel and server on the fly
-jig --server http://127.0.0.1:7117 send --channel '#ops' "Deploying now"
+jig --server https://127.0.0.1:7117 send --channel '#ops' "Deploying now"
 
 # Read the latest blocks
 jig read --limit 20
@@ -41,7 +41,7 @@ Example config (`~/.jig/cli.toml`):
 
 ```toml
 [server]
-base_url = "http://127.0.0.1:7117"
+base_url = "https://127.0.0.1:7117"
 
 [user]
 did = "did:jig:alice"

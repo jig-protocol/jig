@@ -80,10 +80,7 @@ pub async fn info(ctx: &CliContext, override_url: Option<&str>) -> Result<()> {
     }
 
     let endpoint = well_known_url(&base);
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .context("building HTTP client for /.well-known/jig")?;
+    let http = crate::cmd::trust::http(&base, std::time::Duration::from_secs(10)).await?;
 
     let resp = http
         .get(&endpoint)

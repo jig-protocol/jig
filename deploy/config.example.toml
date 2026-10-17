@@ -31,19 +31,24 @@ database_path = "/var/lib/jig/jig.db"
 bind_address = "100.x.y.z"
 port = 7117
 
-# Optional real TLS with no certbot and no public DNS — see deploy/README.md:
+# TLS is on by default. With no cert_path/key_path the server makes a
+# self-signed certificate on first start (/var/lib/jig/tls/) and its DID
+# vouches for it at /.well-known/jig; jig clients and peers trust it through
+# that DID. For a certificate browsers and curl trust too, with no certbot and
+# no public DNS — see deploy/README.md:
 #   tailscale cert <host>.<tailnet>.ts.net
 # [tls]
-# enabled = true
 # cert_path = "/var/lib/jig/tls/<host>.<tailnet>.ts.net.crt"
 # key_path  = "/var/lib/jig/tls/<host>.<tailnet>.ts.net.key"
+# Plaintext, only behind a proxy that terminates TLS:
+# enabled = false
 
-# SET THIS WHENEVER YOU ENABLE [tls]. It is the origin advertised at
-# /.well-known/jig for federated peers to dial. Left unset, the server derives
-# {scheme}://{bind_address}:{port} — the scheme now follows [tls], but
-# bind_address is an IP while your certificate is issued for a HOSTNAME, so a
-# peer that follows the advertisement gets a certificate-name mismatch instead
-# of a useful error. Must appear BEFORE any [table] header (it is a root key).
+# SET THIS WHEN YOU SERVE A CERTIFICATE ISSUED FOR A HOSTNAME. It is the
+# origin advertised at /.well-known/jig. Left unset, the server derives
+# {scheme}://{bind_address}:{port}, and bind_address is an IP: jig clients and
+# peers still trust the certificate through the server DID, but anything else
+# that follows the advertisement (a browser, curl) gets a certificate-name
+# mismatch. Must appear BEFORE any [table] header (it is a root key).
 # public_url = "https://<host>.<tailnet>.ts.net:7117"
 
 # ============================================================================
