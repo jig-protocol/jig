@@ -384,8 +384,13 @@ replay_capacity = {replay_capacity}
 # Reputation is ruleset-scoped: a floor names its ruleset, and a DID with no
 # score under it is UNKNOWN for it — decided by `unknown_dids`, never by the
 # number. `unknown_dids = "refuse"` plus `records` is a members-only server.
+# `unknown_dids = "proof-of-work"` admits a new DID once it has done `pow_bits`
+# of work for this server (`POST /api/v1/admission`; the CLI does it on first
+# contact). Each bit doubles the cost; 20 is under a second on a laptop and
+# much less on a GPU, so it is a speed bump for identity floods, not a wall.
 [auth.admission]
 unknown_dids = "admit"
+# pow_bits = 20
 banned_dids = []
 # [[auth.admission.floors]]
 # ruleset_key = "gigue.highsec.v1"

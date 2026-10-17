@@ -134,6 +134,10 @@ struct ServerInfoResponse {
     /// deciding to peer with it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     bridges: Vec<String>,
+    /// Bits of proof of work a new DID owes before this server deals with it
+    /// (`POST /api/v1/admission`). Absent when it asks for none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admission_pow_bits: Option<u8>,
     /// The server DID's signature over the TLS certificate it serves, so a
     /// client can trust a certificate no CA issued. Absent over plaintext.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -211,6 +215,7 @@ async fn server_info(State(state): State<AppState>) -> Result<Json<ServerInfoRes
         allowed_block_kinds,
         peers,
         bridges,
+        admission_pow_bits: state.v0_0_2.as_ref().and_then(|v| v.auth.pow_bits()),
         tls_binding: state
             .v0_0_2
             .as_ref()

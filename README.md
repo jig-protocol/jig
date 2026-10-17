@@ -48,9 +48,11 @@ loopback and private tailnets.
   ([`jig-server/src/auth/`](repos/jig-server/src/auth/),
   [`jig-pipeline/src/authorize_write.rs`](repos/jig-pipeline/src/authorize_write.rs)).
   `[auth.admission]` lets an operator refuse callers outright (bans, ruleset floors,
-  unknown DIDs), and `[auth.rate_limit]` meters each DID and each address. There is no
-  proof-of-work for new identities yet. Blocks relayed by a federated peer run the same
-  gates as local ones, but only open, unencrypted channels federate.
+  unknown DIDs, or proof-of-work from DIDs it has not seen), and `[auth.rate_limit]`
+  meters each DID and each address. Proof-of-work is off by default. Blocks relayed by a
+  federated peer run the same gates as local ones, except that their authors are not
+  asked for proof-of-work (bans, floors and rate limits still apply), and only open,
+  unencrypted channels federate.
   Channel ops (`POST /api/v1/channels*`) run the same gates and need no `[debug]` flag.
 - **No graphical client.** Riverdance, the unfinished GUI, is not in this repository.
   Its licence is undecided, and it is not a working client. The terminal client is
@@ -77,7 +79,7 @@ loopback and private tailnets.
 | Wasm block execution **on the server** | `text-render` executes for real on plaintext channels: the server runs its canonical module and signs the `render_hash` ([`jig-pipeline/src/ingest.rs`](repos/jig-pipeline/src/ingest.rs), step 4). Encrypted content is never executed and gets a `sealed` receipt; control-plane kinds take a synthetic one |
 | Wasm block execution in the CLI (`jig block run`) | Runs and emits a metered receipt for the runtime's own fixtures. It **rejects the workspace's own `text-block` build** with `MemoryMissingMaximum` from the determinism validator |
 | `jig block lint` / `sign` / `verify` / `capabilities` | Stubs; they print "not yet implemented" and exit 1 |
-| Authentication / authorization | Signed proof of possession on every read; `restricted` channels membership-gated for reading, listing, live delivery and posting; membership changes owner-signed; operator admission policy; per-DID and per-address rate limits. **No proof-of-work** |
+| Authentication / authorization | Signed proof of possession on every read; `restricted` channels membership-gated for reading, listing, live delivery and posting; membership changes owner-signed; operator admission policy, with optional proof-of-work for new DIDs; per-DID and per-address rate limits |
 | Graphical client | None |
 | `jig read` | Works: the signed history endpoint, decrypting encrypted channels you belong to |
 | `jig --version` | Works (prints the crate version, which still says `0.0.1`; see below) |

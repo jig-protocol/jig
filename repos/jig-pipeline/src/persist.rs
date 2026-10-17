@@ -426,6 +426,14 @@ impl SqliteStore {
             CREATE INDEX IF NOT EXISTS mls_key_packages_did
                 ON mls_key_packages(did, consumed_at, last_resort);
 
+            -- DIDs that did this server's admission proof of work, and how
+            -- much. Kept for good: the work was the price of being known.
+            CREATE TABLE IF NOT EXISTS admission_proofs (
+                did        TEXT PRIMARY KEY,
+                bits       INTEGER NOT NULL,
+                proven_at  INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS memberships (
                 channel_id        TEXT NOT NULL,
                 member_did        TEXT NOT NULL,
@@ -968,6 +976,27 @@ impl SqliteStore {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Whether `did` has done this server's admission proof of work.
+    pub fn admission_proven(&self, did: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM admission_proofs WHERE did = ?)",
+            [did],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Record that `did` did `bits` of admission proof of work. A later,
+    /// larger proof replaces a smaller one.
+    pub fn record_admission_proof(&self, did: &str, bits: u8) -> Result<()> {
+        self.conn.lock().expect("poisoned").execute(
+            "INSERT INTO admission_proofs (did, bits, proven_at) VALUES (?, ?, ?)
+             ON CONFLICT(did) DO UPDATE SET bits = MAX(bits, excluded.bits)",
+            params![did, bits, chrono::Utc::now().timestamp()],
+        )?;
+        Ok(())
     }
 
     /// How many ordinary (consumable) key packages `did` has left, and whether
