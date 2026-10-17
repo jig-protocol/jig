@@ -56,7 +56,12 @@ pub struct AppState {
 
 /// Gates 1 and 2 from `[auth]`, plus the federation peers from `[federation]`:
 /// listing a peer is what lets its DID subscribe to this server's stream.
+///
+/// Every `AppState` constructor goes through here, so this is also where a
+/// peer that must not be dialed — a `ws://` URL without
+/// `dangerously_allow_plaintext_federation` — becomes a boot error.
 fn build_auth(config: &JigServerConfig) -> anyhow::Result<Arc<crate::auth::AuthState>> {
+    crate::v0_0_2_federation::check_federation_transport(&config.federation)?;
     let auth = crate::auth::AuthState::from_config(&config.auth)?;
     for (i, peer) in config.federation.peers.iter().enumerate() {
         auth.trust_federation_peer(&peer.expected_did)
