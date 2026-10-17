@@ -304,12 +304,7 @@ pub(crate) async fn create_with(
 pub(crate) fn resolve_who(ctx: &CliContext, who: &str) -> Result<String> {
     let who = who.trim();
     if who.starts_with("did:jig:") {
-        let did = jig_core::Did::from_did_jig_string(who)
-            .ok()
-            .and_then(|d| d.as_bytes().ok())
-            .map(|k| jig_core::Did::from_ed25519_pubkey(&k).to_did_jig_string())
-            .ok_or_else(|| anyhow::anyhow!("`{who}` is not a valid did:jig"))?;
-        return Ok(did);
+        return canonical_did(who);
     }
     let matches: Vec<&String> = ctx
         .effective()
@@ -319,10 +314,22 @@ pub(crate) fn resolve_who(ctx: &CliContext, who: &str) -> Result<String> {
         .map(|(did, _)| did)
         .collect();
     match matches.as_slice() {
-        [did] => Ok((*did).clone()),
+        // A hand-edited `[contacts]` entry may spell the DID differently;
+        // everything downstream (DM slugs, membership) compares canonical ones.
+        [did] => canonical_did(did).with_context(|| format!("the `[contacts]` entry for `{who}`")),
         [] => anyhow::bail!("`{who}` is neither a did:jig nor a name in [contacts]; pass the DID"),
         _ => anyhow::bail!("more than one contact is called `{who}`; pass the DID"),
     }
+}
+
+/// The canonical spelling of a key-derived `did:jig`: the one the server
+/// writes into rows and the one DM slugs are derived from.
+fn canonical_did(did: &str) -> Result<String> {
+    jig_core::Did::from_did_jig_string(did)
+        .ok()
+        .and_then(|d| d.as_bytes().ok())
+        .map(|k| jig_core::Did::from_ed25519_pubkey(&k).to_did_jig_string())
+        .ok_or_else(|| anyhow::anyhow!("`{did}` is not a valid did:jig"))
 }
 
 // ============================================================================
@@ -804,6 +811,16 @@ fn print_channels(channels: &[ChannelView]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_did_resolves_to_one_spelling_however_it_is_written() {
+        let did = jig_core::Did::from_ed25519_pubkey(&[7u8; 32]).to_did_jig_string();
+        let shouted = format!("did:jig:z{}", did["did:jig:z".len()..].to_uppercase());
+        assert_ne!(shouted, did);
+        assert_eq!(canonical_did(&shouted).unwrap(), did);
+        assert_eq!(canonical_did(&did).unwrap(), did);
+        assert!(canonical_did("did:jig:alice").is_err());
+    }
 
     #[test]
     fn channel_exists_is_recognised_from_new_and_old_servers() {

@@ -100,6 +100,15 @@ and on federation inbound. Since v0.2 a channel records its suite at creation
 including plaintext on an `mls` channel (`SUITE_MISMATCH`). Pinning the suites a server
 advertised is still JEP-0001.
 
+The relabel half of this attack also works against the client, which learns a channel's
+suite from the server's unsigned listing. Until the fix below, `jig send` and `jig chat`
+encrypted only when the listing said `mls` and otherwise sent a plaintext `text-render`, so
+an operator could flip a channel to `none` in its own store and receive the next message in
+the clear (the server's own gate agreed, having been relabelled too). A client now decides
+from its own MLS state first (`jig-cli` `must_encrypt`): holding the group means `mls`,
+whatever the listing says, and a contradiction is printed as a warning. A channel the device
+has no group for is still taken on the listing's word, which is what suite pinning closes.
+
 ### OP-04: metadata harvesting
 
 **Attack.** The operator records who talks to whom, when, how often and how much.
@@ -176,7 +185,11 @@ content it has no way to gate, nor post into a local restricted or encrypted cha
 `naively_trust_peer_authored_blocks` antipattern flag is set, and now runs the manifest
 gates. It does not go through `ingest`, so the write gate does not run; it drops blocks for
 local channels that do not federate, and `DeliveryPolicy::federates` keeps restricted and
-encrypted channels' blocks off outbound links. It derives block CIDs the way `ingest` does
+encrypted channels' blocks off outbound links. Peers actually receive a server's blocks
+through the federation-scope subscription they hold on their connection to it, not through
+the server's own dial (whose block frames the peer ignores); until the fix below that
+subscription was filtered by `permits` alone, so an open encrypted channel's commits,
+welcomes and ciphertext reached every peer. `federates` now gates both paths. It derives block CIDs the way `ingest` does
 (before v0.2 it used a different scheme, so one block had two identities).
 
 ### OP-10: discovery and reputation gaming
