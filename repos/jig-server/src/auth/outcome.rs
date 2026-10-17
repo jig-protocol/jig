@@ -157,7 +157,7 @@ mod tests {
 
         assert_eq!(
             all.len(),
-            14,
+            15,
             "a variant was added without covering it here"
         );
     }
