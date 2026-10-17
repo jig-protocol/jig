@@ -27,7 +27,7 @@
 //! authenticated (tier-1) requests need no nonce at all, which is an
 //! independent reason busy servers will want trusted connections.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Why a request was refused by the replay guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +41,9 @@ pub enum ReplayRejection {
     /// accepting this request would mean forgetting one that can still be
     /// replayed. Refusing is the safe direction; see the module docs.
     CapacityExhausted,
+    /// This DID already holds its share of the guard. Refused for that DID
+    /// alone, so one identity cannot spend the capacity everyone shares.
+    DidOverShare,
 }
 
 /// Bounded record of recently-seen request nonces.
@@ -50,6 +53,9 @@ pub enum ReplayRejection {
 pub struct ReplayGuard {
     window_ms: u64,
     capacity: usize,
+    /// Most nonces one DID may hold at once; `usize::MAX` for no share.
+    per_did: usize,
+    held: HashMap<String, usize>,
     seen: HashSet<String>,
     /// Arrival order plus each entry's request timestamp, so expiry can be
     /// evaluated without a second index.
@@ -64,9 +70,17 @@ impl ReplayGuard {
         Self {
             window_ms,
             capacity,
+            per_did: usize::MAX,
+            held: HashMap::new(),
             seen: HashSet::new(),
             order: VecDeque::new(),
         }
+    }
+
+    /// Cap the nonces one DID may hold at once. 0 is no cap.
+    pub fn with_per_did_share(mut self, per_did: usize) -> Self {
+        self.per_did = if per_did == 0 { usize::MAX } else { per_did };
+        self
     }
 
     /// Number of nonces currently retained.
@@ -116,10 +130,14 @@ impl ReplayGuard {
         // Everything still retained is inside the window and therefore still
         // replayable. Refuse rather than forget one — forgetting turns a replay
         // into a cache miss, and a miss is an ACCEPT.
+        if self.held.get(did).copied().unwrap_or(0) >= self.per_did {
+            return Err(ReplayRejection::DidOverShare);
+        }
         if self.seen.len() >= self.capacity {
             return Err(ReplayRejection::CapacityExhausted);
         }
 
+        *self.held.entry(did.to_string()).or_default() += 1;
         self.seen.insert(key.clone());
         self.order.push_back((key, request_ms));
         Ok(())
@@ -138,6 +156,14 @@ impl ReplayGuard {
                 let nonce = nonce.clone();
                 self.order.pop_front();
                 self.seen.remove(&nonce);
+                if let Some((did, _)) = nonce.split_once('\0')
+                    && let Some(n) = self.held.get_mut(did)
+                {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.held.remove(did);
+                    }
+                }
             } else {
                 break;
             }
@@ -148,6 +174,38 @@ impl ReplayGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One identity minting unique nonces fills its own share and is refused;
+    /// everyone else still has the rest of the guard.
+    #[test]
+    fn one_did_cannot_spend_everyones_capacity() {
+        let mut guard = ReplayGuard::new(30_000, 100).with_per_did_share(3);
+        // Every request takes the next fresh nonce.
+        let mut nonces = (0u32..).map(|i| format!("n{i}"));
+        let mut fresh = || nonces.next().expect("unbounded");
+        for _ in 0..3 {
+            assert!(
+                guard
+                    .check_and_record("did:jig:zFlood", &fresh(), 5_000, 5_000)
+                    .is_ok()
+            );
+        }
+        assert_eq!(
+            guard.check_and_record("did:jig:zFlood", &fresh(), 5_000, 5_000),
+            Err(ReplayRejection::DidOverShare)
+        );
+        assert!(
+            guard
+                .check_and_record("did:jig:zOther", &fresh(), 5_000, 5_000)
+                .is_ok()
+        );
+        // Once its nonces age out of the window, its share is free again.
+        assert!(
+            guard
+                .check_and_record("did:jig:zFlood", &fresh(), 40_000, 40_000)
+                .is_ok()
+        );
+    }
 
     /// Two callers may legitimately mint the same nonce string (a clock
     /// millisecond plus a counter). Neither is replaying the other, and

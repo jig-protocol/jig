@@ -111,6 +111,17 @@ banned_dids = []
 # ruleset_key = "gigue.highsec.v1"
 # score = 5
 
+# Token buckets in front of the gates, per verified DID and per remote
+# address; a rate of 0 turns that limit off. Behind a reverse proxy (Caddy,
+# nginx, tailscale serve) every request comes from the proxy's address, so
+# raise per_ip_* or set per_ip_per_second = 0 there.
+[auth.rate_limit]
+per_did_burst = 300
+per_did_per_second = 50
+per_ip_burst = 600
+per_ip_per_second = 100
+replay_per_did = 2000
+
 [debug]
 # Channel ops (`jig channel create/join/delete`) live on /api/v1/channels and
 # are always mounted. This flag only adds the legacy /_admin_v0_0_2/* aliases

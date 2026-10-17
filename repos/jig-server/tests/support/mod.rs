@@ -287,6 +287,35 @@ impl TestServer {
         (status, json)
     }
 
+    /// POST a block to `/api/v1/blocks`, as `jig send` does over REST.
+    pub async fn post_block(&self, block: &BuiltBlock) -> (StatusCode, serde_json::Value) {
+        let http = Request::builder()
+            .method("POST")
+            .uri("/api/v1/blocks")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&submission(block)).unwrap()))
+            .unwrap();
+        self.dispatch(http).await
+    }
+
+    /// An unsigned GET through the full v0.0.2 router, arriving from `from`
+    /// as a listener with connection info would deliver it.
+    pub async fn get_from(&self, from: std::net::SocketAddr, path: &str) -> StatusCode {
+        let mut http = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        http.extensions_mut()
+            .insert(axum::extract::ConnectInfo(from));
+        let router = jig_server::v0_0_2_ws::build_v0_0_2_router(self.state.clone());
+        router
+            .oneshot(http)
+            .await
+            .expect("router responds")
+            .status()
+    }
+
     async fn dispatch(&self, req: Request<Body>) -> (StatusCode, serde_json::Value) {
         // A fresh router per call, over the SAME state — so the replay guard
         // and store persist across requests, which is what makes the replay

@@ -315,6 +315,13 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         ref e @ IngestError::ChannelExists { .. } => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },
+        // Over its rate: a retry later can succeed.
+        IngestError::NotAdmitted {
+            refusal: jig_pipeline::ingest::AdmissionRefusal::RateLimited,
+            ..
+        } => SubmitDenied::RateLimited {
+            retry_after_secs: 1,
+        },
         // This server refuses the block's author; a retry changes nothing.
         ref e @ IngestError::NotAdmitted { .. } => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),

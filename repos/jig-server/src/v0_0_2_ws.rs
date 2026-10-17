@@ -197,9 +197,43 @@ pub mod metrics {
 // ---- Public API ------------------------------------------------------------
 
 /// Axum handler for `GET /api/v1/ws` — upgrades the HTTP request to WebSocket.
-pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+) -> Response {
     let conn_id = CONN_COUNTER.fetch_add(1, Ordering::SeqCst);
-    ws.on_upgrade(move |socket| handle_socket(socket, state, conn_id))
+    let ip = peer.map(|p| p.0.0.ip());
+    ws.on_upgrade(move |socket| handle_socket(socket, state, conn_id, ip))
+}
+
+/// `[auth.rate_limit]` per remote address, on every request this router
+/// serves. A server started without connection info (tests driving the
+/// router directly) has no address to charge.
+async fn per_ip_rate(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip());
+    if let Some(ip) = ip
+        && !state.auth.charge_ip(ip)
+    {
+        let outcome = crate::auth::GateOutcome::RateLimited;
+        tracing::info!(%ip, audit = %crate::auth::audit_line(&outcome), "request refused");
+        let (status, code, message) = state.auth.disclosure.disclose(&outcome);
+        let status = axum::http::StatusCode::from_u16(status)
+            .unwrap_or(axum::http::StatusCode::TOO_MANY_REQUESTS);
+        let body = crate::v0_0_2_blocks::ErrorBody {
+            code: code.to_string(),
+            message,
+        };
+        return axum::response::IntoResponse::into_response((status, axum::Json(body)));
+    }
+    next.run(req).await
 }
 
 /// Build a router that mounts the WSS endpoint on the v0.0.2 `AppState`.
@@ -238,12 +272,19 @@ pub fn build_v0_0_2_router(state: Arc<AppState>) -> Router {
     // only wraps the routes already present; `server.rs` merges these two
     // routers afterwards, so a single layer on one of them would leave the
     // other's routes untraced.
-    router.layer(crate::handler::http_trace_layer())
+    router
+        .layer(axum::middleware::from_fn_with_state(state, per_ip_rate))
+        .layer(crate::handler::http_trace_layer())
 }
 
 // ---- Per-connection handler ------------------------------------------------
 
-async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, conn_id: u64) {
+async fn handle_socket(
+    mut socket: WebSocket,
+    state: Arc<AppState>,
+    conn_id: u64,
+    ip: Option<std::net::IpAddr>,
+) {
     metrics::connection_opened();
     // Per-connection channel: fanout delivers (StoredBlock, StoredReceipt) here.
     let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
@@ -258,6 +299,13 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, conn_id: u64
                     break;
                 };
                 match msg {
+                    // Every frame costs its sender's address, signed or not:
+                    // one upgraded connection is not a licence to flood.
+                    Message::Text(_) if ip.is_some_and(|ip| !state.auth.charge_ip(ip)) => {
+                        let outcome = crate::auth::GateOutcome::RateLimited;
+                        let (status, code, message) = state.auth.disclosure.disclose(&outcome);
+                        let _ = send_error(&mut socket, Some(status), code, None, &message).await;
+                    }
                     Message::Text(text) => {
                         if let Err(e) = handle_client_frame(
                             &text,
@@ -472,7 +520,7 @@ async fn handle_client_frame(
                             // Bind the VERIFIED did, never `a.did` as received —
                             // and only once gate 2 has admitted it, so a refused
                             // caller leaves no identity on the connection.
-                            Ok(did) => match state.auth.admit(did.as_str()) {
+                            Ok(did) => match state.auth.admit_and_charge(did.as_str()) {
                                 Ok(()) => {
                                     session.did = Some(did);
                                     None
@@ -1554,6 +1602,44 @@ mod tests {
             }
         }
         // Timeout is acceptable — primary assertion is the server didn't panic.
+    }
+
+    /// An upgraded connection is still charged to its address, frame by frame:
+    /// past the burst a frame is refused, not processed.
+    #[tokio::test]
+    async fn frames_past_the_address_rate_are_refused() {
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.auth.rate_limit.per_ip_burst = 3;
+        config.auth.rate_limit.per_ip_per_second = 1;
+        let state = Arc::new(AppState::for_test_with_config(config).unwrap());
+        let app = Router::new()
+            .route("/api/v1/ws", get(ws_handler))
+            .with_state(state)
+            .into_make_service_with_connect_info::<SocketAddr>();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/v1/ws", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // The hello is the first of three.
+        let mut ws = established(&url).await;
+        for _ in 0..2 {
+            ws.send(TMessage::Text("not valid json".into()))
+                .await
+                .unwrap();
+            match next_frame(&mut ws).await.frame {
+                Frame::Error { code, .. } => assert_ne!(code, "RATE_LIMITED"),
+                other => panic!("expected an error frame, got {other:?}"),
+            }
+        }
+        ws.send(TMessage::Text("not valid json".into()))
+            .await
+            .unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { status, code, .. } => {
+                assert_eq!((status, code.as_str()), (Some(429), "RATE_LIMITED"));
+            }
+            other => panic!("expected RATE_LIMITED, got {other:?}"),
+        }
     }
 
     /// A well-formed frame at a version or suite this server does not speak is

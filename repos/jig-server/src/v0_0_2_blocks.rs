@@ -436,7 +436,7 @@ pub(crate) fn admit_caller(
     // channel exists.
     state
         .auth
-        .admit(did.as_str())
+        .admit_and_charge(did.as_str())
         .map_err(|outcome| refuse(state, &outcome, started))?;
     Ok(Some(did))
 }
