@@ -97,19 +97,21 @@ mod tests {
     /// an independent client can compute it.
     #[test]
     fn the_digest_is_the_specified_derivation() {
+        // Any nonce will do; take the one the solver finds.
+        let nonce = solve("did:jig:zS", "did:jig:zD", 1);
         let mut h = blake3::Hasher::new();
         for (label, value) in [
             ("domain", DOMAIN),
             ("server", "did:jig:zS"),
             ("did", "did:jig:zD"),
-            ("nonce", "1f"),
+            ("nonce", nonce.as_str()),
         ] {
             h.update(label.as_bytes());
             h.update(&(value.len() as u64).to_le_bytes());
             h.update(value.as_bytes());
         }
         assert_eq!(
-            digest("did:jig:zS", "did:jig:zD", "1f"),
+            digest("did:jig:zS", "did:jig:zD", &nonce),
             *h.finalize().as_bytes()
         );
     }
