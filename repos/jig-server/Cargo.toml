@@ -42,7 +42,7 @@ axum = { version = "0.8", features = ["ws"] }
 # tower 0.5 to match the dev-deps entry below; having both 0.4 and 0.5 in the
 # same crate confuses rustc's crate resolution (E0464 multiple candidates).
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -61,7 +61,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Configuration
 clap = { version = "4.4", features = ["derive"] }
-toml = "0.9"
+toml = "1.1"
 
 # Time
 chrono = "0.4"
