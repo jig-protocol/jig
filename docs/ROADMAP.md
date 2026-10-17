@@ -37,10 +37,12 @@ network is the machine: Alan Kay's "objects all the way down".
   Identities are self-certifying `did:jig` keys.
 - **One write path.** Every surface goes through `ingest → authorize → effect → persist → fanout`.
 - **Encryption is composable and chosen by the server operator.** The envelope carries a
-  cipher-suite identifier ([JEP-0001](../repos/jig-spec/jep/jep-0001-encryption-suites.md)). The
-  default is MLS, and nothing in the protocol stops an operator running another scheme.
-- **MLS for everything by default.** There is no separate DM scheme. A DM is a channel with locked
-  membership, so a conversation grows from DM to group DM to channel without changing schemes.
+  cipher-suite identifier ([JEP-0001](../repos/jig-spec/jep/jep-0001-encryption-suites.md)). MLS
+  is the default and the first suite implemented. Suites are plug-and-play: an operator who wants
+  Signal's protocol, a post-quantum scheme or something else can run it instead, and nothing in the
+  protocol stops them.
+- **MLS for everything by default.** DMs don't get a scheme of their own. A DM is a channel with
+  locked membership, so a conversation grows from DM to group DM to channel without changing suites.
 - **Server operators are untrusted.** Every connection starts with a mandatory handshake
   ([JEP-0002](../repos/jig-spec/jep/jep-0002-handshake.md)), and clients fail closed when it is
   missing or contradicted. The [threat register](../repos/jig-spec/src/threat-register.md) tracks
@@ -57,6 +59,11 @@ network is the machine: Alan Kay's "objects all the way down".
 - **Servers are findable from inside the protocol.** Discovery runs through nameservers, with
   proof-of-work and reputation designed in rather than bolted on
   ([JEP-0003](../repos/jig-spec/jep/jep-0003-server-discovery.md)).
+- **Anchor nameservers coordinate; they don't rule.** A nameserver can anchor a high-security zone,
+  giving it a starting point for coordination (default proof-of-work, address conventions, dispute
+  handling) so nobody has to bootstrap one from scratch. Joining is opt-in. Anyone can run their own
+  zones at any security level, with their own anchors, or just connect to servers without hosting
+  anything.
 - **Keep the spec small.** `jig-spec` holds final decisions, normative and terse. Modelling,
   alternatives and justifications go in `docs/` and link to the spec.
 
@@ -98,7 +105,7 @@ reserve the hooks for encryption so that turning it on in v0.2 changes a value, 
 | 13 | `CONTRIBUTING.md` (with the dependency rule below), `CODE_OF_CONDUCT.md`, templates, `CODEOWNERS` | Done |
 | 14 | CLI papercuts: `jig read`, `jig --version`, client reconnect with backoff, `block` stubs | `read` and `--version` done; reconnect and `block` stubs open |
 | 15 | `publish = false` on crates not meant for crates.io | Open |
-| 16 | CI: macOS job, clippy on every crate, federation and bridge counters in `/metrics` | Partial (macOS covered by the install smoke test only) |
+| 16 | CI: macOS job, clippy on every crate, federation and bridge counters in `/metrics`, scope jobs by changed paths (note below) | Partial (macOS covered by the install smoke test only); path scoping open |
 | 17 | Collapse the hybrid server config into one struct with `deny_unknown_fields` | Open |
 | 18 | Run federated blocks through the write gate; "trusted peer" becomes explicit config | Open (since v0.2 only open, unencrypted channels federate) |
 | 19 | Discovery JEP stub | Done ([JEP-0003](../repos/jig-spec/jep/jep-0003-server-discovery.md)) |
@@ -107,6 +114,21 @@ reserve the hooks for encryption so that turning it on in v0.2 changes a value, 
 
 Explicitly not required for v0.1: E2EE itself, a GUI, more bridges, reputation scoring, discovery
 beyond the JEP stub, the reputation part of the handshake, and Windows.
+
+**Note on item 16: scope CI by changed paths.** Every pull request runs the full `workspace` job
+(fmt, clippy and nextest across the workspace) and `wasm-build`, even when it only touches docs.
+What to watch when scoping it:
+
+- `workspace`, `wasm-build` and `dependency-policy` are required checks. A workflow-level `paths:`
+  filter leaves a required check unreported, which blocks the merge. Decide per job instead: a
+  first job lists the changed files (`git diff --name-only` against the merge base, since the
+  allowed actions exclude third-party path filters), and later jobs skip with a job-level `if:`.
+  A skipped job reports success.
+- Count `repos/Cargo.lock`, `rust-toolchain.toml`, `deny.toml` and `.github/workflows/**` as code.
+  `fuel-portability.yml` already filters on `repos/jig-runtime/**` alone, so a lockfile-only
+  wasmtime bump, the change most likely to move fuel, skips it today.
+- Keep `dependency-policy` unconditional. It is quick, and the advisory database changes whatever
+  the diff touches.
 
 ### Phase 1: secure by default (`v0.2`)
 
@@ -204,7 +226,7 @@ Settled on 2026-10-05 unless noted. Open items follow the table.
 | # | Question | Decision |
 | --- | --- | --- |
 | D1 | E2EE in v0.1 or v0.2? | v0.2. v0.1 reserves the wire and spec hooks for operator-chosen encryption. |
-| D2 | HPKE / `age` sealing, or MLS? | MLS for everything. A DM is a channel with locked membership, so DM → group DM → channel is a membership change. |
+| D2 | HPKE / `age` sealing, or MLS? | MLS as the default suite for everything, with no DM-specific scheme. A DM is a channel with locked membership, so DM → group DM → channel is a membership change. Other suites plug in per D1. |
 | D4 | A public jig server as a hello-world target? | Try one in v0.1, experimental and unencrypted, kept off the critical 60-second path. |
 | D5 | Go public with history, or squash? | Public with full history after a secrets scrub; archive the pre-monorepo repos. Done 2026-10-06. |
 | D6 | Publish crates, or binaries only? | Reserve names now (low priority). Publish `jig-core` + `jig-client` once v0.2 stabilizes the wire. |
@@ -217,6 +239,7 @@ Settled on 2026-10-05 unless noted. Open items follow the table.
 | D13 | Signal's post-quantum protocol vs MLS as the plug-in shape? | **Open:** settled in the v0.2 crypto design. |
 | D15 | Discovery design? | A design project of its own, with proof-of-work and reputation built in. Only the JEP stub is in v0.1. |
 | D18 | Where does the threat register live? | Decisions in `jig-spec`, normative and terse; analysis in `docs/`. |
+| D19 | Does an anchor nameserver set rules for the network? | No. An anchor gives a high-security zone initial coordination, and joining it is opt-in. Users can run their own zones at any security level, or just connect to servers. Settled 2026-10-13. |
 
 D3, D14, D16 and D17 concern the Riverdance GUI's licence and internal hosting and are tracked
 outside this repo.
