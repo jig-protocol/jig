@@ -121,6 +121,12 @@ fn truthful(outcome: &GateOutcome) -> (u16, &'static str, String) {
             "not the owner of this channel".to_string(),
         ),
         GateOutcome::AuthzChannelUnknown => (404, "NO_SUCH_CHANNEL", "no such channel".to_string()),
+        GateOutcome::AuthzNotFederationPeer => (
+            403,
+            "NOT_A_PEER",
+            "only this server's configured peers may subscribe to its federation stream"
+                .to_string(),
+        ),
     }
 }
 

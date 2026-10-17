@@ -19,10 +19,9 @@
 //! Every frame carries `suite`; the remaining examples omit it for brevity.
 //!
 //! `sig_b64` on `Frame::Block` is `Option<String>` for v0.0.2 backward
-//! compatibility (older peers don't carry it). v0.0.3 servers re-verify
-//! the signature against the manifest's claimed sender_did when the field
-//! is present; the `naively_trust_peer_authored_blocks` antipattern flag
-//! bypasses that check (see `jig-config::v0_0_2_server::FederationSection`).
+//! compatibility (older peers don't carry it). A server ingests a relayed
+//! block like any other, so one without a signature that verifies against
+//! its claimed sender_did is refused.
 
 use jig_core::{EncryptionSuite, SuiteNotImplemented};
 use serde::{Deserialize, Serialize};

@@ -54,6 +54,22 @@ pub struct AppState {
     pub auth: Arc<crate::auth::AuthState>,
 }
 
+/// Gates 1 and 2 from `[auth]`, plus the federation peers from `[federation]`:
+/// listing a peer is what lets its DID subscribe to this server's stream.
+///
+/// Every `AppState` constructor goes through here, so this is also where a
+/// peer that must not be dialed — a `ws://` URL without
+/// `dangerously_allow_plaintext_federation` — becomes a boot error.
+fn build_auth(config: &JigServerConfig) -> anyhow::Result<Arc<crate::auth::AuthState>> {
+    crate::v0_0_2_federation::check_federation_transport(&config.federation)?;
+    let auth = crate::auth::AuthState::from_config(&config.auth)?;
+    for (i, peer) in config.federation.peers.iter().enumerate() {
+        auth.trust_federation_peer(&peer.expected_did)
+            .with_context(|| format!("[federation] peers[{i}].expected_did"))?;
+    }
+    Ok(Arc::new(auth))
+}
+
 /// Translate the operator's server-level execution settings into the runtime's
 /// own config type.
 ///
@@ -137,7 +153,7 @@ impl AppState {
 
         // Built before the ingest context so gate 2 can be installed on it;
         // `config` is moved into the struct literal below.
-        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth)?);
+        let auth = build_auth(&config)?;
 
         let ingest_ctx = Arc::new(IngestContext {
             store,
@@ -187,7 +203,7 @@ impl AppState {
 
         // Built before the ingest context so gate 2 can be installed on it;
         // `config` is moved into the struct literal below.
-        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth)?);
+        let auth = build_auth(&config)?;
 
         let ingest_ctx = Arc::new(IngestContext {
             store,
@@ -236,7 +252,7 @@ impl AppState {
 
         // Built before the ingest context so gate 2 can be installed on it;
         // `config` is moved into the struct literal below.
-        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth)?);
+        let auth = build_auth(&config)?;
 
         let ingest_ctx = Arc::new(IngestContext {
             store,

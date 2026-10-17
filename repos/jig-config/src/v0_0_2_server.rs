@@ -275,14 +275,17 @@ pub struct ReputationRecord {
 pub struct FederationSection {
     pub peers: Vec<FederationPeer>,
     pub dangerously_disable_federation_tls: bool,
-    /// Antipattern flag: when true, inbound peer blocks are persisted
-    /// WITHOUT re-verifying the sender's ed25519 signature. v0.0.2 default
-    /// behavior; v0.0.3+ rejects forged-author relays unless this is set.
-    /// Surfaces in `unsafe_options_active` so federated peers and operators
-    /// notice the carve-out via `GET /.well-known/jig`.
-    pub naively_trust_peer_authored_blocks: bool,
+    /// Antipattern flag: permit `ws://` (plaintext) peer URLs. Without it, a
+    /// `ws://` peer is a boot error and is never dialed. The peer's DID is
+    /// still checked by the signed welcome, but nothing after the welcome is
+    /// protected on a plaintext link. Surfaces in `unsafe_options_active`.
+    pub dangerously_allow_plaintext_federation: bool,
 }
 
+/// A server this one federates with. Listing it is what makes it trusted:
+/// this server dials `url` and refuses a welcome signed by any DID but
+/// `expected_did`, and only a DID listed here may subscribe to this server's
+/// federation stream.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FederationPeer {
     pub url: String,
@@ -431,8 +434,8 @@ impl JigServerConfig {
         if self.federation.dangerously_disable_federation_tls {
             active.push("federation.dangerously_disable_federation_tls".to_string());
         }
-        if self.federation.naively_trust_peer_authored_blocks {
-            active.push("federation.naively_trust_peer_authored_blocks".to_string());
+        if self.federation.dangerously_allow_plaintext_federation {
+            active.push("federation.dangerously_allow_plaintext_federation".to_string());
         }
         if self.identity.naively_allow_unknown_handles_fallback {
             active.push("identity.naively_allow_unknown_handles_fallback".to_string());
@@ -664,26 +667,10 @@ mod tests {
     fn antipattern_flags_default_off() {
         let cfg = JigServerConfig::default();
         assert!(!cfg.federation.dangerously_disable_federation_tls);
-        assert!(!cfg.federation.naively_trust_peer_authored_blocks);
+        assert!(!cfg.federation.dangerously_allow_plaintext_federation);
         assert!(!cfg.debug.admin_endpoints);
         assert!(!cfg.identity.naively_allow_unknown_handles_fallback);
         assert!(!cfg.debug.list_handles);
-    }
-
-    #[test]
-    fn naively_trust_peer_authored_blocks_surfaces_in_unsafe_options() {
-        let mut cfg = JigServerConfig::default();
-        assert!(
-            !cfg.unsafe_options_active()
-                .contains(&"federation.naively_trust_peer_authored_blocks".to_string()),
-            "flag must not appear in active list when disabled"
-        );
-        cfg.federation.naively_trust_peer_authored_blocks = true;
-        assert!(
-            cfg.unsafe_options_active()
-                .contains(&"federation.naively_trust_peer_authored_blocks".to_string()),
-            "flag must appear in active list when enabled"
-        );
     }
 
     #[test]
@@ -701,7 +688,7 @@ mod tests {
         let mut cfg = JigServerConfig::default();
         cfg.debug.admin_endpoints = true;
         cfg.federation.dangerously_disable_federation_tls = true;
-        cfg.federation.naively_trust_peer_authored_blocks = true;
+        cfg.federation.dangerously_allow_plaintext_federation = true;
         cfg.identity.naively_allow_unknown_handles_fallback = true;
         cfg.debug.list_handles = true;
         cfg.auth.require_authenticated_reads = false;
@@ -709,7 +696,7 @@ mod tests {
         assert!(active.contains(&"auth.require_authenticated_reads=false".to_string()));
         assert!(active.contains(&"debug.admin_endpoints".to_string()));
         assert!(active.contains(&"federation.dangerously_disable_federation_tls".to_string()));
-        assert!(active.contains(&"federation.naively_trust_peer_authored_blocks".to_string()));
+        assert!(active.contains(&"federation.dangerously_allow_plaintext_federation".to_string()));
         assert!(active.contains(&"identity.naively_allow_unknown_handles_fallback".to_string()));
         assert!(active.contains(&"debug.list_handles".to_string()));
         assert!(active.contains(&"naively_unbounded_clock_skew".to_string()));
@@ -825,7 +812,30 @@ mod tests {
         .expect("partial [federation] must deserialize");
         assert!(cfg.federation.dangerously_disable_federation_tls);
         assert!(cfg.federation.peers.is_empty());
-        assert!(!cfg.federation.naively_trust_peer_authored_blocks);
+        assert!(!cfg.federation.dangerously_allow_plaintext_federation);
+    }
+
+    #[test]
+    fn plaintext_federation_flag_parses_and_surfaces() {
+        let mut cfg = JigServerConfig::default();
+        assert!(
+            !cfg.unsafe_options_active()
+                .contains(&"federation.dangerously_allow_plaintext_federation".to_string()),
+            "flag must not appear in active list when disabled"
+        );
+        cfg = toml::from_str(
+            r#"
+            [federation]
+            dangerously_allow_plaintext_federation = true
+        "#,
+        )
+        .expect("flag must deserialize");
+        assert!(cfg.federation.dangerously_allow_plaintext_federation);
+        assert!(
+            cfg.unsafe_options_active()
+                .contains(&"federation.dangerously_allow_plaintext_federation".to_string()),
+            "flag must appear in active list when enabled"
+        );
     }
 
     #[test]
