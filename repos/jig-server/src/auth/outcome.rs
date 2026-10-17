@@ -58,6 +58,8 @@ pub enum GateOutcome {
     AdmissionBelowRuleset { ruleset_key: String },
     /// The DID is explicitly refused by this server.
     AdmissionBanned,
+    /// The DID is new here and owes `bits` of proof of work first.
+    AdmissionProofRequired { bits: u8 },
     /// The DID, or the address the request came from, is over its rate.
     RateLimited,
 
@@ -87,6 +89,7 @@ impl GateOutcome {
             GateOutcome::AdmissionUnknownDid
             | GateOutcome::AdmissionBelowRuleset { .. }
             | GateOutcome::AdmissionBanned
+            | GateOutcome::AdmissionProofRequired { .. }
             | GateOutcome::RateLimited => Gate::Admit,
 
             GateOutcome::AuthzNotMember
@@ -125,6 +128,7 @@ mod tests {
                 ruleset_key: "highsec.v1".to_string(),
             },
             GateOutcome::AdmissionBanned,
+            GateOutcome::AdmissionProofRequired { bits: 20 },
             GateOutcome::RateLimited,
             GateOutcome::AuthzNotMember,
             GateOutcome::AuthzNotOwner,
@@ -146,6 +150,7 @@ mod tests {
                 GateOutcome::AdmissionUnknownDid
                 | GateOutcome::AdmissionBelowRuleset { .. }
                 | GateOutcome::AdmissionBanned
+                | GateOutcome::AdmissionProofRequired { .. }
                 | GateOutcome::RateLimited => Gate::Admit,
                 GateOutcome::AuthzNotMember
                 | GateOutcome::AuthzNotOwner
@@ -157,7 +162,7 @@ mod tests {
 
         assert_eq!(
             all.len(),
-            15,
+            16,
             "a variant was added without covering it here"
         );
     }

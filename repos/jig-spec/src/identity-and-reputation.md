@@ -285,6 +285,44 @@ a subject, unless `JIG_NS_ANON_ENABLED` is false, and treats every other challen
 low-sec. Turning the setting off removes the floor; it does not stop anonymous aliases
 being minted.
 
+### Admission proof-of-work (servers)
+
+A server MAY ask a DID it has no record of to do proof-of-work once, before the server
+serves that DID anything. The work is not a challenge: the server holds no state for a DID
+until the work is done, and anyone can check it.
+
+Both hashes below are BLAKE3 over labelled parts: for each `(label, value)` in order, the
+label's UTF-8 bytes, the value's length as a little-endian u64, then the value.
+
+- **Work.** The digest is over (`domain`, `jig-admission-pow-v1`), (`server`, the server's
+  DID), (`did`, the new DID) and (`nonce`, chosen by the client, at most 64 bytes). The work
+  is done when the digest has at least `bits` leading zero bits. It is bound to one server
+  and one DID, so it cannot be reused for another. A server MUST NOT ask for more than 28
+  bits, and a client SHOULD refuse to do more.
+- **Proof.** The client posts `{did, nonce, sig_b64}` to `POST /api/v1/admission`.
+  `sig_b64` is the DID's Ed25519 signature over the hash of (`domain`,
+  `jig-admission-v1`), (`server`), (`did`) and (`nonce`), so nobody can admit a key they do
+  not hold. The server MUST verify the signature and the work, and MUST refuse a banned
+  DID. It then records the DID as proven. A DID stays proven if the server later raises
+  `bits`.
+- **Standing.** A signed `GET /api/v1/admission` returns the caller's own `did`, `proven`
+  and `pow_bits`. It runs authentication only, not admission, so a DID that owes work can
+  ask, and it never answers for any DID but the signer's.
+- **Refusal.** Until the DID is proven, admission refuses it on every read, subscription
+  and write with `403 PROOF_OF_WORK_REQUIRED`.
+- **Relayed authors.** The author of a block relayed by a federated peer or submitted by a
+  bridge never spoke to this server, so is not asked for the work. Bans, floors and rate
+  limits still apply to it.
+
+The server advertises the bit count as `admission_pow_bits` at `/.well-known/jig`.
+
+**Status:** the reference server does this under `[auth.admission] unknown_dids =
+"proof-of-work"` with `pow_bits` (default 20, accepted 1 to 28); the default policy is
+still `admit`. The CLI does the work the first time it talks to such a server. At 20 bits
+the work is about a million hashes: under a second on a laptop and far less on a GPU. It
+makes minting identities to spread a flood across rate-limit buckets cost something; it
+does not stop a determined Sybil. Reputation is the answer to that (JEP-0003).
+
 ### Cross-registration within a ruleset group
 
 Nameservers in a high-sec ruleset group MUST cross-register identities: they share their
@@ -625,6 +663,8 @@ not yet meet.
 
 - Trust more than one nameserver (servers).
 - Use local reputation in admission policy (servers).
+- Ask a DID with no record for admission proof-of-work, bound to the server and the DID
+  (servers).
 - Anchor a ruleset group, join one, override its defaults, or run without one.
 - Map reputation between rulesets with translation contracts.
 - Set tribunal panel size, appeal limits and penalty ranges in a ruleset.

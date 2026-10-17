@@ -86,6 +86,14 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
             refusal: jig_pipeline::ingest::AdmissionRefusal::RateLimited,
             ..
         } => (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED", e.to_string()),
+        IngestError::NotAdmitted {
+            refusal: jig_pipeline::ingest::AdmissionRefusal::ProofRequired { .. },
+            ..
+        } => (
+            StatusCode::FORBIDDEN,
+            "PROOF_OF_WORK_REQUIRED",
+            e.to_string(),
+        ),
         IngestError::NotAdmitted { refusal, .. } => {
             (StatusCode::FORBIDDEN, "NOT_ADMITTED", refusal.to_string())
         }

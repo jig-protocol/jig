@@ -316,6 +316,63 @@ impl TestServer {
             .status()
     }
 
+    /// This server's DID, as `/.well-known/jig` advertises it.
+    pub fn server_did(&self) -> String {
+        self.state.server_did.to_did_jig_string()
+    }
+
+    /// Send a signed request through the full v0.0.2 router, for routes the
+    /// blocks router does not carry.
+    pub async fn send_full(&self, req: &SignedRequest) -> (StatusCode, serde_json::Value) {
+        let http = Request::builder()
+            .method(req.method.as_str())
+            .uri(&req.path)
+            .header(headers::DID, &req.did)
+            .header(headers::HLC_WALL_MS, req.hlc_wall_ms.to_string())
+            .header(headers::HLC_LOGICAL, req.hlc_logical.to_string())
+            .header(headers::NONCE, &req.nonce)
+            .header(headers::SIGNATURE, &req.sig_b64)
+            .body(Body::empty())
+            .unwrap();
+        self.dispatch_full(http).await
+    }
+
+    /// An unsigned GET through the full v0.0.2 router.
+    pub async fn send_unsigned_full(&self, path: &str) -> (StatusCode, serde_json::Value) {
+        let http = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        self.dispatch_full(http).await
+    }
+
+    /// POST `body` as JSON through the full v0.0.2 router.
+    pub async fn post_json(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let http = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap();
+        self.dispatch_full(http).await
+    }
+
+    async fn dispatch_full(&self, req: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let router = jig_server::v0_0_2_ws::build_v0_0_2_router(self.state.clone());
+        let resp = router.oneshot(req).await.expect("router responds");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
     async fn dispatch(&self, req: Request<Body>) -> (StatusCode, serde_json::Value) {
         // A fresh router per call, over the SAME state — so the replay guard
         // and store persist across requests, which is what makes the replay

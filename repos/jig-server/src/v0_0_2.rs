@@ -60,9 +60,12 @@ pub struct AppState {
 /// Every `AppState` constructor goes through here, so this is also where a
 /// peer that must not be dialed — a `ws://` URL without
 /// `dangerously_allow_plaintext_federation` — becomes a boot error.
-fn build_auth(config: &JigServerConfig) -> anyhow::Result<Arc<crate::auth::AuthState>> {
+fn build_auth(
+    config: &JigServerConfig,
+    store: Arc<SqliteStore>,
+) -> anyhow::Result<Arc<crate::auth::AuthState>> {
     crate::v0_0_2_federation::check_federation_transport(&config.federation)?;
-    let auth = crate::auth::AuthState::from_config(&config.auth)?;
+    let auth = crate::auth::AuthState::from_config(&config.auth)?.with_proofs(store);
     for (i, peer) in config.federation.peers.iter().enumerate() {
         auth.trust_federation_peer(&peer.expected_did)
             .with_context(|| format!("[federation] peers[{i}].expected_did"))?;
@@ -153,7 +156,7 @@ impl AppState {
 
         // Built before the ingest context so gate 2 can be installed on it;
         // `config` is moved into the struct literal below.
-        let auth = build_auth(&config)?;
+        let auth = build_auth(&config, store.clone())?;
 
         let ingest_ctx = Arc::new(IngestContext {
             store,
@@ -203,7 +206,7 @@ impl AppState {
 
         // Built before the ingest context so gate 2 can be installed on it;
         // `config` is moved into the struct literal below.
-        let auth = build_auth(&config)?;
+        let auth = build_auth(&config, store.clone())?;
 
         let ingest_ctx = Arc::new(IngestContext {
             store,
@@ -252,7 +255,7 @@ impl AppState {
 
         // Built before the ingest context so gate 2 can be installed on it;
         // `config` is moved into the struct literal below.
-        let auth = build_auth(&config)?;
+        let auth = build_auth(&config, store.clone())?;
 
         let ingest_ctx = Arc::new(IngestContext {
             store,

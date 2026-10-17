@@ -28,6 +28,8 @@ use crate::auth::GateOutcome;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReputationView {
     pub scores: BTreeMap<String, i64>,
+    /// The DID has done this server's admission proof of work.
+    pub proven: bool,
 }
 
 impl ReputationView {
@@ -43,6 +45,10 @@ impl ReputationView {
 pub enum UnknownDids {
     Admit,
     Refuse,
+    /// Admit once the DID has done `bits` of proof of work.
+    ProofOfWork {
+        bits: u8,
+    },
 }
 
 /// A reputation floor: refuse a DID whose score under `ruleset_key` is below
@@ -68,7 +74,7 @@ impl AdmissionPolicy {
     /// one where "open channel" means open to the admitted, and ungated
     /// surfaces (`/metrics`) must stop naming even open channels.
     pub fn refuses_anyone(&self) -> bool {
-        self.unknown_dids() == UnknownDids::Refuse
+        self.unknown_dids() != UnknownDids::Admit
             || !self.floors.is_empty()
             || !self.banned_dids.is_empty()
     }
@@ -128,11 +134,18 @@ pub fn admit(
         return Err(GateOutcome::AdmissionBanned);
     }
 
+    // What an unknown DID gets: refused, asked for work it has not done, or
+    // admitted.
+    let unknown = || match policy.unknown_dids() {
+        UnknownDids::Refuse => Err(GateOutcome::AdmissionUnknownDid),
+        UnknownDids::ProofOfWork { bits } if !view.proven => {
+            Err(GateOutcome::AdmissionProofRequired { bits })
+        }
+        _ => Ok(()),
+    };
+
     if policy.floors.is_empty() {
-        return match (view.is_empty(), policy.unknown_dids()) {
-            (true, UnknownDids::Refuse) => Err(GateOutcome::AdmissionUnknownDid),
-            _ => Ok(()),
-        };
+        return if view.is_empty() { unknown() } else { Ok(()) };
     }
 
     for floor in &policy.floors {
@@ -145,11 +158,7 @@ pub fn admit(
             Some(_) => {}
             // No score under this ruleset: unknown for it. Never a
             // comparison against `minimum`.
-            None => {
-                if policy.unknown_dids() == UnknownDids::Refuse {
-                    return Err(GateOutcome::AdmissionUnknownDid);
-                }
-            }
+            None => unknown()?,
         }
     }
     Ok(())
@@ -167,6 +176,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect(),
+            proven: false,
         }
     }
 
@@ -196,6 +206,47 @@ mod tests {
             admit(DID, &nobody, &policy(UnknownDids::Refuse, vec![], &[])),
             Err(GateOutcome::AdmissionUnknownDid)
         );
+    }
+
+    /// Under proof of work an unknown DID owes the work until it has done
+    /// it. A DID the server has a record for is known and owes nothing, and
+    /// the work never outranks a ban or a floor.
+    #[test]
+    fn proof_of_work_admits_an_unknown_did_once_it_is_proven() {
+        let pow = || policy(UnknownDids::ProofOfWork { bits: 9 }, vec![], &[]);
+        let nobody = ReputationView::default();
+        assert_eq!(
+            admit(DID, &nobody, &pow()),
+            Err(GateOutcome::AdmissionProofRequired { bits: 9 })
+        );
+        let proven = ReputationView {
+            proven: true,
+            ..ReputationView::default()
+        };
+        assert_eq!(admit(DID, &proven, &pow()), Ok(()));
+        assert_eq!(admit(DID, &view(&[("r", 1)]), &pow()), Ok(()));
+
+        let banned = policy(UnknownDids::ProofOfWork { bits: 9 }, vec![], &[DID]);
+        assert_eq!(
+            admit(DID, &proven, &banned),
+            Err(GateOutcome::AdmissionBanned)
+        );
+        let floored = policy(
+            UnknownDids::ProofOfWork { bits: 9 },
+            vec![floor("r", 0)],
+            &[],
+        );
+        let low = ReputationView {
+            proven: true,
+            ..view(&[("r", -1)])
+        };
+        assert_eq!(
+            admit(DID, &low, &floored),
+            Err(GateOutcome::AdmissionBelowRuleset {
+                ruleset_key: "r".to_string()
+            })
+        );
+        assert!(pow().refuses_anyone(), "/metrics must stop naming channels");
     }
 
     /// A server that never wrote an admission section has not decided to

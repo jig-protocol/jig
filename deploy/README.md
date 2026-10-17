@@ -123,10 +123,12 @@ the default):
 What it does not enforce yet — the reasons to keep `bind_address` on the
 tailnet:
 
-- **No rate limiting or proof-of-work, and no reputation scoring.** Admission
-  consumes scores the operator wrote down; nothing computes or exchanges them
-  yet. With the default `unknown_dids = "admit"`, anyone who can reach the
-  port can create channels and post to open ones, unthrottled.
+- **No reputation scoring.** Admission consumes scores the operator wrote
+  down; nothing computes or exchanges them yet. With the default
+  `unknown_dids = "admit"`, anyone who can reach the port can create channels
+  and post to open ones, within `[auth.rate_limit]`. `unknown_dids =
+  "proof-of-work"` makes each new key do some hashing first, which slows an
+  identity flood but does not stop one.
 - **Federated peers are trusted.** Blocks relayed from a peer are persisted
   and delivered to local subscribers without running the write gate. Only
   federate with servers you would let post on your behalf.

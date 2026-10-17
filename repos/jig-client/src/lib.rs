@@ -6,6 +6,7 @@
 //! goal is one shared client implementation so bug fixes propagate
 //! to every consumer.
 
+pub mod admission;
 pub mod blocks;
 pub mod connection;
 pub mod identity;
