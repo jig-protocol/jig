@@ -4,8 +4,10 @@ Where jig is going, in phases from a public alpha (`v0.1`) to a distributed OS (
 decisions that shape the path. Last updated 2026-10-17.
 
 **Status in one line:** v0.1 groundwork is tagged (`v0.1.0-alpha.1`, no published release yet),
-and v0.2's per-channel MLS encryption is merged on `main`. For what works today, gate by gate, see
-[`RELEASE_READINESS.md`](RELEASE_READINESS.md). This doc is the direction, not the status page.
+and on `main` v0.2 has per-channel MLS encryption, TLS by default, clients that pin the server's
+identity and each channel's suite, rate limits and opt-in proof-of-work at admission. For what
+works today, gate by gate, see [`RELEASE_READINESS.md`](RELEASE_READINESS.md). This doc is the
+direction, not the status page.
 
 Each phase lands as JEPs in [`repos/jig-spec/jep/`](../repos/jig-spec/jep/) before code. Milestone
 names in PRs map to phases: **M1** = phase 0 (`v0.1`), **M2** = phase 1 (`v0.2`), and so on.
@@ -137,6 +139,18 @@ MLS (RFC 9420, `openmls`) per channel, with the server as a validating delivery 
 no group secret; DMs as locked encrypted channels; `member-remove` (kick and leave); channel
 dynamics in the CLI.
 
+Then the smaller hardening items, each one PR:
+
+- Wasm determinism: modules are validated against a feature allowlist before they run (#87).
+- The email bridge no longer writes to `#dm/` channels; the prefix is reserved for DMs (#89).
+- Federated blocks run through `ingest` and the write gate; peers are pinned and listed (#90).
+- Clients pin the server's DID from its signed welcome and each channel's suite from its signed
+  creation block, and refuse a server or channel that later claims otherwise (#91).
+- Token-bucket rate limits per DID and per address, in front of the gates (#92).
+- Proof-of-work at admission for DIDs a server has not seen, off by default (#94).
+- TLS on by default: a self-signed certificate that the server's DID vouches for at
+  `/.well-known/jig`, so clients trust it through the DID they pin; TLS 1.3 only (#95).
+
 Still to do in this phase:
 
 - **Crypto design (D13):** how a non-MLS scheme (for example Signal's post-quantum protocol) plugs
@@ -146,7 +160,7 @@ Still to do in this phase:
 - **Federation as a data contract (D12):** encrypted channels across servers, with the suite fixed
   in the channel's initial contract, and nameserver-led shared contracts for trusted subnets.
 - Multi-device and key rotation; a server-key rotation ceremony.
-- TLS on by default (self-signed + TOFU, or ACME); rate limiting and proof-of-work at admission.
+- ACME certificates, and TLS on the nameserver (it still serves plaintext).
 - Signed peer policy (federation already runs through the write gate).
 - An external security audit of `jig-core`, `jig-runtime`, the crypto and the handshake.
 
