@@ -1,6 +1,6 @@
 //! Inbound webhook handler: provider webhook -> verified, parsed, deduped ->
 //! a text-render block authored by the sender's shadow identity, submitted to
-//! ingest. Also ensures the 1:1 DM channel + memberships exist on first contact.
+//! ingest. Also ensures the 1:1 thread channel + memberships exist on first contact.
 
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use jig_bridge_core::{BridgeStorage, ManagedDidRegistrar, SubmitDenied, SubmitHa
 use jig_client::Identity;
 
 use crate::address_book::AddressBook;
-use crate::channel::{dm_channel_slug, ensure_dm_channel, submit_built_block};
+use crate::channel::{ensure_thread_channel, submit_built_block, thread_slug};
 use crate::identity::shadow_signing_key;
 use crate::provider::EmailProvider;
 use crate::{CHANNEL_EMAIL_NS, MAX_INLINE_BYTES};
@@ -98,8 +98,8 @@ pub async fn handle_inbound(
             return StatusCode::INTERNAL_SERVER_ERROR;
         }
     };
-    let slug = dm_channel_slug(&shadow_did, &recipient_did);
-    if let Err(e) = ensure_dm_channel(
+    let slug = thread_slug(&shadow_did, &recipient_did);
+    if let Err(e) = ensure_thread_channel(
         &state.submit,
         &*state.storage,
         &shadow,
@@ -282,7 +282,7 @@ mod tests {
         let storage: Arc<dyn BridgeStorage> = Arc::new(MemStore::default());
         let sender = shadow_did("secret", "alice@example.com", false).to_did_jig_string();
         let recipient = shadow_did("secret", "dj@jig.onl", false).to_did_jig_string();
-        let slug = dm_channel_slug(&sender, &recipient);
+        let slug = thread_slug(&sender, &recipient);
         storage
             .put("channel-ensured", &slug, b"1", None)
             .await
