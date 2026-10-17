@@ -106,11 +106,9 @@ repos/
 
 ## License
 
-- **jig-core**: MIT (portable protocol implementation)
-- **jig-server**: AGPL-3.0 (server software)
-- **jig-cli**: MIT (client tool)
-- **jig-runtime**: MIT (execution engine)
-- See individual component licenses for details
+Every crate in this workspace is licensed `MIT OR Apache-2.0`, at your option. The spec
+(`jig-spec/`) is CC-BY-4.0. See the root [`README.md`](../README.md#license) and
+`LICENSE-MIT` / `LICENSE-APACHE`.
 
 ---
 

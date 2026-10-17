@@ -37,10 +37,12 @@ network is the machine: Alan Kay's "objects all the way down".
   Identities are self-certifying `did:jig` keys.
 - **One write path.** Every surface goes through `ingest → authorize → effect → persist → fanout`.
 - **Encryption is composable and chosen by the server operator.** The envelope carries a
-  cipher-suite identifier ([JEP-0001](../repos/jig-spec/jep/jep-0001-encryption-suites.md)). The
-  default is MLS, and nothing in the protocol stops an operator running another scheme.
-- **MLS for everything by default.** There is no separate DM scheme. A DM is a channel with locked
-  membership, so a conversation grows from DM to group DM to channel without changing schemes.
+  cipher-suite identifier ([JEP-0001](../repos/jig-spec/jep/jep-0001-encryption-suites.md)). MLS
+  is the default and the first suite implemented. Suites are plug-and-play: an operator who wants
+  Signal's protocol, a post-quantum scheme or something else can run it instead, and nothing in the
+  protocol stops them.
+- **MLS for everything by default.** DMs don't get a scheme of their own. A DM is a channel with
+  locked membership, so a conversation grows from DM to group DM to channel without changing suites.
 - **Server operators are untrusted.** Every connection starts with a mandatory handshake
   ([JEP-0002](../repos/jig-spec/jep/jep-0002-handshake.md)), and clients fail closed when it is
   missing or contradicted. The [threat register](../repos/jig-spec/src/threat-register.md) tracks
@@ -57,6 +59,11 @@ network is the machine: Alan Kay's "objects all the way down".
 - **Servers are findable from inside the protocol.** Discovery runs through nameservers, with
   proof-of-work and reputation designed in rather than bolted on
   ([JEP-0003](../repos/jig-spec/jep/jep-0003-server-discovery.md)).
+- **Anchor nameservers coordinate; they don't rule.** A nameserver can anchor a high-security zone,
+  giving it a starting point for coordination (default proof-of-work, address conventions, dispute
+  handling) so nobody has to bootstrap one from scratch. Joining is opt-in. Anyone can run their own
+  zones at any security level, with their own anchors, or just connect to servers without hosting
+  anything.
 - **Keep the spec small.** `jig-spec` holds final decisions, normative and terse. Modelling,
   alternatives and justifications go in `docs/` and link to the spec.
 
@@ -219,7 +226,7 @@ Settled on 2026-10-05 unless noted. Open items follow the table.
 | # | Question | Decision |
 | --- | --- | --- |
 | D1 | E2EE in v0.1 or v0.2? | v0.2. v0.1 reserves the wire and spec hooks for operator-chosen encryption. |
-| D2 | HPKE / `age` sealing, or MLS? | MLS for everything. A DM is a channel with locked membership, so DM → group DM → channel is a membership change. |
+| D2 | HPKE / `age` sealing, or MLS? | MLS as the default suite for everything, with no DM-specific scheme. A DM is a channel with locked membership, so DM → group DM → channel is a membership change. Other suites plug in per D1. |
 | D4 | A public jig server as a hello-world target? | Try one in v0.1, experimental and unencrypted, kept off the critical 60-second path. |
 | D5 | Go public with history, or squash? | Public with full history after a secrets scrub; archive the pre-monorepo repos. Done 2026-10-06. |
 | D6 | Publish crates, or binaries only? | Reserve names now (low priority). Publish `jig-core` + `jig-client` once v0.2 stabilizes the wire. |
@@ -232,6 +239,7 @@ Settled on 2026-10-05 unless noted. Open items follow the table.
 | D13 | Signal's post-quantum protocol vs MLS as the plug-in shape? | **Open:** settled in the v0.2 crypto design. |
 | D15 | Discovery design? | A design project of its own, with proof-of-work and reputation built in. Only the JEP stub is in v0.1. |
 | D18 | Where does the threat register live? | Decisions in `jig-spec`, normative and terse; analysis in `docs/`. |
+| D19 | Does an anchor nameserver set rules for the network? | No. An anchor gives a high-security zone initial coordination, and joining it is opt-in. Users can run their own zones at any security level, or just connect to servers. Settled 2026-10-13. |
 
 D3, D14, D16 and D17 concern the Riverdance GUI's licence and internal hosting and are tracked
 outside this repo.
