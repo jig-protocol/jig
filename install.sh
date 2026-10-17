@@ -44,7 +44,7 @@ JIG_DEFAULT_CHANNEL="${JIG_DEFAULT_CHANNEL:-#hello}"
 # Release signing key (trust root), in ssh allowed_signers format. Must match
 # .github/release/allowed_signers; the release workflow refuses to publish if
 # the two drift. Overridable only so CI can test against a throwaway key.
-JIG_RELEASE_SIGNER="${JIG_RELEASE_SIGNER:-jig-release namespaces=\"jig-release\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPWl5eoqC5CMrUrwIT0xexR698+V85uiNWsHea2iHZYW}"
+JIG_RELEASE_SIGNER="${JIG_RELEASE_SIGNER:-jig-release namespaces=\"jig-release\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGFgYuNUl5Z8A3AwRUo2PxIg+MziW2zxjboNOq4ZhXq4}"
 
 log()  { printf '[jig] %s\n' "$*"; }
 warn() { printf '[jig] WARN: %s\n' "$*" >&2; }

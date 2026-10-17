@@ -52,10 +52,9 @@ three parts, always in this order:
 
 - In **Obligations**, each item ends with where it is settled:
   - a numbered decision in the roadmap's [decisions log](../ROADMAP.md#decisions-log) (D1,
-    D11, D12, D19, …);
-  - **decided 2026-10-16**, the maintainer's decisions on `--anon`, reputation scope,
-    encrypted abuse reports, nameserver obligations and channel ownership (listed in
-    [section 16.1](#161-decisions-recorded));
+    D11, D12, D19, …), including D20 to D24 on `--anon`, reputation scope, encrypted abuse
+    reports, the nameserver obligations with the server/nameserver split, and channel
+    ownership (listed in [section 16.1](#161-decisions-recorded));
   - **maintainer**, the security-level model the maintainer set out in review of the
     identity spec and earlier drafts of this paper, not yet numbered in the log;
   - a design document, a roadmap principle, or a threat-register entry;
@@ -84,22 +83,25 @@ These words carry precise meanings throughout.
 - **DID.** A `did:jig` identifier, which is an ed25519 public key. A holder may hold many.
 - **Alias.** A human-readable name such as `alice@example.jig`, mapped to a DID by a
   nameserver that signs the mapping.
+- **Server.** The execution and enforcement boundary. A server looks clients up by DID and
+  deals with them under policies it presets and the client agrees to
+  ([section 8](#8-nameservers-in-a-ruleset-group-and-anchors)).
 - **Nameserver.** A service that attests aliases. Inside a ruleset group, its nameservers
-  also keep the group's shared registry, reputation, proof-of-work parameters and
-  transparency log.
+  also keep the group's shared registry, hold its tribunals, compute and enforce net
+  reputation changes, and enforce servers' good behaviour.
 - **Ruleset.** A published, versioned document, named by its hash, that states how
   identities are registered, what is enforced, what proof-of-work costs, how reputation
   moves, how unknown keys are treated, and who judges disputes.
-- **Ruleset group.** One concrete group of servers and nameservers that have adopted the same
-  ruleset. Reputation, penalties and registrations are shared within one ruleset group and
-  nowhere else. A ruleset's numbers are kept by the group that applies it: two groups never
-  share a number, even if their ruleset texts are identical. A single server applying its own
-  ruleset alone is a ruleset group of one.
+- **Ruleset group.** One concrete group of servers, clients and nameservers that have all
+  agreed to be rated by the same ruleset, whose rules produce the same reputation maths for
+  every member. Reputation, penalties and registrations are shared within one ruleset group.
+  Interop between groups, by translation under a data contract, is possible but comes later.
+  A server with no nameserver sets its own policy.
 - **Security level.** A category describing how demanding a ruleset is: **high-sec**,
   **low-sec** or **null-sec** ([section 7](#7-security-levels-and-ruleset-groups)). A level
   describes a ruleset, and so the servers and groups that apply it; never a user. It is a
-  description, not a party: two high-sec ruleset groups share a level and nothing else, and
-  nothing is shared across a security level.
+  description, not a party: two high-sec ruleset groups share a level and nothing else
+  unless they agree a translation, and nothing is pooled across a security level.
 - **Trusted subnet.** A set of servers whose operators trust each other, such as one
   organisation's sites, that agree to share federation contracts
   ([section 9](#9-federation-as-a-data-contract)).
@@ -342,19 +344,19 @@ are where key substitution happens (OP-08).
 
 1. **`--anon` is a fresh, unregistered session key.** The client mints a key for the session,
    registers it nowhere, and discards it afterwards. It still signs and still proves
-   possession: it is unregistered, not unauthenticated. *(Decided 2026-10-16.)*
+   possession: it is unregistered, not unauthenticated. *(D20.)*
 2. **No protocol link between an `--anon` identity and a DID.** There is no in-protocol link
    between an `--anon` key and any other DID the holder holds, no warrant-based unmasking,
    and no escrowed mapping. Earlier drafts described a "dual" mode in which an anonymous
    persona and a verified one were linked, with the link revealable by a tribunal under
    warrant. That design is dropped: a link that exists can be compelled, stolen or leaked,
    and whoever holds the unmasking key becomes the most valuable target on the network. The
-   only safe link is one that does not exist. *(Decided 2026-10-16.)*
+   only safe link is one that does not exist. *(D20.)*
 3. **What a server does with an `--anon` key is server policy, and a separate question.**
    Whether a server looks the key up against a nameserver, and what it does with the result
    or its absence (admit it as unknown, ask for proof-of-work, allow reads only, refuse), is
    set by the server's ruleset. The protocol does not prescribe it, and nothing on the wire
-   marks a key as `--anon`. *(Decided 2026-10-16.)*
+   marks a key as `--anon`. *(D20.)*
 4. **An `--anon` key carries no reputation beyond its session.** It is unknown everywhere
    ([section 6.1](#61-obligations)) and bears whatever cost the server's ruleset sets for
    unknown keys. *(Derived from 1.)*
@@ -404,15 +406,19 @@ a network layer jig does not provide.
 1. **Reputation is one number per ruleset.** Under each ruleset that has observed it, a DID
    has a single number that behaviour moves up or down. There are no stages, ranks or tiers
    to graduate through; older drafts that moved users from null-sec to low-sec to high-sec by
-   meeting thresholds are superseded. *(Decided 2026-10-16.)*
-2. **Shared within a ruleset group, never across a security level.** The servers and
-   nameservers of one ruleset group may share a DID's number under their ruleset. Two
-   high-sec ruleset groups keep separate numbers under separate rulesets; there is no
-   "high-sec standing", no global scalar, and nothing an attacker can inflate everywhere at
-   once. *(Decided 2026-10-16.)*
-3. **Reputation is required.** Nameservers and a ruleset group's security posture do not
-   work without it, together with proof-of-work, tribunals and the transparency log
-   ([section 8](#8-nameservers-in-a-ruleset-group-and-anchors)). *(Decided 2026-10-16.)*
+   meeting thresholds are superseded. *(D21.)*
+2. **A shared ruleset comes first.** The servers, clients and nameservers of a ruleset group
+   all agree to be rated by the same rules, and those rules produce the same reputation maths
+   for every member, so a number means the same thing wherever the group uses it.
+   Reputation is never pooled across a security level: there is no "high-sec standing", no
+   global scalar, and nothing an attacker can inflate everywhere at once. *(D21.)*
+3. **Reputation is required, and its work is split.** Nameservers and a ruleset group's
+   security posture do not work without it, together with proof-of-work, tribunals and
+   transparency logs ([section 8](#8-nameservers-in-a-ruleset-group-and-anchors)). A server
+   decides about the clients it serves by reputation, using its nameserver network's
+   ruleset, a ruleset it keeps privately, or none, and reports reputation changes for those
+   clients to the nameservers it belongs to. The nameservers compute and enforce the *net*
+   change from every server's reports, not one server's marginal observation. *(D23.)*
 4. **Unknown is not low.** A DID with no number under a ruleset is *unknown* for that
    ruleset. Floors never apply to it; only the ruleset's policy for unknown keys does. If
    unknown silently meant "below threshold", a holder who discarded a key under pressure
@@ -427,10 +433,11 @@ a network layer jig does not provide.
 7. **Sybil and collusion resistance that holds.** Reputation must not be inflatable by many
    cheap identities, by vouching rings, by forged time or by colluding nameservers. The
    known attack classes are listed in section 6.3; each must be answered in full in the
-   phase that builds reputation. *(Decided 2026-10-16; AB-05.)*
+   phase that builds reputation. *(D23; AB-05.)*
 8. **Servers and nameservers carry numbers too**, under the rulesets that observe them. A
-   signed lie, such as a false attestation or a broken federation contract, moves the
-   signer's number; that is where attribution earns its consequence. *(Maintainer.)*
+   signed lie, such as a false attestation, a false reputation report or a broken federation
+   contract, moves the signer's number; that is where attribution earns its consequence.
+   Nameservers enforce servers' good behaviour this way. *(Maintainer; D23.)*
 
 ### 6.2 Today (v0.2)
 
@@ -441,8 +448,8 @@ a network layer jig does not provide.
   ([`jig-server/src/auth/`](../../repos/jig-server/src/auth/),
   [`ingest.rs`](../../repos/jig-pipeline/src/ingest.rs) step 1b).
 - **Partial.** Scores are held as `ruleset key → score`, and floors name the ruleset they
-  apply to. The scores are seeded from operator
-  configuration (`[auth.admission] records`). Nothing computes them, and nothing is shared
+  apply to. The scores are seeded from operator configuration (`[auth.admission] records`).
+  Nothing computes them, servers report nothing to nameservers, and nothing is shared
   between servers.
 - **Built.** The handshake's `reputation` field is signed and is `null`
   ([`handshake.rs`](../../repos/jig-pipeline/src/handshake.rs)).
@@ -452,9 +459,12 @@ a network layer jig does not provide.
   sequencing rule for v0.x; it does not weaken obligation 3.
 - **Prototype.** The nameserver's experimental surface
   ([`jig-nameserver/src/server.rs`](../../repos/jig-nameserver/src/server.rs)) records
-  reputation observations and summaries and adjusts proof-of-work difficulty by penalty. Its
-  configuration models reputation as per-user `ReputationZone` tiers, the model obligation 1
-  supersedes. Neither the alias flow nor `jig-server` uses it. It is a prototype of
+  reputation observations and summaries, computes a per-nameserver aggregate, and adjusts
+  proof-of-work difficulty by penalty. It parses rulesets and translation contracts but
+  applies only a ruleset's proof-of-work multiplier, and it stores reputation gossip from
+  peers without applying it. Its configuration models reputation as per-user
+  `ReputationZone` tiers, the model obligation 1 supersedes. Neither the alias flow nor
+  `jig-server` uses it. It is a prototype of
   obligations 3 and 7, not an implementation of them, and must not be relied on.
 - **None.** Reputation inputs, decay, vouching, numbers for servers and nameservers, and
   ruleset acknowledgement.
@@ -488,15 +498,21 @@ a network layer jig does not provide.
   [`docs/security/nameserver-abuse-economics.md`](../security/nameserver-abuse-economics.md).
   The design must make *standing* costly, not just *existence*, and must ensure that many
   cheap identities never add up to the standing of one costly one (AB-05).
-- **Known attack classes the design must answer in full** (decided 2026-10-16), each tied to
+- **Known attack classes the design must answer in full** (D23), each tied to
   a register entry: identity farming (AB-05); distributed solving of proof-of-work (AB-02);
   challenge replay and theft of solved challenges (AB-01); vouching rings and collusion
   between identities; whitewashing straight after a penalty; buying or renting aged keys,
   since standing attaches to a key and keys can be sold; fast-forwarded clocks (TM-01);
   colluding or equivocating nameservers (NS-02, NS-03); and capture of the panels that issue
   penalties (GV-01, GV-02).
-- **Open.** Who keeps the number for a server or a nameserver, under which ruleset, and how
-  a signed lie reaches it.
+- **Open: the reporting contract.** What a server's reputation report to its nameservers
+  contains (subject, change, evidence by CID), how it is signed, and how nameservers combine
+  reports from many servers into one net change that a single lying server cannot move far.
+- **Open.** Who keeps the number for a nameserver, under which ruleset, and how a signed lie
+  by a nameserver reaches it.
+- **Later: interop between ruleset groups.** Translating one group's numbers into another's
+  under a data contract both agreed to (the spec's translation contracts). Possible, but not
+  a first priority (D21).
 - **Open.** How reputation feeds the handshake's `reputation` field (JEP-0003).
 
 ---
@@ -506,11 +522,12 @@ a network layer jig does not provide.
 ### 7.1 Obligations
 
 1. **A security level describes a ruleset, and so the servers and ruleset groups that apply
-   it; never a user.** A user does not have a level. A user connects to servers, and each server applies a ruleset at some level.
-   *(Maintainer.)*
-2. **Sharing happens only within a ruleset group.** Reputation, penalties, tribunal outcomes
-   and registrations are shared among the servers and nameservers of one ruleset group, and
-   never across a security level. *(Decided 2026-10-16.)*
+   it; never a user.** A user does not have a level. A user connects to servers, and each
+   server applies a ruleset at some level. *(Maintainer.)*
+2. **Sharing happens within a ruleset group.** Reputation, penalties, tribunal outcomes and
+   registrations are shared among the servers and nameservers of one ruleset group, and never
+   pooled across a security level. Interop between groups, by translation under a data
+   contract, is possible but comes later. *(D21.)*
 3. **Joining is opt-in, and leaving is always possible.** A server or nameserver joins a
    ruleset group by choice. A holder can always leave: they stop using that identity and
    connect elsewhere ("just fly out"). No ruleset group can follow a holder out, because none
@@ -531,7 +548,7 @@ What each level means, as a description of what rulesets at that level require:
 | --- | --- | --- | --- |
 | Identity registration | The group's nameservers cross-register identities; one alias maps to one DID across the group | A local nameserver, or TOFU | Not required; unregistered keys, `--anon` included, are typically admitted |
 | Enforcement | Penalties and tribunal outcomes apply on every server in the group | Local to the server | Whatever the operator does, which may be nothing |
-| Proof-of-work | Required; difficulty is a ruleset parameter and may scale with reputation | Lighter; required at any nameserver | The server's choice |
+| Proof-of-work | Enforced by servers; difficulty is a ruleset parameter and may scale with reputation | Lighter; set by the server's ruleset | The server's choice |
 | Reputation | One number per DID under the group's ruleset, shared within the group | Local to the server | Transient, at most per session |
 | Character | Cross-validated, accountable | Community default | The IRC-like wild west |
 
@@ -615,24 +632,32 @@ a high-sec ruleset group, cross-checked.
 1. **No nameserver is an authority.** A DID is valid without one. Every attestation is a
    claim by the nameserver that signed it, and a signed lie is evidence against it.
    *(Maintainer; NS-01.)*
-2. **Four mechanisms are required, together.** Nameservers and a ruleset group's security
-   posture do not work without proof-of-work, reputation, tribunals and a transparency log.
-   These are obligations, not experiments to retire. *(Decided 2026-10-16.)* Every
-   nameserver, and every ruleset group that shares reputation, penalties or registrations,
-   runs all four; their parameters are the ruleset's. A single server that applies its own
-   ruleset alone sets its own. *(Scope: derived, for confirmation.)*
-   - **Proof-of-work** is a rate cost on registration and other costly actions. It is never
-     the only gate, and it is not by itself a Sybil defence (AB-02, AB-05).
-   - **Reputation** is section 6.
-   - **Tribunals** are section 13.
-   - **A transparency log**: registrations, rotations, penalties and verdicts are appended to
-     an append-only log every member of the group can audit, so equivocation and silent
-     erasure are detectable (NS-02, NS-03).
+2. **Four mechanisms are required, split between servers and nameservers.** Nameservers and
+   a ruleset group's security posture do not work without proof-of-work, reputation,
+   tribunals and transparency logs. These are obligations, not experiments to retire.
+   Servers are the execution and enforcement boundary: a server looks clients up by DID and
+   deals with them under policies it presets and the client agrees to. *(D23; spec:
+   [Servers and nameservers](../../repos/jig-spec/src/identity-and-reputation.md#servers-and-nameservers).)*
+   - **The server** enforces proof-of-work on the clients it serves. It decides about a
+     client by reputation, using a ruleset recorded in its nameserver network, a ruleset it
+     holds privately, or none. It reports reputation changes for the clients it works with
+     to the nameservers it belongs to, as part of its data contract with them. It keeps its
+     own transparency log of what it enforced and reported.
+   - **The nameservers** hold the group's tribunals ([section 13](#13-tribunals)). They
+     compute and enforce *net* reputation changes from every member server's reports, not
+     one server's marginal observation ([section 6](#6-reputation)). They enforce servers'
+     good behaviour, through servers' own numbers and penalties. Their transparency log
+     records registrations, rotations, net reputation changes, penalties and verdicts, so
+     equivocation and silent erasure are detectable (NS-02, NS-03).
+   - **Proof-of-work** is a rate cost, never the only gate, and not by itself a Sybil
+     defence (AB-02, AB-05). A nameserver's own binding endpoints, such as alias
+     registration, are an ingress too and require it.
+   - **A server with no nameserver** sets its own policy for all of this.
 3. **Known attack classes are answered in full in the phase that builds them**, starting
    with linear Sybil cost; the list is in [section 6.3](#63-to-be-designed). A mechanism that
-   leaves an applicable class open does not meet obligation 2. *(Decided 2026-10-16.)*
-4. **In a high-sec ruleset group, nameservers cross-register.** The group's nameservers share their
-   registries, so a registration on one is known to all. That gives one alias, one DID,
+   leaves an applicable class open does not meet obligation 2. *(D23.)*
+4. **In a high-sec ruleset group, nameservers cross-register.** The group's nameservers
+   share their registries, so a registration on one is known to all. That gives one alias, one DID,
    group-wide; cross-validation, in which a single compromised nameserver produces a
    disagreement, not a substitution; and shared consequences, so a DID cannot abuse one
    server in the group and move to the next. *(Maintainer.)*
@@ -652,6 +677,8 @@ a high-sec ruleset group, cross-checked.
 - **Built.** The alias flow (challenge, register, resolve, renew, rotate) in section 4.2.
 - **None.** Nameservers do not coordinate or cross-register. There are no group-wide claims,
   no ruleset groups and no anchors.
+- **None.** Servers enforce no proof-of-work, report no reputation changes to nameservers,
+  and keep no transparency log.
 - **None.** Registration through the alias flow (`/v1/register`, which `jig init` and
   `jig ns` use) has no proof-of-work and no rate limit. The experimental surface's own
   `claim` and `alias` endpoints, below, do apply them.
@@ -660,9 +687,9 @@ a high-sec ruleset group, cross-checked.
   ([`jig-nameserver/src/server.rs`](../../repos/jig-nameserver/src/server.rs)):
   proof-of-work challenges with penalty-adjusted difficulty
   ([`pow.rs`](../../repos/jig-nameserver/src/pow.rs)), reputation observations, tribunal case
-  records, a transparency log that computes Merkle roots over its entries
-  ([`transparency.rs`](../../repos/jig-nameserver/src/transparency.rs)), policy-hash exchange
-  and peer gossip. The alias flow and `jig-server` use none of it. It explores the shape of
+  records, transparency-log storage with a chain verifier
+  ([`transparency.rs`](../../repos/jig-nameserver/src/transparency.rs)) to which the running
+  service writes no entries, policy-hash exchange and peer gossip. The alias flow and `jig-server` use none of it. It explores the shape of
   obligation 2 and meets none of it: its proof-of-work is per identity, its reputation model
   is the superseded tier model, and its log is kept by one nameserver with nobody
   cross-checking it. Treat it as a prototype of the obligations, not as the protocol, and do
@@ -680,9 +707,13 @@ a high-sec ruleset group, cross-checked.
 - **Open.** How a ruleset group establishes that its nameservers have independent operators
   without a central registry of operators (NS-03, GV-01), and what happens to a registration
   during a network partition.
-- **Open: the transparency log.** What else is logged, and in what form; who signs log heads; how a client checks
-  inclusion and consistency; how personal data stays out of an append-only record; and how
-  the log of one group relates to another's (it does not merge with it).
+- **Open: the server–nameserver data contract.** What a server agrees to when it joins a
+  ruleset group (the reputation-report format, proof-of-work floors, publishing its log), what
+  the nameservers owe it in return, and how a server that breaks the contract is penalised.
+- **Open: transparency logs.** For servers and for nameservers: what else is logged, and in
+  what form; who signs log heads; how a client checks inclusion and consistency; how personal
+  data stays out of an append-only record; and how the logs of one group relate to another's
+  (they do not merge).
 - **Open: proof-of-work that holds.** Difficulty as a ruleset parameter scaled by reputation,
   applied per action as well as per identity, and paired with the defences in section 6.3 so
   that its linear cost is not the only barrier.
@@ -712,7 +743,7 @@ a high-sec ruleset group, cross-checked.
 2. **Use cases and clients are not typed at this layer.** A chat server and an industrial
    orchestrator can carry one channel without knowing what the other is. Federation agrees on
    bytes, signatures and suite, and nothing about what the bytes mean. *(Roadmap principle.)*
-3. **A channel has, by definition, one owning server.** *(Decided 2026-10-16.)*
+3. **A channel has, by definition, one owning server.** *(D24.)*
 4. **A peer is a transport, not a source of authority.** A receiving server re-verifies every
    relayed block's author signature and runs the same gates a local block passes before
    persisting it. *(OP-09 for authorship, version and suite; roadmap item 18 for the write
@@ -954,13 +985,13 @@ every member. It can withhold, delay and reorder blocks (OP-06).
 2. **Abuse in encrypted channels must be reportable to a tribunal, with proof.** Every
    abusive incident involves at least two keys, the abuser's and the victim's. The victim can
    therefore delegate their key, or their view of the incident, to prove what happened. No
-   third party needs access to the channel. *(Decided 2026-10-16; AB-06.)*
+   third party needs access to the channel. *(D22; AB-06.)*
 3. **On an encrypted channel, only participants can report.** No server, nameserver or
-   tribunal can obtain encrypted content on its own. A report discloses what the reporting participant saw, and no more. *(Derived from
-   1 and 2.)*
+   tribunal can obtain encrypted content on its own. A report discloses what the reporting
+   participant saw, and no more. *(Derived from 1 and 2.)*
 4. **Authorship is provable.** Every block is signed by its author's DID, and on an encrypted
    channel the MLS content signature is made with the same key. That non-deniability is what
-   makes an abuser's authorship provable to a tribunal. *(Decided 2026-10-16; PV-04.)*
+   makes an abuser's authorship provable to a tribunal. *(D22; PV-04.)*
 5. **Every ingress applies its own limits**, using routing facts that need no content: rate
    limits and proof-of-work at servers, nameservers, bridges and relays. *(AB-03; Zero-Trust
    chapter of the spec.)*
@@ -1021,19 +1052,21 @@ some other way. jig chooses provable reporting and states its cost.
 
 ### 13.1 Obligations
 
-1. **Tribunals are required.** Nameservers and a ruleset group's security posture do not
-   work without a way to judge disputes, so every ruleset group that shares penalties has a
-   tribunal process (scope as in [section 8.1](#81-obligations)). *(Decided 2026-10-16.)*
+1. **Tribunals are required, and nameservers hold them.** Nameservers and a ruleset group's
+   security posture do not work without a way to judge disputes, so every ruleset group that
+   shares penalties has a tribunal process, held by its nameservers. Servers bring cases and
+   evidence; nameservers judge, and enforce the outcome as a net reputation change
+   ([section 8.1](#81-obligations)). *(D23.)*
 2. **Tribunals are per ruleset group.** Each group decides how it judges disputes under its
    own ruleset. Recognition across groups is voluntary: any group may adopt, weigh or ignore
    another group's verdicts, which arrive as information, not instructions. There is no court
    above the groups and no central governance body. *(Maintainer; GV-01.)*
 3. **Penalties apply only under an acknowledged ruleset, and only within the ruleset group
-   that adopted it.** *(GV-03; decided 2026-10-16.)*
+   that adopted it.** *(GV-03; D21.)*
 4. **Eligibility to judge does not rest on how many identities a party holds.** *(GV-02.)*
 5. **Verdicts are attributable and cite their evidence.** *(Derived; GV-01.)*
 6. **Tribunals can receive proof of abuse in encrypted channels** through the mechanism in
-   section 12, and no other way. *(Decided 2026-10-16.)*
+   section 12, and no other way. *(D22.)*
 
 ### 13.2 Today (v0.2)
 
@@ -1087,10 +1120,11 @@ gap.
   design:* the binding, for every challenge-consuming action.
 - **AB-02, botnet proof-of-work.** A botnet solves puzzles at a fraction of a legitimate
   user's marginal cost, and difficulty high enough to stop it locks out phones and potatoes.
-  *Obligation:* proof-of-work is required as a rate cost at nameserver registration and
-  wherever a ruleset sets it, never the only gate and never on its own evidence that an
-  identity is one person. *Today:* servers have no proof-of-work or rate limiting, alias
-  registration has none, and the nameserver prototype's is unused. *To design:*
+  *Obligation:* servers enforce proof-of-work on the clients they serve, at the cost their
+  ruleset sets, and a nameserver requires it on its own binding endpoints; it is never the
+  only gate and never on its own evidence that an identity is one person (D23). *Today:*
+  servers have no proof-of-work or rate limiting, alias registration has none, and the
+  nameserver prototype's is unused. *To design:*
   reputation-scaled difficulty, per action as well as per identity.
 - **AB-03, relay and bridge quota abuse.** Bridges and relays connect unidentified sources to
   identified users; a botnet emailing a known jig user through a bridge is the canonical
@@ -1177,8 +1211,8 @@ gap.
   that she is DID 2 is not caught by signature checks, because both answers are validly
   signed. *Obligation:* two such attestations with overlapping validity are proof of
   misbehaviour; resolvers keep the attestations they act on, and a ruleset group's
-  transparency log records every registration. *Today:* nothing keeps attestations, and the
-  alias flow writes to no log. *To design:* the transparency log (section 8.3).
+  nameserver transparency log records every registration (D23). *Today:* nothing keeps
+  attestations, and nothing writes to a log. *To design:* transparency logs (section 8.3).
 - **NS-03, collusion on clock or state.** Facts shared across a ruleset group, such as when a
   DID registered or what penalty it carries, are only as good as the agreement behind them.
   *Obligation:* no single nameserver, anchor included, decides a group-wide claim.
@@ -1190,7 +1224,8 @@ gap.
 [Register: GV](../../repos/jig-spec/src/threat-register.md#governance-gv).
 
 - **GV-01, tribunal capture.** Whoever controls a group's panels controls its consequences.
-  *Obligation:* tribunals are per ruleset group, and no group is bound by another's verdict.
+  *Obligation:* tribunals are per ruleset group and held by its nameservers (D23), and no
+  group is bound by another's verdict.
   Per-group tribunals bound the damage: a captured group can harm only those who stay in it
   and groups that recognise its verdicts, and both can leave. *Today:* no tribunal protocol.
   *To design:* section 13.3.
@@ -1198,9 +1233,10 @@ gap.
   wins. *Obligation:* eligibility does not rest on the number of identities. *Today:* none.
   *To design:* eligibility that holds against patience (section 13.3).
 - **GV-03, penalty propagation without consent or evidence.** Shared consequences are what
-  make high-sec ruleset groups useful and what make it dangerous. *Obligation:* no reputation loss under an
-  unacknowledged ruleset, and penalties propagate only within the ruleset group that adopted
-  the ruleset, citing a verdict or evidence. Other groups receive verdicts as information.
+  make high-sec ruleset groups useful and what make them dangerous. *Obligation:* no
+  reputation loss under an unacknowledged ruleset, and penalties propagate only within the
+  ruleset group that adopted the ruleset, citing a verdict or evidence (D21). Other groups
+  receive verdicts as information, and translation between groups comes later.
   *Today:* bans and floors are local operator configuration. *To design:* acknowledgement
   (section 6.3) and verdict blocks (section 13.3).
 
@@ -1233,23 +1269,23 @@ gap.
 | Many DIDs per holder, nothing linking them; one DID per session | Partial: no message links DIDs; a socket can change read identity | Session binding; client key-store separation (PV-03) |
 | Names are signed claims, verified and pinned by clients | Partial: attestations signed; resolver ignores the signature; only server-side pins | Suffix authority, verification, client pins (NS-01, OP-08) |
 | Equivocation is detectable | None | Attestation retention, transparency log (NS-02) |
-| `--anon` is a fresh, unregistered session key with no protocol link to any DID | None: no `--anon` mode; unknown DIDs admitted by default | Client mode with nothing on disk |
+| `--anon` is a fresh, unregistered session key with no protocol link to any DID (D20) | None: no `--anon` mode; unknown DIDs admitted by default | Client mode with nothing on disk |
 | What a server does with `--anon` is server policy | Partial: only the admit-or-refuse unknown-DID setting | Ruleset vocabulary for unknown keys, declared in the welcome |
-| Reputation is one number per ruleset, shared within a ruleset group, never across a security level | Partial: `ruleset key → score`, seeded by the operator; nothing shared | Inputs, decay, sharing within a group, acknowledgement |
+| Reputation is one number per ruleset; a ruleset group's members are rated by the same rules and maths; never pooled across a security level (D21) | Partial: `ruleset key → score`, seeded by the operator; nothing shared | Inputs, decay, sharing within a group, acknowledgement; interop between groups later |
 | Sybil and collusion resistance that holds against known attack classes | None; prototype prices identities linearly | Every attack class in section 6.3 answered in full (AB-05) |
-| PoW, reputation, tribunals and a transparency log at every nameserver and every ruleset group that shares state | Prototype in the nameserver, unused and unreviewed | Each designed against the attack classes (section 8.3) |
+| Servers enforce PoW, decide by reputation, report changes to their nameservers and keep a transparency log; nameservers hold tribunals, compute net reputation and police servers (D23) | None at servers; prototype in the nameserver, unused | Server–nameserver data contract; each mechanism designed against the attack classes (section 8.3) |
 | Security levels belong to servers and ruleset groups; servers declare their ruleset, signed | Partial: per-server building blocks; no declaration | Ruleset document, declaration in the welcome, joining and leaving |
 | High-sec nameservers cross-register; no single nameserver decides a group-wide claim | None: nameservers do not coordinate | Replicated registry, thresholds, operator independence (NS-03) |
 | Anchors are opt-in with no veto (D19) | None | Structural "no veto"; anchor replacement |
 | Federation is a data contract fixing the channel's suite (D12) | Partial: suite fixed per channel; relay of open, unencrypted channels only | Contract contents and signed acceptance |
-| One owning server per channel | None: each server keeps its own channel state | Cross-server writes: survey XMPP MUC, IRC, Matrix, ActivityPub groups |
+| One owning server per channel (D24) | None: each server keeps its own channel state | Cross-server writes: survey XMPP MUC, IRC, Matrix, ActivityPub groups |
 | A peer is a transport; relayed blocks pass every gate | Partial: authorship, version and schema re-verified; not every gate yet | Write gate for relays (item 18), peer DID pinning |
 | Pluggable suites, MLS default and first (D1, D13) | Built: MLS per channel; validating delivery service | Non-MLS plug-in shape (D13); per-suite conformance |
 | End-to-end encryption by default | Partial: DMs encrypted; channels plaintext unless created `mls` | Encryption on by default |
 | Mandatory signed handshake; clients fail closed and pin | Partial: signed welcome with nonce; no pins; later frames unchecked | Close semantics; pins; real reputation (D11) |
 | No backdoors, no scanning, no default escrow | Holds: no backdoor, scanning or escrow exists | Keep it so as reporting is designed |
-| Provable abuse reports from encrypted channels, by participants only | None: signature exists; no tooling | Delegation or proof mechanism (AB-06) |
-| Tribunals per ruleset group; penalties only under an acknowledged ruleset | None; prototype case records unused | Tribunal process, eligibility (GV-01 to GV-03) |
+| Provable abuse reports from encrypted channels, by participants only (D22) | None: signature exists; no tooling | Delegation or proof mechanism (AB-06) |
+| Tribunals per ruleset group, held by its nameservers; penalties only under an acknowledged ruleset | None; prototype case records unused | Tribunal process, eligibility (GV-01 to GV-03) |
 | Time-based limits use the verifier's clock | Partial: replay windows only; unbounded skew in the HLC | Skew bound; observed age (TM-01, TM-02) |
 
 ---
@@ -1269,24 +1305,30 @@ Settled before this paper and cited throughout:
 - **D19:** anchor nameservers give a high-sec ruleset group initial coordination; joining is
   opt-in, no nameserver has a veto, and anyone can run their own.
 
-Decided by the maintainer on 2026-10-16:
+Decided by the maintainer on 2026-10-16 and 2026-10-17, and numbered in the roadmap's
+[decisions log](../ROADMAP.md#decisions-log):
 
-1. **`--anon`** is a fresh, unregistered session key. Whether a server looks it up against a
-   nameserver, and what it does with the result or its absence, is server policy, a separate
-   question. There is no protocol link between an `--anon` identity and a DID.
-2. **Reputation** is one number per ruleset. A ruleset group is one concrete group of servers
-   and nameservers sharing a ruleset; reputation can be shared within that group, never across
-   a security level.
-3. **Encrypted abuse reports** to a tribunal are required, by delegation or effective proof:
-   every incident involves at least the abuser's and the victim's keys, so the victim can
-   delegate their key or view. The MLS content signature by the DID key makes authorship
-   provable, at the cost of deniability. The mechanism is to be designed.
-4. **Proof-of-work, reputation, tribunals and the transparency log are obligations.**
-   Nameservers and the security posture do not work without them. In the phase that builds
-   them, the known weaknesses, linear Sybil cost and the other known attack classes, must be
-   addressed in full. Today's code is a prototype of these obligations.
-5. **A channel has one owning server.** Cross-server writes are not specified; prior art is to
-   be surveyed before choosing.
+- **D20: `--anon`** is a fresh, unregistered session key. Whether a server looks it up
+  against a nameserver, and what it does with the result or its absence, is server policy, a
+  separate question. There is no protocol link between an `--anon` identity and a DID.
+- **D21: reputation** is one number per ruleset. The servers, clients and nameservers of a
+  ruleset group agree to be rated by the same rules, which produce the same reputation maths.
+  It is never pooled across a security level. Interop between groups, by translation under a
+  data contract, is possible but comes later.
+- **D22: encrypted abuse reports** to a tribunal are required, by delegation or effective
+  proof: every incident involves at least the abuser's and the victim's keys, so the victim
+  can delegate their key or view. The MLS content signature by the DID key makes authorship
+  provable, at the cost of deniability. The mechanism is to be designed.
+- **D23: proof-of-work, reputation, tribunals and transparency logs are obligations**, and
+  the known weaknesses (linear Sybil cost and the other known attack classes) must be
+  addressed in full. Servers are the execution and enforcement boundary: they enforce
+  proof-of-work, decide about clients by reputation (a ruleset in their nameserver network,
+  a private one, or none), report clients' reputation changes to their nameservers under the
+  data contract, and keep their own transparency log. Nameservers hold tribunals, compute and
+  enforce net reputation changes, and enforce servers' good behaviour. A server with no
+  nameserver sets its own policy. Today's code is a prototype of these obligations.
+- **D24: a channel has one owning server.** Cross-server writes are not specified; prior art
+  is to be surveyed before choosing.
 
 ### 16.2 Agenda
 
@@ -1294,15 +1336,17 @@ Each item names what it must satisfy and the register entries it closes.
 
 1. **Sybil and spam resistance that holds.** Make standing, not existence, costly; answer
    every attack class in section 6.3 in full. Closes AB-02, AB-05; feeds GV-02.
-2. **The transparency log.** Contents, signed heads, inclusion and consistency checks,
-   personal data. Closes NS-02; feeds NS-03.
-3. **Cross-registration in high-sec ruleset groups.** Replicated registry, agreement thresholds, operator
-   independence without a central registry, partitions. Closes NS-03.
+2. **Transparency logs and the server–nameserver data contract.** Server and nameserver log
+   contents, signed heads, inclusion and consistency checks, personal data; the reputation
+   reports servers send and how nameservers net them. Closes NS-02; feeds NS-03, GV-03.
+3. **Cross-registration in high-sec ruleset groups.** Replicated registry, agreement
+   thresholds, operator independence without a central registry, partitions. Closes NS-03.
 4. **The ruleset.** Document format, versioning, declaration in the signed welcome,
    acknowledgement (per server, per group or per version), amendment, joining and leaving a
    group. Closes GV-03; feeds OP-02.
-5. **Reputation.** Inputs, decay, numbers for servers and nameservers, soul-validation
-   weights and withdrawal, and the handshake field (JEP-0003). Feeds OP-10.
+5. **Reputation.** Inputs, decay, net computation at nameservers, numbers for servers and
+   nameservers, soul-validation weights and withdrawal, and the handshake field (JEP-0003).
+   Later: translation between ruleset groups. Feeds OP-10.
 6. **Encrypted abuse reports.** Delegation or proof, scoped to the incident, producible only
    by participants, with rules for what a tribunal accepts. Closes AB-06.
 7. **Tribunals.** Process, panel eligibility, appeals, publication, defederation. Closes
@@ -1325,10 +1369,4 @@ Each item names what it must satisfy and the register entries it closes.
     put it behind an opt-in flag, or remove it) until the redesigned mechanisms of items 1, 2,
     5 and 7 land. It is a prototype of those obligations, not their design, and the
     obligations stay whatever happens to the code.
-16. **Housekeeping.** Confirm the obligations marked *derived* (among them the scope of the
-    four nameserver mechanisms in section 8.1, and that two ruleset groups never share a
-    number even under identical rulesets); decide whether the 2026-10-16 decisions get
-    numbers in the roadmap's decisions log; and bring the spec's
-    [Identity and Reputation](../../repos/jig-spec/src/identity-and-reputation.md) chapter
-    in line with them, since it still describes `--anon` as presenting no key and uses
-    "zone" for security levels.
+16. **Housekeeping.** Confirm the obligations still marked *derived*.
