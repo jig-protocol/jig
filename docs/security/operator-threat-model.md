@@ -175,16 +175,22 @@ pins into something verifiable; that is future work.
 **Attack.** A peer relays junk, relays blocks claiming other authors, or impersonates a
 peer.
 
-**Decision rationale.** A relayed block is re-verified like a submitted one; a peer is a
-transport, not a source of authority. The remaining gap is that relayed blocks bypass the
-write gate (membership, ownership), which roadmap item 18 closes. Until it does, v0.2
-federates only open, unencrypted channels: a peer cannot be given a restricted channel's
-content it has no way to gate, nor post into a local restricted or encrypted channel.
+**Decision rationale.** A relayed block is ingested like a submitted one; a peer is a
+transport, not a source of authority. Listing a peer is what trusts it: the server dials
+it, pins its DID, and lets only listed DIDs read its federation stream. v0.2 still
+federates only open, unencrypted channels, because an MLS group spanning two servers needs
+the federation contract (D12).
 
-**Status evidence.** `ingest_peer_block` re-verifies the author signature unless the
-`naively_trust_peer_authored_blocks` antipattern flag is set, and now runs the manifest
-gates. It does not go through `ingest`, so the write gate does not run; it drops blocks for
-local channels that do not federate, and `DeliveryPolicy::federates` keeps restricted and
+**Status evidence.** `ingest_peer_block` runs every relayed block through `ingest` with
+`IngestSource::FederatedPeer`: signature, manifest gates, admission, the kind allowlist,
+archived channels, the write gate, the suite gate, effects, and the server's own execution
+and receipt. Relayed receipts are not kept. Only a federated `text-render` may name a
+channel the server has no row for; a relayed member-add, member-remove, promote or archive
+for an unknown channel is refused, since there is no owner to authorize it against. The
+dialer pins each peer's `expected_did` in the handshake, and a federation-scope subscribe
+must come from a listed peer's DID, authenticated even where reads are not. The
+`naively_trust_peer_authored_blocks` flag is gone. The relay still drops blocks for local
+channels that do not federate, and `DeliveryPolicy::federates` keeps restricted and
 encrypted channels' blocks off outbound links. Peers actually receive a server's blocks
 through the federation-scope subscription they hold on their connection to it, not through
 the server's own dial (whose block frames the peer ignores); until the fix below that

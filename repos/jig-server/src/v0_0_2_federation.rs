@@ -1,31 +1,30 @@
 //! Federation peer manager — connects to configured peers, exchanges
 //! fed-hello bundles, relays blocks bidirectionally.
 //!
-//! v0.0.2 minimum-viable federation: block-relay only. Inbound blocks are
-//! persisted (block + receipts) and fanned out to local CLI subscribers
-//! but do NOT pass through apply_effect — channel + membership state stays
-//! local on each server. Channel ops happen via /_admin_v0_0_2/* or
-//! (v0.0.3+) Wasm-executed channel-create blocks; they don't replicate.
+//! A block a peer relays is ingested like a local submission
+//! ([`ingest_peer_block`]): the same gates, the same write gate and suite
+//! gate, the same effects, and this server's own receipt. A peer vouches for
+//! nothing; every block stands on its author's signature and this server's
+//! rules.
 //!
-//! Trust model: the configured peer's URL + expected_did is the transport
-//! trust anchor (established via fed-hello at session start). v0.0.3+ ALSO
-//! re-verifies the sender's ed25519 signature on each inbound Block frame —
-//! a peer cannot relay a block forged under a third party's DID. The
-//! `naively_trust_peer_authored_blocks` antipattern flag in
-//! `[federation]` skips that check and is surfaced in
-//! `GET /.well-known/jig`'s `unsafe_options_active` list.
+//! Trust model: listing a peer in `[federation] peers` is what trusts it.
+//! This server dials the peer's `url` and refuses a welcome signed by any
+//! key but its `expected_did`, so blocks arrive only over a connection to a
+//! server it chose. Only a listed DID may subscribe to this server's
+//! federation stream (see `v0_0_2_ws`).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
-use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
+use ed25519_dalek::Signer;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use jig_core::{Author, BlockKind, BlockManifest};
 use jig_pipeline::{
     Envelope, Frame, Scope,
     envelope::ReceiptRef,
     fanout::DeliveryPolicy,
+    ingest::IngestError,
     persist::{StoredBlock, StoredReceipt},
 };
 use tokio::sync::mpsc;
@@ -121,16 +120,23 @@ async fn run_peer_loop(state: Arc<AppState>, peer: jig_config::v0_0_2_server::Fe
 /// loop can try again. The server side does not close on those codes; dropping
 /// the dialer's socket here ends the attempt. A missing or self-contradictory
 /// welcome is fail-closed: this sends a close frame before returning.
+///
+/// `pinned_server_did` is the DID the peer must sign the welcome with: a
+/// configured peer's `expected_did`. Any other key fails closed.
 pub async fn complete_client_handshake<S>(
     ws: &mut S,
+    pinned_server_did: Option<&str>,
 ) -> anyhow::Result<jig_pipeline::handshake::VerifiedWelcome>
 where
     S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
         + Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
         + Unpin,
 {
-    let (hello, pending) =
-        jig_pipeline::handshake::begin(&jig_pipeline::handshake::ClientOffer::default());
+    let offer = jig_pipeline::handshake::ClientOffer {
+        pinned_server_did: pinned_server_did.map(str::to_string),
+        ..Default::default()
+    };
+    let (hello, pending) = jig_pipeline::handshake::begin(&offer);
     ws.send(Message::Text(serde_json::to_string(&hello)?.into()))
         .await?;
     // Same absolute deadline as the client. Control frames must not restart it,
@@ -187,7 +193,7 @@ async fn connect_and_relay(
     };
     // Same hello/welcome a CLI client speaks. The fed-hello bundle below is a
     // block, not this handshake, and the server now refuses it until welcome.
-    complete_client_handshake(&mut ws).await?;
+    complete_client_handshake(&mut ws, Some(&peer.expected_did)).await?;
     let (mut sink, mut stream) = ws.split();
     info!(peer_url = %peer.url, "federation peer connected");
 
@@ -242,6 +248,9 @@ async fn connect_and_relay(
                 };
                 match msg {
                     Message::Text(text) => {
+                        if let Some(refusal) = subscription_refusal(&text) {
+                            break Err(anyhow::anyhow!("peer refused our federation subscription: {refusal}"));
+                        }
                         if let Err(e) = handle_inbound_frame(state, peer, &text).await {
                             warn!(peer_url = %peer.url, "inbound frame error: {e}");
                         }
@@ -283,19 +292,9 @@ async fn handle_inbound_frame(
         Frame::Block {
             bundle_b64,
             sig_b64,
-            receipts,
             delivery_cid,
-        } => {
-            ingest_peer_block(
-                state,
-                peer,
-                &bundle_b64,
-                sig_b64.as_deref(),
-                &receipts,
-                &delivery_cid,
-            )
-            .await
-        }
+            ..
+        } => ingest_peer_block(state, peer, &bundle_b64, sig_b64.as_deref(), &delivery_cid).await,
         Frame::Ack { block_cid } => {
             debug!(peer_url = %peer.url, %block_cid, "peer acked our submission");
             Ok(())
@@ -323,78 +322,38 @@ pub fn peer_block_cid(bundle_bytes: &[u8]) -> anyhow::Result<String> {
     Ok(bundle.block_cid()?.to_string())
 }
 
-/// Persist and fan out one block a federation peer relayed. Public so the
-/// integration-test harness drives this exact path rather than a copy of it.
+/// Run one block a federation peer relayed through [`ingest`], exactly as a
+/// local submission runs: manifest gates, signature, admission, kind
+/// allowlist, archived channels, the write gate, the suite gate, effects,
+/// this server's own execution and receipt, then fanout to local subscribers
+/// and bridges (never back out to peers). Public so the integration-test
+/// harness drives this exact path rather than a copy of it.
+///
+/// Receipts the peer relays alongside the block are not kept: nothing here
+/// can verify them, and this server signs its own.
+///
+/// A refused block is logged and dropped: one bad block is no reason to drop
+/// the peer. Only a failing store is an error.
+///
+/// [`ingest`]: jig_pipeline::ingest::ingest
 pub async fn ingest_peer_block(
     state: &Arc<AppState>,
     peer: &jig_config::v0_0_2_server::FederationPeer,
     bundle_b64: &str,
     sig_b64: Option<&str>,
-    receipts: &[ReceiptRef],
     delivery_cid: &str,
 ) -> anyhow::Result<()> {
     let bundle_bytes = base64::engine::general_purpose::STANDARD.decode(bundle_b64)?;
-    let (manifest_bytes, _code_bytes): (Vec<u8>, Vec<u8>) = serde_json::from_slice(&bundle_bytes)?;
+    let (manifest_bytes, code_bytes): (Vec<u8>, Vec<u8>) = serde_json::from_slice(&bundle_bytes)?;
     let manifest: BlockManifest = serde_json::from_slice(&manifest_bytes)?;
-    // This path bypasses `ingest`, so it must run the same gates itself, and
-    // before the signature, whose coverage the schema defines. Dropped like a
-    // bad signature: one unreadable block is no reason to drop the peer.
-    if let Err(e) = manifest.check_gates() {
-        warn!(peer_url = %peer.url, %delivery_cid, "rejecting peer block: {e}");
-        return Ok(());
-    }
-
-    let block_cid = peer_block_cid(&bundle_bytes)?;
-
-    // Already have this block? Avoid duplicate insert.
-    if state.ingest_ctx.store.get_block(&block_cid)?.is_some() {
-        debug!(%delivery_cid, %block_cid, "already have block; skipping");
-        return Ok(());
-    }
-
-    // Decode sig once; we either verify it (default) or stash it (antipattern path).
-    let sig_bytes = match sig_b64 {
-        Some(s) => base64::engine::general_purpose::STANDARD
-            .decode(s)
-            .unwrap_or_default(),
-        None => vec![],
-    };
-
-    // Re-verify the sender's signature against the manifest's claimed
-    // sender_did. Forged-author relays (peer X relays a block whose manifest
-    // claims authorship by DID Y but is signed by some other key) are rejected.
-    //
-    // Operators who explicitly want the old v0.0.2 trust-the-peer behavior
-    // can set [federation] naively_trust_peer_authored_blocks = true; the flag
-    // is advertised in /.well-known/jig unsafe_options_active.
-    if state.config.federation.naively_trust_peer_authored_blocks {
-        warn!(
-            peer_url = %peer.url,
-            %block_cid,
-            "skipping peer-block sig verify (federation.naively_trust_peer_authored_blocks=true)"
-        );
-    } else if let Err(e) = verify_peer_block_sig(&bundle_bytes, &manifest, &sig_bytes) {
-        let claimed_did = manifest
-            .authors
-            .first()
-            .map(|a| a.did.to_did_jig_string())
-            .unwrap_or_default();
-        warn!(
-            peer_url = %peer.url,
-            %block_cid,
-            %claimed_did,
-            "rejecting peer block: sender_sig verification failed ({e})"
-        );
-        return Ok(());
-    }
 
     // v0.2 federates only open, unencrypted channels (see
-    // `DeliveryPolicy::federates`). This relay does not run the write gate or
-    // the MLS delivery service, so a block for a local channel that does not
-    // federate — or one claiming an encrypted suite this server cannot
-    // validate — is dropped rather than carried on the peer's word.
+    // `DeliveryPolicy::federates`): an encrypted channel's group lives on one
+    // server until the federation contract (D12) says how it spans two. So a
+    // block for a local channel that does not federate, or one claiming an
+    // encrypted suite, is dropped before the write gate sees it.
     if manifest.content_suite() != jig_core::EncryptionSuite::Unencrypted {
-        warn!(peer_url = %peer.url, %block_cid, "rejecting peer block: encrypted content does not federate");
+        warn!(peer_url = %peer.url, %delivery_cid, "rejecting peer block: encrypted content does not federate");
         return Ok(());
     }
     if let Some(slug) = manifest
@@ -406,128 +365,50 @@ pub async fn ingest_peer_block(
             .get_channel_by_slug_including_archived(slug)?
         && !DeliveryPolicy::for_channel(&chan, vec![]).federates
     {
-        warn!(peer_url = %peer.url, %block_cid, slug, "rejecting peer block: the local channel does not federate");
+        warn!(peer_url = %peer.url, %delivery_cid, slug, "rejecting peer block: the local channel does not federate");
         return Ok(());
     }
 
-    // Extract sender DID + HLC + kind from manifest (best-effort).
-    // Canonical spelling, as ingest writes it — the relay bypasses ingest, so
-    // it must not be the one path that persists the peer's raw spelling.
-    let sender_did_str = jig_pipeline::effect::canonical_did_string(
-        &manifest
-            .authors
-            .first()
-            .map(|a| a.did.to_did_jig_string())
-            .unwrap_or_default(),
-    );
-    let kind_str = manifest
-        .kind
-        .as_ref()
-        .map(|k| k.as_str().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let (hlc_wall_ms, hlc_logical, hlc_origin) = manifest
-        .hlc_ts
-        .as_ref()
-        .map(|h| (h.wall_ms, h.logical, h.server_did.to_did_jig_string()))
-        .unwrap_or((0, 0, String::new()));
-
-    let stored_block = StoredBlock {
-        cid: block_cid.clone(),
-        // Lift the channel slug from manifest metadata with the same
-        // kind-keyed rule ingest uses, so channel-scoped fanout + the bridge
-        // sink match this federated block against the channel it names. A
-        // block with no kind names no channel.
-        channel_id: manifest
-            .kind
-            .and_then(|kind| jig_pipeline::ingest::channel_slug_of(kind, &manifest))
-            .map(|s| s.to_string()),
-        block_kind: kind_str,
-        sender_did: sender_did_str,
-        // Verified above (unless naively_trust_peer_authored_blocks is set);
-        // store the real sig so downstream code can re-check on read.
-        sender_sig: sig_bytes,
-        bundle_bytes: bundle_bytes.clone(),
-        is_synthetic: false,
-        hlc_wall_ms,
-        hlc_logical,
-        hlc_origin,
-        posted_at: chrono::Utc::now().timestamp(),
-        origin_server: peer.url.clone(),
-        federated_from: Some(peer.url.clone()),
+    let sig = sig_b64
+        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+        .unwrap_or_default();
+    let bundle = jig_core::BlockBundle {
+        manifest_bytes: &manifest_bytes,
+        code_bytes: &code_bytes,
+        resources: vec![],
     };
-    state.ingest_ctx.store.insert_block(&stored_block)?;
-
-    // Persist each receipt from the frame.
-    for r in receipts {
-        let receipt_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&r.receipt_bytes_b64)
-            .unwrap_or_default();
-        // Derive a stable receipt CID from the block CID and server DID.
-        let receipt_cid = format!(
-            "r_{}_{}",
-            &block_cid[..16.min(block_cid.len())],
-            &r.server_did[..16.min(r.server_did.len())]
-        );
-        let stored_receipt = StoredReceipt {
-            cid: receipt_cid,
-            block_cid: block_cid.clone(),
-            server_id: r.server_did.clone(),
-            receipt_bytes,
-            render_hash: r.render_hash.clone(),
-            produced_at: chrono::Utc::now().timestamp(),
-        };
-        // Tolerant of duplicate-receipt error (same block_cid + server_id already exists).
-        let _ = state.ingest_ctx.store.insert_receipt(&stored_receipt);
-    }
-
-    // Broadcast to local CLI subscribers ONLY — broadcast_local_only skips
-    // peer fanout and prevents relay loops between federated servers. Then also
-    // dispatch to bridge sinks for any managed-DID member of the block's
-    // channel, so a federated message posted to a bridged channel reaches
-    // Bridge::outbound (mirrors ingest's FederatedPeer-source path).
-    //
-    // The same resolved facts become the delivery policy. A channel this
-    // server has no row for yields no policy — scope alone decides, as
-    // federation has always worked — but a store ERROR yields a policy naming
-    // nobody, so a failing database narrows delivery rather than widening it.
-    let policy = match stored_block.channel_id.as_deref() {
-        Some(slug) => match state
-            .ingest_ctx
-            .store
-            .get_channel_by_slug_including_archived(slug)
-        {
-            Ok(Some(chan)) => {
-                let member_dids = state
-                    .ingest_ctx
-                    .store
-                    .list_members(&chan.id)
-                    .map(|ms| ms.into_iter().map(|m| m.member_did).collect())
-                    .unwrap_or_default();
-                Some(DeliveryPolicy::for_channel(&chan, member_dids))
-            }
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(slug, error = %e, "channel lookup failed at relay fanout; denying");
-                Some(DeliveryPolicy::default())
-            }
-        },
-        None => None,
+    let source = jig_pipeline::ingest::IngestSource::FederatedPeer {
+        peer_did: jig_core::Did::from_str_unchecked(jig_pipeline::effect::canonical_did_string(
+            &peer.expected_did,
+        )),
+        peer_url: peer.url.clone(),
     };
-    let receipts_in_db = state.ingest_ctx.store.get_receipts_for_block(&block_cid)?;
-    if let Some(rep_receipt) = receipts_in_db.into_iter().next() {
-        state
-            .ingest_ctx
-            .fanout
-            .broadcast_local_only(&stored_block, &rep_receipt, policy.as_ref())
-            .await?;
-        state
-            .ingest_ctx
-            .fanout
-            .dispatch_to_bridges_public(&stored_block, &rep_receipt, policy.as_ref())
-            .await;
+    match jig_pipeline::ingest::ingest(&state.ingest_ctx, bundle, sig, source).await {
+        Ok(block_cid) => {
+            debug!(peer_url = %peer.url, %delivery_cid, %block_cid, "ingested peer block");
+            Ok(())
+        }
+        Err(IngestError::DuplicateBlock { cid }) => {
+            debug!(peer_url = %peer.url, %delivery_cid, block_cid = %cid, "already have block; skipping");
+            Ok(())
+        }
+        Err(IngestError::Persist(e)) => Err(e.into()),
+        Err(e) => {
+            warn!(peer_url = %peer.url, %delivery_cid, "rejecting peer block: {e}");
+            Ok(())
+        }
     }
+}
 
-    Ok(())
+/// The refusal in `text`, if it is the peer turning down our federation
+/// subscription: it does not list this server as a peer. Ends the connection,
+/// so the reconnect loop tries again later, rather than leaving it open and
+/// carrying nothing.
+pub fn subscription_refusal(text: &str) -> Option<String> {
+    match serde_json::from_str::<Envelope>(text).ok()?.frame {
+        Frame::Error { code, message, .. } if code == "NOT_A_PEER" => Some(message),
+        _ => None,
+    }
 }
 
 async fn forward_outbound(
@@ -557,39 +438,6 @@ async fn forward_outbound(
 
 /// Re-verify the sender's ed25519 signature on an inbound peer block.
 ///
-/// Mirrors `jig_pipeline::ingest::verify_sig`: the signature is over the
-/// canonical bundle bytes (the `(manifest_bytes, code_bytes)` JSON tuple
-/// the peer transmitted) and is verified against the public key derived
-/// from `manifest.authors[0].did`. A peer cannot fake authorship under a
-/// third party's DID.
-///
-/// Exposed `pub` for the test harness so it can run the same check on its
-/// inline relay loop without exposing the entire `ingest_peer_block` body.
-pub fn verify_peer_block_sig(
-    bundle_bytes: &[u8],
-    manifest: &BlockManifest,
-    sig: &[u8],
-) -> Result<(), &'static str> {
-    if sig.is_empty() {
-        return Err("missing sender_sig on peer block frame");
-    }
-    let sender_did = manifest
-        .authors
-        .first()
-        .map(|a| a.did.clone())
-        .ok_or("manifest has no authors")?;
-    let pubkey_bytes = sender_did
-        .as_bytes()
-        .map_err(|_| "sender_did not canonical")?;
-    let pubkey = VerifyingKey::from_bytes(&pubkey_bytes)
-        .map_err(|_| "sender_did not a valid ed25519 pubkey")?;
-    let signature = Signature::from_slice(sig).map_err(|_| "sig is not 64 bytes")?;
-    pubkey
-        .verify(bundle_bytes, &signature)
-        .map_err(|_| "sig does not verify against sender_did")?;
-    Ok(())
-}
-
 /// Build the fed-hello manifest + (empty) code bytes for the handshake.
 ///
 /// The fed-hello bundle carries our server DID, URL, advertised block kinds,
@@ -727,23 +575,10 @@ mod tests {
         let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(&bundle_bytes);
         let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&sig);
 
-        let receipts = vec![ReceiptRef {
-            server_did: "did:jig:zPeer".to_string(),
-            render_hash: Some("rh_test".to_string()),
-            receipt_bytes_b64: base64::engine::general_purpose::STANDARD.encode(b"{\"v\":\"0.2\"}"),
-        }];
-
         // First ingest: must persist block + receipt.
-        ingest_peer_block(
-            &state,
-            &peer,
-            &bundle_b64,
-            Some(&sig_b64),
-            &receipts,
-            "delivery:test1",
-        )
-        .await
-        .unwrap();
+        ingest_peer_block(&state, &peer, &bundle_b64, Some(&sig_b64), "delivery:test1")
+            .await
+            .unwrap();
         let block_cid = peer_block_cid(&bundle_bytes).unwrap();
         let stored = state.ingest_ctx.store.get_block(&block_cid).unwrap();
         assert!(
@@ -757,16 +592,9 @@ mod tests {
         );
 
         // Second ingest of the same bundle: must dedupe without error.
-        ingest_peer_block(
-            &state,
-            &peer,
-            &bundle_b64,
-            Some(&sig_b64),
-            &receipts,
-            "delivery:test2",
-        )
-        .await
-        .unwrap();
+        ingest_peer_block(&state, &peer, &bundle_b64, Some(&sig_b64), "delivery:test2")
+            .await
+            .unwrap();
         let receipts_in_db = state
             .ingest_ctx
             .store
@@ -778,6 +606,8 @@ mod tests {
             "duplicate ingest must not produce duplicate receipt; got {} receipts",
             receipts_in_db.len()
         );
+        // The receipt is this server's own: it executed the block.
+        assert_eq!(receipts_in_db[0].server_id, state.server_did.to_string());
     }
 
     #[tokio::test]
@@ -855,18 +685,12 @@ mod tests {
         let sig = signing_key.sign(&bundle_bytes).to_bytes().to_vec();
         let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(&bundle_bytes);
         let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&sig);
-        let receipts = vec![ReceiptRef {
-            server_did: "did:jig:zPeer".to_string(),
-            render_hash: Some("rh".into()),
-            receipt_bytes_b64: base64::engine::general_purpose::STANDARD.encode(b"{}"),
-        }];
 
         ingest_peer_block(
             &state,
             &peer,
             &bundle_b64,
             Some(&sig_b64),
-            &receipts,
             "delivery:fed-bridge",
         )
         .await
@@ -883,9 +707,9 @@ mod tests {
     }
 
     /// v0.2 federates only open, unencrypted channels. A peer block naming a
-    /// local restricted or encrypted channel is dropped: this relay runs
-    /// neither the write gate nor the MLS delivery service, so carrying it
-    /// would let a peer post into a channel its author could not post to.
+    /// local restricted or encrypted channel is dropped before the write
+    /// gate: an encrypted channel's group lives on one server until the
+    /// federation contract says how it spans two.
     #[tokio::test]
     async fn peer_blocks_for_channels_that_do_not_federate_are_dropped() {
         use ed25519_dalek::SigningKey;
@@ -943,7 +767,6 @@ mod tests {
                 &peer,
                 &base64::engine::general_purpose::STANDARD.encode(&bundle_bytes),
                 Some(&base64::engine::general_purpose::STANDARD.encode(&sig)),
-                &[],
                 "delivery:refused",
             )
             .await
@@ -999,7 +822,7 @@ mod tests {
         let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(&bundle_bytes);
         let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&sig);
 
-        ingest_peer_block(&state, &peer, &bundle_b64, Some(&sig_b64), &[], "d:forged")
+        ingest_peer_block(&state, &peer, &bundle_b64, Some(&sig_b64), "d:forged")
             .await
             .unwrap();
 
@@ -1045,7 +868,7 @@ mod tests {
         let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(&bundle_bytes);
 
         // No sig_b64 at all (legacy v0.0.2 emitter shape). Default policy must reject.
-        ingest_peer_block(&state, &peer, &bundle_b64, None, &[], "d:nosig")
+        ingest_peer_block(&state, &peer, &bundle_b64, None, "d:nosig")
             .await
             .unwrap();
 
@@ -1099,7 +922,7 @@ mod tests {
             let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(&bundle_bytes);
             let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&sig);
 
-            ingest_peer_block(&state, &peer, &bundle_b64, Some(&sig_b64), &[], "d:gate")
+            ingest_peer_block(&state, &peer, &bundle_b64, Some(&sig_b64), "d:gate")
                 .await
                 .unwrap();
 
@@ -1116,58 +939,155 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn naively_trust_peer_authored_blocks_bypasses_sig_check() {
-        use jig_core::{Author, BlockKind, BlockManifest};
+    /// A text-render `key` signed, the way a peer relays it: the base64
+    /// bundle and signature, and the bundle bytes for its CID.
+    fn relayed(
+        key: &ed25519_dalek::SigningKey,
+        kind: BlockKind,
+        metadata: serde_json::Value,
+    ) -> (Vec<u8>, String, String) {
+        let did = jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes());
+        let mut builder = BlockManifest::builder()
+            .version(semver::Version::new(0, 1, 0))
+            .author(Author {
+                did: did.clone(),
+                public_key: None,
+                roles: vec![],
+            });
+        if let serde_json::Value::Object(map) = metadata {
+            for (k, v) in map {
+                builder = builder.metadata_entry(&k, v);
+            }
+        }
+        let manifest = builder
+            .build()
+            .unwrap()
+            .with_kind(kind)
+            .with_hlc(jig_core::HlcTimestamp {
+                wall_ms: 1_747_680_000_000,
+                logical: 0,
+                server_did: did,
+            });
+        let bundle_bytes =
+            serde_json::to_vec(&(manifest.to_canonical_bytes().unwrap(), Vec::<u8>::new()))
+                .unwrap();
+        let sig = key.sign(&bundle_bytes).to_bytes().to_vec();
+        let b64 = &base64::engine::general_purpose::STANDARD;
+        let (bundle_b64, sig_b64) = (b64.encode(&bundle_bytes), b64.encode(&sig));
+        (bundle_bytes, bundle_b64, sig_b64)
+    }
 
-        // Build an AppState with the antipattern flag enabled.
-        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
-        config.federation.naively_trust_peer_authored_blocks = true;
-        let tempdir = tempfile::tempdir().unwrap();
-        config.server.server_did_keyfile = tempdir
-            .path()
-            .join("server.key")
-            .to_string_lossy()
-            .into_owned();
-        let state = Arc::new(
-            AppState::new(config, tempdir.path().join("server.db"), Default::default()).unwrap(),
-        );
-
-        let peer = jig_config::v0_0_2_server::FederationPeer {
+    fn test_peer() -> jig_config::v0_0_2_server::FederationPeer {
+        jig_config::v0_0_2_server::FederationPeer {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
-        };
+        }
+    }
 
-        // A manifest with a wholly-bogus author DID and an empty sig: under
-        // the antipattern flag we skip verification and persist anyway.
-        let manifest = BlockManifest::builder()
-            .version(semver::Version::new(0, 1, 0))
-            .author(Author {
-                did: "did:jig:zBogusAuthor".into(),
-                public_key: None,
-                roles: vec![],
+    /// The write gate runs on relayed blocks: a member-add on an open channel
+    /// from someone who does not own it is refused, and nobody is added. The
+    /// relay used to persist it (unapplied) on the peer's word.
+    #[tokio::test]
+    async fn a_peer_cannot_change_a_channel_its_author_does_not_own() {
+        use jig_pipeline::persist::StoredChannel;
+
+        let state = Arc::new(AppState::for_test().unwrap());
+        state
+            .ingest_ctx
+            .store
+            .upsert_channel(&StoredChannel {
+                id: "bafyOpen".into(),
+                slug: "#open".into(),
+                visibility: "open".into(),
+                created_at: 0,
+                owner_did: "did:jig:zOwner".into(),
+                suite: "none".into(),
             })
-            .build()
-            .unwrap()
-            .with_kind(BlockKind::TextRender);
-        let manifest_bytes = manifest.to_canonical_bytes().unwrap();
-        let bundle_bytes = serde_json::to_vec(&(manifest_bytes, Vec::<u8>::new())).unwrap();
-        let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(&bundle_bytes);
+            .unwrap();
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+        let (bundle_bytes, bundle_b64, sig_b64) = relayed(
+            &stranger,
+            BlockKind::MemberAdd,
+            serde_json::json!({"channel": "#open", "member_did": "did:jig:zSomeoneElse"}),
+        );
 
-        ingest_peer_block(&state, &peer, &bundle_b64, None, &[], "d:trusted")
+        ingest_peer_block(&state, &test_peer(), &bundle_b64, Some(&sig_b64), "d:add")
             .await
             .unwrap();
 
-        let block_cid = peer_block_cid(&bundle_bytes).unwrap();
+        let cid = peer_block_cid(&bundle_bytes).unwrap();
+        assert!(state.ingest_ctx.store.get_block(&cid).unwrap().is_none());
         assert!(
             state
                 .ingest_ctx
                 .store
-                .get_block(&block_cid)
+                .list_members("bafyOpen")
                 .unwrap()
-                .is_some(),
-            "naively_trust_peer_authored_blocks must persist even invalid-sig peer blocks"
+                .is_empty(),
+            "a refused member-add must add nobody"
         );
+    }
+
+    /// Admission runs on relayed blocks: an author this server bans is
+    /// refused whichever server it posted through.
+    #[tokio::test]
+    async fn a_banned_author_is_refused_from_a_peer_too() {
+        let banned = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+        let banned_did = jig_core::Did::from_ed25519_pubkey(banned.verifying_key().as_bytes())
+            .to_did_jig_string();
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.auth.admission.banned_dids = vec![banned_did];
+        let state = Arc::new(AppState::for_test_with_config(config).unwrap());
+
+        let (bundle_bytes, bundle_b64, sig_b64) = relayed(
+            &banned,
+            BlockKind::TextRender,
+            serde_json::json!({"channel": "#remote", "body": "hi"}),
+        );
+        ingest_peer_block(
+            &state,
+            &test_peer(),
+            &bundle_b64,
+            Some(&sig_b64),
+            "d:banned",
+        )
+        .await
+        .unwrap();
+
+        let cid = peer_block_cid(&bundle_bytes).unwrap();
+        assert!(state.ingest_ctx.store.get_block(&cid).unwrap().is_none());
+
+        // Control: the same relay from an admitted author lands.
+        let admitted = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+        let (bundle_bytes, bundle_b64, sig_b64) = relayed(
+            &admitted,
+            BlockKind::TextRender,
+            serde_json::json!({"channel": "#remote", "body": "hi"}),
+        );
+        ingest_peer_block(&state, &test_peer(), &bundle_b64, Some(&sig_b64), "d:ok")
+            .await
+            .unwrap();
+        let cid = peer_block_cid(&bundle_bytes).unwrap();
+        assert!(state.ingest_ctx.store.get_block(&cid).unwrap().is_some());
+    }
+
+    #[test]
+    fn only_a_not_a_peer_error_ends_the_connection() {
+        let frame = |code: &str| {
+            serde_json::to_string(&Envelope::new(Frame::Error {
+                status: Some(403),
+                code: code.to_string(),
+                ref_cid: None,
+                message: "no".to_string(),
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            subscription_refusal(&frame("NOT_A_PEER")).as_deref(),
+            Some("no")
+        );
+        assert_eq!(subscription_refusal(&frame("NOT_ADMITTED")), None);
+        assert_eq!(subscription_refusal("not json"), None);
     }
 }
