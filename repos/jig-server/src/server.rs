@@ -125,9 +125,12 @@ impl JigServer {
             serve_tls(listener, router, rustls_config).await?;
         } else {
             tracing::info!("HTTP API listening on http://{}", listener.local_addr()?);
-            axum::serve(listener, router)
-                .await
-                .map_err(|e| ServerError::Server(format!("HTTP server error: {e}")))?;
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .map_err(|e| ServerError::Server(format!("HTTP server error: {e}")))?;
         }
 
         Ok(())
@@ -182,7 +185,7 @@ async fn serve_tls(
 ) -> Result<()> {
     let acceptor = TlsAcceptor::from(std::sync::Arc::new(rustls_config));
     loop {
-        let (tcp, _peer) = listener
+        let (tcp, peer) = listener
             .accept()
             .await
             .map_err(|e| ServerError::Server(format!("accept error: {e}")))?;
@@ -197,10 +200,15 @@ async fn serve_tls(
                 }
             };
             let io = TokioIo::new(tls);
-            let service =
-                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+            let service = hyper::service::service_fn(
+                move |mut req: hyper::Request<hyper::body::Incoming>| {
+                    // What `into_make_service_with_connect_info` gives the
+                    // plain listener: the per-address rate limit needs it.
+                    req.extensions_mut()
+                        .insert(axum::extract::ConnectInfo(peer));
                     router.clone().oneshot(req)
-                });
+                },
+            );
             if let Err(e) = AutoBuilder::new(TokioExecutor::new())
                 .serve_connection_with_upgrades(io, service)
                 .await

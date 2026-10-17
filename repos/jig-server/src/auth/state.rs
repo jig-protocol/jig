@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use jig_config::v0_0_2_server::{AdmissionSection, AuthSection, UnknownDidsPolicy};
 
 use crate::auth::admission::{Floor, SeededRecords, UnknownDids};
+use crate::auth::rate::RateLimiter;
 use crate::auth::{
     AdmissionPolicy, DisclosurePolicy, GateOutcome, ReplayGuard, ReputationSource, admit,
 };
@@ -38,6 +39,10 @@ pub struct AuthState {
     /// Gate 2: what this server knows about each DID. Seeded from config in
     /// this phase; the seam a ledger plugs into.
     pub reputation: Arc<dyn ReputationSource>,
+    /// `[auth.rate_limit]` per verified DID; `None` when off.
+    did_rate: Option<RateLimiter>,
+    /// `[auth.rate_limit]` per remote address; `None` when off.
+    ip_rate: Option<RateLimiter>,
     /// The DIDs that may subscribe to this server's federation stream: the
     /// configured peers' `expected_did`s, canonical. Behind a lock so a peer
     /// added after boot is trusted without a restart.
@@ -78,14 +83,25 @@ impl AuthState {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
+        let limits = &auth.rate_limit;
         Ok(Self {
-            replay_guard: Mutex::new(ReplayGuard::new(
-                auth.replay_window_ms,
-                auth.replay_capacity,
-            )),
+            replay_guard: Mutex::new(
+                ReplayGuard::new(auth.replay_window_ms, auth.replay_capacity)
+                    .with_per_did_share(limits.replay_per_did),
+            ),
             disclosure: DisclosurePolicy::default(),
             admission: admission_policy(&auth.admission, banned),
             reputation: Arc::new(SeededRecords::new(records)),
+            did_rate: RateLimiter::new(
+                limits.per_did_burst,
+                limits.per_did_per_second,
+                limits.max_tracked,
+            ),
+            ip_rate: RateLimiter::new(
+                limits.per_ip_burst,
+                limits.per_ip_per_second,
+                limits.max_tracked,
+            ),
             federation_peers: RwLock::new(BTreeSet::new()),
         })
     }
@@ -113,6 +129,26 @@ impl AuthState {
         })
     }
 
+    /// Gate 2, then the DID's rate: what every read, subscription and write
+    /// runs on the identity gate 1 verified. Admission first, so a refused
+    /// caller spends nothing and learns nothing about its rate.
+    pub fn admit_and_charge(&self, did: &str) -> Result<(), GateOutcome> {
+        self.admit(did)?;
+        match &self.did_rate {
+            Some(rate) if !rate.try_take(did, std::time::Instant::now()) => {
+                Err(GateOutcome::RateLimited)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Take one request's worth from `ip`'s bucket. False when it is over.
+    pub fn charge_ip(&self, ip: std::net::IpAddr) -> bool {
+        self.ip_rate
+            .as_ref()
+            .is_none_or(|rate| rate.try_take(&ip.to_string(), std::time::Instant::now()))
+    }
+
     /// Gate 2 for `did`, which must be the identity gate 1 VERIFIED — never
     /// one merely claimed. Pure apart from the view lookup.
     pub fn admit(&self, did: &str) -> Result<(), GateOutcome> {
@@ -127,7 +163,7 @@ impl AuthState {
 impl jig_pipeline::ingest::Admission for AuthState {
     fn admit(&self, sender_did: &str) -> Result<(), jig_pipeline::ingest::AdmissionRefusal> {
         use jig_pipeline::ingest::AdmissionRefusal;
-        match AuthState::admit(self, sender_did) {
+        match self.admit_and_charge(sender_did) {
             Ok(()) => Ok(()),
             Err(outcome) => {
                 // The audit record of what actually happened, whatever the
@@ -138,6 +174,7 @@ impl jig_pipeline::ingest::Admission for AuthState {
                     GateOutcome::AdmissionBelowRuleset { ruleset_key } => {
                         AdmissionRefusal::BelowRuleset { ruleset_key }
                     }
+                    GateOutcome::RateLimited => AdmissionRefusal::RateLimited,
                     // `admit` only ever returns admission outcomes.
                     _ => AdmissionRefusal::Unknown,
                 })
@@ -187,6 +224,7 @@ mod tests {
             replay_window_ms: 1_234,
             replay_capacity: 7,
             admission: AdmissionSection::default(),
+            rate_limit: Default::default(),
         };
         let state = AuthState::from_config(&section).unwrap();
         let mut guard = state.replay_guard.lock().unwrap();

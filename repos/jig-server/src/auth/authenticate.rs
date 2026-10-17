@@ -93,6 +93,7 @@ pub fn authenticate(
         // Not a replay: the guard had no room to record this nonce, and
         // accepting it unrecorded would leave the request replayable.
         Err(ReplayRejection::CapacityExhausted) => Err(GateOutcome::AuthCapacityExhausted),
+        Err(ReplayRejection::DidOverShare) => Err(GateOutcome::RateLimited),
     }
 }
 

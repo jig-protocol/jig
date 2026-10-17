@@ -104,6 +104,12 @@ fn truthful(outcome: &GateOutcome) -> (u16, &'static str, String) {
             "this identity is refused by this server".to_string(),
         ),
 
+        GateOutcome::RateLimited => (
+            429,
+            "RATE_LIMITED",
+            "too many requests; slow down and retry".to_string(),
+        ),
+
         GateOutcome::AuthzNotMember => (
             403,
             "NOT_A_MEMBER",
