@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use jig_client::Identity;
 use jig_client::admission::AdmissionProof;
 use jig_client::read_auth::{ReadProof, signable_path};
+use jig_client::tls::TlsError;
 use serde::Deserialize;
 
 use crate::cmd::channel::base_http_url;
@@ -43,12 +44,14 @@ pub async fn ensure(ctx: &CliContext) -> Result<()> {
 ///
 /// An unreachable server, or one that predates admission, is not an error
 /// here: the command that follows reports it in its own terms. A server that
-/// refuses the proof is, since nothing after it would work.
+/// refuses the proof is, since nothing after it would work, and so is one
+/// this device does not trust ([`crate::cmd::trust`]).
 pub async fn ensure_for(server: &str, identity: &Identity) -> Result<()> {
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .context("building HTTP client")?;
+    let http = match crate::cmd::trust::http(server, std::time::Duration::from_secs(15)).await {
+        Ok(http) => http,
+        Err(e) if matches!(e.downcast_ref(), Some(TlsError::Fetch { .. })) => return Ok(()),
+        Err(e) => return Err(e),
+    };
     let advertised: Option<Advertised> = match http.get(well_known_url(server)).send().await {
         Ok(resp) if resp.status().is_success() => resp.json().await.ok(),
         _ => None,
