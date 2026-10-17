@@ -515,22 +515,23 @@ mod tests {
 
     #[test]
     fn advertised_origin_is_http_when_tls_is_off() {
-        let cfg = ServerConfig {
-            bind_address: "100.64.0.10".into(),
-            port: 7117,
-            ..Default::default()
-        };
-        assert_eq!(advertised_http(cfg), "http://100.64.0.10:7117");
-    }
-
-    #[test]
-    fn advertised_origin_is_https_when_tls_is_on() {
         let mut cfg = ServerConfig {
             bind_address: "100.64.0.10".into(),
             port: 7117,
             ..Default::default()
         };
-        cfg.tls.enabled = true;
+        cfg.tls.enabled = false;
+        assert_eq!(advertised_http(cfg), "http://100.64.0.10:7117");
+    }
+
+    #[test]
+    fn advertised_origin_is_https_when_tls_is_on() {
+        // On by default.
+        let cfg = ServerConfig {
+            bind_address: "100.64.0.10".into(),
+            port: 7117,
+            ..Default::default()
+        };
         assert_eq!(advertised_http(cfg), "https://100.64.0.10:7117");
     }
 
