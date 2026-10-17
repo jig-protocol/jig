@@ -60,10 +60,10 @@ Every conversation is a channel. An encrypted channel is one MLS group.
   order: (`domain`, `jig-dm-v1`), (`a`, A), (`b`, B). Each part is hashed as its label's
   UTF-8 bytes, then the value's length in bytes as an 8-byte little-endian integer, then
   the value's UTF-8 bytes.
-- A server MUST refuse to create an `mls` `#dm/` channel, or any `#dm/` channel naming a
-  `dm_peer`, unless the creator and that `dm_peer` derive its slug and it is locked and
-  `mls`. A client MUST NOT treat a channel as a DM with a peer while the channel's MLS
-  group holds anyone else.
+- The `#dm/` prefix is reserved for DMs. A server MUST refuse to create any `#dm/` channel
+  unless the creation block names a `dm_peer`, the creator and that `dm_peer` derive its
+  slug, and it is locked and `mls`. A client MUST NOT treat a channel as a DM with a peer
+  while the channel's MLS group holds anyone else.
 - **Locked membership** means nobody joins on their own: the member set changes only
   through an explicit, signed membership block.
 - Growing a conversation (DM → group DM → channel) is a membership change on the same
