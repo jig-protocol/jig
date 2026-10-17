@@ -104,6 +104,39 @@ struct PinFile {
     servers: BTreeMap<String, ServerPin>,
 }
 
+/// The store at `path`; a missing file is an empty store. A file that does
+/// not parse is an error, never a silent reset: forgetting every pin is what
+/// an attacker would want.
+fn read(path: &Path) -> Result<PinFile, PinError> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|source| PinError::Corrupt {
+            path: path.display().to_string(),
+            source,
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PinFile::default()),
+        Err(source) => Err(PinError::Io {
+            path: path.display().to_string(),
+            source,
+        }),
+    }
+}
+
+/// File servers pinned while the URL scheme was part of the key under the
+/// key [`server_key`] gives them now. Returns whether any moved.
+fn rekey(file: &mut PinFile) -> bool {
+    let legacy: Vec<String> = file
+        .servers
+        .keys()
+        .filter(|key| server_key(key) != **key)
+        .cloned()
+        .collect();
+    for key in &legacy {
+        let pin = file.servers.remove(key).expect("listed above");
+        file.servers.entry(server_key(key)).or_insert(pin);
+    }
+    !legacy.is_empty()
+}
+
 /// The pin store: `~/.jig/pins.json` by default.
 pub struct Pins {
     path: PathBuf,
@@ -122,37 +155,14 @@ impl Pins {
     /// that does not parse is an error, never a silent reset: forgetting
     /// every pin is what an attacker would want.
     pub fn load(path: &Path) -> Result<Self, PinError> {
-        let file = match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|source| PinError::Corrupt {
-                path: path.display().to_string(),
-                source,
-            })?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PinFile::default(),
-            Err(source) => {
-                return Err(PinError::Io {
-                    path: path.display().to_string(),
-                    source,
-                });
-            }
-        };
         let mut pins = Self {
             path: path.to_path_buf(),
-            file,
+            file: read(path)?,
         };
-        // Servers pinned while the scheme was part of the key.
-        let legacy: Vec<String> = pins
-            .file
-            .servers
-            .keys()
-            .filter(|key| server_key(key) != **key)
-            .cloned()
-            .collect();
-        if !legacy.is_empty() {
-            for key in legacy {
-                let pin = pins.file.servers.remove(&key).expect("listed above");
-                pins.file.servers.entry(server_key(&key)).or_insert(pin);
-            }
-            pins.save()?;
+        // Stores written while the scheme was part of the key are saved
+        // rekeyed, under the lock like any other change.
+        if rekey(&mut pins.file) {
+            pins.update(|_| Ok(((), false)))?;
         }
         Ok(pins)
     }
@@ -183,45 +193,47 @@ impl Pins {
         welcome: &VerifiedWelcome,
     ) -> Result<(), PinError> {
         let advertised: BTreeSet<String> = welcome.suites.iter().cloned().collect();
-        let pin = self
-            .file
-            .servers
-            .entry(server_key(server))
-            .or_insert_with(|| ServerPin {
+        self.update(|file| {
+            let key = server_key(server);
+            let first = !file.servers.contains_key(&key);
+            let pin = file.servers.entry(key).or_insert_with(|| ServerPin {
                 server_did: welcome.server_did.clone(),
                 ..ServerPin::default()
             });
-        if let Some(dropped) = pin.suites.difference(&advertised).next() {
-            return Err(PinError::SuiteDropped {
-                server: server.to_string(),
-                suite: dropped.clone(),
-            });
-        }
-        if pin.suites != advertised || pin.server_did != welcome.server_did {
-            pin.suites = advertised;
-            pin.server_did.clone_from(&welcome.server_did);
-            self.save()?;
-        }
-        Ok(())
+            if let Some(dropped) = pin.suites.difference(&advertised).next() {
+                return Err(PinError::SuiteDropped {
+                    server: server.to_string(),
+                    suite: dropped.clone(),
+                });
+            }
+            let changed = first || pin.suites != advertised || pin.server_did != welcome.server_did;
+            if changed {
+                pin.suites = advertised;
+                pin.server_did.clone_from(&welcome.server_did);
+            }
+            Ok(((), changed))
+        })
     }
 
     /// Check the DID `server` names against the pin, and pin it on first
     /// sight. Used where no signed welcome is at hand, as when a TLS probe
     /// takes the DID a certificate is bound to.
     pub fn check_server_did(&mut self, server: &str, did: &str) -> Result<(), PinError> {
-        let pin = self.file.servers.entry(server_key(server)).or_default();
-        if pin.server_did.is_empty() {
-            pin.server_did = did.to_string();
-            return self.save();
-        }
-        if pin.server_did != did {
-            return Err(PinError::ServerReplaced {
-                server: server.to_string(),
-                pinned: pin.server_did.clone(),
-                presented: did.to_string(),
-            });
-        }
-        Ok(())
+        self.update(|file| {
+            let pin = file.servers.entry(server_key(server)).or_default();
+            if pin.server_did.is_empty() {
+                pin.server_did = did.to_string();
+                return Ok(((), true));
+            }
+            if pin.server_did != did {
+                return Err(PinError::ServerReplaced {
+                    server: server.to_string(),
+                    pinned: pin.server_did.clone(),
+                    presented: did.to_string(),
+                });
+            }
+            Ok(((), false))
+        })
     }
 
     /// The pin for `slug` on `server`, if this device has one.
@@ -237,30 +249,72 @@ impl Pins {
         slug: &str,
         proven: ChannelPin,
     ) -> Result<ChannelPin, PinError> {
-        let pin = self.file.servers.entry(server_key(server)).or_default();
-        match pin.channels.get(slug) {
-            Some(pinned) if pinned.create_cid == proven.create_cid => Ok(pinned.clone()),
-            Some(pinned) => Err(PinError::ChannelReplaced {
-                server: server.to_string(),
-                slug: slug.to_string(),
-                pinned: pinned.create_cid.clone(),
-                presented: proven.create_cid,
-            }),
-            None => {
-                pin.channels.insert(slug.to_string(), proven.clone());
-                self.save()?;
-                Ok(proven)
+        self.update(|file| {
+            let pin = file.servers.entry(server_key(server)).or_default();
+            match pin.channels.get(slug) {
+                Some(pinned) if pinned.create_cid == proven.create_cid => {
+                    Ok((pinned.clone(), false))
+                }
+                Some(pinned) => Err(PinError::ChannelReplaced {
+                    server: server.to_string(),
+                    slug: slug.to_string(),
+                    pinned: pinned.create_cid.clone(),
+                    presented: proven.create_cid,
+                }),
+                None => {
+                    pin.channels.insert(slug.to_string(), proven.clone());
+                    Ok((proven, true))
+                }
             }
-        }
+        })
     }
 
     /// Drop everything pinned for `server`. Returns whether there was any.
     pub fn forget(&mut self, server: &str) -> Result<bool, PinError> {
-        let had = self.file.servers.remove(&server_key(server)).is_some();
-        if had {
+        self.update(|file| {
+            let had = file.servers.remove(&server_key(server)).is_some();
+            Ok((had, had))
+        })
+    }
+
+    /// Apply `change` to the store as it is on disk now, holding an exclusive
+    /// lock from the read to the write, and save it when `change` reports a
+    /// change. Two processes for one device (a `jig chat` beside a `jig
+    /// send`) each pinning something would otherwise each write back their
+    /// own copy, and the later one would erase the other's pin.
+    fn update<T>(
+        &mut self,
+        change: impl FnOnce(&mut PinFile) -> Result<(T, bool), PinError>,
+    ) -> Result<T, PinError> {
+        let _lock = self.lock()?;
+        self.file = read(&self.path)?;
+        let rekeyed = rekey(&mut self.file);
+        let (out, changed) = change(&mut self.file)?;
+        if changed || rekeyed {
             self.save()?;
         }
-        Ok(had)
+        Ok(out)
+    }
+
+    /// The store's lock file, locked exclusively until the returned handle
+    /// drops. Blocks while another process holds it.
+    fn lock(&self) -> Result<std::fs::File, PinError> {
+        let path = self.path.with_extension("json.lock");
+        let io = |source| PinError::Io {
+            path: path.display().to_string(),
+            source,
+        };
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(io)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(io)?;
+        file.lock().map_err(io)?;
+        Ok(file)
     }
 
     /// Write the store through a temporary file and a rename, so a crash
@@ -552,6 +606,32 @@ mod tests {
         );
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(!on_disk.contains("http://"), "{on_disk}");
+    }
+
+    /// Two processes that loaded the store before either pinned anything
+    /// must both keep their pins: each change is made to the store as it is
+    /// on disk, not to the copy loaded earlier.
+    #[test]
+    fn pins_from_two_processes_both_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let server = "https://host:7117";
+        let (mut chat, mut send) = (Pins::load(&path).unwrap(), Pins::load(&path).unwrap());
+        let pin = |cid: &str| ChannelPin {
+            create_cid: cid.into(),
+            suite: "mls".into(),
+            owner_did: "did:jig:zOwner".into(),
+        };
+        chat.check_channel(server, "#a", pin("bafyA")).unwrap();
+        send.check_channel(server, "#b", pin("bafyB")).unwrap();
+        let on_disk = Pins::load(&path).unwrap();
+        assert_eq!(on_disk.channel(server, "#a"), Some(&pin("bafyA")));
+        assert_eq!(on_disk.channel(server, "#b"), Some(&pin("bafyB")));
+        // And a later change is checked against what another process pinned.
+        assert!(matches!(
+            chat.check_channel(server, "#b", pin("bafyOther")),
+            Err(PinError::ChannelReplaced { .. })
+        ));
     }
 
     #[test]
