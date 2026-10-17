@@ -48,12 +48,18 @@ pub struct ServerConfig {
     pub tls: TlsConfig,
 }
 
-/// Opt-in TLS for the public HTTPS edge. Absent / `enabled = false` keeps the
-/// server on plaintext HTTP (the localhost dev default). The operator supplies
-/// a static cert + key (e.g. from certbot or a Cloudflare origin cert).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// TLS for the listener. On by default.
+///
+/// With neither `cert_path` nor `key_path`, the server makes a self-signed
+/// certificate on first start, keeps it in `tls/` next to the database, and
+/// its DID vouches for it at `/.well-known/jig`: jig clients trust it through
+/// the DID they pinned, not through a CA. Give both paths to serve a
+/// certificate a CA issued (`tailscale cert`, certbot); jig clients accept
+/// either. `enabled = false` serves plaintext HTTP, for loopback development
+/// or behind a proxy that terminates TLS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
-    #[serde(default)]
+    #[serde(default = "default_tls_enabled")]
     pub enabled: bool,
     #[serde(default)]
     pub cert_path: Option<PathBuf>,
@@ -61,16 +67,60 @@ pub struct TlsConfig {
     pub key_path: Option<PathBuf>,
 }
 
-impl TlsConfig {
-    /// `(cert_path, key_path)` when both are present; an error otherwise. The
-    /// server calls this only when `enabled`, so a missing path is a
-    /// misconfiguration that must fail loudly at startup.
-    pub fn resolved_paths(&self) -> Result<(&PathBuf, &PathBuf), String> {
-        match (&self.cert_path, &self.key_path) {
-            (Some(cert), Some(key)) => Ok((cert, key)),
-            _ => Err("[tls] enabled = true requires both cert_path and key_path".to_string()),
+fn default_tls_enabled() -> bool {
+    true
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cert_path: None,
+            key_path: None,
         }
     }
+}
+
+impl TlsConfig {
+    /// The certificate and key to serve: the configured pair, or the
+    /// self-signed pair under `dir/tls/`, made on first use for `names`. One
+    /// path without the other is a misconfiguration and fails loudly.
+    pub fn material(&self, dir: &Path, names: &[String]) -> Result<(PathBuf, PathBuf), String> {
+        match (&self.cert_path, &self.key_path) {
+            (Some(cert), Some(key)) => Ok((cert.clone(), key.clone())),
+            (None, None) => self_signed(&dir.join("tls"), names),
+            _ => Err(
+                "[tls] needs both cert_path and key_path, or neither for a self-signed \
+                 certificate"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+/// The self-signed certificate in `dir`, made now if it is not there yet.
+/// The key is written 0600.
+fn self_signed(dir: &Path, names: &[String]) -> Result<(PathBuf, PathBuf), String> {
+    let (cert, key) = (dir.join("self-signed.crt"), dir.join("self-signed.key"));
+    if cert.exists() && key.exists() {
+        return Ok((cert, key));
+    }
+    let made = rcgen::generate_simple_self_signed(names.to_vec())
+        .map_err(|e| format!("making a self-signed TLS certificate: {e}"))?;
+    fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    std::io::Write::write_all(
+        &mut options
+            .open(&key)
+            .map_err(|e| format!("writing {}: {e}", key.display()))?,
+        made.signing_key.serialize_pem().as_bytes(),
+    )
+    .map_err(|e| format!("writing {}: {e}", key.display()))?;
+    fs::write(&cert, made.cert.pem()).map_err(|e| format!("writing {}: {e}", cert.display()))?;
+    Ok((cert, key))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,6 +265,27 @@ impl ServerConfig {
         // key/value pair once a table header has been emitted.
         template.push_str(&v0_0_2_template_sections(&defaults));
         fs::write(path, template)
+    }
+
+    /// Names a self-signed certificate is made for: `localhost`, the bind
+    /// address unless it is a wildcard, and `public_url`'s host. jig clients
+    /// trust the certificate through the server's DID, not these names; they
+    /// are there for other tools.
+    pub fn tls_names(&self) -> Vec<String> {
+        let mut names = vec!["localhost".to_string()];
+        if !matches!(self.bind_address.as_str(), "0.0.0.0" | "::" | "[::]") {
+            names.push(self.bind_address.clone());
+        }
+        if let Some(host) = self
+            .public_url
+            .as_deref()
+            .and_then(|u| url::Url::parse(u).ok())
+            .and_then(|u| u.host_str().map(str::to_string))
+        {
+            names.push(host.trim_matches(['[', ']']).to_string());
+        }
+        names.dedup();
+        names
     }
 
     pub fn execution_config(&self) -> ExecutionConfig {
@@ -371,10 +442,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tls_defaults_disabled() {
+    fn tls_is_on_by_default_with_a_self_signed_certificate() {
         let cfg = ServerConfig::default();
+        assert!(cfg.tls.enabled);
+        // An operator config that predates `[tls]` gets it too.
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+            database_path = "/tmp/x.db"
+            bind_address = "127.0.0.1"
+            port = 7117
+        "#,
+        )
+        .unwrap();
+        assert!(cfg.tls.enabled);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = cfg.tls.material(dir.path(), &cfg.tls_names()).unwrap();
+        assert!(cert.starts_with(dir.path().join("tls")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(&key).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "the key must not be group/other readable");
+        }
+        // Made once: a restart serves the same certificate.
+        let pem = fs::read(&cert).unwrap();
+        cfg.tls.material(dir.path(), &cfg.tls_names()).unwrap();
+        assert_eq!(fs::read(&cert).unwrap(), pem);
+    }
+
+    #[test]
+    fn tls_can_be_turned_off() {
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+            database_path = "/tmp/x.db"
+            bind_address = "127.0.0.1"
+            port = 7117
+            [tls]
+            enabled = false
+        "#,
+        )
+        .unwrap();
         assert!(!cfg.tls.enabled);
-        assert!(cfg.tls.resolved_paths().is_err());
     }
 
     #[test]
@@ -390,7 +499,7 @@ mod tests {
         "#;
         let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
         assert!(cfg.tls.enabled);
-        let (cert, key) = cfg.tls.resolved_paths().unwrap();
+        let (cert, key) = cfg.tls.material(Path::new("/unused"), &[]).unwrap();
         assert_eq!(cert.to_str().unwrap(), "/etc/jig/tls/fullchain.pem");
         assert_eq!(key.to_str().unwrap(), "/etc/jig/tls/privkey.pem");
     }
@@ -423,16 +532,16 @@ mod tests {
     }
 
     #[test]
-    fn tls_enabled_without_paths_is_error() {
+    fn a_cert_without_its_key_is_an_error() {
         let toml_str = r#"
             database_path = "/tmp/x.db"
             bind_address = "0.0.0.0"
             port = 443
             [tls]
-            enabled = true
+            cert_path = "/etc/jig/tls/fullchain.pem"
         "#;
         let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
-        assert!(cfg.tls.resolved_paths().is_err());
+        assert!(cfg.tls.material(Path::new("/unused"), &[]).is_err());
     }
 }
 
@@ -563,6 +672,10 @@ connection_string = "{db}"
             .expect("install.sh's config must parse as ServerConfig — this is what binds");
         assert_eq!(server.bind_address, "127.0.0.1");
         assert_eq!(server.port, 7117);
+        assert!(
+            server.tls.enabled,
+            "the installer's server serves TLS, and install.sh points the client at https"
+        );
         assert!(
             server.database_path.starts_with("/opt/jig-home"),
             "database_path must live under JIG_HOME, got {}",

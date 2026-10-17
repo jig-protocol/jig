@@ -37,7 +37,6 @@ use tokio_tungstenite::{connect_async, connect_async_tls_with_config, tungstenit
 use tracing::{debug, info, warn};
 
 use crate::v0_0_2::AppState;
-use crate::v0_0_2_federation_tls::select_connector;
 
 /// Reconnect delay after a peer connection drops or fails to establish.
 /// Constant in v0.0.2; exponential backoff is a v0.0.3+ refinement.
@@ -239,21 +238,11 @@ async fn connect_and_relay(
     }
     let ws_url = format!("{}/api/v1/ws", peer.url.trim_end_matches('/'));
 
-    // alpha.1c #4: honor the `federation.dangerously_disable_federation_tls`
-    // antipattern flag. `select_connector` returns `None` (default) so
-    // `connect_async` uses the built-in rustls verifier (native roots), or
-    // `Some(Connector::Rustls(NoCertVerifier))` when the flag is on — in
-    // which case the WSS handshake accepts self-signed and
-    // hostname-mismatched certs. The flag is also advertised in
-    // `/.well-known/jig` so federated peers can detect the misconfiguration.
-    let connector = select_connector(&state.config.federation);
-    if connector.is_some() {
-        warn!(
-            peer_url = %peer.url,
-            "federation.dangerously_disable_federation_tls=true — installing \
-             no-op cert verifier for this peer; TLS server identity is NOT being checked"
-        );
-    }
+    // A `wss://` peer is held to the certificate its expected DID vouches for
+    // (or one a CA issued); `dangerously_disable_federation_tls` checks
+    // nothing and is advertised in `/.well-known/jig`.
+    let connector =
+        crate::v0_0_2_federation_tls::peer_connector(&state.config.federation, peer).await?;
     let (mut ws, _resp) = match connector {
         Some(c) => connect_async_tls_with_config(&ws_url, None, false, Some(c)).await?,
         None => connect_async(&ws_url).await?,

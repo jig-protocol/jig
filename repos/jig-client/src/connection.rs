@@ -186,6 +186,18 @@ impl Client {
         identity: Identity,
         offer: jig_pipeline::handshake::ClientOffer,
     ) -> Result<Self, ClientError> {
+        Self::connect_with_tls(server_url, identity, offer, None).await
+    }
+
+    /// [`Client::connect_with`] over `tls`, typically the config
+    /// [`crate::tls::probe`] built for this server. `None` uses the system's
+    /// CA roots alone, which refuse a server's own certificate.
+    pub async fn connect_with_tls(
+        server_url: &str,
+        identity: Identity,
+        offer: jig_pipeline::handshake::ClientOffer,
+        tls: Option<std::sync::Arc<rustls::ClientConfig>>,
+    ) -> Result<Self, ClientError> {
         let url = Url::parse(server_url).map_err(|e| ClientError::BadUrl(e.to_string()))?;
         // Map http(s) → ws(s) if user gave HTTP scheme; otherwise leave alone.
         let scheme = match url.scheme() {
@@ -199,9 +211,19 @@ impl Client {
         let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
         let ws_url = format!("{scheme}://{host}{port}/api/v1/ws");
 
-        let (ws, _resp) = connect_async(&ws_url)
-            .await
-            .map_err(|e| ClientError::Connect(e.to_string()))?;
+        let (ws, _resp) = match tls {
+            Some(config) => {
+                tokio_tungstenite::connect_async_tls_with_config(
+                    &ws_url,
+                    None,
+                    false,
+                    Some(tokio_tungstenite::Connector::Rustls(config)),
+                )
+                .await
+            }
+            None => connect_async(&ws_url).await,
+        }
+        .map_err(|e| ClientError::Connect(e.to_string()))?;
         let (mut sink, mut stream) = ws.split();
 
         let (welcome, refusal) = match drive_handshake(&mut sink, &mut stream, &offer).await {

@@ -110,6 +110,38 @@ pub fn select_connector(
     }
 }
 
+/// The `Connector` for dialing `peer`.
+///
+/// - With `dangerously_disable_federation_tls`, one that checks nothing, and
+///   a warning naming the flag.
+/// - For a `wss://` peer, the config [`jig_client::tls::probe`] builds: the
+///   peer must name its configured `expected_did`, and present a certificate
+///   that DID vouches for at `/.well-known/jig`, or one a CA issued. A peer
+///   on the default self-signed certificate federates this way.
+/// - For a `ws://` peer, `None`: plaintext.
+pub async fn peer_connector(
+    federation: &jig_config::v0_0_2_server::FederationSection,
+    peer: &jig_config::v0_0_2_server::FederationPeer,
+) -> anyhow::Result<Option<Connector>> {
+    if let Some(insecure) = select_connector(federation) {
+        tracing::warn!(
+            peer_url = %peer.url,
+            "federation.dangerously_disable_federation_tls=true — installing \
+             no-op cert verifier for this peer; TLS server identity is NOT being checked"
+        );
+        return Ok(Some(insecure));
+    }
+    let url = peer.url.trim().to_ascii_lowercase();
+    if !(url.starts_with("wss://") || url.starts_with("https://")) {
+        return Ok(None);
+    }
+    let expected = Some(peer.expected_did.as_str()).filter(|d| !d.is_empty());
+    Ok(jig_client::tls::probe(&peer.url, expected)
+        .await?
+        .config
+        .map(Connector::Rustls))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

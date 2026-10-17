@@ -134,6 +134,10 @@ struct ServerInfoResponse {
     /// deciding to peer with it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     bridges: Vec<String>,
+    /// The server DID's signature over the TLS certificate it serves, so a
+    /// client can trust a certificate no CA issued. Absent over plaintext.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tls_binding: Option<jig_core::tls_binding::TlsBinding>,
 }
 
 #[derive(Serialize, Clone)]
@@ -207,6 +211,10 @@ async fn server_info(State(state): State<AppState>) -> Result<Json<ServerInfoRes
         allowed_block_kinds,
         peers,
         bridges,
+        tls_binding: state
+            .v0_0_2
+            .as_ref()
+            .and_then(|v| v.tls_binding.get().cloned()),
     }))
 }
 
@@ -507,22 +515,23 @@ mod tests {
 
     #[test]
     fn advertised_origin_is_http_when_tls_is_off() {
-        let cfg = ServerConfig {
-            bind_address: "100.64.0.10".into(),
-            port: 7117,
-            ..Default::default()
-        };
-        assert_eq!(advertised_http(cfg), "http://100.64.0.10:7117");
-    }
-
-    #[test]
-    fn advertised_origin_is_https_when_tls_is_on() {
         let mut cfg = ServerConfig {
             bind_address: "100.64.0.10".into(),
             port: 7117,
             ..Default::default()
         };
-        cfg.tls.enabled = true;
+        cfg.tls.enabled = false;
+        assert_eq!(advertised_http(cfg), "http://100.64.0.10:7117");
+    }
+
+    #[test]
+    fn advertised_origin_is_https_when_tls_is_on() {
+        // On by default.
+        let cfg = ServerConfig {
+            bind_address: "100.64.0.10".into(),
+            port: 7117,
+            ..Default::default()
+        };
         assert_eq!(advertised_http(cfg), "https://100.64.0.10:7117");
     }
 

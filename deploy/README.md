@@ -192,22 +192,27 @@ enabling it.
 
 | Check | Command | Expect |
 | --- | --- | --- |
-| Server liveness | `curl http://100.x.y.z:7117/healthz` | `200`, body `ok` |
-| Server identity | `curl http://100.x.y.z:7117/.well-known/jig` | `server_did` + `unsafe_options_active` |
-| Server counters | `curl http://100.x.y.z:7117/metrics` | Prometheus text |
-| Channel list | `curl http://100.x.y.z:7117/api/v1/channels` | `401` `AUTH_REQUIRED` — reads are signed; use `jig channel list` instead |
+| Server liveness | `curl -k https://100.x.y.z:7117/healthz` | `200`, body `ok` |
+| Server identity | `curl -k https://100.x.y.z:7117/.well-known/jig` | `server_did`, `tls_binding` and `unsafe_options_active` |
+| Server counters | `curl -k https://100.x.y.z:7117/metrics` | Prometheus text |
+| Channel list | `curl -k https://100.x.y.z:7117/api/v1/channels` | `401` `AUTH_REQUIRED` — reads are signed; use `jig channel list` instead |
 | Nameserver liveness | `curl http://100.x.y.z:7070/v1/health` | `{"status":"ok"}` |
 | Nameserver alias API | `curl http://100.x.y.z:7070/v1/challenge` | `{"challenge":"<64 hex>"}` |
 | Units | `systemctl status jig-server jig-nameserver` | both `active (running)` |
 
-> ⚠️ **Once you enable `[tls]`, every one of the `:7117` rows above becomes
-> `https://`, not just the ones you were thinking about.** TLS wraps the *whole*
-> router on the single configured port — `/healthz`, `/metrics`,
-> `/.well-known/jig`, `/api/v1/*` and the WebSocket alike. An `http://` request
-> to a TLS port produces no usable response, and **`curl -s` hides the error**,
-> so a working server looks like a silently dead one. Drop the `-s`, or use
-> `https://<host>.<tailnet>.ts.net:7117/healthz`. Clients must move to
-> `https://` / `wss://` too (`jig server set https://…`).
+> ⚠️ **`jig-server` serves TLS by default**, on every route of its one port:
+> `/healthz`, `/metrics`, `/.well-known/jig`, `/api/v1/*` and the WebSocket.
+> With no `[tls] cert_path`/`key_path` it makes a self-signed certificate on
+> first start (`tls/` next to the database) and its DID vouches for it at
+> `/.well-known/jig`. `jig` trusts it through the DID it pinned, so `curl`
+> needs `-k`, and `jig` needs nothing. An `http://` request to the port gets no
+> usable response, and **`curl -s` hides the error**. A client still set to
+> `http://` is told to run `jig server set https://…`.
+>
+> **Upgrading a server that ran without `[tls]`:** it comes back on TLS. Every
+> client re-runs `jig server set https://…`; their pins and encrypted-channel
+> state carry over, because neither is keyed by the scheme. To keep plaintext
+> (behind a proxy that terminates TLS, say), set `[tls] enabled = false`.
 >
 > The nameserver on `:7070` is **not** covered by `[tls]` — that section belongs
 > to `jig-server` only — so its rows stay `http://` unless you terminate TLS in
@@ -296,11 +301,13 @@ mistyped) is `200` with `[]`. `limit` defaults to and is clamped at **200**.
 
 ---
 
-## Real TLS with `tailscale cert` (no certbot, no public DNS)
+## A CA-issued certificate with `tailscale cert` (no certbot, no public DNS)
 
-Tailscale issues genuine Let's Encrypt certificates for your MagicDNS name, so
-you get real HTTPS/WSS with **no public DNS record, no port 80 challenge, and no
-public exposure whatsoever**. This is strictly better than certbot here.
+The server's own self-signed certificate is enough for `jig`, which trusts it
+through the server DID. For a certificate browsers and `curl` trust too,
+Tailscale issues genuine Let's Encrypt certificates for your MagicDNS name,
+with **no public DNS record, no port 80 challenge, and no public exposure
+whatsoever**. This is strictly better than certbot here.
 
 Enable HTTPS + MagicDNS in the tailnet admin console, then:
 
@@ -319,11 +326,10 @@ sudo chown -R jig:jig /var/lib/jig/tls
 sudo sh -c 'chmod 600 /var/lib/jig/tls/*.key'
 ```
 
-Point the server's existing `[tls]` block at them:
+Point the server's `[tls]` block at them:
 
 ```toml
 [tls]
-enabled = true
 cert_path = "/var/lib/jig/tls/<host>.<tailnet>.ts.net.crt"
 key_path  = "/var/lib/jig/tls/<host>.<tailnet>.ts.net.key"
 ```
@@ -334,8 +340,9 @@ device **without `-k`**. Clients use `wss://` for the same host.
 
 **Renewal is not automatic here.** The server reads the cert once at startup (no
 hot reload). Certs are ~90 days, so re-run `tailscale cert` and restart the
-service on a monthly timer, or leave TLS off for a short-lived dogfood — the
-tailnet is already an encrypted transport.
+service on a monthly timer. Each restart, the server DID vouches for whatever
+certificate it serves, so `jig` clients follow a renewal without re-pinning.
+Or remove `cert_path`/`key_path` to go back to the self-signed certificate.
 
 ---
 
@@ -352,9 +359,9 @@ a timezone. Send the invites before anyone builds anything.
 | 3 | Them | Confirm they can see the box | `tailscale ping <host>` |
 | 4 | You | Get them the `jig` binary | AirDrop or `tailscale file cp` |
 | 5 | Them | Clear the macOS quarantine flag | `xattr -d com.apple.quarantine ./jig` |
-| 6 | Them | Confirm the server is reachable | `curl http://100.x.y.z:7117/healthz` |
+| 6 | Them | Confirm the server is reachable | `curl -k https://100.x.y.z:7117/healthz` |
 | 7 | Them | Create an identity | `./jig init <nickname>` |
-| 8 | Them | Point at the server | `./jig server set http://100.x.y.z:7117` |
+| 8 | Them | Point at the server | `./jig server set https://100.x.y.z:7117` |
 | 9 | Them | **Back up `~/.jig/keys/*.key`** | copy into a password manager |
 | 10 | Them | Chat | `./jig chat '#gigue'` |
 
@@ -469,7 +476,7 @@ sudo chown -R jig:jig /var/lib/jig          # -R, not /var/lib/jig/* — see the
                                             # glob note in the TLS section above
 sudo chmod 600 /var/lib/jig/server.key      # or the server refuses to start
 sudo systemctl start jig-server jig-nameserver
-curl http://100.x.y.z:7117/.well-known/jig  # server_did MUST match the old one
+curl -k https://100.x.y.z:7117/.well-known/jig  # server_did MUST match the old one
 ```
 
 That last check is the whole point: if `server_did` changed, you restored the

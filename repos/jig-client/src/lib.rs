@@ -13,6 +13,7 @@ pub mod open;
 pub mod pins;
 pub mod read_auth;
 pub mod secure;
+pub mod tls;
 
 pub use connection::envelope;
 pub use connection::{BlockStream, Client, ClientError, DeliveredBlock};
