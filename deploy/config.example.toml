@@ -121,8 +121,16 @@ list_handles = false
 
 # [federation]
 # dangerously_disable_federation_tls = false
+# A `ws://` (plaintext) peer URL stops the boot unless this is set. The peer's
+# DID is still checked at the handshake, but nothing after it is protected;
+# the flag is advertised in /.well-known/jig. Prefer wss://.
+# dangerously_allow_plaintext_federation = false
+# Listing a peer is what trusts it: this server dials `url` (it appends
+# /api/v1/ws), refuses a welcome signed by any DID but `expected_did`, and
+# lets only listed DIDs subscribe to its own federation stream. Both servers
+# list each other.
 # [[federation.peers]]
-# url = "wss://peer.example.ts.net:7117/v0_0_2/federation"
+# url = "wss://peer.example.ts.net:7117"
 # expected_did = "did:jig:..."
 
 # [bridges]

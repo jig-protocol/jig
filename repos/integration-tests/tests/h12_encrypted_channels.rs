@@ -286,7 +286,7 @@ async fn an_encrypted_channel_round_trip_leaves_no_plaintext_on_the_server() {
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("{}/api/v1/ws", server.ws_url()))
         .await
         .unwrap();
-    jig_server::v0_0_2_federation::complete_client_handshake(&mut ws)
+    jig_server::v0_0_2_federation::complete_client_handshake(&mut ws, None)
         .await
         .unwrap();
     let sub = signed_subscribe(&bob.id, Scope::Channel { slug: slug.into() });

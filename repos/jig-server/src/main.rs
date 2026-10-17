@@ -120,6 +120,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
+        // A plaintext federation peer nobody opted into stops the boot, loudly,
+        // rather than surfacing only as "v0.0.2 module failed to initialize".
+        if let Err(e) =
+            jig_server::v0_0_2_federation::check_federation_transport(&v002_config.federation)
+        {
+            let msg = format!("federation config rejected: {e}");
+            tracing::error!("{msg}");
+            eprintln!("[jig-server] FATAL: {msg}");
+            std::process::exit(1);
+        }
+
         if let Some(warning) = listen_disagreement_warning(
             &v002_config.server.listen,
             &config.bind_address,

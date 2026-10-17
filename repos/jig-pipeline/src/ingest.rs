@@ -682,11 +682,12 @@ pub fn channel_metadata_key(kind: BlockKind) -> &'static str {
 /// a mistyped slug persisted an orphan block and handed the sender a CID, so a
 /// typo was indistinguishable from a delivered message.
 ///
-/// Federated blocks are deliberately EXEMPT. Channel and membership state does
-/// not replicate between peers — jig-server's federation relay persists inbound
-/// blocks without running `apply_effect` — so a peer's block routinely names a
-/// channel this server has no row for. Gating on local channel state would
-/// reject legitimate federated traffic.
+/// A federated `text-render` is deliberately EXEMPT. A channel's state reaches
+/// a peer only through blocks relayed after peering began, so a peer's message
+/// routinely names a channel this server has no row for; refusing it would
+/// drop legitimate federated traffic. The membership and lifecycle kinds are
+/// not exempt from a peer either: with no channel there is no owner to
+/// authorize them against, and the write gate must not pass them by default.
 ///
 /// Bridges are deliberately NOT exempt. The email bridge awaits
 /// `ensure_dm_channel` (a real channel-create through this same pipeline) before
@@ -702,7 +703,7 @@ pub fn channel_metadata_key(kind: BlockKind) -> &'static str {
 /// callers who had proved nothing. The typed 404 here is what lets every
 /// surface answer only after the signature and admission have passed.
 fn requires_existing_channel(kind: BlockKind, source: &IngestSource) -> bool {
-    if matches!(source, IngestSource::FederatedPeer { .. }) {
+    if kind == BlockKind::TextRender && matches!(source, IngestSource::FederatedPeer { .. }) {
         return false;
     }
     matches!(
@@ -2021,10 +2022,10 @@ mod tests {
 
     #[tokio::test]
     async fn federated_text_render_to_unknown_channel_is_admitted() {
-        // Deliberate exemption: channel state does not replicate between peers
-        // (see jig-server v0_0_2_federation docs), so a peer's block routinely
-        // names a channel this server has no row for. Rejecting would break
-        // federation; we admit and let fanout match on the slug.
+        // Deliberate exemption: a peer's message routinely names a channel
+        // this server has no row for (one created before the two peered).
+        // Rejecting would break federation; we admit and let fanout match on
+        // the slug.
         let ctx = test_ctx();
         let sender_key = random_signing_key();
         let (mb, cb, sig) =
@@ -2043,6 +2044,34 @@ mod tests {
         .await
         .expect("federated blocks must not be gated on local channel state");
         assert!(ctx.store.get_block(&cid).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_peers_control_block_for_an_unknown_channel_is_refused() {
+        // A member-add for a channel this server has no row for has no owner
+        // to be authorized against. It must not ride the text-render
+        // exemption past the write gate.
+        let ctx = test_ctx_allowing(&["member-add"]);
+        let sender_key = random_signing_key();
+        let (mb, cb, sig) =
+            build_bundle_parts_with_channel(&sender_key, BlockKind::MemberAdd, "#remote-only");
+
+        let err = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::FederatedPeer {
+                peer_did: Did::default(),
+                peer_url: "wss://peer-a.jig.onl".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, IngestError::UnknownChannel { slug } if slug == "#remote-only"),
+            "expected UnknownChannel, got {err:?}"
+        );
     }
 
     #[tokio::test]

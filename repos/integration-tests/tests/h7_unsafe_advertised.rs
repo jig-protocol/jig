@@ -85,6 +85,21 @@ async fn dangerously_disable_federation_tls_surfaces_in_well_known() {
 }
 
 #[tokio::test]
+async fn dangerously_allow_plaintext_federation_surfaces_in_well_known() {
+    let mut config = JigServerConfig::default();
+    config.federation.dangerously_allow_plaintext_federation = true;
+    let server = TestJigServer::start_with_config(config).await.unwrap();
+    let info = well_known(&server).await;
+    let active: Vec<String> = info["unsafe_options_active"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(active.contains(&"federation.dangerously_allow_plaintext_federation".to_string()));
+}
+
+#[tokio::test]
 async fn naively_allow_unknown_handles_surfaces_in_well_known() {
     let mut config = JigServerConfig::default();
     config.identity.naively_allow_unknown_handles_fallback = true;
@@ -119,6 +134,7 @@ async fn all_antipatterns_simultaneously_advertised() {
     let mut config = JigServerConfig::default();
     config.debug.admin_endpoints = true;
     config.federation.dangerously_disable_federation_tls = true;
+    config.federation.dangerously_allow_plaintext_federation = true;
     config.identity.naively_allow_unknown_handles_fallback = true;
     config.debug.list_handles = true;
 
@@ -135,6 +151,7 @@ async fn all_antipatterns_simultaneously_advertised() {
         "naively_unbounded_clock_skew",
         "debug.admin_endpoints",
         "federation.dangerously_disable_federation_tls",
+        "federation.dangerously_allow_plaintext_federation",
         "identity.naively_allow_unknown_handles_fallback",
         "debug.list_handles",
     ] {
