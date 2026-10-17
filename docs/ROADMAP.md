@@ -98,7 +98,7 @@ reserve the hooks for encryption so that turning it on in v0.2 changes a value, 
 | 13 | `CONTRIBUTING.md` (with the dependency rule below), `CODE_OF_CONDUCT.md`, templates, `CODEOWNERS` | Done |
 | 14 | CLI papercuts: `jig read`, `jig --version`, client reconnect with backoff, `block` stubs | `read` and `--version` done; reconnect and `block` stubs open |
 | 15 | `publish = false` on crates not meant for crates.io | Open |
-| 16 | CI: macOS job, clippy on every crate, federation and bridge counters in `/metrics` | Partial (macOS covered by the install smoke test only) |
+| 16 | CI: macOS job, clippy on every crate, federation and bridge counters in `/metrics`, scope jobs by changed paths (note below) | Partial (macOS covered by the install smoke test only); path scoping open |
 | 17 | Collapse the hybrid server config into one struct with `deny_unknown_fields` | Open |
 | 18 | Run federated blocks through the write gate; "trusted peer" becomes explicit config | Open (since v0.2 only open, unencrypted channels federate) |
 | 19 | Discovery JEP stub | Done ([JEP-0003](../repos/jig-spec/jep/jep-0003-server-discovery.md)) |
@@ -107,6 +107,21 @@ reserve the hooks for encryption so that turning it on in v0.2 changes a value, 
 
 Explicitly not required for v0.1: E2EE itself, a GUI, more bridges, reputation scoring, discovery
 beyond the JEP stub, the reputation part of the handshake, and Windows.
+
+**Note on item 16: scope CI by changed paths.** Every pull request runs the full `workspace` job
+(fmt, clippy and nextest across the workspace) and `wasm-build`, even when it only touches docs.
+What to watch when scoping it:
+
+- `workspace`, `wasm-build` and `dependency-policy` are required checks. A workflow-level `paths:`
+  filter leaves a required check unreported, which blocks the merge. Decide per job instead: a
+  first job lists the changed files (`git diff --name-only` against the merge base, since the
+  allowed actions exclude third-party path filters), and later jobs skip with a job-level `if:`.
+  A skipped job reports success.
+- Count `repos/Cargo.lock`, `rust-toolchain.toml`, `deny.toml` and `.github/workflows/**` as code.
+  `fuel-portability.yml` already filters on `repos/jig-runtime/**` alone, so a lockfile-only
+  wasmtime bump, the change most likely to move fuel, skips it today.
+- Keep `dependency-policy` unconditional. It is quick, and the advisory database changes whatever
+  the diff touches.
 
 ### Phase 1: secure by default (`v0.2`)
 
