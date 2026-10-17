@@ -367,6 +367,7 @@ Before running any code, the host validates the block:
 3. **Signature verification**: Check `/proofs/manifest.sig` against author public keys. Invalid signature → reject.
 4. **Capability policy check**: Does the block request capabilities the host allows? If a `null_sec` user requests `net.fetch`, reject.
 5. **WebAssembly validation**: Parse `code.wasm` and check:
+   - It validates with only the [allowed feature set](#allowed-webassembly-features) enabled
    - Imports limited to approved host functions (no sneaky syscalls)
    - No floats (if `deterministic: true`)
    - Memory limits within bounds
@@ -458,6 +459,16 @@ Jig blocks are **deterministic by default**: same inputs → same outputs, every
 - **Verifiable execution**: Anyone can replay a block and get the same result (prevents fraud).
 - **Reproducible billing**: Fuel consumption is deterministic (no "this block cost 500k fuel on Monday but 1M fuel on Tuesday").
 - **Cacheable results**: If the block and inputs haven't changed, the output hasn't either (hosts can cache aggressively).
+
+### Allowed WebAssembly features
+
+Hosts **MUST** validate every block module with only the features of the WebAssembly 2.0 core specification enabled, **excluding SIMD**, and reject a module that fails. That set is: mutable globals, multi-value, sign extension, non-trapping float-to-int conversions, bulk memory and reference types.
+
+Everything else is outside it, including SIMD, relaxed SIMD, threads and shared memory, memory64, multi-memory, extended constant expressions, tail calls, exceptions, GC and the component model. A later version of this specification may add a feature; a host **MUST NOT** accept one before then.
+
+Hosts **SHOULD** enforce this as an allowlist of features, not as a list of forbidden instructions. A list of instructions misses every proposal its author did not know about: SIMD's float lanes (`f32x4.add`) are float arithmetic that a check naming `f32.add` lets through, and relaxed SIMD is non-deterministic by definition.
+
+The `deterministic` flag does not widen the set. It only decides whether the scalar float instructions below are allowed.
 
 ### Forbidden Operations
 
@@ -696,6 +707,7 @@ If the block had failed (network timeout), it would be a `soft_fail` with 50% re
 - Meter fuel consumption and halt execution when `max_fuel` is exceeded.
 - Enforce memory limits (`max_memory_pages`) and timeouts (`max_execution_time_ms`).
 - Emit signed receipts after execution (success or failure).
+- Reject modules that use a feature outside the [allowed set](#allowed-webassembly-features).
 - Reject modules with floats, non-deterministic syscalls, or threading (when `deterministic: true`).
 - Use canonical serialization (JSON or CBOR) for render output.
 
