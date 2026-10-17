@@ -180,27 +180,29 @@ mod tests {
     #[test]
     fn one_did_cannot_spend_everyones_capacity() {
         let mut guard = ReplayGuard::new(30_000, 100).with_per_did_share(3);
-        let nonce = |i: u32| format!("n{i}");
-        for i in 0..3 {
+        // Every request takes the next fresh nonce.
+        let mut nonces = (0u32..).map(|i| format!("n{i}"));
+        let mut fresh = || nonces.next().expect("unbounded");
+        for _ in 0..3 {
             assert!(
                 guard
-                    .check_and_record("did:jig:zFlood", &nonce(i), 5_000, 5_000)
+                    .check_and_record("did:jig:zFlood", &fresh(), 5_000, 5_000)
                     .is_ok()
             );
         }
         assert_eq!(
-            guard.check_and_record("did:jig:zFlood", &nonce(3), 5_000, 5_000),
+            guard.check_and_record("did:jig:zFlood", &fresh(), 5_000, 5_000),
             Err(ReplayRejection::DidOverShare)
         );
         assert!(
             guard
-                .check_and_record("did:jig:zOther", &nonce(0), 5_000, 5_000)
+                .check_and_record("did:jig:zOther", &fresh(), 5_000, 5_000)
                 .is_ok()
         );
         // Once its nonces age out of the window, its share is free again.
         assert!(
             guard
-                .check_and_record("did:jig:zFlood", &nonce(4), 40_000, 40_000)
+                .check_and_record("did:jig:zFlood", &fresh(), 40_000, 40_000)
                 .is_ok()
         );
     }
