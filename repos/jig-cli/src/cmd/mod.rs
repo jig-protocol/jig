@@ -1,5 +1,6 @@
 //! Command implementations
 
+pub mod admission;
 pub mod blocks_decode;
 pub mod channel;
 pub mod chat;

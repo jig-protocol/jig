@@ -16,6 +16,8 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
+use anyhow::Context as _;
+
 use jig_config::v0_0_2_server::{AdmissionSection, AuthSection, UnknownDidsPolicy};
 
 use crate::auth::admission::{Floor, SeededRecords, UnknownDids};
@@ -43,6 +45,9 @@ pub struct AuthState {
     did_rate: Option<RateLimiter>,
     /// `[auth.rate_limit]` per remote address; `None` when off.
     ip_rate: Option<RateLimiter>,
+    /// Where admission proofs of work are recorded; `None` in a state built
+    /// without a store, where no DID is ever proven.
+    proofs: Option<Arc<jig_pipeline::persist::SqliteStore>>,
 }
 
 impl AuthState {
@@ -78,6 +83,16 @@ impl AuthState {
                     .map_err(|e| anyhow::anyhow!("[auth.admission] records[{i}].did: {e}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        // Zero bits is no work; past the maximum clients refuse to do it.
+        if auth.admission.unknown_dids == UnknownDidsPolicy::ProofOfWork
+            && !(1..=jig_core::admission_pow::MAX_BITS).contains(&auth.admission.pow_bits)
+        {
+            anyhow::bail!(
+                "[auth.admission] pow_bits must be 1..={} under \"proof-of-work\"; got {}",
+                jig_core::admission_pow::MAX_BITS,
+                auth.admission.pow_bits
+            );
+        }
 
         let limits = &auth.rate_limit;
         Ok(Self {
@@ -98,7 +113,43 @@ impl AuthState {
                 limits.per_ip_per_second,
                 limits.max_tracked,
             ),
+            proofs: None,
         })
+    }
+
+    /// Read and record admission proofs of work in `store`.
+    pub fn with_proofs(mut self, store: Arc<jig_pipeline::persist::SqliteStore>) -> Self {
+        self.proofs = Some(store);
+        self
+    }
+
+    /// The bits of work this server asks of a new DID, when it asks for any.
+    pub fn pow_bits(&self) -> Option<u8> {
+        match self.admission.unknown_dids {
+            Some(UnknownDids::ProofOfWork { bits }) => Some(bits),
+            _ => None,
+        }
+    }
+
+    /// Whether `did` has done this server's proof of work.
+    pub fn proven(&self, did: &str) -> bool {
+        self.proofs
+            .as_ref()
+            .is_some_and(|store| store.admission_proven(did).unwrap_or(false))
+    }
+
+    /// Record that `did` did `bits` of work.
+    pub fn record_proof(&self, did: &str, bits: u8) -> anyhow::Result<()> {
+        let store = self
+            .proofs
+            .as_ref()
+            .context("this server keeps no admission proofs")?;
+        Ok(store.record_admission_proof(did, bits)?)
+    }
+
+    /// Whether `did` is banned here, whatever else is true of it.
+    pub fn banned(&self, did: &str) -> bool {
+        self.admission.banned_dids.contains(did)
     }
 
     /// Gate 2, then the DID's rate: what every read, subscription and write
@@ -124,7 +175,50 @@ impl AuthState {
     /// Gate 2 for `did`, which must be the identity gate 1 VERIFIED — never
     /// one merely claimed. Pure apart from the view lookup.
     pub fn admit(&self, did: &str) -> Result<(), GateOutcome> {
-        admit(did, &self.reputation.view(did), &self.admission)
+        let mut view = self.reputation.view(did);
+        // Only a proof-of-work policy reads it: no store lookup otherwise.
+        view.proven = self.pow_bits().is_some() && self.proven(did);
+        admit(did, &view, &self.admission)
+    }
+
+    /// Gate 2 for the author of a block a peer relayed or a bridge submitted.
+    /// The same policy, except that proof of work is not asked for: the
+    /// author never spoke to this server, so it could not have done it. Bans,
+    /// floors and the rate still apply.
+    fn admit_relayed_and_charge(&self, did: &str) -> Result<(), GateOutcome> {
+        match self.admit_and_charge(did) {
+            Err(GateOutcome::AdmissionProofRequired { .. }) => {
+                let mut admit_all = self.admission.clone();
+                admit_all.unknown_dids = Some(UnknownDids::Admit);
+                let mut view = self.reputation.view(did);
+                view.proven = true;
+                admit(did, &view, &admit_all)?;
+                match &self.did_rate {
+                    Some(rate) if !rate.try_take(did, std::time::Instant::now()) => {
+                        Err(GateOutcome::RateLimited)
+                    }
+                    _ => Ok(()),
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+fn admission_refusal(outcome: GateOutcome) -> jig_pipeline::ingest::AdmissionRefusal {
+    use jig_pipeline::ingest::AdmissionRefusal;
+    // The audit record of what actually happened, whatever the write surface
+    // tells the caller.
+    tracing::info!(audit = %crate::auth::audit_line(&outcome), "write refused");
+    match outcome {
+        GateOutcome::AdmissionBanned => AdmissionRefusal::Banned,
+        GateOutcome::AdmissionBelowRuleset { ruleset_key } => {
+            AdmissionRefusal::BelowRuleset { ruleset_key }
+        }
+        GateOutcome::AdmissionProofRequired { bits } => AdmissionRefusal::ProofRequired { bits },
+        GateOutcome::RateLimited => AdmissionRefusal::RateLimited,
+        // Gate 2 only ever returns admission outcomes.
+        _ => AdmissionRefusal::Unknown,
     }
 }
 
@@ -134,24 +228,15 @@ impl AuthState {
 /// depends on this crate's outcomes.
 impl jig_pipeline::ingest::Admission for AuthState {
     fn admit(&self, sender_did: &str) -> Result<(), jig_pipeline::ingest::AdmissionRefusal> {
-        use jig_pipeline::ingest::AdmissionRefusal;
-        match self.admit_and_charge(sender_did) {
-            Ok(()) => Ok(()),
-            Err(outcome) => {
-                // The audit record of what actually happened, whatever the
-                // write surface tells the caller.
-                tracing::info!(audit = %crate::auth::audit_line(&outcome), "write refused");
-                Err(match outcome {
-                    GateOutcome::AdmissionBanned => AdmissionRefusal::Banned,
-                    GateOutcome::AdmissionBelowRuleset { ruleset_key } => {
-                        AdmissionRefusal::BelowRuleset { ruleset_key }
-                    }
-                    GateOutcome::RateLimited => AdmissionRefusal::RateLimited,
-                    // `admit` only ever returns admission outcomes.
-                    _ => AdmissionRefusal::Unknown,
-                })
-            }
-        }
+        self.admit_and_charge(sender_did).map_err(admission_refusal)
+    }
+
+    fn admit_relayed(
+        &self,
+        sender_did: &str,
+    ) -> Result<(), jig_pipeline::ingest::AdmissionRefusal> {
+        self.admit_relayed_and_charge(sender_did)
+            .map_err(admission_refusal)
     }
 }
 
@@ -170,6 +255,9 @@ fn admission_policy(section: &AdmissionSection, banned_dids: BTreeSet<String>) -
         unknown_dids: Some(match section.unknown_dids {
             UnknownDidsPolicy::Admit => UnknownDids::Admit,
             UnknownDidsPolicy::Refuse => UnknownDids::Refuse,
+            UnknownDidsPolicy::ProofOfWork => UnknownDids::ProofOfWork {
+                bits: section.pow_bits,
+            },
         }),
         floors: section
             .floors
@@ -265,6 +353,45 @@ mod tests {
             state.admit(&stranger),
             Err(GateOutcome::AdmissionUnknownDid)
         );
+    }
+
+    /// A peer-relayed or bridged author never spoke to this server, so it
+    /// cannot have done the work: it is not asked for it. Everything else
+    /// about admission still applies to it.
+    #[test]
+    fn relayed_authors_are_not_asked_for_work_but_are_still_banned() {
+        use jig_pipeline::ingest::{Admission as _, AdmissionRefusal};
+        let (stranger, bad) = (did_for(1), did_for(2));
+        let mut section = AuthSection::default();
+        section.admission.unknown_dids = UnknownDidsPolicy::ProofOfWork;
+        section.admission.banned_dids = vec![bad.clone()];
+        let state = AuthState::from_config(&section).unwrap();
+
+        assert_eq!(
+            jig_pipeline::ingest::Admission::admit(&state, &stranger),
+            Err(AdmissionRefusal::ProofRequired { bits: 20 })
+        );
+        assert_eq!(state.admit_relayed(&stranger), Ok(()));
+        assert_eq!(state.admit_relayed(&bad), Err(AdmissionRefusal::Banned));
+    }
+
+    /// Zero bits is no work, and past the maximum clients refuse to do it.
+    #[test]
+    fn pow_bits_out_of_range_is_refused_at_boot() {
+        for bits in [0, 29, 255] {
+            let mut section = AuthSection::default();
+            section.admission.unknown_dids = UnknownDidsPolicy::ProofOfWork;
+            section.admission.pow_bits = bits;
+            let err = match AuthState::from_config(&section) {
+                Ok(_) => panic!("pow_bits = {bits} must be refused at boot"),
+                Err(e) => e,
+            };
+            assert!(err.to_string().contains("pow_bits"), "{err}");
+        }
+        // Only under proof-of-work: the knob is inert otherwise.
+        let mut section = AuthSection::default();
+        section.admission.pow_bits = 0;
+        assert!(AuthState::from_config(&section).is_ok());
     }
 
     /// A server with no admission section admits everyone: the section

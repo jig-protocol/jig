@@ -9,6 +9,7 @@ pub mod server;
 pub mod storage;
 pub mod v0_0_2;
 pub mod v0_0_2_admin;
+pub mod v0_0_2_admission;
 pub mod v0_0_2_blocks;
 pub mod v0_0_2_bridge_storage;
 pub mod v0_0_2_bridges;

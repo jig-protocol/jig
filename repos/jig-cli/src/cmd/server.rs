@@ -135,6 +135,8 @@ pub(crate) struct ServerInfoResponse {
     pub allowed_block_kinds: Vec<String>,
     #[serde(default)]
     pub peers: Vec<PeerInfo>,
+    #[serde(default)]
+    pub admission_pow_bits: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -185,6 +187,12 @@ fn print_server_info(base_url: &str, info: &ServerInfoResponse) {
             .join(", ")
     };
     println!("{:<22}{}", "peers", peers);
+    println!(
+        "{:<22}{}",
+        "admission_pow_bits",
+        info.admission_pow_bits
+            .map_or("[none asked]".to_string(), |b| b.to_string())
+    );
 
     if info.unsafe_options_active.is_empty() {
         println!("{:<22}[empty]", "unsafe_options_active");
@@ -260,6 +268,7 @@ mod tests {
                 url: "wss://deji.jig.onl".into(),
                 alias: Some("deji".into()),
             }],
+            admission_pow_bits: Some(20),
         };
         print_server_info("http://127.0.0.1:7117", &body);
     }
@@ -279,6 +288,7 @@ mod tests {
             unsafe_options_active: vec![],
             allowed_block_kinds: vec![],
             peers: vec![],
+            admission_pow_bits: None,
         };
         print_server_info("http://127.0.0.1:7117", &body);
     }

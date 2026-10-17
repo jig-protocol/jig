@@ -44,6 +44,14 @@ pub enum IngestSource {
 /// signed.
 pub trait Admission: Send + Sync {
     fn admit(&self, sender_did: &str) -> Result<(), AdmissionRefusal>;
+
+    /// [`Self::admit`] for the author of a block that reached this server
+    /// through a federated peer or an in-process bridge rather than from the
+    /// author directly. A server may ask less of such an author (proof of
+    /// work it had no chance to do); by default it asks the same.
+    fn admit_relayed(&self, sender_did: &str) -> Result<(), AdmissionRefusal> {
+        self.admit(sender_did)
+    }
 }
 
 /// Why admission said no. Mirrors the server's admission outcomes without
@@ -58,6 +66,8 @@ pub enum AdmissionRefusal {
     Banned,
     /// The sender is over its rate; a later retry may succeed.
     RateLimited,
+    /// The sender is new here and owes `bits` of proof of work first.
+    ProofRequired { bits: u8 },
 }
 
 impl std::fmt::Display for AdmissionRefusal {
@@ -70,6 +80,11 @@ impl std::fmt::Display for AdmissionRefusal {
             ),
             Self::Banned => f.write_str("this identity is refused by this server"),
             Self::RateLimited => f.write_str("too many requests from this identity; slow down"),
+            Self::ProofRequired { bits } => write!(
+                f,
+                "this server admits a new identity after {bits} bits of proof of work: \
+                 POST /api/v1/admission"
+            ),
         }
     }
 }
@@ -264,7 +279,15 @@ pub async fn ingest(
     // the identity resolver, the kind whitelist and every channel lookup: a
     // caller this server will not deal with gets exactly one answer, whatever
     // they asked.
-    if let Err(refusal) = ctx.admission.admit(sender.as_str()) {
+    let admitted = match source {
+        IngestSource::FederatedPeer { .. } | IngestSource::Bridge => {
+            ctx.admission.admit_relayed(sender.as_str())
+        }
+        IngestSource::LocalClient { .. } | IngestSource::AdminEndpoint => {
+            ctx.admission.admit(sender.as_str())
+        }
+    };
+    if let Err(refusal) = admitted {
         tracing::info!(sender = %sender, refusal = %refusal, "write refused at admission");
         return Err(IngestError::NotAdmitted {
             sender: sender.to_did_jig_string(),

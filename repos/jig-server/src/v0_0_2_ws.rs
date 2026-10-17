@@ -251,7 +251,10 @@ pub fn build_v0_0_2_router(state: Arc<AppState>) -> Router {
     let router = ws_router
         .merge(crate::v0_0_2_blocks::build_blocks_router(state.clone()))
         .merge(crate::v0_0_2_admin::build_channel_ops_router(state.clone()))
-        .merge(crate::v0_0_2_mls::build_mls_router(state.clone()));
+        .merge(crate::v0_0_2_mls::build_mls_router(state.clone()))
+        .merge(crate::v0_0_2_admission::build_admission_router(
+            state.clone(),
+        ));
 
     let mut router = if state.config.debug.admin_endpoints {
         router.merge(crate::v0_0_2_admin::build_admin_router(state.clone()))

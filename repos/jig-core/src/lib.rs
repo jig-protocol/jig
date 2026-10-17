@@ -4,6 +4,7 @@
 //! interfaces shared across the protocol. It intentionally avoids network, storage, or registry
 //! dependencies so other crates can embed these primitives directly.
 
+pub mod admission_pow;
 pub mod block_kind;
 pub mod bundle;
 pub mod capability_dsl;

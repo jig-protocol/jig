@@ -104,6 +104,14 @@ fn truthful(outcome: &GateOutcome) -> (u16, &'static str, String) {
             "this identity is refused by this server".to_string(),
         ),
 
+        GateOutcome::AdmissionProofRequired { bits } => (
+            403,
+            "PROOF_OF_WORK_REQUIRED",
+            format!(
+                "this server admits a new identity after {bits} bits of proof of work: \
+                 POST /api/v1/admission"
+            ),
+        ),
         GateOutcome::RateLimited => (
             429,
             "RATE_LIMITED",

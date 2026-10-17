@@ -512,10 +512,16 @@ async fn main() -> Result<()> {
         match action {
             ServerAction::Set { url } => {
                 cmd::server::set(&ctx, &url)?;
+                let ctx = cmd::common::CliContext::resolve(&overrides)?;
+                // A server that asks new identities for proof of work gets it
+                // now, while the user expects `set` to talk to it, rather
+                // than in the middle of their first message.
+                if let Err(e) = cmd::admission::ensure(&ctx).await {
+                    eprintln!("warning: {e:#}");
+                }
                 // Publish MLS key packages to the new server so others can
                 // add this identity to encrypted channels and DMs straight
                 // away. Best effort: the server may be down, or predate v0.2.
-                let ctx = cmd::common::CliContext::resolve(&overrides)?;
                 if let Ok(secure) = cmd::secure::Secure::open(&ctx)
                     && secure.ensure_key_packages().await.is_ok()
                 {
@@ -548,6 +554,7 @@ async fn main() -> Result<()> {
     // Handle channel subcommands early — they don't touch the legacy
     // messaging HTTP client; they go straight to `/api/v1/channels*` via reqwest.
     if let Some(Commands::Channel { action }) = cli.command {
+        cmd::admission::ensure(&ctx).await?;
         match action {
             ChannelAction::Create {
                 slug,
@@ -581,6 +588,14 @@ async fn main() -> Result<()> {
 
     let stdin_pipe = !io::stdin().is_terminal();
     let direct_message = cli.message;
+
+    // Every command below but the local ones talks to the server.
+    if !matches!(
+        cli.command,
+        Some(Commands::Receipt { .. } | Commands::Block { .. })
+    ) {
+        cmd::admission::ensure(&ctx).await?;
+    }
 
     match cli.command {
         Some(Commands::Send { message, channel }) => {

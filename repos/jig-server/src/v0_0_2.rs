@@ -137,7 +137,8 @@ impl AppState {
 
         // Built before the ingest context so gate 2 can be installed on it;
         // `config` is moved into the struct literal below.
-        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth)?);
+        let auth =
+            Arc::new(crate::auth::AuthState::from_config(&config.auth)?.with_proofs(store.clone()));
 
         let ingest_ctx = Arc::new(IngestContext {
             store,
@@ -187,7 +188,8 @@ impl AppState {
 
         // Built before the ingest context so gate 2 can be installed on it;
         // `config` is moved into the struct literal below.
-        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth)?);
+        let auth =
+            Arc::new(crate::auth::AuthState::from_config(&config.auth)?.with_proofs(store.clone()));
 
         let ingest_ctx = Arc::new(IngestContext {
             store,
@@ -236,7 +238,8 @@ impl AppState {
 
         // Built before the ingest context so gate 2 can be installed on it;
         // `config` is moved into the struct literal below.
-        let auth = Arc::new(crate::auth::AuthState::from_config(&config.auth)?);
+        let auth =
+            Arc::new(crate::auth::AuthState::from_config(&config.auth)?.with_proofs(store.clone()));
 
         let ingest_ctx = Arc::new(IngestContext {
             store,

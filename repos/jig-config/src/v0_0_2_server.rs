@@ -228,13 +228,20 @@ impl Default for RateLimitSection {
 // whose whole job is to NARROW access would silently leave the permissive
 // default in place. A members-only server whose operator wrote `unknown_did`
 // (singular) must not boot as an open one.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdmissionSection {
     /// What to do with a DID this server has no relevant record for.
-    /// `"admit"` (the default) or `"refuse"`. `"refuse"` with a set of
-    /// `records` is a members-only server.
+    /// `"admit"` (the default), `"refuse"`, or `"proof-of-work"`. `"refuse"`
+    /// with a set of `records` is a members-only server. `"proof-of-work"`
+    /// admits a new DID once it has done `pow_bits` of work for this server
+    /// (`POST /api/v1/admission`); blocks relayed by a peer or submitted by a
+    /// bridge are not asked for it.
     pub unknown_dids: UnknownDidsPolicy,
+    /// Leading zero bits of work a new DID owes under `"proof-of-work"`, 1 to
+    /// 28. Each bit doubles the expected cost; 20 is under a second on a
+    /// laptop.
+    pub pow_bits: u8,
     /// DIDs this server refuses outright, whatever their scores.
     pub banned_dids: Vec<String>,
     /// Reputation floors, evaluated in the order written.
@@ -242,6 +249,18 @@ pub struct AdmissionSection {
     /// Reputation this operator wrote down by hand — the server's whole view
     /// until a ledger exists.
     pub records: Vec<ReputationRecord>,
+}
+
+impl Default for AdmissionSection {
+    fn default() -> Self {
+        Self {
+            unknown_dids: UnknownDidsPolicy::default(),
+            pow_bits: 20,
+            banned_dids: Vec::new(),
+            floors: Vec::new(),
+            records: Vec::new(),
+        }
+    }
 }
 
 /// The explicit choice for an unknown DID. Not a bool: "admit" and "refuse"
@@ -253,6 +272,8 @@ pub enum UnknownDidsPolicy {
     #[default]
     Admit,
     Refuse,
+    #[serde(rename = "proof-of-work")]
+    ProofOfWork,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
