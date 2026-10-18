@@ -197,16 +197,14 @@ install_from_release() {
   log "checksum OK"
 
   tar -xzf "$tmp/$tarball" -C "$tmp"
-  # Tarball layout: <name>/bin/{jig,jig-server,jig-nameserver} + <name>/blocks/text_block.wasm
+  # Tarball layout: <name>/bin/{jig,jig-server,jig-nameserver}. Packages from
+  # earlier builds also carried <name>/blocks/text_block.wasm, which nothing loads.
   src="$tmp/$name"
   [ -d "$src/bin" ] || die "unexpected tarball layout: $name/bin missing"
-  mkdir -p "$JIG_HOME/bin" "$JIG_HOME/blocks"
+  mkdir -p "$JIG_HOME/bin"
   for b in jig jig-server jig-nameserver; do
     if [ -f "$src/bin/$b" ]; then install -m 0755 "$src/bin/$b" "$JIG_HOME/bin/$b"; fi
   done
-  if [ -f "$src/blocks/text_block.wasm" ]; then
-    install -m 0644 "$src/blocks/text_block.wasm" "$JIG_HOME/blocks/text_block.wasm"
-  fi
   if [ ! -x "$JIG_HOME/bin/jig" ] || [ ! -x "$JIG_HOME/bin/jig-server" ]; then
     die "tarball did not contain jig + jig-server"
   fi
@@ -221,14 +219,11 @@ install_from_source() {
   (
     cd "$root/repos"
     cargo build --release -p jig-server -p jig-cli -p jig-nameserver
-    rustup target add wasm32-wasip1 >/dev/null 2>&1 || true
-    cargo build --release --target wasm32-wasip1 -p text-block
   )
-  mkdir -p "$JIG_HOME/bin" "$JIG_HOME/blocks"
+  mkdir -p "$JIG_HOME/bin"
   for b in jig jig-server jig-nameserver; do
     install -m 0755 "$root/repos/target/release/$b" "$JIG_HOME/bin/$b"
   done
-  install -m 0644 "$root/repos/target/wasm32-wasip1/release/text_block.wasm" "$JIG_HOME/blocks/text_block.wasm"
   log "installed binaries to $JIG_HOME/bin/"
 }
 
@@ -293,7 +288,6 @@ dangerously_disable_federation_tls = false
 [debug]
 # Channel ops are on /api/v1/channels and always mounted; nothing here is
 # needed for the default path.
-admin_endpoints = false
 list_handles = false
 EOF
   log "wrote $cfg"

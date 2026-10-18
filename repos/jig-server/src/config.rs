@@ -41,8 +41,12 @@ pub struct ServerConfig {
 /// its DID vouches for it at `/.well-known/jig`: jig clients trust it through
 /// the DID they pinned, not through a CA. Give both paths to serve a
 /// certificate a CA issued (`tailscale cert`, certbot); jig clients accept
-/// either. `enabled = false` serves plaintext HTTP, for loopback development
-/// or behind a proxy that terminates TLS.
+/// either.
+///
+/// `enabled = false` serves plaintext HTTP. It is an unsafe option: use it only
+/// on loopback or behind a proxy that terminates TLS, never on a listener peers
+/// or clients reach directly. The server advertises it as `tls.enabled=false`
+/// in `unsafe_options_active` and warns at startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
     #[serde(default = "default_tls_enabled")]
@@ -252,6 +256,17 @@ impl ServerConfig {
         fs::write(path, template)
     }
 
+    /// Unsafe options set in this half of the config, named the way
+    /// `JigServerConfig::unsafe_options_active` names its own, so
+    /// `/.well-known/jig` and the startup log can list both together.
+    pub fn unsafe_options_active(&self) -> Vec<String> {
+        let mut active = Vec::new();
+        if !self.tls.enabled {
+            active.push("tls.enabled=false".to_string());
+        }
+        active
+    }
+
     /// Names a self-signed certificate is made for: `localhost`, the bind
     /// address unless it is a wildcard, and `public_url`'s host. jig clients
     /// trust the certificate through the server's DID, not these names; they
@@ -399,9 +414,6 @@ replay_per_did = {replay_per_did}
 max_tracked = {max_tracked}
 
 [debug]
-# Channel ops live on /api/v1/channels and are always mounted. This flag only
-# adds the legacy /_admin_v0_0_2/* aliases that pre-v0.1 `jig` CLIs POST to.
-admin_endpoints = {admin_endpoints}
 # Handle enumeration stays off — it dumps the registry to any caller.
 list_handles = {list_handles}
 "#,
@@ -419,7 +431,6 @@ list_handles = {list_handles}
         kinds = kinds,
         cache_ttl = defaults.identity.cache_ttl_seconds,
         unknown_handles = defaults.identity.naively_allow_unknown_handles_fallback,
-        admin_endpoints = defaults.debug.admin_endpoints,
         list_handles = defaults.debug.list_handles,
     )
 }
@@ -493,6 +504,14 @@ mod tests {
         )
         .unwrap();
         assert!(!cfg.tls.enabled);
+    }
+
+    #[test]
+    fn plaintext_listener_is_an_unsafe_option() {
+        assert!(ServerConfig::default().unsafe_options_active().is_empty());
+        let mut cfg = ServerConfig::default();
+        cfg.tls.enabled = false;
+        assert_eq!(cfg.unsafe_options_active(), vec!["tls.enabled=false"]);
     }
 
     #[test]
@@ -587,12 +606,11 @@ connection_string = "{db}"
         // Half 1: the socket-opening half.
         let server = ServerConfig::load(&path).unwrap();
 
-        // Half 2: the v0.0.2 half. Channel ops are not debug-gated, so the
-        // template must not need (or switch on) the debug flag.
+        // Half 2: the v0.0.2 half. It must not switch on any debug option.
         let v002 = JigServerConfig::load(&path).unwrap();
         assert!(
-            !v002.debug.admin_endpoints,
-            "template must not enable the legacy admin aliases"
+            !v002.debug.list_handles,
+            "template must not enable handle enumeration"
         );
         assert_eq!(
             v002.server.listen,
@@ -666,13 +684,9 @@ connection_string = "{db}"
 
         let v002: JigServerConfig = toml::from_str(&rendered).unwrap();
         assert!(
-            !v002.debug.admin_endpoints,
-            "install.sh's default path must not depend on a [debug] flag"
-        );
-        assert!(
             v002.unsafe_options_active()
                 .iter()
-                .all(|o| o != "debug.admin_endpoints"),
+                .all(|o| !o.starts_with("debug.")),
             "install.sh must not advertise debug options"
         );
         assert_eq!(v002.server.listen, "127.0.0.1:7117");

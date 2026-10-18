@@ -180,7 +180,7 @@ impl Fanout {
         policy: Option<&DeliveryPolicy>,
     ) -> anyhow::Result<()> {
         self.broadcast_to_locals(block, receipt, policy).await;
-        if policy.is_none_or(|p| p.federates) {
+        if policy.is_some_and(|p| p.federates) {
             self.broadcast_to_peers(block, receipt).await;
         }
         self.dispatch_to_bridges(block, receipt, policy);
@@ -234,7 +234,7 @@ impl Fanout {
         policy: Option<&DeliveryPolicy>,
     ) -> anyhow::Result<()> {
         self.broadcast_to_locals(block, receipt, policy).await;
-        if policy.is_none_or(|p| p.federates) {
+        if policy.is_some_and(|p| p.federates) {
             self.broadcast_to_peers(block, receipt).await;
         }
         Ok(())
@@ -277,7 +277,7 @@ impl Fanout {
                 }
                 SubscriptionScope::Federation { block_kinds } => {
                     (block_kinds.is_empty() || block_kinds.iter().any(|k| k == &block.block_kind))
-                        && policy.is_none_or(|p| p.federates)
+                        && policy.is_some_and(|p| p.federates)
                 }
             };
             let permitted = policy.is_none_or(|p| p.permits(&sub.who));
@@ -674,9 +674,13 @@ mod tests {
                 tx,
             )
             .await;
-        f.broadcast(&sample_block(None, "text-render"), &sample_receipt(), None)
-            .await
-            .unwrap();
+        f.broadcast(
+            &sample_block(Some("#public"), "text-render"),
+            &sample_receipt(),
+            Some(&open_with_members(&[])),
+        )
+        .await
+        .unwrap();
         let delivered = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
             .await
             .unwrap()
@@ -698,16 +702,20 @@ mod tests {
             )
             .await;
         // Matching kind — delivered
-        f.broadcast(&sample_block(None, "text-render"), &sample_receipt(), None)
-            .await
-            .unwrap();
+        f.broadcast(
+            &sample_block(Some("#public"), "text-render"),
+            &sample_receipt(),
+            Some(&open_with_members(&[])),
+        )
+        .await
+        .unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
         assert!(result.is_ok());
         // Non-matching kind — NOT delivered
         f.broadcast(
-            &sample_block(None, "channel-create"),
+            &sample_block(Some("#public"), "channel-create"),
             &sample_receipt(),
-            None,
+            Some(&open_with_members(&[])),
         )
         .await
         .unwrap();
@@ -723,7 +731,7 @@ mod tests {
         f.broadcast(
             &sample_block(Some("#x"), "text-render"),
             &sample_receipt(),
-            None,
+            Some(&open_with_members(&[])),
         )
         .await
         .unwrap();
@@ -732,6 +740,40 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(delivered.0.cid, "bafy_test");
+    }
+
+    /// Fail closed: a block with no channel policy has no channel that could
+    /// have agreed to federate, so it reaches no peer, on either path.
+    #[tokio::test]
+    async fn a_block_with_no_policy_never_federates() {
+        let f = Fanout::new();
+        let (peer_tx, mut peer_rx) = mpsc::unbounded_channel();
+        f.register_peer("wss://peer-a".to_string(), peer_tx).await;
+        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
+        let _ = f
+            .subscribe_local(
+                SubscriptionScope::Federation {
+                    block_kinds: vec![],
+                },
+                SubscriberIdentity::Unchecked,
+                sub_tx,
+            )
+            .await;
+        f.broadcast_with_members(
+            &sample_block(Some("#remote-only"), "text-render"),
+            &sample_receipt(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !received(&mut peer_rx).await,
+            "no policy: not pushed to peers"
+        );
+        assert!(
+            !received(&mut sub_rx).await,
+            "no policy: not streamed to federation subscribers"
+        );
     }
 
     #[tokio::test]
