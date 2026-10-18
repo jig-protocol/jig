@@ -212,13 +212,15 @@ server, with a `sequencer-set` block. Only the owner may sign one in v0.2; it is
 owner-only right in F's role set (#106, sections 5.3 and 6).
 
 - **The handover.** The block names the new sequencer's DID and the last record the
-  old sequencer signed (the "cited head"). The new sequencer's first record links
-  `prev` to the record of the `sequencer-set` block, which the old sequencer or the
-  new one signed.
+  old sequencer signed (the "cited head"). The record for the `sequencer-set` block is
+  always signed by the **new** sequencer, at `seq` = cited head + 1, with `prev` = the
+  cited head's hash. This holds whether the old sequencer is alive or dead, so a
+  handover never looks like a fork (only one key signs any `seq`), and a dead sequencer
+  cannot block it. This matches #106 and JEP-0005 item 11a.
 - **Preconditions.** The new sequencer must have accepted the channel's federation
   contract first, and be on the operators' peer lists (F's rule).
-- **The expected sequencer.** For any `seq` it is the one named by the latest
-  `sequencer-set` before it, or the `channel-create`'s server.
+- **The expected sequencer.** The `channel-create`'s server from `seq` 0, and the new
+  sequencer from the `seq` of each `sequencer-set` record onward.
 
 **A partitioned sequencer.** An old sequencer that is partitioned, not dead, can keep
 signing records after the move. Carriers that hold the `sequencer-set` refuse its later
@@ -239,6 +241,10 @@ This is bounded, because only the owner can trigger a move.
   armed the timer. It also carries `scheduled_at` and `tag`.
 
 The record therefore stays blocks-only.
+
+**Bots on a sequencer move.** Bot DIDs belong to the sequencer that runs them. The new
+sequencer names fresh bot DIDs in its `contract-accept`, and the owner's
+`sequencer-set` carries the reinstalls (agreed by F and C).
 
 **What the client checks:**
 
@@ -288,9 +294,10 @@ record it verified for a channel, with no DID attached.
 - **Withholding by a carrier** shows as "readers through carrier X are stuck at
   `seq` N", which needs no reader identity.
 
-Members under a `read` grant who author nothing send no acknowledgements at all.
-Withholding from them is detected through `seen` on blocks other members write (F's
-design, JEP-0005 items 11a and 14a).
+Members under a `read` grant author nothing, so they send no `seen`. They SHOULD send
+anonymous `head` frames like any client: those are what catch a carrier withholding
+from its own readers. Withholding by the sequencer from them is detected through `seen`
+on blocks other members write (F's design, JEP-0005 items 11a and 14a).
 
 **The limit, stated in JEP-0002.** Gossip that passes only through the sequencer cannot
 catch the sequencer. Records must cross by paths the sequencer does not control:
@@ -498,13 +505,20 @@ Each server keeps one reserved channel: its **manifest log**.
 **What goes in.** Only these block kinds:
 
 - `server-manifest`: the server's suites, capabilities, skew bound and protocol
-  versions;
+  versions, plus its signed peer policy (lane F, #106): the block kinds it relays,
+  per-peer quotas, the peer DIDs it publishes, and the suffixes it attests with their
+  roots;
 - `sequencer-set` notices for channels the server sequences;
 - handover notices.
 
 Every other kind is refused. Only the server's DID writes it. Anyone may read it, so
 clients, owners and admins can review a server's claims over time. It is a channel like
-any other, so it has `ingest` records, gap checks and gossip.
+any other, so it has `ingest` records, gap checks and gossip. Federation contract
+messages cite the manifest by CID and `seq` too, so a server's handshake claims and its
+peer policy are one signed, gap-checked document, not two.
+
+**Metadata cost.** A public manifest log exposes the server's peer graph. A server may
+publish only the peers it wants known.
 
 **How a welcome uses it.** Each welcome carries `manifest`, the CID and `seq` of the
 current `server-manifest` block. In v0.2:

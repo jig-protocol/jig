@@ -109,8 +109,11 @@ Draft. Field names are provisional. The design behind this revision is
    under domain `jig-ingest-v1`: `channel_id` (the CID of the channel's
    `channel-create` block), `seq` (0 for that block, then +1 per accepted block),
    `ingest_hlc`, `block_cid`, `prev` (BLAKE3 of the previous record's canonical bytes;
-   zero at `seq` 0) and `sequencer`. The sequencer is the channel's owning server, or the
-   server named by the latest owner-signed `sequencer-set` block. A block is delivered
+   zero at `seq` 0) and `sequencer`. The sequencer is the channel's owning server from
+   `seq` 0. An owner-signed `sequencer-set` block names a new sequencer and the last
+   record the old one signed (the cited head); its own record is always signed by the
+   new sequencer, at the cited head's `seq` + 1 with `prev` = the cited head's hash, and
+   the new sequencer signs every record from there on. A block is delivered
    with its record; a block the reader may not read is delivered as its record alone. A
    client MUST check, per channel, the signer, `seq` continuity, the `prev` chain,
    `channel_id`, `block_cid`, that `ingest_hlc` never decreases, and on live delivery
@@ -118,8 +121,9 @@ Draft. Field names are provisional. The design behind this revision is
    contradiction. History is ordered by `seq`. A block's `hlc_ts` is its author's
    claim.
 10. Every block a member authors into a channel, except the `channel-create`, carries
-    `seen`: the latest `ingest` record its author verified for that channel. A client
-    MAY send its server a `head` frame holding the latest record it verified, with no
+    `seen`: the latest `ingest` record its author verified for that channel. A client,
+    including a member that only reads, SHOULD send its server a `head` frame holding the
+    latest record it verified, with no
     identity attached; servers verify heads and forward them toward the sequencer and
     other carriers. Two records signed by one sequencer for the same `channel_id` and
     `seq` with different contents are proof of a fork.
@@ -132,8 +136,10 @@ Draft. Field names are provisional. The design behind this revision is
 12. A server MUST keep a manifest log: a reserved channel whose only writer is the
     server's DID and which accepts only `server-manifest`, `sequencer-set` and handover
     notices. Anyone may read it. The server MUST publish a new `server-manifest` block
-    whenever its versions, suites, capabilities or skew bound change, and every
-    `welcome` cites the current one. A server MAY keep an optional handshake-transcript
+    whenever its versions, suites, capabilities, skew bound or signed peer policy
+    (JEP-0005) change, and every `welcome` and federation contract message cites the
+    current one. A public manifest log exposes the server's peer graph; a server MAY
+    publish only the peers it wants known. A server MAY keep an optional handshake-transcript
     channel; if it does, its manifest MUST advertise it, and a client MUST agree to it
     before posting, as part of the ruleset it consents to.
 
