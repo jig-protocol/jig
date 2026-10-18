@@ -330,6 +330,8 @@ jobs:
       # the key is sealed in the login keychain, the path a Mac user gets.
       - name: curl | bash → hello-world, key in the login keychain (untimed)
         if: matrix.name == 'darwin-aarch64'
+        # A keychain access dialog would wait forever on a headless runner.
+        timeout-minutes: 5
         shell: bash
         env:
           JIG_INSTALL_SH_URL: http://127.0.0.1:47391/install.sh
@@ -337,7 +339,22 @@ jobs:
           JIG_VERIFY_SIGNATURE: '1'
           JIG_RELEASE_SIGNER: ${{ needs.sign.outputs.signer }}
           JIG_SMOKE_KEYCHAIN: '1'
+          JIG_SMOKE_KEYCHAIN_MARKER: ${{ runner.temp }}/jig-keychain-smoke-owns-home
         run: scripts/install-smoke.sh ${{ matrix.budget }}
+      # The script cleans up on exit; this covers a step killed by its timeout.
+      # It runs only if that step got past its check that ~/.jig did not exist
+      # (the marker file), and deletes only the items named by the DIDs in
+      # ~/.jig/keys, never others in the login keychain.
+      - name: remove the login keychain items the step above created
+        if: always() && matrix.name == 'darwin-aarch64'
+        shell: bash
+        run: |
+          [ -f "$RUNNER_TEMP/jig-keychain-smoke-owns-home" ] || exit 0
+          for keyfile in "$HOME"/.jig/keys/*.jigkey; do
+            [ -f "$keyfile" ] || continue
+            security delete-generic-password -s jig -a "$(basename "$keyfile" .jigkey)" >/dev/null 2>&1 || true
+          done
+          rm -rf "$HOME/.jig"
 
   publish:
     name: publish GitHub prerelease

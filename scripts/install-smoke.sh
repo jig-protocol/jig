@@ -24,7 +24,9 @@
 # JIG_SMOKE_KEYCHAIN=1 (macOS only) instead installs into the real HOME, so
 # the key is sealed in the login keychain, the path a Mac user gets. It fails
 # if the key ends up anywhere else, and removes ~/.jig and the keychain item
-# afterwards. It refuses to run if ~/.jig already exists.
+# afterwards. It refuses to run if ~/.jig already exists. Once past that check
+# it creates the file $JIG_SMOKE_KEYCHAIN_MARKER (if set), so a cleanup that
+# runs after a killed run knows ~/.jig was this run's.
 set -euo pipefail
 
 budget="${1:-60}"
@@ -57,6 +59,8 @@ if [ "$keychain" = 1 ]; then
     echo "refusing: $HOME/.jig exists, and JIG_SMOKE_KEYCHAIN=1 installs into the real HOME" >&2
     exit 2
   fi
+  # Tells a later cleanup step that ~/.jig is ours to remove.
+  if [ -n "${JIG_SMOKE_KEYCHAIN_MARKER:-}" ]; then : > "$JIG_SMOKE_KEYCHAIN_MARKER"; fi
 fi
 
 sandbox="$(mktemp -d "${TMPDIR:-/tmp}/jig-smoke.XXXXXX")"
