@@ -1413,6 +1413,7 @@ mod tests {
                 receipt_bytes_b64: String::new(),
             }],
             delivery_cid: "delivery:bafy".to_string(),
+            ingest: None,
         }))
         .unwrap();
         let (url, _) = start_scripted_server(vec![block]).await;
