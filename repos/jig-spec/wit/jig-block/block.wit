@@ -1,0 +1,90 @@
+/// The jig block ABI: JEP-0006, design decisions A1–A8 in
+/// docs/superpowers/specs/2026-10-18-v0.3-block-abi-design.md.
+///
+/// Every minor version is incompatible while the package is at 0.x. It becomes 1.0.0 at the v0.3
+/// exit. Host imports (`jig:host/*`) live in their own package (JEP-0007), not here.
+package jig:block@0.1.0;
+
+/// Types shared by every world. The ABI contains no f32 or f64: floats are outside the
+/// determinism profile `jig-det-1`.
+interface types {
+    /// Bytes plus their media type. The outcome hash covers both, encoded canonically, so
+    /// "identical" never depends on how a guest language serialises a record.
+    record payload {
+        media-type: string,
+        body: list<u8>,
+    }
+
+    /// A hybrid logical clock reading.
+    record hlc {
+        wall-ms: u64,
+        logical: u32,
+    }
+
+    /// Everything a block may depend on, passed in as data. A block has no other source of
+    /// time, identity or context.
+    record invocation {
+        /// CID of the block that triggered this run.
+        block-cid: string,
+        /// DID of that block's author.
+        sender-did: string,
+        /// CID of the channel's `channel-create` block. Channels are never keyed by a server.
+        channel-cid: string,
+        /// `seq` from the triggering block's `ingest` record, signed by the channel's
+        /// sequencing server.
+        ingest-seq: u64,
+        /// `ingest_hlc` from that record. Never the author's own `hlc_ts`.
+        ingest-hlc: hlc,
+        /// The input proper.
+        input: payload,
+    }
+
+    /// A failure the guest reports. It is deterministic, so it is a comparable outcome.
+    variant block-error {
+        /// The guest refused its input.
+        invalid-input(string),
+        /// Any other failure the guest reports.
+        failed(string),
+    }
+}
+
+/// A pure transform: invocation in, rendered payload out.
+interface render {
+    use types.{invocation, payload, block-error};
+
+    render: func(inv: invocation) -> result<payload, block-error>;
+}
+
+/// Reacts to an invocation by returning effects for the host to check against the block's
+/// grants and then apply. A handler never performs an effect itself (decision A1).
+interface handler {
+    use types.{invocation, payload, block-error};
+
+    /// What a handler may ask the host to do. JEP-0007 adds variants (timer and others).
+    variant effect {
+        /// Post a message to the invocation's channel, through `ingest`, under the install's
+        /// bot DID.
+        post(payload),
+    }
+
+    /// The result of one call. `state` replaces the install's state when it is `some`, and
+    /// commits atomically with the effects. `none` leaves the state unchanged.
+    record handled {
+        effects: list<effect>,
+        state: option<list<u8>>,
+    }
+
+    handle: func(inv: invocation, state: list<u8>) -> result<handled, block-error>;
+}
+
+/// Tier 1: verifiable by anyone who re-executes it. Its only permitted import is
+/// `jig:host/compose`, for child renderers pinned by CID in its manifest (JEP-0007).
+world renderer {
+    export render;
+}
+
+/// Tier 2: capability-bearing. It imports only the `jig:host/*` interfaces its install grants
+/// (JEP-0007).
+world bot {
+    export handler;
+}

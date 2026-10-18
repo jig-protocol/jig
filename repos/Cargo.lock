@@ -3766,6 +3766,7 @@ dependencies = [
  "time",
  "wasmparser 0.261.0",
  "wat",
+ "wit-parser 0.258.3",
  "zeroize",
 ]
 
