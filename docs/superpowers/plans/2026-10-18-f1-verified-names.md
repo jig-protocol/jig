@@ -117,21 +117,22 @@ Pure types and signed bytes, so the nameserver, the server and the client all co
 signature input.
 
 **Files:**
-- Create: `repos/jig-core/src/naming.rs`, `repos/jig-core/src/dcbor.rs`,
-  `repos/jig-core/src/cose.rs`
-- Modify: `repos/jig-core/src/lib.rs`, `repos/jig-core/Cargo.toml` (`ciborium` under the
-  `ed25519` feature)
+- Depends on: `repos/jig-core/src/dcbor.rs` and `repos/jig-core/src/cose.rs`, the shared
+  layer every lane signs with (#175, no new dependencies)
+- Create: `repos/jig-core/src/naming.rs`
+- Modify: `repos/jig-core/src/lib.rs`
 - Create: `repos/jig-spec/jep/vectors/0004/vectors.json`
 
 **Interface:**
 
 ```rust
 // dcbor: RFC 8949 section 4.2.1; decode refuses non-deterministic input, floats and tags.
-pub fn dcbor::encode(&Value) -> Result<Vec<u8>, DcborError>;
+pub fn dcbor::encode(&dcbor::Value) -> Result<Vec<u8>, DcborError>;
 pub fn dcbor::decode(&[u8]) -> Result<Value, DcborError>;
 // cose: COSE_Sign1, protected {1: -8}, empty unprotected header.
-pub fn cose::sign(key: &SigningKey, payload: &[u8]) -> Vec<u8>;
-pub fn cose::open(envelope: &[u8]) -> Result<Sign1, CoseError>;   // then Sign1::verify(did)
+pub fn cose::sign1(key: &SigningKey, payload: &[u8]) -> Vec<u8>;
+pub fn cose::open_sign1(envelope: &[u8]) -> Result<Sign1, CoseError>;   // then Sign1::verify(did)
+pub fn cose::sign_all(keys: &[&SigningKey], payload: &[u8]) -> Vec<u8>; // COSE_Sign, all must sign
 
 pub struct Name { pub alias: String, pub suffix: String }           // parsed, normalised
 pub enum Root { Config, Dns, Contract }

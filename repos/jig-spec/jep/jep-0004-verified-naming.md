@@ -241,8 +241,8 @@ Non-goals:
 
 # Reference Implementation
 
-In progress (milestone F1): `jig_core::naming`, with `jig_core::dcbor` and
-`jig_core::cose`, in pull request #147.
+In progress (milestone F1): `jig_core::naming` (pull request #147), on the shared
+`jig_core::dcbor` and `jig_core::cose` (pull request #175).
 
 # Test Vectors
 
