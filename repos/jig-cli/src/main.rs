@@ -317,20 +317,6 @@ enum ServerAction {
 #[derive(Subcommand, Debug)]
 #[cfg(feature = "local-runtime")]
 enum BlockAction {
-    /// Initialize a new block project from a template
-    Init {
-        /// Name of the block project
-        name: String,
-
-        /// Template to use (rust-wasi, tinygo-wasi, text-only)
-        #[arg(long, short = 't', default_value = "rust-wasi")]
-        template: String,
-
-        /// Output directory (default: current directory)
-        #[arg(long, short = 'o')]
-        output: Option<PathBuf>,
-    },
-
     /// Run a WASM block locally and generate a receipt
     Run {
         /// Path to WASM file
@@ -367,38 +353,6 @@ enum BlockAction {
         /// Enable pricing in receipt
         #[arg(long)]
         pricing: bool,
-    },
-
-    /// Lint and validate a block manifest and WASM module
-    Lint {
-        /// Path to block directory or manifest file
-        #[arg(default_value = ".")]
-        path: PathBuf,
-    },
-
-    /// Sign a block with your DID key
-    Sign {
-        /// Path to block directory or manifest file
-        #[arg(default_value = ".")]
-        path: PathBuf,
-
-        /// Path to private key file
-        #[arg(long)]
-        key: Option<PathBuf>,
-    },
-
-    /// Verify a block's signature
-    Verify {
-        /// Path to block directory or manifest file
-        #[arg(default_value = ".")]
-        path: PathBuf,
-    },
-
-    /// Inspect block capabilities
-    Capabilities {
-        /// Path to block directory or manifest file
-        #[arg(default_value = ".")]
-        path: PathBuf,
     },
 }
 
@@ -655,22 +609,6 @@ async fn main() -> Result<()> {
         },
         #[cfg(feature = "local-runtime")]
         Some(Commands::Block { action }) => match action {
-            BlockAction::Init {
-                name,
-                template,
-                output,
-            } => {
-                use cmd::block_init::{Template, init_block};
-
-                let template_enum = Template::from_name(&template).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Unknown template '{}'. Available: rust-wasi, tinygo-wasi, text-only",
-                        template
-                    )
-                })?;
-
-                init_block(&name, template_enum, output.as_deref(), &config.user.did)?;
-            }
             BlockAction::Run {
                 wasm,
                 seed,
@@ -694,33 +632,6 @@ async fn main() -> Result<()> {
                     json_output: json || cli.json,
                     enable_pricing: pricing,
                 })?;
-            }
-            BlockAction::Lint { path } => {
-                eprintln!("error: 'jig block lint' is not yet implemented in v0.0.1");
-                eprintln!("  (waiting for jig-core Wasm validation API)");
-                eprintln!("  block: {}", path.display());
-                std::process::exit(1);
-            }
-            BlockAction::Sign { path, key } => {
-                eprintln!("error: 'jig block sign' is not yet implemented in v0.0.1");
-                eprintln!("  (waiting for jig-core Ed25519 signing API)");
-                eprintln!("  block: {}", path.display());
-                if let Some(key_path) = key {
-                    eprintln!("  key: {}", key_path.display());
-                }
-                std::process::exit(1);
-            }
-            BlockAction::Verify { path } => {
-                eprintln!("error: 'jig block verify' is not yet implemented in v0.0.1");
-                eprintln!("  (waiting for jig-core Ed25519 verification API)");
-                eprintln!("  block: {}", path.display());
-                std::process::exit(1);
-            }
-            BlockAction::Capabilities { path } => {
-                eprintln!("error: 'jig block capabilities' is not yet implemented in v0.0.1");
-                eprintln!("  (waiting for jig-core capability DSL)");
-                eprintln!("  block: {}", path.display());
-                std::process::exit(1);
             }
         },
         Some(Commands::Init { .. }) => unreachable!("init handled earlier"),
