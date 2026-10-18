@@ -39,7 +39,7 @@ struct Args {
 /// `server_did_keyfile` reverts to the default path, the server mints a FRESH
 /// ed25519 identity, and it comes up under a NEW server DID — which breaks
 /// TOFU pinning for every already-connected client. The same swallow silently
-/// reverts `[bridges]`, federation peers, and `debug.admin_endpoints`.
+/// reverts `[bridges]`, federation peers, and `[debug]`.
 ///
 /// `None` (no `--config` given) legitimately means defaults.
 fn load_v0_0_2_config(config_path: Option<&Path>) -> Result<JigServerConfig, String> {
@@ -101,6 +101,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Starting Jig server v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("Database: {}", config.database_path.display());
+    for opt in config.unsafe_options_active() {
+        tracing::warn!("unsafe option active: {opt} (loopback or a TLS-terminating proxy only)");
+    }
 
     // Build the v0.0.2 pipeline AppState alongside the existing ServerConfig.
     // Both halves come from the same --config file: root-level keys drive
@@ -222,14 +225,14 @@ mod tests {
         let path = write(
             &dir,
             "good.toml",
-            "[server]\nserver_did_keyfile = \"/srv/keep-me.key\"\n\n[debug]\nadmin_endpoints = true\n",
+            "[server]\nserver_did_keyfile = \"/srv/keep-me.key\"\n\n[debug]\nlist_handles = true\n",
         );
 
         let cfg = load_v0_0_2_config(Some(&path)).unwrap();
         // The whole point: the operator's keyfile must survive. Falling back to
         // defaults here mints a new server DID and breaks TOFU pinning.
         assert_eq!(cfg.server.server_did_keyfile, "/srv/keep-me.key");
-        assert!(cfg.debug.admin_endpoints);
+        assert!(cfg.debug.list_handles);
     }
 
     #[test]

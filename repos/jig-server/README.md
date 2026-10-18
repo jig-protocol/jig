@@ -58,7 +58,6 @@ The v0.0.2 surface, mounted by default:
 | `/api/v1/mls/key-packages/{did}` | GET | Take one of a DID's key packages (consumed unless last-resort) — signed read |
 | `/api/v1/mls/key-packages/{did}/stock` | GET | How many a DID has left — signed read |
 | `/api/v1/channels/{slug}/mls/group-info` | GET | Newest MLS group info of an encrypted channel, for joining by external commit — signed read, channel-gated |
-| `/_admin_v0_0_2/channels[/{slug}/members\|archive]` | POST | Legacy aliases of the channel ops; mounted only with `[debug] admin_endpoints = true` |
 
 Reads carry five `x-jig-*` headers with an ed25519 proof over the request
 (`jig_client::ReadProof`); `jig channel list`, `jig chat`, `jig read` and `jig tail` sign

@@ -707,9 +707,16 @@ mod tests {
             "sig_b64": base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
         });
 
+        let local = || jig_pipeline::metrics::ingested_by_source()[0];
+        let before = local();
         let (status, body) = post_json(router, "/api/v1/blocks", submission).await;
         assert_eq!(status, StatusCode::OK, "body={body}");
         assert!(!body["block_cid"].as_str().unwrap_or("").is_empty());
+        // REST ingest used to be invisible to /metrics. Other tests ingest
+        // concurrently, so assert growth, not an exact value.
+        let after = local();
+        assert_eq!(after.0, "local");
+        assert!(after.1 > before.1, "REST ingest must count as local");
     }
 
     #[tokio::test]
@@ -811,7 +818,7 @@ mod tests {
         // Build a combined router with both blocks (list_channels) and
         // admin (create_channel) routes mounted on the same state.
         let router = build_blocks_router(state.clone())
-            .merge(crate::v0_0_2_admin::build_admin_router(state.clone()));
+            .merge(crate::v0_0_2_admin::build_channel_ops_router(state.clone()));
 
         let id = test_identity();
         let hlc = test_hlc(&id);
@@ -821,8 +828,7 @@ mod tests {
             "sig_b64": base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
         });
 
-        let (status, _body) =
-            post_json(router.clone(), "/_admin_v0_0_2/channels", submission).await;
+        let (status, _body) = post_json(router.clone(), "/api/v1/channels", submission).await;
         assert_eq!(status, StatusCode::OK);
 
         let (status, body) = get_path(router, "/api/v1/channels").await;
@@ -846,7 +852,7 @@ mod tests {
 
         let state = Arc::new(unauthenticated_state());
         let router = build_blocks_router(state.clone())
-            .merge(crate::v0_0_2_admin::build_admin_router(state.clone()));
+            .merge(crate::v0_0_2_admin::build_channel_ops_router(state.clone()));
 
         let id = test_identity();
         // Create channels in a non-sorted order; expect sorted output.
@@ -857,8 +863,7 @@ mod tests {
                 "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
                 "sig_b64":    base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
             });
-            let (status, _) =
-                post_json(router.clone(), "/_admin_v0_0_2/channels", submission).await;
+            let (status, _) = post_json(router.clone(), "/api/v1/channels", submission).await;
             assert_eq!(status, StatusCode::OK, "creating {slug}");
         }
 
@@ -875,13 +880,12 @@ mod tests {
 
     /// The default config (no `[debug]` section) must carry the whole
     /// install.sh hello-world: create `#hello`, list it, post to it. The
-    /// legacy `/_admin_v0_0_2/*` aliases stay behind the debug flag.
+    /// removed `/_admin_v0_0_2/*` aliases must 404.
     #[tokio::test]
-    async fn channel_ops_work_without_the_debug_flag() {
+    async fn channel_ops_work_with_the_default_config() {
         use jig_client::blocks::build_channel_create;
 
         let state = Arc::new(unauthenticated_state());
-        assert!(!state.config.debug.admin_endpoints);
         let router = crate::v0_0_2_ws::build_v0_0_2_router(state.clone());
 
         let id = test_identity();
@@ -900,7 +904,7 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::NOT_FOUND,
-            "legacy alias must stay debug-gated"
+            "removed legacy alias must 404"
         );
 
         let (status, body) = post_json(router.clone(), "/api/v1/channels", submission).await;

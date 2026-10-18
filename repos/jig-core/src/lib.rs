@@ -7,18 +7,25 @@
 pub mod admission_pow;
 pub mod block_kind;
 pub mod bundle;
+pub mod canonical_cid;
 pub mod capability_dsl;
 pub mod capability_registry;
 pub mod capability_scope;
 pub mod capability_validation;
 pub mod component_validation;
+#[cfg(feature = "ed25519")]
+pub mod cose;
 pub mod crypto;
+pub mod dcbor;
 pub mod did;
 pub mod dm;
 pub mod error;
 pub mod hlc;
+#[cfg(feature = "keystore")]
+pub mod keystore;
 pub mod lint;
 pub mod manifest;
+pub mod operator_policy;
 #[cfg(test)]
 pub mod proptest_generators;
 pub mod receipt;
