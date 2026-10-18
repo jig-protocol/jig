@@ -106,10 +106,15 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 
 ## 4. Installs and bot identity
 
-1. A `block-install` block is authored and signed by the channel's owner, and by no one else.
-   Its manifest names: `block` (the bot's program CID, JEP-0011), `channel` (a `channel-id`), `grant`, `bot_did`, `bot_key`,
-   `triggers` (what invokes the bot), and optionally `inherits_state_from` (an earlier install).
-2. The hosting server MUST countersign the install, stating that it holds `bot_key` as custodian.
+1. A `block-install` is **proposed by the channel's owner and countersigned by the hosting
+   server**, the same mechanism as `channel-policy` (JEP-0011): a COSE_Sign object signed by the
+   owner, then the server, carrying `seq` and `prev`. Nobody else can propose one. Its payload
+   names: `block` (the bot's program CID, JEP-0011), `channel` (a `channel-id`), `grant`,
+   `bot_did`, `bot_key`, `triggers` (what invokes the bot), and optionally `inherits_state_from`
+   (an earlier install).
+2. The server's countersignature states that it holds `bot_key` as custodian and that the install
+   passes its restrictions (operator policy, §2.1). The server MUST withdraw an install that no
+   longer passes them, as JEP-0011 specifies for `channel-policy`.
 3. The install's CID is the **instance id**. A host MUST refuse an install whose `grant` is not
    `⊑` the program's `requests`, or whose program is outside operator policy.
 4. A bot's posts are blocks authored by `bot_did` and MUST go through `ingest` like any write.
@@ -208,7 +213,8 @@ author's `hlc_ts`.
 When the owner moves a channel's sequencer with `sequencer-set` *(F)*:
 
 1. The new sequencer names freshly minted bot DIDs in its `contract-accept`, and `sequencer-set`
-   carries an owner-signed reinstall for each bot that continues, with `inherits_state_from`.
+   carries an owner-proposed reinstall for each bot that continues, with `inherits_state_from`.
+   The new home server countersigns the reinstalls as part of its `contract-accept`.
 2. The new sequencer takes the state whose CID is the last `state_after` at or before the handover
    head, or replays the instance from its receipts. If both fail, the reinstall starts empty and
    says so.
