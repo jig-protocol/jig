@@ -292,7 +292,12 @@ impl WasmEngine {
         let memory_limit_bytes = (config.limits.memory_max_mb as u64) * 1024 * 1024;
         wasm_config.memory_reservation(memory_limit_bytes);
         wasm_config.memory_guard_size(0x10000); // 64KB guard
-        wasm_config.max_wasm_stack(2 * 1024 * 1024); // 2MB stack limit
+        // wasmtime's default, and deliberately well below a thread's stack. The wasm stack
+        // limit is counted from where the host calls in, on top of the host frames already on
+        // that thread. At 2 MiB it equalled a spawned thread's whole stack (Rust's and tokio's
+        // default), so unbounded recursion overran the thread's guard page and aborted the
+        // process instead of trapping.
+        wasm_config.max_wasm_stack(512 * 1024);
 
         // Pooling allocator keeps allocation behaviour predictable.
         //
