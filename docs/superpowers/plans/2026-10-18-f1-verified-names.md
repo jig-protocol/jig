@@ -53,7 +53,8 @@ owning lane builds the slice, or agrees in writing (through the orchestrator) th
 
 | Slice | What | Files | Owner | Depends on |
 | --- | --- | --- | --- | --- |
-| 0 | Fail closed on orphan relayed posts and on fanout with no policy | `jig-pipeline/src/ingest.rs`, `jig-pipeline/src/fanout.rs` | To be confirmed by the orchestrator (asked 2026-10-18) | nothing |
+| 0 | Fail closed on orphan relayed posts and on fanout with no policy; hash DIDs in logs (#172) | `jig-pipeline/src/ingest.rs`, `jig-pipeline/src/fanout.rs`, `jig-core/src/did.rs`, `jig-server/src/v0_0_2_admission.rs` | F | nothing |
+| 0b | Key `log_tag` with a value derived from the server's signing key, so a leaked log can't be reversed by enumerating public DIDs or linked across servers | `jig-core/src/did.rs` and its callers | F, scheduled by the orchestrator | 0 |
 | 1 | `jig_core::naming`: types, signed bytes, verification, test vectors | `jig-core/src/naming.rs` (new), `jig-core/src/lib.rs`, `jig-spec/jep/vectors/0004/` (new) | F | nothing |
 | 2 | The nameserver issues the new objects and takes action-bound proofs for register and renew. Rotate stays as it is until lane I's I3 moves `/v1/rotate` onto links | `jig-nameserver/src/v0_0_2*.rs`, alias storage in `jig-pipeline/src/persist.rs` | L6 (nameserver); persistence change agreed with whoever owns `persist.rs` | 1 |
 | 3 | TLS on the nameserver | `jig-nameserver/src/server.rs` | L6 | nothing |
@@ -108,6 +109,16 @@ encrypted content today, but both will matter once channels are keyed by CID in 
   into channels both peers created, so it must stay green. If it relies on orphan relay, stop and
   report: that test encodes the bug.
 - [ ] **Step 5:** commit `fix(federation): refuse relayed posts for unknown channels; no policy means no federation`.
+
+Release note: a channel federates only if a peer saw its `channel-create`, that is, it was
+created after the two servers peered and while their link was up. Nothing replays it at peering
+today (the peer loop ignores `CatchUp`). F2's `contract-offer` carries the creation block and
+closes this.
+
+**Follow-up (slice 0b).** `log_tag` hashes the DID under a public domain tag. DIDs are public
+through nameservers, so a leaked log plus a DID list reverses every tag. Key it instead:
+`blake3::derive_key("jig-log-did-v1", server_seed)` as the key of a keyed BLAKE3 over the DID.
+No new secret, and tags stop being reversible or linkable across servers without that key.
 
 ---
 
