@@ -48,12 +48,12 @@ Verdicts:
 | `CapabilityConfig` (`allowed`, `quotas`, `scope_policies`, `deny_by_default`) | only the dead `capabilities.rs`. jig-nameserver's `NameserverRuntime` (dead, L6) constructs it | Delete after L6 removes `NameserverRuntime` |
 | `ExecutionContext.capabilities` / `with_capability` | written by jig-server's `BlockRuntime` and tests. The runtime never reads it | Delete. jig-server's own call goes in the same PR |
 | `ExecutionContext.env`, `args`, `rng_seed` / `with_env`, `with_rng_seed` | written by jig-cli `runtime.rs` (`rng_seed`) and one integration test. The runtime never reads them: WASI gets no env or args | Delete. The jig-cli line belongs to L3, so ask there first |
-| capability meter (`fuel.rs`, `CapabilityMeterHandle`) | no production writer. No host import exists to charge it | Ask DJ: lane C may claim it for the effectful tier |
+| capability meter (`fuel.rs`, `CapabilityMeterHandle`) | no production writer. No host import exists to charge it | Delete (DJ, Q2). Goes in the jig-runtime deletion PR after #119 and #125 |
 | Cargo feature `deterministic` | no `cfg` reads it | Delete |
 | Cargo feature `component-model` | no `cfg` reads it. It only turns on wasmtime's component model | Delete. Lane A brings it back with the WIT ABI |
 | Cargo feature `receipt-signing` (optional `ed25519-dalek`) | no `cfg` reads it. jig-nameserver enables it in `Cargo.toml` | Delete, with a one-line change to `jig-nameserver/Cargo.toml` (L6) |
 | optional `tokio` dependency ("future async API") | no feature or code uses it | Delete |
-| Cargo feature `tracing` | 40 `cfg`s in jig-runtime. CI never builds it | Ask DJ: build it in CI, or remove it (plan rule 3) |
+| Cargo feature `tracing` | 40 `cfg`s in jig-runtime. CI never builds it | Keep, and build it in CI (DJ, Q3) |
 
 ## jig-server runtime
 
@@ -82,9 +82,9 @@ Verdicts:
   separate, and v0.3 has no `fuel_total`. #109 is the v0.2 stopgap: it keeps the measured wasm
   fuel in the sum that `receipts.md` still requires. `fuel_total` goes away with the v0.2
   `BlockReceipt`, and nothing new may depend on it.
-- **Q2. Capability meter.** Keep `CapabilityMeterHandle` for lane C, or delete it now? Git history
-  keeps it.
-- **Q3. `tracing` feature.** Add a CI build, or remove it?
-- **Q4. `CapabilityRegistry`.** It is live validation with made-up names (`net:http:fetch`,
-  `ai:llm:inference`) and nothing behind them. Leave it to lane C, or narrow it to `core:compute`
-  now? Narrowing changes behaviour.
+- **Q2. Capability meter. Decided: delete.** `CapabilityMeterHandle` has no production writer, and
+  C8 keeps host meters apart from wasm fuel, so lane C's design will not reuse this shape. It goes
+  in the jig-runtime deletion PR after #119 and #125. Git history keeps it.
+- **Q3. `tracing` feature. Decided: build it in CI.** One clippy step with `--features tracing`.
+- **Q4. `CapabilityRegistry`. Decided: leave it to lane C.** It stays as live manifest validation,
+  made-up names included, until lane C's design replaces it. No behaviour change now.
