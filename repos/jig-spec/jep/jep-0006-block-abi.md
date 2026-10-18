@@ -125,7 +125,7 @@ names:
 | `indirect-call-type-mismatch` | `call_indirect` to a function of another type |
 | `integer-overflow` | signed division of the minimum value by -1 |
 | `integer-divide-by-zero` | integer division or remainder by zero |
-| `invalid-conversion-to-integer` | a float-to-integer conversion out of range (not reachable under `jig-det-1`) |
+| `invalid-conversion-to-integer` | a float-to-integer conversion out of range. Unreachable under `jig-det-1` (no floats), so it has no vector. |
 
 Any other trap, including an engine-specific one, is `incomplete` with reason `host-fault`.
 So is a malformed return value, such as a string or list past the end of memory, a bad
