@@ -39,7 +39,6 @@ pub struct NameServerConfig {
     pub federation: FederationConfig,
     pub admin: AdminConfig,
     pub automation: AutomationPolicy,
-    pub transparency: TransparencyConfig,
     pub reputation: ReputationConfig,
     pub useful_work: UsefulWorkConfig,
     pub capabilities: CapabilitiesConfig,
@@ -277,7 +276,6 @@ impl NameServerConfig {
             federation: FederationConfig::from_env(),
             admin: AdminConfig::from_env(),
             automation: AutomationPolicy::from_env(),
-            transparency: TransparencyConfig::from_env(),
             reputation: ReputationConfig::from_env(),
             useful_work: UsefulWorkConfig::from_env(),
             capabilities: CapabilitiesConfig::from_env(),
@@ -303,7 +301,6 @@ impl NameServerConfig {
         self.federation.merge_env();
         self.admin.merge_env();
         self.automation.merge_env();
-        self.transparency.merge_env();
         self.reputation.merge_env();
         self.useful_work.merge_env();
         self.capabilities.merge_env();
@@ -994,48 +991,6 @@ impl AutomationPolicy {
         let growth = (base - 1.0).powf(self.power_law_alpha).max(0.0);
         let amplification = 1.0 + growth * self.pile_on_factor;
         amplification.clamp(1.0, self.max_multiplier.max(1.0))
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct TransparencyConfig {
-    pub log_path: PathBuf,
-    pub publish_interval_secs: i64,
-}
-
-impl Default for TransparencyConfig {
-    fn default() -> Self {
-        Self {
-            log_path: default_transparency_path(),
-            publish_interval_secs: 3600,
-        }
-    }
-}
-
-impl TransparencyConfig {
-    fn from_env() -> Self {
-        let mut cfg = Self::default();
-        if let Ok(path) = std::env::var("JIG_NS_TRANSPARENCY_PATH") {
-            cfg.log_path = PathBuf::from(path);
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_TRANSPARENCY_INTERVAL")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            cfg.publish_interval_secs = parsed;
-        }
-        cfg
-    }
-
-    fn merge_env(&mut self) {
-        if let Ok(path) = std::env::var("JIG_NS_TRANSPARENCY_PATH") {
-            self.log_path = PathBuf::from(path);
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_TRANSPARENCY_INTERVAL")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            self.publish_interval_secs = parsed;
-        }
     }
 }
 
@@ -1910,16 +1865,6 @@ fn default_federation_cache_ttl() -> i64 {
         .unwrap_or(300)
 }
 
-fn default_transparency_path() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        home.join(".jig")
-            .join("nameserver")
-            .join("transparency.log")
-    } else {
-        PathBuf::from("transparency.log")
-    }
-}
-
 const TEMPLATE: &str = r#"
 # Jig Nameserver configuration
 
@@ -1984,10 +1929,6 @@ max_multiplier = 8.0
 quorum = 3
 evidence_window_secs = 600
 human_review_window_secs = 3600
-
-[transparency]
-log_path = "~/.jig/nameserver/transparency.log"
-publish_interval_secs = 3600
 
 [reputation]
 default_ruleset = "high-sec"
