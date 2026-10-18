@@ -174,6 +174,21 @@ pub enum Frame {
         /// base64 ed25519 over [`crate::handshake::WelcomeStatement::canonical_bytes`].
         sig: String,
     },
+    /// Server's signed answer to a [`Frame::Hello`] it shares no version or
+    /// suite with (JEP-0002 rule 3). The server closes after sending it.
+    /// Signed so that a server refusing a suite it once advertised has
+    /// signed its own downgrade.
+    Refusal {
+        server_did: String,
+        /// `UNSUPPORTED_VERSION` or `UNSUPPORTED_SUITE`.
+        code: String,
+        message: String,
+        versions: Vec<u64>,
+        suites: Vec<String>,
+        nonce: String,
+        /// base64 ed25519 over [`crate::handshake::RefusalStatement::canonical_bytes`].
+        sig: String,
+    },
     /// Subscribe to a scope (channel or federation).
     ///
     /// `auth` carries the same tier-0 proof of possession the REST path takes

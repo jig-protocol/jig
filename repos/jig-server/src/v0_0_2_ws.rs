@@ -25,7 +25,7 @@ use axum::{
     Router,
     extract::{
         State, WebSocketUpgrade,
-        ws::{Message, WebSocket},
+        ws::{CloseFrame, Message, WebSocket},
     },
     response::Response,
     routing::get,
@@ -34,7 +34,9 @@ use base64::Engine as _;
 use jig_core::BlockBundle;
 use jig_pipeline::{
     Envelope, Frame, ReceiptRef, Scope, SubscriptionScope,
+    envelope::EnvelopeParseError,
     fanout::SubscriberIdentity,
+    handshake::{HelloRefusal, close},
     ingest::{IngestSource, ingest},
 };
 use tokio::sync::mpsc;
@@ -322,6 +324,15 @@ async fn handle_socket(
                         {
                             tracing::warn!(conn_id, "ws frame error: {e}");
                         }
+                        if let Some((code, reason)) = session.close.take() {
+                            let _ = socket
+                                .send(Message::Close(Some(CloseFrame {
+                                    code,
+                                    reason: reason.into(),
+                                })))
+                                .await;
+                            break;
+                        }
                     }
                     Message::Close(_) => break,
                     // Ignore Ping/Pong/Binary; axum handles Ping→Pong automatically.
@@ -392,13 +403,14 @@ async fn handle_socket(
 /// The identity is set by a verified Subscribe. Delivery re-checks
 /// authorization long after that frame is gone, which is why it lives here
 /// rather than per frame. `handshaken` flips once a welcome has been sent.
-/// Frames before that are refused with `HANDSHAKE_REQUIRED` and the socket
-/// stays up, so the client can still hello.
+/// `close` is set by a frame that ends the connection (JEP-0002 rule 7): the
+/// connection loop sends the close frame and stops.
 #[derive(Default)]
 struct ConnState {
     sub_id: Option<u64>,
     did: Option<jig_core::did::Did>,
     handshaken: bool,
+    close: Option<(u16, &'static str)>,
 }
 
 /// Why a channel subscription was not registered.
@@ -452,22 +464,56 @@ async fn handle_client_frame(
     let env: Envelope = match Envelope::parse(text) {
         Ok(e) => e,
         Err(e) => {
+            // A hello at a version or suite this server does not speak is an
+            // incompatibility, and gets a signed refusal (JEP-0002 rule 3).
+            if !session.handshaken
+                && let EnvelopeParseError::Gate(gate) = &e
+                && let Some(nonce) = unparsed_hello_nonce(text)
+            {
+                let refusal = if gate.code()
+                    == jig_pipeline::envelope::EnvelopeGateError::UNSUPPORTED_VERSION_CODE
+                {
+                    HelloRefusal::UnsupportedVersion(gate.to_string())
+                } else {
+                    HelloRefusal::UnsupportedSuite(gate.to_string())
+                };
+                return refuse_hello(state, socket, session, &refusal, &nonce).await;
+            }
             // Best-effort error reply; ignore send failure (client may have gone away).
             // A malformed frame is the WS analogue of REST's 400 Bad Request:
             // the envelope itself never parsed, so no IngestError was ever
             // constructed for classify_ingest_error to classify.
             let code = match &e {
-                jig_pipeline::envelope::EnvelopeParseError::Gate(gate) => gate.code(),
-                jig_pipeline::envelope::EnvelopeParseError::Malformed(_) => "BAD_JSON",
+                EnvelopeParseError::Gate(gate) => gate.code(),
+                EnvelopeParseError::Malformed(_) => "BAD_JSON",
             };
             let _ = send_error(socket, Some(400), code, None, &e.to_string()).await;
+            // Before the welcome nothing but a hello is acceptable. After it,
+            // a frame outside the version or suite the client offered breaks
+            // its own offer; a frame that is merely malformed is an ordinary
+            // error.
+            if !session.handshaken || matches!(e, EnvelopeParseError::Gate(_)) {
+                session.close = Some((close::PROTOCOL_VIOLATION, code));
+            }
             return Err(e.to_string());
         }
     };
 
-    // Hello is taken first, including a repeat hello, which re-signs a welcome.
+    // Hello is taken first. A connection carries one (JEP-0002 rule 6).
     // A failed `if let` would drop `frame`, so this match rebinds it.
     let frame = match env.frame {
+        Frame::Hello { .. } if session.handshaken => {
+            let _ = send_error(
+                socket,
+                Some(400),
+                jig_pipeline::handshake::PROTOCOL_VIOLATION_CODE,
+                None,
+                "a connection carries one hello; open a new connection for a new offer",
+            )
+            .await;
+            session.close = Some((close::PROTOCOL_VIOLATION, "second hello"));
+            return Ok(());
+        }
         Frame::Hello {
             versions,
             suites,
@@ -477,7 +523,7 @@ async fn handle_client_frame(
             return complete_hello(
                 state,
                 socket,
-                &mut session.handshaken,
+                session,
                 jig_pipeline::handshake::HelloView {
                     versions,
                     suites,
@@ -489,9 +535,8 @@ async fn handle_client_frame(
         }
         other => other,
     };
-    // A parsed frame that is not hello, before the welcome, is refused. The
-    // socket stays open. Version and suite gate failures never reach here:
-    // they are answered above, from Envelope::parse, and also leave it open.
+    // A parsed frame that is not hello, before the welcome, is a protocol
+    // violation: refused, then closed.
     if !session.handshaken {
         let _ = send_error(
             socket,
@@ -501,6 +546,7 @@ async fn handle_client_frame(
             "send hello before any other frame",
         )
         .await;
+        session.close = Some((close::PROTOCOL_VIOLATION, "HANDSHAKE_REQUIRED"));
         return Ok(());
     }
 
@@ -754,9 +800,11 @@ async fn handle_client_frame(
 
         // ------------------------------------------------------------------ Server-only frames
         // These are server→client frames; ignore them when received from a client.
-        Frame::Ack { .. } | Frame::Block { .. } | Frame::Error { .. } | Frame::Welcome { .. } => {
-            Ok(())
-        }
+        Frame::Ack { .. }
+        | Frame::Block { .. }
+        | Frame::Error { .. }
+        | Frame::Welcome { .. }
+        | Frame::Refusal { .. } => Ok(()),
     }
 }
 
@@ -771,11 +819,11 @@ fn handshake_capabilities(state: &AppState) -> jig_pipeline::handshake::Capabili
     }
 }
 
-/// Sign a welcome, or refuse the hello without closing the socket.
+/// Sign a welcome, or refuse the hello and close.
 async fn complete_hello(
     state: &AppState,
     socket: &mut WebSocket,
-    handshaken: &mut bool,
+    session: &mut ConnState,
     hello: jig_pipeline::handshake::HelloView,
 ) -> Result<(), String> {
     let offer = jig_pipeline::handshake::ServerOffer {
@@ -789,16 +837,46 @@ async fn complete_hello(
                 .send(Message::Text(json.into()))
                 .await
                 .map_err(|err| err.to_string())?;
-            *handshaken = true;
+            session.handshaken = true;
             Ok(())
         }
-        Err(refusal) => {
-            // Version and suite refusals leave the connection open so the
-            // client can offer something this server speaks.
+        Err(refusal @ HelloRefusal::Malformed(_)) => {
             let _ = send_error(socket, Some(400), refusal.code(), None, refusal.message()).await;
+            session.close = Some((close::PROTOCOL_VIOLATION, "malformed hello"));
             Ok(())
         }
+        Err(refusal) => refuse_hello(state, socket, session, &refusal, &hello.nonce).await,
     }
+}
+
+/// Answer an incompatible hello with a signed refusal, then close
+/// ([`close::INCOMPATIBLE`]).
+async fn refuse_hello(
+    state: &AppState,
+    socket: &mut WebSocket,
+    session: &mut ConnState,
+    refusal: &HelloRefusal,
+    nonce: &str,
+) -> Result<(), String> {
+    session.close = Some((close::INCOMPATIBLE, refusal.code()));
+    let frame = jig_pipeline::handshake::seal_refusal(&state.ingest_ctx.server_key, refusal, nonce);
+    let json = serde_json::to_string(&frame).map_err(|err| err.to_string())?;
+    socket
+        .send(Message::Text(json.into()))
+        .await
+        .map_err(|err| err.to_string())
+}
+
+/// The nonce of a hello that did not parse at this version or suite. The
+/// refusal echoes it, so the client can tell it answers its own hello.
+fn unparsed_hello_nonce(text: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        op: String,
+        nonce: String,
+    }
+    let probe: Probe = serde_json::from_str(text).ok()?;
+    (probe.op == "hello" && !probe.nonce.is_empty()).then_some(probe.nonce)
 }
 
 // ---- Helpers ---------------------------------------------------------------
@@ -1664,8 +1742,9 @@ mod tests {
         }
     }
 
-    /// A well-formed frame at a version or suite this server does not speak is
-    /// refused with a code that says so, never processed and never reported as
+    /// A well-formed frame at a version or suite this server does not speak,
+    /// sent before any hello, is refused with a code that says so and then
+    /// closed as a protocol violation: never processed, never reported as
     /// garbage.
     #[tokio::test]
     async fn ws_refuses_unsupported_version_and_suite_by_code() {
@@ -1686,23 +1765,56 @@ mod tests {
         ] {
             let (mut ws, _) = connect_async(&url).await.unwrap();
             ws.send(TMessage::Text(frame.into())).await.unwrap();
-            let msg = tokio::time::timeout(Duration::from_secs(3), ws.next())
-                .await
-                .expect("timeout waiting for the refusal")
-                .expect("stream closed")
-                .expect("ws error");
-            let TMessage::Text(reply) = msg else {
-                panic!("expected text frame, got {msg:?}");
-            };
-            let env: Envelope = serde_json::from_str(&reply).unwrap();
-            match env.frame {
+            match next_frame(&mut ws).await.frame {
                 Frame::Error { status, code, .. } => {
                     assert_eq!(code, expected, "frame: {frame}");
                     assert_eq!(status, Some(400));
                 }
                 other => panic!("expected Error for {frame}, got {other:?}"),
             }
+            assert_eq!(
+                close_code(&mut ws).await,
+                Some(close::PROTOCOL_VIOLATION),
+                "frame: {frame}"
+            );
         }
+    }
+
+    /// The close code the server ends the connection with.
+    async fn close_code(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Option<u16> {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(3), ws.next())
+                .await
+                .expect("timeout waiting for the close");
+            match msg {
+                Some(Ok(TMessage::Close(frame))) => return frame.map(|f| u16::from(f.code)),
+                Some(Ok(TMessage::Text(text))) => panic!("expected a close, got {text}"),
+                Some(Ok(_)) => continue,
+                Some(Err(_)) | None => return None,
+            }
+        }
+    }
+
+    async fn handshake(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) {
+        let (hello, pending) =
+            jig_pipeline::handshake::begin(&jig_pipeline::handshake::ClientOffer::default());
+        ws.send(TMessage::Text(
+            serde_json::to_string(&hello).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            pending.interpret(&recv_text(ws).await),
+            jig_pipeline::handshake::HandshakeResult::Established(_)
+        ));
     }
 
     async fn recv_text(
@@ -1741,8 +1853,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn frame_before_hello_is_refused_and_the_socket_stays_open() {
-        let (state, url) = start_test_server().await;
+    async fn a_frame_before_hello_is_refused_and_closed() {
+        let (_state, url) = start_test_server().await;
         let (mut ws, _) = connect_async(&url).await.unwrap();
         let sub = Envelope::new(Frame::Subscribe {
             scope: Scope::Channel {
@@ -1757,71 +1869,103 @@ mod tests {
             Frame::Error { code, .. } => assert_eq!(code, "HANDSHAKE_REQUIRED"),
             other => panic!("expected HANDSHAKE_REQUIRED, got {other:?}"),
         }
-
-        let (hello, pending) =
-            jig_pipeline::handshake::begin(&jig_pipeline::handshake::ClientOffer::default());
-        ws.send(TMessage::Text(
-            serde_json::to_string(&hello).unwrap().into(),
-        ))
-        .await
-        .unwrap();
-        match pending.interpret(&recv_text(&mut ws).await) {
-            jig_pipeline::handshake::HandshakeResult::Established(welcome) => {
-                assert_eq!(welcome.server_did, state.server_did.to_did_jig_string());
-            }
-            other => panic!("hello after a refusal must still be welcomed, got {other:?}"),
-        }
+        assert_eq!(close_code(&mut ws).await, Some(close::PROTOCOL_VIOLATION));
     }
 
     #[tokio::test]
-    async fn version_and_suite_refusals_leave_the_socket_open() {
+    async fn an_incompatible_hello_gets_a_signed_refusal_and_a_close() {
+        let (state, url) = start_test_server().await;
+        for offer in [
+            jig_pipeline::handshake::ClientOffer {
+                versions: vec![2],
+                ..jig_pipeline::handshake::ClientOffer::default()
+            },
+            jig_pipeline::handshake::ClientOffer {
+                suites: vec!["mls".to_string()],
+                ..jig_pipeline::handshake::ClientOffer::default()
+            },
+        ] {
+            let (mut ws, _) = connect_async(&url).await.unwrap();
+            let (hello, pending) = jig_pipeline::handshake::begin(&offer);
+            ws.send(TMessage::Text(
+                serde_json::to_string(&hello).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+            match pending.interpret(&recv_text(&mut ws).await) {
+                jig_pipeline::handshake::HandshakeResult::Incompatible(refusal) => {
+                    assert_eq!(refusal.server_did, state.server_did.to_did_jig_string());
+                    assert_eq!(refusal.versions, vec![1]);
+                    assert_eq!(refusal.suites, vec!["none".to_string(), "mls".to_string()]);
+                }
+                other => panic!("expected a signed refusal for {offer:?}, got {other:?}"),
+            }
+            assert_eq!(close_code(&mut ws).await, Some(close::INCOMPATIBLE));
+        }
+    }
+
+    /// A hello inside an envelope this server cannot parse still gets a
+    /// signed refusal that echoes its nonce.
+    #[tokio::test]
+    async fn a_hello_at_an_unspoken_version_gets_a_signed_refusal() {
         let (_state, url) = start_test_server().await;
         let (mut ws, _) = connect_async(&url).await.unwrap();
-
-        let (hello, _) = jig_pipeline::handshake::begin(&jig_pipeline::handshake::ClientOffer {
-            versions: vec![2],
-            ..jig_pipeline::handshake::ClientOffer::default()
-        });
-        ws.send(TMessage::Text(
-            serde_json::to_string(&hello).unwrap().into(),
-        ))
-        .await
-        .unwrap();
-        match next_frame(&mut ws).await.frame {
-            Frame::Error { code, .. } => {
-                assert_eq!(code, "UNSUPPORTED_VERSION");
-            }
-            other => panic!("expected UNSUPPORTED_VERSION, got {other:?}"),
-        }
-
-        let (hello, _) = jig_pipeline::handshake::begin(&jig_pipeline::handshake::ClientOffer {
-            suites: vec!["mls".to_string()],
-            ..jig_pipeline::handshake::ClientOffer::default()
-        });
-        ws.send(TMessage::Text(
-            serde_json::to_string(&hello).unwrap().into(),
-        ))
-        .await
-        .unwrap();
-        match next_frame(&mut ws).await.frame {
-            Frame::Error { code, .. } => assert_eq!(code, "UNSUPPORTED_SUITE"),
-            other => panic!("expected UNSUPPORTED_SUITE, got {other:?}"),
-        }
-
         let (hello, pending) =
+            jig_pipeline::handshake::begin(&jig_pipeline::handshake::ClientOffer::default());
+        let mut value = serde_json::to_value(&hello).unwrap();
+        value["v"] = serde_json::json!(2);
+        ws.send(TMessage::Text(value.to_string().into()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            pending.interpret(&recv_text(&mut ws).await),
+            jig_pipeline::handshake::HandshakeResult::Incompatible(_)
+        ));
+        assert_eq!(close_code(&mut ws).await, Some(close::INCOMPATIBLE));
+    }
+
+    #[tokio::test]
+    async fn a_second_hello_is_a_protocol_violation() {
+        let (_state, url) = start_test_server().await;
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        handshake(&mut ws).await;
+        let (hello, _) =
             jig_pipeline::handshake::begin(&jig_pipeline::handshake::ClientOffer::default());
         ws.send(TMessage::Text(
             serde_json::to_string(&hello).unwrap().into(),
         ))
         .await
         .unwrap();
-        match pending.interpret(&recv_text(&mut ws).await) {
-            jig_pipeline::handshake::HandshakeResult::Established(welcome) => {
-                assert_eq!(welcome.suites, vec!["none".to_string(), "mls".to_string()]);
-                assert!(welcome.reputation.is_null());
-                assert_eq!(welcome.version, 1);
-            }
-            other => panic!("a later hello must still be welcomed, got {other:?}"),
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { code, .. } => assert_eq!(code, "PROTOCOL_VIOLATION"),
+            other => panic!("expected PROTOCOL_VIOLATION, got {other:?}"),
         }
+        assert_eq!(close_code(&mut ws).await, Some(close::PROTOCOL_VIOLATION));
+    }
+
+    /// After the welcome, a frame outside the client's own offer ends the
+    /// connection; a merely malformed one is an ordinary error.
+    #[tokio::test]
+    async fn after_the_welcome_only_a_frame_outside_the_offer_closes() {
+        let (_state, url) = start_test_server().await;
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        handshake(&mut ws).await;
+
+        ws.send(TMessage::Text("{not json".into())).await.unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { code, .. } => assert_eq!(code, "BAD_JSON"),
+            other => panic!("expected BAD_JSON, got {other:?}"),
+        }
+
+        ws.send(TMessage::Text(
+            r##"{"v":2,"op":"subscribe","scope":{"kind":"channel","slug":"#hello"}}"##.into(),
+        ))
+        .await
+        .unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { code, .. } => assert_eq!(code, "UNSUPPORTED_VERSION"),
+            other => panic!("expected UNSUPPORTED_VERSION, got {other:?}"),
+        }
+        assert_eq!(close_code(&mut ws).await, Some(close::PROTOCOL_VIOLATION));
     }
 }
