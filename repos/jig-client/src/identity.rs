@@ -911,6 +911,48 @@ mod tests {
         assert!(Identity::open(dir.path(), &id.did_string(), &access).is_ok());
     }
 
+    /// A keychain that never answers, as one waiting on a prompt nobody sees.
+    struct StuckKeychain;
+    impl Keychain for StuckKeychain {
+        fn get(&self, _: &str) -> Result<Option<Zeroizing<Vec<u8>>>, KeychainError> {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            Ok(None)
+        }
+        fn set(&self, _: &str, _: &[u8]) -> Result<(), KeychainError> {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            Ok(())
+        }
+        fn delete(&self, _: &str) -> Result<(), KeychainError> {
+            Ok(())
+        }
+        fn name(&self) -> &'static str {
+            "stuck keychain"
+        }
+    }
+
+    #[test]
+    fn a_stuck_keychain_with_a_person_present_ends_in_a_passphrase_never_plaintext() {
+        let dir = tempdir().unwrap();
+        let stuck = crate::keychain::Bounded::new(
+            Box::new(StuckKeychain),
+            std::time::Duration::from_millis(50),
+        );
+        let mut access = passphrase_only("unused");
+        access.passphrase = None;
+        access.keychain = Some(Arc::new(stuck));
+        let access = access.with_prompt(Arc::new(Answers(Mutex::new(vec!["typed"]))));
+        let id = Identity::create(dir.path(), &access).unwrap();
+        assert!(id.is_sealed());
+        let key =
+            JigKey::from_bytes(&std::fs::read(key_path(dir.path(), &id.did_string())).unwrap())
+                .unwrap();
+        assert_eq!(
+            key.slots(),
+            vec![SlotKind::Passphrase(KdfParams::insecure_for_tests())]
+        );
+        assert!(!raw_key_path(dir.path(), &id.did_string()).exists());
+    }
+
     #[test]
     fn plaintext_storage_keeps_the_raw_file() {
         let dir = tempdir().unwrap();

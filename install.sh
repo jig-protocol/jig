@@ -361,14 +361,20 @@ forget_passphrase() {
 # script runs. Otherwise each command would ask again (unlocked keys are cached
 # per process). It lives only in this script's environment: never on disk, and
 # unset before the script ends.
+#
+# `read_passphrase force` asks even where a keychain should exist: jig could not
+# seal with it (it timed out, or refused), and a person is still here, so the
+# answer is a passphrase, never plaintext.
 read_passphrase() {
   [ -n "${JIG_KEY_PASSPHRASE:-}${JIG_KEY_UNLOCK:-}" ] && return 0
   [ "${JIG_KEYS_STORAGE:-}" = "plaintext" ] && return 0
-  # The checks jig makes for a keychain (jig-client/src/keychain.rs).
-  [ "$(uname -s)" = "Darwin" ] && [ "${JIG_KEYCHAIN:-}" != "none" ] && return 0
-  if [ "${JIG_KEYCHAIN:-}" != "none" ] && command -v secret-tool >/dev/null 2>&1 \
-    && { [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || [ -S "${XDG_RUNTIME_DIR:-/nonexistent}/bus" ]; }; then
-    return 0
+  if [ "${1:-}" != "force" ]; then
+    # The checks jig makes for a keychain (jig-client/src/keychain.rs).
+    [ "$(uname -s)" = "Darwin" ] && [ "${JIG_KEYCHAIN:-}" != "none" ] && return 0
+    if [ "${JIG_KEYCHAIN:-}" != "none" ] && command -v secret-tool >/dev/null 2>&1 \
+      && { [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || [ -S "${XDG_RUNTIME_DIR:-/nonexistent}/bus" ]; }; then
+      return 0
+    fi
   fi
   { : </dev/tty; } 2>/dev/null || return 0
   local first second
@@ -376,7 +382,11 @@ read_passphrase() {
   # INT and TERM leave through `exit`, so the EXIT trap restores the terminal.
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  printf '[jig] No OS keychain here: choose a passphrase to seal your identity key.\n' >/dev/tty
+  if [ "${1:-}" = "force" ]; then
+    printf '[jig] The OS keychain could not seal your identity key: choose a passphrase instead.\n' >/dev/tty
+  else
+    printf '[jig] No OS keychain here: choose a passphrase to seal your identity key.\n' >/dev/tty
+  fi
   for _ in 1 2 3; do
     printf '[jig] passphrase: ' >/dev/tty
     IFS= read -rs first </dev/tty || die "could not read a passphrase"
@@ -430,7 +440,15 @@ hello_world() {
     case "$rc" in
       0) ;;
       78)
-        plaintext_keys
+        # Nothing could seal the key. With a person at the terminal, that is a
+        # passphrase (jig may have been told not to prompt, or the keychain
+        # gave up on them); plaintext is only for when nobody can be asked.
+        if { : </dev/tty; } 2>/dev/null; then
+          read_passphrase force
+        fi
+        if [ -z "${JIG_KEY_PASSPHRASE:-}" ]; then
+          plaintext_keys
+        fi
         "$jig" init "$nickname" >/dev/null || die "jig init failed"
         ;;
       *) printf '%s\n' "$init_err" >&2; die "jig init failed" ;;

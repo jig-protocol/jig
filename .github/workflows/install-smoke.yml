@@ -44,6 +44,7 @@ on:
       - repos/jig-client/src/secure.rs
       - repos/jig-cli/src/cmd/init.rs
       - repos/jig-cli/src/cmd/passphrase.rs
+      - scripts/test-install-key-fallback.sh
 
 permissions:
   contents: read
@@ -84,6 +85,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+      - name: install.sh key fallback (stub jig; terminal and headless)
+        shell: bash
+        run: scripts/test-install-key-fallback.sh
       - name: Install Rust toolchain
         shell: bash
         working-directory: repos
