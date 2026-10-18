@@ -53,7 +53,7 @@ pub enum ClientError {
         "the server speaks none of what this client offered ({}): {}; it speaks versions {:?} and suites {:?}",
         .0.code, .0.message, .0.versions, .0.suites
     )]
-    Incompatible(jig_pipeline::handshake::VerifiedRefusal),
+    Incompatible(Box<jig_pipeline::handshake::VerifiedRefusal>),
     /// The server contradicted its signed welcome, or a signed refusal
     /// contradicted what this device pinned. The socket is closed (4003).
     #[error("the server contradicted what it signed: {}", .0.reason)]
@@ -553,7 +553,7 @@ impl Client {
                         && self
                             .welcome
                             .as_ref()
-                            .is_some_and(|w| w.capabilities.block_kinds.iter().any(|k| *k == kind))
+                            .is_some_and(|w| w.capabilities.block_kinds.contains(&kind))
                     {
                         let error = Envelope::new(Frame::Error {
                             status: None,
@@ -697,7 +697,7 @@ async fn drive_handshake(
                 return match pending.interpret(&text) {
                     HandshakeResult::Established(welcome) => Ok(welcome),
                     HandshakeResult::Incompatible(refusal) => {
-                        Err(ClientError::Incompatible(refusal))
+                        Err(ClientError::Incompatible(Box::new(refusal)))
                     }
                     HandshakeResult::FailClosed { reason, evidence } => {
                         Err(ClientError::HandshakeFailed { reason, evidence })
