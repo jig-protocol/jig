@@ -3,7 +3,6 @@
 mod channel_arg;
 mod cmd;
 mod config;
-mod http_client;
 mod receipt;
 
 #[cfg(feature = "local-runtime")]
@@ -12,7 +11,6 @@ mod runtime;
 use anyhow::Result;
 use channel_arg::ChannelArg;
 use clap::{Parser, Subcommand};
-use http_client::JigHttpClient;
 use std::path::PathBuf;
 use std::{io, io::IsTerminal};
 
@@ -434,28 +432,20 @@ enum KeysAction {
 
 #[derive(Subcommand, Debug)]
 enum ReceiptAction {
-    /// View a receipt from a file or server
+    /// View a receipt from a file
     View {
-        /// Load receipt from file path
+        /// Path to the receipt JSON
         #[arg(long)]
-        file: Option<String>,
-
-        /// Fetch receipt by block ID from server
-        #[arg(long)]
-        block: Option<String>,
+        file: String,
     },
 
-    /// Compare two receipts (for parity testing)
+    /// Compare two receipt files (for parity testing)
     Compare {
-        /// First receipt (file path or block ID with --block)
+        /// First receipt file
         first: String,
 
-        /// Second receipt (file path or block ID with --block)
+        /// Second receipt file
         second: String,
-
-        /// Treat arguments as block IDs instead of file paths
-        #[arg(long)]
-        block: bool,
     },
 }
 
@@ -595,7 +585,10 @@ async fn main() -> Result<()> {
     }
 
     let config = ctx.effective().clone();
-    let client = JigHttpClient::new(&config.server.base_url)?;
+    // Fail every command below on a malformed server URL up front, as the
+    // legacy HTTP client's constructor used to.
+    reqwest::Url::parse(&config.server.base_url)
+        .map_err(|e| anyhow::anyhow!("invalid base url: {e}"))?;
     let default_channel = config.user.default_channel.clone();
 
     let stdin_pipe = !io::stdin().is_terminal();
@@ -655,42 +648,9 @@ async fn main() -> Result<()> {
             cmd::chat::run(&ctx, cmd::chat::ChatArgs { channel }).await?;
         }
         Some(Commands::Receipt { action }) => match action {
-            ReceiptAction::View { file, block } => {
-                use cmd::receipt::{ReceiptSource, view_receipt};
-
-                let source = if let Some(file_path) = file {
-                    ReceiptSource::File(file_path.clone())
-                } else if let Some(block_id) = block {
-                    let cid: cid::Cid = block_id.parse()?;
-                    ReceiptSource::BlockId(cid)
-                } else {
-                    anyhow::bail!("Must specify either --file or --block");
-                };
-
-                view_receipt(Some(&client), source, cli.json).await?;
-            }
-            ReceiptAction::Compare {
-                first,
-                second,
-                block,
-            } => {
-                use cmd::receipt::{ReceiptSource, compare_receipts};
-
-                let source_a = if block {
-                    let cid: cid::Cid = first.parse()?;
-                    ReceiptSource::BlockId(cid)
-                } else {
-                    ReceiptSource::File(first.clone())
-                };
-
-                let source_b = if block {
-                    let cid: cid::Cid = second.parse()?;
-                    ReceiptSource::BlockId(cid)
-                } else {
-                    ReceiptSource::File(second.clone())
-                };
-
-                compare_receipts(Some(&client), source_a, source_b).await?;
+            ReceiptAction::View { file } => cmd::receipt::view_receipt(&file, cli.json)?,
+            ReceiptAction::Compare { first, second } => {
+                cmd::receipt::compare_receipts(&first, &second)?
             }
         },
         #[cfg(feature = "local-runtime")]
