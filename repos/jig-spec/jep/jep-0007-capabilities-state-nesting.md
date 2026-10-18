@@ -87,10 +87,13 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 ## 3. Enforcement
 
 1. **At install and at upload,** a host MUST refuse a component whose imports are not a subset of
-   the interfaces its effective authority names, and any `wasi:*` import (`jig-det-1`).
-2. **At link time,** a host MUST instantiate a block with a linker that defines only the
-   interfaces in its effective authority. A host MUST NOT define missing imports as traps or
-   stubs. A failed instantiation makes the run `incomplete` with reason `capability-refused`.
+   the interfaces its effective authority names plus `jig:block/types`, and any `wasi:*` import
+   (`jig-det-1`).
+2. **At link time,** a host MUST instantiate a block with a linker that defines `jig:block/types`
+   as an empty instance (it carries types only; every wit-bindgen component imports it) and
+   otherwise only the interfaces in its effective authority. This applies to every world,
+   `renderer` included. A host MUST NOT define missing imports as traps or stubs. A failed
+   instantiation makes the run `incomplete` with reason `capability-refused`.
 3. **At call time,** every `jig:host` function MUST check its arguments against the scope before
    acting. A refusal is returned to the block as an error value.
 4. **At apply time,** the host MUST check each returned effect against the effective authority
