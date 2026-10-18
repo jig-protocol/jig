@@ -7,7 +7,6 @@
 //! A default install lists none (a block's clock is bounded by
 //! `[server] max_future_skew_ms`). Each flag appears only when explicitly
 //! enabled in the server config:
-//!   - `debug.admin_endpoints`
 //!   - `federation.dangerously_disable_federation_tls`
 //!   - `identity.naively_allow_unknown_handles_fallback`
 //!   - `debug.list_handles`
@@ -48,21 +47,6 @@ async fn default_install_advertises_no_unsafe_option() {
         active.is_empty(),
         "a default install must advertise no unsafe option (got {active:?})"
     );
-}
-
-#[tokio::test]
-async fn admin_endpoints_flag_surfaces_in_well_known() {
-    let mut config = JigServerConfig::default();
-    config.debug.admin_endpoints = true;
-    let server = TestJigServer::start_with_config(config).await.unwrap();
-    let info = well_known(&server).await;
-    let active: Vec<String> = info["unsafe_options_active"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap().to_string())
-        .collect();
-    assert!(active.contains(&"debug.admin_endpoints".to_string()));
 }
 
 #[tokio::test]
@@ -128,7 +112,6 @@ async fn list_handles_flag_surfaces_in_well_known() {
 #[tokio::test]
 async fn all_antipatterns_simultaneously_advertised() {
     let mut config = JigServerConfig::default();
-    config.debug.admin_endpoints = true;
     config.federation.dangerously_disable_federation_tls = true;
     config.federation.dangerously_allow_plaintext_federation = true;
     config.identity.naively_allow_unknown_handles_fallback = true;
@@ -144,7 +127,6 @@ async fn all_antipatterns_simultaneously_advertised() {
         .collect();
 
     for expected in [
-        "debug.admin_endpoints",
         "federation.dangerously_disable_federation_tls",
         "federation.dangerously_allow_plaintext_federation",
         "identity.naively_allow_unknown_handles_fallback",

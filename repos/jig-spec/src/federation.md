@@ -2,6 +2,18 @@
 
 **Audience:** This chapter is for **server operators** running federated Jig servers and **protocol implementers** building federation support. **End users** might care about how federation affects message delivery and privacy. **Developers** building federated applications will want to understand cross-server communication.
 
+> **Mostly not implemented: most of this page's MUSTs are unbuilt.** The reference server
+> federates by dialing the peers its configuration lists, over TLS by default, and refuses
+> a welcome not signed by the DID configured for that peer. [Relayed Blocks](#relayed-blocks)
+> is implemented, with two exceptions: a relayed block's author is not asked for admission
+> proof-of-work, and a relayed `text-render` may name a channel this server does not have. Not built: DNS SRV
+> discovery, X.509 mutual TLS, the signed per-message federation envelope, reputation
+> tiers, receipt exchange and billing, retry backoff and per-peer quotas. The `.well-known`
+> document below is not the real one (see
+> [Transports](transports.md#server-certificates)). Only open, unencrypted channels
+> federate until the federation data contract (D12) is specified. This page is being
+> rewritten under JEP-0005 (the channel contract).
+
 ---
 
 Federation is how Jig servers talk to each other. Without it, every server is an island—users on `server-a.example.com` can't talk to users on `server-b.example.com`. With federation, the network becomes interconnected like email: you choose your server, but you can still communicate with everyone.
@@ -90,7 +102,7 @@ Response:
 
 **Why `.well-known`:** So clients can discover a server's public key and federation endpoints without DNS (useful for IP-based servers or Tor hidden services).
 
-**For server operators:** Host this JSON at `/.well-known/jig` (HTTP, not HTTPS—it's public data anyway).
+**For server operators:** Host this JSON at `/.well-known/jig` (HTTP, not HTTPS—it's public data anyway). *(superseded: the implemented `/.well-known/jig` carries the server's DID and, when TLS is on (the default), its `tls_binding`; a client's first fetch of it is the TLS probe in [Transports § Server Certificates](transports.md#server-certificates). With `[tls] enabled = false`, for loopback or behind a TLS-terminating proxy, it is served over plain HTTP.)*
 
 ## Authentication
 

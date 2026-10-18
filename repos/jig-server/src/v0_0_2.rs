@@ -2,7 +2,7 @@
 //! into jig-server without touching the existing handler tree.
 //!
 //! `AppState` is the boot context Phase D2-D6 will hand to NEW axum routes
-//! (under `/api/v1/*` and `/_admin_v0_0_2/*`). Existing v0.0.1 routes
+//! (under `/api/v1/*`). Existing v0.0.1 routes
 //! (defined in `handler.rs`, `server.rs`, `websocket/`, `federation/`,
 //! etc.) keep their own state and are unaffected by this module.
 //!

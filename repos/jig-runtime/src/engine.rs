@@ -270,12 +270,18 @@ impl WasmEngine {
             // Canonicalize NaN values for deterministic floating-point
             wasm_config.cranelift_nan_canonicalization(config.engine.canonicalize_nans);
 
-            // Disable threads for determinism
-            wasm_config.wasm_threads(false);
-
-            // Disable SIMD for now (can be enabled later with deterministic guards)
-            wasm_config.wasm_simd(false);
-            wasm_config.wasm_relaxed_simd(false); // Must also disable relaxed-simd
+            // Exactly the features jig-core's validator accepts
+            // (`DETERMINISTIC_FEATURES`: WebAssembly 2.0 without SIMD). wasmtime
+            // 49 enables most 3.0 proposals by default (GC, memory64,
+            // exceptions, tail calls, wide arithmetic, component-model async),
+            // and turning off only threads and SIMD left the engine willing to
+            // run them. The validator rejects them first on every current
+            // path; this keeps a path that skips it from running them.
+            //
+            // Spelled out rather than shared with jig-core: wasmtime's
+            // `WasmFeatures` comes from its own wasmparser version.
+            wasm_config.wasm_features(WasmFeatures::all(), false);
+            wasm_config.wasm_features(WasmFeatures::WASM2.difference(WasmFeatures::SIMD), true);
         }
 
         // Memory configuration
@@ -488,6 +494,49 @@ mod tests {
         let config = RuntimeConfig::default();
         let engine = WasmEngine::new(&config);
         assert!(engine.is_ok());
+    }
+
+    /// The engine refuses the same features the determinism validator does.
+    ///
+    /// wasmtime 49 enables most WebAssembly 3.0 proposals by default. The
+    /// validator in jig-core rejects them first on every current path, but a
+    /// path that compiled without validating would have run them.
+    #[test]
+    fn the_engine_rejects_features_outside_wasm2_without_simd() {
+        let engine = WasmEngine::new(&RuntimeConfig::default()).unwrap();
+        let cases = [
+            ("multi-memory", "(module (memory 1) (memory 1))"),
+            ("memory64", "(module (memory i64 1))"),
+            ("tail calls", "(module (func $f (return_call $f)))"),
+            ("exceptions", "(module (tag $t) (func (throw $t)))"),
+            (
+                "wide arithmetic",
+                "(module (func (param i64 i64 i64 i64) (result i64 i64) \
+                 local.get 0 local.get 1 local.get 2 local.get 3 i64.add128))",
+            ),
+            ("simd", "(module (func (result v128) v128.const i64x2 0 0))"),
+        ];
+        for (feature, wat) in cases {
+            let bytes = wat::parse_str(wat).unwrap_or_else(|e| panic!("{feature}: {e}"));
+            assert!(
+                engine.compile_module(&bytes).is_err(),
+                "the engine must refuse {feature}"
+            );
+        }
+
+        // The 2.0 core it does allow still compiles: bulk memory, multi-value,
+        // reference types, sign extension, non-trapping float-to-int.
+        let allowed = wat::parse_str(
+            "(module (memory 1) (table 1 funcref)
+               (func (result i32 i32) i32.const 1 i32.const 2)
+               (func (memory.fill (i32.const 0) (i32.const 0) (i32.const 1)))
+               (func (result i32) i32.const 1 i32.extend8_s)
+               (func (result i32) f32.const 1 i32.trunc_sat_f32_s))",
+        )
+        .unwrap();
+        engine
+            .compile_module(&allowed)
+            .expect("WebAssembly 2.0 without SIMD must compile");
     }
 
     #[test]
