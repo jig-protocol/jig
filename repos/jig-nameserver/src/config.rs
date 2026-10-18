@@ -43,7 +43,6 @@ pub struct NameServerConfig {
     pub reputation: ReputationConfig,
     pub useful_work: UsefulWorkConfig,
     pub capabilities: CapabilitiesConfig,
-    pub runtime: RuntimeConfig, // Phase E: Embedded WASM execution
     pub anomaly_detection: AnomalyDetectionConfig, // Phase D: Anomaly detection and cross-validation
     pub analytics: AnalyticsConfig,                // Phase F: Analytics and insights
     pub hot: HotConfig, // Phase F Tier 2/3: Hot state backend (rate limiting, caching)
@@ -277,7 +276,6 @@ impl NameServerConfig {
             reputation: ReputationConfig::from_env(),
             useful_work: UsefulWorkConfig::from_env(),
             capabilities: CapabilitiesConfig::from_env(),
-            runtime: RuntimeConfig::from_env(),
             anomaly_detection: AnomalyDetectionConfig::from_env(),
             analytics: AnalyticsConfig::from_env(),
             hot: HotConfig::from_env(),
@@ -302,7 +300,6 @@ impl NameServerConfig {
         self.reputation.merge_env();
         self.useful_work.merge_env();
         self.capabilities.merge_env();
-        self.runtime.merge_env();
     }
 
     fn normalize(&mut self) {
@@ -1392,97 +1389,6 @@ impl CapabilitiesConfig {
     }
 }
 
-// Phase E: Runtime Embedding Configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RuntimeConfig {
-    /// Enable embedded WASM execution
-    pub enabled: bool,
-
-    /// Maximum fuel budget (instructions)
-    pub fuel_max: u64,
-
-    /// Maximum linear memory in MB
-    pub memory_max_mb: u32,
-
-    /// Wall-clock execution timeout in milliseconds
-    pub execution_timeout_ms: u64,
-
-    /// Allowed capabilities for nameserver-executed blocks
-    /// Limited to: storage.read:receipts:*, storage.write:attestations:*, net.fetch:federation:*
-    pub allowed_capabilities: Vec<String>,
-
-    /// Enable deterministic execution (strongly recommended)
-    pub deterministic: bool,
-
-    /// Enable WASI preview2
-    pub wasi_preview2: bool,
-}
-
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,            // Opt-in for Phase E
-            fuel_max: 5_000_000,       // 5M instructions
-            memory_max_mb: 32,         // 32MB
-            execution_timeout_ms: 250, // 250ms
-            allowed_capabilities: vec![
-                "storage.read:receipts:*".into(),
-                "storage.write:attestations:*".into(),
-                "net.fetch:federation:*".into(),
-            ],
-            deterministic: true,
-            wasi_preview2: true,
-        }
-    }
-}
-
-impl RuntimeConfig {
-    fn from_env() -> Self {
-        let mut cfg = Self::default();
-        if let Ok(val) = std::env::var("JIG_NS_RUNTIME_ENABLED") {
-            cfg.enabled = val == "true" || val == "1";
-        }
-        if let Ok(val) = std::env::var("JIG_RUNTIME_FUEL_MAX")
-            && let Ok(fuel) = val.parse()
-        {
-            cfg.fuel_max = fuel;
-        }
-        if let Ok(val) = std::env::var("JIG_RUNTIME_MEMORY_MAX_MB")
-            && let Ok(mem) = val.parse()
-        {
-            cfg.memory_max_mb = mem;
-        }
-        if let Ok(val) = std::env::var("JIG_RUNTIME_TIMEOUT_MS")
-            && let Ok(timeout) = val.parse()
-        {
-            cfg.execution_timeout_ms = timeout;
-        }
-        cfg
-    }
-
-    fn merge_env(&mut self) {
-        if let Ok(val) = std::env::var("JIG_NS_RUNTIME_ENABLED") {
-            self.enabled = val == "true" || val == "1";
-        }
-        if let Ok(val) = std::env::var("JIG_RUNTIME_FUEL_MAX")
-            && let Ok(fuel) = val.parse()
-        {
-            self.fuel_max = fuel;
-        }
-        if let Ok(val) = std::env::var("JIG_RUNTIME_MEMORY_MAX_MB")
-            && let Ok(mem) = val.parse()
-        {
-            self.memory_max_mb = mem;
-        }
-        if let Ok(val) = std::env::var("JIG_RUNTIME_TIMEOUT_MS")
-            && let Ok(timeout) = val.parse()
-        {
-            self.execution_timeout_ms = timeout;
-        }
-    }
-}
-
 // Phase D: Anomaly Detection Configuration
 // TODO: Migrate to jig-config/src/nameserver.rs once cross-validation config is upstreamed
 
@@ -1997,19 +1903,6 @@ useful_work_types = ["validate_block", "verify_observation", "audit_ruleset"]
 tribunal_enabled = true
 transparency_enabled = true
 federation_enabled = false
-
-[runtime]
-enabled = false  # Phase E: Enable embedded WASM execution (opt-in)
-fuel_max = 5_000_000
-memory_max_mb = 32
-execution_timeout_ms = 250
-allowed_capabilities = [
-  "storage.read:receipts:*",
-  "storage.write:attestations:*",
-  "net.fetch:federation:*"
-]
-deterministic = true
-wasi_preview2 = true
 
 [anomaly_detection]  # Phase D: Anomaly detection and cross-validation
 enabled = true

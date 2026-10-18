@@ -9,7 +9,6 @@ pub mod federation;
 pub mod hot;
 pub mod identity;
 pub mod pow;
-pub mod runtime;
 pub mod server;
 pub mod storage;
 pub mod transparency;
