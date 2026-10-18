@@ -221,7 +221,7 @@ enabling it.
 > to `jig-server` only — so its rows stay `http://` unless you terminate TLS in
 > front of it yourself.
 
-`/healthz` and `/metrics` are deliberately mounted **outside** the v0.0.1 gate,
+`/healthz` and `/metrics` are always mounted and need no signed read,
 so they answer on a default, locked-down deployment. Use `/healthz` — not
 `/.well-known/jig` — as the uptime check: it touches no storage.
 
@@ -277,13 +277,10 @@ Three landmines, all called out in `config.example.toml`:
   `/api/v1/channels*`, which is always mounted. Set it to `true` only while
   pre-v0.1 `jig` binaries (which POST to `/_admin_v0_0_2/*`) still talk to this
   server.
-- **`dangerously_enable_v0_0_1_rest` defaults to `false`, and should stay false.**
-  It gates the unsigned v0.0.1 REST surface (`GET`/`POST /blocks`,
-  `/blocks/:cid`, `/receipts/:cid`), which takes an attacker-chosen author DID
-  with no signature and signs a receipt attesting to it. The visible cost of
-  leaving it off is that **`jig read` 404s** — it still calls `GET /blocks`. Use
-  `jig chat` or `GET /api/v1/channels/<slug>/blocks` instead; do **not** turn the
-  flag on to make `jig read` work.
+- **The unsigned v0.0.1 REST surface is gone** (D28): `GET`/`POST /blocks`,
+  `/blocks/:cid` and `/receipts/:cid` answer `404`, and the
+  `dangerously_enable_v0_0_1_rest` flag no longer exists. `jig read` uses the
+  signed history endpoint, `GET /api/v1/channels/<slug>/blocks`.
 
 ### Reading history
 

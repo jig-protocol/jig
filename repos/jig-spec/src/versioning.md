@@ -44,6 +44,8 @@ defines what the signature covers.
 | `UNSUPPORTED_SUITE` | Suite unregistered or not implemented |
 | `UNSUPPORTED_SCHEMA` | Manifest `schema` not implemented |
 | `SUITE_MISMATCH` | A block's suite is not its channel's |
+| `RESTRICTED_REQUIRES_MLS` | A restricted channel created with a suite other than `mls` |
+| `CHANNEL_FROZEN` | Content for a restricted channel created unencrypted, before restricted channels were always `mls` (`409`) |
 | `MLS_REJECTED` | The MLS payload of a block on an `mls` channel is invalid, or does not do what the block says |
 | `STALE_EPOCH` | A commit built on an epoch the channel has left (`409` on both transports) |
 

@@ -2,18 +2,24 @@
 
 > **v0.2 implements `mls` for single-server channels.** A channel created under `mls` is
 > one MLS group: its content is end-to-end encrypted and the server stores ciphertext it
-> cannot read. Channels created without a suite are `none`, as before. Encrypted channels
-> do not federate in v0.2. Design record:
+> cannot read. A restricted channel is always `mls`; an open channel is `none` unless its
+> creator chooses `mls`. Encrypted channels do not federate in v0.2. Design record:
 > [M2 design](https://github.com/jig-protocol/jig/blob/main/docs/superpowers/specs/2026-10-11-m2-mls-and-channel-dynamics-design.md);
 > rationale: [`docs/security/encryption.md`](https://github.com/jig-protocol/jig/blob/main/docs/security/encryption.md);
 > open questions: [JEP-0001](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0001-encryption-suites.md).
 
 ## Suites
 
-An **encryption suite** names the scheme that protects a payload. Suites are pluggable:
-a channel created without one is `none` (signed, not encrypted), and MLS is selected per
-channel at creation. An operator MAY run another registered suite. Adding a suite is a
-registry entry plus a JEP and conformance vectors. It MUST NOT need a wire-format change.
+An **encryption suite** names the scheme that protects a payload. Suites are pluggable,
+and a channel's suite is chosen at creation:
+
+- A **restricted** channel is always `mls`. Content a server can read is not restricted
+  from that server's operator, so a creator who wants plaintext makes an open channel.
+- An **open** channel created without a suite is `none` (signed, not encrypted). Its
+  creator MAY choose `mls` instead.
+
+An operator MAY run another registered suite. Adding a suite is a registry entry plus a JEP
+and conformance vectors. It MUST NOT need a wire-format change.
 
 ### Registry
 
@@ -51,6 +57,13 @@ Every conversation is a channel. An encrypted channel is one MLS group.
 
 - A channel's suite is chosen by its creator and recorded in the signed channel-creation
   block. It is fixed at creation.
+- A server MUST refuse a `channel-create` whose visibility is not `open` and whose suite is
+  not `mls` (`RESTRICTED_REQUIRES_MLS`). An absent visibility is `open`; any other value
+  is restricted.
+- A restricted channel whose suite is `none`, created before this rule, is **frozen**: its
+  history stays readable to its members, and a server MUST refuse new content for it
+  (`CHANNEL_FROZEN`). Membership changes, promotion to open and archiving still apply.
+  Promoted to open, it takes content again as an open channel.
 - A **DM** is a channel with two members and **locked membership**. A group DM is a
   locked channel with more members. There is no separate DM scheme.
 - A DM's slug is derived from the pair's DIDs, so either side finds it. Write each DID in

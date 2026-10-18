@@ -264,13 +264,17 @@ Errors I reproduced while writing this guide, unless marked otherwise.
 
 Read this before you type anything sensitive into it.
 
-- **Your messages are not encrypted.** They are *signed*, which proves who wrote them.
-  That is a different thing. The server stores them in readable form and anyone who can
-  read the server can read your messages.
+- **Open channels are not encrypted unless you ask.** Every message is *signed*, which
+  proves who wrote it. That is a different thing. DMs (`jig dm`), every `restricted`
+  channel, and open channels created with `jig channel create --encrypted` are end-to-end
+  encrypted; the server stores every other open channel in readable form, and anyone who can
+  read the server can read it. Even in encrypted channels the server sees who posts where
+  and when.
 - **Permissions are per channel, and that is all.** Reads are signed with your key, so
   nobody can read as you; `restricted` channels really are members-only — for reading,
   listing and posting — and only the owner can add members. But any key can reach the
-  server, create channels, and post to `open` ones, and the operator can read everything.
+  server, create channels, and post to `open` ones, and the operator can read every channel
+  that is not encrypted.
   Treat `open` channels as visible to everyone on the tailnet.
 - **No mobile app and no web page.** Terminal only, on a machine that is on the tailnet.
 - **No notifications.** If `jig chat` is not open, you will not know a message arrived.

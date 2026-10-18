@@ -78,15 +78,22 @@ async fn restricted_channels_are_gated_end_to_end() {
     let server = TestJigServer::start_with_full_kinds()
         .await
         .expect("server");
-    let (alice, _a) = test_identity_with_dir();
-    let (bob, _b) = test_identity_with_dir();
+    let (alice, a) = test_identity_with_dir();
+    let (bob, b) = test_identity_with_dir();
     let (carol, _c) = test_identity_with_dir();
+    let mls = tempfile::tempdir().unwrap();
+    let alice_mls =
+        jig_client::secure::Session::open(mls.path(), load_identity(&a, &alice.did_string()))
+            .unwrap();
+    let bob_mls =
+        jig_client::secure::Session::open(mls.path(), load_identity(&b, &bob.did_string()))
+            .unwrap();
     server
-        .create_channel(&alice, "#private", "restricted")
+        .create_restricted_channel(&alice, &alice_mls, "#private")
         .await
         .expect("create");
     server
-        .add_member(&alice, "#private", &bob.did_string())
+        .add_restricted_member(&alice, &alice_mls, "#private", &bob_mls)
         .await
         .expect("add bob");
 

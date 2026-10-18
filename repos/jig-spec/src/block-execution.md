@@ -2,6 +2,15 @@
 
 **Audience:** This chapter is primarily for **developers** building executable blocks and **protocol implementers** running hosts that execute blocks. **End users** don't need to understand block internals—your client handles execution automatically. **Server operators** might care about resource limits, capability policies, and security sandboxing.
 
+> **Mostly not implemented.** The reference server executes one module, its own canonical
+> `text-render` block, built for `wasm32-unknown-unknown` with no imports. It validates the
+> manifest schema and suite, the author's signature and the module's Wasm features, and
+> meters fuel, memory and time. It does not run third-party blocks, provide host functions
+> or capability handles, check capability policy, mount resources, or bill by outcome.
+> Capability-bearing blocks are phase 2 (`v0.3`) on the roadmap. Where this chapter says
+> `wasm32-wasi`, that Rust target no longer exists; its successor is `wasm32-wasip1`, and a
+> block that needs nothing from the host builds for `wasm32-unknown-unknown`.
+
 ---
 
 Executable blocks are where Jig gets interesting. Instead of just sending text messages, you can send **code** that runs on the server (or recipient's client) in a secure, metered sandbox. Think of it like embedding a Lambda function in a message—but deterministic, portable, and cryptographically verifiable.
