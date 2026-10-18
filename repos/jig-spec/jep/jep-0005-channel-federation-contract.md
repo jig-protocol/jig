@@ -65,7 +65,8 @@ Non-goals for v0.2:
    all MLS commits.
 3. A **follower** is a server the channel has been shared with: it has accepted the
    channel's contract under a grant (7a).
-4. A user is a DID with no home server. A client reads and writes a shared channel
+4. A user is a DID with no home server. A channel does have one: its owner, the only
+   server that signs its `ingest` records. A client reads and writes a shared channel
    through any server it is authenticated to that carries the channel, and need not know
    the owner. The servers where a DID can be reached come from its reachability record
    (JEP-0004).

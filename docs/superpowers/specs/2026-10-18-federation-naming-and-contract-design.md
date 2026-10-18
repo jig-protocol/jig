@@ -396,7 +396,13 @@ The recommendation is yes: the record lists only the servers where she wants to 
 
 **Decided (DJ, 2026-10-18).** A client writes to a shared channel through whatever
 server it is authenticated to, if that server carries the channel. That server relays the
-write to the owner. There is no home server, and the client never has to find the owner.
+write to the owner. The client never has to find the owner.
+
+"No home server" is about **users**: a DID is not tied to one server. A **channel** still
+has exactly one owning server, which L7 calls the channel's home server. That server alone
+accepts writes into the channel's history, signs every `ingest` record and keeps the single
+`seq`/`prev` chain. Carrying servers never sign `ingest` and never accept writes on their
+own authority. They relay to the owner and pass its records through unchanged.
 Sharing a channel is a server-to-server act, and **a share carries a grant**:
 
 | Grant (proposed set) | A follower may relay | Clients authenticated to the follower |
@@ -421,8 +427,11 @@ Consequences:
   detection (5.3). What `read` withholds is content.
   - **Metadata cost:** a `seen` acknowledgement is a read receipt. It tells the owner and
     the follower who read what, and when.
-  - **Proposed:** acknowledgements are checked and kept by servers but not fanned out to
-    members by default. Whether members see read receipts is channel policy.
+  - **Proposed: minimal retention.** A server verifies each acknowledgement, keeps only
+    the latest one per member (enough to detect withholding), and never fans
+    acknowledgements out to members. It keeps no history of who read what, and when. Read
+    receipts visible to members would be a separate, opt-in feature, not a side effect of
+    fork detection.
 - **Rejected:** multi-homing (Matrix, IRC), where any server accepts writes with no owner.
   It needs state resolution, and MLS needs one linear epoch history.
 
