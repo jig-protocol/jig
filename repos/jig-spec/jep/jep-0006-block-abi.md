@@ -92,8 +92,9 @@ A run is identified by:
   imports;
 - for a composed block, the child CIDs its manifest pins.
 
-`invocation.hlc` comes from the owning server's signed per-channel ingest record for the
-triggering block (lane L7; field name to be decided). It is never the author-set `hlc_ts`.
+`invocation.ingest-seq` and `invocation.ingest-hlc` are copied from the triggering block's
+`ingest` record, which the channel's home server signs (lane L7). An executor MUST verify that
+record before execution. The author-set `hlc_ts` is never an input.
 
 Its outcome is one of:
 
