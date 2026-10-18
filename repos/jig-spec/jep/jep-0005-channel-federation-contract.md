@@ -170,16 +170,21 @@ Non-goals for v0.2:
        with new bot DIDs and `inherits_state_from`). By default it carries one per current
        bot. The new sequencer MUST name the new bot DIDs in its `contract-accept`.
 
-11b. When the sequencer moves (11a), the new sequencer countersigns, as part of its
-     `contract-accept`:
-     - the channel's current `channel-policy`;
-     - every live `block-install`.
+11b. When the sequencer moves (11a), the new sequencer issues, as part of its
+     `contract-accept`, a `policy-approval` for the channel's current `channel-policy`
+     and for every live `block-install`.
+     - A `policy-approval` is a `COSE_Sign1` by the hosting server (JEP-0004 rule 0). It
+       names the server, the channel, the CID of the policy or install it approves, and
+       the CID of the server's restrictions. The owner's `channel-policy` and
+       `block-install` stay `COSE_Sign1`s by the owner.
+     - Clients MUST treat a policy or install without a current approval from the hosting
+       server as absent. A move without these approvals therefore leaves the channel with
+       no policy.
+     - Because the approval is separate from the owner's object, a server can re-approve
+       or withdraw one when its restrictions change, and a new sequencer can approve on a
+       move, without the owner signing again.
 
-     Each is a `COSE_Sign` (JEP-0004 rule 0) with the owner's signature first and the
-     hosting server's second. Until the new sequencer has countersigned a policy or an
-     install, that object is not signed by the server that hosts the channel, and clients
-     MUST treat it as absent: no policy, no install. A move without these countersignatures
-     therefore leaves the channel with no policy. JEP-0011 defines both objects.
+     JEP-0011 defines `channel-policy`, `block-install` and `policy-approval`.
 
 ## Ordering
 
