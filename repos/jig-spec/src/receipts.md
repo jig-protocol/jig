@@ -5,7 +5,7 @@
 ---
 
 **Version:** 0.2
-**Status:** Draft. *(partial: `jig-runtime` builds receipts in this schema, but only the legacy v0.0.1 REST path signs and serves them, and it is off by default and being removed (D28).)*
+**Status:** Draft. *(partial: `jig-runtime` builds receipts in this schema, but no server path signs or serves them since the legacy v0.0.1 REST routes were removed (D28).)*
 
 > **Not the receipt the server signs.** The reference server signs a different, smaller
 > object for each rendered block, tagged `"v": "0.3-render"`: `block_cid`, `server_did`,

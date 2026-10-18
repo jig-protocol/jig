@@ -7,7 +7,7 @@ jig is MIT OR Apache-2.0 source in a public-shaped repo, but it has never been
 announced, never been deployed to a public address, and has never had a user
 outside the team. This document is the checklist for changing that. Every
 "current state" row below was checked against the code at merge commit
-`1fa5681`; §1.3, §1.6 to §1.8, the binary install row, §3, §4, §6 and the verdict
+`1fa5681`; §1.3, §1.5 to §1.8, the binary install row, §3, §4, §6 and the verdict
 were re-checked against `d16f26a` on 2026-10-18. Where a claim could not be
 verified from the tree it says so.
 
@@ -88,11 +88,9 @@ ingest, and the working path needs no `[debug]` flag.
 
 | | |
 | --- | --- |
-| **Current state** | Gated off by default. `ServerConfig::dangerously_enable_v0_0_1_rest` is `#[serde(default)]` `bool` = `false` ([`config.rs:30`](../repos/jig-server/src/config.rs)); a unit test pins the default. When false, `/blocks` (GET+POST), `/blocks/:cid` and `/receipts/:cid` are not mounted and 404 ([`handler.rs:44-61`](../repos/jig-server/src/handler.rs)). `/.well-known/jig`, `/healthz` and `/metrics` stay mounted either way. |
-| **What enabling it re-opens** | `POST /blocks` accepts an attacker-chosen author DID with **no signature anywhere in the request**, executes the supplied Wasm, and signs a server receipt attesting to the result. It bypasses the v0.0.2 signature check and the `allowed_block_kinds` allowlist entirely. Net effect: anonymous Wasm execution on your host, plus a server-signed receipt laundering it as authentic. |
+| **Current state** | Removed (D28, #107). `/blocks` (GET+POST), `/blocks/:cid` and `/receipts/:cid` are no longer routes, and a test pins that they answer `404` ([`handler.rs`](../repos/jig-server/src/handler.rs)). The `dangerously_enable_v0_0_1_rest` flag is gone with them. The routes it gated accepted an attacker-chosen author DID with no signature, executed the supplied Wasm and signed a receipt for it. |
 
-**Verdict: READY** as shipped (correctly defaulted off, loudly named,
-documented in the handler). Keep it off; never document it as a workaround.
+**Verdict: READY** (was READY as defaulted off). The hole no longer exists to re-open.
 
 ### 1.6 Wasm sandbox
 
@@ -141,7 +139,7 @@ file records each removal.
 | Upgrade path | None. No `jig upgrade`, no version pinning, no store migration story. `install.sh` overwrites `$JIG_HOME/bin` in place. | A documented upgrade that states what happens to `jig.db` / `jig_v002.db`. | GAP |
 | Backup | `deploy/jig-backup.sh` + systemd timer. Genuinely good: `VACUUM INTO` (not `cp`) for both `jig.db` and the derived `jig_v002.db`, `server.key` included, `umask 077`, partial snapshots removed on failure, retention pruning with `DRY_RUN`. | Same, plus offsite. | READY |
 | Restore | Documented in `deploy/README.md` ("Restore"), including the `chmod 600` on `server.key` and a post-restore `server_did` check. | Same. | READY |
-| Observability | `/healthz` (static 200, deliberately does not touch the store) and `/metrics` (Prometheus text). Both mounted unconditionally, outside the v0.0.1 gate. Counters are hand-rolled atomics in `v0_0_2_ws::metrics`; **federation and bridge ingest are not counted**. | Metrics cover every ingest path, not just WSS. | GAP |
+| Observability | `/healthz` (static 200, deliberately does not touch the store) and `/metrics` (Prometheus text). Both mounted unconditionally and unauthenticated. Counters are hand-rolled atomics in `v0_0_2_ws::metrics`; **federation and bridge ingest are not counted**. | Metrics cover every ingest path, not just WSS. | GAP |
 | Server key loss | `deploy/README.md` opens with a red-flagged section: losing `/var/lib/jig/server.key` changes the server DID and breaks TOFU pinning for every client that ever connected. There is no key-rotation or re-pin flow — recovery is "restore the key from backup". | A documented rotation ceremony, or an identity that survives key change. | GAP |
 | Public exposure | `[tls]` is on by default: with no certificate configured the server makes a self-signed one on first start, and its DID vouches for it at `/.well-known/jig` (`tls_binding`). The CLI and federation peers accept that certificate only when the DID they pinned or were configured with vouches for it, or a certificate a CA issued; the first contact is trust on first use. `bind_address` defaults to loopback, and `deploy/README.md` says never set `0.0.0.0`. The nameserver (`:7070`) still serves plaintext. | n/a — see §1. | See §1 |
 
