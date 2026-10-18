@@ -11,6 +11,7 @@ pub mod capability_dsl;
 pub mod capability_registry;
 pub mod capability_scope;
 pub mod capability_validation;
+pub mod component_validation;
 pub mod crypto;
 pub mod did;
 pub mod dm;
