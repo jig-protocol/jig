@@ -249,6 +249,18 @@ pub enum IngestError {
         current: u64,
         got: u64,
     },
+    /// The block claims a time further ahead of this server's clock than the
+    /// bound its welcome advertises (JEP-0002 rule 13). The sender's clock is
+    /// probably wrong; `server_ms` says what this server's says.
+    #[error(
+        "the block's timestamp is {ahead_ms} ms ahead of this server's clock (bound \
+         {bound_ms} ms; server time {server_ms} ms since the epoch); check the device clock"
+    )]
+    ClockSkew {
+        ahead_ms: u64,
+        bound_ms: u64,
+        server_ms: u64,
+    },
     #[error(transparent)]
     Identity(#[from] crate::identity::IdentityError),
     #[error(transparent)]
@@ -433,8 +445,22 @@ pub async fn ingest(
         });
     }
 
-    // Step 3: HLC update on receive
+    // Step 3: HLC update on receive, within the advertised skew bound. A
+    // block's own time is its author's claim (TM-02); the server adopts it
+    // only when it is no further ahead than the bound (TM-01). The past is
+    // unbounded: a message composed offline may arrive late.
     let wall_now_ms = chrono::Utc::now().timestamp_millis() as u64;
+    if let Some(ts) = manifest.hlc_ts.as_ref() {
+        let bound_ms = ctx.hlc_clock.max_future_skew_ms();
+        let ahead_ms = ts.wall_ms.saturating_sub(wall_now_ms);
+        if ahead_ms > bound_ms {
+            return Err(IngestError::ClockSkew {
+                ahead_ms,
+                bound_ms,
+                server_ms: wall_now_ms,
+            });
+        }
+    }
     if let Some(recv_ts) = manifest.hlc_ts.clone() {
         let _local = ctx.hlc_clock.update_on_receive(recv_ts, wall_now_ms);
     } else {
@@ -1443,6 +1469,19 @@ mod tests {
         suite: jig_core::EncryptionSuite,
         meta: serde_json::Value,
     ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        // A fresh HLC per block, so two blocks with the same payload (a
+        // replayed commit) are different blocks rather than one duplicate.
+        signed_parts_at(key, kind, suite, meta, rand::random::<u32>() as u64)
+    }
+
+    /// [`signed_parts`] with the author's clock at `wall_ms`.
+    fn signed_parts_at(
+        key: &SigningKey,
+        kind: BlockKind,
+        suite: jig_core::EncryptionSuite,
+        meta: serde_json::Value,
+        wall_ms: u64,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let did = Did::from_ed25519_pubkey(key.verifying_key().as_bytes());
         let mut builder = BlockManifest::builder()
             .version(Version::new(0, 1, 0))
@@ -1462,10 +1501,8 @@ mod tests {
         if let serde_json::Value::Object(map) = meta {
             manifest.metadata.extend(map);
         }
-        // A fresh HLC per block, so two blocks with the same payload (a
-        // replayed commit) are different blocks rather than one duplicate.
         manifest.hlc_ts = Some(jig_core::HlcTimestamp {
-            wall_ms: rand::random::<u32>() as u64,
+            wall_ms,
             logical: 0,
             server_did: Did::from_str_unchecked("did:jig:client"),
         });
@@ -1502,6 +1539,48 @@ mod tests {
     ) -> Result<String, IngestError> {
         let (mb, cb, sig) = signed_parts(&who.key, kind, suite, meta);
         do_ingest(ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 }).await
+    }
+
+    /// A block further ahead of the server's clock than the advertised bound
+    /// is refused, and the server's clock does not move to it; a block within
+    /// the bound, or from any time in the past, is taken.
+    #[tokio::test]
+    async fn a_block_from_too_far_in_the_future_is_refused() {
+        let ctx = all_channel_kinds();
+        let who = person();
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        let bound = crate::handshake::DEFAULT_FUTURE_SKEW_MS;
+        let create = |slug: &str, wall_ms: u64| {
+            signed_parts_at(
+                &who.key,
+                BlockKind::ChannelCreate,
+                jig_core::EncryptionSuite::Unencrypted,
+                serde_json::json!({"slug": slug, "visibility": "open"}),
+                wall_ms,
+            )
+        };
+
+        let (mb, cb, sig) = create("#ahead", now + 2 * bound);
+        match do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 }).await {
+            Err(IngestError::ClockSkew {
+                ahead_ms, bound_ms, ..
+            }) => {
+                assert!(ahead_ms > bound);
+                assert_eq!(bound_ms, bound);
+            }
+            other => panic!("expected CLOCK_SKEW, got {other:?}"),
+        }
+        assert!(
+            ctx.hlc_clock.tick(now).wall_ms < now + bound,
+            "the server's clock must not adopt a refused block's time"
+        );
+
+        for (slug, wall_ms) in [("#near", now + bound / 2), ("#old", 1)] {
+            let (mb, cb, sig) = create(slug, wall_ms);
+            do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+                .await
+                .unwrap_or_else(|e| panic!("{slug}: {e}"));
+        }
     }
 
     fn b64(bytes: &[u8]) -> String {

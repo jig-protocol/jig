@@ -103,6 +103,22 @@ fn runtime_config_from(execution: &ExecutionConfig) -> jig_runtime::RuntimeConfi
     }
 }
 
+/// `[server] max_future_skew_ms`, refused outside the protocol's range
+/// (JEP-0002 rule 13) so a server cannot boot advertising an unbounded clock.
+fn checked_skew_bound(config: &JigServerConfig) -> Result<u64> {
+    let skew = config.server.max_future_skew_ms;
+    let range =
+        jig_pipeline::handshake::MIN_FUTURE_SKEW_MS..=jig_pipeline::handshake::MAX_FUTURE_SKEW_MS;
+    if !range.contains(&skew) {
+        anyhow::bail!(
+            "[server] max_future_skew_ms = {skew} is outside the protocol's {}..={} ms",
+            range.start(),
+            range.end()
+        );
+    }
+    Ok(skew)
+}
+
 impl AppState {
     /// Vouch, with the server DID's key, for the certificate the listener
     /// serves (DER), so clients can trust it without a CA. The first call
@@ -141,7 +157,9 @@ impl AppState {
             )),
         };
 
-        let hlc_clock = Arc::new(HlcClock::new(server_did.clone()));
+        let hlc_clock = Arc::new(
+            HlcClock::new(server_did.clone()).with_max_future_skew_ms(checked_skew_bound(&config)?),
+        );
         let fanout = Arc::new(Fanout::new());
         let server_url = format!("ws://{}", config.server.listen);
 
@@ -211,7 +229,9 @@ impl AppState {
         let server_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
 
         let identity: Arc<dyn IdentityResolver> = Arc::new(TofuResolver::new(store.clone()));
-        let hlc_clock = Arc::new(HlcClock::new(server_did.clone()));
+        let hlc_clock = Arc::new(
+            HlcClock::new(server_did.clone()).with_max_future_skew_ms(checked_skew_bound(&config)?),
+        );
         let fanout = Arc::new(Fanout::new());
         let server_url = format!("ws://{}", config.server.listen);
 
@@ -357,6 +377,29 @@ fn load_or_generate_server_key(path: &str) -> Result<SigningKey> {
 
 #[cfg(test)]
 mod tests {
+    /// The configured bound is what ingest enforces and the welcome signs; one
+    /// outside the protocol's range stops the boot.
+    #[test]
+    fn the_skew_bound_is_configured_and_checked() {
+        assert_eq!(
+            jig_config::v0_0_2_server::DEFAULT_MAX_FUTURE_SKEW_MS,
+            jig_pipeline::handshake::DEFAULT_FUTURE_SKEW_MS,
+            "the config default is the protocol default"
+        );
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.server.max_future_skew_ms = 60_000;
+        let state = super::AppState::for_test_with_config(config.clone()).unwrap();
+        assert_eq!(state.ingest_ctx.hlc_clock.max_future_skew_ms(), 60_000);
+
+        for outside in [0, 29_999, 900_001] {
+            config.server.max_future_skew_ms = outside;
+            let err = super::AppState::for_test_with_config(config.clone())
+                .err()
+                .expect("a bound outside the range must not boot");
+            assert!(err.to_string().contains("max_future_skew_ms"), "{err}");
+        }
+    }
+
     /// Every operator-facing execution limit must reach the runtime config.
     ///
     /// Written with values that are all distinct from the defaults, so a field

@@ -796,6 +796,8 @@ fn handshake_capabilities(state: &AppState) -> jig_pipeline::handshake::Capabili
         block_kinds: state.config.server.allowed_block_kinds.clone(),
         execution: state.ingest_ctx.executor.is_some(),
         federation: true,
+        // The bound ingest enforces, so the signed claim is the enforced one.
+        max_future_skew_ms: state.ingest_ctx.hlc_clock.max_future_skew_ms(),
     }
 }
 
