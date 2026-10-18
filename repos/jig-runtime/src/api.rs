@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
 #[cfg(feature = "tracing")]
@@ -311,13 +311,7 @@ impl Runtime {
         }
         let snapshot = capability_meter.snapshot();
         let status_bins = snapshot.status_bins_btree();
-        let mut fuel_by_capability = snapshot.fuel_by_capability.clone();
-        if fuel_by_capability.is_empty() {
-            fuel_by_capability.insert(
-                CapabilityUsageKey::without_scope("engine.wasm").to_canonical_string(),
-                fuel_used,
-            );
-        }
+        let fuel_by_capability = fuel_by_capability(&snapshot, fuel_used);
         let fuel_total: u64 = fuel_by_capability.values().copied().sum();
         let counters = jig_core::receipt::Counters {
             fuel_total,
@@ -625,13 +619,7 @@ impl Runtime {
         }
 
         let snapshot = capability_meter.snapshot();
-        let mut fuel_by_capability = snapshot.fuel_by_capability.clone();
-        if fuel_by_capability.is_empty() {
-            fuel_by_capability.insert(
-                CapabilityUsageKey::without_scope("engine.wasm").to_canonical_string(),
-                fuel_used,
-            );
-        }
+        let fuel_by_capability = fuel_by_capability(&snapshot, fuel_used);
         let fuel_total: u64 = fuel_by_capability.values().copied().sum();
         builder = builder
             .fuel_used(fuel_total)
@@ -666,6 +654,24 @@ impl Runtime {
 
         builder.build()
     }
+}
+
+/// Per-capability fuel for a receipt: host-attributed buckets plus the
+/// measured wasm fuel under `engine.wasm`.
+///
+/// `engine.wasm` is always present. It used to be added only when the meter was
+/// empty, so the first host charge dropped the guest's own instruction count and
+/// `fuel_total` reported host fuel alone.
+fn fuel_by_capability(
+    snapshot: &crate::fuel::CapabilityMeterSnapshot,
+    wasm_fuel: u64,
+) -> BTreeMap<String, u64> {
+    let mut buckets = snapshot.fuel_by_capability.clone();
+    let wasm = buckets
+        .entry(CapabilityUsageKey::without_scope("engine.wasm").to_canonical_string())
+        .or_insert(0);
+    *wasm = wasm.saturating_add(wasm_fuel);
+    buckets
 }
 
 /// Execution context for a single WASM module run
