@@ -77,8 +77,9 @@ interface handler {
     handle: func(inv: invocation, state: list<u8>) -> result<handled, block-error>;
 }
 
-/// Tier 1: verifiable by anyone who re-executes it. Its only permitted import is
-/// `jig:host/compose`, for child renderers pinned by CID in its manifest (JEP-0007).
+/// Tier 1: verifiable by anyone who re-executes it. It imports `types` (types, no functions;
+/// hosts link it as an empty instance) and at most `jig:host/compose`, for child renderers
+/// pinned by CID in its manifest (JEP-0007).
 world renderer {
     export render;
 }

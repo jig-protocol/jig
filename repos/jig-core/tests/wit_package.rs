@@ -69,15 +69,16 @@ fn the_package_is_jig_block_at_0_1_0() {
 }
 
 #[test]
-fn renderer_exports_render_and_imports_nothing_yet() {
+fn renderer_exports_render_and_imports_only_its_own_types() {
     let (resolve, pkg) = resolve();
     assert_eq!(exports(&resolve, pkg, "renderer"), ["render"]);
-    // `jig:host/compose` is added by JEP-0007's package, not declared here.
+    // `types` (types, no functions) is the only import the package itself declares;
+    // `jig:host/compose` comes from JEP-0007's package.
     assert!(foreign_imports(&resolve, pkg, "renderer").is_empty());
 }
 
 #[test]
-fn bot_exports_handler_and_imports_nothing_yet() {
+fn bot_exports_handler_and_imports_only_its_own_types() {
     let (resolve, pkg) = resolve();
     assert_eq!(exports(&resolve, pkg, "bot"), ["handler"]);
     assert!(foreign_imports(&resolve, pkg, "bot").is_empty());
