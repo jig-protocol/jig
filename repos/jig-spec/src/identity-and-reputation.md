@@ -6,7 +6,8 @@
 > - **Implemented:** `did:jig` identities, nameserver-attested aliases, TOFU and nameserver
 >   resolution in servers, per-ruleset reputation scores, proof-of-work with penalties on
 >   the nameserver's claim and alias challenges, and tribunal case records.
-> - **Required, not yet implemented or partial:** proof-of-work enforced by servers and on
+> - **Required, not yet implemented or partial:** proof-of-work enforced by servers as a
+>   ruleset-set cost (only one-time admission proof-of-work exists, off by default) and on
 >   every nameserver binding endpoint, reputation reports from servers to nameservers and
 >   net reputation computed by nameservers, reputation shared within a ruleset group,
 >   cross-registration within a high-sec ruleset group, tribunals held by nameservers,
@@ -57,9 +58,10 @@ servers: they judge and net out, and they hold servers to account (D23).
 
 A server with no nameserver sets its own policy for all of this.
 
-**Status:** not yet implemented. Servers enforce no proof-of-work, report nothing to
-nameservers and keep no transparency log; the reference nameserver computes a
-per-nameserver aggregate from its own observations (see
+**Status:** partial. A server can require proof-of-work of a DID it has not seen
+(`[auth.admission] unknown_dids = "proof-of-work"`), but it is off by default (D26) and is
+not set by a ruleset. Servers report nothing to nameservers and keep no transparency log;
+the reference nameserver computes a per-nameserver aggregate from its own observations (see
 [Reputation is a number](#reputation-is-a-number)).
 
 ## Identity
@@ -401,7 +403,10 @@ clients it serves, at the cost its ruleset sets. A nameserver MUST require a sol
 challenge on every request that creates a binding. A client MUST be able to solve a
 challenge from public information alone.
 
-**Status:** servers enforce no proof-of-work.
+**Status:** partial. A server MAY require one proof from a DID it has not seen before
+admitting it, off by default (D26). That proof is bound to the server's DID and the new
+DID, uses no challenge, and is solvable from public information. It is a one-time cost, not
+a rate cost the ruleset sets. See [Admission proof-of-work](#admission-proof-of-work-servers).
 
 A solution is valid when `BLAKE3(challenge_id|action|subject|scope|nonce)` has at least
 `difficulty` leading zero bits. Expected work is about 2^`difficulty` hashes.

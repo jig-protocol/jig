@@ -17,8 +17,10 @@ use axum::http::{Request, StatusCode};
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
 use jig_client::blocks::{
-    BuiltBlock, build_channel_archive, build_channel_create, build_member_add, build_text_render,
+    BuiltBlock, build_channel_archive, build_channel_create, build_member_add, build_sealed_text,
+    build_text_render, build_with_metadata,
 };
+use jig_client::secure::Session;
 use jig_config::v0_0_2_server::JigServerConfig;
 use jig_core::HlcTimestamp;
 use jig_core::did::Did;
@@ -27,7 +29,8 @@ use jig_server::runtime::ExecutionConfig;
 use jig_server::v0_0_2::AppState;
 use jig_server::v0_0_2_admin::build_admin_router;
 use jig_server::v0_0_2_blocks::build_blocks_router;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use tower::ServiceExt as _;
 
 /// A test identity: a signing key and the DID derived from it.
@@ -82,6 +85,103 @@ pub struct TestServer {
     /// `~/.jig/server/server.key`, which is real user state that tests must
     /// never touch. Both are redirected in here and removed on drop.
     _tmp: tempfile::TempDir,
+    /// Restricted channels are MLS groups (D25), so every identity that
+    /// creates, joins or posts to one does it through a real MLS session.
+    mls: Mls,
+}
+
+/// The MLS side of the test clients: one session per identity, and what each
+/// has seen of every encrypted channel's control plane.
+struct Mls {
+    root: tempfile::TempDir,
+    sessions: Mutex<HashMap<String, Session>>,
+    /// Slugs created as `mls`.
+    sealed: Mutex<HashSet<String>>,
+    /// Accepted commit-carrying blocks per slug, in order.
+    log: Mutex<HashMap<String, Vec<BuiltBlock>>>,
+    /// How far into a slug's log each DID has caught up.
+    cursor: Mutex<HashMap<(String, String), usize>>,
+}
+
+/// The server name the MLS sessions key their groups under.
+const MLS_SERVER: &str = "test-server";
+
+impl Mls {
+    fn new() -> Self {
+        Self {
+            root: tempfile::tempdir().expect("mls dir"),
+            sessions: Mutex::default(),
+            sealed: Mutex::default(),
+            log: Mutex::default(),
+            cursor: Mutex::default(),
+        }
+    }
+
+    /// Run `f` with `who`'s session, opening it on first use.
+    fn with<T>(&self, who: &Identity, f: impl FnOnce(&Session) -> T) -> T {
+        let did = who.did().to_did_jig_string();
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.entry(did).or_insert_with(|| {
+            Session::open(self.root.path(), who.as_client()).expect("mls session")
+        });
+        f(session)
+    }
+
+    fn is_sealed(&self, slug: &str) -> bool {
+        self.sealed.lock().unwrap().contains(slug)
+    }
+
+    /// Whether `who` holds `slug`'s group, after catching up on its commits.
+    fn holds(&self, who: &Identity, slug: &str) -> bool {
+        if !self.is_sealed(slug) {
+            return false;
+        }
+        let did = who.did().to_did_jig_string();
+        let key = (did.clone(), slug.to_string());
+        let Some(&from) = self.cursor.lock().unwrap().get(&key) else {
+            return false;
+        };
+        let log = self
+            .log
+            .lock()
+            .unwrap()
+            .get(slug)
+            .cloned()
+            .unwrap_or_default();
+        self.with(who, |session| {
+            for block in &log[from.min(log.len())..] {
+                let opened = jig_client::open::open(&delivered(block)).expect("open block");
+                if opened.sender != did {
+                    session.observe(MLS_SERVER, &opened);
+                }
+            }
+        });
+        self.cursor.lock().unwrap().insert(key, log.len());
+        true
+    }
+
+    /// Record an accepted commit; `joiner` starts reading the log at it.
+    fn accepted(&self, slug: &str, block: &BuiltBlock, joiner: Option<&Identity>) {
+        let mut log = self.log.lock().unwrap();
+        let entries = log.entry(slug.to_string()).or_default();
+        if let Some(j) = joiner {
+            self.cursor.lock().unwrap().insert(
+                (j.did().to_did_jig_string(), slug.to_string()),
+                entries.len(),
+            );
+        }
+        entries.push(block.clone());
+    }
+}
+
+fn delivered(block: &BuiltBlock) -> jig_client::DeliveredBlock {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    jig_client::DeliveredBlock {
+        bundle_b64: b64.encode(block.canonical_bytes()),
+        sig_b64: Some(b64.encode(&block.sender_sig)),
+        receipts: vec![],
+        delivery_cid: block.cid(),
+    }
 }
 
 impl TestServer {
@@ -129,6 +229,7 @@ impl TestServer {
         Self {
             state: Arc::new(state),
             _tmp: tmp,
+            mls: Mls::new(),
         }
     }
 
@@ -188,17 +289,43 @@ impl TestServer {
 
     /// Create `slug` owned by `owner` through the real admin endpoint, so the
     /// channel row and the owner's membership are written by the same effect
-    /// code production runs — not seeded into the store by hand.
+    /// code production runs — not seeded into the store by hand. A restricted
+    /// channel is created `mls`, its group started in the owner's session.
     pub async fn create_channel(&self, owner: &Identity, slug: &str, visibility: &str) {
-        let owner = owner.as_client();
-        let block = build_channel_create(
-            &owner,
-            slug,
-            visibility,
-            HlcTimestamp::now_wall(owner.did().clone()),
-        );
+        let me = owner.as_client();
+        let hlc = HlcTimestamp::now_wall(me.did().clone());
+        let block = if visibility == "open" {
+            build_channel_create(&me, slug, visibility, hlc)
+        } else {
+            let mut meta = self.mls_genesis(owner, slug);
+            meta["slug"] = slug.into();
+            meta["visibility"] = visibility.into();
+            build_with_metadata(&me, jig_core::BlockKind::ChannelCreate, hlc, meta)
+        };
         let (status, body) = self.post_admin("/_admin_v0_0_2/channels", &block).await;
         assert_eq!(status, StatusCode::OK, "channel-create failed: {body}");
+    }
+
+    /// Start `slug`'s MLS group in `owner`'s session and return the
+    /// creation-block metadata that carries it, for tests that build their
+    /// own `channel-create`.
+    pub fn mls_genesis(&self, owner: &Identity, slug: &str) -> serde_json::Value {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let created = self
+            .mls
+            .with(owner, |s| s.create_group(MLS_SERVER, slug))
+            .expect("create group");
+        self.mls.sealed.lock().unwrap().insert(slug.to_string());
+        self.mls
+            .cursor
+            .lock()
+            .unwrap()
+            .insert((owner.did().to_did_jig_string(), slug.to_string()), 0);
+        serde_json::json!({
+            "suite": "mls",
+            "mls_group_info": b64.encode(&created.group_info),
+            "mls_ratchet_tree": b64.encode(&created.ratchet_tree),
+        })
     }
 
     /// Archive `slug` as `owner` through the real admin endpoint — the
@@ -231,29 +358,109 @@ impl TestServer {
     }
 
     /// Submit a `member-add` for `member` on `slug`, signed by `by`, through
-    /// the admin endpoint. Returns whatever the server said.
+    /// the admin endpoint. Returns whatever the server said. On an encrypted
+    /// channel `by` commits the add if it holds the group; a caller who does
+    /// not sends the bare block, which is what a stranger can send.
     pub async fn try_add_member(
         &self,
         by: &Identity,
         slug: &str,
         member: &Identity,
     ) -> (StatusCode, serde_json::Value) {
-        let by = by.as_client();
-        let block = build_member_add(
-            &by,
-            slug,
-            &member.did().to_did_jig_string(),
-            HlcTimestamp::now_wall(by.did().clone()),
-        );
+        let block = self.member_add_block(by, slug, member);
         let path = format!("/_admin_v0_0_2/channels/{}/members", encode_slug(slug));
-        self.post_admin(&path, &block).await
+        let (status, body) = self.post_admin(&path, &block).await;
+        self.settle_member_add(by, slug, member, &block, status == StatusCode::OK);
+        (status, body)
+    }
+
+    /// The `member-add` `by` would send for `member`: with an MLS commit on an
+    /// encrypted channel whose group `by` holds. Follow it with
+    /// [`settle_member_add`](Self::settle_member_add).
+    pub fn member_add_block(&self, by: &Identity, slug: &str, member: &Identity) -> BuiltBlock {
+        let me = by.as_client();
+        let hlc = HlcTimestamp::now_wall(me.did().clone());
+        let member_did = member.did().to_did_jig_string();
+        if !self.mls.holds(by, slug) {
+            return build_member_add(&me, slug, &member_did, hlc);
+        }
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let key_package = self
+            .mls
+            .with(member, |s| s.key_packages(1, false))
+            .expect("key package")
+            .pop()
+            .expect("one key package");
+        let c = self
+            .mls
+            .with(by, |s| {
+                s.prepare_add(MLS_SERVER, slug, &key_package, &member_did)
+            })
+            .expect("prepare add");
+        let mut meta = serde_json::json!({
+            "channel": slug,
+            "member_did": member_did,
+            "mls_commit": b64.encode(&c.commit),
+            "mls_epoch": c.epoch,
+        });
+        if let Some(w) = &c.welcome {
+            meta["mls_welcome"] = b64.encode(w).into();
+        }
+        if let Some(i) = &c.group_info {
+            meta["mls_group_info"] = b64.encode(i).into();
+        }
+        build_with_metadata(&me, jig_core::BlockKind::MemberAdd, hlc, meta)
+    }
+
+    /// Settle the commit in `block` after the server's answer: kept and
+    /// handed to the new member if `accepted`, dropped if not.
+    pub fn settle_member_add(
+        &self,
+        by: &Identity,
+        slug: &str,
+        member: &Identity,
+        block: &BuiltBlock,
+        accepted: bool,
+    ) {
+        if !self.mls.is_sealed(slug)
+            || !self.mls.with(by, |s| {
+                s.has_pending_commit(MLS_SERVER, slug).unwrap_or(false)
+            })
+        {
+            return;
+        }
+        if accepted {
+            self.mls
+                .with(by, |s| s.confirm(MLS_SERVER, slug))
+                .expect("confirm");
+            self.mls.accepted(slug, block, Some(member));
+        } else {
+            self.mls
+                .with(by, |s| s.abandon(MLS_SERVER, slug))
+                .expect("abandon");
+        }
+    }
+
+    /// A `text-render` from `who` to `slug`: sealed for the group on an
+    /// encrypted channel whose group `who` holds, plaintext otherwise (all a
+    /// stranger can send).
+    pub fn text(&self, who: &Identity, slug: &str, body: &str) -> BuiltBlock {
+        let me = who.as_client();
+        let hlc = HlcTimestamp::now_wall(me.did().clone());
+        if !self.mls.holds(who, slug) {
+            return build_text_render(&me, slug, body, hlc);
+        }
+        let (msg, epoch) = self
+            .mls
+            .with(who, |s| s.encrypt(MLS_SERVER, slug, body))
+            .expect("encrypt");
+        build_sealed_text(&me, slug, &msg, epoch, hlc)
     }
 
     /// Post a `text-render` block to `slug` as `who` through the public
     /// submit path, asserting it was accepted.
     pub async fn post_text(&self, who: &Identity, slug: &str, body: &str) {
-        let who = who.as_client();
-        let block = build_text_render(&who, slug, body, HlcTimestamp::now_wall(who.did().clone()));
+        let block = self.text(who, slug, body);
         let (status, resp) = self.try_submit(&block).await;
         assert_eq!(status, StatusCode::OK, "text-render failed: {resp}");
     }

@@ -93,6 +93,10 @@ pub fn build_text_render_with_nickname(
 /// Build a signed `channel-create` block. v0.0.2 sends this through the
 /// `/api/v1/channels` REST endpoint. v0.0.3 makes
 /// channel-create a real Wasm block submitted via `submit`.
+///
+/// The block names no suite, so it is plaintext: servers refuse it unless
+/// `visibility` is `open` (restricted channels are always MLS). An encrypted
+/// channel is created with [`build_with_metadata`] and its MLS fields.
 pub fn build_channel_create(
     sender: &Identity,
     slug: &str,
