@@ -6,7 +6,6 @@ pub mod config;
 pub mod crypto;
 pub mod error;
 pub mod federation;
-pub mod hot;
 pub mod identity;
 pub mod pow;
 pub mod runtime;
