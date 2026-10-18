@@ -23,17 +23,18 @@ server and the client together, so `main` never holds one side without the other
 | 0 | TLS exporter hook | — | `jig-server/src/server.rs` (`serve_tls` only, agreed with L3), `jig-pipeline/src/handshake.rs` |
 | 1 | Close classes, signed refusal, one `hello`, frame and receipt checks | — | `jig-pipeline/src/handshake.rs`, `jig-pipeline/src/envelope.rs` (new frames), `jig-server/src/v0_0_2_ws.rs` (handshake code), `jig-client/src/connection.rs`, `jig-server/src/v0_0_2_federation.rs` (`complete_client_handshake`) |
 | 2 | Restricted ⇒ MLS; plaintext REST refused | L3's #124 (https default) | `jig-client/src/pins.rs`, `jig-cli/src/cmd/trust.rs`, the jig-cli smoke tests L3 listed |
-| 3 | Skew bound | 1 | `jig-pipeline/src/ingest.rs` (step 3), `jig-pipeline/src/handshake.rs`, `jig-config/src/v0_0_2_server.rs` (the flag and the new key; coordinate with L3's config collapse), `integration-tests/tests/h7_unsafe_advertised.rs` |
-| 4 | `ingest` records | 1 | `jig-pipeline` (new `ingest_record` module, `persist.rs` table, `fanout.rs`), `jig-pipeline/src/envelope.rs` (`ingest` on `block`, new `record` frame), REST history, `jig-client` (chain state, checks) |
+| 3 | Skew bound | — | `jig-pipeline/src/ingest.rs` (step 3), `jig-pipeline/src/{handshake,hlc}.rs`, `jig-config/src/v0_0_2_server.rs` (`[server] max_future_skew_ms` and the flag; agreed with L3, who carries it through the config collapse), `integration-tests/tests/h7_unsafe_advertised.rs` |
+| 4a | `ingest` records, server side | — | `jig-pipeline` (new `ingest_record` module, `persist.rs` table, `ingest.rs`, `fanout.rs`; no other lane owns them), `jig-pipeline/src/envelope.rs` (`ingest` on `block`, new `record` frame), REST history and a records endpoint |
+| 4b | `ingest` records, client checks | 4a | `jig-client` (chain state in the pin store, the checks) |
 | 5 | `seen`, head gossip, fork check; `ends` on removes | 4 | `jig-core` manifest fields, `jig-client/src/blocks.rs`, `jig-pipeline/src/authorize_write.rs` (`ends`), `jig-server/src/v0_0_2_ws.rs` (`head`), federation forwarding |
-| 6 | Evidence and sticky refusals | 1, 4 | new `jig-client/src/evidence.rs`, `jig-client/src/pins.rs`, `jig-cli/src/cmd/trust.rs` (`jig trust evidence`, `jig trust accept`) |
+| 6 | Evidence and sticky refusals | 1, 4b | new `jig-client/src/evidence.rs` (including a name-evidence bundle kind lane F's resolver hands over), `jig-client/src/pins.rs`, `jig-cli/src/cmd/trust.rs` (`jig trust evidence`, `jig trust accept`) |
 | 7 | Manifest log | 4 | server bootstrap of the reserved channel, `server-manifest` kind, welcome `manifest`, client check, `jig trust show` |
 | 8 | Mutual server-to-server handshake with channel binding | 0, 1 | `jig-pipeline/src/handshake.rs` (`peer_proof`, transcript hash), `jig-client/src/connection.rs` (exporter from `MaybeTlsStream`), `jig-server/src/v0_0_2_ws.rs`, `jig-server/src/v0_0_2_federation.rs` |
-| 9 | Name pinning | — | `jig-client/src/pins.rs` (`names`), `jig-cli/src/cmd/trust.rs` (`accept-name`, expiry warning); resolution call sites belong to F/L6 |
+| 9 | Name pinning | F1 slice 1 (#147, `jig_core::naming`) | `jig-client/src/pins.rs` (`names`), `jig-cli/src/cmd/trust.rs` (`accept-name`, expiry warning); resolution call sites belong to F/L6 |
 | 10 | `sequencer-set` and handover | 4, 7, F's contract | `jig-pipeline` (kind, expected-sequencer rule), `jig-client` chain checks |
 
-Slices 2 and 9 do not touch the wire and can run alongside 1. Slice 3 is small and can
-follow 1 at once. 4 is the largest and gates 5, 6, 7 and 10.
+Slices 2 and 3 do not depend on 1. Slice 9 waits on lane F's naming slice. 4a is the
+largest and gates everything after it.
 
 ## Slice details
 
@@ -72,8 +73,9 @@ follow 1 at once. 4 is the largest and gates 5, 6, 7 and 10.
 
 ### 3. Skew bound
 
-- Config key `max_future_skew_ms` (default 300 000, 30 000–900 000, refused at boot
-  outside the range); advertised in `capabilities`; covered by the welcome signature.
+- Config key `[server] max_future_skew_ms` (default 300 000, 30 000–900 000, refused at
+  boot outside the range), carried on the `HlcClock`; advertised in `capabilities`;
+  covered by the welcome signature.
 - Ingest refuses a block more than the bound ahead with `CLOCK_SKEW` and the server's
   time; `update_on_receive` only within the bound.
 - `naively_unbounded_clock_skew` removed from `unsafe_options_active`; h7 updated.
@@ -81,13 +83,27 @@ follow 1 at once. 4 is the largest and gates 5, 6, 7 and 10.
 
 ### 4. `ingest` records
 
+Split in two: 4a (server: signing, storage, delivery) and 4b (client: chain state and
+checks).
+
 - `IngestRecord { channel_id, seq, ingest_hlc, block_cid, prev, sequencer, sig }`,
-  canonical bytes under `jig-ingest-v1`; signed in `ingest` after the write gate, in
-  the same transaction that stores the block; `seq` 0 is the `channel-create`.
+  signed in `ingest` after the write gate, in the same transaction that stores the block
+  (both `insert_block` and `land_mls_commit`); `seq` 0 is the `channel-create`. The
+  encoding and signature sit behind one type, because DJ has still to decide whether
+  signed objects other than receipts move to deterministic CBOR with COSE_Sign1 (lane
+  A's receipt decision); until then it is length-prefixed bytes under `jig-ingest-v1`.
+- The server signs records for channels it holds the row for (the owning server in
+  v0.2). Relayed blocks for channels it has no row for carry the owner's record once
+  lane F's contract relays it; until then they have none.
 - Storage: one row per block (`ingest_records`), indexed by channel and `seq`.
 - Delivery: `block` frames and REST history carry the record; a `record` frame for a
   block the reader may not read.
-- History reads order by `seq`.
+- History reads order by `seq`. The HLC cursor parameters keep working; a `seq` cursor
+  is added beside them, and lane L3 moves `jig-cli` `history.rs` to it later.
+- `GET /api/v1/channels/{slug}/records?from=<seq>` serves records alone, so a client
+  can check a chain from `seq` 0 without downloading every block.
+- Neighbours: L2's receipt line and L3's metrics line in `ingest()` stay as they are,
+  and so do the fail-open paths whose owner DJ is deciding.
 - Client: per-channel chain state in the pin store; the checks of design item 5; a
   failure is class 3.
 - Migration: existing channels get records at first boot, in `hlc_ts` order, signed by
@@ -106,8 +122,9 @@ follow 1 at once. 4 is the largest and gates 5, 6, 7 and 10.
 
 ### 6. Evidence and sticky refusals
 
-- `jig-evidence-v1` writer; the pin store records a sticky refusal per server with the
-  bundle path.
+- `jig-evidence-v1` writer, with a name-evidence kind for lane F's resolver
+  (attestations and rotation chains; an equivocation is one bundle); the pin store
+  records a sticky refusal per server with the bundle path.
 - `jig trust evidence list|show|export|import`, `jig trust accept <server>`.
 - Tests: each class 3 path writes a bundle that verifies offline; timeouts and
   malformed frames never make a refusal sticky; an imported bundle never does.
@@ -133,8 +150,11 @@ follow 1 at once. 4 is the largest and gates 5, 6, 7 and 10.
 
 ### 9. Name pinning
 
-- `names` map in the pin store; a change moves only with a rotation signed by the old
-  key; otherwise refused with the reason and both fingerprints.
+- `names` map in the pin store, keyed `(alias, suffix, root, root_id)` (JEP-0004 rule
+  6); `check_name` takes the rotation chain and calls
+  `jig_core::naming::verify_rotation_chain` (F1 slice 1, #147). A change moves only with
+  a rotation signed by the old key; otherwise refused with the reason and both
+  fingerprints. Not marked ready before #147 merges.
 - `jig trust accept-name <name>`; a warning before an attestation expires.
 - Resolution itself is F's and L6's; this slice provides the check they call.
 
@@ -147,6 +167,6 @@ follow 1 at once. 4 is the largest and gates 5, 6, 7 and 10.
 
 ## Done
 
-Exit criterion 3 is met when slices 1, 3, 4, 6 and 7 are merged and the threat-register
+Exit criterion 3 is met when slices 1, 3, 4a, 4b, 6 and 7 are merged and the threat-register
 rows for OP-01, OP-02 and TM-01 read as the design proposes. Slices 5, 8, 9 and 10 close
 OP-06, OP-09 and OP-08 and are part of v0.2 under B′.
