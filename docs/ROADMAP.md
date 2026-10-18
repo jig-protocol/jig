@@ -153,8 +153,8 @@ Then the smaller hardening items, each one PR:
 
 Still to do in this phase:
 
-- **E2EE by default (D25):** restricted channels are MLS. Whether any opt-out remains is settled
-  against exit criterion 2: a plaintext restricted channel is readable by the operator.
+- **Restricted channels are always MLS (D25):** a creator who wants plaintext makes an open
+  channel. No restricted channel is readable by the operator.
 - **Pluggable suites (D13, deferred):** keep the suite layer composable and prove it with a
   test-only second suite and per-suite conformance vectors. A production second suite (PQ-hybrid
   MLS, or Signal's post-quantum protocol) is a stretch goal.
@@ -271,7 +271,7 @@ Settled on 2026-10-05 unless noted. Open items follow the table.
 | D22 | Can abuse in an encrypted channel reach a tribunal? | Yes, and it must: by victim-key delegation or another effective proof, scoped to the incident, with no backdoor, escrow or scanning. The MLS content signature by the DID key makes authorship provable, at the cost of deniability. Mechanism to be designed. Settled 2026-10-16. |
 | D23 | Are proof-of-work, reputation, tribunals and transparency logs optional? | No, they are obligations, and their known weaknesses (linear Sybil cost and other known attack classes) must be closed in full. Servers are the enforcement boundary: they enforce proof-of-work, decide on clients by reputation (a ruleset in their nameserver network, a private one, or none), report clients' reputation changes to their nameservers under the data contract, and keep their own transparency log. Nameservers hold tribunals, compute and enforce net reputation changes, and enforce servers' good behaviour. A server with no nameserver sets its own policy. Settled 2026-10-16/17. |
 | D24 | Who owns a channel? | Exactly one owning server. How members on other servers write to it is to be designed from prior art (XMPP MUC, IRC, Matrix, ActivityPub groups). Settled 2026-10-16. |
-| D25 | Are channels encrypted by default? | Restricted channels are MLS by default from v0.2. A plaintext restricted channel would be readable by the operator, against exit criterion 2, so whether a creator may still opt one out (for example for server-run blocks or a bridge) is open, to be settled with the E2EE-by-default work. Whether every channel is, after the v0.2 tag, waits on the federation-contract and block-ABI designs: an encrypted channel cannot federate until the contract exists, and a server cannot execute its blocks. Settled 2026-10-18. |
+| D25 | Are channels encrypted by default? | Restricted channels are always MLS from v0.2, with no opt-out: a plaintext restricted channel would be readable by the operator (exit criterion 2). A creator who wants plaintext makes an open channel, so server-run blocks and bridges that need to read content use open channels. Whether every channel is encrypted by default, after the v0.2 tag, waits on the federation-contract and block-ABI designs: an encrypted channel cannot federate until the contract exists, and a server cannot execute its blocks. Settled 2026-10-18. |
 | D26 | Is admission proof-of-work on by default? | No. It stays off until a proof-of-work design covers registration at nameservers, challenges anyone can solve, and what the cost buys against identity farming. Settled 2026-10-18. |
 | D27 | When does the external audit run? | It is designed now and runs once v0.2 is code-complete, so it reviews code that will not be replaced soon. It does not block development. How it is split is open. Settled 2026-10-18. |
 | D28 | Does the v0.0.1 `POST /blocks` route stay? | No. It executes sender-supplied code without a signature check; it is removed before blocks get host functions. Settled 2026-10-18. |
