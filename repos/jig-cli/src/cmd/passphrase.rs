@@ -2,7 +2,9 @@
 //! (`jig_client::identity::KeyAccess::from_env`), then a passphrase typed at
 //! the terminal.
 
-use std::io::{IsTerminal as _, Write as _};
+#[cfg(not(unix))]
+use std::io::IsTerminal as _;
+use std::io::Write as _;
 use std::sync::{Arc, OnceLock};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -35,10 +37,28 @@ pub fn report_migration(identity: &jig_client::Identity, keys_dir: &std::path::P
     }
 }
 
-/// Asks on the terminal, without echo. Declines when stdin is not a terminal,
-/// so a script fails with the error that names `JIG_KEY_PASSPHRASE` instead of
+/// Asks on the terminal, without echo. Declines when there is no terminal, so
+/// a script fails with the error that names `JIG_KEY_PASSPHRASE` instead of
 /// hanging.
 struct TerminalPrompt;
+
+/// Whether a person can be asked. On Unix that is the controlling terminal,
+/// not stdin: `curl … | bash` runs `jig init` with stdin on the pipe and the
+/// person still at `/dev/tty`, which is where crossterm reads keys from.
+fn terminal_available() -> bool {
+    #[cfg(unix)]
+    {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+    }
+}
 
 impl Prompt for TerminalPrompt {
     fn passphrase(
@@ -46,26 +66,28 @@ impl Prompt for TerminalPrompt {
         did: &str,
         purpose: PromptPurpose,
     ) -> std::io::Result<Option<Zeroizing<String>>> {
-        if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        if !terminal_available() {
             return Ok(None);
         }
         match purpose {
             PromptPurpose::Unlock => read_hidden(&format!("passphrase for {did}: ")).map(Some),
             PromptPurpose::New => {
-                eprintln!(
+                let mut out = terminal_writer();
+                writeln!(
+                    out,
                     "No OS keychain is available, so {did} will be sealed with a passphrase."
-                );
+                )?;
                 for _ in 0..3 {
                     let first = read_hidden("new passphrase: ")?;
                     if first.is_empty() {
-                        eprintln!("the passphrase cannot be empty");
+                        writeln!(terminal_writer(), "the passphrase cannot be empty")?;
                         continue;
                     }
                     let second = read_hidden("repeat it: ")?;
                     if *first == *second {
                         return Ok(Some(first));
                     }
-                    eprintln!("the two did not match");
+                    writeln!(terminal_writer(), "the two did not match")?;
                 }
                 Ok(None)
             }
@@ -73,16 +95,25 @@ impl Prompt for TerminalPrompt {
     }
 }
 
-/// Read one line from the terminal with echo off.
+/// Read one line from the terminal with echo off. The label goes to the
+/// terminal too, so it shows even when stderr is redirected.
 fn read_hidden(label: &str) -> std::io::Result<Zeroizing<String>> {
-    let mut stderr = std::io::stderr();
-    write!(stderr, "{label}")?;
-    stderr.flush()?;
+    let mut out = terminal_writer();
+    write!(out, "{label}")?;
+    out.flush()?;
     terminal::enable_raw_mode()?;
     let result = read_line_raw();
     terminal::disable_raw_mode()?;
-    writeln!(stderr)?;
+    writeln!(out)?;
     result
+}
+
+fn terminal_writer() -> Box<dyn std::io::Write> {
+    #[cfg(unix)]
+    if let Ok(tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        return Box::new(tty);
+    }
+    Box::new(std::io::stderr())
 }
 
 fn read_line_raw() -> std::io::Result<Zeroizing<String>> {

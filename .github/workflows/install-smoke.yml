@@ -36,6 +36,14 @@ on:
       - repos/jig-server/src/v0_0_2_ws.rs
       - repos/jig-server/src/v0_0_2_ingest_error.rs
       - repos/jig-pipeline/src/ingest.rs
+      # How `jig init` seals and unlocks keys (I1): a change here can break a
+      # headless install.
+      - repos/jig-core/src/keystore.rs
+      - repos/jig-client/src/identity.rs
+      - repos/jig-client/src/keychain.rs
+      - repos/jig-client/src/secure.rs
+      - repos/jig-cli/src/cmd/init.rs
+      - repos/jig-cli/src/cmd/passphrase.rs
 
 permissions:
   contents: read

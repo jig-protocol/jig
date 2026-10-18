@@ -5,7 +5,8 @@
 //! identity key itself never enters the keychain.
 //!
 //! - **macOS:** the login keychain, through the Security framework.
-//! - **Windows:** Credential Manager.
+//! - **Windows:** none yet. Windows is not a release target, so it uses the
+//!   passphrase.
 //! - **Linux and other Unix:** the Secret Service (GNOME Keyring, KWallet),
 //!   through the `secret-tool` command from libsecret, when it is installed and
 //!   a session bus is running. Otherwise there is no keychain, and the identity
@@ -74,18 +75,14 @@ impl Keychain for MemoryKeychain {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "macos")]
 mod platform {
     use super::{Keychain, KeychainError, SERVICE};
     use std::sync::Arc;
     use zeroize::Zeroizing;
 
     pub fn system() -> Option<Box<dyn Keychain>> {
-        #[cfg(target_os = "macos")]
-        let store = apple_native_keyring_store::keychain::Store::new();
-        #[cfg(target_os = "windows")]
-        let store = windows_native_keyring_store::Store::new();
-        match store {
+        match apple_native_keyring_store::keychain::Store::new() {
             Ok(store) => Some(Box::new(Native(
                 store as Arc<keyring_core::CredentialStore>,
             ))),
@@ -129,16 +126,21 @@ mod platform {
         }
 
         fn name(&self) -> &'static str {
-            if cfg!(target_os = "macos") {
-                "macOS keychain"
-            } else {
-                "Windows Credential Manager"
-            }
+            "macOS keychain"
         }
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(windows)]
+mod platform {
+    use super::Keychain;
+
+    pub fn system() -> Option<Box<dyn Keychain>> {
+        None
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 mod platform {
     //! The Secret Service through `secret-tool` (libsecret).
     //!
