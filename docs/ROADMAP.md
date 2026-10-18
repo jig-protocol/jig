@@ -1,7 +1,7 @@
 # jig roadmap
 
 Where jig is going, in phases from a public alpha (`v0.1`) to a distributed OS (`v1+`), and the
-decisions that shape the path. Last updated 2026-10-17.
+decisions that shape the path. Last updated 2026-10-18.
 
 **Status in one line:** v0.1 groundwork is tagged (`v0.1.0-alpha.1`, no published release yet),
 and on `main` v0.2 has per-channel MLS encryption, TLS by default, clients that pin the server's
@@ -78,7 +78,7 @@ Each phase has an exit criterion. Phases 2 and 3 can overlap.
 | Phase | Theme | Exit criterion |
 | --- | --- | --- |
 | **0. Public alpha** (`v0.1`, M1) | Honest, installable, green | A stranger goes `curl` → `#hello` in under 60s on Linux and macOS, measured in CI |
-| **1. Secure by default** (`v0.2`, M2) | E2EE, hostile-operator resistance, abuse resistance | The spec's privacy claims are true; the operator cannot read restricted content; a hostile operator's downgrade or false handshake is detected; a second suite plugs in without wire changes; two unlike servers federate a channel through the contract alone; an external audit report is published |
+| **1. Secure by default** (`v0.2`, M2) | E2EE, hostile-operator resistance, abuse resistance | The spec's privacy claims are true; the operator cannot read restricted content; a hostile operator's downgrade or false handshake is detected; suites are pluggable, shown by a test suite that runs through the registry with conformance vectors; a channel's federation data contract is specified and two jig servers federate an encrypted channel through it; an external audit is scoped, to run once v0.2 is code-complete |
 | **2. Executable blocks** (`v0.3`) | From pure functions to capability-bearing programs | A third party writes, signs and ships a block in under 10 minutes that runs identically on client and server; a nested block composes with capability attenuation verified by tests |
 | **3. The executable web client** | "Not HTML", made visible | A "page" (a live doc, a poll, a game) authored as blocks and browsable with no developer-authored HTML |
 | **4. Potato → data center** | Scale both ways | The same server runs natively on a Pi Zero 2, as a Wasm component on a Wasm host, and on a 50-node cluster; a deployment holds 1M members; benchmarks are published |
@@ -153,16 +153,23 @@ Then the smaller hardening items, each one PR:
 
 Still to do in this phase:
 
-- **Crypto design (D13):** how a non-MLS scheme (for example Signal's post-quantum protocol) plugs
-  in, versus PQ-hybrid MLS suites, with a conformance test per suite.
+- **E2EE by default (D25):** a restricted channel is MLS unless its creator opts out.
+- **Pluggable suites (D13, deferred):** keep the suite layer composable and prove it with a
+  test-only second suite and per-suite conformance vectors. A production second suite (PQ-hybrid
+  MLS, or Signal's post-quantum protocol) is a stretch goal.
 - **Full handshake (D11):** reputation and real suites; clients detect false answers and
   downgrades, mitigating each threat-register entry.
-- **Federation as a data contract (D12):** encrypted channels across servers, with the suite fixed
-  in the channel's initial contract, and nameserver-led shared contracts for trusted subnets.
+- **Federation as a data contract (D12, D24) and naming:** specify and build a channel's contract
+  between jig servers (encrypted channels across servers, the suite fixed in the contract), with
+  how names map to DIDs and who resolves them. Nameserver-led shared contracts for trusted subnets
+  and ruleset groups follow. Federating with a differently built server comes after the MVP.
 - Multi-device and key rotation; a server-key rotation ceremony.
 - ACME certificates, and TLS on the nameserver (it still serves plaintext).
 - Signed peer policy (federation already runs through the write gate).
-- An external security audit of `jig-core`, `jig-runtime`, the crypto and the handshake.
+- **One implementation of each thing:** remove the v0.0.1 paths that sit beside v0.0.2 ones, the
+  capability scaffolding that enforces nothing, and prototypes nothing calls.
+- An external security audit (D27), designed now and run once v0.2 is code-complete. It does not
+  block development.
 
 ### Phase 2: executable blocks (`v0.3`)
 
@@ -254,7 +261,7 @@ Settled on 2026-10-05 unless noted. Open items follow the table.
 | D10 | Should deployed servers track `main` or tags? | Both: a canary on tagged releases and a bleeding-edge deployment on `main`. |
 | D11 | How far does the protocol trust server operators? | Not at all. Malicious operators are in scope; every connection starts with a mandatory handshake, and clients fail closed. |
 | D12 | Mixed encryption suites across federated servers? | Cross-server channels are a data contract over the transmission. The contract fixes the channel's suite; a server that can't speak it is refused. Trusted subnets may share a nameserver-led contract. |
-| D13 | Signal's post-quantum protocol vs MLS as the plug-in shape? | **Open:** settled in the v0.2 crypto design. |
+| D13 | Signal's post-quantum protocol vs MLS as the plug-in shape? | **Deferred.** Suites stay pluggable, shown in v0.2 by a test-only second suite with conformance vectors. Choosing a production second suite is a stretch goal. Settled 2026-10-18. |
 | D15 | Discovery design? | A design project of its own, with proof-of-work and reputation built in. Only the JEP stub is in v0.1. |
 | D18 | Where does the threat register live? | Decisions in `jig-spec`, normative and terse; analysis in `docs/`. |
 | D19 | Does an anchor nameserver set rules for the network? | No. An anchor gives a high-security zone initial coordination, and joining it is opt-in. Users can run their own zones at any security level, or just connect to servers. Settled 2026-10-13. |
@@ -263,6 +270,10 @@ Settled on 2026-10-05 unless noted. Open items follow the table.
 | D22 | Can abuse in an encrypted channel reach a tribunal? | Yes, and it must: by victim-key delegation or another effective proof, scoped to the incident, with no backdoor, escrow or scanning. The MLS content signature by the DID key makes authorship provable, at the cost of deniability. Mechanism to be designed. Settled 2026-10-16. |
 | D23 | Are proof-of-work, reputation, tribunals and transparency logs optional? | No, they are obligations, and their known weaknesses (linear Sybil cost and other known attack classes) must be closed in full. Servers are the enforcement boundary: they enforce proof-of-work, decide on clients by reputation (a ruleset in their nameserver network, a private one, or none), report clients' reputation changes to their nameservers under the data contract, and keep their own transparency log. Nameservers hold tribunals, compute and enforce net reputation changes, and enforce servers' good behaviour. A server with no nameserver sets its own policy. Settled 2026-10-16/17. |
 | D24 | Who owns a channel? | Exactly one owning server. How members on other servers write to it is to be designed from prior art (XMPP MUC, IRC, Matrix, ActivityPub groups). Settled 2026-10-16. |
+| D25 | Are channels encrypted by default? | Restricted channels are MLS by default from v0.2. Whether every channel is, after the v0.2 tag, waits on the federation-contract and block-ABI designs: an encrypted channel cannot federate until the contract exists, and a server cannot execute its blocks. Settled 2026-10-18. |
+| D26 | Is admission proof-of-work on by default? | No. It stays off until a proof-of-work design covers registration at nameservers, challenges anyone can solve, and what the cost buys against identity farming. Settled 2026-10-18. |
+| D27 | When does the external audit run? | It is designed now and runs once v0.2 is code-complete, so it reviews code that will not be replaced soon. It does not block development. How it is split is open. Settled 2026-10-18. |
+| D28 | Does the v0.0.1 `POST /blocks` route stay? | No. It executes sender-supplied code without a signature check; it is removed before blocks get host functions. Settled 2026-10-18. |
 
 D3, D14, D16 and D17 concern the Riverdance GUI's licence and internal hosting and are tracked
 outside this repo.
@@ -270,5 +281,9 @@ outside this repo.
 ### Still open
 
 1. Where the public trial server runs, and whether it tracks the canary or `main` (D4).
-2. Signal post-quantum vs MLS as the plug-in shape (D13).
-3. Publishing the `v0.1.0-alpha.1` release: both release runs for the tag failed.
+2. Which production second suite to build, if any, after v0.2 (D13).
+3. Publishing a release. Every `v0.1.0-alpha.1` attempt re-ran the tag's own commit, which pins
+   an older signing key; `main` pins the key the signing secret holds, so the next release is a
+   fresh tag from `main`.
+4. Whether every channel is encrypted by default after the v0.2 tag (D25).
+5. How the external audit is split (D27).
