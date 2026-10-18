@@ -171,15 +171,14 @@ Non-goals for v0.2:
        bot. The new sequencer MUST name the new bot DIDs in its `contract-accept`.
 
 11b. When the sequencer moves (11a), the new sequencer issues, as part of its
-     `contract-accept`, a `host-approval` for the channel's current `channel-policy`
+     `contract-accept`, a `policy-approval` for the channel's current `channel-policy`
      and for every live `block-install`.
-     - A `host-approval` is a `COSE_Sign1` by the hosting server (JEP-0004 rule 0). It
-       carries `kind` (`channel-policy` or `block-install`) and names the server, the
-       channel, the CID of the object it approves, and the CID of the server's
-       restrictions. A `host-withdrawal` has the same shape and withdraws an approval.
-       The owner's `channel-policy` and `block-install` stay `COSE_Sign1`s by the owner.
+     - A `policy-approval` is a `COSE_Sign1` by the hosting server (JEP-0004 rule 0). It
+       names the server, the channel, the CID of the policy or install it approves, and
+       the CID of the server's restrictions. The owner's `channel-policy` and
+       `block-install` stay `COSE_Sign1`s by the owner.
      - Which approval is current is decided by the channel's `ingest` order: the latest
-       `host-approval` or `host-withdrawal` for an object CID wins.
+       `policy-approval` or `policy-withdrawn` for an object CID wins.
      - Clients MUST treat a policy or install without a current approval from the hosting
        server as absent. A move without these approvals therefore leaves the channel with
        no policy.
@@ -187,8 +186,8 @@ Non-goals for v0.2:
        or withdraw one when its restrictions change, and a new sequencer can approve on a
        move, without the owner signing again.
 
-     JEP-0011 defines `channel-policy`, `block-install`, `host-approval` and
-     `host-withdrawal`.
+     JEP-0011 defines `channel-policy`, `block-install`, `policy-approval` and
+     `policy-withdrawn`.
 
 ## Ordering
 
