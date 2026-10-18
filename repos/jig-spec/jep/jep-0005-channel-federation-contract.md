@@ -84,7 +84,8 @@ Non-goals for v0.2:
    - `contract-accept {channel_id, owner_server, policy_hash}`, stating that it
      implements the suite and will enforce the membership rule;
    - `contract-refuse {channel_id, code}`, where `code` is one of `UNSUPPORTED_SUITE`,
-     `UNSUPPORTED_VERSION`, `POLICY_REFUSED` or `NOT_A_PEER`.
+     `UNSUPPORTED_VERSION`, `POLICY_REFUSED`, `NOT_A_PEER` or `SUFFIX_CONFLICT` (the two
+     servers claim one name suffix under different authorities, JEP-0004).
 9. A server MUST refuse when it does not implement the suite. It MUST NOT fall back to
    another suite or relay plaintext.
 10. The owner MUST append each accept to the channel's log as a block, so members can see
@@ -121,7 +122,8 @@ Non-goals for v0.2:
     - hosted suites;
     - block kinds it relays;
     - per-peer quotas;
-    - the DIDs of the peers it federates with.
+    - the DIDs of the peers it federates with;
+    - the name suffixes it attests and their roots (JEP-0004).
 
     Contract messages cite its hash.
 17. (pending DJ) In v0.2 a server MUST refuse an offer from a server that is not on its

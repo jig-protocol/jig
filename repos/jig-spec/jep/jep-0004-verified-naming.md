@@ -62,20 +62,29 @@ Non-goals:
 
 ## Suffix authority
 
-3. A resolver MUST determine the set of nameserver DIDs authoritative for a suffix before
-   it accepts an attestation under that suffix. In order of precedence:
-   1. **Local configuration:** a map from suffix to nameserver DIDs. Configuration MUST
-      override discovery.
-   2. **Discovery** (pending DJ): `GET https://<suffix>/.well-known/jig-ns-delegation`
-      over TLS with a CA-valid certificate, returning
-      `{suffix, nameservers: [ns_did], valid_until, sigs: [{ns_did, sig}]}`.
-      - Each listed nameserver MUST sign the document.
-      - The resolver MUST refuse a document where any listed DID's signature is missing
-        or invalid.
-4. A resolver MUST NOT accept an attestation signed by a nameserver outside the suffix's
-   authoritative set.
-5. In v0.3, a ruleset group's signed delegation replaces discovery for suffixes the group
-   governs.
+3. A **suffix delegation** is `{suffix, authorities: [did], root, valid_until, sigs}`.
+   - Every listed authority MUST sign it.
+   - An authority is a nameserver, or a server attesting names under its own suffix.
+   - `root` says what makes the delegation authoritative:
+     - `config`: the resolver's own configuration;
+     - `dns`: served at `https://<suffix>/.well-known/jig-ns-delegation` under a CA-valid
+       certificate;
+     - `contract`: signed by a threshold of the parties to a shared data contract (v0.3).
+4. A resolver MUST determine a suffix's delegation before it accepts an attestation under
+   it, with precedence `config` > `contract` > `dns`.
+   - A resolver MUST refuse a delegation where any listed DID's signature is missing or
+     invalid.
+   - It MUST surface, not silently resolve, a `contract` delegation that disagrees with
+     `dns` for the same suffix.
+   - A party MUST NOT assert a `config` delegation to anyone else.
+5. A resolver MUST NOT accept an attestation signed by a DID outside the suffix's
+   authorities.
+6. A name means (alias, suffix, root). A client MUST NOT display a name as verified unless
+   its own resolver verified it. A name received from elsewhere is a hint, re-verified by
+   the receiver.
+7. A server's signed peer policy (JEP-0005) declares the suffixes it attests and their
+   roots. A contract MUST be refused (`SUFFIX_CONFLICT`) when two parties claim one suffix
+   under different authorities.
 
 ## Attestations
 

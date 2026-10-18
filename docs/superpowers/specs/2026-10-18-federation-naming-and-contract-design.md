@@ -206,16 +206,70 @@ This is the real question. A signed attestation verifies the same whoever fetche
 | **B. Local configuration only** | The client's and server's config maps suffix → nameserver DIDs | No outside trust at all. Fits small and private deployments | Does not scale. Every client must be configured before first use |
 | **C. Ruleset-group delegation** | The ruleset group's nameservers sign a delegation, at a threshold the ruleset fixes, and an anchor publishes the initial one (D19, D21) | No single party, domain registrar included, can redirect a suffix. Fits high-sec groups and NS-03 | Needs ruleset groups, which do not exist yet. It is the v0.3 work |
 
-**Recommendation: A, with B as an override, in v0.2; C replaces A inside a ruleset group
-in v0.3.** Configuration always wins over discovery, so a private deployment never needs
-DNS. Under A, a suffix must be a real domain whose owner can serve the delegation. The
-default `gigue.jig` cannot be served that way. It either becomes a real domain or works
-only through B. **Open for DJ.**
+**Decided (DJ, 2026-10-18): A, with B as an override.** Configuration always wins over
+discovery, so a private deployment never needs DNS.
 
-The delegation document is signed by every nameserver DID it lists, so a CA or web host
-that serves a forged list without those keys produces an unsigned or wrongly signed
-document. That does not stop the domain owner from listing a new nameserver, which is why
-4.4 pins.
+**A and C are one mechanism (DJ).** A ruleset group is not a separate entity. It is what
+forms when nameservers and servers share data contracts. So both A and C produce the same
+artefact, a **suffix delegation**: a signed statement that a set of authority DIDs speaks
+for a suffix. They differ only in what roots the claim:
+
+| Root | Who can redirect the suffix | Visible to |
+| --- | --- | --- |
+| `config` (B) | The configuring party, locally | Only that party. A config override MUST NOT be asserted to anyone else |
+| `dns` (A) | One controller: the domain owner, or whoever controls the registrar, DNS or CA | Everyone |
+| `contract` (C) | Only a threshold of the contract's parties; no single party | Parties to the contract |
+
+The shared format holds, but the security does not: `dns` imports one controller, and
+`contract` has none. A "domain claim" therefore costs DNS trust; it is not free.
+
+**Precedence: `config` > `contract` > `dns`.** A party to a contract that claims a suffix
+uses the contract. Everyone else sees DNS. A disagreement between a contract's delegation
+and DNS for the same suffix is surfaced, never silently resolved.
+
+**A server with no nameserver is its own authority.** Nameservers are opt-in, so a server
+MAY attest names under its own suffix with its own DID. It is then simply the delegation's
+only authority. Under A the suffix is a domain the server controls; under B it is whatever
+its operator configures.
+
+**Duplicates and impersonation (DJ's question).** Where no shared root exists, uniqueness
+cannot be enforced, only scoped and detected. This is Zooko's triangle: a name cannot be
+global, secure and human-meaningful without an anchor. DNS or a contract is that anchor.
+
+1. **Across isolated servers.** Two servers can each configure the suffix `acme`, and
+   nothing global stops them. No protocol rule can prevent that without a central
+   registry, which D19 rules out. Instead, **a name means (alias, suffix, root)**:
+   - `alice@acme` resolved under my config is a different name from `alice@acme` under
+     yours.
+   - A client shows a name bare only when its own resolver verifies it under its own root.
+   - Otherwise the client shows the name marked as unverified, with the DID's
+     fingerprint.
+
+   DNS-rooted suffixes cannot collide, because DNS is unique. Only config-rooted suffixes
+   can, and they are local by definition.
+2. **Within one server.** The server is the only authority for its suffix, so it can bind
+   a name to its own key. Nobody can **prevent** a lone authority from lying. It can be
+   **detected**: the attestation is signed, clients pin (4.4), and retained evidence
+   (4.5) makes two conflicting bindings a proof. Prevention needs a second, independent
+   signer, which is the threshold of a `contract` root.
+3. **Across a federation link.** Here a data contract can prevent the collision:
+   - **Each server's signed peer policy (5.6) declares the suffixes it attests and their
+     root.**
+   - A `contract-offer` is refused with `SUFFIX_CONFLICT` when two parties claim one
+     suffix under different authorities.
+   - A name never crosses a link as identity. Blocks carry DIDs, and a name is a hint the
+     receiver re-verifies under its own root (rule 1).
+
+   So a federated isolated server cannot impersonate a peer's names. At worst its names
+   show as unverified on the peer.
+
+**`gigue.jig`.** `.jig` is not a DNS name, so it can only be config-rooted (B) or
+contract-rooted. **Open:** pick a real domain as the reference default, or keep `gigue.jig`
+and accept that it is local.
+
+The delegation document is signed by every authority DID it lists. A CA or web host that
+serves a forged list without those keys produces an unsigned or wrongly signed document.
+That does not stop the domain owner from listing a new nameserver, which is why 4.4 pins.
 
 ### 4.3 Who resolves and who verifies
 
@@ -389,7 +443,8 @@ fetches a key package **through the owner**: Bob's client → Bob's home server 
    - An accept cites the creation block's CID and its own policy's hash, and states that
      it implements the suite and will enforce the membership rule.
    - A refusal carries a code: `UNSUPPORTED_SUITE`, `UNSUPPORTED_VERSION`,
-     `POLICY_REFUSED` or `NOT_A_PEER`. There is no fallback suite and no plaintext relay.
+     `POLICY_REFUSED`, `NOT_A_PEER` or `SUFFIX_CONFLICT` (4.2). There is no fallback
+     suite and no plaintext relay.
 4. **The accept is a block in the channel's log,** so every member can see which servers
    carry the channel, and a server that breaks the contract has signed the evidence
    (whitepaper 9.1.5).
@@ -400,8 +455,9 @@ fetches a key package **through the owner**: Bob's client → Bob's home server 
 ### 5.6 Signed peer policy
 
 **Proposed.** A server publishes, signed by its DID, a policy document: the protocol
-versions, the suites it hosts, the block kinds it relays, the per-peer quotas it applies
-and the peers it federates with (DIDs, not URLs). `/.well-known/jig` already carries most
+versions, the suites it hosts, the block kinds it relays, the per-peer quotas it applies,
+the peers it federates with (DIDs, not URLs), and the name suffixes it attests with their
+roots (4.2). `/.well-known/jig` already carries most
 of these fields unsigned. Contract messages cite the policy's hash, so a server that
 changes its policy mid-contract leaves evidence. This is the roadmap's "signed peer
 policy" item.
@@ -525,8 +581,10 @@ Updated in the implementation PRs, not here.
 
 ## 11. Questions for DJ, in the order they will be asked
 
-1. Suffix authority (4.2): DNS-anchored plus config in v0.2, and ruleset groups in v0.3?
-   What happens to `gigue.jig`?
+1. ~~Suffix authority (4.2)~~ **Decided:** A with a B override; A and C are one delegation
+   mechanism with different roots; servers without a nameserver are their own authority;
+   suffix conflicts across a federation link refuse the contract. Still open: the
+   reference default suffix.
 2. Remote writes (5.2): relay through the home server?
 3. Name-pin changes (4.4): automatic only with a rotation signed by the old key, and
    refused otherwise?
