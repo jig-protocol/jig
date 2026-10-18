@@ -680,14 +680,14 @@ a high-sec ruleset group, cross-checked.
 - **Partial.** Servers can require one-time admission proof-of-work of unknown DIDs, off by
   default (D26). They report no reputation changes to nameservers and keep no transparency
   log.
-- **None.** Registration through the alias flow (`/v1/register`, which `jig init` and
-  `jig ns` use) has no proof-of-work and no rate limit. No nameserver endpoint requires
-  proof-of-work.
+- **Partial.** Registration through the alias flow (`/v1/register`, which `jig init` and
+  `jig ns` use), and rotation and renewal, are rate-limited per client IP and per DID by
+  default (`[alias_rate_limits]`). No nameserver endpoint requires proof-of-work.
 - **Removed prototype.** The nameserver binary used to serve an earlier, experimental surface
   beside the alias routes: proof-of-work challenges with penalty-adjusted difficulty,
   reputation observations, tribunal case records, transparency-log reads, policy-hash
   exchange and peer gossip. Its routes were removed in #154; the modules behind them
-  (`pow.rs`, `transparency.rs`, `federation.rs`) are unreachable and slated for removal. It
+  were deleted in #157 and #159, except `federation.rs`, which stays but serves no route. It
   explored the shape of obligation 2 and met none of it: its proof-of-work was per identity,
   its reputation model the superseded tier model, and its log kept by one nameserver with
   nobody cross-checking it. The redesign is lane R's: the framing doc (#152) and the draft
@@ -1131,8 +1131,9 @@ gap.
   only gate and never on its own evidence that an identity is one person (D23). *Today:*
   servers rate-limit every verified DID and, on their v0.0.2 routes, every remote address by default, and can
   require one-time admission proof-of-work of unknown DIDs, off by default (D26); the
-  nameserver's binding endpoints (register, rotate, renew) have neither proof-of-work nor a
-  rate limit, and the nameserver's legacy proof-of-work routes are removed. *To design:*
+  nameserver's binding endpoints (register, rotate, renew) are rate-limited per client IP and
+  per DID but ask for no proof-of-work, and the nameserver's legacy proof-of-work routes are
+  removed. *To design:*
   reputation-scaled difficulty, per action as well as per identity.
 - **AB-03, relay and bridge quota abuse.** Bridges and relays connect unidentified sources to
   identified users; a botnet emailing a known jig user through a bridge is the canonical
@@ -1374,6 +1375,7 @@ Each item names what it must satisfy and the register entries it closes.
 13. **The handshake.** Close semantics and JEP-0002's other open questions. Closes OP-01 to
     OP-03.
 14. **Anchors.** Replacement procedure, and the signed, versioned defaults document.
-15. **The nameserver prototype.** Removed in #154; its unreachable modules follow.
+15. **The nameserver prototype.** Removed in #154; its proof-of-work, claim and transparency
+    modules were deleted in #157 and #159, and `federation.rs` remains.
     The obligations it explored stay, and items 1, 2, 5 and 7 design them afresh.
 16. **Housekeeping.** Confirm the obligations still marked *derived*.
