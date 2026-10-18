@@ -158,10 +158,11 @@ so that every approval names the exact rules it was checked against.
    - It is the operator policy of JEP-0006 Q7 and JEP-0007 §2: which programs this server will
      execute at all.
    - `components` allows a program by the hash of its component (§2.1 `component`), whoever
-     authored the manifest. It applies only to programs whose `world` is a `renderer` world. A
-     renderer imports at most `compose` over pinned children, and each child is checked on its
-     own (closure rule), so the manifest around an allowed component adds no authority. Installs
-     (`bot` world) MUST match by `programs` or `authors`, never by `components`.
+     authored the manifest. A `components` entry MUST match only a program whose `world` is a
+     `renderer` world, whose `requests` is empty, and whose `children` is empty. Such a manifest
+     can add nothing to the code it wraps.
+   - Any other program, including every `bot`-world install, MUST be allowed by `programs` or
+     `authors`.
    - A server's default `operator-policy` lists in `components` exactly the renderer components it
      ships, and nothing else: today, text-block's component hash. Clients therefore see everything
      the server will run, and built-ins get no implicit exception. "Empty by default" means empty
@@ -334,15 +335,18 @@ To come with slice 4 and slice 6:
 - **federation:** a `render` composed on server X, naming X's program CID for text-block, is
   executed by server Y under Y's default `operator-policy` (allowed by component), and both
   servers' `exec` receipts carry the same outcome hash;
-- a `bot`-world program whose component is in `components` but whose program and author are not
-  allowed is refused for install;
+- programs whose component hash is in `components`, but whose program and author are not allowed,
+  are refused in each of these cases:
+  - a `bot`-world program, at install;
+  - a renderer whose manifest requests any capability;
+  - a renderer whose manifest pins any child;
 - a `channel-policy` chain with host approvals and a withdrawal.
 
 # Rejected Alternatives
 
-- **Policy keyed by component hash alone, for every world.** For a `bot` it would approve the code
-  under any manifest, including one that requests more effects. Component matching is kept only
-  for renderers (§5.1), where the manifest can add no authority.
+- **Policy keyed by component hash alone, for every program.** It would approve the code under any
+  manifest, including one that requests capabilities or pins children. Component matching is kept
+  only for renderers with no requests and no children (§5.1), where the manifest adds nothing.
 - **Signature inside the program CID.** Every later attestation would then need a second name.
 - **A registry service, or programs on nameservers.** This adds a second write path and a second
   trust root.
