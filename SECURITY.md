@@ -1,8 +1,12 @@
 # Security policy
 
-jig is pre-alpha. **v0.1 does not encrypt message content**: a server operator can read
-everything posted to their server. End-to-end encryption (MLS) is planned for v0.2. Do not
-use jig for anything confidential yet.
+jig is pre-alpha. **Only encrypted channels and DMs are end-to-end encrypted.** A channel
+created with `--encrypted`, and every `jig dm`, is one MLS group (RFC 9420), and the server
+holds no group secret. Every other channel is plaintext to its server's operator.
+Restricted channels become always-MLS in v0.2 ([D25](docs/ROADMAP.md)); until that lands, a
+restricted channel created without `--encrypted` is readable by the operator. Encrypted
+channels do not federate yet. Do not use jig for anything confidential yet: it has not been
+audited.
 
 ## Reporting a vulnerability
 
@@ -61,8 +65,12 @@ In scope:
 
 Known and documented, so not reportable on their own:
 
-- Operators can read content (no E2EE in v0.1), and see who talks to whom and when.
-- TLS is off by default; the default admission policy admits any key.
+- Operators can read the content of channels that are not encrypted, and see who talks to
+  whom and when in every channel, encrypted or not.
+- The default admission policy admits any key. Admission proof-of-work exists but is off by
+  default ([D26](docs/ROADMAP.md)). Rate limits are on by default.
+- The nameserver serves plaintext HTTP. A server's default TLS certificate is self-signed and
+  trusted through the DID the client pins, not through a certificate authority.
 - The open entries in the [threat register](repos/jig-spec/src/threat-register.md).
 
 If you find a cheaper or wider way to exploit one of these, please do report it.

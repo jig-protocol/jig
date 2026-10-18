@@ -7,7 +7,9 @@ jig is MIT OR Apache-2.0 source in a public-shaped repo, but it has never been
 announced, never been deployed to a public address, and has never had a user
 outside the team. This document is the checklist for changing that. Every
 "current state" row below was checked against the code at merge commit
-`1fa5681`; where a claim could not be verified from the tree it says so.
+`1fa5681`; §1.3, §1.6 to §1.8, the binary install row, §3, §4, §6 and the verdict
+were re-checked against `d16f26a` on 2026-10-18. Where a claim could not be
+verified from the tree it says so.
 
 **Verdict vocabulary**
 
@@ -38,7 +40,7 @@ phases 1–3) moved identity into the server; the tailnet is now defence in dept
 
 **Verdict: GAP** (was BLOCKER). The part that let strangers read and write every
 channel is closed and proven by fault injection at each gate, and an operator can
-now refuse callers outright; what remains is scoring, throttling and the tier-1
+now refuse and rate-limit callers; what remains is scoring and the tier-1
 fast path, not the absence of a model.
 
 ### 1.2 `visibility = "restricted"` is enforced
@@ -54,17 +56,17 @@ The CLI's `restricted (membership-gated reads)` help text is now true, and
 
 **Verdict: READY.**
 
-### 1.3 No end-to-end encryption
+### 1.3 End-to-end encryption
 
 | | |
 | --- | --- |
 | **Current state** | **Per channel, since v0.2.** A channel created with `suite = "mls"` (`jig channel create --encrypted`, and every `jig dm`) is one MLS group ([`jig-mls`](../repos/jig-mls/), `openmls` 0.9): content is an MLS `PrivateMessage`, the server validates every commit through a public-state `PublicGroup` and holds no group secret, and plaintext into such a channel is refused (`SUITE_MISMATCH`). `integration-tests/tests/h12_encrypted_channels.rs` searches the server's files after a conversation and finds none of it. Channels created without a suite are still signed-not-encrypted and stored in cleartext. |
 | **Ready means** | Message bodies are encrypted to recipient keys; the server stores ciphertext it cannot read. |
-| **Gap** | Encryption is opt-in, not the default for new channels. Encrypted channels do not federate. One device per DID. The client's plaintext cache (`~/.jig/mls/`) is as sensitive as the identity key and is not encrypted at rest. No independent review of the MLS integration. |
+| **Gap** | Encryption is opt-in, not the default for new channels; restricted channels become always-MLS, with no opt-out, before the v0.2 tag (D25). Encrypted channels do not federate. One device per DID. The client's plaintext cache (`~/.jig/mls/`) is as sensitive as the identity key and is not encrypted at rest. No independent review of the MLS integration. |
 
 `repos/jig-spec/` used to document `age+x25519` E2EE in the present tense. Since
-2026-10-05 it specifies MLS by default, suite-pluggable, in `src/encryption.md`, bannered
-as not implemented in v0.1.
+2026-10-05 it specifies MLS, suite-pluggable, in `src/encryption.md`, whose banner now
+states what v0.2 implements: `mls` for single-server channels.
 
 **Verdict: GAP** (was BLOCKER). Encrypted channels and DMs are real for
 single-server use; "private by default" is not yet a true claim, and nothing
@@ -96,42 +98,37 @@ documented in the handler). Keep it off; never document it as a workaround.
 
 | | |
 | --- | --- |
-| **Current state** | Tighter than the rest of the system. `build_wasi_context` ([`jig-runtime/src/engine.rs:293`](../repos/jig-runtime/src/engine.rs)) grants an empty stdin pipe and an in-memory stdout buffer — no host stdio, no preopened directories, no sockets. Store limits pin one instance, one memory, 10 tables, 10k table elements; fuel and an epoch deadline bound runtime. Server defaults: 5,000,000 fuel, 64 MB, plus a timeout ([`jig-server/src/config.rs:296-304`](../repos/jig-server/src/config.rs)). wasmtime is 47.0.4 (RUSTSEC-2026-0268/0269 closed by the patch bump, not suppressed; jig never enables WASI, so neither was reachable) — including RUSTSEC-2026-0096 (aarch64 Cranelift guest-heap miscompile → sandbox escape). |
+| **Current state** | Tighter than the rest of the system. `build_wasi_context` ([`jig-runtime/src/engine.rs:293`](../repos/jig-runtime/src/engine.rs)) grants an empty stdin pipe and an in-memory stdout buffer — no host stdio, no preopened directories, no sockets. Store limits pin one instance, one memory, 10 tables, 10k table elements; fuel and an epoch deadline bound runtime. Server defaults: 5,000,000 fuel, 64 MB, plus a timeout ([`jig-server/src/config.rs:296-304`](../repos/jig-server/src/config.rs)). wasmtime is 49.0.3, with no wasmtime advisory suppressed in `deny.toml` — including RUSTSEC-2026-0096 (aarch64 Cranelift guest-heap miscompile → sandbox escape). |
 | **Gap** | None material for external use. This is the strongest part of the security story. |
 
 **Verdict: READY.**
 
 ### 1.7 Advisory suppressions (`deny.toml`)
 
-13 individually-pinned RustSec ignores, plus `yanked = "warn"`.
-`cargo deny --manifest-path repos/Cargo.toml check` was run and reports
-`advisories ok, bans ok, licenses ok, sources ok` — i.e. clean *given* these
-suppressions.
+One RustSec ignore, and `yanked = "deny"`.
 
 | Category | IDs | Matters to an external user? |
 | --- | --- | --- |
-| Build-time only (proc macros) | RUSTSEC-2024-0370 (`proc-macro-error`), RUSTSEC-2024-0436 (`paste`) | No. Never linked into a shipped binary. |
-| CLI-local, non-network | RUSTSEC-2021-0145, RUSTSEC-2024-0375 (`atty`) | No. Windows-only, and only under a custom global allocator we do not install. |
-| Unmaintained, no upgrade published | RUSTSEC-2025-0134 (`rustls-pemfile`), RUSTSEC-2026-0105 (`core2`, all versions yanked) | Indirectly. Unmaintained crypto-adjacent code in the TLS cert-loading path is a supply-chain smell an external auditor will flag. |
-| Fixable by a lockfile bump | RUSTSEC-2026-0009 (`time` RFC-2822 stack exhaustion), RUSTSEC-2025-0055 (`tracing-subscriber` ANSI injection into logs), RUSTSEC-2026-0097 (`rand` ThreadRng unsoundness) | **Yes — two of them.** The `time` parse path is reachable from `hickory-resolver`; the premise "we do not parse attacker-supplied RFC 2822 dates" holds only while the email bridge does not. The `tracing-subscriber` one is log poisoning by a remote party, which is exactly what an unauthenticated public listener invites. All three are a `Cargo.lock` bump away. |
-| `rustls-webpki` (0.102.8 via rustls 0.22 + 0.103.4 via rustls 0.23) | RUSTSEC-2026-0049, -0098, -0099, -0104 | **Yes.** Two are name-constraint bypasses and one is a reachable panic parsing a CRL. The stated mitigation ("we use no CRLs and no name-constrained CAs") is true of *our* config today and is not a property an external operator's PKI will preserve. Blocked on retiring the rustls 0.22 branch, i.e. the `tokio-tungstenite` 0.21 bump already tracked as a follow-up. |
+| Build-time only (proc macro) | RUSTSEC-2026-0173 (`proc-macro-error2`, unmaintained, no vulnerability), reached through `jig-mls` → `openmls_rust_crypto` → `hpke-rs` → `libcrux-sha3` → `hax-lib` | No. Never linked into a shipped binary. |
 
-**Verdict: GAP.** Three lockfile bumps and one rustls dedup would take this to
-zero-or-near-zero suppressions. The current list is well-documented and
-individually justified — the file's own invariant comment is better discipline
-than most projects have — but "13 ignores" is a bad first impression and two
-categories are genuinely reachable once the listener is public.
+The twelve other ignores this section used to list are gone, resolved rather than
+re-annotated: the `time`, `tracing-subscriber` and `rand` fixes arrived with later
+lockfile changes; `paste` left with ratatui 0.30 and `atty` with an unused `jig-cli`
+dependency; and unifying on rustls 0.23 removed both `rustls-pemfile` and the
+`rustls-webpki` 0.102 copy behind the four name-constraint and CRL advisories. The
+file records each removal.
+
+**Verdict: READY** (was GAP).
 
 ### 1.8 Responsible disclosure
 
 | | |
 | --- | --- |
-| **Current state** | No `SECURITY.md` at the repo root. GitHub only surfaces a policy from the root, `.github/`, or `docs/` — so today the repo shows no security policy at all. Seven per-crate `SECURITY.md` files exist (`repos/jig-{cli,config,core,gui,nameserver,runtime,server}/SECURITY.md`, 17 lines each, plus a 30-line one in `jig-spec`). Their contents are **internal-facing**: they route reporters to an internal security mailbox and an internal chat channel, tell them not to DM engineers because it hurts SLAs, and tell them not to open tickets without coordinating with security engineering first. |
+| **Current state** | A root [`SECURITY.md`](../SECURITY.md) written for an outside reporter: GitHub private vulnerability reporting or security@jig.onl, 1-day acknowledgement, 7-day triage, 28-day fix, 90-day coordinated disclosure, safe harbour, and malicious operators in scope. The per-crate `SECURITY.md` files (`repos/jig-{cli,config,core,nameserver,runtime,server,spec}/`) now only point to it. |
 | **Ready means** | One root `SECURITY.md` written for an outside reporter: what's in scope, how to report, expected acknowledgement window, disclosure timeline, and whether GitHub private vulnerability reporting is enabled. |
-| **Gap** | The file is missing where it counts, and the text that does exist reads as an internal runbook. "#alert-security" is a channel a stranger cannot join. |
+| **Gap** | None in the repository. |
 
-**Verdict: BLOCKER.** Cheap to fix, and going public without a disclosure path
-means the first finding arrives as a tweet.
+**Verdict: READY** (was BLOCKER).
 
 ---
 
@@ -140,7 +137,7 @@ means the first finding arrives as a tweet.
 | Item | Current state (verified) | Ready means | Verdict |
 | --- | --- | --- | --- |
 | Install (source) | `install.sh` detects a source checkout and runs `cargo build --release` for `jig-server`, `jig-cli`, and `text-block` (wasm32-wasip1). Works. | Same. | READY |
-| Install (binary) | **Broken, and unverifiable.** `install_from_release` fetches `${JIG_RELEASES_BASE}/${JIG_VERSION}/jig-<os>-<arch>.tar.gz` — default base `https://releases.jig.onl`, default version `v0.0.2` — but `release.yml` publishes to **GitHub Releases**, not to that host. It also extracts to `$tmp` and then copies `$tmp/bin/jig-server`, while the release tarball's root is `jig-<platform>/bin/…`. And no checksum is verified, despite `release.yml` publishing a `.sha256` alongside every tarball. | URL points where artifacts actually are; paths match the tarball layout; `.sha256` verified before extraction. | BLOCKER |
+| Install (binary) | `install.sh` downloads the tarball and `SHA256SUMS` from the GitHub Release (or a `JIG_RELEASES_BASE` mirror), verifies the checksum, and verifies `SHA256SUMS.sig` with `ssh-keygen -Y` against a pinned release key. A missing signature file is refused. Without `ssh-keygen` it warns and installs on the checksum alone, unless `JIG_VERIFY_SIGNATURE=1`. `install-smoke.yml` runs the `curl \| bash` path on every PR that touches the installer, against that PR's build signed with a throwaway key, and after each release against the published tag on Linux and macOS. No release has been published yet. | URL points where artifacts actually are; paths match the tarball layout; checksum and signature verified before extraction. | GAP: no published release |
 | Upgrade path | None. No `jig upgrade`, no version pinning, no store migration story. `install.sh` overwrites `$JIG_HOME/bin` in place. | A documented upgrade that states what happens to `jig.db` / `jig_v002.db`. | GAP |
 | Backup | `deploy/jig-backup.sh` + systemd timer. Genuinely good: `VACUUM INTO` (not `cp`) for both `jig.db` and the derived `jig_v002.db`, `server.key` included, `umask 077`, partial snapshots removed on failure, retention pruning with `DRY_RUN`. | Same, plus offsite. | READY |
 | Restore | Documented in `deploy/README.md` ("Restore"), including the `chmod 600` on `server.key` and a post-restore `server_did` check. | Same. | READY |
@@ -154,9 +151,9 @@ means the first finding arrives as a tweet.
 
 | Layer | Versioned? | Enforced? |
 | --- | --- | --- |
-| WSS envelope | Yes — `Envelope { v: u8 }`, always `1` ([`envelope.rs:27`](../repos/jig-pipeline/src/envelope.rs)) | **No.** No code path reads `env.v`. A `v: 99` frame is processed identically to `v: 1`. |
-| Block manifest | Yes — `BlockManifest.schema`, default `https://jig.dev/schema/block-manifest/v0.1` ([`manifest.rs:22`](../repos/jig-core/src/manifest.rs)) | **No.** The field is never compared, validated, or dispatched on outside of test fixtures. Also note the URI says `jig.dev`, which is not our domain. |
-| Receipt | Yes — `RECEIPT_SCHEMA_VERSION = "0.2"` ([`receipt.rs:38`](../repos/jig-core/src/receipt.rs)), stamped on every receipt | Structurally, yes: the field must be non-empty. No consumer branches on its value. |
+| WSS envelope | Yes — `Envelope { v: u8 }`, always `1`, plus `suite` ([`envelope.rs`](../repos/jig-pipeline/src/envelope.rs)) | **Yes.** A frame with any other `v` is refused `UNSUPPORTED_VERSION`, and an unknown or unimplemented suite `UNSUPPORTED_SUITE`, before the frame is read. |
+| Block manifest | Yes — `BlockManifest.schema`, default `https://jig.dev/schema/block-manifest/v0.1` ([`manifest.rs`](../repos/jig-core/src/manifest.rs)) | **Yes.** `ingest` runs `BlockManifest::check_gates`, which refuses any schema outside `SUPPORTED_SCHEMAS` and any unimplemented encryption suite. The URI still says `jig.dev`, which is not our domain. |
+| Receipt | Partly. `RECEIPT_SCHEMA_VERSION = "0.2"` ([`receipt.rs`](../repos/jig-core/src/receipt.rs)) stamps `jig-core` receipts, but the receipt the server signs for a rendered block is a separate JSON object tagged `"v": "0.3-render"` ([`ingest.rs`](../repos/jig-pipeline/src/ingest.rs)), which the spec's [Receipts](../repos/jig-spec/src/receipts.md) chapter does not describe | No consumer branches on either value. |
 | Fuel pricing | Yes — `PricingConfig::schedule_version`, now `"0.2.0"` ([`jig-runtime/src/config.rs:215`](../repos/jig-runtime/src/config.rs)) | Advisory. Carried into receipts and into `runtime/mod.rs` metadata; nothing rejects a mismatch. |
 
 The `0.1.0 → 0.2.0` pricing bump is the clearest example of why external users
@@ -179,7 +176,8 @@ determinism and cost, and both halves are unstable:
   the outcome is a warning, not a rejection.
 
 **Verdict: BLOCKER for any compatibility promise; READY if we promise nothing.**
-Every version field in the system is a *label*, not a *gate*. External users
+The envelope version, the encryption suite and the manifest schema are now gates; the
+receipt and pricing versions are still labels. External users
 must be told, in the README and on the release page, that v0.0.x makes no wire
 or receipt compatibility guarantee and that breaking changes ship without a
 migration. Crate versions already say this (`0.0.1`–`0.0.3`) and
@@ -192,19 +190,19 @@ match.
 
 | Artifact | Exists? | Notes |
 | --- | --- | --- |
-| Root `README.md` | No | Landing in this same batch (a sibling lane owns it). `release.yml` already tries to `cp install.sh README.md LICENSE "$STAGE/"` with `2>/dev/null \|\| true` — so today it silently ships a tarball with neither. |
+| Root `README.md` | Yes | The front door: what jig is, install, quick start, crate map. `scripts/package-release.sh` copies it and the licence pair into every release tarball. |
 | `repos/README.md` | Yes | Workspace-level architecture. Accurate on crate roles. Not a front door. |
-| `CONTRIBUTING.md` (root) | No | One exists at `repos/jig-spec/CONTRIBUTING.md`, scoped to the spec book only. |
-| `CODE_OF_CONDUCT.md` | No | Nowhere in the tree. |
-| `SECURITY.md` (root) | No | See §1.8. |
+| `CONTRIBUTING.md` (root) | Yes | Build, test and pull-request rules, including the DAG rule. `repos/jig-spec/CONTRIBUTING.md` covers the spec book. |
+| `CODE_OF_CONDUCT.md` | Yes | At the repo root. |
+| `SECURITY.md` (root) | Yes | See §1.8. |
 | Deployment docs | Yes, strong | `deploy/README.md` (426 lines: install, tailnet security model, TLS via `tailscale cert`, teammate onboarding, backups, restore, gotchas), `docs/deployment/gcp-vps-runbook.md` (940 lines), plus dogfood runbooks and an install benchmark. |
 | Per-crate rustdoc | Partial | Module- and item-level doc comments are dense and unusually good (the `//!` headers carry real rationale). But **no crate sets `#![warn(missing_docs)]`** and none carries `[package.metadata.docs.rs]`, so there is no rendered API reference anywhere. Only `integration-tests` sets `publish = false`; the rest are publishable-by-accident. |
-| `jig-spec` book | Yes | mdbook under `repos/jig-spec/`. Describes much unshipped behaviour. E2EE (now MLS), the handshake and the transports carry not-implemented banners as of 2026-10-05; other chapters (receipts, analytics, identity and reputation) are still aspirational in places. |
+| `jig-spec` book | Yes | mdbook under `repos/jig-spec/`. Describes much unshipped behaviour. Each chapter's banner, and the threat register's status column, say what the reference implementation does (re-checked 2026-10-18); `message-format.md` is bannered as historical, not the wire format. |
 | Riverdance | Not in this repo | The unfinished GUI is not part of this repository. Its licence is undecided, and it is not a working client. |
 
-**Verdict: GAP**, trending to READY once the README lands — with the caveat
-that `jig-spec` shipping unimplemented crypto in the present tense is closer to
-a security-communication BLOCKER than a docs gap (see §1.3).
+**Verdict: GAP.** The front-door files exist and the spec is bannered; what
+remains is a rendered API reference and `publish = false` on crates not meant for
+crates.io.
 
 ---
 
@@ -250,20 +248,21 @@ registry, or copied code may appear anywhere under `repos/`. This belongs in
 
 ## 6. Community readiness
 
-`.github/` contains exactly two files: `workflows/ci.yml` and
-`workflows/release.yml`. Nothing else.
+`.github/` holds the workflows (`ci.yml`, `release.yml`, `install-smoke.yml`,
+`fuel-portability.yml`), issue templates, a PR template, `CODEOWNERS` and
+`dependabot.yml`.
 
 | Item | State | Verdict |
 | --- | --- | --- |
-| Issue templates | None | GAP |
-| PR template | None | GAP |
-| `CODEOWNERS` | None | GAP |
-| Discussion / support channel | None public. Per-crate `SECURITY.md` points at `#alert-security`, an internal channel. | GAP |
-| Triage owner | Undefined. No rotation, no SLA, nothing written down. | BLOCKER-adjacent — an unowned inbox is how a project acquires a reputation for ignoring people. |
-| Release cadence | Undefined. `release.yml` is tag-triggered and marks `v0.0.*` as prerelease; no schedule or policy exists. | GAP |
-| CI coverage | 3 jobs: `workspace`, `wasm-build`, `dependency-policy` (the last also runs daily at 07:17 UTC against `main` so advisory-DB drift is not blamed on a contributor's PR — good practice). **Caveats an external contributor will hit:** clippy runs on 7 crates only — `jig-server`, `jig-nameserver`, and `jig-cli` are formatted and tested but **not linted**; `jig-runtime` and `hello-wasm` are neither built nor tested; the matrix is `ubuntu-latest` only, so macOS and Windows are untested despite `release.yml` shipping darwin binaries. | GAP |
+| Issue templates | Bug report, feature request and JEP proposal; blank issues are off, and the chooser links private vulnerability reporting and dev@jig.onl | READY |
+| PR template | `.github/pull_request_template.md`: what changed, test plan, spec/JEP impact, the DAG rule | READY |
+| `CODEOWNERS` | DJ owns everything, repeated on sensitive paths | READY |
+| Discussion / support channel | dev@jig.onl and issues; security reports go to security@jig.onl or GitHub private reporting. No public chat. | GAP |
+| Triage owner | DJ, named in `SECURITY.md` for vulnerability reports. No rotation or SLA for ordinary issues. | GAP |
+| Release cadence | Undefined. `release.yml` is tag-triggered and marks every v0.x tag a prerelease; no release has been published. | GAP |
+| CI coverage | `changes`, `workspace` (fmt, clippy and nextest on every workspace crate but `hello-wasm`), `wasm-build` and `dependency-policy` (also daily at 07:17 UTC against `main`). Drafts and docs-only PRs skip the build jobs; the merge queue runs everything. Linux only for the workspace job; macOS runs in `install-smoke.yml` (published releases) and `fuel-portability.yml`. | GAP |
 
-**Test counts, measured** (`cargo nextest list`, stable 1.97.1): 1,054 tests in
+**Test counts, measured at `1fa5681`** (`cargo nextest list`, stable 1.97.1): 1,054 tests in
 the CI-gated package set, plus 87 in `jig-runtime` + `hello-wasm` = **1,141**.
 Reports of 1,143 are within rounding of this but do not reproduce exactly; if a
 precise number goes in a README, re-measure it there.
@@ -272,36 +271,41 @@ precise number goes in a README, re-measure it there.
 
 ## Verdict
 
-**No. jig is not ready for external users today.** Not close.
+**No. jig is not ready for external users today.**
 
 The sentence that used to decide it — *a jig server has no authentication and
 no authorization* — is no longer true: reads require proof of possession,
-restricted channels are membership-gated on every surface, and membership
-changes are owner-signed. What decides it now is the rest of this document:
-admission that rests on operator-written config, not earned reputation, federation on
-trust, no E2EE, a broken install path, and no disclosure channel. Publishing an
-install script that stands up a server on a public address is still handing
-strangers a footgun — a smaller one, with the safety on.
+restricted channels are membership-gated on every surface, membership changes
+are owner-signed, and rate limits are on by default. Nor are the next three: DMs
+and `--encrypted` channels are end-to-end encrypted with MLS, the binary
+installer verifies a signed checksum, and `SECURITY.md` gives a disclosure path.
+What decides it now:
+
+- Restricted channels created without `--encrypted` are still readable by the
+  operator until D25 lands, and encryption is not the default for open channels.
+- Encrypted channels do not federate, and nothing has had an outside review (the
+  audit, D27, runs once v0.2 is code-complete).
+- Admission rests on operator-written config, not earned reputation; the
+  nameserver serves plaintext.
+- No release has been published, so the `curl | bash` path has only run against
+  CI builds.
 
 ### Minimum credible blocker set, ordered
 
 | # | Blocker | Why it is in this position |
 | --- | --- | --- |
-| ~~1~~ | ~~**Authn + authz on `jig-server`**~~ | **Phases 1–4 DONE 2026-09-11** — per-request proof of possession on reads, `visibility`/membership enforced on history, listing, live delivery and posting, owner-signed membership changes, and an admission policy (bans, ruleset floors, explicit unknown-DID choice) on every read and write. Still open from the same design: trusted connections (phase 5); see §1.1. |
+| ~~1~~ | ~~**Authn + authz on `jig-server`**~~ | **Phases 1–4 DONE 2026-09-11** — per-request proof of possession on reads, `visibility`/membership enforced on history, listing, live delivery and posting, owner-signed membership changes, and an admission policy (bans, ruleset floors, explicit unknown-DID choice) on every read and write. Rate limits (#92) and optional admission proof-of-work (#94) followed. Still open from the same design: trusted connections (phase 5); see §1.1. |
 | ~~2~~ | ~~**Root `SECURITY.md` with an external reporting path**~~ | **DONE 2026-10-05** — `SECURITY.md`: security@jig.onl, 1/7/28-day targets, 90-day disclosure, malicious operators in scope. |
 | ~~3~~ | ~~**Root `LICENSE` + consistent per-crate SPDX ids**~~ | **DONE 2026-08-06** — dual-licensed MIT OR Apache-2.0, root licence pair added, every protocol crate aligned. `jig-spec` moved to CC-BY-4.0 on 2026-10-05. |
-| 4 | **Fix the binary install path** | `install.sh` points at a host that serves nothing, unpacks the wrong paths, and verifies no checksum — while `release.yml` already publishes the `.sha256`. A `curl \| sh` KPI that does not work is worse than not having one. |
-| 5 | **Say plainly that v0.x has no compatibility guarantee** | README and spec done 2026-10-05; release notes still to do. `Envelope.v`, the manifest `schema` and the encryption suite are now gates, not labels. |
-| ~~6~~ | ~~**Implementation-status banner on `jig-spec`**~~ | **DONE 2026-10-05** — E2EE rewritten from `age+x25519` to MLS and bannered as not implemented; handshake and transports bannered. |
-| 7 | **Clear the reachable advisory suppressions** | Three lockfile bumps (`time`, `tracing-subscriber`, `rand`) plus the rustls 0.22 → 0.23 dedup that retires the four `rustls-webpki` ignores. |
-| 8 | **Name a triage owner and publish a support channel** | Not technical. Determines whether the first outside contributor comes back. |
+| 4 | **Publish a release the installer can install** | The installer is fixed: it fetches from GitHub Releases, verifies `SHA256SUMS` and its signature, and `install-smoke.yml` tests it on PRs. What is missing is a published release; every `v0.1.0-alpha.1` attempt failed (see the roadmap). |
+| 5 | **Say plainly that v0.x has no compatibility guarantee** | README and spec done 2026-10-05; release notes still to do. `Envelope.v`, the manifest `schema` and the encryption suite are gates; receipt and pricing versions are labels (§3). |
+| ~~6~~ | ~~**Implementation-status banner on `jig-spec`**~~ | **DONE 2026-10-05**, re-checked 2026-10-18 — every chapter's banner and the threat register's status column match `main`. |
+| ~~7~~ | ~~**Clear the reachable advisory suppressions**~~ | **DONE** — one build-time-only ignore left (§1.7). |
+| 8 | **Publish a support channel** | DJ is the named triage owner for security reports, and dev@jig.onl takes everything else. No public discussion channel, and no SLA for ordinary issues. |
 
-Items 2–8 are days of work. Item 1 was the real project; its first three
-phases have landed, and what remains of it (admission, trusted connections) is
-policy on top of a model rather than the absence of one.
-
-Until the rest lands, the honest external posture is still: **source-available
-for reading and auditing, not for running on a public address.** That is a
-defensible thing to announce — "here is a protocol implementation, here is what
-works, here is the security model, do not put it on the internet yet" — and it
-is far better than shipping an install script that implies otherwise.
+Until those land, along with the encryption and review items above, the honest
+external posture is still: **source-available for reading and auditing, not for
+running on a public address.** That is a defensible thing to announce — "here is
+a protocol implementation, here is what works, here is the security model, do
+not put it on the internet yet" — and it is far better than shipping an install
+script that implies otherwise.

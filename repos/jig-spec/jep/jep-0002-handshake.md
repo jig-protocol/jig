@@ -24,8 +24,10 @@ OP-01, OP-02).
 
 Operators are untrusted (D11). Without a mandatory, signed handshake a client cannot tell
 "this server does not support encryption" from "this server is hiding it", and a lie
-leaves no evidence. Today no handshake exists: the first frame may be anything. The
-`src/handshake.md` chapter predates this JEP and is not implemented.
+leaves no evidence. Before this JEP no handshake existed: the first frame could be
+anything. The `src/handshake.md` chapter predates this JEP and is not implemented. The
+reference implementation now implements a subset of this JEP; the threat register's OP-01
+and OP-02 rows say which.
 
 # Specification
 
@@ -64,7 +66,8 @@ Draft. Field names are provisional.
 
 v0.1 scope (roadmap P1): version, capabilities and suite (`none`) in `jig-server` and
 `jig-client`; the client refuses to proceed without a valid `welcome`. Reputation and real
-suites follow in v0.2.
+suites follow in v0.2. *(Done in v0.2: the welcome advertises `none` and `mls`, and the CLI
+pins the server's DID and advertised suites; reputation is still `null`.)*
 
 # Open questions
 

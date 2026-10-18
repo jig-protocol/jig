@@ -3,7 +3,8 @@
 > **Encryption is per channel since v0.2.** This chapter's signature, hashing and key
 > management sections describe the protocol. Confidentiality is specified in
 > [Encryption](encryption.md): channels created under `mls` are end-to-end encrypted;
-> others are signed, not encrypted.
+> others are signed, not encrypted. Key storage at rest, rotation and revocation are not
+> yet implemented; those sections are marked.
 
 **Audience:** This chapter is primarily for **protocol implementers** and **developers building on Jig**. If you're an **end user** or **server operator**, you don't need to understand the cryptographic details—just know that Jig uses modern, audited crypto that's the same stuff Signal, SSH, and WireGuard use.
 
@@ -57,12 +58,14 @@ did:jig:<base58(public_key)>
 ```
 
 **Storage:**
-- Private keys MUST be stored encrypted at rest (OS keychain, hardware token, or encrypted file)
+- Private keys MUST be stored encrypted at rest (OS keychain, hardware token, or encrypted file) *(not yet implemented: the CLI and server store raw Ed25519 keys in files with 0600 permissions, unencrypted)*
 - Backups SHOULD use multiple mechanisms (paper backup + cloud + hardware key)
 
 **Rotation:**
 - Clients and servers MUST support key rotation (publishing new key signed by old key)
 - Rotation certificates MUST be published to nameserver and propagated via transparency log
+
+*(not yet implemented: a DID is its key, and nothing rotates it. The nameserver's `/v1/rotate` moves an alias to a new DID, with proofs from both keys; it is not a rotation certificate and no transparency log receives it.)*
 
 **For end users:** Your keys = your identity. If you lose them, you lose your account. Back them up. If they're stolen, rotate immediately.
 
@@ -148,6 +151,10 @@ ed25519:v1:PkQx7TfHJ_3eLZ8YxH4YGJLXVJsJcZjYh7x_VJLXVJs
 **Audience: Server operators and protocol implementers**
 
 Keys need to be rotated periodically (annual schedule) or immediately (after compromise).
+
+> **Not implemented.** No rotation certificate, `/v1/identity/rotate` endpoint, grace period
+> or revocation certificate exists. A server whose key changes has a new DID, and clients
+> that pinned the old one refuse it.
 
 ### Rotation Certificate Format
 
@@ -235,8 +242,8 @@ chosen when it was created (`mls`). DMs are channels with locked membership, not
 
 **What you need to know:**
 - Your keys = your identity. Back them up (paper backup + cloud backup).
-- v0.1 does not encrypt anything: the server operator can read every message. From v0.2,
-  channels and DMs can be end-to-end encrypted with MLS.
+- DMs and channels created encrypted are end-to-end encrypted with MLS. Every other
+  channel is readable by the server operator.
 - If a server bans you, take your keys elsewhere. You're still you.
 
 **What you DON'T need to know:**
@@ -280,7 +287,7 @@ chosen when it was created (`mls`). DMs are channels with locked membership, not
 - Constant-time operations (use vetted libraries)
 - Explicit algorithm negotiation (no silent downgrade)
 - Zeroize ephemeral secrets (explicit_bzero)
-- Support key rotation (dual-signature certificates)
+- Support key rotation (dual-signature certificates) *(not yet implemented)*
 
 **Test vectors:** See [Appendix § Test Vectors](appendix.md#test-vectors) for canonical examples.
 

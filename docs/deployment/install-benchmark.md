@@ -1,5 +1,11 @@
 # v0.0.2 Install Benchmark (H8)
 
+> **Historical.** Superseded by
+> [`install-smoke.yml`](../../.github/workflows/install-smoke.yml), which runs this 60-second
+> gate in CI: on Linux for every PR that touches the installer, and on Linux and macOS after
+> each release. `install.sh` now installs from GitHub Releases, not
+> `releases.jig.onl`.
+
 Acceptance gate: `curl -fsSL https://jig.onl/install.sh | bash` completes in
 under 60 seconds on a fresh Ubuntu 22.04 VM ($5/mo droplet class), landing
 the user in an interactive `jig chat #hello` session.

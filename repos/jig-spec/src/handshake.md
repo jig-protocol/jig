@@ -1,7 +1,7 @@
 # Handshake
 
-> **Not the v0.1 wire format.** The implemented handshake is the JEP-0002 subset:
-> client `hello`, server-signed `welcome` (version, capabilities, suite `none`,
+> **Not the wire format.** The implemented handshake is the JEP-0002 subset:
+> client `hello`, server-signed `welcome` (version, capabilities, suites `none` and `mls`,
 > reputation `null`). This chapter predates
 > [JEP-0002](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0002-handshake.md).
 > Where they differ, JEP-0002 is the direction. Encryption suites are specified in

@@ -39,8 +39,9 @@ loopback and private tailnets.
   `--encrypted` (and every DM) is one MLS group (RFC 9420): the server stores and relays
   ciphertext it cannot read, and validates every membership change without holding any
   group secret. Every *other* channel is signed, not encrypted — the server stores its
-  plaintext. Encrypted channels do not federate yet. Metadata (who, when, how much, who
-  joined) is visible to the server either way. See
+  plaintext. Restricted channels become always-MLS, with no opt-out, before the v0.2 tag
+  ([D25](docs/ROADMAP.md)). Encrypted channels do not federate yet. Metadata (who, when,
+  how much, who joined) is visible to the server either way. See
   [`docs/security/encryption.md`](docs/security/encryption.md).
 - **Authentication, authorization, admission and rate limits.** Every read
   carries a signed proof of possession of the caller's key, and `visibility = "restricted"`
@@ -192,7 +193,7 @@ and lives at the repo root.
 | [`jig-runtime`](repos/jig-runtime/) | Wasmtime-based Wasm runtime: deterministic execution, fuel metering, receipts |
 | [`bridges/core`](repos/bridges/core/) | Common `Bridge` trait and context types |
 | [`bridges/email`](repos/bridges/email/) | In-process email bridge (Resend provider) |
-| [`text-block`](repos/text-block/) | The canonical `text-render` Wasm block (`wasm32-wasip1`) |
+| [`text-block`](repos/text-block/) | The canonical `text-render` Wasm block (`wasm32-unknown-unknown`) |
 | [`hello-wasm`](repos/hello-wasm/) | Minimal WASI hello-world used for runtime measurements |
 | [`integration-tests`](repos/integration-tests/) | Cross-component scenario tests: federation, TOFU mismatch, nameserver modes, persistence across restart, email bridge, TLS, encrypted channels |
 
@@ -220,7 +221,7 @@ the default port is unreachable, so it fails against your own running server.
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs three jobs: `workspace`
 (fmt, clippy, nextest — scoped to the v0.0.2 crate surface, not the legacy crates),
-`wasm-build` (`text-block` for `wasm32-wasip1`), and `dependency-policy`
+`wasm-build` (`text-block` for `wasm32-unknown-unknown`), and `dependency-policy`
 (`cargo deny check` — advisories, bans, licenses, sources). Toolchain is
 `dtolnay/rust-toolchain@stable`.
 

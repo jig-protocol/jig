@@ -2,6 +2,16 @@
 
 **Audience:** This chapter is for **server operators** running federated Jig servers and **protocol implementers** building federation support. **End users** might care about how federation affects message delivery and privacy. **Developers** building federated applications will want to understand cross-server communication.
 
+> **Mostly not implemented.** The reference server federates by dialing the peers its
+> configuration lists, over TLS by default, and pins each peer's DID from the peer's signed
+> welcome. [Relayed Blocks](#relayed-blocks) is implemented: relayed blocks run every gate a
+> local block runs. Everything else here is design: DNS SRV discovery, the `.well-known`
+> document below (the real one is in [Transports](transports.md#server-certificates)),
+> mutual TLS, a signed federation envelope, retry backoff, per-peer quotas, receipt
+> exchange and peer reputation. Only open, unencrypted channels federate until the
+> federation data contract (D12) is specified. This chapter will be rewritten with that
+> contract.
+
 ---
 
 Federation is how Jig servers talk to each other. Without it, every server is an island—users on `server-a.example.com` can't talk to users on `server-b.example.com`. With federation, the network becomes interconnected like email: you choose your server, but you can still communicate with everyone.
@@ -90,7 +100,7 @@ Response:
 
 **Why `.well-known`:** So clients can discover a server's public key and federation endpoints without DNS (useful for IP-based servers or Tor hidden services).
 
-**For server operators:** Host this JSON at `/.well-known/jig` (HTTP, not HTTPS—it's public data anyway).
+**For server operators:** Host this JSON at `/.well-known/jig` (HTTP, not HTTPS—it's public data anyway). *(superseded: the implemented `/.well-known/jig` is served over TLS and carries the server's DID and `tls_binding`; a client's first fetch of it is the TLS probe in [Transports § Server Certificates](transports.md#server-certificates).)*
 
 ## Authentication
 

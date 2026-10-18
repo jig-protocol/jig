@@ -10,7 +10,7 @@ should not be read as a status page.
 | --- | --- |
 | Stand up a server on a box I already have | [`deploy/README.md`](../deploy/README.md) |
 | Get the box first, on GCP | [`docs/deployment/gcp-vps-runbook.md`](deployment/gcp-vps-runbook.md) |
-| Know what actually works today | the STATUS section of [`internal-dogfood-3day.md`](deployment/internal-dogfood-3day.md) |
+| Know what actually works today | [What works, what does not](../README.md#what-works-what-does-not) in the root README, and the [threat register](../repos/jig-spec/src/threat-register.md) for security status |
 | Know what is left before a public release | [`RELEASE_READINESS.md`](RELEASE_READINESS.md) |
 | See where the project is headed, phase by phase | [`ROADMAP.md`](ROADMAP.md) |
 | See end-to-end encryption work, on a throwaway server | [`scripts/demo-e2ee.sh`](../scripts/demo-e2ee.sh) |
@@ -24,7 +24,7 @@ should not be read as a status page.
 | [`deployment/gcp-vps-runbook.md`](deployment/gcp-vps-runbook.md) | CURRENT | GCP-specific box setup — machine sizing, the build-big-then-shrink recommendation, Tailscale-only reachability. Prices and build times in it are the author's estimates, unverified against the console. |
 | [`deployment/internal-dogfood-3day.md`](deployment/internal-dogfood-3day.md) | CURRENT | The internal-MVP plan. Opens with a STATUS section listing what shipped and where to check it; the plan body below that predates the implementation and is kept for its reasoning. |
 | [`deployment/internal-dogfood-24h.md`](deployment/internal-dogfood-24h.md) | HISTORICAL | Superseded by the 3-day plan. Retained for its verified state-of-the-union table, which was proven by running binaries rather than reading code. |
-| [`deployment/install-benchmark.md`](deployment/install-benchmark.md) | CURRENT | Manual procedure for the 60-second `curl \| bash` install acceptance gate. Not yet run: it needs `jig.onl` serving `install.sh` and release tarballs at `releases.jig.onl`, neither of which exists. |
+| [`deployment/install-benchmark.md`](deployment/install-benchmark.md) | HISTORICAL | Manual procedure for the 60-second `curl \| bash` install gate, written when releases were to be served from `releases.jig.onl`. Superseded by `install-smoke.yml`, which runs the same gate in CI against GitHub Releases. |
 | [`operations/nameserver-abuse-runbook.md`](operations/nameserver-abuse-runbook.md) | CURRENT | Nameserver incident runbooks: harassment reports, registration and relay abuse, a compromised nameserver, a rogue federated instance. Uses the shipped parameters and endpoints; tribunal steps are marked future. |
 
 ## Design and implementation records
