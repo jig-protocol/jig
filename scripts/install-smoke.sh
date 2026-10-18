@@ -15,10 +15,11 @@
 # Writes the measured seconds to $JIG_SMOKE_RESULT (if set) and, on GitHub
 # Actions, to the job summary.
 #
-# Identity keys (I1): on macOS the timed run uses the OS keychain, which is the
-# path a person gets. Elsewhere it seals the key with a random secret
+# Identity keys (I1): the timed run seals the key with a random secret
 # (JIG_KEY_UNLOCK), the sealed path without a prompt, and an untimed second
 # install with nothing to seal with checks install.sh's plaintext fallback.
+# The OS keychain is switched off (JIG_KEYCHAIN=none): HOME here is a fresh
+# directory, and on macOS that means no login keychain to write to.
 set -euo pipefail
 
 budget="${1:-60}"
@@ -49,11 +50,10 @@ export JIG_SERVER_LISTEN="127.0.0.1:$port"
 export JIG_NONINTERACTIVE=1
 export USER="${USER:-smoke}"
 mkdir -p "$HOME"
-if [ "$(uname -s)" != "Darwin" ]; then
-  JIG_SMOKE_KEY_SECRET="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
-  export JIG_SMOKE_KEY_SECRET
-  export JIG_KEY_UNLOCK="env:JIG_SMOKE_KEY_SECRET"
-fi
+JIG_SMOKE_KEY_SECRET="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+export JIG_SMOKE_KEY_SECRET
+export JIG_KEY_UNLOCK="env:JIG_SMOKE_KEY_SECRET"
+export JIG_KEYCHAIN=none
 
 cleanup() {
   for pidfile in "$sandbox"/home*/.jig/jig-server.pid; do
@@ -95,30 +95,27 @@ read_back "$sandbox/tail.out"
 echo "== re-running install.sh over the existing install"
 curl "${curl_args[@]}" "$JIG_INSTALL_SH_URL" | bash
 
-# Plaintext fallback (untimed, not on macOS, where the keychain seals): a fresh
-# install with no keychain, no terminal and nothing in the environment to seal
-# with must still reach hello-world, say loudly that the key is unencrypted, and
+# Plaintext fallback (untimed): a fresh install with no keychain, no terminal
+# and nothing in the environment to seal with must still reach hello-world, say loudly that the key is unencrypted, and
 # leave a key that jig reads with JIG_KEYS_STORAGE=plaintext.
-if [ "$(uname -s)" != "Darwin" ]; then
-  echo "== install with nothing to seal the key with (plaintext fallback)"
-  export HOME="$sandbox/home-plain"
-  export JIG_HOME="$HOME/.jig"
-  export JIG_SERVER_LISTEN="127.0.0.1:$(( port + 1 ))"
-  mkdir -p "$HOME"
-  unset JIG_KEY_UNLOCK JIG_SMOKE_KEY_SECRET
-  curl "${curl_args[@]}" "$JIG_INSTALL_SH_URL" | JIG_KEYCHAIN=none bash 2> "$sandbox/plain.err"
-  if ! grep -q "stored UNENCRYPTED" "$sandbox/plain.err"; then
-    echo "FAIL: the plaintext fallback did not warn. install.sh said:" >&2
-    cat "$sandbox/plain.err" >&2
-    exit 1
-  fi
-  export JIG_KEYS_STORAGE=plaintext
-  read_back "$sandbox/tail-plain.out"
-  unset JIG_KEYS_STORAGE
-  if ! grep -q "stored unencrypted" "$sandbox/tail-plain.out"; then
-    echo "FAIL: jig did not warn that it loaded an unencrypted key" >&2
-    exit 1
-  fi
+echo "== install with nothing to seal the key with (plaintext fallback)"
+export HOME="$sandbox/home-plain"
+export JIG_HOME="$HOME/.jig"
+export JIG_SERVER_LISTEN="127.0.0.1:$(( port + 1 ))"
+mkdir -p "$HOME"
+unset JIG_KEY_UNLOCK JIG_SMOKE_KEY_SECRET
+curl "${curl_args[@]}" "$JIG_INSTALL_SH_URL" | bash 2> "$sandbox/plain.err"
+if ! grep -q "stored UNENCRYPTED" "$sandbox/plain.err"; then
+  echo "FAIL: the plaintext fallback did not warn. install.sh said:" >&2
+  cat "$sandbox/plain.err" >&2
+  exit 1
+fi
+export JIG_KEYS_STORAGE=plaintext
+read_back "$sandbox/tail-plain.out"
+unset JIG_KEYS_STORAGE
+if ! grep -q "stored unencrypted" "$sandbox/tail-plain.out"; then
+  echo "FAIL: jig did not warn that it loaded an unencrypted key" >&2
+  exit 1
 fi
 
 [ -n "${JIG_SMOKE_RESULT:-}" ] && echo "$elapsed" > "$JIG_SMOKE_RESULT"
