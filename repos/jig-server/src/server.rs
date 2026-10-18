@@ -342,16 +342,21 @@ mod tests {
             let _ = serve_tls(listener, router, rustls_config).await;
         });
 
+        // Trust exactly the server's own certificate, by name, so the check
+        // stays on.
+        let root = reqwest::Certificate::from_pem(ck.cert.pem().as_bytes()).unwrap();
         let mut seen = Vec::new();
         for _ in 0..2 {
             // A fresh client per request, so each one is its own TLS session.
             let client = reqwest::Client::builder()
                 .use_rustls_tls()
-                .danger_accept_invalid_certs(true)
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(root.clone())
+                .resolve("localhost", bound)
                 .build()
                 .unwrap();
             let body = client
-                .get(format!("https://{bound}/exporter"))
+                .get(format!("https://localhost:{}/exporter", bound.port()))
                 .send()
                 .await
                 .expect("https request")
