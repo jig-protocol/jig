@@ -25,10 +25,10 @@ the WebAssembly Component Model. It defines:
 Hosts and clients run the same components under the same profile, so anyone holding a block
 and its inputs can re-execute it and check a receipt, on any architecture.
 
-**Draft status.** Every requirement below is proposed and awaits the maintainer's decisions on
-the open questions in the
-[design doc](../../../docs/superpowers/specs/2026-10-18-v0.3-block-abi-design.md), which holds
-the options and rationale. Nothing here is implemented.
+**Draft status.** The maintainer decided the design questions on 2026-10-18 (decisions A1–A8
+in the [design doc](../../../docs/superpowers/specs/2026-10-18-v0.3-block-abi-design.md), which
+holds the options and rationale). The JEP stays Draft until the reference implementation and test
+vectors exist. Nothing here is implemented yet.
 
 # Motivation
 
@@ -122,8 +122,9 @@ evidence of misbehaviour.
 
 ## Receipts
 
-A receipt is a JSON object, signed by its executor over the exact bytes (`canonical_hex` and
-`sig_hex`). Its fields:
+A receipt is a CBOR map with text keys, encoded under the core deterministic rules of RFC 8949
+§4.2.1. It is signed by its executor as a COSE_Sign1 object (RFC 9052) with an attached payload,
+algorithm EdDSA (`-8`, Ed25519) and `kid` set to the executor's DID. Its fields:
 
 - `v`: `"0.3"`.
 - `kind`: `exec`, `sealed` or `accepted`.
@@ -187,6 +188,9 @@ sources. The maintainer reviews every decision.
 
 - **A deterministic WASI 0.2 subset.** No standard profile exists; host WASI answers varied by
   OS in jig's own measurements; pure `wasm32-wasip2` builds import 14 interfaces.
+- **Receipts as signed JSON (`canonical_hex`).** Replaced by deterministic CBOR and COSE_Sign1
+  (decision A5): one canonical encoding for receipts and outcome hashes, and a standard signature
+  envelope.
 - **Comparing fuel.** Fuel is not portable across engines or versions (fuel-portability
   investigation).
 - **Host functions that perform effects mid-call** for v0.3. Their results can be attested but
