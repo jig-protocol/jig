@@ -131,10 +131,6 @@ pub struct ExecutionSection {
     pub memory_max_mb: u32,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
-    #[serde(default)]
-    pub pricing_enabled: bool,
-    #[serde(default)]
-    pub cost_per_fuel: Option<f64>,
     /// How many block executions may run at once.
     ///
     /// Sizes wasmtime's instance pool. Past it, execution does not queue inside
@@ -238,8 +234,6 @@ impl Default for ExecutionSection {
             memory_max_mb: default_memory_max_mb(),
             timeout_ms: default_timeout_ms(),
             max_concurrent_executions: default_max_concurrent_executions(),
-            pricing_enabled: false,
-            cost_per_fuel: None,
         }
     }
 }
@@ -295,8 +289,10 @@ impl ServerConfig {
             timeout_ms: self.execution.timeout_ms,
             max_concurrent_executions: self.execution.max_concurrent_executions,
             host_id: self.host_id.clone(),
-            pricing_enabled: self.execution.pricing_enabled,
-            cost_per_fuel: self.execution.cost_per_fuel,
+            // No operator setting: the v0.0.2 render path never prices
+            // executions (`v0_0_2::runtime_config_from` maps no pricing).
+            pricing_enabled: false,
+            cost_per_fuel: None,
         }
     }
 
