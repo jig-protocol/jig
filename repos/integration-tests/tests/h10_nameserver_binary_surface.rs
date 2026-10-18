@@ -176,11 +176,10 @@ async fn build_app_serves_the_v0_0_2_alias_lifecycle() {
     );
 }
 
-/// The merge must not cost the legacy surface: `/v1/health` is legacy-only and
-/// `POST /v1/challenge` is the legacy handler sharing a path with the v0.0.2
-/// GET. Both must still answer.
+/// `/v1/health` stays, and the legacy v0.0.1 `POST /v1/challenge` is gone:
+/// only the v0.0.2 GET answers on that path.
 #[tokio::test]
-async fn build_app_keeps_the_legacy_surface() {
+async fn build_app_serves_health_and_not_the_legacy_challenge() {
     let ns = BinarySurface::start(false).await.expect("start");
 
     let resp = ns
@@ -189,11 +188,7 @@ async fn build_app_keeps_the_legacy_surface() {
         .send()
         .await
         .expect("GET /v1/health");
-    assert_eq!(
-        resp.status(),
-        reqwest::StatusCode::OK,
-        "legacy health check"
-    );
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "health check");
 
     let resp = ns
         .client
@@ -207,14 +202,13 @@ async fn build_app_keeps_the_legacy_surface() {
         .send()
         .await
         .expect("POST /v1/challenge");
-    assert_ne!(
+    assert_eq!(
         resp.status(),
         reqwest::StatusCode::METHOD_NOT_ALLOWED,
-        "legacy POST /v1/challenge must survive merging with the v0.0.2 GET"
+        "legacy POST /v1/challenge is removed"
     );
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    // ...and the v0.0.2 GET is live on the same path in the same process.
+    // The v0.0.2 GET is live on the same path.
     let resp = ns
         .client
         .get(ns.url("/v1/challenge"))
