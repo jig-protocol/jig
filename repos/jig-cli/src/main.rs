@@ -460,8 +460,35 @@ enum ReceiptAction {
     },
 }
 
+/// Exit status when no key slot can seal a new identity key: no OS keychain,
+/// no terminal, and no `JIG_KEY_PASSPHRASE` or `JIG_KEY_UNLOCK`. `install.sh`
+/// matches it, not the message, to fall back to plaintext keys. 78 is
+/// `EX_CONFIG` in sysexits.h.
+const EXIT_NO_KEY_SLOT: u8 = 78;
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // The same report `fn main() -> anyhow::Result<()>` prints.
+            eprintln!("Error: {e:?}");
+            let no_slot = e.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<jig_client::IdentityError>(),
+                    Some(jig_client::IdentityError::NoWayToSeal { .. })
+                )
+            });
+            if no_slot {
+                std::process::ExitCode::from(EXIT_NO_KEY_SLOT)
+            } else {
+                std::process::ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // Lift the global flags out of `cli` FIRST. Everything below reads

@@ -142,3 +142,25 @@ fn init_refuses_to_clobber_existing_config_without_force() {
         "stderr should mention --force or existing config. got: {stderr}"
     );
 }
+
+/// With no keychain, no terminal and nothing in the environment to seal a key
+/// with, `jig init` refuses, with the exit status `install.sh` matches (78),
+/// and leaves no key behind.
+#[test]
+fn init_with_no_way_to_seal_exits_78_and_writes_no_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        .env("HOME", tmp.path())
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_NONINTERACTIVE", "1")
+        .env_remove("JIG_KEY_PASSPHRASE")
+        .env_remove("JIG_KEY_UNLOCK")
+        .env_remove("JIG_KEYS_STORAGE")
+        .args(["init", "tester"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(78), "{output:?}");
+    let keys = tmp.path().join(".jig/keys");
+    let left = std::fs::read_dir(&keys).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(left, 0, "no key file may be left behind");
+}

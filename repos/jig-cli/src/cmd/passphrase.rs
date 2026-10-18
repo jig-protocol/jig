@@ -58,7 +58,11 @@ struct TerminalPrompt;
 /// Whether a person can be asked. On Unix that is the controlling terminal,
 /// not stdin: `curl … | bash` runs `jig init` with stdin on the pipe and the
 /// person still at `/dev/tty`, which is where crossterm reads keys from.
+/// `JIG_NONINTERACTIVE=1` says never to ask, as it does for `install.sh`.
 fn terminal_available() -> bool {
+    if std::env::var_os("JIG_NONINTERACTIVE").is_some_and(|v| v == "1") {
+        return false;
+    }
     #[cfg(unix)]
     {
         std::fs::OpenOptions::new()

@@ -36,9 +36,76 @@ pub trait Keychain: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
-/// The keychain this platform offers, if any is usable right now.
+/// The keychain this platform offers, if any is usable right now. Every call
+/// is bounded by [`TIMEOUT`].
 pub fn system() -> Option<Box<dyn Keychain>> {
-    platform::system()
+    platform::system().map(|k| Box::new(Bounded::new(k, TIMEOUT)) as Box<dyn Keychain>)
+}
+
+/// How long one keychain call may take. A keychain can stop to ask a person
+/// (macOS asks again after the binary changes; a locked GNOME keyring asks for
+/// its password), and with nobody there that question never ends. Past this,
+/// the call counts as a keychain that is unavailable, and the key falls back
+/// to its other slots, or to a passphrase, as it does where there is no
+/// keychain at all.
+pub const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A keychain whose every call gives up after a deadline. The call runs on its
+/// own thread; one that never returns is abandoned there, and ends with the
+/// process.
+pub struct Bounded {
+    inner: std::sync::Arc<dyn Keychain>,
+    timeout: std::time::Duration,
+}
+
+impl Bounded {
+    pub fn new(inner: Box<dyn Keychain>, timeout: std::time::Duration) -> Self {
+        Self {
+            inner: inner.into(),
+            timeout,
+        }
+    }
+
+    fn call<T: Send + 'static>(
+        &self,
+        what: &'static str,
+        f: impl FnOnce(&dyn Keychain) -> Result<T, KeychainError> + Send + 'static,
+    ) -> Result<T, KeychainError> {
+        let inner = self.inner.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f(inner.as_ref()));
+        });
+        rx.recv_timeout(self.timeout).unwrap_or_else(|_| {
+            Err(KeychainError::Backend(format!(
+                "{} did not answer a {what} within {}s; is it waiting for a prompt?",
+                self.inner.name(),
+                self.timeout.as_secs()
+            )))
+        })
+    }
+}
+
+impl Keychain for Bounded {
+    fn get(&self, did: &str) -> Result<Option<Zeroizing<Vec<u8>>>, KeychainError> {
+        let did = did.to_string();
+        self.call("lookup", move |k| k.get(&did))
+    }
+
+    fn set(&self, did: &str, secret: &[u8]) -> Result<(), KeychainError> {
+        let did = did.to_string();
+        let secret = Zeroizing::new(secret.to_vec());
+        self.call("store", move |k| k.set(&did, &secret))
+    }
+
+    fn delete(&self, did: &str) -> Result<(), KeychainError> {
+        let did = did.to_string();
+        self.call("delete", move |k| k.delete(&did))
+    }
+
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
 }
 
 /// An in-memory keychain, for tests and for embedding callers that bring their
@@ -250,6 +317,43 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Stuck;
+    impl Keychain for Stuck {
+        fn get(&self, _: &str) -> Result<Option<Zeroizing<Vec<u8>>>, KeychainError> {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            Ok(None)
+        }
+        fn set(&self, _: &str, _: &[u8]) -> Result<(), KeychainError> {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            Ok(())
+        }
+        fn delete(&self, _: &str) -> Result<(), KeychainError> {
+            Ok(())
+        }
+        fn name(&self) -> &'static str {
+            "stuck keychain"
+        }
+    }
+
+    #[test]
+    fn a_keychain_waiting_on_a_prompt_times_out_instead_of_hanging() {
+        let k = Bounded::new(Box::new(Stuck), std::time::Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        assert!(k.get("did:jig:za").is_err());
+        assert!(k.set("did:jig:za", b"s").is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_bounded_keychain_passes_answers_through() {
+        let k = Bounded::new(
+            Box::new(MemoryKeychain::default()),
+            std::time::Duration::from_secs(5),
+        );
+        k.set("did:jig:za", b"one").unwrap();
+        assert_eq!(&*k.get("did:jig:za").unwrap().unwrap(), b"one");
+    }
 
     #[test]
     fn memory_keychain_files_replaces_and_deletes() {

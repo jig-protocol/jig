@@ -181,7 +181,6 @@ install_from_release() {
   tarball="${name}.tar.gz"
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/jig-install.XXXXXX")"
   INSTALL_TMP="$tmp"
-  trap on_exit EXIT
 
   if [ -z "$JIG_RELEASES_BASE" ]; then
     resolve_release "$tmp"
@@ -341,6 +340,9 @@ start_server_background() {
 # may have read, so nothing it started later inherits it.
 on_exit() {
   if [ -n "${INSTALL_TMP:-}" ]; then rm -rf "$INSTALL_TMP"; fi
+  # `read -s` turns echo back on when it returns, and bash restores it on
+  # Ctrl-C too; this covers any other way out of the prompt.
+  if [ "${INSTALL_PROMPTING:-0}" = "1" ]; then stty echo </dev/tty 2>/dev/null || true; fi
   forget_passphrase
 }
 
@@ -370,6 +372,10 @@ read_passphrase() {
   fi
   { : </dev/tty; } 2>/dev/null || return 0
   local first second
+  INSTALL_PROMPTING=1
+  # INT and TERM leave through `exit`, so the EXIT trap restores the terminal.
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   printf '[jig] No OS keychain here: choose a passphrase to seal your identity key.\n' >/dev/tty
   for _ in 1 2 3; do
     printf '[jig] passphrase: ' >/dev/tty
@@ -385,6 +391,8 @@ read_passphrase() {
     if [ "$first" = "$second" ]; then
       export JIG_KEY_PASSPHRASE="$first"
       INSTALL_READ_PASSPHRASE=1
+      INSTALL_PROMPTING=0
+      trap - INT TERM
       return 0
     fi
     printf '[jig] the two did not match\n' >/dev/tty
@@ -414,17 +422,19 @@ hello_world() {
   if [ ! -f "$HOME/.jig/cli.toml" ]; then
     read_passphrase
     log "generating your DID (nickname: $nickname)"
-    # The passphrase prompt, if any, is on /dev/tty, so capturing stderr here
-    # does not hide it.
-    if ! init_err="$("$jig" init "$nickname" 2>&1 >/dev/null)"; then
-      case "$init_err" in
-        *"no way to seal"*)
-          plaintext_keys
-          "$jig" init "$nickname" >/dev/null || die "jig init failed"
-          ;;
-        *) printf '%s\n' "$init_err" >&2; die "jig init failed" ;;
-      esac
-    fi
+    # Exit status 78: no key slot could seal the key (jig-cli's
+    # EXIT_NO_KEY_SLOT). The passphrase prompt, if any, is on /dev/tty, so
+    # capturing stderr does not hide it.
+    local rc=0
+    init_err="$("$jig" init "$nickname" 2>&1 >/dev/null)" || rc=$?
+    case "$rc" in
+      0) ;;
+      78)
+        plaintext_keys
+        "$jig" init "$nickname" >/dev/null || die "jig init failed"
+        ;;
+      *) printf '%s\n' "$init_err" >&2; die "jig init failed" ;;
+    esac
   else
     log "reusing identity in ~/.jig/cli.toml"
   fi
@@ -448,6 +458,7 @@ hello_world() {
 }
 
 main() {
+  trap on_exit EXIT
   log "installing jig into $JIG_HOME"
   case "$JIG_INSTALL_FROM" in
     release) install_from_release ;;
