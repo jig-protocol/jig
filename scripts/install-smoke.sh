@@ -24,7 +24,8 @@
 # JIG_SMOKE_KEYCHAIN=1 (macOS only) instead installs into the real HOME, so
 # the key is sealed in the login keychain, the path a Mac user gets. It fails
 # if the key ends up anywhere else, and removes ~/.jig and the keychain item
-# afterwards. It refuses to run if ~/.jig already exists. Once past that check
+# afterwards. It is untimed: the budget argument is ignored. It refuses to run
+# if ~/.jig already exists. Once past that check
 # it creates the file $JIG_SMOKE_KEYCHAIN_MARKER (if set), so a cleanup that
 # runs after a killed run knows ~/.jig was this run's.
 set -euo pipefail
@@ -174,11 +175,15 @@ if [ "$keychain" != 1 ]; then
   fi
 fi
 
-[ -n "${JIG_SMOKE_RESULT:-}" ] && echo "$elapsed" > "$JIG_SMOKE_RESULT"
-verdict=$(awk -v e="$elapsed" -v b="$budget" 'BEGIN { print (e <= b) ? "PASS" : "FAIL" }')
-mode=""
-[ "$keychain" = 1 ] && mode=" (login keychain)"
-line="install → hello-world${mode}: ${elapsed}s (budget ${budget}s) on $(uname -s)/$(uname -m): $verdict"
+# Keychain mode is untimed: it checks where the key went, not the 60s KPI.
+if [ "$keychain" = 1 ]; then
+  verdict=PASS
+  line="install → hello-world (login keychain, untimed): ${elapsed}s on $(uname -s)/$(uname -m): $verdict"
+else
+  [ -n "${JIG_SMOKE_RESULT:-}" ] && echo "$elapsed" > "$JIG_SMOKE_RESULT"
+  verdict=$(awk -v e="$elapsed" -v b="$budget" 'BEGIN { print (e <= b) ? "PASS" : "FAIL" }')
+  line="install → hello-world: ${elapsed}s (budget ${budget}s) on $(uname -s)/$(uname -m): $verdict"
+fi
 echo "== $line"
 [ -n "${GITHUB_STEP_SUMMARY:-}" ] && echo "- $line" >> "$GITHUB_STEP_SUMMARY"
 [ "$verdict" = "PASS" ]

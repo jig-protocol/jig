@@ -340,7 +340,7 @@ jobs:
           JIG_RELEASE_SIGNER: ${{ needs.sign.outputs.signer }}
           JIG_SMOKE_KEYCHAIN: '1'
           JIG_SMOKE_KEYCHAIN_MARKER: ${{ runner.temp }}/jig-keychain-smoke-owns-home
-        run: scripts/install-smoke.sh ${{ matrix.budget }}
+        run: scripts/install-smoke.sh
       # The script cleans up on exit; this covers a step killed by its timeout.
       # It runs only if that step got past its check that ~/.jig did not exist
       # (the marker file), and deletes only the items named by the DIDs in
