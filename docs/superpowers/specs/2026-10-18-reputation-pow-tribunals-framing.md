@@ -6,9 +6,10 @@ D15, D19–D23 and D26 in the [roadmap](../../ROADMAP.md#decisions-log), and lan
 [federation and naming design](2026-10-18-federation-naming-and-contract-design.md) (JEP-0004,
 JEP-0005).
 
-**Status: framing, research pass done, no DJ decisions yet.** Every "Recommended" below is lane
-R's proposal. Section 17 lists the questions for DJ in the order they will be asked. Nothing here
-is normative until it lands in `jig-spec` through an implementation PR.
+**Status: framing, research pass done, DJ's answers recorded (2026-10-18).** "Decided (DJ)" marks
+an answer; "Recommended" marks a lane R proposal DJ has not ruled on. Section 17 lists the
+questions and answers. Nothing here is normative until it lands in `jig-spec` through an
+implementation PR.
 
 Register families: AB (abuse and Sybil), NS (nameservers), GV (governance), TM (time), plus OP-10.
 
@@ -63,7 +64,7 @@ Sources are in Appendix A.
 
 ## 4. What proof-of-work is for
 
-**Recommended.** PoW in jig is a **price on a stranger's use of capacity, and an ordering of
+**Decided (DJ, Q1).** PoW in jig is a **price on a stranger's use of capacity, and an ordering of
 strangers under load**. It is never an identity price, never a Sybil defence and never a gate on
 its own (AB-02, AB-05).
 
@@ -122,7 +123,7 @@ and custodians. It extends the admission PoW rather than replacing it.
 | **B. Equi-X** (Tor) | Slower per attempt, fewer attempts | Small: designed to narrow it | Microseconds | Its HashX JIT-compiles per challenge; the interpreter fallback is slow on a potato and in Wasm | Proven at Tor's scale; narrows the GPU gap |
 | **C. Argon2id stamp** | Tunable by memory | Small | As slow as one solve, so verification is not cheap | Fine | Ruled out: verification must cost far less than solving, or the verifier is the one being attacked |
 
-**Recommended: A as `alg = 1` now, with algorithm agility in the digest and the ruleset.** B
+**Decided (DJ, Q5): A as `alg = 1` now, with algorithm agility in the digest and the ruleset.** B
 becomes `alg = 2` when a ruleset group shows it faces GPU-backed farming, after R1 measures the
 gap. Rationale: the attacker that matters is a botnet, against which B buys nothing (section 3),
 and B costs a JIT-shaped dependency on the platforms (potato, Wasm-hosted server) the product
@@ -159,8 +160,8 @@ admission does not make it cheaper, only earlier.
 
 ### 5.5 The stranger pool: what actually protects members
 
-**Recommended. This is the piece that makes identity farming harmless to members at a server,
-whatever it costs the attacker.**
+**Decided (DJ, Q3), with a 20 % reference share. This is the piece that makes identity farming
+harmless to members at a server, whatever it costs the attacker.**
 
 - A server partitions its ingest capacity (writes per second, subscriptions, handshakes) between
   **members**, subjects with standing at or above the ruleset's `established` level, and
@@ -168,6 +169,10 @@ whatever it costs the attacker.**
 - The stranger pool gets at most `stranger_share` of capacity (ruleset parameter; the reference
   default is 20 %). Members never compete with strangers for the rest.
 - Inside the stranger pool: per-DID and per-address buckets as today, then the PoW priority queue.
+- A third, **invited pool** (6.3) holds newcomers admitted on an invite until their accrual
+  matures. It is capped separately (`invited_share`), so a swarm of invitees cannot spill into the
+  member pool.
+- `--anon` keys are always strangers. They carry no reputation at all (6.1).
 - **Effect:** a flood of fresh identities, however cheaply minted, can consume only the stranger
   pool. Members are unaffected. Honest newcomers are slowed during an attack, which is the price,
   and invites (6.3) let a newcomer skip the queue on a member's budget.
@@ -249,7 +254,7 @@ three.
 | **B. On, static 20 bits** | Every new user pays, every GPU ignores it, potatoes and phones pay most. The 60-second KPI pays about a second |
 | **C. On, adaptive: `unknown_dids = "proof-of-work"` with the controller, effort zero when idle** | Free in normal operation; rises only under a stranger flood; meets D23 |
 
-**Recommended: C, switched on in R1 once the nameserver's binding endpoints also carry PoW**, so
+**Decided (DJ, Q4): C, switched on in R1 once the nameserver's binding endpoints also carry PoW**, so
 D26's condition (a) is met in code, not only on paper. A ruleset MAY set a non-zero floor; the
 reference ruleset does not.
 
@@ -273,14 +278,27 @@ all of these exist:
 
 ### 6.1 The target property
 
-D23 wants identity farming closed, not priced. Recommended definition, to agree with DJ (Q2):
+D23 wants identity farming closed, not priced. **Decided (DJ, Q2):**
 
 > **Standing is sublinear in compute.** The standing an attacker can hold under a ruleset is bounded
 > by quantities compute cannot multiply: elapsed time as observed by the group, and standing the
 > attacker already holds. No decision under a ruleset adds standing across identities.
 
 Hashing cannot buy standing at all under this rule. A botnet can mint unknown keys without limit,
-and unknown keys get only the stranger pool.
+and unknown keys get only the stranger pool. Aged-key trading, the one class that cannot be closed
+without linking keys to people, becomes a new register row, AB-07, Accepted, bounded (6.5).
+
+Two further rules from the same answer:
+
+- **`--anon` forecloses reputation.** A server that admits `--anon` keys (null-sec rules) cannot
+  learn anything about the holder and cannot assign the key reputation. It treats every such key
+  as **unknown** under every ruleset, for the whole session, and structures its policy for that.
+  The spec's "reputation lasts at most for the session" becomes "an `--anon` key has none".
+  Unknown, not zero: zero would mean evidence that nets out, and floors would apply to it.
+- **Person-binding is a rarity, never a protocol default.** A high-sec ruleset MAY bind
+  identities to persons, and MUST declare it in its ruleset document. The protocol never requires
+  it: taken far, it would end the holder's ability to discard a key and start fresh, which the
+  anonymity model depends on.
 
 ### 6.2 Time-gated accrual
 
@@ -293,23 +311,36 @@ and unknown keys get only the stranger pool.
 - Many cheap identities never sum: tribunals, report weighting and vouching weigh each identity by
   its own standing, and unknown identities weigh zero (GV-02).
 
-### 6.3 Invites: unlinkable, budgeted acceleration
+### 6.3 Invites: budgeted, contained, accountable on verdict
+
+**Decided (DJ, Q6 and its follow-up).** Invites are the default acceleration, and soul validation
+(6.4) is an opt-in a ruleset declares.
 
 - An established DID gets `invites_per_period` (ruleset) **rate-limited anonymous credentials**
-  from a group nameserver, ARC- or ACT-style. Presenting one at registration or admission puts the
-  newcomer in the member pool and starts its accrual at `invite_start` instead of zero.
-- The presentation is unlinkable to the inviter (Privacy Pass property), so inviting does not link
-  two DIDs (PV-03).
-- Bound: an attacker holding `k` established identities can invite at most `k × invites_per_period`
-  per period, and must have earned those `k` under 6.2 first. Growth is bounded by time and
-  existing standing, not compute.
-- Cost of unlinkability: an abusive invitee cannot be traced to its inviter, so loss cannot
-  propagate back. Budget is the only accountability. 6.4 is the linked alternative.
-- Dependency risk: ARC and ACT are drafts. R7 prototypes with a frozen draft version behind a
-  ruleset flag, or uses blind RSA (RFC 9474) tokens with one token per invite, which is a
-  standard today.
+  from a group nameserver, ARC- or ACT-style. Presenting one at registration or admission starts
+  the newcomer's accrual at `invite_start` instead of zero.
+- **Containment.** An invitee sits in the **invited pool** (5.5), capped separately, until its
+  accrual matures to `established`. A swarm of invitees cannot reach the member pool.
+- **Escrowed inviter tag.** At redemption the invitee carries the inviter's DID, verifiably
+  encrypted to the group's threshold key, which the tribunal seats hold. By default nobody can read
+  it, and the presentation stays unlinkable to the inviter. A tribunal verdict on invitees opens
+  the tag at the seat threshold. The inviter then takes the ruleset's inviter penalty and loses its
+  invite budget.
+- **Why not a nameserver that sees both parties** (DJ's first proposal): one nameserver would hold
+  the group's invite graph. That is a honeypot, and it breaks NS-03. The threshold tag gives the
+  same accountability with nobody holding the graph.
+- **The insider swarm** (DJ): an attacker waits out accrual on `k` identities, then invites the
+  rest of a swarm. It is bounded three ways: by `k × invites_per_period`, by the invited pool's
+  cap, and by the first verdict on the swarm, which opens the tags and burns the `k` inviters.
+- **`--anon` keys can neither invite nor be invited.**
+- **Cost: a PV-03 carve-out.** A protocol message now carries an encrypted link between two DIDs,
+  which only a verdict at the seat threshold can open. PV-03's wording changes to match (16).
+- **Crypto choices for R7.** ARC and ACT are drafts, so R7 starts on blind-RSA tokens (RFC 9474),
+  one token per invite. The verifiable-encryption and threshold-decryption scheme is open; R7
+  surveys it. It must let a verifier check that the tag encrypts a DID that holds an invite
+  budget, without learning which DID.
 
-### 6.4 Soul validation (linked vouching), opt-in per ruleset
+### 6.4 Soul validation (linked vouching), opt-in per ruleset (decided, Q6)
 
 The spec's proposal stays, scoped: a public, signed vouch that links two DIDs, boosts the
 vouchee's accrual and propagates losses back. It suits high-sec work groups whose members are
@@ -321,7 +352,7 @@ voucher's standing, are capped per voucher, and a ring member's loss propagates 
 
 - **Buying aged keys.** Standing attaches to a key, and keys can be sold. Bounded by the supply of
   established keys, and burnt by the first verdict. Not closable without linking key to person,
-  which D20 and PV-03 forbid. Proposed as **Accepted, bounded** (Q2).
+  which D20 and PV-03 forbid. **Accepted, bounded** as AB-07 (decided, Q2).
 - **A patient attacker** who behaves well for the accrual period on many identities. Bounded by
   6.2's per-subject cap and by observation: each identity must be observed by servers that report
   it, and the attacker's own servers' reports are capped (7.3).
@@ -369,9 +400,10 @@ group's log.
 
 ### 8.1 Encoding
 
-All of R's formats are records of named fields signed by a DID. **Recommended: follow lane A's A5,
-deterministic CBOR (RFC 8949 §4.2.1) signed with COSE_Sign1 (EdDSA, `kid` = signer DID), once DJ
-confirms A5 applies beyond receipts (Q9).** Reasons: these objects are nested (evidence bundles,
+All of R's formats are records of named fields signed by a DID. **Decided (DJ, Q9): lane A's A5
+extends to R. Every multi-field signed record of R's is deterministic CBOR (RFC 8949 §4.2.1)
+signed with COSE_Sign1 (EdDSA, `kid` = signer DID).** Labelled hashing stays for flat statements
+and for PoW digests. Reasons: these objects are nested (evidence bundles,
 reports inside log leaves), are verified by third parties in other ruleset groups, and need
 versioned optional fields. JEP-0004's labelled hashing suits flat statements; R's are not flat. The
 formats below are defined as field lists so either encoding can carry them.
@@ -389,8 +421,8 @@ code, count, evidence: [CID], ref?}], sig}`
 
 ### 8.3 Abuse report from an encrypted channel (AB-06, D22)
 
-**Recommended mechanism: per-message key disclosure, which is victim-key delegation scoped to one
-message.** In RFC 9420, each application message is encrypted under a key and nonce derived from
+**Decided (DJ, Q7): per-message key disclosure, which is victim-key delegation scoped to one
+message, and a report profile required of every suite.** In RFC 9420, each application message is encrypted under a key and nonce derived from
 the sender's secret-tree ratchet for that generation, and its sender data under a key derived from
 the epoch's sender-data secret and a sample of the ciphertext. Revealing those per-message values
 decrypts that message and nothing else: the ratchet secrets they come from are not revealed.
@@ -468,29 +500,52 @@ hashes, which has no inclusion or consistency proofs.
 
 ## 10. Tribunals (GV-01..03, D22)
 
-**Recommended shape (the spec's and whitepaper's, made concrete):**
+**Decided (DJ, Q8 and its follow-up): one seat per operator, and every seat is automated first.**
+Operators cannot watch around the clock or adjudicate full time, and a tribunal that waits for
+people cannot answer a concerted attack. So each seat runs a **seat agent**, and people handle
+confirmation and appeals.
 
 1. **Seats.** Each party to the group's data contract that runs nameservers holds **one seat per
    operator**, not per nameserver or per identity (GV-02). A new party joins by a threshold
    decision of existing parties. A party that runs several nameservers declares them under one
-   seat; undeclared common control, once shown, is itself sanctionable.
-2. **Cases** open automatically (penalty accumulation, fork or equivocation evidence) or by report
-   (8.2, 8.3). The subject is notified through its reachability record or custodian mailbox
-   (JEP-0004 rule 21) and gets a response window.
-3. **Panels** are drawn by verifiable randomness: seed = the hash of the group log checkpoint at
-   case opening plus the case id. Parties involved in the case are excluded. Size and
-   supermajority come from the ruleset (reference: 5 seats, 4 to sustain).
-4. **Verdicts** are signed by every panelist, cite evidence by CID, and are logged. A verdict
-   without evidence is void (spec).
-5. **Enforcement** is a net reputation change computed under the ruleset (7.3) and applied by the
+   seat; undeclared common control, once shown, is itself sanctionable. Each seat also holds a
+   share of the group's threshold key (6.3).
+2. **Cases** open automatically (penalty accumulation, fork or equivocation evidence, report
+   volume weighted by reporter standing) or by report (8.2, 8.3). The subject is notified through
+   its reachability record or custodian mailbox (JEP-0004 rule 21) and gets a response window.
+   Reports weigh by the reporter's standing; unknown reporters weigh zero, so a swarm of fresh
+   identities cannot open a case or tip one.
+3. **Two tracks.**
+
+   | Track | Cases | Who decides | How fast | What it may do |
+   | --- | --- | --- | --- | --- |
+   | **Evidence** | Machine-checkable: forks, equivocation, quota breaches, invalid proofs, flood stamps, signed contradictions | A deterministic rule, shipped by the ruleset as a signed **adjudication block** that every seat agent runs, with conformance vectors (D21: same maths everywhere) | Minutes: the verdict stands when a threshold of seat agents sign the same output | The ruleset's full penalty range |
+   | **Judgement** | Harassment and other content cases (8.3 reports) | Seat agents apply **provisional measures** automatically; a human panel confirms them | Measures in minutes; confirmation asynchronous | Only reversible, expiring measures within the ruleset's bounds: throttling, demotion to the stranger pool, suspending invites. They lapse unless people confirm them in the ruleset's window. They are never permanent |
+
+   A seat agent that signs a different output from the threshold is evidence against that seat.
+   Fully automated permanent verdicts on content were rejected: both swarm false reports and
+   classifier evasion can game them, and they turn mistakes into permanent bans.
+4. **Human panels** (judgement confirmations and appeals) are drawn by verifiable randomness:
+   the seed is the hash of the group log checkpoint at case opening plus the case id. Parties
+   involved in the case are excluded. Size and supermajority come from the ruleset (reference:
+   5 seats, 4 to sustain).
+5. **Verdicts** are signed by every seat agent or panelist that made them, cite evidence by CID,
+   and are logged. A verdict without evidence is void (spec).
+6. **Enforcement** is a net reputation change computed under the ruleset (7.3) and applied by the
    group's servers. Nothing binds outside the group. Other groups receive verdicts as information.
-6. **One appeal** to a disjoint panel. An appeal suspends nothing except listings (section 11).
-7. **Limits:** no path to unmask an `--anon` key; no penalty under a ruleset the subject did not
-   acknowledge (GV-03, R2); defederation of a server or nameserver needs a supermajority and
-   published evidence.
-8. **Residual (GV-02):** a patient party that gets several seats admitted by deceiving the
-   threshold. Bounded by the seat admission threshold and by exit: a captured group loses members
-   to groups that do not recognise it.
+7. **One appeal,** to a disjoint human panel, on either track. An appeal suspends nothing except
+   listings (section 11).
+8. **Limits:**
+   - there is no path to unmask an `--anon` key;
+   - no penalty under a ruleset the subject did not acknowledge (GV-03, R2);
+   - defederating a server or nameserver needs a supermajority and published evidence;
+   - opening an invite tag (6.3) needs a verdict at the seat threshold.
+9. **Residual (GV-02):** a patient party that deceives the admission threshold into granting it
+   several seats. Bounded by that threshold, and by exit: a captured group loses members to groups
+   that do not recognise it.
+10. **Dependency.** An adjudication block is deterministic code every seat runs. Until lane A's
+    v0.3 block ABI exists, the reference rule ships as native code pinned by the ruleset's version
+    and vectors. It moves to a block once JEP-0006 lands.
 
 ## 11. Server lists: who may list, evidence, appeals (F5)
 
@@ -544,7 +599,9 @@ The whitepaper's list (6.3), with R's answer and what remains.
 | Challenge replay and theft | AB-01 | Work bound to verifier, subject, action and binding (5.1); single-use challenges and spent sets (5.3) | None |
 | Vouching rings | — | Vouches and invites weigh by voucher standing, are capped and budgeted; ring losses propagate (6.3, 6.4) | A ring of patient, established identities; bounded by accrual caps |
 | Whitewashing after a penalty | — | A fresh key starts unknown, in the stranger pool, with time-gated accrual (6.2) | By design: leaving is always possible (whitepaper 7.1 obligation 3) |
-| Buying or renting aged keys | — | Burnt by the first verdict; invites budgeted | **Accepted, bounded** (6.5, Q2) |
+| Buying or renting aged keys | AB-07 (new) | Burnt by the first verdict; invites budgeted | **Accepted, bounded** (6.5, decided Q2) |
+| Insider swarm through invites | AB-05 | Invite budget, the capped invited pool, and escrowed inviter tags opened by verdict (6.3) | `k × invites_per_period` invitees per period, contained in the invited pool until the first verdict |
+| Swarm false reports | GV-02 | Reports weigh by reporter standing, unknowns weigh zero; content cases get only provisional measures (10) | Established reporters colluding; bounded by the provisional measures' expiry and human confirmation |
 | Fast-forwarded clocks | TM-01, TM-02 | Accrual and age on observers' clocks; witnessed log checkpoints as group time (9) | None at the group level; a single-server deployment trusts its own clock |
 | Colluding or equivocating nameservers | NS-02, NS-03 | Witnessed logs, thresholds on net changes and listings (7.3, 9) | Collusion above the threshold; bounded by operator-seat admission |
 | Panel capture | GV-01, GV-02 | One seat per operator; random panels; disjoint appeal; per-group scope (10) | A patient party admitted to several seats |
@@ -560,13 +617,13 @@ nameserver; the server and client lanes for theirs). R writes designs and JEPs o
 | Milestone | Ships in | Contents | Exit criterion | Depends on |
 | --- | --- | --- | --- | --- |
 | **R0: framing** | now | This document and its DJ answers | DJ has answered section 17 | F's checkpoint (met) |
-| **R1: PoW that anyone can solve** | v0.2.x | JEP for 5.1–5.7: one puzzle, three modes, linear effort, signed suggested effort, stranger pool at servers and nameservers, (target, requester) penalties, decay with memory. Nameserver register, rotate and renew carry challenge-mode PoW and rate limits. Admission PoW on by default, adaptive (5.9, if Q4 agrees). Phone, laptop, potato and GPU throughput measured and published | A third-party client solves every challenge from public information only, tested against vectors; a flood of fresh DIDs in an integration test leaves members' p99 latency within the ruleset's bound; D26's three conditions are met in code; the 60-second KPI still passes with PoW on | F1 (the register encoding is rewritten there first; R1's PoW rides on F1's challenge) |
-| **R2: rulesets declared and acknowledged** | v0.2.x / v0.3 | Ruleset document format and versioning; declaration in the signed welcome and manifest (L7's); the client's signed acknowledgement block | A client can show which ruleset a server applies before acting, and a penalty under an unacknowledged ruleset is refused in tests (GV-03) | L7's welcome and manifest; encoding (Q9) |
+| **R1: PoW that anyone can solve** | v0.2.x | JEP for 5.1–5.7: one puzzle, three modes, linear effort, signed suggested effort, stranger pool at servers and nameservers, (target, requester) penalties, decay with memory. Nameserver register, rotate and renew carry challenge-mode PoW and rate limits. Admission PoW on by default, adaptive (5.9, decided Q4). Phone, laptop, potato and GPU throughput measured and published | A third-party client solves every challenge from public information only, tested against vectors; a flood of fresh DIDs in an integration test leaves members' p99 latency within the ruleset's bound; D26's three conditions are met in code; the 60-second KPI still passes with PoW on | F1 (the register encoding is rewritten there first; R1's PoW rides on F1's challenge) |
+| **R2: rulesets declared and acknowledged** | v0.2.x / v0.3 | Ruleset document format and versioning; declaration in the signed welcome and manifest (L7's); the client's signed acknowledgement block | A client can show which ruleset a server applies before acting, and a penalty under an unacknowledged ruleset is refused in tests (GV-03) | L7's welcome and manifest |
 | **R3: reports and reputation maths** | v0.3 | Report format (8.2), the server's report chain as its log, event codes, the reference beta ruleset with conformance vectors, per-reporter caps; reputation becomes a protocol input (7.4); servers carry standing | Given a vector of reports, every implementation computes the same net score; one lying server moves a subject by at most its cap; OP-10 updated | R2 |
 | **R4: witnessed transparency logs** | v0.3 | C2SP tlog at nameservers and servers; witnessing within a group; subject commitments; attestation inclusion checked before pinning | A split view between two group members is refused by a client in tests; a removed entry is detected (NS-02) | R3; F3's group delegation |
 | **R5: abuse reports from encrypted channels** | v0.3 | MLS report profile (8.3); report envelope; tribunal intake; the suite-profile requirement in JEP-0001 | A test report proves one message's authorship to a third party holding nothing else, and the disclosed values decrypt no other message (AB-06) | F2 (`ingest` chain), lane S (suite profile) |
-| **R6: tribunals** | v0.3 | Seats, cases, random panels, verdicts, appeal, enforcement as net change | A case runs from report to logged verdict to applied penalty across two servers of one group; an appeal reaches a disjoint panel (GV-01..03) | R3, R4, R5 |
-| **R7: standing beyond linear cost** | v0.3 / v0.4 | Time-gated accrual, invite credentials, optional soul validation | A simulated farm of 10^5 identities with unlimited compute holds no member-pool standing after the accrual period except through budgeted invites (AB-05) | R3, R4 (group time), the invite-crypto choice (Q6) |
+| **R6: tribunals, automated first** | v0.3 | Operator seats and seat agents; the two tracks (10.3); the reference adjudication rule with conformance vectors (native first, as a block after JEP-0006); provisional measures with expiry; random human panels for confirmation and appeal; enforcement as net change | An evidence-track case (a fork) runs from detection to a threshold verdict to an applied penalty across two servers of one group within minutes, with no person involved. A provisional measure on a judgement case lapses when nobody confirms it. An appeal reaches a disjoint panel (GV-01..03) | R3, R4, R5; lane A for the block form |
+| **R7: standing beyond linear cost** | v0.3 / v0.4 | Time-gated accrual; invite credentials (blind-RSA first); the invited pool; escrowed inviter tags under the seats' threshold key; optional, declared soul validation and person-binding | A simulated farm of 10^5 identities with unlimited compute holds no member-pool standing after the accrual period. An insider swarm of `k` aged identities cannot place more than `k × invites_per_period` invitees, all inside the invited pool. A verdict opens their tags and burns the inviters (AB-05) | R3, R4 (group time), R6 (seats hold the threshold key), the verifiable-encryption scheme (6.3) |
 | **R8: server lists and open federation** | post-MVP | Section 11 on F5's format; `dial` stamps; stranger-server pool; per-peer quotas for strangers | An unlisted server can federate under a ruleset without operator configuration, and a flood of stranger servers leaves listed peers unaffected | R1, R3, R6, F2, F5 |
 | **R9: anchors and group lifecycle** | post-MVP | Defaults document, joining and leaving, anchor replacement, cross-registration with F3 | A group replaces its anchor by amendment with no loss of state | R4, F3 |
 
@@ -624,7 +681,15 @@ To land in R1's and R3's implementation PRs (framing lanes edit no existing file
 - AB-01: add "proof-of-work is bound to the verifier, subject, action and its binding".
 - NS-02: add witnessed checkpoints.
 - GV-02: "one seat per admitted operator".
-- A new row, **AB-07, aged-key trading**, status Accepted, bounded, if DJ agrees (Q2).
+- A new row, **AB-07, aged-key trading**, status Accepted, bounded (decided, Q2).
+- PV-03: "No protocol message links two DIDs in the clear. The one exception is an invite's
+  inviter tag, encrypted to a ruleset group's threshold key and opened only by a tribunal verdict
+  at the seat threshold (6.3)."
+- PV-03 and the `--anon` section of `identity-and-reputation.md`: "An `--anon` key has no
+  reputation. It is unknown under every ruleset for its whole session, and it can neither invite
+  nor be invited."
+- GV-01: automated-first seats; content cases get only provisional, expiring measures until
+  people confirm them.
 
 **JEP-0003 (Server Discovery), Specification section, "Reputation and PoW" row:** the stub stays a
 stub for discovery. Replace the row's question with pointers:
@@ -633,42 +698,54 @@ stub for discovery. Replace the row's question with pointers:
 > handshake's `reputation` field carries the server's own standing under its declared ruleset
 > (R3). Until R3 ships, reputation is not a security input (OP-10).
 
-and add a "Governance" pointer to R6 and R8 (server lists). Whether PoW and reputation get their
-own JEPs (recommended: one for PoW, one for rulesets and reputation, one for tribunals and
-reports) or grow inside JEP-0003 is Q10.
+and add a "Governance" pointer to R6 and R8 (server lists). **Decided (DJ, Q10): three new
+JEPs**, numbered when each opens (0006 and 0007 are taken):
+
+1. proof-of-work and admission (R1);
+2. rulesets and reputation (R2, R3, R7), with transparency logs (R4) unless F3's
+   group-delegation JEP takes them;
+3. reports, tribunals and server lists (R5, R6, R8).
 
 **JEP-0001:** every suite JEP defines a report profile (8.3); lane S owns the edit.
 
 **JEP-0005:** rule 15's "admission, proof-of-work and rate limits" gains a reference to R1's
 stranger pool; rule 14b's list gains R's issuer and evidence rules (section 11).
 
-## 17. Questions for DJ, in the order they will be asked
+## 17. Questions for DJ, and the answers (2026-10-18)
 
-1. **What PoW is for (4, 5.8).** Recommended: a price on strangers' capacity and an ordering under
-   load, never an identity price. Alternatives: PoW as the per-identity price (the current spec's
-   reading), or PoW only at nameservers.
-2. **What "closed in full" means for Sybils (6.1, 6.5).** Recommended: standing sublinear in
-   compute, with aged-key trading recorded as Accepted, bounded (a new AB-07). Alternative: hold
-   out for full closure, which needs linking keys to persons and contradicts D20.
-3. **The stranger pool (5.5).** Recommended: capacity partitioned by standing, 20 % for strangers
-   by default. Alternatives: no partition (PoW only), or a refusal floor for unknown keys
-   (contradicts "unknown is not low").
-4. **Admission PoW default (5.9).** Recommended: on, adaptive, zero when idle, from R1, after the
-   nameserver's binding endpoints carry PoW. Alternatives: keep off; on at a static 20 bits.
-5. **Puzzle algorithm (5.2).** Recommended: BLAKE3 hashcash with linear effort now, algorithm
-   agility, Equi-X later if R1's measurements justify it. Alternative: Equi-X from the start.
-6. **Invites (6.3, 6.4).** Recommended: unlinkable, budgeted invite credentials as the default
-   acceleration, with linked soul validation opt-in per ruleset. Alternatives: soul validation only
-   (links DIDs); no acceleration (newcomers wait out accrual).
-7. **Abuse reports (8.3).** Recommended: per-message key disclosure plus the MLS content signature,
-   and a report profile required of every suite. Alternative: disclose the plaintext and signature
-   only (simpler, but proves less: it does not prove the message was delivered in the channel).
-8. **Tribunal seats (10).** Recommended: one seat per admitted operator, random panels.
-   Alternatives: one seat per nameserver (Sybil-prone), user juries (later, needs R7 first).
-9. **Encoding (8.1).** Does A5's deterministic CBOR with COSE_Sign1 extend to R's signed objects?
-   Recommended: yes, so jig has one format for multi-field signed records.
-10. **JEP split (16).** Recommended: three JEPs (PoW; rulesets and reputation; tribunals and
-    reports), with JEP-0003 pointing at them.
+1. ~~What PoW is for (4, 5.8)~~ **Decided:** a price on strangers' capacity and an ordering under
+   load, Tor-style, never an identity price.
+2. ~~What "closed in full" means for Sybils (6.1, 6.5)~~ **Decided:** standing sublinear in
+   compute; aged-key trading is a new AB-07, Accepted, bounded. Added by DJ: `--anon` forecloses
+   reputation, so a server admitting it treats every such key as unknown; person-binding is an
+   optional high-sec ruleset mechanism, never a protocol default, because taken far it stops a
+   holder discarding a key.
+3. ~~The stranger pool (5.5)~~ **Decided:** capacity partitioned by standing, a 20 % reference
+   share for strangers.
+4. ~~Admission PoW default (5.9)~~ **Decided:** on, adaptive, zero when idle, from R1, after the
+   nameserver's binding endpoints carry PoW.
+5. ~~Puzzle algorithm (5.2)~~ **Decided:** BLAKE3 hashcash with linear effort, algorithm agility;
+   Equi-X only if R1's measurements justify it.
+6. ~~Invites (6.3, 6.4)~~ **Decided:** invites by default, soul validation opt-in. DJ raised the
+   insider swarm; the answer is the capped invited pool plus inviter tags encrypted to the
+   seats' threshold key and opened only by verdict, with a PV-03 carve-out. A nameserver that sees
+   both parties was considered and rejected: it would hold the group's invite graph (NS-03).
+7. ~~Abuse reports (8.3)~~ **Decided:** per-message key disclosure plus the MLS content
+   signature; every suite defines a report profile.
+8. ~~Tribunal seats (10)~~ **Decided:** one seat per admitted operator. Added by DJ: seats are
+   automated first, because tribunals must be fast enough to answer a concerted attack and
+   operators cannot adjudicate full time. This gives the two tracks in 10.3: deterministic
+   adjudication blocks with threshold verdicts, and only provisional, expiring measures for content
+   cases until people confirm them.
+9. ~~Encoding (8.1)~~ **Decided:** A5's deterministic CBOR with COSE_Sign1 for R's multi-field
+   signed records; labelled hashing stays for flat statements and PoW digests.
+10. ~~JEP split (16)~~ **Decided:** three JEPs; JEP-0003 points at them.
+
+Still open, for later milestones:
+
+- the verifiable-encryption and threshold scheme for inviter tags (R7);
+- whether openmls exposes per-message secrets (R5);
+- whether F3's JEP or R's second JEP takes transparency logs.
 
 The plain rate limit on the nameserver's `register`, `rotate` and `renew` is not a lane R question
 (it is with DJ separately). R's view, for that decision: a rate limit per address and per signed
