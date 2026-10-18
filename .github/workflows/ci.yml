@@ -3,7 +3,16 @@ name: CI
 on:
   push:
     branches: [ main ]
+  # The merge queue is the gate that cannot be skipped: every queued group runs
+  # the full suite on exactly the tree that lands on main.
+  merge_group:
+  # Pull requests run the expensive jobs only when they could matter (see the
+  # `changes` job): not on drafts, and not when only docs changed. Marking a
+  # draft ready (`ready_for_review`) runs them.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  # A full run on any branch, on demand (for example a draft that wants CI).
+  workflow_dispatch:
   # The RustSec advisory DB moves independently of this repo, so a brand-new
   # advisory against an untouched dependency would otherwise first surface as a
   # red build on whatever unrelated PR happens to run next (this has already
@@ -12,6 +21,12 @@ on:
   # NOTE: GitHub disables scheduled workflows after 60 days of repo inactivity.
   schedule:
     - cron: '17 7 * * *'  # daily 07:17 UTC; off-the-hour to dodge cron peak queueing
+
+# A new push to a pull request supersedes its running CI. Merge-queue groups,
+# main and scheduled runs are never cancelled.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # All cargo invocations expect to be run from the `repos/` workspace root.
 # The dependency-policy job is the exception — `deny.toml` lives at the repo root.
@@ -25,10 +40,54 @@ env:
   JIG_NS_SECRET: ci_dummy_jig_ns_secret_not_a_real_value
 
 jobs:
+  # Pull requests only: does this PR change anything a build could see? Docs
+  # (`*.md` anywhere, `docs/**`) and repo metadata do not; everything else does,
+  # including Cargo.lock, rust-toolchain.toml, deny.toml and workflows. Nothing
+  # in the workspace embeds a markdown file (no include_str! of one), so a
+  # docs-only PR cannot change what compiles.
+  #
+  # `workspace` and `wasm-build` are required checks. A job skipped by its
+  # `if:` reports success, which is what lets a docs-only PR merge; a job that
+  # never reports would block the merge forever. If this job fails, the
+  # dependent jobs run anyway (fail open to running, never to skipping).
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    defaults:
+      run:
+        working-directory: .
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename')
+          code=false
+          while IFS= read -r f; do
+            case "$f" in
+              '' | *.md | docs/* | LICENSE* | .github/ISSUE_TEMPLATE/* | .github/CODEOWNERS | .coderabbit.yaml) ;;
+              *) code=true; echo "code change: $f"; break ;;
+            esac
+          done <<< "$files"
+          echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+
   workspace:
     # The scheduled run exists only to re-check the advisory DB; skip the
-    # expensive build/test matrix on that trigger.
-    if: github.event_name != 'schedule'
+    # expensive build/test matrix on that trigger. On a pull request, run only
+    # when it is ready for review and touches code (see `changes`).
+    needs: changes
+    if: >-
+      ${{ !cancelled() && github.event_name != 'schedule' &&
+      (github.event_name != 'pull_request' ||
+       (!github.event.pull_request.draft &&
+        (needs.changes.result != 'success' || needs.changes.outputs.code == 'true'))) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -127,7 +186,13 @@ jobs:
 
   wasm-build:
     name: wasm-build (text-block, wasm32-unknown-unknown)
-    if: github.event_name != 'schedule'
+    # Same rule as `workspace`.
+    needs: changes
+    if: >-
+      ${{ !cancelled() && github.event_name != 'schedule' &&
+      (github.event_name != 'pull_request' ||
+       (!github.event.pull_request.draft &&
+        (needs.changes.result != 'success' || needs.changes.outputs.code == 'true'))) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

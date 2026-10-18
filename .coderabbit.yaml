@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit's free tier allows this repository about one review an hour, and
+# many lanes open pull requests at once (docs/superpowers/plans/). Spend each
+# review once per pull request, when it is ready, not on every push:
+#
+# - drafts are not reviewed;
+# - later pushes are not re-reviewed automatically.
+#
+# The free tier may skip automatic reviews on this repository altogether, so
+# ask for one with a `@coderabbitai review` comment when a PR is ready, and
+# again only when a round of fixes is worth a second look.
+#
+# Settings here override the organisation's CodeRabbit UI settings.
+language: en-US
+reviews:
+  profile: assertive
+  high_level_summary: true
+  poem: false
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: false
+    base_branches:
+      - main
+  path_filters:
+    - "!repos/Cargo.lock"
+    - "!**/*.wasm"
+chat:
+  auto_reply: true
