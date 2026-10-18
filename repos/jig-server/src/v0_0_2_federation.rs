@@ -176,10 +176,10 @@ async fn run_peer_loop(state: Arc<AppState>, peer: jig_config::v0_0_2_server::Fe
 
 /// Speak JEP-0002 as the dialer: hello, then require a signed welcome.
 ///
-/// A version or suite refusal is an error from this function so the reconnect
-/// loop can try again. The server side does not close on those codes; dropping
-/// the dialer's socket here ends the attempt. A missing or self-contradictory
-/// welcome is fail-closed: this sends a close frame before returning.
+/// Every outcome but a welcome is an error, so the reconnect loop tries again
+/// later. A signed refusal means the peer speaks none of the offer, and the
+/// peer closes. Anything else is a handshake failure: this sends a close
+/// frame (4001) before returning.
 ///
 /// `pinned_server_did` is the DID the peer must sign the welcome with: a
 /// configured peer's `expected_did`. Any other key fails closed.
@@ -214,14 +214,29 @@ where
             Ok(Some(Ok(_))) => anyhow::bail!("first frame is not a welcome"),
         }
     };
+    use jig_pipeline::handshake::{HandshakeResult, close};
+    let close_with = |code: u16| {
+        Message::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+            code: code.into(),
+            reason: "handshake failed".into(),
+        }))
+    };
     match pending.interpret(&text) {
-        jig_pipeline::handshake::HandshakeResult::Established(welcome) => Ok(welcome),
-        jig_pipeline::handshake::HandshakeResult::LeaveOpen { code, message } => {
-            anyhow::bail!("peer refused the handshake ({code}): {message}")
-        }
-        jig_pipeline::handshake::HandshakeResult::FailClosed { reason, .. } => {
-            let _ = ws.send(Message::Close(None)).await;
+        HandshakeResult::Established(welcome) => Ok(welcome),
+        HandshakeResult::Incompatible(refusal) => anyhow::bail!(
+            "peer speaks none of this offer ({}): {}; it speaks versions {:?}, suites {:?}",
+            refusal.code,
+            refusal.message,
+            refusal.versions,
+            refusal.suites
+        ),
+        HandshakeResult::FailClosed { reason, .. } => {
+            let _ = ws.send(close_with(close::HANDSHAKE_FAILED)).await;
             anyhow::bail!("handshake failed closed: {reason}")
+        }
+        HandshakeResult::Contradiction { reason, .. } => {
+            let _ = ws.send(close_with(close::CONTRADICTION)).await;
+            anyhow::bail!("peer contradicted what it signed: {reason}")
         }
     }
 }
@@ -1180,6 +1195,19 @@ mod tests {
         let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
         config.auth.admission.banned_dids = vec![banned_did];
         let state = Arc::new(AppState::for_test_with_config(config).unwrap());
+        // A relayed post needs a channel this server holds.
+        state
+            .ingest_ctx
+            .store
+            .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                id: "bafyRemote".into(),
+                slug: "#remote".into(),
+                visibility: "open".into(),
+                created_at: 0,
+                owner_did: "did:jig:zOwner".into(),
+                suite: "none".into(),
+            })
+            .unwrap();
 
         let (bundle_bytes, bundle_b64, sig_b64) = relayed(
             &banned,
