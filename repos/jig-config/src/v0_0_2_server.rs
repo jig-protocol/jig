@@ -54,7 +54,16 @@ pub struct ServerSection {
     pub listen: String,
     pub server_did_keyfile: String,
     pub allowed_block_kinds: Vec<String>,
+    /// How far ahead of this server's clock a block's `hlc_ts` may run, in
+    /// milliseconds (JEP-0002 rule 13). Ingest refuses anything further with
+    /// `CLOCK_SKEW`, and the welcome signs the value. The protocol bounds it
+    /// to 30 000–900 000 (`jig_pipeline::handshake`); the server refuses to
+    /// boot outside that range.
+    pub max_future_skew_ms: u64,
 }
+
+/// The default `[server] max_future_skew_ms`: five minutes.
+pub const DEFAULT_MAX_FUTURE_SKEW_MS: u64 = 300_000;
 
 impl Default for ServerSection {
     fn default() -> Self {
@@ -78,6 +87,7 @@ impl Default for ServerSection {
                 "channel-promote".to_string(),
                 "channel-archive".to_string(),
             ],
+            max_future_skew_ms: DEFAULT_MAX_FUTURE_SKEW_MS,
         }
     }
 }
@@ -318,7 +328,6 @@ pub struct FederationPeer {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct DebugSection {
-    pub admin_endpoints: bool,
     pub list_handles: bool,
 }
 
@@ -445,13 +454,11 @@ impl JigServerConfig {
     }
 
     /// List of active antipattern flags. Returned by `GET /.well-known/jig`
-    /// so federated peers can detect a misconfigured node. ALWAYS includes
-    /// `naively_unbounded_clock_skew` in v0.0.2 (no time-attestation servers exist yet).
+    /// so federated peers can detect a misconfigured node. A block's clock is
+    /// bounded by `[server] max_future_skew_ms`, so there is no unbounded
+    /// clock-skew flag any more.
     pub fn unsafe_options_active(&self) -> Vec<String> {
-        let mut active = vec!["naively_unbounded_clock_skew".to_string()];
-        if self.debug.admin_endpoints {
-            active.push("debug.admin_endpoints".to_string());
-        }
+        let mut active = Vec::new();
         if self.federation.dangerously_disable_federation_tls {
             active.push("federation.dangerously_disable_federation_tls".to_string());
         }
@@ -689,25 +696,32 @@ mod tests {
         let cfg = JigServerConfig::default();
         assert!(!cfg.federation.dangerously_disable_federation_tls);
         assert!(!cfg.federation.dangerously_allow_plaintext_federation);
-        assert!(!cfg.debug.admin_endpoints);
         assert!(!cfg.identity.naively_allow_unknown_handles_fallback);
         assert!(!cfg.debug.list_handles);
     }
 
     #[test]
-    fn unsafe_options_always_lists_unbounded_clock_skew() {
+    fn a_default_install_advertises_no_unsafe_option() {
         let cfg = JigServerConfig::default();
-        let active = cfg.unsafe_options_active();
-        assert!(
-            active.contains(&"naively_unbounded_clock_skew".to_string()),
-            "v0.0.2 default install must always advertise naively_unbounded_clock_skew"
+        assert_eq!(cfg.unsafe_options_active(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_skew_bound_defaults_when_omitted_and_parses_when_set() {
+        let omitted: JigServerConfig =
+            toml::from_str("[server]\nlisten = \"0.0.0.0:443\"\n").unwrap();
+        assert_eq!(
+            omitted.server.max_future_skew_ms,
+            DEFAULT_MAX_FUTURE_SKEW_MS
         );
+        let set: JigServerConfig =
+            toml::from_str("[server]\nmax_future_skew_ms = 60000\n").unwrap();
+        assert_eq!(set.server.max_future_skew_ms, 60_000);
     }
 
     #[test]
     fn unsafe_options_active_lists_enabled_antipatterns() {
         let mut cfg = JigServerConfig::default();
-        cfg.debug.admin_endpoints = true;
         cfg.federation.dangerously_disable_federation_tls = true;
         cfg.federation.dangerously_allow_plaintext_federation = true;
         cfg.identity.naively_allow_unknown_handles_fallback = true;
@@ -715,12 +729,11 @@ mod tests {
         cfg.auth.require_authenticated_reads = false;
         let active = cfg.unsafe_options_active();
         assert!(active.contains(&"auth.require_authenticated_reads=false".to_string()));
-        assert!(active.contains(&"debug.admin_endpoints".to_string()));
         assert!(active.contains(&"federation.dangerously_disable_federation_tls".to_string()));
         assert!(active.contains(&"federation.dangerously_allow_plaintext_federation".to_string()));
         assert!(active.contains(&"identity.naively_allow_unknown_handles_fallback".to_string()));
         assert!(active.contains(&"debug.list_handles".to_string()));
-        assert!(active.contains(&"naively_unbounded_clock_skew".to_string()));
+        assert!(!active.contains(&"naively_unbounded_clock_skew".to_string()));
     }
 
     #[test]
@@ -746,7 +759,6 @@ mod tests {
             alias = "deji.jig"
 
             [debug]
-            admin_endpoints = true
             list_handles = false
         "#;
         let cfg: JigServerConfig = toml::from_str(toml_input).unwrap();
@@ -755,7 +767,7 @@ mod tests {
         assert_eq!(cfg.identity.trusted_nameservers, vec!["https://ns.jig.onl"]);
         assert_eq!(cfg.federation.peers.len(), 1);
         assert_eq!(cfg.federation.peers[0].alias.as_deref(), Some("deji.jig"));
-        assert!(cfg.debug.admin_endpoints);
+        assert!(!cfg.debug.list_handles);
     }
 
     #[test]
@@ -770,7 +782,7 @@ mod tests {
         let cfg: JigServerConfig = toml::from_str(toml_input).unwrap();
         assert_eq!(cfg.identity.mode, IdentityMode::Tofu);
         assert!(cfg.federation.peers.is_empty());
-        assert!(!cfg.debug.admin_endpoints);
+        assert!(!cfg.debug.list_handles);
     }
 
     // --- partial-section defaults -------------------------------------
@@ -814,12 +826,31 @@ mod tests {
         let cfg: JigServerConfig = toml::from_str(
             r#"
             [debug]
-            admin_endpoints = true
+            list_handles = true
         "#,
         )
         .expect("partial [debug] must deserialize");
-        assert!(cfg.debug.admin_endpoints);
+        assert!(cfg.debug.list_handles);
+    }
+
+    /// `[debug] admin_endpoints` is gone, but configs written by older
+    /// install.sh runs still carry it. Until removed keys are rejected with
+    /// a named error, it must keep parsing, and must not show up as active.
+    #[test]
+    fn removed_admin_endpoints_key_still_parses() {
+        let cfg: JigServerConfig = toml::from_str(
+            r#"
+            [debug]
+            admin_endpoints = true
+        "#,
+        )
+        .expect("a config with the removed key must still deserialize");
         assert!(!cfg.debug.list_handles);
+        assert!(
+            !cfg.unsafe_options_active()
+                .iter()
+                .any(|o| o.contains("admin_endpoints"))
+        );
     }
 
     #[test]

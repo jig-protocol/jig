@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use jig_pipeline::envelope::{Envelope, Frame, HlcCursor, ReceiptRef, Scope, SubscribeAuth};
+use jig_pipeline::envelope::{
+    Envelope, EnvelopeParseError, Frame, HlcCursor, ReceiptRef, Scope, SubscribeAuth,
+};
 use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
@@ -38,16 +40,24 @@ pub enum ClientError {
     #[error("submit ack timed out after {0}s")]
     AckTimeout(u64),
     /// The welcome was missing, malformed, or contradicted itself. The socket
-    /// is closed and nothing further was sent.
+    /// is closed (4001) and nothing further was sent.
     #[error("handshake failed closed: {reason}")]
     HandshakeFailed {
         reason: String,
         /// The frame that failed, when one arrived.
         evidence: Option<String>,
     },
-    /// The server refused the version or suite and left the socket open.
-    #[error("handshake refused ({code}): {message}")]
-    HandshakeRefused { code: String, message: String },
+    /// The server signed that it speaks none of the versions or suites this
+    /// client offered, and closed the connection (4002).
+    #[error(
+        "the server speaks none of what this client offered ({}): {}; it speaks versions {:?} and suites {:?}",
+        .0.code, .0.message, .0.versions, .0.suites
+    )]
+    Incompatible(Box<jig_pipeline::handshake::VerifiedRefusal>),
+    /// The server contradicted its signed welcome, or a signed refusal
+    /// contradicted what this device pinned. The socket is closed (4003).
+    #[error("the server contradicted what it signed: {}", .0.reason)]
+    Contradiction(Contradiction),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -72,16 +82,21 @@ pub struct Client {
     server_url: String,
     submit_ack_timeout_seconds: u64,
     welcome: Option<jig_pipeline::handshake::VerifiedWelcome>,
-    /// Set when the server refused the offered version or suite. The socket
-    /// is still open; application frames are not sent.
-    refusal: Option<HandshakeRefusal>,
+    /// Set once the server contradicts its welcome. The connection is then
+    /// closed, and every later call returns it.
+    contradiction: Arc<StdMutex<Option<Contradiction>>>,
 }
 
-/// A version or suite refusal that did not close the socket.
+/// The server contradicted something it signed (JEP-0002 rule 8).
+///
+/// `evidence` holds the frames as received: the signed welcome or refusal
+/// first, then what contradicts it. Every item that proves the contradiction
+/// is signed by the server, so it can be checked without trusting this
+/// client.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HandshakeRefusal {
-    pub code: String,
-    pub message: String,
+pub struct Contradiction {
+    pub reason: String,
+    pub evidence: Vec<String>,
 }
 
 /// Per-channel delivery senders, keyed by channel slug.
@@ -179,8 +194,9 @@ impl Client {
     }
 
     /// [`Client::connect`] with an explicit offer. A pinned server DID that
-    /// does not match the welcome fails closed. A version or suite the server
-    /// refuses leaves the socket open; [`Client::handshake_refusal`] reports it.
+    /// does not match the welcome fails closed. A server that speaks none of
+    /// the offer answers with a signed refusal and closes
+    /// ([`ClientError::Incompatible`]).
     pub async fn connect_with(
         server_url: &str,
         identity: Identity,
@@ -226,13 +242,26 @@ impl Client {
         .map_err(|e| ClientError::Connect(e.to_string()))?;
         let (mut sink, mut stream) = ws.split();
 
-        let (welcome, refusal) = match drive_handshake(&mut sink, &mut stream, &offer).await {
-            Ok(outcome) => outcome,
+        let welcome = match drive_handshake(&mut sink, &mut stream, &offer).await {
+            Ok(welcome) => welcome,
             Err(err) => {
+                use jig_pipeline::handshake::close;
+                let code = match &err {
+                    ClientError::Contradiction(_) => Some(close::CONTRADICTION),
+                    // The server closes after its refusal.
+                    ClientError::Incompatible(_) => None,
+                    _ => Some(close::HANDSHAKE_FAILED),
+                };
+                if let Some(code) = code {
+                    let _ = sink.send(close_frame(code, "handshake failed")).await;
+                }
                 let _ = sink.close().await;
                 return Err(err);
             }
         };
+        let welcome_did = welcome.server_did.clone();
+        let welcome_text = welcome.evidence.clone();
+        let contradiction: Arc<StdMutex<Option<Contradiction>>> = Arc::new(StdMutex::new(None));
 
         let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Message>();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<Frame>();
@@ -258,17 +287,49 @@ impl Client {
         let pending_subs_for_reader = pending_subscriptions.clone();
         let cursors_for_reader = last_cursors.clone();
         let closed_for_reader = closed.clone();
+        let contradiction_for_reader = contradiction.clone();
+        let write_tx_for_reader = write_tx.clone();
         tokio::spawn(async move {
             let _cleanup = ReaderCleanup {
                 pending_subscriptions: pending_subs_for_reader.clone(),
                 closed: closed_for_reader,
             };
+            let contradict = |reason: String, frame: &str| {
+                contradicted(
+                    &contradiction_for_reader,
+                    &write_tx_for_reader,
+                    reason,
+                    vec![welcome_text.clone(), frame.to_string()],
+                );
+            };
             while let Some(Ok(msg)) = stream.next().await {
                 if let Message::Text(text) = msg {
-                    let Ok(env) = serde_json::from_str::<Envelope>(&text) else {
-                        continue;
+                    // Every frame is checked against the signed welcome
+                    // (JEP-0002 rule 8): one at a version or suite it did not
+                    // advertise ends the connection. One that does not parse
+                    // at all is noise, not evidence.
+                    let env = match Envelope::parse(&text) {
+                        Ok(env) => env,
+                        Err(EnvelopeParseError::Gate(gate)) => {
+                            contradict(
+                                format!("a frame outside the signed welcome: {gate}"),
+                                &text,
+                            );
+                            break;
+                        }
+                        Err(EnvelopeParseError::Malformed(e)) => {
+                            tracing::debug!("ignoring a frame that does not parse: {e}");
+                            continue;
+                        }
                     };
                     match env.frame {
+                        Frame::Welcome { .. } | Frame::Refusal { .. } => {
+                            contradict(
+                                "a second handshake answer on one connection".to_string(),
+                                &text,
+                            );
+                            break;
+                        }
                         Frame::Block {
                             bundle_b64,
                             sig_b64,
@@ -276,6 +337,21 @@ impl Client {
                             delivery_cid,
                             ..
                         } => {
+                            // This server's receipts name the key that signed
+                            // its welcome; a relayed block arrives with the
+                            // receipt this server produced for it.
+                            if let Some(other) = receipts.iter().find(|r| {
+                                !jig_pipeline::handshake::same_did(&r.server_did, &welcome_did)
+                            }) {
+                                contradict(
+                                    format!(
+                                        "a receipt names {}, not the server that signed the welcome",
+                                        other.server_did
+                                    ),
+                                    &text,
+                                );
+                                break;
+                            }
                             // Track HLC cursor from receipts (best-effort —
                             // receipts may carry render_hash but not HLC; the
                             // bundle_b64 contains the manifest with hlc_ts).
@@ -329,8 +405,8 @@ impl Client {
             closed,
             server_url: server_url.to_string(),
             submit_ack_timeout_seconds: 5,
-            welcome,
-            refusal,
+            welcome: Some(welcome),
+            contradiction,
         })
     }
 
@@ -339,20 +415,18 @@ impl Client {
         self.welcome.as_ref()
     }
 
-    /// Set when the server refused the version or suite without closing.
-    pub fn handshake_refusal(&self) -> Option<&HandshakeRefusal> {
-        self.refusal.as_ref()
+    /// Set once the server has contradicted its signed welcome. The
+    /// connection is closed from then on.
+    pub fn contradiction(&self) -> Option<Contradiction> {
+        lock_contradiction(&self.contradiction).clone()
     }
 
     fn require_welcome(&self) -> Result<(), ClientError> {
+        if let Some(contradiction) = self.contradiction() {
+            return Err(ClientError::Contradiction(contradiction));
+        }
         if self.closed.load(Ordering::SeqCst) {
             return Err(ClientError::ConnectionClosed);
-        }
-        if let Some(refusal) = &self.refusal {
-            return Err(ClientError::HandshakeRefused {
-                code: refusal.code.clone(),
-                message: refusal.message.clone(),
-            });
         }
         if self.welcome.is_none() {
             return Err(ClientError::HandshakeFailed {
@@ -467,11 +541,45 @@ impl Client {
                 .await
                 .map_err(|_| ClientError::AckTimeout(self.submit_ack_timeout_seconds))?;
             let Some(frame) = received else {
-                return Err(ClientError::ConnectionClosed);
+                return Err(self
+                    .contradiction()
+                    .map_or(ClientError::ConnectionClosed, ClientError::Contradiction));
             };
             match frame {
                 Frame::Ack { block_cid } => return Ok(block_cid),
                 Frame::Error { code, message, .. } => {
+                    // Refusing a kind the welcome advertised contradicts it.
+                    if code == DISALLOWED_BLOCK_KIND
+                        && let Some(kind) = block_kind(&block)
+                        && self
+                            .welcome
+                            .as_ref()
+                            .is_some_and(|w| w.capabilities.block_kinds.contains(&kind))
+                    {
+                        let error = Envelope::new(Frame::Error {
+                            status: None,
+                            code: code.clone(),
+                            ref_cid: None,
+                            message: message.clone(),
+                        });
+                        contradicted(
+                            &self.contradiction,
+                            &self.write_tx,
+                            format!(
+                                "the server refused `{kind}`, a block kind its welcome advertises"
+                            ),
+                            vec![
+                                self.welcome
+                                    .as_ref()
+                                    .map(|w| w.evidence.clone())
+                                    .unwrap_or_default(),
+                                serde_json::to_string(&error)?,
+                            ],
+                        );
+                        return Err(ClientError::Contradiction(
+                            self.contradiction().expect("just recorded"),
+                        ));
+                    }
                     return Err(ClientError::ServerError { code, message });
                 }
                 // Ignore other non-Block frames while waiting for ack;
@@ -499,9 +607,52 @@ impl Client {
     }
 }
 
-/// Send hello and read the first frame. `Err` means fail closed: the caller
-/// closes the socket and sends nothing else. `Ok` is either a verified welcome
-/// or a version/suite refusal, and in both of those the socket stays open.
+/// The code a server refuses a disallowed block kind with.
+const DISALLOWED_BLOCK_KIND: &str = "DISALLOWED_BLOCK_KIND";
+
+/// The kind `block` declares, as the welcome names kinds.
+fn block_kind(block: &BuiltBlock) -> Option<String> {
+    let manifest: jig_core::BlockManifest = serde_json::from_slice(&block.manifest_bytes).ok()?;
+    manifest.kind.map(|kind| kind.as_str().to_string())
+}
+
+fn lock_contradiction(
+    slot: &StdMutex<Option<Contradiction>>,
+) -> MutexGuard<'_, Option<Contradiction>> {
+    slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Record the first contradiction and close the connection with
+/// [`jig_pipeline::handshake::close::CONTRADICTION`]. A later one is dropped:
+/// the connection is already ending.
+fn contradicted(
+    slot: &StdMutex<Option<Contradiction>>,
+    write_tx: &mpsc::UnboundedSender<Message>,
+    reason: String,
+    evidence: Vec<String>,
+) {
+    let mut guard = lock_contradiction(slot);
+    if guard.is_some() {
+        return;
+    }
+    tracing::warn!("closing: the server contradicted what it signed: {reason}");
+    *guard = Some(Contradiction { reason, evidence });
+    let _ = write_tx.send(close_frame(
+        jig_pipeline::handshake::close::CONTRADICTION,
+        "contradiction",
+    ));
+}
+
+fn close_frame(code: u16, reason: &str) -> Message {
+    use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+    Message::Close(Some(CloseFrame {
+        code: CloseCode::from(code),
+        reason: reason.into(),
+    }))
+}
+
+/// Send hello and read the first frame. `Err` means the handshake did not
+/// establish: the caller closes with the code the error's class names.
 async fn drive_handshake(
     sink: &mut (impl futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
     stream: &mut (
@@ -509,13 +660,7 @@ async fn drive_handshake(
              + Unpin
          ),
     offer: &jig_pipeline::handshake::ClientOffer,
-) -> Result<
-    (
-        Option<jig_pipeline::handshake::VerifiedWelcome>,
-        Option<HandshakeRefusal>,
-    ),
-    ClientError,
-> {
+) -> Result<jig_pipeline::handshake::VerifiedWelcome, ClientError> {
     use futures_util::SinkExt;
 
     let (hello, pending) = jig_pipeline::handshake::begin(offer);
@@ -549,15 +694,20 @@ async fn drive_handshake(
         };
         match message {
             Message::Text(text) => {
+                use jig_pipeline::handshake::HandshakeResult;
                 return match pending.interpret(&text) {
-                    jig_pipeline::handshake::HandshakeResult::Established(welcome) => {
-                        Ok((Some(welcome), None))
+                    HandshakeResult::Established(welcome) => Ok(welcome),
+                    HandshakeResult::Incompatible(refusal) => {
+                        Err(ClientError::Incompatible(Box::new(refusal)))
                     }
-                    jig_pipeline::handshake::HandshakeResult::LeaveOpen { code, message } => {
-                        Ok((None, Some(HandshakeRefusal { code, message })))
-                    }
-                    jig_pipeline::handshake::HandshakeResult::FailClosed { reason, evidence } => {
+                    HandshakeResult::FailClosed { reason, evidence } => {
                         Err(ClientError::HandshakeFailed { reason, evidence })
+                    }
+                    HandshakeResult::Contradiction { reason, evidence } => {
+                        Err(ClientError::Contradiction(Contradiction {
+                            reason,
+                            evidence: vec![evidence],
+                        }))
                     }
                 };
             }
@@ -620,18 +770,72 @@ mod tests {
                     block_kinds: vec!["text-render".to_string()],
                     execution: true,
                     federation: false,
+                    ..Default::default()
                 },
             },
         ) {
             Ok(statement) => jig_pipeline::handshake::seal(key, statement),
-            Err(refusal) => Envelope::new(Frame::Error {
-                status: Some(400),
-                code: refusal.code().to_string(),
-                ref_cid: None,
-                message: refusal.message().to_string(),
-            }),
+            Err(refusal) => jig_pipeline::handshake::seal_refusal(key, &refusal, &nonce_of(text)),
         };
         Some(serde_json::to_string(&reply).unwrap())
+    }
+
+    fn nonce_of(hello: &str) -> String {
+        match serde_json::from_str::<Envelope>(hello).map(|env| env.frame) {
+            Ok(Frame::Hello { nonce, .. }) => nonce,
+            _ => panic!("not a hello: {hello}"),
+        }
+    }
+
+    /// One connection: answers hello with a signed welcome, then sends each
+    /// of `after_welcome` as raw text, then reports the close code the client
+    /// sends, if any.
+    async fn start_scripted_server(
+        after_welcome: Vec<String>,
+    ) -> (String, Arc<StdMutex<Option<u16>>>) {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let close_code = Arc::new(StdMutex::new(None));
+        let close_for_server = close_code.clone();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = accept_async(stream).await else {
+                return;
+            };
+            let key = test_signing_key();
+            while let Some(Ok(msg)) = ws.next().await {
+                if let Message::Text(text) = msg
+                    && let Some(reply) = welcome_reply(&text, &key)
+                {
+                    let _ = ws.send(Message::Text(reply.into())).await;
+                    break;
+                }
+            }
+            for text in after_welcome {
+                let _ = ws.send(Message::Text(text.into())).await;
+            }
+            while let Some(Ok(msg)) = ws.next().await {
+                if let Message::Close(frame) = msg {
+                    *close_for_server.lock().unwrap() = frame.map(|f| u16::from(f.code));
+                    break;
+                }
+            }
+        });
+        (url, close_code)
+    }
+
+    /// Wait until the client records a contradiction, or fail.
+    async fn await_contradiction(client: &Client) -> Contradiction {
+        for _ in 0..50 {
+            if let Some(c) = client.contradiction() {
+                return c;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no contradiction recorded");
     }
 
     fn test_identity() -> Identity {
@@ -1037,7 +1241,7 @@ mod tests {
         assert!(welcome.capabilities.execution);
         assert!(!welcome.capabilities.federation);
         assert!(welcome.server_did.starts_with("did:jig:z"));
-        assert!(client.handshake_refusal().is_none());
+        assert!(client.contradiction().is_none());
     }
 
     #[tokio::test]
@@ -1109,8 +1313,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn version_refusal_leaves_the_connection_open() {
-        let (url, texts, closed) = start_probe_server(|_| {
+    async fn a_signed_refusal_is_an_incompatibility() {
+        let (url, texts, _closed) = start_probe_server(|hello| {
+            serde_json::to_string(&jig_pipeline::handshake::seal_refusal(
+                &test_signing_key(),
+                &jig_pipeline::handshake::HelloRefusal::UnsupportedVersion(
+                    "server speaks envelope v1".to_string(),
+                ),
+                &nonce_of(hello),
+            ))
+            .unwrap()
+        })
+        .await;
+        match Client::connect(&url, test_identity()).await {
+            Err(ClientError::Incompatible(refusal)) => {
+                assert_eq!(refusal.code, "UNSUPPORTED_VERSION");
+            }
+            other => panic!("expected an incompatibility, got {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(texts.load(Ordering::SeqCst), 1, "nothing follows a refusal");
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_refusal_fails_closed() {
+        let (url, _texts, closed) = start_probe_server(|_| {
             serde_json::to_string(&Envelope::new(Frame::Error {
                 status: Some(400),
                 code: "UNSUPPORTED_VERSION".to_string(),
@@ -1120,26 +1347,116 @@ mod tests {
             .unwrap()
         })
         .await;
+        assert!(matches!(
+            Client::connect(&url, test_identity()).await,
+            Err(ClientError::HandshakeFailed { .. })
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(closed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_frame_outside_the_welcome_is_a_contradiction() {
+        let v2 = r##"{"v":2,"op":"ack","block_cid":"bafy"}"##.to_string();
+        let (url, close_code) = start_scripted_server(vec![v2.clone()]).await;
         let client = Client::connect(&url, test_identity()).await.unwrap();
-        let refusal = client.handshake_refusal().expect("refusal is not a close");
-        assert_eq!(refusal.code, "UNSUPPORTED_VERSION");
-        assert!(client.welcome().is_none());
-        match client.subscribe_channel("#hello").await {
-            Err(ClientError::HandshakeRefused { code, .. }) => {
-                assert_eq!(code, "UNSUPPORTED_VERSION");
-            }
-            Err(other) => panic!("expected the refusal to block subscribe, got {other:?}"),
-            Ok(_) => panic!("expected the refusal to block subscribe, got a stream"),
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let contradiction = await_contradiction(&client).await;
+        assert!(contradiction.reason.contains("outside the signed welcome"));
+        assert_eq!(contradiction.evidence[1], v2);
         assert_eq!(
-            texts.load(Ordering::SeqCst),
-            1,
-            "a version refusal must not be followed by an application frame"
+            contradiction.evidence[0],
+            client.welcome().unwrap().evidence,
+            "the evidence starts with the signed welcome"
         );
+        assert!(matches!(
+            client.subscribe_channel("#hello").await,
+            Err(ClientError::Contradiction(_))
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            *close_code.lock().unwrap(),
+            Some(jig_pipeline::handshake::close::CONTRADICTION)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_welcome_is_a_contradiction() {
+        let again = serde_json::to_string(&Envelope::new(Frame::Welcome {
+            server_did: "did:jig:zElsewhere".to_string(),
+            suites: vec!["none".to_string()],
+            capabilities: Default::default(),
+            reputation: jig_pipeline::handshake::Reputation::none(),
+            nonce: "n".to_string(),
+            sig: String::new(),
+        }))
+        .unwrap();
+        let (url, _) = start_scripted_server(vec![again]).await;
+        let client = Client::connect(&url, test_identity()).await.unwrap();
         assert!(
-            !closed.load(Ordering::SeqCst),
-            "a version refusal must leave the connection open"
+            await_contradiction(&client)
+                .await
+                .reason
+                .contains("second handshake")
         );
+    }
+
+    #[tokio::test]
+    async fn a_receipt_from_another_key_is_a_contradiction() {
+        let stranger =
+            jig_core::Did::from_ed25519_pubkey(test_signing_key().verifying_key().as_bytes())
+                .to_did_jig_string();
+        let block = serde_json::to_string(&Envelope::new(Frame::Block {
+            bundle_b64: "YQ==".to_string(),
+            sig_b64: None,
+            receipts: vec![ReceiptRef {
+                server_did: stranger.clone(),
+                render_hash: None,
+                receipt_bytes_b64: String::new(),
+            }],
+            delivery_cid: "delivery:bafy".to_string(),
+        }))
+        .unwrap();
+        let (url, _) = start_scripted_server(vec![block]).await;
+        let client = Client::connect(&url, test_identity()).await.unwrap();
+        assert!(
+            await_contradiction(&client)
+                .await
+                .reason
+                .contains(&stranger)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_that_does_not_parse_is_not_a_contradiction() {
+        let (url, close_code) = start_scripted_server(vec!["{not json".to_string()]).await;
+        let client = Client::connect(&url, test_identity()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(client.contradiction().is_none());
+        assert_eq!(*close_code.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn refusing_an_advertised_kind_is_a_contradiction() {
+        let (url, _) = start_test_server(|env| async move {
+            match env.frame {
+                Frame::Submit { .. } => vec![Envelope::new(Frame::Error {
+                    status: Some(403),
+                    code: "DISALLOWED_BLOCK_KIND".to_string(),
+                    ref_cid: None,
+                    message: "kind not in allow list: text-render".to_string(),
+                })],
+                _ => vec![],
+            }
+        })
+        .await;
+        let id = test_identity();
+        let hlc = jig_core::HlcTimestamp::now_wall(id.did().clone());
+        let block = crate::blocks::build_text_render(&id, "#hello", "hi", hlc);
+        let client = Client::connect(&url, id).await.unwrap();
+        match client.submit(block).await {
+            Err(ClientError::Contradiction(c)) => assert!(c.reason.contains("text-render")),
+            other => panic!("expected a contradiction, got {other:?}"),
+        }
+        assert!(client.contradiction().is_some());
     }
 }

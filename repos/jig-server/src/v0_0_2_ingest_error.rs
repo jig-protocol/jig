@@ -137,6 +137,9 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         // 409: someone else committed first. The client catches up and
         // rebuilds; nothing about the request itself was wrong.
         IngestError::StaleEpoch { .. } => (StatusCode::CONFLICT, "STALE_EPOCH", e.to_string()),
+        // 400: the sender's clock runs ahead of the bound. An ordinary error,
+        // not a contradiction: the message says what time this server has.
+        IngestError::ClockSkew { .. } => (StatusCode::BAD_REQUEST, "CLOCK_SKEW", e.to_string()),
         IngestError::Identity(ide) => (StatusCode::UNAUTHORIZED, "IDENTITY_ERROR", ide.to_string()),
         IngestError::Persist(pe) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -235,6 +238,11 @@ mod tests {
                 slug: "#sealed".to_string(),
                 current: 2,
                 got: 1,
+            },
+            IngestError::ClockSkew {
+                ahead_ms: 600_000,
+                bound_ms: 300_000,
+                server_ms: 1,
             },
         ]
     }
