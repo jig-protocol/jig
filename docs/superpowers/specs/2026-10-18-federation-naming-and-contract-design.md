@@ -308,10 +308,13 @@ name the DID, the attestation and the nameserver DID.
 - **First use.** The client shows the DID's fingerprint and the nameserver that vouched
   for it, then pins. A non-interactive `jig dm alice@example.org` pins and prints the
   fingerprint.
-- **A change is accepted automatically only with proof from the old key.** The nameserver
-  already requires both keys to sign a rotation (`/v1/rotate`). The nameserver keeps that
-  rotation statement and serves it with the new attestation. A client that holds the old
-  pin and sees a valid rotation signed by the old DID moves the pin and says so.
+- **A change is accepted automatically only with proof from the old key.** A rotation is
+  lane I's dual-signed link (DJ, 2026-10-18: a DID is bound to its key, and a rotation is a
+  new DID). Its audience is this nameserver and this alias. `/v1/rotate` takes the link,
+  and the nameserver keeps it and serves it with the new attestation. A client that holds
+  the old pin and sees a valid link from the pinned DID, with that audience, moves the pin
+  and says so. Until links exist (lane I's I3), every change needs the holder's
+  acceptance.
 - **Any other change is refused until the holder accepts it.** That covers expiry
   followed by re-registration to another DID, a different nameserver, and a nameserver
   that simply answers differently. It is surfaced the way a changed server DID is, with
@@ -359,9 +362,10 @@ it to a tribunal or a transparency log is v0.3 (lane R).
   JSON map order stops mattering.
 - **Proof of control binds the action.** The DID signs (`domain`,
   `jig-alias-register-v1`), (`ns_did`), (`alias`), (`challenge`). The same applies to
-  renew and rotate, each with its own domain. This closes AB-01 for this flow.
-- **Rotation statements are kept and served** with the attestation that resulted from
-  them (4.4).
+  renew, with its own domain. This closes AB-01 for this flow. Rotation proves control
+  through lane I's link instead.
+- **Rotation links are kept and served** with the attestation that resulted from them
+  (4.4).
 - **The nameserver serves TLS**, CA-issued or DID-bound like the server (#95). Plaintext
   HTTP stays only behind an antipattern flag. The attestation's signature does not depend
   on the transport, but discovery under option A does.
@@ -559,6 +563,10 @@ key packages and hand them out while she is offline. Alice still controls who ge
    release beyond the policy, which means unwanted invites and a drained stock, not
    decryption. A release outside the policy is provable: the custodian logs it, and the
    request is signed by its requester and checkable against Alice's signed policy.
+6. **One key package per device, and none after revocation (lane I, decided 2026-10-18).**
+   - A custodian releases one package for each device Alice has stocked, so an add covers
+     all her devices. Each package carries a fresh leaf key certified by her DID.
+   - A custodian that holds Alice's revocation releases none of that DID's packages.
 
 **Default policy (decided):** automatic release to Alice's contacts; everyone else held
 for approval. That is privacy-first and spam-resistant, and it costs latency on first
@@ -714,6 +722,11 @@ an interface lane R builds on).**
   assign and unassign policies. "The owner shares" generalises to "the owner delegates":
   the owner assigns roles, and a role carries rights such as `share` and `membership`.
 - **The grant set is `read`, `write` and `member`** (5.2).
+- **Roles follow a channel-scoped key-link (lane I, decided 2026-10-18).** A rotation is a
+  new DID. A `key-link` block in the channel, authored by the new DID and carrying a link
+  whose audience is this channel, moves the old DID's roles and membership to the new DID
+  from that block's `seq`. The creator rule carries across. A link scoped elsewhere moves
+  nothing in this channel.
 
 **Proposed, for the build:**
 - **Role assignments are signed blocks in the channel's log** (`role-assign`,
@@ -854,7 +867,7 @@ Updated in the implementation PRs, not here.
 - **R (reputation, PoW, tribunals).** R builds on the nameserver server-list interface
   (5.8, F5), 4.5 (retained evidence), 4.2 C
   (ruleset-group delegation) and 5.7 (open federation).
-- **I (identity lifecycle).** Reachability records (4.7) and rotation statements (4.4) are inputs
+- **I (identity lifecycle).** Reachability records (4.7) and rotation links (4.4) are inputs
   to multi-device and key rotation.
 
 ## 11. Questions for DJ, in the order they will be asked

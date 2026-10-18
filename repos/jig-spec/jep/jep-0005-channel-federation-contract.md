@@ -114,6 +114,11 @@ Non-goals for v0.2:
     - v0.2 defines one more role, `admin`, with the rights `share` and `membership`. Only
       owners assign roles, and admins cannot create admins. Co-owners may be listed in the
       `channel-create` block only.
+    - **Roles follow a channel-scoped key-link** (lane I's identity design). A `key-link`
+      block, authored by the new DID and carrying a link whose audience is this channel,
+      is ordered in the `ingest` chain. From its `seq`, the owning server reads the old
+      DID's roles and membership as the new DID's. The creator rule carries across the
+      link. A link scoped to another channel, alias or contact moves nothing here.
 8. The offered server MUST answer, signed by its DID, with exactly one of:
    - `contract-accept {channel_id, offer_id, sequencer, manifest, private_suffixes}`.
      - `offer_id` names the exact offer accepted, under the follower's signature. An
@@ -208,7 +213,11 @@ Non-goals for v0.2:
     - A custodian MUST log every release. It MAY hold MLS Welcomes for the DID as a
       mailbox.
     - Key packages are self-signed by the DID, so a custodian can withhold one but cannot
-      substitute one.
+      substitute one. Each carries a fresh leaf key certified by the DID (lane I).
+    - A custodian MUST release **one key package per device** for a request, so the adder
+      can add every device the DID has stocked packages for.
+    - A custodian MUST stop releasing a DID's key packages once it holds that DID's
+      revocation (lane I).
     - The sequencer takes no part in fetching key packages.
 
 ## Unchanged

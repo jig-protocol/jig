@@ -8,7 +8,8 @@ pinned lookup.
 
 **Architecture:**
 - **One shared module, `jig_core::naming`, holds every signed naming object** with its exact
-  signed bytes: attestation, rotation statement, suffix delegation and reachability record. It is
+  signed bytes: attestation, suffix delegation and reachability record, plus the rotation-chain
+  check over lane I's links. It is
   pure code, with no I/O.
 - **The nameserver issues and stores** these objects.
 - **The server's resolver verifies them** for the `nickname` gate.
@@ -54,7 +55,7 @@ owning lane builds the slice, or agrees in writing (through the orchestrator) th
 | --- | --- | --- | --- | --- |
 | 0 | Fail closed on orphan relayed posts and on fanout with no policy | `jig-pipeline/src/ingest.rs`, `jig-pipeline/src/fanout.rs` | To be confirmed by the orchestrator (asked 2026-10-18) | nothing |
 | 1 | `jig_core::naming`: types, signed bytes, verification, test vectors | `jig-core/src/naming.rs` (new), `jig-core/src/lib.rs`, `jig-spec/jep/vectors/0004/` (new) | F | nothing |
-| 2 | The nameserver issues the new objects, takes action-bound proofs, keeps rotation chains | `jig-nameserver/src/v0_0_2*.rs`, alias storage in `jig-pipeline/src/persist.rs` | L6 (nameserver); persistence change agreed with whoever owns `persist.rs` | 1 |
+| 2 | The nameserver issues the new objects and takes action-bound proofs for register and renew. Rotate stays as it is until lane I's I3 moves `/v1/rotate` onto links | `jig-nameserver/src/v0_0_2*.rs`, alias storage in `jig-pipeline/src/persist.rs` | L6 (nameserver); persistence change agreed with whoever owns `persist.rs` | 1 |
 | 3 | TLS on the nameserver | `jig-nameserver/src/server.rs` | L6 | nothing |
 | 4 | The server's resolver verifies, binds suffixes, caches within validity and keeps evidence | `jig-pipeline/src/identity.rs`, `jig-config/src/v0_0_2_server.rs` | F for `identity.rs`; L3 for the config field | 1 |
 | 5 | Client resolver (F) and name pins (L7's slice 9) | `jig-client/src/naming.rs` (new, F); `jig-client/src/pins.rs` `names` map and `jig trust accept-name` plus expiry warning (L7's slice 9) | F + L7 | 1; L7's slice 9 also needs F1 slice 1 (`verify_rotation_chain`, the pin key) |
@@ -64,6 +65,19 @@ owning lane builds the slice, or agrees in writing (through the orchestrator) th
 
 Slices 1 and 3 can start at once. Slices 2, 4 and 5 can run in parallel after slice 1. Ship 2
 and 6 in the same release (see Compatibility).
+
+**Lane I (identity, decided 2026-10-18):** a DID is bound to its key, and a rotation is a
+new DID plus a dual-signed link (COSE over deterministic CBOR), scoped to one audience. For
+F1 this means:
+- an alias moves only by a link scoped to that nameserver and alias;
+- `/v1/rotate` switches to links in lane I's I3;
+- F1 ships with no automatic rotation, so every change of DID behind a pinned name needs
+  the holder's acceptance until I3;
+- `jig_core::naming::verify_rotation_chain` is generic over lane I's link type
+  (`AliasLink`).
+
+Roles across a channel `key-link`, and one key package per device at custodians, are F2
+work (JEP-0005 items 7b and 21).
 
 **Open decision carried into the build:** the reference default suffix (`gigue.jig`) is not a DNS
 name. Until DJ decides, it works only through a `config` delegation, and every test uses an
@@ -152,7 +166,9 @@ Times, counts and `seq` are decimal ASCII. Authorities are sorted bytewise befor
   - the attestation is expired (`now == valid_until`);
   - the attestation is not yet valid;
   - the alias differs from the requested name;
-  - the rotation chain breaks (`old_did` does not equal the previous `new_did`);
+  - the rotation chain breaks (a gap, a link scoped to another alias or nameserver, an
+    unsigned link). The link type is lane I's; slice 1 tests against a stand-in through the
+    `AliasLink` trait;
   - a rotation's `ns_did` differs from the attestation's;
   - a reachability record's servers are reordered after signing.
 - [ ] **Step 4: Implement** until the tests pass. `NamingError` variants name the exact failure;
@@ -189,7 +205,7 @@ Today's facts this task changes:
 - [ ] **Step 1: Failing tests.**
   - A proof over the bare challenge is refused.
   - A register proof replayed as renew is refused.
-  - A rotate whose second signature is bad leaves the challenge usable for one more attempt.
+  - A renew whose proof is bad leaves the challenge usable for one more attempt.
   - A consumed challenge is refused for every action.
   - A challenge older than its TTL is refused.
   - `/v1/resolve/{alias}` after a rotation returns both the statement and the new attestation.
@@ -221,7 +237,7 @@ Today's facts this task changes:
 - [ ] **Step 5:** `cargo nextest run -p jig-nameserver -p integration-tests --test h6_nameserver_mode --test h10_nameserver_binary_surface`.
   `h6` will fail until slice 4 lands, if it asserts on the old encoding. Update its expectations
   in this PR, and say so in the PR body.
-- [ ] **Step 6:** commit `feat(nameserver): verifiable attestations, action-bound proofs, rotation chains (JEP-0004)`.
+- [ ] **Step 6:** commit `feat(nameserver): verifiable attestations, action-bound proofs (JEP-0004)`.
 
 ---
 
@@ -293,7 +309,8 @@ Today's facts:
 4. Compare with the pin, keyed by `(alias, suffix, root, root_id)` (rule 6):
    - no pin: return `Verified::New`, and the caller must pin before any E2EE use (rule 17);
    - same DID: `Verified::Pinned`;
-   - different DID with a valid rotation chain: `Verified::Rotated`, and the caller moves the pin
+   - different DID with a valid chain of rotation links (lane I's I3; until then this branch
+     never fires): `Verified::Rotated`, and the caller moves the pin
      and says so;
    - anything else: `ResolveError::PinMismatch { reason, old, new }`, where `reason` is one of
      `ReRegistered`, `OtherNameserver` or `NoRotationProof`.
@@ -373,7 +390,8 @@ Bob's client does:
 After L1's banners merge, in the PR that lands slice 7.
 
 - [ ] Rewrite `identity-and-reputation.md`:
-  - "Aliases": signed bytes, action-bound proofs, rotation chains, delegation, reachability;
+  - "Aliases": signed bytes, action-bound proofs, rotation by link (lane I), delegation,
+    reachability;
   - "Resolution by servers": verification, suffix binding, caching within validity, evidence.
 
   Point both at JEP-0004 for the details.
