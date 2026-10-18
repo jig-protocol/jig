@@ -212,16 +212,26 @@ pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
     // merges method-disjoint routers for the same path. Adding a same-method
     // duplicate would panic at startup — covered by
     // `both_challenge_methods_survive_the_merge`.
+    // register/rotate/renew sit behind the per-IP and per-DID limiter; it
+    // passes GETs (the challenge route) straight through.
+    let limiter = crate::v0_0_2_rate_limit::AliasRateLimiter::new(
+        cfg.alias_rate_limits.clone(),
+        cfg.network.clone(),
+    );
+    let rate_limited =
+        axum::middleware::from_fn_with_state(limiter, crate::v0_0_2_rate_limit::limit);
     let mut router = app_router(state)
-        .merge(crate::v0_0_2_register::build_register_router(
-            v0_0_2_state.clone(),
-        ))
+        .merge(
+            crate::v0_0_2_register::build_register_router(v0_0_2_state.clone())
+                .layer(rate_limited.clone()),
+        )
         .merge(crate::v0_0_2_resolve::build_resolve_router(
             v0_0_2_state.clone(),
         ))
-        .merge(crate::v0_0_2_rotate_renew::build_rotate_renew_router(
-            v0_0_2_state.clone(),
-        ));
+        .merge(
+            crate::v0_0_2_rotate_renew::build_rotate_renew_router(v0_0_2_state.clone())
+                .layer(rate_limited),
+        );
 
     // `/v1/handles` enumerates every registered alias. `build_handles_router`
     // documents that the caller must gate it; honour that here rather than
@@ -281,6 +291,8 @@ mod tests {
     use super::*;
     use axum::http::Request;
     use axum::http::StatusCode;
+    use axum::{body::Body, http::Response};
+    use ed25519_dalek::Signer;
     use http_body_util::BodyExt as _; // for collect
     use tower::util::ServiceExt; // for `oneshot`
 
@@ -485,6 +497,102 @@ mod tests {
         let cfg = scratch_config(&dir, "deji.jig");
         let app = build_app_parts(&cfg).expect("build_app_parts");
         assert_eq!(app.v0_0_2_state.suffix(), "deji.jig");
+    }
+
+    async fn post_json(router: &Router, uri: &str, body: serde_json::Value) -> Response<Body> {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn fresh_challenge(router: &Router) -> String {
+        let (status, body) = get(router, "/v1/challenge").await;
+        assert_eq!(status, StatusCode::OK);
+        body["challenge"].as_str().unwrap().to_string()
+    }
+
+    /// The limiter sits in front of the mounted register/rotate/renew
+    /// handlers. Requests with forged proofs naming DID X are rejected by the
+    /// handler and do not use up X's bucket, so X's own signed register still
+    /// succeeds; with a per-DID limit of 1, the next request naming X is
+    /// then refused with 429 + Retry-After before reaching a handler.
+    #[tokio::test]
+    async fn alias_routes_are_rate_limited_per_verified_did() {
+        use base64::Engine as _;
+
+        let dir = ScratchDir::new("alias-rate-limit");
+        let mut cfg = scratch_config(&dir, "dj.jig");
+        cfg.alias_rate_limits.per_did_per_min = 1;
+        let (router, _) = build_app(&cfg).expect("build_app");
+
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let did =
+            jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
+
+        // An attacker floods forged registers naming the victim's DID.
+        for i in 1..=5 {
+            let challenge = fresh_challenge(&router).await;
+            let resp = post_json(
+                &router,
+                "/v1/register",
+                serde_json::json!({
+                    "did": did,
+                    "requested_alias": "victim",
+                    "proof_of_control": "AAAA",
+                    "challenge": challenge,
+                }),
+            )
+            .await;
+            assert!(
+                resp.status().is_client_error() && resp.status() != StatusCode::TOO_MANY_REQUESTS,
+                "forged request {i} is rejected by the handler, not the limiter: {}",
+                resp.status()
+            );
+        }
+
+        // The key holder's own signed register still gets through.
+        let challenge = fresh_challenge(&router).await;
+        let proof = base64::engine::general_purpose::STANDARD
+            .encode(key.sign(challenge.as_bytes()).to_bytes());
+        let resp = post_json(
+            &router,
+            "/v1/register",
+            serde_json::json!({
+                "did": did,
+                "requested_alias": "victim",
+                "proof_of_control": proof,
+                "challenge": challenge,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "verified register admitted");
+
+        // That verified request used the DID's one slot: the next is refused.
+        let resp = post_json(
+            &router,
+            "/v1/renew",
+            serde_json::json!({
+                "alias": "victim@dj.jig",
+                "did": did,
+                "challenge": "00",
+                "proof_of_control": "AAAA",
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().contains_key("retry-after"));
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["code"], "RATE_LIMITED");
     }
 
     #[test]
