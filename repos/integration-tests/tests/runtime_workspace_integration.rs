@@ -1,8 +1,6 @@
 //! Workspace integration test: Verify jig-runtime can be consumed by other workspace members
 
-use jig_runtime::{
-    BlockPackage, CostSchedule, ExecutionContext, ExecutionOutcome, Runtime, RuntimeConfig,
-};
+use jig_runtime::{BlockPackage, ExecutionContext, ExecutionOutcome, Runtime, RuntimeConfig};
 
 #[test]
 fn test_runtime_api_imports() {
@@ -24,18 +22,6 @@ fn test_config_types_accessible() {
     assert!(config.fuel.enabled);
     assert_eq!(config.limits.fuel_max, 5_000_000);
     assert!(!config.pricing.enabled);
-}
-
-#[test]
-fn test_cost_schedule_loading() {
-    let schedule = CostSchedule::default_v0_1();
-
-    assert_eq!(schedule.version, "0.1.0");
-    assert!(schedule.validate().is_ok());
-
-    // Verify capability costs are defined
-    assert!(schedule.capability_costs.contains_key("http"));
-    assert!(schedule.capability_costs.contains_key("kv"));
 }
 
 #[test]

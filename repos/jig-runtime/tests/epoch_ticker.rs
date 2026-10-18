@@ -127,11 +127,17 @@ fn dropping_a_runtime_reclaims_its_ticker_thread() {
     );
 }
 
-/// Re-read the thread count until it falls back to `target`, or 50ms passes.
+/// Re-read the thread count until it falls back to `target`, or 5 s passes.
+///
+/// The window is generous on purpose. A reaped thread leaves `/proc` within
+/// milliseconds on an idle machine but can take longer on a loaded CI runner,
+/// and the loop returns as soon as the count falls, so a passing run pays
+/// nothing for it. A leaked ticker never leaves, so the window does not
+/// weaken the check.
 fn settled_thread_count(target: usize) -> usize {
     let mut last = thread_count().expect("thread count");
     let start = Instant::now();
-    while last > target && start.elapsed() < Duration::from_millis(50) {
+    while last > target && start.elapsed() < Duration::from_secs(5) {
         std::thread::sleep(Duration::from_millis(1));
         last = thread_count().expect("thread count");
     }

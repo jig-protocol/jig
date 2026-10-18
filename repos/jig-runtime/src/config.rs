@@ -193,21 +193,11 @@ pub struct CapabilityQuota {
 pub struct FuelConfig {
     /// Enable instruction-level fuel metering
     pub enabled: bool,
-
-    /// Path to cost schedule file (TOML)
-    pub cost_schedule_path: Option<String>,
-
-    /// Default fuel costs for hostcalls (if no schedule provided)
-    pub default_hostcall_costs: HashMap<String, u64>,
 }
 
 impl Default for FuelConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            cost_schedule_path: None,
-            default_hostcall_costs: HashMap::new(),
-        }
+        Self { enabled: true }
     }
 }
 
