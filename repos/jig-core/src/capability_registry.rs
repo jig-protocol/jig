@@ -12,7 +12,6 @@ pub struct CapabilityDefinition {
     pub name: CapabilityName,
     pub description: String,
     /// Host imports required for this capability: (module, function)
-    pub required_imports: Vec<(String, String)>,
     /// Estimated fuel cost for typical usage
     pub fuel_cost_estimate: u64,
     /// Required attestations (e.g., "code_review:v1", "security_audit:v2")
@@ -60,52 +59,42 @@ impl CapabilityRegistry {
             .register(CapabilityDefinition {
                 name: "core:compute".into(),
                 description: "Pure computation with no external interactions".into(),
-                required_imports: vec![],
                 fuel_cost_estimate: 100_000,
                 attestation_requirements: vec![],
             })
             .register(CapabilityDefinition {
                 name: "net:http:fetch".into(),
                 description: "HTTP fetch operations to external URLs".into(),
-                required_imports: vec![("jig_host".into(), "http_fetch".into())],
                 fuel_cost_estimate: 500_000,
                 attestation_requirements: vec![],
             })
             .register(CapabilityDefinition {
                 name: "storage:read".into(),
                 description: "Read access to content-addressed storage".into(),
-                required_imports: vec![
-                    ("jig_host".into(), "storage_get".into()),
-                    ("jig_host".into(), "read_resource".into()),
-                ],
                 fuel_cost_estimate: 200_000,
                 attestation_requirements: vec![],
             })
             .register(CapabilityDefinition {
                 name: "storage:write".into(),
                 description: "Write access to content-addressed storage".into(),
-                required_imports: vec![("jig_host".into(), "storage_put".into())],
                 fuel_cost_estimate: 300_000,
                 attestation_requirements: vec![],
             })
             .register(CapabilityDefinition {
                 name: "ai:llm:inference".into(),
                 description: "Large language model inference calls".into(),
-                required_imports: vec![("jig_host".into(), "llm_call".into())],
                 fuel_cost_estimate: 5_000_000,
                 attestation_requirements: vec!["ai_usage_policy:v1".into()],
             })
             .register(CapabilityDefinition {
                 name: "log:emit".into(),
                 description: "Emit log messages to host".into(),
-                required_imports: vec![("jig_host".into(), "log".into())],
                 fuel_cost_estimate: 1_000,
                 attestation_requirements: vec![],
             })
             .register(CapabilityDefinition {
                 name: "message:emit".into(),
                 description: "Emit messages to Jig protocol".into(),
-                required_imports: vec![("jig_host".into(), "emit_message".into())],
                 fuel_cost_estimate: 50_000,
                 attestation_requirements: vec![],
             })
@@ -136,11 +125,6 @@ mod tests {
         let registry = CapabilityRegistry::default();
         let def = registry.get("net:http:fetch").unwrap();
         assert_eq!(def.name, "net:http:fetch");
-        assert_eq!(def.required_imports.len(), 1);
-        assert_eq!(
-            def.required_imports[0],
-            ("jig_host".into(), "http_fetch".into())
-        );
     }
 
     #[test]
@@ -163,7 +147,6 @@ mod tests {
         let registry = CapabilityRegistry::new().register(CapabilityDefinition {
             name: "custom:test".into(),
             description: "Test capability".into(),
-            required_imports: vec![("test".into(), "func".into())],
             fuel_cost_estimate: 1000,
             attestation_requirements: vec![],
         });
@@ -182,12 +165,5 @@ mod tests {
             def.attestation_requirements
                 .contains(&"ai_usage_policy:v1".into())
         );
-    }
-
-    #[test]
-    fn core_compute_has_no_imports() {
-        let registry = CapabilityRegistry::default();
-        let def = registry.get("core:compute").unwrap();
-        assert!(def.required_imports.is_empty());
     }
 }
