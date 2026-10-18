@@ -297,7 +297,9 @@ That does not stop the domain owner from listing a new nameserver, which is why 
 
 ### 4.4 Pinning names on the client (OP-08)
 
-**Proposed.** The client keeps a name pin store beside its server pins, holding for each
+**Decided (DJ, 2026-10-18): B.** A pinned name moves to a new DID automatically only with a
+rotation signed by the old key. Any other change is refused until the holder accepts it.
+UX mitigates the friction; it never weakens the check. The client keeps a name pin store beside its server pins, holding for each
 name the DID, the attestation and the nameserver DID.
 
 - **First use.** The client shows the DID's fingerprint and the nameserver that vouched
@@ -314,6 +316,19 @@ name the DID, the attestation and the nameserver DID.
   F names the cases and L7 owns the command.
 - **`jig dm` and `jig channel add` accept a name only through this path.** `[contacts]`
   stays: a contact is a pin the holder wrote themselves.
+
+**UX that softens the friction without weakening the check** (L7 owns `jig trust`, so these
+are inputs to it):
+- The refusal says why, in plain words: "re-registered after expiry", "different
+  nameserver", or "no rotation signed by the old key". It shows both fingerprints.
+- One command accepts the change after the holder has compared fingerprints out of band,
+  and records that the holder accepted it.
+- A contact who lost their key can send a fingerprint by any other channel. Accepting
+  stays a manual act.
+- Lane I's multi-device work lets a second device sign a rotation, so losing one device
+  stops being a reason for a manual change.
+- Clients warn before an attestation expires, so a renewal under the same key happens
+  before a lapse makes re-registration look like a takeover.
 
 **Push-back on a likely assumption:** "the nameserver signs it, so it is safe". A signed
 attestation proves which nameserver lied, not that it did not. Without client pins, a
@@ -746,8 +761,7 @@ Updated in the implementation PRs, not here.
    delegate, plus the owning operator's peer list, plus the target's accept; role-based
    authority; grants `read`/`write`/`member`; `read` still carries `seen` and
    self-updates.
-3. Name-pin changes (4.4): automatic only with a rotation signed by the old key, and
-   refused otherwise?
+3. ~~Name-pin changes (4.4)~~ **Decided:** B; UX mitigates, never weakens the check.
 4. Reachability records (4.7): signed by the DID, not the nameserver?
 5. Key packages (5.4): through the owner, under a coarse consent policy in v0.2?
 6. ~~Owner failure (5.8)~~ **Decided:** the movable sequencer, owner-only `sequencer-set`.
