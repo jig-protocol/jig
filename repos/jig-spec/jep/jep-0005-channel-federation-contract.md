@@ -107,8 +107,8 @@ Non-goals for v0.2:
     - The creator holds the root `owner` role, which carries every right and cannot be
       removed.
     - v0.2 defines one more role, `admin`, with the rights `share` and `membership`. Only
-      owners assign roles, and admins cannot create admins. Whether owners can create
-      owners is pending DJ.
+      owners assign roles, and admins cannot create admins. Co-owners may be listed in the
+      `channel-create` block only.
 8. The offered server MUST answer, signed by its DID, with exactly one of:
    - `contract-accept {channel_id, sequencer, policy_hash}`, stating that it
      implements the suite and will enforce the membership rule;
@@ -188,14 +188,17 @@ Non-goals for v0.2:
 19. Followers MUST track the group's public state from the stream and MUST NOT deliver a
     commit that does not validate.
 20. Only clients commit. The group has no external senders in v0.2.
-21. (pending DJ) Key packages are fetched through the owner: the requester's server → owner
-    → a follower (holding a `member` grant) where the target's reachability record says
-    the target can be reached. The owner may also serve one itself.
-    - The request MUST be signed by the requester's DID and MUST name the channel.
-    - The serving server MUST apply the target's consent policy before releasing a key
-      package.
-    - Key packages are self-signed by the target's DID, so relays can withhold but cannot
-      substitute.
+21. (pending DJ) Key packages are held by **custodians**: servers or nameservers the DID
+    names in its reachability record (JEP-0004). Each holds a release policy the DID
+    signed.
+    - A custodian MUST release a key package only to a request inside the policy's
+      scopes. It holds any other request for the DID's approval.
+    - Requests MUST be signed by the requester's DID and MUST name the channel.
+    - A custodian MUST log every release. It MAY hold MLS Welcomes for the DID as a
+      mailbox.
+    - Key packages are self-signed by the DID, so a custodian can withhold one but cannot
+      substitute one.
+    - The sequencer takes no part in fetching key packages.
 
 ## Unchanged
 
@@ -246,8 +249,8 @@ To be added with F2:
   attack surface (Matrix's 2025 state-reset CVEs), and MLS needs one linear epoch history.
 - **Requiring clients to find and connect to the owner.** That defeats sharing. A client
   connects to the owner directly only to write past a follower's grant.
-- **Fetching key packages follower to follower.** Every pair of servers would need to
-  peer.
+- **Routing key-package requests through the sequencer.** The sequencer gains nothing
+  from them, and the DID's custodian is what has to enforce its policy.
 
 # Copyright
 

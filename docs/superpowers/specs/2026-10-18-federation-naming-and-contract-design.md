@@ -489,27 +489,53 @@ Consequences:
   whose share ended). The recommendation for v0.2 is no external senders: members commit
   everything, as today.
 
-### 5.4 Fetching key packages across servers
+### 5.4 Key packages: custody and release while Alice is offline
 
-**Proposed.** Bob adds Alice to channel X, owned by server A.
-- Alice's reachability record (4.7) lists the servers she uses. At least one of them must
-  carry X under a `member` grant, or be A itself. Otherwise X has to be shared to one of
-  them first (5.5).
-- Bob's client asks the server it is authenticated to. That server asks A, and A asks the
-  follower where Alice is reachable, over the share link: Bob's server → A → Alice's
-  server.
+**Terms in this section.**
+- **Alice** is a DID, reached only through clients that come and go.
+- **Bob** is a client: a DID connected to some server for the moment. He has no server
+  of his own.
+- **The sequencer** is the server that orders the channel.
+- **The channel owner** is a DID holding the `owner` role.
 
-Rules:
+None of these is a home server.
 
-- **Through the owner,** because A is a peer of every follower anyway. Routing between
-  followers directly would need every pair of servers to peer (n² links).
-- **Alice's server releases a key package only under Alice's consent policy.** In v0.2 the
-  policy is coarse: anyone; members of channels shared with this server; or contacts only.
-  MIMI's per-requester consent exchange is v0.3.
-- **The request is signed by the requester's DID** and names the channel, so Alice's
-  server can apply the policy and log the request.
-- **The key package is self-signed by Alice's DID,** so A and the relays cannot substitute
-  one (D2 / decision 1 of M2). They can only withhold.
+**The problem (DJ).** Clients have no permanent presence, so someone has to hold Alice's
+key packages and hand them out while she is offline. Alice still controls who gets them.
+
+**Proposed: custodians under an Alice-signed release policy.**
+1. **Custody.** Alice's client uploads a stock of key packages, plus one last-resort
+   package, to one or more **custodians**. A custodian is any server or nameserver she
+   names in her reachability record (4.7). A nameserver can take custody as part of
+   registration, where a data contract asks for a contact point.
+2. **Release policy.** Alice signs a policy and gives it to each custodian. It lists, by
+   scope, who gets a key package automatically:
+   - named DIDs (her contacts);
+   - requests naming a given channel (a channel scope);
+   - anyone admitted under a ruleset group's contract;
+   - anyone at all.
+
+   A request outside every scope is **held for Alice's approval**: she sees it the next
+   time she connects, and can approve or refuse. So Alice need not be asked every time,
+   but can be, by scoping narrowly.
+3. **Request.** Bob's client asks a custodian directly; clients connect to any server.
+   If that fails, it asks through the server it is connected to. The request is signed by
+   Bob's DID and names the channel. The custodian applies Alice's policy, rate-limits per
+   requester, and logs each release for Alice to audit. The sequencer takes no part.
+4. **Welcome delivery.** Bob's `member-add` carries the MLS Welcome through the channel
+   as today. When no server Alice uses carries the channel, the custodian also holds the
+   Welcome as a mailbox, so Alice finds it when she next connects. She then joins through
+   any server that carries the channel, or connects to the sequencer.
+5. **What a custodian can do wrong.** It cannot forge: key packages are self-signed by
+   Alice's DID (M2, decision 1). It can withhold them, which is denial of service. It can
+   release beyond the policy, which means unwanted invites and a drained stock, not
+   decryption. A release outside the policy is provable: the custodian logs it, and the
+   request is signed by its requester and checkable against Alice's signed policy.
+
+**Recommended default policy:** automatic release to Alice's contacts; everyone else held
+for approval. That is privacy-first and spam-resistant, and it costs latency on first
+contact from strangers. Rejected: always asking Alice, which breaks asynchronous adds;
+and releasing to anyone by default, which invites spam and drains the stock.
 
 ### 5.5 Offer, accept and refuse on the wire
 
@@ -654,12 +680,10 @@ an interface lane R builds on).**
 - **Decided (DJ):** an admin cannot assign `admin`. Only owners assign roles. `owner` is
   in effect a super-admin, the only role that can create admins. An intermediary role is
   not an MVP problem.
-- **Open:** may an owner create other owners? Single ownership has a real cost now:
-  moving the sequencer is owner-only, so a lost owner key freezes the channel on its
-  current sequencer for good. Recommendation for v0.2: co-owners may be listed in the
-  `channel-create` block only, fixed at creation, as in Matrix v12's
-  `additional_creators`. That gives a channel more than one key that can rescue it, with
-  no escalation chain. Adding owners later, and transferring ownership, are post-MVP.
+- **Decided (DJ): co-owners at creation only.** The `channel-create` block may list
+  co-owners, fixed for the channel's life, as in Matrix v12's `additional_creators`. A
+  lost owner key would otherwise freeze the channel on its current sequencer, because
+  moving it is owner-only. Adding owners later, and transferring ownership, are post-MVP.
 
 ## 6. Addressing
 
@@ -776,7 +800,8 @@ Updated in the implementation PRs, not here.
 3. ~~Name-pin changes (4.4)~~ **Decided:** B; UX mitigates, never weakens the check.
 4. ~~Reachability records (4.7)~~ **Decided:** B, optional, and Alice chooses the servers.
    Data contracts may require a contact point at registration.
-5. Key packages (5.4): through the owner, under a coarse consent policy in v0.2?
+5. Key packages (5.4): custodians under an Alice-signed release policy; default contacts
+   automatically, others held for approval?
 6. ~~Owner failure (5.8)~~ **Decided:** the movable sequencer, owner-only `sequencer-set`.
 7. Who may federate (5.7): configured peers only in v0.2?
 8. `federation.md` (7): this disposition?
