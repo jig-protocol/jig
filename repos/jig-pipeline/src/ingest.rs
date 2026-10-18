@@ -437,7 +437,7 @@ pub async fn ingest(
     // unbounded: a message composed offline may arrive late.
     let wall_now_ms = chrono::Utc::now().timestamp_millis() as u64;
     if let Some(ts) = manifest.hlc_ts.as_ref() {
-        let bound_ms = crate::handshake::DEFAULT_FUTURE_SKEW_MS;
+        let bound_ms = ctx.hlc_clock.max_future_skew_ms();
         let ahead_ms = ts.wall_ms.saturating_sub(wall_now_ms);
         if ahead_ms > bound_ms {
             return Err(IngestError::ClockSkew {

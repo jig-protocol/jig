@@ -4,9 +4,9 @@
 //! — must surface in the server's well-known discovery JSON so federated
 //! peers can detect a misconfigured neighbor and refuse to peer with it.
 //!
-//! v0.0.2 always lists `naively_unbounded_clock_skew` (no time-attestation
-//! servers exist yet). The other flags only appear when explicitly enabled
-//! in the server config:
+//! A default install lists none (a block's clock is bounded by
+//! `[server] max_future_skew_ms`). Each flag appears only when explicitly
+//! enabled in the server config:
 //!   - `debug.admin_endpoints`
 //!   - `federation.dangerously_disable_federation_tls`
 //!   - `identity.naively_allow_unknown_handles_fallback`
@@ -25,12 +25,9 @@ async fn well_known(server: &TestJigServer) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn default_install_always_advertises_unbounded_clock_skew() {
-    // Even with no antipatterns enabled, naively_unbounded_clock_skew must
-    // be present — it captures the v0.0.2 reality that no time-attestation
-    // server exists yet.
-    // No debug.admin_endpoints, no TLS-disabled, no allow-unknown-handles.
-    // (Default config already has these off, but be explicit.)
+async fn default_install_advertises_no_unsafe_option() {
+    // A block's clock is bounded by `[server] max_future_skew_ms`, so a
+    // default install has nothing to advertise.
     let config = JigServerConfig {
         debug: DebugSection::default(),
         identity: IdentitySection::default(),
@@ -48,8 +45,8 @@ async fn default_install_always_advertises_unbounded_clock_skew() {
         .map(|v| v.as_str().unwrap_or("").to_string())
         .collect::<Vec<_>>();
     assert!(
-        active.contains(&"naively_unbounded_clock_skew".to_string()),
-        "default install must always advertise naively_unbounded_clock_skew (got {active:?})"
+        active.is_empty(),
+        "a default install must advertise no unsafe option (got {active:?})"
     );
 }
 
@@ -66,7 +63,6 @@ async fn admin_endpoints_flag_surfaces_in_well_known() {
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
     assert!(active.contains(&"debug.admin_endpoints".to_string()));
-    assert!(active.contains(&"naively_unbounded_clock_skew".to_string()));
 }
 
 #[tokio::test]
@@ -148,7 +144,6 @@ async fn all_antipatterns_simultaneously_advertised() {
         .collect();
 
     for expected in [
-        "naively_unbounded_clock_skew",
         "debug.admin_endpoints",
         "federation.dangerously_disable_federation_tls",
         "federation.dangerously_allow_plaintext_federation",

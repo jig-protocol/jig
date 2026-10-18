@@ -563,6 +563,7 @@ fn base_config() -> Result<JigServerConfig> {
                 "channel-promote".to_string(),
                 "fed-hello".to_string(),
             ],
+            ..ServerSection::default()
         },
         identity: IdentitySection::default(),
         federation: FederationSection::default(),
