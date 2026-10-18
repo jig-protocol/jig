@@ -154,14 +154,25 @@ so that every approval names the exact rules it was checked against.
    - It limits which channel policies and installs the server will approve (§5.3).
    - It does not limit what clients run.
 2. **`operator-policy`**:
-   `{domain: "jig-operator-policy-v1", server, seq, allow: {programs: [cid…], authors: [did…]}}`.
+   `{domain: "jig-operator-policy-v1", server, seq, allow: {programs: [cid…], authors: [did…], components: [hash…]}}`.
    - It is the operator policy of JEP-0006 Q7 and JEP-0007 §2: which programs this server will
      execute at all.
-   - A server's default `operator-policy` lists in `programs` exactly the programs the server
-     ships, and nothing else. Today that is text-block. Each built-in is published as a program
-     (§2), authored by the server's DID, so it has a program CID. Clients therefore see everything
+   - `components` allows a program by the hash of its component (§2.1 `component`), whoever
+     authored the manifest. It applies only to programs whose `world` is a `renderer` world. A
+     renderer imports at most `compose` over pinned children, and each child is checked on its
+     own (closure rule), so the manifest around an allowed component adds no authority. Installs
+     (`bot` world) MUST match by `programs` or `authors`, never by `components`.
+   - A server's default `operator-policy` lists in `components` exactly the renderer components it
+     ships, and nothing else: today, text-block's component hash. Clients therefore see everything
      the server will run, and built-ins get no implicit exception. "Empty by default" means empty
      of third-party entries.
+   - **Why components, not program CIDs, for built-ins.** A built-in published as a program by each
+     server's own DID would have a different program CID on every server. A `render` composed on
+     server X would name X's program CID, and server Y's default policy would refuse it, so plain
+     rendered messages would stop federating. The component hash is the same everywhere.
+   - **Cross-server comparison keys on the component.** Two executors agree on a run when they
+     agree on the component hash, world and invocation (JEP-0006 Q3). The program CID may differ
+     between servers for the same component.
    - Allowing an author does not extend to children by other authors.
 
 ### 5.2 Channel policy
@@ -317,9 +328,14 @@ slices 4–8.
 
 # Test Vectors
 
-To come with slice 4:
+To come with slice 4 and slice 6:
 - program manifests, with their program CIDs;
 - tampered variants of each;
+- **federation:** a `render` composed on server X, naming X's program CID for text-block, is
+  executed by server Y under Y's default `operator-policy` (allowed by component), and both
+  servers' `exec` receipts carry the same outcome hash;
+- a `bot`-world program whose component is in `components` but whose program and author are not
+  allowed is refused for install;
 - a `channel-policy` chain with host approvals and a withdrawal.
 
 # Rejected Alternatives
