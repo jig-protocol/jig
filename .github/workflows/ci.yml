@@ -246,14 +246,17 @@ jobs:
           JIG_TEXT_BLOCK_WASM: target/wasm32-unknown-unknown/release/text_block.wasm
         run: cargo test -p jig-runtime --test text_block_payload
 
-  # Doc tests. Nextest does not run them, so a broken example in a doc comment
-  # never turns `workspace` red; one already sat broken on main for a while
-  # (jig-config's validation.rs). They run on the nightly schedule rather than on
-  # every pull request and queue group, to keep those runs short, and the nightly
-  # skips itself when no Rust source changed in the previous day. Not a required
-  # check: a red nightly means fix forward, it does not gate merges.
-  # jig-cli is left out because it has no library target for `--doc` to test.
-  doctests:
+  # Nightly checks that `workspace` leaves out to keep pull request and queue
+  # runs short. The nightly skips itself when no Rust source changed in the
+  # previous day. Not a required check: a red nightly means fix forward, it does
+  # not gate merges.
+  # - Doc tests. Nextest does not run them, so a broken example in a doc comment
+  #   never turns `workspace` red; one already sat broken on main for a while
+  #   (jig-config's validation.rs). jig-cli is left out because it has no
+  #   library target for `--doc` to test.
+  # - jig-runtime's `tracing` feature, which no default build enables, so a
+  #   warning or a break behind it would otherwise go unseen.
+  nightly:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
@@ -307,6 +310,10 @@ jobs:
             -p integration-tests \
             -p jig-bridge-core \
             -p jig-bridge-email
+      - name: Clippy, jig-runtime with the tracing feature
+        # Runs even when the doc tests failed, so one red step never hides the other.
+        if: ${{ !cancelled() && steps.changed.outputs.run == 'true' }}
+        run: cargo clippy -p jig-runtime --all-targets --features tracing -- -D warnings
 
   # Renamed from `license-compliance`: bare `cargo deny check` runs ALL FOUR
   # checks (advisories, bans, licenses, sources). The old name once sent a
