@@ -204,6 +204,16 @@ Today's facts this task changes:
     with `root: dns` and `root_id` = the suffix.
   - Serving it at the domain is how `dns` discovery finds it when the suffix's host points at the
     nameserver. A test fetches and verifies it.
+- [ ] **Step 3b: Reserve the proof-of-work field (for lane R's R1, draft #152).**
+  - `RegisterReq`, `RenewReq` and `RotateReq` gain an optional `pow` field: an opaque JSON
+    object that F1 neither defines nor checks.
+  - F1 accepts requests with or without it.
+  - R1 defines its contents and makes it required. Its stamp should commit to
+    `naming::proof_hash(action, ns_did, alias, challenge)`, so the work is bound to the same
+    action, alias, nameserver and challenge as the proof (AB-01), with no second binding to
+    design.
+  - Test: a request carrying an arbitrary `pow` object is accepted and the object is ignored.
+    This pins the reservation so R1 is a pure addition.
 - [ ] **Step 4: Reachability.**
   - `POST /v1/register` accepts an optional `reachability` field. Verify it and store it.
   - `resolve` returns it.
