@@ -2,8 +2,9 @@
 //!
 //! A name is `alias@suffix`. A nameserver vouches that a name belongs to a DID
 //! with an [`Attestation`]; a [`SuffixDelegation`] says which DIDs may vouch for
-//! a suffix; a [`RotationStatement`], signed by both keys, moves a name from one
-//! DID to another; a [`ReachabilityRecord`], signed by the DID itself, says where
+//! a suffix; a link from the identity design (lane I), signed by both keys and
+//! scoped to one nameserver and alias, moves a name from one DID to another
+//! ([`AliasLink`]); a [`ReachabilityRecord`], signed by the DID itself, says where
 //! the DID wants to be found. Whoever acts on a binding verifies it here; who
 //! fetched it does not matter.
 //!
@@ -20,7 +21,6 @@ use crate::crypto::hash_labeled_parts;
 use crate::did::Did;
 
 pub const ATTESTATION_DOMAIN: &str = "jig-alias-attestation-v1";
-pub const ROTATION_DOMAIN: &str = "jig-alias-rotate-v1";
 pub const DELEGATION_DOMAIN: &str = "jig-suffix-delegation-v1";
 pub const REACHABILITY_DOMAIN: &str = "jig-reach-v1";
 
@@ -217,61 +217,21 @@ impl Attestation {
     }
 }
 
-/// Both keys' agreement that `alias` moves from `old_did` to `new_did`
-/// (JEP-0004 rule 9).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RotationStatement {
-    pub alias: String,
-    /// The nameserver that accepted the rotation.
-    pub ns_did: String,
-    pub old_did: String,
-    pub new_did: String,
-    pub at: i64,
-    pub sig_old: String,
-    pub sig_new: String,
-}
-
-impl RotationStatement {
-    pub fn signed_hash(&self) -> [u8; 32] {
-        let at = self.at.to_string();
-        *hash_labeled_parts(&[
-            ("domain", ROTATION_DOMAIN.as_bytes()),
-            ("alias", self.alias.as_bytes()),
-            ("ns_did", self.ns_did.as_bytes()),
-            ("old_did", self.old_did.as_bytes()),
-            ("new_did", self.new_did.as_bytes()),
-            ("at", at.as_bytes()),
-        ])
-        .as_bytes()
-    }
-
-    pub fn sign(
-        old_key: &SigningKey,
-        new_key: &SigningKey,
-        alias: &str,
-        ns_did: &str,
-        at: i64,
-    ) -> Self {
-        let mut st = Self {
-            alias: alias.to_string(),
-            ns_did: ns_did.to_string(),
-            old_did: did_of(old_key),
-            new_did: did_of(new_key),
-            at,
-            sig_old: String::new(),
-            sig_new: String::new(),
-        };
-        let hash = st.signed_hash();
-        st.sig_old = b64(&old_key.sign(&hash));
-        st.sig_new = b64(&new_key.sign(&hash));
-        st
-    }
-
-    pub fn verify(&self) -> Result<(), NamingError> {
-        let hash = self.signed_hash();
-        verify_sig(&self.old_did, &self.sig_old, &hash)?;
-        verify_sig(&self.new_did, &self.sig_new, &hash)
-    }
+/// A link that moves `alias` from one DID to another (JEP-0004 rule 9).
+///
+/// The link itself is the identity design's dual-signed, audience-scoped
+/// statement (COSE over deterministic CBOR, lane I), with the audience set to
+/// one nameserver and one alias. This crate does not own that encoding; it
+/// only needs to read a link's fields and check its signatures.
+pub trait AliasLink {
+    fn old_did(&self) -> &str;
+    fn new_did(&self) -> &str;
+    /// The nameserver the link's audience names.
+    fn audience_ns_did(&self) -> &str;
+    /// The alias the link's audience names.
+    fn audience_alias(&self) -> &str;
+    /// Both keys signed the link.
+    fn verify_signatures(&self) -> Result<(), NamingError>;
 }
 
 /// Which DIDs speak for a suffix, under which root (JEP-0004 rule 3).
@@ -431,29 +391,29 @@ pub fn verify_binding(
     Ok(())
 }
 
-/// A chain of rotations leads from `pinned` to `new` for `alias`, each signed
-/// by both keys and accepted by `ns_did` (JEP-0004 rule 18). An empty chain
-/// only connects a DID to itself.
-pub fn verify_rotation_chain(
+/// A chain of links leads from `pinned` to `new` for `alias`, each signed by
+/// both keys and scoped to `ns_did` and `alias` (JEP-0004 rule 18). An empty
+/// chain only connects a DID to itself.
+pub fn verify_rotation_chain<L: AliasLink>(
     alias: &str,
     ns_did: &str,
     pinned: &str,
-    chain: &[RotationStatement],
+    chain: &[L],
     new: &str,
 ) -> Result<(), NamingError> {
     let mut current = pinned;
-    for st in chain {
-        if st.alias != alias || st.old_did != current {
+    for link in chain {
+        if link.audience_alias() != alias || link.old_did() != current {
             return Err(NamingError::BrokenChain(pinned.into(), new.into()));
         }
-        if st.ns_did != ns_did {
+        if link.audience_ns_did() != ns_did {
             return Err(NamingError::OtherNameserver(
-                st.ns_did.clone(),
+                link.audience_ns_did().to_string(),
                 ns_did.into(),
             ));
         }
-        st.verify()?;
-        current = &st.new_did;
+        link.verify_signatures()?;
+        current = link.new_did();
     }
     if current == new {
         Ok(())
@@ -612,42 +572,83 @@ mod tests {
         assert_eq!(swapped.verify(), Ok(()));
     }
 
+    /// A stand-in for lane I's link: the chain logic only reads fields and
+    /// asks whether both signatures hold.
+    struct TestLink {
+        old: String,
+        new: String,
+        ns: String,
+        alias: String,
+        signed: bool,
+    }
+
+    impl AliasLink for TestLink {
+        fn old_did(&self) -> &str {
+            &self.old
+        }
+        fn new_did(&self) -> &str {
+            &self.new
+        }
+        fn audience_ns_did(&self) -> &str {
+            &self.ns
+        }
+        fn audience_alias(&self) -> &str {
+            &self.alias
+        }
+        fn verify_signatures(&self) -> Result<(), NamingError> {
+            if self.signed {
+                Ok(())
+            } else {
+                Err(NamingError::BadSignature(self.old.clone()))
+            }
+        }
+    }
+
+    fn link(old: &str, new: &str, ns: &str) -> TestLink {
+        TestLink {
+            old: old.into(),
+            new: new.into(),
+            ns: ns.into(),
+            alias: "alice@example.org".into(),
+            signed: true,
+        }
+    }
+
     #[test]
-    fn rotation_chains_move_a_pin_only_with_both_keys() {
-        let (k1, k2, k3) = (key(9), key(11), key(13));
-        let ns_did = did_of(&ns());
-        let r1 = RotationStatement::sign(&k1, &k2, "alice@example.org", &ns_did, NOW);
-        let r2 = RotationStatement::sign(&k2, &k3, "alice@example.org", &ns_did, NOW + 1);
-        let (d1, d3) = (did_of(&k1), did_of(&k3));
-        let chain = [r1.clone(), r2.clone()];
+    fn rotation_chains_move_a_pin_only_along_signed_scoped_links() {
+        let ns = "did:jig:zns";
+        let chain = [
+            link("did:jig:z1", "did:jig:z2", ns),
+            link("did:jig:z2", "did:jig:z3", ns),
+        ];
+        let alias = "alice@example.org";
         assert_eq!(
-            verify_rotation_chain("alice@example.org", &ns_did, &d1, &chain, &d3),
+            verify_rotation_chain(alias, ns, "did:jig:z1", &chain, "did:jig:z3"),
             Ok(())
         );
+        // A gap, an empty chain, or the wrong end breaks it.
+        assert!(verify_rotation_chain(alias, ns, "did:jig:z1", &chain[1..], "did:jig:z3").is_err());
         assert!(
-            verify_rotation_chain(
-                "alice@example.org",
-                &ns_did,
-                &d1,
-                std::slice::from_ref(&r2),
-                &d3
-            )
-            .is_err()
+            verify_rotation_chain::<TestLink>(alias, ns, "did:jig:z1", &[], "did:jig:z3").is_err()
         );
-        assert!(verify_rotation_chain("alice@example.org", &ns_did, &d1, &[], &d3).is_err());
-
-        let mut tampered = r1.clone();
-        tampered.new_did = did_of(&key(42));
-        assert!(matches!(
-            tampered.verify(),
-            Err(NamingError::BadSignature(_))
-        ));
-
-        let other_ns = did_of(&key(8));
+        assert!(verify_rotation_chain(alias, ns, "did:jig:z1", &chain, "did:jig:z2").is_err());
+        // A link scoped to another alias or nameserver does not count here.
+        let mut other_alias = link("did:jig:z1", "did:jig:z3", ns);
+        other_alias.alias = "bob@example.org".into();
+        assert!(
+            verify_rotation_chain(alias, ns, "did:jig:z1", &[other_alias], "did:jig:z3").is_err()
+        );
         assert_eq!(
-            verify_rotation_chain("alice@example.org", &other_ns, &d1, &chain, &d3),
-            Err(NamingError::OtherNameserver(ns_did, other_ns))
+            verify_rotation_chain(alias, "did:jig:zother", "did:jig:z1", &chain, "did:jig:z3"),
+            Err(NamingError::OtherNameserver(
+                ns.into(),
+                "did:jig:zother".into()
+            ))
         );
+        // An unsigned link is refused.
+        let mut unsigned = link("did:jig:z1", "did:jig:z3", ns);
+        unsigned.signed = false;
+        assert!(verify_rotation_chain(alias, ns, "did:jig:z1", &[unsigned], "did:jig:z3").is_err());
     }
 
     #[test]
@@ -727,20 +728,13 @@ mod tests {
     }
 
     fn vectors() -> serde_json::Value {
-        let (ns, alice, alice2) = (key(7), key(9), key(11));
+        let (ns, alice) = (key(7), key(9));
         let att = Attestation::sign(
             &ns,
             &did_of(&alice),
             "alice@example.org",
             1_800_000_000,
             1_807_776_000,
-        );
-        let rot = RotationStatement::sign(
-            &alice,
-            &alice2,
-            "alice@example.org",
-            &did_of(&ns),
-            1_800_000_500,
         );
         let deleg = SuffixDelegation::sign(
             &[&ns],
@@ -766,11 +760,9 @@ mod tests {
                 "comment": "Ed25519 seeds: every byte set to the given value",
                 "nameserver": {"seed_byte": 7, "did": did_of(&ns)},
                 "alice": {"seed_byte": 9, "did": did_of(&alice)},
-                "alice_rotated": {"seed_byte": 11, "did": did_of(&alice2)},
                 "server": {"seed_byte": 13, "did": did_of(&key(13))},
             },
             "attestation": {"object": att, "signed_hash_hex": hex::encode(att.signed_hash())},
-            "rotation": {"object": rot, "signed_hash_hex": hex::encode(rot.signed_hash())},
             "delegation": {"object": deleg, "signed_hash_hex": hex::encode(deleg.signed_hash())},
             "reachability": {"object": reach, "signed_hash_hex": hex::encode(reach.signed_hash())},
             "register_proof": {

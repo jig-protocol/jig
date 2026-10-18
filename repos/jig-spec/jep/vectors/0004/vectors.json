@@ -33,10 +33,6 @@
       "did": "did:jig:z7ulsioc2uddvwzh3pdgwal5b3gi7327xnmj4ldwxalvmqnpj6yma",
       "seed_byte": 9
     },
-    "alice_rotated": {
-      "did": "did:jig:zm27h4mzmpjctgmv5tufh67nqkx24l3y2a2w2m3mywop3naimi45a",
-      "seed_byte": 11
-    },
     "comment": "Ed25519 seeds: every byte set to the given value",
     "nameserver": {
       "did": "did:jig:z5jfgyy7ctrjavpxvkb5rglwf7gkuo5vox27hxescd3vgsfcg2iwa",
@@ -68,17 +64,5 @@
     "ns_did": "did:jig:z5jfgyy7ctrjavpxvkb5rglwf7gkuo5vox27hxescd3vgsfcg2iwa",
     "sig": "An84O2PyMdaNmD4D68nDTSLiYaE+OAck+z8RoHZQuSTrYDoaiBIyvql/Iri1rE3cQOlYjKS5dugc71gG/qJWBQ==",
     "signed_hash_hex": "911617fadcf061b75ce20f14aeee6905c30d87c3606938ab3b1b40b33a76762c"
-  },
-  "rotation": {
-    "object": {
-      "alias": "alice@example.org",
-      "at": 1800000500,
-      "new_did": "did:jig:zm27h4mzmpjctgmv5tufh67nqkx24l3y2a2w2m3mywop3naimi45a",
-      "ns_did": "did:jig:z5jfgyy7ctrjavpxvkb5rglwf7gkuo5vox27hxescd3vgsfcg2iwa",
-      "old_did": "did:jig:z7ulsioc2uddvwzh3pdgwal5b3gi7327xnmj4ldwxalvmqnpj6yma",
-      "sig_new": "ofe6n3K2OPquyH3IBUlUQWnIdNqsf8CTDETJ7QGwkzWQkJ1/SwlszJNfRdUFTw7nWE4pPcERwYN3V9tfJjnhBA==",
-      "sig_old": "lfQFewnFZT63EkZScTXlI3gnn9t38RQ1IMoEPjebqU8czCKp7mUl9POGAr55XtR5YsgzheLDpKnR1I64adrXAg=="
-    },
-    "signed_hash_hex": "053dd18ae4d42e78b87f81450ee522a3997010868811b859fa619f934472f7a3"
   }
 }
