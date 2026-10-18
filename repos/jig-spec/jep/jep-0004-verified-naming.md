@@ -112,17 +112,21 @@ Non-goals:
    - **Labelled hashing**, as in the admission proof-of-work: for each part, the label's
      UTF-8 bytes, then the value's length as a little-endian u64, then the value's bytes.
      Every signature in this JEP uses it.
-9. A **rotation statement** is `{alias, ns_did, old_did, new_did, at, sig_old, sig_new}`.
-   - `ns_did` is the nameserver that accepted the rotation. It MUST equal the `ns_did` of
-     the attestation the rotation produced.
-   - Both keys sign over (`domain`, `jig-alias-rotate-v1`), (`alias`), (`ns_did`),
-     (`old_did`), (`new_did`), (`at`).
-   - A nameserver MUST keep every rotation statement it accepted, and MUST serve the chain
-     of them with the attestation that resulted.
+9. A **rotation** is a link as defined by the identity-lifecycle design (lane I): from
+   `old` to `new`, signed by both keys, COSE over deterministic CBOR, with its audience set
+   to one nameserver DID and one alias.
+   - The audience's nameserver MUST equal the `ns_did` of the attestation the rotation
+     produced, and its alias MUST equal that attestation's `alias`. A link with any other
+     audience moves no alias.
+   - `/v1/rotate` takes the link, in place of two challenge signatures.
+   - A nameserver MUST keep every link it accepted, and MUST serve the chain of them with
+     the attestation that resulted.
+   - Until links exist (lane I's milestone I3), no alias can be rotated, and every change
+     of DID behind a pinned name needs the holder's acceptance (rule 18).
 
 ## Registration
 
-10. Proof of control for register, renew and rotate MUST be a signature by the DID over
+10. Proof of control for register and renew MUST be a signature by the DID over
     (`domain`, `jig-alias-<action>-v1`), (`ns_did`), (`alias`), (`challenge`). A
     nameserver MUST refuse a proof over the bare challenge.
     - A challenge MUST be fresh: at least 32 random bytes, issued by the nameserver, and
@@ -159,7 +163,7 @@ Non-goals:
     use. When it pins, it shows the DID's fingerprint and the vouching nameserver.
 18. A client MUST NOT act on a binding that differs from its pin unless one of these
     holds:
-    1. a chain of valid rotation statements leads from the pinned DID to the new DID; or
+    1. a chain of valid rotation links (rule 9) leads from the pinned DID to the new DID; or
     2. the holder explicitly accepts the change.
 
     That covers expiry followed by re-registration to another DID, a change of
@@ -169,7 +173,7 @@ Non-goals:
 
 ## Evidence
 
-20. A resolver SHOULD keep every attestation and rotation statement it acted on until at
+20. A resolver SHOULD keep every attestation and rotation link it acted on until at
     least its `valid_until` plus 30 days, and SHOULD let the holder export them.
 
 ## Reachability records
@@ -216,7 +220,7 @@ Non-goals:
 
 - Lookups through the server hide the client's address from the nameserver.
 - Direct lookups hide them from the server.
-- No message links two user DIDs except a rotation statement, which both keys sign
+- No message links two user DIDs except a rotation link, which both keys sign
   (PV-03). Service links are by design: an attestation links a user's DID to the
   nameserver's, and a reachability record links it to the servers the user chose to list.
 
@@ -237,7 +241,7 @@ None yet. Milestone F1 of the design.
 To be added with F1:
 
 - an attestation;
-- a rotation statement;
+- rotation links: lane I's vectors;
 - a delegation document;
 - a reachability record;
 
