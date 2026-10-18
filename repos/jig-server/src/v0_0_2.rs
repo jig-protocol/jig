@@ -147,6 +147,12 @@ impl AppState {
         let store = Arc::new(SqliteStore::open(&db_path).context("opening SqliteStore")?);
         let signing_key = load_or_generate_server_key(&config.server.server_did_keyfile)
             .context("loading server signing key")?;
+        // Before anything logs a DID: tags are keyed by this server's seed.
+        if !jig_core::did::set_log_tag_key(&signing_key.to_bytes()) {
+            tracing::warn!(
+                "a different log tag key is already in effect in this process; DID tags keep using it"
+            );
+        }
         let server_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
 
         let identity: Arc<dyn IdentityResolver> = match config.identity.mode {
