@@ -38,7 +38,7 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::crypto::ed25519::fill_random;
+use crate::crypto::ed25519::random_array;
 use crate::crypto::hash_labeled_parts;
 
 const MAGIC: &[u8; 8] = b"jigkey\0\x01";
@@ -49,6 +49,20 @@ const TAG_LEN: usize = 16;
 /// Largest header [`JigKey::from_bytes`] will read. A header is a few hundred
 /// bytes per slot.
 const MAX_HEADER: usize = 64 * 1024;
+/// Where nonces, salts and data keys come from: the OS CSPRNG, or a fixed
+/// sequence for the format's golden vectors.
+trait Entropy {
+    fn bytes<const N: usize>(&mut self) -> [u8; N];
+}
+
+struct OsEntropy;
+
+impl Entropy for OsEntropy {
+    fn bytes<const N: usize>(&mut self) -> [u8; N] {
+        random_array()
+    }
+}
+
 /// Shortest secret a secret slot accepts. A secret slot does no stretching, so
 /// its input must already be a key; a passphrase belongs in a passphrase slot.
 pub const MIN_SECRET_LEN: usize = 32;
@@ -237,13 +251,11 @@ impl JigKey {
     /// Seal `seed` for `did` under a fresh data key, with one slot per entry
     /// of `slots`. At least one slot is required.
     pub fn seal(did: &str, seed: &[u8; 32], slots: &[NewSlot]) -> Result<(Self, Opened)> {
-        let mut data_key = Zeroizing::new([0u8; 32]);
-        fill_random(data_key.as_mut());
         let opened = Opened {
             seed: Zeroizing::new(*seed),
-            data_key,
+            data_key: Zeroizing::new(OsEntropy.bytes()),
         };
-        let key = Self::build(did, &opened, slots, &mut fill_random)?;
+        let key = Self::build(did, &opened, slots, &mut OsEntropy)?;
         Ok((key, opened))
     }
 
@@ -251,7 +263,7 @@ impl JigKey {
         did: &str,
         opened: &Opened,
         slots: &[NewSlot],
-        rng: &mut dyn FnMut(&mut [u8]),
+        rng: &mut impl Entropy,
     ) -> Result<Self> {
         if slots.is_empty() {
             return Err(KeystoreError::LastSlot);
@@ -267,16 +279,16 @@ impl JigKey {
         did: &str,
         opened: &Opened,
         slots: Vec<SlotRecord>,
-        rng: &mut dyn FnMut(&mut [u8]),
+        rng: &mut impl Entropy,
     ) -> Result<Self> {
         let header = Header {
             v: VERSION,
             did: did.to_string(),
             slots,
         };
-        let header_bytes = serde_json::to_vec(&header).expect("header serializes");
-        let mut nonce = [0u8; NONCE_LEN];
-        rng(&mut nonce);
+        let header_bytes = serde_json::to_vec(&header)
+            .map_err(|e| KeystoreError::Malformed(format!("header: {e}")))?;
+        let nonce: [u8; NONCE_LEN] = rng.bytes();
         let key = payload_key(&opened.data_key);
         let sealed_seed = aead_seal(
             &key,
@@ -350,9 +362,9 @@ impl JigKey {
             &self.header.did,
             &opened.data_key,
             slot,
-            &mut fill_random,
+            &mut OsEntropy,
         )?);
-        Self::assemble(&self.header.did, opened, slots, &mut fill_random)
+        Self::assemble(&self.header.did, opened, slots, &mut OsEntropy)
     }
 
     /// A copy without the slot at `index`. Refuses to remove the last one.
@@ -365,7 +377,7 @@ impl JigKey {
         }
         let mut slots = self.header.slots.clone();
         slots.remove(index);
-        Self::assemble(&self.header.did, opened, slots, &mut fill_random)
+        Self::assemble(&self.header.did, opened, slots, &mut OsEntropy)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -437,9 +449,7 @@ pub fn derive_file_key(data_key: &[u8; 32], context: &str) -> FileKey {
 /// bind the blob to its place, for example the DID and the file's role, so a
 /// blob cannot be moved between files or identities.
 pub fn seal(key: &FileKey, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
-    let mut nonce = [0u8; NONCE_LEN];
-    fill_random(&mut nonce);
-    seal_with_nonce(key, &nonce, aad, plaintext)
+    seal_with_nonce(key, &random_array(), aad, plaintext)
 }
 
 fn seal_with_nonce(
@@ -547,15 +557,13 @@ fn wrap_slot(
     did: &str,
     data_key: &[u8; 32],
     slot: &NewSlot,
-    rng: &mut dyn FnMut(&mut [u8]),
+    rng: &mut impl Entropy,
 ) -> Result<SlotRecord> {
-    let mut nonce = [0u8; NONCE_LEN];
     match slot {
         NewSlot::Passphrase { passphrase, params } => {
-            let mut salt = [0u8; 16];
-            rng(&mut salt);
+            let salt: [u8; 16] = rng.bytes();
             let kek = argon2_kek(passphrase, &salt, params)?;
-            rng(&mut nonce);
+            let nonce: [u8; NONCE_LEN] = rng.bytes();
             let aad = slot_aad(did, "passphrase", &passphrase_params_bytes(params, &salt));
             Ok(SlotRecord::Passphrase {
                 kdf: "argon2id".into(),
@@ -567,7 +575,7 @@ fn wrap_slot(
         }
         NewSlot::Secret { source, secret } => {
             let kek = secret_kek(secret)?;
-            rng(&mut nonce);
+            let nonce: [u8; NONCE_LEN] = rng.bytes();
             let aad = slot_aad(did, source.as_str(), &[]);
             Ok(SlotRecord::Secret {
                 source: *source,
@@ -881,22 +889,25 @@ mod tests {
     /// open: it is not a fixture to refresh.
     #[test]
     fn golden_jigkey_opens() {
+        /// A fixed byte sequence, standing in for the OS CSPRNG.
+        struct Counter(u8);
+        impl Entropy for Counter {
+            fn bytes<const N: usize>(&mut self) -> [u8; N] {
+                std::array::from_fn(|_| {
+                    self.0 = self.0.wrapping_add(1);
+                    self.0
+                })
+            }
+        }
         let opened = Opened {
             seed: Zeroizing::new(SEED),
-            data_key: Zeroizing::new([0x42; 32]),
-        };
-        let mut counter = 0u8;
-        let mut rng = |buf: &mut [u8]| {
-            for b in buf {
-                counter = counter.wrapping_add(1);
-                *b = counter;
-            }
+            data_key: Zeroizing::new(Counter(0x41).bytes()),
         };
         let key = JigKey::build(
             DID,
             &opened,
             &[pass("golden"), secret(SecretSource::Credential, 0x5a)],
-            &mut rng,
+            &mut Counter(0),
         )
         .unwrap();
         let bytes = key.to_bytes();
@@ -906,7 +917,12 @@ mod tests {
         assert_eq!(*back.open(&[offer_pass("golden")]).unwrap().seed, SEED);
         assert_eq!(*back.open(&[offer_secret(0x5a)]).unwrap().seed, SEED);
 
-        let blob = seal_with_nonce(&opened.file_key("golden"), &[9; NONCE_LEN], b"aad", b"msg");
+        let blob = seal_with_nonce(
+            &opened.file_key("golden"),
+            &Counter(8).bytes(),
+            b"aad",
+            b"msg",
+        );
         assert_eq!(hex::encode(&blob), GOLDEN_BLOB);
         let frozen = hex::decode(GOLDEN_BLOB).unwrap();
         assert_eq!(
@@ -915,6 +931,6 @@ mod tests {
         );
     }
 
-    const GOLDEN_JIGKEY: &str = "6a69676b65790001cf0100007b2276223a312c22646964223a226469643a6a69673a7a706732766d6c7570347a6b707371647977656a6f726b6d6c7536696237626a3234326b3335763761346f6971786c6965737a7361222c22736c6f7473223a5b7b226b696e64223a2270617373706872617365222c226b6466223a226172676f6e326964222c226d5f6b6962223a36342c2274223a312c2270223a312c2273616c74223a2241514944424155474277674a4367734d4451345045413d3d222c226e6f6e6365223a2245524954464255574678675a4768736348523466494345694979516c4a69636f222c2277726170706564223a22677167343555684b566969343947657a71456b435131354859624f772b656f5374544b65456d742f355a426c4436344d4f524445446a7568716f5a364a585a38227d2c7b226b696e64223a22736563726574222c22736f75726365223a2263726564656e7469616c222c226e6f6e6365223a224b536f724c4330754c7a41784d6a4d304e5459334f446b364f7a7739506a3941222c2277726170706564223a22482b52674d66704e715a3553652b67684c6f466e2f41344d62385950514e4a4e317a774963612f446153443548323376746a70496864454932494f682b70704a227d5d7d4142434445464748494a4b4c4d4e4f5051525354555657585645a1dd097953fbd6843d9ad7188f1dd65234e3265d29021aef7da430068b07a3ca9f45daafc5e944b82fd35498b65b";
-    const GOLDEN_BLOB: &str = "6a69677365616c3109090909090909090909090909090909090909090909090994ab018c0e8f691185aa9977acd7412a07e80f";
+    const GOLDEN_JIGKEY: &str = "6a69676b65790001cf0100007b2276223a312c22646964223a226469643a6a69673a7a706732766d6c7570347a6b707371647977656a6f726b6d6c7536696237626a3234326b3335763761346f6971786c6965737a7361222c22736c6f7473223a5b7b226b696e64223a2270617373706872617365222c226b6466223a226172676f6e326964222c226d5f6b6962223a36342c2274223a312c2270223a312c2273616c74223a2241514944424155474277674a4367734d4451345045413d3d222c226e6f6e6365223a2245524954464255574678675a4768736348523466494345694979516c4a69636f222c2277726170706564223a2267716b2b346b785058434f772f576d3870455151554535576436536b3750414a725375414458646978374e785239363371715a6e63444e646e726e38356a416f227d2c7b226b696e64223a22736563726574222c22736f75726365223a2263726564656e7469616c222c226e6f6e6365223a224b536f724c4330754c7a41784d6a4d304e5459334f446b364f7a7739506a3941222c2277726170706564223a22482b566d4e7635496f35566163755975496f78313778346465644562566368577a7955576272506553774f38634a6d4c6f6d5537493544745779694f74725955227d5d7d4142434445464748494a4b4c4d4e4f5051525354555657588051b6299b938d630531975243e87a98a71cf54b0a7488375214f77814fed324f080d74dd286deffbad317e46ce72344";
+    const GOLDEN_BLOB: &str = "6a69677365616c31090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2062a0376493495b58ee9f45c5a53fd6fdcf402d";
 }
