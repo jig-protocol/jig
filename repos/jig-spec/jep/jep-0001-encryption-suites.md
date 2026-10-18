@@ -69,8 +69,12 @@ A gate treats a suite by its properties, not by name:
 - **Payload field.** The block-metadata key that carries an encrypted suite's ciphertext
   (`mls_message`; `test_ciphertext`). A content block without it is refused
   (`MISSING_METADATA`).
-- **Restricted channels.** Only `mls` may serve a restricted channel or a DM (decision D25).
-  A new suite's JEP says whether it may; a suite whose operator can read its content may not.
+- **Operator-confidential.** The server's operator cannot read content under the suite:
+  `mls` only. `none` is not encrypted, and `test-aead` is encrypted under a published key.
+  A restricted channel's suite MUST be operator-confidential (decision D25), and a server and
+  a client apply the same property. The refusal code stays `RESTRICTED_REQUIRES_MLS`. A
+  new suite's JEP states whether the suite is operator-confidential. A DM is always `mls`,
+  because it relies on MLS group membership.
 
 ## Report profile
 

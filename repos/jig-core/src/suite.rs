@@ -84,6 +84,19 @@ impl EncryptionSuite {
         !matches!(self, EncryptionSuite::Unencrypted)
     }
 
+    /// Whether the server's operator cannot read content under the suite.
+    /// Only such a suite may serve a restricted channel (ROADMAP D25): content
+    /// the operator can read is not restricted from it. `test-aead` is
+    /// encrypted but not confidential, because its key is published.
+    pub const fn is_operator_confidential(self) -> bool {
+        match self {
+            EncryptionSuite::Mls => true,
+            EncryptionSuite::Unencrypted => false,
+            #[cfg(feature = "test-suite")]
+            EncryptionSuite::TestAead => false,
+        }
+    }
+
     /// The block-metadata key that carries a content block's ciphertext, for
     /// an encrypted suite.
     pub const fn payload_field(self) -> Option<&'static str> {
@@ -293,6 +306,8 @@ mod tests {
         assert_eq!(EncryptionSuite::Unencrypted.payload_field(), None);
         assert!(EncryptionSuite::Mls.is_encrypted());
         assert_eq!(EncryptionSuite::Mls.payload_field(), Some("mls_message"));
+        assert!(EncryptionSuite::Mls.is_operator_confidential());
+        assert!(!EncryptionSuite::Unencrypted.is_operator_confidential());
         for suite in EncryptionSuite::REGISTERED {
             assert_eq!(suite.is_encrypted(), suite.payload_field().is_some());
             assert_eq!(suite.is_advertised(), !suite.as_str().starts_with("test-"));
@@ -316,6 +331,9 @@ mod tests {
         assert!(suite.ensure_frame_suite().is_err());
         assert!(suite.is_encrypted());
         assert!(!suite.is_advertised());
+        // Encrypted is not confidential: anyone holds the key, the operator
+        // included, so it may not serve a restricted channel.
+        assert!(!suite.is_operator_confidential());
     }
 
     #[test]

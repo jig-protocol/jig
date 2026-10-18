@@ -61,9 +61,10 @@ pub enum SuiteRefusal {
     },
     /// The MLS payload failed validation.
     Mls(jig_mls::MlsError),
-    /// A restricted `channel-create` whose suite is not `mls`. Content the
-    /// server can read is open content; a creator who wants plaintext makes
-    /// an open channel.
+    /// A restricted `channel-create` whose suite is not operator-confidential
+    /// ([`EncryptionSuite::is_operator_confidential`]; today only `mls`).
+    /// Content the server can read is open content; a creator who wants
+    /// plaintext makes an open channel.
     RestrictedNeedsMls { slug: String },
     /// Content for a restricted channel that was created as plaintext, before
     /// restricted channels were always encrypted. Its history stays readable;
@@ -122,13 +123,14 @@ pub fn plan(
         if slug.starts_with(jig_core::dm::DM_PREFIX) {
             check_dm_create(sender, manifest, &slug, suite)?;
         }
+        // A restricted channel needs a suite its operator cannot read (D25).
+        // Absent visibility is open, as the effect stores it; anything else
+        // that is not exactly `open` is restricted (fail closed).
+        let visibility = meta_str(manifest, "visibility").unwrap_or("open");
+        if !suite.is_operator_confidential() && !crate::visibility::is_open(visibility) {
+            return Err(SuiteRefusal::RestrictedNeedsMls { slug });
+        }
         if suite != EncryptionSuite::Mls {
-            // Absent visibility is open, as the effect stores it; anything
-            // else that is not exactly `open` is restricted (fail closed).
-            let visibility = meta_str(manifest, "visibility").unwrap_or("open");
-            if !crate::visibility::is_open(visibility) {
-                return Err(SuiteRefusal::RestrictedNeedsMls { slug });
-            }
             return Ok(MlsPlan::Nothing);
         }
         let info = meta_bytes(manifest, keys::GROUP_INFO)?;
