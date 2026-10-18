@@ -210,7 +210,6 @@ async fn naively_allow_unknown_handles_fallback_bypasses_lock() {
             "member-add".to_string(),
             "fed-hello".to_string(),
         ];
-        cfg.debug.admin_endpoints = true;
         cfg
     };
     config.identity = IdentitySection {

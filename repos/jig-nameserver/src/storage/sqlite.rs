@@ -870,16 +870,17 @@ impl NamesStorage for SqliteStorage {
             let (new_min, new_count) = if let Some(row) = rows.next()? {
                 let win: i64 = row.get(0)?;
                 let cnt: i64 = row.get(1)?;
-                if win == now_min {
-                    if (cnt as u32) >= limit_per_min { (win, cnt) } else { (win, cnt + 1) }
-                } else {
-                    (now_min, 1)
-                }
+                if win == now_min { (win, cnt + 1) } else { (now_min, 1) }
             } else {
                 (now_min, 1)
             };
             drop(rows);
             drop(stmt);
+            // Over the limit: refuse without advancing the counter, matching
+            // `MemoryStorage`.
+            if new_count > i64::from(limit_per_min) {
+                return Ok(false);
+            }
             // Write back
             tx.execute(
                 "INSERT INTO rate_limits(key, window_minute, count) VALUES (?1, ?2, ?3)
@@ -887,7 +888,7 @@ impl NamesStorage for SqliteStorage {
                 params![key_s, new_min, new_count],
             )?;
             tx.commit()?;
-            Ok::<_, NameServerError>(new_min == now_min && (new_count as u32) <= limit_per_min)
+            Ok::<_, NameServerError>(true)
         })
         .await
         .map_err(|e| NameServerError::Other(anyhow::anyhow!(format!("join error: {e}"))))??;
@@ -2899,6 +2900,35 @@ mod tests {
                 .is_empty(),
             "lifted penalty must not remain active"
         );
+    }
+
+    /// A limit of N admits exactly N requests per window. The counter used to
+    /// stop at N while still reporting `count <= limit`, so request N+1 (and
+    /// every one after it) was admitted.
+    #[tokio::test]
+    async fn rate_limit_admits_exactly_the_limit() {
+        let scratch = ScratchDir::new();
+        let store = SqliteStorage::new(scratch.db_path()).expect("init");
+        let key = "ip:203.0.113.9";
+
+        for i in 1..=3 {
+            assert!(
+                store.rate_check_and_increment(key, 3).await.expect("check"),
+                "request {i} of 3 must be admitted"
+            );
+        }
+        for i in 4..=5 {
+            assert!(
+                !store.rate_check_and_increment(key, 3).await.expect("check"),
+                "request {i} over a limit of 3 must be refused"
+            );
+        }
+        let (_, count) = store
+            .get_rate_info(key)
+            .await
+            .expect("rate info")
+            .expect("row exists");
+        assert_eq!(count, 3, "refused requests must not advance the counter");
     }
 
     /// The legacy points API must keep working off its own table.
