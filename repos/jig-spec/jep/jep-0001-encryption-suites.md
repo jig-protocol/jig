@@ -76,38 +76,19 @@ A gate treats a suite by its properties, not by name:
   new suite's JEP states whether the suite is operator-confidential. A DM is always `mls`,
   because it relies on MLS group membership.
 
-## Report profile
+## Reporting
 
-Every suite JEP MUST define a **report profile**: what a member discloses about one message
-so a third party (a tribunal) can verify who wrote it and what it said, and how that party
-checks it. The disclosure MUST open that message and no other. A suite without a report
-profile cannot be admitted by a group that has a tribunal. The report envelope and the
-tribunal are R's ([framing](../../../docs/superpowers/specs/2026-10-18-reputation-pow-tribunals-framing.md),
-section 8.3; decided by DJ 2026-10-18). This section fixes only what each suite contributes.
+Encrypted abuse reports use message franking, which sits above the suite
+([JEP-0010](jep-0010-reports-tribunals-lists.md), rules 6–8a). A suite contributes one
+property, and every suite JEP MUST state it:
 
-- **`none`.** Nothing to disclose. The plaintext `body` is in the block, and the block's author
-  signature binds the author's DID to it.
-- **`mls`: per-message key disclosure, pending R5.** The decided profile works like this. The
-  reporter discloses, for that one application message, the message key and nonce from the
-  sender's secret-tree ratchet for its generation, the sender-data key and nonce, and the
-  epoch's `GroupContext`. The verifier checks the block's author signature over the
-  ciphertext, decrypts with the disclosed values, and checks the MLS content signature over
-  the `FramedContent` and `GroupContext`. That signature uses the DID key, because in jig the
-  leaf key is the DID key. No ratchet secret is disclosed, so no other message opens.
-  **Not implementable on openmls 0.9 as it stands.** openmls 0.9 has no public API that
-  returns a message's key, its nonce, or the signed `FramedContent`. The secret tree is
-  crate-private, and a processed message carries its content, sender and credential but
-  not its signature. The sender ratchet also deletes a generation's key once it is used, so
-  a reporter would have to capture the values when the message is first decrypted. R5
-  decides between an openmls change that returns those values on decryption, upstream or
-  carried as a patch, and a different profile.
-- **`test-aead`.** Nothing to disclose: the key is published. The verifier opens the payload
-  with the key and the AAD (channel slug and author), and checks the block's author signature
-  over the payload. The key is fixed and public, so the payload cannot open to a different
-  plaintext under a different key.
+- **Faithful delivery.** The suite delivers the plaintext, franking key `k_f` included,
+  unchanged to every member of the channel. A ruleset group that holds tribunals MUST NOT
+  admit a suite that does not (JEP-0010 rule 8a).
 
-Report-profile vectors are R5's (a report proves one message's authorship and opens no
-other). They are not part of the format below yet.
+`none` and `mls` both have this property: every member receives the same plaintext, and
+for `mls` it is authenticated by the sender's MLS content signature. `test-aead` has it too:
+there is one key and one payload, and every member opens it to the same bytes.
 
 ## Conformance vectors
 
@@ -167,6 +148,8 @@ sealed receipt without MLS.
   `jig-test-aead-v1|<channel slug>|<sender DID>`, so a payload reads only in its own channel
   under its own author.
 - **No group state.** Membership blocks on a `test-aead` channel are plain control blocks.
+- **Faithful delivery** (see Reporting): every member opens the one payload to the same
+  plaintext, so the suite meets JEP-0010 rule 8a.
 - **Open channels only.** Anyone can read it, so it may not serve a restricted channel or a
   DM.
 - **Never in a production build.** The `test-` prefix is reserved: a production
