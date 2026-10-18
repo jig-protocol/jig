@@ -662,8 +662,9 @@ mod tests {
 
         // Seed one message directly through the store (the admin router has no
         // text-render endpoint; the history-retention claim is about storage).
+        let msg_cid = jig_pipeline::ingest_record::label_cid("msg 1");
         let msg = jig_pipeline::persist::StoredBlock {
-            cid: "bafy_msg_1".into(),
+            cid: msg_cid.clone(),
             channel_id: Some("#scratch".into()),
             block_kind: "text-render".into(),
             sender_did: owner.did_string(),
@@ -709,7 +710,7 @@ mod tests {
             state
                 .ingest_ctx
                 .store
-                .get_block("bafy_msg_1")
+                .get_block(&msg_cid)
                 .unwrap()
                 .is_some(),
             "archive must not delete blocks"
@@ -723,7 +724,7 @@ mod tests {
             .list_blocks_by_channel("#scratch", 100, None)
             .unwrap();
         assert!(
-            timeline.iter().any(|b| b.cid == "bafy_msg_1"),
+            timeline.iter().any(|b| b.cid == msg_cid),
             "channel history must still be readable from storage; got {:?}",
             timeline.iter().map(|b| &b.cid).collect::<Vec<_>>()
         );

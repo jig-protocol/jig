@@ -1185,7 +1185,7 @@ mod tests {
     }
 
     fn seed_channel_owned_by(ctx: &IngestContext, slug: &str, owner_did: &str) -> String {
-        let id = format!("bafySeed_{}", slug.trim_start_matches('#'));
+        let id = crate::ingest_record::label_cid(&format!("seed {slug}"));
         ctx.store
             .upsert_channel(&crate::persist::StoredChannel {
                 id: id.clone(),
@@ -2320,9 +2320,10 @@ mod tests {
         ctx.fanout.register_bridge_did(shadow.clone(), tx);
 
         // Channel "#dm/x" with members [bob, shadow].
+        let channel_cid = crate::ingest_record::label_cid("dm x");
         ctx.store
             .upsert_channel(&StoredChannel {
-                id: "#dm/x".into(),
+                id: channel_cid.clone(),
                 slug: "#dm/x".into(),
                 // Bridges carry plaintext, which only an open channel takes (D25).
                 visibility: "open".into(),
@@ -2334,7 +2335,7 @@ mod tests {
         for did in [bob_did.clone(), shadow.clone()] {
             ctx.store
                 .upsert_membership(&StoredMembership {
-                    channel_id: "#dm/x".into(),
+                    channel_id: channel_cid.clone(),
                     member_did: did,
                     role: "member".into(),
                     joined_at: 0,
@@ -2363,7 +2364,7 @@ mod tests {
         // Regression: memberships are keyed by the channel's CID, not its slug.
         // The prior dispatch used `list_members(slug)` which returns nothing when
         // `channel.id != channel.slug` (the realistic shape from channel-create).
-        // This test stores channel.id = "bafyCID_xyz" and channel.slug = "#dm/z"
+        // This test stores channel.id = a CID and channel.slug = "#dm/z"
         // and verifies the bridge sink still fires.
         use crate::persist::{StoredChannel, StoredMembership};
         let ctx = test_ctx(); // allows "text-render"
@@ -2377,7 +2378,7 @@ mod tests {
 
         // Channel stored with a CID as id (distinct from slug) — realistic
         // shape written by channel-create effect handling.
-        let channel_cid = "bafyCID_xyz".to_string();
+        let channel_cid = crate::ingest_record::label_cid("dm z");
         ctx.store
             .upsert_channel(&StoredChannel {
                 id: channel_cid.clone(),

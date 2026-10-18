@@ -114,7 +114,8 @@ Draft. Field names are provisional. The design behind this revision is
 9. Every block in a channel has an `ingest` record, signed by the channel's sequencer
    as a COSE_Sign1 (EdDSA) over a deterministic CBOR map with `domain` =
    `jig-ingest-v2`, which its `format` field names (a client MUST refuse a record in
-   a format it does not verify by that name): `channel_id` (the CID of the channel's
+   a format it does not verify by that name; CIDs in the payload are binary CIDv1
+   byte strings, per JEP-0004 rule 0): `channel_id` (the CID of the channel's
    `channel-create` block), `seq` (0 for that block, then +1 per accepted block),
    `ingest_hlc`, `block_cid`, `prev` (BLAKE3 of the previous record's COSE_Sign1 envelope;
    zero at `seq` 0) and `sequencer`. The sequencer is the channel's owning server from

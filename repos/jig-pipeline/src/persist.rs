@@ -296,7 +296,9 @@ fn sequence_on(
             (last.seq + 1, last.hash())
         }
     };
-    let record = signer.sign(seq, block_cid, prev);
+    let record = signer
+        .sign(seq, block_cid, prev)
+        .map_err(|e| PersistError::Corrupt(format!("cannot sequence {block_cid}: {e}")))?;
     conn.execute(
         "INSERT INTO ingest_records (block_cid, channel_id, slug, seq, record)
          VALUES (?,?,?,?,?)",
@@ -1548,11 +1550,16 @@ mod tests {
 
     fn test_signer(key: &ed25519_dalek::SigningKey, wall: u64) -> RecordSigner<'_> {
         RecordSigner {
-            channel_id: "bafy_create".to_string(),
+            channel_id: c("bafy_create"),
             key,
             ingest_wall_ms: wall,
             ingest_logical: 0,
         }
+    }
+
+    /// A real CIDv1 standing for `label`: records sign only CIDs.
+    fn c(label: &str) -> String {
+        crate::ingest_record::label_cid(label)
     }
 
     fn at_hlc(cid: &str, wall: u64) -> StoredBlock {
@@ -1571,7 +1578,7 @@ mod tests {
         let did =
             jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
         // Each author claims an earlier time than the last.
-        let order = ["bafy_create", "bafy_b", "bafy_c", "bafy_d"];
+        let order = [c("bafy_create"), c("bafy_b"), c("bafy_c"), c("bafy_d")];
         let mut records = Vec::new();
         for (i, cid) in order.iter().enumerate() {
             let block = at_hlc(cid, 1_000 - i as u64 * 10);
@@ -1589,28 +1596,24 @@ mod tests {
             record.verify(&did).unwrap();
         }
         assert_eq!(
-            store.get_ingest_record("bafy_c").unwrap().as_ref(),
+            store.get_ingest_record(&order[2]).unwrap().as_ref(),
             Some(&records[2])
         );
 
         let history = block_cids(store.list_blocks_by_channel("#seq", 50, None).unwrap());
-        assert_eq!(history, cids_of(&order), "history follows seq, not hlc_ts");
+        assert_eq!(history, order.to_vec(), "history follows seq, not hlc_ts");
         let newest_two = block_cids(store.list_blocks_by_channel("#seq", 2, None).unwrap());
-        assert_eq!(newest_two, cids_of(&order[2..]));
+        assert_eq!(newest_two, order[2..].to_vec());
         let older = block_cids(
             store
-                .list_blocks_before("#seq", 2, "bafy_c")
+                .list_blocks_before("#seq", 2, &order[2])
                 .unwrap()
                 .unwrap(),
         );
-        assert_eq!(older, cids_of(&order[..2]), "paging back follows seq too");
+        assert_eq!(older, order[..2].to_vec(), "paging back follows seq too");
 
         let from_one = store.list_ingest_records("#seq", 1, 2).unwrap();
         assert_eq!(from_one, records[1..3].to_vec());
-    }
-
-    fn cids_of(cids: &[&str]) -> Vec<String> {
-        cids.iter().map(|c| c.to_string()).collect()
     }
 
     fn block_cids(blocks: Vec<StoredBlock>) -> Vec<String> {
@@ -1625,7 +1628,7 @@ mod tests {
         let key = jig_core::crypto::ed25519::generate_signing_key();
         store
             .upsert_channel(&StoredChannel {
-                id: "bafy_create".to_string(),
+                id: c("bafy_create"),
                 slug: "#seq".to_string(),
                 visibility: "open".to_string(),
                 created_at: 0,
@@ -1634,21 +1637,28 @@ mod tests {
             })
             .unwrap();
         // A post whose author's clock runs before the channel's creation.
-        store.insert_block(&at_hlc("bafy_early_post", 10)).unwrap();
-        store.insert_block(&at_hlc("bafy_create", 500)).unwrap();
-        store.insert_block(&at_hlc("bafy_late_post", 900)).unwrap();
+        store
+            .insert_block(&at_hlc(&c("bafy_early_post"), 10))
+            .unwrap();
+        store.insert_block(&at_hlc(&c("bafy_create"), 500)).unwrap();
+        store
+            .insert_block(&at_hlc(&c("bafy_late_post"), 900))
+            .unwrap();
 
         assert_eq!(store.backfill_ingest_records(&key).unwrap(), 3);
         assert_eq!(store.backfill_ingest_records(&key).unwrap(), 0, "only once");
         let chain = store.list_ingest_records("#seq", 0, 50).unwrap();
-        let order: Vec<&str> = chain.iter().map(|r| r.block_cid.as_str()).collect();
-        assert_eq!(order, ["bafy_create", "bafy_early_post", "bafy_late_post"]);
+        let order: Vec<String> = chain.iter().map(|r| r.block_cid.clone()).collect();
+        assert_eq!(
+            order,
+            [c("bafy_create"), c("bafy_early_post"), c("bafy_late_post")]
+        );
         assert!(chain[0].is_genesis());
         assert!(chain[1].follows(&chain[0]) && chain[2].follows(&chain[1]));
 
         // A later block continues the same chain.
         let next = store
-            .insert_block_sequenced(&at_hlc("bafy_next", 1_000), &test_signer(&key, 9_000))
+            .insert_block_sequenced(&at_hlc(&c("bafy_next"), 1_000), &test_signer(&key, 9_000))
             .unwrap();
         assert!(next.follows(&chain[2]));
     }
@@ -1661,7 +1671,7 @@ mod tests {
         let key = jig_core::crypto::ed25519::generate_signing_key();
         store
             .upsert_channel(&StoredChannel {
-                id: "bafy_create".to_string(),
+                id: c("bafy_create"),
                 slug: "#seq".to_string(),
                 visibility: "open".to_string(),
                 created_at: 0,
@@ -1669,8 +1679,8 @@ mod tests {
                 suite: "none".to_string(),
             })
             .unwrap();
-        store.insert_block(&at_hlc("bafy_create", 500)).unwrap();
-        store.insert_block(&at_hlc("bafy_post", 900)).unwrap();
+        store.insert_block(&at_hlc(&c("bafy_create"), 500)).unwrap();
+        store.insert_block(&at_hlc(&c("bafy_post"), 900)).unwrap();
         assert_eq!(store.backfill_ingest_records(&key).unwrap(), 2);
 
         let mut old = store.list_ingest_records("#seq", 1, 1).unwrap().remove(0);
@@ -1680,8 +1690,8 @@ mod tests {
             .lock()
             .unwrap()
             .execute(
-                "UPDATE ingest_records SET record = ?1 WHERE block_cid = 'bafy_post'",
-                [old.encode()],
+                "UPDATE ingest_records SET record = ?1 WHERE block_cid = ?2",
+                rusqlite::params![old.encode(), c("bafy_post")],
             )
             .unwrap();
 

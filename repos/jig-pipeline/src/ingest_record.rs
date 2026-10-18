@@ -73,7 +73,13 @@ pub struct RecordSigner<'a> {
 
 impl RecordSigner<'_> {
     /// Sign `block_cid` as entry `seq`, after the record hashing to `prev`.
-    pub fn sign(&self, seq: u64, block_cid: &str, prev: [u8; 32]) -> IngestRecord {
+    /// Refused when `block_cid` or the channel id is not a CIDv1.
+    pub fn sign(
+        &self,
+        seq: u64,
+        block_cid: &str,
+        prev: [u8; 32],
+    ) -> Result<IngestRecord, RecordError> {
         let mut record = IngestRecord {
             format: RECORD_FORMAT.to_string(),
             channel_id: self.channel_id.clone(),
@@ -86,17 +92,33 @@ impl RecordSigner<'_> {
                 .to_did_jig_string(),
             cose: String::new(),
         };
-        let payload = record
-            .payload()
-            .expect("a record this signer built encodes");
+        let payload = record.payload()?;
         record.cose = STANDARD.encode(jig_core::cose::sign1(self.key, &payload));
-        record
+        Ok(record)
     }
+}
+
+/// A CID as the binary CIDv1 it names. Text CIDs (any multibase) parse; a
+/// CIDv0 or anything else is refused.
+fn cid_bytes(text: &str) -> Result<Vec<u8>, RecordError> {
+    match cid::Cid::try_from(text) {
+        Ok(cid) if cid.version() == cid::Version::V1 => Ok(cid.to_bytes()),
+        _ => Err(RecordError::Malformed("a CID in the record is not a CIDv1")),
+    }
+}
+
+/// A CIDv1 naming `label`'s bytes, for test fixtures and tools that need a
+/// channel or block id a record can sign: records sign only real CIDs.
+pub fn label_cid(label: &str) -> String {
+    jig_core::bundle::compute_cid(label.as_bytes(), b"", &[])
+        .expect("a CID always computes")
+        .to_string()
 }
 
 impl IngestRecord {
     /// The deterministic CBOR payload the sequencer signs: a text-keyed map
-    /// with `domain` = [`RECORD_FORMAT`] and every field, `prev` as 32 bytes.
+    /// with `domain` = [`RECORD_FORMAT`] and every field. CIDs are binary
+    /// CIDv1 byte strings (JEP-0004 rule 0); `prev` is the 32 hash bytes.
     pub fn payload(&self) -> Result<Vec<u8>, RecordError> {
         let prev: [u8; 32] = hex::decode(&self.prev)
             .ok()
@@ -104,14 +126,14 @@ impl IngestRecord {
             .ok_or(RecordError::Malformed("prev is not 32 hex bytes"))?;
         dcbor::encode(&Value::text_map([
             ("domain", Value::text(RECORD_FORMAT)),
-            ("channel_id", Value::text(&self.channel_id)),
+            ("channel_id", Value::Bytes(cid_bytes(&self.channel_id)?)),
             ("seq", Value::Unsigned(self.seq)),
             ("ingest_wall_ms", Value::Unsigned(self.ingest_wall_ms)),
             (
                 "ingest_logical",
                 Value::Unsigned(u64::from(self.ingest_logical)),
             ),
-            ("block_cid", Value::text(&self.block_cid)),
+            ("block_cid", Value::Bytes(cid_bytes(&self.block_cid)?)),
             ("prev", Value::Bytes(prev.to_vec())),
             ("sequencer", Value::text(&self.sequencer)),
         ]))
@@ -196,7 +218,7 @@ mod tests {
 
     fn signer(key: &SigningKey) -> RecordSigner<'_> {
         RecordSigner {
-            channel_id: "bafyCreate".to_string(),
+            channel_id: label_cid("Create"),
             key,
             ingest_wall_ms: 1_000,
             ingest_logical: 2,
@@ -206,15 +228,21 @@ mod tests {
     #[test]
     fn a_chain_verifies_and_links() {
         let key = generate_signing_key();
-        let first = signer(&key).sign(0, "bafyCreate", GENESIS_PREV);
-        let second = signer(&key).sign(1, "bafyPost", first.hash());
+        let first = signer(&key)
+            .sign(0, &label_cid("Create"), GENESIS_PREV)
+            .unwrap();
+        let second = signer(&key)
+            .sign(1, &label_cid("Post"), first.hash())
+            .unwrap();
         for record in [&first, &second] {
             record.verify(&did_of(&key)).unwrap();
         }
         assert!(first.is_genesis());
         assert!(second.follows(&first));
         assert!(!first.follows(&second));
-        let skipped = signer(&key).sign(2, "bafyLater", first.hash());
+        let skipped = signer(&key)
+            .sign(2, &label_cid("Later"), first.hash())
+            .unwrap();
         assert!(!skipped.follows(&first), "a gap is not a link");
         assert_eq!(IngestRecord::decode(&second.encode()).unwrap(), second);
     }
@@ -222,10 +250,12 @@ mod tests {
     #[test]
     fn every_field_is_signed() {
         let key = generate_signing_key();
-        let record = signer(&key).sign(3, "bafyPost", GENESIS_PREV);
+        let record = signer(&key)
+            .sign(3, &label_cid("Post"), GENESIS_PREV)
+            .unwrap();
         let tampered: Vec<IngestRecord> = vec![
             IngestRecord {
-                channel_id: "bafyOther".into(),
+                channel_id: label_cid("Other"),
                 ..record.clone()
             },
             IngestRecord {
@@ -241,7 +271,7 @@ mod tests {
                 ..record.clone()
             },
             IngestRecord {
-                block_cid: "bafyElse".into(),
+                block_cid: label_cid("Else"),
                 ..record.clone()
             },
             IngestRecord {
@@ -263,7 +293,9 @@ mod tests {
         let key = generate_signing_key();
         let record = IngestRecord {
             format: "jig-ingest-v1".into(),
-            ..signer(&key).sign(0, "bafyCreate", GENESIS_PREV)
+            ..signer(&key)
+                .sign(0, &label_cid("Create"), GENESIS_PREV)
+                .unwrap()
         };
         assert!(matches!(
             record.verify(&did_of(&key)),
@@ -274,8 +306,12 @@ mod tests {
     #[test]
     fn an_envelope_from_another_record_is_refused() {
         let key = generate_signing_key();
-        let first = signer(&key).sign(0, "bafyCreate", GENESIS_PREV);
-        let second = signer(&key).sign(1, "bafyPost", first.hash());
+        let first = signer(&key)
+            .sign(0, &label_cid("Create"), GENESIS_PREV)
+            .unwrap();
+        let second = signer(&key)
+            .sign(1, &label_cid("Post"), first.hash())
+            .unwrap();
         let swapped = IngestRecord {
             cose: first.cose.clone(),
             ..second.clone()
@@ -288,9 +324,34 @@ mod tests {
     }
 
     #[test]
+    fn cids_are_signed_as_binary_cidv1_and_nothing_else_signs() {
+        let key = generate_signing_key();
+        let record = signer(&key)
+            .sign(0, &label_cid("Create"), GENESIS_PREV)
+            .unwrap();
+        let payload = jig_core::dcbor::decode(&record.payload().unwrap()).unwrap();
+        let block = payload.get("block_cid").and_then(|v| v.as_bytes()).unwrap();
+        assert_eq!(
+            cid::Cid::try_from(block).unwrap().to_string(),
+            record.block_cid
+        );
+        assert_eq!(
+            signer(&key).sign(1, "not-a-cid", record.hash()),
+            Err(RecordError::Malformed("a CID in the record is not a CIDv1"))
+        );
+        let v0 = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
+        assert!(
+            signer(&key).sign(1, v0, record.hash()).is_err(),
+            "CIDv0 is refused"
+        );
+    }
+
+    #[test]
     fn only_the_expected_sequencer_signs() {
         let key = generate_signing_key();
-        let record = signer(&key).sign(0, "bafyCreate", GENESIS_PREV);
+        let record = signer(&key)
+            .sign(0, &label_cid("Create"), GENESIS_PREV)
+            .unwrap();
         let other = did_of(&generate_signing_key());
         assert!(matches!(
             record.verify(&other),
