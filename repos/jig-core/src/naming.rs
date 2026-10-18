@@ -532,10 +532,19 @@ pub fn verify_rotation_chain<L: AliasLink>(
     }
 }
 
-/// `s` is a CIDv1 written in its canonical text form: base32 lowercase with
-/// the `b` multibase prefix, exactly as it round-trips.
+/// `s` is the canonical text form (base32 lowercase, `b` prefix, exactly as
+/// it round-trips) of the one CID form JEP-0004 rule 0 admits: CIDv1, codec
+/// `raw`, multihash `blake3-256` with a 32-byte digest.
 fn is_canonical_cidv1(s: &str) -> bool {
-    cid::Cid::try_from(s).is_ok_and(|c| c.version() == cid::Version::V1 && c.to_string() == s)
+    const RAW: u64 = 0x55;
+    const BLAKE3_256: u64 = 0x1e;
+    cid::Cid::try_from(s).is_ok_and(|c| {
+        c.version() == cid::Version::V1
+            && c.codec() == RAW
+            && c.hash().code() == BLAKE3_256
+            && c.hash().size() == 32
+            && c.to_string() == s
+    })
 }
 
 fn did_of(key: &SigningKey) -> String {
@@ -725,16 +734,26 @@ mod tests {
         use multihash_codetable::MultihashDigest as _;
         let k = key(7);
         let cid = cid::Cid::new_v1(
-            0x71,
+            0x55,
             multihash_codetable::Code::Blake3_256.digest(b"contract"),
         );
+        let dag_cbor = cid::Cid::new_v1(
+            0x71,
+            multihash_codetable::Code::Blake3_256.digest(b"contract"),
+        )
+        .to_string();
+        let sha2 = cid::Cid::new_v1(
+            0x55,
+            cid::multihash::Multihash::<64>::wrap(0x12, &[7; 32]).unwrap(),
+        )
+        .to_string();
         let canonical = cid.to_string();
         assert!(canonical.starts_with('b'));
         let ok = SuffixDelegation::sign(&[&k], "example.org", Root::Contract, &canonical, NOW);
         assert_eq!(ok.verify(), Ok(()));
         let upper = canonical.to_uppercase();
         let v0 = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
-        for bad in [upper.as_str(), v0, "not-a-cid"] {
+        for bad in [upper.as_str(), v0, "not-a-cid", &dag_cbor, &sha2] {
             let d = SuffixDelegation::sign(&[&k], "example.org", Root::Contract, bad, NOW);
             assert_eq!(d.verify(), Err(NamingError::BadContractRootId(bad.into())));
         }
