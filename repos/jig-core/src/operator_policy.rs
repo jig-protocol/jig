@@ -15,7 +15,8 @@
 //!
 //! - `server` is the signer's `did:jig`, as text.
 //! - `programs` are program CIDs, each a binary CIDv1 as an untagged CBOR byte string (JEP-0004
-//!   rule 0). A tag-42 CID, a text CID or a CIDv0 is refused.
+//!   rule 0) with the raw codec and a BLAKE3-256 multihash ([`crate::canonical_cid`]). A tag-42
+//!   or text CID, a CIDv0, another codec or another hash is refused.
 //! - `authors` are `did:jig` strings.
 //! - `components` are BLAKE3-256 hashes of component bytes, as 32-byte strings.
 //!
@@ -49,9 +50,6 @@ pub const DOMAIN: &str = "jig-operator-policy-v1";
 
 /// The prefix every `renderer`-world version shares (JEP-0006).
 const RENDERER_WORLD_PREFIX: &str = "jig:block/renderer@";
-
-#[cfg(any(feature = "ed25519", test))]
-const RAW_CODEC: u64 = 0x55;
 
 /// A BLAKE3-256 hash of component bytes.
 pub type ComponentHash = [u8; 32];
@@ -98,8 +96,8 @@ pub enum PolicyError {
     Shape(&'static str),
     #[error("`{0}` is not strictly ascending, or repeats an entry")]
     Unordered(&'static str),
-    #[error("a program entry is not a valid CID")]
-    BadCid,
+    #[error("a program entry is not a canonical CID: {0}")]
+    BadCid(#[from] crate::canonical_cid::CidError),
     #[cfg(feature = "ed25519")]
     #[error(transparent)]
     Cose(#[from] crate::cose::CoseError),
@@ -204,20 +202,10 @@ impl OperatorPolicy {
         let allow_value = map.get("allow").expect("checked by exact_map");
         let allow = exact_map(allow_value, &["programs", "authors", "components"])?;
 
-        let program_bytes = ascending_bytes(allow.get("programs").copied(), "programs")?;
-        let programs = program_bytes
+        let programs = ascending_bytes(allow.get("programs").copied(), "programs")?
             .iter()
-            .map(|b| Cid::try_from(b.as_slice()).map_err(|_| PolicyError::BadCid))
+            .map(|b| crate::canonical_cid::from_bytes(b))
             .collect::<Result<Vec<_>, _>>()?;
-        // CIDv1 only. A CID that re-encodes differently would give the same policy two
-        // payloads.
-        if programs
-            .iter()
-            .zip(&program_bytes)
-            .any(|(c, b)| c.version() != cid::Version::V1 || c.to_bytes() != *b)
-        {
-            return Err(PolicyError::BadCid);
-        }
 
         let authors = text_array(allow.get("authors").copied())?;
         if !strictly_ascending(authors.iter().map(|a| text_key(a))) {
@@ -285,8 +273,7 @@ impl SignedOperatorPolicy {
 
 #[cfg(feature = "ed25519")]
 fn envelope_cid(envelope: &[u8]) -> Cid {
-    use multihash_codetable::{Code, MultihashDigest};
-    Cid::new_v1(RAW_CODEC, Code::Blake3_256.digest(envelope))
+    crate::canonical_cid::of(envelope)
 }
 
 /// The bytes a text entry sorts by: its own deterministic encoding.
@@ -305,6 +292,9 @@ fn strictly_ascending<T: Ord>(items: impl IntoIterator<Item = T>) -> bool {
 }
 
 /// The entries of a text-keyed map that has exactly `keys`.
+///
+/// Collecting into a map cannot hide a repeated key: [`dcbor::decode`] already refuses one
+/// (`DcborError::DuplicateKey`).
 fn exact_map<'a>(
     value: &'a Value,
     keys: &[&str],
@@ -362,14 +352,14 @@ fn text_array(value: Option<&Value>) -> Result<Vec<String>, PolicyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use multihash_codetable::{Code, MultihashDigest};
+    use crate::canonical_cid::{self, RAW_CODEC};
 
     const RENDERER: &str = "jig:block/renderer@0.1.0";
     const BOT: &str = "jig:block/bot@0.1.0";
     const TEXT_BLOCK: ComponentHash = [7; 32];
 
     fn cid(seed: u8) -> Cid {
-        Cid::new_v1(RAW_CODEC, Code::Blake3_256.digest(&[seed]))
+        canonical_cid::of(&[seed])
     }
 
     /// A program by `author` wrapping `component`, with no requests and no children.
@@ -561,9 +551,17 @@ mod tests {
             Box::new(Value::Bytes([&[0u8][..], &v1.to_bytes()].concat())),
         );
         let text = Value::text(v1.to_string());
-        let v0 =
-            Cid::new_v0(cid::multihash::Multihash::<64>::wrap(0x12, &[0; 32]).unwrap()).unwrap();
-        for entry in [tag42, text, Value::Bytes(v0.to_bytes())] {
+        let sha2_256 = || cid::multihash::Multihash::<64>::wrap(0x12, &[0; 32]).unwrap();
+        let v0 = Cid::new_v0(sha2_256()).unwrap();
+        let dag_cbor = Cid::new_v1(0x71, v1.hash().to_owned());
+        let sha2 = Cid::new_v1(RAW_CODEC, sha2_256());
+        for entry in [
+            tag42,
+            text,
+            Value::Bytes(v0.to_bytes()),
+            Value::Bytes(dag_cbor.to_bytes()),
+            Value::Bytes(sha2.to_bytes()),
+        ] {
             assert!(
                 OperatorPolicy::from_payload(&payload_with_program(entry.clone())).is_err(),
                 "{entry:?}"
