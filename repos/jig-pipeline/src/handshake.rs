@@ -15,14 +15,20 @@
 //!   it executes Wasm, and whether it speaks federation
 //! - `reputation`, which is JSON `null` until JEP-0003
 //!
-//! A missing welcome, a bad signature, a nonce mismatch, a pin mismatch, or a
-//! welcome that contradicts itself closes the connection. A version or suite
-//! refusal (`UNSUPPORTED_VERSION`, `UNSUPPORTED_SUITE`) does not: JEP-0002's
-//! open question on which failures end a connection is unsettled, and closing
-//! on those two codes would make an ordinary mismatch look like an attack.
+//! Every failure falls into one of JEP-0002 rule 7's classes, and the class
+//! decides who closes and with which WebSocket code ([`close`]):
 //!
-//! Not in this subset: MLS, a non-null reputation, binding later frames to the
-//! welcome, REST, or a second handshake in the other direction on one socket.
+//! - a missing, malformed, unsigned or mismatched welcome is a handshake
+//!   failure: the client closes, sending nothing else;
+//! - no version or suite in common is an incompatibility: the server sends a
+//!   signed [`Frame::Refusal`] and closes;
+//! - behaviour that contradicts the signed welcome is a contradiction: the
+//!   client closes and keeps the evidence;
+//! - a frame before `hello`, or a second `hello`, is a protocol violation:
+//!   the server closes.
+//!
+//! Not in this subset: a non-null reputation, REST, or a second handshake in
+//! the other direction on one socket.
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -36,6 +42,26 @@ use crate::envelope::{ENVELOPE_VERSION, Envelope, EnvelopeGateError, EnvelopePar
 pub const WELCOME_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 const DOMAIN: &[u8] = b"jig-handshake-welcome-v1";
+const REFUSAL_DOMAIN: &[u8] = b"jig-handshake-refusal-v1";
+
+/// WebSocket close codes, one per failure class (JEP-0002 rule 7).
+pub mod close {
+    /// The welcome is missing, malformed, unsigned or mismatched. The client
+    /// closes.
+    pub const HANDSHAKE_FAILED: u16 = 4001;
+    /// No version or suite in common. The server closes after its signed
+    /// refusal.
+    pub const INCOMPATIBLE: u16 = 4002;
+    /// The server contradicted its signed welcome. The client closes.
+    pub const CONTRADICTION: u16 = 4003;
+    /// A frame before `hello`, a second `hello`, or a frame outside the
+    /// client's own offer. The server closes.
+    pub const PROTOCOL_VIOLATION: u16 = 4004;
+}
+
+/// The error code a server sends before closing with
+/// [`close::PROTOCOL_VIOLATION`] for anything but a missing `hello`.
+pub const PROTOCOL_VIOLATION_CODE: &str = "PROTOCOL_VIOLATION";
 
 /// What a server is willing to do, taken from configuration it already has.
 ///
@@ -113,6 +139,9 @@ pub struct ClientOffer {
     pub capabilities: Capabilities,
     /// When set, a welcome whose `server_did` is a different key fails closed.
     pub pinned_server_did: Option<String>,
+    /// Suites this client pinned for the server. A signed refusal that no
+    /// longer lists one is a downgrade, not an incompatibility.
+    pub pinned_suites: Vec<String>,
 }
 
 impl Default for ClientOffer {
@@ -122,6 +151,7 @@ impl Default for ClientOffer {
             suites: implemented_suite_names(),
             capabilities: Capabilities::default(),
             pinned_server_did: None,
+            pinned_suites: Vec::new(),
         }
     }
 }
@@ -183,7 +213,11 @@ impl WelcomeStatement {
     }
 }
 
-/// Why the server will not welcome this hello. The connection stays open.
+/// Why the server will not welcome this hello.
+///
+/// `UnsupportedVersion` and `UnsupportedSuite` are incompatibilities: the
+/// server answers with [`seal_refusal`] and closes. `Malformed` is a protocol
+/// violation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelloRefusal {
     UnsupportedVersion(String),
@@ -209,6 +243,52 @@ impl HelloRefusal {
     }
 }
 
+/// The bytes a server signs to refuse a hello.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusalStatement {
+    pub v: u8,
+    pub frame_suite: String,
+    pub server_did: String,
+    pub code: String,
+    pub message: String,
+    pub versions: Vec<u64>,
+    pub suites: Vec<String>,
+    pub nonce: String,
+}
+
+impl RefusalStatement {
+    /// Length-prefixed, domain-separated, like
+    /// [`WelcomeStatement::canonical_bytes`] under its own domain, so neither
+    /// signature can stand in for the other.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        push(&mut out, REFUSAL_DOMAIN);
+        push(&mut out, &[self.v]);
+        push(&mut out, self.frame_suite.as_bytes());
+        push(&mut out, self.server_did.as_bytes());
+        push(&mut out, self.code.as_bytes());
+        push(&mut out, self.message.as_bytes());
+        let versions: Vec<String> = self.versions.iter().map(u64::to_string).collect();
+        push(&mut out, &canonical_list(&versions));
+        push(&mut out, &canonical_list(&self.suites));
+        push(&mut out, self.nonce.as_bytes());
+        out
+    }
+}
+
+/// A refusal whose signature verified against `server_did`: the server
+/// signed that it speaks none of what the client offered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedRefusal {
+    pub server_did: String,
+    pub code: String,
+    pub message: String,
+    pub versions: Vec<u64>,
+    pub suites: Vec<String>,
+    /// The frame text, kept as evidence.
+    pub evidence: String,
+}
+
 /// A welcome whose signature verified against `server_did`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedWelcome {
@@ -226,15 +306,21 @@ pub struct VerifiedWelcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandshakeResult {
     Established(VerifiedWelcome),
-    /// `UNSUPPORTED_VERSION` or `UNSUPPORTED_SUITE`. Do not close.
-    LeaveOpen {
-        code: String,
-        message: String,
-    },
-    /// Missing, malformed, or self-contradictory. The client closes.
+    /// A signed refusal: nothing in common. The server closes
+    /// ([`close::INCOMPATIBLE`]).
+    Incompatible(VerifiedRefusal),
+    /// Missing, malformed, unsigned or mismatched. The client closes
+    /// ([`close::HANDSHAKE_FAILED`]).
     FailClosed {
         reason: String,
         evidence: Option<String>,
+    },
+    /// A signed answer that contradicts what this client pinned, such as a
+    /// refusal that drops a pinned suite. The client closes
+    /// ([`close::CONTRADICTION`]) and keeps the evidence.
+    Contradiction {
+        reason: String,
+        evidence: String,
     },
 }
 
@@ -250,10 +336,12 @@ impl PendingHello {
     pub fn interpret(&self, text: &str) -> HandshakeResult {
         let env = match Envelope::parse(text) {
             Ok(env) => env,
+            // A first frame at a version or suite this client does not speak
+            // is outside its offer, whatever it says.
             Err(EnvelopeParseError::Gate(gate)) => {
-                return HandshakeResult::LeaveOpen {
-                    code: gate.code().to_string(),
-                    message: gate.to_string(),
+                return HandshakeResult::FailClosed {
+                    reason: format!("first frame is outside the offer: {gate}"),
+                    evidence: Some(text.to_string()),
                 };
             }
             Err(EnvelopeParseError::Malformed(_)) => {
@@ -303,7 +391,7 @@ pub fn begin(offer: &ClientOffer) -> (Envelope, PendingHello) {
     )
 }
 
-/// Choose a welcome, or a refusal that leaves the connection open.
+/// Choose a welcome, or say why not.
 ///
 /// An unknown or unimplemented suite in the offer is skipped. It is never
 /// treated as `none`. If nothing implemented overlaps, the refusal is
@@ -361,6 +449,113 @@ pub fn seal(key: &SigningKey, mut statement: WelcomeStatement) -> Envelope {
     })
 }
 
+/// Sign a refusal of `hello` for `refusal`, which must be a version or suite
+/// incompatibility. The server sends it and closes with
+/// [`close::INCOMPATIBLE`].
+pub fn seal_refusal(key: &SigningKey, refusal: &HelloRefusal, nonce: &str) -> Envelope {
+    let statement = RefusalStatement {
+        v: ENVELOPE_VERSION,
+        frame_suite: EncryptionSuite::Unencrypted.as_str().to_string(),
+        server_did: Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string(),
+        code: refusal.code().to_string(),
+        message: refusal.message().to_string(),
+        versions: vec![u64::from(ENVELOPE_VERSION)],
+        suites: implemented_suite_names(),
+        nonce: nonce.to_string(),
+    };
+    let sig = STANDARD.encode(key.sign(&statement.canonical_bytes()).to_bytes());
+    Envelope::new(Frame::Refusal {
+        server_did: statement.server_did,
+        code: statement.code,
+        message: statement.message,
+        versions: statement.versions,
+        suites: statement.suites,
+        nonce: statement.nonce,
+        sig,
+    })
+}
+
+/// Whether two DID strings name the same key. Unparseable strings name
+/// nothing, so they match nothing.
+pub fn same_did(a: &str, b: &str) -> bool {
+    let key = |s: &str| {
+        Did::from_did_jig_string(s)
+            .and_then(|did| did.as_bytes())
+            .ok()
+    };
+    matches!((key(a), key(b)), (Some(a), Some(b)) if a == b)
+}
+
+fn interpret_refusal(
+    env: &Envelope,
+    text: &str,
+    nonce: &str,
+    offer: &ClientOffer,
+) -> HandshakeResult {
+    let Frame::Refusal {
+        server_did,
+        code,
+        message,
+        versions,
+        suites,
+        nonce: echoed,
+        sig,
+    } = &env.frame
+    else {
+        unreachable!("called for a refusal");
+    };
+    let fail = |reason: String| HandshakeResult::FailClosed {
+        reason,
+        evidence: Some(text.to_string()),
+    };
+    if echoed != nonce {
+        return fail("refusal nonce does not match".to_string());
+    }
+    if code != EnvelopeGateError::UNSUPPORTED_VERSION_CODE
+        && code != EnvelopeGateError::UNSUPPORTED_SUITE_CODE
+    {
+        return fail(format!("refusal carries an unknown code {code}"));
+    }
+    let statement = RefusalStatement {
+        v: env.v,
+        frame_suite: env.suite.as_str().to_string(),
+        server_did: server_did.clone(),
+        code: code.clone(),
+        message: message.clone(),
+        versions: versions.clone(),
+        suites: suites.clone(),
+        nonce: echoed.clone(),
+    };
+    if let Err(reason) =
+        verify_key_signature(&statement.server_did, &statement.canonical_bytes(), sig)
+    {
+        return fail(reason);
+    }
+    if let Some(reason) = pin_mismatch(server_did, offer.pinned_server_did.as_deref()) {
+        return fail(reason);
+    }
+    if let Some(dropped) = offer
+        .pinned_suites
+        .iter()
+        .find(|pinned| !suites.contains(pinned))
+    {
+        return HandshakeResult::Contradiction {
+            reason: format!(
+                "the server signed a refusal that no longer lists the `{dropped}` suite it advertised before"
+            ),
+            evidence: text.to_string(),
+        };
+    }
+    HandshakeResult::Incompatible(VerifiedRefusal {
+        server_did: server_did.clone(),
+        code: code.clone(),
+        message: message.clone(),
+        versions: versions.clone(),
+        suites: suites.clone(),
+        evidence: text.to_string(),
+    })
+}
+
 fn interpret_envelope(
     env: &Envelope,
     text: &str,
@@ -376,15 +571,10 @@ fn interpret_envelope(
         sig,
     } = &env.frame
     else {
-        if let Frame::Error { code, message, .. } = &env.frame
-            && (code == EnvelopeGateError::UNSUPPORTED_VERSION_CODE
-                || code == EnvelopeGateError::UNSUPPORTED_SUITE_CODE)
-        {
-            return HandshakeResult::LeaveOpen {
-                code: code.clone(),
-                message: message.clone(),
-            };
+        if matches!(env.frame, Frame::Refusal { .. }) {
+            return interpret_refusal(env, text, nonce, offer);
         }
+        // An unsigned refusal leaves nothing to show, so it is not one.
         return HandshakeResult::FailClosed {
             reason: format!("first frame is {} not a welcome", frame_name(&env.frame)),
             evidence: Some(text.to_string()),
@@ -444,7 +634,11 @@ fn interpret_envelope(
 }
 
 fn verify_signature(statement: &WelcomeStatement, sig_b64: &str) -> Result<(), String> {
-    let did = Did::from_did_jig_string(&statement.server_did)
+    verify_key_signature(&statement.server_did, &statement.canonical_bytes(), sig_b64)
+}
+
+fn verify_key_signature(server_did: &str, signed: &[u8], sig_b64: &str) -> Result<(), String> {
+    let did = Did::from_did_jig_string(server_did)
         .map_err(|_| "server_did is not a canonical did:jig key".to_string())?;
     let public_key = did
         .as_bytes()
@@ -457,7 +651,7 @@ fn verify_signature(statement: &WelcomeStatement, sig_b64: &str) -> Result<(), S
     let signature = Signature::from_slice(&sig_bytes)
         .map_err(|_| "sig is not an ed25519 signature".to_string())?;
     verifying
-        .verify(&statement.canonical_bytes(), &signature)
+        .verify(signed, &signature)
         .map_err(|_| "signature does not verify".to_string())
 }
 
@@ -484,24 +678,15 @@ fn outside_offer(statement: &WelcomeStatement, offer: &ClientOffer) -> Option<&'
 
 fn pin_mismatch(server_did: &str, pinned: Option<&str>) -> Option<String> {
     let pinned = pinned?;
-    let pinned_bytes = Did::from_did_jig_string(pinned)
-        .and_then(|did| did.as_bytes())
-        .ok();
-    let got_bytes = Did::from_did_jig_string(server_did)
-        .and_then(|did| did.as_bytes())
-        .ok();
-    match (pinned_bytes, got_bytes) {
-        (Some(pinned_bytes), Some(got_bytes)) if pinned_bytes == got_bytes => None,
-        _ => Some(format!(
-            "server_did {server_did} does not match the pinned DID"
-        )),
-    }
+    (!same_did(pinned, server_did))
+        .then(|| format!("server_did {server_did} does not match the pinned DID"))
 }
 
 fn frame_name(frame: &Frame) -> &'static str {
     match frame {
         Frame::Hello { .. } => "hello",
         Frame::Welcome { .. } => "welcome",
+        Frame::Refusal { .. } => "refusal",
         Frame::Subscribe { .. } => "subscribe",
         Frame::Submit { .. } => "submit",
         Frame::CatchUp { .. } => "catch_up",
@@ -715,28 +900,127 @@ mod tests {
     }
 
     #[test]
-    fn version_and_suite_refusals_leave_the_connection_open() {
+    fn an_unsigned_refusal_or_an_unspoken_version_fails_closed() {
         let (_hello, pending) = begin(&ClientOffer::default());
         let version = r##"{"v":2,"op":"subscribe","scope":{"kind":"channel","slug":"#hello"}}"##;
-        match pending.interpret(version) {
-            HandshakeResult::LeaveOpen { code, .. } => {
-                assert_eq!(code, EnvelopeGateError::UNSUPPORTED_VERSION_CODE);
-            }
-            other => panic!("version refusal must leave the connection open, got {other:?}"),
-        }
+        assert!(matches!(
+            pending.interpret(version),
+            HandshakeResult::FailClosed { .. }
+        ));
 
-        let suite = Envelope::new(Frame::Error {
+        let unsigned = Envelope::new(Frame::Error {
             status: Some(400),
             code: EnvelopeGateError::UNSUPPORTED_SUITE_CODE.to_string(),
             ref_cid: None,
             message: "server implements none".to_string(),
         });
-        match pending.interpret(&serde_json::to_string(&suite).unwrap()) {
-            HandshakeResult::LeaveOpen { code, .. } => {
-                assert_eq!(code, EnvelopeGateError::UNSUPPORTED_SUITE_CODE);
+        assert!(matches!(
+            pending.interpret(&serde_json::to_string(&unsigned).unwrap()),
+            HandshakeResult::FailClosed { .. }
+        ));
+    }
+
+    fn refusal_for(pending: &PendingHello, key: &SigningKey) -> Envelope {
+        seal_refusal(
+            key,
+            &HelloRefusal::UnsupportedVersion("server speaks envelope v1".to_string()),
+            &pending.nonce,
+        )
+    }
+
+    #[test]
+    fn a_signed_refusal_is_an_incompatibility() {
+        let key = generate_signing_key();
+        let (_hello, pending) = begin(&ClientOffer::default());
+        let text = serde_json::to_string(&refusal_for(&pending, &key)).unwrap();
+        match pending.interpret(&text) {
+            HandshakeResult::Incompatible(refusal) => {
+                assert_eq!(refusal.code, EnvelopeGateError::UNSUPPORTED_VERSION_CODE);
+                assert_eq!(refusal.versions, vec![u64::from(ENVELOPE_VERSION)]);
+                assert_eq!(refusal.suites, implemented_suite_names());
+                assert_eq!(refusal.evidence, text);
             }
-            other => panic!("suite refusal must leave the connection open, got {other:?}"),
+            other => panic!("expected an incompatibility, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_refusal_that_does_not_verify_fails_closed() {
+        let key = generate_signing_key();
+        let (_hello, pending) = begin(&ClientOffer::default());
+
+        let mut tampered = refusal_for(&pending, &key);
+        if let Frame::Refusal { suites, .. } = &mut tampered.frame {
+            suites.retain(|s| s == "none");
+        }
+        assert!(matches!(
+            pending.interpret(&serde_json::to_string(&tampered).unwrap()),
+            HandshakeResult::FailClosed { reason, .. } if reason.contains("signature")
+        ));
+
+        let (_other, stale) = begin(&ClientOffer::default());
+        let replayed = serde_json::to_string(&refusal_for(&stale, &key)).unwrap();
+        assert!(matches!(
+            pending.interpret(&replayed),
+            HandshakeResult::FailClosed { reason, .. } if reason.contains("nonce")
+        ));
+
+        let pinned = PendingHello {
+            offer: ClientOffer {
+                pinned_server_did: Some(
+                    Did::from_ed25519_pubkey(generate_signing_key().verifying_key().as_bytes())
+                        .to_did_jig_string(),
+                ),
+                ..ClientOffer::default()
+            },
+            ..pending.clone()
+        };
+        let text = serde_json::to_string(&refusal_for(&pinned, &key)).unwrap();
+        assert!(matches!(
+            pinned.interpret(&text),
+            HandshakeResult::FailClosed { reason, .. } if reason.contains("pinned")
+        ));
+    }
+
+    #[test]
+    fn a_refusal_that_drops_a_pinned_suite_is_a_contradiction() {
+        let key = generate_signing_key();
+        let (_hello, pending) = begin(&ClientOffer {
+            pinned_suites: vec!["mls".to_string(), "rot13".to_string()],
+            ..ClientOffer::default()
+        });
+        let text = serde_json::to_string(&refusal_for(&pending, &key)).unwrap();
+        match pending.interpret(&text) {
+            HandshakeResult::Contradiction { reason, evidence } => {
+                assert!(reason.contains("rot13"), "{reason}");
+                assert_eq!(evidence, text);
+            }
+            other => panic!("expected a contradiction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refusal_and_a_welcome_sign_different_bytes() {
+        let refusal = RefusalStatement {
+            v: 1,
+            frame_suite: "none".to_string(),
+            server_did: "did:jig:zA".to_string(),
+            code: "UNSUPPORTED_VERSION".to_string(),
+            message: String::new(),
+            versions: vec![1],
+            suites: vec!["none".to_string()],
+            nonce: "n".to_string(),
+        };
+        let bytes = refusal.canonical_bytes();
+        assert!(
+            bytes
+                .windows(REFUSAL_DOMAIN.len())
+                .any(|w| w == REFUSAL_DOMAIN)
+        );
+        assert!(!bytes.windows(DOMAIN.len()).any(|w| w == DOMAIN));
+        let mut other = refusal.clone();
+        other.suites.push("mls".to_string());
+        assert_ne!(bytes, other.canonical_bytes());
     }
 
     #[test]
