@@ -2,11 +2,23 @@
 //! `/v1/rotate`, `/v1/renew`).
 //!
 //! A middleware layer in front of the handlers, so the handlers stay
-//! untouched: it counts each request against the client's IP bucket and
-//! against one bucket per DID the body names (`did`, `old_did`, `new_did`).
-//! A request is admitted only if every bucket it touches has room, and only
-//! an admitted request is counted. Refusals are HTTP 429 with code
-//! `RATE_LIMITED` and a `Retry-After` header.
+//! untouched. Two kinds of bucket:
+//!
+//! - **Per client IP**, charged before the handler runs, for every request
+//!   admitted.
+//! - **Per DID** the body names (`did`, `old_did`, `new_did`), checked before
+//!   the handler but charged only when the handler returns 2xx. Each of the
+//!   three handlers verifies a signature by every DID it names before it can
+//!   succeed (register and renew: `proof_of_control` over the challenge;
+//!   rotate: `sig_by_old` and `sig_by_new`), so only a DID's key holder can
+//!   use up its bucket. Forged requests naming a victim's DID cost the
+//!   sender's IP bucket and leave the victim's untouched.
+//!
+//! A request is refused if any bucket it touches is full, and a refusal
+//! charges nothing. Refusals are HTTP 429 with code `RATE_LIMITED` and a
+//! `Retry-After` header. Because the DID charge lands after the handler, a
+//! key holder sending requests concurrently can exceed their own DID limit
+//! by the number in flight; their IP bucket still bounds them.
 //!
 //! Buckets are fixed one-minute windows held in memory, so limits reset on
 //! restart and are per process. Proof of work (lane R) goes on top of this.
@@ -34,11 +46,13 @@ const PRUNE_THRESHOLD: usize = 10_000;
 
 const WINDOW_SECS: i64 = 60;
 
+type Buckets = HashMap<String, (i64, u32)>;
+
 /// Shared limiter state; clone the `Arc` into each router's layer.
 pub struct AliasRateLimiter {
     cfg: AliasRateLimitConfig,
     network: NetworkConfig,
-    buckets: Mutex<HashMap<String, (i64, u32)>>,
+    buckets: Mutex<Buckets>,
 }
 
 impl AliasRateLimiter {
@@ -50,33 +64,34 @@ impl AliasRateLimiter {
         })
     }
 
-    /// Admit or refuse one request touching `ip_key` and `did_keys` at
-    /// `now_secs`. On refusal, returns the seconds until the window resets.
-    fn check(&self, now_secs: i64, ip_key: &str, did_keys: &[String]) -> Result<(), u64> {
+    /// Pre-handler gate. Refuses if the IP bucket or any named DID's bucket
+    /// is full; otherwise charges the IP bucket only. On refusal, returns the
+    /// seconds until the window resets.
+    fn admit(&self, now_secs: i64, ip_key: &str, dids: &[String]) -> Result<(), u64> {
         let window = now_secs.div_euclid(WINDOW_SECS);
-        let retry_after = (WINDOW_SECS - now_secs.rem_euclid(WINDOW_SECS)) as u64;
-
-        let mut keys: Vec<(String, u32)> = vec![(ip_key.to_string(), self.cfg.per_ip_per_min)];
-        for did in did_keys {
-            keys.push((format!("did:{did}"), self.cfg.per_did_per_min));
-        }
-
         let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
         if buckets.len() > PRUNE_THRESHOLD {
             buckets.retain(|_, (w, _)| *w == window);
         }
-        let used = |b: &HashMap<String, (i64, u32)>, k: &str| match b.get(k) {
-            Some((w, n)) if *w == window => *n,
-            _ => 0,
-        };
-        if keys.iter().any(|(k, limit)| used(&buckets, k) >= *limit) {
-            return Err(retry_after);
+        let ip_full = used(&buckets, ip_key, window) >= self.cfg.per_ip_per_min;
+        let did_full = dids
+            .iter()
+            .any(|d| used(&buckets, &did_key(d), window) >= self.cfg.per_did_per_min);
+        if ip_full || did_full {
+            return Err((WINDOW_SECS - now_secs.rem_euclid(WINDOW_SECS)) as u64);
         }
-        for (k, _) in keys {
-            let n = used(&buckets, &k) + 1;
-            buckets.insert(k, (window, n));
-        }
+        bump(&mut buckets, ip_key.to_string(), window);
         Ok(())
+    }
+
+    /// Post-handler: charge each DID once the handler has verified its
+    /// signature and succeeded.
+    fn charge_dids(&self, now_secs: i64, dids: &[String]) {
+        let window = now_secs.div_euclid(WINDOW_SECS);
+        let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        for d in dids {
+            bump(&mut buckets, did_key(d), window);
+        }
     }
 
     fn client_ip(&self, req: &Request) -> Option<IpAddr> {
@@ -94,6 +109,22 @@ impl AliasRateLimiter {
             .get::<ConnectInfo<SocketAddr>>()
             .map(|ConnectInfo(addr)| addr.ip())
     }
+}
+
+fn did_key(did: &str) -> String {
+    format!("did:{did}")
+}
+
+fn used(buckets: &Buckets, key: &str, window: i64) -> u32 {
+    match buckets.get(key) {
+        Some((w, n)) if *w == window => *n,
+        _ => 0,
+    }
+}
+
+fn bump(buckets: &mut Buckets, key: String, window: i64) {
+    let n = used(buckets, &key, window) + 1;
+    buckets.insert(key, (window, n));
 }
 
 fn refuse(status: StatusCode, code: &str, message: String, retry_after: Option<u64>) -> Response {
@@ -152,7 +183,7 @@ pub async fn limit(
         );
     };
     let dids = dids_in(&bytes);
-    if let Err(retry_after) = limiter.check(chrono::Utc::now().timestamp(), &ip_key, &dids) {
+    if let Err(retry_after) = limiter.admit(chrono::Utc::now().timestamp(), &ip_key, &dids) {
         return refuse(
             StatusCode::TOO_MANY_REQUESTS,
             "RATE_LIMITED",
@@ -160,8 +191,13 @@ pub async fn limit(
             Some(retry_after),
         );
     }
-    next.run(Request::from_parts(parts, Body::from(bytes)))
-        .await
+    let resp = next
+        .run(Request::from_parts(parts, Body::from(bytes)))
+        .await;
+    if resp.status().is_success() {
+        limiter.charge_dids(chrono::Utc::now().timestamp(), &dids);
+    }
+    resp
 }
 
 #[cfg(test)]
@@ -182,42 +218,57 @@ mod tests {
     const T0: i64 = 1_800_000_000; // start of a window (divisible by 60)
 
     #[test]
-    fn per_did_limit_admits_exactly_the_limit() {
+    fn per_did_limit_admits_exactly_the_limit_of_verified_requests() {
         let l = limiter(100, 3);
         let did = vec!["did:key:zA".to_string()];
         for i in 1..=3 {
-            assert!(l.check(T0, "ip:1", &did).is_ok(), "request {i} of 3");
+            assert!(l.admit(T0, "ip:1", &did).is_ok(), "request {i} of 3");
+            l.charge_dids(T0, &did); // the handler succeeded
         }
-        assert_eq!(l.check(T0 + 10, "ip:1", &did), Err(50), "request 4 refused");
-        // Refusals are not counted: the bucket stays at the limit, and the
-        // next window admits again.
-        assert!(l.check(T0 + 60, "ip:1", &did).is_ok());
+        assert_eq!(l.admit(T0 + 10, "ip:1", &did), Err(50), "request 4 refused");
+        assert!(l.admit(T0 + 60, "ip:1", &did).is_ok(), "next window admits");
+    }
+
+    /// The targeted-DoS case: requests the handler rejects (forged
+    /// signatures) never charge the DID they name, however many arrive.
+    #[test]
+    fn unverified_requests_do_not_use_up_a_did_bucket() {
+        let l = limiter(1_000, 2);
+        let victim = vec!["did:key:zVictim".to_string()];
+        for _ in 0..50 {
+            assert!(l.admit(T0, "ip:attacker", &victim).is_ok());
+            // handler rejected the signature: no charge_dids
+        }
+        assert!(l.admit(T0, "ip:victim", &victim).is_ok());
     }
 
     #[test]
     fn per_ip_limit_admits_exactly_the_limit_across_dids() {
         let l = limiter(2, 100);
-        assert!(l.check(T0, "ip:1", &["did:a".into()]).is_ok());
-        assert!(l.check(T0, "ip:1", &["did:b".into()]).is_ok());
-        assert!(l.check(T0, "ip:1", &["did:c".into()]).is_err());
+        assert!(l.admit(T0, "ip:1", &["did:a".into()]).is_ok());
+        assert!(l.admit(T0, "ip:1", &["did:b".into()]).is_ok());
+        assert!(l.admit(T0, "ip:1", &["did:c".into()]).is_err());
         assert!(
-            l.check(T0, "ip:2", &["did:c".into()]).is_ok(),
+            l.admit(T0, "ip:2", &["did:c".into()]).is_ok(),
             "other IPs unaffected"
         );
     }
 
     #[test]
-    fn a_refused_bucket_does_not_charge_the_others() {
-        let l = limiter(100, 1);
+    fn a_refusal_charges_nothing() {
+        let l = limiter(2, 1);
         let a = vec!["did:a".to_string()];
-        assert!(l.check(T0, "ip:1", &a).is_ok());
-        // did:a is full, so this rotate (a -> b) is refused and must not use
-        // up did:b's only slot.
+        assert!(l.admit(T0, "ip:1", &a).is_ok());
+        l.charge_dids(T0, &a);
+        // did:a is full, so this is refused and must not charge the IP.
         assert!(
-            l.check(T0, "ip:1", &["did:a".into(), "did:b".into()])
+            l.admit(T0, "ip:1", &["did:a".into(), "did:b".into()])
                 .is_err()
         );
-        assert!(l.check(T0, "ip:1", &["did:b".into()]).is_ok());
+        assert!(
+            l.admit(T0, "ip:1", &["did:b".into()]).is_ok(),
+            "the IP still has its second slot"
+        );
     }
 
     #[test]

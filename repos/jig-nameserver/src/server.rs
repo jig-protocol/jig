@@ -3123,39 +3123,77 @@ mod tests {
             .unwrap()
     }
 
+    async fn fresh_challenge(router: &Router) -> String {
+        let (status, body) = get(router, "/v1/challenge").await;
+        assert_eq!(status, StatusCode::OK);
+        body["challenge"].as_str().unwrap().to_string()
+    }
+
     /// The limiter sits in front of the mounted register/rotate/renew
-    /// handlers: with a per-DID limit of 2, the third request naming the
-    /// same DID is refused with 429 + Retry-After before reaching a handler.
+    /// handlers. Requests with forged proofs naming DID X are rejected by the
+    /// handler and do not use up X's bucket, so X's own signed register still
+    /// succeeds; with a per-DID limit of 1, the next request naming X is
+    /// then refused with 429 + Retry-After before reaching a handler.
     #[tokio::test]
-    async fn alias_routes_are_rate_limited_per_did() {
+    async fn alias_routes_are_rate_limited_per_verified_did() {
+        use base64::Engine as _;
+
         let dir = ScratchDir::new("alias-rate-limit");
         let mut cfg = scratch_config(&dir, "dj.jig");
-        cfg.alias_rate_limits.per_did_per_min = 2;
+        cfg.alias_rate_limits.per_did_per_min = 1;
         let (router, _) = build_app(&cfg).expect("build_app");
 
-        let body = serde_json::json!({
-            "did": "did:key:zLimited",
-            "requested_alias": "alice",
-            "proof_of_control": "AA==",
-            "challenge": "00",
-        });
-        for i in 1..=2 {
-            let resp = post_json(&router, "/v1/register", body.clone()).await;
-            assert_ne!(
-                resp.status(),
-                StatusCode::TOO_MANY_REQUESTS,
-                "request {i} of 2 reaches the handler"
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let did =
+            jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
+
+        // An attacker floods forged registers naming the victim's DID.
+        for i in 1..=5 {
+            let challenge = fresh_challenge(&router).await;
+            let resp = post_json(
+                &router,
+                "/v1/register",
+                serde_json::json!({
+                    "did": did,
+                    "requested_alias": "victim",
+                    "proof_of_control": "AAAA",
+                    "challenge": challenge,
+                }),
+            )
+            .await;
+            assert!(
+                resp.status().is_client_error() && resp.status() != StatusCode::TOO_MANY_REQUESTS,
+                "forged request {i} is rejected by the handler, not the limiter: {}",
+                resp.status()
             );
         }
-        // The same DID via renew shares the bucket.
+
+        // The key holder's own signed register still gets through.
+        let challenge = fresh_challenge(&router).await;
+        let proof = base64::engine::general_purpose::STANDARD
+            .encode(key.sign(challenge.as_bytes()).to_bytes());
+        let resp = post_json(
+            &router,
+            "/v1/register",
+            serde_json::json!({
+                "did": did,
+                "requested_alias": "victim",
+                "proof_of_control": proof,
+                "challenge": challenge,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "verified register admitted");
+
+        // That verified request used the DID's one slot: the next is refused.
         let resp = post_json(
             &router,
             "/v1/renew",
             serde_json::json!({
-                "alias": "alice@dj.jig",
-                "did": "did:key:zLimited",
+                "alias": "victim@dj.jig",
+                "did": did,
                 "challenge": "00",
-                "proof_of_control": "AA==",
+                "proof_of_control": "AAAA",
             }),
         )
         .await;
@@ -3164,14 +3202,6 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["code"], "RATE_LIMITED");
-
-        // GET /v1/challenge is not limited, and other DIDs are unaffected.
-        let (status, _) = get(&router, "/v1/challenge").await;
-        assert_eq!(status, StatusCode::OK);
-        let mut other = body.clone();
-        other["did"] = "did:key:zOther".into();
-        let resp = post_json(&router, "/v1/register", other).await;
-        assert_ne!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]
