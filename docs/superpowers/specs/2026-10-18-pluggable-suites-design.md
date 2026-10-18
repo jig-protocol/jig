@@ -1,6 +1,6 @@
 # Pluggable suites: a test suite and conformance vectors (lane S)
 
-Status: draft for approval. Decision D13 is deferred (ROADMAP, settled 2026-10-18): v0.2 proves
+Status: questions settled by DJ 2026-10-18 (§6). Decision D13 is deferred (ROADMAP, settled 2026-10-18): v0.2 proves
 suites are pluggable with a test-only second suite and per-suite conformance vectors. A
 production second suite stays a stretch goal.
 
@@ -174,14 +174,16 @@ is not registered. No new CI job.
    harness, the `cargo tree` CI check, the spec and JEP-0001 text. Touches `Cargo.lock`.
    If it grows past about 1,500 lines I split the audit fixes out first.
 
-## 6. Open questions for DJ (my recommendation first)
+## 6. Decisions
 
-1. **May the test suite serve restricted channels?** Recommend **no**: its key is public,
+DJ settled all four on 2026-10-18, each as recommended below.
+
+1. **May the test suite serve restricted channels?** **No**: its key is public,
    so the operator can read it, which is exactly what D25 forbids. The gate keeps
    "restricted requires `mls`". A future production suite's JEP decides whether it may.
-2. **Test suite id.** Recommend `test-aead`, with the whole `test-` prefix reserved.
-3. **Where the vectors live.** Recommend `repos/jig-spec/vectors/suites/` (normative,
+2. **Test suite id.** `test-aead`, with the whole `test-` prefix reserved.
+3. **Where the vectors live.** `repos/jig-spec/vectors/suites/` (normative,
    CC-BY-4.0, next to the JEPs), not a crate's `tests/` directory.
-4. **Does the CLI speak `test-aead`?** Recommend **no**: the gate, the server and the
+4. **Does the CLI speak `test-aead`?** **No**: the gate, the server and the
    vectors prove pluggability; teaching the CLI a suite nobody may deploy adds code no
    user path runs. The CLI only learns to refuse suites it does not speak.
