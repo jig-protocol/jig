@@ -255,8 +255,9 @@ global, secure and human-meaningful without an anchor. DNS or a contract is that
    (4.5) makes two conflicting bindings a proof. Prevention needs a second, independent
    signer, which is the threshold of a `contract` root.
 3. **Across a federation link.** Here a data contract can prevent the collision:
-   - **Each server's signed peer policy (5.6) declares the suffixes it attests and their
-     root.**
+   - **Each server declares the suffixes it attests.** Its `server-manifest` (5.6) lists
+     the `dns`- and `contract`-rooted ones. A `config`-rooted suffix is never published: a
+     server tells only its contract counterparty, inside the signed offer or accept.
    - A `contract-offer` is refused with `SUFFIX_CONFLICT` when two parties claim one
      suffix under different authorities.
    - A name never crosses a link as identity. Blocks carry DIDs, and a name is a hint the
@@ -606,7 +607,8 @@ signed, logged document instead of two.
   - the block kinds the server relays;
   - its per-peer quotas;
   - the peers it federates with (DIDs, not URLs);
-  - the name suffixes it attests, with their roots (4.2).
+  - the `dns`- and `contract`-rooted name suffixes it attests (4.2). `config`-rooted
+    suffixes stay out of the public log and travel only in contract messages.
 - Contract messages cite the manifest by CID and `seq`, not by a separate policy hash.
   A server that changes its policy mid-contract leaves the change in its own signed,
   gap-checked log.

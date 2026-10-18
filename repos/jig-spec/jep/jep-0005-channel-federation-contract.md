@@ -48,7 +48,9 @@ servers federate an encrypted channel through it". Today:
 Non-goals for v0.2:
 
 - open federation with unconfigured servers;
-- moving ownership;
+- transferring channel ownership (the `owner` role, held by DIDs), beyond co-owners named
+  at creation. Moving the sequencer, the server that orders the channel, is in scope
+  (11a) and does not change who owns the channel;
 - nameserver-led contract templates;
 - servers built differently from jig.
 
@@ -86,10 +88,13 @@ Non-goals for v0.2:
    that point in the `ingest` chain (7b). The owning server MUST then check that the
    target is on its configured peer list, and sends the target a `contract-offer`, signed
    by the owner. Only the owning server sends offers. The offer carries:
+   - `offer_id`, unique per offer: the BLAKE3 hash of the offer's signed bytes;
    - the grant (7a);
    - the creation block;
    - the current `ingest` head (12);
-   - the owner's current `server-manifest`, by CID and `seq` (16).
+   - the owner's current `server-manifest`, by CID and `seq` (16);
+   - any `config`-rooted suffixes the owner attests, which are never published (JEP-0004
+     rule 7).
 7a. A grant is one of:
     - `read`: the follower relays only protocol traffic (MLS self-updates, self-leave) and
       no content;
@@ -110,10 +115,14 @@ Non-goals for v0.2:
       owners assign roles, and admins cannot create admins. Co-owners may be listed in the
       `channel-create` block only.
 8. The offered server MUST answer, signed by its DID, with exactly one of:
-   - `contract-accept {channel_id, sequencer, manifest}`, where `manifest` names its
-     current `server-manifest`, stating that it
-     implements the suite and will enforce the membership rule;
-   - `contract-refuse {channel_id, code}`, where `code` is one of `UNSUPPORTED_SUITE`,
+   - `contract-accept {channel_id, offer_id, sequencer, manifest, private_suffixes}`.
+     - `offer_id` names the exact offer accepted, under the follower's signature. An
+       accept binds only the grant in that offer.
+     - `manifest` names its current `server-manifest`.
+     - `private_suffixes` lists its `config`-rooted suffixes.
+     - The accept states that the server implements the suite and will enforce the
+       membership rule.
+   - `contract-refuse {channel_id, offer_id, code}`, where `code` is one of `UNSUPPORTED_SUITE`,
      `UNSUPPORTED_VERSION`, `POLICY_REFUSED`, `NOT_A_PEER` or `SUFFIX_CONFLICT` (the two
      servers claim one name suffix under different authorities, JEP-0004).
 9. A server MUST refuse when it does not implement the suite. It MUST NOT fall back to
@@ -176,7 +185,8 @@ Non-goals for v0.2:
     - the block kinds it relays;
     - per-peer quotas;
     - the DIDs of the peers it federates with that it chooses to publish;
-    - the name suffixes it attests and their roots (JEP-0004).
+    - the `dns`- and `contract`-rooted name suffixes it attests (JEP-0004). `config`-rooted
+      suffixes are never published; they travel only in contract messages.
 
     Contract messages cite the current manifest by CID and `seq`.
 17. In v0.2 a server MUST refuse an offer from a server that is not on its
@@ -203,8 +213,19 @@ Non-goals for v0.2:
 
 ## Unchanged
 
-22. Every receiving server re-verifies author signatures and runs its gates on relayed
-    blocks (federation.md, Relayed Blocks).
+22. **Client writes relayed to the owner.** For a client's block relayed by a follower,
+    the owner re-verifies the author signature and runs its full write gate, including
+    grants and roles (7a, 7b, 15), as for a local submission (federation.md, Relayed
+    Blocks).
+22a. **The owner's stream delivered to a follower.** For a block arriving in the owner's
+     sequenced stream, a follower verifies:
+     - the author signature;
+     - the owner's `ingest` record, signed by the expected sequencer;
+     - the `channel_id`, and the `seq`/`prev` chain (12–14);
+     - the MLS state (19).
+
+     A follower does not apply a local ownership write gate to such a block. The channel's
+     authority is the owner's chain, not a local channel row.
 23. Encrypted content is never executed. Its receipts are `sealed`.
 
 # Security Considerations (Zero-Trust)

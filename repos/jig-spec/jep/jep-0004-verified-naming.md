@@ -62,14 +62,27 @@ Non-goals:
 
 ## Suffix authority
 
-3. A **suffix delegation** is `{suffix, authorities: [did], root, valid_until, sigs}`.
-   - Every listed authority MUST sign it.
+3. A **suffix delegation** is
+   `{suffix, authorities: [did], root, root_id, valid_until, sigs: [{did, sig}]}`.
    - An authority is a nameserver, or a server attesting names under its own suffix.
    - `root` says what makes the delegation authoritative:
      - `config`: the resolver's own configuration;
      - `dns`: served at `https://<suffix>/.well-known/jig-ns-delegation` under a CA-valid
        certificate;
      - `contract`: signed by a threshold of the parties to a shared data contract (v0.3).
+   - `root_id` names the specific root:
+     - for `config`, a local identifier the resolver chooses, never sent to anyone;
+     - for `dns`, the suffix's domain name, lowercased;
+     - for `contract`, the contract's CID.
+   - Every listed authority MUST sign. Each `sig` is by that authority over the labelled
+     hash (rule 8) of these parts, in order:
+     - (`domain`, `jig-suffix-delegation-v1`);
+     - (`suffix`);
+     - (`root`);
+     - (`root_id`);
+     - (`count`, the number of authorities as decimal ASCII);
+     - one (`authority`, did) part per authority, in bytewise ascending order;
+     - (`valid_until`).
 4. A resolver MUST determine a suffix's delegation before it accepts an attestation under
    it, with precedence `config` > `contract` > `dns`.
    - A resolver MUST refuse a delegation where any listed DID's signature is missing or
@@ -79,81 +92,98 @@ Non-goals:
    - A party MUST NOT assert a `config` delegation to anyone else.
 5. A resolver MUST NOT accept an attestation signed by a DID outside the suffix's
    authorities.
-6. A name means (alias, suffix, root). A client MUST NOT display a name as verified unless
-   its own resolver verified it. A name received from elsewhere is a hint, re-verified by
-   the receiver.
-7. A server's signed peer policy (JEP-0005) declares the suffixes it attests and their
-   roots. A contract MUST be refused (`SUFFIX_CONFLICT`) when two parties claim one suffix
-   under different authorities.
+6. A name means (alias, suffix, root, root_id), and a client pin is keyed by all four
+   (rule 17). A client MUST NOT display a name as verified unless its own resolver
+   verified it. A name received from elsewhere is a hint, re-verified by the receiver.
+7. A server's `server-manifest` (JEP-0005) declares the `dns`- and `contract`-rooted
+   suffixes it attests. A `config`-rooted suffix is never published. A server declares it
+   only to the other party of a contract, inside its signed `contract-offer` or
+   `contract-accept`. A contract MUST be refused (`SUFFIX_CONFLICT`) when two parties claim
+   one suffix under different authorities, whatever the roots.
 
 ## Attestations
 
-6. An attestation is `{did, alias, ns_did, valid_from, valid_until, sig}`.
+8. An attestation is `{did, alias, ns_did, valid_from, valid_until, sig}`.
    - `alias` is the full name.
    - Times are Unix seconds.
    - `sig` is the Ed25519 signature by `ns_did` over the labelled BLAKE3 hash of
      (`domain`, `jig-alias-attestation-v1`), (`did`), (`alias`), (`ns_did`),
-     (`valid_from`), (`valid_until`). Times are encoded as decimal ASCII.
-   - Labelled hashing is as in the admission proof-of-work: each label's UTF-8 bytes, then
-     the value's length as a little-endian u64, then the value.
-7. A **rotation statement** `{alias, old_did, new_did, at, sig_old, sig_new}` is signed by
-   both keys over (`domain`, `jig-alias-rotate-v1`), (`alias`), (`old_did`), (`new_did`),
-   (`ns_did`), (`at`). A nameserver MUST keep every rotation statement it accepted and
-   MUST serve the chain of them with the attestation that resulted.
+     (`valid_from`), (`valid_until`). Times and counts are encoded as decimal ASCII.
+   - **Labelled hashing**, as in the admission proof-of-work: for each part, the label's
+     UTF-8 bytes, then the value's length as a little-endian u64, then the value's bytes.
+     Every signature in this JEP uses it.
+9. A **rotation statement** is `{alias, ns_did, old_did, new_did, at, sig_old, sig_new}`.
+   - `ns_did` is the nameserver that accepted the rotation. It MUST equal the `ns_did` of
+     the attestation the rotation produced.
+   - Both keys sign over (`domain`, `jig-alias-rotate-v1`), (`alias`), (`ns_did`),
+     (`old_did`), (`new_did`), (`at`).
+   - A nameserver MUST keep every rotation statement it accepted, and MUST serve the chain
+     of them with the attestation that resulted.
 
 ## Registration
 
-8. Proof of control for register, renew and rotate MUST be a signature by the DID over
-   (`domain`, `jig-alias-<action>-v1`), (`ns_did`), (`alias`), (`challenge`). A
-   nameserver MUST refuse a proof over the bare challenge.
-9. Registration is a binding endpoint. It MUST carry proof-of-work and rate limits
-   (identity-and-reputation.md; D23, D26). This JEP does not set the parameters.
-10. A nameserver MUST serve TLS: CA-issued, or bound to its DID as for servers. Plaintext
+10. Proof of control for register, renew and rotate MUST be a signature by the DID over
+    (`domain`, `jig-alias-<action>-v1`), (`ns_did`), (`alias`), (`challenge`). A
+    nameserver MUST refuse a proof over the bare challenge.
+    - A challenge MUST be fresh: at least 32 random bytes, issued by the nameserver, and
+      valid for a short window it sets (at most 300 s).
+    - A nameserver MUST consume a challenge atomically, on the first proof that verifies.
+      It MUST refuse a challenge that is expired, unknown or already consumed, for any
+      action.
+11. Registration is a binding endpoint. It MUST carry proof-of-work and rate limits
+    (identity-and-reputation.md; D23, D26). This JEP does not set the parameters.
+12. A nameserver MUST serve TLS: CA-issued, or bound to its DID as for servers. Plaintext
     is allowed only behind an antipattern flag that the nameserver advertises.
 
 ## Verification
 
-11. Whoever acts on a binding MUST verify it. A client MUST verify before it encrypts to,
+13. Whoever acts on a binding MUST verify it. A client MUST verify before it encrypts to,
     adds, or opens a DM with a name, and MUST NOT rely on a server's check. Verification
     means all of the following:
-    1. the signer is authoritative for the suffix (3–4);
+    1. the signer is authoritative for the suffix (rules 3–5);
     2. `sig` verifies;
     3. `valid_from ≤ now < valid_until` on the verifier's clock;
     4. `alias` equals the requested name after normalisation.
-12. A resolver MUST NOT cache a binding past `valid_until` and MUST re-check validity on
+14. A resolver MUST NOT cache a binding past `valid_until` and MUST re-check validity on
     every use of a cached binding.
-13. A resolver that obtains two valid attestations for one name with different DIDs and
+15. A resolver that obtains two valid attestations for one name with different DIDs and
     overlapping windows MUST refuse the name, MUST keep both, and SHOULD surface them as
     evidence of equivocation.
-14. A resolver MAY fetch through its own server or directly from a nameserver. The fetch
+16. A resolver MAY fetch through its own server or directly from a nameserver. The fetch
     path does not affect verification.
 
 ## Client pins
 
-15. A client SHOULD pin `(name → did, attestation, ns_did)` on first verified use and
-    show the DID's fingerprint and the vouching nameserver.
-16. A client MUST NOT act on a binding that differs from its pin unless one of these
+17. A client MUST pin `(name → did, attestation, ns_did)` on first verified use of a name
+    in any E2EE operation, keyed as in rule 6, and SHOULD pin on any other first verified
+    use. When it pins, it shows the DID's fingerprint and the vouching nameserver.
+18. A client MUST NOT act on a binding that differs from its pin unless one of these
     holds:
     1. a chain of valid rotation statements leads from the pinned DID to the new DID; or
     2. the holder explicitly accepts the change.
 
     That covers expiry followed by re-registration to another DID, a change of
     nameserver, and any other differing answer.
-17. A client MUST accept names for E2EE operations only through 11 and 15–16. Local
-    contacts written by the holder count as pins.
+19. A client MUST accept names for E2EE operations only through rules 13, 17 and 18.
+    Local contacts written by the holder count as pins.
 
 ## Evidence
 
-18. A resolver SHOULD keep every attestation and rotation statement it acted on until at
+20. A resolver SHOULD keep every attestation and rotation statement it acted on until at
     least its `valid_until` plus 30 days, and SHOULD let the holder export them.
 
 ## Reachability records
 
-19. A reachability record is `{did, servers: [{server_did, url}], seq, sig}`,
-    signed by `did` over (`domain`, `jig-reach-v1`), (`did`), the canonical JSON of
-    `servers`, and (`seq`).
+21. A reachability record is `{did, servers: [{server_did, url}], seq, sig}`.
+    - `sig` is by `did` over the labelled hash of these parts, in order:
+      - (`domain`, `jig-reach-v1`);
+      - (`did`);
+      - (`seq`);
+      - (`count`, the number of servers);
+      - for each server in the order listed, (`server_did`) then (`url`).
     - A DID has no home server. The record lists the servers where the DID wants to be
-      found, in no order. The DID MAY leave servers out, or publish no record at all.
+      found, in no order of preference. The DID MAY leave servers out, or publish no
+      record at all.
     - A nameserver whose data contract requires a contact point MAY require a record at
       registration (`POST /v1/register` then carries it).
     - The record with the highest valid `seq` wins.
@@ -186,7 +216,9 @@ Non-goals:
 
 - Lookups through the server hide the client's address from the nameserver.
 - Direct lookups hide them from the server.
-- No message links two DIDs except a rotation statement, which both keys sign (PV-03).
+- No message links two user DIDs except a rotation statement, which both keys sign
+  (PV-03). Service links are by design: an attestation links a user's DID to the
+  nameserver's, and a reachability record links it to the servers the user chose to list.
 
 # Backwards Compatibility
 
