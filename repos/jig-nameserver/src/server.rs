@@ -1516,16 +1516,26 @@ pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
     // merges method-disjoint routers for the same path. Adding a same-method
     // duplicate would panic at startup — covered by
     // `both_challenge_methods_survive_the_merge`.
+    // register/rotate/renew sit behind the per-IP and per-DID limiter; it
+    // passes GETs (the challenge route) straight through.
+    let limiter = crate::v0_0_2_rate_limit::AliasRateLimiter::new(
+        cfg.alias_rate_limits.clone(),
+        cfg.network.clone(),
+    );
+    let rate_limited =
+        axum::middleware::from_fn_with_state(limiter, crate::v0_0_2_rate_limit::limit);
     let mut router = app_router(state)
-        .merge(crate::v0_0_2_register::build_register_router(
-            v0_0_2_state.clone(),
-        ))
+        .merge(
+            crate::v0_0_2_register::build_register_router(v0_0_2_state.clone())
+                .layer(rate_limited.clone()),
+        )
         .merge(crate::v0_0_2_resolve::build_resolve_router(
             v0_0_2_state.clone(),
         ))
-        .merge(crate::v0_0_2_rotate_renew::build_rotate_renew_router(
-            v0_0_2_state.clone(),
-        ));
+        .merge(
+            crate::v0_0_2_rotate_renew::build_rotate_renew_router(v0_0_2_state.clone())
+                .layer(rate_limited),
+        );
 
     // `/v1/handles` enumerates every registered alias. `build_handles_router`
     // documents that the caller must gate it; honour that here rather than
@@ -1993,6 +2003,7 @@ mod tests {
     use crate::types::PublicKeyEd25519;
     use axum::http::Request;
     use axum::http::StatusCode;
+    use axum::{body::Body, http::Response};
     use ed25519_dalek::{Signer, SigningKey};
     use http_body_util::BodyExt as _; // for collect
     use tower::util::ServiceExt; // for `oneshot`
@@ -3095,6 +3106,72 @@ mod tests {
         let cfg = scratch_config(&dir, "deji.jig");
         let app = build_app_parts(&cfg).expect("build_app_parts");
         assert_eq!(app.v0_0_2_state.suffix(), "deji.jig");
+    }
+
+    async fn post_json(router: &Router, uri: &str, body: serde_json::Value) -> Response<Body> {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// The limiter sits in front of the mounted register/rotate/renew
+    /// handlers: with a per-DID limit of 2, the third request naming the
+    /// same DID is refused with 429 + Retry-After before reaching a handler.
+    #[tokio::test]
+    async fn alias_routes_are_rate_limited_per_did() {
+        let dir = ScratchDir::new("alias-rate-limit");
+        let mut cfg = scratch_config(&dir, "dj.jig");
+        cfg.alias_rate_limits.per_did_per_min = 2;
+        let (router, _) = build_app(&cfg).expect("build_app");
+
+        let body = serde_json::json!({
+            "did": "did:key:zLimited",
+            "requested_alias": "alice",
+            "proof_of_control": "AA==",
+            "challenge": "00",
+        });
+        for i in 1..=2 {
+            let resp = post_json(&router, "/v1/register", body.clone()).await;
+            assert_ne!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "request {i} of 2 reaches the handler"
+            );
+        }
+        // The same DID via renew shares the bucket.
+        let resp = post_json(
+            &router,
+            "/v1/renew",
+            serde_json::json!({
+                "alias": "alice@dj.jig",
+                "did": "did:key:zLimited",
+                "challenge": "00",
+                "proof_of_control": "AA==",
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().contains_key("retry-after"));
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["code"], "RATE_LIMITED");
+
+        // GET /v1/challenge is not limited, and other DIDs are unaffected.
+        let (status, _) = get(&router, "/v1/challenge").await;
+        assert_eq!(status, StatusCode::OK);
+        let mut other = body.clone();
+        other["did"] = "did:key:zOther".into();
+        let resp = post_json(&router, "/v1/register", other).await;
+        assert_ne!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]
