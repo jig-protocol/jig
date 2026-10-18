@@ -140,8 +140,10 @@ one. Revisit after v0.2.
 **Status evidence.** v0.2 channels created under `mls` store only MLS ciphertext; the
 server holds no group secret (`jig_mls::delivery` tracks public state only).
 `integration-tests/tests/h12_encrypted_channels.rs` searches every file the server wrote
-after a conversation and finds none of it. Channels created without a suite remain
-plaintext, and encrypted channels do not federate.
+after a conversation and finds none of it. A restricted channel is always `mls`; ingest
+refuses a plaintext one, and one created plaintext before that rule is frozen
+(`CHANNEL_FROZEN` on new content) with its history still readable to the operator. Open
+channels created without a suite remain plaintext, and encrypted channels do not federate.
 
 ### OP-06: dropping, reordering, delaying, replaying, selective censorship
 

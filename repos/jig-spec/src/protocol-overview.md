@@ -2,8 +2,8 @@
 
 > **Status:** every transport except WebSocket and the email bridge is not implemented.
 > The handshake is the [JEP-0002](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0002-handshake.md)
-> subset. Content is always signed, and end-to-end encrypted only on channels created under
-> `mls` and on DMs; see [Encryption](encryption.md). The envelope this chapter describes is
+> subset. Content is always signed, and end-to-end encrypted on DMs, on every restricted
+> channel, and on open channels created under `mls`; see [Encryption](encryption.md). The envelope this chapter describes is
 > not the wire format (see [Message Format](message-format.md)).
 
 **Audience:** This chapter is for **developers** and **protocol implementers** who need to understand Jig's architecture. **Server operators** might find the scaling and transport sections useful. **End users** can skip this—it's pretty technical.
