@@ -121,6 +121,17 @@ pub mod ed25519 {
             .expect("OS CSPRNG must be available");
     }
 
+    /// `N` bytes from the OS CSPRNG, the same source as [`fill_random`],
+    /// returned by value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS CSPRNG is unavailable, as [`fill_random`] does.
+    pub fn random_array<const N: usize>() -> [u8; N] {
+        use rand::RngExt as _;
+        rand::rand_core::UnwrapErr(SysRng).random()
+    }
+
     /// Write `key`'s seed to a new file at `path`, owner-only from the start.
     ///
     /// The file is created with `create_new`, so an existing file is never

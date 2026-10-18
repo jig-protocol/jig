@@ -19,6 +19,8 @@ pub mod did;
 pub mod dm;
 pub mod error;
 pub mod hlc;
+#[cfg(feature = "keystore")]
+pub mod keystore;
 pub mod lint;
 pub mod manifest;
 #[cfg(test)]
