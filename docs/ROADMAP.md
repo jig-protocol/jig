@@ -107,7 +107,7 @@ reserve the hooks for encryption so that turning it on in v0.2 changes a value, 
 | 13 | `CONTRIBUTING.md` (with the dependency rule below), `CODE_OF_CONDUCT.md`, templates, `CODEOWNERS` | Done |
 | 14 | CLI papercuts: `jig read`, `jig --version`, client reconnect with backoff, `block` stubs | `read` and `--version` done; reconnect and `block` stubs open |
 | 15 | `publish = false` on crates not meant for crates.io | Open |
-| 16 | CI: macOS job, clippy on every crate, federation and bridge counters in `/metrics`, scope jobs by changed paths (note below) | Partial (macOS covered by the install smoke test only); path scoping open |
+| 16 | CI: macOS job, clippy on every crate, federation and bridge counters in `/metrics`, scope jobs by changed paths (note below) | Partial (macOS covered by the install smoke test only). Scoping done: pull requests skip the build jobs when only docs change or while a draft, and the merge queue runs everything |
 | 17 | Collapse the hybrid server config into one struct with `deny_unknown_fields` | Open |
 | 18 | Run federated blocks through the write gate; "trusted peer" becomes explicit config | Done: relayed blocks go through `ingest`, peers are pinned and listed. Encrypted and restricted channels still do not federate (D12) |
 | 19 | Discovery JEP stub | Done ([JEP-0003](../repos/jig-spec/jep/jep-0003-server-discovery.md)) |

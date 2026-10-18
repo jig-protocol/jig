@@ -24,6 +24,7 @@ on:
         required: true
         default: latest
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - install.sh
       - scripts/install-smoke.sh
@@ -38,6 +39,11 @@ on:
 
 permissions:
   contents: read
+
+# A new push to a pull request supersedes its running smoke test.
+concurrency:
+  group: install-smoke-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.tag }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   published:
@@ -65,7 +71,8 @@ jobs:
 
   pr:
     name: PR build on ubuntu-24.04
-    if: github.event_name == 'pull_request'
+    # Drafts skip it; marking the PR ready for review runs it.
+    if: github.event_name == 'pull_request' && !github.event.pull_request.draft
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:

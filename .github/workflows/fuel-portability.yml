@@ -36,6 +36,7 @@ name: fuel-portability
 on:
   workflow_dispatch:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'repos/jig-runtime/**'
       - '.github/workflows/fuel-portability.yml'
@@ -68,6 +69,8 @@ jobs:
   # push contained. Trimming the matrix is the lever that actually works.
   select-platforms:
     name: select platforms
+    # Drafts skip the profile (and so the matrix); marking the PR ready runs it.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
     permissions: {}
     outputs:
@@ -138,7 +141,8 @@ jobs:
   interpret:
     name: how to read the results
     needs: profile
-    if: always()
+    # After the profile, pass or fail; not when drafts skipped it.
+    if: ${{ !cancelled() && needs.profile.result != 'skipped' }}
     runs-on: ubuntu-latest
     permissions: {}
     steps:
