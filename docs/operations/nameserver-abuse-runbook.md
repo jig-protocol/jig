@@ -48,8 +48,9 @@ spreads further than the group.
   `/var/lib/jig/nameserver_v002.key` (or `[v0_0_2.server] server_did_keyfile`), and
   `JIG_NS_SECRET` in `/etc/jig/jig-nameserver.env`.
 - **Know that settings are read at start-up.** Every `JIG_NS_*` change below needs
-  `sudo systemctl restart jig-nameserver`. A restart does not reset penalties or rate
-  windows; they live in the database.
+  `sudo systemctl restart jig-nameserver`. A restart does not reset the legacy penalties or
+  rate windows, which live in the database. It does reset the `[alias_rate_limits]`
+  buckets on `/v1/register`, `/v1/rotate` and `/v1/renew`, which are held in memory.
 - **Turn on a default ruleset** (`[reputation] default_ruleset`) if you want reputation
   observations to affect proof-of-work. Without one, they are recorded and ignored.
 
