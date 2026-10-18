@@ -81,6 +81,10 @@ pub struct ChannelPin {
     pub create_cid: String,
     pub suite: String,
     pub owner_did: String,
+    /// The last record of the channel's `ingest` chain this device verified
+    /// ([`crate::chain`]); the server is held to it on every later read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_head: Option<crate::chain::ChainHead>,
 }
 
 impl ChannelPin {
@@ -273,6 +277,32 @@ impl Pins {
         })
     }
 
+    /// Move the pinned chain head of `slug` on `server` to `head`, which the
+    /// caller verified follows the pinned one ([`crate::chain::ChannelChain`]).
+    /// A head behind the pinned one is ignored: pins never move backwards.
+    /// Returns whether the channel is pinned at all.
+    pub fn advance_chain(
+        &mut self,
+        server: &str,
+        slug: &str,
+        head: &crate::chain::ChainHead,
+    ) -> Result<bool, PinError> {
+        self.update(|file| {
+            let Some(pin) = file
+                .servers
+                .get_mut(&server_key(server))
+                .and_then(|p| p.channels.get_mut(slug))
+            else {
+                return Ok((false, false));
+            };
+            let ahead = pin.chain_head.as_ref().is_none_or(|h| head.seq > h.seq);
+            if ahead {
+                pin.chain_head = Some(head.clone());
+            }
+            Ok((true, ahead))
+        })
+    }
+
     /// Drop everything pinned for `server`. Returns whether there was any.
     pub fn forget(&mut self, server: &str) -> Result<bool, PinError> {
         self.update(|file| {
@@ -411,6 +441,7 @@ pub fn prove_channel(
         create_cid: cid.to_string(),
         suite: suite.as_str().to_string(),
         owner_did: Did::from_ed25519_pubkey(&key_bytes).to_did_jig_string(),
+        chain_head: None,
     })
 }
 
@@ -548,6 +579,7 @@ mod tests {
             create_cid: "bafyFirst".into(),
             suite: "mls".into(),
             owner_did: "did:jig:zOwner".into(),
+            chain_head: None,
         };
         assert_eq!(
             pins.check_channel(server, "#ops", first.clone()).unwrap(),
@@ -630,6 +662,7 @@ mod tests {
             create_cid: cid.into(),
             suite: "mls".into(),
             owner_did: "did:jig:zOwner".into(),
+            chain_head: None,
         };
         chat.check_channel(server, "#a", pin("bafyA")).unwrap();
         send.check_channel(server, "#b", pin("bafyB")).unwrap();
@@ -641,6 +674,43 @@ mod tests {
             chat.check_channel(server, "#b", pin("bafyOther")),
             Err(PinError::ChannelReplaced { .. })
         ));
+    }
+
+    #[test]
+    fn a_chain_head_only_moves_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let server = "https://host:7117";
+        let mut pins = Pins::load(&path).unwrap();
+        let head = |seq: u64| crate::chain::ChainHead {
+            seq,
+            hash: format!("{seq:064x}"),
+            ingest_wall_ms: seq,
+            ingest_logical: 0,
+        };
+        assert!(
+            !pins.advance_chain(server, "#ops", &head(1)).unwrap(),
+            "not pinned"
+        );
+        pins.check_channel(
+            server,
+            "#ops",
+            ChannelPin {
+                create_cid: "bafyC".into(),
+                suite: "mls".into(),
+                owner_did: "did:jig:zOwner".into(),
+                chain_head: None,
+            },
+        )
+        .unwrap();
+        assert!(pins.advance_chain(server, "#ops", &head(5)).unwrap());
+        pins.advance_chain(server, "#ops", &head(3)).unwrap();
+        let reloaded = Pins::load(&path).unwrap();
+        assert_eq!(
+            reloaded.channel(server, "#ops").unwrap().chain_head,
+            Some(head(5)),
+            "a head behind the pinned one is ignored"
+        );
     }
 
     #[test]
