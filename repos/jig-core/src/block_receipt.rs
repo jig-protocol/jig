@@ -25,6 +25,11 @@
 //! `cost` is reserved for pricing: an executor MUST NOT emit it, and [`Receipt::from_payload`]
 //! ignores it.
 //!
+//! Because `cost` is ignored rather than refused, two envelopes can decode to the same
+//! [`Receipt`] and still have different [`SignedReceipt::cid`]s. Deduplicate receipts on their
+//! decoded content (`block_cid`, `executor` and kind, plus `invocation_hash` for `exec`), never on
+//! the envelope CID.
+//!
 //! # Comparison
 //!
 //! Two `exec` receipts are evidence about the same run when their `component`, `world` and
@@ -41,6 +46,11 @@
 //! `invocation_hash` and outcome `hash` are derived from the plaintext, so for a low-entropy input
 //! (a yes or no, a vote, a dice roll) anyone holding the receipt could confirm a guess by hashing
 //! it. [`compare_in_channel`] refuses such a receipt when it came from the server's store.
+//!
+//! For the same reason a `server`-role `exec` receipt for an encrypted channel cannot carry a real
+//! outcome: the server never had the plaintext. Comparing one against a member's run would show
+//! the user false evidence of a divergence, so [`compare_in_channel`] refuses it too. A server's
+//! receipt there is `sealed`.
 
 use cid::Cid;
 
@@ -147,6 +157,10 @@ pub enum ReceiptError {
         "a member receipt for an encrypted channel may only be read from the group's ciphertext"
     )]
     MemberReceiptFromPlaintextStore,
+    #[error("a server cannot execute encrypted content, so its exec receipt there is not evidence")]
+    ServerExecInEncryptedChannel,
+    #[error("the signing key is not the key of the receipt's executor")]
+    SignerIsNotExecutor,
     #[cfg(feature = "ed25519")]
     #[error(transparent)]
     Cose(#[from] crate::cose::CoseError),
@@ -277,8 +291,9 @@ pub enum Provenance {
 
 /// [`compare`] for a client checking another executor's receipt against its own run in a channel.
 ///
-/// Refuses a `member`-role receipt for an encrypted channel that came from the server's store:
-/// such a receipt must only ever travel inside the group's ciphertext (see the module docs).
+/// For an encrypted channel, refuses a `member`-role receipt that came from the server's store
+/// (it must only ever travel inside the group's ciphertext), and a `server`-role `exec` receipt
+/// (a server never has the plaintext, so its outcome is not evidence). See the module docs.
 pub fn compare_in_channel(
     ours: &Exec,
     theirs: &Receipt,
@@ -287,6 +302,9 @@ pub fn compare_in_channel(
 ) -> Result<Option<Comparison>, ReceiptError> {
     if channel_encrypted && theirs.role == Role::Member && theirs_from == Provenance::ServerStore {
         return Err(ReceiptError::MemberReceiptFromPlaintextStore);
+    }
+    if channel_encrypted && theirs.role == Role::Server && matches!(theirs.body, Body::Exec(_)) {
+        return Err(ReceiptError::ServerExecInEncryptedChannel);
     }
     Ok(match &theirs.body {
         Body::Exec(exec) => Some(compare(ours, exec)),
@@ -304,9 +322,12 @@ pub struct SignedReceipt {
 
 #[cfg(feature = "ed25519")]
 impl SignedReceipt {
-    /// Sign `receipt` as its executor. `key` must be `receipt.executor`'s key; [`Self::open`]
-    /// refuses the envelope otherwise.
+    /// Sign `receipt` as its executor. Refuses a `key` that is not `receipt.executor`'s.
     pub fn sign(receipt: Receipt, key: &ed25519_dalek::SigningKey) -> Result<Self, ReceiptError> {
+        let signer = crate::did::Did::from_ed25519_pubkey(&key.verifying_key().to_bytes());
+        if signer.to_did_jig_string() != receipt.executor {
+            return Err(ReceiptError::SignerIsNotExecutor);
+        }
         let envelope = crate::cose::sign1(key, &receipt.to_payload()?);
         Ok(Self { envelope, receipt })
     }
@@ -708,6 +729,26 @@ mod tests {
         );
     }
 
+    // A server never has an encrypted block's plaintext, so its exec receipt there is not
+    // evidence; comparing it would show a false divergence.
+    #[test]
+    fn a_server_exec_receipt_for_an_encrypted_channel_is_refused() {
+        let ours = exec(ok(1), false);
+        let fabricated = receipt(Role::Server, Body::Exec(exec(ok(9), true)));
+        for from in [Provenance::ServerStore, Provenance::GroupCiphertext] {
+            assert_eq!(
+                compare_in_channel(&ours, &fabricated, from, true),
+                Err(ReceiptError::ServerExecInEncryptedChannel)
+            );
+        }
+        let sealed = receipt(Role::Server, Body::Sealed);
+        assert_eq!(
+            compare_in_channel(&ours, &sealed, Provenance::ServerStore, true),
+            Ok(None),
+            "a server's sealed receipt is fine; it just compares nothing"
+        );
+    }
+
     /// Pins the encoding: an `accepted` receipt's keys, in encoded-byte order (shorter keys
     /// first, then bytewise), and its payload byte for byte. A change here changes every
     /// signature over a receipt.
@@ -760,13 +801,26 @@ mod tests {
         }
 
         #[test]
-        fn a_receipt_signed_by_someone_else_is_refused() {
+        fn signing_with_someone_elses_key_is_refused() {
             let (_, did) = executor();
             let mut r = receipt(Role::Member, Body::Accepted);
             r.executor = did;
-            let signed = SignedReceipt::sign(r, &SigningKey::from_bytes(&[6; 32])).unwrap();
+            assert_eq!(
+                SignedReceipt::sign(r, &SigningKey::from_bytes(&[6; 32])),
+                Err(ReceiptError::SignerIsNotExecutor)
+            );
+        }
+
+        #[test]
+        fn an_envelope_signed_by_someone_else_is_refused() {
+            let (_, did) = executor();
+            let mut r = receipt(Role::Member, Body::Accepted);
+            r.executor = did;
+            // Built with cose directly, bypassing sign()'s check.
+            let forged =
+                crate::cose::sign1(&SigningKey::from_bytes(&[6; 32]), &r.to_payload().unwrap());
             assert!(matches!(
-                SignedReceipt::open(&signed.envelope),
+                SignedReceipt::open(&forged),
                 Err(ReceiptError::Cose(_))
             ));
         }
