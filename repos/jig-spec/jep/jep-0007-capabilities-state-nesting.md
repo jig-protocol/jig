@@ -117,7 +117,8 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
    `custodian` is required for an install and names `bot_did`, stating that the server holds
    `bot_key` (SC-04). A `host-approval` whose `custodian` is not the install's `bot_did` is invalid.
    - The **current** approval is read from the channel's `ingest` chain: the latest
-     `host-approval` or `host-withdrawal` (`{…, kind, reason, conflicts}`) for that install CID, in
+     `host-approval` or `host-withdrawal` (`{…, kind, restrictions, reason, conflicts}`, where
+     `restrictions` is the CID the install no longer passes) for that install CID, in
      ingest order, wins, and a withdrawal stands until a newer approval. The approval carries no `seq` or `prev` of its own.
    - The server MUST withdraw the approval of an install that no longer passes its restrictions.
      Withdrawal and re-approval need nothing from the owner.
