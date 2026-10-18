@@ -123,6 +123,38 @@ fn valid_explicit_config_still_boots() {
 }
 
 #[test]
+fn a_v0_0_2_module_that_cannot_start_is_fatal() {
+    // A server without the v0.0.2 module serves only /.well-known/jig,
+    // /healthz and /metrics: it passes every health check while accepting and
+    // serving nothing. So a module that cannot start must stop the boot.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(&cfg, valid_hybrid_config(dir.path())).unwrap();
+    // The configured server_did_keyfile exists but holds no key.
+    std::fs::write(dir.path().join("server.key"), b"not a key").unwrap();
+
+    let mut child = spawn(dir.path(), &["--config", cfg.to_str().unwrap()]);
+    let Some(status) = wait_bounded(&mut child, Duration::from_secs(15)) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "a v0.0.2 module that cannot start must be fatal, but the server was still \
+             running\nstderr:\n{}",
+            drain_stderr(&mut child)
+        );
+    };
+    let stderr = drain_stderr(&mut child);
+    assert!(
+        !status.success(),
+        "expected a non-zero exit, got {status:?}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("v0.0.2 module failed to initialize"),
+        "the failure must say what failed; stderr was:\n{stderr}"
+    );
+}
+
+#[test]
 fn no_config_flag_still_uses_defaults() {
     // Defaults are legitimate when the operator never passed --config; only an
     // EXPLICIT path that fails to load is fatal.

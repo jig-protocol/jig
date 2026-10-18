@@ -165,8 +165,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(state)
             }
             Err(e) => {
-                tracing::warn!("v0.0.2 module failed to initialize, running without it: {e}");
-                None
+                // Fatal: without the v0.0.2 module the server would serve only
+                // /.well-known/jig, /healthz and /metrics, which reads as "up"
+                // to every health check while accepting and serving nothing.
+                let msg = format!("v0.0.2 module failed to initialize: {e}");
+                tracing::error!("{msg}");
+                eprintln!("[jig-server] FATAL: {msg}");
+                std::process::exit(1);
             }
         }
     };
