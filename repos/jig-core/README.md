@@ -64,18 +64,6 @@ bundle.validate_code(&constraints)?;
 let allowlist = HostImportAllowlist::new().allow_module("jig_host", vec!["http_fetch".into()]);
 bundle.validate_code_with_allowlist(&constraints, &allowlist)?;
 
-// Lint manifest + Wasm together (capabilities + determinism)
-use jig_core::{lint_block, CapabilityRegistry};
-let registry = CapabilityRegistry::default();
-let lint = lint_block(&manifest, &code_bytes, &constraints, &registry)?;
-assert!(lint.is_clean());
-
-// Author capabilities ergonomically
-use jig_core::{capability, capabilities};
-let caps = capabilities![
-    capability!("core:compute"),
-    capability!("net:http:fetch", scopes: ["https://api.example.com/*"]),
-];
 ```
 
 See also:
