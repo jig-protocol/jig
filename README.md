@@ -196,9 +196,8 @@ and lives at the repo root.
 | [`hello-wasm`](repos/hello-wasm/) | Minimal WASI hello-world used for runtime measurements |
 | [`integration-tests`](repos/integration-tests/) | Cross-component scenario tests: federation, TOFU mismatch, nameserver modes, persistence across restart, email bridge, TLS, encrypted channels |
 
-Not Cargo members: [`repos/jig-spec/`](repos/jig-spec/) — an mdBook protocol spec, still
-draft scaffolding, licensed CC-BY-4.0 — and [`repos/jig-docs/`](repos/jig-docs/), a
-holding area of per-milestone working notes.
+Not a Cargo member: [`repos/jig-spec/`](repos/jig-spec/), an mdBook protocol spec, still
+draft scaffolding, licensed CC-BY-4.0.
 
 ## Building and testing
 
