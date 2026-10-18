@@ -67,6 +67,10 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
    *(F)*.
 4. A verifier MUST refuse an envelope or payload that is not deterministically encoded, or that
    carries any other header.
+5. CIDs are encoded per JEP-0004 rule 0: a CID in a payload is the binary CIDv1 as an untagged CBOR
+   byte string, and CIDv0 is refused. This applies to every CID field here (`children`, `offers`
+   keys, `supersedes`, `object_cid`, `restrictions_cid`, `operator_policy_cid`, `prev`, `allow` and
+   `deny` program lists).
 
 This is the encoding layer jig uses for every new signed object (reference implementation:
 `jig_core::dcbor` and `jig_core::cose`).
