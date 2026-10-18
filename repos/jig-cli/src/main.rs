@@ -414,7 +414,7 @@ enum KeysAction {
         #[arg()]
         alias: String,
 
-        /// Nameserver base URL (e.g. http://127.0.0.1:7118).
+        /// Nameserver base URL (e.g. http://127.0.0.1:7070).
         #[arg(long)]
         nameserver: String,
     },
