@@ -28,7 +28,7 @@ Design record, alternatives and prior art:
 [`docs/superpowers/specs/2026-10-18-federation-naming-and-contract-design.md`](../../../docs/superpowers/specs/2026-10-18-federation-naming-and-contract-design.md),
 section 4.
 
-**Draft. Choices marked (pending DJ) are recommendations, not decisions.**
+**Draft.** The decisions behind it are recorded in the design document, section 11.
 
 # Motivation
 

@@ -31,7 +31,7 @@ IETF MIMI):
 [`docs/superpowers/specs/2026-10-18-federation-naming-and-contract-design.md`](../../../docs/superpowers/specs/2026-10-18-federation-naming-and-contract-design.md),
 sections 5–7.
 
-**Draft. Choices marked (pending DJ) are recommendations, not decisions.** The
+**Draft.** The decisions behind it are recorded in the design document, section 11. The
 server-to-server handshake is lane L7's JEP-0002 work. This JEP assumes a mutually
 authenticated, bidirectional server connection and specifies only what runs over it.
 

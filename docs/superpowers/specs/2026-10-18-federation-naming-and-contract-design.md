@@ -3,8 +3,10 @@
 **Date:** 2026-10-18
 **Author:** DJ + Claude (lane F of the
 [v0.2-close plan](../plans/2026-10-18-v0.2-close-and-m3-start.md))
-**Status:** Research pass done. Every choice marked **Proposed** waits for DJ. Nothing here
-is built, and no implementation starts until DJ approves.
+**Status:** Brainstorm complete (2026-10-18). Items marked **Decided** are DJ's answers to
+the eight questions in section 11. Items marked **Proposed** are the design detail around
+those decisions, which DJ approves or amends by reviewing this document. No
+implementation starts until it is approved. Plans for milestone F1 follow in their own PR.
 **Decisions it rests on:** D11, D12, D15, D19–D25 in the
 [roadmap](../../ROADMAP.md#decisions-log), and phase 1's exit criterion: "a channel's
 federation data contract is specified and two jig servers federate an encrypted channel
