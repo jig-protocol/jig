@@ -94,20 +94,40 @@ impl AliasRateLimiter {
         }
     }
 
+    /// The connection's peer address, or with `trust_proxy` the **last**
+    /// entry of `proxy_ip_header`: the one the nearest proxy appended. Earlier
+    /// entries were written by the client and can be anything.
     fn client_ip(&self, req: &Request) -> Option<IpAddr> {
         if self.network.trust_proxy
             && let Some(ip) = req
                 .headers()
                 .get(&self.network.proxy_ip_header)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.split(',').next())
-                .and_then(|s| s.trim().parse::<IpAddr>().ok())
+                .and_then(last_forwarded)
         {
             return Some(ip);
         }
         req.extensions()
             .get::<ConnectInfo<SocketAddr>>()
             .map(|ConnectInfo(addr)| addr.ip())
+    }
+}
+
+fn last_forwarded(header: &str) -> Option<IpAddr> {
+    header.rsplit(',').next()?.trim().parse::<IpAddr>().ok()
+}
+
+/// Bucket key for a client address. IPv4-mapped IPv6 counts as its IPv4
+/// address, and IPv6 is keyed by its /64, since one host can hold a whole
+/// /64 and would otherwise get a fresh bucket per address.
+fn ip_key(ip: IpAddr) -> String {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => format!("ip:{v4}"),
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            let prefix = std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0);
+            format!("ip:{prefix}/64")
+        }
     }
 }
 
@@ -170,7 +190,7 @@ pub async fn limit(
         return next.run(req).await;
     }
     let ip_key = match limiter.client_ip(&req) {
-        Some(ip) => format!("ip:{ip}"),
+        Some(ip) => ip_key(ip),
         None => "ip:unknown".to_string(),
     };
     let (parts, body) = req.into_parts();
@@ -269,6 +289,48 @@ mod tests {
             l.admit(T0, "ip:1", &["did:b".into()]).is_ok(),
             "the IP still has its second slot"
         );
+    }
+
+    #[test]
+    fn ipv6_is_keyed_per_slash_64_and_mapped_v4_as_v4() {
+        let a: IpAddr = "2001:db8:1:2:aaaa::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff:ffff:ffff:ffff".parse().unwrap();
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(ip_key(a), ip_key(b), "same /64 shares a bucket");
+        assert_ne!(ip_key(a), ip_key(other), "different /64s do not");
+
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        let plain: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(ip_key(mapped), ip_key(plain));
+        assert_eq!(ip_key(plain), "ip:203.0.113.7");
+    }
+
+    #[test]
+    fn forwarded_header_uses_the_last_entry() {
+        assert_eq!(
+            last_forwarded("1.2.3.4, 5.6.7.8"),
+            Some("5.6.7.8".parse().unwrap()),
+            "the client-written first entry is ignored"
+        );
+        assert_eq!(last_forwarded("5.6.7.8"), Some("5.6.7.8".parse().unwrap()));
+        assert_eq!(last_forwarded("1.2.3.4, garbage"), None);
+    }
+
+    #[test]
+    fn trusted_proxy_header_keys_on_the_proxy_appended_address() {
+        let l = AliasRateLimiter::new(
+            AliasRateLimitConfig::default(),
+            NetworkConfig {
+                trust_proxy: true,
+                proxy_ip_header: "x-forwarded-for".into(),
+                ..NetworkConfig::default()
+            },
+        );
+        let req = Request::builder()
+            .header("x-forwarded-for", "1.2.3.4, 5.6.7.8")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(l.client_ip(&req), Some("5.6.7.8".parse().unwrap()));
     }
 
     #[test]
