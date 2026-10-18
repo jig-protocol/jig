@@ -56,11 +56,11 @@ Non-goals for v0.2:
 
 ## Roles and addressing
 
-1. A channel is identified by `(owner_server, channel_id)`.
-   - `owner_server` is the owning server's DID.
-   - `channel_id` is the CID of the `channel-create` block.
-   - A slug is a display name, unique only per owner.
-   - A server MUST key remote channels by this pair, never by slug.
+1. A channel is identified by `channel_id`, the CID of its `channel-create` block.
+   - The channel's current **sequencer** (the owner) is a hint, not part of the identity,
+     because it can move (11a).
+   - A slug is a display name, unique only per sequencer.
+   - A server MUST key channels by `channel_id`, never by slug.
 2. The **owner** holds the channel's authoritative state, orders all blocks and validates
    all MLS commits.
 3. A **follower** is a server the channel has been shared with: it has accepted the
@@ -73,8 +73,9 @@ Non-goals for v0.2:
 
 ## Terms
 
-5. A `channel-create` block for a federable channel MUST carry `owner_server`.
-6. The terms of the contract are the creation block's fields: `owner_server`, `suite`,
+5. A `channel-create` block for a federable channel MUST carry `sequencer`, the first
+   owning server's DID.
+6. The terms of the contract are the creation block's fields: `sequencer`, `suite`,
    visibility and lock (the membership rule), and protocol version. The suite is fixed for
    the channel's life.
 
@@ -90,8 +91,8 @@ Non-goals for v0.2:
    - the current `ingest` head (12);
    - the hash of the owner's signed peer policy (16).
 7a. A grant is one of:
-    - `read`: the follower relays only protocol traffic (`seen` acknowledgements, MLS
-      self-updates, self-leave) and no content;
+    - `read`: the follower relays only protocol traffic (MLS self-updates, self-leave) and
+      no content;
     - `write`: the follower also relays content blocks from channel members;
     - `member`: the follower also relays the membership blocks the channel's rule allows.
 
@@ -108,7 +109,7 @@ Non-goals for v0.2:
     - v0.2 defines one more role, `admin`, with the rights `share` and `membership`. Only
       the owner assigns roles (pending DJ).
 8. The offered server MUST answer, signed by its DID, with exactly one of:
-   - `contract-accept {channel_id, owner_server, policy_hash}`, stating that it
+   - `contract-accept {channel_id, sequencer, policy_hash}`, stating that it
      implements the suite and will enforce the membership rule;
    - `contract-refuse {channel_id, code}`, where `code` is one of `UNSUPPORTED_SUITE`,
      `UNSUPPORTED_VERSION`, `POLICY_REFUSED`, `NOT_A_PEER` or `SUFFIX_CONFLICT` (the two
@@ -133,6 +134,19 @@ Non-goals for v0.2:
     - two records with the same `seq` and different content;
     - a block whose `seen` cites a record the follower does not hold and cannot obtain
       from the owner.
+
+11a. (pending DJ) The owner moves the sequencer with a `sequencer-set` block. In v0.2 only
+     the `owner` role holds that right.
+     - The new sequencer MUST have accepted the contract before its first record.
+     - Its first record links `prev` to the head the `sequencer-set` cites, and cites the
+       `sequencer-set` block.
+     - Carriers MUST refuse records from the previous sequencer once they hold the
+       `sequencer-set`.
+     - A member whose client merged a commit past the cited head rejoins by external
+       commit.
+14a. Clients report the latest sequencer record they verified to their server, which
+     forwards heads to other carriers with no reader DID attached. Fork evidence is two
+     conflicting sequencer signatures.
 
 ## Writes through followers
 
@@ -204,7 +218,7 @@ Non-goals for v0.2:
 
 - v0.x makes no compatibility guarantee.
 - Open, unencrypted channels keep today's relay until F2 replaces it.
-- Slug-keyed channels without `owner_server` stay local.
+- Slug-keyed channels without `sequencer` stay local.
 
 # Reference Implementation
 

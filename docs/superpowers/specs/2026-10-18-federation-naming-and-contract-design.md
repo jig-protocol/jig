@@ -407,7 +407,7 @@ Sharing a channel is a server-to-server act, and **a share carries a grant**:
 
 | Grant (proposed set) | A follower may relay | Clients authenticated to the follower |
 | --- | --- | --- |
-| `read` | protocol traffic only: `seen` acknowledgements, MLS self-updates, self-leave. No content | read; to post, they connect to the owner directly, if the owner admits them |
+| `read` | protocol traffic only: MLS self-updates and self-leave. No content | read; to post, they connect to the owner directly, if the owner admits them |
 | `write` | content blocks from channel members | read and post |
 | `member` | content, plus membership blocks (adds, self-joins on open channels, removals) the channel's membership rule allows | everything a local client could do |
 
@@ -422,16 +422,11 @@ Consequences:
 - **A read-only share forces "connect to the owner directly"** for anyone who wants to
   write. The owner then treats that client as its own, under its own admission.
 - **`read` is a content promise, not a signing rule (DJ).** Readers still sign and send
-  protocol traffic back: `seen` acknowledgements (L7's field) and MLS self-updates. So
-  remote readers keep post-compromise security, and their acknowledgements feed fork
-  detection (5.3). What `read` withholds is content.
-  - **Metadata cost:** a `seen` acknowledgement is a read receipt. It tells the owner and
-    the follower who read what, and when.
-  - **Proposed: minimal retention.** A server verifies each acknowledgement, keeps only
-    the latest one per member (enough to detect withholding), and never fans
-    acknowledgements out to members. It keeps no history of who read what, and when. Read
-    receipts visible to members would be a separate, opt-in feature, not a side effect of
-    fork detection.
+  MLS self-updates back, so remote readers keep post-compromise security. What `read`
+  withholds is content.
+- **Readers send no per-member acknowledgements** (L7's proposal, adopted here). Fork and
+  withholding detection uses anonymous head gossip (5.3), so no server learns who read what
+  or when beyond what it delivered itself.
 - **Rejected:** multi-homing (Matrix, IRC), where any server accepts writes with no owner.
   It needs state resolution, and MLS needs one linear epoch history.
 
@@ -449,10 +444,24 @@ Consequences:
     never re-sign it.
   - Authored blocks carry `seen`, the hash of the latest record their author verified.
   - JEP-0002 (L7) defines the record. This design only relies on it.
-  - Followers keep the chain. Two followers that compare heads detect an owner showing them
-    different histories, and a gap in `seq` shows an omission. `seen` adds detection by
-    authors: a block citing a record the follower never received shows withholding (OP-06:
-    detection, not prevention).
+  - Followers keep the chain, and a gap in `seq` shows an omission.
+  - **Anonymous head gossip (L7's proposal).** A client reports to its server the latest
+    sequencer-signed record it verified. Carriers forward the heads they have seen, with
+    no reader DID attached. The evidence of a fork is two conflicting sequencer
+    signatures, so a reader's own signature adds nothing.
+  - `seen` on authored blocks adds a second signal: a block citing a record a carrier
+    never received shows withholding (OP-06: detection, not prevention).
+  - **Caveat:** gossip relayed only through the sequencer cannot catch the sequencer.
+    Detection needs heads to cross between carriers by some path the sequencer does not
+    control:
+    - carrier-to-carrier links where they exist;
+    - clients authenticated to more than one carrier;
+    - `seen` on blocks from members on other carriers, which reaches every reader,
+      `read`-grant followers included.
+
+    The last is the reliable path in a star. So withholding **from a whole carrier** is
+    detected as soon as a member on another carrier posts. Withholding **by a carrier from
+    its own clients** is detected by those clients through `seen` on others' blocks.
 - **Followers validate too** (5.1), so a buggy or hostile owner cannot wedge remote
   members with a commit that will not apply.
 - **The owner's server key goes into the group's `external_senders`** only if the owner
@@ -486,8 +495,8 @@ Rules:
 
 **Proposed.**
 
-1. **The channel-create block names its owner.** New field `owner_server`, the owning
-   server's DID. The suite, the membership rule and the protocol version are already in
+1. **The channel-create block names its first sequencer.** New field `sequencer`, the
+   owning server's DID. It can later move (5.8). The suite, the membership rule and the protocol version are already in
    it. The creation block is the contract's terms, and the suite is fixed there for the
    channel's life (D12).
 2. **A share starts with an offer.** The owner sends the target server a `contract-offer`,
@@ -535,16 +544,36 @@ reputation and proof-of-work between servers (lane R, D26).
 
 | Owner behaviour | Effect | v0.2 answer |
 | --- | --- | --- |
-| Down | No new blocks; followers serve history they hold | Accepted, like an XMPP MUC. Clients say the channel is unreachable |
+| Down | No new blocks; carriers serve history they hold and queue writes | The owner moves the sequencer (below) |
 | Censors a member | That member's writes vanish | Detectable only by the member. Accepted (OP-06) |
 | Shows followers different histories | Fork | Detected by comparing signed sequence heads (5.3) |
 | Reads content | Cannot: MLS | Exit criterion 2 holds |
 | Forges a block | Cannot: author signatures | OP-09 |
 | Adds a key the owner controls | Cannot unilaterally: only the channel owner's DID may add, and the add is a client-made commit naming the DID | Holds while the channel owner (a DID) and the owning server are different parties. **The channel-owner DID and the owning server can collude**, which is the same trust the single-server channel already has |
 
-**Open for DJ:** whether members can move a channel to a new owner. The recommendation is
-not in v0.2: members create a new channel. A signed handover by the channel-owner DID is
-v0.3.
+**Moving the sequencer (L7's proposal; pending DJ).**
+- The owning server is the channel's **sequencer**: a server DID named in the creation
+  block, or later in a `sequencer-set` block.
+- **Moving the sequencer is an `owner`-only right** in v0.2. Delegating it to `admin`
+  waits for the v0.3 policy language.
+- The new sequencer's first record links `prev` to the old head and cites the
+  `sequencer-set` block, so the chain continues across the handover.
+- While the sequencer is down, carriers queue writes until the owner moves it.
+
+F's caveats:
+1. **The new sequencer must accept,** like any share: it must be on the owning operators'
+   peer lists, and its `contract-accept` comes before its first record.
+2. **A sequencer that is partitioned, not dead, can fork the channel.** The old sequencer
+   may have extended past the head the `sequencer-set` cites.
+   - Carriers MUST refuse the old sequencer's records once they hold the `sequencer-set`.
+   - Blocks it accepted past the cited head are lost writes.
+   - Members whose clients merged an MLS commit past the cited head are now in an epoch
+     the new chain never had. MLS cannot roll back, so those members rejoin by external
+     commit.
+
+   This is the price of liveness. It is bounded because only the `owner` can trigger it.
+3. **Channel identity must not include the sequencer** (section 6), or every move would
+   rename the channel.
 
 ### 5.9 Shares and roles
 
@@ -584,13 +613,14 @@ v0.3.
 | --- | --- | --- |
 | Server | its DID | URL, from config, a reachability record or `/.well-known/jig` |
 | User | their DID | name (`alias@suffix`), reachability record |
-| Channel | `(owner_server DID, channel id)`, where the id is the CID of the `channel-create` block | slug, unique only per owner |
+| Channel | the CID of its `channel-create` block, which is globally unique | the current sequencer's DID; the slug, unique only per sequencer |
 | Device | out of scope: one DID, one device, until lane I | |
 
-A URI form for links: `jig:<owner-server-did>/<channel-cid>`, with the slug as an optional
-display parameter. **Consequence:** today's tables are keyed by slug and are first-come
-per server. A follower that has its own `#ops` and joins A's `#ops` must keep both, so
-remote channels are keyed by owner and CID. That is a schema change in the server, and the
+A URI form for links: `jig:<channel-cid>`, with the sequencer and the slug as optional
+hints. The sequencer is not part of the identity, because it can move. This matches Matrix
+room v12, which took the server out of the room ID. **Consequence:** today's tables are
+keyed by slug and are first-come per server. A follower that has its own `#ops` and joins
+A's `#ops` must keep both, so channels are keyed by CID. That is a schema change in the server, and the
 largest single piece of build work in F2.
 
 ## 7. `federation.md`: keep, rewrite or drop
@@ -638,7 +668,7 @@ Updated in the implementation PRs, not here.
 | --- | --- | --- | --- |
 | **F0** | now | This design and the two JEP drafts. L1 adds a banner to `federation.md`. A small PR makes the orphan-post and no-policy paths fail closed | nothing |
 | **F1: verified names** | v0.2.x | Canonical attestation and proof encodings (4.6); nameserver TLS; suffix delegation by config and `.well-known` (4.2 A+B); verification in the client and the server's resolver (4.3); client name pins and the change rule (4.4); retained attestations (4.5); `jig dm`/`channel add` accept names; reachability records (4.7) | L7 for `jig trust` UX; L6 for nameserver code |
-| **F2: the contract between two jig servers** | v0.2.x, gate G3 | Channels keyed by owner and CID (6); `owner_server` in the creation block; offer, accept, refuse and end (5.5); signed peer policy (5.6); relay through the client's server under share grants (5.2); owner sequencing with a signed chain, and follower validation (5.3); key packages through the owner under consent (5.4); restricted MLS channels federate between configured peers; the `federation.md` rewrite | **L7's mutual server-to-server handshake**; F1's reachability records |
+| **F2: the contract between two jig servers** | v0.2.x, gate G3 | Channels keyed by CID (6); `sequencer` in the creation block and `sequencer-set`; offer, accept, refuse and end (5.5); signed peer policy (5.6); relay through the client's server under share grants (5.2); owner sequencing with a signed chain, and follower validation (5.3); key packages through the owner under consent (5.4); restricted MLS channels federate between configured peers; the `federation.md` rewrite | **L7's mutual server-to-server handshake**; F1's reachability records |
 | **F3** | v0.3+ | Ruleset-group delegation with thresholds (4.2 C); replicated registry and transparency log (NS-02, NS-03, with lane R); nameserver-led contract templates (D12); MIMI-style consent; ownership handover; open federation with reputation; interop with other implementations by contract | lane R; ruleset groups |
 
 **Exit criterion 5 is met at the end of F2.**
@@ -688,7 +718,7 @@ Updated in the implementation PRs, not here.
    refused otherwise?
 4. Reachability records (4.7): signed by the DID, not the nameserver?
 5. Key packages (5.4): through the owner, under a coarse consent policy in v0.2?
-6. Owner failure and handover (5.8): accept liveness loss in v0.2, no handover?
+6. Owner failure (5.8): the movable sequencer (L7's proposal, going to DJ through L7).
 7. Who may federate (5.7): configured peers only in v0.2?
 8. `federation.md` (7): this disposition?
 
