@@ -51,7 +51,7 @@ fast path, not the absence of a model.
 | **Ready means** | `restricted` gates reads (history, WSS delivery) and writes to non-members. |
 | **Gap** | Restricted channels do not federate yet: a relayed block runs the same posting gate, but there is no way to carry membership across servers (see §1.1). Timing still distinguishes a refused read from an unknown channel under a concealing disclosure policy — a stated limitation of the design, and the default policy conceals nothing. |
 
-The CLI's `restricted (membership-gated reads)` help text is now true, and
+The CLI's `restricted` help text (members only, always end-to-end encrypted) is true, and
 `jig channel join` says which channels it can join.
 
 **Verdict: READY.**
@@ -62,7 +62,7 @@ The CLI's `restricted (membership-gated reads)` help text is now true, and
 | --- | --- |
 | **Current state** | **Per channel, since v0.2.** A channel created with `suite = "mls"` (`jig channel create --encrypted`, and every `jig dm`) is one MLS group ([`jig-mls`](../repos/jig-mls/), `openmls` 0.9): content is an MLS `PrivateMessage`, the server validates every commit through a public-state `PublicGroup` and holds no group secret, and plaintext into such a channel is refused (`SUITE_MISMATCH`). `integration-tests/tests/h12_encrypted_channels.rs` searches the server's files after a conversation and finds none of it. Channels created without a suite are still signed-not-encrypted and stored in cleartext. |
 | **Ready means** | Message bodies are encrypted to recipient keys; the server stores ciphertext it cannot read. |
-| **Gap** | Encryption is opt-in, not the default for new channels; restricted channels become always-MLS, with no opt-out, before the v0.2 tag (D25). Encrypted channels do not federate. One device per DID. The client's plaintext cache (`~/.jig/mls/`) is as sensitive as the identity key and is not encrypted at rest. No independent review of the MLS integration. |
+| **Gap** | Restricted channels are always MLS (D25), but encryption is opt-in for open channels; restricted channels created plaintext before D25 are frozen, their history still readable to the operator. Encrypted channels do not federate. One device per DID. The client's plaintext cache (`~/.jig/mls/`) is as sensitive as the identity key and is not encrypted at rest. No independent review of the MLS integration. |
 
 `repos/jig-spec/` used to document `age+x25519` E2EE in the present tense. Since
 2026-10-05 it specifies MLS, suite-pluggable, in `src/encryption.md`, whose banner now
@@ -275,12 +275,12 @@ The sentence that used to decide it — *a jig server has no authentication and
 no authorization* — is no longer true: reads require proof of possession,
 restricted channels are membership-gated on every surface, membership changes
 are owner-signed, and rate limits are on by default. Nor are the next three: DMs
-and `--encrypted` channels are end-to-end encrypted with MLS, the binary
+restricted channels and `--encrypted` open channels are end-to-end encrypted with MLS, the binary
 installer verifies a signed checksum, and `SECURITY.md` gives a disclosure path.
 What decides it now:
 
-- Restricted channels created without `--encrypted` are still readable by the
-  operator until D25 lands, and encryption is not the default for open channels.
+- Encryption is not the default for open channels (restricted channels are always MLS
+  since D25), and the email bridge refuses inbound mail until it can join MLS groups.
 - Encrypted channels do not federate, and nothing has had an outside review (the
   audit, D27, runs once v0.2 is code-complete).
 - Admission rests on operator-written config, not earned reputation; the

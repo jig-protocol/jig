@@ -14,12 +14,11 @@
 //! envelope bytes are what travels and what a resolver keeps as evidence. Test
 //! vectors live in `repos/jig-spec/jep/vectors/0004/`.
 
-use ciborium::value::Value;
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
 use crate::cose::{self, CoseError};
-use crate::dcbor::{self, text_map};
+use crate::dcbor::{self, Value};
 use crate::did::Did;
 
 pub const ATTESTATION_DOMAIN: &str = "jig-alias-attestation-v1";
@@ -154,7 +153,7 @@ impl Action {
 /// The payload a DID signs to prove control for `action` on `alias` at
 /// `ns_did`: `{domain, ns_did, alias, challenge}`.
 pub fn proof_payload(action: Action, ns_did: &str, alias: &str, challenge: &str) -> Vec<u8> {
-    encode(text_map(vec![
+    encode(Value::text_map([
         ("domain", Value::Text(action.domain().into())),
         ("ns_did", Value::Text(ns_did.into())),
         ("alias", Value::Text(alias.into())),
@@ -175,7 +174,7 @@ pub fn sign_proof(
     alias: &str,
     challenge: &str,
 ) -> Vec<u8> {
-    cose::sign(key, &proof_payload(action, ns_did, alias, challenge))
+    cose::sign1(key, &proof_payload(action, ns_did, alias, challenge))
 }
 
 /// Check a proof of control by `did`.
@@ -210,13 +209,13 @@ impl Attestation {
     const WHAT: &'static str = "alias attestation";
 
     pub fn payload(&self) -> Vec<u8> {
-        encode(text_map(vec![
+        encode(Value::text_map([
             ("domain", Value::Text(ATTESTATION_DOMAIN.into())),
             ("did", Value::Text(self.did.clone())),
             ("alias", Value::Text(self.alias.clone())),
             ("ns_did", Value::Text(self.ns_did.clone())),
-            ("valid_from", Value::Integer(self.valid_from.into())),
-            ("valid_until", Value::Integer(self.valid_until.into())),
+            ("valid_from", Value::int(self.valid_from)),
+            ("valid_until", Value::int(self.valid_until)),
         ]))
     }
 
@@ -236,7 +235,7 @@ impl Attestation {
             valid_until,
             envelope: Vec::new(),
         };
-        att.envelope = cose::sign(ns_key, &att.payload());
+        att.envelope = cose::sign1(ns_key, &att.payload());
         att
     }
 
@@ -301,7 +300,7 @@ impl SuffixDelegation {
     pub fn payload(&self) -> Vec<u8> {
         let mut authorities = self.authorities.clone();
         authorities.sort_unstable();
-        encode(text_map(vec![
+        encode(Value::text_map([
             ("domain", Value::Text(DELEGATION_DOMAIN.into())),
             ("suffix", Value::Text(self.suffix.clone())),
             (
@@ -310,7 +309,7 @@ impl SuffixDelegation {
             ),
             ("root", Value::Text(self.root.as_str().into())),
             ("root_id", Value::Text(self.root_id.clone())),
-            ("valid_until", Value::Integer(self.valid_until.into())),
+            ("valid_until", Value::int(self.valid_until)),
         ]))
     }
 
@@ -333,7 +332,7 @@ impl SuffixDelegation {
         let payload = deleg.payload();
         deleg.envelopes = authority_keys
             .iter()
-            .map(|k| cose::sign(k, &payload))
+            .map(|k| cose::sign1(k, &payload))
             .collect();
         deleg
     }
@@ -403,17 +402,17 @@ impl ReachabilityRecord {
             .servers
             .iter()
             .map(|(server_did, url)| {
-                text_map(vec![
+                Value::text_map([
                     ("server_did", Value::Text(server_did.clone())),
                     ("url", Value::Text(url.clone())),
                 ])
             })
             .collect();
-        encode(text_map(vec![
+        encode(Value::text_map([
             ("domain", Value::Text(REACHABILITY_DOMAIN.into())),
             ("did", Value::Text(self.did.clone())),
             ("servers", Value::Array(servers)),
-            ("seq", Value::Integer(self.seq.into())),
+            ("seq", Value::Unsigned(self.seq)),
         ]))
     }
 
@@ -424,7 +423,7 @@ impl ReachabilityRecord {
             seq,
             envelope: Vec::new(),
         };
-        rec.envelope = cose::sign(key, &rec.payload());
+        rec.envelope = cose::sign1(key, &rec.payload());
         rec
     }
 
@@ -443,7 +442,7 @@ impl ReachabilityRecord {
         let rec = Self {
             did: text(&p, "did", Self::WHAT)?,
             servers,
-            seq: int(&p, "seq", Self::WHAT)?,
+            seq: uint(&p, "seq", Self::WHAT)?,
             envelope: envelope.to_vec(),
         };
         rec.verify()?;
@@ -535,25 +534,26 @@ fn encode(map: Value) -> Vec<u8> {
 }
 
 fn text(map: &Value, key: &str, what: &'static str) -> Result<String, NamingError> {
-    match dcbor::get(map, key) {
+    match map.get(key) {
         Some(Value::Text(t)) => Ok(t.clone()),
         _ => Err(NamingError::BadPayload(what)),
     }
 }
 
-fn int<T: TryFrom<ciborium::value::Integer>>(
-    map: &Value,
-    key: &str,
-    what: &'static str,
-) -> Result<T, NamingError> {
-    match dcbor::get(map, key) {
-        Some(Value::Integer(i)) => T::try_from(*i).map_err(|_| NamingError::BadPayload(what)),
-        _ => Err(NamingError::BadPayload(what)),
-    }
+fn int(map: &Value, key: &str, what: &'static str) -> Result<i64, NamingError> {
+    map.get(key)
+        .and_then(Value::as_i64)
+        .ok_or(NamingError::BadPayload(what))
+}
+
+fn uint(map: &Value, key: &str, what: &'static str) -> Result<u64, NamingError> {
+    map.get(key)
+        .and_then(Value::as_u64)
+        .ok_or(NamingError::BadPayload(what))
 }
 
 fn array<'a>(map: &'a Value, key: &str, what: &'static str) -> Result<&'a [Value], NamingError> {
-    match dcbor::get(map, key) {
+    match map.get(key) {
         Some(Value::Array(items)) => Ok(items),
         _ => Err(NamingError::BadPayload(what)),
     }
@@ -562,7 +562,7 @@ fn array<'a>(map: &'a Value, key: &str, what: &'static str) -> Result<&'a [Value
 /// Open `envelope`, decode its payload and check its `domain`. The caller
 /// still verifies the signature, through its own `verify`.
 fn open(envelope: &[u8], domain: &str, what: &'static str) -> Result<Value, NamingError> {
-    let opened = cose::open(envelope)?;
+    let opened = cose::open_sign1(envelope)?;
     let payload = dcbor::decode(&opened.payload).map_err(|_| NamingError::BadPayload(what))?;
     if text(&payload, "domain", what)? != domain {
         return Err(NamingError::BadPayload(what));
@@ -573,7 +573,7 @@ fn open(envelope: &[u8], domain: &str, what: &'static str) -> Result<Value, Nami
 /// `envelope` carries exactly `payload` and is signed by `did`. Comparing
 /// the re-encoded fields with the signed bytes also refuses unknown keys.
 fn verify_envelope(envelope: &[u8], payload: &[u8], did: &str) -> Result<(), NamingError> {
-    let opened = cose::open(envelope)?;
+    let opened = cose::open_sign1(envelope)?;
     if opened.payload != payload {
         return Err(NamingError::BadSignature(did.to_string()));
     }
@@ -811,7 +811,7 @@ mod tests {
             assert!(verify_proof(&did, &sig, action, &ns_did, alias, challenge).is_err());
         }
         // A signature over the bare challenge is not a proof.
-        let bare = cose::sign(&k, b"c0ffee");
+        let bare = cose::sign1(&k, b"c0ffee");
         assert!(
             verify_proof(
                 &did,
@@ -888,7 +888,7 @@ mod tests {
         if let Value::Map(entries) = &mut extra {
             entries.push((Value::Text("note".into()), Value::Text("x".into())));
         }
-        let envelope = cose::sign(&ns, &dcbor::encode(&extra).unwrap());
+        let envelope = cose::sign1(&ns, &dcbor::encode(&extra).unwrap());
         assert_eq!(
             Attestation::from_envelope(&envelope),
             Err(NamingError::BadSignature(did_of(&ns)))

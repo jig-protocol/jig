@@ -125,7 +125,7 @@ jobs:
             rustup toolchain install stable --profile minimal
             rustup default stable
           fi
-          rustup target add ${{ matrix.target }} wasm32-wasip1
+          rustup target add ${{ matrix.target }}
           rustc -V
 
       # musl targets cross-link with zig: no musl-gcc or aarch64 sysroot to
@@ -145,17 +145,15 @@ jobs:
           workspaces: repos
           key: release-${{ matrix.target }}
 
+      # No separate text-block build: jig-server embeds the committed,
+      # CI-verified artifact (repos/text-block/artifacts/text_block.wasm) and
+      # executes only that.
       - name: Build jig-server, jig, jig-nameserver
         working-directory: repos
         shell: bash
         run: |
           cargo ${{ matrix.zigbuild && 'zigbuild' || 'build' }} --release --locked \
             --target ${{ matrix.target }} -p jig-server -p jig-cli -p jig-nameserver
-
-      - name: Build text-block (wasm32-wasip1)
-        working-directory: repos
-        shell: bash
-        run: cargo build --release --locked --target wasm32-wasip1 -p text-block
 
       - name: Check binaries
         shell: bash

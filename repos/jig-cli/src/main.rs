@@ -23,7 +23,7 @@ struct Cli {
     #[arg(long)]
     config: Option<PathBuf>,
 
-    /// Override server base URL (e.g. http://127.0.0.1:7117)
+    /// Override server base URL (e.g. https://127.0.0.1:7117)
     #[arg(long)]
     server: Option<String>,
 
@@ -293,7 +293,7 @@ enum ServerAction {
     /// `http://`, `https://`, `ws://`, or `wss://`. v0.0.2 stores
     /// whatever the operator supplies (validated for basic URL shape).
     Set {
-        /// e.g. `http://127.0.0.1:7117` or `wss://deji.jig.onl`.
+        /// e.g. `https://127.0.0.1:7117` or `wss://deji.jig.onl`.
         #[arg()]
         url: String,
     },
@@ -414,7 +414,7 @@ enum KeysAction {
         #[arg()]
         alias: String,
 
-        /// Nameserver base URL (e.g. http://127.0.0.1:7118).
+        /// Nameserver base URL (e.g. http://127.0.0.1:7070).
         #[arg(long)]
         nameserver: String,
     },

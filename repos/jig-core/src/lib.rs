@@ -14,7 +14,6 @@ pub mod capability_validation;
 #[cfg(feature = "ed25519")]
 pub mod cose;
 pub mod crypto;
-#[cfg(feature = "ed25519")]
 pub mod dcbor;
 pub mod did;
 pub mod dm;
