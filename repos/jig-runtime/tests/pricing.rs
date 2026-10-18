@@ -57,10 +57,11 @@ fn test_pricing_enabled() {
     let pricing = receipt.pricing.as_ref().unwrap();
     assert_eq!(pricing.cost_per_fuel_unit, 0.00001);
     assert_eq!(pricing.currency, Some("USD".to_string()));
-    // Pins the DEFAULT schedule version. Bumped to 0.2.0 when wasmtime 47
-    // started billing bulk memory ops per byte; update deliberately, never to
-    // make a failure go away.
+    // Pins the schedule version. Bumped to 0.2.0 when wasmtime 47 started
+    // billing bulk memory ops per byte; update deliberately, never to make a
+    // failure go away.
     assert_eq!(pricing.schedule_version, "0.2.0");
+    assert_eq!(pricing.schedule_version, jig_runtime::FUEL_SCHEDULE_VERSION);
 
     // Total cost should be fuel_used * cost_per_fuel_unit
     let expected_cost = receipt.fuel_used() as f64 * 0.00001;
@@ -73,7 +74,6 @@ fn test_pricing_calculation_accuracy() {
     config.pricing.enabled = true;
     config.pricing.cost_per_fuel_unit = 0.000001; // 1 micro-unit
     config.pricing.currency = Some("credits".to_string());
-    config.pricing.schedule_version = "test-v1".to_string();
 
     let runtime = Runtime::with_config(config).expect("Failed to create runtime");
 
@@ -113,7 +113,7 @@ fn test_pricing_calculation_accuracy() {
 
     // Verify custom values
     assert_eq!(pricing.currency, Some("credits".to_string()));
-    assert_eq!(pricing.schedule_version, "test-v1");
+    assert_eq!(pricing.schedule_version, jig_runtime::FUEL_SCHEDULE_VERSION);
 
     // Should have consumed significant fuel
     assert!(
@@ -165,5 +165,25 @@ fn test_receipt_serialization_with_pricing() {
     assert_eq!(
         deserialized.pricing.as_ref().unwrap().total_cost,
         receipt.pricing.as_ref().unwrap().total_cost
+    );
+}
+
+/// The schedule version is not a free label. It used to be an operator setting,
+/// so any string could be signed into receipts while the engine metered under
+/// its own schedule. A config that still sets it must fail to load rather than
+/// be silently ignored.
+#[test]
+fn a_configured_schedule_version_is_rejected() {
+    let err = RuntimeConfig::from_toml_str(
+        r#"
+        [pricing]
+        enabled = true
+        schedule_version = "anything-i-like"
+        "#,
+    )
+    .expect_err("schedule_version must not be configurable");
+    assert!(
+        err.to_string().contains("schedule_version"),
+        "the error must name the rejected key, got: {err}"
     );
 }

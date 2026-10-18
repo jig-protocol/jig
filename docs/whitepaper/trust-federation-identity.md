@@ -893,8 +893,9 @@ proposal.
 - **Built.** Unknown and unimplemented suites are refused; a channel's suite is fixed at
   creation and enforced on every post (OP-03). The server executes nothing under an encrypted
   suite, and its receipt says `"content": "sealed"`.
-- **Partial.** Encryption is off by default for channels: a channel created without a suite
-  is plaintext to the operator. `jig dm` always creates an encrypted channel.
+- **Partial.** Restricted channels are always MLS (D25), and `jig dm` always creates an
+  encrypted channel. An open channel created without a suite is plaintext to the operator,
+  and a restricted channel created plaintext before D25 is frozen.
 - **Partial.** Encrypted channels do not federate (section 9.2).
 - **None.** A second suite, and conformance vectors per suite (JEP-0001, open question 8).
 
@@ -1293,7 +1294,7 @@ gap.
 | One owning server per channel (D24) | None: each server keeps its own channel state | Cross-server writes: survey XMPP MUC, IRC, Matrix, ActivityPub groups |
 | A peer is a transport; relayed blocks pass every gate | Built: relayed blocks run through `ingest` and the write gate (authors not asked for admission proof-of-work); peers listed and pinned in configuration | Peer DID in the contract; per-peer limits |
 | Pluggable suites, MLS default and first (D1, D13) | Built: MLS per channel; validating delivery service | Non-MLS plug-in shape (D13); per-suite conformance |
-| End-to-end encryption by default | Partial: DMs encrypted; channels plaintext unless created `mls` | Encryption on by default |
+| End-to-end encryption by default | Partial: DMs and restricted channels always encrypted; open channels plaintext unless created `mls` | Encryption on by default |
 | Mandatory signed handshake; clients fail closed and pin | Partial: signed welcome with nonce; CLI pins server DIDs, suites and channel suites; later frames unchecked | Close semantics; pins; real reputation (D11) |
 | No backdoors, no scanning, no default escrow | Holds: no backdoor, scanning or escrow exists | Keep it so as reporting is designed |
 | Provable abuse reports from encrypted channels, by participants only (D22) | None: signature exists; no tooling | Delegation or proof mechanism (AB-06) |

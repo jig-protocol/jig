@@ -42,7 +42,7 @@ pub struct InitArgs {
     /// value comes from the global `--config <path>` flag.
     pub config_path: Option<PathBuf>,
     /// `[server] base_url` to record. `None` keeps `Config::default()`'s
-    /// `http://127.0.0.1:7117`; a `Some` value comes from `--server`.
+    /// `https://127.0.0.1:7117`; a `Some` value comes from `--server`.
     pub server_url: Option<String>,
 }
 

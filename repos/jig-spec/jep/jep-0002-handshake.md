@@ -58,7 +58,10 @@ Draft. Field names are provisional. The design behind this revision is
 3. If the server shares no version or suite with the `hello`, it sends a `refusal`
    instead of a `welcome`, signed under domain `jig-handshake-refusal-v1` over the
    client's `nonce`, the refusal code (`UNSUPPORTED_VERSION` or `UNSUPPORTED_SUITE`),
-   and the versions and suites it supports. It then closes the connection.
+   and the versions and suites it supports. It then closes the connection. The frame's
+   `format` field names the signature format (`jig-handshake-refusal-v1`); a client
+   MUST treat a refusal in a format it does not verify as a handshake failure, by
+   that name, not by trying to parse it.
 4. When the `hello` carried `peer_did`, the dialer's next frame is `peer_proof`: an
    ed25519 signature by `peer_did`, under domain `jig-handshake-peer-v1`, over the
    transcript hash. The transcript hash is BLAKE3 over the domain tag and the
