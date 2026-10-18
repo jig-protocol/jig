@@ -177,6 +177,8 @@ Non-goals for v0.2:
        names the server, the channel, the CID of the policy or install it approves, and
        the CID of the server's restrictions. The owner's `channel-policy` and
        `block-install` stay `COSE_Sign1`s by the owner.
+     - Which approval is current is decided by the channel's `ingest` order: the latest
+       `policy-approval` or `policy-withdrawn` for an object CID wins.
      - Clients MUST treat a policy or install without a current approval from the hosting
        server as absent. A move without these approvals therefore leaves the channel with
        no policy.
@@ -184,7 +186,8 @@ Non-goals for v0.2:
        or withdraw one when its restrictions change, and a new sequencer can approve on a
        move, without the owner signing again.
 
-     JEP-0011 defines `channel-policy`, `block-install` and `policy-approval`.
+     JEP-0011 defines `channel-policy`, `block-install`, `policy-approval` and
+     `policy-withdrawn`.
 
 ## Ordering
 
