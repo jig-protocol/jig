@@ -6,31 +6,32 @@
 //! what orders history (TM-02), what clients check for gaps and reordering
 //! (OP-06), and the time lanes A and C run a block at.
 //!
-//! The encoding and signature live here and nowhere else. Whether signed
-//! objects move to deterministic CBOR with COSE_Sign1 (as v0.3 receipts do)
-//! is still open; switching is a change to this module alone.
+//! Signed as a COSE_Sign1 over a deterministic CBOR payload ([`jig_core::cose`],
+//! [`jig_core::dcbor`]), like every new signed object. The JSON fields beside
+//! the envelope are a view of the payload for readers; [`IngestRecord::verify`]
+//! requires them to be exactly what was signed.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::SigningKey;
 use jig_core::Did;
+use jig_core::dcbor::{self, Value};
 use serde::{Deserialize, Serialize};
 
 /// The format a record is signed in, named on the record and in the signed
-/// bytes. A record in any other format is refused by name.
-pub const RECORD_FORMAT: &str = "jig-ingest-v1";
-const DOMAIN: &[u8] = RECORD_FORMAT.as_bytes();
+/// payload's `domain`. A record in any other format is refused by name.
+pub const RECORD_FORMAT: &str = "jig-ingest-v2";
 
 /// The hash a chain starts from: `prev` at `seq` 0.
 pub const GENESIS_PREV: [u8; 32] = [0; 32];
 
 /// A signed ingest record, as it travels on the wire and is stored.
 ///
-/// `prev` and `sig` are hex and base64 strings so the JSON form is plain;
+/// `prev` and `cose` are hex and base64 strings so the JSON form is plain;
 /// [`IngestRecord::hash`] and [`IngestRecord::verify`] decode them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestRecord {
-    /// How `sig` is made: [`RECORD_FORMAT`]. Named so that a later encoding
+    /// How `cose` is made: [`RECORD_FORMAT`]. Named so that another encoding
     /// is told apart from a damaged record.
     pub format: String,
     /// The CID of the channel's `channel-create` block.
@@ -44,8 +45,8 @@ pub struct IngestRecord {
     pub prev: String,
     /// The DID that signed this record.
     pub sequencer: String,
-    /// Base64 ed25519 over [`IngestRecord::signed_bytes`].
-    pub sig: String,
+    /// Base64 COSE_Sign1 over [`IngestRecord::payload`], by `sequencer`.
+    pub cose: String,
 }
 
 /// Why a record is not one this client can rely on.
@@ -83,45 +84,49 @@ impl RecordSigner<'_> {
             prev: hex::encode(prev),
             sequencer: Did::from_ed25519_pubkey(self.key.verifying_key().as_bytes())
                 .to_did_jig_string(),
-            sig: String::new(),
+            cose: String::new(),
         };
-        record.sig = STANDARD.encode(self.key.sign(&record.signed_bytes()).to_bytes());
+        let payload = record
+            .payload()
+            .expect("a record this signer built encodes");
+        record.cose = STANDARD.encode(jig_core::cose::sign1(self.key, &payload));
         record
     }
 }
 
 impl IngestRecord {
-    /// Length-prefixed and domain-separated, in a fixed field order, so the
-    /// signature does not depend on JSON key order.
-    pub fn signed_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        for field in [
-            DOMAIN,
-            self.channel_id.as_bytes(),
-            &self.seq.to_le_bytes(),
-            &self.ingest_wall_ms.to_le_bytes(),
-            &self.ingest_logical.to_le_bytes(),
-            self.block_cid.as_bytes(),
-            self.prev.as_bytes(),
-            self.sequencer.as_bytes(),
-        ] {
-            let len = u64::try_from(field.len()).expect("record field fits in u64");
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(field);
-        }
-        out
+    /// The deterministic CBOR payload the sequencer signs: a text-keyed map
+    /// with `domain` = [`RECORD_FORMAT`] and every field, `prev` as 32 bytes.
+    pub fn payload(&self) -> Result<Vec<u8>, RecordError> {
+        let prev: [u8; 32] = hex::decode(&self.prev)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or(RecordError::Malformed("prev is not 32 hex bytes"))?;
+        dcbor::encode(&Value::text_map([
+            ("domain", Value::text(RECORD_FORMAT)),
+            ("channel_id", Value::text(&self.channel_id)),
+            ("seq", Value::Unsigned(self.seq)),
+            ("ingest_wall_ms", Value::Unsigned(self.ingest_wall_ms)),
+            (
+                "ingest_logical",
+                Value::Unsigned(u64::from(self.ingest_logical)),
+            ),
+            ("block_cid", Value::text(&self.block_cid)),
+            ("prev", Value::Bytes(prev.to_vec())),
+            ("sequencer", Value::text(&self.sequencer)),
+        ]))
+        .map_err(|_| RecordError::Malformed("record fields do not encode"))
     }
 
-    /// The hash the next record's `prev` names: the signed bytes and the
-    /// signature, so a chain binds every signature in it.
+    /// The hash the next record's `prev` names: BLAKE3 of the COSE envelope,
+    /// so a chain binds every payload and signature in it.
     pub fn hash(&self) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&self.signed_bytes());
-        hasher.update(self.sig.as_bytes());
-        *hasher.finalize().as_bytes()
+        let envelope = STANDARD.decode(&self.cose).unwrap_or_default();
+        *blake3::hash(&envelope).as_bytes()
     }
 
-    /// Check the signature, by `expected_sequencer`.
+    /// Check the signature, by `expected_sequencer`, and that the fields are
+    /// exactly what was signed.
     pub fn verify(&self, expected_sequencer: &str) -> Result<(), RecordError> {
         if self.format != RECORD_FORMAT {
             return Err(RecordError::UnknownFormat {
@@ -143,17 +148,16 @@ impl IngestRecord {
                 got: self.sequencer.clone(),
             });
         }
-        let key = Did::from_did_jig_string(&self.sequencer)
-            .and_then(|did| did.as_bytes())
-            .map_err(|_| RecordError::Malformed("sequencer is not a did:jig key"))?;
-        let key = VerifyingKey::from_bytes(&key)
-            .map_err(|_| RecordError::Malformed("sequencer is not an ed25519 key"))?;
-        let sig = STANDARD
-            .decode(&self.sig)
-            .map_err(|_| RecordError::Malformed("sig is not base64"))?;
-        let sig = Signature::from_slice(&sig)
-            .map_err(|_| RecordError::Malformed("sig is not ed25519"))?;
-        key.verify(&self.signed_bytes(), &sig)
+        let envelope = STANDARD
+            .decode(&self.cose)
+            .map_err(|_| RecordError::Malformed("cose is not base64"))?;
+        let signed = jig_core::cose::open_sign1(&envelope)
+            .map_err(|_| RecordError::Malformed("cose is not a COSE_Sign1"))?;
+        if signed.payload != self.payload()? {
+            return Err(RecordError::BadSignature);
+        }
+        signed
+            .verify(&self.sequencer)
             .map_err(|_| RecordError::BadSignature)
     }
 
@@ -258,13 +262,29 @@ mod tests {
     fn a_record_in_another_format_is_refused_by_name() {
         let key = generate_signing_key();
         let record = IngestRecord {
-            format: "jig-ingest-cose-v1".into(),
+            format: "jig-ingest-v1".into(),
             ..signer(&key).sign(0, "bafyCreate", GENESIS_PREV)
         };
         assert!(matches!(
             record.verify(&did_of(&key)),
-            Err(RecordError::UnknownFormat { format }) if format == "jig-ingest-cose-v1"
+            Err(RecordError::UnknownFormat { format }) if format == "jig-ingest-v1"
         ));
+    }
+
+    #[test]
+    fn an_envelope_from_another_record_is_refused() {
+        let key = generate_signing_key();
+        let first = signer(&key).sign(0, "bafyCreate", GENESIS_PREV);
+        let second = signer(&key).sign(1, "bafyPost", first.hash());
+        let swapped = IngestRecord {
+            cose: first.cose.clone(),
+            ..second.clone()
+        };
+        assert_eq!(
+            swapped.verify(&did_of(&key)),
+            Err(RecordError::BadSignature)
+        );
+        assert_ne!(first.hash(), second.hash());
     }
 
     #[test]

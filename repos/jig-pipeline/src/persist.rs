@@ -668,6 +668,34 @@ impl SqliteStore {
             stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
+        // A channel holding records in an older format is re-signed whole:
+        // its chain cannot mix formats, and pre-release data is re-sequenced
+        // rather than migrated.
+        let stale: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT channel_id, record FROM ingest_records")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut stale: Vec<String> = rows
+                .into_iter()
+                .filter(|(_, record)| {
+                    IngestRecord::decode(record)
+                        .map_or(true, |r| r.format != crate::ingest_record::RECORD_FORMAT)
+                })
+                .map(|(channel_id, _)| channel_id)
+                .collect();
+            stale.sort();
+            stale.dedup();
+            stale
+        };
+        for channel_id in &stale {
+            tx.execute(
+                "DELETE FROM ingest_records WHERE channel_id = ?",
+                [channel_id],
+            )?;
+        }
         let mut written = 0;
         for (channel_id, slug) in channels {
             let unsequenced: Vec<(String, i64)> = {
@@ -1623,6 +1651,49 @@ mod tests {
             .insert_block_sequenced(&at_hlc("bafy_next", 1_000), &test_signer(&key, 9_000))
             .unwrap();
         assert!(next.follows(&chain[2]));
+    }
+
+    /// Records left in an older format re-sign the channel's whole chain at
+    /// boot, so no chain mixes formats.
+    #[test]
+    fn backfill_re_signs_a_chain_in_an_older_format() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        store
+            .upsert_channel(&StoredChannel {
+                id: "bafy_create".to_string(),
+                slug: "#seq".to_string(),
+                visibility: "open".to_string(),
+                created_at: 0,
+                owner_did: "did:jig:zOwner".to_string(),
+                suite: "none".to_string(),
+            })
+            .unwrap();
+        store.insert_block(&at_hlc("bafy_create", 500)).unwrap();
+        store.insert_block(&at_hlc("bafy_post", 900)).unwrap();
+        assert_eq!(store.backfill_ingest_records(&key).unwrap(), 2);
+
+        let mut old = store.list_ingest_records("#seq", 1, 1).unwrap().remove(0);
+        old.format = "jig-ingest-v1".to_string();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE ingest_records SET record = ?1 WHERE block_cid = 'bafy_post'",
+                [old.encode()],
+            )
+            .unwrap();
+
+        assert_eq!(store.backfill_ingest_records(&key).unwrap(), 2);
+        let chain = store.list_ingest_records("#seq", 0, 50).unwrap();
+        let did =
+            jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
+        for record in &chain {
+            assert_eq!(record.format, crate::ingest_record::RECORD_FORMAT);
+            record.verify(&did).unwrap();
+        }
+        assert!(chain[1].follows(&chain[0]));
     }
 
     fn sample_receipt(
