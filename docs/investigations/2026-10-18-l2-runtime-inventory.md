@@ -21,7 +21,7 @@ Verdicts:
 | 1 | Engine identity in signed receipts | `RUNTIME_VERSION` is jig-runtime's crate version, "0.1.0" since 2024, and it is signed into every text-render receipt | #119: replaced by `EngineIdentity` (exact wasmtime version, config fingerprint, fuel schedule) |
 | 1a | Engine features wider than the validator | wasmtime 49 enables most WebAssembly 3.0 proposals. The engine turned off only threads and SIMD | #125: the engine enables exactly WebAssembly 2.0 without SIMD |
 | 2 | Pricing version is a free label | `pricing.schedule_version` is an operator setting, signed into priced receipts as given | #119: now the constant `FUEL_SCHEDULE_VERSION`; configs that set it are rejected |
-| 3 | `fuel_total` sum | `engine.wasm` is dropped once any host bucket exists | #109: always recorded. The sum itself is required by `receipts.md`, so it stays: see open question Q1 |
+| 3 | `fuel_total` sum | `engine.wasm` is dropped once any host bucket exists | #109: always recorded. The sum stays for v0.2, as `receipts.md` requires; v0.3 drops `fuel_total` (Q1, decided) |
 | 4 | Post-hoc `capabilities_used` filter | `BlockRuntime::finalize_block_receipt` filters the receipt's capabilities to match the manifest, and codeless blocks get the manifest's capabilities copied in as "used" | Its only caller is `POST /blocks`, which #107 (L3) removes. L2 then deletes `BlockRuntime::execute` and the conversion, filter included |
 
 ## jig-core capability modules
@@ -78,11 +78,10 @@ Verdicts:
 
 ## Open questions for DJ
 
-- **Q1. Fuel sum.** `receipts.md` says `fuel_total` MUST equal the sum of `fuel_by_capability`.
-  The fuel-portability investigation says host-attributed fuel must never be summed with the
-  portable `engine.wasm` measurement. Today no host charge exists, so the two agree. Lane C's draft
-  (#117, question 9) proposes that v0.3 drop `fuel_total` and carry `engine.fuel_used` plus named
-  host counters, never summed. Until DJ decides, nothing new may depend on `fuel_total`.
+- **Q1. Fuel sum. Decided (C8 in lane C's design, #117).** Wasm fuel and host meters stay
+  separate, and v0.3 has no `fuel_total`. #109 is the v0.2 stopgap: it keeps the measured wasm
+  fuel in the sum that `receipts.md` still requires. `fuel_total` goes away with the v0.2
+  `BlockReceipt`, and nothing new may depend on it.
 - **Q2. Capability meter.** Keep `CapabilityMeterHandle` for lane C, or delete it now? Git history
   keeps it.
 - **Q3. `tracing` feature.** Add a CI build, or remove it?
