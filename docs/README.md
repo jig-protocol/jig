@@ -51,13 +51,12 @@ Per-crate READMEs live next to the code under [`repos/`](../repos/):
 `jig-core`, `jig-server`, `jig-cli`, `jig-config`, `jig-runtime`, `jig-nameserver`,
 `bridges/email`. `jig-mls` documents itself in its crate docs (`src/lib.rs`).
 
-Two directories under `repos/` are documentation rather than crates and are not
-workspace members:
+One directory under `repos/` is documentation rather than a crate and is not a
+workspace member:
 
 | Path | Status | What it is |
 | --- | --- | --- |
 | [`repos/jig-spec/`](../repos/jig-spec/) | CURRENT | mdBook protocol specification plus JSON schemas and the JEP directory. Self-described as draft scaffolding; no publishing pipeline is wired up. |
-| [`repos/jig-docs/`](../repos/jig-docs/) | CURRENT | Working-notes directory, explicitly a placeholder. Excluded from crate tarballs. |
 
 ## Archive contents
 
