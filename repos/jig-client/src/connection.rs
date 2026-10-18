@@ -619,6 +619,7 @@ mod tests {
                     block_kinds: vec!["text-render".to_string()],
                     execution: true,
                     federation: false,
+                    ..Default::default()
                 },
             },
         ) {
