@@ -224,6 +224,20 @@ pub enum IngestError {
         channel: String,
         block: String,
     },
+    /// A restricted `channel-create` whose suite is not `mls`. Restricted
+    /// channels are always end-to-end encrypted (ROADMAP D25).
+    #[error(
+        "channel '{slug}' is restricted, and restricted channels are end-to-end encrypted: \
+         create it with suite `mls`, or make it open for plaintext"
+    )]
+    RestrictedRequiresMls { slug: String },
+    /// Content for a restricted channel created as plaintext before D25. The
+    /// channel is frozen: its history stays, nothing new is accepted.
+    #[error(
+        "channel '{slug}' is restricted but was created unencrypted, so it takes no new \
+         content; make a new restricted channel (always end-to-end encrypted) or an open one"
+    )]
+    PlaintextRestrictedFrozen { slug: String },
     /// The MLS payload of a block on an encrypted channel failed validation.
     #[error("MLS payload refused: {detail}")]
     MlsRejected { detail: String },
@@ -839,6 +853,10 @@ fn suite_refusal(refusal: crate::mls_gate::SuiteRefusal, slug: &str) -> IngestEr
         SuiteRefusal::Mls(e) => IngestError::MlsRejected {
             detail: e.to_string(),
         },
+        SuiteRefusal::RestrictedNeedsMls { slug } => IngestError::RestrictedRequiresMls { slug },
+        SuiteRefusal::PlaintextRestricted { slug } => {
+            IngestError::PlaintextRestrictedFrozen { slug }
+        }
     }
 }
 
@@ -2217,7 +2235,8 @@ mod tests {
             .upsert_channel(&StoredChannel {
                 id: "#dm/x".into(),
                 slug: "#dm/x".into(),
-                visibility: "restricted".into(),
+                // Bridges carry plaintext, which only an open channel takes (D25).
+                visibility: "open".into(),
                 created_at: 0,
                 owner_did: bob_did.clone(),
                 suite: "none".to_string(),
@@ -2274,7 +2293,8 @@ mod tests {
             .upsert_channel(&StoredChannel {
                 id: channel_cid.clone(),
                 slug: "#dm/z".into(),
-                visibility: "restricted".into(),
+                // Bridges carry plaintext, which only an open channel takes (D25).
+                visibility: "open".into(),
                 created_at: 0,
                 owner_did: bob_did.clone(),
                 suite: "none".to_string(),

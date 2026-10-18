@@ -469,7 +469,7 @@ mod tests {
         let hlc = test_hlc(&id);
 
         // First create the channel
-        let create_block = build_channel_create(&id, "#room", "restricted", hlc.clone());
+        let create_block = build_channel_create(&id, "#room", "open", hlc.clone());
         let (status, _) = post_json(
             router.clone(),
             "/_admin_v0_0_2/channels",
