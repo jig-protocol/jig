@@ -176,7 +176,9 @@ Non-goals for v0.2:
      - A `policy-approval` is a `COSE_Sign1` by the hosting server (JEP-0004 rule 0). It
        names the server, the channel, the CID of the policy or install it approves, and
        the CID of the server's restrictions. An approval of a `block-install` also
-       carries the required `bot_did`, stating that the server holds that bot's key.
+       carries the required `operator_policy_cid`, naming the operator policy the
+       install's program was checked against, and the required `bot_did`, stating that the
+       server holds that bot's key.
        The owner's `channel-policy` and `block-install` stay `COSE_Sign1`s by the owner.
      - Which approval is current is decided by the channel's `ingest` order: the latest
        `policy-approval` or `policy-withdrawn` for an object CID wins.
