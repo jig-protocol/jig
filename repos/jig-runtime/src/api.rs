@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 #[cfg(feature = "tracing")]
@@ -10,9 +10,8 @@ use serde_json::Value;
 use crate::config::{ResourceLimits, RuntimeConfig};
 use crate::engine::WasmEngine;
 use crate::error::{Result, RuntimeError};
-use crate::fuel::CapabilityMeterHandle;
 use crate::identity::{EngineIdentity, FUEL_SCHEDULE_VERSION};
-use crate::receipt::{CapabilityCall, ExecutionOutcome, ModuleHash, Receipt, ReceiptPricing};
+use crate::receipt::{ExecutionOutcome, ModuleHash, Receipt, ReceiptPricing};
 use crate::trap::trap_verdict;
 use jig_core::CapabilityUsageKey;
 use jig_core::receipt::{HashAlgorithms, Limits as CoreLimits, Outcome as CoreOutcome, ReasonCode};
@@ -132,8 +131,6 @@ impl Runtime {
             .unwrap_or(self.config.limits.execution_timeout_ms);
         let timeout_duration = Duration::from_millis(timeout_ms);
 
-        let capability_meter = context.capability_meter.clone();
-
         #[cfg(feature = "tracing")]
         debug!(
             fuel_limit,
@@ -149,7 +146,6 @@ impl Runtime {
                 wasm_bytes,
                 fuel_limit,
                 memory_limit_mb,
-                capability_meter,
                 timeout_ms,
                 module_hash_hex,
                 start_time,
@@ -316,53 +312,12 @@ impl Runtime {
             };
             builder = builder.pricing(pricing);
         }
-        let snapshot = capability_meter.snapshot();
-        let status_bins = snapshot.status_bins_btree();
-        let mut fuel_by_capability = snapshot.fuel_by_capability.clone();
-        if fuel_by_capability.is_empty() {
-            fuel_by_capability.insert(
-                CapabilityUsageKey::without_scope("engine.wasm").to_canonical_string(),
-                fuel_used,
-            );
-        }
-        let fuel_total: u64 = fuel_by_capability.values().copied().sum();
-        let counters = jig_core::receipt::Counters {
-            fuel_total,
-            fuel_by_capability: fuel_by_capability.clone(),
-            status_by_capability: status_bins.clone(),
-            bytes_tx: snapshot.bytes_tx,
-            bytes_rx: snapshot.bytes_rx,
-            syscalls: 0,
-        };
-        builder = builder.fuel_used(fuel_total).counters(counters);
-
-        let mut capability_keys: BTreeSet<String> = fuel_by_capability.keys().cloned().collect();
-
-        for record in snapshot.call_records.iter() {
-            let canonical = record.key.to_canonical_string();
-            capability_keys.insert(canonical.clone());
-            builder = builder.capability_call(CapabilityCall {
-                capability: canonical,
-                operation: record.operation.clone(),
-                fuel_used: record.fuel_used,
-                bytes_transferred: if record.bytes_transferred > 0 {
-                    Some(record.bytes_transferred)
-                } else {
-                    None
-                },
-                status: record.status.clone(),
-            });
-        }
-
-        if !status_bins.is_empty()
-            && let Ok(value) = serde_json::to_value(&status_bins)
-        {
-            builder = builder.metadata("runtime.status_bins", value);
-        }
-
-        for capability in capability_keys {
-            builder = builder.capability(capability);
-        }
+        // The only fuel bucket is the measured wasm fuel: no host import exists
+        // to charge anything else. `engine.wasm` is listed as used, as before.
+        builder = builder
+            .fuel_used(fuel_used)
+            .counters(wasm_fuel_counters(fuel_used))
+            .capability(ENGINE_WASM.to_string());
 
         builder.build()
     }
@@ -460,7 +415,6 @@ impl Runtime {
         wasm_bytes: &[u8],
         fuel_limit: u64,
         memory_limit_mb: u32,
-        capability_meter: CapabilityMeterHandle,
         timeout_ms: u64,
         module_hash_hex: String,
         start_time: std::time::Instant,
@@ -637,54 +591,40 @@ impl Runtime {
             builder = builder.pricing(pricing);
         }
 
-        let snapshot = capability_meter.snapshot();
-        let mut fuel_by_capability = snapshot.fuel_by_capability.clone();
-        if fuel_by_capability.is_empty() {
-            fuel_by_capability.insert(
-                CapabilityUsageKey::without_scope("engine.wasm").to_canonical_string(),
-                fuel_used,
-            );
-        }
-        let fuel_total: u64 = fuel_by_capability.values().copied().sum();
         builder = builder
-            .fuel_used(fuel_total)
-            .counters(jig_core::receipt::Counters {
-                fuel_total,
-                fuel_by_capability,
-                status_by_capability: snapshot.status_bins_btree(),
-                bytes_tx: snapshot.bytes_tx,
-                bytes_rx: snapshot.bytes_rx,
-                syscalls: 0,
-            });
-
-        for record in snapshot.call_records.iter() {
-            builder = builder.capability_call(CapabilityCall {
-                capability: record.key.to_canonical_string(),
-                operation: record.operation.clone(),
-                fuel_used: record.fuel_used,
-                bytes_transferred: if record.bytes_transferred > 0 {
-                    Some(record.bytes_transferred)
-                } else {
-                    None
-                },
-                status: record.status.clone(),
-            });
-        }
-
-        if !snapshot.status_bins.is_empty()
-            && let Ok(value) = serde_json::to_value(&snapshot.status_bins)
-        {
-            builder = builder.metadata("runtime.status_bins", value);
-        }
+            .fuel_used(fuel_used)
+            .counters(wasm_fuel_counters(fuel_used));
 
         builder.build()
+    }
+}
+
+/// The pseudo-capability that in-module wasm fuel is reported under.
+const ENGINE_WASM: &str = "engine.wasm";
+
+/// Receipt counters for one execution: the measured wasm fuel, under
+/// `engine.wasm`, is the only bucket.
+///
+/// `fuel_total` must equal the sum of the buckets (`receipts.md`), so with one
+/// bucket it is the wasm fuel itself. v0.3 drops `fuel_total` (C8).
+fn wasm_fuel_counters(fuel_used: u64) -> jig_core::receipt::Counters {
+    jig_core::receipt::Counters {
+        fuel_total: fuel_used,
+        fuel_by_capability: BTreeMap::from([(
+            CapabilityUsageKey::without_scope(ENGINE_WASM).to_canonical_string(),
+            fuel_used,
+        )]),
+        ..Default::default()
     }
 }
 
 /// Execution context for a single WASM module run
 ///
 /// Contains all parameters, limits, and capabilities for one execution.
+// Non-exhaustive so other crates build it through `Default` and the `with_*`
+// builders, as they always have: lane A's component path adds fields here.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ExecutionContext {
     /// Block package (module + metadata)
     pub block: BlockPackage,
@@ -703,8 +643,6 @@ pub struct ExecutionContext {
 
     /// Deterministic seed for RNG capability
     pub rng_seed: Option<[u8; 32]>,
-
-    pub(crate) capability_meter: CapabilityMeterHandle,
 }
 
 impl ExecutionContext {
@@ -742,17 +680,6 @@ impl ExecutionContext {
     pub fn with_rng_seed(mut self, seed: [u8; 32]) -> Self {
         self.rng_seed = Some(seed);
         self
-    }
-
-    /// Builder: provide a custom capability meter handle (primarily for tests/bridges).
-    pub fn with_capability_meter(mut self, meter: CapabilityMeterHandle) -> Self {
-        self.capability_meter = meter;
-        self
-    }
-
-    /// Cloneable handle that host bridges can use to record capability usage.
-    pub fn capability_meter_handle(&self) -> CapabilityMeterHandle {
-        self.capability_meter.clone()
     }
 }
 
