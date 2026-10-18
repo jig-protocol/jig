@@ -574,6 +574,18 @@ F's caveats:
    This is the price of liveness. It is bounded because only the `owner` can trigger it.
 3. **Channel identity must not include the sequencer** (section 6), or every move would
    rename the channel.
+4. **Bots move in the same action (lane C's question; F's answer: one action).**
+   - `sequencer-set` carries the bot reinstalls: for each bot, the owner-signed install
+     lane C defines, with a new bot DID and `inherits_state_from`.
+   - Each reinstall lands at the same chain position as the move, so no record exists
+     where the channel has a new sequencer and an orphaned bot.
+   - **By default the move carries every current bot.** An owner drops a bot by leaving
+     it out. A bot can also be reinstalled later, as its own step.
+   - **The owner cannot sign a bot DID it has never seen.** So the new sequencer mints
+     the bot keys and names their DIDs in its `contract-accept`. The owner's
+     `sequencer-set` then signs installs for exactly those DIDs.
+   - The handover therefore takes two messages, the accept and then the
+     `sequencer-set`, and still only one owner action.
 
 ### 5.9 Shares and roles
 

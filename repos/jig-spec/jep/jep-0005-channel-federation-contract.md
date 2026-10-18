@@ -131,6 +131,9 @@ Non-goals for v0.2:
        `sequencer-set`.
      - A member whose client merged a commit past the cited head rejoins by external
        commit.
+     - A `sequencer-set` MAY carry owner-signed bot reinstalls (lane C's install format,
+       with new bot DIDs and `inherits_state_from`). By default it carries one per current
+       bot. The new sequencer MUST name the new bot DIDs in its `contract-accept`.
 
 ## Ordering
 
