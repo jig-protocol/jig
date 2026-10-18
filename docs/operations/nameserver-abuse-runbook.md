@@ -45,8 +45,9 @@ spreads further than the group.
 - **Know your files.** With the shipped unit: legacy store `/var/lib/jig/nameserver.db`
   (penalties, rate windows, federation cache, reputation, tribunal records, the
   `ns_identity` key), alias store `/var/lib/jig/nameserver_v002.db`, attestation signing key
-  `/var/lib/jig/nameserver_v002.key` (or `[v0_0_2.server] server_did_keyfile`), and
-  `JIG_NS_SECRET` in `/etc/jig/jig-nameserver.env`.
+  `/var/lib/jig/nameserver_v002.key` (or `[v0_0_2.server] server_did_keyfile`), and any
+  `JIG_NS_*` settings in the optional `/etc/jig/jig-nameserver.env`. The nameserver has no
+  `JIG_NS_SECRET` any more (#192).
 - **Know that settings are read at start-up.** Every `JIG_NS_*` change below needs
   `sudo systemctl restart jig-nameserver`. A restart does not reset the legacy penalties or
   rate windows, which live in the database. It does reset the `[alias_rate_limits]`
@@ -183,8 +184,6 @@ issue attestations, and read or change everything in its databases.
 3. **Find what changed.** Compare alias bindings in `nameserver_v002.db` and identities in
    `nameserver.db` against your latest backup. List every alias whose DID changed.
 4. **Rotate everything:**
-   - `JIG_NS_SECRET`: new value from `openssl rand -hex 32`. Outstanding challenges become
-     invalid; there is no overlap window.
    - `JIG_NS_ADMIN_TOKEN`: new value.
    - Attestation key: move `nameserver_v002.key` aside and let the service mint a new one,
      which gives the nameserver a new `ns_did`. Every attestation signed by the old key
