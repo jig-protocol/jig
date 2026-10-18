@@ -89,6 +89,8 @@ pub enum KeystoreError {
     NoSuchSlot(usize),
     #[error("sealed data is not a jigseal blob")]
     NotSealed,
+    #[error("the seed is the key for {actual}, not {claimed}")]
+    DidMismatch { claimed: String, actual: String },
 }
 
 pub type Result<T> = std::result::Result<T, KeystoreError>;
@@ -251,6 +253,20 @@ impl JigKey {
     /// Seal `seed` for `did` under a fresh data key, with one slot per entry
     /// of `slots`. At least one slot is required.
     pub fn seal(did: &str, seed: &[u8; 32], slots: &[NewSlot]) -> Result<(Self, Opened)> {
+        // A DID is its key: a file that names another DID would mislabel the
+        // key it holds.
+        let actual = crate::Did::from_ed25519_pubkey(
+            ed25519_dalek::SigningKey::from_bytes(seed)
+                .verifying_key()
+                .as_bytes(),
+        )
+        .to_did_jig_string();
+        if actual != did {
+            return Err(KeystoreError::DidMismatch {
+                claimed: did.to_string(),
+                actual,
+            });
+        }
         let opened = Opened {
             seed: Zeroizing::new(*seed),
             data_key: Zeroizing::new(OsEntropy.bytes()),
@@ -356,7 +372,18 @@ impl JigKey {
 
     /// A copy with one more slot. Needs the opened key, so only a holder can
     /// add a way in.
+    /// `Tampered` unless `opened` is this key's own data key and seed, so a
+    /// slot change never reseals this file under another key's data key.
+    fn check_opened(&self, opened: &Opened) -> Result<()> {
+        let current = self.open_with(Zeroizing::new(*opened.data_key))?;
+        if *current.seed != *opened.seed {
+            return Err(KeystoreError::Tampered);
+        }
+        Ok(())
+    }
+
     pub fn with_slot(&self, opened: &Opened, slot: &NewSlot) -> Result<Self> {
+        self.check_opened(opened)?;
         let mut slots = self.header.slots.clone();
         slots.push(wrap_slot(
             &self.header.did,
@@ -375,6 +402,7 @@ impl JigKey {
         if self.header.slots.len() == 1 {
             return Err(KeystoreError::LastSlot);
         }
+        self.check_opened(opened)?;
         let mut slots = self.header.slots.clone();
         slots.remove(index);
         Self::assemble(&self.header.did, opened, slots, &mut OsEntropy)
@@ -401,16 +429,17 @@ impl JigKey {
         if format != MAGIC[7] {
             return Err(KeystoreError::Version(format.into()));
         }
-        if rest.len() < 4 {
-            return Err(malformed("truncated header length"));
-        }
-        let (len, rest) = rest.split_at(4);
-        let len = u32::from_le_bytes(len.try_into().expect("4 bytes")) as usize;
+        let (len, rest) = rest
+            .split_first_chunk::<4>()
+            .ok_or_else(|| malformed("truncated header length"))?;
+        let len = u32::from_le_bytes(*len) as usize;
         if len > MAX_HEADER || rest.len() < len + NONCE_LEN + 32 + TAG_LEN {
             return Err(malformed("truncated or oversized"));
         }
         let (header_bytes, rest) = rest.split_at(len);
-        let (nonce, sealed_seed) = rest.split_at(NONCE_LEN);
+        let (nonce, sealed_seed) = rest
+            .split_first_chunk::<NONCE_LEN>()
+            .ok_or_else(|| malformed("truncated nonce"))?;
         if sealed_seed.len() != 32 + TAG_LEN {
             return Err(malformed("trailing bytes after the sealed seed"));
         }
@@ -425,7 +454,7 @@ impl JigKey {
         Ok(Self {
             header,
             header_bytes: header_bytes.to_vec(),
-            nonce: nonce.try_into().expect("24 bytes"),
+            nonce: *nonce,
             sealed_seed: sealed_seed.to_vec(),
         })
     }
@@ -477,18 +506,15 @@ pub fn open(key: &FileKey, aad: &[u8], sealed: &[u8]) -> Result<Zeroizing<Vec<u8
     let rest = sealed
         .strip_prefix(SEAL_MAGIC)
         .ok_or(KeystoreError::NotSealed)?;
-    if rest.len() < NONCE_LEN + TAG_LEN {
+    let (nonce, ct) = rest
+        .split_first_chunk::<NONCE_LEN>()
+        .ok_or(KeystoreError::Tampered)?;
+    if ct.len() < TAG_LEN {
         return Err(KeystoreError::Tampered);
     }
-    let (nonce, ct) = rest.split_at(NONCE_LEN);
-    aead_open(
-        &key.0,
-        nonce.try_into().expect("24 bytes"),
-        &seal_aad(aad),
-        ct,
-    )
-    .map(Zeroizing::new)
-    .ok_or(KeystoreError::Tampered)
+    aead_open(&key.0, nonce, &seal_aad(aad), ct)
+        .map(Zeroizing::new)
+        .ok_or(KeystoreError::Tampered)
 }
 
 fn seal_aad(aad: &[u8]) -> Vec<u8> {
@@ -661,7 +687,11 @@ mod tests {
     use super::*;
 
     const DID: &str = "did:jig:zpg2vmlup4zkpsqdywejorkmlu6ib7bj242k35v7a4oiqxlieszsa";
-    const SEED: [u8; 32] = [7u8; 32];
+    /// The seed `jig-core`'s signing vectors use, and the DID it is the key of.
+    const SEED: [u8; 32] = [
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+        26, 27, 28, 29, 30, 31, 32,
+    ];
 
     fn pass(p: &str) -> NewSlot {
         NewSlot::Passphrase {
@@ -733,6 +763,31 @@ mod tests {
         assert!(matches!(
             JigKey::seal(DID, &SEED, &[slot]).unwrap_err(),
             KeystoreError::SecretTooShort(31)
+        ));
+    }
+
+    #[test]
+    fn a_seed_sealed_under_another_did_is_refused() {
+        assert!(matches!(
+            JigKey::seal("did:jig:zother", &SEED, &[secret(SecretSource::Env, 1)]).unwrap_err(),
+            KeystoreError::DidMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn slot_changes_need_this_keys_own_opened_key() {
+        let (a, _) = JigKey::seal(DID, &SEED, &[secret(SecretSource::Env, 1)]).unwrap();
+        let (_, other) = JigKey::seal(DID, &SEED, &[secret(SecretSource::Env, 2)]).unwrap();
+        assert!(matches!(
+            a.with_slot(&other, &pass("x")).unwrap_err(),
+            KeystoreError::Tampered
+        ));
+        let a = a
+            .with_slot(&a.open(&[offer_secret(1)]).unwrap(), &pass("x"))
+            .unwrap();
+        assert!(matches!(
+            a.without_slot(&other, 0).unwrap_err(),
+            KeystoreError::Tampered
         ));
     }
 
@@ -931,6 +986,6 @@ mod tests {
         );
     }
 
-    const GOLDEN_JIGKEY: &str = "6a69676b65790001cf0100007b2276223a312c22646964223a226469643a6a69673a7a706732766d6c7570347a6b707371647977656a6f726b6d6c7536696237626a3234326b3335763761346f6971786c6965737a7361222c22736c6f7473223a5b7b226b696e64223a2270617373706872617365222c226b6466223a226172676f6e326964222c226d5f6b6962223a36342c2274223a312c2270223a312c2273616c74223a2241514944424155474277674a4367734d4451345045413d3d222c226e6f6e6365223a2245524954464255574678675a4768736348523466494345694979516c4a69636f222c2277726170706564223a2267716b2b346b785058434f772f576d3870455151554535576436536b3750414a725375414458646978374e785239363371715a6e63444e646e726e38356a416f227d2c7b226b696e64223a22736563726574222c22736f75726365223a2263726564656e7469616c222c226e6f6e6365223a224b536f724c4330754c7a41784d6a4d304e5459334f446b364f7a7739506a3941222c2277726170706564223a22482b566d4e7635496f35566163755975496f78313778346465644562566368577a7955576272506553774f38634a6d4c6f6d5537493544745779694f74725955227d5d7d4142434445464748494a4b4c4d4e4f5051525354555657588051b6299b938d630531975243e87a98a71cf54b0a7488375214f77814fed324f080d74dd286deffbad317e46ce72344";
+    const GOLDEN_JIGKEY: &str = "6a69676b65790001cf0100007b2276223a312c22646964223a226469643a6a69673a7a706732766d6c7570347a6b707371647977656a6f726b6d6c7536696237626a3234326b3335763761346f6971786c6965737a7361222c22736c6f7473223a5b7b226b696e64223a2270617373706872617365222c226b6466223a226172676f6e326964222c226d5f6b6962223a36342c2274223a312c2270223a312c2273616c74223a2241514944424155474277674a4367734d4451345045413d3d222c226e6f6e6365223a2245524954464255574678675a4768736348523466494345694979516c4a69636f222c2277726170706564223a2267716b2b346b785058434f772f576d3870455151554535576436536b3750414a725375414458646978374e785239363371715a6e63444e646e726e38356a416f227d2c7b226b696e64223a22736563726574222c22736f75726365223a2263726564656e7469616c222c226e6f6e6365223a224b536f724c4330754c7a41784d6a4d304e5459334f446b364f7a7739506a3941222c2277726170706564223a22482b566d4e7635496f35566163755975496f78313778346465644562566368577a7955576272506553774f38634a6d4c6f6d5537493544745779694f74725955227d5d7d4142434445464748494a4b4c4d4e4f5051525354555657588654b22a99928d6c0b3c9b5949e1728fb109e158186598284c09eb630ee7cb03159352f96e08a8feb3a84d9816020b66";
     const GOLDEN_BLOB: &str = "6a69677365616c31090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2062a0376493495b58ee9f45c5a53fd6fdcf402d";
 }
