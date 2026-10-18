@@ -42,9 +42,11 @@ by DJ, 2026-10-18: key slots).
 | File | Owner | How |
 | --- | --- | --- |
 | New `jig-core/src/keystore/` | lane I (new files) | this plan |
-| `jig-client/src/identity.rs`, `jig-client/src/secure.rs` | no lane listed in the v0.2 plan; L7 owns `pins.rs`, which this plan does not touch | lane I, after the orchestrator confirms |
-| `jig-server/src/v0_0_2.rs` key loading | L3 sweeps v0.0.1 paths only; this is a v0.0.2 path | lane I; tell L3 |
-| `jig-nameserver/src/v0_0_2.rs` key loading; the legacy `ns_identity` table in SQLite (a raw seed) | L6 | ask L6. Delete the legacy table if L6 removes the legacy routes, otherwise seal it |
+| `jig-client/src/identity.rs` | lane I (confirmed by the orchestrator, 2026-10-18) | this plan |
+| `jig-client/src/secure.rs` | lane I for the storage and loading paths only. Lane S (#143) edits its suite display | tell the orchestrator before touching suite logic |
+| `jig-server/src/v0_0_2.rs` key loading | lane I, for the key-load functions only. L3's config collapse touches nearby structs | the orchestrator sequences the PR with L3 |
+| `jig-nameserver/src/v0_0_2.rs` key loading | lane I, for key-load only. L6 owns the crate, and F1 changes the alias flow | tell the orchestrator before pushing |
+| The legacy `ns_identity` table in SQLite (a raw seed) | L6 | asked through the orchestrator: L6 deletes it, or I1 seals it |
 | `jig-cli/src/cmd/{keys,init}.rs` | L3 | small PRs against `main`, coordinated with L3 |
 | `repos/jig-spec/src/crypto.md` storage text | applied in the last implementation PR, after L1 merges | lane I |
 
@@ -57,8 +59,10 @@ by DJ, 2026-10-18: key slots).
   D-Bus.
 - `derive_file_key(data_key, context)` and the sealed-file and sealed-record helpers.
 - The wire format: a magic number, a version, and a JSON header carrying the slots.
-- New dependencies: `chacha20poly1305`, `argon2`, `zeroize`, and `keyring` behind its
-  feature. `age` comes in Task 4.
+- New dependencies: `chacha20poly1305`, `argon2`, `zeroize`, `keyring` behind its
+  feature, and `age` for Task 4. All of them land in this PR, so `Cargo.lock` changes
+  once; lockfile PRs queue one at a time. The PR is flagged to the orchestrator as a
+  lockfile change.
 - **Merge the two copies of `load_or_generate_server_key`,** one each in `jig-server` and
   `jig-nameserver`, into one function here.
 - **Tests:**
