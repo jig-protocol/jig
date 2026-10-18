@@ -104,7 +104,8 @@ Non-goals for v0.2:
     surface the conflicting records as evidence:
     - a gap in `seq`;
     - two records with the same `seq` and different content;
-    - a block whose `seen` cites a record the follower does not hold.
+    - a block whose `seen` cites a record the follower does not hold and cannot obtain
+      from the owner.
 
 ## Writes from remote members
 
