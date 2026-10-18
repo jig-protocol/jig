@@ -3736,8 +3736,6 @@ dependencies = [
 name = "jig-config"
 version = "0.0.1"
 dependencies = [
- "anyhow",
- "chrono",
  "dirs 7.0.0",
  "serde",
  "serde_json",
