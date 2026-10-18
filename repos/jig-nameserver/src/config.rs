@@ -1,7 +1,6 @@
 //! Configuration for the Jig Nameserver.
 
 use crate::error::{NameServerError, Result};
-use crate::types::ReputationScore;
 use jig_config;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -32,7 +31,6 @@ fn merge_tables(target: &mut toml::value::Table, source: &toml::value::Table) {
 pub struct NameServerConfig {
     pub network: NetworkConfig,
     pub storage: StorageConfig,
-    pub pow: PowConfig,
     pub rate_limits: RateLimitConfig,
     pub penalties: PenaltyConfig,
     pub anonymous: AnonymousPolicy,
@@ -66,10 +64,8 @@ pub struct NameServerConfig {
 
 impl NameServerConfig {
     /// Load configuration from disk if available, otherwise fall back to env
-    /// defaults. The result is [`validate`](Self::validate)d, so a missing
-    /// `[pow].server_secret` surfaces as an `Err` the caller can log — it used
-    /// to panic inside `Default` during deserialization, which reached stderr
-    /// via the panic hook only and looked like a silent death under systemd.
+    /// defaults. The result is [`validate`](Self::validate)d, so a
+    /// misconfiguration surfaces as an `Err` the caller can log.
     pub fn load() -> Result<Self> {
         let cfg = Self::load_unvalidated()?;
         cfg.validate()?;
@@ -80,14 +76,6 @@ impl NameServerConfig {
     /// (and callers who want to patch a field before booting) can build an
     /// unvalidated config, and so failures are errors rather than panics.
     pub fn validate(&self) -> Result<()> {
-        if self.pow.server_secret.trim().is_empty() {
-            return Err(NameServerError::Other(anyhow::anyhow!(
-                "JIG_NS_SECRET env var is required. \
-                 Set it to a strong random secret (e.g. `openssl rand -hex 32`), \
-                 or set [pow].server_secret in the nameserver config file. \
-                 See .env.example for all required variables."
-            )));
-        }
         self.v0_0_2
             .nameserver
             .validate()
@@ -269,7 +257,6 @@ impl NameServerConfig {
         Self {
             network: NetworkConfig::from_env(),
             storage: StorageConfig::from_env(),
-            pow: PowConfig::from_env(),
             rate_limits: RateLimitConfig::from_env(),
             penalties: PenaltyConfig::from_env(),
             anonymous: AnonymousPolicy::from_env(),
@@ -292,7 +279,6 @@ impl NameServerConfig {
         // Allow env vars to override settings after TOML load for quick tweaks.
         self.network.merge_env();
         self.storage.merge_env();
-        self.pow.merge_env();
         self.rate_limits.merge_env();
         self.analytics.merge_env();
         self.hot.merge_env();
@@ -317,69 +303,6 @@ impl NameServerConfig {
             .iter_mut()
             .for_each(|d| *d = d.trim().to_lowercase());
         self.reputation.normalize();
-    }
-
-    pub fn compute_pow_difficulty(
-        &self,
-        base_bits: u16,
-        penalty_points: u32,
-        zone: ReputationZone,
-        reputation: Option<&ReputationScore>,
-        witness_weight: Option<f64>,
-    ) -> u16 {
-        let mut effective = base_bits;
-        let constrained_points = penalty_points.min(self.penalties.max_points);
-        let penalty_bits = self
-            .penalties
-            .step_bits
-            .saturating_mul(constrained_points as u16);
-        effective = effective.saturating_add(penalty_bits);
-
-        let mut multiplier = 1.0;
-        if let Some(score) = reputation {
-            multiplier *= self.reputation_multiplier(score);
-        }
-        let witness = witness_weight
-            .unwrap_or_else(|| self.automation.score_hint_from_penalty(constrained_points));
-        multiplier *= self.automation.multiplier(witness);
-        effective = ((effective as f64) * multiplier).round() as u16;
-
-        let minimum_zone = match zone {
-            ReputationZone::Anonymous if self.anonymous.enabled => self.anonymous.min_difficulty,
-            ReputationZone::High => self.pow.min_difficulty.saturating_add(2),
-            _ => self.pow.min_difficulty,
-        };
-        if effective < minimum_zone {
-            effective = minimum_zone;
-        }
-        if effective < self.pow.min_difficulty {
-            effective = self.pow.min_difficulty;
-        }
-        if effective > self.pow.max_difficulty {
-            effective = self.pow.max_difficulty;
-        }
-        effective
-    }
-
-    fn reputation_multiplier(&self, score: &ReputationScore) -> f64 {
-        let mut multiplier = 1.0;
-        if let Some(rule) = self
-            .reputation
-            .local_rulesets
-            .iter()
-            .find(|r| r.key == score.ruleset)
-            && let Some(rule_mult) = rule.pow_policy.multiplier
-        {
-            multiplier *= rule_mult;
-        }
-        let bounded_score = score.score.clamp(-1.0, 1.0);
-        let trust_factor = (1.0 - bounded_score * 0.25).clamp(0.25, 4.0);
-        multiplier *= trust_factor;
-        let weight = score.weight.clamp(0.0, 1.0);
-        if weight < 1.0 {
-            multiplier = 1.0 + (multiplier - 1.0) * weight;
-        }
-        multiplier.clamp(0.1, 8.0)
     }
 }
 
@@ -502,72 +425,6 @@ impl StorageConfig {
     fn merge_env(&mut self) {
         if let Ok(path) = std::env::var("JIG_NS_DB_PATH") {
             self.database_path = PathBuf::from(path);
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PowConfig {
-    pub server_secret: String,
-    pub base_difficulty: u16,
-    pub min_difficulty: u16,
-    pub max_difficulty: u16,
-}
-
-impl Default for PowConfig {
-    fn default() -> Self {
-        Self {
-            server_secret: default_server_secret(),
-            base_difficulty: default_base_pow(),
-            min_difficulty: default_min_pow(),
-            max_difficulty: default_max_pow(),
-        }
-    }
-}
-
-impl PowConfig {
-    fn from_env() -> Self {
-        let mut cfg = Self::default();
-        if let Ok(secret) = std::env::var("JIG_NS_SECRET") {
-            cfg.server_secret = secret;
-        }
-        if let Ok(bits) = std::env::var("JIG_NS_POW_DIFFICULTY")
-            && let Ok(parsed) = bits.parse::<u16>()
-        {
-            cfg.base_difficulty = parsed;
-        }
-        if let Ok(bits) = std::env::var("JIG_NS_POW_MIN")
-            && let Ok(parsed) = bits.parse::<u16>()
-        {
-            cfg.min_difficulty = parsed;
-        }
-        if let Ok(bits) = std::env::var("JIG_NS_POW_MAX")
-            && let Ok(parsed) = bits.parse::<u16>()
-        {
-            cfg.max_difficulty = parsed;
-        }
-        cfg
-    }
-
-    fn merge_env(&mut self) {
-        if let Ok(secret) = std::env::var("JIG_NS_SECRET") {
-            self.server_secret = secret;
-        }
-        if let Ok(bits) = std::env::var("JIG_NS_POW_DIFFICULTY")
-            && let Ok(parsed) = bits.parse::<u16>()
-        {
-            self.base_difficulty = parsed;
-        }
-        if let Ok(bits) = std::env::var("JIG_NS_POW_MIN")
-            && let Ok(parsed) = bits.parse::<u16>()
-        {
-            self.min_difficulty = parsed;
-        }
-        if let Ok(bits) = std::env::var("JIG_NS_POW_MAX")
-            && let Ok(parsed) = bits.parse::<u16>()
-        {
-            self.max_difficulty = parsed;
         }
     }
 }
@@ -1784,38 +1641,6 @@ fn default_database_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("nameserver.db"))
 }
 
-/// Empty when `JIG_NS_SECRET` is unset — deliberately NOT auto-generated and
-/// deliberately not a panic. A `Default` impl runs during deserialization of
-/// any config lacking `[pow].server_secret`, so panicking here killed the
-/// process before `tracing` was ever consulted. The empty value is caught by
-/// [`NameServerConfig::validate`]. Auto-generating would be worse: the secret
-/// is security-relevant, and a fresh one per restart invalidates every
-/// outstanding PoW challenge.
-fn default_server_secret() -> String {
-    std::env::var("JIG_NS_SECRET").unwrap_or_default()
-}
-
-fn default_base_pow() -> u16 {
-    std::env::var("JIG_NS_POW_DIFFICULTY")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(18)
-}
-
-fn default_min_pow() -> u16 {
-    std::env::var("JIG_NS_POW_MIN")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(8)
-}
-
-fn default_max_pow() -> u16 {
-    std::env::var("JIG_NS_POW_MAX")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(28)
-}
-
 fn default_per_key_limit() -> u32 {
     std::env::var("JIG_NS_RATE_PER_MIN")
         .ok()
@@ -1885,12 +1710,6 @@ backend = "sqlite"  # Default: Tier 1
 # connection_string = "postgres://localhost/nameserver"
 # pool_size = "10"
 # max_connections = "20"
-
-[pow]
-server_secret = "replace-me"
-base_difficulty = 18
-min_difficulty = 8
-max_difficulty = 28
 
 [rate_limits]
 per_key_per_min = 60
@@ -2070,38 +1889,12 @@ mod tests {
 
     #[test]
     fn default_config_is_sane() {
-        // Set required env var for test environment. Edition 2024 makes
-        // set_var unsafe; this test is single-threaded and runs once, so
-        // the requirements (no concurrent env access from other threads)
-        // are satisfied trivially.
-        unsafe {
-            std::env::set_var("JIG_NS_SECRET", "test-secret-for-unit-tests");
-        }
         let cfg = NameServerConfig::from_env();
-        assert!(!cfg.pow.server_secret.is_empty());
-        assert!(cfg.pow.base_difficulty >= cfg.pow.min_difficulty);
         assert_eq!(cfg.network.port, default_port());
         assert!(cfg.reputation.local_rulesets.is_empty());
         assert!(cfg.reputation.translation_contracts.is_empty());
         assert!(cfg.useful_work.assignment_ttl_secs > 0);
         assert!(cfg.useful_work.max_queue_depth > 0);
-    }
-
-    #[test]
-    fn compute_pow_respects_bounds() {
-        unsafe {
-            std::env::set_var("JIG_NS_SECRET", "test-secret-for-unit-tests");
-        }
-        let mut cfg = NameServerConfig::from_env();
-        cfg.pow.base_difficulty = 18;
-        cfg.pow.min_difficulty = 8;
-        cfg.pow.max_difficulty = 28;
-        cfg.penalties.step_bits = 3;
-        cfg.automation.enabled = true;
-        cfg.automation.max_multiplier = 4.0;
-        let diff = cfg.compute_pow_difficulty(18, 10, ReputationZone::Low, None, None);
-        assert!(diff >= cfg.pow.min_difficulty);
-        assert!(diff <= cfg.pow.max_difficulty);
     }
 
     #[test]
@@ -2240,52 +2033,29 @@ federation_enabled = true
         assert!(!cfg.capabilities.federation_enabled);
     }
 
-    // --- startup validation -------------------------------------------------
-    //
-    // These two tests mutate JIG_NS_SECRET. Safe under `cargo nextest`, which
-    // runs every test in its own process; they would race under `cargo test`'s
-    // shared-process threads.
-
-    #[test]
-    fn missing_secret_yields_empty_default_instead_of_panicking() {
-        unsafe {
-            std::env::remove_var("JIG_NS_SECRET");
-        }
-        // A `Default` impl must never panic — the panic used to fire during
-        // *deserialization* of any config lacking `[pow].server_secret`.
-        let cfg = NameServerConfig::from_env();
-        assert!(cfg.pow.server_secret.is_empty());
-
-        let err = cfg
-            .validate()
-            .expect_err("empty server_secret must fail validation");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("JIG_NS_SECRET"),
-            "operator-facing message must name the env var, got: {msg}"
-        );
-        assert!(
-            msg.contains("openssl rand -hex 32"),
-            "operator-facing message must keep the remediation hint, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn configured_secret_passes_validation() {
-        unsafe {
-            std::env::set_var("JIG_NS_SECRET", "test-secret-for-unit-tests");
-        }
-        let cfg = NameServerConfig::from_env();
-        cfg.validate().expect("a configured secret validates");
-    }
-
     // --- [v0_0_2] alias-API section ----------------------------------------
 
     #[test]
+    fn default_config_validates() {
+        NameServerConfig::from_env()
+            .validate()
+            .expect("defaults need no secret");
+    }
+
+    #[test]
+    fn retired_pow_section_is_ignored() {
+        // Configs written before `[pow]` was removed must keep loading.
+        let doc = r#"
+[pow]
+server_secret = "old"
+base_difficulty = 18
+"#;
+        let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
+        cfg.validate().expect("valid");
+    }
+
+    #[test]
     fn v0_0_2_alias_suffix_defaults_to_gigue_jig() {
-        unsafe {
-            std::env::set_var("JIG_NS_SECRET", "test-secret-for-unit-tests");
-        }
         let cfg = NameServerConfig::from_env();
         assert_eq!(cfg.v0_0_2.nameserver.alias_suffix, "gigue.jig");
     }
@@ -2298,9 +2068,6 @@ alias_suffix = "dj.jig"
 
 [v0_0_2.server]
 server_did_keyfile = "/var/lib/jig-ns/ns.key"
-
-[pow]
-server_secret = "s"
 "#;
         let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
         assert_eq!(cfg.v0_0_2.nameserver.alias_suffix, "dj.jig");
@@ -2316,9 +2083,6 @@ server_secret = "s"
         let doc = r#"
 [v0_0_2.nameserver]
 alias_suffix = "dj@dj.jig"
-
-[pow]
-server_secret = "s"
 "#;
         let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
         let err = cfg.validate().expect_err("'@' in a suffix must be caught");

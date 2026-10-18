@@ -37,7 +37,6 @@ impl BinarySurface {
 
         let mut cfg = NameServerConfig::default();
         cfg.storage.database_path = tempdir.path().join("nameserver.db");
-        cfg.pow.server_secret = "h10-test-secret".to_string();
         cfg.federation.enabled = false;
         cfg.v0_0_2.server.server_did_keyfile = tempdir
             .path()

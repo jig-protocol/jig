@@ -53,12 +53,6 @@ async fn well_known(State(state): State<AppState>) -> Result<Json<WellKnownNsInf
         "health": "/v1/health",
     });
     let policy = serde_json::json!({
-        "pow": {
-            "base": state.cfg.pow.base_difficulty,
-            "min": state.cfg.pow.min_difficulty,
-            "max": state.cfg.pow.max_difficulty,
-            "anonymous_min": state.cfg.anonymous.min_difficulty,
-        },
         "rate_limit": {
             "per_key_per_min": state.cfg.rate_limits.per_key_per_min,
             "per_ip_per_min": state.cfg.rate_limits.per_ip_per_min,
@@ -326,7 +320,6 @@ mod tests {
     fn scratch_config(dir: &ScratchDir, alias_suffix: &str) -> NameServerConfig {
         let mut cfg = NameServerConfig::default();
         cfg.storage.database_path = dir.0.join("nameserver.db");
-        cfg.pow.server_secret = "test-secret".to_string();
         cfg.federation.enabled = false;
         cfg.v0_0_2.nameserver.alias_suffix = alias_suffix.to_string();
         cfg.v0_0_2.server.server_did_keyfile = dir.0.join("ns.key").to_string_lossy().into_owned();
