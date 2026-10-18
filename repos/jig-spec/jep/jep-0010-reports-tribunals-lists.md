@@ -16,8 +16,10 @@ discussions_to = "https://github.com/jig-protocol/jig/issues"
 
 A ruleset group's nameservers hold its tribunals (D23). This JEP specifies:
 
-- **abuse reports**, including from encrypted channels: a participant discloses one message's
-  keys, and the tribunal verifies authorship and delivery without any other access (D22, AB-06);
+- **abuse reports**, including from encrypted channels. Every encrypted message is franked: a
+  commitment in the author-signed, sequenced block, with its key inside the ciphertext. A
+  participant opens one message's commitment, and the tribunal verifies authorship in that
+  channel without any other access (D22, AB-06);
 - **tribunals that are automated first.** Each operator holds one seat, and each seat runs an
   agent:
   - an **evidence track** of deterministic adjudication, whose verdicts stand at a threshold of
@@ -81,37 +83,53 @@ here is appended to the issuing nameserver's log (JEP-0009 rule 31).
    - a block, by CID with its bytes;
    - signed artefacts: two conflicting `ingest` records, attestations, handshake answers or
      reports;
-   - an **encrypted-message disclosure** (rule 6).
-6. **Encrypted-message disclosure, MLS profile** (`suite = "mls"`). For one message, the item is:
-   1. the author-signed block that carries the `PrivateMessage`;
-   2. the owning server's signed `ingest` record for it (JEP-0005 rule 12);
-   3. that message's AEAD key and nonce, from the sender's secret-tree ratchet for its generation
-      (RFC 9420 §9);
-   4. that message's sender-data key and nonce (RFC 9420 §6.3.2);
-   5. the epoch's `GroupContext`.
+   - a **franked message**, opened as in rule 8.
+6. **Franking.** Every content message on an encrypted channel is franked. For each message, the
+   sender's client:
+   1. picks a fresh, uniformly random 32-byte **franking key** `k_f`;
+   2. computes the **franking tag** `c` as the labelled BLAKE3 hash (JEP-0004 rule 8) of:
+      - (`domain`, `jig-frank-v1`);
+      - (`k_f`);
+      - (`channel_id`);
+      - (`sender`, the sender's DID or session key);
+      - (`epoch`, as decimal ASCII);
+      - (`body`, the plaintext body);
+      - (`count`, the number of attachments);
+      - one (`attachment`, the BLAKE3 hash of the attachment's plaintext) part per attachment,
+        in order;
+   3. puts `k_f` inside the encrypted plaintext, beside the body and the attachment references;
+   4. puts `c` in the author-signed outer block, as the field `frank`.
 
-   The disclosure MUST NOT include any epoch secret, ratchet secret or other key from which other
-   messages' keys derive.
-7. **Verification.** A tribunal accepts an encrypted-message item only when all of these hold:
-   1. the block's author signature verifies under the accused's DID;
-   2. the `ingest` record verifies under the channel's sequencer of record, and names that block's
-      CID;
-   3. the disclosed keys decrypt the `PrivateMessage` in the block;
-   4. the decrypted `FramedContent` carries a content signature that verifies under the accused's
-      DID key over the disclosed `GroupContext` (in jig, the MLS leaf key is the DID key);
-   5. the `GroupContext`'s group and epoch match what the owner or a follower attests from the
-      commits it validated (JEP-0005 rule 19).
+   The owner's `ingest` record then sequences a block that carries `c`. A sender MUST NOT reuse
+   `k_f`.
+7. **The recipient's check.** After decrypting, a client MUST recompute `c` from the decrypted
+   body, the attachments, `k_f`, the channel, the sender and the epoch.
+   - If `c` does not match the block's `frank`, or `frank` is missing on an encrypted content
+     block, the client MUST NOT display the message as valid, and MUST mark it as unverifiable.
+   - A client MUST NOT display an attachment whose plaintext hash differs from the one `c`
+     covers.
 
-   Check 4 proves authorship of the plaintext independently of whether the AEAD commits to its
-   key.
-8. **Report profiles.** Every suite JEP MUST define a report profile: what a participant
-   discloses for one message, and how a third party verifies authorship and delivery from that
-   disclosure without being able to read other messages.
-   - A ruleset group that holds tribunals MUST NOT admit a suite without a report profile.
-   - Rule 6 is the profile for `mls`. The requirement belongs in JEP-0001, and lane S carries it.
+   This stops a sender from making a message unreportable.
+8. **The report item.** For a franked message, the item is:
+   - the author-signed block;
+   - the owner's signed `ingest` record for it (JEP-0005 rule 12);
+   - the plaintext body and attachments;
+   - `k_f`.
+
+   A tribunal accepts the item only when all of these hold:
+   1. the block's author signature verifies under the accused's DID or session key;
+   2. the `ingest` record verifies under the channel's sequencer of record, and names that
+      block's CID;
+   3. `c` recomputed from the disclosure equals the block's `frank`.
+
+   The disclosure reveals nothing about any other message.
+8a. **Suites.** Franking sits above the encryption suite. Every suite JEP MUST state that the
+    suite delivers the plaintext, `k_f` included, unchanged to every member. A ruleset group that
+    holds tribunals MUST NOT admit a suite that does not. The requirement belongs in JEP-0001, and
+    lane S carries it.
 9. **Context.** A report MAY name `seq` ranges around the reported messages.
    - The tribunal MAY ask the accused and other members to disclose their own messages in that
-     range, under the same profile.
+     range, by opening their franking tags.
    - A refusal to disclose is recorded, not inferred against anyone.
    - Several members' reports of one incident merge into one case.
 10. A report about an `--anon` sender attributes to its session key only. Nothing in a report or a
@@ -244,7 +262,9 @@ here is appended to the issuing nameserver's log (JEP-0009 rule 31).
 **Threats addressed:**
 
 - **AB-06.** Encrypted abuse becomes provable by a participant alone. The proof is scoped to one
-  message, with no escrow, server keys or scanning (rules 6–8).
+  message, with no escrow, server keys or scanning (rules 6–8a). The tag commits the sender to
+  the plaintext, so the question of whether the suite's AEAD commits to its key does not arise.
+  The recipient's check at decrypt (rule 7) stops a sender from making a message unreportable.
 - **GV-01, capture.**
   - One seat per operator.
   - Panels are drawn at random from a witnessed checkpoint.
@@ -268,7 +288,10 @@ here is appended to the issuing nameserver's log (JEP-0009 rule 31).
 
 **Privacy:**
 
-- Disclosures reveal only the reported messages.
+- Disclosures reveal only the reported messages. A franking tag reveals nothing without its
+  `k_f`, so a server cannot test guesses at content.
+- Franked content is not deniable, which is by design (PV-04). Because the block is author-signed,
+  anyone the reporter shows an opening to can verify it, not only a platform.
 - Inviter tags open only under rule 25.
 - No path unmasks an `--anon` key.
 - Logs carry subject commitments (JEP-0009 rule 32).
@@ -287,17 +310,19 @@ None yet. Milestones R5 (rules 4–10), R6 (rules 1–3 and 11–25) and R8 (rul
 
 To be added with each milestone:
 
-- an MLS encrypted-message disclosure that verifies, and one whose keys do not decrypt;
+- a franked message and its opening, one opening whose `k_f` does not match, and one block whose
+  `frank` does not match its plaintext;
 - an evidence-track case with the adjudication's expected output;
 - a provisional measure, its expiry, and a confirmation;
 - each class of listing, with its evidence.
 
 # Rejected Alternatives
 
-- **Disclosing only plaintext and its signature.** That proves authorship, but not that the
-  message was delivered in the channel.
-- **Message franking.** jig's content signature is already made with the DID key (PV-04), so
-  franking adds nothing.
+- **Disclosing per-message MLS keys.** It is the strongest MLS-native proof, but openmls 0.9.1
+  exposes no per-message secrets. It would need a fork that jig maintains, and the same
+  internals work for every other suite.
+- **An inner envelope signed by the sender inside the plaintext.** It proves authorship, but does
+  not commit the delivered ciphertext to the plaintext, and it costs a signature per message.
 - **Fully automated permanent verdicts on content.** Swarm reports and classifier evasion can game
   them, and they turn mistakes into permanent bans.
 - **One seat per nameserver.** A party running many nameservers would get many seats (GV-02).
