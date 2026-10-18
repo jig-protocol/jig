@@ -44,6 +44,8 @@ pub enum NamingError {
     NotAuthoritative(String, String),
     #[error("the delegation for `{0}` lacks a signature from {1}")]
     MissingDelegationSignature(String, String),
+    #[error("a contract root_id must be a canonical CIDv1 (base32, `b` prefix), not `{0}`")]
+    BadContractRootId(String),
     #[error("the delegation is for `{0}`, not `{1}`")]
     OtherSuffix(String, String),
     #[error("the attestation is for `{0}`, not `{1}`")]
@@ -364,8 +366,13 @@ impl SuffixDelegation {
     }
 
     /// Every listed authority signed these fields. An envelope signed by
-    /// anyone else, or over other bytes, does not count.
+    /// anyone else, or over other bytes, does not count. A `contract` root's
+    /// `root_id` must be the contract CID's one canonical text form (JEP-0004
+    /// rule 3), so one root has one encoding.
     pub fn verify(&self) -> Result<(), NamingError> {
+        if self.root == Root::Contract && !is_canonical_cidv1(&self.root_id) {
+            return Err(NamingError::BadContractRootId(self.root_id.clone()));
+        }
         let payload = self.payload();
         for authority in &self.authorities {
             if !self
@@ -523,6 +530,12 @@ pub fn verify_rotation_chain<L: AliasLink>(
     } else {
         Err(NamingError::BrokenChain(pinned.into(), new.into()))
     }
+}
+
+/// `s` is a CIDv1 written in its canonical text form: base32 lowercase with
+/// the `b` multibase prefix, exactly as it round-trips.
+fn is_canonical_cidv1(s: &str) -> bool {
+    cid::Cid::try_from(s).is_ok_and(|c| c.version() == cid::Version::V1 && c.to_string() == s)
 }
 
 fn did_of(key: &SigningKey) -> String {
@@ -705,6 +718,28 @@ mod tests {
         let mut swapped = deleg(&[&a, &b]);
         swapped.authorities.reverse();
         assert_eq!(swapped.verify(), Ok(()));
+    }
+
+    #[test]
+    fn a_contract_root_needs_a_canonical_cidv1() {
+        use multihash_codetable::MultihashDigest as _;
+        let k = key(7);
+        let cid = cid::Cid::new_v1(
+            0x71,
+            multihash_codetable::Code::Blake3_256.digest(b"contract"),
+        );
+        let canonical = cid.to_string();
+        assert!(canonical.starts_with('b'));
+        let ok = SuffixDelegation::sign(&[&k], "example.org", Root::Contract, &canonical, NOW);
+        assert_eq!(ok.verify(), Ok(()));
+        let upper = canonical.to_uppercase();
+        let v0 = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
+        for bad in [upper.as_str(), v0, "not-a-cid"] {
+            let d = SuffixDelegation::sign(&[&k], "example.org", Root::Contract, bad, NOW);
+            assert_eq!(d.verify(), Err(NamingError::BadContractRootId(bad.into())));
+        }
+        // Other roots keep free text.
+        assert_eq!(deleg(&[&k]).verify(), Ok(()));
     }
 
     /// A stand-in for lane I's link: the chain logic only reads fields and
