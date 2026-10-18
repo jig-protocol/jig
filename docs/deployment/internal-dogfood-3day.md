@@ -13,6 +13,13 @@ since landed — see the status section immediately following.
 
 ## STATUS (as of the internal-MVP batch)
 
+> **Historical snapshot.** This table describes the tree at the internal-MVP batch and is
+> not maintained. Since then, among others: per-channel MLS and DMs shipped, the v0.0.1
+> REST routes were removed (D28), `jig read` uses the signed history endpoint, and
+> wasmtime is 49. For current status read
+> [What works, what does not](../../README.md#what-works-what-does-not) and the
+> [threat register](../../repos/jig-spec/src/threat-register.md).
+
 The plan below was written against a pre-implementation tree. Read this section first; the
 rest is preserved for its reasoning, not as a to-do list.
 

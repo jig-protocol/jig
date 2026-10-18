@@ -10,7 +10,7 @@ should not be read as a status page.
 | --- | --- |
 | Stand up a server on a box I already have | [`deploy/README.md`](../deploy/README.md) |
 | Get the box first, on GCP | [`docs/deployment/gcp-vps-runbook.md`](deployment/gcp-vps-runbook.md) |
-| Know what actually works today | the STATUS section of [`internal-dogfood-3day.md`](deployment/internal-dogfood-3day.md) |
+| Know what actually works today | [What works, what does not](../README.md#what-works-what-does-not) in the root README, and the [threat register](../repos/jig-spec/src/threat-register.md) for security status |
 | Know what is left before a public release | [`RELEASE_READINESS.md`](RELEASE_READINESS.md) |
 | See where the project is headed, phase by phase | [`ROADMAP.md`](ROADMAP.md) |
 | See end-to-end encryption work, on a throwaway server | [`scripts/demo-e2ee.sh`](../scripts/demo-e2ee.sh) |
@@ -22,10 +22,10 @@ should not be read as a status page.
 | --- | --- | --- |
 | [`deploy/README.md`](../deploy/README.md) | CURRENT | Operator runbook: systemd units, hybrid `/etc/jig/config.toml`, backups, and the `server.key` warning. The unit files carry their own rationale in comments; this doc covers sequence. |
 | [`deployment/gcp-vps-runbook.md`](deployment/gcp-vps-runbook.md) | CURRENT | GCP-specific box setup — machine sizing, the build-big-then-shrink recommendation, Tailscale-only reachability. Prices and build times in it are the author's estimates, unverified against the console. |
-| [`deployment/internal-dogfood-3day.md`](deployment/internal-dogfood-3day.md) | CURRENT | The internal-MVP plan. Opens with a STATUS section listing what shipped and where to check it; the plan body below that predates the implementation and is kept for its reasoning. |
+| [`deployment/internal-dogfood-3day.md`](deployment/internal-dogfood-3day.md) | HISTORICAL | The internal-MVP plan. Its STATUS section is a snapshot of what had shipped by that batch, not maintained; the plan body predates the implementation and is kept for its reasoning. |
 | [`deployment/internal-dogfood-24h.md`](deployment/internal-dogfood-24h.md) | HISTORICAL | Superseded by the 3-day plan. Retained for its verified state-of-the-union table, which was proven by running binaries rather than reading code. |
-| [`deployment/install-benchmark.md`](deployment/install-benchmark.md) | CURRENT | Manual procedure for the 60-second `curl \| bash` install acceptance gate. Not yet run: it needs `jig.onl` serving `install.sh` and release tarballs at `releases.jig.onl`, neither of which exists. |
-| [`operations/nameserver-abuse-runbook.md`](operations/nameserver-abuse-runbook.md) | CURRENT | Nameserver incident runbooks: harassment reports, registration and relay abuse, a compromised nameserver, a rogue federated instance. Uses the shipped parameters and endpoints; tribunal steps are marked future. |
+| [`deployment/install-benchmark.md`](deployment/install-benchmark.md) | CURRENT | The 60-second `curl \| bash` install gate: the manual procedure on a $5-class VM, still the only measure on target hardware, and the CI runs (`scripts/install-smoke.sh` in `release.yml` and `install-smoke.yml`) with their first measurements. |
+| [`operations/nameserver-abuse-runbook.md`](operations/nameserver-abuse-runbook.md) | HISTORICAL | Nameserver incident runbooks: harassment reports, registration and relay abuse, a compromised nameserver, a rogue federated instance. Mostly out of date since #154 removed the legacy routes it calls; a banner lists the steps that still apply; tribunal steps are marked future. |
 
 ## Design and implementation records
 
@@ -51,13 +51,12 @@ Per-crate READMEs live next to the code under [`repos/`](../repos/):
 `jig-core`, `jig-server`, `jig-cli`, `jig-config`, `jig-runtime`, `jig-nameserver`,
 `bridges/email`. `jig-mls` documents itself in its crate docs (`src/lib.rs`).
 
-Two directories under `repos/` are documentation rather than crates and are not
-workspace members:
+One directory under `repos/` is documentation rather than a crate and is not a
+workspace member:
 
 | Path | Status | What it is |
 | --- | --- | --- |
 | [`repos/jig-spec/`](../repos/jig-spec/) | CURRENT | mdBook protocol specification plus JSON schemas and the JEP directory. Self-described as draft scaffolding; no publishing pipeline is wired up. |
-| [`repos/jig-docs/`](../repos/jig-docs/) | CURRENT | Working-notes directory, explicitly a placeholder. Excluded from crate tarballs. |
 
 ## Archive contents
 

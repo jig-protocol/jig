@@ -174,7 +174,11 @@ async fn prove(
         ));
     }
     state.auth.record_proof(&did, bits).map_err(|e| {
-        tracing::error!(error = %e, did = %did, "recording an admission proof failed");
+        tracing::error!(
+            error = %e,
+            did = %jig_core::did::log_tag(&did),
+            "recording an admission proof failed"
+        );
         refuse(
             StatusCode::INTERNAL_SERVER_ERROR,
             "PERSIST_ERROR",

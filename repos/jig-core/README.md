@@ -68,7 +68,7 @@ bundle.validate_code_with_allowlist(&constraints, &allowlist)?;
 
 See also:
 
-- `repos/jig-docs/core/RECEIPT_V0_2.md` for receipt structure, counters, timings, and validation rules.
+- `repos/jig-spec/src/receipts.md` for receipt structure, counters, timings, and validation rules.
 - `repos/jig-spec/src/block-execution.md` for runtime semantics and on-wire examples.
 
 ## Quick Start

@@ -1,7 +1,10 @@
 # Protocol Overview
 
-> **v0.1 status:** E2EE, the handshake and every transport except WebSocket and the email
-> bridge are not implemented. Content is signed, and end-to-end encrypted on channels created under `mls`. See [Encryption](encryption.md).
+> **Status:** every transport except WebSocket and the email bridge is not implemented.
+> The handshake is the [JEP-0002](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0002-handshake.md)
+> subset. Content is always signed, and end-to-end encrypted on DMs, on every restricted
+> channel, and on open channels created under `mls`; see [Encryption](encryption.md). The envelope this chapter describes is
+> not the wire format (see [Message Format](message-format.md)).
 
 **Audience:** This chapter is for **developers** and **protocol implementers** who need to understand Jig's architecture. **Server operators** might find the scaling and transport sections useful. **End users** can skip this—it's pretty technical.
 
@@ -112,7 +115,7 @@ When a client connects, the [Handshake](handshake.md) negotiates:
 : Things like E2EE, block execution, federation support. Client asks, server grants or denies. Example: An IRC-only server might disable block execution entirely (no Wasm runtime needed).
 
 **Cryptographic suites**
-: Agree on signature algorithms (Ed25519), hashing (BLAKE3) and the [encryption suites](encryption.md) each side implements (MLS by default from v0.2; v0.1 implements only `none`). Unknown or unimplemented suites fail closed.
+: Agree on signature algorithms (Ed25519), hashing (BLAKE3) and the [encryption suites](encryption.md) each side implements (the reference implementation implements `none` and `mls`). Unknown or unimplemented suites fail closed.
 
 **Capability grants**
 : Server tells client what it's allowed to do (send messages, execute blocks, join channels). This is where reputation tiers kick in—`low_sec` users might have stricter rate limits than `verified` users.

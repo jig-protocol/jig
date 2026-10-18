@@ -243,7 +243,7 @@ The manifest is a JSON file describing the block. Here's what's in it:
 }
 ```
 
-**What this means:** `encryption` names the block's [encryption suite](encryption.md#registry). It MUST be a registered suite this implementation implements; anything else is refused. v0.1 implements only `none`. MLS (`mls`) is reserved for v0.2. Metadata (who sent it, when, how much fuel it used) is visible to the server under every suite.
+**What this means:** `encryption` names the block's [encryption suite](encryption.md#registry). It MUST be a registered suite this implementation implements; anything else is refused. The reference implementation implements `none` and `mls`. Metadata (who sent it, when, how much fuel it used) is visible to the server under every suite.
 
 ## Execution Lifecycle
 

@@ -12,10 +12,6 @@
 //! to `/api/v1/channels/<url-escaped slug>/archive`. Owner-only, and a
 //! soft delete: the server retires the channel and keeps its history.
 //!
-//! Servers that predate `/api/v1/channels*` only expose the same handlers
-//! under `/_admin_v0_0_2/*` (behind `[debug] admin_endpoints`), so a 404 on the
-//! stable path is retried once against the legacy one.
-//!
 //! `list` GETs `/api/v1/channels` and pretty-prints a column-aligned table.
 //!
 //! ## HLC
@@ -104,15 +100,25 @@ impl ChannelOpError {
     fn is_channel_exists(&self) -> bool {
         is_channel_exists(self.status, &self.body)
     }
+
+    /// The server's error `code`, if the body carries one.
+    fn code(&self) -> Option<String> {
+        error_code(&self.body)
+    }
+}
+
+/// The `code` field of a JSON error body.
+fn error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["code"].as_str().map(str::to_string))
 }
 
 /// Whether a channel-create refusal means "that slug is already taken".
 /// Servers before the `CHANNEL_EXISTS` code answered with a 500 carrying the
 /// SQLite constraint text, so that exact shape counts too.
 fn is_channel_exists(status: reqwest::StatusCode, body: &str) -> bool {
-    let code = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v["code"].as_str().map(str::to_string));
+    let code = error_code(body);
     match status {
         reqwest::StatusCode::CONFLICT => code.as_deref() == Some("CHANNEL_EXISTS"),
         reqwest::StatusCode::INTERNAL_SERVER_ERROR => {
@@ -123,7 +129,6 @@ fn is_channel_exists(status: reqwest::StatusCode, body: &str) -> bool {
 }
 
 const CHANNEL_OPS_PREFIX: &str = "/api/v1/channels";
-const LEGACY_CHANNEL_OPS_PREFIX: &str = "/_admin_v0_0_2/channels";
 
 /// POST a signed channel-op block to `<base><prefix><suffix>`, where `suffix`
 /// is `""`, `/<slug>/members` or `/<slug>/archive`.
@@ -131,24 +136,13 @@ async fn post_channel_op(base: &str, suffix: &str, block: &BuiltBlock) -> Result
     let http = crate::cmd::trust::http(base, std::time::Duration::from_secs(15)).await?;
     let submission = submission_for(block);
 
-    let mut url = format!("{base}{CHANNEL_OPS_PREFIX}{suffix}");
-    let mut resp = http
+    let url = format!("{base}{CHANNEL_OPS_PREFIX}{suffix}");
+    let resp = http
         .post(&url)
         .json(&submission)
         .send()
         .await
         .with_context(|| format!("POST {url}"))?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND
-        || resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
-    {
-        url = format!("{base}{LEGACY_CHANNEL_OPS_PREFIX}{suffix}");
-        resp = http
-            .post(&url)
-            .json(&submission)
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?;
-    }
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -205,6 +199,9 @@ pub(crate) async fn create_with(
     if !matches!(visibility.as_str(), "open" | "restricted") {
         anyhow::bail!("--visibility must be `open` or `restricted` (got `{visibility}`)");
     }
+    // A restricted channel is always end-to-end encrypted (ROADMAP D25): the
+    // server refuses a plaintext one. Only an open channel is a choice.
+    let encrypted = encrypted || visibility == "restricted";
 
     let id = ctx.identity()?;
     let hlc = HlcTimestamp::now_wall(id.did().clone());
@@ -280,6 +277,15 @@ pub(crate) async fn create_with(
             println!("channel created: {slug} ({label})");
             println!("  block_cid: {}", result.block_cid);
             Ok(true)
+        }
+        Err(e)
+            if e.downcast_ref::<ChannelOpError>()
+                .is_some_and(|c| c.code().as_deref() == Some("RESTRICTED_REQUIRES_MLS")) =>
+        {
+            Err(e.context(format!(
+                "the server will not create {slug} unencrypted: restricted channels are \
+                 end-to-end encrypted. For plaintext, make it open (`--visibility open`)"
+            )))
         }
         Err(e)
             if e.downcast_ref::<ChannelOpError>()
