@@ -8,16 +8,18 @@
 //! the DID wants to be found. Whoever acts on a binding verifies it here; who
 //! fetched it does not matter.
 //!
-//! Every signature is Ed25519 over a [`hash_labeled_parts`] digest whose first
-//! part is (`domain`, a tag naming the object). Times, counts and sequence
-//! numbers are decimal ASCII. Test vectors live in
-//! `repos/jig-spec/jep/vectors/0004/`.
+//! Every signed object is a COSE_Sign1 ([`crate::cose`]) whose payload is a
+//! text-keyed map in deterministic CBOR ([`crate::dcbor`]) with a `domain`
+//! entry naming the object. Times and sequence numbers are CBOR integers. The
+//! envelope bytes are what travels and what a resolver keeps as evidence. Test
+//! vectors live in `repos/jig-spec/jep/vectors/0004/`.
 
-use base64::Engine as _;
-use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
+use ciborium::value::Value;
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::hash_labeled_parts;
+use crate::cose::{self, CoseError};
+use crate::dcbor::{self, text_map};
 use crate::did::Did;
 
 pub const ATTESTATION_DOMAIN: &str = "jig-alias-attestation-v1";
@@ -35,6 +37,10 @@ pub enum NamingError {
     BadDid(String),
     #[error("the signature is not by {0}")]
     BadSignature(String),
+    #[error("not a {0}")]
+    BadPayload(&'static str),
+    #[error(transparent)]
+    Envelope(CoseError),
     #[error("{0} is not an authority for suffix `{1}`")]
     NotAuthoritative(String, String),
     #[error("the delegation for `{0}` lacks a signature from {1}")]
@@ -53,6 +59,16 @@ pub enum NamingError {
     BrokenChain(String, String),
     #[error("a rotation was accepted by {0}, not by {1}")]
     OtherNameserver(String, String),
+}
+
+impl From<CoseError> for NamingError {
+    fn from(e: CoseError) -> Self {
+        match e {
+            CoseError::BadDid(did) => NamingError::BadDid(did),
+            CoseError::BadSignature(did) => NamingError::BadSignature(did),
+            other => NamingError::Envelope(other),
+        }
+    }
 }
 
 /// A parsed, normalised `alias@suffix`.
@@ -110,6 +126,12 @@ impl Root {
             Root::Contract => "contract",
         }
     }
+
+    fn parse(s: &str) -> Option<Self> {
+        [Root::Config, Root::Dns, Root::Contract]
+            .into_iter()
+            .find(|r| r.as_str() == s)
+    }
 }
 
 /// The action a proof of control is bound to (JEP-0004 rule 10). Rotation
@@ -129,65 +151,73 @@ impl Action {
     }
 }
 
-/// What a DID signs to prove control for `action` on `alias` at `ns_did`.
-pub fn proof_hash(action: Action, ns_did: &str, alias: &str, challenge: &str) -> [u8; 32] {
-    *hash_labeled_parts(&[
-        ("domain", action.domain().as_bytes()),
-        ("ns_did", ns_did.as_bytes()),
-        ("alias", alias.as_bytes()),
-        ("challenge", challenge.as_bytes()),
-    ])
-    .as_bytes()
+/// The payload a DID signs to prove control for `action` on `alias` at
+/// `ns_did`: `{domain, ns_did, alias, challenge}`.
+pub fn proof_payload(action: Action, ns_did: &str, alias: &str, challenge: &str) -> Vec<u8> {
+    encode(text_map(vec![
+        ("domain", Value::Text(action.domain().into())),
+        ("ns_did", Value::Text(ns_did.into())),
+        ("alias", Value::Text(alias.into())),
+        ("challenge", Value::Text(challenge.into())),
+    ]))
 }
 
-/// Sign a proof of control as `key`.
+/// BLAKE3 of [`proof_payload`]: what an admission proof-of-work binds to.
+pub fn proof_hash(action: Action, ns_did: &str, alias: &str, challenge: &str) -> [u8; 32] {
+    *blake3::hash(&proof_payload(action, ns_did, alias, challenge)).as_bytes()
+}
+
+/// Sign a proof of control as `key`: a COSE_Sign1 over [`proof_payload`].
 pub fn sign_proof(
     key: &SigningKey,
     action: Action,
     ns_did: &str,
     alias: &str,
     challenge: &str,
-) -> String {
-    b64(&key.sign(&proof_hash(action, ns_did, alias, challenge)))
+) -> Vec<u8> {
+    cose::sign(key, &proof_payload(action, ns_did, alias, challenge))
 }
 
 /// Check a proof of control by `did`.
 pub fn verify_proof(
     did: &str,
-    sig_b64: &str,
+    envelope: &[u8],
     action: Action,
     ns_did: &str,
     alias: &str,
     challenge: &str,
 ) -> Result<(), NamingError> {
-    verify_sig(did, sig_b64, &proof_hash(action, ns_did, alias, challenge))
+    verify_envelope(
+        envelope,
+        &proof_payload(action, ns_did, alias, challenge),
+        did,
+    )
 }
 
 /// A nameserver's claim that `alias` belongs to `did` (JEP-0004 rule 8).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attestation {
     pub did: String,
     pub alias: String,
     pub ns_did: String,
     pub valid_from: i64,
     pub valid_until: i64,
-    /// `ns_did`'s signature over [`Attestation::signed_hash`], base64.
-    pub sig: String,
+    /// `ns_did`'s COSE_Sign1 over [`Attestation::payload`].
+    pub envelope: Vec<u8>,
 }
 
 impl Attestation {
-    pub fn signed_hash(&self) -> [u8; 32] {
-        let from = self.valid_from.to_string();
-        let until = self.valid_until.to_string();
-        *hash_labeled_parts(&[
-            ("domain", ATTESTATION_DOMAIN.as_bytes()),
-            ("did", self.did.as_bytes()),
-            ("alias", self.alias.as_bytes()),
-            ("ns_did", self.ns_did.as_bytes()),
-            ("valid_from", from.as_bytes()),
-            ("valid_until", until.as_bytes()),
-        ])
-        .as_bytes()
+    const WHAT: &'static str = "alias attestation";
+
+    pub fn payload(&self) -> Vec<u8> {
+        encode(text_map(vec![
+            ("domain", Value::Text(ATTESTATION_DOMAIN.into())),
+            ("did", Value::Text(self.did.clone())),
+            ("alias", Value::Text(self.alias.clone())),
+            ("ns_did", Value::Text(self.ns_did.clone())),
+            ("valid_from", Value::Integer(self.valid_from.into())),
+            ("valid_until", Value::Integer(self.valid_until.into())),
+        ]))
     }
 
     /// Issue an attestation signed by `ns_key`.
@@ -204,15 +234,31 @@ impl Attestation {
             ns_did: did_of(ns_key),
             valid_from,
             valid_until,
-            sig: String::new(),
+            envelope: Vec::new(),
         };
-        att.sig = b64(&ns_key.sign(&att.signed_hash()));
+        att.envelope = cose::sign(ns_key, &att.payload());
         att
     }
 
-    /// The signature is `ns_did`'s. Says nothing about authority or time.
+    /// Parse an envelope and check that its `ns_did` signed it.
+    pub fn from_envelope(envelope: &[u8]) -> Result<Self, NamingError> {
+        let p = open(envelope, ATTESTATION_DOMAIN, Self::WHAT)?;
+        let att = Self {
+            did: text(&p, "did", Self::WHAT)?,
+            alias: text(&p, "alias", Self::WHAT)?,
+            ns_did: text(&p, "ns_did", Self::WHAT)?,
+            valid_from: int(&p, "valid_from", Self::WHAT)?,
+            valid_until: int(&p, "valid_until", Self::WHAT)?,
+            envelope: envelope.to_vec(),
+        };
+        att.verify()?;
+        Ok(att)
+    }
+
+    /// The envelope carries exactly these fields and is `ns_did`'s. Says
+    /// nothing about authority or time.
     pub fn verify(&self) -> Result<(), NamingError> {
-        verify_sig(&self.ns_did, &self.sig, &self.signed_hash())
+        verify_envelope(&self.envelope, &self.payload(), &self.ns_did)
     }
 }
 
@@ -234,35 +280,38 @@ pub trait AliasLink {
 }
 
 /// Which DIDs speak for a suffix, under which root (JEP-0004 rule 3).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuffixDelegation {
     pub suffix: String,
+    /// Signed in bytewise ascending order, whatever the order here.
     pub authorities: Vec<String>,
     pub root: Root,
     /// For `config`, a local identifier never sent to anyone; for `dns`, the
     /// domain; for `contract`, the contract's CID.
     pub root_id: String,
     pub valid_until: i64,
-    /// One `(authority DID, signature)` per authority.
-    pub sigs: Vec<(String, String)>,
+    /// One COSE_Sign1 per authority, each over the same
+    /// [`SuffixDelegation::payload`].
+    pub envelopes: Vec<Vec<u8>>,
 }
 
 impl SuffixDelegation {
-    pub fn signed_hash(&self) -> [u8; 32] {
-        let mut authorities: Vec<&str> = self.authorities.iter().map(String::as_str).collect();
+    const WHAT: &'static str = "suffix delegation";
+
+    pub fn payload(&self) -> Vec<u8> {
+        let mut authorities = self.authorities.clone();
         authorities.sort_unstable();
-        let count = authorities.len().to_string();
-        let until = self.valid_until.to_string();
-        let mut parts: Vec<(&str, &[u8])> = vec![
-            ("domain", DELEGATION_DOMAIN.as_bytes()),
-            ("suffix", self.suffix.as_bytes()),
-            ("root", self.root.as_str().as_bytes()),
-            ("root_id", self.root_id.as_bytes()),
-            ("count", count.as_bytes()),
-        ];
-        parts.extend(authorities.iter().map(|a| ("authority", a.as_bytes())));
-        parts.push(("valid_until", until.as_bytes()));
-        *hash_labeled_parts(&parts).as_bytes()
+        encode(text_map(vec![
+            ("domain", Value::Text(DELEGATION_DOMAIN.into())),
+            ("suffix", Value::Text(self.suffix.clone())),
+            (
+                "authorities",
+                Value::Array(authorities.into_iter().map(Value::Text).collect()),
+            ),
+            ("root", Value::Text(self.root.as_str().into())),
+            ("root_id", Value::Text(self.root_id.clone())),
+            ("valid_until", Value::Integer(self.valid_until.into())),
+        ]))
     }
 
     /// A delegation signed by every key in `authority_keys`.
@@ -279,59 +328,93 @@ impl SuffixDelegation {
             root,
             root_id: root_id.to_string(),
             valid_until,
-            sigs: Vec::new(),
+            envelopes: Vec::new(),
         };
-        let hash = deleg.signed_hash();
-        deleg.sigs = authority_keys
+        let payload = deleg.payload();
+        deleg.envelopes = authority_keys
             .iter()
-            .map(|k| (did_of(k), b64(&k.sign(&hash))))
+            .map(|k| cose::sign(k, &payload))
             .collect();
         deleg
     }
 
-    /// Every listed authority signed, and nobody else counts.
+    /// Parse the envelopes and check that every authority signed.
+    pub fn from_envelopes(envelopes: &[Vec<u8>]) -> Result<Self, NamingError> {
+        let first = envelopes
+            .first()
+            .ok_or(NamingError::BadPayload(Self::WHAT))?;
+        let p = open(first, DELEGATION_DOMAIN, Self::WHAT)?;
+        let authorities = array(&p, "authorities", Self::WHAT)?
+            .iter()
+            .map(|a| match a {
+                Value::Text(t) => Ok(t.clone()),
+                _ => Err(NamingError::BadPayload(Self::WHAT)),
+            })
+            .collect::<Result<_, _>>()?;
+        let deleg = Self {
+            suffix: text(&p, "suffix", Self::WHAT)?,
+            authorities,
+            root: Root::parse(&text(&p, "root", Self::WHAT)?)
+                .ok_or(NamingError::BadPayload(Self::WHAT))?,
+            root_id: text(&p, "root_id", Self::WHAT)?,
+            valid_until: int(&p, "valid_until", Self::WHAT)?,
+            envelopes: envelopes.to_vec(),
+        };
+        deleg.verify()?;
+        Ok(deleg)
+    }
+
+    /// Every listed authority signed these fields. An envelope signed by
+    /// anyone else, or over other bytes, does not count.
     pub fn verify(&self) -> Result<(), NamingError> {
-        let hash = self.signed_hash();
+        let payload = self.payload();
         for authority in &self.authorities {
-            let sig = self
-                .sigs
+            if !self
+                .envelopes
                 .iter()
-                .find(|(did, _)| did == authority)
-                .map(|(_, sig)| sig)
-                .ok_or_else(|| {
-                    NamingError::MissingDelegationSignature(self.suffix.clone(), authority.clone())
-                })?;
-            verify_sig(authority, sig, &hash)?;
+                .any(|e| verify_envelope(e, &payload, authority).is_ok())
+            {
+                return Err(NamingError::MissingDelegationSignature(
+                    self.suffix.clone(),
+                    authority.clone(),
+                ));
+            }
         }
         Ok(())
     }
 }
 
 /// Where a DID wants to be found, signed by that DID (JEP-0004 rule 21).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReachabilityRecord {
     pub did: String,
     /// `(server DID, URL)` pairs, in the order signed.
     pub servers: Vec<(String, String)>,
     pub seq: u64,
-    pub sig: String,
+    /// `did`'s COSE_Sign1 over [`ReachabilityRecord::payload`].
+    pub envelope: Vec<u8>,
 }
 
 impl ReachabilityRecord {
-    pub fn signed_hash(&self) -> [u8; 32] {
-        let seq = self.seq.to_string();
-        let count = self.servers.len().to_string();
-        let mut parts: Vec<(&str, &[u8])> = vec![
-            ("domain", REACHABILITY_DOMAIN.as_bytes()),
-            ("did", self.did.as_bytes()),
-            ("seq", seq.as_bytes()),
-            ("count", count.as_bytes()),
-        ];
-        for (server_did, url) in &self.servers {
-            parts.push(("server_did", server_did.as_bytes()));
-            parts.push(("url", url.as_bytes()));
-        }
-        *hash_labeled_parts(&parts).as_bytes()
+    const WHAT: &'static str = "reachability record";
+
+    pub fn payload(&self) -> Vec<u8> {
+        let servers = self
+            .servers
+            .iter()
+            .map(|(server_did, url)| {
+                text_map(vec![
+                    ("server_did", Value::Text(server_did.clone())),
+                    ("url", Value::Text(url.clone())),
+                ])
+            })
+            .collect();
+        encode(text_map(vec![
+            ("domain", Value::Text(REACHABILITY_DOMAIN.into())),
+            ("did", Value::Text(self.did.clone())),
+            ("servers", Value::Array(servers)),
+            ("seq", Value::Integer(self.seq.into())),
+        ]))
     }
 
     pub fn sign(key: &SigningKey, servers: Vec<(String, String)>, seq: u64) -> Self {
@@ -339,14 +422,36 @@ impl ReachabilityRecord {
             did: did_of(key),
             servers,
             seq,
-            sig: String::new(),
+            envelope: Vec::new(),
         };
-        rec.sig = b64(&key.sign(&rec.signed_hash()));
+        rec.envelope = cose::sign(key, &rec.payload());
         rec
     }
 
+    /// Parse an envelope and check that its `did` signed it.
+    pub fn from_envelope(envelope: &[u8]) -> Result<Self, NamingError> {
+        let p = open(envelope, REACHABILITY_DOMAIN, Self::WHAT)?;
+        let servers = array(&p, "servers", Self::WHAT)?
+            .iter()
+            .map(|s| {
+                Ok((
+                    text(s, "server_did", Self::WHAT)?,
+                    text(s, "url", Self::WHAT)?,
+                ))
+            })
+            .collect::<Result<_, NamingError>>()?;
+        let rec = Self {
+            did: text(&p, "did", Self::WHAT)?,
+            servers,
+            seq: int(&p, "seq", Self::WHAT)?,
+            envelope: envelope.to_vec(),
+        };
+        rec.verify()?;
+        Ok(rec)
+    }
+
     pub fn verify(&self) -> Result<(), NamingError> {
-        verify_sig(&self.did, &self.sig, &self.signed_hash())
+        verify_envelope(&self.envelope, &self.payload(), &self.did)
     }
 }
 
@@ -425,23 +530,54 @@ fn did_of(key: &SigningKey) -> String {
     Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string()
 }
 
-fn b64(sig: &Signature) -> String {
-    base64::engine::general_purpose::STANDARD.encode(sig.to_bytes())
+fn encode(map: Value) -> Vec<u8> {
+    dcbor::encode(&map).expect("a map of text, integers and arrays encodes")
 }
 
-fn verify_sig(did: &str, sig_b64: &str, msg: &[u8; 32]) -> Result<(), NamingError> {
-    let key = Did::from_did_jig_string(did)
-        .and_then(|d| d.as_bytes())
-        .ok()
-        .and_then(|k| VerifyingKey::from_bytes(&k).ok())
-        .ok_or_else(|| NamingError::BadDid(did.to_string()))?;
-    let bad_sig = || NamingError::BadSignature(did.to_string());
-    let sig = base64::engine::general_purpose::STANDARD
-        .decode(sig_b64)
-        .ok()
-        .and_then(|b| Signature::from_slice(&b).ok())
-        .ok_or_else(bad_sig)?;
-    key.verify(msg, &sig).map_err(|_| bad_sig())
+fn text(map: &Value, key: &str, what: &'static str) -> Result<String, NamingError> {
+    match dcbor::get(map, key) {
+        Some(Value::Text(t)) => Ok(t.clone()),
+        _ => Err(NamingError::BadPayload(what)),
+    }
+}
+
+fn int<T: TryFrom<ciborium::value::Integer>>(
+    map: &Value,
+    key: &str,
+    what: &'static str,
+) -> Result<T, NamingError> {
+    match dcbor::get(map, key) {
+        Some(Value::Integer(i)) => T::try_from(*i).map_err(|_| NamingError::BadPayload(what)),
+        _ => Err(NamingError::BadPayload(what)),
+    }
+}
+
+fn array<'a>(map: &'a Value, key: &str, what: &'static str) -> Result<&'a [Value], NamingError> {
+    match dcbor::get(map, key) {
+        Some(Value::Array(items)) => Ok(items),
+        _ => Err(NamingError::BadPayload(what)),
+    }
+}
+
+/// Open `envelope`, decode its payload and check its `domain`. The caller
+/// still verifies the signature, through its own `verify`.
+fn open(envelope: &[u8], domain: &str, what: &'static str) -> Result<Value, NamingError> {
+    let opened = cose::open(envelope)?;
+    let payload = dcbor::decode(&opened.payload).map_err(|_| NamingError::BadPayload(what))?;
+    if text(&payload, "domain", what)? != domain {
+        return Err(NamingError::BadPayload(what));
+    }
+    Ok(payload)
+}
+
+/// `envelope` carries exactly `payload` and is signed by `did`. Comparing
+/// the re-encoded fields with the signed bytes also refuses unknown keys.
+fn verify_envelope(envelope: &[u8], payload: &[u8], did: &str) -> Result<(), NamingError> {
+    let opened = cose::open(envelope)?;
+    if opened.payload != payload {
+        return Err(NamingError::BadSignature(did.to_string()));
+    }
+    Ok(opened.verify(did)?)
 }
 
 #[cfg(test)]
@@ -557,7 +693,7 @@ mod tests {
         let (a, b) = (key(7), key(8));
         let mut d = deleg(&[&a, &b]);
         assert_eq!(d.verify(), Ok(()));
-        d.sigs.retain(|(did, _)| *did == did_of(&a));
+        d.envelopes.truncate(1);
         assert_eq!(
             d.verify(),
             Err(NamingError::MissingDelegationSignature(
@@ -675,7 +811,7 @@ mod tests {
             assert!(verify_proof(&did, &sig, action, &ns_did, alias, challenge).is_err());
         }
         // A signature over the bare challenge is not a proof.
-        let bare = b64(&k.sign(b"c0ffee"));
+        let bare = cose::sign(&k, b"c0ffee");
         assert!(
             verify_proof(
                 &did,
@@ -726,7 +862,41 @@ mod tests {
         println!("{}", serde_json::to_string_pretty(&vectors()).unwrap());
     }
 
+    #[test]
+    fn envelopes_round_trip_and_refuse_other_objects() {
+        let (ns, alice) = (key(7), key(9));
+        let att = att(&ns, &did_of(&alice));
+        assert_eq!(Attestation::from_envelope(&att.envelope), Ok(att.clone()));
+        let d = deleg(&[&ns, &key(8)]);
+        assert_eq!(
+            SuffixDelegation::from_envelopes(&d.envelopes),
+            Ok(d.clone())
+        );
+        let rec =
+            ReachabilityRecord::sign(&alice, vec![("did:jig:zs".into(), "https://s".into())], 1);
+        assert_eq!(
+            ReachabilityRecord::from_envelope(&rec.envelope),
+            Ok(rec.clone())
+        );
+        // A validly signed object of another kind is not an attestation.
+        assert_eq!(
+            Attestation::from_envelope(&rec.envelope),
+            Err(NamingError::BadPayload(Attestation::WHAT))
+        );
+        // A signed payload with an extra key is refused, though the signature holds.
+        let mut extra = dcbor::decode(&att.payload()).unwrap();
+        if let Value::Map(entries) = &mut extra {
+            entries.push((Value::Text("note".into()), Value::Text("x".into())));
+        }
+        let envelope = cose::sign(&ns, &dcbor::encode(&extra).unwrap());
+        assert_eq!(
+            Attestation::from_envelope(&envelope),
+            Err(NamingError::BadSignature(did_of(&ns)))
+        );
+    }
+
     fn vectors() -> serde_json::Value {
+        const CHALLENGE: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
         let (ns, alice) = (key(7), key(9));
         let att = Attestation::sign(
             &ns,
@@ -747,35 +917,38 @@ mod tests {
             vec![(did_of(&key(13)), "https://chat.example.org".to_string())],
             1,
         );
+        let ns_did = did_of(&ns);
         let proof = sign_proof(
             &alice,
             Action::Register,
-            &did_of(&ns),
+            &ns_did,
             "alice@example.org",
-            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            CHALLENGE,
         );
         serde_json::json!({
+            "comment": "payload_hex is the deterministic CBOR payload; cose_sign1_hex is the envelope",
             "keys": {
                 "comment": "Ed25519 seeds: every byte set to the given value",
-                "nameserver": {"seed_byte": 7, "did": did_of(&ns)},
+                "nameserver": {"seed_byte": 7, "did": ns_did},
                 "alice": {"seed_byte": 9, "did": did_of(&alice)},
                 "server": {"seed_byte": 13, "did": did_of(&key(13))},
             },
-            "attestation": {"object": att, "signed_hash_hex": hex::encode(att.signed_hash())},
-            "delegation": {"object": deleg, "signed_hash_hex": hex::encode(deleg.signed_hash())},
-            "reachability": {"object": reach, "signed_hash_hex": hex::encode(reach.signed_hash())},
+            "attestation": {
+                "payload_hex": hex::encode(att.payload()),
+                "cose_sign1_hex": hex::encode(&att.envelope),
+            },
+            "delegation": {
+                "payload_hex": hex::encode(deleg.payload()),
+                "cose_sign1_hex": deleg.envelopes.iter().map(hex::encode).collect::<Vec<_>>(),
+            },
+            "reachability": {
+                "payload_hex": hex::encode(reach.payload()),
+                "cose_sign1_hex": hex::encode(&reach.envelope),
+            },
             "register_proof": {
-                "action": "register",
-                "ns_did": did_of(&ns),
-                "alias": "alice@example.org",
-                "challenge": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
-                "signed_hash_hex": hex::encode(proof_hash(
-                    Action::Register,
-                    &did_of(&ns),
-                    "alice@example.org",
-                    "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
-                )),
-                "sig": proof,
+                "payload_hex": hex::encode(proof_payload(Action::Register, &ns_did, "alice@example.org", CHALLENGE)),
+                "proof_hash_hex": hex::encode(proof_hash(Action::Register, &ns_did, "alice@example.org", CHALLENGE)),
+                "cose_sign1_hex": hex::encode(&proof),
             },
         })
     }

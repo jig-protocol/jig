@@ -11,7 +11,11 @@ pub mod capability_dsl;
 pub mod capability_registry;
 pub mod capability_scope;
 pub mod capability_validation;
+#[cfg(feature = "ed25519")]
+pub mod cose;
 pub mod crypto;
+#[cfg(feature = "ed25519")]
+pub mod dcbor;
 pub mod did;
 pub mod dm;
 pub mod error;
