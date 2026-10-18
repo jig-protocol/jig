@@ -37,6 +37,19 @@ pub fn report_migration(identity: &jig_client::Identity, keys_dir: &std::path::P
     }
 }
 
+/// Say, every time, that this identity's key is stored unencrypted. An install
+/// banner scrolls away; this does not.
+pub fn warn_if_unsealed(identity: &jig_client::Identity) {
+    if !identity.is_sealed() {
+        eprintln!(
+            "warning: the key for {} is stored unencrypted (JIG_KEYS_STORAGE=plaintext). \
+             Seal it by running jig once without that variable, from a terminal or with \
+             JIG_KEY_PASSPHRASE set.",
+            identity.did_string()
+        );
+    }
+}
+
 /// Asks on the terminal, without echo. Declines when there is no terminal, so
 /// a script fails with the error that names `JIG_KEY_PASSPHRASE` instead of
 /// hanging.

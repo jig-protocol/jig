@@ -92,6 +92,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
     let keys_dir = jig_client::identity::default_keys_dir();
     let id = Identity::create(&keys_dir, super::passphrase::key_access()?)
         .with_context(|| format!("generating identity under {}", keys_dir.display()))?;
+    super::passphrase::warn_if_unsealed(&id);
     let did_string = id.did_string();
     println!("generated DID: {did_string}");
     println!(

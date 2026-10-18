@@ -152,6 +152,7 @@ impl CliContext {
         let id = Identity::open(&keys_dir, &did_str, access)
             .with_context(|| format!("loading identity {did_str} from {}", keys_dir.display()))?;
         super::passphrase::report_migration(&id, &keys_dir);
+        super::passphrase::warn_if_unsealed(&id);
         for sealed in jig_client::identity::seal_rotated_keys(&keys_dir, access)? {
             eprintln!("note: sealed the rotated key {}", sealed.display());
         }
