@@ -219,12 +219,14 @@ One environment caveat: stop any local `jig-server` on `127.0.0.1:7117` first.
 `jig-cli::global_flags missing_implicit_config_still_falls_back_to_defaults` asserts that
 the default port is unreachable, so it fails against your own running server.
 
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs four jobs: `changes`
-(skips the build jobs on drafts and docs-only PRs), `workspace` (fmt, clippy, nextest on
-every workspace crate but `hello-wasm`),
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs four jobs on pull
+requests and the merge queue: `changes` (skips the build jobs on drafts and docs-only PRs),
+`workspace` (fmt, clippy, nextest on every workspace crate but `hello-wasm`),
 `wasm-build` (`text-block` for `wasm32-unknown-unknown`), and `dependency-policy`
-(`cargo deny check` — advisories, bans, licenses, sources). Toolchain is
-`dtolnay/rust-toolchain@stable`.
+(`cargo deny check` — advisories, bans, licenses, sources). A fifth job, `nightly`, runs
+on the daily schedule and skips itself when no Rust source changed: doc tests, which
+nextest does not run, and clippy on `jig-runtime`'s `tracing` feature. It is not a
+required check. Every job installs the toolchain `rust-toolchain.toml` pins.
 
 ## Where to go next
 
