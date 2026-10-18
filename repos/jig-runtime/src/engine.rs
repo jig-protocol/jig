@@ -252,79 +252,90 @@ pub struct WasmEngine {
     _epoch_ticker: Option<EpochTicker>,
 }
 
+/// The deterministic wasmtime configuration every jig engine starts from.
+///
+/// [`WasmEngine::new`] builds on it for core modules and `crate::component` for `jig:block`
+/// components, which adds only the component model. One source keeps the two engines from
+/// drifting apart on fuel, NaN canonicalization, the feature allowlist, stack and allocation.
+pub(crate) fn deterministic_config(config: &RuntimeConfig) -> Result<Config> {
+    let mut wasm_config = Config::new();
+
+    // Enable fuel consumption for resource metering
+    if config.fuel.enabled {
+        wasm_config.consume_fuel(true);
+    }
+
+    // Enable epoch interruption so we can enforce wall-clock-style deadlines.
+    wasm_config.epoch_interruption(true);
+
+    // Deterministic execution settings
+    if config.engine.deterministic {
+        // Canonicalize NaN values for deterministic floating-point
+        wasm_config.cranelift_nan_canonicalization(config.engine.canonicalize_nans);
+
+        // Exactly the features jig-core's validator accepts
+        // (`DETERMINISTIC_FEATURES`: WebAssembly 2.0 without SIMD). wasmtime
+        // 49 enables most 3.0 proposals by default (GC, memory64,
+        // exceptions, tail calls, wide arithmetic, component-model async),
+        // and turning off only threads and SIMD left the engine willing to
+        // run them. The validator rejects them first on every current
+        // path; this keeps a path that skips it from running them.
+        //
+        // Spelled out rather than shared with jig-core: wasmtime's
+        // `WasmFeatures` comes from its own wasmparser version.
+        wasm_config.wasm_features(WasmFeatures::all(), false);
+        wasm_config.wasm_features(WasmFeatures::WASM2.difference(WasmFeatures::SIMD), true);
+    }
+
+    // Memory configuration
+    //
+    // `memory_reservation` / `memory_guard_size` are wasmtime's successors to
+    // the 24.x `static_memory_maximum_size` / `dynamic_memory_guard_size`
+    // pair; upstream merged the static/dynamic split into one knob each.
+    let memory_limit_bytes = (config.limits.memory_max_mb as u64) * 1024 * 1024;
+    wasm_config.memory_reservation(memory_limit_bytes);
+    wasm_config.memory_guard_size(0x10000); // 64KB guard
+    // wasmtime's default, and deliberately well below a thread's stack. The wasm stack
+    // limit is counted from where the host calls in, on top of the host frames already on
+    // that thread. At 2 MiB it equalled a spawned thread's whole stack (Rust's and tokio's
+    // default), so unbounded recursion overran the thread's guard page and aborted the
+    // process instead of trapping.
+    wasm_config.max_wasm_stack(512 * 1024);
+
+    // Pooling allocator keeps allocation behaviour predictable.
+    //
+    // These two are the CONCURRENCY ceiling for the whole engine, not a
+    // per-execution limit. They were previously sized from
+    // `limits.max_instances` (default 1, documented as "single instance for
+    // now"), which meant a second simultaneous execution failed outright with
+    // "maximum concurrent limit of 1 for core instances reached" — invisible
+    // to any sequential benchmark, fatal to a server handling concurrent
+    // messages. `max_instances` remains the per-execution cap, enforced via
+    // StoreLimits.
+    let mut pooling = PoolingAllocationConfig::default();
+    let concurrency = config.limits.max_concurrent_instances.max(1);
+    pooling.total_core_instances(concurrency);
+    pooling.total_memories(concurrency);
+    pooling.max_memories_per_module(1);
+    pooling.max_memory_size(memory_limit_bytes as usize);
+    wasm_config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling));
+
+    // Module caching (only if explicitly enabled)
+    if config.engine.enable_cache
+        && let Some(cache_dir) = &config.engine.cache_dir
+    {
+        let cache = Cache::from_file(Some(std::path::Path::new(cache_dir)))
+            .map_err(|e| RuntimeError::InvalidConfig(format!("Cache config: {e}")))?;
+        wasm_config.cache(Some(cache));
+    }
+
+    Ok(wasm_config)
+}
+
 impl WasmEngine {
     /// Create a new deterministic Wasmtime engine
     pub fn new(config: &RuntimeConfig) -> Result<Self> {
-        let mut wasm_config = Config::new();
-
-        // Enable fuel consumption for resource metering
-        if config.fuel.enabled {
-            wasm_config.consume_fuel(true);
-        }
-
-        // Enable epoch interruption so we can enforce wall-clock-style deadlines.
-        wasm_config.epoch_interruption(true);
-
-        // Deterministic execution settings
-        if config.engine.deterministic {
-            // Canonicalize NaN values for deterministic floating-point
-            wasm_config.cranelift_nan_canonicalization(config.engine.canonicalize_nans);
-
-            // Exactly the features jig-core's validator accepts
-            // (`DETERMINISTIC_FEATURES`: WebAssembly 2.0 without SIMD). wasmtime
-            // 49 enables most 3.0 proposals by default (GC, memory64,
-            // exceptions, tail calls, wide arithmetic, component-model async),
-            // and turning off only threads and SIMD left the engine willing to
-            // run them. The validator rejects them first on every current
-            // path; this keeps a path that skips it from running them.
-            //
-            // Spelled out rather than shared with jig-core: wasmtime's
-            // `WasmFeatures` comes from its own wasmparser version.
-            wasm_config.wasm_features(WasmFeatures::all(), false);
-            wasm_config.wasm_features(WasmFeatures::WASM2.difference(WasmFeatures::SIMD), true);
-        }
-
-        // Memory configuration
-        //
-        // `memory_reservation` / `memory_guard_size` are wasmtime's successors to
-        // the 24.x `static_memory_maximum_size` / `dynamic_memory_guard_size`
-        // pair; upstream merged the static/dynamic split into one knob each.
-        let memory_limit_bytes = (config.limits.memory_max_mb as u64) * 1024 * 1024;
-        wasm_config.memory_reservation(memory_limit_bytes);
-        wasm_config.memory_guard_size(0x10000); // 64KB guard
-        // wasmtime's default, and deliberately well below a thread's stack. The wasm stack
-        // limit is counted from where the host calls in, on top of the host frames already on
-        // that thread. At 2 MiB it equalled a spawned thread's whole stack (Rust's and tokio's
-        // default), so unbounded recursion overran the thread's guard page and aborted the
-        // process instead of trapping.
-        wasm_config.max_wasm_stack(512 * 1024);
-
-        // Pooling allocator keeps allocation behaviour predictable.
-        //
-        // These two are the CONCURRENCY ceiling for the whole engine, not a
-        // per-execution limit. They were previously sized from
-        // `limits.max_instances` (default 1, documented as "single instance for
-        // now"), which meant a second simultaneous execution failed outright with
-        // "maximum concurrent limit of 1 for core instances reached" — invisible
-        // to any sequential benchmark, fatal to a server handling concurrent
-        // messages. `max_instances` remains the per-execution cap, enforced via
-        // StoreLimits.
-        let mut pooling = PoolingAllocationConfig::default();
-        let concurrency = config.limits.max_concurrent_instances.max(1);
-        pooling.total_core_instances(concurrency);
-        pooling.total_memories(concurrency);
-        pooling.max_memories_per_module(1);
-        pooling.max_memory_size(memory_limit_bytes as usize);
-        wasm_config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling));
-
-        // Module caching (only if explicitly enabled)
-        if config.engine.enable_cache
-            && let Some(cache_dir) = &config.engine.cache_dir
-        {
-            let cache = Cache::from_file(Some(std::path::Path::new(cache_dir)))
-                .map_err(|e| RuntimeError::InvalidConfig(format!("Cache config: {e}")))?;
-            wasm_config.cache(Some(cache));
-        }
+        let wasm_config = deterministic_config(config)?;
 
         // Build the engine
         let engine = Engine::new(&wasm_config)

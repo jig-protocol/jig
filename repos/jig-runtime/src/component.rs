@@ -6,10 +6,10 @@
 //! What it does, per decisions A2 and A3:
 //!
 //! - It refuses a component that fails jig-core's `jig-det-1` profile before compiling it.
-//! - It runs on its own engine. The engine's feature set is the profile's: WebAssembly 2.0 minus
-//!   SIMD, plus the component model, with component-model async off and NaN canonicalization and
-//!   fuel on. It does not share [`crate::engine`]'s engine, whose feature set has no component
-//!   model.
+//! - It runs on its own engine, built from the same deterministic configuration as
+//!   [`crate::engine`]'s (fuel, NaN canonicalization, WebAssembly 2.0 minus SIMD, stack limit,
+//!   pooling allocator). On top it adds only the component model, and turns component-model
+//!   async support off.
 //! - It classifies every run as one of three outcomes:
 //!   - [`RunOutcome::Ok`] for the export's `ok`;
 //!   - [`RunOutcome::Error`] for the export's `err`, or a trap that any conforming engine raises
@@ -21,13 +21,16 @@
 //! interfaces.
 //!
 //! Termination is by fuel alone. A renderer imports nothing that can block, so fuel bounds every
-//! run. A wall-clock guard would be liveness only; it can join when the engine's epoch ticker is
-//! shared.
+//! run. The shared configuration turns epoch interruption on, but nothing advances this engine's
+//! epoch, so each store's deadline is set out of reach. A wall-clock guard would be liveness only;
+//! it can join when the engine's epoch ticker is shared.
 
 use jig_core::component_validation::{BlockWorld, ComponentProfile, validate_component};
 use wasmtime::component::{Component, Linker};
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap, WasmFeatures};
+use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
 
+use crate::config::RuntimeConfig;
+use crate::engine::deterministic_config;
 use crate::error::{Result, RuntimeError};
 use crate::identity::EngineIdentity;
 
@@ -41,6 +44,10 @@ pub use jig::block::types::{BlockError, Hlc, Invocation, Payload};
 
 /// The version of `jig:block/types` the host links as an empty instance.
 const TYPES_INTERFACE: &str = "jig:block/types@0.1.0";
+
+/// An epoch deadline no run reaches. `set_epoch_deadline` adds it to the current epoch, so it
+/// stays well clear of `u64::MAX`.
+const UNREACHABLE_EPOCH: u64 = u64::MAX / 2;
 
 /// Why a run asserts nothing about the block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,19 +126,11 @@ pub struct ComponentRuntime {
 
 impl ComponentRuntime {
     pub fn new() -> Result<Self> {
-        let mut config = Config::new();
-        config.consume_fuel(true);
-        config.cranelift_nan_canonicalization(true);
+        let mut config = deterministic_config(&RuntimeConfig::default())?;
+        config.wasm_component_model(true);
+        // A narrowing, not a feature: the allowlist already leaves the component-model async
+        // features off, and this also drops wasmtime's task machinery for them.
         config.concurrency_support(false);
-        // Exactly the profile's features. wasmtime 49 enables most WebAssembly 3.0 proposals and
-        // component-model async by default.
-        config.wasm_features(WasmFeatures::all(), false);
-        config.wasm_features(
-            WasmFeatures::WASM2
-                .difference(WasmFeatures::SIMD)
-                .union(WasmFeatures::COMPONENT_MODEL),
-            true,
-        );
         let engine = Engine::new(&config)
             .map_err(|e| RuntimeError::InternalError(format!("component engine: {e}")))?;
 
@@ -200,6 +199,8 @@ impl ComponentRuntime {
         if let Err(e) = store.set_fuel(fuel) {
             return host_fault(format!("setting fuel: {e}"), 0);
         }
+        // Nothing advances this engine's epoch (see the module docs).
+        store.set_epoch_deadline(UNREACHABLE_EPOCH);
 
         let call = renderer
             .pre
@@ -233,5 +234,54 @@ fn classify(err: wasmtime::Error) -> RunOutcome {
         }
         Some(trap) => RunOutcome::Error(ErrorOutcome::Trap(trap.to_string())),
         None => RunOutcome::Incomplete(IncompleteReason::HostFault(format!("{err:#}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A component whose one core module runs `body` from its start function.
+    fn component_with_core_start(body: &str) -> Vec<u8> {
+        wat::parse_str(format!(
+            r#"(component
+                (core module $m (func $f {body}) (start $f))
+                (core instance (instantiate $m)))"#
+        ))
+        .expect("test component WAT parses")
+    }
+
+    // The engine itself refuses SIMD; the validator is not the only gate. `Component::new` is
+    // called directly so that `compile_renderer`'s validation does not get there first.
+    #[test]
+    fn the_component_engine_refuses_simd() {
+        let runtime = ComponentRuntime::new().expect("runtime builds");
+        let simd = component_with_core_start("(drop (v128.const i64x2 0 0))");
+        let err = Component::new(&runtime.engine, simd).expect_err("SIMD must be refused");
+        assert!(format!("{err:#}").contains("SIMD"), "{err:#}");
+    }
+
+    #[test]
+    fn the_component_engine_runs_out_of_fuel() {
+        let runtime = ComponentRuntime::new().expect("runtime builds");
+        let spin = component_with_core_start("(loop $l (br $l))");
+        let component = Component::new(&runtime.engine, spin).expect("compiles");
+        let mut store = Store::new(
+            &runtime.engine,
+            HostState {
+                limits: StoreLimitsBuilder::new().build(),
+            },
+        );
+        store.set_fuel(10_000).expect("fuel is on");
+        store.set_epoch_deadline(UNREACHABLE_EPOCH);
+        let err = runtime
+            .linker
+            .instantiate(&mut store, &component)
+            .map(|_| ())
+            .expect_err("an endless loop must stop");
+        assert_eq!(
+            classify(err),
+            RunOutcome::Incomplete(IncompleteReason::FuelExhausted)
+        );
     }
 }
