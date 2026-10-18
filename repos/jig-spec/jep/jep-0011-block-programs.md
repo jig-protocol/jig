@@ -115,7 +115,8 @@ This is the encoding layer jig uses for every new signed object (reference imple
    the channel gains the program (§4).
 2. **`render`** names a `program` (program CID) and carries an `input` payload.
    - A server executes it only if its `operator-policy` (§5.1) allows the program, and then
-     issues an `exec` receipt carrying both `component` and `program`. Otherwise it issues
+     issues an `exec` receipt carrying `component`, `program` and `operator_policy_cid`
+     (the `operator-policy` that authorised the run). Otherwise it issues
      `accepted`.
    - Operator policy allowing an author MUST NOT extend to children by other authors.
    - A server MUST NOT execute a `render` in a channel whose suite is not `none`.
@@ -156,7 +157,11 @@ so that every approval names the exact rules it was checked against.
    `{domain: "jig-operator-policy-v1", server, seq, allow: {programs: [cid…], authors: [did…]}}`.
    - It is the operator policy of JEP-0006 Q7 and JEP-0007 §2: which programs this server will
      execute at all.
-   - It is empty by default.
+   - A server's default `operator-policy` lists in `programs` exactly the programs the server
+     ships, and nothing else. Today that is text-block. Each built-in is published as a program
+     (§2), authored by the server's DID, so it has a program CID. Clients therefore see everything
+     the server will run, and built-ins get no implicit exception. "Empty by default" means empty
+     of third-party entries.
    - Allowing an author does not extend to children by other authors.
 
 ### 5.2 Channel policy
