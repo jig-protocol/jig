@@ -197,8 +197,10 @@ fn test_deep_recursion_traps_on_a_default_sized_thread() {
         .join()
         .expect("the test thread completes");
 
+    // The stack-overflow trap, reported as a failed run. Anything else, an unrelated error
+    // included, fails the test.
     assert!(
-        !matches!(outcome, Ok(jig_runtime::ExecutionOutcome::Success)),
+        matches!(outcome, Ok(jig_runtime::ExecutionOutcome::ExecutionFailed)),
         "{outcome:?}"
     );
 }
