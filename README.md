@@ -241,9 +241,9 @@ every workspace crate but `hello-wasm`),
 
 Back up `server.key` before you do anything else. Losing it changes the server's DID, so
 the server comes back as a different identity: its receipts are signed by a new key, and
-federation peers that list it by `expected_did` hold a stale value. Clients do not pin the
-server's DID yet. Once they do (the handshake in JEP-0002 and threat-register OP-08), a
-lost key will look like a man-in-the-middle to every client. `deploy/README.md` opens
+federation peers that list it by `expected_did` hold a stale value. The CLI pins each server's
+DID on first contact (JEP-0002, threat-register OP-08), so a lost key looks like a
+man-in-the-middle to every client that has connected before. `deploy/README.md` opens
 with this for a reason.
 
 [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the implementation, the DAG rule, and how to send a change. [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) is the community standard. [`repos/jig-spec/CONTRIBUTING.md`](repos/jig-spec/CONTRIBUTING.md) is the spec-only guide.

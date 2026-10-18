@@ -58,7 +58,7 @@ did:jig:<base58(public_key)>
 ```
 
 **Storage:**
-- Private keys MUST be stored encrypted at rest (OS keychain, hardware token, or encrypted file) *(not yet implemented: the CLI and server store raw Ed25519 keys in files with 0600 permissions, unencrypted)*
+- Private keys MUST be stored encrypted at rest (OS keychain, hardware token, or encrypted file) *(not yet implemented: the CLI and server store raw Ed25519 keys in files, unencrypted, with 0600 permissions on Unix)*
 - Backups SHOULD use multiple mechanisms (paper backup + cloud + hardware key)
 
 **Rotation:**

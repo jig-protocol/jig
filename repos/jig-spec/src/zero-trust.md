@@ -55,7 +55,7 @@ These principles guide every normative requirement in this spec:
 
 This doesn't mean you can't have trusted peers—it means trust is **earned and continuously verified**, not assumed.
 
-**Example:** When federating with another server, you don't just accept their receipts at face value. You replay blocks locally and verify the receipts match. If they diverge repeatedly, you downgrade that peer's reputation or stop federating entirely.
+**Example:** When federating with another server, you don't just accept their receipts at face value. You replay blocks locally and verify the receipts match. If they diverge repeatedly, you downgrade that peer's reputation or stop federating entirely. *(not yet implemented: a `render_hash` divergence is a warning; there is no peer reputation.)*
 
 **Trade-off:** More verification means higher CPU costs. But it prevents billing fraud and makes trustless federation possible.
 
@@ -65,7 +65,7 @@ This doesn't mean you can't have trusted peers—it means trust is **earned and 
 
 Metadata leaks are attacks. Who you talk to, when, and how often reveals a lot—even if the content is encrypted.
 
-**Example:** Jig separates routing metadata (plaintext, needed for delivery) from content (encrypted). But we still minimize routing metadata: timestamps are coarse-grained, DIDs are pseudonymous, and servers don't log connection graphs unless abuse mitigation requires it (and then with time-bounded retention). *(partial: DIDs are pseudonymous, but block timestamps carry milliseconds and the reference server logs sender DIDs; see [Logging](#logging-and-metadata-retention).)*
+**Example:** Jig separates routing metadata (plaintext, needed for delivery) from content (encrypted). But we still minimize routing metadata: timestamps are coarse-grained, DIDs are pseudonymous, and servers don't log connection graphs unless abuse mitigation requires it (and then with time-bounded retention). *(partial: DIDs are pseudonymous, but timestamps are not coarse-grained: block timestamps carry milliseconds, and the reference server logs sender DIDs; see [Logging](#logging-and-metadata-retention).)*
 
 **Why IRC mode exists:** IRC clients can't do E2EE, so content stays plaintext. This is a conscious trade-off for compatibility—users who need privacy should use WebSocket transport with E2EE enabled.
 
@@ -237,7 +237,7 @@ Here are the specific attacks Jig is designed to resist:
 
 *(partial: relayed blocks are re-verified and re-executed by the receiving server, and a `render_hash` divergence is a warning; there is no peer reputation, no per-peer quota and no useful-work proof.)*
 
-**Example attack:** Malicious server sends you receipts claiming blocks used 1M fuel when they actually used 100k (billing fraud). You replay locally, detect mismatch, and downgrade that peer's reputation. After repeated violations, you stop federating with them.
+**Example attack:** Malicious server sends you receipts claiming blocks used 1M fuel when they actually used 100k (billing fraud). You replay locally, detect mismatch, and downgrade that peer's reputation. After repeated violations, you stop federating with them. *(not yet implemented: see above.)*
 
 ### 3. Compromised Client or Server
 

@@ -424,7 +424,7 @@ After 5 seconds → both sent together
 
 **Don't:**
 
-- Store keys in plaintext files. *(the reference CLI and server do, with 0600 permissions; see [Crypto Primitives § Identity Keys](crypto.md#identity-keys-long-term))*
+- Store keys in plaintext files. *(the reference CLI and server do, with 0600 permissions on Unix; see [Crypto Primitives § Identity Keys](crypto.md#identity-keys-long-term))*
 - Commit keys to git.
 - Send keys via email or Slack.
 
@@ -463,7 +463,7 @@ After 5 seconds → both sent together
 
 **For end users:** If you suspect your key is compromised:
 
-1. **Rotate immediately** (publish rotation certificate).
+1. **Rotate immediately** (publish rotation certificate). *(not yet implemented: generate a new key, which is a new DID, and, if you still hold the old key, move your alias to it with the nameserver's `/v1/rotate`.)*
 2. **Notify contacts** ("I rotated my key—verify new key fingerprint is XYZ").
 3. **Audit recent messages** (check if attacker sent messages on your behalf).
 

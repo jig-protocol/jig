@@ -29,7 +29,7 @@ Messages aren't just text—they can contain **blocks** (WebAssembly modules) th
 
 ### It's Zero-Trust
 
-You sure _seem_ friendly, but... we're not going to take your word for it. We assume networks are hostile and metadata leaks. Every operation requires cryptographic proof. Capabilities are explicitly granted, never assumed. Encryption is on by default. Fail closed, not open.
+You sure _seem_ friendly, but... we're not going to take your word for it. We assume networks are hostile and metadata leaks. Every operation requires cryptographic proof. Capabilities are explicitly granted, never assumed. Encryption is on by default *(a goal: today only DMs and channels created encrypted are end-to-end encrypted)*. Fail closed, not open.
 
 ### It's Designed to Scale
 
