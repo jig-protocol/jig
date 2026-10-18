@@ -52,8 +52,9 @@ Non-goals:
 The package is `jig:block`, versioned with semver. During v0.3 development it is `0.1.0`, and
 every minor version is incompatible.
 
-- **`renderer`** exports `render: func(inv: invocation) -> result<payload, block-error>`. Its
-  only possible import is `jig:host/compose`, for child renderers its manifest pins by CID.
+- **`renderer`** exports `render: func(inv: invocation) -> result<payload, block-error>`. It
+  imports `jig:block/types` (types, no functions), which every host links as an empty instance,
+  and at most `jig:host/compose`, for child renderers its manifest pins by CID.
 - **`bot`** exports
   `handle: func(inv: invocation, state: list<u8>) -> result<handled, block-error>`, where
   `handled` carries the returned effects and an optional new state. It imports only
