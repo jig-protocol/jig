@@ -55,7 +55,10 @@ pub enum SuiteRefusal {
     Missing { field: &'static str },
     /// Plaintext `body` on an encrypted channel. Refused outright, so a buggy
     /// client cannot leak a message into a channel its users think is sealed.
-    Plaintext { slug: String },
+    Plaintext {
+        slug: String,
+        suite: EncryptionSuite,
+    },
     /// The MLS payload failed validation.
     Mls(jig_mls::MlsError),
     /// A restricted `channel-create` whose suite is not `mls`. Content the
@@ -241,23 +244,28 @@ pub fn plan(
                     block: block_suite.to_string(),
                 });
             }
-            if channel_suite != EncryptionSuite::Mls {
+            let Some(payload_field) = channel_suite.payload_field() else {
                 if !crate::visibility::is_open(&channel.visibility) {
                     return Err(SuiteRefusal::PlaintextRestricted {
                         slug: channel.slug.clone(),
                     });
                 }
                 return Ok(MlsPlan::Nothing);
-            }
+            };
+            // Every encrypted suite: ciphertext in the suite's field, and no
+            // plaintext beside it.
             if manifest.metadata.contains_key("body") {
                 return Err(SuiteRefusal::Plaintext {
                     slug: channel.slug.clone(),
+                    suite: channel_suite,
                 });
             }
-            let group = group.ok_or(SuiteRefusal::Mls(jig_mls::MlsError::UnknownGroup))?;
-            let message = meta_bytes(manifest, keys::MESSAGE)?;
-            delivery::check_application(&group.state, &group.group_id, &message)
-                .map_err(SuiteRefusal::Mls)?;
+            let payload = meta_bytes(manifest, payload_field)?;
+            if channel_suite == EncryptionSuite::Mls {
+                let group = group.ok_or(SuiteRefusal::Mls(jig_mls::MlsError::UnknownGroup))?;
+                delivery::check_application(&group.state, &group.group_id, &payload)
+                    .map_err(SuiteRefusal::Mls)?;
+            }
             Ok(MlsPlan::Sealed)
         }
     }
@@ -738,7 +746,8 @@ mod tests {
                 Some(&g)
             ),
             Err(SuiteRefusal::Plaintext {
-                slug: "#sealed".to_string()
+                slug: "#sealed".to_string(),
+                suite: EncryptionSuite::Mls,
             })
         );
     }
@@ -834,5 +843,132 @@ mod tests {
                 field: keys::COMMIT
             })
         );
+    }
+
+    /// A second suite runs through the same gate: open-only, ciphertext in
+    /// its own field, no plaintext beside it, a sealed receipt, and no group.
+    /// This crate's dev-dependency on jig-core registers the suite.
+    mod test_aead {
+        use super::*;
+        use jig_core::suite::test_aead;
+
+        fn open_chan(owner: &str) -> StoredChannel {
+            StoredChannel {
+                visibility: "open".to_string(),
+                ..chan("test-aead", owner)
+            }
+        }
+
+        fn post(sender: &str, meta: Value) -> BlockManifest {
+            manifest(
+                BlockKind::TextRender,
+                sender,
+                EncryptionSuite::TestAead,
+                meta,
+            )
+        }
+
+        #[test]
+        fn create_is_open_only_and_needs_no_group() {
+            let a = who(1);
+            let open = manifest(
+                BlockKind::ChannelCreate,
+                &a.did,
+                EncryptionSuite::Unencrypted,
+                json!({"slug": "#t", "suite": "test-aead"}),
+            );
+            assert_eq!(
+                plan(BlockKind::ChannelCreate, &a.did, &open, None, None),
+                Ok(MlsPlan::Nothing)
+            );
+            let restricted = manifest(
+                BlockKind::ChannelCreate,
+                &a.did,
+                EncryptionSuite::Unencrypted,
+                json!({"slug": "#t", "suite": "test-aead", "visibility": "restricted"}),
+            );
+            assert_eq!(
+                plan(BlockKind::ChannelCreate, &a.did, &restricted, None, None),
+                Err(SuiteRefusal::RestrictedNeedsMls {
+                    slug: "#t".to_string()
+                })
+            );
+        }
+
+        #[test]
+        fn content_is_sealed_ciphertext_in_its_own_field() {
+            let a = who(1);
+            let c = open_chan(&a.did);
+            let sealed = test_aead::seal("#sealed", &a.did, &[1; 12], b"hi");
+            let ok = post(
+                &a.did,
+                json!({"channel": "#sealed", "test_ciphertext": b64(&sealed)}),
+            );
+            assert_eq!(
+                plan(BlockKind::TextRender, &a.did, &ok, Some(&c), None),
+                Ok(MlsPlan::Sealed)
+            );
+            let missing = post(&a.did, json!({"channel": "#sealed"}));
+            assert_eq!(
+                plan(BlockKind::TextRender, &a.did, &missing, Some(&c), None),
+                Err(SuiteRefusal::Missing {
+                    field: "test_ciphertext"
+                })
+            );
+            let leaky = post(
+                &a.did,
+                json!({"channel": "#sealed", "test_ciphertext": b64(&sealed), "body": "hi"}),
+            );
+            assert_eq!(
+                plan(BlockKind::TextRender, &a.did, &leaky, Some(&c), None),
+                Err(SuiteRefusal::Plaintext {
+                    slug: "#sealed".to_string(),
+                    suite: EncryptionSuite::TestAead,
+                })
+            );
+            // MLS ciphertext is not this suite's, and neither is plaintext.
+            for (suite, meta) in [
+                (
+                    EncryptionSuite::Mls,
+                    json!({"channel": "#sealed", "mls_message": "AA=="}),
+                ),
+                (
+                    EncryptionSuite::Unencrypted,
+                    json!({"channel": "#sealed", "body": "hi"}),
+                ),
+            ] {
+                let m = manifest(BlockKind::TextRender, &a.did, suite, meta);
+                assert!(matches!(
+                    plan(BlockKind::TextRender, &a.did, &m, Some(&c), None),
+                    Err(SuiteRefusal::Mismatch { .. })
+                ));
+            }
+        }
+
+        #[test]
+        fn membership_is_plain_control() {
+            let a = who(1);
+            let c = open_chan(&a.did);
+            let add = manifest(
+                BlockKind::MemberAdd,
+                &a.did,
+                EncryptionSuite::Unencrypted,
+                json!({"channel": "#sealed", "member_did": who(2).did}),
+            );
+            assert_eq!(
+                plan(BlockKind::MemberAdd, &a.did, &add, Some(&c), None),
+                Ok(MlsPlan::Nothing)
+            );
+            let declared = manifest(
+                BlockKind::MemberAdd,
+                &a.did,
+                EncryptionSuite::TestAead,
+                json!({"channel": "#sealed", "member_did": who(2).did}),
+            );
+            assert!(matches!(
+                plan(BlockKind::MemberAdd, &a.did, &declared, Some(&c), None),
+                Err(SuiteRefusal::Mismatch { .. })
+            ));
+        }
     }
 }

@@ -815,7 +815,11 @@ fn print_channels(channels: &[ChannelView]) {
         .unwrap_or(0)
         .max(10);
     for c in channels {
-        let sealed = if c.suite == "mls" { "🔒" } else { "  " };
+        let sealed = if !matches!(c.suite.as_str(), "" | "none") {
+            "🔒"
+        } else {
+            "  "
+        };
         println!(
             "{:<slug_w$}  {:<vis_w$}  {sealed}  {}",
             c.slug,

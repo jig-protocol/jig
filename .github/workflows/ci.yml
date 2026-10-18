@@ -102,6 +102,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: repos
+      - name: Test-only suites stay out of every build
+        # `test-aead` (jig-core `test-suite`) and long-lived MLS leaves
+        # (jig-mls `conformance`) exist for the conformance vectors only.
+        # Dev-dependencies may enable them; no crate's normal or build graph
+        # may, or a release binary would register a test suite (JEP-0001).
+        run: |
+          if cargo tree --workspace -e normal,build,features \
+              | grep -E 'jig-core feature "test-suite"|jig-mls feature "conformance"'; then
+            echo "::error::a normal dependency enables a test-only feature"
+            exit 1
+          fi
       - name: Format (v0.0.2 surface)
         # Scoped to v0.0.2-touched crates. jig-spec may still have
         # upstream formatting drift and is not gated. jig-bridge-email is

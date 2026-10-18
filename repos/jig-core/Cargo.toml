@@ -30,6 +30,8 @@ rand = { version = "0.10", optional = true }
 # Clears the seed buffer in `crypto::ed25519::generate_signing_key`. Already in
 # the tree via curve25519-dalek, so this adds a Cargo.toml line, not a build.
 zeroize = { version = "1", optional = true }
+# The `test-aead` conformance suite. Already in the tree through openmls.
+chacha20poly1305 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 proptest = "1.0"
@@ -38,3 +40,8 @@ wat = "1.0"
 [features]
 default = []
 ed25519 = ["ed25519-dalek", "rand", "zeroize"]
+# Registers `test-aead`, the suite reserved for conformance testing
+# (JEP-0001). Enable it only from `[dev-dependencies]`: a production build
+# must refuse every `test-` suite as unregistered. CI checks that no binary's
+# normal dependency graph turns it on.
+test-suite = ["dep:chacha20poly1305"]
