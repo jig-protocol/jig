@@ -170,6 +170,17 @@ Non-goals for v0.2:
        with new bot DIDs and `inherits_state_from`). By default it carries one per current
        bot. The new sequencer MUST name the new bot DIDs in its `contract-accept`.
 
+11b. When the sequencer moves (11a), the new sequencer countersigns, as part of its
+     `contract-accept`:
+     - the channel's current `channel-policy`;
+     - every live `block-install`.
+
+     Each is a `COSE_Sign` (JEP-0004 rule 0) with the owner's signature first and the
+     hosting server's second. Until the new sequencer has countersigned a policy or an
+     install, that object is not signed by the server that hosts the channel, and clients
+     MUST treat it as absent: no policy, no install. A move without these countersignatures
+     therefore leaves the channel with no policy. JEP-0011 defines both objects.
+
 ## Ordering
 
 12. The owner MUST attach to each block it accepts the `ingest` record of JEP-0002:
