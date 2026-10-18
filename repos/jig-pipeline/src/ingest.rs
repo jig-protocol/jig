@@ -2172,7 +2172,8 @@ mod tests {
             .upsert_channel(&StoredChannel {
                 id: "#dm/x".into(),
                 slug: "#dm/x".into(),
-                visibility: "restricted".into(),
+                // Bridges carry plaintext, which only an open channel takes (D25).
+                visibility: "open".into(),
                 created_at: 0,
                 owner_did: bob_did.clone(),
                 suite: "none".to_string(),
@@ -2229,7 +2230,8 @@ mod tests {
             .upsert_channel(&StoredChannel {
                 id: channel_cid.clone(),
                 slug: "#dm/z".into(),
-                visibility: "restricted".into(),
+                // Bridges carry plaintext, which only an open channel takes (D25).
+                visibility: "open".into(),
                 created_at: 0,
                 owner_did: bob_did.clone(),
                 suite: "none".to_string(),

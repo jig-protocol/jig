@@ -654,8 +654,14 @@ mod tests {
             squat("#dm/0011223344556677"),
             Err(SuiteRefusal::Missing { field: "dm_peer" })
         );
-        // The rest of the namespace is untouched.
-        assert_eq!(squat("#email/0011223344556677"), Ok(MlsPlan::Nothing));
+        // The rest of the namespace is not a DM; restricted, it still needs
+        // `mls` like any other restricted channel.
+        assert_eq!(
+            squat("#email/0011223344556677"),
+            Err(SuiteRefusal::RestrictedNeedsMls {
+                slug: "#email/0011223344556677".to_string()
+            })
+        );
     }
 
     #[test]
@@ -663,7 +669,10 @@ mod tests {
         let a = who(1);
         let g = genesis(&a);
         let sealed = chan("mls", &a.did);
-        let plain = chan("none", &a.did);
+        let plain = StoredChannel {
+            visibility: "open".to_string(),
+            ..chan("none", &a.did)
+        };
 
         let text = manifest(
             BlockKind::TextRender,

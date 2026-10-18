@@ -22,7 +22,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use jig_bridge_email::{
     EmailBridge, EmailBridgeConfig, EmailProvider, InboundEmail, InboundNotification,
-    OutboundEmail, ProviderMessageId, shadow_did, shadow_signing_key, thread_slug,
+    OutboundEmail, ProviderMessageId, shadow_did, thread_slug,
 };
 use jig_config::v0_0_2_server::JigServerConfig;
 use jig_server::v0_0_2::AppState;
@@ -210,21 +210,6 @@ fn convo_slug() -> String {
     let alice = shadow_did(SECRET, "alice@example.com", false).to_did_jig_string();
     let dj = shadow_did(SECRET, "dj@jig.onl", false).to_did_jig_string();
     thread_slug(&alice, &dj)
-}
-
-/// Poll `cond` every 20ms until it is true or `secs` elapse (then panic).
-/// Replaces fixed sleeps so the test isn't flaky under CI load — it waits only
-/// as long as needed and fails loudly with a clear message on a real hang.
-async fn wait_until<F: FnMut() -> bool>(mut cond: F, secs: u64, what: &str) {
-    let start = tokio::time::Instant::now();
-    let deadline = std::time::Duration::from_secs(secs);
-    while !cond() {
-        assert!(
-            start.elapsed() < deadline,
-            "timed out after {secs}s waiting for: {what}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -623,7 +623,8 @@ mod tests {
             .upsert_channel(&StoredChannel {
                 id: "bafyDmX".to_string(),
                 slug: "#dm/x".to_string(),
-                visibility: "restricted".to_string(),
+                // Bridges carry plaintext, which only an open channel takes (D25).
+                visibility: "open".to_string(),
                 created_at: 0,
                 owner_did: shadow_did.clone(),
                 suite: "none".to_string(),
@@ -640,9 +641,8 @@ mod tests {
             .unwrap();
 
         // Bob (NOT the shadow DID) posts a text-render block to "#dm/x". He
-        // is the DM's other member, exactly as `ensure_dm_channel` would have
-        // enrolled him: the channel is restricted, and a non-member's post is
-        // refused at ingest before it reaches fanout.
+        // is the channel's other member, exactly as the bridge would have
+        // enrolled him; delivery to the shadow DID follows membership.
         let dir = tempdir().unwrap();
         let bob = Identity::generate_and_save(&dir.keep()).unwrap();
         store
