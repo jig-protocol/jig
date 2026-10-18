@@ -751,7 +751,7 @@ JEPs**, with numbers reserved by the orchestrator:
    assigned the logs here rather than to F3's JEP;
 3. **JEP-0010**, reports, tribunals and server lists (R5, R6, R8).
 
-**JEP-0001:** every suite JEP defines a report profile (8.3); lane S owns the edit.
+**JEP-0001:** every suite JEP states that it delivers the plaintext, franking key included, intact to every member, so franking works over it (8.3); lane S owns the edit.
 
 **JEP-0005:** rule 15's "admission, proof-of-work and rate limits" gains a reference to R1's
 stranger pool; rule 14b's list gains R's issuer and evidence rules (section 11).
