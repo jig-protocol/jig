@@ -92,11 +92,10 @@ async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok\n")
 }
 
-/// Prometheus text exposition of the v0.0.2 WebSocket counters.
+/// Prometheus text exposition of the v0.0.2 counters.
 ///
-/// The numbers are hand-rolled `AtomicU64`s living in
-/// [`crate::v0_0_2_ws::metrics`] — see that module for what is and is not
-/// counted (federation and bridge ingest are NOT).
+/// The numbers are hand-rolled `AtomicU64`s rendered by
+/// [`crate::v0_0_2_ws::metrics`] — see that module for what each one counts.
 async fn metrics() -> impl IntoResponse {
     (
         StatusCode::OK,

@@ -673,6 +673,7 @@ pub async fn ingest(
         }
     }
 
+    crate::metrics::block_ingested(&source);
     Ok(block_cid)
 }
 
