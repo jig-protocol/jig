@@ -22,7 +22,7 @@ authoritative for the suffix. This JEP specifies:
 - how whoever acts on a binding verifies it;
 - how clients pin names and accept changes;
 - what resolvers keep as evidence;
-- the DID-signed home record that says where a DID is served.
+- the DID-signed reachability record that says where a DID can be reached.
 
 Design record, alternatives and prior art:
 [`docs/superpowers/specs/2026-10-18-federation-naming-and-contract-design.md`](../../../docs/superpowers/specs/2026-10-18-federation-naming-and-contract-design.md),
@@ -147,13 +147,15 @@ Non-goals:
 18. A resolver SHOULD keep every attestation and rotation statement it acted on until at
     least its `valid_until` plus 30 days, and SHOULD let the holder export them.
 
-## Home records
+## Reachability records
 
-19. A home record (pending DJ) is `{did, homes: [{server_did, url}], seq, sig}`, signed by
-    `did` over (`domain`, `jig-home-v1`), (`did`), the canonical JSON of `homes`, and
-    (`seq`).
+19. A reachability record (pending DJ) is `{did, servers: [{server_did, url}], seq, sig}`,
+    signed by `did` over (`domain`, `jig-reach-v1`), (`did`), the canonical JSON of
+    `servers`, and (`seq`).
+    - A DID has no home server. The record lists the servers where the DID wants to be
+      found, in no order, and the DID MAY leave servers out.
     - The record with the highest valid `seq` wins.
-    - A server SHOULD serve its users' home records.
+    - A server SHOULD serve the records of DIDs that list it.
     - A nameserver MAY serve one beside an attestation.
     - Nobody but the DID can produce one.
 
@@ -175,7 +177,7 @@ Non-goals:
   (v0.3) or out-of-band comparison.
 - **NS-03** is unchanged until ruleset-group delegation.
 - **Domain seizure** under discovery redirects a suffix for names nobody has pinned yet.
-- **Home records** misroute only to denial of service, because key packages are
+- **Reachability records** misroute only to denial of service, because key packages are
   self-signed.
 
 **Privacy:**
@@ -189,8 +191,8 @@ Non-goals:
 - v0.x makes no compatibility guarantee.
 - Attestations signed under the old JSON encoding are refused once a resolver implements
   this JEP. Nameservers re-issue them on renew.
-- `/v1/resolve/{alias}` keeps its path and adds the rotation chain and an optional home
-  record.
+- `/v1/resolve/{alias}` keeps its path and adds the rotation chain and an optional
+  reachability record.
 
 # Reference Implementation
 
@@ -203,7 +205,7 @@ To be added with F1:
 - an attestation;
 - a rotation statement;
 - a delegation document;
-- a home record;
+- a reachability record;
 
 each as inputs, hash and signature, under a fixed test key.
 
@@ -213,7 +215,7 @@ each as inputs, hash and signature, under a fixed test key.
   able to substitute keys (D11).
 - **Failover between nameservers.** A second nameserver that is asked only when the first
   fails adds availability and hides disagreement. Disagreement must refuse.
-- **The nameserver asserting the home server.** It couples routing to naming and lets the
+- **The nameserver asserting where a DID is reached.** It couples routing to naming and lets the
   nameserver misdirect.
 - **Names as `user@server`.** That ties identity to a server, which DIDs exist to avoid.
 

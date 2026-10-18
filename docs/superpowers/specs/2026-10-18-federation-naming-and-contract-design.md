@@ -20,7 +20,7 @@ Two things, so that v0.2 can meet exit criterion 5 without weakening criteria 1�
    nameserver nor the user's own server can swap in another key without the client
    noticing (OP-08, NS-01, NS-02).
 2. **A contract between two jig servers** under which a restricted MLS channel owned by
-   server A has members whose home is server B, with no plaintext anywhere but the
+   server A is shared with server B, and B's clients read and write it, with no plaintext anywhere but the
    members' clients (D12, D24, D25).
 
 Out of scope for v0.2, and placed in [section 9](#9-milestones): ruleset groups and
@@ -114,7 +114,7 @@ is a small fix PR, not part of this design.
   commits as `PublicMessage`, exact epoch match, and the commit must do exactly what the
   block says (`jig-mls/src/delivery.rs:125`). Ordering is a compare-and-swap on the epoch,
   atomic with the membership change (`jig-pipeline/src/persist.rs:888`).
-- Key packages live on the DID's home server: `POST`/`GET /api/v1/mls/key-packages`,
+- Key packages live on the server the DID uploads them to: `POST`/`GET /api/v1/mls/key-packages`,
   validated as self-signed and bound to the DID (`jig-server/src/v0_0_2_mls.rs`).
 - Only clients commit. The owner adds; anyone may external-join an open channel.
 
@@ -348,22 +348,28 @@ it to a tribunal or a transparency log is v0.3 (lane R).
   HTTP stays only behind an antipattern flag. The attestation's signature does not depend
   on the transport, but discovery under option A does.
 
-### 4.7 Where a DID lives: the home record
+### 4.7 Where a DID can be reached: the reachability record
 
-The contract needs to know which server hosts a DID's key packages and inbox. A DID is a
-key and carries no location.
+A DID has no home server (DJ, 2026-10-18). A client authenticates to whichever servers it
+chooses and may use several. The contract still needs to know where a DID can be reached
+and where its key packages are stocked, because a DID is a key and carries no location.
 
-| Option | Who asserts "Alice's home is server B" | Against |
+| Option | Who asserts "Alice is reachable at server B" | Against |
 | --- | --- | --- |
 | **A. The attestation carries it** | The nameserver | The nameserver can misdirect. Key packages are self-signed, so the harm is denial of service, but it couples naming to routing |
-| **B. A home record signed by the DID** | Alice's own key: `{did, homes: [{server_did, url}], seq, sig}` | Alice's client must publish it. A stale record misroutes until it is replaced |
+| **B. A reachability record signed by the DID** | Alice's own key: `{did, servers: [{server_did, url}], seq, sig}` | Alice's client must publish it. A stale record misroutes until it is replaced |
 | **C. Ask around** | Nobody in particular | Leaks who is looking for whom, and there is no answer when nobody knows |
 
-**Recommendation: B.** The record is self-certifying, so it can be served by Alice's
-server, by any nameserver next to her attestation, or embedded in a `member-add` block.
-The highest `seq` wins. It also keeps routing out of the nameserver's power. **Open for
-DJ:** whether one DID may name several home servers in v0.2. The recommendation is that
-the type allows a list and v0.2 uses the first entry.
+**Recommendation: B.**
+- The record is self-certifying, so it can be served by any server Alice uses, by any
+  nameserver next to her attestation, or embedded in a `member-add` block.
+- The highest `seq` wins.
+- It keeps routing out of the nameserver's power.
+- It lists every server Alice uses, in no particular order. It names no "home".
+- Alice's client stocks key packages on each server it lists.
+
+**Open for DJ:** whether Alice may leave a server she uses out of the record, for privacy.
+The recommendation is yes: the record lists only the servers where she wants to be found.
 
 ## 5. The channel contract (JEP-0005)
 
@@ -374,24 +380,50 @@ the type allows a list and v0.2 uses the first entry.
 - The **owning server** (MIMI's hub) holds the channel's authoritative state: the creation
   block, membership, and the MLS public group. It orders every block, validates every
   commit, and fans accepted blocks out to followers.
-- A **follower** is a server with at least one member of the channel among its users. It
-  relays its users' writes to the owner and delivers the owner's ordered stream to its
-  users.
+- A **follower** is a server the channel has been **shared** with, under a grant
+  (5.2). It serves the channel to the clients authenticated to it, relays their writes to
+  the owner as far as its grant allows, and delivers the owner's ordered stream.
+- **Clients do not care who owns a channel (DJ).** A client reads and writes a shared
+  channel through whatever server it is authenticated to, if that server carries the
+  channel. Ownership is a server-to-server concern. A client that sees one channel through
+  two servers recognises it by its id (6) and the same `ingest` records.
 - Every server, owner or follower, re-verifies each block's author signature and runs its
   own gates (OP-09 as today). A follower also tracks the MLS public group from the stream
   and refuses to deliver a commit that does not validate. It does not have to trust the
   owner to be correct, only to be live.
 
-### 5.2 How a remote member writes
+### 5.2 How a member on another server writes, and share grants
 
-| Option | Path | For | Against |
-| --- | --- | --- | --- |
-| **A. Relay through the home server** (MIMI, MIX, ActivityPub) | client → home → owner | The home server stays the enforcement boundary for its own users: admission, proof-of-work, rate limits, reputation reports (D23). It queues for offline clients. The owner sees one accountable peer per server, not every client (AB-03). The client's address stays hidden from the owner | Two hops. The home server sees channel metadata. The home server can censor its own users, which it can already do to everything they send |
-| **B. The client connects to the owner directly** | client → owner | DIDs are server-independent, so a jig client could simply authenticate to the owner. No server-to-server write path at all | The owner must admit and rate-limit strangers. Every client needs a link to every owner. Offline delivery and reputation reporting have no home. It is not federation in D23's sense |
-| **C. Multi-homed** (Matrix, IRC) | client → any participating server | No single point of failure | Rejected: it needs a state-resolution algorithm, and the MLS delivery service needs one linear epoch history. This is the Matrix state-reset class, plus MLS forks |
+**Decided (DJ, 2026-10-18).** A client writes to a shared channel through whatever
+server it is authenticated to, if that server carries the channel. That server relays the
+write to the owner. There is no home server, and the client never has to find the owner.
+Sharing a channel is a server-to-server act, and **a share carries a grant**:
 
-**Recommendation: A**, with B allowed later as a client fallback when the home server is
-down. **Open for DJ.**
+| Grant (proposed set) | A follower may relay | Clients authenticated to the follower |
+| --- | --- | --- |
+| `read` | nothing but self-leave | read; to write, they connect to the owner directly, if the owner admits them |
+| `write` | content blocks from channel members | read and post |
+| `member` | content, plus membership blocks (adds, self-joins on open channels, removals) the channel's membership rule allows | everything a local client could do |
+
+Consequences:
+
+- **The owner enforces the grant,** on every relayed block, in its write gate. A follower
+  SHOULD refuse early, but the owner never trusts it to.
+- **The relaying server is the enforcement boundary for the clients authenticated to
+  it.** It applies admission, proof-of-work, rate limits and reputation reports (D23)
+  before it relays. The owner sees one accountable peer per server, not every client
+  (AB-03). The client's address stays hidden from the owner.
+- **A read-only share forces "connect to the owner directly"** for anyone who wants to
+  write. The owner then treats that client as its own, under its own admission.
+- **A `read` grant on an encrypted channel weakens it.** Remote readers are MLS members
+  who can never send a commit, so they cannot update their own keys and post-compromise
+  security does not reach them. Two ways to handle it:
+  - a `read` grant still relays MLS self-updates (empty commits) but not content;
+  - `read` is for open channels only.
+
+  Recommendation: the first.
+- **Rejected:** multi-homing (Matrix, IRC), where any server accepts writes with no owner.
+  It needs state resolution, and MLS needs one linear epoch history.
 
 ### 5.3 The MLS delivery service across servers
 
@@ -401,8 +433,8 @@ down. **Open for DJ.**
   unchanged: an exact epoch match, a commit that does exactly what its block says, and a
   compare-and-swap on the epoch. Only clients commit.
 - **The owner signs the order, using L7's `ingest` record (decided by DJ, 2026-10-18).**
-  - Every block gets a record signed by the channel's home server:
-    `{channel_id, seq, ingest_hlc, block_cid, prev}`. Here the home server is the owner.
+  - Every block gets a record signed by the channel's owning server (L7 calls it the
+    channel's home server): `{channel_id, seq, ingest_hlc, block_cid, prev}`.
   - The record travels with the block. Relaying servers pass it through unchanged and
     never re-sign it.
   - Authored blocks carry `seen`, the hash of the latest record their author verified.
@@ -414,24 +446,31 @@ down. **Open for DJ.**
 - **Followers validate too** (5.1), so a buggy or hostile owner cannot wedge remote
   members with a commit that will not apply.
 - **The owner's server key goes into the group's `external_senders`** only if the owner
-  needs to propose removals (for example, of a member whose home server left the
-  contract). The recommendation for v0.2 is no external senders: members commit
+  needs to propose removals (for example, of members reachable only through a follower
+  whose share ended). The recommendation for v0.2 is no external senders: members commit
   everything, as today.
 
 ### 5.4 Fetching key packages across servers
 
-**Proposed.** Bob's client, adding Alice (home: server B) to channel X (owner: A),
-fetches a key package **through the owner**: Bob's client → Bob's home server → A → B.
+**Proposed.** Bob adds Alice to channel X, owned by server A.
+- Alice's reachability record (4.7) lists the servers she uses. At least one of them must
+  carry X under a `member` grant, or be A itself. Otherwise X has to be shared to one of
+  them first (5.5).
+- Bob's client asks the server it is authenticated to. That server asks A, and A asks the
+  follower where Alice is reachable, over the share link: Bob's server → A → Alice's
+  server.
 
-- **Through the owner,** because A must be a peer of every follower anyway. Routing
-  direct from home to home would need every pair of servers to peer (n² links).
-- **B releases a key package only under Alice's consent policy.** In v0.2 the policy is
-  coarse: anyone, members of servers I share a channel with, or contacts only. MIMI's
-  per-requester consent exchange is v0.3.
-- **The request is signed by the requester's DID** and names the channel, so B can apply
-  the policy and log the request.
-- **The key package is self-signed by Alice's DID,** so A and the relays cannot
-  substitute one (D2 / decision 1 of M2). They can only withhold.
+Rules:
+
+- **Through the owner,** because A is a peer of every follower anyway. Routing between
+  followers directly would need every pair of servers to peer (n² links).
+- **Alice's server releases a key package only under Alice's consent policy.** In v0.2 the
+  policy is coarse: anyone; members of channels shared with this server; or contacts only.
+  MIMI's per-requester consent exchange is v0.3.
+- **The request is signed by the requester's DID** and names the channel, so Alice's
+  server can apply the policy and log the request.
+- **The key package is self-signed by Alice's DID,** so A and the relays cannot substitute
+  one (D2 / decision 1 of M2). They can only withhold.
 
 ### 5.5 Offer, accept and refuse on the wire
 
@@ -441,10 +480,14 @@ fetches a key package **through the owner**: Bob's client → Bob's home server 
    server's DID. The suite, the membership rule and the protocol version are already in
    it. The creation block is the contract's terms, and the suite is fixed there for the
    channel's life (D12).
-2. **A follower joins when a `member-add` names a DID whose home is a server not yet
-   party.** The owner sends that server a `contract-offer`, signed by the owner, carrying
-   the creation block, the current sequence head and the owner's signed peer policy
-   (5.6).
+2. **A share starts with an offer.** The owner sends the target server a `contract-offer`,
+   signed by the owner, carrying:
+   - the creation block;
+   - the grant (5.2);
+   - the current `ingest` head;
+   - the owner's signed peer policy (5.6).
+
+   Who may cause an owner to share a channel is open (section 11, question 2b).
 3. **The server answers with a `contract-accept` or a `contract-refuse`, signed by its
    DID.**
    - An accept cites the creation block's CID and its own policy's hash, and states that
@@ -455,9 +498,9 @@ fetches a key package **through the owner**: Bob's client → Bob's home server 
 4. **The accept is a block in the channel's log,** so every member can see which servers
    carry the channel, and a server that breaks the contract has signed the evidence
    (whitepaper 9.1.5).
-5. **Leaving.** When a follower's last member leaves, the follower sends a signed
-   `contract-end`, or the owner ends it. Members commit the removal of any leaves that
-   remain.
+5. **Ending.** Either side ends a share with a signed `contract-end`. Members then commit
+   removals for any leaves reachable only through that follower. A grant changes by a new
+   offer and accept.
 
 ### 5.6 Signed peer policy
 
@@ -497,8 +540,8 @@ v0.3.
 
 | Thing | Identifier | Hints (not identity) |
 | --- | --- | --- |
-| Server | its DID | URL, from config, a home record or `/.well-known/jig` |
-| User | their DID | name (`alias@suffix`), home record |
+| Server | its DID | URL, from config, a reachability record or `/.well-known/jig` |
+| User | their DID | name (`alias@suffix`), reachability record |
 | Channel | `(owner_server DID, channel id)`, where the id is the CID of the `channel-create` block | slug, unique only per owner |
 | Device | out of scope: one DID, one device, until lane I | |
 
@@ -516,7 +559,7 @@ L1, so F asks L1 to add one now.
 
 | Requirement today | Disposition |
 | --- | --- |
-| DNS SRV `_jig._tcp` discovery, MUST | **Drop to MAY.** Peers are configured by DID plus URL, and URLs come from config, home records or `/.well-known/jig` |
+| DNS SRV `_jig._tcp` discovery, MUST | **Drop to MAY.** Peers are configured by DID plus URL, and URLs come from config, reachability records or `/.well-known/jig` |
 | `/.well-known/jig` "HTTP, not HTTPS" | **Drop.** It is served over TLS, and the DID-bound TLS binding lives there (#95) |
 | mTLS with X.509 client certificates | **Rewrite:** DID-bound TLS, plus a mutual JEP-0002 handshake in both directions (lane L7 owns the handshake) |
 | Server signs every federation payload in a `from_server`/`to_server`/nonce envelope | **Rewrite.** Blocks are author-signed and CID-addressed. Contract messages and `ingest` records are server-signed. The handshake binds the connection. No second envelope |
@@ -545,15 +588,15 @@ Updated in the implementation PRs, not here.
 | NS-03 | Unchanged in v0.2; ruleset-group threshold delegation in v0.3 |
 | AB-01 | Domain-separated, alias-bound proof of control |
 | AB-03 | Per-peer quotas; relayed writes attributable to the relaying server |
-| PV-01, OP-04 | Unchanged claim (none). Follower relay adds the home server as an observer of channel metadata, which is stated |
+| PV-01, OP-04 | Unchanged claim (none). Follower relay adds the relaying server as an observer of channel metadata, which is stated |
 
 ## 9. Milestones
 
 | Milestone | Ships in | Contents | Depends on |
 | --- | --- | --- | --- |
 | **F0** | now | This design and the two JEP drafts. L1 adds a banner to `federation.md`. A small PR makes the orphan-post and no-policy paths fail closed | nothing |
-| **F1: verified names** | v0.2.x | Canonical attestation and proof encodings (4.6); nameserver TLS; suffix delegation by config and `.well-known` (4.2 A+B); verification in the client and the server's resolver (4.3); client name pins and the change rule (4.4); retained attestations (4.5); `jig dm`/`channel add` accept names; home records (4.7) | L7 for `jig trust` UX; L6 for nameserver code |
-| **F2: the contract between two jig servers** | v0.2.x, gate G3 | Channels keyed by owner and CID (6); `owner_server` in the creation block; offer, accept, refuse and end (5.5); signed peer policy (5.6); relay through the home server (5.2); owner sequencing with a signed chain, and follower validation (5.3); key packages through the owner under consent (5.4); restricted MLS channels federate between configured peers; the `federation.md` rewrite | **L7's mutual server-to-server handshake**; F1's home records |
+| **F1: verified names** | v0.2.x | Canonical attestation and proof encodings (4.6); nameserver TLS; suffix delegation by config and `.well-known` (4.2 A+B); verification in the client and the server's resolver (4.3); client name pins and the change rule (4.4); retained attestations (4.5); `jig dm`/`channel add` accept names; reachability records (4.7) | L7 for `jig trust` UX; L6 for nameserver code |
+| **F2: the contract between two jig servers** | v0.2.x, gate G3 | Channels keyed by owner and CID (6); `owner_server` in the creation block; offer, accept, refuse and end (5.5); signed peer policy (5.6); relay through the client's server under share grants (5.2); owner sequencing with a signed chain, and follower validation (5.3); key packages through the owner under consent (5.4); restricted MLS channels federate between configured peers; the `federation.md` rewrite | **L7's mutual server-to-server handshake**; F1's reachability records |
 | **F3** | v0.3+ | Ruleset-group delegation with thresholds (4.2 C); replicated registry and transparency log (NS-02, NS-03, with lane R); nameserver-led contract templates (D12); MIMI-style consent; ownership handover; open federation with reputation; interop with other implementations by contract | lane R; ruleset groups |
 
 **Exit criterion 5 is met at the end of F2.**
@@ -583,7 +626,7 @@ Updated in the implementation PRs, not here.
   debug `/v1/handles` route is L6's call.
 - **R (reputation, PoW, tribunals).** R builds on 4.5 (retained evidence), 4.2 C
   (ruleset-group delegation) and 5.7 (open federation).
-- **I (identity lifecycle).** Home records (4.7) and rotation statements (4.4) are inputs
+- **I (identity lifecycle).** Reachability records (4.7) and rotation statements (4.4) are inputs
   to multi-device and key rotation.
 
 ## 11. Questions for DJ, in the order they will be asked
@@ -592,10 +635,13 @@ Updated in the implementation PRs, not here.
    mechanism with different roots; servers without a nameserver are their own authority;
    suffix conflicts across a federation link refuse the contract. Still open: the
    reference default suffix.
-2. Remote writes (5.2): relay through the home server?
+2. ~~Remote writes (5.2)~~ **Decided:** a client writes through whatever server it is
+   authenticated to, if that server carries the channel. Shares carry grants; a read-only
+   share forces writers to the owner.
+2b. Who may share a channel, and the grant set (5.2, 5.5).
 3. Name-pin changes (4.4): automatic only with a rotation signed by the old key, and
    refused otherwise?
-4. Home records (4.7): signed by the DID, not the nameserver?
+4. Reachability records (4.7): signed by the DID, not the nameserver?
 5. Key packages (5.4): through the owner, under a coarse consent policy in v0.2?
 6. Owner failure and handover (5.8): accept liveness loss in v0.2, no handover?
 7. Who may federate (5.7): configured peers only in v0.2?

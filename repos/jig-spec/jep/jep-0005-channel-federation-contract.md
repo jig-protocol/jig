@@ -15,9 +15,10 @@ discussions_to = "https://github.com/jig-protocol/jig/issues"
 # Abstract
 
 A cross-server channel has exactly one owning server (D24). The owner orders every block
-and is the MLS delivery service. Servers whose users are members are followers: they relay
-their users' writes to the owner and deliver the owner's ordered stream. The contract is
-three things:
+and is the MLS delivery service. Servers the channel is shared with are followers, each
+under a grant (read, write or member). A client reads and writes through whichever server
+it is authenticated to, without knowing the owner. Followers relay writes to the owner
+within their grant and deliver the owner's ordered stream. The contract is three things:
 
 - the creator-signed `channel-create` block, which fixes the suite, the membership rule
   and the owner (D12);
@@ -42,7 +43,7 @@ servers federate an encrypted channel through it". Today:
 - only open, unencrypted channels federate;
 - channels are identified by slug and are first-come per server;
 - nothing records an owner;
-- only the home server can validate a channel's MLS commits.
+- only the server that hosts a channel can validate its MLS commits.
 
 Non-goals for v0.2:
 
@@ -62,9 +63,12 @@ Non-goals for v0.2:
    - A server MUST key remote channels by this pair, never by slug.
 2. The **owner** holds the channel's authoritative state, orders all blocks and validates
    all MLS commits.
-3. A **follower** is a server that has accepted the channel's contract because one or
-   more of its users are members.
-4. A user is a DID. Their home server comes from their home record (JEP-0004).
+3. A **follower** is a server the channel has been shared with: it has accepted the
+   channel's contract under a grant (7a).
+4. A user is a DID with no home server. A client reads and writes a shared channel
+   through any server it is authenticated to that carries the channel, and need not know
+   the owner. The servers where a DID can be reached come from its reachability record
+   (JEP-0004).
 
 ## Terms
 
@@ -75,12 +79,20 @@ Non-goals for v0.2:
 
 ## Offer, accept, refuse, end
 
-7. When a `member-add` names a DID whose home server is not yet a follower, the owner
-   MUST obtain that server's acceptance before it relays the add. The owner sends a
-   `contract-offer`, signed by the owner, carrying:
+7. A share starts when the owner sends the target server a `contract-offer`, signed by
+   the owner. Who may cause an owner to share is pending DJ. The offer carries:
+   - the grant (7a);
    - the creation block;
-   - the current sequence head (12);
+   - the current `ingest` head (12);
    - the hash of the owner's signed peer policy (16).
+7a. A grant (pending DJ) is one of:
+    - `read`: the follower relays nothing but self-leave and MLS self-updates;
+    - `write`: the follower also relays content blocks from channel members;
+    - `member`: the follower also relays the membership blocks the channel's rule allows.
+
+    The owner MUST enforce the grant on every relayed block. A follower SHOULD refuse
+    early. A client that wants to write past a follower's grant connects to the owner
+    directly, under the owner's admission.
 8. The offered server MUST answer, signed by its DID, with exactly one of:
    - `contract-accept {channel_id, owner_server, policy_hash}`, stating that it
      implements the suite and will enforce the membership rule;
@@ -91,8 +103,9 @@ Non-goals for v0.2:
    another suite or relay plaintext.
 10. The owner MUST append each accept to the channel's log as a block, so members can see
     which servers carry the channel.
-11. When a follower has no members left, either side ends the contract with a signed
-    `contract-end`. Members then commit removals for any leaves that remain.
+11. Either side ends a share with a signed `contract-end`. Members then commit removals
+    for any leaves reachable only through that follower. A grant changes by a new offer
+    and accept.
 
 ## Ordering
 
@@ -107,11 +120,12 @@ Non-goals for v0.2:
     - a block whose `seen` cites a record the follower does not hold and cannot obtain
       from the owner.
 
-## Writes from remote members
+## Writes through followers
 
-15. (pending DJ) A remote member submits to their home server, which relays to the owner.
-    - The home server MUST apply its own admission, proof-of-work and rate limits to its
-      user before relaying.
+15. A client submits to the server it is authenticated to. If that server is a follower,
+    it relays the block to the owner within its grant.
+    - The follower MUST apply its own admission, proof-of-work and rate limits to the
+      client before relaying.
     - The owner MUST run its full write gate on the relayed block, as for a local
       submission (OP-09).
     - A relayed block MUST stay attributable to its author, and the owner SHOULD record
@@ -138,11 +152,12 @@ Non-goals for v0.2:
 19. Followers MUST track the group's public state from the stream and MUST NOT deliver a
     commit that does not validate.
 20. Only clients commit. The group has no external senders in v0.2.
-21. (pending DJ) Key packages are fetched through the owner: requesting client → its home
-    server → owner → the target's home server.
+21. (pending DJ) Key packages are fetched through the owner: the requester's server → owner
+    → a follower (holding a `member` grant) where the target's reachability record says
+    the target can be reached. The owner may also serve one itself.
     - The request MUST be signed by the requester's DID and MUST name the channel.
-    - The target's home server MUST apply the target's consent policy before releasing a
-      key package.
+    - The serving server MUST apply the target's consent policy before releasing a key
+      package.
     - Key packages are self-signed by the target's DID, so relays can withhold but cannot
       substitute.
 
@@ -193,10 +208,10 @@ To be added with F2:
 
 - **Multi-homed channels with state resolution** (Matrix, IRC). Merge rules become the
   attack surface (Matrix's 2025 state-reset CVEs), and MLS needs one linear epoch history.
-- **Clients connecting directly to the owner.** The owner would have to admit and
-  rate-limit strangers, and there is no home server for offline delivery or reputation
-  reports (D23). It may return later as a fallback.
-- **Fetching key packages home to home.** Every pair of servers would need to peer.
+- **Requiring clients to find and connect to the owner.** That defeats sharing. A client
+  connects to the owner directly only to write past a follower's grant.
+- **Fetching key packages follower to follower.** Every pair of servers would need to
+  peer.
 
 # Copyright
 
