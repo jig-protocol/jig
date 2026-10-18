@@ -141,8 +141,7 @@ enum Commands {
     },
 
     /// Create, join, delete, or list channels on the configured server via
-    /// `/api/v1/channels*` (falls back to the legacy `/_admin_v0_0_2/*` aliases
-    /// on servers that predate them).
+    /// `/api/v1/channels*`.
     Channel {
         #[command(subcommand)]
         action: ChannelAction,

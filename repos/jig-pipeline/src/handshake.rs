@@ -41,6 +41,14 @@ use crate::envelope::{ENVELOPE_VERSION, Envelope, EnvelopeGateError, EnvelopePar
 /// How long a peer waits for the welcome before treating it as missing.
 pub const WELCOME_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The label for the TLS exporter value the handshake signs (JEP-0002 rule 2,
+/// RFC 9266 channel binding). Both ends export 32 bytes under it, with no
+/// context, so a signed handshake cannot be relayed into another TLS session.
+pub const TLS_EXPORTER_LABEL: &[u8] = b"EXPORTER-jig-handshake";
+
+/// Length of the exported value.
+pub const TLS_EXPORTER_LEN: usize = 32;
+
 const DOMAIN: &[u8] = b"jig-handshake-welcome-v1";
 /// The format a refusal is signed in, named on the frame and in the signed
 /// bytes. A refusal in any other format is refused by name.

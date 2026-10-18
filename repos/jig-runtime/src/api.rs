@@ -11,6 +11,7 @@ use crate::config::{ResourceLimits, RuntimeConfig};
 use crate::engine::WasmEngine;
 use crate::error::{Result, RuntimeError};
 use crate::fuel::CapabilityMeterHandle;
+use crate::identity::{EngineIdentity, FUEL_SCHEDULE_VERSION};
 use crate::receipt::{CapabilityCall, ExecutionOutcome, ModuleHash, Receipt, ReceiptPricing};
 use crate::trap::trap_verdict;
 use jig_core::CapabilityUsageKey;
@@ -27,6 +28,7 @@ pub struct Runtime {
     // the same engine and limits rather than standing up a second one.
     pub(crate) config: RuntimeConfig,
     pub(crate) engine: WasmEngine,
+    identity: EngineIdentity,
 }
 
 impl Runtime {
@@ -60,7 +62,12 @@ impl Runtime {
         #[cfg(feature = "tracing")]
         info!("Runtime created successfully");
 
-        Ok(Self { config, engine })
+        let identity = EngineIdentity::of(engine.engine());
+        Ok(Self {
+            config,
+            engine,
+            identity,
+        })
     }
 
     /// Execute a WebAssembly module and return a receipt
@@ -305,7 +312,7 @@ impl Runtime {
                 cost_per_fuel_unit: self.config.pricing.cost_per_fuel_unit,
                 total_cost: fuel_used as f64 * self.config.pricing.cost_per_fuel_unit,
                 currency: self.config.pricing.currency.clone(),
-                schedule_version: self.config.pricing.schedule_version.clone(),
+                schedule_version: FUEL_SCHEDULE_VERSION.to_string(),
             };
             builder = builder.pricing(pricing);
         }
@@ -413,6 +420,12 @@ impl Runtime {
         }
 
         result
+    }
+
+    /// Which engine this runtime executes with. Record it beside any fuel
+    /// number taken from this runtime.
+    pub fn engine_identity(&self) -> &EngineIdentity {
+        &self.identity
     }
 
     /// Get the current configuration
@@ -619,7 +632,7 @@ impl Runtime {
                 cost_per_fuel_unit: self.config.pricing.cost_per_fuel_unit,
                 total_cost: fuel_used as f64 * self.config.pricing.cost_per_fuel_unit,
                 currency: self.config.pricing.currency.clone(),
-                schedule_version: self.config.pricing.schedule_version.clone(),
+                schedule_version: FUEL_SCHEDULE_VERSION.to_string(),
             };
             builder = builder.pricing(pricing);
         }
