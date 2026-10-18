@@ -214,7 +214,9 @@ When the owner moves a channel's sequencer with `sequencer-set` *(F)*:
 
 1. The new sequencer names freshly minted bot DIDs in its `contract-accept`, and `sequencer-set`
    carries an owner-proposed reinstall for each bot that continues, with `inherits_state_from`.
-   The new home server countersigns the reinstalls as part of its `contract-accept`.
+   The new home server countersigns the live `block-install`s, with the channel's
+   `channel-policy`, in its `contract-accept` (JEP-0005 rule 11b). A client MUST treat an install
+   the current home server has not countersigned as absent.
 2. The new sequencer takes the state whose CID is the last `state_after` at or before the handover
    head, or replays the instance from its receipts. If both fail, the reinstall starts empty and
    says so.
