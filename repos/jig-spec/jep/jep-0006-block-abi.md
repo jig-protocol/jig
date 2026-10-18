@@ -92,8 +92,8 @@ A run is identified by:
   imports;
 - for a composed block, the child CIDs its manifest pins.
 
-`invocation.hlc` is the owning server's ingest HLC for the triggering block, as signed in that
-server's receipt. It is never the author-set `hlc_ts`.
+`invocation.hlc` is the owning server's signed ingest HLC for the triggering block (its form
+waits on JEP-0002 work in lane L7). It is never the author-set `hlc_ts`.
 
 Its outcome is one of:
 
