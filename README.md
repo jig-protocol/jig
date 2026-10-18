@@ -224,9 +224,10 @@ requests and the merge queue: `changes` (skips the build jobs on drafts and docs
 `workspace` (fmt, clippy, nextest on every workspace crate but `hello-wasm`),
 `wasm-build` (`text-block` for `wasm32-unknown-unknown`), and `dependency-policy`
 (`cargo deny check` — advisories, bans, licenses, sources). A fifth job, `nightly`, runs
-on the daily schedule and skips itself when no Rust source changed: doc tests, which
-nextest does not run, and clippy on `jig-runtime`'s `tracing` feature. It is not a
-required check. Every job installs the toolchain `rust-toolchain.toml` pins.
+on the daily schedule: doc tests, which nextest does not run, and clippy on
+`jig-runtime`'s `tracing` feature. It skips itself when nothing under `repos/` (Markdown
+aside) and not `rust-toolchain.toml` changed in the last 25 hours, and it is not a
+required check. Jobs that build install the toolchain `rust-toolchain.toml` pins.
 
 ## Where to go next
 
