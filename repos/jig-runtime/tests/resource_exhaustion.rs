@@ -169,3 +169,36 @@ fn test_module_size_reasonable() {
 
     assert_eq!(receipt.outcome, jig_runtime::ExecutionOutcome::Success);
 }
+
+/// Unbounded recursion must trap, not overrun the host thread's stack and abort the process.
+///
+/// Runs on a thread with an explicit 2 MiB stack, the default for spawned Rust threads and tokio
+/// workers, which is where a server runs blocks. The test harness's own threads would also do,
+/// but naming the size keeps the test meaningful if `RUST_MIN_STACK` is set.
+#[test]
+fn test_deep_recursion_traps_on_a_default_sized_thread() {
+    let wasm = wat::parse_str(
+        r#"(module
+            (memory (export "memory") 1 1)
+            (func $deep (call $deep))
+            (func (export "run") (call $deep)))"#,
+    )
+    .expect("test module WAT parses");
+
+    let outcome = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let runtime = Runtime::new().expect("runtime creation");
+            let block = BlockPackage::from_wasm(vec![]).with_id("deep-recursion-001");
+            let context = ExecutionContext::default().with_block(block);
+            runtime.execute(&wasm, context).map(|r| r.outcome)
+        })
+        .expect("spawning the test thread")
+        .join()
+        .expect("the test thread completes");
+
+    assert!(
+        !matches!(outcome, Ok(jig_runtime::ExecutionOutcome::Success)),
+        "{outcome:?}"
+    );
+}
