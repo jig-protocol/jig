@@ -279,6 +279,8 @@ Any verifier that holds both keeps them as evidence and accepts neither automati
 - Every payload carries a domain tag: `jig-key-link-v1`, `jig-key-revoke-v1`,
   `jig-mls-leaf-v1`.
 - Encoding sits behind one trait, so another encoding would be one new implementation.
+- The link type implements F's `AliasLink` trait (`jig_core::naming`, #147), so
+  `verify_rotation_chain` checks alias moves without knowing the encoding.
 - This is the same stack as the v0.3 receipts.
 
 ## Q3. Revocation
@@ -357,8 +359,18 @@ sequencing for every channel it sequences.
   *server*.
 - `sequencer-rekey` is a new record kind (an L7 amendment): the *same* server under a
   new key, signed by the old key, with the link cited.
+- **Precedence: the owner's `sequencer-set` beats a server's `sequencer-rekey`** (L7's
+  rule, 2026-10-18). A `sequencer-rekey` is the server's own act, so a leaked server key
+  could otherwise rekey channels to a thief's DID without the owner.
+  - The owner may answer a rekey with a `sequencer-set` whose cited head is the record
+    before the rekey. That set overrides the rekey.
+  - Carriers that hold the set refuse the rekey and every record after it, the same way
+    they refuse a partitioned old sequencer (L7 item 5).
+  - A rekey never overrides a `sequencer-set`. A rekey whose cited head precedes a set
+    the carrier already holds is a class 3 contradiction.
 - A compromised server key is the race case. The thief can sign a competing link, and
-  the fork row above catches it. Rotate fast and revoke the old key.
+  the fork row above catches it. Rotate fast and revoke the old key. Owners undo any
+  rekey to the thief's DID with `sequencer-set`, under the precedence rule above.
 
 **Bots (C3)** have their own DIDs, so a server rekey does not touch them. A bot is rekeyed
 by its host with its own `public` link, and the owner's next `block-install` names it.
@@ -367,7 +379,7 @@ by its host with its own `public` link, and the owner's next `block-install` nam
 
 | Lane | What this design asks of it | When |
 | --- | --- | --- |
-| L7 (handshake, pins, trust) | A `sequencer-rekey` record; the welcome carries a server link during the overlap; the evidence bundle takes link forks; `server-rekey` joins the manifest log's allow-list; `jig trust` shows key changes and revocations | I2 |
+| L7 (handshake, pins, trust) | A `sequencer-rekey` record, which an owner's `sequencer-set` overrides; the welcome carries a server link during the overlap; the evidence bundle takes link forks; `server-rekey` joins the manifest log's allow-list; `jig trust` shows key changes and revocations | I2 |
 | F (federation, naming) | `/v1/rotate` takes a COSE link in place of two challenge signatures, and serves it with the attestation. The name-pin rule (4.4) reads "a link from the pinned DID, audience this nameserver and alias". Roles follow a channel-scoped `key-link` at its `seq` (5.9), and the creator rule carries across. Custodians release one key package per device, and stop on revocation. Peers move `expected_did` on a `public` link | I2 (servers), I3 (users), I4 (devices) |
 | A (block ABI), A5 | New block kinds `key-link` and `key-revoke`; the COSE stack is shared with receipts | I2 |
 | C (capabilities) | Bot keys sealed in the server's keystore (I1). Bot rekey by `public` link | I1, I2 |
