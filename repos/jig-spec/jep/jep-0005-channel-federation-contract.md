@@ -122,6 +122,16 @@ Non-goals for v0.2:
     for any leaves reachable only through that follower. A grant changes by a new offer
     and accept.
 
+11a. (pending DJ) The owner moves the sequencer with a `sequencer-set` block. In v0.2 only
+     the `owner` role holds that right.
+     - The new sequencer MUST have accepted the contract before its first record.
+     - Its first record links `prev` to the head the `sequencer-set` cites, and cites the
+       `sequencer-set` block.
+     - Carriers MUST refuse records from the previous sequencer once they hold the
+       `sequencer-set`.
+     - A member whose client merged a commit past the cited head rejoins by external
+       commit.
+
 ## Ordering
 
 12. The owner MUST attach to each block it accepts the `ingest` record of JEP-0002:
@@ -135,15 +145,6 @@ Non-goals for v0.2:
     - a block whose `seen` cites a record the follower does not hold and cannot obtain
       from the owner.
 
-11a. (pending DJ) The owner moves the sequencer with a `sequencer-set` block. In v0.2 only
-     the `owner` role holds that right.
-     - The new sequencer MUST have accepted the contract before its first record.
-     - Its first record links `prev` to the head the `sequencer-set` cites, and cites the
-       `sequencer-set` block.
-     - Carriers MUST refuse records from the previous sequencer once they hold the
-       `sequencer-set`.
-     - A member whose client merged a commit past the cited head rejoins by external
-       commit.
 14a. Clients report the latest sequencer record they verified to their server, which
      forwards heads to other carriers with no reader DID attached. Fork evidence is two
      conflicting sequencer signatures.
