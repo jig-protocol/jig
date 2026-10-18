@@ -3,7 +3,6 @@
 mod channel_arg;
 mod cmd;
 mod config;
-mod http_client;
 mod receipt;
 
 #[cfg(feature = "local-runtime")]
@@ -12,7 +11,6 @@ mod runtime;
 use anyhow::Result;
 use channel_arg::ChannelArg;
 use clap::{Parser, Subcommand};
-use http_client::JigHttpClient;
 use std::path::PathBuf;
 use std::{io, io::IsTerminal};
 
@@ -595,7 +593,10 @@ async fn main() -> Result<()> {
     }
 
     let config = ctx.effective().clone();
-    let client = JigHttpClient::new(&config.server.base_url)?;
+    // Fail every command below on a malformed server URL up front, as the
+    // legacy HTTP client's constructor used to.
+    reqwest::Url::parse(&config.server.base_url)
+        .map_err(|e| anyhow::anyhow!("invalid base url: {e}"))?;
     let default_channel = config.user.default_channel.clone();
 
     let stdin_pipe = !io::stdin().is_terminal();
@@ -667,7 +668,7 @@ async fn main() -> Result<()> {
                     anyhow::bail!("Must specify either --file or --block");
                 };
 
-                view_receipt(Some(&client), source, cli.json).await?;
+                view_receipt(source, cli.json).await?;
             }
             ReceiptAction::Compare {
                 first,
@@ -690,7 +691,7 @@ async fn main() -> Result<()> {
                     ReceiptSource::File(second.clone())
                 };
 
-                compare_receipts(Some(&client), source_a, source_b).await?;
+                compare_receipts(source_a, source_b).await?;
             }
         },
         #[cfg(feature = "local-runtime")]

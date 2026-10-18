@@ -1,22 +1,13 @@
 //! Receipt viewing and inspection commands
 
-use crate::http_client::JigHttpClient;
 use crate::receipt::v0_2::{BlockReceipt, ReceiptExt};
 use anyhow::{Result, anyhow};
 use cid::Cid;
 
 /// View a receipt by block ID or from a file
-pub async fn view_receipt(
-    client: Option<&JigHttpClient>,
-    receipt_source: ReceiptSource,
-    json_output: bool,
-) -> Result<()> {
+pub async fn view_receipt(receipt_source: ReceiptSource, json_output: bool) -> Result<()> {
     let receipt = match receipt_source {
-        ReceiptSource::BlockId(cid) => {
-            let client = client
-                .ok_or_else(|| anyhow!("Client required for fetching receipts by block ID"))?;
-            fetch_receipt_from_server(client, &cid).await?
-        }
+        ReceiptSource::BlockId(cid) => fetch_receipt_from_server(&cid).await?,
         ReceiptSource::File(path) => load_receipt_from_file(&path)?,
     };
 
@@ -37,24 +28,14 @@ pub async fn view_receipt(
 }
 
 /// Compare two receipts (for parity testing)
-pub async fn compare_receipts(
-    client: Option<&JigHttpClient>,
-    receipt_a: ReceiptSource,
-    receipt_b: ReceiptSource,
-) -> Result<()> {
+pub async fn compare_receipts(receipt_a: ReceiptSource, receipt_b: ReceiptSource) -> Result<()> {
     let a = match receipt_a {
-        ReceiptSource::BlockId(cid) => {
-            let client = client.ok_or_else(|| anyhow!("Client required for fetching receipts"))?;
-            fetch_receipt_from_server(client, &cid).await?
-        }
+        ReceiptSource::BlockId(cid) => fetch_receipt_from_server(&cid).await?,
         ReceiptSource::File(path) => load_receipt_from_file(&path)?,
     };
 
     let b = match receipt_b {
-        ReceiptSource::BlockId(cid) => {
-            let client = client.ok_or_else(|| anyhow!("Client required for fetching receipts"))?;
-            fetch_receipt_from_server(client, &cid).await?
-        }
+        ReceiptSource::BlockId(cid) => fetch_receipt_from_server(&cid).await?,
         ReceiptSource::File(path) => load_receipt_from_file(&path)?,
     };
 
@@ -167,7 +148,7 @@ pub enum ReceiptSource {
     File(String),
 }
 
-async fn fetch_receipt_from_server(_client: &JigHttpClient, _cid: &Cid) -> Result<BlockReceipt> {
+async fn fetch_receipt_from_server(_cid: &Cid) -> Result<BlockReceipt> {
     // Note: This assumes the server has a /receipts/{cid} endpoint
     // which needs to be implemented in jig-server
     // For now, return error with helpful message
