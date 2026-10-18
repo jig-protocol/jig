@@ -391,6 +391,31 @@ and where its key packages are stocked, because a DID is a key and carries no lo
 Alice may leave out any server she uses. The record lists only where she wants to be
 found, so it does not link all her accounts for anyone who fetches it.
 
+### 4.8 Three layers of names (DJ, 2026-10-18)
+
+Federation carries DIDs only. Every human-readable name is a local view onto a DID, held
+at one of three layers. Each layer is honest only within its own scope.
+
+| Layer | Who holds the map | Scope | Strength |
+| --- | --- | --- | --- |
+| **Client address book** (petnames, `[contacts]`) | The client | That client only | Strongest for its holder: the holder wrote it. Covers only DIDs the client knows |
+| **Server nicknames** | A server, for DIDs it knows (today's `nickname` TOFU) | That server's clients | A claim by that server. A server with no nameserver can use any suffix it likes |
+| **Nameserver aliases** (`alias@suffix`) | Nameservers, rooted in config, DNS or a contract (4.2) | Everyone who accepts that root | Shared names, with the trade-offs of whoever controls the root |
+
+Rules:
+1. **A client shows the strongest name it has for a DID.** In order: its own address-book
+   name; an alias it verified (4.3) and pinned (4.4); a server nickname labelled with the
+   server that assigned it; the DID's fingerprint.
+2. **Names never cross a federation link as identity.** A server nickname or alias that
+   arrives over a link is a hint. The receiver shows it only as "X calls this DID 'nick'"
+   unless it verifies the name under its own root (4.2, rule 1).
+3. **Isolated servers choose their own suffixes,** so two can collide. That is acceptable
+   under rule 2: a collision is visible, never an impersonation. Across a contract, it is
+   refused (`SUFFIX_CONFLICT`).
+4. **Shared names are a choice of authority.** Nameserver federation gives control over
+   names and suffixes to whoever roots them. That is the config, DNS and contract
+   trade-off in 4.2, not a protocol rule.
+
 ## 5. The channel contract (JEP-0005)
 
 ### 5.1 Topology: owner plus followers
@@ -692,6 +717,28 @@ an interface lane R builds on).**
   lost owner key would otherwise freeze the channel on its current sequencer, because
   moving it is owner-only. Adding owners later, and transferring ownership, are post-MVP.
 
+### 5.10 Abuse and denial of service on federation links
+
+DJ's test: rate limiting is fine as long as it survives abuse such as DDoS. Per-peer
+quotas alone do not survive it, so the defence is layered, and each layer says what it
+stops.
+
+| Layer | Defence | Stops |
+| --- | --- | --- |
+| Network | Out of protocol scope: the operator's network and hosting absorb volumetric floods | Bandwidth and packet floods. The protocol cannot, and does not claim to |
+| Connection | **Refuse before working.** A link does no block processing before the mutual handshake proves a listed peer's DID (5.7, L7). Connection counts and handshake attempts are limited per source address | Strangers: in v0.2 an unlisted server never reaches parsing or signature checks |
+| Cost ordering | **Cheap checks first:** frame size, then the per-peer quota, then the CID dedupe, then the author's signature, then MLS validation | CPU exhaustion through expensive verification of junk |
+| Per peer | Quotas in the signed peer policy (5.6), counted per relaying server's DID | A listed peer that floods. Its breach is attributable and signed (AB-03) |
+| Per author | The existing per-DID token buckets apply to relayed authors | One identity spread across many peers |
+| Fan-out | **Amplification is bounded by the share list.** One accepted write goes to at most the channel's carriers, a set the owner and operators chose. Head gossip (5.3) is rate-limited and deduplicated by head | Amplification through shares or gossip |
+| Custodians | Signed key-package requests, a per-requester rate limit, the contacts-only default (5.4), and the last-resort package never consumed | Draining Alice's stock, and invite spam |
+| Sequencer | A sequencer that is flooded or down is replaced by `sequencer-set` (5.8). Carriers queue writes meanwhile, under a cap | A channel held hostage by one overloaded server |
+
+**Residual:** a listed peer can still spend its full quota on junk. That is detected and
+attributable, and the operator removes the peer. Open federation (5.7) must not ship
+until reputation and proof-of-work between servers (lane R, D26) add a cost per
+stranger.
+
 ## 6. Addressing
 
 **Proposed.**
@@ -712,7 +759,7 @@ largest single piece of build work in F2.
 
 ## 7. `federation.md`: keep, rewrite or drop
 
-**Proposed disposition.** The rewrite lands in F2's implementation PR. Until then the
+**Decided (DJ, 2026-10-18).** The rewrite lands in F2's implementation PR. Until then the
 chapter needs a status banner saying that most of it is unbuilt. Banners belong to lane
 L1, so F asks L1 to add one now.
 
@@ -725,11 +772,11 @@ L1, so F asks L1 to add one now.
 | Relayed blocks: full gate, no persisting on a peer's word, receipts are evidence, configured pinned peers only | **Keep** (built, #90) |
 | Nonce and ±10 min window on every message | **Rewrite:** the nonce and window apply to the handshake and subscription (built, ±30 s). Blocks are deduped by CID |
 | Explicit version negotiation, no silent downgrade | **Keep** |
-| `user@server` routing | **Drop.** Users are DIDs; names are `alias@suffix` and say nothing about servers |
+| `user@server` routing | **Replace** with the three naming layers of 4.8. Federation routes by DID. Names are address-book entries, server nicknames or nameserver aliases, each local to its scope and never identity across a link |
 | Exponential backoff with jitter, circuit breaker, MUST | **Keep as SHOULD** without the fixed numbers or library advice (today: a constant 5 s) |
-| Rate limiting at ingress | **Rewrite:** per-peer quotas in the signed peer policy, plus the author's own bucket (built) |
-| Receipt exchange for billing | **Rewrite:** receipts are evidence about a peer, verified by replay where possible. Encrypted blocks have sealed receipts and nothing to replay. No billing |
-| Reputation tiers (`verified`, `high_sec`, …) | **Drop:** superseded by D21. Reputation is one number per ruleset, and lane R owns it |
+| Rate limiting at ingress | **Rewrite** as the layered abuse defences of 5.10: refuse before working, put cheap checks first, per-peer quotas, per-author buckets, and bounded fan-out. Volumetric network floods are the operator's to absorb |
+| Receipt exchange for billing | **Rewrite:** receipts are evidence about a peer, verified by replay where possible. Encrypted blocks have sealed receipts and nothing to replay. **Billing for compute is deferred, not dropped (DJ).** It belongs to the distributed-OS phase, where someone pays for compute run across the network. The receipt format stays extensible for cost and fuel, and nothing here forbids it |
+| Reputation tiers (`verified`, `high_sec`, …) | **Drop.** The chapter confused two things. High-sec, low-sec and null-sec describe the relative strength of a ruleset group, not an individual's score. Reputation is one number per ruleset (D21), and lane R owns it |
 | Metadata minimisation, fail closed on unknown critical fields, minimal logging | **Keep** |
 | Examples (`did:jig:server-b.com`, Python) | **Drop:** `did:jig` is a key |
 
@@ -812,7 +859,8 @@ Updated in the implementation PRs, not here.
 6. ~~Owner failure (5.8)~~ **Decided:** the movable sequencer, owner-only `sequencer-set`.
 7. ~~Who may federate (5.7)~~ **Decided:** configured peers only in v0.2. Contract
    vouching and open federation are later and unscoped.
-8. `federation.md` (7): this disposition?
+8. ~~`federation.md` (7)~~ **Decided:** the table in section 7, with naming layers (4.8),
+   layered DoS defences (5.10) and billing deferred rather than dropped.
 
 ## Appendix A: sources
 
