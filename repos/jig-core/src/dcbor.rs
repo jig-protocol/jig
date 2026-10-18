@@ -334,6 +334,7 @@ impl Reader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn hex(v: &Value) -> String {
         hex::encode(encode(v).unwrap())
@@ -466,6 +467,66 @@ mod tests {
         let mut ok = vec![0x81; MAX_DEPTH];
         ok.push(0x00);
         assert!(decode(&ok).is_ok());
+    }
+
+    fn arb_value() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![
+            any::<u64>().prop_map(Value::Unsigned),
+            any::<u64>().prop_map(Value::Negative),
+            proptest::collection::vec(any::<u8>(), 0..40).prop_map(Value::Bytes),
+            ".{0,20}".prop_map(Value::Text),
+            any::<bool>().prop_map(Value::Bool),
+            Just(Value::Null),
+        ];
+        leaf.prop_recursive(6, 64, 8, |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..8).prop_map(Value::Array),
+                proptest::collection::vec((inner.clone(), inner.clone()), 0..8)
+                    .prop_map(Value::Map),
+                (any::<u64>(), inner).prop_map(|(n, v)| Value::Tag(n, Box::new(v))),
+            ]
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4096))]
+
+        /// The decoder is the parser at the trust boundary: it never panics,
+        /// and whatever it accepts is already canonical, byte for byte.
+        #[test]
+        fn decode_never_panics_and_accepts_only_canonical_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0..4096),
+        ) {
+            if let Ok(v) = decode(&bytes) {
+                prop_assert_eq!(encode(&v).unwrap(), bytes);
+            }
+        }
+
+        /// The same, from inputs that start as valid CBOR heads more often
+        /// than random bytes do: a canonical encoding with one byte changed.
+        #[test]
+        fn mutated_canonical_bytes_are_canonical_or_refused(
+            v in arb_value(),
+            at in any::<prop::sample::Index>(),
+            byte in any::<u8>(),
+        ) {
+            if let Ok(mut bytes) = encode(&v) {
+                let i = at.index(bytes.len());
+                bytes[i] = byte;
+                if let Ok(d) = decode(&bytes) {
+                    prop_assert_eq!(encode(&d).unwrap(), bytes);
+                }
+            }
+        }
+
+        /// Every value within the depth limit round-trips to its canonical form.
+        #[test]
+        fn encoded_values_decode_to_themselves(v in arb_value()) {
+            if let Ok(bytes) = encode(&v) {
+                let d = decode(&bytes).unwrap();
+                prop_assert_eq!(encode(&d).unwrap(), bytes);
+            }
+        }
     }
 
     #[test]
