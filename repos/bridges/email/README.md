@@ -2,6 +2,12 @@
 
 Bidirectional email gateway for the Jig protocol.
 
+> **Inbound mail is refused for now.** Each mail conversation is a restricted 1:1 channel,
+> and restricted channels are always end-to-end encrypted with MLS (ROADMAP D25). The
+> bridge cannot be an MLS member yet, so a server refuses the plaintext thread it asks for.
+> Making the thread open instead would let every user on the server read the mail. Email
+> comes back when the bridge joins its threads' MLS groups.
+
 ## Overview
 
 This bridge allows Jig messages to be sent and received via standard email protocols (SMTP/IMAP), enabling communication between Jig users and email users.

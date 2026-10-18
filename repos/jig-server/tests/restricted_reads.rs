@@ -322,12 +322,8 @@ async fn the_escape_hatch_lists_every_channel() {
 // messaged by anyone with a keypair is not a private club, it is a private
 // club with an open letterbox.
 
-use jig_client::blocks::build_text_render;
-
-fn text(who: &Identity, slug: &str, body: &str) -> jig_client::blocks::BuiltBlock {
-    let me = who.as_client();
-    build_text_render(&me, slug, body, HlcTimestamp::now_wall(me.did().clone()))
-}
+// `TestServer::text` builds a post as its sender would: sealed by a member of
+// an encrypted channel, plaintext from anyone else.
 
 #[tokio::test]
 async fn a_stranger_cannot_post_to_a_restricted_channel() {
@@ -346,7 +342,7 @@ async fn a_stranger_cannot_post_to_a_restricted_channel() {
         .await;
 
     let (status, body) = server
-        .try_submit(&text(&stranger, "#private", "psst"))
+        .try_submit(&server.text(&stranger, "#private", "psst"))
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
     assert_eq!(body["code"], "NOT_A_MEMBER");
@@ -373,11 +369,11 @@ async fn members_and_the_owner_can_post_to_a_restricted_channel() {
     server.add_member(&owner, "#private", &member).await;
 
     let (status, body) = server
-        .try_submit(&text(&owner, "#private", "welcome"))
+        .try_submit(&server.text(&owner, "#private", "welcome"))
         .await;
     assert_eq!(status, StatusCode::OK, "owner: body={body}");
     let (status, body) = server
-        .try_submit(&text(&member, "#private", "thanks"))
+        .try_submit(&server.text(&member, "#private", "thanks"))
         .await;
     assert_eq!(status, StatusCode::OK, "member: body={body}");
 }
@@ -389,7 +385,9 @@ async fn anyone_can_post_to_an_open_channel() {
     let stranger = Identity::new(2);
     server.create_channel(&owner, "#open", "open").await;
 
-    let (status, body) = server.try_submit(&text(&stranger, "#open", "hello")).await;
+    let (status, body) = server
+        .try_submit(&server.text(&stranger, "#open", "hello"))
+        .await;
     assert_eq!(status, StatusCode::OK, "body={body}");
 }
 
@@ -400,7 +398,9 @@ async fn anyone_can_post_to_an_open_channel() {
 // as the timeline the block lives in, or the timeline gate is a detour.
 
 async fn post_and_get_cid(server: &TestServer, who: &Identity, slug: &str) -> String {
-    let (status, body) = server.try_submit(&text(who, slug, "for the record")).await;
+    let (status, body) = server
+        .try_submit(&server.text(who, slug, "for the record"))
+        .await;
     assert_eq!(status, StatusCode::OK, "body={body}");
     body["block_cid"]
         .as_str()
@@ -569,15 +569,10 @@ async fn replaying_an_accepted_member_add_does_not_undo_a_revocation() {
         .create_channel(&owner, "#private", "restricted")
         .await;
 
-    let by = owner.as_client();
-    let block = build_member_add(
-        &by,
-        "#private",
-        &member.did().to_did_jig_string(),
-        HlcTimestamp::now_wall(by.did().clone()),
-    );
+    let block = server.member_add_block(&owner, "#private", &member);
     let (status, body) = server.try_submit(&block).await;
     assert_eq!(status, StatusCode::OK, "owner enrols member: {body}");
+    server.settle_member_add(&owner, "#private", &member, &block, true);
     let (status, _) = server
         .send(&server.sign_get(&member, &history_path("#private")))
         .await;
@@ -666,7 +661,7 @@ async fn an_archived_channel_accepts_no_new_blocks() {
     server.archive_channel(&owner, "#retired").await;
 
     let (status, body) = server
-        .try_submit(&text(&owner, "#retired", "one more"))
+        .try_submit(&server.text(&owner, "#retired", "one more"))
         .await;
     assert_eq!(status, StatusCode::GONE, "body={body}");
     assert_eq!(body["code"], "CHANNEL_ARCHIVED");
@@ -695,7 +690,14 @@ async fn an_owner_who_recased_their_did_still_owns_their_channel() {
             roles: vec![],
         })
         .metadata_entry("slug", serde_json::json!("#mine"))
-        .metadata_entry("visibility", serde_json::json!("restricted"))
+        .metadata_entry("visibility", serde_json::json!("restricted"));
+    let mut manifest = manifest;
+    if let serde_json::Value::Object(genesis) = server.mls_genesis(&owner, "#mine") {
+        for (k, v) in genesis {
+            manifest = manifest.metadata_entry(&k, v);
+        }
+    }
+    let manifest = manifest
         .build()
         .unwrap()
         .with_kind(BlockKind::ChannelCreate)
