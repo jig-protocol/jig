@@ -17,14 +17,38 @@ name: Release
 # JIG_RELEASE_SIGNING_KEY secret; the public key is pinned in install.sh and
 # .github/release/allowed_signers. install.sh verifies both on download.
 #
-# workflow_dispatch runs everything up to (not including) publish, so the
-# pipeline can be exercised without cutting a tag.
+# workflow_dispatch has two modes and never publishes:
+# * dry-run (default): everything up to publish, signed with a throwaway key
+#   in `release-dry-run`. Tests builds, packaging and the install smoke test,
+#   not the real key.
+# * verify-key: only the `verify-key` job. It waits for approval in `release`,
+#   derives the public half of JIG_RELEASE_SIGNING_KEY and compares it with
+#   both pins. Run it before cutting a tag; otherwise the real key is first
+#   checked after the tag is pushed.
+#
+# Runbook:
+# * Never re-run a failed tag's workflow after fixing main. A re-run uses the
+#   workflow, scripts and pinned key as they were at the tag's commit, so it
+#   cannot pick up the fix. Cut a new tag instead.
+# * Before tagging: a green dry run and a green verify-key on the commit to tag.
+# * Release notes must list the threat-register entries the release mitigates
+#   (repos/jig-spec/src/threat-register.md). Commit them as
+#   .github/release/notes/<tag>.md before tagging; the sign job refuses a tag
+#   without that file or without an entry ID in it, and publish puts it at the
+#   top of the release page.
+# * Pushing a v* tag publishes. Only a maintainer pushes one.
 
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: dry-run (build, sign with a throwaway key, smoke) or verify-key (check the signing secret against the pins)
+        type: choice
+        options: [dry-run, verify-key]
+        default: dry-run
 
 concurrency:
   group: release-${{ github.ref }}
@@ -37,8 +61,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Approval-gated check of the real signing key, with no build, signing or
+  # publishing. prepare-release-signing-key.sh prints the derived public key
+  # and fingerprint only. `release` admits only the refs its deployment rules
+  # allow, so dispatch this from one of them.
+  verify-key:
+    name: verify signing key against the pins
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'verify-key'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release
+    steps:
+      - uses: actions/checkout@v7
+      - name: Derive the public key and compare it with install.sh and allowed_signers
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.JIG_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key="$RUNNER_TEMP/jig-release.key"
+          trap 'rm -f "$key" "$key.pub"' EXIT
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "JIG_RELEASE_SIGNING_KEY is not available in the release environment" >&2
+            exit 1
+          fi
+          scripts/prepare-release-signing-key.sh "$key"
+          echo "signing key matches both pins" | tee -a "$GITHUB_STEP_SUMMARY"
+
   build:
     name: build ${{ matrix.name }}
+    if: inputs.mode != 'verify-key'
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 60
     strategy:
@@ -163,6 +216,21 @@ jobs:
           [ "$pinned" = "$(cat .github/release/allowed_signers)" ] \
             || { echo "install.sh JIG_RELEASE_SIGNER drifted from .github/release/allowed_signers" >&2; exit 1; }
 
+      # The threat register requires release notes to list the entries a
+      # release mitigates. Checked before the signing key is used, so a tag
+      # without notes stops here, not at publish.
+      - name: Release notes list the threat-register entries mitigated
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          notes=".github/release/notes/$TAG.md"
+          [ -f "$notes" ] || { echo "$notes is missing; commit release notes before tagging" >&2; exit 1; }
+          grep -qE '\b[A-Z]{2}-[0-9]{2}\b' "$notes" \
+            || { echo "$notes lists no threat-register entry (e.g. SC-02)" >&2; exit 1; }
+
       - name: Write and sign SHA256SUMS
         id: sign
         shell: bash
@@ -174,17 +242,8 @@ jobs:
           key="$RUNNER_TEMP/jig-release.key"
           signers="$PWD/.github/release/allowed_signers"
           if [ -n "$SIGNING_KEY" ]; then
+            # Refuses a key that install.sh will not accept (both pins).
             scripts/prepare-release-signing-key.sh "$key"
-            # Refuse to sign with a key that install.sh will not accept.
-            # On mismatch print only the public key, never the secret.
-            derived=$(awk '{print $1, $2}' "$key.pub")
-            pinned=$(awk '{print $(NF-1), $NF}' "$signers")
-            if [ "$derived" != "$pinned" ]; then
-              echo "signing key does not match the pinned jig-release public key" >&2
-              echo "derived public key: $derived" >&2
-              ssh-keygen -l -f "$key.pub" >&2
-              exit 1
-            fi
           elif [ "$GITHUB_EVENT_NAME" = "push" ]; then
             echo "JIG_RELEASE_SIGNING_KEY is not set; refusing to publish unsigned binaries" >&2
             exit 1
@@ -278,6 +337,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/release
       - uses: actions/download-artifact@v8
         with:
           name: release-dist
@@ -289,7 +351,8 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          cat > notes.md <<EOF
+          { cat ".github/release/notes/$TAG.md"; echo; } > notes.md
+          cat >> notes.md <<EOF
           Pre-1.0: no wire or receipt compatibility guarantee between releases.
 
           ### Install
