@@ -106,15 +106,22 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 
 ## 4. Installs and bot identity
 
-1. A `block-install` is **proposed by the channel's owner and countersigned by the hosting
-   server**, the same mechanism as `channel-policy` (JEP-0011): a COSE_Sign object signed by the
-   owner, then the server, carrying `seq` and `prev`. Nobody else can propose one. Its payload
-   names: `block` (the bot's program CID, JEP-0011), `channel` (a `channel-id`), `grant`,
-   `bot_did`, `bot_key`, `triggers` (what invokes the bot), and optionally `inherits_state_from`
-   (an earlier install).
-2. The server's countersignature states that it holds `bot_key` as custodian and that the install
-   passes its restrictions (operator policy, §2.1). The server MUST withdraw an install that no
-   longer passes them, as JEP-0011 specifies for `channel-policy`.
+1. A `block-install` is signed by the channel's owner alone, as a COSE_Sign1, and carries the
+   owner's `seq` and `prev`. Nobody else can sign one. Its payload names: `block` (the bot's
+   program CID, JEP-0011), `channel` (a `channel-id`), `grant`, `bot_did`, `bot_key`, `triggers`
+   (what invokes the bot), and optionally `inherits_state_from` (an earlier install).
+2. The hosting server approves it with a separate **`policy-approval`** (JEP-0011, the same object
+   it issues for a `channel-policy`): a COSE_Sign1 of `{domain: "jig-policy-approval-v1", server,
+   channel, object_cid, restrictions_cid}`, with `object_cid` the install's CID. Issuing it states
+   that the install passes the server's restrictions (operator policy, §2.1) and that the server
+   holds `bot_key` as custodian.
+   - The **current** approval is read from the channel's `ingest` chain: the latest
+     `policy-approval` or `policy-withdrawn` for that install CID wins, and a withdrawal stands
+     until a newer approval. The approval carries no `seq` or `prev` of its own.
+   - The server MUST withdraw the approval of an install that no longer passes its restrictions.
+     Withdrawal and re-approval need nothing from the owner.
+   - A host MUST NOT invoke a bot whose install has no current approval, and a client MUST treat
+     such an install as absent.
 3. The install's CID is the **instance id**. A host MUST refuse an install whose `grant` is not
    `⊑` the program's `requests`, or whose program is outside operator policy.
 4. A bot's posts are blocks authored by `bot_did` and MUST go through `ingest` like any write.
@@ -214,9 +221,9 @@ When the owner moves a channel's sequencer with `sequencer-set` *(F)*:
 
 1. The new sequencer names freshly minted bot DIDs in its `contract-accept`, and `sequencer-set`
    carries an owner-proposed reinstall for each bot that continues, with `inherits_state_from`.
-   The new home server countersigns the live `block-install`s, with the channel's
-   `channel-policy`, in its `contract-accept` (JEP-0005 rule 11b). A client MUST treat an install
-   the current home server has not countersigned as absent.
+   The new home server issues fresh `policy-approval`s for the live `block-install`s and the
+   channel's `channel-policy` (JEP-0005 rule 11b). An approval by the old home server does not
+   carry over; until the new one approves, the install is absent (§4.2).
 2. The new sequencer takes the state whose CID is the last `state_after` at or before the handover
    head, or replays the instance from its receipts. If both fail, the reinstall starts empty and
    says so.
