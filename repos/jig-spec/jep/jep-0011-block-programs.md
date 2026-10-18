@@ -24,7 +24,7 @@ This JEP defines how block code is named, published, fetched, and chosen for exe
 - **Read gate.** A program can be fetched only by callers who can read a channel that holds it. A
   message links a program into its channel only under its sender's read authority.
 - **Execution policy.** Clients auto-run only renderers that the channel's policy allows. The
-  channel owner signs that policy, and the hosting server approves it, in a separate `policy-approval`,
+  channel owner signs that policy, and the hosting server approves it, in a separate `host-approval`,
   against restrictions it publishes. Users can still refuse execution or allow it for themselves.
 
 **Draft status.** The maintainer approved the design on 2026-10-18 (decisions Dv1–Dv6 in the
@@ -114,14 +114,15 @@ This is the encoding layer jig uses for every new signed object (reference imple
    a program on ingest. Re-publishing a CID the server already holds is a no-op for storage, and
    the channel gains the program (§4).
 2. **`render`** names a `program` (program CID) and carries an `input` payload.
-   - A server executes it only if its `operator-policy` (§5.1) allows the program, and then
+   - A server executes it only if the `run` list of its `server-restrictions` (§5.1) allows the
+     program, and then
      issues an `exec` receipt carrying both `component` and `program`. Otherwise it issues
      `accepted`.
    - Operator policy allowing an author MUST NOT extend to children by other authors.
    - A server MUST NOT execute a `render` in a channel whose suite is not `none`.
 3. **`program-yank`**, signed by a program's author, names a program CID and a reason. It is
    advisory: pinned uses keep working, and clients SHOULD warn.
-4. **`server-restrictions`**, **`channel-policy`**, **`policy-approval`** and **`policy-withdrawn`**
+4. **`server-restrictions`**, **`channel-policy`**, **`host-approval`** and **`host-withdrawal`**
    are defined in §5.
 
 ## 4. Read gate
@@ -142,22 +143,18 @@ This is the encoding layer jig uses for every new signed object (reference imple
 
 ## 5. Client execution policy
 
-### 5.1 Server rules
+### 5.1 Server restrictions
 
-A server publishes two rule sets, each a COSE_Sign1 signed by the server, versioned by `seq` and
-named by CID. A server that issues any `policy-approval` MUST publish both, even if one is empty,
-so that every approval names the exact rules it was checked against.
-
-1. **`server-restrictions`**:
-   `{domain: "jig-server-restrictions-v1", server, seq, deny: {programs: [cid…], authors: [did…]}}`.
-   - It limits which channel policies and installs the server will approve (§5.3).
-   - It does not limit what clients run.
-2. **`operator-policy`**:
-   `{domain: "jig-operator-policy-v1", server, seq, allow: {programs: [cid…], authors: [did…]}}`.
-   - It is the operator policy of JEP-0006 Q7 and JEP-0007 §2: which programs this server will
-     execute at all.
-   - It is empty by default.
-   - Allowing an author does not extend to children by other authors.
+1. A server publishes its rules as one **`server-restrictions`** object, a COSE_Sign1 signed by the
+   server and named by CID:
+   `{domain: "jig-server-restrictions-v1", server, seq, deny: {programs: [cid…], authors: [did…]}, run: {programs: [cid…], authors: [did…]}}`.
+   - `deny` limits which channel policies and installs the server will approve (§5.3). It does not
+     limit what clients run.
+   - `run` is the server's operator policy (JEP-0006 Q7, JEP-0007 §2): which programs this server
+     will execute at all. It is empty by default. Allowing an author does not extend to children by
+     other authors.
+2. A server that issues any `host-approval` MUST publish a `server-restrictions`, even an empty
+   one, so that every approval names the exact rules it was checked against.
 
 ### 5.2 Channel policy
 
@@ -177,43 +174,39 @@ so that every approval names the exact rules it was checked against.
 The hosting server signs off on owner-signed channel objects with one object kind, used for
 `channel-policy` here and for `block-install` (JEP-0007 §4).
 
-1. A **`policy-approval`** is a COSE_Sign1 signed by the channel's home server *(F)*:
-   `{domain: "jig-policy-approval-v1", server, channel, object_cid, restrictions_cid, operator_policy_cid?, bot_did?}`.
-   - `object_cid` is the CID of the approved `channel-policy` or `block-install`.
-   - `restrictions_cid` is REQUIRED for both kinds: the `server-restrictions` the object was
-     checked against.
-   - `operator_policy_cid` MUST be present when the approved object is a `block-install`, and MUST
-     be absent otherwise. It names the `operator-policy` the install's program was checked
-     against.
-   - `bot_did` MUST be present when the approved object is a `block-install`, and MUST be absent
-     otherwise. It states that this server holds the private key for `bot_did`, as custodian
-     (JEP-0007 §4, SC-04). A verifier MUST check that it equals the install's `bot_did`.
-2. A **`policy-withdrawn`** is a COSE_Sign1 signed by the home server:
-   `{domain: "jig-policy-withdrawn-v1", server, channel, object_cid, restrictions_cid, operator_policy_cid?, conflicts}`.
-   - The rule CIDs are the versions that the object now fails. `operator_policy_cid` appears under
-     the same condition as in an approval.
-   - For a `channel-policy`, `conflicts` lists the entries the current restrictions deny.
-   - For a `block-install`, it means the server will no longer run the bot.
+1. A **`host-approval`** is a COSE_Sign1 signed by the channel's home server *(F)*:
+   `{domain: "jig-host-approval-v1", server, channel, object: cid, kind: "channel-policy" | "block-install", restrictions: cid, custodian?: did}`.
+   - `object` is the CID of the approved `channel-policy` or `block-install`.
+   - `restrictions` is REQUIRED for both kinds. It names the `server-restrictions` the object was
+     checked against: for a policy, its `deny` lists; for an install, its `run` and `deny` lists.
+   - `custodian` MUST be present when `kind` is `block-install`, and MUST be absent otherwise. It
+     states that this server holds the private key for that DID (JEP-0007 §4, SC-04). It MUST
+     equal the install's `bot_did`, or the approval is invalid.
+2. A **`host-withdrawal`** is a COSE_Sign1 signed by the home server:
+   `{domain: "jig-host-withdrawal-v1", server, channel, object: cid, kind, restrictions: cid, reason, conflicts}`.
+   - `restrictions` names the version the object now fails.
+   - For a `channel-policy`, `conflicts` lists the entries that version denies. For a
+     `block-install`, the withdrawal means the server will no longer run the bot.
 3. **Approving a policy.** The home server checks each `channel-policy` against its current
    restrictions.
-   - If the policy allows nothing the restrictions deny, it issues a `policy-approval`.
+   - If the policy allows nothing the restrictions deny, it issues a `host-approval`.
    - Otherwise it MUST refuse the policy, naming the conflicting entries.
 
-   For a `block-install`, the server approves only if the installed program is in its
-   `operator-policy` and not denied by its `server-restrictions`.
-4. **When either rule set changes**, the server MUST re-check every object it has approved.
-   - For each object that still passes, it issues a new `policy-approval` naming the new rule
+   For a `block-install`, the server approves only if its `server-restrictions` allow the installed
+   program under `run` and do not deny it under `deny`.
+4. **When its restrictions change**, the server MUST re-check every object it has approved.
+   - For each object that still passes, it issues a new `host-approval` naming the new rule
      CIDs.
-   - For each object that now fails, it issues a `policy-withdrawn`.
+   - For each object that now fails, it issues a `host-withdrawal`.
    - A server cannot change an owner's object. It can only approve or withdraw.
 5. **Ordering.** Approvals and withdrawals are control blocks, so the channel's `ingest` chain
    (JEP-0002) orders them, in encrypted channels too.
-   - For a given object CID, the latest `policy-approval` or `policy-withdrawn` in the chain is the
+   - For a given object CID, the latest `host-approval` or `host-withdrawal` in the chain is the
      current one.
-   - A withdrawal is final for that object CID until a newer `policy-approval` for it appears later
+   - A withdrawal is final for that object CID until a newer `host-approval` for it appears later
      in the chain.
    - Approvals carry no counter of their own, so their order cannot disagree with the chain's.
-6. **Sequencer moves.** When the sequencer moves, the new home server issues a `policy-approval` as
+6. **Sequencer moves.** When the sequencer moves, the new home server issues a `host-approval` as
    part of its `contract-accept`, as JEP-0005 rule 11b (#173) requires. It does this for the
    current `channel-policy` and for every live `block-install`. The owner does not need to be
    online.
@@ -225,7 +218,7 @@ The hosting server signs off on owner-signed channel objects with one object kin
 1. A client MUST treat a channel as having an **effective policy** only when all of these hold:
    - the latest `channel-policy` is signed by the owner;
    - its `seq`/`prev` chain is unbroken;
-   - its current entry in the ingest chain (§5.3.5) is a `policy-approval` from the current home
+   - its current entry in the ingest chain (§5.3.5) is a `host-approval` from the current home
      server.
 
    Otherwise the channel has no policy.
@@ -270,7 +263,7 @@ A component cannot be checked against its source, so trusting a program means tr
 ## 6.3 Cost: channel policies are plaintext in encrypted channels
 
 The hosting server must read a policy to approve it. So in a channel whose suite is not `none`,
-the `channel-policy` and its `policy-approval` are visible to the server, and to anyone who can read the
+the `channel-policy` and its `host-approval` are visible to the server, and to anyone who can read the
 channel's control stream. They reveal which program CIDs and author DIDs the channel allows. That
 says something about what the channel is for, even though no message content leaks. The
 maintainer accepted this cost (Dv5d) so that a server can refuse policies it will not host, and
@@ -330,7 +323,7 @@ To come with slice 4:
   of two, but it records no restrictions version. And because Ed25519 signatures are
   deterministic, a server re-approving a policy after withdrawing it would produce the very same
   bytes as before. That re-approval could not be told apart from the original, so the owner would
-  have to amend the policy. A separate `policy-approval` keeps the owner's object fixed and the
+  have to amend the policy. A separate `host-approval` keeps the owner's object fixed and the
   host's judgement current and ordered.
 - **A counter on each approval.** The `ingest` chain is already the server-signed order, so a
   second counter would be redundant and could disagree with it.
