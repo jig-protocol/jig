@@ -93,7 +93,8 @@ A run is identified by:
 - for a composed block, the child CIDs its manifest pins.
 
 `invocation.ingest-seq` and `invocation.ingest-hlc` are copied from the triggering block's
-`ingest` record, which the channel's home server signs (lane L7). An executor MUST verify that
+`ingest` record, which the channel's sequencing server signs (lane L7). Every per-channel key, including
+`invocation.channel-cid`, is the CID of the channel's `channel-create` block (lane F). An executor MUST verify that
 record before execution. The author-set `hlc_ts` is never an input.
 
 Its outcome is one of:
