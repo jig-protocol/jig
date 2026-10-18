@@ -64,11 +64,10 @@ async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok\n")
 }
 
-/// Prometheus text exposition of the v0.0.2 WebSocket counters.
+/// Prometheus text exposition of the v0.0.2 counters.
 ///
-/// The numbers are hand-rolled `AtomicU64`s living in
-/// [`crate::v0_0_2_ws::metrics`] — see that module for what is and is not
-/// counted (federation and bridge ingest are NOT).
+/// The numbers are hand-rolled `AtomicU64`s rendered by
+/// [`crate::v0_0_2_ws::metrics`] — see that module for what each one counts.
 async fn metrics() -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -167,13 +166,23 @@ async fn server_info(State(state): State<AppState>) -> Json<ServerInfoResponse> 
                 .collect();
             (
                 Some(v002.server_did.to_did_jig_string()),
-                v002.config.unsafe_options_active(),
+                [
+                    v002.config.unsafe_options_active(),
+                    state.config.unsafe_options_active(),
+                ]
+                .concat(),
                 v002.config.server.allowed_block_kinds.clone(),
                 peers,
                 v002.bridges.permitted_names().to_vec(),
             )
         } else {
-            (None, vec![], vec![], vec![], vec![])
+            (
+                None,
+                state.config.unsafe_options_active(),
+                vec![],
+                vec![],
+                vec![],
+            )
         };
 
     Json(ServerInfoResponse {
@@ -354,6 +363,31 @@ mod tests {
         assert!(body.unsafe_options_active.is_empty());
         assert!(body.allowed_block_kinds.is_empty());
         assert!(body.peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn server_info_advertises_a_plaintext_listener() {
+        let dir = tempdir().unwrap();
+        let mut config = ServerConfig {
+            database_path: dir.path().join("test.db"),
+            ..Default::default()
+        };
+        config.tls.enabled = false;
+        let v002 = Arc::new(crate::v0_0_2::AppState::for_test().unwrap());
+
+        for v0_0_2 in [None, Some(v002)] {
+            let state = AppState {
+                config: config.clone(),
+                v0_0_2,
+            };
+            let body = server_info(State(state)).await.0;
+            assert!(
+                body.unsafe_options_active
+                    .contains(&"tls.enabled=false".to_string()),
+                "got {:?}",
+                body.unsafe_options_active
+            );
+        }
     }
 
     #[tokio::test]
