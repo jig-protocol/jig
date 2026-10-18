@@ -1,0 +1,213 @@
++++
+jep = 0004
+title = "Verified Naming: Suffix Authority, Attestations and Client Pins"
+status = "Draft"
+type = "Standards Track"
+category = "Security"
+authors = ["DJ <dev@jig.onl>"]
+created = "2026-10-18"
+requires = ["0002", "0003"]
+replaces = []
+superseded_by = []
+discussions_to = "https://github.com/jig-protocol/jig/issues"
++++
+
+# Abstract
+
+A name `alias@suffix` maps to a `did:jig` through an attestation signed by a nameserver
+authoritative for the suffix. This JEP specifies:
+
+- how a resolver learns which nameservers are authoritative for a suffix;
+- the canonical form of attestations and registration proofs;
+- how whoever acts on a binding verifies it;
+- how clients pin names and accept changes;
+- what resolvers keep as evidence;
+- the DID-signed home record that says where a DID is served.
+
+Design record, alternatives and prior art:
+[`docs/superpowers/specs/2026-10-18-federation-naming-and-contract-design.md`](../../../docs/superpowers/specs/2026-10-18-federation-naming-and-contract-design.md),
+section 4.
+
+**Draft. Choices marked (pending DJ) are recommendations, not decisions.**
+
+# Motivation
+
+A DID is its own key, so key substitution happens where a name maps to a DID (OP-08).
+Today:
+
+- the server's resolver verifies no signature and binds no suffix to a nameserver;
+- it takes the first answer and caches past validity (NS-01);
+- nothing retains attestations (NS-02);
+- registration proofs bind no action (AB-01);
+- clients accept only DIDs and local contacts, which is what keeps nameserver lies away
+  from E2EE.
+
+This JEP lets clients use names without losing that property.
+
+Non-goals:
+
+- ruleset-group delegation with thresholds, cross-registration and transparency logs
+  (v0.3, with lane R);
+- multi-device (lane I).
+
+# Specification
+
+## Names
+
+1. A name is `alias@suffix`.
+   - The alias is 1–24 characters from `[A-Za-z0-9_-]`, compared case-insensitively and
+     stored lowercase.
+   - The suffix is a domain name, compared case-insensitively.
+2. A name says nothing about which server its holder uses.
+
+## Suffix authority
+
+3. A resolver MUST determine the set of nameserver DIDs authoritative for a suffix before
+   it accepts an attestation under that suffix. In order of precedence:
+   1. **Local configuration:** a map from suffix to nameserver DIDs. Configuration MUST
+      override discovery.
+   2. **Discovery** (pending DJ): `GET https://<suffix>/.well-known/jig-ns-delegation`
+      over TLS with a CA-valid certificate, returning
+      `{suffix, nameservers: [ns_did], valid_until, sigs: [{ns_did, sig}]}`.
+      - Each listed nameserver MUST sign the document.
+      - The resolver MUST refuse a document where any listed DID's signature is missing
+        or invalid.
+4. A resolver MUST NOT accept an attestation signed by a nameserver outside the suffix's
+   authoritative set.
+5. In v0.3, a ruleset group's signed delegation replaces discovery for suffixes the group
+   governs.
+
+## Attestations
+
+6. An attestation is `{did, alias, ns_did, valid_from, valid_until, sig}`.
+   - `alias` is the full name.
+   - Times are Unix seconds.
+   - `sig` is the Ed25519 signature by `ns_did` over the labelled BLAKE3 hash of
+     (`domain`, `jig-alias-attestation-v1`), (`did`), (`alias`), (`ns_did`),
+     (`valid_from`), (`valid_until`). Times are encoded as decimal ASCII.
+   - Labelled hashing is as in the admission proof-of-work: each label's UTF-8 bytes, then
+     the value's length as a little-endian u64, then the value.
+7. A **rotation statement** `{alias, old_did, new_did, at, sig_old, sig_new}` is signed by
+   both keys over (`domain`, `jig-alias-rotate-v1`), (`alias`), (`old_did`), (`new_did`),
+   (`ns_did`), (`at`). A nameserver MUST keep every rotation statement it accepted and
+   MUST serve the chain of them with the attestation that resulted.
+
+## Registration
+
+8. Proof of control for register, renew and rotate MUST be a signature by the DID over
+   (`domain`, `jig-alias-<action>-v1`), (`ns_did`), (`alias`), (`challenge`). A
+   nameserver MUST refuse a proof over the bare challenge.
+9. Registration is a binding endpoint. It MUST carry proof-of-work and rate limits
+   (identity-and-reputation.md; D23, D26). This JEP does not set the parameters.
+10. A nameserver MUST serve TLS: CA-issued, or bound to its DID as for servers. Plaintext
+    is allowed only behind an antipattern flag that the nameserver advertises.
+
+## Verification
+
+11. Whoever acts on a binding MUST verify it. A client MUST verify before it encrypts to,
+    adds, or opens a DM with a name, and MUST NOT rely on a server's check. Verification
+    means all of the following:
+    1. the signer is authoritative for the suffix (3–4);
+    2. `sig` verifies;
+    3. `valid_from ≤ now < valid_until` on the verifier's clock;
+    4. `alias` equals the requested name after normalisation.
+12. A resolver MUST NOT cache a binding past `valid_until` and MUST re-check validity on
+    every use of a cached binding.
+13. A resolver that obtains two valid attestations for one name with different DIDs and
+    overlapping windows MUST refuse the name, MUST keep both, and SHOULD surface them as
+    evidence of equivocation.
+14. A resolver MAY fetch through its own server or directly from a nameserver. The fetch
+    path does not affect verification.
+
+## Client pins
+
+15. A client SHOULD pin `(name → did, attestation, ns_did)` on first verified use and
+    show the DID's fingerprint and the vouching nameserver.
+16. A client MUST NOT act on a binding that differs from its pin unless one of these
+    holds:
+    1. a chain of valid rotation statements leads from the pinned DID to the new DID; or
+    2. the holder explicitly accepts the change.
+
+    That covers expiry followed by re-registration to another DID, a change of
+    nameserver, and any other differing answer.
+17. A client MUST accept names for E2EE operations only through 11 and 15–16. Local
+    contacts written by the holder count as pins.
+
+## Evidence
+
+18. A resolver SHOULD keep every attestation and rotation statement it acted on until at
+    least its `valid_until` plus 30 days, and SHOULD let the holder export them.
+
+## Home records
+
+19. A home record (pending DJ) is `{did, homes: [{server_did, url}], seq, sig}`, signed by
+    `did` over (`domain`, `jig-home-v1`), (`did`), the canonical JSON of `homes`, and
+    (`seq`).
+    - The record with the highest valid `seq` wins.
+    - A server SHOULD serve its users' home records.
+    - A nameserver MAY serve one beside an attestation.
+    - Nobody but the DID can produce one.
+
+# Security Considerations (Zero-Trust)
+
+**Threats addressed:**
+
+- **OP-08:** pins, with a change accepted only by a rotation signed by the old key or by
+  the holder.
+- **NS-01:** suffix authority, verification and bounded caching.
+- **NS-02:** retention, and conflicting answers as proof.
+- **AB-01:** proofs bound to the action, alias and nameserver.
+
+**Residual risks:**
+
+- **First contact.** A nameserver, or the controller of a suffix's domain under
+  discovery, can bind a name to its own key before the client first pins it. A signature
+  makes the lie provable, not impossible. Closing first contact needs transparency
+  (v0.3) or out-of-band comparison.
+- **NS-03** is unchanged until ruleset-group delegation.
+- **Domain seizure** under discovery redirects a suffix for names nobody has pinned yet.
+- **Home records** misroute only to denial of service, because key packages are
+  self-signed.
+
+**Privacy:**
+
+- Lookups through the server hide the client's address from the nameserver.
+- Direct lookups hide them from the server.
+- No message links two DIDs except a rotation statement, which both keys sign (PV-03).
+
+# Backwards Compatibility
+
+- v0.x makes no compatibility guarantee.
+- Attestations signed under the old JSON encoding are refused once a resolver implements
+  this JEP. Nameservers re-issue them on renew.
+- `/v1/resolve/{alias}` keeps its path and adds the rotation chain and an optional home
+  record.
+
+# Reference Implementation
+
+None yet. Milestone F1 of the design.
+
+# Test Vectors
+
+To be added with F1:
+
+- an attestation;
+- a rotation statement;
+- a delegation document;
+- a home record;
+
+each as inputs, hash and signature, under a fixed test key.
+
+# Rejected Alternatives
+
+- **Trusting the user's server to resolve.** That is today's model. The server becomes
+  able to substitute keys (D11).
+- **Failover between nameservers.** A second nameserver that is asked only when the first
+  fails adds availability and hides disagreement. Disagreement must refuse.
+- **The nameserver asserting the home server.** It couples routing to naming and lets the
+  nameserver misdirect.
+- **Names as `user@server`.** That ties identity to a server, which DIDs exist to avoid.
+
+# Copyright
+
+This document is licensed under CC-BY-4.0.
