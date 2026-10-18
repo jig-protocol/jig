@@ -18,6 +18,8 @@ pub mod error;
 pub mod hlc;
 pub mod lint;
 pub mod manifest;
+#[cfg(feature = "ed25519")]
+pub mod naming;
 #[cfg(test)]
 pub mod proptest_generators;
 pub mod receipt;
