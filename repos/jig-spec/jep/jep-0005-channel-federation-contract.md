@@ -56,6 +56,16 @@ Non-goals for v0.2:
 
 # Specification
 
+## Encoding
+
+0. Every message this JEP defines and signs (`contract-offer`, `contract-accept`,
+   `contract-refuse`, `contract-end`, a custodian release policy and a key-package
+   request) is a `COSE_Sign1` over deterministic CBOR, exactly as JEP-0004 rule 0 states,
+   with `domain` `jig-contract-offer-v1`, `jig-contract-accept-v1`,
+   `jig-contract-refuse-v1`, `jig-contract-end-v1`, `jig-kp-release-policy-v1` and
+   `jig-kp-request-v1` respectively. Blocks (`channel-share`, `role-assign`,
+   `sequencer-set` and the rest) and the `ingest` record are signed as JEP-0002 defines.
+
 ## Roles and addressing
 
 1. A channel is identified by `channel_id`, the CID of its `channel-create` block.
@@ -88,7 +98,8 @@ Non-goals for v0.2:
    that point in the `ingest` chain (7b). The owning server MUST then check that the
    target is on its configured peer list, and sends the target a `contract-offer`, signed
    by the owner. Only the owning server sends offers. The offer carries:
-   - `offer_id`, unique per offer: the BLAKE3 hash of the offer's signed bytes;
+   - `offer_id`, unique per offer: the BLAKE3 hash of the deterministic encoding of the
+     offer's payload, without `offer_id` itself;
    - the grant (7a);
    - the creation block;
    - the current `ingest` head (12);
