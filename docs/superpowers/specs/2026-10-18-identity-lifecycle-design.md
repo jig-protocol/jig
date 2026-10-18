@@ -2,9 +2,10 @@
 
 **Date:** 2026-10-18
 **Author:** DJ + Claude (lane I)
-**Status:** Research pass. Every answer below is a **recommendation**, not a decision. DJ
-decides them one at a time in this lane's Q&A, starting with Q5 (keys at rest), because
-gate G2 waits on it. No code until DJ approves.
+**Status:** Decided by DJ in the lane's Q&A, 2026-10-18 (see the decisions log at the
+end). The plan for milestone I1, which gates G2, is in
+[`plans/2026-10-18-identity-i1-keys-at-rest.md`](../plans/2026-10-18-identity-i1-keys-at-rest.md).
+No code yet.
 **Builds on:** the D11 handshake design (#136, JEP-0002, lane L7), the federation and
 naming design (#106, JEP-0004 and JEP-0005, lane F), the block ABI (#112, lane A) and
 capabilities (#117, lane C) designs, the
@@ -36,8 +37,10 @@ Checked against `main` at `062fe91`.
 | Everything is keyed by DID: the owner in a channel pin (`owner_did`), memberships, roles (F 5.9), DM slugs (`#dm/` + hash of the two DIDs), server pins (`server_did`), peers' `expected_did`, `ingest` record signers, reputation | `pins.rs`, `jig-core/src/dm.rs` |
 | The email bridge derives shadow identities from `bridge_secret` (read from the environment) and never stores them | `bridges/email/src/inbound.rs:89` |
 
-So rotating a key today means a new DID, and a new DID loses the channels it owns, its
-DMs, its roles, its pins at every contact and every peer, and its reputation.
+So rotating a key today means a new DID. That stays true (Q2). What changes is that a new
+DID no longer has to lose the channels it owns, its DMs, its roles, or its pins at every
+contact and every peer: the holder can carry them across with a link, disclosed to the
+parties they choose.
 
 ## Prior art
 
@@ -52,32 +55,16 @@ DMs, its roles, its pins at every contact and every peer, and its reputation.
 | **age** | n/a | n/a | File encryption to recipients (X25519, plugins for YubiKey, TPM, Secure Enclave) or to a passphrase (scrypt). An scrypt stanza must be the only one in a file | Good for exported backups. Cannot hold "keychain *or* passphrase" in one file |
 | **OS keychains** (macOS Keychain, Windows Credential Manager/DPAPI, Secret Service on Linux) | n/a | n/a | A per-user secret, unlocked with the login session | No prompt for routine use. Absent on headless Linux and over plain SSH. Secure Enclave and most TPMs cannot hold Ed25519 keys, so hardware can wrap a key-encryption key but not hold the signing key |
 
-## The idea that makes the rest cheap
+**Why jig does not adopt the log designs** (Keybase, did:plc, KERI, Matrix cross-signing).
+Each keeps an online record of every key behind an identifier. That record undoes **key
+ablation**: a holder discards a key under deanonymization pressure, and nobody can tell
+the old and new identities apart unless the holder says so (DJ, 2026-10-18). jig takes
+from them only the ideas that survive without a public record: dual-signed rotation and
+self-signed revocation.
 
-**Make the DID outlive its key.** Keep today's DID string, `did:jig:z<base32(key)>`, but
-read it as "the identity whose first key is this one", as did:plc and KERI do. Each DID
-gets an **identity log**: an append-only chain of entries, each signed by a key the log
-already authorises. A DID with an empty log is exactly today's DID, so every existing
-identity stays valid with no migration.
+## Q5. Keys and MLS state at rest (gates G2)
 
-Then:
-
-- **Rotation changes no DID.** Channel ownership, roles, memberships, DM slugs, server
-  pins, `expected_did`, `ingest` signers, name attestations and reputation all stay put.
-  Nothing has to "follow" a rotation, because nothing that is keyed by DID moves.
-- **Devices are entries in the same log.** Adding and revoking a device is the same
-  mechanism as rotating.
-- **The cost is one new seam:** every verifier asks "which keys does this DID authorise
-  at this point?" instead of decoding the DID. That is about 20 call sites today, behind
-  one `KeyResolver` in `jig-core`.
-
-The alternative is a new DID per rotation, plus a rotation certificate linking old to new
-(what `crypto.md` describes now). Every DID-keyed thing then needs its own migration rule,
-and one of them breaks outright: a server that rotates its key would need every channel
-owner to sign a `sequencer-set` naming its new DID (L7 item 5), because only owners move a
-sequencer. Q2 compares the two.
-
-## Q5 first: keys and MLS state at rest (gates G2)
+**Decided (DJ, 2026-10-18): option A, key slots.**
 
 ### What encryption at rest buys, said plainly
 
@@ -99,7 +86,7 @@ sequencer. Q2 compares the two.
 | **B. Passphrase only** (age with scrypt, or Argon2id) | A prompt every time a process starts | `jig send` in a script prompts or needs a passphrase in the environment. Concurrent `jig chat` and `jig send` each prompt. Needs an agent to be usable, which is more code than A |
 | **C. Ship G2 with an honest `crypto.md`** | Nothing changes | The G2 line is met on paper. The plaintext cache stays the weakest point in the system for another milestone |
 
-**Recommendation: A.**
+Option A was chosen (decided above).
 
 ### The envelope (option A)
 
@@ -142,8 +129,7 @@ YubiKey). The hardware wraps the data key. It cannot hold the identity key, beca
 Secure Enclave and most TPMs do not do Ed25519, and MLS signs too often for a token. The
 identity key is in memory while a process uses it, and the spec says so.
 
-**Exported backups** use age: `jig keys export` writes the seed (and, later, the identity
-log) to an age file, encrypted to a passphrase or an age recipient. That is a standard,
+**Exported backups** use age: `jig keys export` writes the seed to an age file, encrypted to a passphrase or an age recipient. That is a standard,
 audited format that other tools can open.
 
 ### Who unlocks how
@@ -164,7 +150,7 @@ audited format that other tools can open.
 into a `.jigkey` with the default slot, re-encrypts the MLS directory, and removes the raw
 files. It says plainly that removing a file does not erase it on an SSD or a
 copy-on-write filesystem, and that a key which was ever in a backup should be rotated
-once rotation exists (milestone I2). `jig-server` refuses a raw keyfile unless the flag is
+once rotation exists (milestone I3). `jig-server` refuses a raw keyfile unless the flag is
 set, and prints the one command that seals it.
 
 **Crates:** `chacha20poly1305`, `argon2`, `keyring` (OS keychains), `zeroize`. All are
@@ -175,309 +161,277 @@ the operator." It does not. The key belongs to the operator. At rest it protects
 operator from disk theft and leaked backups. Restricted content is protected from the
 operator by MLS (D25), not by this.
 
-## Q1. Device model
 
-| Option | MLS | Signatures | DM slugs, ownership, roles | Admission and reputation | Revoking one device |
-| --- | --- | --- | --- | --- | --- |
-| **A. One DID per device, plus an account-binding certificate** | A leaf per device | Each device signs as itself | Keyed by device, so DMs and ownership fork per device, or everything moves up to a new "account" identifier | Split per device, or moved to the account | Easy |
-| **B. One DID key copied to every device** (Signal) | Impossible as is: RFC 9420 7.3 forbids two leaves with one signature key. MLS would need per-device keys anyway, so B becomes C for MLS | Unchanged | Unchanged | Unchanged | Impossible without a new key for the whole identity: every device holds the root |
-| **C. Device keys certified by the DID** (Matrix, Keybase) | A leaf per device; the credential is the DID plus the device's certificate | A device key signs; the signature carries its certificate | Unchanged: still keyed by DID | Unchanged: still per DID | One log entry. The DID does not change |
+## Q1. Devices
 
-**Recommendation: C**, built on the identity log.
+**Decided (DJ, 2026-10-18): copy the DID key to each device. MLS leaves are scoped.**
 
-- **Option A is C with the names swapped.** Its "account" identifier is C's DID, and
-  everything that is keyed by DID today would move to it.
-- **Option B is not available for MLS,** and a stolen device is unrecoverable without a
-  new identity.
+Rejected:
+- **Device subkeys certified by the DID.** These need a public device list, which is the
+  log Q2 rejects.
+- **One DID per device.** DMs, ownership and roles would split per device.
 
-### How C works
+**Pairing.**
+- The new device shows a one-time X25519 recipient, as text or a QR code.
+- The existing device seals the DID seed to that recipient with age. The user moves the
+  sealed seed over any channel, or through a server mailbox.
+- The new device seals the seed under its own key slots (Q5). The user compares
+  fingerprints on both screens.
+- No server learns that a pairing happened.
 
-**Keys and their powers:**
+**MLS: a fresh leaf key per key package.**
+- RFC 9420 7.3 makes each leaf's `signature_key` unique, so a device cannot use the DID
+  key as its leaf key.
+- Each key package gets a fresh Ed25519 leaf key. The DID key signs a **leaf
+  certificate**: (`domain`, `jig-mls-leaf-v1`), the DID, the leaf key.
+- Key packages are single-use, so each group sees a different leaf key per device. A
+  device cannot be correlated across groups by its leaf key.
+- An external commit makes its own fresh leaf key.
+- `jig_mls::credential::bound_did` checks the leaf certificate instead of requiring the
+  leaf key to be the DID key.
+- **What members learn.** A group's members see how many devices a DID has in that
+  group, and nothing else. No list exists outside groups.
 
-- The **root key** is the DID's first key, or whichever key the log last rotated to.
-- **Device keys** are Ed25519 keys, one per device, each added by a `device-add` entry.
-- **Who may sign what:**
+**Adding and removing:**
+- **Adding a DID** adds one leaf per device that has stocked key packages. Custodians (F
+  5.4) release one package per device under the DID's single release policy.
+- **A newly paired device joins groups through its sibling.** The existing device commits
+  the new leaf.
+- **MLS gate rule (new):** any member may commit leaves certified by its own DID, and
+  remove its own DID's leaves. Roles still govern adding and removing *other* DIDs.
+- **Removing a DID** removes all its leaves.
 
-  | Entry | Root | Any device |
-  | --- | --- | --- |
-  | `device-add` | yes | yes (Keybase's rule; every other device shows the addition) |
-  | `device-revoke` | yes | yes. A stolen device that revokes the others is a denial of service; the root re-adds them |
-  | `root-rotate` | yes, at once | yes, but it takes effect only after a **contest window** (did:plc's idea; default 72 hours). The root can veto it inside the window. This is how "a second device signs a rotation" (F's Q3) stays safe against a stolen device |
+**Unchanged:** blocks (signed by the DID key), DM slugs, roles, ownership, pins,
+admission and reputation. `--anon` keys (D20) never pair.
 
-- **Where the root lives.** On the first device by default, plus a recovery kit (an age
-  export) that the CLI asks the user to make. A user may move it offline and run every
-  device on a device key.
+**History** before a device joined is unreadable to it. Transfer between sibling devices
+is v0.3.
 
-**Blocks:**
+**The cost.**
+- Every device holds the identity.
+- A stolen device burns the DID. Its holder revokes it (Q3) and, if they choose, links a
+  new DID (Q2).
+- This is key ablation as designed: keys are expendable.
 
-- The author is still the DID.
-- The signature is by a device key. The block carries that device's certificate (the
-  `device-add` entry, about 200 bytes) and the identity-log head it was signed under.
-- A verifier checks the chain back to the DID with no network round trip.
-- **Legacy path:** a block signed by the DID's own key, under an empty log, verifies
-  exactly as today.
+## Q2. Rotation and links
 
-**MLS:**
+**Decided (DJ, 2026-10-18): a DID is bound to its key and does not outlive it.** A
+rotation is a new DID. Rejected: an identity log that ties keys to a DID. Its online record
+of every key behind a DID would undo key ablation, one of jig's main anonymity guarantees
+([authn/authz design](2026-08-24-jig-server-authn-authz-design.md): "unless I tell
+them").
 
-- **A leaf per device.** The credential is the DID; the signature key is the device key;
-  a leaf extension carries the device certificate. `jig_mls::credential::bound_did`
-  checks the certificate instead of decoding the DID.
-- **Adding a DID adds all its devices.** A `member-add` names the DID, and the commit adds
-  one leaf per current device, from key packages each device stocks at its custodians
-  (F 5.4). Alice's release policy (F 5.4) is per DID, so it covers all her devices.
-- **A new MLS gate rule:** any member may commit leaves for its own DID's devices, and any
-  member may remove a leaf whose device the DID's log revoked. Both are checked against
-  the log, not the role. Roles still govern adding and removing *DIDs*.
-- **A new device reads from the epoch it joins.** Moving history between one's own
-  devices (a private self-channel, as in Matrix key backup or Signal's transfer) is v0.3.
+**Decided (DJ, 2026-10-18): the holder chooses who learns that two DIDs share a
+holder.**
 
-**DM slugs** hash the two DIDs and are unchanged. **Admission and reputation** stay per
-DID. A server may still limit devices per DID.
+### The link statement
 
-**Privacy (PV-03):**
-
-- A DID's log shows how many devices it has.
-- MLS leaves show the same to channel members, as in every multi-device MLS system.
-- Device certificates name no device and no platform.
-- No entry links two DIDs.
-- `--anon` keys (D20) are unaffected: they have no log.
-
-## Q2. Rotation: format, propagation, and what follows it
-
-### Options
-
-| Option | What rotation is | What must follow it |
-| --- | --- | --- |
-| **A. The DID outlives its key (identity log)** | A `root-rotate` entry in the DID's log, signed by the old root and the new one | Nothing that is keyed by DID. Verifiers learn the new key from the log |
-| **B. A new DID, with a rotation certificate** (`crypto.md` today) | A dual-signed certificate from old DID to new DID | Pins, `expected_did`, ownership (F has no ownership transfer before v0.3), roles, memberships (an MLS rejoin), DM slugs (a new DM; history splits), reputation, name attestations. Server rotation needs a `sequencer-set` from every owner whose channel the server sequences |
-
-**Recommendation: A.** B is the status quo's design, and it turns one key change into
-eight migrations, one of which another party has to sign.
-
-### The identity log
+A **link** is one signed object:
 
 | Field | Meaning |
 | --- | --- |
-| `did` | The DID |
-| `seq` | 0, 1, 2, … |
-| `prev` | Hash of the previous entry; absent at 0 |
-| `kind` | `device-add`, `device-revoke`, `root-rotate`, `root-veto` |
-| `body` | Per kind: the device key; the revoked key and an optional `compromised_since`; the new root key; the vetoed entry's hash |
-| `signer` | The key that signs: root, or a device the log authorises at `seq - 1` |
-| `sig` | The signature. A `root-rotate` by the root carries two: old root and new root |
+| `old` | The DID being left |
+| `new` | The DID taking over |
+| `audience` | Exactly one of: a channel (its `channel_id`), a nameserver DID with an alias, a contact's DID, or `public` (servers only, in practice) |
+| `issued_at` | When it was signed |
 
-- **Self-certifying.** Entry 0 is checked against the key the DID string encodes. Each
-  later entry is checked against the key set the log has authorised so far.
-- **A fork is evidence.** Two valid entries at one `seq` are proof of a stolen key (or of
-  equivocation), the same shape as two conflicting `ingest` records. The client keeps
-  both and asks the user to choose (L7's evidence bundle, item 9).
-- **Pre-rotation** (KERI: each root commits to the hash of the next root) is an optional
-  field reserved for v0.3. It closes the race in which a thief with the current root
-  rotates first.
+- **Signed by both keys**, so neither key alone can claim the other.
+- **Not published by default.** The holder hands it to the audience it names.
+- **Bound to its audience.** A link scoped to one channel cannot move roles in another,
+  or an alias.
 
-### Encoding (A5)
+**Push-back: a disclosed link is permanent and can be forwarded.** A signature proves the
+link to anyone the recipient shows it to. "The holder chooses who learns" therefore holds
+only as far as each recipient keeps it to itself. The CLI must say so before it sends one.
+**Deniable links** would fix this for contacts: a MAC under a key the two parties share, so
+the recipient is convinced but cannot prove it to anyone else. They are v0.3. Channels and
+nameservers need a transferable signature, because more than one party verifies the link.
 
-**Recommendation:** each entry is a COSE_Sign1 (RFC 9052) over deterministic CBOR (RFC
-8949 section 4.2), algorithm EdDSA with Ed25519. A dual-signed `root-rotate` is a
-COSE_Sign with two signatures. This matches the v0.3 receipts (A5), so jig would have one
-stack for long-lived signed objects. The other formats are short-lived or wire-level.
+**Push-back: keeping a public name means a public link.** A nameserver that moves
+`alice@example.org` to a new DID must show the link to every resolver that pinned the old
+DID (F 4.4). That is the point of keeping the name. A holder who wants ablation drops the
+name.
 
-**Swappable:**
+### What a link moves, per audience
 
-- The verifier consumes a decoded `LogEntry` and the exact bytes that were signed.
-- Encoding sits behind one trait. A labelled-BLAKE3 encoding (`hash_labeled_parts` with
-  the domain `jig-identity-log-v1`, the form F 4.6 uses for attestations) implements the
-  same trait.
-- If DJ decides A5 does not extend past receipts, I1 to I3 ship with the labelled hash
-  and lose nothing.
-- The domain tag goes into the signed bytes either way.
+| Audience | What moves | How |
+| --- | --- | --- |
+| A channel | The old DID's roles (owner, co-owner, admin), and its membership | A `key-link` block, authored by the new DID, carrying the link. Through `ingest`, so the chain fixes the cut-over. From that `seq`, the owner's server reads the old DID's roles as the new DID's. The new DID commits its own leaves in, and the old DID's leaves out, under the Q1 gate rule. The creator rule (F 5.9: the creator cannot be demoted) carries across the link |
+| A nameserver and alias | The alias attestation | `/v1/rotate` takes the link (audience = that nameserver and alias) in place of today's two challenge signatures. The nameserver keeps it and serves it with the new attestation. Name pins follow it (F 4.4, L7 item 11) |
+| A contact | The contact's pin of the old DID, and the DM | Sent in the old DM. The contact's client moves its pin and opens the new DM (a new slug), showing the old one locally as earlier history |
+| `public` | Server pins, peers' `expected_did`, sequencing | Q4 |
 
-### Propagation: how everyone learns
+**Not moved by any link:** reputation. A score is a scorer's opinion of a DID. Whether a
+scorer accepts a link it is shown is the scorer's policy, and a holder with a bad score
+need not show one. This is what ablation means
+([authn/authz phase 4](../plans/2026-09-11-authn-authz-phase-4-admit.md): "unknown is a
+choice").
 
-There are no rotation endpoints to add. The log is served wherever the DID is already
-found.
+**A fork.** Two links from one old DID to different new DIDs mean the old key was stolen.
+Any verifier that holds both keeps them as evidence and accepts neither automatically.
 
-1. **Custodians and the reachability record (F 4.7).** The record gains `id_head`:
-   `{seq, hash}`. Every custodian that stocks the DID's key packages also serves its log.
-   Key packages are signed by device keys, so a custodian must serve the log for them to
-   verify at all.
-2. **Nameservers** serve the log next to the attestation. Under A, an alias stays bound to
-   the same DID across rotations, so `/v1/rotate` is only for moving an alias to a
-   *different* DID, and F's name-pin rule fires only then. Key rotation stops touching
-   names at all.
-3. **In each channel: an `identity-update` block.** It cites a log entry. The DID's own
-   device posts one into every channel it is in after a rotation or revocation. Servers
-   may post one too. It goes through `ingest`, so the channel's own chain fixes the order:
-   blocks before it are judged by the old key set, blocks after it by the new one. A
-   hostile sequencer that delays it is outrun by the DID's device posting it, and by
-   carriers that already hold the newer log.
-4. **The handshake.** A client's `hello` authentication carries its device certificate
-   and `id_head`. A server answers with its own, so clients learn of server rotations at
-   connect (Q4).
-5. **Head gossip.** Identity-log heads ride L7's anonymous head gossip next to `ingest`
-   heads, so a fork that only some carriers saw becomes visible to all.
+### Encoding
 
-### What each DID-keyed thing does
-
-| Thing | Under A |
-| --- | --- |
-| Server pins (`pins.json`), `expected_did` | Unchanged. The pin store adds the last verified `id_head` per DID |
-| Name pins (L7 item 11) | Unchanged on rotation. A name that moves to another DID still follows F's rule. F's "signed by the old key" reads as "signed by a key the old DID's log authorises" |
-| Channel ownership, co-owners, roles (F 5.9) | Unchanged |
-| Memberships, MLS leaves | Unchanged by root rotation: device certificates the old root signed stay valid. A revoked device's leaves are removed (Q3) |
-| DM slugs | Unchanged |
-| `ingest` signers, the manifest log | Unchanged. Records are checked against the sequencer DID's keys at that `seq` (Q4) |
-| Reputation | Unchanged |
+**Decided (DJ, 2026-10-18): COSE over deterministic CBOR (A5).**
+- Single-signer objects (revocations, leaf certificates) are COSE_Sign1 (RFC 9052),
+  EdDSA with Ed25519, over RFC 8949 section 4.2 deterministic CBOR.
+- Links are COSE_Sign, with two signatures.
+- Every payload carries a domain tag: `jig-key-link-v1`, `jig-key-revoke-v1`,
+  `jig-mls-leaf-v1`.
+- Encoding sits behind one trait, so another encoding would be one new implementation.
+- This is the same stack as the v0.3 receipts.
 
 ## Q3. Revocation
 
-- **One device lost or stolen:**
-  1. Another device, or the root, signs `device-revoke`.
-  2. It posts `identity-update` into each of the DID's channels.
-  3. It commits the removal of that device's leaves.
-  4. Other members may also remove a revoked leaf (Q1's gate rule).
-- **Latency:**
-  - Immediate at any server that sees the update.
-  - In every channel, as fast as a remaining device can post. The CLI does it on the
-    revoke command and again at its next connect.
-  - A channel nobody posts the update to keeps accepting the revoked key until a carrier
-    learns the log from gossip, a handshake or a custodian. That is bounded by gossip, not
-    by any guarantee. The spec says so.
-- **Past content:**
-  - Blocks ordered before the `identity-update` stay valid: they were signed while the key
-    was good, and the chain proves the order.
-  - What the stolen device had already decrypted is gone; nothing can recall it.
-  - After the removal commit, MLS post-compromise security keeps it out of new epochs.
-  - If the revocation carries `compromised_since`, clients mark that device's blocks
-    after that time as suspect. They still show them; they never delete them.
-- **Root lost, a device left:** the device signs `root-rotate`, which takes effect after
-  the contest window.
-- **Root stolen:** rotate from the root, or the recovery kit, at once, and revoke the
-  devices. A thief who rotated first creates a fork (two entries at one `seq`). That is
-  evidence, not a resolution: contacts see a fork and must choose. Pre-rotation (v0.3)
-  removes this race.
-- **Everything lost:** the identity is gone. The user makes a new DID and contacts accept
-  it by hand (F's rule). `crypto.md`'s threshold revocation by trusted peers becomes
-  **recovery contacts**: a k-of-n log entry naming DIDs who may jointly sign a
-  `root-rotate` after a longer contest window. That is v0.3, with lane R (tribunals).
+**Decided (DJ, 2026-10-18): self-revocation.**
+
+**The statement.** A **revocation** is signed by the key it revokes:
+`{did, compromised_since?, issued_at}`.
+- It names no other DID, so it links nothing.
+- It is final: nothing un-revokes a DID.
+- A thief can sign one too. That only burns a key that was already burned.
+
+**Who learns, and how fast:**
+
+| Party | How it learns | Then |
+| --- | --- | --- |
+| Each channel the DID is in | A `key-revoke` block, posted by the holder's client from its local `groups.json` list, through `ingest` | The owner's server refuses blocks from the DID after that `seq`. Members remove its leaves (any member may remove a revoked DID's leaves). Blocks before the cut-over stay valid. If `compromised_since` is set, clients mark the DID's blocks after that time as suspect, and still show them |
+| Custodians (F 5.4) | Sent directly | They stop releasing its key packages |
+| Nameservers | Sent directly | They expire attestations bound to it. A later link to a new DID re-binds the alias |
+| Servers it authenticates to | Sent directly, and seen in channels | They refuse its handshakes |
+| Everyone else | Head gossip and carriers, eventually | Bounded by gossip, not by any guarantee. The spec says so |
+
+**What cannot be done:**
+- **Past content stays read.** Whatever the stolen device decrypted cannot be recalled.
+  MLS post-compromise security protects only epochs after the removal commit.
+- **A withheld revocation.** A hostile sequencer can withhold a `key-revoke` block. The
+  holder detects that the same way as any withheld block (`seen`, L7) and posts through
+  another carrier. This is ID-03.
+- **Recovery after total loss.** A holder whose only copy of the key is gone cannot sign
+  a revocation. But the key is gone for a thief too, unless the thief holds the device.
+  So the CLI makes a **recovery kit** (`jig keys export`, an age file) at `jig init` and
+  asks the holder to store it elsewhere. Recovery contacts are v0.3, with lane R.
 
 ## Q4. The server-key ceremony
 
-**A server is a DID like any other,** so it gets the same log. The practice the spec
-already asks for ("HSMs or encrypted volumes", "rotate annually") becomes concrete:
-
-- **Root offline, operational key online.** The server runs on a device key. Its root
-  lives offline: in a `.jigkey` with only a passphrase slot, on another machine, or
-  later in an HSM.
-- **A routine rotation** is `device-add` of a new operational key followed by
-  `device-revoke` of the old. It is cheap enough to automate. Every DID-keyed thing
-  stays put.
-- **The ceremony is for the root.** It is rare: compromise, or a policy period.
+**Decided (DJ, 2026-10-18).** A server publishes a `public` link. On a verified link,
+clients move the server pin, peers move `expected_did`, and the old key hands over
+sequencing for every channel it sequences.
 
 **Steps:**
 
-1. **Generate** the new key and **sign** the log entry: the old key signs; for a root,
-   both keys sign.
-2. **Publish:**
-   - an `identity-update` block in the server's **manifest log** (L7 item 13; add the kind
-     to the manifest log's allow-list);
-   - an `identity-update` in each channel it sequences, so each `ingest` chain fixes the
-     cut-over `seq`;
-   - the new `id_head` in its welcome.
-3. **Re-issue the TLS binding** (#95). `/.well-known/jig` serves a certificate vouched for
-   by the new key, plus the log chain that authorises it. During an overlap window it
-   serves both, so connections that are already open and cached certificates keep
-   working.
-4. **Peers** keep `expected_did`. The mutual handshake (L7 item 12) carries `id_head`
-   both ways, so each peer verifies the extension and moves on.
-5. **Revoke** the old operational key once the overlap ends.
+1. **Generate** the new key into a `.jigkey`. Sign the link `old → new`, audience
+   `public`.
+2. **Publish the link:**
+   - in the old DID's **manifest log** (L7 item 13), as its last block, a
+     `server-rekey` block carrying the link;
+   - the first block of the new DID's manifest log cites it;
+   - the welcome carries the link during an overlap window (a config value; 30 days is
+     the proposed default).
+3. **Hand over sequencing.** In each channel it sequences, the server ingests a
+   `sequencer-rekey` record:
+   - signed by the **old** key, at `seq` = head + 1;
+   - naming the new DID and citing the link;
+   - from the next `seq` on, the new key signs records.
 
-**What a client does on a mismatch** (the server signs with a key the client did not
-expect):
+   No owner signature is needed: this is the same server under a new key, not a new
+   sequencer.
+4. **Re-issue the TLS binding** (#95). `/.well-known/jig` serves a certificate vouched
+   for by the new DID. During the overlap the old key also vouches, so clients that still
+   pin the old DID connect, read the link, and move.
+5. **Retire the old key.** At the end of the overlap the server signs a revocation of
+   the old DID, and the old key's `.jigkey` is destroyed.
 
-| What the client finds | Result |
+**What a client or peer does when the server is not the pinned DID:**
+
+| What it finds | Result |
 | --- | --- |
-| A log chain from its pinned `id_head` that authorises the new key | It updates `id_head` and says once that the server rotated its key, on what date, signed by the old key. No refusal |
-| No chain, or a chain that does not verify | A class 3 contradiction (L7): refuse, keep evidence. Not sticky: the server has signed nothing that proves a lie |
-| A fork: two valid entries at one `seq`, both signed by the server's keys | Server-signed evidence, so the refusal is **sticky** (L7 item 9) until `jig trust accept` |
+| A link `pinned → presented`, audience `public`, both signatures valid | Move the pin (or `expected_did`) and say once: the server's key changed, the date, signed by the old key. No refusal |
+| No link, or one that does not verify | A class 3 contradiction (L7): refuse and keep evidence. Not sticky: the server has signed nothing that proves a lie |
+| Two links from the pinned DID to different DIDs | Server-signed evidence of a stolen key: a **sticky** refusal (L7 item 9) until `jig trust accept` |
+| A `sequencer-rekey` not signed by the expected sequencer, or naming a DID without a matching link | A class 3 contradiction in that channel's chain |
 
 **How it fits L7:**
+- Signed refusals verify under whichever DID the client accepted at the time.
+- `sequencer-set` is unchanged: it is still the owner's tool to move a channel to another
+  *server*.
+- `sequencer-rekey` is a new record kind (an L7 amendment): the *same* server under a
+  new key, signed by the old key, with the link cited.
+- A compromised server key is the race case. The thief can sign a competing link, and
+  the fork row above catches it. Rotate fast and revoke the old key.
 
-- **Signed refusals** (`jig-handshake-refusal-v1`) verify under the key set at the time
-  of signing.
-- **`ingest` records** verify under the sequencer DID's keys at that `seq`. The
-  `identity-update` record marks the cut-over inside each chain.
-- **`sequencer-set`** is untouched: it names a DID, and the DID did not change. That is
-  the main reason to prefer A.
-- **A server that moves the sequencer** (`sequencer-set`) to escape a key compromise is
-  the wrong tool. Rotation is the right one. The runbook should say so.
+**Bots (C3)** have their own DIDs, so a server rekey does not touch them. A bot is rekeyed
+by its host with its own `public` link, and the owner's next `block-install` names it.
 
 ## Q6. Coordination with other lanes
 
 | Lane | What this design asks of it | When |
 | --- | --- | --- |
-| L7 (handshake, pins, trust) | Pins keep `id_head` per DID. The evidence bundle takes identity-log forks. `hello` and the welcome carry the device certificate and `id_head`. The name-pin rule reads "signed by a key the old DID's log authorises". `identity-update` joins the manifest log's allow-list. `jig trust` shows device lists and pending rotations | I2 (servers) and I3 (devices). Nothing in I1 |
-| F (federation, naming) | The reachability record gains `id_head`. Custodians and nameservers serve logs. Key packages are per device; a `member-add` adds every device. `/v1/rotate` narrows to "alias moves to another DID". Role checks are unchanged | I3 |
-| A (block ABI) | Blocks carry a signer certificate and `id_head` beside the author DID | I3 |
-| C (capabilities) | Bot keys are sealed in the server's keystore (I1). A bot is a DID, so it can have a log, and its host rotates it | I1, then I2 |
-| S (suite registry) | The MLS credential carries a device certificate, so the `mls` suite's conformance vectors grow a multi-device case | I3 |
-| L3 (CLI) | New commands: `jig keys protect`, `jig keys export`, `jig device link / list / revoke`, `jig keys rotate` rebuilt on the log | I1 to I4 |
-| DJ (A5) | Whether COSE extends to identity-log entries | Before I2 |
+| L7 (handshake, pins, trust) | A `sequencer-rekey` record; the welcome carries a server link during the overlap; the evidence bundle takes link forks; `server-rekey` joins the manifest log's allow-list; `jig trust` shows key changes and revocations | I2 |
+| F (federation, naming) | `/v1/rotate` takes a COSE link in place of two challenge signatures, and serves it with the attestation. The name-pin rule (4.4) reads "a link from the pinned DID, audience this nameserver and alias". Roles follow a channel-scoped `key-link` at its `seq` (5.9), and the creator rule carries across. Custodians release one key package per device, and stop on revocation. Peers move `expected_did` on a `public` link | I2 (servers), I3 (users), I4 (devices) |
+| A (block ABI), A5 | New block kinds `key-link` and `key-revoke`; the COSE stack is shared with receipts | I2 |
+| C (capabilities) | Bot keys sealed in the server's keystore (I1). Bot rekey by `public` link | I1, I2 |
+| S (suite registry) | MLS credentials carry a leaf certificate; the conformance vectors grow a multi-device case | I4 |
+| L3 (CLI) | `jig keys protect`, `jig keys export`, `jig keys rotate` (rebuilt on links), `jig keys revoke`, `jig device pair` | I1 to I4 |
+| R (reputation) | Whether and how a scorer accepts a link it is shown; recovery contacts | Later |
 
 ## Proposed spec and JEP changes
 
 These are applied in implementation PRs, not in this one.
 
-- **`crypto.md`**
+- **`crypto.md`:**
   - Fix the DID encoding (base32, `z` prefix).
-  - Replace "Storage" with the slot model and the plain statement of what at-rest
-    encryption does not cover.
-  - Replace the rotation-certificate section with the identity log.
-  - Replace threshold revocation with recovery contacts (marked v0.3).
-- **`zero-trust.md`, `security.md`:** server rotation is a log entry, and the DID stays.
-  The incident runbook (`security.md:466`) becomes "revoke the device, or rotate the root".
-- **`threat-register.md`**
-  - New rows:
-    - ID-01: stolen device.
-    - ID-02: identity-log fork or equivocation.
-    - ID-03: revocation withheld by a sequencer.
-    - ID-04: key or cache theft at rest.
-  - OP-08 and PV-03 updated.
-- **New JEP-0006, "Identity logs":** entry format, verification, propagation and the
-  `identity-update` block.
-- **JEP-0001 Q4:** answered by JEP-0006: a leaf per device; rotation without a rejoin.
-- **JEP-0002:** `id_head` and the device certificate in `hello` and the welcome.
-- **JEP-0004 and JEP-0005:**
-  - `id_head` in the reachability record.
-  - Logs served by custodians and nameservers.
-  - `/v1/rotate` narrowed.
+  - "Storage": the slot model, and a plain statement of what at-rest encryption does not
+    cover.
+  - "Rotation": a rotation is a new DID. Replace the old certificate with the link: both
+    keys sign it, and the holder chooses its audience. **Drop the MUST that publishes
+    rotations to a transparency log**, which contradicts key ablation. Servers publish
+    theirs.
+  - "Revocation": self-revocation. Threshold revocation by peers becomes recovery
+    contacts (v0.3, lane R).
+- **`zero-trust.md` and `security.md`:**
+  - Server rotation becomes the Q4 ceremony.
+  - The incident runbook (`security.md:466`) becomes "revoke, then link, to whom you
+    choose".
+- **`threat-register.md`.** New rows:
+  - ID-01: stolen device;
+  - ID-02: link fork (stolen key);
+  - ID-03: revocation withheld by a sequencer;
+  - ID-04: key or cache theft at rest;
+  - ID-05: a disclosed link forwarded.
+
+  PV-03 gains a sentence: a link is the one message that ties two DIDs, and only the
+  holder makes one.
+- **New JEP-0006, "Key links and revocation":** the objects, their encoding, the
+  `key-link`, `key-revoke`, `server-rekey` and `sequencer-rekey` records, and who acts
+  on each.
+- **JEP-0001 Q4:** a leaf per device, under leaf certificates. A rotation is a new DID
+  and a channel-scoped link.
+- **JEP-0002:** `sequencer-rekey`; the welcome carries the link during an overlap.
+- **JEP-0004 and JEP-0005:** `/v1/rotate` on links; roles across links; custodians per
+  device.
 
 ## Milestones
 
+**Decided (DJ, 2026-10-18): G2 waits on I1 only.**
+
 | Milestone | Scope | Gate | Rough size |
 | --- | --- | --- | --- |
-| **I1. Keys at rest** | The `.jigkey` envelope and its slots; encrypted MLS state and plaintext cache; server, nameserver and bot keys; migration; `jig keys protect` and `jig keys export`; `crypto.md` storage text | **G2** | 3 PRs: envelope and slots in `jig-core`/`jig-client`; MLS directory; servers and migration |
-| **I2. Identity logs, servers first** | The log format and verifier (`KeyResolver`, replacing direct DID decoding); `identity-update`; servers on operational keys; the root ceremony; client handling of mismatches; manifest-log and TLS-binding changes | M3 | Large: the resolver seam touches about 20 files |
-| **I3. User devices** | Device keys and certificates; device linking (the new device shows a code, an existing device confirms and signs); a leaf per device; key packages per device; the MLS gate rule | M3 | Large; leans on F's custodians |
-| **I4. Revocation and contested rotation** | `device-revoke` end to end, leaf removal, `compromised_since`, rotation from a device with the contest window and veto | M3 | Medium |
-| **Later (v0.3)** | Pre-rotation, recovery contacts, history transfer between one's own devices, hardware slots, an unlock agent, a transparency log (lane R) | | |
+| **I1. Keys at rest** | The `.jigkey` envelope and slots; encrypted MLS state and plaintext cache; server, nameserver and bot keys; migration; `jig keys protect` and `jig keys export` (the recovery kit); `crypto.md` storage text | **G2** | 3 PRs ([plan](../plans/2026-10-18-identity-i1-keys-at-rest.md)) |
+| **I2. Signed objects and the server ceremony** | The COSE and deterministic-CBOR stack; links and revocations; `server-rekey`, `sequencer-rekey`, link-following in clients and peers; TLS re-binding | M3 | Medium, and it depends on L7's manifest log and `ingest` records |
+| **I3. User rotation and revocation** | `key-link` and `key-revoke` blocks; roles across links; `/v1/rotate` on links; the contact and DM flow; `jig keys rotate` and `jig keys revoke` | M3 | Medium, and it depends on F's roles |
+| **I4. Devices** | Pairing; leaf certificates and fresh leaf keys; the MLS gate rule; one key package per device at custodians | M3 | Medium, and it depends on F's custodians |
+| **Later (v0.3)** | Deniable links, history transfer between devices, an unlock agent, hardware slots, recovery contacts | | |
 
-**Push-back on scope:** the phase-1 list has "multi-device and key rotation; a server-key
-rotation ceremony", but phase 1's exit criterion does not mention them. I recommend that
-G2 wait only on I1, and that I2 to I4 land in M3. DJ should say if v0.2 must hold them.
+## Decisions log
 
-## Open questions for DJ, in order
-
-1. **Q5:** key slots (A), passphrase only (B), or an honest `crypto.md` for G2 (C).
-   Recommended: A.
-2. **Q2:** does the DID outlive its key (identity log, A) or does each rotation make a new
-   DID (B)? Recommended: A. This decides most of the rest.
-3. **Q1:** device subkeys certified by the DID (C), a copied root key (B), or a DID per
-   device (A). Recommended: C.
-4. **Q1 detail:** may any device add devices, and may a device rotate the root after a
-   72-hour contest window? Recommended: yes to both.
-5. **A5:** COSE_Sign1 over deterministic CBOR for log entries, or the labelled BLAKE3
-   hash. Recommended: COSE, with the encoding behind a trait.
-6. **Q4:** servers run on an operational key, with the root offline, by default?
-   Recommended: yes, from I2.
-7. **Scope:** does G2 wait only on I1? Recommended: yes.
+| # | Question | Decision (DJ, 2026-10-18) |
+| --- | --- | --- |
+| I-Q5 | Keys and MLS state at rest | Key slots: keychain, passphrase, credential, env |
+| I-Q2 | Does a DID outlive its key? | No. A DID is bound to its key; an identity log would undo key ablation. A rotation is a new DID |
+| I-Q2b | Who learns that two DIDs are linked? | Whoever the holder chooses: a link signed by both keys, scoped to one audience. Servers publish theirs |
+| I-Q1 | Devices | The DID key copied by pairing; a fresh MLS leaf key per key package, certified by the DID |
+| I-Q3 | Revocation | Self-revocation, posted to channels, custodians, nameservers and servers |
+| I-Q4 | Server ceremony | A `public` link moves pins and `expected_did`; the old key signs a `sequencer-rekey` in each channel it sequences |
+| I-A5 | Encoding | COSE over deterministic CBOR, behind a trait |
+| I-Scope | What G2 waits on | I1 only |
