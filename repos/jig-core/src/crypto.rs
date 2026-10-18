@@ -132,6 +132,29 @@ pub mod ed25519 {
         rand::rand_core::UnwrapErr(SysRng).random()
     }
 
+    /// Write `key`'s seed to a new file at `path`, owner-only from the start.
+    ///
+    /// The file is created with `create_new`, so an existing file is never
+    /// overwritten, and on Unix with mode 0600 at open, so the seed is never
+    /// readable by anyone else, not even between write and `chmod`. Missing
+    /// parent directories are created.
+    pub fn write_new_key_file(path: &std::path::Path, key: &SigningKey) -> std::io::Result<()> {
+        use std::io::Write as _;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path)?;
+        file.write_all(&key.to_bytes())?;
+        file.sync_all()
+    }
+
     /// Convenience wrapper around an ed25519 keypair.
     #[derive(Clone)]
     pub struct KeyPair {

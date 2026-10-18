@@ -261,7 +261,6 @@ fn spawn_challenge_sweeper(pending: Arc<RwLock<HashMap<String, Instant>>>, ttl: 
 }
 
 fn load_or_generate_server_key(path: &str) -> Result<SigningKey> {
-    use rand::Rng;
     let expanded = shellexpand::tilde(path).into_owned();
     let path = std::path::Path::new(&expanded);
     if path.exists() {
@@ -278,18 +277,9 @@ fn load_or_generate_server_key(path: &str) -> Result<SigningKey> {
         arr.copy_from_slice(&bytes);
         Ok(SigningKey::from_bytes(&arr))
     } else {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut secret = [0u8; 32];
-        rand::rng().fill_bytes(&mut secret);
-        let signing = SigningKey::from_bytes(&secret);
-        std::fs::write(path, signing.to_bytes())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        let signing = jig_core::crypto::ed25519::generate_signing_key();
+        jig_core::crypto::ed25519::write_new_key_file(path, &signing)
+            .with_context(|| format!("writing nameserver keyfile to {}", path.display()))?;
         Ok(signing)
     }
 }

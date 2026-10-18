@@ -86,19 +86,16 @@ pub struct TestJigServer {
 }
 
 impl TestJigServer {
-    /// Default: TOFU mode, debug.admin_endpoints = true, full v0.0.2
+    /// Default: TOFU mode, full v0.0.2
     /// allowed_block_kinds (text-render + channel-create + member-add).
     pub async fn start() -> Result<Self> {
-        let mut config = base_config()?;
-        config.debug.admin_endpoints = true;
-        Self::start_with_config(config).await
+        Self::start_with_config(base_config()?).await
     }
 
     /// Start with ONLY text-render in allowed_block_kinds. Used by H1
     /// where the test is about block-kind ingest determinism, not channels.
     pub async fn start_with_text_render_only() -> Result<Self> {
         let mut config = base_config()?;
-        config.debug.admin_endpoints = true;
         config.server.allowed_block_kinds = vec!["text-render".to_string()];
         Self::start_with_config(config).await
     }
@@ -113,7 +110,6 @@ impl TestJigServer {
     /// the `.jig` namespace the NS is authoritative for (e.g. `"dj.jig"`).
     pub async fn start_with_nameserver(ns: &TestNameserver, _alias_suffix: &str) -> Result<Self> {
         let mut config = base_config()?;
-        config.debug.admin_endpoints = true;
         config.identity = IdentitySection {
             mode: IdentityMode::Nameserver,
             trusted_nameservers: vec![ns.http_url()],
@@ -255,7 +251,7 @@ impl TestJigServer {
     /// receipts, render-hash parity or TOFU pinning need the channel to be
     /// there — but several of them deliberately run with
     /// `allowed_block_kinds = ["text-render"]`, which makes it impossible to
-    /// create one through the admin path.
+    /// create one through the channel-op endpoint.
     ///
     /// Going around ingest keeps `allowed_block_kinds` meaningful in those
     /// tests instead of widening it just to satisfy a precondition. Reach for
@@ -306,7 +302,7 @@ impl TestJigServer {
         Ok(id)
     }
 
-    /// Create a channel via the admin REST endpoint. Returns the channel CID
+    /// Create a channel via the channel-op REST endpoint. Returns the channel CID
     /// (the channel's `id` in the StoredChannel table).
     pub async fn create_channel(
         &self,
@@ -322,11 +318,11 @@ impl TestJigServer {
         let block = jig_client::blocks::build_channel_create(owner, slug, visibility, hlc);
         let client = reqwest::Client::new();
         let resp = client
-            .post(format!("{}/_admin_v0_0_2/channels", self.http_url()))
+            .post(format!("{}/api/v1/channels", self.http_url()))
             .json(&submission_payload(&block))
             .send()
             .await
-            .context("POST /_admin_v0_0_2/channels")?;
+            .context("POST /api/v1/channels")?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -359,8 +355,7 @@ impl TestJigServer {
                 "mls_ratchet_tree": b64.encode(&created.ratchet_tree),
             }),
         );
-        self.post_channel_op("/_admin_v0_0_2/channels", &block)
-            .await
+        self.post_channel_op("/api/v1/channels", &block).await
     }
 
     /// Add `member` to a restricted channel: the owner's commit adding the
@@ -397,7 +392,7 @@ impl TestJigServer {
             jig_core::HlcTimestamp::now_wall(owner.did().clone()),
             meta,
         );
-        let path = format!("/_admin_v0_0_2/channels/{}/members", urlencode(slug));
+        let path = format!("/api/v1/channels/{}/members", urlencode(slug));
         let cid = self.post_channel_op(&path, &block).await?;
         session.confirm(&server, slug)?;
         Ok(cid)
@@ -419,7 +414,7 @@ impl TestJigServer {
         Ok(body["block_cid"].as_str().unwrap_or_default().to_string())
     }
 
-    /// Add a member to an existing channel via the admin endpoint.
+    /// Add a member to an existing channel via the channel-op endpoint.
     pub async fn add_member(
         &self,
         owner: &Identity,
@@ -437,13 +432,13 @@ impl TestJigServer {
         let url_slug = urlencode(slug);
         let resp = client
             .post(format!(
-                "{}/_admin_v0_0_2/channels/{url_slug}/members",
+                "{}/api/v1/channels/{url_slug}/members",
                 self.http_url()
             ))
             .json(&submission_payload(&block))
             .send()
             .await
-            .context("POST /_admin_v0_0_2/channels/:slug/members")?;
+            .context("POST /api/v1/channels/:slug/members")?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -653,7 +648,7 @@ pub fn load_identity(keys_dir: &std::path::Path, did_str: &str) -> Identity {
     Identity::load_for_tests(keys_dir, did_str)
 }
 
-/// Build the JSON body for the `/api/v1/blocks` and `/_admin_v0_0_2/*`
+/// Build the JSON body for the `/api/v1/blocks` and `/api/v1/channels*`
 /// REST endpoints. Both accept the same `{bundle_b64, sig_b64}` shape.
 fn submission_payload(block: &BuiltBlock) -> serde_json::Value {
     serde_json::json!({
@@ -675,6 +670,7 @@ fn base_config() -> Result<JigServerConfig> {
                 "channel-promote".to_string(),
                 "fed-hello".to_string(),
             ],
+            ..ServerSection::default()
         },
         identity: IdentitySection::default(),
         federation: FederationSection::default(),

@@ -87,8 +87,8 @@ struct ServerInfoResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     server_did: Option<String>,
     /// v0.0.2: active antipattern flags so peers can refuse federation with
-    /// misconfigured neighbors. Always includes `naively_unbounded_clock_skew`
-    /// in v0.0.2. Absent (not serialized) when v0.0.2 module is not active.
+    /// misconfigured neighbors. Absent (not serialized) when the v0.0.2 module
+    /// is not active or no flag is set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     unsafe_options_active: Vec<String>,
     /// v0.0.2: block kinds this server accepts on ingest. Absent when v0.0.2
@@ -379,11 +379,11 @@ mod tests {
 
         // server_did must be present and match the v0.0.2 state's DID
         assert_eq!(body.server_did.as_deref(), Some(v002_did.as_str()));
-        // naively_unbounded_clock_skew is always present in v0.0.2
+        // A default install sets no unsafe option; the clock is bounded.
         assert!(
+            body.unsafe_options_active.is_empty(),
+            "expected no unsafe option, got {:?}",
             body.unsafe_options_active
-                .contains(&"naively_unbounded_clock_skew".to_string()),
-            "expected naively_unbounded_clock_skew in unsafe_options_active"
         );
         // default config includes "text-render" in allowed_block_kinds
         assert!(
