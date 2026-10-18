@@ -285,6 +285,24 @@ async fn federated_block_with_forged_author_did_is_rejected() {
     let bob_key = SigningKey::from_bytes(&bob_secret);
     let bob_did = Did::from_ed25519_pubkey(bob_key.verifying_key().as_bytes());
 
+    // #hello must exist on srv_b, or both relays are refused there as posts
+    // to an unknown channel and the forged one proves nothing. Its
+    // channel-create federates ahead of them on the same link.
+    let (owner, _owner_dir) = test_identity_with_dir();
+    srv_a
+        .create_channel(&owner, "#hello", "open")
+        .await
+        .expect("create_channel");
+
+    // #hello is open and unencrypted, so its blocks federate. A block with
+    // no channel policy never does.
+    let open_policy = jig_pipeline::fanout::DeliveryPolicy {
+        open: true,
+        owner_did: String::new(),
+        member_dids: Vec::new(),
+        federates: true,
+    };
+
     // Forged block: alice signs, manifest claims bob.
     let (forged_bundle, forged_sig) =
         build_forged_block(&alice_key, &bob_did, "#hello", "I am bob (forged)");
@@ -303,7 +321,7 @@ async fn federated_block_with_forged_author_did_is_rejected() {
         .state
         .ingest_ctx
         .fanout
-        .broadcast(&forged_block, &forged_receipt, None)
+        .broadcast(&forged_block, &forged_receipt, Some(&open_policy))
         .await
         .expect("a fanout broadcast");
 
@@ -325,7 +343,7 @@ async fn federated_block_with_forged_author_did_is_rejected() {
         .state
         .ingest_ctx
         .fanout
-        .broadcast(&genuine_block, &genuine_receipt, None)
+        .broadcast(&genuine_block, &genuine_receipt, Some(&open_policy))
         .await
         .expect("a fanout broadcast");
 

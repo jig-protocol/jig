@@ -3,7 +3,7 @@
 This repository contains the official specification for the Jig protocol.
 
 - License: CC-BY-4.0 (see LICENSE)
-- Status: Draft. v0.1 implements signing, not encryption; chapters describing unbuilt features carry a banner.
+- Status: Draft. The reference implementation signs every block and end-to-end encrypts DMs and channels created under `mls`; chapters describing unbuilt features carry a banner.
 - Build: mdBook
 
 ## Goals

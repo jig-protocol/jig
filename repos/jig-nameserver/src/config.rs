@@ -39,7 +39,6 @@ pub struct NameServerConfig {
     pub federation: FederationConfig,
     pub admin: AdminConfig,
     pub automation: AutomationPolicy,
-    pub transparency: TransparencyConfig,
     pub reputation: ReputationConfig,
     pub useful_work: UsefulWorkConfig,
     pub capabilities: CapabilitiesConfig,
@@ -58,6 +57,10 @@ pub struct NameServerConfig {
     /// `v0_0_2::AppState::new`.
     #[serde(default)]
     pub v0_0_2: jig_config::v0_0_2_server::JigServerConfig,
+    /// Per-IP and per-DID limits on the v0.0.2 `register`, `rotate` and
+    /// `renew` routes (`[alias_rate_limits]`). Separate from the legacy
+    /// `[rate_limits]`, which only the v0.0.1 challenge route read.
+    pub alias_rate_limits: AliasRateLimitConfig,
 }
 
 impl NameServerConfig {
@@ -272,7 +275,6 @@ impl NameServerConfig {
             federation: FederationConfig::from_env(),
             admin: AdminConfig::from_env(),
             automation: AutomationPolicy::from_env(),
-            transparency: TransparencyConfig::from_env(),
             reputation: ReputationConfig::from_env(),
             useful_work: UsefulWorkConfig::from_env(),
             capabilities: CapabilitiesConfig::from_env(),
@@ -280,6 +282,7 @@ impl NameServerConfig {
             anomaly_detection: AnomalyDetectionConfig::from_env(),
             analytics: AnalyticsConfig::from_env(),
             v0_0_2: jig_config::v0_0_2_server::JigServerConfig::default(),
+            alias_rate_limits: AliasRateLimitConfig::default(),
         }
     }
 
@@ -295,7 +298,6 @@ impl NameServerConfig {
         self.federation.merge_env();
         self.admin.merge_env();
         self.automation.merge_env();
-        self.transparency.merge_env();
         self.reputation.merge_env();
         self.useful_work.merge_env();
         self.capabilities.merge_env();
@@ -540,6 +542,29 @@ impl PowConfig {
             && let Ok(parsed) = bits.parse::<u16>()
         {
             self.max_difficulty = parsed;
+        }
+    }
+}
+
+/// Limits for the v0.0.2 alias-mutating routes, enforced by
+/// [`crate::v0_0_2_rate_limit`]. Each counts requests in a fixed one-minute
+/// window; a limit of `0` refuses every request on that bucket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AliasRateLimitConfig {
+    pub enabled: bool,
+    /// Requests per client IP per minute, across register, rotate and renew.
+    pub per_ip_per_min: u32,
+    /// Requests naming a given DID per minute (`did`, `old_did` or `new_did`).
+    pub per_did_per_min: u32,
+}
+
+impl Default for AliasRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            per_ip_per_min: 30,
+            per_did_per_min: 10,
         }
     }
 }
@@ -940,48 +965,6 @@ impl AutomationPolicy {
         let growth = (base - 1.0).powf(self.power_law_alpha).max(0.0);
         let amplification = 1.0 + growth * self.pile_on_factor;
         amplification.clamp(1.0, self.max_multiplier.max(1.0))
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct TransparencyConfig {
-    pub log_path: PathBuf,
-    pub publish_interval_secs: i64,
-}
-
-impl Default for TransparencyConfig {
-    fn default() -> Self {
-        Self {
-            log_path: default_transparency_path(),
-            publish_interval_secs: 3600,
-        }
-    }
-}
-
-impl TransparencyConfig {
-    fn from_env() -> Self {
-        let mut cfg = Self::default();
-        if let Ok(path) = std::env::var("JIG_NS_TRANSPARENCY_PATH") {
-            cfg.log_path = PathBuf::from(path);
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_TRANSPARENCY_INTERVAL")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            cfg.publish_interval_secs = parsed;
-        }
-        cfg
-    }
-
-    fn merge_env(&mut self) {
-        if let Ok(path) = std::env::var("JIG_NS_TRANSPARENCY_PATH") {
-            self.log_path = PathBuf::from(path);
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_TRANSPARENCY_INTERVAL")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            self.publish_interval_secs = parsed;
-        }
     }
 }
 
@@ -1784,16 +1767,6 @@ fn default_federation_cache_ttl() -> i64 {
         .unwrap_or(300)
 }
 
-fn default_transparency_path() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        home.join(".jig")
-            .join("nameserver")
-            .join("transparency.log")
-    } else {
-        PathBuf::from("transparency.log")
-    }
-}
-
 const TEMPLATE: &str = r#"
 # Jig Nameserver configuration
 
@@ -1815,6 +1788,13 @@ max_difficulty = 28
 [rate_limits]
 per_key_per_min = 60
 per_ip_per_min = 120
+
+# v0.0.2 register / rotate / renew. Refused requests get HTTP 429 with code
+# RATE_LIMITED and a Retry-After header.
+[alias_rate_limits]
+enabled = true
+per_ip_per_min = 30
+per_did_per_min = 10
 
 [penalties]
 decay_secs = 300
@@ -1842,10 +1822,6 @@ max_multiplier = 8.0
 quorum = 3
 evidence_window_secs = 600
 human_review_window_secs = 3600
-
-[transparency]
-log_path = "~/.jig/nameserver/transparency.log"
-publish_interval_secs = 3600
 
 [reputation]
 default_ruleset = "high-sec"

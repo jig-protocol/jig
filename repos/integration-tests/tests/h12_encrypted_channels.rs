@@ -721,6 +721,89 @@ async fn only_the_pair_can_open_their_dm() {
     assert_eq!(status, 200, "{body}");
 }
 
+fn submission(block: &BuiltBlock) -> Value {
+    json!({
+        "bundle_b64": STANDARD.encode(block.canonical_bytes()),
+        "sig_b64": STANDARD.encode(&block.sender_sig),
+    })
+}
+
+/// D25: a restricted channel is always `mls`. However a plaintext restricted
+/// channel is asked for, through either door, the server refuses it and keeps
+/// nothing; an open channel may still be plaintext.
+#[tokio::test]
+async fn a_restricted_channel_cannot_be_plaintext() {
+    let server = TestJigServer::start_with_full_kinds().await.unwrap();
+    let api = Api { server: &server };
+    let root = tempfile::tempdir().unwrap();
+    let alice = Person::new(root.path());
+
+    let asks = [
+        json!({"slug": "#quiet", "visibility": "restricted"}),
+        json!({"slug": "#quiet", "visibility": "restricted", "suite": "none"}),
+        json!({"slug": "#quiet", "visibility": "members-only"}),
+    ];
+    for meta in asks {
+        let block = build_with_metadata(
+            &alice.id,
+            BlockKind::ChannelCreate,
+            alice.hlc(),
+            meta.clone(),
+        );
+        for path in ["/api/v1/channels", "/api/v1/blocks"] {
+            let (status, body) = api.post(path, &submission(&block)).await;
+            assert_eq!(
+                (status, body["code"].as_str()),
+                (400, Some("RESTRICTED_REQUIRES_MLS")),
+                "{path} {meta}: {body}"
+            );
+        }
+    }
+    let (status, listed) = api.get(&alice.id, "/api/v1/channels").await;
+    assert_eq!(status, 200, "{listed}");
+    assert!(
+        !listed.to_string().contains("#quiet"),
+        "a refused create left a channel behind: {listed}"
+    );
+
+    // The same slug, restricted and `mls`, is fine.
+    create_encrypted(&api, &alice, "#quiet", "restricted").await;
+    // And plaintext is what open channels are for.
+    let open = build_with_metadata(
+        &alice.id,
+        BlockKind::ChannelCreate,
+        alice.hlc(),
+        json!({"slug": "#lobby", "visibility": "open"}),
+    );
+    let (status, body) = api.post("/api/v1/channels", &submission(&open)).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+/// A restricted channel created plaintext before D25 cannot become `mls`, so
+/// it is frozen: its members still read its history, and it takes nothing new.
+#[tokio::test]
+async fn a_plaintext_restricted_channel_from_before_d25_is_frozen() {
+    let server = TestJigServer::start_with_full_kinds().await.unwrap();
+    let api = Api { server: &server };
+    let root = tempfile::tempdir().unwrap();
+    let alice = Person::new(root.path());
+    let slug = "#legacy";
+    server
+        .seed_plaintext_restricted_channel(&alice.id, slug)
+        .unwrap();
+
+    let post = jig_client::blocks::build_text_render(&alice.id, slug, "still here?", alice.hlc());
+    let (status, body) = api.submit(&post).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (409, Some("CHANNEL_FROZEN")),
+        "{body}"
+    );
+    let (status, blocks) = api.history(&alice.id, slug).await;
+    assert_eq!(status, 200, "members still read a frozen channel");
+    assert!(blocks.is_empty(), "the refused post was stored: {blocks:?}");
+}
+
 /// OP-03 for a device that holds no group for a channel: the server can
 /// relabel the channel in its own store, but not the block its owner signed.
 /// The listing names the creation block; that block, served with its

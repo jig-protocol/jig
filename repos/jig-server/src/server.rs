@@ -19,27 +19,44 @@ use crate::handler::{self, AppState};
 use crate::runtime::BlockRuntime;
 use crate::storage::SqliteBlockStore;
 
+/// The TLS session's exporter value for the jig handshake (JEP-0002 rule 2,
+/// RFC 9266). [`serve_tls`] puts it in every request it serves, so the
+/// WebSocket handshake can sign it; a plaintext request has none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlsExporter(pub [u8; jig_pipeline::handshake::TLS_EXPORTER_LEN]);
+
+impl TlsExporter {
+    fn of(conn: &rustls::ServerConnection) -> Option<Self> {
+        conn.export_keying_material(
+            [0u8; jig_pipeline::handshake::TLS_EXPORTER_LEN],
+            jig_pipeline::handshake::TLS_EXPORTER_LABEL,
+            None,
+        )
+        .map(Self)
+        .map_err(|e| tracing::warn!("TLS exporter unavailable: {e}"))
+        .ok()
+    }
+}
+
 pub struct JigServer {
     config: ServerConfig,
-    store: Arc<SqliteBlockStore>,
-    runtime: Arc<BlockRuntime>,
-    /// v0.0.2 pipeline state. `None` when only running v0.0.1 routes.
+    /// v0.0.2 pipeline state. `None` when the module failed to initialize.
     v0_0_2: Option<Arc<crate::v0_0_2::AppState>>,
+}
+
+/// Boot-time checks that used to run while building the v0.0.1 REST state:
+/// the v0.0.1 store at `database_path` opens and answers, and the `[execution]`
+/// limits make a valid runtime. Kept so that removing those routes does not
+/// also change which configs boot.
+fn boot_checks(config: &ServerConfig) -> Result<()> {
+    SqliteBlockStore::new(&config.database_path)?.health_check()?;
+    BlockRuntime::new(config.execution_config())?;
+    Ok(())
 }
 
 impl JigServer {
     pub fn new(config: ServerConfig) -> Result<Self> {
-        let store = Arc::new(SqliteBlockStore::new(&config.database_path)?);
-        store.health_check()?;
-
-        let runtime = Arc::new(BlockRuntime::new(config.execution_config())?);
-
-        Ok(Self {
-            config,
-            store,
-            runtime,
-            v0_0_2: None,
-        })
+        Self::new_with_v0_0_2(config, None)
     }
 
     /// Construct a JigServer with the v0.0.2 pipeline state wired in. When
@@ -51,17 +68,8 @@ impl JigServer {
         config: ServerConfig,
         v0_0_2: Option<Arc<crate::v0_0_2::AppState>>,
     ) -> Result<Self> {
-        let store = Arc::new(SqliteBlockStore::new(&config.database_path)?);
-        store.health_check()?;
-
-        let runtime = Arc::new(BlockRuntime::new(config.execution_config())?);
-
-        Ok(Self {
-            config,
-            store,
-            runtime,
-            v0_0_2,
-        })
+        boot_checks(&config)?;
+        Ok(Self { config, v0_0_2 })
     }
 
     pub async fn start(&self) -> Result<()> {
@@ -72,8 +80,6 @@ impl JigServer {
         );
 
         let app_state = AppState {
-            store: self.store.clone(),
-            runtime: self.runtime.clone(),
             config: self.config.clone(),
             v0_0_2: self.v0_0_2.clone(),
         };
@@ -81,8 +87,7 @@ impl JigServer {
         let main_router: Router = handler::build_router(app_state);
 
         // Merge the v0.0.2 WSS router when the pipeline state is present.
-        // The v0.0.2 routes have their own AppState (Arc<v0_0_2::AppState>)
-        // and do not conflict with any existing v0.0.1 routes.
+        // The v0.0.2 routes have their own AppState (Arc<v0_0_2::AppState>).
         let router = if let Some(v002_state) = &self.v0_0_2 {
             main_router.merge(crate::v0_0_2_ws::build_v0_0_2_router(v002_state.clone()))
         } else {
@@ -199,6 +204,7 @@ async fn serve_tls(
                     return;
                 }
             };
+            let exporter = TlsExporter::of(tls.get_ref().1);
             let io = TokioIo::new(tls);
             let service = hyper::service::service_fn(
                 move |mut req: hyper::Request<hyper::body::Incoming>| {
@@ -206,6 +212,9 @@ async fn serve_tls(
                     // plain listener: the per-address rate limit needs it.
                     req.extensions_mut()
                         .insert(axum::extract::ConnectInfo(peer));
+                    if let Some(exporter) = exporter {
+                        req.extensions_mut().insert(exporter);
+                    }
                     router.clone().oneshot(req)
                 },
             );
@@ -299,6 +308,69 @@ mod tests {
             .expect("https request");
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         assert_eq!(resp.text().await.unwrap(), "ok");
+
+        task.abort();
+    }
+
+    /// Every request over TLS carries its session's exporter value: one value
+    /// per session, so two connections never share one.
+    #[tokio::test]
+    async fn serve_tls_hands_each_session_its_exporter() {
+        use axum::Extension;
+        use axum::routing::get;
+
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("self-signed cert");
+        let dir = tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, ck.cert.pem()).unwrap();
+        std::fs::write(&key_path, ck.signing_key.serialize_pem()).unwrap();
+
+        let (rustls_config, _) = load_rustls_config(&cert_path, &key_path).expect("rustls config");
+        let router: Router = Router::new().route(
+            "/exporter",
+            get(|exporter: Option<Extension<TlsExporter>>| async move {
+                exporter
+                    .map(|Extension(e)| hex::encode(e.0))
+                    .unwrap_or_default()
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = serve_tls(listener, router, rustls_config).await;
+        });
+
+        // Trust exactly the server's own certificate, by name, so the check
+        // stays on.
+        let root = reqwest::Certificate::from_pem(ck.cert.pem().as_bytes()).unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            // A fresh client per request, so each one is its own TLS session.
+            let client = reqwest::Client::builder()
+                .use_rustls_tls()
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(root.clone())
+                .resolve("localhost", bound)
+                .build()
+                .unwrap();
+            let body = client
+                .get(format!("https://localhost:{}/exporter", bound.port()))
+                .send()
+                .await
+                .expect("https request")
+                .text()
+                .await
+                .unwrap();
+            assert_eq!(
+                body.len(),
+                2 * jig_pipeline::handshake::TLS_EXPORTER_LEN,
+                "{body:?}"
+            );
+            seen.push(body);
+        }
+        assert_ne!(seen[0], seen[1]);
 
         task.abort();
     }

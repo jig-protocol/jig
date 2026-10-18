@@ -198,7 +198,7 @@ fn apply_channel_promote(store: &Arc<SqliteStore>, m: &BlockManifest) -> anyhow:
 ///
 /// ## Why the owner check lives here
 ///
-/// The `/_admin_v0_0_2/*` endpoints are unauthenticated, so anything they can
+/// The `/api/v1/channels*` endpoints are unauthenticated, so anything they can
 /// reach must authorize itself. `ingest()` has already verified the sender's
 /// ed25519 signature against the pubkey embedded in their DID by the time this
 /// runs, which makes `manifest.authors[0].did` a trustworthy identity — and

@@ -57,9 +57,6 @@ allowed_block_kinds = ["text-render", "channel-create", "member-add"]
 mode = "tofu"
 trusted_nameservers = []
 cache_ttl_seconds = 300
-
-[debug]
-admin_endpoints = true
 "#,
         db = home.join("jig.db").display(),
         key = home.join("server.key").display(),

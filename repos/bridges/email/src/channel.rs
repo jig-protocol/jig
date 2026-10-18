@@ -41,7 +41,13 @@ pub(crate) async fn submit_built_block(
 }
 
 /// Ensure the 1:1 thread channel `slug` exists with both members, creating it on
-/// first contact. Idempotent via a BridgeStorage marker so repeat inbound mail
+/// first contact.
+///
+/// A thread is a restricted channel, and restricted channels are always MLS
+/// (ROADMAP D25). The bridge is not an MLS member yet, so a server enforcing
+/// D25 refuses the plaintext create, and inbound mail fails here rather than
+/// landing in a channel its operator could read. The thread stays restricted:
+/// an open one would let every admitted user read the mail. Idempotent via a BridgeStorage marker so repeat inbound mail
 /// on an existing conversation doesn't re-create the channel. `creator` is the
 /// bridge's shadow identity (it authors the channel-create — which auto-adds it
 /// as owner — and the member-add for the real recipient DID).

@@ -21,7 +21,8 @@
 #   JIG_GITHUB_TOKEN      token for a private repo (falls back to GITHUB_TOKEN).
 #   JIG_RELEASES_BASE     mirror base URL; files are fetched as $BASE/<file> and
 #                         no GitHub API call is made.
-#   JIG_VERIFY_SIGNATURE  auto (default: verify when ssh-keygen exists), 1 (require), 0 (skip).
+#   JIG_VERIFY_SIGNATURE  1 (default): verify the signature, and refuse to install
+#                         without ssh-keygen. 0: skip it, checksum only.
 #   JIG_INSTALL_FROM      release (default) | source (cargo build; only from a checkout).
 #   JIG_NONINTERACTIVE=1  never exec into the chat TUI.
 #   JIG_NO_START=1        install binaries + config only.
@@ -34,7 +35,7 @@ JIG_REPO="${JIG_REPO:-jig-protocol/jig}"
 JIG_VERSION="${JIG_VERSION:-latest}"
 JIG_RELEASES_BASE="${JIG_RELEASES_BASE:-}"
 JIG_GITHUB_TOKEN="${JIG_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
-JIG_VERIFY_SIGNATURE="${JIG_VERIFY_SIGNATURE:-auto}"
+JIG_VERIFY_SIGNATURE="${JIG_VERIFY_SIGNATURE:-1}"
 JIG_INSTALL_FROM="${JIG_INSTALL_FROM:-release}"
 JIG_NONINTERACTIVE="${JIG_NONINTERACTIVE:-0}"
 JIG_NO_START="${JIG_NO_START:-0}"
@@ -138,24 +139,31 @@ download_asset() {
   fi
 }
 
+# Fails closed: threat-register SC-02 says installers MUST verify both the
+# signature and the checksum, so a machine without ssh-keygen gets an error,
+# not a checksum-only install. Only an explicit JIG_VERIFY_SIGNATURE=0 skips it.
 verify_signature() {
-  local sums="$1" sig="$2" signers
-  if [ "$JIG_VERIFY_SIGNATURE" = "0" ]; then
-    warn "JIG_VERIFY_SIGNATURE=0: skipping signature check"
-    return 0
-  fi
+  local sums="$1" sig="$2" signers err
+  case "$JIG_VERIFY_SIGNATURE" in
+    0)
+      warn "JIG_VERIFY_SIGNATURE=0: skipping signature check (checksum only)"
+      return 0 ;;
+    1|auto) ;;
+    *) die "JIG_VERIFY_SIGNATURE must be 1 or 0, not '$JIG_VERIFY_SIGNATURE'" ;;
+  esac
   if ! command -v ssh-keygen >/dev/null 2>&1; then
-    if [ "$JIG_VERIFY_SIGNATURE" = "1" ]; then
-      die "JIG_VERIFY_SIGNATURE=1 but ssh-keygen (OpenSSH >= 8.1) is not installed"
-    fi
-    warn "ssh-keygen not found: checksum verified, signature NOT verified"
-    return 0
+    die "ssh-keygen (OpenSSH >= 8.1) is not installed, so the release signature cannot be verified.
+  Install it and re-run: openssh-client (Debian/Ubuntu), openssh-keygen (Alpine), openssh (Fedora, Arch).
+  To install anyway with the checksum check only, re-run with JIG_VERIFY_SIGNATURE=0."
   fi
   [ -f "$sig" ] || die "SHA256SUMS.sig missing from the release; refusing unsigned binaries (JIG_VERIFY_SIGNATURE=0 to override)"
   signers="$(dirname "$sums")/allowed_signers"
   printf '%s\n' "$JIG_RELEASE_SIGNER" > "$signers"
-  ssh-keygen -Y verify -f "$signers" -I jig-release -n jig-release -s "$sig" < "$sums" >/dev/null 2>&1 \
-    || die "SHA256SUMS signature does not verify against the pinned jig release key"
+  # OpenSSH older than 8.1 has no -Y; its usage error goes in the message so
+  # that case doesn't read as a bad signature.
+  if ! err=$(ssh-keygen -Y verify -f "$signers" -I jig-release -n jig-release -s "$sig" < "$sums" 2>&1); then
+    die "SHA256SUMS signature does not verify against the pinned jig release key (ssh-keygen: $(printf '%s' "$err" | head -n 1))"
+  fi
   log "signature OK (jig-release ed25519)"
 }
 
@@ -189,16 +197,14 @@ install_from_release() {
   log "checksum OK"
 
   tar -xzf "$tmp/$tarball" -C "$tmp"
-  # Tarball layout: <name>/bin/{jig,jig-server,jig-nameserver} + <name>/blocks/text_block.wasm
+  # Tarball layout: <name>/bin/{jig,jig-server,jig-nameserver}. Packages from
+  # earlier builds also carried <name>/blocks/text_block.wasm, which nothing loads.
   src="$tmp/$name"
   [ -d "$src/bin" ] || die "unexpected tarball layout: $name/bin missing"
-  mkdir -p "$JIG_HOME/bin" "$JIG_HOME/blocks"
+  mkdir -p "$JIG_HOME/bin"
   for b in jig jig-server jig-nameserver; do
     if [ -f "$src/bin/$b" ]; then install -m 0755 "$src/bin/$b" "$JIG_HOME/bin/$b"; fi
   done
-  if [ -f "$src/blocks/text_block.wasm" ]; then
-    install -m 0644 "$src/blocks/text_block.wasm" "$JIG_HOME/blocks/text_block.wasm"
-  fi
   if [ ! -x "$JIG_HOME/bin/jig" ] || [ ! -x "$JIG_HOME/bin/jig-server" ]; then
     die "tarball did not contain jig + jig-server"
   fi
@@ -213,14 +219,11 @@ install_from_source() {
   (
     cd "$root/repos"
     cargo build --release -p jig-server -p jig-cli -p jig-nameserver
-    rustup target add wasm32-wasip1 >/dev/null 2>&1 || true
-    cargo build --release --target wasm32-wasip1 -p text-block
   )
-  mkdir -p "$JIG_HOME/bin" "$JIG_HOME/blocks"
+  mkdir -p "$JIG_HOME/bin"
   for b in jig jig-server jig-nameserver; do
     install -m 0755 "$root/repos/target/release/$b" "$JIG_HOME/bin/$b"
   done
-  install -m 0644 "$root/repos/target/wasm32-wasip1/release/text_block.wasm" "$JIG_HOME/blocks/text_block.wasm"
   log "installed binaries to $JIG_HOME/bin/"
 }
 
@@ -285,7 +288,6 @@ dangerously_disable_federation_tls = false
 [debug]
 # Channel ops are on /api/v1/channels and always mounted; nothing here is
 # needed for the default path.
-admin_endpoints = false
 list_handles = false
 EOF
   log "wrote $cfg"

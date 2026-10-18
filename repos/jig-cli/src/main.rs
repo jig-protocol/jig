@@ -23,7 +23,7 @@ struct Cli {
     #[arg(long)]
     config: Option<PathBuf>,
 
-    /// Override server base URL (e.g. http://127.0.0.1:7117)
+    /// Override server base URL (e.g. https://127.0.0.1:7117)
     #[arg(long)]
     server: Option<String>,
 
@@ -141,8 +141,7 @@ enum Commands {
     },
 
     /// Create, join, delete, or list channels on the configured server via
-    /// `/api/v1/channels*` (falls back to the legacy `/_admin_v0_0_2/*` aliases
-    /// on servers that predate them).
+    /// `/api/v1/channels*`.
     Channel {
         #[command(subcommand)]
         action: ChannelAction,
@@ -173,7 +172,7 @@ enum ChannelAction {
         slug: String,
 
         /// Channel visibility — `open` (anyone can read; default) or
-        /// `restricted` (membership-gated reads).
+        /// `restricted` (members only, and always end-to-end encrypted).
         #[arg(long, default_value = "open")]
         visibility: String,
 
@@ -182,7 +181,8 @@ enum ChannelAction {
         exist_ok: bool,
 
         /// End-to-end encrypt the channel with MLS: the server stores and
-        /// relays ciphertext it cannot read. Fixed at creation.
+        /// relays ciphertext it cannot read. Fixed at creation. Restricted
+        /// channels are always encrypted, so this only changes open ones.
         #[arg(long)]
         encrypted: bool,
     },
@@ -292,7 +292,7 @@ enum ServerAction {
     /// `http://`, `https://`, `ws://`, or `wss://`. v0.0.2 stores
     /// whatever the operator supplies (validated for basic URL shape).
     Set {
-        /// e.g. `http://127.0.0.1:7117` or `wss://deji.jig.onl`.
+        /// e.g. `https://127.0.0.1:7117` or `wss://deji.jig.onl`.
         #[arg()]
         url: String,
     },
@@ -413,7 +413,7 @@ enum KeysAction {
         #[arg()]
         alias: String,
 
-        /// Nameserver base URL (e.g. http://127.0.0.1:7118).
+        /// Nameserver base URL (e.g. http://127.0.0.1:7070).
         #[arg(long)]
         nameserver: String,
     },

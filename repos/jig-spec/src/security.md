@@ -228,7 +228,7 @@ Even if message content is encrypted, metadata reveals:
 
 ### Key Rotation
 
-**MUST support key rotation** (see [Crypto Primitives § Key Rotation](crypto.md#key-rotation-and-revocation)).
+**MUST support key rotation** (see [Crypto Primitives § Key Rotation](crypto.md#key-rotation-and-revocation)). *(not yet implemented: no rotation certificate exists, and a server whose key changes has a new DID.)*
 
 **Process:**
 
@@ -243,7 +243,7 @@ Even if message content is encrypted, metadata reveals:
 
 ### Ephemeral Secret Handling
 
-**MUST keep ephemeral secrets in memory only.** Zeroize immediately after use.
+**MUST keep ephemeral secrets in memory only.** Zeroize immediately after use. *(partial: the CLI persists each MLS group's current state, epoch secrets included, unencrypted under `~/.jig/`, so it can decrypt across runs; signing keys are zeroized on drop.)*
 
 **What's ephemeral:**
 
@@ -324,7 +324,7 @@ No `ssh-rsa` (weak), `3des-cbc` (broken), or `arcfour` (broken).
 
 ## Abuse Mitigation
 
-**MUST enforce rate limiting and admission control** at all ingress points.
+**MUST enforce rate limiting and admission control** at all ingress points. *(partial: the reference server's token buckets are on by default, per verified DID across REST, WebSocket, federation and bridge writes, and per remote address on every v0.0.2 HTTP request and WebSocket frame (not `/.well-known/jig`, `/healthz` or `/metrics`). Its defaults (a burst of 300 refilling at 50/s per DID, 600 at 100/s per address) are far looser than the per-minute figures below. There is no per-federated-server limit.)*
 
 ### Rate Limiting
 
@@ -361,7 +361,7 @@ No `ssh-rsa` (weak), `3des-cbc` (broken), or `arcfour` (broken).
 
 ### Backoff and Jitter
 
-**MUST use exponential backoff + jitter** for retries (see [Federation § Retry Logic](federation.md#retry-logic)).
+**MUST use exponential backoff + jitter** for retries (see [Federation § Retry Logic](federation.md#retry-logic)). *(not yet implemented: the federation dialer reconnects after a constant delay, and the CLI does not reconnect.)*
 
 **Why jitter:** Prevents all clients from retrying at the exact same time (avoids thundering herd).
 
@@ -424,7 +424,7 @@ After 5 seconds → both sent together
 
 **Don't:**
 
-- Store keys in plaintext files.
+- Store keys in plaintext files. *(the reference CLI and server do, with 0600 permissions on Unix; see [Crypto Primitives § Identity Keys](crypto.md#identity-keys-long-term))*
 - Commit keys to git.
 - Send keys via email or Slack.
 
@@ -463,7 +463,7 @@ After 5 seconds → both sent together
 
 **For end users:** If you suspect your key is compromised:
 
-1. **Rotate immediately** (publish rotation certificate).
+1. **Rotate immediately** (publish rotation certificate). *(not yet implemented: generate a new key, which is a new DID, and, if you still hold the old key, move your alias to it with the nameserver's `/v1/rotate`.)*
 2. **Notify contacts** ("I rotated my key—verify new key fingerprint is XYZ").
 3. **Audit recent messages** (check if attacker sent messages on your behalf).
 
