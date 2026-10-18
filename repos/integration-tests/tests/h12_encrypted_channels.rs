@@ -320,6 +320,7 @@ async fn an_encrypted_channel_round_trip_leaves_no_plaintext_on_the_server() {
             sig_b64,
             receipts,
             delivery_cid,
+            ..
         } = env.frame
         {
             break DeliveredBlock {
@@ -667,17 +668,14 @@ async fn a_commit_stamped_by_a_slow_clock_is_still_found() {
         say(&api, &alice, slug, &format!("after {i}")).await;
     }
 
-    // The newest page holds messages from bob's own epoch, but not the commit
-    // that ended it: that is not enough.
+    // History is in the order the server sequenced blocks (JEP-0002 rule 9),
+    // not the order their authors' clocks claim: the slow commit sits where it
+    // arrived, after the page before it, so the newest page already holds it
+    // and the five messages that followed it.
     let opened =
         |blocks: &[DeliveredBlock]| -> Vec<_> { blocks.iter().map(|b| open(b).unwrap()).collect() };
     let (_, newest) = api.history_page(&bob.id, slug, PAGE, None).await;
-    assert!(!history_reaches(&opened(&newest), bobs_epoch, &bob.did()));
-
-    let before = open(&newest[0]).unwrap().cid;
-    let (_, mut history) = api.history_page(&bob.id, slug, 200, Some(&before)).await;
-    history.extend(newest);
-    let history = opened(&history);
+    let history = opened(&newest);
     assert!(history_reaches(&history, bobs_epoch, &bob.did()));
     let seen: Vec<Seen> = replay_order(history)
         .iter()

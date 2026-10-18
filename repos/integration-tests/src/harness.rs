@@ -731,6 +731,7 @@ async fn spawn_one_peer_loop(state: Arc<jig_server::v0_0_2::AppState>, peer: Fed
                                 .encode(&receipt.receipt_bytes),
                         }],
                         delivery_cid: format!("delivery:{}", block.cid),
+                        ingest: None,
                     });
                     let json = serde_json::to_string(&frame).unwrap();
                     if sink.send(Message::Text(json.into())).await.is_err() {

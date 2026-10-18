@@ -274,6 +274,7 @@ impl Client {
                             sig_b64,
                             receipts,
                             delivery_cid,
+                            ..
                         } => {
                             // Track HLC cursor from receipts (best-effort —
                             // receipts may carry render_hash but not HLC; the
@@ -943,6 +944,7 @@ mod tests {
                     sig_b64: None,
                     receipts: vec![],
                     delivery_cid: "bafy_delivery_1".to_string(),
+                    ingest: None,
                 })],
                 _ => vec![],
             }

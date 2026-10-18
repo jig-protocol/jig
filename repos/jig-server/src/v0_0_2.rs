@@ -132,6 +132,15 @@ impl AppState {
         let signing_key = load_or_generate_server_key(&config.server.server_did_keyfile)
             .context("loading server signing key")?;
         let server_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
+        // A store written before `ingest` records existed is sequenced once,
+        // here: each local channel's chain starts at its channel-create and
+        // follows the old history order (JEP-0002 rule 9).
+        let backfilled = store
+            .backfill_ingest_records(&signing_key)
+            .context("sequencing stored blocks")?;
+        if backfilled > 0 {
+            tracing::info!(backfilled, "gave stored blocks their ingest records");
+        }
 
         let identity: Arc<dyn IdentityResolver> = match config.identity.mode {
             IdentityMode::Tofu => Arc::new(TofuResolver::new(store.clone())),

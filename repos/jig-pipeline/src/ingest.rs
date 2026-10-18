@@ -535,6 +535,26 @@ pub async fn ingest(
         produced_at: chrono::Utc::now().timestamp(),
     };
 
+    // Step 5b: the block's `ingest` record (JEP-0002 rule 9), when this server
+    // holds the channel and so sequences it. A channel-create starts its own
+    // chain; a block for a channel this server has no row for (a relayed
+    // post for a remote channel) carries its owner's record, not one of ours.
+    let record_channel = if kind == BlockKind::ChannelCreate {
+        Some(block_cid.clone())
+    } else {
+        resolved_channel.as_ref().map(|chan| chan.id.clone())
+    };
+    let ingest_hlc = ctx
+        .hlc_clock
+        .tick(chrono::Utc::now().timestamp_millis() as u64);
+    let signer = record_channel.map(|channel_id| crate::ingest_record::RecordSigner {
+        channel_id,
+        key: &ctx.server_key,
+        ingest_wall_ms: ingest_hlc.wall_ms,
+        ingest_logical: ingest_hlc.logical,
+    });
+    let signer = signer.filter(|_| stored_block.channel_id.is_some());
+
     match mls_plan {
         // Step 5/6 for a commit on an encrypted channel: the group's advance,
         // the membership change and the block land in one transaction (see
@@ -549,16 +569,21 @@ pub async fn ingest(
         } => {
             let membership =
                 membership_change(kind, &manifest, resolved_channel.as_ref(), &block_cid);
-            if !ctx.store.land_mls_commit(
-                &slug,
-                from_epoch,
-                &state,
-                to_epoch,
-                group_info.as_deref(),
-                &membership,
-                &stored_block,
-                &stored_receipt,
-            )? {
+            if ctx
+                .store
+                .land_mls_commit(
+                    &slug,
+                    from_epoch,
+                    &state,
+                    to_epoch,
+                    group_info.as_deref(),
+                    &membership,
+                    &stored_block,
+                    &stored_receipt,
+                    signer.as_ref(),
+                )?
+                .is_none()
+            {
                 let current = ctx
                     .store
                     .get_mls_group(&slug)?
@@ -585,8 +610,13 @@ pub async fn ingest(
                 &block_cid,
             )
             .await?;
-            // Step 6: persist block + receipt
-            ctx.store.insert_block(&stored_block)?;
+            // Step 6: persist block (+ its record) + receipt
+            match signer.as_ref() {
+                Some(signer) => {
+                    ctx.store.insert_block_sequenced(&stored_block, signer)?;
+                }
+                None => ctx.store.insert_block(&stored_block)?,
+            }
             ctx.store.insert_receipt(&stored_receipt)?;
         }
     }
@@ -1515,6 +1545,39 @@ mod tests {
         .await
         .unwrap();
         created.group_id
+    }
+
+    /// Every block of a channel this server holds gets the next record of
+    /// one chain, signed by the server: the channel-create at 0, then a
+    /// commit carried through the MLS transaction, in arrival order.
+    #[tokio::test]
+    async fn a_channels_blocks_form_one_signed_chain() {
+        let ctx = all_channel_kinds();
+        let owner = person();
+        let gid = create_sealed(&ctx, &owner).await;
+        let bob = person();
+        add_to_sealed(&ctx, &owner, &bob, &gid).await;
+
+        let chain = ctx.store.list_ingest_records("#sealed", 0, 50).unwrap();
+        assert_eq!(chain.len(), 2, "{chain:?}");
+        let server = ctx.server_did.to_did_jig_string();
+        for record in &chain {
+            record.verify(&server).unwrap();
+        }
+        assert!(chain[0].is_genesis());
+        assert_eq!(
+            chain[0].block_cid, chain[0].channel_id,
+            "the chain is named by its creation"
+        );
+        assert!(
+            chain[1].follows(&chain[0]),
+            "the commit's record is carried in its transaction"
+        );
+        assert!(
+            (chain[1].ingest_wall_ms, chain[1].ingest_logical)
+                > (chain[0].ingest_wall_ms, chain[0].ingest_logical),
+            "the sequencer's clock moves forward along the chain"
+        );
     }
 
     async fn add_to_sealed(

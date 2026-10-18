@@ -203,6 +203,11 @@ pub enum Frame {
         sig_b64: Option<String>,
         receipts: Vec<ReceiptRef>,
         delivery_cid: String,
+        /// The block's record in its channel's chain, signed by the channel's
+        /// sequencer (JEP-0002 rule 9). Absent for a block with no channel,
+        /// or one this server does not sequence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ingest: Option<crate::ingest_record::IngestRecord>,
     },
     /// Report an error in reply to a prior frame.
     ///
@@ -348,6 +353,7 @@ mod tests {
                 receipt_bytes_b64: "cmI=".into(),
             }],
             delivery_cid: "bafy".into(),
+            ingest: None,
         });
         let json = serde_json::to_string(&env).unwrap();
         let parsed: Envelope = serde_json::from_str(&json).unwrap();
