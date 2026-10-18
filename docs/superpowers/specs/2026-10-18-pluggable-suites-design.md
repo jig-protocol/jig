@@ -171,6 +171,23 @@ is not registered. No new CI job.
   vector file" as a registration requirement (closes open question 8), and D13 recorded as
   deferred in open question 2.
 
+## 4a. Report profile (added for lane R)
+
+DJ decided in lane R (Q7) that every suite defines a report profile: what a member
+discloses about one message so a tribunal can verify its authorship and content, opening no
+other message. JEP-0001 (in the build PR) records it:
+
+- `none`: nothing to disclose. The block's author signature covers the plaintext.
+- `mls`: per-message key disclosure (R's framing, 8.3). The reporter discloses the message
+  key and nonce and the sender-data key and nonce for that one message, plus the epoch's
+  `GroupContext`. The verifier checks the block signature, decrypts, and checks the MLS
+  content signature, which is made with the DID key.
+- `test-aead`: nothing to disclose. The key is published, and the AAD plus the block
+  signature bind the payload to its channel and author.
+
+Report-profile vectors belong to R5. Whether openmls exposes per-message secrets is R5's to
+confirm.
+
 ## 5. PRs
 
 1. This design (docs only).
