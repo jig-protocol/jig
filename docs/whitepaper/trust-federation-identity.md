@@ -6,7 +6,8 @@ contract, pluggable encryption, abuse handling, tribunals, and the threats each 
 survive.
 
 **Status:** non-normative. Written 2026-10-16 against `main` at v0.2 (M2); status lines
-updated 2026-10-18 for the hardening PRs #90 to #95. The
+updated 2026-10-18 for the hardening PRs #90 to #95 and the nameserver's removed legacy
+routes (#154). The
 specification in [`repos/jig-spec/`](../../repos/jig-spec/) is normative and terse; this
 paper explains the design and the reasoning behind it (decision D18). Where the two
 disagree, the spec wins and this paper is out of date.
@@ -373,9 +374,9 @@ a network layer jig does not provide.
 
 - **None.** There is no `--anon` mode. `jig init` mints a persistent key and stores it under
   `~/.jig/keys/`; it registers an alias only when asked (`--request-alias`).
-- **Prototype.** The nameserver's experimental surface mints `anon-` aliases. A minted alias
-  is a registration, so it is not `--anon` as decided; it is a prototype of the anonymity
-  obligations, not their design.
+- **Removed prototype.** The nameserver's experimental surface used to mint `anon-` aliases.
+  A minted alias was a registration, so it was not `--anon` as decided. Its routes were
+  removed in #154.
 - **Built.** The server's admission policy admits unknown DIDs by default; refusing them is
   an explicit operator choice
   ([`jig-server/src/auth/admission.rs`](../../repos/jig-server/src/auth/admission.rs)).
@@ -458,15 +459,14 @@ a network layer jig does not provide.
   [JEP-0003](../../repos/jig-spec/jep/jep-0003-server-discovery.md) defines it. An operator
   may use its own numbers on its own server; nothing relies on anyone else's. This is a
   sequencing rule for v0.x; it does not weaken obligation 3.
-- **Prototype.** The nameserver's experimental surface
-  ([`jig-nameserver/src/server.rs`](../../repos/jig-nameserver/src/server.rs)) records
-  reputation observations and summaries, computes a per-nameserver aggregate, and adjusts
-  proof-of-work difficulty by penalty. It parses rulesets and translation contracts but
-  applies only a ruleset's proof-of-work multiplier, and it stores reputation gossip from
-  peers without applying it. Its configuration models reputation as per-user
-  `ReputationZone` tiers, the model obligation 1 supersedes. Neither the alias flow nor
-  `jig-server` uses it. It is a prototype of
-  obligations 3 and 7, not an implementation of them, and must not be relied on.
+- **Removed prototype.** The nameserver's experimental surface recorded reputation
+  observations, computed a per-nameserver aggregate and adjusted proof-of-work difficulty by
+  penalty. Its routes were removed in #154, and nothing records or serves scores now. The
+  nameserver still parses rulesets and translation contracts and publishes them in
+  `/.well-known/jig-ns`; nothing applies them. Its configuration still models reputation as
+  per-user `ReputationZone` tiers, the model obligation 1 supersedes.
+  Redesign in progress: rulesets, reputation and transparency logs in JEP-0009 (draft,
+  #163); proof-of-work in JEP-0008 (#162); framing in #152.
 - **None.** Reputation inputs, decay, vouching, numbers for servers and nameservers, and
   ruleset acknowledgement.
 
@@ -494,8 +494,8 @@ a network layer jig does not provide.
 - **Known weakness: linear Sybil cost.** Any defence that charges a fixed price per identity,
   such as proof-of-work at registration, makes *n* identities cost *n* times one. An attacker
   with a botnet pays that price at a fraction of a legitimate user's marginal cost (AB-02),
-  so per-identity cost alone does not hold. The nameserver prototype's penalty-adjusted
-  proof-of-work is of this kind; the cost model behind its parameters is in
+  so per-identity cost alone does not hold. The removed nameserver prototype's
+  penalty-adjusted proof-of-work was of this kind; the cost model behind its parameters is in
   [`docs/security/nameserver-abuse-economics.md`](../security/nameserver-abuse-economics.md).
   The design must make *standing* costly, not just *existence*, and must ensure that many
   cheap identities never add up to the standing of one costly one (AB-05).
@@ -603,9 +603,8 @@ flowchart TB
   mode (`tofu` or `nameserver`), the admission policy (bans, ruleset-scoped floors, the
   unknown-DID setting), and the block-kind allow-list. Nothing ties them into a declared
   ruleset, no server declares a level, and nothing is shared between servers.
-- **Prototype.** The nameserver's experimental surface exchanges policy hashes and gossips
-  with peers, and models reputation as per-user tiers (section 6.2). `jig-server` uses none
-  of it.
+- **Removed prototype.** The nameserver's experimental policy-hash exchange and gossip
+  routes were removed in #154 (section 6.2). Redesign in progress: JEP-0009 (draft, #163).
 
 ### 7.3 To be designed
 
@@ -682,20 +681,18 @@ a high-sec ruleset group, cross-checked.
   default (D26). They report no reputation changes to nameservers and keep no transparency
   log.
 - **None.** Registration through the alias flow (`/v1/register`, which `jig init` and
-  `jig ns` use) has no proof-of-work and no rate limit. The experimental surface's own
-  `claim` and `alias` endpoints, below, do apply them.
-- **Prototype.** The nameserver binary also carries an earlier, experimental surface beside
-  the alias routes
-  ([`jig-nameserver/src/server.rs`](../../repos/jig-nameserver/src/server.rs)):
-  proof-of-work challenges with penalty-adjusted difficulty
-  ([`pow.rs`](../../repos/jig-nameserver/src/pow.rs)), reputation observations, tribunal case
-  records, transparency-log storage with a chain verifier
-  ([`transparency.rs`](../../repos/jig-nameserver/src/transparency.rs)) to which the running
-  service writes no entries, policy-hash exchange and peer gossip. The alias flow and `jig-server` use none of it. It explores the shape of
-  obligation 2 and meets none of it: its proof-of-work is per identity, its reputation model
-  is the superseded tier model, and its log is kept by one nameserver with nobody
-  cross-checking it. Treat it as a prototype of the obligations, not as the protocol, and do
-  not rely on it.
+  `jig ns` use) has no proof-of-work and no rate limit. No nameserver endpoint requires
+  proof-of-work.
+- **Removed prototype.** The nameserver binary used to serve an earlier, experimental surface
+  beside the alias routes: proof-of-work challenges with penalty-adjusted difficulty,
+  reputation observations, tribunal case records, transparency-log reads, policy-hash
+  exchange and peer gossip. Its routes were removed in #154; the modules behind them
+  (`pow.rs`, `transparency.rs`, `federation.rs`) are unreachable and slated for removal. It
+  explored the shape of obligation 2 and met none of it: its proof-of-work was per identity,
+  its reputation model the superseded tier model, and its log kept by one nameserver with
+  nobody cross-checking it. The redesign is lane R's: the framing doc (#152) and the draft
+  JEP-0008 (proof-of-work, #162), JEP-0009 (rulesets, reputation, transparency logs, #163)
+  and JEP-0010 (abuse reports, tribunals, #166), none merged yet.
 
 ### 8.3 To be designed
 
@@ -725,11 +722,10 @@ a high-sec ruleset group, cross-checked.
   cross-validation and cannot meet the agreement threshold alone. Replacing it is an ordinary
   change of the group's ruleset. **Open:** what the ruleset needs to say for that, and how the
   defaults document is versioned and signed.
-- **Known weakness.** The prototype's proof-of-work prices identities linearly (AB-05), its
-  reputation, case records and log are local to one nameserver (NS-03), and its challenge
-  proofs are not bound to an action or a DID (AB-01). Meeting obligation 2 means designing
-  each mechanism against the attack classes first; whether any prototype code survives is an
-  implementation question.
+- **Known weakness.** The removed prototype priced identities linearly (AB-05), kept its
+  reputation, case records and log local to one nameserver (NS-03), and did not bind its
+  challenge proofs to an action or a DID (AB-01). Meeting obligation 2 means designing each
+  mechanism against the attack classes first.
 
 ---
 
@@ -1083,8 +1079,8 @@ some other way. jig chooses provable reporting and states its cost.
 - **None.** No tribunal exists in the protocol. The only consequences in the tree are local
   operator decisions (admission bans and floors in `[auth.admission]`) and channel owners'
   kicks.
-- **Prototype.** The nameserver's experimental surface keeps tribunal case records
-  (section 8.2). They are records, not a tribunal, and nothing consumes them.
+- **Removed prototype.** The nameserver's experimental tribunal case records were removed
+  with its other legacy routes (section 8.2). The redesign is the JEP-0010 draft (#166).
 
 ### 13.3 To be designed
 
@@ -1136,7 +1132,7 @@ gap.
   servers rate-limit every verified DID and, on their v0.0.2 routes, every remote address by default, and can
   require one-time admission proof-of-work of unknown DIDs, off by default (D26); the
   nameserver's binding endpoints (register, rotate, renew) have neither proof-of-work nor a
-  rate limit, and the nameserver prototype's proof-of-work is unused. *To design:*
+  rate limit, and the nameserver's legacy proof-of-work routes are removed. *To design:*
   reputation-scaled difficulty, per action as well as per identity.
 - **AB-03, relay and bridge quota abuse.** Bridges and relays connect unidentified sources to
   identified users; a botnet emailing a known jig user through a bridge is the canonical
@@ -1153,8 +1149,7 @@ gap.
   the number of identities, which an attacker with many machines pays cheaply.
   *Obligation:* Sybil resistance holds against farming, not just prices it: a fresh DID
   starts unknown, standing is earned under the ruleset over time the group measures, and many
-  cheap identities never add up to the standing of one costly one. *Today:* no mechanism; the
-  nameserver prototype prices identities linearly. *To design:* section 6.3, against every
+  cheap identities never add up to the standing of one costly one. *Today:* no mechanism. *To design:* section 6.3, against every
   listed attack class.
 - **AB-06, unprovable abuse in encrypted channels.** If abuse in an encrypted channel cannot
   be proven, abusers retreat into encryption; if it is policed by a backdoor, everyone loses
@@ -1285,8 +1280,8 @@ gap.
 | `--anon` is a fresh, unregistered session key with no protocol link to any DID (D20) | None: no `--anon` mode; unknown DIDs admitted by default (admission proof-of-work is optional) | Client mode with nothing on disk |
 | What a server does with `--anon` is server policy | Partial: only the unknown-DID setting (admit, refuse, or proof-of-work) | Ruleset vocabulary for unknown keys, declared in the welcome |
 | Reputation is one number per ruleset; a ruleset group's members are rated by the same rules and maths; never pooled across a security level (D21) | Partial: `ruleset key → score`, seeded by the operator; nothing shared | Inputs, decay, sharing within a group, acknowledgement; interop between groups later |
-| Sybil and collusion resistance that holds against known attack classes | None; prototype prices identities linearly | Every attack class in section 6.3 answered in full (AB-05) |
-| Servers enforce PoW, decide by reputation, report changes to their nameservers and keep a transparency log; nameservers hold tribunals, compute net reputation and police servers (D23) | Partial at servers: rate limits on by default, one-time admission PoW off by default; no reputation decisions, reports or log; prototype in the nameserver, unused | Server–nameserver data contract; each mechanism designed against the attack classes (section 8.3) |
+| Sybil and collusion resistance that holds against known attack classes | None | Every attack class in section 6.3 answered in full (AB-05) |
+| Servers enforce PoW, decide by reputation, report changes to their nameservers and keep a transparency log; nameservers hold tribunals, compute net reputation and police servers (D23) | Partial at servers: rate limits on by default, one-time admission PoW off by default; no reputation decisions, reports or log; the nameserver prototype is removed | Server–nameserver data contract; each mechanism designed against the attack classes (section 8.3) |
 | Security levels belong to servers and ruleset groups; servers declare their ruleset, signed | Partial: per-server building blocks; no declaration | Ruleset document, declaration in the welcome, joining and leaving |
 | High-sec nameservers cross-register; no single nameserver decides a group-wide claim | None: nameservers do not coordinate | Replicated registry, thresholds, operator independence (NS-03) |
 | Anchors are opt-in with no veto (D19) | None | Structural "no veto"; anchor replacement |
@@ -1298,7 +1293,7 @@ gap.
 | Mandatory signed handshake; clients fail closed and pin | Partial: signed welcome with nonce; CLI pins server DIDs, suites and channel suites; later frames unchecked | Close semantics; pins; real reputation (D11) |
 | No backdoors, no scanning, no default escrow | Holds: no backdoor, scanning or escrow exists | Keep it so as reporting is designed |
 | Provable abuse reports from encrypted channels, by participants only (D22) | None: signature exists; no tooling | Delegation or proof mechanism (AB-06) |
-| Tribunals per ruleset group, held by its nameservers; penalties only under an acknowledged ruleset | None; prototype case records unused | Tribunal process, eligibility (GV-01 to GV-03) |
+| Tribunals per ruleset group, held by its nameservers; penalties only under an acknowledged ruleset | None | Tribunal process, eligibility (GV-01 to GV-03) |
 | Time-based limits use the verifier's clock | Partial: replay windows only; unbounded skew in the HLC | Skew bound; observed age (TM-01, TM-02) |
 
 ---
@@ -1339,7 +1334,8 @@ Decided by the maintainer on 2026-10-16 and 2026-10-17, and numbered in the road
   a private one, or none), report clients' reputation changes to their nameservers under the
   data contract, and keep their own transparency log. Nameservers hold tribunals, compute and
   enforce net reputation changes, and enforce servers' good behaviour. A server with no
-  nameserver sets its own policy. Today's code is a prototype of these obligations.
+  nameserver sets its own policy. Today's code meets none of these beyond the server's
+  admission policy and rate limits; the nameserver's prototype of them was removed (#154).
 - **D24: a channel has one owning server.** Cross-server writes are not specified; prior art
   is to be surveyed before choosing.
 
@@ -1378,8 +1374,6 @@ Each item names what it must satisfy and the register entries it closes.
 13. **The handshake.** Close semantics and JEP-0002's other open questions. Closes OP-01 to
     OP-03.
 14. **Anchors.** Replacement procedure, and the signed, versioned defaults document.
-15. **The nameserver prototype.** Decide what happens to the experimental surface (keep it,
-    put it behind an opt-in flag, or remove it) until the redesigned mechanisms of items 1, 2,
-    5 and 7 land. It is a prototype of those obligations, not their design, and the
-    obligations stay whatever happens to the code.
+15. **The nameserver prototype.** Removed in #154; its unreachable modules follow.
+    The obligations it explored stay, and items 1, 2, 5 and 7 design them afresh.
 16. **Housekeeping.** Confirm the obligations still marked *derived*.
