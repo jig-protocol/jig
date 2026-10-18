@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # prepare-release-signing-key.sh <private-key-path>
 #
-# Writes SIGNING_KEY to <path> and the matching public key to <path>.pub.
+# Writes SIGNING_KEY to <path> and the matching public key to <path>.pub,
+# then checks that public key against both pins: JIG_RELEASE_SIGNER in
+# install.sh and .github/release/allowed_signers. Exits non-zero if they
+# differ, so nothing is signed with a key installers would reject.
+#
 # ssh-keygen -Y sign looks up the public half beside the private key and
 # fails with "Couldn't load public key … No such file or directory" when
 # that file is missing or the secret was stored as one line with literal
@@ -56,3 +60,23 @@ if ! ssh-keygen -y -f "$dest" > "${dest}.pub" 2>"$err"; then
 fi
 rm -f "$err"
 chmod 644 "${dest}.pub"
+
+# Compare the derived public key with both pins. Print public keys and
+# fingerprints only.
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+derived="$(awk '{print $1, $2}' "${dest}.pub")"
+pinned_file="$(awk '{print $(NF-1), $NF}' "$root/.github/release/allowed_signers")"
+pinned_install="$(env -u JIG_RELEASE_SIGNER bash -c "$(grep '^JIG_RELEASE_SIGNER=' "$root/install.sh"); printf '%s' \"\$JIG_RELEASE_SIGNER\"" \
+  | awk '{print $(NF-1), $NF}')"
+echo "derived public key: $derived"
+ssh-keygen -l -f "${dest}.pub"
+status=0
+if [ "$derived" != "$pinned_file" ]; then
+  echo "signing key does not match .github/release/allowed_signers ($pinned_file)" >&2
+  status=1
+fi
+if [ "$derived" != "$pinned_install" ]; then
+  echo "signing key does not match JIG_RELEASE_SIGNER in install.sh ($pinned_install)" >&2
+  status=1
+fi
+exit "$status"
