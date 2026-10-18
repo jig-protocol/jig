@@ -21,25 +21,23 @@ use crate::storage::SqliteBlockStore;
 
 pub struct JigServer {
     config: ServerConfig,
-    store: Arc<SqliteBlockStore>,
-    runtime: Arc<BlockRuntime>,
-    /// v0.0.2 pipeline state. `None` when only running v0.0.1 routes.
+    /// v0.0.2 pipeline state. `None` when the module failed to initialize.
     v0_0_2: Option<Arc<crate::v0_0_2::AppState>>,
+}
+
+/// Boot-time checks that used to run while building the v0.0.1 REST state:
+/// the v0.0.1 store at `database_path` opens and answers, and the `[execution]`
+/// limits make a valid runtime. Kept so that removing those routes does not
+/// also change which configs boot.
+fn boot_checks(config: &ServerConfig) -> Result<()> {
+    SqliteBlockStore::new(&config.database_path)?.health_check()?;
+    BlockRuntime::new(config.execution_config())?;
+    Ok(())
 }
 
 impl JigServer {
     pub fn new(config: ServerConfig) -> Result<Self> {
-        let store = Arc::new(SqliteBlockStore::new(&config.database_path)?);
-        store.health_check()?;
-
-        let runtime = Arc::new(BlockRuntime::new(config.execution_config())?);
-
-        Ok(Self {
-            config,
-            store,
-            runtime,
-            v0_0_2: None,
-        })
+        Self::new_with_v0_0_2(config, None)
     }
 
     /// Construct a JigServer with the v0.0.2 pipeline state wired in. When
@@ -51,17 +49,8 @@ impl JigServer {
         config: ServerConfig,
         v0_0_2: Option<Arc<crate::v0_0_2::AppState>>,
     ) -> Result<Self> {
-        let store = Arc::new(SqliteBlockStore::new(&config.database_path)?);
-        store.health_check()?;
-
-        let runtime = Arc::new(BlockRuntime::new(config.execution_config())?);
-
-        Ok(Self {
-            config,
-            store,
-            runtime,
-            v0_0_2,
-        })
+        boot_checks(&config)?;
+        Ok(Self { config, v0_0_2 })
     }
 
     pub async fn start(&self) -> Result<()> {
@@ -72,8 +61,6 @@ impl JigServer {
         );
 
         let app_state = AppState {
-            store: self.store.clone(),
-            runtime: self.runtime.clone(),
             config: self.config.clone(),
             v0_0_2: self.v0_0_2.clone(),
         };
@@ -81,8 +68,7 @@ impl JigServer {
         let main_router: Router = handler::build_router(app_state);
 
         // Merge the v0.0.2 WSS router when the pipeline state is present.
-        // The v0.0.2 routes have their own AppState (Arc<v0_0_2::AppState>)
-        // and do not conflict with any existing v0.0.1 routes.
+        // The v0.0.2 routes have their own AppState (Arc<v0_0_2::AppState>).
         let router = if let Some(v002_state) = &self.v0_0_2 {
             main_router.merge(crate::v0_0_2_ws::build_v0_0_2_router(v002_state.clone()))
         } else {
