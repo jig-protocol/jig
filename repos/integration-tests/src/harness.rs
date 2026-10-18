@@ -277,6 +277,35 @@ impl TestJigServer {
         Ok(id)
     }
 
+    /// Write a restricted, plaintext channel row, with `owner` as its owner
+    /// member, the way a server before D25 created one. No server creates
+    /// these any more; tests use this for the channels that still exist.
+    pub fn seed_plaintext_restricted_channel(
+        &self,
+        owner: &Identity,
+        slug: &str,
+    ) -> Result<String> {
+        let id = format!("seeded-{}", slug.trim_start_matches('#'));
+        let store = &self.state.ingest_ctx.store;
+        let now = chrono::Utc::now().timestamp_millis();
+        store.upsert_channel(&jig_pipeline::persist::StoredChannel {
+            id: id.clone(),
+            slug: slug.to_string(),
+            visibility: "restricted".to_string(),
+            created_at: now,
+            owner_did: owner.did().to_did_jig_string(),
+            suite: "none".to_string(),
+        })?;
+        store.upsert_membership(&jig_pipeline::persist::StoredMembership {
+            channel_id: id.clone(),
+            member_did: owner.did().to_did_jig_string(),
+            role: "owner".to_string(),
+            joined_at: now,
+            source_block_cid: id.clone(),
+        })?;
+        Ok(id)
+    }
+
     /// Create a channel via the admin REST endpoint. Returns the channel CID
     /// (the channel's `id` in the StoredChannel table).
     pub async fn create_channel(
@@ -302,6 +331,89 @@ impl TestJigServer {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("create_channel failed: {status} body={body}");
+        }
+        let body: serde_json::Value = resp.json().await?;
+        Ok(body["block_cid"].as_str().unwrap_or_default().to_string())
+    }
+
+    /// Create a restricted channel the way `jig channel create` does: one MLS
+    /// group holding only the owner, its epoch-0 state on the creation block.
+    /// Restricted channels are always `mls` (D25).
+    pub async fn create_restricted_channel(
+        &self,
+        owner: &Identity,
+        session: &jig_client::secure::Session,
+        slug: &str,
+    ) -> Result<String> {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let created = session.create_group(&self.http_url(), slug)?;
+        let block = jig_client::blocks::build_with_metadata(
+            owner,
+            jig_core::BlockKind::ChannelCreate,
+            jig_core::HlcTimestamp::now_wall(owner.did().clone()),
+            serde_json::json!({
+                "slug": slug,
+                "visibility": "restricted",
+                "suite": "mls",
+                "mls_group_info": b64.encode(&created.group_info),
+                "mls_ratchet_tree": b64.encode(&created.ratchet_tree),
+            }),
+        );
+        self.post_channel_op("/_admin_v0_0_2/channels", &block)
+            .await
+    }
+
+    /// Add `member` to a restricted channel: the owner's commit adding the
+    /// member's key package, with its welcome, as `jig channel add` sends it.
+    pub async fn add_restricted_member(
+        &self,
+        owner: &Identity,
+        session: &jig_client::secure::Session,
+        slug: &str,
+        member: &jig_client::secure::Session,
+    ) -> Result<String> {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let server = self.http_url();
+        let key_package = member
+            .key_packages(1, false)?
+            .pop()
+            .context("no key package")?;
+        let c = session.prepare_add(&server, slug, &key_package, member.did())?;
+        let mut meta = serde_json::json!({
+            "channel": slug,
+            "member_did": member.did(),
+            "mls_commit": b64.encode(&c.commit),
+            "mls_epoch": c.epoch,
+        });
+        if let Some(w) = &c.welcome {
+            meta["mls_welcome"] = b64.encode(w).into();
+        }
+        if let Some(i) = &c.group_info {
+            meta["mls_group_info"] = b64.encode(i).into();
+        }
+        let block = jig_client::blocks::build_with_metadata(
+            owner,
+            jig_core::BlockKind::MemberAdd,
+            jig_core::HlcTimestamp::now_wall(owner.did().clone()),
+            meta,
+        );
+        let path = format!("/_admin_v0_0_2/channels/{}/members", urlencode(slug));
+        let cid = self.post_channel_op(&path, &block).await?;
+        session.confirm(&server, slug)?;
+        Ok(cid)
+    }
+
+    async fn post_channel_op(&self, path: &str, block: &BuiltBlock) -> Result<String> {
+        let resp = reqwest::Client::new()
+            .post(format!("{}{path}", self.http_url()))
+            .json(&submission_payload(block))
+            .send()
+            .await
+            .with_context(|| format!("POST {path}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("POST {path} failed: {status} body={body}");
         }
         let body: serde_json::Value = resp.json().await?;
         Ok(body["block_cid"].as_str().unwrap_or_default().to_string())

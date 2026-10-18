@@ -104,15 +104,25 @@ impl ChannelOpError {
     fn is_channel_exists(&self) -> bool {
         is_channel_exists(self.status, &self.body)
     }
+
+    /// The server's error `code`, if the body carries one.
+    fn code(&self) -> Option<String> {
+        error_code(&self.body)
+    }
+}
+
+/// The `code` field of a JSON error body.
+fn error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["code"].as_str().map(str::to_string))
 }
 
 /// Whether a channel-create refusal means "that slug is already taken".
 /// Servers before the `CHANNEL_EXISTS` code answered with a 500 carrying the
 /// SQLite constraint text, so that exact shape counts too.
 fn is_channel_exists(status: reqwest::StatusCode, body: &str) -> bool {
-    let code = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v["code"].as_str().map(str::to_string));
+    let code = error_code(body);
     match status {
         reqwest::StatusCode::CONFLICT => code.as_deref() == Some("CHANNEL_EXISTS"),
         reqwest::StatusCode::INTERNAL_SERVER_ERROR => {
@@ -205,6 +215,9 @@ pub(crate) async fn create_with(
     if !matches!(visibility.as_str(), "open" | "restricted") {
         anyhow::bail!("--visibility must be `open` or `restricted` (got `{visibility}`)");
     }
+    // A restricted channel is always end-to-end encrypted (ROADMAP D25): the
+    // server refuses a plaintext one. Only an open channel is a choice.
+    let encrypted = encrypted || visibility == "restricted";
 
     let id = ctx.identity()?;
     let hlc = HlcTimestamp::now_wall(id.did().clone());
@@ -280,6 +293,15 @@ pub(crate) async fn create_with(
             println!("channel created: {slug} ({label})");
             println!("  block_cid: {}", result.block_cid);
             Ok(true)
+        }
+        Err(e)
+            if e.downcast_ref::<ChannelOpError>()
+                .is_some_and(|c| c.code().as_deref() == Some("RESTRICTED_REQUIRES_MLS")) =>
+        {
+            Err(e.context(format!(
+                "the server will not create {slug} unencrypted: restricted channels are \
+                 end-to-end encrypted. For plaintext, make it open (`--visibility open`)"
+            )))
         }
         Err(e)
             if e.downcast_ref::<ChannelOpError>()
