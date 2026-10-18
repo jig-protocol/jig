@@ -13,6 +13,11 @@
 //! | `member-remove` | `mls_commit` removing `member_did`; none when the sender leaves |
 //! | content | `mls_message`, an application `PrivateMessage` for this group; no `body` |
 //!
+//! A restricted channel is always `mls` (ROADMAP D25): a `channel-create` that
+//! is not open and names no suite, or suite `none`, is refused. Restricted
+//! channels created as plaintext before that rule are frozen: they keep their
+//! history, but take no new content.
+//!
 //! Pure like the write gate: the caller resolves the rows and applies the
 //! returned [`MlsPlan`]. Validation is a pure function of the stored state, so
 //! two racing commits both validate; the store's compare-and-swap on the epoch
@@ -53,6 +58,14 @@ pub enum SuiteRefusal {
     Plaintext { slug: String },
     /// The MLS payload failed validation.
     Mls(jig_mls::MlsError),
+    /// A restricted `channel-create` whose suite is not `mls`. Content the
+    /// server can read is open content; a creator who wants plaintext makes
+    /// an open channel.
+    RestrictedNeedsMls { slug: String },
+    /// Content for a restricted channel that was created as plaintext, before
+    /// restricted channels were always encrypted. Its history stays readable;
+    /// it takes nothing new.
+    PlaintextRestricted { slug: String },
 }
 
 /// What ingest must do once every gate has passed.
@@ -107,6 +120,12 @@ pub fn plan(
             check_dm_create(sender, manifest, &slug, suite)?;
         }
         if suite != EncryptionSuite::Mls {
+            // Absent visibility is open, as the effect stores it; anything
+            // else that is not exactly `open` is restricted (fail closed).
+            let visibility = meta_str(manifest, "visibility").unwrap_or("open");
+            if !crate::visibility::is_open(visibility) {
+                return Err(SuiteRefusal::RestrictedNeedsMls { slug });
+            }
             return Ok(MlsPlan::Nothing);
         }
         let info = meta_bytes(manifest, keys::GROUP_INFO)?;
@@ -223,6 +242,11 @@ pub fn plan(
                 });
             }
             if channel_suite != EncryptionSuite::Mls {
+                if !crate::visibility::is_open(&channel.visibility) {
+                    return Err(SuiteRefusal::PlaintextRestricted {
+                        slug: channel.slug.clone(),
+                    });
+                }
                 return Ok(MlsPlan::Nothing);
             }
             if manifest.metadata.contains_key("body") {
@@ -413,6 +437,116 @@ mod tests {
         assert_eq!(
             plan(BlockKind::ChannelCreate, &a.did, &m, None, None),
             Err(SuiteRefusal::UnknownSuite("rot13".to_string()))
+        );
+    }
+
+    /// D25: a restricted channel is always `mls`. Anything but exactly
+    /// `open` is restricted, so a misspelt visibility cannot slip through
+    /// as plaintext.
+    #[test]
+    fn a_restricted_channel_create_must_be_mls() {
+        let a = who(1);
+        for visibility in ["restricted", "Restricted", "private", ""] {
+            for suite in [None, Some("none")] {
+                let mut meta = json!({"slug": "#private", "visibility": visibility});
+                if let Some(s) = suite {
+                    meta["suite"] = json!(s);
+                }
+                let m = manifest(
+                    BlockKind::ChannelCreate,
+                    &a.did,
+                    EncryptionSuite::Unencrypted,
+                    meta,
+                );
+                assert_eq!(
+                    plan(BlockKind::ChannelCreate, &a.did, &m, None, None),
+                    Err(SuiteRefusal::RestrictedNeedsMls {
+                        slug: "#private".to_string()
+                    }),
+                    "visibility {visibility:?}, suite {suite:?}"
+                );
+            }
+        }
+        // Open, said or implied, may still be plaintext.
+        for meta in [
+            json!({"slug": "#plain", "visibility": "open"}),
+            json!({"slug": "#plain", "visibility": "open", "suite": "none"}),
+        ] {
+            let m = manifest(
+                BlockKind::ChannelCreate,
+                &a.did,
+                EncryptionSuite::Unencrypted,
+                meta,
+            );
+            assert_eq!(
+                plan(BlockKind::ChannelCreate, &a.did, &m, None, None),
+                Ok(MlsPlan::Nothing)
+            );
+        }
+    }
+
+    #[test]
+    fn a_restricted_mls_channel_create_is_accepted() {
+        let a = who(1);
+        let created = a.member.create_group().unwrap();
+        let m = manifest(
+            BlockKind::ChannelCreate,
+            &a.did,
+            EncryptionSuite::Unencrypted,
+            json!({"slug": "#sealed", "visibility": "restricted", "suite": "mls",
+                   "mls_group_info": b64(&created.group_info),
+                   "mls_ratchet_tree": b64(&created.ratchet_tree)}),
+        );
+        assert!(matches!(
+            plan(BlockKind::ChannelCreate, &a.did, &m, None, None),
+            Ok(MlsPlan::Genesis(_))
+        ));
+    }
+
+    /// A restricted channel created plaintext before D25 keeps its history
+    /// and its control plane, and takes no new content. Promoted to open it
+    /// is an ordinary open channel again.
+    #[test]
+    fn a_plaintext_restricted_channel_is_frozen() {
+        let a = who(1);
+        let old = chan("none", &a.did);
+        let post = manifest(
+            BlockKind::TextRender,
+            &a.did,
+            EncryptionSuite::Unencrypted,
+            json!({"channel": "#sealed", "body": "hi"}),
+        );
+        assert_eq!(
+            plan(BlockKind::TextRender, &a.did, &post, Some(&old), None),
+            Err(SuiteRefusal::PlaintextRestricted {
+                slug: "#sealed".to_string()
+            })
+        );
+        for kind in [
+            BlockKind::MemberAdd,
+            BlockKind::MemberRemove,
+            BlockKind::ChannelPromote,
+            BlockKind::ChannelArchive,
+        ] {
+            let m = manifest(
+                kind,
+                &a.did,
+                EncryptionSuite::Unencrypted,
+                json!({"channel": "#sealed", "member_did": who(2).did}),
+            );
+            assert_eq!(
+                plan(kind, &a.did, &m, Some(&old), None),
+                Ok(MlsPlan::Nothing),
+                "{kind:?}"
+            );
+        }
+        let promoted = StoredChannel {
+            visibility: "open".to_string(),
+            ..old
+        };
+        assert_eq!(
+            plan(BlockKind::TextRender, &a.did, &post, Some(&promoted), None),
+            Ok(MlsPlan::Nothing)
         );
     }
 

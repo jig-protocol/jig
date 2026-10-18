@@ -173,7 +173,7 @@ enum ChannelAction {
         slug: String,
 
         /// Channel visibility — `open` (anyone can read; default) or
-        /// `restricted` (membership-gated reads).
+        /// `restricted` (members only, and always end-to-end encrypted).
         #[arg(long, default_value = "open")]
         visibility: String,
 
@@ -182,7 +182,8 @@ enum ChannelAction {
         exist_ok: bool,
 
         /// End-to-end encrypt the channel with MLS: the server stores and
-        /// relays ciphertext it cannot read. Fixed at creation.
+        /// relays ciphertext it cannot read. Fixed at creation. Restricted
+        /// channels are always encrypted, so this only changes open ones.
         #[arg(long)]
         encrypted: bool,
     },

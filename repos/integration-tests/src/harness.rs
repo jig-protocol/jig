@@ -277,6 +277,35 @@ impl TestJigServer {
         Ok(id)
     }
 
+    /// Write a restricted, plaintext channel row, with `owner` as its owner
+    /// member, the way a server before D25 created one. No server creates
+    /// these any more; tests use this for the channels that still exist.
+    pub fn seed_plaintext_restricted_channel(
+        &self,
+        owner: &Identity,
+        slug: &str,
+    ) -> Result<String> {
+        let id = format!("seeded-{}", slug.trim_start_matches('#'));
+        let store = &self.state.ingest_ctx.store;
+        let now = chrono::Utc::now().timestamp_millis();
+        store.upsert_channel(&jig_pipeline::persist::StoredChannel {
+            id: id.clone(),
+            slug: slug.to_string(),
+            visibility: "restricted".to_string(),
+            created_at: now,
+            owner_did: owner.did().to_did_jig_string(),
+            suite: "none".to_string(),
+        })?;
+        store.upsert_membership(&jig_pipeline::persist::StoredMembership {
+            channel_id: id.clone(),
+            member_did: owner.did().to_did_jig_string(),
+            role: "owner".to_string(),
+            joined_at: now,
+            source_block_cid: id.clone(),
+        })?;
+        Ok(id)
+    }
+
     /// Create a channel via the admin REST endpoint. Returns the channel CID
     /// (the channel's `id` in the StoredChannel table).
     pub async fn create_channel(

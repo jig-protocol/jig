@@ -326,11 +326,14 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         ref e @ IngestError::NotAdmitted { .. } => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },
-        // Bridges post plaintext; an encrypted channel will never take it, and
-        // the same bytes will be refused the same way again.
+        // Bridges post plaintext; an encrypted channel will never take it, nor
+        // will a restricted one (D25), and the same bytes will be refused the
+        // same way again.
         ref e @ (IngestError::OwnerCannotLeave { .. }
         | IngestError::UnknownSuite { .. }
         | IngestError::SuiteMismatch { .. }
+        | IngestError::RestrictedRequiresMls { .. }
+        | IngestError::PlaintextRestrictedFrozen { .. }
         | IngestError::MlsRejected { .. }) => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },

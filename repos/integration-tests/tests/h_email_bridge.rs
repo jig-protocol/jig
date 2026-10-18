@@ -1,18 +1,19 @@
 //! End-to-end email-bridge integration tests with a MockProvider.
 //!
-//! These tests exercise the complete inbound/outbound path through a real
-//! `AppState` + ingest pipeline + mounted webhook route without live Resend:
+//! These tests exercise the inbound path through a real `AppState` + ingest
+//! pipeline + mounted webhook route without live Resend:
 //!
-//! * `inbound_webhook_creates_channel_and_lands_block` — one POST to
-//!   `/_bridge/email/inbound` creates the shadow-DID thread channel + two members.
-//! * `round_trip_reply_emails_original_sender` — after an inbound webhook, the
-//!   other channel member posts a block; the dispatch task calls
-//!   `outbound()` → `MockProvider::send()` → the sent email is routed back to
-//!   the original external sender.
+//! * `inbound_mail_is_refused_until_the_bridge_speaks_mls` — a mail thread is
+//!   a restricted channel, restricted channels are always MLS (D25), and the
+//!   bridge is not an MLS member yet: the server refuses the thread, and
+//!   nothing about the mail is stored.
 //! * `denied_bridge_route_is_not_mounted` — a policy-denied bridge mounts no
 //!   route (GET `/_bridge/email/inbound` → 404).
-//! * `inbound_webhook_is_idempotent_on_redelivery` — posting the same
-//!   provider_message_id twice doesn't duplicate channel state.
+//! * `disabled_bridge_route_is_not_mounted` — nor does a disabled one.
+//!
+//! The round trip (inbound thread, reply, outbound mail) comes back when the
+//! bridge joins its threads' MLS groups; the outbound path keeps its unit
+//! tests in `jig-bridge-email` meanwhile.
 
 use std::sync::{Arc, Mutex};
 
@@ -230,109 +231,53 @@ async fn wait_until<F: FnMut() -> bool>(mut cond: F, secs: u64, what: &str) {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Posting one inbound webhook creates the thread channel + shadow members in the
-/// server's SQLite store.
+/// A mail thread is a 1:1 restricted channel, and a restricted channel is
+/// always MLS (D25). Until the bridge can be a member of its threads' groups,
+/// the server refuses the thread: the webhook fails, and neither the channel
+/// nor the mail's text is stored.
 #[tokio::test]
-async fn inbound_webhook_creates_channel_and_lands_block() {
+async fn inbound_mail_is_refused_until_the_bridge_speaks_mls() {
     let mock = Arc::new(MockProvider::default());
     *mock.notification.lock().unwrap() = Some(inbound_notification());
     *mock.body.lock().unwrap() = "hello from alice".into();
-    let (state, router, _tmp) = setup(mock, true).await;
+    let (state, router, tmp) = setup(mock.clone(), true).await;
 
-    let status = post_inbound(&router).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(post_inbound(&router).await, StatusCode::BAD_GATEWAY);
+    // A redelivery is refused the same way; nothing was half-made.
+    assert_eq!(post_inbound(&router).await, StatusCode::BAD_GATEWAY);
 
     let slug = convo_slug();
-    let chan = state
-        .ingest_ctx
-        .store
-        .get_channel_by_slug(&slug)
-        .unwrap()
-        .expect("thread channel must be created on first inbound");
-
-    let members = state
-        .ingest_ctx
-        .store
-        .list_members(&chan.id)
-        .expect("list_members should succeed");
-    let alice_did = shadow_did(SECRET, "alice@example.com", false).to_did_jig_string();
     assert!(
-        members.iter().any(|m| m.member_did == alice_did),
-        "shadow-alice must be a member; members = {members:?}"
+        state
+            .ingest_ctx
+            .store
+            .get_channel_by_slug_including_archived(&slug)
+            .unwrap()
+            .is_none(),
+        "the server created a plaintext restricted thread"
     );
+    assert!(mock.sent.lock().unwrap().is_empty());
+    let mut disk = Vec::new();
+    for entry in walkdir(tmp.path()) {
+        disk.extend(std::fs::read(entry).unwrap_or_default());
+    }
     assert!(
-        members.len() >= 2,
-        "both shadow-alice and shadow-dj must be present; members = {members:?}"
+        !disk.windows(16).any(|w| w == b"hello from alice"),
+        "the refused mail's text reached the server's disk"
     );
 }
 
-/// After an inbound webhook (alice→dj), the other member (shadow-dj) posting a
-/// block triggers the fanout sink → dispatch task → `MockProvider::send()` back
-/// to `alice@example.com`.
-#[tokio::test]
-async fn round_trip_reply_emails_original_sender() {
-    let mock = Arc::new(MockProvider::default());
-    *mock.notification.lock().unwrap() = Some(inbound_notification());
-    *mock.body.lock().unwrap() = "hello from alice".into();
-    let (state, router, _tmp) = setup(mock.clone(), true).await;
-
-    // Inbound: alice → creates dm(shadow_alice, shadow_dj), registers
-    // shadow_alice as a managed DID, records slug→alice@example.com.
-    assert_eq!(
-        post_inbound(&router).await,
-        StatusCode::OK,
-        "inbound webhook must return 200"
-    );
-
-    // The other channel member (shadow-dj) replies. `shadow_signing_key`
-    // derives the same key that the inbound handler resolved for dj@jig.onl
-    // (nameserver_url=None → shadow resolution). We use that key to author
-    // a text-render block on the thread channel, then ingest it directly.
-    let slug = convo_slug();
-    let dj_sk = shadow_signing_key(SECRET, "dj@jig.onl", false);
-    let dj = jig_client::Identity::from_signing_key(dj_sk);
-    let hlc = jig_core::HlcTimestamp::now_wall(dj.did().clone());
-    let block = jig_client::blocks::build_text_render(&dj, &slug, "reply from dj", hlc);
-    let bundle = jig_core::BlockBundle {
-        manifest_bytes: &block.manifest_bytes,
-        code_bytes: &block.code_bytes,
-        resources: vec![],
-    };
-    jig_pipeline::ingest::ingest(
-        &state.ingest_ctx,
-        bundle,
-        block.sender_sig.clone(),
-        jig_pipeline::ingest::IngestSource::LocalClient { conn_id: 99 },
-    )
-    .await
-    .expect("ingest reply block");
-
-    // Wait (up to 5s) for the dispatch task to call outbound() → send().
-    {
-        let mock = mock.clone();
-        wait_until(
-            move || !mock.sent.lock().unwrap().is_empty(),
-            5,
-            "dispatch task should call MockProvider::send",
-        )
-        .await;
+fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walkdir(&path));
+        } else {
+            out.push(path);
+        }
     }
-
-    let sent = mock.sent.lock().unwrap();
-    assert_eq!(
-        sent.len(),
-        1,
-        "exactly one outbound email expected; got {sent:?}"
-    );
-    assert_eq!(
-        sent[0].to, "alice@example.com",
-        "outbound email must be addressed to the original inbound sender"
-    );
-    assert!(
-        sent[0].body.contains("reply from dj"),
-        "outbound email body must carry the block content; body = {:?}",
-        sent[0].body
-    );
+    out
 }
 
 /// When the bridge is policy-denied, `register_and_start` returns `Ok(false)`
@@ -372,38 +317,5 @@ enabled = false
         post_inbound(&router).await,
         StatusCode::NOT_FOUND,
         "an allow-listed but disabled bridge must not mount any route"
-    );
-}
-
-/// Delivering the same webhook twice (same provider_message_id) must be
-/// idempotent: the second delivery returns 200 and does not duplicate the
-/// channel or its members.
-#[tokio::test]
-async fn inbound_webhook_is_idempotent_on_redelivery() {
-    let mock = Arc::new(MockProvider::default());
-    *mock.notification.lock().unwrap() = Some(inbound_notification());
-    *mock.body.lock().unwrap() = "hello from alice".into();
-    let (state, router, _tmp) = setup(mock, true).await;
-
-    assert_eq!(post_inbound(&router).await, StatusCode::OK);
-    // Same provider_message_id again → deduped, still 200, no duplicate state.
-    assert_eq!(post_inbound(&router).await, StatusCode::OK);
-
-    let slug = convo_slug();
-    let chan = state
-        .ingest_ctx
-        .store
-        .get_channel_by_slug(&slug)
-        .unwrap()
-        .expect("channel must exist after first inbound");
-    let members = state
-        .ingest_ctx
-        .store
-        .list_members(&chan.id)
-        .expect("list_members should succeed");
-    assert_eq!(
-        members.len(),
-        2,
-        "redelivery must not duplicate membership rows; got {members:?}"
     );
 }
