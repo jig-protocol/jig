@@ -63,6 +63,9 @@ Non-goals:
    - Every payload has a `domain` entry naming the object, listed with each object below.
    - Times and sequence numbers are CBOR unsigned or negative integers (Unix seconds for
      times). Floating-point values and tags MUST NOT appear.
+   - A CID is the binary CIDv1 as an untagged CBOR byte string (major type 2): no tag 42,
+     no multibase text. A receiver MUST refuse a CIDv0. The schema says which fields are
+     CIDs, so one CID has one encoding.
    - A receiver MUST refuse an envelope or payload that is not in deterministic form,
      that carries an unknown key, or whose `domain` is not the one expected.
    - The signer is named inside the payload, not in the envelope, and the receiver
@@ -93,7 +96,9 @@ Non-goals:
    - `root_id` names the specific root:
      - for `config`, a local identifier the resolver chooses, never sent to anyone;
      - for `dns`, the suffix's domain name, lowercased;
-     - for `contract`, the contract's CID.
+     - for `contract`, the contract's CID, as its canonical text form (CIDv1, base32
+       lowercase, `b` prefix), because `root_id` is text under every root. A resolver
+       MUST refuse any other spelling.
    - Every listed authority MUST sign. An envelope over other bytes, or signed by a DID
      outside `authorities`, counts for nothing.
 4. A resolver MUST determine a suffix's delegation before it accepts an attestation under
