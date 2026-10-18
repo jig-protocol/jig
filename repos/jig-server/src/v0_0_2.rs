@@ -83,12 +83,12 @@ fn build_auth(
 /// Kept as a named function rather than inlined so the mapping is one visible
 /// place: a limit added on either side that is not wired here is the same class
 /// of silent divergence this exists to remove.
-fn runtime_config_from(execution: &ExecutionConfig) -> jig_runtime::RuntimeConfig {
+pub(crate) fn runtime_config_from(execution: &ExecutionConfig) -> jig_runtime::RuntimeConfig {
     jig_runtime::RuntimeConfig {
         // Enumerated rather than assigned onto a default, and deliberately: a
         // limit added to `ResourceLimits` should break this build so somebody
         // decides whether operators can set it, instead of it silently taking a
-        // default here. Same reasoning as `BlockRuntime::new`.
+        // default here.
         limits: jig_runtime::config::ResourceLimits {
             fuel_max: execution.fuel_max,
             memory_max_mb: execution.memory_max_mb,
