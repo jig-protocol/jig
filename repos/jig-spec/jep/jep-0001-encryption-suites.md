@@ -72,6 +72,34 @@ A gate treats a suite by its properties, not by name:
 - **Restricted channels.** Only `mls` may serve a restricted channel or a DM (decision D25).
   A new suite's JEP says whether it may; a suite whose operator can read its content may not.
 
+## Report profile
+
+Every suite JEP MUST define a **report profile**: what a member discloses about one message
+so a third party (a tribunal) can verify who wrote it and what it said, and how that party
+checks it. The disclosure MUST open that message and no other. A suite without a report
+profile cannot be admitted by a group that has a tribunal. The report envelope and the
+tribunal are R's ([framing](../../../docs/superpowers/specs/2026-10-18-reputation-pow-tribunals-framing.md),
+section 8.3; decided by DJ 2026-10-18). This section fixes only what each suite contributes.
+
+- **`none`.** Nothing to disclose. The plaintext `body` is in the block, and the block's author
+  signature binds the author's DID to it.
+- **`mls`: per-message key disclosure.** The reporter discloses, for that one application
+  message, the message key and nonce from the sender's secret-tree ratchet for its
+  generation, and the sender-data key and nonce. It also discloses the epoch's
+  `GroupContext`. The verifier checks the block's author signature over the ciphertext,
+  decrypts with the disclosed values, and checks the MLS content signature over the
+  `FramedContent` and `GroupContext`. That signature uses the DID key, because in jig the
+  leaf key is the DID key. The result proves the author signed this plaintext in this group
+  and epoch, whether or not the AEAD is key-committing. The ratchet secrets are not
+  disclosed, so no other message opens.
+- **`test-aead`.** Nothing to disclose: the key is published. The verifier opens the payload
+  with the key and the AAD (channel slug and author), and checks the block's author signature
+  over the payload. The key is fixed and public, so the payload cannot open to a different
+  plaintext under a different key.
+
+Report-profile vectors are R5's (a report proves one message's authorship and opens no
+other). They are not part of the format below yet.
+
 ## Conformance vectors
 
 Every registered suite ships one file, `vectors/suites/<id>.json` in this repository
