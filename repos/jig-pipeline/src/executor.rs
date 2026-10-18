@@ -353,14 +353,16 @@ mod tests {
     ///
     /// Deliberately oversubscribed: more threads than the configured ceiling, so
     /// the slot gate is exercised rather than merely present.
+    ///
+    /// Nothing here depends on timing. The wall-clock deadline is raised far
+    /// above any render: under the default 250 ms, a full `cargo nextest` run on
+    /// a loaded machine could push one debug-build render past it, and the test
+    /// would fail on CPU contention rather than on a concurrency defect. The
+    /// overlap is proved by [`an_execution_runs_while_another_holds_a_slot`],
+    /// not by hoping the scheduler interleaves these threads.
     #[test]
     fn many_concurrent_renders_all_succeed() {
-        // Its OWN executor, not `shared()`. `peak` is per-executor, so a shared
-        // one accumulates every other test's concurrency in this process — and
-        // the `in_flight_peak() > 1` assertion below would then pass on someone
-        // else's overlap rather than this test's, which is precisely the evidence
-        // it is supposed to provide.
-        let ex = Arc::new(BlockExecutor::new().expect("executor construction"));
+        let ex = Arc::new(executor_without_wall_clock_pressure());
         let threads = 64;
         let per_thread = 8;
 
@@ -389,13 +391,42 @@ mod tests {
         for h in handles {
             h.join().expect("no thread should panic");
         }
+    }
 
-        assert!(
-            ex.in_flight_peak() > 1,
-            "peak in-flight was {} — the test did not actually overlap any \
-             executions, so it is not testing concurrency",
-            ex.in_flight_peak()
+    /// A render succeeds while another execution holds a slot, and the gate
+    /// records both: two executions really were in flight at once.
+    ///
+    /// Deterministic where an assertion on `in_flight_peak()` after a burst of
+    /// threads is not. Holding a slot ourselves forces the overlap instead of
+    /// waiting for the scheduler to produce one.
+    #[test]
+    fn an_execution_runs_while_another_holds_a_slot() {
+        // Its OWN executor, not `shared()`: `peak` is per-executor, so a shared
+        // one would carry other tests' concurrency into this assertion.
+        let ex = executor_without_wall_clock_pressure();
+        let held = ex.slots.acquire();
+
+        let got = ex
+            .render_text(&input("rendered while a slot is held"))
+            .expect("a render must not need the slot another execution holds");
+        assert_eq!(
+            got.output.render_hash,
+            text_block::execute_pure(&input("rendered while a slot is held")).render_hash
         );
+        assert_eq!(
+            ex.in_flight_peak(),
+            2,
+            "the held slot and the render must have been in flight together"
+        );
+        drop(held);
+    }
+
+    /// A default-limits executor whose wall-clock deadline cannot fire in a
+    /// test, so a loaded CI machine cannot fail a render on time alone.
+    fn executor_without_wall_clock_pressure() -> BlockExecutor {
+        let mut config = jig_runtime::RuntimeConfig::default();
+        config.limits.execution_timeout_ms = 60_000;
+        BlockExecutor::with_config(config).expect("executor construction")
     }
 
     /// `with_config` must actually apply the limits it is handed.
