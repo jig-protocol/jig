@@ -340,8 +340,9 @@ To come with slice 4 and slice 6:
 
 # Rejected Alternatives
 
-- **Policy and receipts keyed by component hash.** This approves the code under any manifest,
-  including one that requests more.
+- **Policy keyed by component hash alone, for every world.** For a `bot` it would approve the code
+  under any manifest, including one that requests more effects. Component matching is kept only
+  for renderers (§5.1), where the manifest can add no authority.
 - **Signature inside the program CID.** Every later attestation would then need a second name.
 - **A registry service, or programs on nameservers.** This adds a second write path and a second
   trust root.
