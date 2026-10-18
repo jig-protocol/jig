@@ -1131,8 +1131,9 @@ gap.
   ruleset sets, and a nameserver requires it on its own binding endpoints; it is never the
   only gate and never on its own evidence that an identity is one person (D23). *Today:*
   servers rate-limit every verified DID and every remote address by default, and can
-  require one-time admission proof-of-work of unknown DIDs, off by default (D26); alias
-  registration has no proof-of-work, and the nameserver prototype's is unused. *To design:*
+  require one-time admission proof-of-work of unknown DIDs, off by default (D26); the
+  nameserver's binding endpoints (register, rotate, renew) have neither proof-of-work nor a
+  rate limit, and the nameserver prototype's proof-of-work is unused. *To design:*
   reputation-scaled difficulty, per action as well as per identity.
 - **AB-03, relay and bridge quota abuse.** Bridges and relays connect unidentified sources to
   identified users; a botnet emailing a known jig user through a bridge is the canonical
