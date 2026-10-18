@@ -688,7 +688,9 @@ a high-sec ruleset group, cross-checked.
   (`pow.rs`, `transparency.rs`, `federation.rs`) are unreachable and slated for removal. It
   explored the shape of obligation 2 and met none of it: its proof-of-work was per identity,
   its reputation model the superseded tier model, and its log kept by one nameserver with
-  nobody cross-checking it.
+  nobody cross-checking it. The redesign is lane R's: the framing doc (#152) and the draft
+  JEP-0008 (proof-of-work, #162), JEP-0009 (rulesets, reputation, transparency logs, #163)
+  and JEP-0010 (abuse reports, tribunals, #166), none merged yet.
 
 ### 8.3 To be designed
 
@@ -1076,7 +1078,7 @@ some other way. jig chooses provable reporting and states its cost.
   operator decisions (admission bans and floors in `[auth.admission]`) and channel owners'
   kicks.
 - **Removed prototype.** The nameserver's experimental tribunal case records were removed
-  with its other legacy routes (section 8.2).
+  with its other legacy routes (section 8.2). The redesign is the JEP-0010 draft (#166).
 
 ### 13.3 To be designed
 
