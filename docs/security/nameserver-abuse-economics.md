@@ -12,6 +12,13 @@ responses are in the
 Numbers below are the reference nameserver's defaults (`repos/jig-nameserver/src/config.rs`)
 unless stated.
 
+> **The mechanisms priced here are no longer served.** Proof-of-work challenges, penalties,
+> the per-IP and per-key challenge limits, the anonymous floor, reputation observations,
+> the admin reset endpoints and federation gossip were the nameserver's legacy prototype,
+> whose routes were removed in #154. Today the nameserver serves only the alias routes,
+> which have no proof-of-work and no rate limit. The analysis stays as input to the
+> redesign; read "today" below as "in the removed prototype".
+
 ## What the model is for
 
 - Make abuse cost more than ordinary use, without identifying anyone.
