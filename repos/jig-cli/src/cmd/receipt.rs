@@ -1,15 +1,11 @@
 //! Receipt viewing and inspection commands
 
 use crate::receipt::v0_2::{BlockReceipt, ReceiptExt};
-use anyhow::{Result, anyhow};
-use cid::Cid;
+use anyhow::Result;
 
-/// View a receipt by block ID or from a file
-pub async fn view_receipt(receipt_source: ReceiptSource, json_output: bool) -> Result<()> {
-    let receipt = match receipt_source {
-        ReceiptSource::BlockId(cid) => fetch_receipt_from_server(&cid).await?,
-        ReceiptSource::File(path) => load_receipt_from_file(&path)?,
-    };
+/// View a receipt from a file
+pub fn view_receipt(path: &str, json_output: bool) -> Result<()> {
+    let receipt = load_receipt_from_file(path)?;
 
     // Validate receipt
     if let Err(e) = receipt.validate_cli() {
@@ -28,16 +24,9 @@ pub async fn view_receipt(receipt_source: ReceiptSource, json_output: bool) -> R
 }
 
 /// Compare two receipts (for parity testing)
-pub async fn compare_receipts(receipt_a: ReceiptSource, receipt_b: ReceiptSource) -> Result<()> {
-    let a = match receipt_a {
-        ReceiptSource::BlockId(cid) => fetch_receipt_from_server(&cid).await?,
-        ReceiptSource::File(path) => load_receipt_from_file(&path)?,
-    };
-
-    let b = match receipt_b {
-        ReceiptSource::BlockId(cid) => fetch_receipt_from_server(&cid).await?,
-        ReceiptSource::File(path) => load_receipt_from_file(&path)?,
-    };
+pub fn compare_receipts(path_a: &str, path_b: &str) -> Result<()> {
+    let a = load_receipt_from_file(path_a)?;
+    let b = load_receipt_from_file(path_b)?;
 
     println!("Comparing receipts...\n");
 
@@ -143,22 +132,6 @@ pub async fn compare_receipts(receipt_a: ReceiptSource, receipt_b: ReceiptSource
     Ok(())
 }
 
-pub enum ReceiptSource {
-    BlockId(Cid),
-    File(String),
-}
-
-async fn fetch_receipt_from_server(_cid: &Cid) -> Result<BlockReceipt> {
-    // Note: This assumes the server has a /receipts/{cid} endpoint
-    // which needs to be implemented in jig-server
-    // For now, return error with helpful message
-    Err(anyhow!(
-        "Fetching receipts from server not yet implemented.\n\
-         Server needs /receipts/{{cid}} endpoint.\n\
-         Use --file <path> to load receipt from file instead."
-    ))
-}
-
 fn load_receipt_from_file(path: &str) -> Result<BlockReceipt> {
     let content = std::fs::read_to_string(path)?;
     let receipt: BlockReceipt = serde_json::from_str(&content)?;
@@ -168,6 +141,7 @@ fn load_receipt_from_file(path: &str) -> Result<BlockReceipt> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cid::Cid;
     use std::str::FromStr;
 
     #[test]
