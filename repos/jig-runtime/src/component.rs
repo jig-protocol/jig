@@ -7,7 +7,7 @@
 //!
 //! - It refuses a component that fails jig-core's `jig-det-1` profile before compiling it.
 //! - It runs on its own engine, built from the same deterministic configuration as
-//!   [`crate::engine`]'s (fuel, NaN canonicalization, WebAssembly 2.0 minus SIMD, stack limit,
+//!   `crate::engine`'s (fuel, NaN canonicalization, WebAssembly 2.0 minus SIMD, stack limit,
 //!   pooling allocator). On top it adds only the component model, and turns component-model
 //!   async support off.
 //! - It classifies every run as one of three outcomes:
@@ -20,17 +20,25 @@
 //! Only the `renderer` world is wired up here. The `bot` world comes with lane C's host
 //! interfaces.
 //!
-//! Termination is by fuel alone. A renderer imports nothing that can block, so fuel bounds every
-//! run. The shared configuration turns epoch interruption on, but nothing advances this engine's
-//! epoch, so each store's deadline is set out of reach. A wall-clock guard would be liveness only;
-//! it can join when the engine's epoch ticker is shared.
+//! Every run is bounded three ways, all per store:
+//!
+//! - **Fuel**, the bound that decides receipts. wasmtime 49.0.3 charges bulk memory operations
+//!   per byte, so fuel tracks CPU closely, but only as closely as its cost table does.
+//! - **A wall-clock deadline**, from `crate::engine`'s epoch ticker, as a backstop for work
+//!   fuel prices too low: a cost-table gap, host-side canonical-ABI copies, a slow or loaded
+//!   machine. This engine runs its own ticker. Missing the deadline is
+//!   [`IncompleteReason::DeadlineExceeded`].
+//! - **A memory cap** of the renderer's `max_memory_pages`, enforced by a resource limiter on top
+//!   of the validator's check of declared maxima.
 
 use jig_core::component_validation::{BlockWorld, ComponentProfile, validate_component};
+use std::time::Duration;
+
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
 
 use crate::config::RuntimeConfig;
-use crate::engine::deterministic_config;
+use crate::engine::{EPOCH_TICK, EpochTicker, deadline_ticks, deterministic_config};
 use crate::error::{Result, RuntimeError};
 use crate::identity::EngineIdentity;
 
@@ -45,10 +53,6 @@ pub use jig::block::types::{BlockError, Hlc, Invocation, Payload};
 /// The version of `jig:block/types` the host links as an empty instance.
 const TYPES_INTERFACE: &str = "jig:block/types@0.1.0";
 
-/// An epoch deadline no run reaches. `set_epoch_deadline` adds it to the current epoch, so it
-/// stays well clear of `u64::MAX`.
-const UNREACHABLE_EPOCH: u64 = u64::MAX / 2;
-
 /// Why a run asserts nothing about the block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IncompleteReason {
@@ -56,6 +60,8 @@ pub enum IncompleteReason {
     FuelExhausted,
     /// The native stack ran out. Stack use differs by architecture and engine.
     StackExhausted,
+    /// The wall-clock deadline passed. Speed differs by machine and load.
+    DeadlineExceeded,
     /// The host failed outside the guest's control.
     HostFault(String),
 }
@@ -83,6 +89,15 @@ impl RunOutcome {
     pub fn is_comparable(&self) -> bool {
         !matches!(self, RunOutcome::Incomplete(_))
     }
+}
+
+/// The bounds on one run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderLimits {
+    /// Fuel for the run.
+    pub fuel: u64,
+    /// Wall-clock time for the run, to within one epoch tick (10 ms) over.
+    pub timeout: Duration,
 }
 
 /// One run: its outcome and the fuel it used. Fuel is local telemetry, never compared.
@@ -122,6 +137,8 @@ struct HostState {
 pub struct ComponentRuntime {
     engine: Engine,
     linker: Linker<HostState>,
+    /// Advances `engine`'s epoch for render deadlines; stops when the runtime drops.
+    _epoch_ticker: EpochTicker,
 }
 
 impl ComponentRuntime {
@@ -139,7 +156,12 @@ impl ComponentRuntime {
         linker
             .instance(TYPES_INTERFACE)
             .map_err(|e| RuntimeError::InternalError(format!("linking {TYPES_INTERFACE}: {e}")))?;
-        Ok(Self { engine, linker })
+        let _epoch_ticker = EpochTicker::start(engine.clone(), EPOCH_TICK)?;
+        Ok(Self {
+            engine,
+            linker,
+            _epoch_ticker,
+        })
     }
 
     /// The identity a receipt names for runs on this engine.
@@ -186,21 +208,13 @@ impl ComponentRuntime {
         &self,
         renderer: &CompiledRenderer,
         invocation: &Invocation,
-        fuel: u64,
+        limits: &RenderLimits,
     ) -> RenderRun {
-        let memory_bytes = renderer.max_memory_pages as usize * 64 * 1024;
-        let mut store = Store::new(
-            &self.engine,
-            HostState {
-                limits: StoreLimitsBuilder::new().memory_size(memory_bytes).build(),
-            },
-        );
-        store.limiter(|s| &mut s.limits);
-        if let Err(e) = store.set_fuel(fuel) {
-            return host_fault(format!("setting fuel: {e}"), 0);
-        }
-        // Nothing advances this engine's epoch (see the module docs).
-        store.set_epoch_deadline(UNREACHABLE_EPOCH);
+        let fuel = limits.fuel;
+        let mut store = match self.store(renderer.max_memory_pages, limits) {
+            Ok(store) => store,
+            Err(e) => return host_fault(e.to_string(), 0),
+        };
 
         let call = renderer
             .pre
@@ -213,6 +227,23 @@ impl ComponentRuntime {
             Err(e) => classify(e),
         };
         RenderRun { outcome, fuel_used }
+    }
+
+    /// A fresh store carrying all three bounds (see the module docs).
+    fn store(&self, max_memory_pages: u32, limits: &RenderLimits) -> Result<Store<HostState>> {
+        let memory_bytes = max_memory_pages as usize * 64 * 1024;
+        let mut store = Store::new(
+            &self.engine,
+            HostState {
+                limits: StoreLimitsBuilder::new().memory_size(memory_bytes).build(),
+            },
+        );
+        store.limiter(|s| &mut s.limits);
+        store
+            .set_fuel(limits.fuel)
+            .map_err(|e| RuntimeError::InternalError(format!("setting fuel: {e}")))?;
+        store.set_epoch_deadline(deadline_ticks(limits.timeout));
+        Ok(store)
     }
 }
 
@@ -228,8 +259,8 @@ fn classify(err: wasmtime::Error) -> RunOutcome {
     match err.downcast_ref::<Trap>() {
         Some(Trap::OutOfFuel) => RunOutcome::Incomplete(IncompleteReason::FuelExhausted),
         Some(Trap::StackOverflow) => RunOutcome::Incomplete(IncompleteReason::StackExhausted),
-        // Interrupts come from a wall clock; allocation failures from the host.
-        Some(Trap::Interrupt) | Some(Trap::AllocationTooLarge) => {
+        Some(Trap::Interrupt) => RunOutcome::Incomplete(IncompleteReason::DeadlineExceeded),
+        Some(Trap::AllocationTooLarge) => {
             RunOutcome::Incomplete(IncompleteReason::HostFault(err.to_string()))
         }
         Some(trap) => RunOutcome::Error(ErrorOutcome::Trap(trap.to_string())),
@@ -266,14 +297,15 @@ mod tests {
         let runtime = ComponentRuntime::new().expect("runtime builds");
         let spin = component_with_core_start("(loop $l (br $l))");
         let component = Component::new(&runtime.engine, spin).expect("compiles");
-        let mut store = Store::new(
-            &runtime.engine,
-            HostState {
-                limits: StoreLimitsBuilder::new().build(),
-            },
-        );
-        store.set_fuel(10_000).expect("fuel is on");
-        store.set_epoch_deadline(UNREACHABLE_EPOCH);
+        let mut store = runtime
+            .store(
+                1,
+                &RenderLimits {
+                    fuel: 10_000,
+                    timeout: Duration::from_secs(60),
+                },
+            )
+            .expect("store");
         let err = runtime
             .linker
             .instantiate(&mut store, &component)
@@ -283,5 +315,43 @@ mod tests {
             classify(err),
             RunOutcome::Incomplete(IncompleteReason::FuelExhausted)
         );
+    }
+
+    // The store's memory cap holds even where the validator's check of declared maxima is not
+    // in the way: the module may grow to 16 pages, the store allows 1.
+    #[test]
+    fn the_store_caps_memory_growth() {
+        let runtime = ComponentRuntime::new().expect("runtime builds");
+        let grow = wat::parse_str(
+            r#"(component
+                (core module $m
+                    (memory 1 16)
+                    (func $f
+                        (if (i32.eq (memory.grow (i32.const 4)) (i32.const -1))
+                            (then unreachable)))
+                    (start $f))
+                (core instance (instantiate $m)))"#,
+        )
+        .expect("test component WAT parses");
+        let component = Component::new(&runtime.engine, grow).expect("compiles");
+        let limits = RenderLimits {
+            fuel: 1_000_000,
+            timeout: Duration::from_secs(60),
+        };
+        let mut capped = runtime.store(1, &limits).expect("store");
+        let err = runtime
+            .linker
+            .instantiate(&mut capped, &component)
+            .map(|_| ())
+            .expect_err("growth past the cap must fail");
+        assert!(
+            matches!(classify(err), RunOutcome::Error(ErrorOutcome::Trap(_))),
+            "the start function traps when memory.grow returns -1"
+        );
+        let mut roomy = runtime.store(16, &limits).expect("store");
+        runtime
+            .linker
+            .instantiate(&mut roomy, &component)
+            .expect("growth within the cap succeeds");
     }
 }

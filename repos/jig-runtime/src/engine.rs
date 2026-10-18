@@ -92,7 +92,7 @@ impl ResourceLimiter for StoreContext {
 /// 10 ms is chosen to overshoot the 250 ms default by at most 4%, while keeping
 /// the ticker at 100 wakeups/second — negligible on the $5-VPS and Raspberry Pi
 /// targets, and unlike the previous design it does not scale with message rate.
-const EPOCH_TICK: Duration = Duration::from_millis(10);
+pub(crate) const EPOCH_TICK: Duration = Duration::from_millis(10);
 
 /// Ticks a store must survive to be granted at least `timeout` of wall clock.
 ///
@@ -102,7 +102,7 @@ const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// is the safe direction — a run cut short reports a partial `fuel_used` that is
 /// not the program's cost, which is precisely the receipt corruption documented
 /// in `docs/investigations/2026-08-11-fuel-portability.md`.
-fn deadline_ticks(timeout: Duration) -> u64 {
+pub(crate) fn deadline_ticks(timeout: Duration) -> u64 {
     let tick_ms = EPOCH_TICK.as_millis().max(1);
     (timeout.as_millis().div_ceil(tick_ms) as u64).saturating_add(1)
 }
@@ -117,7 +117,7 @@ fn deadline_ticks(timeout: Duration) -> u64 {
 /// Stops when the engine drops, which matters more than it looks: tests build
 /// many short-lived `Runtime`s, and a ticker that outlived its engine would leak
 /// a thread per construction.
-struct EpochTicker {
+pub(crate) struct EpochTicker {
     /// `true` once the engine is going away. Paired with the condvar so shutdown
     /// is immediate rather than waiting out the current tick.
     stop: Arc<(Mutex<bool>, Condvar)>,
@@ -130,7 +130,7 @@ struct EpochTicker {
 }
 
 impl EpochTicker {
-    fn start(engine: Engine, cadence: Duration) -> Result<Self> {
+    pub(crate) fn start(engine: Engine, cadence: Duration) -> Result<Self> {
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let stop_for_thread = Arc::clone(&stop);
         #[cfg(target_os = "linux")]

@@ -19,11 +19,14 @@ use jig_core::component_validation::{BlockWorld, ComponentProfile, validate_comp
 use jig_runtime::Runtime;
 use jig_runtime::component::{
     BlockError, CompiledRenderer, ComponentRuntime, ErrorOutcome, Hlc, Invocation, Payload,
-    RunOutcome,
+    RenderLimits, RunOutcome,
 };
 use text_block::{Input, Output, canonical, execute_pure};
 
-const FUEL: u64 = 50_000_000;
+const LIMITS: RenderLimits = RenderLimits {
+    fuel: 50_000_000,
+    timeout: std::time::Duration::from_secs(60),
+};
 
 /// The manifest memory limit the profile checks against: the 16 MiB `build-artifact.sh` sets.
 const MAX_MEMORY_PAGES: u32 = 256;
@@ -88,7 +91,7 @@ fn native_input(body: &str) -> Input {
 }
 
 fn render(runtime: &ComponentRuntime, renderer: &CompiledRenderer, body: &[u8]) -> RunOutcome {
-    runtime.render(renderer, &invocation(body), FUEL).outcome
+    runtime.render(renderer, &invocation(body), &LIMITS).outcome
 }
 
 fn render_output(runtime: &ComponentRuntime, renderer: &CompiledRenderer, body: &str) -> Output {

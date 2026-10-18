@@ -4,13 +4,15 @@
 //! core module behind the canonical ABI, so that one run lands in each outcome class:
 //!
 //! - an `err` from the guest, and a deterministic trap: comparable `Error` outcomes;
-//! - fuel exhaustion and stack exhaustion: `Incomplete`, never compared.
+//! - fuel exhaustion, stack exhaustion and a missed deadline: `Incomplete`, never compared.
 //!
 //! It also checks that a component failing `jig-det-1` is refused before it compiles.
 
+use std::time::{Duration, Instant};
+
 use jig_runtime::component::{
     BlockError, ComponentRuntime, ErrorOutcome, Hlc, IncompleteReason, Invocation, Payload,
-    RunOutcome,
+    RenderLimits, RunOutcome,
 };
 
 const MAX_MEMORY_PAGES: u32 = 16;
@@ -83,11 +85,21 @@ fn invocation() -> Invocation {
 }
 
 fn run(component: &[u8], fuel: u64) -> RunOutcome {
+    run_with(
+        component,
+        RenderLimits {
+            fuel,
+            timeout: Duration::from_secs(60),
+        },
+    )
+}
+
+fn run_with(component: &[u8], limits: RenderLimits) -> RunOutcome {
     let runtime = ComponentRuntime::new().expect("runtime builds");
     let renderer = runtime
         .compile_renderer(component, MAX_MEMORY_PAGES)
         .expect("test component validates and compiles");
-    runtime.render(&renderer, &invocation(), fuel).outcome
+    runtime.render(&renderer, &invocation(), &limits).outcome
 }
 
 #[test]
@@ -140,6 +152,35 @@ fn stack_exhaustion_is_incomplete() {
         RunOutcome::Incomplete(IncompleteReason::StackExhausted)
     );
     assert!(!outcome.is_comparable());
+}
+
+// With fuel out of the way, the deadline alone stops a run. The loop fills the whole 64 KiB page
+// each pass, so the test also checks that the deadline interrupts long bulk operations.
+#[test]
+fn a_bulk_memory_loop_misses_its_deadline() {
+    let body = r#"
+        (loop $l
+            (memory.fill (i32.const 0) (i32.const 0) (i32.const 65536))
+            (br $l))
+        (i32.const 0)"#;
+    let started = Instant::now();
+    let outcome = run_with(
+        &renderer(body, ""),
+        RenderLimits {
+            fuel: u64::MAX / 2,
+            timeout: Duration::from_millis(50),
+        },
+    );
+    assert_eq!(
+        outcome,
+        RunOutcome::Incomplete(IncompleteReason::DeadlineExceeded)
+    );
+    assert!(!outcome.is_comparable());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
