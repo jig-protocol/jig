@@ -6,14 +6,16 @@
 //!
 //! 1. The whole binary validates with exactly the WebAssembly 2.0 features minus SIMD, plus the
 //!    component model without its async, threading, error-context or other gated extensions.
-//! 2. It contains no nested component (nesting goes through `jig:host/compose`, not
-//!    composition inside one binary).
+//! 2. No nested component contains code. Block nesting goes through `jig:host/compose`, not
+//!    composition inside one binary. A nested component with no core module is allowed:
+//!    `wit-component` emits one to give the exported instance its exact type.
 //! 3. Every core module inside passes the same checks as a standalone block module: no float
 //!    instruction, declared maxima for memories and tables, within the limit. A core module's
 //!    own imports are wired inside the component, so only the component's imports face the
 //!    host; those are checked next.
-//! 4. Imports: no `wasi:*` interface ever. A renderer may import only `jig:host/compose`; a bot
-//!    may import only `jig:host/*` interfaces. Either way, each import must be granted.
+//! 4. Imports: no `wasi:*` interface ever. `jig:block/types` is always allowed: it holds only
+//!    type definitions, so the host provides nothing for it. Beyond that, a renderer may import
+//!    only `jig:host/compose`, and a bot only `jig:host/*` interfaces, each of them granted.
 //! 5. Exports: exactly the one interface of the declared world, plus any type exports.
 //!
 //! Interface versions are matched the way the component model matches them: `0.x.*` with
@@ -76,7 +78,7 @@ pub enum ComponentViolation {
     NotAComponent,
     /// The binary does not validate with [`COMPONENT_FEATURES`].
     OutsideFeatureSet(String),
-    /// The component embeds another component.
+    /// A component nested inside this one contains a core module.
     NestedComponent,
     /// A core module inside the component breaks a module-level rule. `module` counts core
     /// modules in binary order from 0.
@@ -105,7 +107,12 @@ impl fmt::Display for ComponentViolation {
                 "component does not validate with WebAssembly 2.0 minus SIMD plus the plain \
                  component model: {e}"
             ),
-            ComponentViolation::NestedComponent => write!(f, "nested components are not allowed"),
+            ComponentViolation::NestedComponent => {
+                write!(
+                    f,
+                    "a nested component contains code; nested blocks use jig:host/compose"
+                )
+            }
             ComponentViolation::CoreModule { module, violation } => {
                 write!(f, "core module {module}: {violation}")
             }
@@ -156,7 +163,10 @@ pub fn validate_component(bytes: &[u8], profile: &ComponentProfile<'_>) -> Resul
 
     let module_policy =
         DeterminismPolicy::strict().with_memory_limit_pages(profile.max_memory_pages);
-    let mut depth = 0usize;
+    // One entry per open component or module: `true` for a component nested below the top.
+    let mut frames: Vec<bool> = Vec::new();
+    // Report code in nested components once, however many modules it holds.
+    let mut reported_nested = false;
     let mut module_index = 0usize;
 
     for payload in Parser::new(0).parse_all(bytes) {
@@ -164,15 +174,18 @@ pub fn validate_component(bytes: &[u8], profile: &ComponentProfile<'_>) -> Resul
             payload.map_err(|e| JigError::Validation(format!("wasm parse error: {e}")))?;
         match payload {
             Payload::Version { encoding, .. } => {
-                depth += 1;
-                if depth > 1 && encoding == Encoding::Component {
-                    report.violations.push(ComponentViolation::NestedComponent);
-                }
+                frames.push(!frames.is_empty() && encoding == Encoding::Component);
             }
-            Payload::End(_) => depth = depth.saturating_sub(1),
+            Payload::End(_) => {
+                frames.pop();
+            }
             Payload::ModuleSection {
                 unchecked_range, ..
             } => {
+                if frames.iter().any(|nested| *nested) && !reported_nested {
+                    report.violations.push(ComponentViolation::NestedComponent);
+                    reported_nested = true;
+                }
                 let range = usize::try_from(unchecked_range.start)
                     .and_then(|start| Ok(start..usize::try_from(unchecked_range.end)?))
                     .map_err(|_| JigError::Validation("core module offset overflows".into()))?;
@@ -193,7 +206,7 @@ pub fn validate_component(bytes: &[u8], profile: &ComponentProfile<'_>) -> Resul
                 }
                 module_index += 1;
             }
-            Payload::ComponentImportSection(reader) if depth == 1 => {
+            Payload::ComponentImportSection(reader) if frames.len() == 1 => {
                 for import in reader {
                     let import = import
                         .map_err(|e| JigError::Validation(format!("component import: {e}")))?;
@@ -204,7 +217,7 @@ pub fn validate_component(bytes: &[u8], profile: &ComponentProfile<'_>) -> Resul
                     report.imports.push(name);
                 }
             }
-            Payload::ComponentExportSection(reader) if depth == 1 => {
+            Payload::ComponentExportSection(reader) if frames.len() == 1 => {
                 for export in reader {
                     let export = export
                         .map_err(|e| JigError::Validation(format!("component export: {e}")))?;
@@ -226,6 +239,9 @@ fn check_import(name: &str, profile: &ComponentProfile<'_>) -> Option<ComponentV
     let (base, _) = split_version(name);
     if base.starts_with("wasi:") {
         return Some(ComponentViolation::WasiImport(name.to_string()));
+    }
+    if compatible(name, &format!("jig:block/types@{JIG_BLOCK_VERSION}")) {
+        return None;
     }
     let in_world = match profile.world {
         BlockWorld::Renderer => base == "jig:host/compose",
@@ -501,9 +517,32 @@ mod tests {
     }
 
     #[test]
-    fn a_nested_component_is_refused() {
+    fn a_code_free_nested_component_and_the_types_import_pass() {
+        // The shape wit-component emits: `jig:block/types` imported, and the export typed by
+        // instantiating an inner component that holds no code.
         let wat = r#"(component
-            (component $inner)
+            (import "jig:block/types@0.1.0" (instance $types))
+            (core module $m (memory (export "memory") 1 1)
+                (func (export "f") (result i32) i32.const 0))
+            (core instance $i (instantiate $m))
+            (type $t (func (result u32)))
+            (func $f (type $t) (canon lift (core func $i "f")))
+            (component $shim
+                (import "import-func-f" (func $g (result u32)))
+                (export "f" (func $g)))
+            (instance $e (instantiate $shim (with "import-func-f" (func $f))))
+            (export "jig:block/render@0.1.0" (instance $e)))"#;
+        let c = wat::parse_str(wat).unwrap();
+        let report = validate_component(&c, &renderer(&[])).unwrap();
+        assert!(report.is_compliant(), "{:?}", report.violations);
+        assert_eq!(report.imports, ["jig:block/types@0.1.0"]);
+    }
+
+    #[test]
+    fn a_nested_component_with_code_is_refused() {
+        let wat = r#"(component
+            (component $inner
+                (core module $hidden (func (export "g"))))
             (core module $m (memory (export "memory") 1 1)
                 (func (export "f") (result i32) i32.const 0))
             (core instance $i (instantiate $m))
