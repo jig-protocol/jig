@@ -14,7 +14,8 @@
 //! ```
 //!
 //! - `server` is the signer's `did:jig`, as text.
-//! - `programs` are program CIDs, each as the bytes of a binary CID.
+//! - `programs` are program CIDs, each a binary CIDv1 as an untagged CBOR byte string (JEP-0004
+//!   rule 0). A tag-42 CID, a text CID or a CIDv0 is refused.
 //! - `authors` are `did:jig` strings.
 //! - `components` are BLAKE3-256 hashes of component bytes, as 32-byte strings.
 //!
@@ -208,11 +209,12 @@ impl OperatorPolicy {
             .iter()
             .map(|b| Cid::try_from(b.as_slice()).map_err(|_| PolicyError::BadCid))
             .collect::<Result<Vec<_>, _>>()?;
-        // A CID that re-encodes differently would give the same policy two payloads.
+        // CIDv1 only. A CID that re-encodes differently would give the same policy two
+        // payloads.
         if programs
             .iter()
             .zip(&program_bytes)
-            .any(|(c, b)| c.to_bytes() != *b)
+            .any(|(c, b)| c.version() != cid::Version::V1 || c.to_bytes() != *b)
         {
             return Err(PolicyError::BadCid);
         }
@@ -525,6 +527,48 @@ mod tests {
             OperatorPolicy::from_payload(&payload),
             Err(PolicyError::Unordered("authors"))
         ));
+    }
+
+    /// A payload whose `programs` holds exactly `entry`.
+    fn payload_with_program(entry: Value) -> Vec<u8> {
+        dcbor::encode(&Value::text_map([
+            ("domain", Value::text(DOMAIN)),
+            ("server", Value::text("did:jig:zs")),
+            ("seq", Value::Unsigned(0)),
+            (
+                "allow",
+                Value::text_map([
+                    ("programs", Value::Array(vec![entry])),
+                    ("authors", Value::Array(vec![])),
+                    ("components", Value::Array(vec![])),
+                ]),
+            ),
+        ]))
+        .unwrap()
+    }
+
+    // JEP-0004 rule 0: a CID in a payload is a binary CIDv1 as an untagged byte string.
+    #[test]
+    fn a_program_cid_in_any_other_form_is_refused() {
+        let v1 = cid(1);
+        assert!(
+            OperatorPolicy::from_payload(&payload_with_program(Value::Bytes(v1.to_bytes())))
+                .is_ok()
+        );
+
+        let tag42 = Value::Tag(
+            42,
+            Box::new(Value::Bytes([&[0u8][..], &v1.to_bytes()].concat())),
+        );
+        let text = Value::text(v1.to_string());
+        let v0 =
+            Cid::new_v0(cid::multihash::Multihash::<64>::wrap(0x12, &[0; 32]).unwrap()).unwrap();
+        for entry in [tag42, text, Value::Bytes(v0.to_bytes())] {
+            assert!(
+                OperatorPolicy::from_payload(&payload_with_program(entry.clone())).is_err(),
+                "{entry:?}"
+            );
+        }
     }
 
     #[test]
