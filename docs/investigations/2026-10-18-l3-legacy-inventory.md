@@ -104,8 +104,9 @@ merges them into one struct with `deny_unknown_fields` (roadmap item 17).
   - It reads only `storage.truth.connection_string` (sqlite) into `database_path`, through
     `jig_config::storage::MultiTierStorageConfig` (`config.rs:155-180`).
   - `JigServerConfig` falls back to defaults in the same case (`main.rs:44-49`).
-- So a server started without `--config` takes its database path from a file that
-  `~/.jig/config.toml` shares with the CLI, and takes everything else from defaults.
+- So a server started without `--config` takes its database path from the v0.0.1 jig-config
+  file, and takes everything else from defaults. That file is not the CLI's: the CLI moved to
+  `~/.jig/cli.toml` (`repos/jig-cli/src/config.rs:106-115`).
 - This is jig-server's only production use of `jig_config::storage`.
 
 **Q3:** drop this discovery in slice 4, so that only `--config` (or `JIG_DB_PATH` /
