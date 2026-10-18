@@ -107,7 +107,8 @@ Non-goals for v0.2:
     - The creator holds the root `owner` role, which carries every right and cannot be
       removed.
     - v0.2 defines one more role, `admin`, with the rights `share` and `membership`. Only
-      the owner assigns roles (pending DJ).
+      owners assign roles, and admins cannot create admins. Whether owners can create
+      owners is pending DJ.
 8. The offered server MUST answer, signed by its DID, with exactly one of:
    - `contract-accept {channel_id, sequencer, policy_hash}`, stating that it
      implements the suite and will enforce the membership rule;

@@ -149,11 +149,13 @@ Non-goals:
 
 ## Reachability records
 
-19. A reachability record (pending DJ) is `{did, servers: [{server_did, url}], seq, sig}`,
+19. A reachability record is `{did, servers: [{server_did, url}], seq, sig}`,
     signed by `did` over (`domain`, `jig-reach-v1`), (`did`), the canonical JSON of
     `servers`, and (`seq`).
     - A DID has no home server. The record lists the servers where the DID wants to be
-      found, in no order, and the DID MAY leave servers out.
+      found, in no order. The DID MAY leave servers out, or publish no record at all.
+    - A nameserver whose data contract requires a contact point MAY require a record at
+      registration (`POST /v1/register` then carries it).
     - The record with the highest valid `seq` wins.
     - A server SHOULD serve the records of DIDs that list it.
     - A nameserver MAY serve one beside an attestation.

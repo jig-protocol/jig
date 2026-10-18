@@ -375,7 +375,12 @@ and where its key packages are stocked, because a DID is a key and carries no lo
 | **B. A reachability record signed by the DID** | Alice's own key: `{did, servers: [{server_did, url}], seq, sig}` | Alice's client must publish it. A stale record misroutes until it is replaced |
 | **C. Ask around** | Nobody in particular | Leaks who is looking for whom, and there is no answer when nobody knows |
 
-**Recommendation: B.**
+**Decided (DJ, 2026-10-18): B.** Alice says where she prefers to be reached, if at all.
+- A DID MAY publish no record. It is then reachable only through servers that already
+  carry a channel with it, and remote servers cannot add it.
+- A ruleset group's data contract MAY require a contact point at a known server. A
+  nameserver bound by such a contract asks for a record when it registers the DID. It is
+  part of registration, not a protocol-wide rule.
 - The record is self-certifying, so it can be served by any server Alice uses, by any
   nameserver next to her attestation, or embedded in a `member-add` block.
 - The highest `seq` wins.
@@ -383,8 +388,8 @@ and where its key packages are stocked, because a DID is a key and carries no lo
 - It lists every server Alice uses, in no particular order. It names no "home".
 - Alice's client stocks key packages on each server it lists.
 
-**Open for DJ:** whether Alice may leave a server she uses out of the record, for privacy.
-The recommendation is yes: the record lists only the servers where she wants to be found.
+Alice may leave out any server she uses. The record lists only where she wants to be
+found, so it does not link all her accounts for anyone who fetches it.
 
 ## 5. The channel contract (JEP-0005)
 
@@ -646,8 +651,15 @@ an interface lane R builds on).**
 - **v0.2 ships the mechanism with two roles:** `owner`, which holds every right, and
   `admin`, which holds `share` and `membership` and is assignable by the owner. Custom
   roles and finer rights, in the style of MIMI room policy, are v0.3.
-- **Open:** may an admin assign `admin`? Recommendation: no in v0.2. Only the owner
-  assigns roles, which avoids escalation chains until the policy language exists.
+- **Decided (DJ):** an admin cannot assign `admin`. Only owners assign roles. `owner` is
+  in effect a super-admin, the only role that can create admins. An intermediary role is
+  not an MVP problem.
+- **Open:** may an owner create other owners? Single ownership has a real cost now:
+  moving the sequencer is owner-only, so a lost owner key freezes the channel on its
+  current sequencer for good. Recommendation for v0.2: co-owners may be listed in the
+  `channel-create` block only, fixed at creation, as in Matrix v12's
+  `additional_creators`. That gives a channel more than one key that can rescue it, with
+  no escalation chain. Adding owners later, and transferring ownership, are post-MVP.
 
 ## 6. Addressing
 
@@ -762,7 +774,8 @@ Updated in the implementation PRs, not here.
    authority; grants `read`/`write`/`member`; `read` still carries `seen` and
    self-updates.
 3. ~~Name-pin changes (4.4)~~ **Decided:** B; UX mitigates, never weakens the check.
-4. Reachability records (4.7): signed by the DID, not the nameserver?
+4. ~~Reachability records (4.7)~~ **Decided:** B, optional, and Alice chooses the servers.
+   Data contracts may require a contact point at registration.
 5. Key packages (5.4): through the owner, under a coarse consent policy in v0.2?
 6. ~~Owner failure (5.8)~~ **Decided:** the movable sequencer, owner-only `sequencer-set`.
 7. Who may federate (5.7): configured peers only in v0.2?
