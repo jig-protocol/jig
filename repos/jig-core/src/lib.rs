@@ -21,6 +21,7 @@ pub mod error;
 pub mod hlc;
 pub mod lint;
 pub mod manifest;
+pub mod operator_policy;
 #[cfg(test)]
 pub mod proptest_generators;
 pub mod receipt;
