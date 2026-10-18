@@ -4,9 +4,12 @@
 # many lanes open pull requests at once (docs/superpowers/plans/). Spend each
 # review once per pull request, when it is ready, not on every push:
 #
-# - drafts are not reviewed; marking a PR ready for review starts the review;
-# - later pushes are not re-reviewed automatically. Ask for a second look with
-#   a `@coderabbitai review` comment when a round of fixes is worth one.
+# - drafts are not reviewed;
+# - later pushes are not re-reviewed automatically.
+#
+# The free tier may skip automatic reviews on this repository altogether, so
+# ask for one with a `@coderabbitai review` comment when a PR is ready, and
+# again only when a round of fixes is worth a second look.
 #
 # Settings here override the organisation's CodeRabbit UI settings.
 language: en-US
