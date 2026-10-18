@@ -83,15 +83,20 @@ section 8.3; decided by DJ 2026-10-18). This section fixes only what each suite 
 
 - **`none`.** Nothing to disclose. The plaintext `body` is in the block, and the block's author
   signature binds the author's DID to it.
-- **`mls`: per-message key disclosure.** The reporter discloses, for that one application
-  message, the message key and nonce from the sender's secret-tree ratchet for its
-  generation, and the sender-data key and nonce. It also discloses the epoch's
-  `GroupContext`. The verifier checks the block's author signature over the ciphertext,
-  decrypts with the disclosed values, and checks the MLS content signature over the
-  `FramedContent` and `GroupContext`. That signature uses the DID key, because in jig the
-  leaf key is the DID key. The result proves the author signed this plaintext in this group
-  and epoch, whether or not the AEAD is key-committing. The ratchet secrets are not
-  disclosed, so no other message opens.
+- **`mls`: per-message key disclosure, pending R5.** The decided profile works like this. The
+  reporter discloses, for that one application message, the message key and nonce from the
+  sender's secret-tree ratchet for its generation, the sender-data key and nonce, and the
+  epoch's `GroupContext`. The verifier checks the block's author signature over the
+  ciphertext, decrypts with the disclosed values, and checks the MLS content signature over
+  the `FramedContent` and `GroupContext`. That signature uses the DID key, because in jig the
+  leaf key is the DID key. No ratchet secret is disclosed, so no other message opens.
+  **Not implementable on openmls 0.9 as it stands.** openmls 0.9 has no public API that
+  returns a message's key, its nonce, or the signed `FramedContent`. The secret tree is
+  crate-private, and a processed message carries its content, sender and credential but
+  not its signature. The sender ratchet also deletes a generation's key once it is used, so
+  a reporter would have to capture the values when the message is first decrypted. R5
+  decides between an openmls change that returns those values on decryption, upstream or
+  carried as a patch, and a different profile.
 - **`test-aead`.** Nothing to disclose: the key is published. The verifier opens the payload
   with the key and the AAD (channel slug and author), and checks the block's author signature
   over the payload. The key is fixed and public, so the payload cannot open to a different
