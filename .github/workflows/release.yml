@@ -325,6 +325,19 @@ jobs:
           else
             scripts/install-smoke.sh ${{ matrix.budget }}
           fi
+      # The timed smoke runs in a fresh HOME, which on macOS has no login
+      # keychain. This installs into the runner's real HOME and fails unless
+      # the key is sealed in the login keychain, the path a Mac user gets.
+      - name: curl | bash → hello-world, key in the login keychain (untimed)
+        if: matrix.name == 'darwin-aarch64'
+        shell: bash
+        env:
+          JIG_INSTALL_SH_URL: http://127.0.0.1:47391/install.sh
+          JIG_RELEASES_BASE: http://127.0.0.1:47391
+          JIG_VERIFY_SIGNATURE: '1'
+          JIG_RELEASE_SIGNER: ${{ needs.sign.outputs.signer }}
+          JIG_SMOKE_KEYCHAIN: '1'
+        run: scripts/install-smoke.sh ${{ matrix.budget }}
 
   publish:
     name: publish GitHub prerelease
