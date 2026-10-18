@@ -500,9 +500,21 @@ reputation, tribunal, transparency and federation) were removed:
 | `/v1/rotate`, `/v1/renew` | POST | key rotation / renewal |
 | `/v1/handles` | GET | **debug-gated** behind `[debug] list_handles` |
 
-`/v1/register`, `/v1/rotate` and `/v1/renew` have no proof-of-work and no rate
-limit yet; rate-limit them at the reverse proxy if the nameserver is reachable
-by people you do not trust.
+> **Rate limits.** The nameserver limits `POST /v1/register`, `/v1/rotate` and
+> `/v1/renew` per client IP (default 30/min) and per DID (default 10/min,
+> counting only requests that succeed, each of which needs that DID's
+> signature). Set them in `[alias_rate_limits]` (`enabled`, `per_ip_per_min`,
+> `per_did_per_min`). Refused requests get HTTP 429 with code `RATE_LIMITED`
+> and a `Retry-After` header. IPv6 clients are limited per /64. If the
+> nameserver runs behind a reverse proxy, set `[network] trust_proxy = true`
+> and `proxy_ip_header` (default `x-forwarded-for`); the nameserver uses the
+> last address in that header, the one your proxy appended. With one proxy in
+> front this is the client's address; behind several, the limit applies to the
+> nearest proxy. Without `trust_proxy`, every client behind the proxy shares
+> the proxy's address and its limit. Limits are in memory and reset when the
+> nameserver restarts.
+
+None of the nameserver's routes asks for proof-of-work.
 
 `/v1/handles` enumerates every registered alias, so it stays off unless you
 explicitly set `list_handles = true`. Alias resolution never touches DNS, so the
