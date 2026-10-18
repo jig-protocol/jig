@@ -52,9 +52,6 @@ pub enum RuntimeError {
     #[error("Capability quota exceeded: {capability}")]
     CapabilityQuotaExceeded { capability: String },
 
-    #[error("Invalid capability handle")]
-    InvalidCapabilityHandle,
-
     // I/O and system errors
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
@@ -85,8 +82,7 @@ impl RuntimeError {
 
             RuntimeError::CapabilityDenied { .. }
             | RuntimeError::CapabilityNotFound { .. }
-            | RuntimeError::CapabilityQuotaExceeded { .. }
-            | RuntimeError::InvalidCapabilityHandle => "capability_error",
+            | RuntimeError::CapabilityQuotaExceeded { .. } => "capability_error",
 
             RuntimeError::ExecutionError(_)
             | RuntimeError::Trap(_)
@@ -114,7 +110,6 @@ impl RuntimeError {
             RuntimeError::CapabilityDenied { .. } => "ERR_CAPABILITY_DENIED",
             RuntimeError::CapabilityNotFound { .. } => "ERR_CAPABILITY_NOT_FOUND",
             RuntimeError::CapabilityQuotaExceeded { .. } => "ERR_QUOTA_EXCEEDED",
-            RuntimeError::InvalidCapabilityHandle => "ERR_INVALID_HANDLE",
             RuntimeError::IoError(_) => "ERR_IO",
             RuntimeError::SerializationError(_) => "ERR_SERIALIZATION",
             RuntimeError::InternalError(_) => "ERR_INTERNAL",

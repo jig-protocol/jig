@@ -129,7 +129,8 @@ ignore = [
     # a >=0.103.12 fixes. Unifying on rustls 0.23 removed the 0.102 copy, and
     # rustls-pemfile went with it (rustls-pki-types parses PEM itself).
 
-    # --- No wasmtime entries. jig-runtime + jig-server are on wasmtime 48.0.5,
+    # --- No wasmtime entries. jig-runtime + jig-server are on wasmtime 49.0.3
+    #     (Cargo.lock is authoritative),
     #     which carries fixes for every wasmtime advisory currently published
     #     against our graph — including RUSTSEC-2026-0096 (aarch64 Cranelift
     #     miscompiled guest heap access -> sandbox escape), which had no fix on
