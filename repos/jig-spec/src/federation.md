@@ -2,15 +2,16 @@
 
 **Audience:** This chapter is for **server operators** running federated Jig servers and **protocol implementers** building federation support. **End users** might care about how federation affects message delivery and privacy. **Developers** building federated applications will want to understand cross-server communication.
 
-> **Mostly not implemented.** The reference server federates by dialing the peers its
-> configuration lists, over TLS by default, and pins each peer's DID from the peer's signed
-> welcome. [Relayed Blocks](#relayed-blocks) is implemented: relayed blocks run every gate a
-> local block runs. Everything else here is design: DNS SRV discovery, the `.well-known`
-> document below (the real one is in [Transports](transports.md#server-certificates)),
-> mutual TLS, a signed federation envelope, retry backoff, per-peer quotas, receipt
-> exchange and peer reputation. Only open, unencrypted channels federate until the
-> federation data contract (D12) is specified. This chapter will be rewritten with that
-> contract.
+> **Mostly not implemented: most of this page's MUSTs are unbuilt.** The reference server
+> federates by dialing the peers its configuration lists, over TLS by default, and pins each
+> peer's DID from the peer's signed welcome. [Relayed Blocks](#relayed-blocks) is
+> implemented: relayed blocks run every gate a local block runs. Not built: DNS SRV
+> discovery, X.509 mutual TLS, the signed per-message federation envelope, reputation
+> tiers, receipt exchange and billing, retry backoff and per-peer quotas. The `.well-known`
+> document below is not the real one (see
+> [Transports](transports.md#server-certificates)). Only open, unencrypted channels
+> federate until the federation data contract (D12) is specified. This page is being
+> rewritten under JEP-0005 (the channel contract).
 
 ---
 

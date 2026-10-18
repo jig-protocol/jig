@@ -155,8 +155,11 @@ servers and members. Both are design work, so the register says Open for those p
 
 **Status evidence.** `IngestError::DuplicateBlock` refuses a CID seen before, which also
 stops replay of control-plane blocks. Read proofs go through a
-`ReplayGuard` (`jig-server/src/auth/`). The manifest's `hlc_ts` is set by the ingesting
-server, so it does not help a client detect reordering by that server.
+`ReplayGuard` (`jig-server/src/auth/`). The manifest's `hlc_ts` is set by the block's
+author (TM-02), not the server, but it still does not help a client detect reordering or
+omission: nothing binds one author's block to the blocks before it, so the server can
+reorder or withhold blocks whatever their timestamps say, and the server's clock adopts
+block timestamps with no skew bound (TM-01).
 
 ### OP-07: forged or withheld receipts; lying about fuel or execution
 
