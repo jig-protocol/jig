@@ -16,7 +16,10 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use jig_core::Did;
 use serde::{Deserialize, Serialize};
 
-const DOMAIN: &[u8] = b"jig-ingest-v1";
+/// The format a record is signed in, named on the record and in the signed
+/// bytes. A record in any other format is refused by name.
+pub const RECORD_FORMAT: &str = "jig-ingest-v1";
+const DOMAIN: &[u8] = RECORD_FORMAT.as_bytes();
 
 /// The hash a chain starts from: `prev` at `seq` 0.
 pub const GENESIS_PREV: [u8; 32] = [0; 32];
@@ -27,6 +30,9 @@ pub const GENESIS_PREV: [u8; 32] = [0; 32];
 /// [`IngestRecord::hash`] and [`IngestRecord::verify`] decode them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestRecord {
+    /// How `sig` is made: [`RECORD_FORMAT`]. Named so that a later encoding
+    /// is told apart from a damaged record.
+    pub format: String,
     /// The CID of the channel's `channel-create` block.
     pub channel_id: String,
     pub seq: u64,
@@ -45,6 +51,8 @@ pub struct IngestRecord {
 /// Why a record is not one this client can rely on.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RecordError {
+    #[error("the record is signed in format `{format}`, which this build does not verify")]
+    UnknownFormat { format: String },
     #[error("the record is signed by {got}, not the channel's sequencer {expected}")]
     WrongSequencer { expected: String, got: String },
     #[error("the record's signature does not verify")]
@@ -66,6 +74,7 @@ impl RecordSigner<'_> {
     /// Sign `block_cid` as entry `seq`, after the record hashing to `prev`.
     pub fn sign(&self, seq: u64, block_cid: &str, prev: [u8; 32]) -> IngestRecord {
         let mut record = IngestRecord {
+            format: RECORD_FORMAT.to_string(),
             channel_id: self.channel_id.clone(),
             seq,
             ingest_wall_ms: self.ingest_wall_ms,
@@ -114,6 +123,11 @@ impl IngestRecord {
 
     /// Check the signature, by `expected_sequencer`.
     pub fn verify(&self, expected_sequencer: &str) -> Result<(), RecordError> {
+        if self.format != RECORD_FORMAT {
+            return Err(RecordError::UnknownFormat {
+                format: self.format.clone(),
+            });
+        }
         let key_of = |s: &str| {
             Did::from_did_jig_string(s)
                 .and_then(|did| did.as_bytes())
@@ -238,6 +252,19 @@ mod tests {
                 "{t:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_record_in_another_format_is_refused_by_name() {
+        let key = generate_signing_key();
+        let record = IngestRecord {
+            format: "jig-ingest-cose-v1".into(),
+            ..signer(&key).sign(0, "bafyCreate", GENESIS_PREV)
+        };
+        assert!(matches!(
+            record.verify(&did_of(&key)),
+            Err(RecordError::UnknownFormat { format }) if format == "jig-ingest-cose-v1"
+        ));
     }
 
     #[test]
