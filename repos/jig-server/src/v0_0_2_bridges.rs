@@ -644,7 +644,7 @@ mod tests {
         // is the channel's other member, exactly as the bridge would have
         // enrolled him; delivery to the shadow DID follows membership.
         let dir = tempdir().unwrap();
-        let bob = Identity::generate_and_save(&dir.keep()).unwrap();
+        let bob = Identity::generate_for_tests(&dir.keep());
         store
             .upsert_membership(&StoredMembership {
                 channel_id: "bafyDmX".to_string(),

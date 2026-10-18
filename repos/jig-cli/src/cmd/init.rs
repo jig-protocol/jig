@@ -90,13 +90,13 @@ pub async fn run(args: InitArgs) -> Result<()> {
 
     // 2. Generate fresh ed25519 keypair under ~/.jig/keys/.
     let keys_dir = jig_client::identity::default_keys_dir();
-    let id = Identity::generate_and_save(&keys_dir)
+    let id = Identity::create(&keys_dir, super::passphrase::key_access()?)
         .with_context(|| format!("generating identity under {}", keys_dir.display()))?;
     let did_string = id.did_string();
     println!("generated DID: {did_string}");
     println!(
         "keyfile: {}",
-        keys_dir.join(format!("{did_string}.key")).display()
+        jig_client::identity::key_path(&keys_dir, &did_string).display()
     );
 
     // 3. Persist nickname + DID binding to ~/.jig/cli.toml.
@@ -243,7 +243,7 @@ mod tests {
     fn build_register_request_signs_challenge_and_uses_canonical_did() {
         // Generate a fresh identity in a tempdir (separate from ~/.jig/keys/).
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(dir.path()).unwrap();
+        let id = Identity::generate_for_tests(dir.path());
         let challenge = "deadbeef".to_string();
 
         let req = build_register_request(&id, "dj", &challenge);
@@ -273,7 +273,7 @@ mod tests {
         // Seeding the address book with your own DID is what stops `jig chat`
         // rendering a 61-char DID for every line you write yourself.
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(dir.path()).unwrap();
+        let id = Identity::generate_for_tests(dir.path());
 
         let cfg = build_initial_config(&id, "dj", None);
 
@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn initial_config_keeps_the_default_server_unless_overridden() {
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(dir.path()).unwrap();
+        let id = Identity::generate_for_tests(dir.path());
         assert_eq!(
             build_initial_config(&id, "dj", None).server.base_url,
             Config::default().server.base_url
@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn build_register_request_passes_local_part_through_unchanged() {
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(dir.path()).unwrap();
+        let id = Identity::generate_for_tests(dir.path());
         // Local part should not be uppercased, suffixed, or rewritten —
         // the nameserver owns suffix composition (`<local>@<ns_suffix>`).
         let req = build_register_request(&id, "Alice_42", "abc");

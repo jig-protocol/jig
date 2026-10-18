@@ -420,8 +420,8 @@ enum KeysAction {
     },
 
     /// Mint a fresh keypair and rotate the alias binding from the
-    /// current DID to the new one. The old keyfile is preserved as
-    /// `<old_did>.key.rotated` for offline recovery.
+    /// current DID to the new one. The old keyfile is preserved, still
+    /// sealed, as `<old_did>.jigkey.rotated` for offline recovery.
     Rotate {
         /// Fully-qualified alias whose DID binding is being rotated.
         #[arg()]

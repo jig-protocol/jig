@@ -18,6 +18,13 @@ fn binary_exposes_keys_renew_subcommand() {
     // `--help` should mention both subcommands. If clap isn't wired up,
     // this catches it before someone tries to use the binary.
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["keys", "--help"])
         .output()
         .unwrap();
@@ -42,6 +49,13 @@ fn keys_renew_requires_alias_and_nameserver_flag() {
     // No args at all → clap should bail with non-zero and mention the
     // required ALIAS positional.
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["keys", "renew"])
         .output()
         .unwrap();
@@ -59,6 +73,13 @@ fn keys_renew_requires_alias_and_nameserver_flag() {
 #[test]
 fn keys_rotate_requires_alias_and_nameserver_flag() {
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["keys", "rotate"])
         .output()
         .unwrap();
@@ -76,6 +97,13 @@ fn keys_renew_fails_loudly_when_no_cli_toml_or_keyfile() {
     // bogus identity. Confirm we get a non-zero exit and a useful stderr.
     let tmp = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args([
             "keys",
             "renew",

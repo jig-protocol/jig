@@ -19,6 +19,13 @@ use std::process::Command;
 fn init_generates_keypair_under_jig_keys() {
     let tmp = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["init", "dj"])
         .env("HOME", tmp.path())
         .output()
@@ -59,6 +66,13 @@ fn init_generates_keypair_under_jig_keys() {
 fn init_writes_cli_toml_with_nickname_and_did() {
     let tmp = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["init", "dj"])
         .env("HOME", tmp.path())
         .output()
@@ -91,6 +105,13 @@ fn init_refuses_to_clobber_existing_config_without_force() {
     let tmp = tempfile::tempdir().unwrap();
     // First init succeeds.
     let first = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["init", "dj"])
         .env("HOME", tmp.path())
         .output()
@@ -99,6 +120,13 @@ fn init_refuses_to_clobber_existing_config_without_force() {
 
     // Second init without --force must fail.
     let second = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["init", "dj"])
         .env("HOME", tmp.path())
         .output()

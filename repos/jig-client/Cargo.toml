@@ -53,6 +53,20 @@ dirs = "7"
 # makes that regression a compile error rather than a review catch.
 base64 = "0.23"
 semver = { version = "1.0", features = ["serde"] }
+# Identity keys and MLS state at rest: the opened key is held in `Zeroizing`.
+zeroize = "1"
+
+# The OS keychain, as a `.jigkey` slot (I1). Native stores only: Linux reaches
+# the Secret Service through the `secret-tool` command instead, which keeps an
+# async D-Bus stack out of every build (DJ, 2026-10-18).
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+keyring-core = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = "1"
 
 [dev-dependencies]
 tempfile = "3"

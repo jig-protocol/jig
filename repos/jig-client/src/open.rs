@@ -113,7 +113,7 @@ mod tests {
 
     fn identity() -> Identity {
         let dir = tempfile::tempdir().unwrap();
-        Identity::generate_and_save(&dir.keep()).unwrap()
+        Identity::generate_for_tests(&dir.keep())
     }
 
     fn delivered(id: &Identity, body: &str) -> DeliveredBlock {

@@ -375,7 +375,7 @@ mod tests {
 
         // Build a real text-render block on a known DM slug, authored by a Jig user.
         let dir = tempfile::tempdir().unwrap();
-        let author = jig_client::Identity::generate_and_save(dir.path()).unwrap();
+        let author = jig_client::Identity::generate_for_tests(dir.path());
         let shadow = "did:jig:zShadowAlice";
         let slug = thread_slug(&author.did().to_string(), shadow);
         let hlc = jig_core::HlcTimestamp::now_wall(author.did().clone());
@@ -418,7 +418,7 @@ mod tests {
         let storage: Arc<dyn BridgeStorage> = Arc::new(MemStore::default());
         let mock = Arc::new(MockProvider::default());
         let dir = tempfile::tempdir().unwrap();
-        let author = jig_client::Identity::generate_and_save(dir.path()).unwrap();
+        let author = jig_client::Identity::generate_for_tests(dir.path());
         let hlc = jig_core::HlcTimestamp::now_wall(author.did().clone());
         let blk = jig_client::blocks::build_text_render(&author, "#email/unmapped", "x", hlc);
         let delivered = DeliveredBlock {

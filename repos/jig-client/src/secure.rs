@@ -15,6 +15,17 @@
 //! own. Without it, history would be unreadable the second time a channel is
 //! opened.
 //!
+//! # At rest
+//!
+//! All three are sealed under keys derived from the identity's `.jigkey`
+//! (`jig_core::keystore`): `state.bin` and `groups.json` whole, and
+//! `plaintext.jsonl` one record per line, so appends stay appends. Each is
+//! bound to the DID and its own file name, so a sealed file cannot be moved
+//! to another identity or another role. Files written in clear by an earlier
+//! version are sealed when the session opens. An identity that is not sealed
+//! at rest ([`Identity::from_signing_key`], plaintext key storage) keeps its
+//! state in clear.
+//!
 //! # Concurrency
 //!
 //! `jig chat` and `jig send` can run for the same DID at once. Every operation
@@ -50,6 +61,8 @@ pub enum SecureError {
     NoGroup(String),
     #[error("malformed MLS field `{0}` in block")]
     Field(&'static str),
+    #[error("MLS state at {path:?} does not open: {reason}")]
+    Sealed { path: PathBuf, reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, SecureError>;
@@ -112,6 +125,18 @@ pub struct Session {
     read: Mutex<HashMap<String, (String, String)>>,
 }
 
+const STATE: &str = "state.bin";
+const GROUPS: &str = "groups.json";
+const PLAINTEXT: &str = "plaintext.jsonl";
+/// The prefix of a sealed `plaintext.jsonl` record. A record in clear is JSON
+/// and starts with `{`.
+const SEALED_LINE: &str = "s1:";
+
+/// The key-derivation context for one of this module's files.
+fn file_context(file: &str) -> String {
+    format!("jig mls {file} v1")
+}
+
 /// Default root for MLS state: `~/.jig/mls/`.
 pub fn default_dir() -> PathBuf {
     dirs::home_dir()
@@ -172,8 +197,89 @@ impl Session {
             dir,
             read: Mutex::new(HashMap::new()),
         };
+        session.seal_clear_files()?;
         session.reload_read()?;
         Ok(session)
+    }
+
+    /// Seal any file an earlier version wrote in clear, under the lock.
+    fn seal_clear_files(&self) -> Result<()> {
+        if !self.identity.is_sealed() {
+            return Ok(());
+        }
+        let _lock = self.lock()?;
+        for file in [STATE, GROUPS] {
+            let path = self.dir.join(file);
+            match std::fs::read(&path) {
+                Ok(bytes) if !jig_core::keystore::is_sealed(&bytes) => {
+                    write_atomic(&path, &self.seal(file, &bytes))?;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => return Err(SecureError::Io { path, source }),
+            }
+        }
+        let path = self.dir.join(PLAINTEXT);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => zeroize::Zeroizing::new(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(SecureError::Io { path, source }),
+        };
+        if text.lines().all(|l| l.starts_with(SEALED_LINE)) {
+            return Ok(());
+        }
+        let mut sealed = String::new();
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            if line.starts_with(SEALED_LINE) {
+                sealed.push_str(line);
+            } else {
+                sealed.push_str(&self.seal_line(line));
+            }
+            sealed.push('\n');
+        }
+        write_atomic(&path, sealed.as_bytes())
+    }
+
+    /// `bytes` sealed for `file`, or as they are when this identity is not
+    /// sealed at rest.
+    fn seal(&self, file: &str, bytes: &[u8]) -> Vec<u8> {
+        match self.identity.file_key(&file_context(file)) {
+            Some(key) => jig_core::keystore::seal(&key, &self.aad(file), bytes),
+            None => bytes.to_vec(),
+        }
+    }
+
+    fn aad(&self, file: &str) -> Vec<u8> {
+        format!("{}|{file}", self.did).into_bytes()
+    }
+
+    /// The contents of `file`, opened if sealed. A file in clear is returned
+    /// as it is: written by an earlier version, it is sealed on the next save.
+    fn unseal(
+        &self,
+        file: &str,
+        path: &Path,
+        bytes: Vec<u8>,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        if !jig_core::keystore::is_sealed(&bytes) {
+            return Ok(zeroize::Zeroizing::new(bytes));
+        }
+        let sealed_err = |reason: String| SecureError::Sealed {
+            path: path.to_path_buf(),
+            reason,
+        };
+        let key = self.identity.file_key(&file_context(file)).ok_or_else(|| {
+            sealed_err("it is sealed, and this identity's key is not sealed at rest".into())
+        })?;
+        jig_core::keystore::open(&key, &self.aad(file), &bytes)
+            .map_err(|e| sealed_err(e.to_string()))
+    }
+
+    fn seal_line(&self, line: &str) -> String {
+        format!(
+            "{SEALED_LINE}{}",
+            STANDARD.encode(self.seal(PLAINTEXT, line.as_bytes()))
+        )
     }
 
     pub fn did(&self) -> &str {
@@ -287,7 +393,7 @@ impl Session {
 
     /// File the plaintext of a block this member sent or read.
     pub fn remember(&self, cid: &str, sender: &str, text: &str) -> Result<()> {
-        let path = self.dir.join("plaintext.jsonl");
+        let path = self.dir.join(PLAINTEXT);
         let _lock = self.lock()?;
         let mut f = OpenOptions::new()
             .create(true)
@@ -297,12 +403,19 @@ impl Session {
                 path: path.clone(),
                 source,
             })?;
-        let line = serde_json::to_string(&Read {
-            cid: cid.to_string(),
-            sender: sender.to_string(),
-            text: text.to_string(),
-        })
-        .expect("plaintext record serializes");
+        let line = zeroize::Zeroizing::new(
+            serde_json::to_string(&Read {
+                cid: cid.to_string(),
+                sender: sender.to_string(),
+                text: text.to_string(),
+            })
+            .expect("plaintext record serializes"),
+        );
+        let line = if self.identity.is_sealed() {
+            self.seal_line(&line)
+        } else {
+            line.to_string()
+        };
         writeln!(f, "{line}").map_err(|source| SecureError::Io { path, source })?;
         self.read
             .lock()
@@ -515,7 +628,7 @@ impl Session {
     }
 
     fn reload_read(&self) -> Result<()> {
-        let path = self.dir.join("plaintext.jsonl");
+        let path = self.dir.join(PLAINTEXT);
         let Ok(f) = File::open(&path) else {
             return Ok(());
         };
@@ -525,6 +638,24 @@ impl Session {
                 path: path.clone(),
                 source,
             })?;
+            // A sealed record that does not open is an error, never skipped:
+            // skipping would hide tampering, and the next write would bury it.
+            let line = match line.strip_prefix(SEALED_LINE) {
+                Some(encoded) => {
+                    let sealed = STANDARD.decode(encoded).map_err(|e| SecureError::Sealed {
+                        path: path.clone(),
+                        reason: format!("a record is not base64: {e}"),
+                    })?;
+                    let opened = self.unseal(PLAINTEXT, &path, sealed)?;
+                    zeroize::Zeroizing::new(String::from_utf8(opened.to_vec()).map_err(|e| {
+                        SecureError::Sealed {
+                            path: path.clone(),
+                            reason: e.to_string(),
+                        }
+                    })?)
+                }
+                None => zeroize::Zeroizing::new(line),
+            };
             if let Ok(r) = serde_json::from_str::<Read>(&line) {
                 read.insert(r.cid, (r.sender, r.text));
             }
@@ -550,10 +681,13 @@ impl Session {
     /// Lock, load, apply `f`, save. The one way state changes.
     fn with_member<T>(&self, f: impl FnOnce(&Member, &mut Groups) -> Result<T>) -> Result<T> {
         let _lock = self.lock()?;
-        let state_path = self.dir.join("state.bin");
-        let groups_path = self.dir.join("groups.json");
+        let state_path = self.dir.join(STATE);
+        let groups_path = self.dir.join(GROUPS);
         let member = match std::fs::read(&state_path) {
-            Ok(bytes) => self.identity.restore_mls_member(&bytes)?,
+            Ok(bytes) => {
+                self.identity
+                    .restore_mls_member(&self.unseal(STATE, &state_path, bytes)?)?
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.identity.mls_member()?,
             Err(source) => {
                 return Err(SecureError::Io {
@@ -565,10 +699,11 @@ impl Session {
         // Only a missing file means "no groups yet". Anything else would be
         // saved back over the real mapping below, orphaning every group.
         let mut groups: Groups = match std::fs::read(&groups_path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| SecureError::Io {
-                path: groups_path.clone(),
-                source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
-            })?,
+            Ok(bytes) => serde_json::from_slice(&self.unseal(GROUPS, &groups_path, bytes)?)
+                .map_err(|e| SecureError::Io {
+                    path: groups_path.clone(),
+                    source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+                })?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Groups::default(),
             Err(source) => {
                 return Err(SecureError::Io {
@@ -585,10 +720,13 @@ impl Session {
         let out = f(&member, &mut groups);
         // Save even when `f` failed: openmls may have written state (a staged
         // commit, a consumed key package) before the failure.
-        write_atomic(&state_path, &member.snapshot())?;
+        write_atomic(&state_path, &self.seal(STATE, &member.snapshot()))?;
         write_atomic(
             &groups_path,
-            &serde_json::to_vec_pretty(&groups).expect("groups serialize"),
+            &self.seal(
+                GROUPS,
+                &serde_json::to_vec_pretty(&groups).expect("groups serialize"),
+            ),
         )?;
         out
     }
@@ -806,7 +944,7 @@ mod tests {
 
     fn session(root: &Path) -> Session {
         let keys = tempfile::tempdir().unwrap();
-        let id = Identity::generate_and_save(&keys.keep()).unwrap();
+        let id = Identity::generate_for_tests(&keys.keep());
         Session::open(root, id).unwrap()
     }
 
@@ -886,13 +1024,7 @@ mod tests {
 
         // A fresh session over the same directory — the next `jig chat` —
         // still has both the group and the plaintext.
-        let bob_again = Session::open(
-            root.path(),
-            Identity::from_signing_key(ed25519_dalek::SigningKey::from_bytes(
-                &bob.identity.signing_bytes_for_test(),
-            )),
-        )
-        .unwrap();
+        let bob_again = Session::open(root.path(), bob.identity.duplicate()).unwrap();
         assert_eq!(bob_again.observe(SERVER, &msg), read);
         assert!(bob_again.has_group(SERVER, "#sealed").unwrap());
     }
@@ -1024,6 +1156,127 @@ mod tests {
         assert!(bob.has_group(SERVER, "#sealed").unwrap());
     }
 
+    /// Every file under the DID's directory, read raw.
+    fn files_of(root: &Path, s: &Session) -> Vec<(String, Vec<u8>)> {
+        std::fs::read_dir(root.join(s.did()))
+            .unwrap()
+            .map(|e| {
+                let p = e.unwrap().path();
+                (
+                    p.file_name().unwrap().to_string_lossy().into_owned(),
+                    std::fs::read(&p).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn nothing_under_the_mls_directory_is_in_clear() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        alice.create_group(SERVER, "#sealed-at-rest").unwrap();
+        alice
+            .remember(
+                "bafy-cid",
+                "did:jig:zsender",
+                "a message nobody else may read",
+            )
+            .unwrap();
+        let files = files_of(root.path(), &alice);
+        for name in [STATE, GROUPS, PLAINTEXT] {
+            assert!(files.iter().any(|(n, _)| n == name), "{name} written");
+        }
+        for (name, bytes) in &files {
+            assert!(
+                !contains(bytes, b"a message nobody else may read"),
+                "{name}"
+            );
+            assert!(!contains(bytes, b"#sealed-at-rest"), "{name}");
+        }
+        // And it reads back, in a fresh session.
+        let again = Session::open(root.path(), alice.identity.duplicate()).unwrap();
+        assert_eq!(
+            again.recall("bafy-cid").unwrap(),
+            Some((
+                "did:jig:zsender".to_string(),
+                "a message nobody else may read".to_string()
+            ))
+        );
+        assert!(again.has_group(SERVER, "#sealed-at-rest").unwrap());
+    }
+
+    #[test]
+    fn files_an_older_version_wrote_in_clear_are_sealed_on_open() {
+        let root = tempfile::tempdir().unwrap();
+        let keys = tempfile::tempdir().unwrap();
+        let sealed = Identity::generate_for_tests(keys.path());
+        // The same identity, unsealed: the state an earlier version wrote.
+        let clear = Session::open(
+            root.path(),
+            Identity::from_signing_key(ed25519_dalek::SigningKey::from_bytes(
+                &sealed.signing_bytes_for_test(),
+            )),
+        )
+        .unwrap();
+        clear.create_group(SERVER, "#old").unwrap();
+        clear
+            .remember("cid-1", "did:jig:zs", "old history")
+            .unwrap();
+        drop(clear);
+        assert!(
+            files_of(root.path(), &session_for(root.path(), sealed.duplicate()))
+                .iter()
+                .all(|(n, b)| n == "lock" || !contains(b, b"old history") && !contains(b, b"#old"))
+        );
+        let reopened = session_for(root.path(), sealed);
+        assert!(reopened.has_group(SERVER, "#old").unwrap());
+        assert_eq!(
+            reopened.recall("cid-1").unwrap().map(|(_, t)| t),
+            Some("old history".to_string())
+        );
+    }
+
+    fn session_for(root: &Path, id: Identity) -> Session {
+        Session::open(root, id).unwrap()
+    }
+
+    #[test]
+    fn a_tampered_record_is_an_error_not_a_skipped_line() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        alice.remember("cid-1", "did:jig:zs", "kept").unwrap();
+        let path = root.path().join(alice.did()).join(PLAINTEXT);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        // Flip one character of the sealed record.
+        let at = text.len() - 3;
+        let flipped = if &text[at..at + 1] == "A" { "B" } else { "A" };
+        text.replace_range(at..at + 1, flipped);
+        std::fs::write(&path, text).unwrap();
+        assert!(matches!(
+            Session::open(root.path(), alice.identity.duplicate()),
+            Err(SecureError::Sealed { .. })
+        ));
+    }
+
+    #[test]
+    fn sealed_state_does_not_open_for_another_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        alice.create_group(SERVER, "#a").unwrap();
+        let bob = session(root.path());
+        let from = root.path().join(alice.did()).join(GROUPS);
+        let to = root.path().join(bob.did()).join(GROUPS);
+        std::fs::copy(from, to).unwrap();
+        assert!(matches!(
+            bob.has_group(SERVER, "#a"),
+            Err(SecureError::Sealed { .. })
+        ));
+    }
+
     #[test]
     fn a_corrupt_group_map_is_an_error_not_an_empty_map() {
         let root = tempfile::tempdir().unwrap();
@@ -1117,13 +1370,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let first = session(root.path());
         // A second process for the same DID: same directory, its own handles.
-        let second = Session::open(
-            root.path(),
-            Identity::from_signing_key(ed25519_dalek::SigningKey::from_bytes(
-                &first.identity.signing_bytes_for_test(),
-            )),
-        )
-        .unwrap();
+        let second = Session::open(root.path(), first.identity.duplicate()).unwrap();
 
         let held = first.commit_lock(SERVER, "#a").unwrap();
         assert!(second.try_commit_lock(SERVER, "#a").unwrap().is_none());

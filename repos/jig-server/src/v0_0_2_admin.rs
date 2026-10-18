@@ -331,7 +331,7 @@ mod tests {
     fn test_identity() -> Identity {
         let dir = tempdir().unwrap();
         let path = dir.keep();
-        Identity::generate_and_save(&path).unwrap()
+        Identity::generate_for_tests(&path)
     }
 
     fn test_hlc(id: &Identity) -> HlcTimestamp {

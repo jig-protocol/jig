@@ -28,6 +28,8 @@ jig-runtime = { workspace = true, optional = true }
 # paths (e.g., src/http_client.rs) stay as legacy until Phase F replaces
 # them with jig-client-backed equivalents.
 jig-client = { path = "../jig-client" }
+# Passphrases typed at the terminal are cleared from memory after use.
+zeroize = "1"
 # MLS commit type, carried between jig-client's session and the blocks the CLI
 # submits for it.
 jig-mls = { workspace = true }

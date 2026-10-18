@@ -8,19 +8,19 @@
 //! `jig_nameserver::v0_0_2_rotate_renew`. Keep field names in lockstep.
 //!
 //! Rotate semantics:
-//!   1. Load the current identity from `~/.jig/keys/<old_did>.key`.
-//!   2. Mint a fresh identity (writes the new keyfile via
-//!      `Identity::generate_and_save`).
+//!   1. Load the current identity from `~/.jig/keys/<old_did>.jigkey`.
+//!   2. Mint a fresh identity (seals the new keyfile via
+//!      `Identity::create`).
 //!   3. Sign the same challenge with BOTH keys.
 //!   4. POST /v1/rotate. If the request fails, the new keyfile is
 //!      removed before bailing so we never end up with two valid keys
 //!      and a stale config.
-//!   5. On success: rename the OLD keyfile to `<old_did>.key.rotated`
+//!   5. On success: rename the OLD keyfile to `<old_did>.jigkey.rotated`
 //!      (kept for offline recovery) and rewrite the active config file
 //!      (`--config <path>`, else `~/.jig/cli.toml`) so `[user] did`
 //!      points at the new DID.
 //!
-//! The `.key.rotated` rename is a design call — `v0_0_2_rotate_renew.rs`
+//! The `.jigkey.rotated` rename is a design call — `v0_0_2_rotate_renew.rs`
 //! handles the server-side expiry but is silent on client-side cleanup;
 //! keeping the file (under a non-loadable name) preserves the operator's
 //! ability to verify or recover offline.
@@ -149,10 +149,10 @@ pub async fn rotate(ctx: &CliContext, args: KeysRotateArgs) -> Result<()> {
     let keys_dir = jig_client::identity::default_keys_dir();
 
     // 2. Mint a fresh keypair. This writes the new keyfile to disk.
-    let new_id = Identity::generate_and_save(&keys_dir)
+    let new_id = Identity::create(&keys_dir, super::passphrase::key_access()?)
         .with_context(|| format!("generating new identity under {}", keys_dir.display()))?;
     let new_did_str = new_id.did_string();
-    let new_keyfile = keys_dir.join(format!("{new_did_str}.key"));
+    let new_keyfile = jig_client::identity::key_path(&keys_dir, &new_did_str);
 
     // 3. Drive the rotate handshake. On any failure, undo the new keyfile
     //    so we don't leak an orphaned key.
@@ -166,11 +166,11 @@ pub async fn rotate(ctx: &CliContext, args: KeysRotateArgs) -> Result<()> {
             }
         };
 
-    // 4. Rename the OLD keyfile to <old_did>.key.rotated. Operator may
-    //    want it for offline recovery. The rename keeps it on disk but
-    //    out of the DID-load lookup path.
-    let old_keyfile = keys_dir.join(format!("{old_did_str}.key"));
-    let rotated_keyfile = keys_dir.join(format!("{old_did_str}.key.rotated"));
+    // 4. Rename the OLD keyfile to <old_did>.jigkey.rotated. Operator may
+    //    want it for offline recovery. The rename keeps it on disk, still
+    //    sealed, but out of the DID-load lookup path.
+    let old_keyfile = jig_client::identity::key_path(&keys_dir, &old_did_str);
+    let rotated_keyfile = keys_dir.join(format!("{old_did_str}.jigkey.rotated"));
     std::fs::rename(&old_keyfile, &rotated_keyfile).with_context(|| {
         format!(
             "renaming {} -> {} after successful rotation",
@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn build_renew_request_signs_challenge_and_uses_canonical_did() {
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(dir.path()).unwrap();
+        let id = Identity::generate_for_tests(dir.path());
         let challenge = "deadbeef".to_string();
 
         let req = build_renew_request(&id, "dj@dj.jig", &challenge);
@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn build_renew_request_passes_full_alias_through_unchanged() {
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(dir.path()).unwrap();
+        let id = Identity::generate_for_tests(dir.path());
         // Renew takes a fully-qualified alias (`local@ns_suffix`), unlike
         // register which takes only the local part. Make sure we don't
         // strip or rewrite it.
@@ -329,10 +329,10 @@ mod tests {
     #[test]
     fn build_rotate_request_signs_with_both_keys_and_pins_both_dids() {
         let dir = tempdir().unwrap();
-        let old = Identity::generate_and_save(dir.path()).unwrap();
+        let old = Identity::generate_for_tests(dir.path());
         // Sleep is unnecessary — two separate generate calls produce
         // distinct keys with overwhelming probability.
-        let new = Identity::generate_and_save(dir.path()).unwrap();
+        let new = Identity::generate_for_tests(dir.path());
         assert_ne!(old.did_string(), new.did_string(), "DIDs must differ");
 
         let challenge = "c0ffee".to_string();
@@ -371,8 +371,8 @@ mod tests {
         // Defence-in-depth: confirm that swapping sigs across pubkeys
         // doesn't accidentally pass (would indicate identical signing input).
         let dir = tempdir().unwrap();
-        let old = Identity::generate_and_save(dir.path()).unwrap();
-        let new = Identity::generate_and_save(dir.path()).unwrap();
+        let old = Identity::generate_for_tests(dir.path());
+        let new = Identity::generate_for_tests(dir.path());
         let req = build_rotate_request(&old, &new, "dj@dj.jig", "zz");
 
         let old_sig = ed25519_dalek::Signature::from_slice(

@@ -135,8 +135,9 @@ impl CliContext {
     /// Load the identity named by the effective `[user] did`.
     ///
     /// Bails with a friendly hint to run `jig init` if the DID looks empty
-    /// or non-canonical. The keyfile must exist under
-    /// `~/.jig/keys/<did>.key` with 0600 permissions on Unix.
+    /// or non-canonical. The key is `~/.jig/keys/<did>.jigkey`, unlocked as
+    /// [`super::passphrase::key_access`] allows; a raw `<did>.key` from an
+    /// earlier version is sealed on first load.
     pub fn identity(&self) -> Result<Identity> {
         let did_str = self.effective.user.did.clone();
         if !did_str.starts_with("did:jig:") {
@@ -147,8 +148,14 @@ impl CliContext {
             );
         }
         let keys_dir = jig_client::identity::default_keys_dir();
-        Identity::load_from_dir(&keys_dir, &did_str)
-            .with_context(|| format!("loading identity {did_str} from {}", keys_dir.display()))
+        let access = super::passphrase::key_access()?;
+        let id = Identity::open(&keys_dir, &did_str, access)
+            .with_context(|| format!("loading identity {did_str} from {}", keys_dir.display()))?;
+        super::passphrase::report_migration(&id, &keys_dir);
+        for sealed in jig_client::identity::seal_rotated_keys(&keys_dir, access)? {
+            eprintln!("note: sealed the rotated key {}", sealed.display());
+        }
+        Ok(id)
     }
 
     /// The effective server base URL. May be `http://`, `https://`,
