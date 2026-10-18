@@ -52,10 +52,12 @@ Non-goals:
 The package is `jig:block`, versioned with semver. During v0.3 development it is `0.1.0`, and
 every minor version is incompatible.
 
-- **`renderer`** exports `render: func(inv: invocation) -> result<payload, block-error>` and
-  imports nothing.
-- **`bot`** exports `handle: func(inv: invocation) -> result<list<effect>, block-error>`. It
-  imports only `jig:host/*` interfaces, specified elsewhere.
+- **`renderer`** exports `render: func(inv: invocation) -> result<payload, block-error>`. Its
+  only possible import is `jig:host/compose`, for child renderers its manifest pins by CID.
+- **`bot`** exports
+  `handle: func(inv: invocation, state: list<u8>) -> result<handled, block-error>`, where
+  `handled` carries the returned effects and an optional new state. It imports only
+  `jig:host/*` interfaces, specified in JEP-0007.
   - A `bot` MUST NOT perform an effect during a call. It returns effects for the host to check
     against granted capabilities and apply.
 - **No floats.** The ABI contains no `f32` or `f64`.
@@ -73,7 +75,7 @@ A host MUST refuse, before execution, a component that fails any of the followin
    without its async, threading or error-context extensions.
 2. For every core module: no scalar float instruction, and declared maxima for every memory and
    table, within the manifest's limits.
-3. Imports: none for `renderer`. For `bot`, only `jig:host/*` interfaces that its manifest
+3. Imports: for `renderer`, at most `jig:host/compose`. For `bot`, only `jig:host/*` interfaces that its manifest
    capabilities grant, at a version the host links. No `wasi:*` import.
 4. Exports: exactly the interface of the world its manifest declares.
 
@@ -86,7 +88,12 @@ A run is identified by:
 - the component's CID;
 - the world and its version;
 - `invocation_hash`, BLAKE3 over the canonical encoding of the invocation value;
-- for `bot`, the content-addressed answers to its read imports.
+- for `bot`, the hash of the state passed in and the content-addressed answers to its fetch
+  imports;
+- for a composed block, the child CIDs its manifest pins.
+
+`invocation.hlc` is the owning server's ingest HLC for the triggering block, as signed in that
+server's receipt. It is never the author-set `hlc_ts`.
 
 Its outcome is one of:
 
