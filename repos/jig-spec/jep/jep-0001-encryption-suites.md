@@ -79,7 +79,7 @@ A gate treats a suite by its properties, not by name:
 ## Reporting
 
 Encrypted abuse reports use message franking, which sits above the suite
-([JEP-0010](jep-0010-reports-tribunals-lists.md), rules 6–8a). A suite contributes one
+(JEP-0010, rules 6–8a; draft, PR #166). A suite contributes one
 property, and every suite JEP MUST state it:
 
 - **Faithful delivery.** The suite delivers the plaintext, franking key `k_f` included,
