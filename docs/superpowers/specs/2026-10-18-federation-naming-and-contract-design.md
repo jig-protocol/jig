@@ -551,7 +551,10 @@ reputation and proof-of-work between servers (lane R, D26).
 | Forges a block | Cannot: author signatures | OP-09 |
 | Adds a key the owner controls | Cannot unilaterally: only the channel owner's DID may add, and the add is a client-made commit naming the DID | Holds while the channel owner (a DID) and the owning server are different parties. **The channel-owner DID and the owning server can collude**, which is the same trust the single-server channel already has |
 
-**Moving the sequencer (L7's proposal; pending DJ).**
+**Moving the sequencer (decided by DJ, 2026-10-18, on the joint L7 and F proposal).** The
+same decision fixes `channel_id` as the creation block's CID, adopts anonymous head
+gossip, and has JEP-0002 state the limit that a channel with a single poster has no
+detection against its sequencer.
 - The owning server is the channel's **sequencer**: a server DID named in the creation
   block, or later in a `sequencer-set` block.
 - **Moving the sequencer is an `owner`-only right** in v0.2. Delegating it to `admin`
@@ -586,6 +589,20 @@ F's caveats:
      `sequencer-set` then signs installs for exactly those DIDs.
    - The handover therefore takes two messages, the accept and then the
      `sequencer-set`, and still only one owner action.
+
+**Nameservers may name abandoned or compromised servers (DJ, 2026-10-18; post-MVP,
+an interface lane R builds on).**
+- A nameserver MAY publish a signed list of servers it believes are abandoned or
+  compromised, so that other servers can refuse them.
+- **The list is a claim, not a verdict (NS-01, NS-02).** It is advisory. A server MAY
+  refuse new shares and contract offers involving a listed server. Each entry cites
+  evidence, and resolvers retain lists as they retain attestations.
+- **A list never unseats a sequencer the owner currently names.** Only the channel's
+  `owner` moves a sequencer (`sequencer-set`). A nameserver that could do it would hold
+  the veto D19 forbids. A listing can prompt the owner to move; it cannot move.
+- Who may list, on what evidence, and how a listing is appealed belong to lane R
+  (reputation and tribunals) and to the ruleset group's tribunal process (GV-01). F
+  defines only the signed list format and the "advisory, never unseats" rule.
 
 ### 5.9 Shares and roles
 
@@ -682,6 +699,8 @@ Updated in the implementation PRs, not here.
 | **F1: verified names** | v0.2.x | Canonical attestation and proof encodings (4.6); nameserver TLS; suffix delegation by config and `.well-known` (4.2 A+B); verification in the client and the server's resolver (4.3); client name pins and the change rule (4.4); retained attestations (4.5); `jig dm`/`channel add` accept names; reachability records (4.7) | L7 for `jig trust` UX; L6 for nameserver code |
 | **F2: the contract between two jig servers** | v0.2.x, gate G3 | Channels keyed by CID (6); `sequencer` in the creation block and `sequencer-set`; offer, accept, refuse and end (5.5); signed peer policy (5.6); relay through the client's server under share grants (5.2); owner sequencing with a signed chain, and follower validation (5.3); key packages through the owner under consent (5.4); restricted MLS channels federate between configured peers; the `federation.md` rewrite | **L7's mutual server-to-server handshake**; F1's reachability records |
 | **F3** | v0.3+ | Ruleset-group delegation with thresholds (4.2 C); replicated registry and transparency log (NS-02, NS-03, with lane R); nameserver-led contract templates (D12); MIMI-style consent; ownership handover; open federation with reputation; interop with other implementations by contract | lane R; ruleset groups |
+| **F4: high-security federation** | post-MVP | Consensus on channel heads, so a channel with one poster is protected too: carriers co-sign `ingest` heads, and a head counts only at the ruleset's threshold. Merkle-tree logs plus gossip as the long-term direction, in the style of CT and KEYTRANS (DJ, 2026-10-18) | F3, lane R |
+| **F5: nameserver server-lists** | post-MVP | The signed, advisory list of abandoned or compromised servers (5.8), with lane R's evidence and appeal process | lane R |
 
 **Exit criterion 5 is met at the end of F2.**
 
@@ -708,7 +727,8 @@ Updated in the implementation PRs, not here.
 
   Lane R may want `pow` or `transparency` as reference, and git history keeps them. The
   debug `/v1/handles` route is L6's call.
-- **R (reputation, PoW, tribunals).** R builds on 4.5 (retained evidence), 4.2 C
+- **R (reputation, PoW, tribunals).** R builds on the nameserver server-list interface
+  (5.8, F5), 4.5 (retained evidence), 4.2 C
   (ruleset-group delegation) and 5.7 (open federation).
 - **I (identity lifecycle).** Reachability records (4.7) and rotation statements (4.4) are inputs
   to multi-device and key rotation.
@@ -730,7 +750,7 @@ Updated in the implementation PRs, not here.
    refused otherwise?
 4. Reachability records (4.7): signed by the DID, not the nameserver?
 5. Key packages (5.4): through the owner, under a coarse consent policy in v0.2?
-6. Owner failure (5.8): the movable sequencer (L7's proposal, going to DJ through L7).
+6. ~~Owner failure (5.8)~~ **Decided:** the movable sequencer, owner-only `sequencer-set`.
 7. Who may federate (5.7): configured peers only in v0.2?
 8. `federation.md` (7): this disposition?
 

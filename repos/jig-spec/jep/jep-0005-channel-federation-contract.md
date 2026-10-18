@@ -122,7 +122,7 @@ Non-goals for v0.2:
     for any leaves reachable only through that follower. A grant changes by a new offer
     and accept.
 
-11a. (pending DJ) The owner moves the sequencer with a `sequencer-set` block. In v0.2 only
+11a. The owner moves the sequencer with a `sequencer-set` block. In v0.2 only
      the `owner` role holds that right.
      - The new sequencer MUST have accepted the contract before its first record.
      - Its first record links `prev` to the head the `sequencer-set` cites, and cites the
@@ -151,6 +151,9 @@ Non-goals for v0.2:
 14a. Clients report the latest sequencer record they verified to their server, which
      forwards heads to other carriers with no reader DID attached. Fork evidence is two
      conflicting sequencer signatures.
+14b. A nameserver's list of abandoned or compromised servers (post-MVP) is advisory. A
+     server MAY refuse new shares involving a listed server, and MUST NOT treat a listing
+     as moving or unseating the sequencer the owner names.
 
 ## Writes through followers
 
