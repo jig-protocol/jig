@@ -465,6 +465,8 @@ a network layer jig does not provide.
   nameserver still parses rulesets and translation contracts and publishes them in
   `/.well-known/jig-ns`; nothing applies them. Its configuration still models reputation as
   per-user `ReputationZone` tiers, the model obligation 1 supersedes.
+  Redesign in progress: rulesets, reputation and transparency logs in JEP-0009 (draft,
+  #163); proof-of-work in JEP-0008 (#162); framing in #152.
 - **None.** Reputation inputs, decay, vouching, numbers for servers and nameservers, and
   ruleset acknowledgement.
 
@@ -602,7 +604,7 @@ flowchart TB
   unknown-DID setting), and the block-kind allow-list. Nothing ties them into a declared
   ruleset, no server declares a level, and nothing is shared between servers.
 - **Removed prototype.** The nameserver's experimental policy-hash exchange and gossip
-  routes were removed in #154 (section 6.2).
+  routes were removed in #154 (section 6.2). Redesign in progress: JEP-0009 (draft, #163).
 
 ### 7.3 To be designed
 

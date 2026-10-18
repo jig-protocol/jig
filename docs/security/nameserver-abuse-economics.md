@@ -18,6 +18,10 @@ unless stated.
 > whose routes were removed in #154. Today the nameserver serves only the alias routes,
 > which have no proof-of-work and no rate limit. The analysis stays as input to the
 > redesign; read "today" below as "in the removed prototype".
+>
+> Redesign in progress: proof-of-work in JEP-0008 (draft, #162); rulesets, reputation and
+> transparency logs in JEP-0009 (#163); reports and tribunals in JEP-0010 (#166); framing in
+> #152.
 
 ## What the model is for
 
