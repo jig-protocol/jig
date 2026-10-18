@@ -91,6 +91,8 @@ it goes in a separate PR.
 
 **Q2:** were the pricing keys meant to come back with the M3 pricing work? If so, they come back
 in the design that uses them. They don't stay as dead keys.
+- On hold: L2's hazard-2 PR, which signs the pricing schedule version actually in force, will
+  show which keys are live. No pricing key is dropped before that PR lands.
 
 ## 4. Server config: hybrid file discovery
 
@@ -263,6 +265,20 @@ The `local-runtime` feature is on by default.
 - Plain-HTTP nameserver clients (`cmd/ns.rs:149-154`, `cmd/init.rs:168`, `cmd/keys.rs:102,211`).
   The nameserver is not DID-pinned; that is L6's area.
 - The deliberate plaintext probe in `cmd/trust.rs:80`.
+
+## 10. What still uses plaintext `http://` to a jig-server
+
+DJ decided the client refuses plaintext REST for now; L7 builds the refusal in `cmd/trust.rs`
+after #107. These are the things that refusal would break, and what to do about each one.
+
+| Dependent | Evidence | What breaks | Proposed handling |
+|---|---|---|---|
+| `JigHttpClient` | `repos/jig-cli/src/http_client.rs:16`, built at `main.rs:598` | Nothing at runtime: its only method is dead code (§7) | L3 deletes it before L7's refusal lands (no open question blocks this) |
+| CLI default server URL | `repos/jig-cli/src/config.rs:46`: `base_url = "http://127.0.0.1:7117"` | With no `--server` and no `cli.toml`, every REST command is refused. The server's default is TLS on (`[tls] enabled = true`), so this default already disagrees with a default server | Change the default to `https://127.0.0.1:7117` in the same PR as the refusal, or just before it (L3 owns the file; L7 sequences it) |
+| `scripts/demo-e2ee.sh` | `:43` uses `https://` | Nothing | none |
+| `integration-tests` harness | `src/harness.rs:221-222`, `:456-457` (`http://`), `:217-218` (`ws://`) | The tests call it with raw `reqwest` and `jig_client::Client` over `ws://`, not through `cmd::trust`, so a refusal in `trust.rs` doesn't reach them. A refusal added in `jig-client` itself would | none if the refusal stays in `cmd/trust.rs`; otherwise the harness needs TLS (L7) |
+| `jig-cli/tests` | `global_flags.rs:23,143,158`; `send_tail_smoke.rs:68,110,151`; `channel_smoke.rs:139`; `server_smoke.rs:21,152`; `keys_smoke.rs:84`; `ns_smoke.rs:16,23` | Most of these point at a closed port (`http://127.0.0.1:1`) and expect a connection failure. A refusal fails them earlier, with a different message. `global_flags.rs:143-158` sets an `http://` server and checks that it is used. `server_smoke.rs:21` only writes config | L7 updates these in the refusal PR: switch them to `https://` or assert the refusal message |
+| Nameserver clients | `cmd/ns.rs:149-154`, `cmd/init.rs:168`, `cmd/keys.rs:102,211` | Nothing, if the refusal applies only to jig-server REST. The nameserver is not DID-pinned | none; L6's area |
 
 ## Questions for DJ
 
