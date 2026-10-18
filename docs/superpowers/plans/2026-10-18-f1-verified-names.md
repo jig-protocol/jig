@@ -24,6 +24,10 @@ Nothing trusts a binding because of which party fetched it.
   sections 4.1–4.8.
 - Name pins and `jig trust accept-name`:
   [D11 design item 11](../specs/2026-10-18-d11-handshake-completion-design.md) (lane L7).
+- **Aligned with L7's build plan** (`2026-10-18-d11-handshake-completion.md`):
+  - L7's slice 9 (name pinning) is the pin half of F1's slice 5.
+  - L7's slice 6 (evidence) is where F1's name evidence goes. F1 adds no evidence store or
+    command of its own.
 
 **Compatibility, stated precisely:**
 - Attestations signed under the old JSON encoding stop verifying once a resolver implements this
@@ -53,8 +57,8 @@ owning lane builds the slice, or agrees in writing (through the orchestrator) th
 | 2 | The nameserver issues the new objects, takes action-bound proofs, keeps rotation chains | `jig-nameserver/src/v0_0_2*.rs`, alias storage in `jig-pipeline/src/persist.rs` | L6 (nameserver); persistence change agreed with whoever owns `persist.rs` | 1 |
 | 3 | TLS on the nameserver | `jig-nameserver/src/server.rs` | L6 | nothing |
 | 4 | The server's resolver verifies, binds suffixes, caches within validity and keeps evidence | `jig-pipeline/src/identity.rs`, `jig-config/src/v0_0_2_server.rs` | F for `identity.rs`; L3 for the config field | 1 |
-| 5 | Client resolver and name pins | `jig-client/src/naming.rs` (new, F); `jig-client/src/pins.rs` `names` map (L7, D11 item 11) | F + L7 | 1 |
-| 6 | CLI: names in `dm`/`channel add`, verified `init`/`ns`, evidence export, reachability | `jig-cli/src/cmd/{channel,dm,init,ns}.rs`, `jig-cli/src/config.rs` | L3; `jig trust accept-name` is L7 | 2, 5 |
+| 5 | Client resolver (F) and name pins (L7's slice 9) | `jig-client/src/naming.rs` (new, F); `jig-client/src/pins.rs` `names` map and `jig trust accept-name` plus expiry warning (L7's slice 9) | F + L7 | 1; L7's slice 9 also needs F1 slice 1 (`verify_rotation_chain`, the pin key) |
+| 6 | CLI: names in `dm`/`channel add`, verified `init`/`ns`, reachability | `jig-cli/src/cmd/{channel,dm,init,ns}.rs`, `jig-cli/src/config.rs` | L3 | 2, 5; L7's slices 6 and 9 |
 | 7 | End-to-end test against a lying nameserver | `integration-tests/tests/h13_verified_names.rs` (new) | F | 2, 4, 6 |
 | 8 | Spec pages and threat-register rows | `jig-spec/src/identity-and-reputation.md`, `threat-register.md` | F, in the implementation PR, after L1 has merged its banners | 7 |
 
@@ -283,16 +287,23 @@ Today's facts:
      and says so;
    - anything else: `ResolveError::PinMismatch { reason, old, new }`, where `reason` is one of
      `ReRegistered`, `OtherNameserver` or `NoRotationProof`.
-5. Append every attestation acted on to `~/.jig/evidence/names.jsonl` (rule 20).
+5. Hand every attestation and rotation chain acted on to L7's evidence writer
+   (`jig-client/src/evidence.rs`, `jig-evidence-v1`, L7's slice 6) as a name-evidence bundle
+   (rule 20). An equivocation, meaning two valid attestations with different DIDs, is written as
+   one bundle holding both. F1 keeps no separate evidence file.
 
 - [ ] **Step 1:** tests for each branch of step 4, using a stub nameserver and an in-memory pin
   store.
 - [ ] **Step 2:** a test that a `dns` delegation served over a self-signed certificate is
   refused.
-- [ ] **Step 3: Pin store.** L7 adds `names` to `PinFile` with
-  `check_name(key, did, attestation)`, using the same atomic write as server pins. F's resolver
-  calls it. Until L7's change lands, F's PR stubs the call behind a trait, so the two can merge in
-  either order.
+- [ ] **Step 3: Pin store.** This is L7's slice 9. It adds `names` to `PinFile`:
+  - keyed by `(alias, suffix, root, root_id)`;
+  - with `check_name(key, did, attestation, rotations)`, which calls
+    `jig_core::naming::verify_rotation_chain`;
+  - using the same atomic write as server pins.
+
+  F's resolver calls it. Until L7's slice 9 lands, F's PR stubs the call behind a trait, so the
+  two can merge in either order. L7's slice 9 needs F1's slice 1 merged first.
 - [ ] **Step 4:** commit `feat(client): verified name resolution against pinned bindings (OP-08)`.
 
 ---
@@ -316,12 +327,11 @@ Today's facts:
   - Optionally send a reachability record listing the server in `cli.toml`.
 - [ ] **Step 3: `jig ns resolve`.** Print `verified`, `pinned`, `rotated` or the exact refusal,
   never a bare DID.
-- [ ] **Step 4: `jig ns evidence`.** Print or export `~/.jig/evidence/names.jsonl`.
-- [ ] **Step 5: Expiry warning.** Warn when a pinned name's attestation expires within 14 days
-  (D11 item 11).
-- [ ] **Step 6: Tests.** `resolve_who` against a stub nameserver covers the new-pin, pinned,
+- [ ] **Step 4: Evidence and expiry.** No new commands. Name evidence is listed and exported by
+  L7's `jig trust evidence`, and the expiry warning is L7's slice 9.
+- [ ] **Step 5: Tests.** `resolve_who` against a stub nameserver covers the new-pin, pinned,
   rotated and mismatch cases. A test confirms `jig dm` with a mismatched name sends nothing.
-- [ ] **Step 7:** commit `feat(cli): verified, pinned names in dm and channel add`.
+- [ ] **Step 6:** commit `feat(cli): verified, pinned names in dm and channel add`.
 
 ---
 
@@ -338,7 +348,7 @@ Bob's client does:
 | Substitution after pin | The nameserver re-binds the alias to Mallory without a rotation | `PinMismatch(NoRotationProof)`; nothing sent |
 | Rotation | Alice rotates with both keys | Pin moves; Bob is told; the DM goes to the new DID |
 | Unauthorised signer | A second nameserver, not in the delegation, answers | Refused: signer not authoritative |
-| Equivocation | Two delegated nameservers answer different DIDs | Refused; both attestations in evidence |
+| Equivocation | Two delegated nameservers answer different DIDs | Refused; one evidence bundle holding both attestations (`jig trust evidence show`) |
 | Expired | Clock moved past `valid_until` | Refused; refetch attempted |
 | Server lies | Bob's server serves a forged attestation | Refused: the client verifies itself |
 
