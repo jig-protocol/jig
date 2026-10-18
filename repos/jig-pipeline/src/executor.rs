@@ -129,6 +129,9 @@ pub struct Rendered {
     /// Cross-server agreement rests on `render_hash` alone. See
     /// `docs/investigations/2026-08-11-fuel-portability.md`.
     pub fuel_used: u64,
+    /// The engine, configuration and fuel schedule `fuel_used` was measured
+    /// under. It is what makes the number comparable at all.
+    pub engine_identity: jig_runtime::EngineIdentity,
 }
 
 /// Holds the compiled canonical modules for the lifetime of a server.
@@ -248,6 +251,7 @@ impl BlockExecutor {
             output,
             module_id: self.text_render_module_id.clone(),
             fuel_used: result.fuel_used,
+            engine_identity: self.runtime.engine_identity().clone(),
         })
     }
 }

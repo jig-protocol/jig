@@ -174,13 +174,17 @@ impl Pins {
     }
 
     /// The handshake offer for `server`: the default offer, with the pinned
-    /// DID when there is one, so a welcome signed by another key fails closed.
+    /// DID when there is one, so a welcome signed by another key fails closed,
+    /// and the pinned suites, so a signed refusal that drops one is caught.
     pub fn offer(&self, server: &str) -> ClientOffer {
+        let pin = self.server(server);
         ClientOffer {
-            pinned_server_did: self
-                .server(server)
+            pinned_server_did: pin
                 .map(|p| p.server_did.clone())
                 .filter(|did| !did.is_empty()),
+            pinned_suites: pin
+                .map(|p| p.suites.iter().cloned().collect())
+                .unwrap_or_default(),
             ..ClientOffer::default()
         }
     }
@@ -540,6 +544,11 @@ mod tests {
         assert_eq!(
             pins.offer("http://host:7117").pinned_server_did.as_deref(),
             Some("did:jig:zA")
+        );
+        assert_eq!(
+            pins.offer(server).pinned_suites,
+            vec!["mls".to_string(), "none".to_string()],
+            "the offer carries the pinned suites, so a refusal cannot drop one"
         );
         let mut pins = pins;
         // Dropping `mls` is a downgrade.

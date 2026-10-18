@@ -1000,7 +1000,7 @@ async fn build_render_receipt(
         },
         "engine": {
             "name": "wasmtime",
-            "runtime_version": jig_runtime::RUNTIME_VERSION,
+            "identity": rendered.engine_identity,
             "fuel_used": rendered.fuel_used,
         },
         "produced_at": chrono::Utc::now().timestamp(),

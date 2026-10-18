@@ -12,10 +12,6 @@
 //! to `/api/v1/channels/<url-escaped slug>/archive`. Owner-only, and a
 //! soft delete: the server retires the channel and keeps its history.
 //!
-//! Servers that predate `/api/v1/channels*` only expose the same handlers
-//! under `/_admin_v0_0_2/*` (behind `[debug] admin_endpoints`), so a 404 on the
-//! stable path is retried once against the legacy one.
-//!
 //! `list` GETs `/api/v1/channels` and pretty-prints a column-aligned table.
 //!
 //! ## HLC
@@ -133,7 +129,6 @@ fn is_channel_exists(status: reqwest::StatusCode, body: &str) -> bool {
 }
 
 const CHANNEL_OPS_PREFIX: &str = "/api/v1/channels";
-const LEGACY_CHANNEL_OPS_PREFIX: &str = "/_admin_v0_0_2/channels";
 
 /// POST a signed channel-op block to `<base><prefix><suffix>`, where `suffix`
 /// is `""`, `/<slug>/members` or `/<slug>/archive`.
@@ -141,24 +136,13 @@ async fn post_channel_op(base: &str, suffix: &str, block: &BuiltBlock) -> Result
     let http = crate::cmd::trust::http(base, std::time::Duration::from_secs(15)).await?;
     let submission = submission_for(block);
 
-    let mut url = format!("{base}{CHANNEL_OPS_PREFIX}{suffix}");
-    let mut resp = http
+    let url = format!("{base}{CHANNEL_OPS_PREFIX}{suffix}");
+    let resp = http
         .post(&url)
         .json(&submission)
         .send()
         .await
         .with_context(|| format!("POST {url}"))?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND
-        || resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
-    {
-        url = format!("{base}{LEGACY_CHANNEL_OPS_PREFIX}{suffix}");
-        resp = http
-            .post(&url)
-            .json(&submission)
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?;
-    }
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
