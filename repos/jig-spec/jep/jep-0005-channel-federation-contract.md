@@ -146,6 +146,13 @@ Non-goals for v0.2:
        or not the old sequencer is reachable.
      - Carriers MUST refuse records from the previous sequencer once they hold the
        `sequencer-set`.
+     - **An owner's `sequencer-set` always wins over a server's own `sequencer-rekey`**
+       (lane I's server-key ceremony).
+       - A `sequencer-rekey` moves sequencing only to the rekeyed server's new DID, under a
+         public link signed by the old and new server keys.
+       - It is void from the first `sequencer-set` that follows it in the chain.
+       - A carrier holding both for overlapping positions follows the `sequencer-set`.
+       - So a thief with a leaked server key cannot keep a channel the owner has moved.
      - A member whose client merged a commit past the cited head rejoins by external
        commit.
      - A `sequencer-set` MAY carry owner-signed bot reinstalls (lane C's install format,

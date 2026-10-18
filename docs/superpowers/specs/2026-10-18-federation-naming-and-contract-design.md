@@ -682,6 +682,11 @@ F's caveats:
    This is the price of liveness. It is bounded because only the `owner` can trigger it.
 3. **Channel identity must not include the sequencer** (section 6), or every move would
    rename the channel.
+3a. **The owner's `sequencer-set` beats the server's `sequencer-rekey`** (L7, for lane I's
+   server-key ceremony). A server that rotates its key signs a `sequencer-rekey` in each
+   channel it sequences, moving sequencing to its own new DID under a public link. An
+   owner's `sequencer-set` overrides it. Otherwise a thief with a leaked server key could
+   rekey channels the owner never agreed to.
 4. **Bots move in the same action (lane C's question; F's answer: one action).**
    - `sequencer-set` carries the bot reinstalls: for each bot, the owner-signed install
      lane C defines, with a new bot DID and `inherits_state_from`.
