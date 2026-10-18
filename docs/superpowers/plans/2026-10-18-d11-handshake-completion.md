@@ -30,7 +30,7 @@ server and the client together, so `main` never holds one side without the other
 | 6 | Evidence and sticky refusals | 1, 4b | new `jig-client/src/evidence.rs` (including a name-evidence bundle kind lane F's resolver hands over), `jig-client/src/pins.rs`, `jig-cli/src/cmd/trust.rs` (`jig trust evidence`, `jig trust accept`) |
 | 7 | Manifest log | 4 | server bootstrap of the reserved channel, `server-manifest` kind, welcome `manifest`, client check, `jig trust show` |
 | 8 | Mutual server-to-server handshake with channel binding | 0, 1 | `jig-pipeline/src/handshake.rs` (`peer_proof`, transcript hash), `jig-client/src/connection.rs` (exporter from `MaybeTlsStream`), `jig-server/src/v0_0_2_ws.rs`, `jig-server/src/v0_0_2_federation.rs` |
-| 9 | Name pinning | F1 slice 1 (#147, `jig_core::naming`) | `jig-client/src/pins.rs` (`names`), `jig-cli/src/cmd/trust.rs` (`accept-name`, expiry warning); resolution call sites belong to F/L6 |
+| 9 | Name pinning | F1 slice 1 (#147, `jig_core::naming`), F's `AliasLink` (#144) | `jig-client/src/pins.rs` (`names`), `jig-cli/src/cmd/trust.rs` (`accept-name`, expiry warning); resolution call sites belong to F/L6 |
 | 10 | `sequencer-set` and handover | 4, 7, F's contract | `jig-pipeline` (kind, expected-sequencer rule), `jig-client` chain checks |
 
 Slices 2 and 3 do not depend on 1. Slice 9 waits on lane F's naming slice. 4a is the
@@ -123,7 +123,8 @@ checks).
 ### 6. Evidence and sticky refusals
 
 - `jig-evidence-v1` writer, with a name-evidence kind for lane F's resolver
-  (attestations and rotation chains; an equivocation is one bundle); the pin store
+  (attestations and rotation chains; an equivocation is one bundle), and a link-fork
+  kind for lane I (two dual-signed links out of one DID); the pin store
   records a sticky refusal per server with the bundle path.
 - `jig trust evidence list|show|export|import`, `jig trust accept <server>`.
 - Tests: each class 3 path writes a bundle that verifies offline; timeouts and
@@ -141,6 +142,9 @@ checks).
 
 - `hello.peer_did`, `welcome.server_nonce` and `welcome.tls_exporter` (signed),
   `peer_proof` under `jig-handshake-peer-v1` over the transcript hash.
+- Lane I: during a rotation's overlap the welcome carries the server's public link
+  (old DID → new DID, dual-signed); a client with the old DID pinned moves the pin
+  and `expected_did` only through that link (the check itself is slice 9's).
 - The dialed server requires `peer_proof` when `peer_did` is set, closing 4001
   otherwise; the connection is then symmetric, with authorization left to F's rules.
 - Client: exporter from the rustls connection inside `MaybeTlsStream`; an empty
@@ -151,10 +155,14 @@ checks).
 ### 9. Name pinning
 
 - `names` map in the pin store, keyed `(alias, suffix, root, root_id)` (JEP-0004 rule
-  6); `check_name` takes the rotation chain and calls
-  `jig_core::naming::verify_rotation_chain` (F1 slice 1, #147). A change moves only with
-  a rotation signed by the old key; otherwise refused with the reason and both
-  fingerprints. Not marked ready before #147 merges.
+  6); `check_name` takes a chain of lane I links through F's `AliasLink` trait and
+  calls `jig_core::naming::verify_rotation_chain` (#147, #144). A change moves only
+  along a chain that verifies from the pinned DID; otherwise refused with the reason
+  and both fingerprints. No rotation is followed automatically until lane I's I3: until
+  then every DID change behind a name needs `jig trust accept-name`. Not marked ready
+  before #147 merges.
+- Server pins and `expected_did` follow the server's public link the same way
+  (slice 8 delivers it).
 - `jig trust accept-name <name>`; a warning before an attestation expires.
 - Resolution itself is F's and L6's; this slice provides the check they call.
 
@@ -163,6 +171,8 @@ checks).
 - The kind (owner-only), its record signed by the new sequencer at cited head + 1, and
   the expected-sequencer rule in client checks; carriers refuse the old sequencer's
   later records.
+- Lane I's `sequencer-rekey` (the sequencer moves to its own rotated DID) is checked
+  here too; an owner's `sequencer-set` takes precedence over it.
 - Lands with or after F's contract build.
 
 ## Done
