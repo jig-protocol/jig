@@ -75,6 +75,24 @@ pub fn module_id() -> String {
     format!("{MODULE_NAME}@{MODULE_VERSION}/blake3:{}", module_hash())
 }
 
+/// The same block as a `jig:block/renderer@0.1.0` component (JEP-0006), built by
+/// `build-artifact.sh` from this crate with `--features component`. It renders exactly what
+/// [`CANONICAL_WASM`] renders; it replaces it once the server and client run components.
+#[cfg(not(target_arch = "wasm32"))]
+pub const CANONICAL_COMPONENT: &[u8] = include_bytes!("../artifacts/text_block.component.wasm");
+
+/// Media type of the component's output body: the postcard-encoded [`crate::Output`].
+pub const COMPONENT_OUTPUT_MEDIA_TYPE: &str = "application/x.jig-text-render+postcard";
+
+/// `text-block@<version>/blake3:<hash>` for [`CANONICAL_COMPONENT`].
+#[cfg(not(target_arch = "wasm32"))]
+pub fn component_id() -> String {
+    format!(
+        "{MODULE_NAME}@{MODULE_VERSION}/blake3:{}",
+        blake3::hash(CANONICAL_COMPONENT).to_hex()
+    )
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;

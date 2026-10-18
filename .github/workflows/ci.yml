@@ -237,6 +237,12 @@ jobs:
       - name: Committed artifact behaves correctly
         working-directory: repos
         run: cargo test -p jig-runtime --test text_block_payload
+      # The same check for the jig:block/renderer component (JEP-0006): it passes jig-core's
+      # component validator, agrees with `execute_pure`, and keeps the module's render_hash.
+      # build-artifact.sh rebuilds it too, so it is exercised here first for the same reason.
+      - name: Committed component behaves correctly
+        working-directory: repos
+        run: cargo test -p jig-runtime --test text_block_component
       - name: Rebuild the canonical artifact (enforces structural invariants)
         working-directory: repos
         run: ./text-block/build-artifact.sh
@@ -245,6 +251,11 @@ jobs:
         env:
           JIG_TEXT_BLOCK_WASM: target/wasm32-unknown-unknown/release/text_block.wasm
         run: cargo test -p jig-runtime --test text_block_payload
+      - name: Fresh component behaves identically
+        working-directory: repos
+        env:
+          JIG_TEXT_BLOCK_COMPONENT: target/wasm32-unknown-unknown/release/text_block.component.wasm
+        run: cargo test -p jig-runtime --test text_block_component
 
   # Renamed from `license-compliance`: bare `cargo deny check` runs ALL FOUR
   # checks (advisories, bans, licenses, sources). The old name once sent a
