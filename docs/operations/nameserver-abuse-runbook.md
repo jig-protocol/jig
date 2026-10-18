@@ -1,5 +1,21 @@
 # Nameserver abuse runbook
 
+> **Superseded.** This runbook described the nameserver's legacy prototype. #154 removed the
+> routes most steps below call: `/v1/admin/*`,
+> `/v1/policy`, `/v1/tribunal/*`, `/v1/reputation/*`, `/v1/work/*`, `/v1/hosts/*`,
+> `/v1/resolve?name=`, `/v1/federation/*`, and the proof-of-work challenges for `/v1/claim`
+> and `/v1/alias`. The `JIG_NS_POW_*`, `JIG_NS_PENALTY_*`, `JIG_NS_ANON_*` and
+> `JIG_NS_RATE_*` settings no longer affect any served route. What still applies:
+> - Section 1: steps 1, 2, 5 and 6.
+> - Section 2: step 5 (rate-limit `/v1/register`, `/v1/rotate` and `/v1/renew` at the reverse
+>   proxy).
+> - Section 3, "Compromised nameserver": steps 1 to 3 and 5 to 7. Step 4's attestation-key
+>   rotation also still applies.
+> - Section 4: steps 5 and 6.
+>
+> A new runbook follows lane R's redesign (framing doc #152; draft JEP-0008, JEP-0009 and
+> JEP-0010 in #162, #163 and #166).
+
 What a `jig-nameserver` operator does about harassment reports, registration and relay
 abuse, a compromised nameserver, and a rogue federated instance. Parameters and endpoints
 are the reference implementation's. Settings and defaults are listed in the

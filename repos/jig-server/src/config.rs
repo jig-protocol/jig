@@ -13,21 +13,6 @@ pub struct ServerConfig {
     pub port: u16,
     #[serde(default = "default_host_id")]
     pub host_id: String,
-    /// Opt-in escape hatch for the legacy v0.0.1 `POST /blocks` + `/receipts`
-    /// routes. Those routes take an attacker-chosen author DID with no
-    /// signature anywhere in the request, execute the supplied Wasm, and sign a
-    /// receipt attesting to it.
-    ///
-    /// Enforced in [`crate::handler::build_router`]: when `false` (the
-    /// default) those four routes are not mounted at all and return 404.
-    /// `/.well-known/jig` is deliberately outside the gate — peers need it to
-    /// detect a misconfigured neighbour.
-    ///
-    /// Must stay ahead of the `[execution]` / `[tls]` tables: `write_template`
-    /// serializes this struct in declaration order, and TOML forbids a bare
-    /// value after a table.
-    #[serde(default)]
-    pub dangerously_enable_v0_0_1_rest: bool,
     /// The origin to advertise at `/.well-known/jig`, e.g.
     /// `https://jig-vps.example.ts.net:7117`.
     ///
@@ -38,8 +23,9 @@ pub struct ServerConfig {
     /// that follows the advertisement gets a certificate-name mismatch rather
     /// than a useful error. Set this to whatever name the cert actually covers.
     ///
-    /// Must stay ahead of the `[execution]` / `[tls]` tables — see the note on
-    /// `dangerously_enable_v0_0_1_rest`.
+    /// Must stay ahead of the `[execution]` / `[tls]` tables: `write_template`
+    /// serializes this struct in declaration order, and TOML forbids a bare
+    /// value after a table.
     #[serde(default)]
     pub public_url: Option<String>,
     #[serde(default)]
@@ -155,7 +141,6 @@ impl Default for ServerConfig {
             bind_address: "127.0.0.1".into(),
             port: 7117,
             host_id: default_host_id(),
-            dangerously_enable_v0_0_1_rest: false,
             public_url: None,
             execution: ExecutionSection::default(),
             tls: TlsConfig::default(),
@@ -414,9 +399,6 @@ replay_per_did = {replay_per_did}
 max_tracked = {max_tracked}
 
 [debug]
-# Channel ops live on /api/v1/channels and are always mounted. This flag only
-# adds the legacy /_admin_v0_0_2/* aliases that pre-v0.1 `jig` CLIs POST to.
-admin_endpoints = {admin_endpoints}
 # Handle enumeration stays off — it dumps the registry to any caller.
 list_handles = {list_handles}
 "#,
@@ -434,7 +416,6 @@ list_handles = {list_handles}
         kinds = kinds,
         cache_ttl = defaults.identity.cache_ttl_seconds,
         unknown_handles = defaults.identity.naively_allow_unknown_handles_fallback,
-        admin_endpoints = defaults.debug.admin_endpoints,
         list_handles = defaults.debug.list_handles,
     )
 }
@@ -529,33 +510,6 @@ mod tests {
     }
 
     #[test]
-    fn dangerously_enable_v0_0_1_rest_defaults_false() {
-        assert!(!ServerConfig::default().dangerously_enable_v0_0_1_rest);
-
-        // Existing operator configs predate the key, so omitting it must still
-        // parse — and must land on the safe (disabled) side.
-        let toml_str = r#"
-            database_path = "/tmp/x.db"
-            bind_address = "127.0.0.1"
-            port = 7117
-        "#;
-        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
-        assert!(!cfg.dangerously_enable_v0_0_1_rest);
-    }
-
-    #[test]
-    fn dangerously_enable_v0_0_1_rest_parses_true() {
-        let toml_str = r#"
-            database_path = "/tmp/x.db"
-            bind_address = "127.0.0.1"
-            port = 7117
-            dangerously_enable_v0_0_1_rest = true
-        "#;
-        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
-        assert!(cfg.dangerously_enable_v0_0_1_rest);
-    }
-
-    #[test]
     fn a_cert_without_its_key_is_an_error() {
         let toml_str = r#"
             database_path = "/tmp/x.db"
@@ -629,12 +583,11 @@ connection_string = "{db}"
         // Half 1: the socket-opening half.
         let server = ServerConfig::load(&path).unwrap();
 
-        // Half 2: the v0.0.2 half. Channel ops are not debug-gated, so the
-        // template must not need (or switch on) the debug flag.
+        // Half 2: the v0.0.2 half. It must not switch on any debug option.
         let v002 = JigServerConfig::load(&path).unwrap();
         assert!(
-            !v002.debug.admin_endpoints,
-            "template must not enable the legacy admin aliases"
+            !v002.debug.list_handles,
+            "template must not enable handle enumeration"
         );
         assert_eq!(
             v002.server.listen,
@@ -708,13 +661,9 @@ connection_string = "{db}"
 
         let v002: JigServerConfig = toml::from_str(&rendered).unwrap();
         assert!(
-            !v002.debug.admin_endpoints,
-            "install.sh's default path must not depend on a [debug] flag"
-        );
-        assert!(
             v002.unsafe_options_active()
                 .iter()
-                .all(|o| o != "debug.admin_endpoints"),
+                .all(|o| !o.starts_with("debug.")),
             "install.sh must not advertise debug options"
         );
         assert_eq!(v002.server.listen, "127.0.0.1:7117");
