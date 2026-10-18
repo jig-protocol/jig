@@ -621,7 +621,10 @@ fn wasm_fuel_counters(fuel_used: u64) -> jig_core::receipt::Counters {
 /// Execution context for a single WASM module run
 ///
 /// Contains all parameters, limits, and capabilities for one execution.
+// Non-exhaustive so other crates build it through `Default` and the `with_*`
+// builders, as they always have: lane A's component path adds fields here.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ExecutionContext {
     /// Block package (module + metadata)
     pub block: BlockPackage,
