@@ -88,7 +88,6 @@ jobs:
             rustup toolchain install stable --profile minimal
             rustup default stable
           fi
-          rustup target add wasm32-wasip1
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: repos
@@ -97,7 +96,6 @@ jobs:
         working-directory: repos
         run: |
           cargo build --release --locked -p jig-server -p jig-cli -p jig-nameserver
-          cargo build --release --locked --target wasm32-wasip1 -p text-block
       - name: Package, checksum, sign with a throwaway key, serve
         id: mirror
         shell: bash

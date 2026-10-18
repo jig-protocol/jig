@@ -4,8 +4,10 @@
 # Stages the release layout install.sh expects and writes <out-dir>/<name>.tar.gz:
 #
 #   <name>/bin/{jig,jig-server,jig-nameserver}
-#   <name>/blocks/text_block.wasm
 #   <name>/{install.sh,README.md,LICENSE*}
+#
+# No text-block module: jig-server embeds the canonical, CI-verified artifact
+# (repos/text-block/artifacts/text_block.wasm) and executes only that.
 #
 # Binaries are read from <target-dir>/<rust-target>/release (default target dir:
 # repos/target). Used by .github/workflows/release.yml and install-smoke.yml.
@@ -22,14 +24,12 @@ cd "$root"
 bin_dir="$target_dir/$target/release"
 # A host build without --target lands in <target-dir>/release.
 [ -d "$bin_dir" ] || bin_dir="$target_dir/release"
-wasm="$target_dir/wasm32-wasip1/release/text_block.wasm"
 stage="$(mktemp -d)/$name"
-mkdir -p "$stage/bin" "$stage/blocks" "$out"
+mkdir -p "$stage/bin" "$out"
 
 for b in jig jig-server jig-nameserver; do
   install -m 0755 "$bin_dir/$b" "$stage/bin/$b"
 done
-install -m 0644 "$wasm" "$stage/blocks/text_block.wasm"
 cp install.sh README.md "$stage/"
 cp LICENSE* "$stage/" 2>/dev/null || true
 
