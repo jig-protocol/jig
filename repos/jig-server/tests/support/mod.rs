@@ -27,7 +27,7 @@ use jig_core::did::Did;
 use jig_server::auth::authenticate::headers;
 use jig_server::runtime::ExecutionConfig;
 use jig_server::v0_0_2::AppState;
-use jig_server::v0_0_2_admin::build_admin_router;
+use jig_server::v0_0_2_admin::build_channel_ops_router;
 use jig_server::v0_0_2_blocks::build_blocks_router;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -303,7 +303,7 @@ impl TestServer {
             meta["visibility"] = visibility.into();
             build_with_metadata(&me, jig_core::BlockKind::ChannelCreate, hlc, meta)
         };
-        let (status, body) = self.post_admin("/_admin_v0_0_2/channels", &block).await;
+        let (status, body) = self.post_admin("/api/v1/channels", &block).await;
         assert_eq!(status, StatusCode::OK, "channel-create failed: {body}");
     }
 
@@ -335,7 +335,7 @@ impl TestServer {
         let owner = owner.as_client();
         let block =
             build_channel_archive(&owner, slug, HlcTimestamp::now_wall(owner.did().clone()));
-        let path = format!("/_admin_v0_0_2/channels/{}/archive", encode_slug(slug));
+        let path = format!("/api/v1/channels/{}/archive", encode_slug(slug));
         let (status, body) = self.post_admin(&path, &block).await;
         assert_eq!(status, StatusCode::OK, "channel-archive failed: {body}");
     }
@@ -347,7 +347,7 @@ impl TestServer {
         slug: &str,
         block: &BuiltBlock,
     ) -> (StatusCode, serde_json::Value) {
-        let path = format!("/_admin_v0_0_2/channels/{}/archive", encode_slug(slug));
+        let path = format!("/api/v1/channels/{}/archive", encode_slug(slug));
         self.post_admin(&path, block).await
     }
 
@@ -369,7 +369,7 @@ impl TestServer {
         member: &Identity,
     ) -> (StatusCode, serde_json::Value) {
         let block = self.member_add_block(by, slug, member);
-        let path = format!("/_admin_v0_0_2/channels/{}/members", encode_slug(slug));
+        let path = format!("/api/v1/channels/{}/members", encode_slug(slug));
         let (status, body) = self.post_admin(&path, &block).await;
         self.settle_member_add(by, slug, member, &block, status == StatusCode::OK);
         (status, body)
@@ -485,7 +485,7 @@ impl TestServer {
             .header("Content-Type", "application/json")
             .body(Body::from(serde_json::to_vec(&submission(block)).unwrap()))
             .unwrap();
-        let router = build_admin_router(self.state.clone());
+        let router = build_channel_ops_router(self.state.clone());
         let resp = router.oneshot(http).await.expect("admin router responds");
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)

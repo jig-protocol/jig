@@ -41,8 +41,19 @@ use crate::envelope::{ENVELOPE_VERSION, Envelope, EnvelopeGateError, EnvelopePar
 /// How long a peer waits for the welcome before treating it as missing.
 pub const WELCOME_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The label for the TLS exporter value the handshake signs (JEP-0002 rule 2,
+/// RFC 9266 channel binding). Both ends export 32 bytes under it, with no
+/// context, so a signed handshake cannot be relayed into another TLS session.
+pub const TLS_EXPORTER_LABEL: &[u8] = b"EXPORTER-jig-handshake";
+
+/// Length of the exported value.
+pub const TLS_EXPORTER_LEN: usize = 32;
+
 const DOMAIN: &[u8] = b"jig-handshake-welcome-v1";
-const REFUSAL_DOMAIN: &[u8] = b"jig-handshake-refusal-v1";
+/// The format a refusal is signed in, named on the frame and in the signed
+/// bytes. A refusal in any other format is refused by name.
+pub const REFUSAL_FORMAT: &str = "jig-handshake-refusal-v1";
+const REFUSAL_DOMAIN: &[u8] = REFUSAL_FORMAT.as_bytes();
 
 /// WebSocket close codes, one per failure class (JEP-0002 rule 7).
 pub mod close {
@@ -63,16 +74,44 @@ pub mod close {
 /// [`close::PROTOCOL_VIOLATION`] for anything but a missing `hello`.
 pub const PROTOCOL_VIOLATION_CODE: &str = "PROTOCOL_VIOLATION";
 
+/// The protocol's bounds on how far ahead of the server's clock a block's
+/// `hlc_ts` may run (JEP-0002 rule 13). A server picks a value in this range
+/// and signs it in its welcome; a client refuses a welcome outside it.
+pub const MIN_FUTURE_SKEW_MS: u64 = 30_000;
+/// See [`MIN_FUTURE_SKEW_MS`]. A ceiling, so no server can advertise an
+/// unbounded clock under another name.
+pub const MAX_FUTURE_SKEW_MS: u64 = 900_000;
+/// The bound a server uses unless configured otherwise: five minutes.
+pub const DEFAULT_FUTURE_SKEW_MS: u64 = 300_000;
+
 /// What a server is willing to do, taken from configuration it already has.
 ///
 /// `block_kinds` is the server's allow-list. `execution` is whether a Wasm
 /// executor is installed. `federation` is whether this process speaks the
-/// federation relay. v0.1 has no rate-limit object to advertise.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// federation relay. `max_future_skew_ms` is how far ahead of the server's
+/// clock a block may claim to be; ingest refuses anything further.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
     pub block_kinds: Vec<String>,
     pub execution: bool,
     pub federation: bool,
+    #[serde(default = "default_future_skew_ms")]
+    pub max_future_skew_ms: u64,
+}
+
+fn default_future_skew_ms() -> u64 {
+    DEFAULT_FUTURE_SKEW_MS
+}
+
+impl Default for Capabilities {
+    fn default() -> Self {
+        Self {
+            block_kinds: Vec::new(),
+            execution: false,
+            federation: false,
+            max_future_skew_ms: DEFAULT_FUTURE_SKEW_MS,
+        }
+    }
 }
 
 impl Capabilities {
@@ -81,6 +120,7 @@ impl Capabilities {
         push(&mut out, &canonical_list(&self.block_kinds));
         push(&mut out, &[u8::from(self.execution)]);
         push(&mut out, &[u8::from(self.federation)]);
+        push(&mut out, &self.max_future_skew_ms.to_le_bytes());
         out
     }
 }
@@ -465,6 +505,7 @@ pub fn seal_refusal(key: &SigningKey, refusal: &HelloRefusal, nonce: &str) -> En
     };
     let sig = STANDARD.encode(key.sign(&statement.canonical_bytes()).to_bytes());
     Envelope::new(Frame::Refusal {
+        format: REFUSAL_FORMAT.to_string(),
         server_did: statement.server_did,
         code: statement.code,
         message: statement.message,
@@ -493,6 +534,7 @@ fn interpret_refusal(
     offer: &ClientOffer,
 ) -> HandshakeResult {
     let Frame::Refusal {
+        format,
         server_did,
         code,
         message,
@@ -508,6 +550,11 @@ fn interpret_refusal(
         reason,
         evidence: Some(text.to_string()),
     };
+    if format != REFUSAL_FORMAT {
+        return fail(format!(
+            "refusal is signed in format `{format}`, which this client does not verify"
+        ));
+    }
     if echoed != nonce {
         return fail("refusal nonce does not match".to_string());
     }
@@ -612,6 +659,16 @@ fn interpret_envelope(
     if let Some(why) = outside_offer(&statement, offer) {
         return HandshakeResult::FailClosed {
             reason: why.to_string(),
+            evidence: Some(text.to_string()),
+        };
+    }
+    let skew = statement.capabilities.max_future_skew_ms;
+    if !(MIN_FUTURE_SKEW_MS..=MAX_FUTURE_SKEW_MS).contains(&skew) {
+        return HandshakeResult::FailClosed {
+            reason: format!(
+                "welcome advertises a clock-skew bound of {skew} ms, outside the protocol's \
+                 {MIN_FUTURE_SKEW_MS}–{MAX_FUTURE_SKEW_MS} ms"
+            ),
             evidence: Some(text.to_string()),
         };
     }
@@ -723,6 +780,7 @@ mod tests {
                 block_kinds: vec!["text-render".to_string()],
                 execution: true,
                 federation: false,
+                ..Capabilities::default()
             },
         }
     }
@@ -783,6 +841,8 @@ mod tests {
         changed_suites.suites = vec!["mls".to_string()];
         let mut changed_caps = base.clone();
         changed_caps.capabilities.execution = false;
+        let mut changed_skew = base.clone();
+        changed_skew.capabilities.max_future_skew_ms += 1;
         let mut changed_rep = base.clone();
         changed_rep.reputation = Reputation {
             canonical: "{\"tier\":1}".to_string(),
@@ -797,6 +857,7 @@ mod tests {
             ("frame_suite", changed_suite.canonical_bytes()),
             ("suites", changed_suites.canonical_bytes()),
             ("capabilities", changed_caps.canonical_bytes()),
+            ("max_future_skew_ms", changed_skew.canonical_bytes()),
             ("reputation", changed_rep.canonical_bytes()),
             ("nonce", changed_nonce.canonical_bytes()),
             ("v", changed_v.canonical_bytes()),
@@ -958,6 +1019,15 @@ mod tests {
             HandshakeResult::FailClosed { reason, .. } if reason.contains("signature")
         ));
 
+        let mut renamed = refusal_for(&pending, &key);
+        if let Frame::Refusal { format, .. } = &mut renamed.frame {
+            *format = "jig-handshake-refusal-cose-v1".to_string();
+        }
+        assert!(matches!(
+            pending.interpret(&serde_json::to_string(&renamed).unwrap()),
+            HandshakeResult::FailClosed { reason, .. } if reason.contains("format")
+        ));
+
         let (_other, stale) = begin(&ClientOffer::default());
         let replayed = serde_json::to_string(&refusal_for(&stale, &key)).unwrap();
         assert!(matches!(
@@ -1074,6 +1144,27 @@ mod tests {
                 assert!(reason.contains("pinned"), "{reason}");
             }
             other => panic!("expected pin mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_skew_bound_outside_the_protocol_range_fails_closed() {
+        let key = generate_signing_key();
+        for skew in [0, MIN_FUTURE_SKEW_MS - 1, MAX_FUTURE_SKEW_MS + 1, u64::MAX] {
+            let (hello, pending) = begin(&ClientOffer::default());
+            let Frame::Hello { nonce, .. } = hello.frame else {
+                panic!("hello");
+            };
+            let mut statement = negotiate(&hello_view(&nonce), &offer_server()).unwrap();
+            statement.capabilities.max_future_skew_ms = skew;
+            let text = serde_json::to_string(&seal(&key, statement)).unwrap();
+            assert!(
+                matches!(
+                    pending.interpret(&text),
+                    HandshakeResult::FailClosed { reason, .. } if reason.contains("skew")
+                ),
+                "{skew}"
+            );
         }
     }
 

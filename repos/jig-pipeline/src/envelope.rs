@@ -179,6 +179,10 @@ pub enum Frame {
     /// Signed so that a server refusing a suite it once advertised has
     /// signed its own downgrade.
     Refusal {
+        /// How `sig` is made: [`crate::handshake::REFUSAL_FORMAT`]. A
+        /// verifier refuses any other format by this name, so a later
+        /// encoding is told apart from a damaged frame.
+        format: String,
         server_did: String,
         /// `UNSUPPORTED_VERSION` or `UNSUPPORTED_SUITE`.
         code: String,
