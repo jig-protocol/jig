@@ -110,15 +110,16 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
    owner's `seq` and `prev`. Nobody else can sign one. Its payload names: `block` (the bot's
    program CID, JEP-0011), `channel` (a `channel-id`), `grant`, `bot_did`, `bot_key`, `triggers`
    (what invokes the bot), and optionally `inherits_state_from` (an earlier install).
-2. The hosting server approves it with a separate **`host-approval`** (JEP-0011, the same object
-   it issues for a `channel-policy`): a COSE_Sign1 of `{domain: "jig-host-approval-v1", server,
-   channel, object, kind: "block-install", restrictions, custodian}`. `object` is the install's
-   CID; `restrictions` is the CID of the operator policy (§2.1) the server checked it against;
-   `custodian` is required for an install and names `bot_did`, stating that the server holds
-   `bot_key` (SC-04). A `host-approval` whose `custodian` is not the install's `bot_did` is invalid.
+2. The hosting server approves it with a separate **`policy-approval`** (JEP-0011, the same object
+   it issues for a `channel-policy`): a COSE_Sign1 of `{domain: "jig-policy-approval-v1", server,
+   channel, object_cid, restrictions_cid, bot_did}`.
+   - `object_cid` is the install's CID. `restrictions_cid` names the operator policy (§2.1) and
+     the server's restrictions the install was checked against (JEP-0011 §5.3.3).
+   - `bot_did` MUST be present in an approval of a `block-install` and absent otherwise. It states
+     that the server holds the private key for `bot_did` (SC-04). A verifier MUST check that it
+     equals the install's `bot_did`, and treat the approval as invalid if not.
    - The **current** approval is read from the channel's `ingest` chain: the latest
-     `host-approval` or `host-withdrawal` (`{…, kind, reason, conflicts}`) for that install CID, in
-     ingest order, wins, and a withdrawal stands until a newer approval. The approval carries no `seq` or `prev` of its own.
+     `policy-approval` or `policy-withdrawn` for that install CID, in ingest order, wins, and a withdrawal stands until a newer approval. The approval carries no `seq` or `prev` of its own.
    - The server MUST withdraw the approval of an install that no longer passes its restrictions.
      Withdrawal and re-approval need nothing from the owner.
    - A host MUST NOT invoke a bot whose install has no current approval, and a client MUST treat
@@ -222,7 +223,7 @@ When the owner moves a channel's sequencer with `sequencer-set` *(F)*:
 
 1. The new sequencer names freshly minted bot DIDs in its `contract-accept`, and `sequencer-set`
    carries an owner-proposed reinstall for each bot that continues, with `inherits_state_from`.
-   The new home server issues fresh `host-approval`s for the live `block-install`s and the
+   The new home server issues fresh `policy-approval`s for the live `block-install`s and the
    channel's `channel-policy` (JEP-0005 rule 11b). An approval by the old home server does not
    carry over; until the new one approves, the install is absent (§4.2).
 2. The new sequencer takes the state whose CID is the last `state_after` at or before the handover
