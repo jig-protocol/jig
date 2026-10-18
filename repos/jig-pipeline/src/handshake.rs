@@ -42,7 +42,10 @@ use crate::envelope::{ENVELOPE_VERSION, Envelope, EnvelopeGateError, EnvelopePar
 pub const WELCOME_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 const DOMAIN: &[u8] = b"jig-handshake-welcome-v1";
-const REFUSAL_DOMAIN: &[u8] = b"jig-handshake-refusal-v1";
+/// The format a refusal is signed in, named on the frame and in the signed
+/// bytes. A refusal in any other format is refused by name.
+pub const REFUSAL_FORMAT: &str = "jig-handshake-refusal-v1";
+const REFUSAL_DOMAIN: &[u8] = REFUSAL_FORMAT.as_bytes();
 
 /// WebSocket close codes, one per failure class (JEP-0002 rule 7).
 pub mod close {
@@ -465,6 +468,7 @@ pub fn seal_refusal(key: &SigningKey, refusal: &HelloRefusal, nonce: &str) -> En
     };
     let sig = STANDARD.encode(key.sign(&statement.canonical_bytes()).to_bytes());
     Envelope::new(Frame::Refusal {
+        format: REFUSAL_FORMAT.to_string(),
         server_did: statement.server_did,
         code: statement.code,
         message: statement.message,
@@ -493,6 +497,7 @@ fn interpret_refusal(
     offer: &ClientOffer,
 ) -> HandshakeResult {
     let Frame::Refusal {
+        format,
         server_did,
         code,
         message,
@@ -508,6 +513,11 @@ fn interpret_refusal(
         reason,
         evidence: Some(text.to_string()),
     };
+    if format != REFUSAL_FORMAT {
+        return fail(format!(
+            "refusal is signed in format `{format}`, which this client does not verify"
+        ));
+    }
     if echoed != nonce {
         return fail("refusal nonce does not match".to_string());
     }
@@ -956,6 +966,15 @@ mod tests {
         assert!(matches!(
             pending.interpret(&serde_json::to_string(&tampered).unwrap()),
             HandshakeResult::FailClosed { reason, .. } if reason.contains("signature")
+        ));
+
+        let mut renamed = refusal_for(&pending, &key);
+        if let Frame::Refusal { format, .. } = &mut renamed.frame {
+            *format = "jig-handshake-refusal-cose-v1".to_string();
+        }
+        assert!(matches!(
+            pending.interpret(&serde_json::to_string(&renamed).unwrap()),
+            HandshakeResult::FailClosed { reason, .. } if reason.contains("format")
         ));
 
         let (_other, stale) = begin(&ClientOffer::default());
