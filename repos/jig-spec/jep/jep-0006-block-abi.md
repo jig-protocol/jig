@@ -72,10 +72,12 @@ current sketch.
 A host MUST refuse, before execution, a component that fails any of the following:
 
 1. Validation with exactly the WebAssembly 2.0 features minus SIMD, plus the component model
-   without its async, threading or error-context extensions.
-2. For every core module: no scalar float instruction, and declared maxima for every memory and
+   without its async, threading or error-context extensions. No nested component may contain a
+   core module.
+2. For every core module, at any depth: no scalar float instruction, and declared maxima for every memory and
    table, within the manifest's limits.
-3. Imports: for `renderer`, at most `jig:host/compose`. For `bot`, only `jig:host/*` interfaces that its manifest
+3. Imports: `jig:block/types` (types only) is always allowed. Beyond it, a `renderer` may import
+   at most `jig:host/compose`, and a `bot` only `jig:host/*` interfaces that its manifest
    capabilities grant, at a version the host links. No `wasi:*` import.
 4. Exports: exactly the interface of the world its manifest declares.
 
