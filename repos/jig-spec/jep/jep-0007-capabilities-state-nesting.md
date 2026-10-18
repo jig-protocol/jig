@@ -113,7 +113,8 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 2. The hosting server approves it with a separate **`host-approval`** (JEP-0011, the same object
    it issues for a `channel-policy`): a COSE_Sign1 of `{domain: "jig-host-approval-v1", server,
    channel, object, kind: "block-install", restrictions, custodian}`. `object` is the install's
-   CID; `restrictions` is the CID of the operator policy (§2.1) the server checked it against;
+   CID; `restrictions` names the `server-restrictions` (JEP-0011 §5.3) whose `run` and `deny`
+   lists the server checked it against;
    `custodian` is required for an install and names `bot_did`, stating that the server holds
    `bot_key` (SC-04). A `host-approval` whose `custodian` is not the install's `bot_did` is invalid.
    - The **current** approval is read from the channel's `ingest` chain: the latest
