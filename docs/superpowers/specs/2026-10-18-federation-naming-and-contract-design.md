@@ -503,7 +503,7 @@ None of these is a home server.
 **The problem (DJ).** Clients have no permanent presence, so someone has to hold Alice's
 key packages and hand them out while she is offline. Alice still controls who gets them.
 
-**Proposed: custodians under an Alice-signed release policy.**
+**Decided (DJ, 2026-10-18): custodians under an Alice-signed release policy.**
 1. **Custody.** Alice's client uploads a stock of key packages, plus one last-resort
    package, to one or more **custodians**. A custodian is any server or nameserver she
    names in her reachability record (4.7). A nameserver can take custody as part of
@@ -532,7 +532,7 @@ key packages and hand them out while she is offline. Alice still controls who ge
    decryption. A release outside the policy is provable: the custodian logs it, and the
    request is signed by its requester and checkable against Alice's signed policy.
 
-**Recommended default policy:** automatic release to Alice's contacts; everyone else held
+**Default policy (decided):** automatic release to Alice's contacts; everyone else held
 for approval. That is privacy-first and spam-resistant, and it costs latency on first
 contact from strangers. Rejected: always asking Alice, which breaks asynchronous adds;
 and releasing to anyone by default, which invites spam and drains the stock.
@@ -800,8 +800,8 @@ Updated in the implementation PRs, not here.
 3. ~~Name-pin changes (4.4)~~ **Decided:** B; UX mitigates, never weakens the check.
 4. ~~Reachability records (4.7)~~ **Decided:** B, optional, and Alice chooses the servers.
    Data contracts may require a contact point at registration.
-5. Key packages (5.4): custodians under an Alice-signed release policy; default contacts
-   automatically, others held for approval?
+5. ~~Key packages (5.4)~~ **Decided:** custodians under an Alice-signed release policy;
+   contacts automatically, everyone else held for approval.
 6. ~~Owner failure (5.8)~~ **Decided:** the movable sequencer, owner-only `sequencer-set`.
 7. Who may federate (5.7): configured peers only in v0.2?
 8. `federation.md` (7): this disposition?

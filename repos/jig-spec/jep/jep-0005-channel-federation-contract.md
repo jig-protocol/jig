@@ -188,7 +188,7 @@ Non-goals for v0.2:
 19. Followers MUST track the group's public state from the stream and MUST NOT deliver a
     commit that does not validate.
 20. Only clients commit. The group has no external senders in v0.2.
-21. (pending DJ) Key packages are held by **custodians**: servers or nameservers the DID
+21. Key packages are held by **custodians**: servers or nameservers the DID
     names in its reachability record (JEP-0004). Each holds a release policy the DID
     signed.
     - A custodian MUST release a key package only to a request inside the policy's
