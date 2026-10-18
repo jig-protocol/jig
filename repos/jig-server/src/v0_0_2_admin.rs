@@ -3,14 +3,9 @@
 //! it here; the server runs it through the shared ingest pipeline as if it
 //! had arrived via WSS (signature, admission, write gate, ownership).
 //!
-//! Two mounts of the same handlers:
-//! * `/api/v1/channels*` — always mounted ([`build_channel_ops_router`]).
-//!   The signed block is the authorization, so there is nothing for a
-//!   config flag to protect, and the default install must be able to
-//!   create `#hello`.
-//! * `/_admin_v0_0_2/channels*` — the legacy aliases older CLIs POST to,
-//!   still gated on `[debug] admin_endpoints = true`
-//!   ([`build_admin_router`]).
+//! Mounted at `/api/v1/channels*`, always ([`build_channel_ops_router`]).
+//! The signed block is the authorization, so there is nothing for a config
+//! flag to protect, and the default install must be able to create `#hello`.
 
 use std::sync::Arc;
 
@@ -113,7 +108,7 @@ pub(crate) fn map_ingest_error(e: IngestError) -> (StatusCode, Json<AdminError>)
     err(status, code, message)
 }
 
-/// POST /_admin_v0_0_2/channels
+/// POST /api/v1/channels
 ///
 /// Body: `{ "bundle_b64": "...", "sig_b64": "..." }` where the bundle is
 /// a signed channel-create block. The block kind MUST be `channel-create`.
@@ -149,7 +144,7 @@ pub async fn create_channel(
     Ok(Json(AdminResult { block_cid: cid }))
 }
 
-/// POST /_admin_v0_0_2/channels/:slug/members
+/// POST /api/v1/channels/:slug/members
 ///
 /// Body: signed `member-add` block. The `slug` path parameter is asserted
 /// to match the `channel` metadata in the bundle (defense in depth).
@@ -206,7 +201,7 @@ pub async fn add_member(
     Ok(Json(AdminResult { block_cid: cid }))
 }
 
-/// POST /_admin_v0_0_2/channels/:slug/archive
+/// POST /api/v1/channels/:slug/archive
 ///
 /// The v0.0.2 channel delete. Body: signed `channel-archive` block. Archiving
 /// is a **soft delete** — the channel stops being listed and stops resolving as
@@ -290,19 +285,6 @@ pub fn build_channel_ops_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/channels", post(create_channel))
         .route("/api/v1/channels/{slug}/members", post(add_member))
         .route("/api/v1/channels/{slug}/archive", post(archive_channel))
-        .with_state(state)
-}
-
-/// The legacy `/_admin_v0_0_2/*` aliases. Caller is responsible for gating
-/// this on `state.config.debug.admin_endpoints`.
-pub fn build_admin_router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/_admin_v0_0_2/channels", post(create_channel))
-        .route("/_admin_v0_0_2/channels/{slug}/members", post(add_member))
-        .route(
-            "/_admin_v0_0_2/channels/{slug}/archive",
-            post(archive_channel),
-        )
         .with_state(state)
 }
 
@@ -426,14 +408,13 @@ mod tests {
     #[tokio::test]
     async fn create_channel_signed_request_succeeds() {
         let state = state_with_channel_kinds_allowed();
-        let router = build_admin_router(state.clone());
+        let router = build_channel_ops_router(state.clone());
 
         let id = test_identity();
         let hlc = test_hlc(&id);
         let block = build_channel_create(&id, "#hello", "open", hlc);
 
-        let (status, body) =
-            post_json(router, "/_admin_v0_0_2/channels", submission_from(&block)).await;
+        let (status, body) = post_json(router, "/api/v1/channels", submission_from(&block)).await;
         assert_eq!(status, StatusCode::OK, "body={body}");
         assert!(!body["block_cid"].as_str().unwrap_or("").is_empty());
 
@@ -447,15 +428,14 @@ mod tests {
     #[tokio::test]
     async fn create_channel_rejects_wrong_kind_bundle() {
         let state = state_with_channel_kinds_allowed();
-        let router = build_admin_router(state);
+        let router = build_channel_ops_router(state);
 
         let id = test_identity();
         let hlc = test_hlc(&id);
         // text-render instead of channel-create
         let block = build_text_render(&id, "#hello", "hi", hlc);
 
-        let (status, body) =
-            post_json(router, "/_admin_v0_0_2/channels", submission_from(&block)).await;
+        let (status, body) = post_json(router, "/api/v1/channels", submission_from(&block)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "WRONG_KIND");
     }
@@ -463,16 +443,16 @@ mod tests {
     #[tokio::test]
     async fn add_member_signed_request_succeeds() {
         let state = state_with_channel_kinds_allowed();
-        let router = build_admin_router(state.clone());
+        let router = build_channel_ops_router(state.clone());
 
         let id = test_identity();
         let hlc = test_hlc(&id);
 
         // First create the channel
-        let create_block = build_channel_create(&id, "#room", "restricted", hlc.clone());
+        let create_block = build_channel_create(&id, "#room", "open", hlc.clone());
         let (status, _) = post_json(
             router.clone(),
-            "/_admin_v0_0_2/channels",
+            "/api/v1/channels",
             submission_from(&create_block),
         )
         .await;
@@ -483,7 +463,7 @@ mod tests {
         let add_block = build_member_add(&id, "#room", member_did, hlc);
         let (status, body) = post_json(
             router,
-            "/_admin_v0_0_2/channels/%23room/members",
+            "/api/v1/channels/%23room/members",
             submission_from(&add_block),
         )
         .await;
@@ -506,7 +486,7 @@ mod tests {
     #[tokio::test]
     async fn add_member_rejects_slug_mismatch() {
         let state = state_with_channel_kinds_allowed();
-        let router = build_admin_router(state);
+        let router = build_channel_ops_router(state);
 
         let id = test_identity();
         let hlc = test_hlc(&id);
@@ -515,7 +495,7 @@ mod tests {
         // URL says #wrong but bundle says #room
         let (status, body) = post_json(
             router,
-            "/_admin_v0_0_2/channels/%23wrong/members",
+            "/api/v1/channels/%23wrong/members",
             submission_from(&add_block),
         )
         .await;
@@ -527,23 +507,16 @@ mod tests {
 
     /// Create `slug` owned by `owner` and return the router used to do it.
     async fn router_with_channel(state: Arc<AppState>, owner: &Identity, slug: &str) -> Router {
-        let router = build_admin_router(state);
+        let router = build_channel_ops_router(state);
         let create = build_channel_create(owner, slug, "open", test_hlc(owner));
-        let (status, body) = post_json(
-            router.clone(),
-            "/_admin_v0_0_2/channels",
-            submission_from(&create),
-        )
-        .await;
+        let (status, body) =
+            post_json(router.clone(), "/api/v1/channels", submission_from(&create)).await;
         assert_eq!(status, StatusCode::OK, "setup create failed: {body}");
         router
     }
 
     fn archive_path(slug: &str) -> String {
-        format!(
-            "/_admin_v0_0_2/channels/{}/archive",
-            slug.replace('#', "%23")
-        )
+        format!("/api/v1/channels/{}/archive", slug.replace('#', "%23"))
     }
 
     #[tokio::test]
@@ -601,7 +574,7 @@ mod tests {
     #[tokio::test]
     async fn archive_channel_reports_a_missing_channel_instead_of_succeeding() {
         let state = state_with_channel_kinds_allowed();
-        let router = build_admin_router(state);
+        let router = build_channel_ops_router(state);
 
         let owner = test_identity();
         let block = build_channel_archive(&owner, "#never-existed", test_hlc(&owner));
@@ -747,7 +720,7 @@ mod tests {
     #[tokio::test]
     async fn create_channel_rejects_invalid_signature() {
         let state = state_with_channel_kinds_allowed();
-        let router = build_admin_router(state);
+        let router = build_channel_ops_router(state);
 
         let id = test_identity();
         let hlc = test_hlc(&id);
@@ -759,7 +732,7 @@ mod tests {
             "sig_b64":    base64::engine::general_purpose::STANDARD.encode([0u8; 64]),
         });
 
-        let (status, body) = post_json(router, "/_admin_v0_0_2/channels", submission).await;
+        let (status, body) = post_json(router, "/api/v1/channels", submission).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["code"], "INVALID_SIG");
     }

@@ -1,5 +1,14 @@
 # Message Format
 
+> **Historical: not the wire format.** This chapter describes a `JigMessage` envelope that
+> no implementation sends or accepts. The wire is JSON frames carrying `v`, `suite` and an
+> operation, opened by the signed handshake in
+> [JEP-0002](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0002-handshake.md),
+> whose content is signed [blocks](blocks.md) under the channel's
+> [encryption suite](encryption.md). The requirements below are kept as design input; they
+> do not bind implementations, and the chapter will be replaced by a description of the
+> real wire format.
+
 **Audience:** This chapter is for **protocol implementers** and **developers** building clients or servers. **End users** don't need to understand message formats—your client handles this. **Server operators** might care about message size limits and signature validation.
 
 ---

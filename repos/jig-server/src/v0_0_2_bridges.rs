@@ -315,6 +315,11 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         ref e @ IngestError::ChannelExists { .. } => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },
+        // The bridge stamped a time ahead of this server's clock; resending
+        // the same block cannot fix that.
+        ref e @ IngestError::ClockSkew { .. } => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
         // Over its rate: a retry later can succeed.
         IngestError::NotAdmitted {
             refusal: jig_pipeline::ingest::AdmissionRefusal::RateLimited,
@@ -326,11 +331,14 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         ref e @ IngestError::NotAdmitted { .. } => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },
-        // Bridges post plaintext; an encrypted channel will never take it, and
-        // the same bytes will be refused the same way again.
+        // Bridges post plaintext; an encrypted channel will never take it, nor
+        // will a restricted one (D25), and the same bytes will be refused the
+        // same way again.
         ref e @ (IngestError::OwnerCannotLeave { .. }
         | IngestError::UnknownSuite { .. }
         | IngestError::SuiteMismatch { .. }
+        | IngestError::RestrictedRequiresMls { .. }
+        | IngestError::PlaintextRestrictedFrozen { .. }
         | IngestError::MlsRejected { .. }) => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },
@@ -620,7 +628,8 @@ mod tests {
             .upsert_channel(&StoredChannel {
                 id: "bafyDmX".to_string(),
                 slug: "#dm/x".to_string(),
-                visibility: "restricted".to_string(),
+                // Bridges carry plaintext, which only an open channel takes (D25).
+                visibility: "open".to_string(),
                 created_at: 0,
                 owner_did: shadow_did.clone(),
                 suite: "none".to_string(),
@@ -637,9 +646,8 @@ mod tests {
             .unwrap();
 
         // Bob (NOT the shadow DID) posts a text-render block to "#dm/x". He
-        // is the DM's other member, exactly as `ensure_dm_channel` would have
-        // enrolled him: the channel is restricted, and a non-member's post is
-        // refused at ingest before it reaches fanout.
+        // is the channel's other member, exactly as the bridge would have
+        // enrolled him; delivery to the shadow DID follows membership.
         let dir = tempdir().unwrap();
         let bob = Identity::generate_and_save(&dir.keep()).unwrap();
         store

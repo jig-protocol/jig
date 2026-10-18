@@ -2,6 +2,11 @@
 
 **Audience:** This chapter is foundational for **everyone**—protocol implementers, server operators, and developers. **End users** might find the "What Zero-Trust Means in Practice" section useful for understanding why Jig works the way it does.
 
+> **Status.** The principles and requirements here bind implementations; the reference
+> implementation meets only some of them. Items it does not meet are marked
+> *(not yet implemented)* or *(partial)*. Per-threat status is in the
+> [Threat Register](threat-register.md).
+
 ---
 
 This chapter establishes the security assumptions that inform every decision in the Jig protocol. If you're wondering why something seems paranoid or inconvenient, the answer is usually "because zero-trust."
@@ -50,7 +55,7 @@ These principles guide every normative requirement in this spec:
 
 This doesn't mean you can't have trusted peers—it means trust is **earned and continuously verified**, not assumed.
 
-**Example:** When federating with another server, you don't just accept their receipts at face value. You replay blocks locally and verify the receipts match. If they diverge repeatedly, you downgrade that peer's reputation or stop federating entirely.
+**Example:** When federating with another server, you don't just accept their receipts at face value. You replay blocks locally and verify the receipts match. If they diverge repeatedly, you downgrade that peer's reputation or stop federating entirely. *(not yet implemented: a `render_hash` divergence is a warning; there is no peer reputation.)*
 
 **Trade-off:** More verification means higher CPU costs. But it prevents billing fraud and makes trustless federation possible.
 
@@ -60,7 +65,7 @@ This doesn't mean you can't have trusted peers—it means trust is **earned and 
 
 Metadata leaks are attacks. Who you talk to, when, and how often reveals a lot—even if the content is encrypted.
 
-**Example:** Jig separates routing metadata (plaintext, needed for delivery) from content (encrypted). But we still minimize routing metadata: timestamps are coarse-grained, DIDs are pseudonymous, and servers don't log connection graphs unless abuse mitigation requires it (and then with time-bounded retention).
+**Example:** Jig separates routing metadata (plaintext, needed for delivery) from content (encrypted). But we still minimize routing metadata: timestamps are coarse-grained, DIDs are pseudonymous, and servers don't log connection graphs unless abuse mitigation requires it (and then with time-bounded retention). *(partial: DIDs are pseudonymous, but timestamps are not coarse-grained: block timestamps carry milliseconds, and the reference server logs sender DIDs; see [Logging](#logging-and-metadata-retention).)*
 
 **Why IRC mode exists:** IRC clients can't do E2EE, so content stays plaintext. This is a conscious trade-off for compatibility—users who need privacy should use WebSocket transport with E2EE enabled.
 
@@ -90,6 +95,8 @@ Even if an attacker bypasses one layer (e.g., finds a Wasm escape), fuel limits 
 - Clients verify the rotation was signed by both old and new keys
 - Federation peers are notified and update their trust anchors
 
+*(not yet implemented: there is no server key rotation certificate. Losing or replacing a server key changes the server's DID, and clients that pinned it refuse the new one. Nameserver alias rotation, `/v1/rotate`, is a different mechanism.)*
+
 The blast radius is "receipts signed during the compromise window" (which can be audited via replays), not "every receipt ever signed."
 
 **Why key rotation matters:** Hardware fails, admins get coerced, bugs leak secrets. Rotation is inevitable, so the protocol makes it non-catastrophic.
@@ -117,6 +124,8 @@ See [Handshake](handshake.md#version-negotiation) for details.
 - Every message includes a unique nonce (e.g., UUIDv7) and/or a timestamp
 - Servers reject messages with duplicate nonces or stale timestamps
 - Acceptance windows should be narrow (e.g., ±5 minutes) to limit replay window
+
+*(partial: signed read requests carry a nonce and a 30-second acceptance window with a replay guard; a block is accepted once per CID; block timestamps are not checked against a window.)*
 
 **Why:** Without replay protection, an attacker can record a signed "transfer 10 credits" message and replay it 100 times.
 
@@ -158,7 +167,7 @@ See [Crypto Primitives § Key Management](crypto.md#key-management).
 
 **MUST exclude sensitive identifiers from logs unless strictly necessary. Retention MUST be minimal and time-bounded.**
 
-- Don't log DIDs, message content, or linkable metadata in plaintext
+- Don't log DIDs, message content, or linkable metadata in plaintext *(not yet implemented: the reference server logs sender DIDs in plaintext on refused writes and admission failures)*
 - If abuse mitigation requires logging (e.g., rate limit tracking), use hashed IDs and expire logs quickly (e.g., 7-30 days)
 - Make log retention configurable; operators decide based on their threat model
 
@@ -176,6 +185,8 @@ See [Security Considerations § Operational Security](security.md#operational-se
 - Use proof-of-work challenges for new or low-reputation identities
 - Federation peers get quotas based on reputation scores
 
+*(partial: token buckets are on by default: per verified DID across REST, WebSocket, federation and bridge writes, and per remote address on v0.0.2 HTTP requests and WebSocket frames; proof-of-work for new DIDs exists but is off by default; there are no reputation tiers or per-peer quotas.)*
+
 **Why:** Without rate limits, a single attacker can flood the server with garbage and take it offline.
 
 **Trade-off:** Legitimate high-volume users, verified bots, etc. need higher quotas. Reputation tiers solve this: `verified` users get higher limits than `null_sec` users.
@@ -190,7 +201,7 @@ See [Protocol Overview § Capability Grants](protocol-overview.md#step-1-connect
 
 - Unknown protocol version? Reject connection.
 - Malformed JSON? Reject message.
-- Invalid signature? Drop silently (no error response to avoid oracle attacks).
+- Invalid signature? Drop silently (no error response to avoid oracle attacks). *(not yet implemented: the reference server answers an invalid block signature with `INVALID_SIG`.)*
 
 **Why:** "Fail open" (allow by default, deny on error) leads to weird bugs and security bypasses. "Fail closed" (deny by default, allow on explicit match) is safer but less flexible.
 
@@ -224,7 +235,9 @@ Here are the specific attacks Jig is designed to resist:
 - Rate limiting (federated peers get quotas)
 - Cryptographic attestations (useful-work proofs can't be forged)
 
-**Example attack:** Malicious server sends you receipts claiming blocks used 1M fuel when they actually used 100k (billing fraud). You replay locally, detect mismatch, and downgrade that peer's reputation. After repeated violations, you stop federating with them.
+*(partial: relayed blocks are re-verified and re-executed by the receiving server, and a `render_hash` divergence is a warning; there is no peer reputation, no per-peer quota and no useful-work proof.)*
+
+**Example attack:** Malicious server sends you receipts claiming blocks used 1M fuel when they actually used 100k (billing fraud). You replay locally, detect mismatch, and downgrade that peer's reputation. After repeated violations, you stop federating with them. *(not yet implemented: see above.)*
 
 ### 3. Compromised Client or Server
 
@@ -237,7 +250,9 @@ Here are the specific attacks Jig is designed to resist:
 - Audit logs (detect anomalous behavior post-compromise)
 - Multi-signature requirements (for high-value operations like tribunal decisions)
 
-**Example attack:** Attacker steals server's signing key. They can sign new receipts, but can't rewrite old receipts (signatures are immutable). Server operator detects compromise, rotates key, and publishes rotation certificate. Clients verify and update trust anchors.
+*(partial: MLS gives forward secrecy on encrypted channels; there is no key rotation, audit log or multi-signature requirement.)*
+
+**Example attack:** Attacker steals server's signing key. They can sign new receipts, but can't rewrite old receipts (signatures are immutable). Server operator detects compromise, rotates key, and publishes rotation certificate. Clients verify and update trust anchors. *(not yet implemented: see [Compromise Containment](#4-compromise-containment).)*
 
 ### 4. Side-Channel and Timing Attacks
 

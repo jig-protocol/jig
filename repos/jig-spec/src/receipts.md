@@ -5,7 +5,16 @@
 ---
 
 **Version:** 0.2
-**Status:** Stable
+**Status:** Draft. *(partial: `jig-runtime` builds receipts in this schema, but no server path signs or serves them since the legacy v0.0.1 REST routes were removed (D28).)*
+
+> **Not the receipt the server signs.** The reference server signs a different, smaller
+> object for each rendered block, tagged `"v": "0.3-render"`: `block_cid`, `server_did`,
+> `synthetic`, `render` (`hash`, `module`, `length_bytes`), `engine` (`name`,
+> `runtime_version`, `fuel_used`) and `produced_at`, hex-encoded and signed with the
+> server key. Blocks it does not execute get a signed synthetic receipt, and encrypted
+> blocks a `sealed` one with no `render_hash`. That format is not yet specified here.
+> Outcome-based pricing, affordances, per-capability counters and receipt exchange between
+> servers are not implemented.
 
 Receipts are like itemized bills for block execution. When a host runs your block, it emits a signed receipt proving:
 
