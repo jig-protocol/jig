@@ -89,7 +89,7 @@ Non-goals for v0.2:
    - the grant (7a);
    - the creation block;
    - the current `ingest` head (12);
-   - the hash of the owner's signed peer policy (16).
+   - the owner's current `server-manifest`, by CID and `seq` (16).
 7a. A grant is one of:
     - `read`: the follower relays only protocol traffic (MLS self-updates, self-leave) and
       no content;
@@ -110,7 +110,8 @@ Non-goals for v0.2:
       owners assign roles, and admins cannot create admins. Co-owners may be listed in the
       `channel-create` block only.
 8. The offered server MUST answer, signed by its DID, with exactly one of:
-   - `contract-accept {channel_id, sequencer, policy_hash}`, stating that it
+   - `contract-accept {channel_id, sequencer, manifest}`, where `manifest` names its
+     current `server-manifest`, stating that it
      implements the suite and will enforce the membership rule;
    - `contract-refuse {channel_id, code}`, where `code` is one of `UNSUPPORTED_SUITE`,
      `UNSUPPORTED_VERSION`, `POLICY_REFUSED`, `NOT_A_PEER` or `SUFFIX_CONFLICT` (the two
@@ -126,8 +127,9 @@ Non-goals for v0.2:
 11a. The owner moves the sequencer with a `sequencer-set` block. In v0.2 only
      the `owner` role holds that right.
      - The new sequencer MUST have accepted the contract before its first record.
-     - Its first record links `prev` to the head the `sequencer-set` cites, and cites the
-       `sequencer-set` block.
+     - The record for the `sequencer-set` block itself MUST be signed by the new
+       sequencer, with `seq` = cited head + 1 and `prev` = the cited head's hash, whether
+       or not the old sequencer is reachable.
      - Carriers MUST refuse records from the previous sequencer once they hold the
        `sequencer-set`.
      - A member whose client merged a commit past the cited head rejoins by external
@@ -169,15 +171,14 @@ Non-goals for v0.2:
 
 ## Peer policy
 
-16. A server MUST publish a policy document signed by its DID, listing:
-    - protocol versions;
-    - hosted suites;
-    - block kinds it relays;
+16. A server's peer policy is its `server-manifest` block (JEP-0002), in its manifest
+    log. Beyond JEP-0002's fields it MUST list:
+    - the block kinds it relays;
     - per-peer quotas;
-    - the DIDs of the peers it federates with;
+    - the DIDs of the peers it federates with that it chooses to publish;
     - the name suffixes it attests and their roots (JEP-0004).
 
-    Contract messages cite its hash.
+    Contract messages cite the current manifest by CID and `seq`.
 17. In v0.2 a server MUST refuse an offer from a server that is not on its
     configured peer list (`NOT_A_PEER`).
 
@@ -241,7 +242,7 @@ To be added with F2:
 
 - a `contract-offer`, a `contract-accept`, a `contract-refuse`;
 - a three-entry sequence chain;
-- a signed peer policy.
+- a `server-manifest` carrying peer policy.
 
 # Rejected Alternatives
 

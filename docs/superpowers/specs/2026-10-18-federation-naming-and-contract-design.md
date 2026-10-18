@@ -577,14 +577,15 @@ and releasing to anyone by default, which invites spam and drains the stock.
    - the creation block;
    - the grant (5.2);
    - the current `ingest` head;
-   - the owner's signed peer policy (5.6).
+   - the owner's current `server-manifest` (CID and `seq`), which is its signed peer
+     policy (5.6).
 
    The offer is triggered by a `channel-share` block (5.9). The owner never shares on its
    own initiative, and it is the only server that sends offers, so the topology stays a
    star.
 3. **The server answers with a `contract-accept` or a `contract-refuse`, signed by its
    DID.**
-   - An accept cites the creation block's CID and its own policy's hash, and states that
+   - An accept cites the creation block's CID and its own current `server-manifest`, and states that
      it implements the suite and will enforce the membership rule.
    - A refusal carries a code: `UNSUPPORTED_SUITE`, `UNSUPPORTED_VERSION`,
      `POLICY_REFUSED`, `NOT_A_PEER` or `SUFFIX_CONFLICT` (4.2). There is no fallback
@@ -598,13 +599,23 @@ and releasing to anyone by default, which invites spam and drains the stock.
 
 ### 5.6 Signed peer policy
 
-**Proposed.** A server publishes, signed by its DID, a policy document: the protocol
-versions, the suites it hosts, the block kinds it relays, the per-peer quotas it applies,
-the peers it federates with (DIDs, not URLs), and the name suffixes it attests with their
-roots (4.2). `/.well-known/jig` already carries most
-of these fields unsigned. Contract messages cite the policy's hash, so a server that
-changes its policy mid-contract leaves evidence. This is the roadmap's "signed peer
-policy" item.
+**Proposed: the peer policy is the server manifest of L7's design (D11, item 13).** One
+signed, logged document instead of two.
+- L7's `server-manifest` block, in the server's manifest log, already carries protocol
+  versions, suites, capabilities and the skew bound. F adds:
+  - the block kinds the server relays;
+  - its per-peer quotas;
+  - the peers it federates with (DIDs, not URLs);
+  - the name suffixes it attests, with their roots (4.2).
+- Contract messages cite the manifest by CID and `seq`, not by a separate policy hash.
+  A server that changes its policy mid-contract leaves the change in its own signed,
+  gap-checked log.
+- `/.well-known/jig` keeps serving the same fields unsigned, for discovery.
+- **Metadata:** the manifest log is public, so the peer list exposes the server's
+  federation graph. Servers are public infrastructure, so this is acceptable by default.
+  A server MAY publish only the peers it wants known; peering itself is enforced from
+  configuration either way.
+- This is the roadmap's "signed peer policy" item.
 
 ### 5.7 Who may federate (v0.2)
 
@@ -639,8 +650,12 @@ detection against its sequencer.
   block, or later in a `sequencer-set` block.
 - **Moving the sequencer is an `owner`-only right** in v0.2. Delegating it to `admin`
   waits for the v0.3 policy language.
-- The new sequencer's first record links `prev` to the old head and cites the
-  `sequencer-set` block, so the chain continues across the handover.
+- **The handover record is signed by the new sequencer** (aligned with L7's D11 item 5).
+  The `sequencer-set` block names the cited head, the last record the old sequencer
+  signed. The record for the `sequencer-set` block itself has `seq` = cited head + 1,
+  `prev` = the cited head's hash, and is signed by the new sequencer. That holds whether
+  the old sequencer is alive or dead. Only one key can ever sign that `seq`, so a
+  handover never looks like a fork, and a dead sequencer never blocks it.
 - While the sequencer is down, carriers queue writes until the owner moves it.
 
 F's caveats:
