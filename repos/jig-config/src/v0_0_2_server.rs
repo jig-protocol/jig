@@ -318,7 +318,6 @@ pub struct FederationPeer {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct DebugSection {
-    pub admin_endpoints: bool,
     pub list_handles: bool,
 }
 
@@ -449,9 +448,6 @@ impl JigServerConfig {
     /// `naively_unbounded_clock_skew` in v0.0.2 (no time-attestation servers exist yet).
     pub fn unsafe_options_active(&self) -> Vec<String> {
         let mut active = vec!["naively_unbounded_clock_skew".to_string()];
-        if self.debug.admin_endpoints {
-            active.push("debug.admin_endpoints".to_string());
-        }
         if self.federation.dangerously_disable_federation_tls {
             active.push("federation.dangerously_disable_federation_tls".to_string());
         }
@@ -689,7 +685,6 @@ mod tests {
         let cfg = JigServerConfig::default();
         assert!(!cfg.federation.dangerously_disable_federation_tls);
         assert!(!cfg.federation.dangerously_allow_plaintext_federation);
-        assert!(!cfg.debug.admin_endpoints);
         assert!(!cfg.identity.naively_allow_unknown_handles_fallback);
         assert!(!cfg.debug.list_handles);
     }
@@ -707,7 +702,6 @@ mod tests {
     #[test]
     fn unsafe_options_active_lists_enabled_antipatterns() {
         let mut cfg = JigServerConfig::default();
-        cfg.debug.admin_endpoints = true;
         cfg.federation.dangerously_disable_federation_tls = true;
         cfg.federation.dangerously_allow_plaintext_federation = true;
         cfg.identity.naively_allow_unknown_handles_fallback = true;
@@ -715,7 +709,6 @@ mod tests {
         cfg.auth.require_authenticated_reads = false;
         let active = cfg.unsafe_options_active();
         assert!(active.contains(&"auth.require_authenticated_reads=false".to_string()));
-        assert!(active.contains(&"debug.admin_endpoints".to_string()));
         assert!(active.contains(&"federation.dangerously_disable_federation_tls".to_string()));
         assert!(active.contains(&"federation.dangerously_allow_plaintext_federation".to_string()));
         assert!(active.contains(&"identity.naively_allow_unknown_handles_fallback".to_string()));
@@ -746,7 +739,6 @@ mod tests {
             alias = "deji.jig"
 
             [debug]
-            admin_endpoints = true
             list_handles = false
         "#;
         let cfg: JigServerConfig = toml::from_str(toml_input).unwrap();
@@ -755,7 +747,7 @@ mod tests {
         assert_eq!(cfg.identity.trusted_nameservers, vec!["https://ns.jig.onl"]);
         assert_eq!(cfg.federation.peers.len(), 1);
         assert_eq!(cfg.federation.peers[0].alias.as_deref(), Some("deji.jig"));
-        assert!(cfg.debug.admin_endpoints);
+        assert!(!cfg.debug.list_handles);
     }
 
     #[test]
@@ -770,7 +762,7 @@ mod tests {
         let cfg: JigServerConfig = toml::from_str(toml_input).unwrap();
         assert_eq!(cfg.identity.mode, IdentityMode::Tofu);
         assert!(cfg.federation.peers.is_empty());
-        assert!(!cfg.debug.admin_endpoints);
+        assert!(!cfg.debug.list_handles);
     }
 
     // --- partial-section defaults -------------------------------------
@@ -814,12 +806,31 @@ mod tests {
         let cfg: JigServerConfig = toml::from_str(
             r#"
             [debug]
-            admin_endpoints = true
+            list_handles = true
         "#,
         )
         .expect("partial [debug] must deserialize");
-        assert!(cfg.debug.admin_endpoints);
+        assert!(cfg.debug.list_handles);
+    }
+
+    /// `[debug] admin_endpoints` is gone, but configs written by older
+    /// install.sh runs still carry it. Until removed keys are rejected with
+    /// a named error, it must keep parsing, and must not show up as active.
+    #[test]
+    fn removed_admin_endpoints_key_still_parses() {
+        let cfg: JigServerConfig = toml::from_str(
+            r#"
+            [debug]
+            admin_endpoints = true
+        "#,
+        )
+        .expect("a config with the removed key must still deserialize");
         assert!(!cfg.debug.list_handles);
+        assert!(
+            !cfg.unsafe_options_active()
+                .iter()
+                .any(|o| o.contains("admin_endpoints"))
+        );
     }
 
     #[test]
