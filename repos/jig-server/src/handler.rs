@@ -374,18 +374,14 @@ mod tests {
             ..Default::default()
         };
         config.tls.enabled = false;
-        let store = Arc::new(SqliteBlockStore::new(&config.database_path).unwrap());
-        let runtime = Arc::new(BlockRuntime::new(config.execution_config()).unwrap());
         let v002 = Arc::new(crate::v0_0_2::AppState::for_test().unwrap());
 
         for v0_0_2 in [None, Some(v002)] {
             let state = AppState {
-                store: store.clone(),
-                runtime: runtime.clone(),
                 config: config.clone(),
                 v0_0_2,
             };
-            let body = server_info(State(state)).await.unwrap().0;
+            let body = server_info(State(state)).await.0;
             assert!(
                 body.unsafe_options_active
                     .contains(&"tls.enabled=false".to_string()),
