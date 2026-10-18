@@ -149,7 +149,9 @@ impl AppState {
             .context("loading server signing key")?;
         // Before anything logs a DID: tags are keyed by this server's seed.
         if !jig_core::did::set_log_tag_key(&signing_key.to_bytes()) {
-            tracing::debug!("log tag key already set in this process");
+            tracing::warn!(
+                "a different log tag key is already in effect in this process; DID tags keep using it"
+            );
         }
         let server_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
 

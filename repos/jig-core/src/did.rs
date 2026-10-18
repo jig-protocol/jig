@@ -220,12 +220,12 @@ static LOG_TAG_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
 /// (BLAKE3 `derive_key`, context `jig-log-did-v1`), so tags are stable
 /// across restarts of one server but cannot be reversed by hashing a list of
 /// public DIDs, nor linked across servers. Call once at startup, before
-/// anything logs. Returns `false` if the key was already set, in which case
-/// the earlier key stays.
+/// anything logs. The key is process-wide and set once: returns `true` when
+/// the key in effect is this seed's (newly set, or set before from the same
+/// seed), and `false` when an earlier, different key stays in effect.
 pub fn set_log_tag_key(seed: &[u8; 32]) -> bool {
-    LOG_TAG_KEY
-        .set(blake3::derive_key("jig-log-did-v1", seed))
-        .is_ok()
+    let key = blake3::derive_key("jig-log-did-v1", seed);
+    *LOG_TAG_KEY.get_or_init(|| key) == key
 }
 
 /// A process-random key, used when nothing called [`set_log_tag_key`]: tags
