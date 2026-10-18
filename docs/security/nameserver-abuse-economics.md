@@ -12,6 +12,20 @@ responses are in the
 Numbers below are the reference nameserver's defaults (`repos/jig-nameserver/src/config.rs`)
 unless stated.
 
+> **The mechanisms priced here are no longer served.** Proof-of-work challenges, penalties,
+> the per-IP and per-key challenge limits, the anonymous floor, reputation observations,
+> the admin reset endpoints and federation gossip were the nameserver's legacy prototype,
+> whose routes were removed in #154. Today the nameserver serves discovery
+> (`/.well-known/jig-ns`), health and the alias routes. `/v1/register`, `/v1/rotate` and
+> `/v1/renew` need a proof-of-control signature (rotate needs one from the old and the new
+> DID) but have no proof-of-work and no rate
+> limit. The analysis stays as input to the
+> redesign; read "today" below as "in the removed prototype".
+>
+> Redesign in progress: proof-of-work in JEP-0008 (draft, #162); rulesets, reputation and
+> transparency logs in JEP-0009 (#163); reports and tribunals in JEP-0010 (#166); framing in
+> #152.
+
 ## What the model is for
 
 - Make abuse cost more than ordinary use, without identifying anyone.

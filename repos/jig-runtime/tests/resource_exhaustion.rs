@@ -96,6 +96,10 @@ fn test_concurrent_executions_isolated() {
     // The two were previously the same field, which is how a one-instance
     // concurrency ceiling shipped.
     config.limits.max_concurrent_instances = 4;
+    // Far above any execution of this fixture, so four threads contending for a
+    // loaded CI machine cannot fail on the default 250 ms deadline. Isolation is
+    // what this test checks, not speed.
+    config.limits.execution_timeout_ms = 60_000;
     let runtime = Runtime::with_config(config).expect("runtime creation");
 
     use std::sync::Arc;

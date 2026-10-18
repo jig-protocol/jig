@@ -28,7 +28,6 @@
 //!
 //! ## Feature Flags
 //!
-//! - `deterministic` (default): Enable deterministic execution guarantees
 //! - `wasi-preview2` (default): Enable WASI preview1 with minimal surfaces (name kept for compatibility)
 //! - `component-model`: Enable WebAssembly Component Model support
 //! - `tracing`: Enable structured logging with tracing
@@ -40,13 +39,9 @@ pub mod component;
 pub mod config;
 pub mod error;
 pub mod payload;
-pub mod telemetry;
 
 // Internal implementation modules
-mod capabilities;
-mod costs;
 mod engine;
-mod fuel;
 mod identity;
 pub(crate) mod receipt;
 mod trap;
@@ -54,23 +49,11 @@ mod trap;
 // Re-export primary types
 pub use api::{BlockPackage, ExecutionContext, Limits, Outcome, Runtime};
 pub use config::{PricingConfig, RuntimeConfig};
-pub use costs::{CapabilityCosts, CostSchedule, InstructionCosts};
 pub use error::{Result, RuntimeError};
 
-pub use fuel::{CapabilityMeterHandle, CapabilityMeterSnapshot};
 pub use identity::{EngineIdentity, FUEL_SCHEDULE_VERSION, WASMTIME_VERSION};
 pub use payload::{CompiledBlock, PayloadOutput, RC_OUTPUT_TOO_SMALL};
 pub use receipt::{
     CapabilityCall, ExecutionOutcome, ModuleHash, Receipt, ReceiptBuilder, ReceiptError,
     ReceiptPricing,
 };
-
-// Legacy types (deprecated, kept for backward compatibility)
-#[allow(dead_code)]
-#[deprecated(since = "0.1.0", note = "Use Runtime API instead")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExitStatus {
-    Success,
-    Failure,
-    Aborted,
-}
