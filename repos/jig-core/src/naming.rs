@@ -533,18 +533,11 @@ pub fn verify_rotation_chain<L: AliasLink>(
 }
 
 /// `s` is the canonical text form (base32 lowercase, `b` prefix, exactly as
-/// it round-trips) of the one CID form JEP-0004 rule 0 admits: CIDv1, codec
-/// `raw`, multihash `blake3-256` with a 32-byte digest.
+/// it round-trips) of a CID that JEP-0004 rule 0 admits
+/// ([`crate::canonical_cid::check`]).
 fn is_canonical_cidv1(s: &str) -> bool {
-    const RAW: u64 = 0x55;
-    const BLAKE3_256: u64 = 0x1e;
-    cid::Cid::try_from(s).is_ok_and(|c| {
-        c.version() == cid::Version::V1
-            && c.codec() == RAW
-            && c.hash().code() == BLAKE3_256
-            && c.hash().size() == 32
-            && c.to_string() == s
-    })
+    cid::Cid::try_from(s)
+        .is_ok_and(|c| crate::canonical_cid::check(&c).is_ok() && c.to_string() == s)
 }
 
 fn did_of(key: &SigningKey) -> String {
