@@ -107,6 +107,32 @@ Its outcome is one of:
 - **`incomplete`**, with a `reason`: fuel exhaustion, stack exhaustion, wall-clock deadline,
   host fault, or refusal by host policy.
 
+**What is hashed.** `ok` and a guest `err` hash the export's whole return value: for a renderer,
+the `result<payload, block-error>`, encoded as `["ok", …]` or `["err", …]`. A trap hashes the
+variant value `trap(<code>)`, encoded `["trap", "<code>"]`, which cannot equal either. Every
+outcome hash is BLAKE3 in key-derivation mode with the context `jig:block outcome v1`, over the
+canonical encoding.
+
+**Trap codes.** Only the WebAssembly core specification's traps are comparable, under these
+names:
+
+| Code | Raised by |
+| --- | --- |
+| `unreachable` | `unreachable` |
+| `memory-out-of-bounds` | a load, store or bulk memory operation outside linear memory |
+| `table-out-of-bounds` | `call_indirect` or a table operation past the end of a table |
+| `uninitialized-element` | `call_indirect` through an empty table slot |
+| `indirect-call-type-mismatch` | `call_indirect` to a function of another type |
+| `integer-overflow` | signed division of the minimum value by -1 |
+| `integer-divide-by-zero` | integer division or remainder by zero |
+| `invalid-conversion-to-integer` | a float-to-integer conversion out of range (not reachable under `jig-det-1`) |
+
+Any other trap, including an engine-specific one, is `incomplete` with reason `host-fault`.
+So is a malformed return value, such as a string or list past the end of memory, a bad
+discriminant or a misaligned return pointer. Engines report those differently, and treating
+them as `incomplete` costs nothing: such a block is never compared, and `incomplete` is never
+evidence against an executor.
+
 Two conforming executors that both reach `ok` or `error` for the same run MUST reach the same
 outcome and hash, on any architecture, operating system, engine or engine version. An
 `incomplete` outcome asserts nothing about the block, and MUST NOT be compared or treated as
@@ -179,8 +205,20 @@ by `jig-client`, with a CI determinism matrix on x86_64 and aarch64, native and 
 
 # Test Vectors
 
-To be added with the reference implementation: component, invocation, and expected outcome and
-hash.
+[`vectors/block-abi/`](../vectors/block-abi/README.md) holds the renderer vectors. Each one
+gives a component, an invocation, the invocation hash and the expected outcome: the class, the
+trap code or incomplete reason, and the outcome hash for a comparable outcome. They cover:
+
+- `ok` with an empty payload, an echo of the invocation's strings and list, every integer field
+  at its maximum, and a body that is not UTF-8;
+- both `block-error` cases;
+- each trap code reachable under `jig-det-1`;
+- malformed return values, which are `incomplete(host-fault)`;
+- fuel and stack exhaustion;
+- `text-block` on six inputs, one of them not UTF-8.
+
+jig-runtime runs them on native Cranelift and on Pulley; CI runs them on x86_64 and aarch64
+Linux.
 
 # LLM Influence (if applicable)
 

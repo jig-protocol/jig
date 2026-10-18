@@ -31,6 +31,7 @@
 //! - **A memory cap** of the renderer's `max_memory_pages`, enforced by a resource limiter on top
 //!   of the validator's check of declared maxima.
 
+use jig_core::block_abi::{self, WitValue};
 use jig_core::component_validation::{BlockWorld, ComponentProfile, validate_component};
 use std::time::Duration;
 
@@ -66,14 +67,82 @@ pub enum IncompleteReason {
     HostFault(String),
 }
 
+/// A trap every conforming engine raises at the same point of the same run (JEP-0006).
+///
+/// The set is closed: the WebAssembly core spec's traps. A trap outside it (fuel, stack, an
+/// interrupt, an engine-specific one such as a disabled Pulley opcode) is not comparable, so
+/// [`classify`] makes it incomplete instead. The names, not wasmtime's messages, go into the
+/// outcome hash.
+///
+/// A malformed return value (a string or list past the end of memory, a bad discriminant, a
+/// misaligned pointer) is not in the set either. wasmtime reports those from host-side lifting
+/// as plain errors, and other engines word them differently, so they are
+/// `incomplete(host-fault)` for now. That costs nothing: a block that returns garbage is never
+/// compared, and `incomplete` is never evidence against an executor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TrapCode {
+    /// `unreachable` executed.
+    Unreachable,
+    /// A load, store or bulk memory operation outside linear memory.
+    MemoryOutOfBounds,
+    /// `call_indirect` or a table operation past the end of a table.
+    TableOutOfBounds,
+    /// `call_indirect` through an uninitialized table slot.
+    UninitializedElement,
+    /// `call_indirect` to a function of another type.
+    IndirectCallTypeMismatch,
+    /// Signed division of the minimum value by -1.
+    IntegerOverflow,
+    /// Integer division or remainder by zero.
+    IntegerDivideByZero,
+    /// A float-to-integer conversion out of range. Unreachable while `jig-det-1` forbids floats;
+    /// listed so the mapping stays total over the core spec's traps.
+    InvalidConversionToInteger,
+}
+
+impl TrapCode {
+    /// The code's name in the outcome hash and in conformance vectors.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TrapCode::Unreachable => "unreachable",
+            TrapCode::MemoryOutOfBounds => "memory-out-of-bounds",
+            TrapCode::TableOutOfBounds => "table-out-of-bounds",
+            TrapCode::UninitializedElement => "uninitialized-element",
+            TrapCode::IndirectCallTypeMismatch => "indirect-call-type-mismatch",
+            TrapCode::IntegerOverflow => "integer-overflow",
+            TrapCode::IntegerDivideByZero => "integer-divide-by-zero",
+            TrapCode::InvalidConversionToInteger => "invalid-conversion-to-integer",
+        }
+    }
+
+    fn from_wasmtime(trap: Trap) -> Option<Self> {
+        Some(match trap {
+            Trap::UnreachableCodeReached => TrapCode::Unreachable,
+            Trap::MemoryOutOfBounds => TrapCode::MemoryOutOfBounds,
+            Trap::TableOutOfBounds => TrapCode::TableOutOfBounds,
+            Trap::IndirectCallToNull => TrapCode::UninitializedElement,
+            Trap::BadSignature => TrapCode::IndirectCallTypeMismatch,
+            Trap::IntegerOverflow => TrapCode::IntegerOverflow,
+            Trap::IntegerDivisionByZero => TrapCode::IntegerDivideByZero,
+            Trap::BadConversionToInteger => TrapCode::InvalidConversionToInteger,
+            _ => return None,
+        })
+    }
+}
+
+impl std::fmt::Display for TrapCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A comparable failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ErrorOutcome {
     /// The export returned `err`.
     Guest(BlockError),
-    /// The guest trapped in a way every conforming engine reproduces (`unreachable`, an
-    /// out-of-bounds access, an integer divide by zero, and so on). The string is the trap code.
-    Trap(String),
+    /// The guest trapped in a way every conforming engine reproduces.
+    Trap(TrapCode),
 }
 
 /// The outcome of one run (decision A3).
@@ -89,6 +158,77 @@ impl RunOutcome {
     pub fn is_comparable(&self) -> bool {
         !matches!(self, RunOutcome::Incomplete(_))
     }
+
+    /// The outcome hash two executors compare (A3), or `None` for an incomplete run.
+    ///
+    /// `ok` and a guest `err` hash the export's whole return value, the
+    /// `result<payload, block-error>`. A trap hashes the variant `trap(<code>)`. Its CBOR form
+    /// `["trap", "<code>"]` cannot equal a `result`'s `["ok", …]` or `["err", …]`.
+    pub fn hash(&self) -> Option<String> {
+        let value = match self {
+            RunOutcome::Ok(payload) => WitValue::Result(Ok(Some(Box::new(payload_value(payload))))),
+            RunOutcome::Error(ErrorOutcome::Guest(e)) => {
+                WitValue::Result(Err(Some(Box::new(block_error_value(e)))))
+            }
+            RunOutcome::Error(ErrorOutcome::Trap(code)) => WitValue::Variant {
+                case: "trap".into(),
+                payload: Some(Box::new(WitValue::Enum(code.as_str().into()))),
+            },
+            RunOutcome::Incomplete(_) => return None,
+        };
+        Some(block_abi::outcome_hash(&value).expect("block-ABI values always encode"))
+    }
+}
+
+/// The hash that identifies a run's input (JEP-0006): the `invocation` record, encoded
+/// canonically.
+pub fn invocation_hash(invocation: &Invocation) -> String {
+    block_abi::invocation_hash(&invocation_value(invocation))
+        .expect("block-ABI values always encode")
+}
+
+fn payload_value(payload: &Payload) -> WitValue {
+    WitValue::Record(vec![
+        (
+            "media-type".into(),
+            WitValue::String(payload.media_type.clone()),
+        ),
+        ("body".into(), WitValue::Bytes(payload.body.clone())),
+    ])
+}
+
+fn block_error_value(error: &BlockError) -> WitValue {
+    let (case, message) = match error {
+        BlockError::InvalidInput(m) => ("invalid-input", m),
+        BlockError::Failed(m) => ("failed", m),
+    };
+    WitValue::Variant {
+        case: case.into(),
+        payload: Some(Box::new(WitValue::String(message.clone()))),
+    }
+}
+
+fn invocation_value(inv: &Invocation) -> WitValue {
+    WitValue::Record(vec![
+        ("block-cid".into(), WitValue::String(inv.block_cid.clone())),
+        (
+            "sender-did".into(),
+            WitValue::String(inv.sender_did.clone()),
+        ),
+        (
+            "channel-cid".into(),
+            WitValue::String(inv.channel_cid.clone()),
+        ),
+        ("ingest-seq".into(), WitValue::U64(inv.ingest_seq)),
+        (
+            "ingest-hlc".into(),
+            WitValue::Record(vec![
+                ("wall-ms".into(), WitValue::U64(inv.ingest_hlc.wall_ms)),
+                ("logical".into(), WitValue::U32(inv.ingest_hlc.logical)),
+            ]),
+        ),
+        ("input".into(), payload_value(&inv.input)),
+    ])
 }
 
 /// The bounds on one run.
@@ -133,6 +273,15 @@ struct HostState {
     limits: StoreLimits,
 }
 
+/// Where compiled code runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// Cranelift, compiling to the host's machine code.
+    Native,
+    /// Pulley, wasmtime's portable interpreter, for hosts that cannot run generated code.
+    Pulley,
+}
+
 /// Compiles and runs `jig:block` components under the `jig-det-1` profile.
 pub struct ComponentRuntime {
     engine: Engine,
@@ -142,8 +291,20 @@ pub struct ComponentRuntime {
 }
 
 impl ComponentRuntime {
+    /// A runtime that compiles to the host's native code.
     pub fn new() -> Result<Self> {
+        Self::with_backend(Backend::Native)
+    }
+
+    /// A runtime on the given backend. Outcomes must not depend on the choice; the conformance
+    /// vectors run on both.
+    pub fn with_backend(backend: Backend) -> Result<Self> {
         let mut config = deterministic_config(&RuntimeConfig::default())?;
+        if backend == Backend::Pulley {
+            config
+                .target("pulley64")
+                .map_err(|e| RuntimeError::InternalError(format!("pulley target: {e}")))?;
+        }
         config.wasm_component_model(true);
         // A narrowing, not a feature: the allowlist already leaves the component-model async
         // features off, and this also drops wasmtime's task machinery for them.
@@ -190,7 +351,7 @@ impl ComponentRuntime {
             )));
         }
         let component = Component::new(&self.engine, bytes)
-            .map_err(|e| RuntimeError::InvalidWasm(e.to_string()))?;
+            .map_err(|e| RuntimeError::InvalidWasm(format!("{e:#}")))?;
         let pre = self
             .linker
             .instantiate_pre(&component)
@@ -263,7 +424,10 @@ fn classify(err: wasmtime::Error) -> RunOutcome {
         Some(Trap::AllocationTooLarge) => {
             RunOutcome::Incomplete(IncompleteReason::HostFault(err.to_string()))
         }
-        Some(trap) => RunOutcome::Error(ErrorOutcome::Trap(trap.to_string())),
+        Some(trap) => match TrapCode::from_wasmtime(*trap) {
+            Some(code) => RunOutcome::Error(ErrorOutcome::Trap(code)),
+            None => RunOutcome::Incomplete(IncompleteReason::HostFault(err.to_string())),
+        },
         None => RunOutcome::Incomplete(IncompleteReason::HostFault(format!("{err:#}"))),
     }
 }
@@ -345,7 +509,7 @@ mod tests {
             .map(|_| ())
             .expect_err("growth past the cap must fail");
         assert!(
-            matches!(classify(err), RunOutcome::Error(ErrorOutcome::Trap(_))),
+            classify(err) == RunOutcome::Error(ErrorOutcome::Trap(TrapCode::Unreachable)),
             "the start function traps when memory.grow returns -1"
         );
         let mut roomy = runtime.store(16, &limits).expect("store");
