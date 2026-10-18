@@ -10,12 +10,19 @@ use std::sync::Mutex;
 pub use jig_core::HlcTimestamp as Timestamp;
 
 /// Process-wide HLC state for one server.
+///
+/// `max_future_skew_ms` is how far ahead of this clock a received timestamp
+/// may be (JEP-0002 rule 13). Ingest refuses anything further before it
+/// reaches [`HlcClock::update_on_receive`], so the clock only ever adopts
+/// time within the bound.
 pub struct HlcClock {
     state: Mutex<HlcTimestamp>,
+    max_future_skew_ms: u64,
 }
 
 impl HlcClock {
-    /// New clock at wall=0, logical=0 with the given server DID.
+    /// New clock at wall=0, logical=0 with the given server DID, bounded by
+    /// [`crate::handshake::DEFAULT_FUTURE_SKEW_MS`].
     pub fn new(server_did: Did) -> Self {
         Self {
             state: Mutex::new(HlcTimestamp {
@@ -23,7 +30,20 @@ impl HlcClock {
                 logical: 0,
                 server_did,
             }),
+            max_future_skew_ms: crate::handshake::DEFAULT_FUTURE_SKEW_MS,
         }
+    }
+
+    /// The same clock bounded by `max_future_skew_ms` instead of the default.
+    /// The caller has checked it against the protocol's range.
+    pub fn with_max_future_skew_ms(mut self, max_future_skew_ms: u64) -> Self {
+        self.max_future_skew_ms = max_future_skew_ms;
+        self
+    }
+
+    /// How far ahead of this clock a received timestamp may be.
+    pub fn max_future_skew_ms(&self) -> u64 {
+        self.max_future_skew_ms
     }
 
     /// Advance the wall component without producing a timestamp.

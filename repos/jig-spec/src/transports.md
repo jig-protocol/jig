@@ -1,8 +1,10 @@
 # Transports
 
-> **Mostly not implemented in v0.1.** Only WebSocket and the email bridge exist, and
-> neither matches this chapter in every detail. IRC and SSH are design only. No transport
-> carries encrypted content in v0.1.
+> **Mostly not implemented.** Only WebSocket and the email bridge exist, and neither
+> matches this chapter in every detail. IRC and SSH are design only. WebSocket and REST run
+> over TLS 1.3 by default, with the self-signed certificate binding described under
+> [Server Certificates](#server-certificates). Encrypted channels and DMs travel as MLS
+> ciphertext; no bridge can read them.
 
 **Audience:** This chapter is for **protocol implementers** building clients or servers that need to support multiple transports, and **server operators** deciding which transports to enable. **End users** might care about which transports their favorite clients support. **Developers** building integrations (IRC bots, email gateways) will want to understand transport-specific constraints.
 

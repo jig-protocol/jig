@@ -43,7 +43,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             server: ServerSection {
-                base_url: "http://127.0.0.1:7117".to_string(),
+                // TLS, like the server's default (`[tls] enabled = true`).
+                base_url: "https://127.0.0.1:7117".to_string(),
                 nameserver_url: None,
             },
             user: UserSection {
@@ -117,6 +118,15 @@ pub fn default_config_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_server_is_the_local_server_over_tls() {
+        let base = Config::default().server.base_url;
+        let url = reqwest::Url::parse(&base).unwrap();
+        assert_eq!(url.scheme(), "https", "the server serves TLS by default");
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert_eq!(url.port(), Some(7117));
+    }
 
     #[test]
     fn config_without_a_contacts_table_still_loads() {

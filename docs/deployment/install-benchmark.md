@@ -1,12 +1,14 @@
 # v0.0.2 Install Benchmark (H8)
 
+> Releases are now served from GitHub Releases, not `releases.jig.onl`. The CI runs of
+> this gate are described at the end of this page.
+
 Acceptance gate: `curl -fsSL https://jig.onl/install.sh | bash` completes in
 under 60 seconds on a fresh Ubuntu 22.04 VM ($5/mo droplet class), landing
 the user in an interactive `jig chat #hello` session.
 
-This is a manual benchmark — it requires a fresh VM, real DNS, and the
-release tarballs published to `releases.jig.onl`. Until those operational
-pieces land, the benchmark is run by hand on an arbitrary cloud VM.
+This is a manual benchmark — it requires a fresh VM, real DNS for `jig.onl`, and a
+release published on GitHub Releases. It is run by hand on an arbitrary cloud VM.
 
 ## Procedure
 
@@ -62,7 +64,7 @@ The 60s budget covers, in this order:
 If any single phase blows past these budgets, the corresponding install.sh
 step needs investigation. Common culprits historically:
 
-- **DNS slow-resolve for releases.jig.onl** — keep the host on a fast CDN.
+- **Slow downloads from GitHub Releases** — compare with a mirror (`JIG_RELEASES_BASE`).
 - **`cargo build` triggered by mistake** — install.sh detects this and
   switches modes; ensure the standalone path is taken on fresh VMs.
 - **Interactive prompts hanging** — set `JIG_NONINTERACTIVE=1` for the

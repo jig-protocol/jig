@@ -72,7 +72,7 @@ BOB="$(did_of bob)"
 CAROL="$(did_of carol)"
 
 say "alice creates #ops: restricted, end-to-end encrypted"
-as alice channel create '#ops' --visibility restricted --encrypted
+as alice channel create '#ops' --visibility restricted
 as alice channel add '#ops' "$BOB"
 as alice channel list
 

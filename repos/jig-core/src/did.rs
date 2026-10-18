@@ -215,6 +215,19 @@ impl<'de> Deserialize<'de> for Did {
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
+/// A short, stable tag for a DID in logs: the first 12 hex digits of a
+/// domain-separated BLAKE3 hash. The same DID always gets the same tag, so
+/// log lines can be correlated, but the DID itself is never written
+/// (zero-trust, "Logging and metadata retention"). Anyone who already knows a
+/// DID can compute its tag; a keyed tag would need a per-server secret.
+pub fn log_tag(did: &str) -> String {
+    let hash = crate::crypto::hash_labeled_parts(&[
+        ("domain", b"jig-log-did-v1"),
+        ("did", did.as_bytes()),
+    ]);
+    hex::encode(&hash.as_bytes()[..6])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +329,16 @@ mod tests {
             "z-prefixed corrupted DID returned NotCanonical, which would let \
              callers silently fall back to legacy-label handling. err: {err:?}"
         );
+    }
+
+    #[test]
+    fn log_tags_hide_the_did_but_correlate_it() {
+        let a = "did:jig:zaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let b = "did:jig:zbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let tag = log_tag(a);
+        assert_eq!(tag, log_tag(a), "the same DID always gets the same tag");
+        assert_ne!(tag, log_tag(b));
+        assert_eq!(tag.len(), 12);
+        assert!(!tag.contains("did:jig"), "a tag never carries the DID");
     }
 }
