@@ -429,16 +429,17 @@ impl JigKey {
         if format != MAGIC[7] {
             return Err(KeystoreError::Version(format.into()));
         }
-        if rest.len() < 4 {
-            return Err(malformed("truncated header length"));
-        }
-        let (len, rest) = rest.split_at(4);
-        let len = u32::from_le_bytes(len.try_into().expect("4 bytes")) as usize;
+        let (len, rest) = rest
+            .split_first_chunk::<4>()
+            .ok_or_else(|| malformed("truncated header length"))?;
+        let len = u32::from_le_bytes(*len) as usize;
         if len > MAX_HEADER || rest.len() < len + NONCE_LEN + 32 + TAG_LEN {
             return Err(malformed("truncated or oversized"));
         }
         let (header_bytes, rest) = rest.split_at(len);
-        let (nonce, sealed_seed) = rest.split_at(NONCE_LEN);
+        let (nonce, sealed_seed) = rest
+            .split_first_chunk::<NONCE_LEN>()
+            .ok_or_else(|| malformed("truncated nonce"))?;
         if sealed_seed.len() != 32 + TAG_LEN {
             return Err(malformed("trailing bytes after the sealed seed"));
         }
@@ -453,7 +454,7 @@ impl JigKey {
         Ok(Self {
             header,
             header_bytes: header_bytes.to_vec(),
-            nonce: nonce.try_into().expect("24 bytes"),
+            nonce: *nonce,
             sealed_seed: sealed_seed.to_vec(),
         })
     }
@@ -505,18 +506,15 @@ pub fn open(key: &FileKey, aad: &[u8], sealed: &[u8]) -> Result<Zeroizing<Vec<u8
     let rest = sealed
         .strip_prefix(SEAL_MAGIC)
         .ok_or(KeystoreError::NotSealed)?;
-    if rest.len() < NONCE_LEN + TAG_LEN {
+    let (nonce, ct) = rest
+        .split_first_chunk::<NONCE_LEN>()
+        .ok_or(KeystoreError::Tampered)?;
+    if ct.len() < TAG_LEN {
         return Err(KeystoreError::Tampered);
     }
-    let (nonce, ct) = rest.split_at(NONCE_LEN);
-    aead_open(
-        &key.0,
-        nonce.try_into().expect("24 bytes"),
-        &seal_aad(aad),
-        ct,
-    )
-    .map(Zeroizing::new)
-    .ok_or(KeystoreError::Tampered)
+    aead_open(&key.0, nonce, &seal_aad(aad), ct)
+        .map(Zeroizing::new)
+        .ok_or(KeystoreError::Tampered)
 }
 
 fn seal_aad(aad: &[u8]) -> Vec<u8> {
