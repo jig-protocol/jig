@@ -400,10 +400,17 @@ down. **Open for DJ.**
 - **The owner is the delivery service.** It applies the current single-server rules
   unchanged: an exact epoch match, a commit that does exactly what its block says, and a
   compare-and-swap on the epoch. Only clients commit.
-- **The owner signs the order.** Each accepted block gets an owner-signed sequence entry
-  `{channel, seq, cid, prev}`, hash-chained per channel. Followers keep the chain. Two
-  followers that compare heads detect an owner showing them different histories, and a
-  gap in `seq` shows an omission (OP-06: detection, not prevention).
+- **The owner signs the order, using L7's `ingest` record (decided by DJ, 2026-10-18).**
+  - Every block gets a record signed by the channel's home server:
+    `{channel_id, seq, ingest_hlc, block_cid, prev}`. Here the home server is the owner.
+  - The record travels with the block. Relaying servers pass it through unchanged and
+    never re-sign it.
+  - Authored blocks carry `seen`, the hash of the latest record their author verified.
+  - JEP-0002 (L7) defines the record. This design only relies on it.
+  - Followers keep the chain. Two followers that compare heads detect an owner showing them
+    different histories, and a gap in `seq` shows an omission. `seen` adds detection by
+    authors: a block citing a record the follower never received shows withholding (OP-06:
+    detection, not prevention).
 - **Followers validate too** (5.1), so a buggy or hostile owner cannot wedge remote
   members with a commit that will not apply.
 - **The owner's server key goes into the group's `external_senders`** only if the owner
@@ -512,7 +519,7 @@ L1, so F asks L1 to add one now.
 | DNS SRV `_jig._tcp` discovery, MUST | **Drop to MAY.** Peers are configured by DID plus URL, and URLs come from config, home records or `/.well-known/jig` |
 | `/.well-known/jig` "HTTP, not HTTPS" | **Drop.** It is served over TLS, and the DID-bound TLS binding lives there (#95) |
 | mTLS with X.509 client certificates | **Rewrite:** DID-bound TLS, plus a mutual JEP-0002 handshake in both directions (lane L7 owns the handshake) |
-| Server signs every federation payload in a `from_server`/`to_server`/nonce envelope | **Rewrite.** Blocks are author-signed and CID-addressed. Contract messages and sequence entries are server-signed. The handshake binds the connection. No second envelope |
+| Server signs every federation payload in a `from_server`/`to_server`/nonce envelope | **Rewrite.** Blocks are author-signed and CID-addressed. Contract messages and `ingest` records are server-signed. The handshake binds the connection. No second envelope |
 | Relayed blocks: full gate, no persisting on a peer's word, receipts are evidence, configured pinned peers only | **Keep** (built, #90) |
 | Nonce and ±10 min window on every message | **Rewrite:** the nonce and window apply to the handshake and subscription (built, ±30 s). Blocks are deduped by CID |
 | Explicit version negotiation, no silent downgrade | **Keep** |
@@ -562,7 +569,7 @@ Updated in the implementation PRs, not here.
   3. `jig trust` handles name-pin changes as well as server-pin changes.
 
   F owns every frame above the handshake (contract messages, relay-submit, key-package
-  requests, sequence entries).
+  requests). The `ingest` record is L7's.
 - **L6 (nameserver sweep).** F claims **only the `v0_0_2_*` alias flow** (register,
   resolve, renew, rotate), which F1 changes in place. F claims **none** of the legacy
   modules. In particular:

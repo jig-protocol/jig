@@ -22,7 +22,8 @@ three things:
 - the creator-signed `channel-create` block, which fixes the suite, the membership rule
   and the owner (D12);
 - a server-signed accept or refuse from each follower;
-- owner-signed sequence entries that make forks and omissions detectable.
+- the owner-signed `ingest` record on every block (JEP-0002), which makes forks and
+  omissions detectable.
 
 Design record, alternatives and prior art (XMPP MUC, IRC, Matrix, ActivityPub groups,
 IETF MIMI):
@@ -95,15 +96,15 @@ Non-goals for v0.2:
 
 ## Ordering
 
-12. For each block it accepts, the owner MUST emit a sequence entry
-    `{channel_id, seq, cid, prev}`.
-    - `seq` increases by one per entry.
-    - `prev` is the hash of the previous entry.
-    - The entry is signed by the owner.
+12. The owner MUST attach to each block it accepts the `ingest` record of JEP-0002:
+    `{channel_id, seq, ingest_hlc, block_cid, prev}`, signed by the owner.
+    - Followers MUST relay the record unchanged and MUST NOT re-sign it.
 13. Followers MUST keep the chain and MUST deliver blocks to their users in `seq` order.
-14. A follower that sees a gap, or two entries with the same `seq` and different content,
-    MUST stop delivering the channel and SHOULD surface the conflicting entries as
-    evidence.
+14. A follower MUST stop delivering the channel when it sees any of these, and SHOULD
+    surface the conflicting records as evidence:
+    - a gap in `seq`;
+    - two records with the same `seq` and different content;
+    - a block whose `seen` cites a record the follower does not hold.
 
 ## Writes from remote members
 
