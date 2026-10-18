@@ -115,7 +115,7 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
    channel, object, kind: "block-install", restrictions, custodian}`. `object` is the install's
    CID; `restrictions` is the CID of the operator policy (§2.1) the server checked it against;
    `custodian` is required for an install and names `bot_did`, stating that the server holds
-   `bot_key` (SC-04).
+   `bot_key` (SC-04). A `host-approval` whose `custodian` is not the install's `bot_did` is invalid.
    - The **current** approval is read from the channel's `ingest` chain: the latest
      `host-approval` or `host-withdrawal` (`{…, kind, reason, conflicts}`) for that install CID, in
      ingest order, wins, and a withdrawal stands until a newer approval. The approval carries no `seq` or `prev` of its own.
