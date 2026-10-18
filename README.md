@@ -35,12 +35,13 @@ loopback and private tailnets.
   encryption suite are checked, and anything unsupported is rejected
   ([`repos/jig-spec/src/versioning.md`](repos/jig-spec/src/versioning.md)).
 
-- **End-to-end encryption is per channel, and off by default.** A channel created with
-  `--encrypted` (and every DM) is one MLS group (RFC 9420): the server stores and relays
-  ciphertext it cannot read, and validates every membership change without holding any
-  group secret. Every *other* channel is signed, not encrypted — the server stores its
-  plaintext. Restricted channels become always-MLS, with no opt-out, before the v0.2 tag
-  ([D25](docs/ROADMAP.md)). Encrypted channels do not federate yet. Metadata (who, when,
+- **End-to-end encryption is per channel.** Every restricted channel, every DM and every
+  open channel created with `--encrypted` is one MLS group (RFC 9420): the server stores and
+  relays ciphertext it cannot read, and validates every membership change without holding
+  any group secret. Other open channels are signed, not encrypted — the server stores their
+  plaintext. Restricted channels are always MLS, with no opt-out ([D25](docs/ROADMAP.md));
+  one created plaintext before that rule is frozen and takes no new content. Encrypted
+  channels do not federate yet. Metadata (who, when,
   how much, who joined) is visible to the server either way. See
   [`docs/security/encryption.md`](docs/security/encryption.md).
 - **Authentication, authorization, admission and rate limits.** Every read
@@ -76,7 +77,7 @@ loopback and private tailnets.
 | `GET /api/v1/channels/:slug/blocks`, `/healthz`, `/metrics` | Works |
 | Nameserver: alias register / resolve / rotate / renew | Works (`jig-nameserver`, `jig ns …`) |
 | Server-to-server federation over WSS | Implemented for open, unencrypted channels and covered by [`h3_federation.rs`](repos/integration-tests/tests/h3_federation.rs); never run between two hosts on the public internet |
-| Email bridge (Resend) | Implemented in-process; see [`bridges/email/README.md`](repos/bridges/email/README.md) |
+| Email bridge (Resend) | Implemented in-process, but inbound mail is refused until the bridge can join a thread's MLS group (D25); see [`bridges/email/README.md`](repos/bridges/email/README.md) |
 | Wasm block execution **on the server** | `text-render` executes for real on plaintext channels: the server runs its canonical module and signs the `render_hash` ([`jig-pipeline/src/ingest.rs`](repos/jig-pipeline/src/ingest.rs), step 4). Encrypted content is never executed and gets a `sealed` receipt; control-plane kinds take a synthetic one |
 | Wasm block execution in the CLI (`jig block run`) | Runs and emits a metered receipt for the runtime's own fixtures. It **rejects the workspace's own `text-block` build** with `MemoryMissingMaximum` from the determinism validator |
 | `jig block lint` / `sign` / `verify` / `capabilities` | Stubs; they print "not yet implemented" and exit 1 |
