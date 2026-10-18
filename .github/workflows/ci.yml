@@ -246,6 +246,75 @@ jobs:
           JIG_TEXT_BLOCK_WASM: target/wasm32-unknown-unknown/release/text_block.wasm
         run: cargo test -p jig-runtime --test text_block_payload
 
+  # Nightly checks that `workspace` leaves out to keep pull request and queue
+  # runs short. The nightly skips itself when no Rust source changed in the
+  # previous day. Not a required check: a red nightly means fix forward, it does
+  # not gate merges.
+  # - Doc tests. Nextest does not run them, so a broken example in a doc comment
+  #   never turns `workspace` red; one already sat broken on main for a while
+  #   (jig-config's validation.rs). jig-cli is left out because it has no
+  #   library target for `--doc` to test.
+  # - jig-runtime's `tracing` feature, which no default build enables, so a
+  #   warning or a break behind it would otherwise go unseen.
+  nightly:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Swatinem/rust-cache saves to the Actions cache API.
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The skip check below reads the last day of history.
+          fetch-depth: 0
+      - name: Did any Rust source change since the previous nightly?
+        id: changed
+        working-directory: .
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != schedule ]; then
+            echo "run=true" | tee -a "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 25h, not 24h, so a late-starting cron run never misses a commit.
+          if git log --since='25 hours ago' --format=%H -- \
+              repos rust-toolchain.toml ':(exclude,glob)**/*.md' | grep -q .; then
+            echo "run=true" | tee -a "$GITHUB_OUTPUT"
+          else
+            echo "No Rust source changed since the previous nightly; skipping."
+            echo "run=false" | tee -a "$GITHUB_OUTPUT"
+          fi
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        if: steps.changed.outputs.run == 'true'
+        run: rustup toolchain install && rustc --version && cargo --version
+      - uses: Swatinem/rust-cache@v2
+        if: steps.changed.outputs.run == 'true'
+        with:
+          workspaces: repos
+      - name: Doc tests (v0.0.2 surface)
+        if: steps.changed.outputs.run == 'true'
+        run: |
+          cargo test --doc \
+            -p jig-core \
+            -p jig-config \
+            -p jig-pipeline \
+            -p jig-client \
+            -p jig-mls \
+            -p jig-server \
+            -p jig-nameserver \
+            -p jig-runtime \
+            -p text-block \
+            -p integration-tests \
+            -p jig-bridge-core \
+            -p jig-bridge-email
+      - name: Clippy, jig-runtime with the tracing feature
+        # Runs even when the doc tests failed, so one red step never hides the other.
+        if: ${{ !cancelled() && steps.changed.outputs.run == 'true' }}
+        run: cargo clippy -p jig-runtime --all-targets --features tracing -- -D warnings
+
   # Renamed from `license-compliance`: bare `cargo deny check` runs ALL FOUR
   # checks (advisories, bans, licenses, sources). The old name once sent a
   # failure investigation at the licenses check when the actual red was
