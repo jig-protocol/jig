@@ -102,8 +102,11 @@ and custodians. It extends the admission PoW rather than replacing it.
   4. (`subject`, the DID asking, or the session key for `--anon`);
   5. (`action`, a registered action label such as `admit`, `post`, `ns-register`, `dial`,
      `kp-request`);
-  6. (`binding`, bytes fixed by the action: the block CID for `post`, the full name for
-     `ns-register`, the dialed server's DID for `dial`; empty for `admit`);
+  6. (`binding`, bytes fixed by the action: the block CID for `post`; for `ns-register`,
+     `ns-rotate` and `ns-renew`, the JEP-0004 proof hash
+     `jig_core::naming::proof_hash(action, ns_did, alias, challenge)`, so the work commits to
+     exactly what the proof of control signs (lane F's suggestion); the dialed server's DID for
+     `dial`; empty for `admit`);
   7. (`salt`, 5.3);
   8. (`nonce`, at most 64 bytes, chosen by the solver).
 - **Effort** is a linear integer `E ≥ 1`, the expected number of attempts, as in Tor, not a bit
@@ -135,7 +138,7 @@ constraints protect. Numbers here are estimates; R1's exit criterion includes me
 | --- | --- | --- | --- | --- |
 | **Admission** | empty | `admit`, once per (verifier, subject) | the binding: one admission per pair | records the DID as proven (as today) |
 | **Stamp** | the verifier's current epoch salt: 32 random bytes, rotated every `epoch_secs` (ruleset; default 600), published in the signed welcome or manifest and in `/.well-known/jig` as a hint. The current and previous salts are accepted | per-action costs at servers: `post`, `kp-request`, `dial` | the binding (one stamp per block CID), plus a spent set of digests kept for two epochs | bounded: two epochs of digests |
-| **Challenge** | a fresh challenge the verifier issued (at least 32 random bytes, at most 300 s, consumed on first use: JEP-0004 rule 10) | nameserver binding endpoints: `ns-register`, `ns-rotate`, `ns-renew` | single use | the challenge map, bounded by count and TTL |
+| **Challenge** | empty: the challenge (at least 32 random bytes, at most 300 s, consumed on first use: JEP-0004 rule 10) is already inside the binding's proof hash | nameserver binding endpoints: `ns-register`, `ns-rotate`, `ns-renew`, carried in F1's optional `pow` object on the request | single use of the challenge | the challenge map, bounded by count and TTL |
 
 The epoch salt bounds precomputation to one epoch. Admission needs no salt: precomputing an
 admission does not make it cheaper, only earlier.
@@ -326,6 +329,13 @@ Two further rules from the same answer:
   it, and the presentation stays unlinkable to the inviter. A tribunal verdict on invitees opens
   the tag at the seat threshold. The inviter then takes the ruleset's inviter penalty and loses its
   invite budget.
+- **Only a human-confirmed verdict opens a tag.** No automated output can open one: not an
+  evidence-track threshold verdict (10.3), and not a provisional measure. Each seat's decryption
+  share is released only by a person at that seat, after the human panel's verdict, and the
+  release is logged. Seat agents never hold a share in a form they can use alone. Otherwise the
+  machines holding the shares could de-anonymise inviters on their own. Automation still acts
+  fast on the swarm itself: evidence-track verdicts and provisional measures apply to the invitees
+  (demotion, throttling), which the invited pool already contains.
 - **Why not a nameserver that sees both parties** (DJ's first proposal): one nameserver would hold
   the group's invite graph. That is a honeypot, and it breaks NS-03. The threshold tag gives the
   same accountability with nobody holding the graph.
@@ -539,7 +549,8 @@ confirmation and appeals.
    - there is no path to unmask an `--anon` key;
    - no penalty under a ruleset the subject did not acknowledge (GV-03, R2);
    - defederating a server or nameserver needs a supermajority and published evidence;
-   - opening an invite tag (6.3) needs a verdict at the seat threshold.
+   - opening an invite tag (6.3) needs a human-confirmed verdict, with each share released by a
+     person at its seat; no automated verdict or measure can open one.
 9. **Residual (GV-02):** a patient party that deceives the admission threshold into granting it
    several seats. Bounded by that threshold, and by exit: a captured group loses members to groups
    that do not recognise it.
@@ -683,8 +694,9 @@ To land in R1's and R3's implementation PRs (framing lanes edit no existing file
 - GV-02: "one seat per admitted operator".
 - A new row, **AB-07, aged-key trading**, status Accepted, bounded (decided, Q2).
 - PV-03: "No protocol message links two DIDs in the clear. The one exception is an invite's
-  inviter tag, encrypted to a ruleset group's threshold key and opened only by a tribunal verdict
-  at the seat threshold (6.3)."
+  inviter tag, encrypted to a ruleset group's threshold key and opened only after a
+  human-confirmed tribunal verdict, by decryption shares people release at the seat threshold
+  (6.3)."
 - PV-03 and the `--anon` section of `identity-and-reputation.md`: "An `--anon` key has no
   reputation. It is unknown under every ruleset for its whole session, and it can neither invite
   nor be invited."
@@ -699,12 +711,12 @@ stub for discovery. Replace the row's question with pointers:
 > (R3). Until R3 ships, reputation is not a security input (OP-10).
 
 and add a "Governance" pointer to R6 and R8 (server lists). **Decided (DJ, Q10): three new
-JEPs**, numbered when each opens (0006 and 0007 are taken):
+JEPs**, with numbers reserved by the orchestrator:
 
-1. proof-of-work and admission (R1);
-2. rulesets and reputation (R2, R3, R7), with transparency logs (R4) unless F3's
-   group-delegation JEP takes them;
-3. reports, tribunals and server lists (R5, R6, R8).
+1. **JEP-0008**, proof-of-work and admission (R1);
+2. **JEP-0009**, rulesets, reputation and transparency logs (R2, R3, R4, R7). The orchestrator
+   assigned the logs here rather than to F3's JEP;
+3. **JEP-0010**, reports, tribunals and server lists (R5, R6, R8).
 
 **JEP-0001:** every suite JEP defines a report profile (8.3); lane S owns the edit.
 
@@ -744,8 +756,14 @@ stranger pool; rule 14b's list gains R's issuer and evidence rules (section 11).
 Still open, for later milestones:
 
 - the verifiable-encryption and threshold scheme for inviter tags (R7);
-- whether openmls exposes per-message secrets (R5);
-- whether F3's JEP or R's second JEP takes transparency logs.
+- whether openmls exposes per-message secrets (R5).
+
+Settled after the questions, through the orchestrator:
+
+- transparency logs go in JEP-0009, not F3's JEP;
+- the nameserver challenge mode binds F1's proof hash (5.1);
+- an inviter tag opens only on a human-confirmed verdict (6.3). This is the tight reading of
+  DJ's Q6 answer, needed because Q8 made seats automated first. DJ may override it.
 
 The plain rate limit on the nameserver's `register`, `rotate` and `renew` is not a lane R question
 (it is with DJ separately). R's view, for that decision: a rate limit per address and per signed
