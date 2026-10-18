@@ -24,7 +24,7 @@ This JEP defines how block code is named, published, fetched, and chosen for exe
 - **Read gate.** A program can be fetched only by callers who can read a channel that holds it. A
   message links a program into its channel only under its sender's read authority.
 - **Execution policy.** Clients auto-run only renderers that the channel's policy allows. The
-  channel owner signs that policy, and the hosting server approves it against restrictions it
+  channel owner signs that policy, and the hosting server countersigns it against restrictions it
   publishes. Users can still refuse execution or allow it for themselves.
 
 **Draft status.** The maintainer approved the design on 2026-10-18 (decisions Dv1–Dv6 in the
@@ -57,10 +57,14 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 
 1. Every object defined here is a deterministic CBOR payload (RFC 8949 §4.2.1, with a strict
    decoder) carrying a `domain` entry.
-2. Each object is signed as an untagged COSE_Sign1 (RFC 9052) with protected header `{1: -8}`
-   (EdDSA over Ed25519), an empty unprotected header, no external AAD, and the payload attached.
-3. The envelope names no signer. Each payload names its signer's DID, and a verifier MUST check the
-   signature against that DID.
+2. Each object is signed with protected header `{1: -8}` (EdDSA over Ed25519), an empty
+   unprotected header, no external AAD, the payload attached, and the envelope untagged:
+   - as a COSE_Sign1 (RFC 9052) when it has one signer;
+   - as a COSE_Sign when it has several, every one of which must sign (JEP-0004 rule 0). In that
+     case the signatures are in a fixed order, and a verifier checks against that exact list.
+3. The envelope names no signer. A verifier MUST check each signature against a DID it learns
+   elsewhere: from the payload, or, for a hosting server, from the channel's sequencer record
+   *(F)*.
 4. A verifier MUST refuse an envelope or payload that is not deterministically encoded, or that
    carries any other header.
 
@@ -117,7 +121,7 @@ This is the encoding layer jig uses for every new signed object (reference imple
    - A server MUST NOT execute a `render` in a channel whose suite is not `none`.
 3. **`program-yank`**, signed by a program's author, names a program CID and a reason. It is
    advisory: pinned uses keep working, and clients SHOULD warn.
-4. **`server-restrictions`**, **`channel-policy`**, **`policy-approval`** and **`policy-withdrawn`**
+4. **`server-restrictions`**, **`channel-policy`** and **`policy-withdrawn`**
    are defined in §5.
 
 ## 4. Read gate
@@ -143,45 +147,53 @@ This is the encoding layer jig uses for every new signed object (reference imple
 1. An operator MAY publish a `server-restrictions` object:
    `{domain: "jig-server-restrictions-v1", server, seq, deny: {programs: [cid…], authors: [did…]}}`,
    signed by the server.
-2. Restrictions limit which channel policies the server will approve (§5.3). They do not limit
+2. Restrictions limit which channel policies the server will countersign (§5.3). They do not limit
    what clients run, and they do not affect server execution, which operator policy alone governs
    (JEP-0007 §2).
 
 ### 5.2 Channel policy
 
-1. A `channel-policy` is signed by the channel's owner:
+1. A `channel-policy` payload is
    `{domain: "jig-channel-policy-v1", channel, owner, seq, prev, allow: {programs: [cid…], authors: [did…]}}`.
+   It is a COSE_Sign with two signatures, in this order:
+   - the channel's owner (`owner`);
+   - the channel's hosting (home) server *(F)*.
+
+   The payload does not name the server, so a new home server can countersign the same payload.
 2. The owner sets one when creating the channel, and MAY amend it with a new `channel-policy` whose
-   `seq` is one higher and whose `prev` is the previous policy's CID.
-3. A host MUST refuse a `channel-policy` that is not signed by the channel's owner.
+   `seq` is one higher and whose `prev` is the previous policy's CID. The CID of a policy is the
+   CID of its payload.
+3. A host MUST refuse a `channel-policy` whose first signature is not the channel owner's.
 4. A `channel-policy` is a plaintext control block in every channel, including encrypted ones
    (§6.3).
 5. A `channel-policy` gates client execution only. It grants no capability, is not a
    `block-install`, and MUST NOT cause a server to execute anything.
 
-### 5.3 Approval by the hosting server
+### 5.3 Countersignature by the hosting server
 
-1. The channel's home server *(F)* checks each `channel-policy` against its current restrictions.
-   If the policy allows nothing the restrictions deny, the server issues a `policy-approval`:
-   `{domain: "jig-policy-approval-v1", server, channel, policy: cid, restrictions: cid, seq}`.
-   Otherwise it MUST refuse the policy, naming the conflicting entries.
-2. When its restrictions change, the server MUST re-check every policy it approved. For each one
-   it issues either a new `policy-approval` against the new restrictions, or a `policy-withdrawn`:
-   `{domain: "jig-policy-withdrawn-v1", server, channel, policy: cid, restrictions: cid, conflicts}`.
-3. A server cannot change a policy. It can only approve or withdraw.
-4. **Sequencer moves.** When a channel's sequencer moves *(F)*, the new home server MUST issue a
-   `policy-approval` for the current policy as part of taking over. Until it does, clients treat
-   the channel as having no policy.
-   - This is to be carried as a term of JEP-0005's `contract-accept`. That amendment is pending
-     with lane F, and no PR exists for it yet.
+1. The home server checks each owner-signed `channel-policy` against its current restrictions.
+   - If the policy allows nothing the restrictions deny, the server adds its signature.
+   - Otherwise it MUST refuse to countersign, naming the conflicting entries.
+2. When its restrictions change, the server MUST re-check every policy it countersigned.
+   - A policy that still passes needs nothing further.
+   - For a policy that now fails, the server issues a `policy-withdrawn`, signed by the server:
+     `{domain: "jig-policy-withdrawn-v1", server, channel, policy: cid, restrictions: cid, conflicts}`.
+   - A withdrawn policy stays withdrawn. The owner restores a policy by amending it (§5.2.2), and
+     the server countersigns the amendment.
+3. A server cannot change a policy. It can only countersign, or withdraw.
+4. **Sequencer moves.** When a channel's sequencer moves, the new home server countersigns the
+   current `channel-policy` as part of its `contract-accept`, as JEP-0005 rule 11b (#173) requires.
+   Until it does, the policy carries no signature from the server that hosts the channel, and
+   clients treat the channel as having no policy. Rule 11b applies the same requirement to every
+   live `block-install` (JEP-0007 §4).
 
 ### 5.4 What a client runs
 
 1. A client MUST treat a channel as having an **effective policy** only when all of these hold:
-   - the latest `channel-policy` is signed by the owner;
+   - the latest `channel-policy` carries both signatures, the owner's and then the current home
+     server's;
    - the `seq`/`prev` chain is unbroken;
-   - the current home server has a `policy-approval` for it;
-   - that approval has not been followed by a `policy-withdrawn`.
+   - the current home server has not issued a `policy-withdrawn` for it.
 
    Otherwise the channel has no policy.
 2. A client MAY auto-run a renderer only if its program CID, or its author's DID, is in the
@@ -213,7 +225,7 @@ This is the encoding layer jig uses for every new signed object (reference imple
 - **Pinning by CID, with no automatic upgrades:** a compromised author key cannot change anything
   already pinned.
 - **Operator policy:** whether this server executes the program.
-- **Channel policy with server approval:** what members auto-run.
+- **Channel policy countersigned by the hosting server:** what members auto-run.
 - **`jig-det-1` and the sandbox:** bound execution. They do not protect against a runtime zero-day
   (SC-03).
 
@@ -224,8 +236,8 @@ A component cannot be checked against its source, so trusting a program means tr
 
 ## 6.3 Cost: channel policies are plaintext in encrypted channels
 
-The hosting server must read a policy to approve it. So in a channel whose suite is not `none`,
-the `channel-policy` and its approval are visible to the server, and to anyone who can read the
+The hosting server must read a policy to countersign it. So in a channel whose suite is not `none`,
+the `channel-policy` and its countersignature are visible to the server, and to anyone who can read the
 channel's control stream. They reveal which program CIDs and author DIDs the channel allows. That
 says something about what the channel is for, even though no message content leaks. The
 maintainer accepted this cost (Dv5d) so that a server can refuse policies it will not host, and
@@ -270,7 +282,7 @@ slices 4–8.
 To come with slice 4:
 - program manifests, with their program CIDs;
 - tampered variants of each;
-- a `channel-policy` chain with approvals and a withdrawal.
+- a `channel-policy` chain with countersignatures and a withdrawal.
 
 # Rejected Alternatives
 
@@ -281,9 +293,10 @@ To come with slice 4:
   trust root.
 - **Linking programs on the server's own authority.** This is the confused-deputy case (§6.4).
 - **Clients auto-run any renderer.** Exposure would extend to anyone who can post.
-- **One COSE_Sign by owner and server over the policy.** The server could then not re-approve or
-  withdraw after a change to its restrictions without the owner re-signing. A separate approval
-  object keeps the owner's policy fixed and the server's judgement current.
+- **A separate server approval object** naming the policy and the restrictions version. It would
+  let the server re-approve against each version of its restrictions, but it adds a third object
+  kind, and it breaks the single "owner first, host second" COSE_Sign pattern that
+  `block-install` and JEP-0005 rule 11b use. Withdrawal alone covers the case that matters.
 
 # Copyright
 
