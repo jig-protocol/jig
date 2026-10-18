@@ -178,7 +178,7 @@ Non-goals for v0.2:
     - the name suffixes it attests and their roots (JEP-0004).
 
     Contract messages cite its hash.
-17. (pending DJ) In v0.2 a server MUST refuse an offer from a server that is not on its
+17. In v0.2 a server MUST refuse an offer from a server that is not on its
     configured peer list (`NOT_A_PEER`).
 
 ## MLS

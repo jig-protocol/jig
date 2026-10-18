@@ -581,10 +581,17 @@ policy" item.
 
 ### 5.7 Who may federate (v0.2)
 
-**Proposed: configured peers only.** Today both sides must list each other, and the
-contract keeps that: an offer from a server that is not on the list is refused with
-`NOT_A_PEER`. Open federation, meaning accepting an offer from a stranger, waits for
-reputation and proof-of-work between servers (lane R, D26).
+**Decided (DJ, 2026-10-18): configured peers only.**
+- Today both sides must list each other, and the contract keeps that. An offer from a
+  server that is not on the list is refused with `NOT_A_PEER`.
+- A `channel-share` naming an unlisted server fails visibly in the channel log, so the
+  owner sees the refusal. The owner's signature never adds a peer; an operator does.
+
+Beyond v0.2, and deliberately not scoped yet:
+- **Peers vouched for by a contract.** A ruleset group's shared contract admits its
+  member servers as peers. This is a data-contract and nameserver question (F3).
+- **Open federation,** or federation open to anyone meeting a standard a ruleset
+  describes. This waits on reputation and proof-of-work between servers (lane R, D26).
 
 ### 5.8 The owner fails or turns hostile
 
@@ -803,7 +810,8 @@ Updated in the implementation PRs, not here.
 5. ~~Key packages (5.4)~~ **Decided:** custodians under an Alice-signed release policy;
    contacts automatically, everyone else held for approval.
 6. ~~Owner failure (5.8)~~ **Decided:** the movable sequencer, owner-only `sequencer-set`.
-7. Who may federate (5.7): configured peers only in v0.2?
+7. ~~Who may federate (5.7)~~ **Decided:** configured peers only in v0.2. Contract
+   vouching and open federation are later and unscoped.
 8. `federation.md` (7): this disposition?
 
 ## Appendix A: sources
