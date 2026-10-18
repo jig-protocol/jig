@@ -71,6 +71,10 @@ impl AppState {
         let store = Arc::new(SqliteStore::open(&db_path).context("opening SqliteStore")?);
         let signing_key = load_or_generate_server_key(&config.server.server_did_keyfile)
             .context("loading nameserver signing key")?;
+        // Before anything logs a DID: tags are keyed by this nameserver's seed.
+        if !jig_core::did::set_log_tag_key(&signing_key.to_bytes()) {
+            tracing::debug!("log tag key already set in this process");
+        }
         let ns_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
 
         // Nameservers always run TOFU identity (they don't recurse).
