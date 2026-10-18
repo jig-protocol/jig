@@ -112,12 +112,12 @@ impl Root {
     }
 }
 
-/// The action a proof of control is bound to (JEP-0004 rule 10).
+/// The action a proof of control is bound to (JEP-0004 rule 10). Rotation
+/// proves control through a link instead (rule 9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Register,
     Renew,
-    Rotate,
 }
 
 impl Action {
@@ -125,7 +125,6 @@ impl Action {
         match self {
             Action::Register => "jig-alias-register-v1",
             Action::Renew => "jig-alias-renew-v1",
-            Action::Rotate => "jig-alias-rotate-proof-v1",
         }
     }
 }
