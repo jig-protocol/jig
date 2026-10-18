@@ -403,8 +403,17 @@ impl JigKey {
             return Err(KeystoreError::LastSlot);
         }
         self.check_opened(opened)?;
-        let mut slots = self.header.slots.clone();
-        slots.remove(index);
+        // A filter, not `Vec::remove`: the index is checked above, and this
+        // keeps a panic path (which CodeQL reads as a log sink) out of code
+        // that handles wrapped keys.
+        let slots = self
+            .header
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .map(|(_, s)| s.clone())
+            .collect();
         Self::assemble(&self.header.did, opened, slots, &mut OsEntropy)
     }
 
