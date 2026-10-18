@@ -30,6 +30,10 @@ The `hash` of a comparable outcome is BLAKE3 (key derivation, context `jig:block
 over the canonical CBOR of the returned `result`, or of `trap(<code>)` for a trap. JEP-0006
 defines both, and the trap codes.
 
+There is one vector per trap code, except `invalid-conversion-to-integer`, which needs a float
+instruction that `jig-det-1` refuses. Four `malformed-*` vectors pin the malformed return values
+that are `incomplete(host-fault)`.
+
 An `incomplete` vector asserts only its reason. Stack exhaustion in particular happens at a depth
 that differs by engine and architecture.
 

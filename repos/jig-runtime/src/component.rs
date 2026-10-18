@@ -518,4 +518,28 @@ mod tests {
             .instantiate(&mut roomy, &component)
             .expect("growth within the cap succeeds");
     }
+
+    // A trap the closed set does not name is never comparable, so a feature enabled later has
+    // to add its codes on purpose: threads, GC and a Pulley-only opcode stand in for them here.
+    #[test]
+    fn a_trap_outside_the_set_is_a_host_fault() {
+        for trap in [
+            Trap::HeapMisaligned,
+            Trap::NullReference,
+            Trap::DisabledOpcode,
+            Trap::CannotEnterComponent,
+        ] {
+            assert!(
+                matches!(
+                    classify(wasmtime::Error::new(trap)),
+                    RunOutcome::Incomplete(IncompleteReason::HostFault(_))
+                ),
+                "{trap:?}"
+            );
+        }
+        assert_eq!(
+            classify(wasmtime::Error::new(Trap::IntegerDivisionByZero)),
+            RunOutcome::Error(ErrorOutcome::Trap(TrapCode::IntegerDivideByZero))
+        );
+    }
 }

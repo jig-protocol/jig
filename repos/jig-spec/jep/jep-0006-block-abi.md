@@ -131,7 +131,12 @@ Any other trap, including an engine-specific one, is `incomplete` with reason `h
 So is a malformed return value, such as a string or list past the end of memory, a bad
 discriminant or a misaligned return pointer. Engines report those differently, and treating
 them as `incomplete` costs nothing: such a block is never compared, and `incomplete` is never
-evidence against an executor.
+evidence against an executor. A later revision may replace this with a single comparable
+`invalid-return` code, once a second engine's lifting order has been checked against the
+vectors.
+
+A feature added to `jig-det-1` later (threads, GC, exceptions) brings its own traps. Each one
+stays `incomplete(host-fault)` until this table names it.
 
 Two conforming executors that both reach `ok` or `error` for the same run MUST reach the same
 outcome and hash, on any architecture, operating system, engine or engine version. An
