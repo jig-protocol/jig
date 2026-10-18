@@ -135,6 +135,8 @@ A receipt is a JSON object, signed by its executor over the exact bytes (`canoni
 
 Rules:
 - `engine` is telemetry. Verifiers MUST NOT compare `fuel_used` across executors.
+- `cost` is reserved for pricing (billing is deferred to the distributed-OS phase). v0.3
+  executors MUST NOT emit it; verifiers MUST ignore it.
 - A `sealed` receipt MUST NOT carry any content-derived value.
 - A member-signed receipt for encrypted content MUST travel only inside the group's encrypted
   messages.
