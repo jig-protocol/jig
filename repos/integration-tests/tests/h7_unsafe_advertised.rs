@@ -7,7 +7,6 @@
 //! v0.0.2 always lists `naively_unbounded_clock_skew` (no time-attestation
 //! servers exist yet). The other flags only appear when explicitly enabled
 //! in the server config:
-//!   - `debug.admin_endpoints`
 //!   - `federation.dangerously_disable_federation_tls`
 //!   - `identity.naively_allow_unknown_handles_fallback`
 //!   - `debug.list_handles`
@@ -29,7 +28,7 @@ async fn default_install_always_advertises_unbounded_clock_skew() {
     // Even with no antipatterns enabled, naively_unbounded_clock_skew must
     // be present — it captures the v0.0.2 reality that no time-attestation
     // server exists yet.
-    // No debug.admin_endpoints, no TLS-disabled, no allow-unknown-handles.
+    // No debug options, no TLS-disabled, no allow-unknown-handles.
     // (Default config already has these off, but be explicit.)
     let config = JigServerConfig {
         debug: DebugSection::default(),
@@ -51,22 +50,6 @@ async fn default_install_always_advertises_unbounded_clock_skew() {
         active.contains(&"naively_unbounded_clock_skew".to_string()),
         "default install must always advertise naively_unbounded_clock_skew (got {active:?})"
     );
-}
-
-#[tokio::test]
-async fn admin_endpoints_flag_surfaces_in_well_known() {
-    let mut config = JigServerConfig::default();
-    config.debug.admin_endpoints = true;
-    let server = TestJigServer::start_with_config(config).await.unwrap();
-    let info = well_known(&server).await;
-    let active: Vec<String> = info["unsafe_options_active"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap().to_string())
-        .collect();
-    assert!(active.contains(&"debug.admin_endpoints".to_string()));
-    assert!(active.contains(&"naively_unbounded_clock_skew".to_string()));
 }
 
 #[tokio::test]
@@ -132,7 +115,6 @@ async fn list_handles_flag_surfaces_in_well_known() {
 #[tokio::test]
 async fn all_antipatterns_simultaneously_advertised() {
     let mut config = JigServerConfig::default();
-    config.debug.admin_endpoints = true;
     config.federation.dangerously_disable_federation_tls = true;
     config.federation.dangerously_allow_plaintext_federation = true;
     config.identity.naively_allow_unknown_handles_fallback = true;
@@ -149,7 +131,6 @@ async fn all_antipatterns_simultaneously_advertised() {
 
     for expected in [
         "naively_unbounded_clock_skew",
-        "debug.admin_endpoints",
         "federation.dangerously_disable_federation_tls",
         "federation.dangerously_allow_plaintext_federation",
         "identity.naively_allow_unknown_handles_fallback",
