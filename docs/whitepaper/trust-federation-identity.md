@@ -1176,8 +1176,8 @@ gap.
   depends only on this workspace and public crates, and release artifacts are signed and
   checksummed and verified by installers. *Today:* [`deny.toml`](../../deny.toml) refuses
   unknown registries and git sources. Release tarballs ship with a signed `SHA256SUMS`;
-  `install.sh` verifies it against a pinned key when `ssh-keygen` is present, and by default
-  falls back to the checksum alone, with a warning, when it is not. No release is published,
+  `install.sh` verifies it against a pinned key and refuses to install without `ssh-keygen`,
+  unless the user opts into a checksum-only install with `JIG_VERIFY_SIGNATURE=0`. No release is published,
   and builds are not reproducible. *To design:* reproducible builds, so a user can check a
   binary against the source.
 - **SC-03, Wasm runtime zero-days.** *Obligation:* the sandbox is one layer of several:
