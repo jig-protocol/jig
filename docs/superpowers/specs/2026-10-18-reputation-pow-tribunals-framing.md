@@ -58,7 +58,7 @@ mechanism that links an `--anon` key to a DID (D20).
 | **Matrix policy lists** (Mjolnir, Draupnir; `m.policy.rule.*` events) and **policy servers** (MSC4284) | Moderation lists as rooms that bots subscribe to; a room-chosen server that gives an opinion on each event | Lists are subscribed, not imposed: each consumer picks which lists bind it. The policy server shows the risk of one party's opinion becoming a de facto gate for every room that adopts it |
 | **Fediverse denylists** (FediBlock, Oliphant tiers via FediBlockHole, IFTAS DNI and abandoned-domain lists, CARIAD) | Shared domain blocklists, often by consensus of N curators; IFTAS keeps a separate abandoned/unmanaged list | Consensus thresholds are the common defence against one curator's bias; retractions must propagate; evidence is often private because of harassment. IFTAS's own guidance names overblocking and absent appeals as the main harms. **Abandoned and abusive are different lists with different evidence** |
 | **Certificate Transparency** (RFC 6962/9162), CT gossip (draft-ietf-trans-gossip, expired as experimental), **C2SP tlog-checkpoint, tlog-cosignature, tlog-witness, tlog-tiles** | Merkle logs with signed tree heads; split views detected by gossip or prevented by witness cosignatures | Gossip never deployed at scale; **witness cosigning did**. A ruleset group's other nameservers are natural witnesses. Use the C2SP formats rather than invent one |
-| **Message franking** (Facebook; Grubbs et al. 2017; Dodis et al. 2018 on attachment franking; asymmetric franking, Tyagi et al. 2019) | A commitment to the plaintext that the platform binds at delivery, opened by the reporter | Franking exists because Messenger content is not signed by the sender. **jig does not need it**: the MLS content signature is the DID key (PV-04), so authorship is already provable. The lesson that does carry over is Dodis et al.'s: verify the exact bytes the victim saw, or a sender can make content unreportable |
+| **Message franking** (Facebook; Grubbs et al. 2017; Dodis et al. 2018 on attachment franking; asymmetric franking, Tyagi et al. 2019) | A commitment to the plaintext that the platform binds at delivery, opened by the reporter | **Adopted for encrypted reports (8.3)**, after openmls proved unable to expose per-message keys. In jig the commitment sits in the author-signed outer block, so anyone can verify it, not only the platform. Dodis et al.'s lesson carries over: the recipient must check the tag at decrypt, or a sender can make content unreportable |
 
 Sources are in Appendix A.
 
@@ -431,43 +431,76 @@ code, count, evidence: [CID], ref?}], sig}`
 
 ### 8.3 Abuse report from an encrypted channel (AB-06, D22)
 
-**Decided (DJ, Q7): per-message key disclosure, which is victim-key delegation scoped to one
-message, and a report profile required of every suite.** In RFC 9420, each application message is encrypted under a key and nonce derived from
-the sender's secret-tree ratchet for that generation, and its sender data under a key derived from
-the epoch's sender-data secret and a sample of the ciphertext. Revealing those per-message values
-decrypts that message and nothing else: the ratchet secrets they come from are not revealed.
+**Decided (DJ, Q7, revisited 2026-10-18): message franking, defined above the encryption suite.**
+DJ first chose per-message key disclosure. Lane S then checked openmls 0.9.1, and per-message
+secrets cannot be reached:
 
-An item in the report:
+- the secret tree is crate-private;
+- processed messages expose no message key, no nonce, no sender-data key and no content
+  signature;
+- each generation's secret is wiped after use.
 
-1. the author-signed jig block carrying the `PrivateMessage` (its CID is in the channel's chain);
-2. the owner's signed `ingest` record for it (JEP-0005 rule 12): channel, `seq`, `prev`;
-3. the per-message key and nonce, and the sender-data key and nonce, for that message;
-4. the epoch's `GroupContext`, which the owner and every follower can also attest from the public
-   commits they validated (JEP-0005 rule 19).
+Three options were weighed:
 
-The tribunal verifies, without any other access to the channel:
+| Option | Proves | Cost | Verdict |
+| --- | --- | --- | --- |
+| (a) Patch or fork openmls to return per-message keys at decrypt | The accused's ciphertext decrypts to this plaintext, under the MLS content signature | A fork jig maintains. Every other suite needs the same internals work. Values must be captured at first decrypt | Rejected |
+| (b) An inner envelope `{channel, group_id, epoch, msg_id, body}`, signed by the sender's DID inside the plaintext, with `msg_id` in the outer block | The accused signed this plaintext for this channel | One extra signature per message. It does not commit the delivered ciphertext to the plaintext | Rejected |
+| **(c) Message franking** | The accused committed to this plaintext in the exact block the owner sequenced | 32 bytes and one hash per message; no MLS internals | **Chosen** |
 
-- the block's author signature, which binds the accused's DID to that exact ciphertext;
-- the `ingest` record, which proves the block was in this channel at this position;
-- decryption with the disclosed values, then the MLS content signature over the `FramedContent`
-  and `GroupContext`, made with the DID key (the leaf key is the DID key in jig). That proves the
-  accused signed **this plaintext**, in this group and epoch, independently of whether the AEAD is
-  key-committing, so the invisible-salamanders class (Dodis et al.) does not apply.
+**Mechanism.**
+
+1. For each content message, the sender's client picks a fresh 32-byte **franking key** `k_f`.
+2. It computes the **franking tag**
+   `c = H(("domain", "jig-frank-v1"), ("k_f", k_f), ("channel_id", …), ("sender", DID),
+   ("epoch", …), ("body", plaintext body), ("attachments", the BLAKE3 hash of each attachment's
+   plaintext, in order))`. `H` is labelled BLAKE3 (JEP-0004 rule 8).
+3. `k_f` travels inside the encrypted plaintext. `c` goes in the author-signed outer block, so the
+   owner's `ingest` record sequences it.
+4. The recipient's client recomputes `c` after decrypting. If it does not match, the client MUST
+   refuse to display the message as valid and MUST mark it. Otherwise a sender could make a
+   message unreportable, which is the Dodis et al. attack on attachment franking.
+
+**A report item** is:
+
+- the author-signed block, with `c`;
+- the owner's `ingest` record for it;
+- the disclosed plaintext body and attachments;
+- `k_f`.
+
+**The tribunal checks:**
+
+- the author signature over the block, which binds the accused's DID to `c`;
+- the `ingest` record, which places the block in this channel at this position;
+- `c` recomputed from the disclosure, which binds `c` to exactly this plaintext.
+
+**Properties.**
+
+- *Binding:* `c` is a collision-resistant hash over `k_f` and the content. Neither the sender nor
+  a reporter can open one tag to two plaintexts. This is a committing construction, so the
+  question of whether the suite's AEAD commits to its key does not arise.
+- *Hiding:* without `k_f`, `c` reveals nothing. A server cannot test guesses at the content.
+- *Only a recipient can report:* only holders of the group's keys, and the sender itself, learn
+  `k_f`.
+- *Scope:* one `k_f` opens one message, and nothing about any other.
+- *Suites:* franking sits above the suite. A suite's report profile reduces to delivering the
+  plaintext, `k_f` included, intact to every member. Every suite JEP still states that it does
+  (lane S, JEP-0001).
+- *Deniability:* none, as by design (PV-04). Because the outer block is author-signed, a franked
+  message is verifiable by anyone the reporter shows it to, not only by the platform as in
+  Facebook's scheme. That is what lets independent tribunals verify it.
 
 Properties against the spec's requirements:
 
 | Requirement | Met by |
 | --- | --- |
-| Only a recipient can start a report | Only a member holds the ratchet that derives the per-message values |
-| Scoped to the reported messages; no standing access | One key per message; nothing that derives others |
-| No escrow, server keys or scanning | None used |
+| Only a recipient can start a report | `k_f` exists only inside the ciphertext |
+| Scoped to the reported messages; no standing access | One `k_f` per message |
+| No escrow, server keys or scanning | None used. The server sees only `c` |
 | `--anon` sender reveals nothing more | Attribution reaches the signing key only |
-| Works for every suite a group admits | Each suite JEP MUST define a **report profile**: what a member discloses per message, and how a third party verifies it. A suite without one cannot be admitted by a group that has a tribunal. Lane S carries this into JEP-0001 |
-| Context against selective disclosure | The report MAY list surrounding `seq` ranges; the tribunal MAY ask the accused and other members to disclose their own messages in that range; non-disclosure is recorded, not inferred |
+| Works for every suite a group admits | Franking is suite-independent; a suite need only deliver the plaintext intact. A suite that cannot is not admitted by a group that has a tribunal |
+| Context against selective disclosure | The report MAY list surrounding `seq` ranges; the tribunal MAY ask the accused and other members to disclose their own franked messages in that range; non-disclosure is recorded, not inferred |
 | A channel as victim | Any member may report; several members' reports of one incident merge into one case |
-
-To confirm in R5: that openmls exposes the per-message secrets to the application (or that jig-mls
-can derive them), and the exact sender-data derivation in the ciphersuites jig registers.
 
 Report envelope: `{v, reporter, case_ref?, channel_id, items: [above], context: [seq ranges],
 statement, sig}`, sent to the group's tribunal intake, never to the channel's owner by default
@@ -632,7 +665,7 @@ nameserver; the server and client lanes for theirs). R writes designs and JEPs o
 | **R2: rulesets declared and acknowledged** | v0.2.x / v0.3 | Ruleset document format and versioning; declaration in the signed welcome and manifest (L7's); the client's signed acknowledgement block | A client can show which ruleset a server applies before acting, and a penalty under an unacknowledged ruleset is refused in tests (GV-03) | L7's welcome and manifest |
 | **R3: reports and reputation maths** | v0.3 | Report format (8.2), the server's report chain as its log, event codes, the reference beta ruleset with conformance vectors, per-reporter caps; reputation becomes a protocol input (7.4); servers carry standing | Given a vector of reports, every implementation computes the same net score; one lying server moves a subject by at most its cap; OP-10 updated | R2 |
 | **R4: witnessed transparency logs** | v0.3 | C2SP tlog at nameservers and servers; witnessing within a group; subject commitments; attestation inclusion checked before pinning | A split view between two group members is refused by a client in tests; a removed entry is detected (NS-02) | R3; F3's group delegation |
-| **R5: abuse reports from encrypted channels** | v0.3 | MLS report profile (8.3); report envelope; tribunal intake; the suite-profile requirement in JEP-0001 | A test report proves one message's authorship to a third party holding nothing else, and the disclosed values decrypt no other message (AB-06) | F2 (`ingest` chain), lane S (suite profile) |
+| **R5: abuse reports from encrypted channels** | v0.3 | Franking tags in the outer block and `k_f` in the plaintext (8.3); the recipient's check at decrypt; report envelope; tribunal intake; the suite requirement in JEP-0001 | A test report proves to a third party holding nothing else that the accused committed to the reported plaintext in the sequenced block. A message whose tag does not match is refused at decrypt. One `k_f` reveals no other message (AB-06) | F2 (`ingest` chain), lane S (suite profile) |
 | **R6: tribunals, automated first** | v0.3 | Operator seats and seat agents; the two tracks (10.3); the reference adjudication rule with conformance vectors (native first, as a block after JEP-0006); provisional measures with expiry; random human panels for confirmation and appeal; enforcement as net change | An evidence-track case (a fork) runs from detection to a threshold verdict to an applied penalty across two servers of one group within minutes, with no person involved. A provisional measure on a judgement case lapses when nobody confirms it. An appeal reaches a disjoint panel (GV-01..03) | R3, R4, R5; lane A for the block form |
 | **R7: standing beyond linear cost** | v0.3 / v0.4 | Time-gated accrual; invite credentials (blind-RSA first); the invited pool; escrowed inviter tags under the seats' threshold key; optional, declared soul validation and person-binding | A simulated farm of 10^5 identities with unlimited compute holds no member-pool standing after the accrual period. An insider swarm of `k` aged identities cannot place more than `k × invites_per_period` invitees, all inside the invited pool. A verdict opens their tags and burns the inviters (AB-05) | R3, R4 (group time), R6 (seats hold the threshold key), the verifiable-encryption scheme (6.3) |
 | **R8: server lists and open federation** | post-MVP | Section 11 on F5's format; `dial` stamps; stranger-server pool; per-peer quotas for strangers | An unlisted server can federate under a ruleset without operator configuration, and a flood of stranger servers leaves listed peers unaffected | R1, R3, R6, F2, F5 |
@@ -682,7 +715,7 @@ To land in R1's and R3's implementation PRs (framing lanes edit no existing file
 - *Reputation is not a protocol gate:* replace with 7.4 once R3 ships.
 - *Transparency log:* name the C2SP formats, witnessing within a group and subject commitments.
 - *Tribunals and Reporting abuse in encrypted channels:* the seat rule (10.1), random panels,
-  per-message key disclosure (8.3) and the per-suite report profile.
+  message franking (8.3), and the suite requirement to deliver the plaintext and `k_f` intact.
 
 **`threat-register.md` (decision column):**
 
@@ -742,8 +775,11 @@ stranger pool; rule 14b's list gains R's issuer and evidence rules (section 11).
    insider swarm; the answer is the capped invited pool plus inviter tags encrypted to the
    seats' threshold key and opened only by verdict, with a PV-03 carve-out. A nameserver that sees
    both parties was considered and rejected: it would hold the group's invite graph (NS-03).
-7. ~~Abuse reports (8.3)~~ **Decided:** per-message key disclosure plus the MLS content
-   signature; every suite defines a report profile.
+7. ~~Abuse reports (8.3)~~ **Decided, then revisited:** DJ first chose per-message key
+   disclosure. Lane S found that openmls 0.9.1 cannot expose those keys, and DJ then chose
+   **message franking**: a commitment in the author-signed, sequenced outer block, with its key
+   inside the ciphertext and a check by the recipient at decrypt. Patching openmls and an inner
+   signed envelope were rejected.
 8. ~~Tribunal seats (10)~~ **Decided:** one seat per admitted operator. Added by DJ: seats are
    automated first, because tribunals must be fast enough to answer a concerted attack and
    operators cannot adjudicate full time. This gives the two tracks in 10.3: deterministic
@@ -755,8 +791,10 @@ stranger pool; rule 14b's list gains R's issuer and evidence rules (section 11).
 
 Still open, for later milestones:
 
-- the verifiable-encryption and threshold scheme for inviter tags (R7);
-- whether openmls exposes per-message secrets (R5).
+- the verifiable-encryption and threshold scheme for inviter tags (R7).
+
+Answered since: openmls does not expose per-message secrets (lane S, checked against 0.9.1),
+hence franking (Q7).
 
 Settled after the questions, through the orchestrator:
 
@@ -804,6 +842,6 @@ requester is needed with or without PoW (5.7), so adding it now costs nothing R 
 - Message franking: Grubbs et al. (2017) [search]; Dodis et al., attachment franking
   [search]: <https://eprint.iacr.org/2019/016>; Tyagi et al., asymmetric franking, cited in
   [search]: <https://eprint.iacr.org/2021/1686>
-- RFC 9420 secret tree and sender-data derivation [recall]: to be confirmed against the RFC and
-  openmls in R5
+- openmls 0.9.1: the secret tree is crate-private and processed messages expose no per-message
+  secrets (lane S's source check, relayed by the orchestrator)
 - Jøsang and Ismail, beta reputation system (2002) [recall]
