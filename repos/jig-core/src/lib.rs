@@ -5,6 +5,7 @@
 //! dependencies so other crates can embed these primitives directly.
 
 pub mod admission_pow;
+pub mod block_abi;
 pub mod block_kind;
 pub mod bundle;
 pub mod capability_dsl;
