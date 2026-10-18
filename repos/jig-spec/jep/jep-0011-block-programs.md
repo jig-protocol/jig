@@ -71,6 +71,11 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
    byte string, and CIDv0 is refused. This applies to every CID field here (`children`, `offers`
    keys, `supersedes`, `object_cid`, `restrictions_cid`, `operator_policy_cid`, `prev`, `allow` and
    `deny` program lists).
+6. Every list in a payload that is a set (the `allow`, `deny` and `run` lists, `children`) MUST be
+   strictly ascending by the bytes of each entry's own deterministic encoding, with no repeats. A
+   verifier MUST refuse a payload that breaks this, so each object has exactly one encoding.
+7. A map's keys are exactly those this JEP defines for it. A verifier MUST refuse a payload with an
+   unknown or missing key, except a key this JEP marks optional.
 
 This is the encoding layer jig uses for every new signed object (reference implementation:
 `jig_core::dcbor` and `jig_core::cose`).
