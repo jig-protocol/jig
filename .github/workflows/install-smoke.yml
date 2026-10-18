@@ -63,8 +63,7 @@ jobs:
         shell: bash
         env:
           JIG_VERSION: ${{ inputs.tag }}
-          # The repo is private: install.sh and the assets come through the
-          # API with this token. Once public, no token is needed.
+          # Not needed for a public repo; it raises the API rate limit.
           JIG_GITHUB_TOKEN: ${{ github.token }}
           JIG_VERIFY_SIGNATURE: '1'
         run: scripts/install-smoke.sh 60
@@ -120,3 +119,24 @@ jobs:
           JIG_VERIFY_SIGNATURE: '1'
           JIG_RELEASE_SIGNER: ${{ steps.mirror.outputs.signer }}
         run: scripts/install-smoke.sh 60
+      # SC-02: without ssh-keygen the installer must refuse, not fall back to
+      # the checksum alone. alpine:3.20 without openssh-keygen has none.
+      # JIG_NO_START=1: the binaries are glibc builds and are never run here.
+      - name: fails closed without ssh-keygen; JIG_VERIFY_SIGNATURE=0 overrides
+        shell: bash
+        run: |
+          set -euo pipefail
+          run() {
+            docker run --rm --network host -e JIG_RELEASES_BASE=http://127.0.0.1:47391 \
+              -e JIG_NO_START=1 -e JIG_NONINTERACTIVE=1 "$@" alpine:3.20 sh -c \
+              'apk add --no-cache bash curl >/dev/null && curl -fsSL "$JIG_RELEASES_BASE/install.sh" | bash' 2>&1
+          }
+          if out=$(run); then
+            echo "$out"; echo "install.sh installed without ssh-keygen" >&2; exit 1
+          fi
+          echo "$out"
+          grep -q 'ssh-keygen (OpenSSH >= 8.1) is not installed' <<<"$out"
+          out=$(run -e JIG_VERIFY_SIGNATURE=0)
+          echo "$out"
+          grep -q 'JIG_VERIFY_SIGNATURE=0: skipping signature check' <<<"$out"
+          grep -q 'checksum OK' <<<"$out"
