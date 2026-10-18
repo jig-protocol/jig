@@ -98,7 +98,7 @@ documented in the handler). Keep it off; never document it as a workaround.
 
 | | |
 | --- | --- |
-| **Current state** | Tighter than the rest of the system. `build_wasi_context` ([`jig-runtime/src/engine.rs:293`](../repos/jig-runtime/src/engine.rs)) grants an empty stdin pipe and an in-memory stdout buffer — no host stdio, no preopened directories, no sockets. Store limits pin one instance, one memory, 10 tables, 10k table elements; fuel and an epoch deadline bound runtime. Server defaults: 5,000,000 fuel, 64 MB, plus a timeout ([`jig-server/src/config.rs:296-304`](../repos/jig-server/src/config.rs)). wasmtime is 49.0.3, with no wasmtime advisory suppressed in `deny.toml` — including RUSTSEC-2026-0096 (aarch64 Cranelift guest-heap miscompile → sandbox escape). |
+| **Current state** | Tighter than the rest of the system. `build_wasi_context` ([`jig-runtime/src/engine.rs:458`](../repos/jig-runtime/src/engine.rs)) grants an empty stdin pipe and an in-memory stdout buffer — no host stdio, no preopened directories, no sockets. Store limits pin one instance, one memory, 10 tables, 10k table elements; fuel and an epoch deadline bound runtime. Server defaults: 5,000,000 fuel, 64 MB, plus a timeout ([`jig-server/src/config.rs:446-452`](../repos/jig-server/src/config.rs)). wasmtime is 49.0.3, with no wasmtime advisory suppressed in `deny.toml` — including RUSTSEC-2026-0096 (aarch64 Cranelift guest-heap miscompile → sandbox escape). |
 | **Gap** | None material for external use. This is the strongest part of the security story. |
 
 **Verdict: READY.**
@@ -113,8 +113,8 @@ One RustSec ignore, and `yanked = "deny"`.
 
 The twelve other ignores this section used to list are gone, resolved rather than
 re-annotated: the `time`, `tracing-subscriber` and `rand` fixes arrived with later
-lockfile changes; `paste` left with ratatui 0.30 and `atty` with an unused `jig-cli`
-dependency; and unifying on rustls 0.23 removed both `rustls-pemfile` and the
+lockfile changes; `paste` left with ratatui 0.30, `atty` with an unused `jig-cli`
+dependency, and the yanked `core2` with `cid` 0.11; and unifying on rustls 0.23 removed both `rustls-pemfile` and the
 `rustls-webpki` 0.102 copy behind the four name-constraint and CRL advisories. The
 file records each removal.
 
@@ -151,7 +151,7 @@ file records each removal.
 
 | Layer | Versioned? | Enforced? |
 | --- | --- | --- |
-| WSS envelope | Yes — `Envelope { v: u8 }`, always `1`, plus `suite` ([`envelope.rs`](../repos/jig-pipeline/src/envelope.rs)) | **Yes.** A frame with any other `v` is refused `UNSUPPORTED_VERSION`, and an unknown or unimplemented suite `UNSUPPORTED_SUITE`, before the frame is read. |
+| WSS envelope | Yes — `Envelope { v: u8 }`, always `1`, plus `suite` ([`envelope.rs`](../repos/jig-pipeline/src/envelope.rs)) | **Yes.** A frame with any other `v` is refused `UNSUPPORTED_VERSION`, and any frame suite other than `none` `UNSUPPORTED_SUITE` (content suites, `mls` included, are per block), before the frame is read. |
 | Block manifest | Yes — `BlockManifest.schema`, default `https://jig.dev/schema/block-manifest/v0.1` ([`manifest.rs`](../repos/jig-core/src/manifest.rs)) | **Yes.** `ingest` runs `BlockManifest::check_gates`, which refuses any schema outside `SUPPORTED_SCHEMAS` and any unimplemented encryption suite. The URI still says `jig.dev`, which is not our domain. |
 | Receipt | Partly. `RECEIPT_SCHEMA_VERSION = "0.2"` ([`receipt.rs`](../repos/jig-core/src/receipt.rs)) stamps `jig-core` receipts, but the receipt the server signs for a rendered block is a separate JSON object tagged `"v": "0.3-render"` ([`ingest.rs`](../repos/jig-pipeline/src/ingest.rs)), which the spec's [Receipts](../repos/jig-spec/src/receipts.md) chapter does not describe | No consumer branches on either value. |
 | Fuel pricing | Yes — `PricingConfig::schedule_version`, now `"0.2.0"` ([`jig-runtime/src/config.rs:215`](../repos/jig-runtime/src/config.rs)) | Advisory. Carried into receipts and into `runtime/mod.rs` metadata; nothing rejects a mismatch. |
@@ -260,7 +260,7 @@ registry, or copied code may appear anywhere under `repos/`. This belongs in
 | Discussion / support channel | dev@jig.onl and issues; security reports go to security@jig.onl or GitHub private reporting. No public chat. | GAP |
 | Triage owner | DJ, named in `SECURITY.md` for vulnerability reports. No rotation or SLA for ordinary issues. | GAP |
 | Release cadence | Undefined. `release.yml` is tag-triggered and marks every v0.x tag a prerelease; no release has been published. | GAP |
-| CI coverage | `changes`, `workspace` (fmt, clippy and nextest on every workspace crate but `hello-wasm`), `wasm-build` and `dependency-policy` (also daily at 07:17 UTC against `main`). Drafts and docs-only PRs skip the build jobs; the merge queue runs everything. Linux only for the workspace job; macOS runs in `install-smoke.yml` (published releases) and `fuel-portability.yml`. | GAP |
+| CI coverage | `changes`, `workspace` (fmt, clippy and nextest on every workspace crate but `hello-wasm`), `wasm-build` and `dependency-policy` (also daily at 07:17 UTC against `main`). Drafts and docs-only PRs skip the build jobs; the merge queue runs everything. Linux only for the workspace job; macOS runs in the install smoke test inside `release.yml` and after each release, and in `fuel-portability.yml` on manual dispatch only. | GAP |
 
 **Test counts, measured at `1fa5681`** (`cargo nextest list`, stable 1.97.1): 1,054 tests in
 the CI-gated package set, plus 87 in `jig-runtime` + `hello-wasm` = **1,141**.
@@ -287,8 +287,8 @@ What decides it now:
   audit, D27, runs once v0.2 is code-complete).
 - Admission rests on operator-written config, not earned reputation; the
   nameserver serves plaintext.
-- No release has been published, so the `curl | bash` path has only run against
-  CI builds.
+- No real release has been published; the `curl | bash` path has run only against
+  CI builds and a throwaway prerelease (`v0.0.0-relpipe.1`).
 
 ### Minimum credible blocker set, ordered
 

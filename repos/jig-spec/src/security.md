@@ -324,7 +324,7 @@ No `ssh-rsa` (weak), `3des-cbc` (broken), or `arcfour` (broken).
 
 ## Abuse Mitigation
 
-**MUST enforce rate limiting and admission control** at all ingress points. *(partial: the reference server's token buckets are on by default, per verified DID across REST, WebSocket, federation and bridge writes, and per remote address on every HTTP request and WebSocket frame. Its defaults are bursts, not the per-minute figures below. There is no per-federated-server limit.)*
+**MUST enforce rate limiting and admission control** at all ingress points. *(partial: the reference server's token buckets are on by default, per verified DID across REST, WebSocket, federation and bridge writes, and per remote address on every v0.0.2 HTTP request and WebSocket frame (not `/.well-known/jig`, `/healthz`, `/metrics` or the legacy v0.0.1 routes). Its defaults (a burst of 300 refilling at 50/s per DID, 600 at 100/s per address) are far looser than the per-minute figures below. There is no per-federated-server limit.)*
 
 ### Rate Limiting
 

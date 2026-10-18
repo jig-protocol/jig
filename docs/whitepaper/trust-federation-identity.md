@@ -316,7 +316,7 @@ are where key substitution happens (OP-08).
   server's check, which protects users from each other but not from the operator (OP-08).
   The CLI pins each server's DID on its first signed welcome (or first TLS probe) and
   refuses another, but it does not yet pin a name's DID
-  ([`jig-pipeline/src/handshake.rs`](../../repos/jig-pipeline/src/handshake.rs)).
+  ([`jig-client/src/pins.rs`](../../repos/jig-client/src/pins.rs)).
 - **Partial: attestations are signed but not yet verified.** The server's resolver does not
   yet verify attestation signatures or suffix authority (NS-01).
 - **Partial: "one or more nameservers" means failover, not agreement.** A second configured
@@ -330,8 +330,8 @@ are where key substitution happens (OP-08).
   configuration, the ruleset, or a signed delegation.
 - **Proposed.** Verification of attestations, and expiry of cached answers, in the resolver
   and in clients.
-- **Proposed.** A client pin store for names and servers, and how a change is shown to the
-  holder.
+- **Proposed.** A client pin store for names (the CLI's store for server DIDs and suites is
+  built), and how a change is shown to the holder.
 - **Proposed.** Resolvers keep the attestations they act on, and a ruleset group's
   transparency log ([section 8](#8-nameservers-in-a-ruleset-group-and-anchors)) makes
   equivocation public evidence.
@@ -678,8 +678,9 @@ a high-sec ruleset group, cross-checked.
 - **Built.** The alias flow (challenge, register, resolve, renew, rotate) in section 4.2.
 - **None.** Nameservers do not coordinate or cross-register. There are no group-wide claims,
   no ruleset groups and no anchors.
-- **None.** Servers enforce no proof-of-work, report no reputation changes to nameservers,
-  and keep no transparency log.
+- **Partial.** Servers can require one-time admission proof-of-work of unknown DIDs, off by
+  default (D26). They report no reputation changes to nameservers and keep no transparency
+  log.
 - **None.** Registration through the alias flow (`/v1/register`, which `jig init` and
   `jig ns` use) has no proof-of-work and no rate limit. The experimental surface's own
   `claim` and `alias` endpoints, below, do apply them.
@@ -774,10 +775,11 @@ a high-sec ruleset group, cross-checked.
   ([`jig-pipeline/src/fanout.rs`](../../repos/jig-pipeline/src/fanout.rs)). Restricted and
   encrypted channels' blocks never leave their server, and a relayed block for a local
   restricted or encrypted channel is refused.
-- **Built: relayed blocks pass the gates a local block passes.** A relayed block runs
-  through `ingest` like a local submission: author signature, version and suite gates,
-  admission, the write gate, effects, and the receiving server's own execution and receipt
-  (OP-09). Only open, unencrypted channels federate because the federation contract (D12)
+- **Built: relayed blocks pass the gates a local block passes, with two exceptions.** A
+  relayed block runs through `ingest` like a local submission: author signature, version and
+  suite gates, admission, the write gate, effects, and the receiving server's own execution
+  and receipt (OP-09). Its author is not asked for admission proof-of-work, and a relayed
+  `text-render` may name a channel the receiving server has no record of. Only open, unencrypted channels federate because the federation contract (D12)
   does not yet say how one MLS group spans two servers.
 - **Built: peers are pinned and listed.** A server accepts relayed blocks only over a
   connection it dialed to a listed peer whose welcome is signed by that peer's configured
@@ -1020,7 +1022,7 @@ some other way. jig chooses provable reporting and states its cost.
 - **Built.** An operator can ban DIDs, set reputation floors and refuse unknown DIDs at
   admission. A channel owner can kick a member, which on an encrypted channel commits them
   out of the group.
-- **Partial.** Servers rate-limit every verified DID and every remote address by default,
+- **Partial.** Servers rate-limit every verified DID and, on their v0.0.2 routes, every remote address by default,
   and can require one-time proof-of-work of unknown DIDs at admission, off by default (D26).
 - **Partial.** On a plaintext channel a block is signed by its author, so a forwarded block
   is verifiable evidence of who said it. On an encrypted channel the content signature is
@@ -1130,7 +1132,7 @@ gap.
   *Obligation:* servers enforce proof-of-work on the clients they serve, at the cost their
   ruleset sets, and a nameserver requires it on its own binding endpoints; it is never the
   only gate and never on its own evidence that an identity is one person (D23). *Today:*
-  servers rate-limit every verified DID and every remote address by default, and can
+  servers rate-limit every verified DID and, on their v0.0.2 routes, every remote address by default, and can
   require one-time admission proof-of-work of unknown DIDs, off by default (D26); the
   nameserver's binding endpoints (register, rotate, renew) have neither proof-of-work nor a
   rate limit, and the nameserver prototype's proof-of-work is unused. *To design:*
@@ -1289,7 +1291,7 @@ gap.
 | Anchors are opt-in with no veto (D19) | None | Structural "no veto"; anchor replacement |
 | Federation is a data contract fixing the channel's suite (D12) | Partial: suite fixed per channel; relay of open, unencrypted channels only | Contract contents and signed acceptance |
 | One owning server per channel (D24) | None: each server keeps its own channel state | Cross-server writes: survey XMPP MUC, IRC, Matrix, ActivityPub groups |
-| A peer is a transport; relayed blocks pass every gate | Built: relayed blocks run through `ingest` and the write gate; peers listed and pinned in configuration | Peer DID in the contract; per-peer limits |
+| A peer is a transport; relayed blocks pass every gate | Built: relayed blocks run through `ingest` and the write gate (authors not asked for admission proof-of-work); peers listed and pinned in configuration | Peer DID in the contract; per-peer limits |
 | Pluggable suites, MLS default and first (D1, D13) | Built: MLS per channel; validating delivery service | Non-MLS plug-in shape (D13); per-suite conformance |
 | End-to-end encryption by default | Partial: DMs encrypted; channels plaintext unless created `mls` | Encryption on by default |
 | Mandatory signed handshake; clients fail closed and pin | Partial: signed welcome with nonce; CLI pins server DIDs, suites and channel suites; later frames unchecked | Close semantics; pins; real reputation (D11) |

@@ -185,7 +185,7 @@ See [Security Considerations § Operational Security](security.md#operational-se
 - Use proof-of-work challenges for new or low-reputation identities
 - Federation peers get quotas based on reputation scores
 
-*(partial: per-DID and per-address token buckets are on by default and cover REST, WebSocket, federation and bridge writes; proof-of-work for new DIDs exists but is off by default; there are no reputation tiers or per-peer quotas.)*
+*(partial: token buckets are on by default: per verified DID across REST, WebSocket, federation and bridge writes, and per remote address on v0.0.2 HTTP requests and WebSocket frames; proof-of-work for new DIDs exists but is off by default; there are no reputation tiers or per-peer quotas.)*
 
 **Why:** Without rate limits, a single attacker can flood the server with garbage and take it offline.
 

@@ -3,9 +3,10 @@
 **Audience:** This chapter is for **server operators** running federated Jig servers and **protocol implementers** building federation support. **End users** might care about how federation affects message delivery and privacy. **Developers** building federated applications will want to understand cross-server communication.
 
 > **Mostly not implemented: most of this page's MUSTs are unbuilt.** The reference server
-> federates by dialing the peers its configuration lists, over TLS by default, and pins each
-> peer's DID from the peer's signed welcome. [Relayed Blocks](#relayed-blocks) is
-> implemented: relayed blocks run every gate a local block runs. Not built: DNS SRV
+> federates by dialing the peers its configuration lists, over TLS by default, and refuses
+> a welcome not signed by the DID configured for that peer. [Relayed Blocks](#relayed-blocks)
+> is implemented, with two exceptions: a relayed block's author is not asked for admission
+> proof-of-work, and a relayed `text-render` may name a channel this server does not have. Not built: DNS SRV
 > discovery, X.509 mutual TLS, the signed per-message federation envelope, reputation
 > tiers, receipt exchange and billing, retry backoff and per-peer quotas. The `.well-known`
 > document below is not the real one (see

@@ -98,7 +98,7 @@ from `curl` to "hello, world" accepted in `#hello`. CI fails above 60s; see
 
 ## Quickstart
 
-Requires Rust **1.95+** (MSRV is set by wasmtime 48); `rust-toolchain.toml` pins the exact toolchain CI uses, and rustup picks it up automatically. Build the two binaries:
+Requires Rust **1.95+** (MSRV is set by wasmtime); `rust-toolchain.toml` pins the exact toolchain CI uses, and rustup picks it up automatically. Build the two binaries:
 
 ```bash
 git clone https://github.com/jig-protocol/jig
@@ -193,7 +193,7 @@ and lives at the repo root.
 | [`jig-runtime`](repos/jig-runtime/) | Wasmtime-based Wasm runtime: deterministic execution, fuel metering, receipts |
 | [`bridges/core`](repos/bridges/core/) | Common `Bridge` trait and context types |
 | [`bridges/email`](repos/bridges/email/) | In-process email bridge (Resend provider) |
-| [`text-block`](repos/text-block/) | The canonical `text-render` Wasm block (`wasm32-unknown-unknown`) |
+| [`text-block`](repos/text-block/) | The canonical `text-render` Wasm block (`wasm32-unknown-unknown`, embedded in the server; release tarballs also ship a `wasm32-wasip1` build) |
 | [`hello-wasm`](repos/hello-wasm/) | Minimal WASI hello-world used for runtime measurements |
 | [`integration-tests`](repos/integration-tests/) | Cross-component scenario tests: federation, TOFU mismatch, nameserver modes, persistence across restart, email bridge, TLS, encrypted channels |
 
@@ -219,8 +219,9 @@ One environment caveat: stop any local `jig-server` on `127.0.0.1:7117` first.
 `jig-cli::global_flags missing_implicit_config_still_falls_back_to_defaults` asserts that
 the default port is unreachable, so it fails against your own running server.
 
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs three jobs: `workspace`
-(fmt, clippy, nextest — scoped to the v0.0.2 crate surface, not the legacy crates),
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs four jobs: `changes`
+(skips the build jobs on drafts and docs-only PRs), `workspace` (fmt, clippy, nextest on
+every workspace crate but `hello-wasm`),
 `wasm-build` (`text-block` for `wasm32-unknown-unknown`), and `dependency-policy`
 (`cargo deny check` — advisories, bans, licenses, sources). Toolchain is
 `dtolnay/rust-toolchain@stable`.
