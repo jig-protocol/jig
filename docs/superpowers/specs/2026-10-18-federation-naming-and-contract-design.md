@@ -401,7 +401,7 @@ Sharing a channel is a server-to-server act, and **a share carries a grant**:
 
 | Grant (proposed set) | A follower may relay | Clients authenticated to the follower |
 | --- | --- | --- |
-| `read` | nothing but self-leave | read; to write, they connect to the owner directly, if the owner admits them |
+| `read` | protocol traffic only: `seen` acknowledgements, MLS self-updates, self-leave. No content | read; to post, they connect to the owner directly, if the owner admits them |
 | `write` | content blocks from channel members | read and post |
 | `member` | content, plus membership blocks (adds, self-joins on open channels, removals) the channel's membership rule allows | everything a local client could do |
 
@@ -415,13 +415,14 @@ Consequences:
   (AB-03). The client's address stays hidden from the owner.
 - **A read-only share forces "connect to the owner directly"** for anyone who wants to
   write. The owner then treats that client as its own, under its own admission.
-- **A `read` grant on an encrypted channel weakens it.** Remote readers are MLS members
-  who can never send a commit, so they cannot update their own keys and post-compromise
-  security does not reach them. Two ways to handle it:
-  - a `read` grant still relays MLS self-updates (empty commits) but not content;
-  - `read` is for open channels only.
-
-  Recommendation: the first.
+- **`read` is a content promise, not a signing rule (DJ).** Readers still sign and send
+  protocol traffic back: `seen` acknowledgements (L7's field) and MLS self-updates. So
+  remote readers keep post-compromise security, and their acknowledgements feed fork
+  detection (5.3). What `read` withholds is content.
+  - **Metadata cost:** a `seen` acknowledgement is a read receipt. It tells the owner and
+    the follower who read what, and when.
+  - **Proposed:** acknowledgements are checked and kept by servers but not fanned out to
+    members by default. Whether members see read receipts is channel policy.
 - **Rejected:** multi-homing (Matrix, IRC), where any server accepts writes with no owner.
   It needs state resolution, and MLS needs one linear epoch history.
 
@@ -487,7 +488,9 @@ Rules:
    - the current `ingest` head;
    - the owner's signed peer policy (5.6).
 
-   Who may cause an owner to share a channel is open (section 11, question 2b).
+   The offer is triggered by a `channel-share` block (5.9). The owner never shares on its
+   own initiative, and it is the only server that sends offers, so the topology stays a
+   star.
 3. **The server answers with a `contract-accept` or a `contract-refuse`, signed by its
    DID.**
    - An accept cites the creation block's CID and its own policy's hash, and states that
@@ -533,6 +536,36 @@ reputation and proof-of-work between servers (lane R, D26).
 **Open for DJ:** whether members can move a channel to a new owner. The recommendation is
 not in v0.2: members create a new channel. A signed handover by the channel-owner DID is
 v0.3.
+
+### 5.9 Shares and roles
+
+**Decided (DJ, 2026-10-18).**
+- **Shares are controlled by a `channel-share` block.** It names the target server and the
+  grant. It is signed by the channel's owner, or by a DID the owner has delegated the
+  right to. Ending or changing a share is the same kind of block.
+- **The owning server honours a share only for a server on its configured peer list,** and
+  the target's operator must accept (5.5). That gives three parties: the channel's
+  authority, the owning operator and the target operator.
+- **Authority is role-based (eventually).** The owner, or admins the owner delegated,
+  assign and unassign policies. "The owner shares" generalises to "the owner delegates":
+  the owner assigns roles, and a role carries rights such as `share` and `membership`.
+- **The grant set is `read`, `write` and `member`** (5.2).
+
+**Proposed, for the build:**
+- **Role assignments are signed blocks in the channel's log** (`role-assign`,
+  `role-unassign`), ordered by the same `ingest` chain as commits. So "was this DID an
+  admin when it signed this?" has exactly one answer. This is the property Matrix lacked
+  before room v12.
+- **The owner's server checks the signer's role at that point in the chain** for every
+  share, membership block and MLS commit. This replaces today's hard-coded "owner only
+  adds" in `authorize_block` and the MLS gate.
+- **The channel's creator holds the root role and cannot be demoted.** This follows
+  Matrix v12's creator rule and today's "the owner cannot be kicked".
+- **v0.2 ships the mechanism with two roles:** `owner`, which holds every right, and
+  `admin`, which holds `share` and `membership` and is assignable by the owner. Custom
+  roles and finer rights, in the style of MIMI room policy, are v0.3.
+- **Open:** may an admin assign `admin`? Recommendation: no in v0.2. Only the owner
+  assigns roles, which avoids escalation chains until the policy language exists.
 
 ## 6. Addressing
 
@@ -638,7 +671,10 @@ Updated in the implementation PRs, not here.
 2. ~~Remote writes (5.2)~~ **Decided:** a client writes through whatever server it is
    authenticated to, if that server carries the channel. Shares carry grants; a read-only
    share forces writers to the owner.
-2b. Who may share a channel, and the grant set (5.2, 5.5).
+2b. ~~Who may share (5.9)~~ **Decided:** a `channel-share` block signed by the owner or a
+   delegate, plus the owning operator's peer list, plus the target's accept; role-based
+   authority; grants `read`/`write`/`member`; `read` still carries `seen` and
+   self-updates.
 3. Name-pin changes (4.4): automatic only with a rotation signed by the old key, and
    refused otherwise?
 4. Reachability records (4.7): signed by the DID, not the nameserver?

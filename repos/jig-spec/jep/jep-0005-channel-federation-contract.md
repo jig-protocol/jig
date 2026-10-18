@@ -79,20 +79,33 @@ Non-goals for v0.2:
 
 ## Offer, accept, refuse, end
 
-7. A share starts when the owner sends the target server a `contract-offer`, signed by
-   the owner. Who may cause an owner to share is pending DJ. The offer carries:
+7. A share starts with a `channel-share` block naming the target server and a grant. The
+   block MUST be signed by the channel's owner or by a DID holding the `share` right at
+   that point in the `ingest` chain (7b). The owning server MUST then check that the
+   target is on its configured peer list, and sends the target a `contract-offer`, signed
+   by the owner. Only the owning server sends offers. The offer carries:
    - the grant (7a);
    - the creation block;
    - the current `ingest` head (12);
    - the hash of the owner's signed peer policy (16).
-7a. A grant (pending DJ) is one of:
-    - `read`: the follower relays nothing but self-leave and MLS self-updates;
+7a. A grant is one of:
+    - `read`: the follower relays only protocol traffic (`seen` acknowledgements, MLS
+      self-updates, self-leave) and no content;
     - `write`: the follower also relays content blocks from channel members;
     - `member`: the follower also relays the membership blocks the channel's rule allows.
 
     The owner MUST enforce the grant on every relayed block. A follower SHOULD refuse
     early. A client that wants to write past a follower's grant connects to the owner
     directly, under the owner's admission.
+7b. Authority is role-based.
+    - Role assignments are `role-assign` and `role-unassign` blocks, ordered in the
+      `ingest` chain.
+    - The owning server MUST check the signer's rights as of the block's position in the
+      chain for every `channel-share`, membership block and commit.
+    - The creator holds the root `owner` role, which carries every right and cannot be
+      removed.
+    - v0.2 defines one more role, `admin`, with the rights `share` and `membership`. Only
+      the owner assigns roles (pending DJ).
 8. The offered server MUST answer, signed by its DID, with exactly one of:
    - `contract-accept {channel_id, owner_server, policy_hash}`, stating that it
      implements the suite and will enforce the membership rule;
