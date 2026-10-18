@@ -39,8 +39,9 @@ loopback and private tailnets.
   `--encrypted` (and every DM) is one MLS group (RFC 9420): the server stores and relays
   ciphertext it cannot read, and validates every membership change without holding any
   group secret. Every *other* channel is signed, not encrypted — the server stores its
-  plaintext. Encrypted channels do not federate yet. Metadata (who, when, how much, who
-  joined) is visible to the server either way. See
+  plaintext. Restricted channels become always-MLS, with no opt-out, before the v0.2 tag
+  ([D25](docs/ROADMAP.md)). Encrypted channels do not federate yet. Metadata (who, when,
+  how much, who joined) is visible to the server either way. See
   [`docs/security/encryption.md`](docs/security/encryption.md).
 - **Authentication, authorization, admission and rate limits.** Every read
   carries a signed proof of possession of the caller's key, and `visibility = "restricted"`
@@ -97,7 +98,7 @@ from `curl` to "hello, world" accepted in `#hello`. CI fails above 60s; see
 
 ## Quickstart
 
-Requires Rust **1.95+** (MSRV is set by wasmtime 48); `rust-toolchain.toml` pins the exact toolchain CI uses, and rustup picks it up automatically. Build the two binaries:
+Requires Rust **1.95+** (MSRV is set by wasmtime); `rust-toolchain.toml` pins the exact toolchain CI uses, and rustup picks it up automatically. Build the two binaries:
 
 ```bash
 git clone https://github.com/jig-protocol/jig
@@ -192,7 +193,7 @@ and lives at the repo root.
 | [`jig-runtime`](repos/jig-runtime/) | Wasmtime-based Wasm runtime: deterministic execution, fuel metering, receipts |
 | [`bridges/core`](repos/bridges/core/) | Common `Bridge` trait and context types |
 | [`bridges/email`](repos/bridges/email/) | In-process email bridge (Resend provider) |
-| [`text-block`](repos/text-block/) | The canonical `text-render` Wasm block (`wasm32-wasip1`) |
+| [`text-block`](repos/text-block/) | The canonical `text-render` Wasm block (`wasm32-unknown-unknown`, embedded in the server; release tarballs also ship a `wasm32-wasip1` build) |
 | [`hello-wasm`](repos/hello-wasm/) | Minimal WASI hello-world used for runtime measurements |
 | [`integration-tests`](repos/integration-tests/) | Cross-component scenario tests: federation, TOFU mismatch, nameserver modes, persistence across restart, email bridge, TLS, encrypted channels |
 
@@ -217,9 +218,10 @@ One environment caveat: stop any local `jig-server` on `127.0.0.1:7117` first.
 `jig-cli::global_flags missing_implicit_config_still_falls_back_to_defaults` asserts that
 the default port is unreachable, so it fails against your own running server.
 
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs three jobs: `workspace`
-(fmt, clippy, nextest — scoped to the v0.0.2 crate surface, not the legacy crates),
-`wasm-build` (`text-block` for `wasm32-wasip1`), and `dependency-policy`
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs four jobs: `changes`
+(skips the build jobs on drafts and docs-only PRs), `workspace` (fmt, clippy, nextest on
+every workspace crate but `hello-wasm`),
+`wasm-build` (`text-block` for `wasm32-unknown-unknown`), and `dependency-policy`
 (`cargo deny check` — advisories, bans, licenses, sources). Toolchain is
 `dtolnay/rust-toolchain@stable`.
 
@@ -238,9 +240,9 @@ CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs three jobs: `wo
 
 Back up `server.key` before you do anything else. Losing it changes the server's DID, so
 the server comes back as a different identity: its receipts are signed by a new key, and
-federation peers that list it by `expected_did` hold a stale value. Clients do not pin the
-server's DID yet. Once they do (the handshake in JEP-0002 and threat-register OP-08), a
-lost key will look like a man-in-the-middle to every client. `deploy/README.md` opens
+federation peers that list it by `expected_did` hold a stale value. The CLI pins each server's
+DID on first contact (JEP-0002, threat-register OP-08), so a lost key looks like a
+man-in-the-middle to every client that has connected before. `deploy/README.md` opens
 with this for a reason.
 
 [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the implementation, the DAG rule, and how to send a change. [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) is the community standard. [`repos/jig-spec/CONTRIBUTING.md`](repos/jig-spec/CONTRIBUTING.md) is the spec-only guide.

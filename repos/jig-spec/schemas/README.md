@@ -33,6 +33,6 @@ See `src/message-format.md` and `src/zero-trust.md` for normative requirements t
 Current schemas:
 
 - `wire-envelope.json` – header fields (`v`, `suite`, `op`) of every v0.1 wire frame
-- `message-envelope.json` – the `JigMessage` format described in `src/message-format.md` (not implemented in v0.1)
+- `message-envelope.json` – the `JigMessage` format described in `src/message-format.md` (historical; no implementation uses it)
 - `block-manifest.json` – block manifest schema (v0.1) for execution blocks
 - `receipt-v0.2.json` – execution receipt schema (v0.2) with counters, timings, and outcome
