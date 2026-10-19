@@ -77,6 +77,7 @@ impl Default for ServerSection {
             // default does not widen who can change what. member-remove (kick
             // and leave) and channel-promote (opening a restricted channel or
             // DM up) are v0.2 channel dynamics, gated the same way.
+            // role-assign and role-unassign (JEP-0005 rule 7b) are owner-only.
             allowed_block_kinds: vec![
                 "text-render".to_string(),
                 "channel-create".to_string(),
@@ -84,6 +85,8 @@ impl Default for ServerSection {
                 "member-remove".to_string(),
                 "channel-promote".to_string(),
                 "channel-archive".to_string(),
+                "role-assign".to_string(),
+                "role-unassign".to_string(),
             ],
             max_future_skew_ms: DEFAULT_MAX_FUTURE_SKEW_MS,
         }
@@ -842,6 +845,8 @@ mod tests {
             "member-remove",
             "channel-promote",
             "channel-archive",
+            "role-assign",
+            "role-unassign",
         ] {
             assert!(
                 cfg.server.allowed_block_kinds.iter().any(|k| k == required),

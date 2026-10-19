@@ -807,6 +807,8 @@ mod tests {
                 created_at: 0,
                 owner_did: managed_did.clone(),
                 suite: "none".to_string(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })
             .unwrap();
         state
@@ -907,6 +909,8 @@ mod tests {
                     created_at: 0,
                     owner_did: "did:jig:zOwner".into(),
                     suite: suite.into(),
+                    sequencer_did: String::new(),
+                    co_owners: Vec::new(),
                 })
                 .unwrap();
             let secret: [u8; 32] = rand::random();
@@ -1174,6 +1178,8 @@ mod tests {
                 created_at: 0,
                 owner_did: "did:jig:zOwner".into(),
                 suite: "none".into(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })
             .unwrap();
         let stranger = ed25519_dalek::SigningKey::from_bytes(&rand::random());
@@ -1221,6 +1227,8 @@ mod tests {
                 created_at: 0,
                 owner_did: "did:jig:zOwner".into(),
                 suite: "none".into(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })
             .unwrap();
 

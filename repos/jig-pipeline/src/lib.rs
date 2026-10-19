@@ -22,6 +22,7 @@ pub mod ingest_record;
 pub mod metrics;
 pub mod mls_gate;
 pub mod persist;
+pub mod roles;
 pub mod visibility;
 
 pub use effect::apply_effect;

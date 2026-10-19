@@ -163,6 +163,18 @@ impl AppState {
         if backfilled > 0 {
             tracing::info!(backfilled, "gave stored blocks their ingest records");
         }
+        // Channels from before channel terms (JEP-0005 rules 5-6) were all
+        // this server's: they take its DID as their sequencer, here, where
+        // the key is known. The migration could only mark them "this server".
+        let adopted = store
+            .adopt_local_sequencer(&server_did.to_did_jig_string())
+            .context("recording this server as its channels' sequencer")?;
+        if adopted > 0 {
+            tracing::info!(
+                adopted,
+                "recorded this server as the sequencer of stored channels"
+            );
+        }
 
         let identity: Arc<dyn IdentityResolver> = match config.identity.mode {
             IdentityMode::Tofu => Arc::new(TofuResolver::new(store.clone())),
