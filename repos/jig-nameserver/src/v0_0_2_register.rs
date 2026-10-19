@@ -19,6 +19,7 @@ use jig_pipeline::persist::StoredAliasAttestation;
 use serde::{Deserialize, Serialize};
 
 use crate::v0_0_2::AppState;
+use crate::v0_0_2_policy::{Admission, Refusal, SuffixPolicy};
 
 /// v0.0.2 attestation default TTL: 90 days, per the design spec.
 pub(crate) const DEFAULT_TTL_SECONDS: i64 = 90 * 24 * 60 * 60;
@@ -27,6 +28,10 @@ pub(crate) const DEFAULT_TTL_SECONDS: i64 = 90 * 24 * 60 * 60;
 pub struct RegisterReq {
     pub did: String,
     pub requested_alias: String,
+    /// Which served suffix to register under. May be left out when the
+    /// nameserver serves exactly one.
+    #[serde(default)]
+    pub suffix: Option<String>,
     /// Unpadded base64url of the DID's COSE_Sign1 over
     /// `naming::proof_payload(Register, ns_did, alias@suffix, challenge)`.
     pub proof_of_control: String,
@@ -101,6 +106,102 @@ fn validate_local_part(s: &str) -> Result<(), ApiError> {
 /// Parse and lowercase a full `alias@suffix` (JEP-0004 rule 1).
 pub(crate) fn parse_name(full: &str) -> Result<Name, ApiError> {
     Name::parse(full).map_err(|e| err(StatusCode::BAD_REQUEST, "INVALID_NAME", e.to_string()))
+}
+
+fn unknown_suffix(suffix: &str) -> ApiError {
+    err(
+        StatusCode::NOT_FOUND,
+        "UNKNOWN_SUFFIX",
+        format!("this nameserver does not serve the suffix `{suffix}`"),
+    )
+}
+
+/// Parse a full name and check this nameserver serves its suffix.
+pub(crate) fn served_name(state: &AppState, full: &str) -> Result<Name, ApiError> {
+    let name = parse_name(full)?;
+    if state.suffixes.get(&name.suffix).is_none() {
+        return Err(unknown_suffix(&name.suffix));
+    }
+    Ok(name)
+}
+
+/// The suffix a registration asks for, or the only one served.
+fn requested_suffix<'a>(
+    state: &'a AppState,
+    suffix: Option<&str>,
+) -> Result<&'a SuffixPolicy, ApiError> {
+    match suffix {
+        Some(s) => {
+            let s = s.to_ascii_lowercase();
+            state.suffixes.get(&s).ok_or_else(|| unknown_suffix(&s))
+        }
+        None => state.suffixes.only().ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "SUFFIX_REQUIRED",
+                "this nameserver serves several suffixes; name one in `suffix`",
+            )
+        }),
+    }
+}
+
+fn refused(refusal: Refusal, policy: &SuffixPolicy) -> ApiError {
+    match refusal {
+        Refusal::Closed => err(
+            StatusCode::FORBIDDEN,
+            "REGISTRATION_CLOSED",
+            format!("registration on `{}` is closed", policy.suffix),
+        ),
+        Refusal::TooShort { min } => err(
+            StatusCode::BAD_REQUEST,
+            "ALIAS_TOO_SHORT",
+            format!(
+                "aliases on `{}` are at least {min} characters",
+                policy.suffix
+            ),
+        ),
+        Refusal::Reserved { word } => err(
+            StatusCode::FORBIDDEN,
+            "ALIAS_RESERVED",
+            format!(
+                "alias is reserved on `{}` (matches `{word}`)",
+                policy.suffix
+            ),
+        ),
+    }
+}
+
+/// The alias `did` already holds under `suffix` here, if any.
+pub(crate) async fn name_held_by(
+    state: &AppState,
+    did: &str,
+    suffix: &str,
+) -> Result<Option<String>, ApiError> {
+    let now = chrono::Utc::now().timestamp();
+    let store = state.ingest_ctx.store.clone();
+    let (did, ns_did, suffix) = (did.to_string(), state.ns_did_string(), suffix.to_string());
+    tokio::task::spawn_blocking(move || store.alias_held_by(&did, &ns_did, &suffix, now))
+        .await
+        .map_err(|e| internal("JOIN_ERROR")(e.to_string()))?
+        .map_err(|e| internal("PERSIST_ERROR")(e.to_string()))
+}
+
+/// Refuse to bind a second name under one suffix to `did`: the store keeps
+/// one name per DID per suffix, so the first would be silently dropped.
+pub(crate) async fn refuse_second_name(
+    state: &AppState,
+    did: &str,
+    name: &Name,
+) -> Result<(), ApiError> {
+    let alias = name.as_alias();
+    match name_held_by(state, did, &name.suffix).await? {
+        Some(held) if held != alias => Err(err(
+            StatusCode::CONFLICT,
+            "DID_HOLDS_NAME",
+            format!("this DID already holds `{held}`; one name per DID per suffix"),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Check that `did` signed a proof of control for `action` on `alias` at this
@@ -242,6 +343,13 @@ struct StoredBinding {
     reachability: Option<String>,
 }
 
+/// A stored row in the encoding from before attestations were COSE
+/// envelopes. [`Binding::from_row`] re-signs these from the row's columns,
+/// which is what makes rewriting those columns safe.
+pub(crate) fn is_legacy_row(attestation_bytes: &[u8]) -> bool {
+    serde_json::from_slice::<StoredBinding>(attestation_bytes).is_err()
+}
+
 impl Binding {
     /// The body of resolve, register, renew and rotate. `links` stays empty
     /// until lane I's I3 defines rotation links.
@@ -380,7 +488,12 @@ pub async fn register(
     Json(req): Json<RegisterReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     validate_local_part(&req.requested_alias)?;
-    let alias = parse_name(&format!("{}@{}", req.requested_alias, state.suffix()))?.as_alias();
+    let policy = requested_suffix(&state, req.suffix.as_deref())?;
+    let name = parse_name(&format!("{}@{}", req.requested_alias, policy.suffix))?;
+    let alias = name.as_alias();
+    let admission = policy
+        .admit(&req.did, &name.alias)
+        .map_err(|r| refused(r, policy))?;
 
     verify_action_proof(
         &state,
@@ -406,7 +519,15 @@ pub async fn register(
             format!("alias `{alias}` is already attested to a different DID"),
         ));
     }
+    refuse_second_name(&state, &req.did, &name).await?;
 
+    if admission == Admission::Allowlisted {
+        tracing::info!(
+            alias = %alias,
+            did_tag = %jig_core::did::log_tag(&req.did),
+            "registered an allowlisted alias"
+        );
+    }
     issue_and_persist(&state, &req.did, &alias, reachability).await
 }
 

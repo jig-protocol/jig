@@ -11,8 +11,8 @@ use serde::Deserialize;
 
 use crate::v0_0_2::AppState;
 use crate::v0_0_2_register::{
-    ApiError, consume_challenge, current_binding, err, issue_and_persist, parse_name,
-    verify_action_proof, verify_bare_challenge_sig,
+    ApiError, consume_challenge, current_binding, err, issue_and_persist, refuse_second_name,
+    served_name, verify_action_proof, verify_bare_challenge_sig,
 };
 
 #[derive(Debug, Deserialize)]
@@ -47,7 +47,8 @@ pub async fn rotate(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RotateReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let alias = parse_name(&req.alias)?.as_alias();
+    let name = served_name(&state, &req.alias)?;
+    let alias = name.as_alias();
 
     // 1. Consume challenge
     consume_challenge(&state, &req.challenge).await?;
@@ -85,18 +86,23 @@ pub async fn rotate(
         }
     }
 
+    // The new DID must not already hold another name under this suffix, or
+    // the rotation would silently drop it.
+    refuse_second_name(&state, &req.new_did, &name).await?;
+
     // 4. Expire the old-DID row so it no longer matches alias queries.
     //    Without this, both the old and new rows would be valid for the same
     //    alias and the result would be non-deterministic when their valid_from
     //    timestamps are equal (common in tests). Setting valid_until = now on
-    //    the old row is the cleanest fix within the v0.0.2 (did, ns_did) PK
-    //    model; a v0.0.3+ refactor can add a proper `alias → did` unique index.
+    //    the old row is the cleanest fix within the (did, ns_did, suffix) PK
+    //    model; a later refactor can add a proper `alias → did` unique index.
     let now = chrono::Utc::now().timestamp();
     let store_expire = state.ingest_ctx.store.clone();
     let old_did_clone = req.old_did.clone();
     let ns_did_clone = state.ns_did_string();
+    let alias_clone = alias.clone();
     tokio::task::spawn_blocking(move || {
-        store_expire.expire_alias_attestation(&old_did_clone, &ns_did_clone, now)
+        store_expire.expire_alias_attestation(&old_did_clone, &ns_did_clone, &alias_clone, now)
     })
     .await
     .map_err(|e| {
@@ -126,7 +132,7 @@ pub async fn renew(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RenewReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let alias = parse_name(&req.alias)?.as_alias();
+    let alias = served_name(&state, &req.alias)?.as_alias();
 
     // 1. Verify the proof, then consume the challenge, so a bad proof leaves
     //    the challenge usable.
@@ -159,8 +165,8 @@ pub async fn renew(
         }
     };
 
-    // 3. Issue + sign refreshed attestation. Same (did, ns_did) PK so the
-    //    existing row is updated in place.
+    // 3. Issue + sign refreshed attestation. Same (did, ns_did, suffix) PK so
+    //    the existing row is updated in place.
     issue_and_persist(&state, &req.did, &alias, binding.reachability).await
 }
 

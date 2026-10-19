@@ -19,6 +19,12 @@ pub enum PersistError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// [`SqliteStore::normalize_alias_case`] would hand one alias to two DIDs.
+    #[error(
+        "lowercasing aliases would give `{0}` to more than one DID; \
+         resolve the conflicting alias_attestations rows by hand"
+    )]
+    AliasCaseClash(String),
 }
 
 pub type Result<T> = std::result::Result<T, PersistError>;
@@ -225,6 +231,88 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &st
     // format! is not an injection vector — SQLite forbids binding identifiers.
     conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
     Ok(true)
+}
+
+/// The suffix an `alias_attestations` row is keyed by: the text after the last
+/// `@` of its alias, or `''` for a bare alias (an ingested `ns-attestation`
+/// block may carry one).
+fn alias_suffix_of(alias: &str) -> &str {
+    alias.rsplit_once('@').map_or("", |(_, suffix)| suffix)
+}
+
+/// Re-key `alias_attestations` from `(did, ns_did)` to `(did, ns_did, suffix)`
+/// so one DID can hold a name under each suffix a nameserver serves.
+///
+/// SQLite cannot change a primary key in place, so a database that predates
+/// the `suffix` column has its table rebuilt in one transaction, with each
+/// row's suffix derived from its alias. A table that already has the column is
+/// left alone, which makes this idempotent.
+fn rebuild_alias_attestations_with_suffix(conn: &Connection) -> Result<bool> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('alias_attestations') WHERE name = 'suffix')",
+        [],
+        |r| r.get(0),
+    )?;
+    if present {
+        return Ok(false);
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE alias_attestations_new (
+             did                  TEXT NOT NULL,
+             alias                TEXT NOT NULL,
+             ns_did               TEXT NOT NULL,
+             valid_from           INTEGER NOT NULL,
+             valid_until          INTEGER NOT NULL,
+             attestation_bytes    BLOB NOT NULL,
+             suffix               TEXT NOT NULL DEFAULT '',
+             PRIMARY KEY (did, ns_did, suffix)
+         );",
+    )?;
+    {
+        let mut read = tx.prepare(
+            "SELECT did, alias, ns_did, valid_from, valid_until, attestation_bytes
+             FROM alias_attestations",
+        )?;
+        let mut write = tx.prepare(
+            "INSERT INTO alias_attestations_new
+                 (did, alias, ns_did, valid_from, valid_until, attestation_bytes, suffix)
+             VALUES (?,?,?,?,?,?,?)",
+        )?;
+        let rows = read
+            .query_map([], row_to_stored_alias_attestation)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for a in rows {
+            write.execute(params![
+                a.did,
+                a.alias,
+                a.ns_did,
+                a.valid_from,
+                a.valid_until,
+                a.attestation_bytes,
+                alias_suffix_of(&a.alias)
+            ])?;
+        }
+    }
+    tx.execute_batch(
+        "DROP TABLE alias_attestations;
+         ALTER TABLE alias_attestations_new RENAME TO alias_attestations;",
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+fn row_to_stored_alias_attestation(
+    r: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredAliasAttestation> {
+    Ok(StoredAliasAttestation {
+        did: r.get(0)?,
+        alias: r.get(1)?,
+        ns_did: r.get(2)?,
+        valid_from: r.get(3)?,
+        valid_until: r.get(4)?,
+        attestation_bytes: r.get(5)?,
+    })
 }
 
 fn row_to_stored_channel(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChannel> {
@@ -458,7 +546,8 @@ impl SqliteStore {
                 valid_from           INTEGER NOT NULL,
                 valid_until          INTEGER NOT NULL,
                 attestation_bytes    BLOB NOT NULL,
-                PRIMARY KEY (did, ns_did)
+                suffix               TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (did, ns_did, suffix)
             );
 
             CREATE TABLE IF NOT EXISTS tofu_keys (
@@ -494,6 +583,7 @@ impl SqliteStore {
         add_column_if_missing(conn, "channels", "archived_at", "INTEGER")?;
         // Every channel created before v0.2 was unencrypted.
         add_column_if_missing(conn, "channels", "suite", "TEXT NOT NULL DEFAULT 'none'")?;
+        rebuild_alias_attestations_with_suffix(conn)?;
         Ok(())
     }
 
@@ -1060,11 +1150,14 @@ impl SqliteStore {
 
     // --- alias attestations ---
 
+    /// Insert or replace `a.did`'s binding under `a.alias`'s suffix at
+    /// `a.ns_did`. One DID holds at most one name per suffix per nameserver.
     pub fn upsert_alias_attestation(&self, a: &StoredAliasAttestation) -> Result<()> {
         self.conn.lock().expect("poisoned").execute(
-            "INSERT INTO alias_attestations (did, alias, ns_did, valid_from, valid_until, attestation_bytes)
-             VALUES (?,?,?,?,?,?)
-             ON CONFLICT(did, ns_did) DO UPDATE SET
+            "INSERT INTO alias_attestations
+                 (did, alias, ns_did, valid_from, valid_until, attestation_bytes, suffix)
+             VALUES (?,?,?,?,?,?,?)
+             ON CONFLICT(did, ns_did, suffix) DO UPDATE SET
                 alias = excluded.alias,
                 valid_from = excluded.valid_from,
                 valid_until = excluded.valid_until,
@@ -1075,7 +1168,8 @@ impl SqliteStore {
                 a.ns_did,
                 a.valid_from,
                 a.valid_until,
-                a.attestation_bytes
+                a.attestation_bytes,
+                alias_suffix_of(&a.alias)
             ],
         )?;
         Ok(())
@@ -1093,31 +1187,108 @@ impl SqliteStore {
              WHERE alias = ? AND valid_from <= ? AND valid_until > ?
              ORDER BY valid_from DESC LIMIT 1",
             params![alias, as_of, as_of],
-            |r| {
-                Ok(StoredAliasAttestation {
-                    did: r.get(0)?,
-                    alias: r.get(1)?,
-                    ns_did: r.get(2)?,
-                    valid_from: r.get(3)?,
-                    valid_until: r.get(4)?,
-                    attestation_bytes: r.get(5)?,
-                })
-            },
+            row_to_stored_alias_attestation,
         )
         .optional()
         .map_err(Into::into)
     }
 
-    /// Immediately expire an attestation for a specific (did, ns_did) pair by
-    /// setting valid_until = as_of. Called during key rotation to ensure the
-    /// old-DID row no longer appears as a current binding for its alias.
-    pub fn expire_alias_attestation(&self, did: &str, ns_did: &str, as_of: i64) -> Result<()> {
+    /// The alias `did` holds under `suffix` at `ns_did` with a binding valid at
+    /// `as_of`, if any.
+    pub fn alias_held_by(
+        &self,
+        did: &str,
+        ns_did: &str,
+        suffix: &str,
+        as_of: i64,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("poisoned");
+        conn.query_row(
+            "SELECT alias FROM alias_attestations
+             WHERE did = ? AND ns_did = ? AND suffix = ? AND valid_from <= ? AND valid_until > ?",
+            params![did, ns_did, suffix, as_of, as_of],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Immediately expire `did`'s binding under `alias`'s suffix at `ns_did`
+    /// by setting valid_until = as_of. Called during key rotation so the
+    /// old-DID row no longer appears as a current binding for its alias; the
+    /// same DID's names under other suffixes are untouched.
+    pub fn expire_alias_attestation(
+        &self,
+        did: &str,
+        ns_did: &str,
+        alias: &str,
+        as_of: i64,
+    ) -> Result<()> {
         self.conn.lock().expect("poisoned").execute(
             "UPDATE alias_attestations SET valid_until = ?
-             WHERE did = ? AND ns_did = ?",
-            rusqlite::params![as_of, did, ns_did],
+             WHERE did = ? AND ns_did = ? AND suffix = ?",
+            rusqlite::params![as_of, did, ns_did, alias_suffix_of(alias)],
         )?;
         Ok(())
+    }
+
+    /// Lowercase `alias` (and with it `suffix`) on the rows `is_legacy`
+    /// selects by their `attestation_bytes`, in one transaction. Returns how
+    /// many rows changed.
+    ///
+    /// This store does not know any nameserver's formats: the caller decides
+    /// which rows are safe to rewrite, namely those it re-signs from their
+    /// columns on read. Fails, changing nothing, when lowercasing would leave
+    /// two different DIDs holding the same alias with a binding valid at
+    /// `as_of`, or would collide with another row's key.
+    pub fn normalize_alias_case(
+        &self,
+        is_legacy: impl Fn(&[u8]) -> bool,
+        as_of: i64,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().expect("poisoned");
+        let tx = conn.unchecked_transaction()?;
+        let rows = tx
+            .prepare(
+                "SELECT did, alias, ns_did, valid_from, valid_until, attestation_bytes
+                 FROM alias_attestations",
+            )?
+            .query_map([], row_to_stored_alias_attestation)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut changed = 0;
+        for a in rows {
+            let lower = a.alias.to_ascii_lowercase();
+            if lower == a.alias || !is_legacy(&a.attestation_bytes) {
+                continue;
+            }
+            tx.execute(
+                "UPDATE alias_attestations SET alias = ?, suffix = ?
+                 WHERE did = ? AND ns_did = ? AND suffix = ?",
+                params![
+                    lower,
+                    alias_suffix_of(&lower),
+                    a.did,
+                    a.ns_did,
+                    alias_suffix_of(&a.alias)
+                ],
+            )?;
+            changed += 1;
+        }
+        let clash: Option<String> = tx
+            .query_row(
+                "SELECT alias FROM alias_attestations
+                 WHERE valid_from <= ?1 AND valid_until > ?1
+                 GROUP BY alias HAVING COUNT(DISTINCT did) > 1
+                 ORDER BY alias LIMIT 1",
+                [as_of],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(alias) = clash {
+            return Err(PersistError::AliasCaseClash(alias));
+        }
+        tx.commit()?;
+        Ok(changed)
     }
 
     /// List all currently-valid attestations (valid_from <= as_of < valid_until).
@@ -1131,16 +1302,10 @@ impl SqliteStore {
              ORDER BY alias ASC",
         )?;
         let rows = stmt
-            .query_map(rusqlite::params![as_of, as_of], |r| {
-                Ok(StoredAliasAttestation {
-                    did: r.get(0)?,
-                    alias: r.get(1)?,
-                    ns_did: r.get(2)?,
-                    valid_from: r.get(3)?,
-                    valid_until: r.get(4)?,
-                    attestation_bytes: r.get(5)?,
-                })
-            })?
+            .query_map(
+                rusqlite::params![as_of, as_of],
+                row_to_stored_alias_attestation,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -2291,5 +2456,204 @@ mod tests {
                 "ORDER BY is not satisfied by the index: {plan}\nsql: {sql}"
             );
         }
+    }
+
+    fn att(did: &str, alias: &str, bytes: &[u8]) -> StoredAliasAttestation {
+        StoredAliasAttestation {
+            did: did.into(),
+            alias: alias.into(),
+            ns_did: "did:jig:zNs".into(),
+            valid_from: 0,
+            valid_until: 2000,
+            attestation_bytes: bytes.to_vec(),
+        }
+    }
+
+    fn alias_rows(conn: &Connection) -> Vec<(String, String, String)> {
+        conn.prepare("SELECT did, alias, suffix FROM alias_attestations ORDER BY did, suffix")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    /// A nameserver database from before suffixes keyed its aliases by
+    /// `(did, ns_did)`. Migration rebuilds the table keyed by suffix and keeps
+    /// every row, and running it again changes nothing.
+    #[test]
+    fn migrate_rekeys_a_pre_existing_alias_table_by_suffix() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE alias_attestations (
+                 did TEXT NOT NULL, alias TEXT NOT NULL, ns_did TEXT NOT NULL,
+                 valid_from INTEGER NOT NULL, valid_until INTEGER NOT NULL,
+                 attestation_bytes BLOB NOT NULL,
+                 PRIMARY KEY (did, ns_did)
+             );
+             INSERT INTO alias_attestations VALUES
+                 ('did:jig:zA', 'Alice@dj.jig', 'did:jig:zNs', 0, 2000, x'7b7d'),
+                 ('did:jig:zB', 'bare', 'did:jig:zNs', 0, 2000, x'7b7d');",
+        )
+        .unwrap();
+
+        SqliteStore::migrate(&conn).unwrap();
+        let once = alias_rows(&conn);
+        SqliteStore::migrate(&conn).unwrap();
+        assert_eq!(alias_rows(&conn), once, "a second run is a no-op");
+        assert_eq!(
+            once,
+            [
+                ("did:jig:zA".into(), "Alice@dj.jig".into(), "dj.jig".into()),
+                ("did:jig:zB".into(), "bare".into(), "".into()),
+            ]
+        );
+
+        let pk: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM pragma_table_info('alias_attestations') WHERE pk > 0 ORDER BY pk",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(pk, ["did", "ns_did", "suffix"]);
+    }
+
+    #[test]
+    fn one_did_holds_a_name_per_suffix() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "dj@a.example", b"1"))
+            .unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "dj@b.example", b"2"))
+            .unwrap();
+        // Same suffix again replaces that suffix's row only.
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "deejay@a.example", b"3"))
+            .unwrap();
+
+        assert!(
+            store
+                .find_alias_attestation("dj@a.example", 1000)
+                .unwrap()
+                .is_none()
+        );
+        let a = store
+            .find_alias_attestation("deejay@a.example", 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.attestation_bytes, b"3");
+        let b = store
+            .find_alias_attestation("dj@b.example", 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.attestation_bytes, b"2");
+
+        let held = |suffix| {
+            store
+                .alias_held_by("did:jig:zA", "did:jig:zNs", suffix, 1000)
+                .unwrap()
+        };
+        assert_eq!(held("a.example").as_deref(), Some("deejay@a.example"));
+        assert_eq!(held("b.example").as_deref(), Some("dj@b.example"));
+        assert_eq!(held("c.example"), None);
+    }
+
+    #[test]
+    fn expiring_a_name_leaves_the_same_did_s_other_suffixes() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "dj@a.example", b"1"))
+            .unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "dj@b.example", b"2"))
+            .unwrap();
+        store
+            .expire_alias_attestation("did:jig:zA", "did:jig:zNs", "dj@a.example", 500)
+            .unwrap();
+        assert!(
+            store
+                .find_alias_attestation("dj@a.example", 1000)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .find_alias_attestation("dj@b.example", 1000)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn normalize_alias_case_rewrites_only_the_rows_the_caller_selects() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "Alice@A.example", b"legacy"))
+            .unwrap();
+        // Signed rows are never rewritten, even if their alias had capitals.
+        store
+            .upsert_alias_attestation(&att("did:jig:zB", "Bob@b.example", b"signed"))
+            .unwrap();
+        let before = store.find_alias_attestation("Bob@b.example", 1000).unwrap();
+
+        let changed = store
+            .normalize_alias_case(|bytes| bytes == b"legacy", 1000)
+            .unwrap();
+        assert_eq!(changed, 1);
+        let alice = store
+            .find_alias_attestation("alice@a.example", 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(alice.attestation_bytes, b"legacy");
+        assert_eq!(
+            store.find_alias_attestation("Bob@b.example", 1000).unwrap(),
+            before,
+            "a signed row comes out byte-identical"
+        );
+        let conn = store.conn.lock().unwrap();
+        assert!(alias_rows(&conn).contains(&(
+            "did:jig:zA".into(),
+            "alice@a.example".into(),
+            "a.example".into()
+        )));
+        drop(conn);
+        assert_eq!(
+            store.normalize_alias_case(|_| true, 1000).unwrap(),
+            1,
+            "Bob, once allowed"
+        );
+        assert_eq!(
+            store.normalize_alias_case(|_| true, 1000).unwrap(),
+            0,
+            "idempotent"
+        );
+    }
+
+    #[test]
+    fn normalize_alias_case_refuses_to_merge_two_holders() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "Alice@a.example", b"x"))
+            .unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zB", "alice@a.example", b"x"))
+            .unwrap();
+
+        let err = store.normalize_alias_case(|_| true, 1000).unwrap_err();
+        assert!(
+            matches!(&err, PersistError::AliasCaseClash(a) if a == "alice@a.example"),
+            "{err}"
+        );
+        assert!(
+            store
+                .find_alias_attestation("Alice@a.example", 1000)
+                .unwrap()
+                .is_some(),
+            "nothing changed"
+        );
     }
 }

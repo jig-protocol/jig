@@ -23,10 +23,16 @@ use jig_pipeline::{
 };
 use tokio::sync::RwLock;
 
+use crate::v0_0_2_policy::Suffixes;
+
 /// Default time-to-live for an issued challenge nonce. Picked to comfortably
 /// exceed normal HTTP round-trip + signing time while staying small enough
 /// that the in-memory map can't grow without bound under DoS.
 const DEFAULT_CHALLENGE_TTL: Duration = Duration::from_secs(60);
+
+/// The suffix of [`AppState::for_test`].
+#[cfg(test)]
+pub const TEST_SUFFIX: &str = "dj.jig";
 
 /// Nameserver-scoped v0.0.2 boot state. Identity resolution in a
 /// nameserver is always TOFU — nameservers don't query other
@@ -36,10 +42,8 @@ pub struct AppState {
     pub config: JigServerConfig,
     pub ingest_ctx: Arc<IngestContext>,
     pub ns_did: Did,
-    /// `dj.jig` etc. — the alias suffix this nameserver is authoritative for.
-    /// Read from config.identity.trusted_nameservers[0] as a v0.0.2 placeholder;
-    /// real config field lands in v0.0.3+.
-    pub alias_suffix: String,
+    /// The suffixes this nameserver serves and their registration policy.
+    pub suffixes: Arc<Suffixes>,
     /// Recently-issued challenge nonces with their issued-at timestamp.
     /// A background task started in `new` / `for_test*` sweeps entries
     /// older than `challenge_ttl` every `challenge_ttl / 2`. Without the
@@ -54,11 +58,7 @@ pub struct AppState {
 impl AppState {
     /// Boot the v0.0.2 state. The nameserver-specific block-kind allowlist
     /// is enforced here: only `ns-*` and `fed-hello` blocks ingest.
-    pub fn new(
-        mut config: JigServerConfig,
-        db_path: PathBuf,
-        alias_suffix: String,
-    ) -> Result<Self> {
+    pub fn new(mut config: JigServerConfig, db_path: PathBuf, suffixes: Suffixes) -> Result<Self> {
         // Override the allowlist for nameserver mode (config defaults to text-render).
         config.server.allowed_block_kinds = vec![
             "ns-register".to_string(),
@@ -69,6 +69,21 @@ impl AppState {
         ];
 
         let store = Arc::new(SqliteStore::open(&db_path).context("opening SqliteStore")?);
+        // Before suffixes, aliases were matched as typed. Rows from then are
+        // re-signed from their columns on read, so lowercasing them is safe;
+        // signed rows are already lowercase and are left byte-identical.
+        let lowered = store
+            .normalize_alias_case(
+                crate::v0_0_2_register::is_legacy_row,
+                chrono::Utc::now().timestamp(),
+            )
+            .context("lowercasing aliases stored before names were case-folded")?;
+        if lowered > 0 {
+            tracing::info!(
+                rows = lowered,
+                "lowercased aliases stored before case folding"
+            );
+        }
         let signing_key = load_or_generate_server_key(&config.server.server_did_keyfile)
             .context("loading nameserver signing key")?;
         // Before anything logs a DID: tags are keyed by this nameserver's seed.
@@ -112,7 +127,7 @@ impl AppState {
             config,
             ingest_ctx,
             ns_did,
-            alias_suffix,
+            suffixes: Arc::new(suffixes),
             pending_challenges,
             challenge_ttl: DEFAULT_CHALLENGE_TTL,
         })
@@ -121,7 +136,7 @@ impl AppState {
     /// Convenience for tests: in-memory store, freshly generated keys.
     #[cfg(test)]
     pub fn for_test() -> Result<Self> {
-        Self::for_test_with_suffix("dj.jig")
+        Self::for_test_with_suffix(TEST_SUFFIX)
     }
 
     /// Tests-only constructor that overrides the challenge TTL so we can
@@ -129,7 +144,7 @@ impl AppState {
     /// to `for_test()`.
     #[cfg(test)]
     pub fn for_test_with_short_challenge_ttl(ttl: Duration) -> Result<Self> {
-        let mut state = Self::for_test_with_suffix("dj.jig")?;
+        let mut state = Self::for_test_with_suffix(TEST_SUFFIX)?;
         // The sweeper spawned in for_test_with_suffix already uses the default
         // TTL; replace pending_challenges + restart the sweeper at the new TTL.
         let pending = Arc::new(RwLock::new(HashMap::new()));
@@ -139,9 +154,29 @@ impl AppState {
         Ok(state)
     }
 
+    /// One open suffix with no minimum length and no reserved names, so tests
+    /// can register short names like `dj`. Policy tests build their own.
     #[cfg(test)]
     pub fn for_test_with_suffix(alias_suffix: &str) -> Result<Self> {
+        let mut cfg = jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix);
+        cfg.min_alias_len = 1;
+        cfg.reserved.clear();
+        cfg.reserved_contains.clear();
+        cfg.reserved_affixes.clear();
+        cfg.single_label_authority = true;
+        Self::for_test_with_suffixes(vec![cfg])
+    }
+
+    #[cfg(test)]
+    pub fn for_test_with_suffixes(
+        suffixes: Vec<jig_config::v0_0_2_server::SuffixConfig>,
+    ) -> Result<Self> {
         use rand::Rng;
+
+        let suffixes = Suffixes::from_config(&jig_config::v0_0_2_server::NameserverSection {
+            alias_suffix: None,
+            alias_suffixes: suffixes,
+        })?;
 
         let store = Arc::new(SqliteStore::open_in_memory()?);
         let mut secret = [0u8; 32];
@@ -186,7 +221,7 @@ impl AppState {
             config,
             ingest_ctx,
             ns_did,
-            alias_suffix: alias_suffix.to_string(),
+            suffixes: Arc::new(suffixes),
             pending_challenges,
             challenge_ttl: DEFAULT_CHALLENGE_TTL,
         })
@@ -196,8 +231,10 @@ impl AppState {
         self.ns_did.to_did_jig_string()
     }
 
+    /// The single suffix of a test state.
+    #[cfg(test)]
     pub fn suffix(&self) -> &str {
-        &self.alias_suffix
+        &self.suffixes.only().expect("one suffix").suffix
     }
 
     /// Record a challenge nonce so a later /v1/register can verify it was issued.
@@ -266,6 +303,24 @@ fn spawn_challenge_sweeper(pending: Arc<RwLock<HashMap<String, Instant>>>, ttl: 
     });
 }
 
+/// Write a new nameserver signing key to `path` and return the DID the
+/// nameserver will sign as when it loads that file. For a key ceremony on an
+/// offline machine: the DID can be recorded before any server exists.
+///
+/// The file is created owner-only (0600) at open, never chmod'ed after, and
+/// synced to disk. An existing file is never overwritten. Errors name the
+/// path only, never key material.
+pub fn keygen(path: &std::path::Path) -> Result<String> {
+    let signing = jig_core::crypto::ed25519::generate_signing_key();
+    jig_core::crypto::ed25519::write_new_key_file(path, &signing).with_context(|| {
+        format!(
+            "writing a new nameserver keyfile to {} (an existing file is never overwritten)",
+            path.display()
+        )
+    })?;
+    Ok(Did::from_ed25519_pubkey(signing.verifying_key().as_bytes()).to_did_jig_string())
+}
+
 fn load_or_generate_server_key(path: &str) -> Result<SigningKey> {
     let expanded = shellexpand::tilde(path).into_owned();
     let path = std::path::Path::new(&expanded);
@@ -297,7 +352,7 @@ mod tests {
     #[tokio::test]
     async fn for_test_constructs_with_default_suffix() {
         let state = AppState::for_test().unwrap();
-        assert_eq!(state.suffix(), "dj.jig");
+        assert_eq!(state.suffix(), TEST_SUFFIX);
         assert!(state.ns_did_string().starts_with("did:jig:z"));
     }
 
@@ -345,6 +400,34 @@ mod tests {
             !state.take_challenge("nonce-b").await,
             "expired challenge must be rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn keygen_prints_the_did_the_nameserver_signs_as() {
+        let dir = std::env::temp_dir().join(format!("jig-ns-keygen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let key = dir.join("ns.key");
+        let did = keygen(&key).unwrap();
+
+        let mut config = JigServerConfig::default();
+        config.server.server_did_keyfile = key.to_string_lossy().into_owned();
+        let suffixes = Suffixes::from_config(&jig_config::v0_0_2_server::NameserverSection {
+            alias_suffix: None,
+            alias_suffixes: vec![jig_config::v0_0_2_server::SuffixConfig::new("dj.jig")],
+        })
+        .unwrap();
+        let state = AppState::new(config, dir.join("ns.db"), suffixes).unwrap();
+        assert_eq!(state.ns_did_string(), did);
+
+        let before = std::fs::read(&key).unwrap();
+        let err = keygen(&key).unwrap_err();
+        assert!(format!("{err:#}").contains("never overwritten"), "{err:#}");
+        assert_eq!(
+            std::fs::read(&key).unwrap(),
+            before,
+            "the existing key is untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
