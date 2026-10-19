@@ -3731,7 +3731,6 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "futures-util",
  "hex",
- "jig-config",
  "jig-core",
  "jig-mls",
  "jig-pipeline",
@@ -3783,6 +3782,7 @@ dependencies = [
  "time",
  "wasmparser 0.261.0",
  "wat",
+ "wit-parser 0.258.3",
  "zeroize",
 ]
 
@@ -3863,7 +3863,6 @@ dependencies = [
  "chrono",
  "ed25519-dalek 3.0.0",
  "hex",
- "jig-config",
  "jig-core",
  "jig-mls",
  "jig-runtime",

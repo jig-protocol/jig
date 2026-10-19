@@ -1,0 +1,1017 @@
+{
+  "format": 1,
+  "suite": "mls",
+  "description": "MLS (RFC 9420), MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519. Gate cases only: MLS reading depends on member secrets, covered by RFC 9420's own vectors. Leaves expire at 4922289600 (Unix seconds); regenerate before then.",
+  "cases": [
+    {
+      "name": "a restricted channel: create, add with a welcome, talk, remove",
+      "steps": [
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "channel-create",
+              "metadata": {
+                "mls_group_info": "AAEABAABAAEQ3h8GvtqHNWv5d5F9xfMr+AAAAAAAAAAAINKj9HbKrvW8fzAEJQZqDFDeD4vX2PYfDeHQr4vjXXETAABBEQACQOlA5wEBIIbGtiMz2YEDBh4zspoVo/xXrN4M9EjrnByqy23SRiYUIIqI4910CfGV/VLbLTy6XXLKZwm/HZQSG/N0iAG0D29cAAE9ZGlkOmppZzp6cmtlb2h4bHViaHl6bDdrczNtd3R6b3M1b2xmZ29jbjdkd2tiZWc3dG9zZWFkbmFwbjVvYQIAAQYAAQACAAMAAAIAAQEAAAAAatR5VwAAAAElZC3AAEBAmjtJ8WZaxtq36sVHR994x9H9yCqRjZ8BASAtRtV8iAYtg3St2vDr2AxJrijHtfQ4vw9HsQD9plAqIOl60eTrAgAEISAhjxbimexyMCxjXSRUaEkLzC4FzMZzYV5rirDbRWuEdiBYw9HFrrs7+zK8qpklPEdbMIU0c4eRl/mLhJw4x0PZ+QAAAABAQM14u3A+64CfURXBYnrmFClaTXbupJujMYRHg3JfMy6/9ejxNs3/T3RB4M0JwTL6P57L31j5ASGtzZUOb3AQcAQ=",
+                "mls_ratchet_tree": "QOcBASCGxrYjM9mBAwYeM7KaFaP8V6zeDPRI65wcqstt0kYmFCCKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXAABPWRpZDpqaWc6enJrZW9oeGx1Ymh5emw3a3MzbXd0em9zNW9sZmdvY243ZHdrYmVnN3Rvc2VhZG5hcG41b2ECAAEGAAEAAgADAAACAAEBAAAAAGrUeVcAAAABJWQtwABAQJo7SfFmWsbat+rFR0ffeMfR/cgqkY2fAQEgLUbVfIgGLYN0rdrw69gMSa4ox7X0OL8PR7EA/aZQKiDpetHk6wI=",
+                "slug": "#v",
+                "suite": "mls",
+                "visibility": "restricted"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": "accept"
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "member-add",
+              "metadata": {
+                "channel": "#v",
+                "member_did": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka",
+                "mls_commit": "AAEAARDeHwa+2oc1a/l3kX3F8yv4AAAAAAAAAAABAAAAAAADQVIBAAEAAQABIE+cbn7nJCSS6yYdH/aA2PiNK8Dmexd1AsG7fvAHpgdeIH3Y0gsyH00mRne60uE69mwG6HE0dwmEizjfTnFc5wJPIIE5dw6ofRdfVqNUZsNMfszLjYqRtO43ol32D1uPybOUAAE9ZGlkOmppZzp6cWU0eG9kdmlwdWx2NnZ2ZGtydG1ndGQ2enRmeTNjdXJ3dHhkcGlzNTZ5aHZ4ZDZqd29rYQIAAQYAAQACAAMCAAoAAgABAQAAAABq1HlXAAAAASVkLcAAQECYywuiQStWCN+y9ojorwc14HR50cLnDoIzPpWLSOetejSUwoAdsnFuva+CxAt3uxbgqxBWHrDQFfga3XfqabwKAEBABudWtwcz7Y5KsnlQ4PEr6WLbNASPJZ7ELrSyff3gyYZsJvUTxcfO3VTCmeVIJtbOiVLXSWwpWdGZU8vb+h59BgEg9RSMcI7K5av+VIhgxKDNEg9tOOMx8pHbBGG+V0YkhSMgiojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1wAAT1kaWQ6amlnOnpya2VvaHhsdWJoeXpsN2tzM213dHpvczVvbGZnb2NuN2R3a2JlZzd0b3NlYWRuYXBuNW9hAgABBgABAAIAAwAAAgABAyBdqC7kkPdHIwYoVx2MmAOE7BPw+9Jj5EelsJfQEcpVeABAQJHl4m1rJcp8SbuAzXmIlptMWwSFXiPMFGRMKhtPUSUF0YxNzRyJKtD+dA3q8S1pgIKNHVKvTFo7VZ4mpPdVdg4iIM+Q63stn6noMEFOcvBZHtFXJumkv8WLyEdNgOo+oTJcAEBAt0mDPwFrzvV12OEKNhbcN5zWV4HKO3PJ1p1cOqEA1BF/7x6LoiK77Cuw4AdX/J0BJDxSqWelloEwIjlz3f4wCyC6zba7MF3Oa7QyoLxxZZ4ooZ6p+fsFBX5ODXfjEPEy3yDymSd6S17x6zcxn8KFEPe+BDrwAs+xWZlQ6YE6E4l2XQ==",
+                "mls_epoch": 0,
+                "mls_group_info": "AAEABAABAAEQ3h8GvtqHNWv5d5F9xfMr+AAAAAAAAAABIN8hr3Uu2k5uHS8/OpFScCHF4+asx8QeQ7IUpDyr5YISINyv2bXZ0UcWl/CQjpZrxSQjaEJQF+imVe8eurwcCv6pAEIwAAJCCEIGAQEg9RSMcI7K5av+VIhgxKDNEg9tOOMx8pHbBGG+V0YkhSMgiojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1wAAT1kaWQ6amlnOnpya2VvaHhsdWJoeXpsN2tzM213dHpvczVvbGZnb2NuN2R3a2JlZzd0b3NlYWRuYXBuNW9hAgABBgABAAIAAwAAAgABAyBdqC7kkPdHIwYoVx2MmAOE7BPw+9Jj5EelsJfQEcpVeABAQJHl4m1rJcp8SbuAzXmIlptMWwSFXiPMFGRMKhtPUSUF0YxNzRyJKtD+dA3q8S1pgIKNHVKvTFo7VZ4mpPdVdg4BAiDPkOt7LZ+p6DBBTnLwWR7RVybppL/Fi8hHTYDqPqEyXAAAAQEgfdjSCzIfTSZGd7rS4Tr2bAbocTR3CYSLON9OcVznAk8ggTl3Dqh9F19Wo1Rmw0x+zMuNipG07jeiXfYPW4/Js5QAAT1kaWQ6amlnOnpxZTR4b2R2aXB1bHY2dnZka3J0bWd0ZDZ6dGZ5M2N1cnd0eGRwaXM1NnlodnhkNmp3b2thAgABBgABAAIAAwIACgACAAEBAAAAAGrUeVcAAAABJWQtwABAQJjLC6JBK1YI37L2iOivBzXgdHnRwucOgjM+lYtI5616NJTCgB2ycW69r4LEC3e7FuCrEFYesNAV+Brdd+ppvAoABCEg3s4eZg/IojIeeuxGb+smFZ7cXd2F6pWJUWI6WvMd8z8gus22uzBdzmu0MqC8cWWeKKGeqfn7BQV+Tg134xDxMt8AAAAAQEBHjGjepyu7xf8IRvma2P3s9TQlo0rQGJViUgOhBOGrxEFgX/lsA6zajCa+nqwdSDw436LsoIhRxWO/FUy2QZEI",
+                "mls_welcome": "AAEAAwABQJggF+AqQOA7Hpgr4KFEB7KMWCxt3WSrby9ODZODMaIG3cwgdQMrFnsZU7RNJoIlAPG0zC1hT1wAS0/YVAJdb+7PM3NAVKsjdrMLDTHFKNq/PsTrSgcB87HayTGjUETfWdrbjk/AXrdP590jscU9GylMhw9b3l6DNGPtW8dYDgidFV0PVcTjIOdEZJiBq/7XJsq351RqPNPXQELla1TOWaNrOG99W5we9Ajvv183CKxg4oUP5gn+whgTZFy3Us9jKBc85F3gpshyIMgqC8n4k0fXp3BiaWSTQcpEmrGwrgcXaaPQTHqGX2u/ECV0u63hgwr397V1XSd8FB8Yb4eAgSAx4sNZS6qOYk1JN03mHkaj43PryvwK9/Ma4dxSjqMhZPQT37L8GrBjsDRqI+0e+BgzxlkMXHmJw6FoWaR0TOJRZPsjjxQbagdSAMo4OuF2y4CQBa3xjRYpHu/p8oSj2OcIIX/Q4TYsB0zzL3K9Lbjs6FMYbKfL2ZrsxxLh+MrTYvNGPnakl39WEF5lGD0Py+qNMpld63pv83AwntGWCC9zoyRVwJXkGxEyXcLFHnjmfxH6jwHODXvPALDS5EVbhGESJ+E36do/S5ra6Jx0maJ7KN4uKxrXCW/cbfRuTmobjfvA7khAh01Vuh1r/n+Eur/KU2Zt1oBanUjgtuB00RbwyRG4/kKh2OilZpLCE+Vr5JKiuhPNP8lPqAoQjTqyMyJI4pqtkeo5fGymIVPUmtDOpvQwPgeH40BSuAJko4GAfzwZexz8QUQyQUB+1U94s3EtKaYq+D0w9plDTMvxhU0xLDUuQNu//caUzMJTB69ZHSLl2gwO0PF6+81nbNiAMuya7Q5Pkixoe6tiKHFfqUO6tNQQpY6cm4FwAZAs5Dlt6KLbE/A7vYc5/3en6TCegFnInEkeeU5MjFMWG+uKLQkPGkADojGYKbBbkbTdw7q+9qL9PXAP2hzms7RswCRVXoo8SiYAq63aQRTDkf/U7sTsjg6syRn1uKQzha/XBEyWcQ92dps0rXCMV6Q2WdAwjfuqspH2sYeuWOqAkaO/N7os1h2P/JJsyyOvDLSGMDBA5YF9uHawtzq9IpVspW0qPOA/NlurrglI4cUHmYs5n/50CRCs+XcI6kdLJ6nJF5vsUA/+frgRs3ueq2SjBVOph6wIk0NJBZ7e30sUkBqR1wDX"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": "accept"
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "text-render",
+              "metadata": {
+                "channel": "#v",
+                "mls_epoch": 1,
+                "mls_message": "AAEAAhDeHwa+2oc1a/l3kX3F8yv4AAAAAAAAAAEBABy/PF7wcwSYRv0xJSCptyO4qp0Q/L5UPSbOpvR7QFgU2Py2NUOD5AsCrg6/3P0U3mT5qD6YLHJQY5DVmMv0YIksA9BrF39EUhCLfZp5zoqbQEIypKj+T9HoSn72B7KOpXsFgmAM+n3cFrMRMMPvmEGJv7Jh6GKN"
+              },
+              "parents": [],
+              "privacy": {
+                "encryption": "mls",
+                "metadata_visibility": "public",
+                "recipients": []
+              },
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": "accept"
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "text-render",
+              "metadata": {
+                "channel": "#v",
+                "mls_epoch": 1,
+                "mls_message": "AAEAAhDeHwa+2oc1a/l3kX3F8yv4AAAAAAAAAAEBAByC/5SMWA2omMWg5PUI3l6zADIrb3umIyC1PyfUQFVo5AuMf4dRWLIMbe1RfP2kpcyRf61yTqP0DN3NS2jma27EPF7djG56V1f8/LLLpSvdbhkExaGpMxZyrOorw9dn9HrThfFn2tPM6pAa75IMbmceDyCm"
+              },
+              "parents": [],
+              "privacy": {
+                "encryption": "mls",
+                "metadata_visibility": "public",
+                "recipients": []
+              },
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": "accept"
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "member-remove",
+              "metadata": {
+                "channel": "#v",
+                "member_did": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka",
+                "mls_commit": "AAEAARDeHwa+2oc1a/l3kX3F8yv4AAAAAAAAAAEBAAAAAAADBwEAAwAAAAEBIAKd9Yh/M7SZecjcTo+BSZdq6NIt63meaYYrmBPZLPdRIIqI4910CfGV/VLbLTy6XXLKZwm/HZQSG/N0iAG0D29cAAE9ZGlkOmppZzp6cmtlb2h4bHViaHl6bDdrczNtd3R6b3M1b2xmZ29jbjdkd2tiZWc3dG9zZWFkbmFwbjVvYQIAAQYAAQACAAMAAAIAAQMAAEBAPFNSBJ6thtL2JGzC8UPXpybMMxYpiPvorrghc3ge889c5TJ/zvbquxU4bReREOHEJvjvyLFDnFV3CYoZLB3FAABAQB1TELvVvL2XjKsWEKZBUiC263IAOHzmguMc/XsMGvcHRJSEJrH7FRih44KelWF/3Gk1KzZosfvSblm6ZjzUkAQgl51pftBlWCBuUTgWv0Xa3etWXg9ixwiZ+CkxJAr9n4EgECnNWlS1E+RtzawDHuAwGVr1ohpdTHtr10W7DqVdVlU=",
+                "mls_epoch": 1,
+                "mls_group_info": "AAEABAABAAEQ3h8GvtqHNWv5d5F9xfMr+AAAAAAAAAACIPf6oYsrnM04jdWRDPk/Jxx1XlVpM+URAL/CePVrHX5uIFlBhVfR6kNOU+HZgJjP75TFTj5hZghus+lgsaepx5GLAEECAAJA2kDYAQEgAp31iH8ztJl5yNxOj4FJl2ro0i3reZ5phiuYE9ks91Egiojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1wAAT1kaWQ6amlnOnpya2VvaHhsdWJoeXpsN2tzM213dHpvczVvbGZnb2NuN2R3a2JlZzd0b3NlYWRuYXBuNW9hAgABBgABAAIAAwAAAgABAwAAQEA8U1IEnq2G0vYkbMLxQ9enJswzFimI++iuuCFzeB7zz1zlMn/O9uq7FThtF5EQ4cQm+O/IsUOcVXcJihksHcUAAAQhIAbVTeRdYV2npXbaeJFB6pjYh3fLiY5aRFuFh+x7JXZkIJedaX7QZVggblE4Fr9F2t3rVl4PYscImfgpMSQK/Z+BAAAAAEBAViiLNa2m4V+GWWleW0oK5TI1+HjbQ0ndsF3o8iEwzcT50jb7uiZ3FwjEbE4qMtVfYQ34cLSWsxDYHrJG3t4dCA=="
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": "accept"
+          }
+        }
+      ]
+    },
+    {
+      "name": "an open channel: external join, then a commit on a passed epoch is stale",
+      "steps": [
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "channel-create",
+              "metadata": {
+                "mls_group_info": "AAEABAABAAEQpYJJ6PJAPaOL7D5eEswzBAAAAAAAAAAAINtM8GfKDr54IaPGBV0B9tBm7cLQxGLtt5SNEn2UOte3AABBEQACQOlA5wEBIFhSIWHcMRNoiACGEkJ78vEWxgp9sucZ2IvEhDbyy+9OIIqI4910CfGV/VLbLTy6XXLKZwm/HZQSG/N0iAG0D29cAAE9ZGlkOmppZzp6cmtlb2h4bHViaHl6bDdrczNtd3R6b3M1b2xmZ29jbjdkd2tiZWc3dG9zZWFkbmFwbjVvYQIAAQYAAQACAAMAAAIAAQEAAAAAatR5VwAAAAElZC3AAEBA/YTpF9bjgrDon3XSUksE1Po+vdcCb8jXAcmIynhhXBbOin0P3DcqMcYavaUqhMKqqjm4IUuMOXBndiTvXWEwAAAEISDc1it/l5RKDGb3/SZprtSimIsoGo1opyH4imPXJUnhHyBLBFiAi+iIr4/3z1EcMPmDR1G+y1wOG9bplbbIENKXCAAAAABAQLS2Yf9wwgWHMw2t+Jp+U1PGD2cVXj2VMWTkJpsGrnPvVgKBUcOT34xZhpZTlogm3HRKWGv1Pv/w4UyjM223ZwY=",
+                "mls_ratchet_tree": "QOcBASBYUiFh3DETaIgAhhJCe/LxFsYKfbLnGdiLxIQ28svvTiCKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXAABPWRpZDpqaWc6enJrZW9oeGx1Ymh5emw3a3MzbXd0em9zNW9sZmdvY243ZHdrYmVnN3Rvc2VhZG5hcG41b2ECAAEGAAEAAgADAAACAAEBAAAAAGrUeVcAAAABJWQtwABAQP2E6RfW44Kw6J910lJLBNT6Pr3XAm/I1wHJiMp4YVwWzop9D9w3KjHGGr2lKoTCqqo5uCFLjDlwZ3Yk711hMAA=",
+                "slug": "#v",
+                "suite": "mls",
+                "visibility": "open"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": "accept"
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "member-add",
+              "metadata": {
+                "channel": "#v",
+                "member_did": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka",
+                "mls_commit": "AAEAARClgkno8kA9o4vsPl4SzDMEAAAAAAAAAAAEAAMkAQAGIDfaMW65T0EQ1iX8h58ixq1eUYoSFL9LOSd8qtx+RUZjASCqWxOq9SLaLBgZf4CmC3T4qddx95JiK+uxX4DWBnFGBiCBOXcOqH0XX1ajVGbDTH7My42KkbTuN6Jd9g9bj8mzlAABPWRpZDpqaWc6enFlNHhvZHZpcHVsdjZ2dmRrcnRtZ3RkNnp0ZnkzY3Vyd3R4ZHBpczU2eWh2eGQ2andva2ECAAEGAAEAAgADAAACAAEDIMBEuPY9xt0wTS2C6nG8FYjqJZaZaC9kxyeQxG34EB0uAEBAOy8G3fl3wgEX8spSH7bYeaS+zX/Jj65bU3OhqOjiiq8tZ5bJDKFr2jZ6c95qtYYxv/MQ6XAdr29Laeptk6vMDEB1IDrZJAVSB57GV668I30ocUD+ZfLMEdA83svi4t6Fq8BuQFIgPzMlYayGKZbA19RmrFlFpJGuGOiXNlT7Phlr9OoMvUUwOg/NcuFNy5Bsx6cpdEpgS7t/pKTyCrkWHedY0SIiIPH2WYSgM/O9QSMQfxXHr+I0QEDunVYmyN+6ruLhpMCuAWHak50z5dnle2cd+I/Xb/CEs3BIheHDh7r4btQB3hjM1crEfagQnYJpvg5mMLdCpHgLIDi6+p+MFUJzu4SV0qnm+PLkeORbfo1C9xwjyVPEOHT3",
+                "mls_epoch": 0,
+                "mls_group_info": "AAEABAABAAEQpYJJ6PJAPaOL7D5eEswzBAAAAAAAAAABIOGSf5aiO/1kvxKtvetcYQVnGj/ZrwlaaOCtnz4c2vSeIBLGOs9Q5CfwrrHycJUgUzPH17RnUlo3uiAEuH1oeLrnAEIuAAJCBkIEAQEgWFIhYdwxE2iIAIYSQnvy8RbGCn2y5xnYi8SENvLL704giojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1wAAT1kaWQ6amlnOnpya2VvaHhsdWJoeXpsN2tzM213dHpvczVvbGZnb2NuN2R3a2JlZzd0b3NlYWRuYXBuNW9hAgABBgABAAIAAwAAAgABAQAAAABq1HlXAAAAASVkLcAAQED9hOkX1uOCsOifddJSSwTU+j691wJvyNcByYjKeGFcFs6KfQ/cNyoxxhq9pSqEwqqqObghS4w5cGd2JO9dYTAAAQIgOtkkBVIHnsZXrrwjfShxQP5l8swR0Dzey+Li3oWrwG4AAAEBIKpbE6r1ItosGBl/gKYLdPip13H3kmIr67FfgNYGcUYGIIE5dw6ofRdfVqNUZsNMfszLjYqRtO43ol32D1uPybOUAAE9ZGlkOmppZzp6cWU0eG9kdmlwdWx2NnZ2ZGtydG1ndGQ2enRmeTNjdXJ3dHhkcGlzNTZ5aHZ4ZDZqd29rYQIAAQYAAQACAAMAAAIAAQMgwES49j3G3TBNLYLqcbwViOollploL2THJ5DEbfgQHS4AQEA7Lwbd+XfCARfyylIftth5pL7Nf8mPrltTc6Go6OKKry1nlskMoWvaNnpz3mq1hjG/8xDpcB2vb0tp6m2Tq8wMAAQhIIhP1r9KreHUuzJiQH4tPfGniZFd2gOfbZiznlXOLucKIDi6+p+MFUJzu4SV0qnm+PLkeORbfo1C9xwjyVPEOHT3AAAAAUBAs7D3x9pbi3QRUNB9nSnWFGNEd5fEK8uZQc4EnLaRnmEF4xLqejd6FIabrkpOUIOXZtpTJogO8HVG5M6Q03mxDg=="
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": "accept"
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:z5vesrrri2hbmn2xjam4jawmvmeuvsjz2lrr7snrwyfdbjlehg7iq",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:z5vesrrri2hbmn2xjam4jawmvmeuvsjz2lrr7snrwyfdbjlehg7iq",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "member-add",
+              "metadata": {
+                "channel": "#v",
+                "member_did": "did:jig:z5vesrrri2hbmn2xjam4jawmvmeuvsjz2lrr7snrwyfdbjlehg7iq",
+                "mls_commit": "AAEAARClgkno8kA9o4vsPl4SzDMEAAAAAAAAAAAEAAMkAQAGIOl/rUgWJcyfss8GEMoFk7716YRNqHTfb7pA1M0+v7x2ASDSG75kHH/N2/75RLugf84J6YycfdWC9Ek905dKRxoOAiDtSSjGKNHCxurpAziQWZVhKVknOlxj+TY2wUYUrIc30QABPWRpZDpqaWc6ejV2ZXNycnJpMmhibW4yeGphbTRqYXdtdm1ldXZzanoybHJyN3Nucnd5ZmRiamxlaGc3aXECAAEGAAEAAgADAAACAAEDILbyvDJeFnN6M25RN1ijDQB3W/T79La7qNT3KYTKJOUPAEBAu5+CYuam7GwGjFDAPuOIhBFzOLraqpAcM6ifaQ/FrCIMqyO+6A41p6xMwo2M9lh9gSuPr3XYm5bgQkwtVTkqDkB1IN9nF5yKTx3ka4KWFjh6ql3/7mRoExJf9DRQAnujyCFMQFIgXQHXl2NJY7CQwloqq5DDAq3pePbXviYXTbLagVVbL2MwcBcM6RQao+2UafxkIABfG/jONoxQm1EdX3JhrLNR0s5LCI/dD696tHrKrtS7wQxgQECrxxl5Jath8x+5TeD/Tow48/eC96qgj2igvGtgjLocO587aAPsRn/an81AzKprdcZCCcAUSbsT3RSo0yha7g8NINcFrztihD9RtV1AE8pLZQylMTDqkYbtKGrkPXWB2YBU",
+                "mls_epoch": 0,
+                "mls_group_info": "AAEABAABAAEQpYJJ6PJAPaOL7D5eEswzBAAAAAAAAAABIJalcIiK5cq96j1x/8EjWtXo8xGH9JvhVGgrJJ9ydc1eID+AwKJKkU2ktr1634TBRA4vRH7q+aVOS0AqlyGnFDoPAEIuAAJCBkIEAQEgWFIhYdwxE2iIAIYSQnvy8RbGCn2y5xnYi8SENvLL704giojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1wAAT1kaWQ6amlnOnpya2VvaHhsdWJoeXpsN2tzM213dHpvczVvbGZnb2NuN2R3a2JlZzd0b3NlYWRuYXBuNW9hAgABBgABAAIAAwAAAgABAQAAAABq1HlXAAAAASVkLcAAQED9hOkX1uOCsOifddJSSwTU+j691wJvyNcByYjKeGFcFs6KfQ/cNyoxxhq9pSqEwqqqObghS4w5cGd2JO9dYTAAAQIg32cXnIpPHeRrgpYWOHqqXf/uZGgTEl/0NFACe6PIIUwAAAEBINIbvmQcf83b/vlEu6B/zgnpjJx91YL0ST3Tl0pHGg4CIO1JKMYo0cLG6ukDOJBZlWEpWSc6XGP5NjbBRhSshzfRAAE9ZGlkOmppZzp6NXZlc3JycmkyaGJtbjJ4amFtNGphd212bWV1dnNqejJscnI3c25yd3lmZGJqbGVoZzdpcQIAAQYAAQACAAMAAAIAAQMgtvK8Ml4Wc3ozblE3WKMNAHdb9Pv0truo1PcphMok5Q8AQEC7n4Ji5qbsbAaMUMA+44iEEXM4utqqkBwzqJ9pD8WsIgyrI77oDjWnrEzCjYz2WH2BK4+vddibluBCTC1VOSoOAAQhICRYCX2V7mWSX5V0dhv2pauRcG+emxxbOyQfTixZ4NEzINcFrztihD9RtV1AE8pLZQylMTDqkYbtKGrkPXWB2YBUAAAAAUBAEjDPaT8ftZnp3Zh0e8jf213n9jkDLgtuOWs90xYWHYujahv44JEd/ci2UyTL3/jb9HNBQl2XLwo2FNN0egzCDQ=="
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": {
+              "refuse": "STALE_EPOCH"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "a commit does exactly what its block says, and an add carries its welcome",
+      "steps": [
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "channel-create",
+              "metadata": {
+                "mls_group_info": "AAEABAABAAEQ93Iw7G/in28pB7UWP5Ul7wAAAAAAAAAAIIvBciQ6/62K72ivul15TLEvT1hDyDLFBEac5YgMNaA3AABBEQACQOlA5wEBILfjbn40crvzUpbAx2MoAkhAx69/8XXzAVQx0xOT1UY3IIqI4910CfGV/VLbLTy6XXLKZwm/HZQSG/N0iAG0D29cAAE9ZGlkOmppZzp6cmtlb2h4bHViaHl6bDdrczNtd3R6b3M1b2xmZ29jbjdkd2tiZWc3dG9zZWFkbmFwbjVvYQIAAQYAAQACAAMAAAIAAQEAAAAAatR5VwAAAAElZC3AAEBAGxKSuC342Uu+UWtGgyuw7I9oA5Yjtx5vvPfKMVkceujFxhPms+g64l6Lxr8bAV+16WE8WOq6z7GezyZiegYTDwAEISDMjrcp1vxFLNj/ZGdKq2vwxlBabMnRmSLmOaWvjqbAHCBAwrDvmlRxZ3xw1bBNery1Kr346nMuIIVTBw53Bsn7cgAAAABAQAfsfh3ulbLV5GMCstnDtesewqoNIA+96Ut69smHAu5V4tCRZK3iV5nzE8IIB5CeKcwmnwLq5I4Cc9JuhOg12AE=",
+                "mls_ratchet_tree": "QOcBASC3425+NHK781KWwMdjKAJIQMevf/F18wFUMdMTk9VGNyCKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXAABPWRpZDpqaWc6enJrZW9oeGx1Ymh5emw3a3MzbXd0em9zNW9sZmdvY243ZHdrYmVnN3Rvc2VhZG5hcG41b2ECAAEGAAEAAgADAAACAAEBAAAAAGrUeVcAAAABJWQtwABAQBsSkrgt+NlLvlFrRoMrsOyPaAOWI7ceb7z3yjFZHHroxcYT5rPoOuJei8a/GwFftelhPFjqus+xns8mYnoGEw8=",
+                "slug": "#v",
+                "suite": "mls",
+                "visibility": "restricted"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": "accept"
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "member-add",
+              "metadata": {
+                "channel": "#v",
+                "member_did": "did:jig:z5vesrrri2hbmn2xjam4jawmvmeuvsjz2lrr7snrwyfdbjlehg7iq",
+                "mls_commit": "AAEAARD3cjDsb+KfbykHtRY/lSXvAAAAAAAAAAABAAAAAAADQVIBAAEAAQABIP31d19KpPB3n4iA5dLv3kv1GR/HlDhU1Ef6aIyDT01iIDUf07rnFi0sCvdHbAlIYJ4ejTnsCUjQ8sFLCDbICrICIIE5dw6ofRdfVqNUZsNMfszLjYqRtO43ol32D1uPybOUAAE9ZGlkOmppZzp6cWU0eG9kdmlwdWx2NnZ2ZGtydG1ndGQ2enRmeTNjdXJ3dHhkcGlzNTZ5aHZ4ZDZqd29rYQIAAQYAAQACAAMCAAoAAgABAQAAAABq1HlXAAAAASVkLcAAQEDaE8b0IoDvMC3VWaPKRbglNFl8XvUihSyfgyxJrqJ+lDOXCtlR11BH8BS3Pn93k9UV14ZsHRkeg1JEznEhdIcBAEBA5ekOx8gbhFid2imHyULxyYHK4yT1k/1GVv7tmKcBYdUxGAKa0RGWQifOdsHe0y6Xxhq8xJD0+cAiJ4prYbZqCAEgRolZgBP0leXdZ8WG1SAgjBYliAZ21ssEKMiBxRyJtmQgiojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1wAAT1kaWQ6amlnOnpya2VvaHhsdWJoeXpsN2tzM213dHpvczVvbGZnb2NuN2R3a2JlZzd0b3NlYWRuYXBuNW9hAgABBgABAAIAAwAAAgABAyAaH/jnn7FFsfiyWNhxhKafyONDebWiJ+ZSnL04TX/EKQBAQEpi52gSpXwddzm4Jy7BAHsVqaQTFJGrHkTjxAgnpEywuDcOsa59k+n9AowBiNf/6hUcToGgB5PyhxPgo3A+lgAiIJ8cnlM9H+yEO4/QmyWxdA1L5cAsIEXL4BOwPDjc3jpBAEBAQzRsonJLZylzf5yCEJv5GRWWoyDu4O6npkMos+yHDn2Ed5mI4+V2FamM9dVUE0Tu/73ZCbEWqPyJow6+7GEpDCAVUZzuE3CA4+2j7RT3p0Mdsoif14mJuMoVWrTi/hy4OSCzKZEJQnwyw5KyASrItV10dKrD62yf+Kt/Kyuta7jjWw==",
+                "mls_epoch": 0,
+                "mls_group_info": "AAEABAABAAEQ93Iw7G/in28pB7UWP5Ul7wAAAAAAAAABIBEAsJW7fM+W1JDivRfx5nqst79ftSAd7/S2ZAhzuVHCIODHB7bpuQcjyZhD9eb5/k9HPFzmfzMNfyg0a3kShlezAEIwAAJCCEIGAQEgRolZgBP0leXdZ8WG1SAgjBYliAZ21ssEKMiBxRyJtmQgiojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1wAAT1kaWQ6amlnOnpya2VvaHhsdWJoeXpsN2tzM213dHpvczVvbGZnb2NuN2R3a2JlZzd0b3NlYWRuYXBuNW9hAgABBgABAAIAAwAAAgABAyAaH/jnn7FFsfiyWNhxhKafyONDebWiJ+ZSnL04TX/EKQBAQEpi52gSpXwddzm4Jy7BAHsVqaQTFJGrHkTjxAgnpEywuDcOsa59k+n9AowBiNf/6hUcToGgB5PyhxPgo3A+lgABAiCfHJ5TPR/shDuP0JslsXQNS+XALCBFy+ATsDw43N46QQAAAQEgNR/TuucWLSwK90dsCUhgnh6NOewJSNDywUsINsgKsgIggTl3Dqh9F19Wo1Rmw0x+zMuNipG07jeiXfYPW4/Js5QAAT1kaWQ6amlnOnpxZTR4b2R2aXB1bHY2dnZka3J0bWd0ZDZ6dGZ5M2N1cnd0eGRwaXM1NnlodnhkNmp3b2thAgABBgABAAIAAwIACgACAAEBAAAAAGrUeVcAAAABJWQtwABAQNoTxvQigO8wLdVZo8pFuCU0WXxe9SKFLJ+DLEmuon6UM5cK2VHXUEfwFLc+f3eT1RXXhmwdGR6DUkTOcSF0hwEABCEgJNOKaDC0U4xMYxUl/Kt51jfU3VGZTSlEYX+EXKVSQxMgFVGc7hNwgOPto+0U96dDHbKIn9eJibjKFVq04v4cuDkAAAAAQEAJTxWOxlBRGS8gMFhG5tBhCC+XBWo1GAafg4wapjoPB/5/osPZXoPF3DDIIAd+O/Aj2CMiLwFOsYlWEsPdqkIB",
+                "mls_welcome": "AAEAAwABQJggBveXVaDC7l/YrzBo+ANOLTLzAdgS+DODRNIrLTeICX4guxpRJwhFXIiFgu/MjGRL4JMs8q3rnCuHnDzQ3491bR9AVJXnYQGLYT11ev/o5b4jLaNCve7hspzjG0cC1Mjd96HAGKDmgiDkrZxxn4aEUTI5fZRQpx3Oi7ovecMrgCvixF2oHHUBGUlYjD+8aK4NRg1OLqNYKkLlqlYfysS/k62kmeZY1/77r9Li7W8JFRmNJmsMHsH30NZT+UUuZKoaHEmJGwwmzB30ez356Kmb9HMSHB0N/ktYipBbvt97qUnw4GZ6qu47St8TQwlPI8OtC/GsYdWX+dqE5GQM2uz2Dze0UzT3VQ/a4JYMJaT6/2bzZR1nxZ0uMDFQ0vDW9W8YiHMN2OBLjT8Mo6SXkSbr26YQNZTqOdvuRhTrQjwOIqn8luWAhhbsKDCHbdshcVIiEzzErHPEMK9xGaaKb4jeQ1UUyK7vW3u1yxD7n2b0KXLC4C4/qaHsfanhS0UdN+xcrfRfoJUrMUPMluky+zzsh89R3tUykFb3ERjQFXAUqbqytdX7SzLynemEJl5kjgzDGFYS3R+6gu8+7yfsyYJk3dcYPhO1vwnWKWnCdOhFsKg3dRI8Wfc3bUY+A37I8AEeX+GylTg3GP6ajWNAz4YNLiLdSOhw3QWpS/qJKfV2z9PNDwc+OSog78UVkG9eqZuBueNXN9rNNOINwSb2OfiRT2fVISkfKpdYCw21IlPNP17ieIG17yuhKVpMLGFZ5vfSM3Jc0+2yNS96S51K8C+WX1n6ipgGrXa/zLnV0gF5IHcIPvgW8UNPL9c4dX5JeT43WT7MZhlqX6IPhXjaSXkjJwZpZnFpbvxP5I1CQBwf/HAJvdYqsz1PD42xgdKcLpK4Xp2lbp6HFFXiEPNVc/1HgD+a2g8z5oAPNisGxO4aGg3E8+pNQ7VadW7HWaie0TBwLrcc8o12psR+ul5Q5HypBCE2l437HFycKPdIN/oWBF89rNlDBy8Q/7cZQxcHQN9fqtF2V6M9uXwGqlFV5vTV0qxPFTYGHxZzBZbIuP6K2MTMVtguUaUEy24pnqr1DyIu/YPsjEa5DQJdlPq9IjeW9NniyamPDI2IZXnL0B7LCRJUPqfMH5zWGgN1zN9Mw8t6iozB64bCOpQvarpQg9Uek1l6MKsGn3hjfNrW9XIT"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": {
+              "refuse": "MLS_REJECTED"
+            }
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "member-add",
+              "metadata": {
+                "channel": "#v",
+                "member_did": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka",
+                "mls_commit": "AAEAARD3cjDsb+KfbykHtRY/lSXvAAAAAAAAAAABAAAAAAADQVIBAAEAAQABIP31d19KpPB3n4iA5dLv3kv1GR/HlDhU1Ef6aIyDT01iIDUf07rnFi0sCvdHbAlIYJ4ejTnsCUjQ8sFLCDbICrICIIE5dw6ofRdfVqNUZsNMfszLjYqRtO43ol32D1uPybOUAAE9ZGlkOmppZzp6cWU0eG9kdmlwdWx2NnZ2ZGtydG1ndGQ2enRmeTNjdXJ3dHhkcGlzNTZ5aHZ4ZDZqd29rYQIAAQYAAQACAAMCAAoAAgABAQAAAABq1HlXAAAAASVkLcAAQEDaE8b0IoDvMC3VWaPKRbglNFl8XvUihSyfgyxJrqJ+lDOXCtlR11BH8BS3Pn93k9UV14ZsHRkeg1JEznEhdIcBAEBA5ekOx8gbhFid2imHyULxyYHK4yT1k/1GVv7tmKcBYdUxGAKa0RGWQifOdsHe0y6Xxhq8xJD0+cAiJ4prYbZqCAEgRolZgBP0leXdZ8WG1SAgjBYliAZ21ssEKMiBxRyJtmQgiojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1wAAT1kaWQ6amlnOnpya2VvaHhsdWJoeXpsN2tzM213dHpvczVvbGZnb2NuN2R3a2JlZzd0b3NlYWRuYXBuNW9hAgABBgABAAIAAwAAAgABAyAaH/jnn7FFsfiyWNhxhKafyONDebWiJ+ZSnL04TX/EKQBAQEpi52gSpXwddzm4Jy7BAHsVqaQTFJGrHkTjxAgnpEywuDcOsa59k+n9AowBiNf/6hUcToGgB5PyhxPgo3A+lgAiIJ8cnlM9H+yEO4/QmyWxdA1L5cAsIEXL4BOwPDjc3jpBAEBAQzRsonJLZylzf5yCEJv5GRWWoyDu4O6npkMos+yHDn2Ed5mI4+V2FamM9dVUE0Tu/73ZCbEWqPyJow6+7GEpDCAVUZzuE3CA4+2j7RT3p0Mdsoif14mJuMoVWrTi/hy4OSCzKZEJQnwyw5KyASrItV10dKrD62yf+Kt/Kyuta7jjWw==",
+                "mls_epoch": 0,
+                "mls_group_info": "AAEABAABAAEQ93Iw7G/in28pB7UWP5Ul7wAAAAAAAAABIBEAsJW7fM+W1JDivRfx5nqst79ftSAd7/S2ZAhzuVHCIODHB7bpuQcjyZhD9eb5/k9HPFzmfzMNfyg0a3kShlezAEIwAAJCCEIGAQEgRolZgBP0leXdZ8WG1SAgjBYliAZ21ssEKMiBxRyJtmQgiojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1wAAT1kaWQ6amlnOnpya2VvaHhsdWJoeXpsN2tzM213dHpvczVvbGZnb2NuN2R3a2JlZzd0b3NlYWRuYXBuNW9hAgABBgABAAIAAwAAAgABAyAaH/jnn7FFsfiyWNhxhKafyONDebWiJ+ZSnL04TX/EKQBAQEpi52gSpXwddzm4Jy7BAHsVqaQTFJGrHkTjxAgnpEywuDcOsa59k+n9AowBiNf/6hUcToGgB5PyhxPgo3A+lgABAiCfHJ5TPR/shDuP0JslsXQNS+XALCBFy+ATsDw43N46QQAAAQEgNR/TuucWLSwK90dsCUhgnh6NOewJSNDywUsINsgKsgIggTl3Dqh9F19Wo1Rmw0x+zMuNipG07jeiXfYPW4/Js5QAAT1kaWQ6amlnOnpxZTR4b2R2aXB1bHY2dnZka3J0bWd0ZDZ6dGZ5M2N1cnd0eGRwaXM1NnlodnhkNmp3b2thAgABBgABAAIAAwIACgACAAEBAAAAAGrUeVcAAAABJWQtwABAQNoTxvQigO8wLdVZo8pFuCU0WXxe9SKFLJ+DLEmuon6UM5cK2VHXUEfwFLc+f3eT1RXXhmwdGR6DUkTOcSF0hwEABCEgJNOKaDC0U4xMYxUl/Kt51jfU3VGZTSlEYX+EXKVSQxMgFVGc7hNwgOPto+0U96dDHbKIn9eJibjKFVq04v4cuDkAAAAAQEAJTxWOxlBRGS8gMFhG5tBhCC+XBWo1GAafg4wapjoPB/5/osPZXoPF3DDIIAd+O/Aj2CMiLwFOsYlWEsPdqkIB"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": {
+              "refuse": "MISSING_METADATA"
+            }
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "member-remove",
+              "metadata": {
+                "channel": "#v",
+                "member_did": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka",
+                "mls_commit": "AAEAARD3cjDsb+KfbykHtRY/lSXvAAAAAAAAAAABAAAAAAADQVIBAAEAAQABIP31d19KpPB3n4iA5dLv3kv1GR/HlDhU1Ef6aIyDT01iIDUf07rnFi0sCvdHbAlIYJ4ejTnsCUjQ8sFLCDbICrICIIE5dw6ofRdfVqNUZsNMfszLjYqRtO43ol32D1uPybOUAAE9ZGlkOmppZzp6cWU0eG9kdmlwdWx2NnZ2ZGtydG1ndGQ2enRmeTNjdXJ3dHhkcGlzNTZ5aHZ4ZDZqd29rYQIAAQYAAQACAAMCAAoAAgABAQAAAABq1HlXAAAAASVkLcAAQEDaE8b0IoDvMC3VWaPKRbglNFl8XvUihSyfgyxJrqJ+lDOXCtlR11BH8BS3Pn93k9UV14ZsHRkeg1JEznEhdIcBAEBA5ekOx8gbhFid2imHyULxyYHK4yT1k/1GVv7tmKcBYdUxGAKa0RGWQifOdsHe0y6Xxhq8xJD0+cAiJ4prYbZqCAEgRolZgBP0leXdZ8WG1SAgjBYliAZ21ssEKMiBxRyJtmQgiojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1wAAT1kaWQ6amlnOnpya2VvaHhsdWJoeXpsN2tzM213dHpvczVvbGZnb2NuN2R3a2JlZzd0b3NlYWRuYXBuNW9hAgABBgABAAIAAwAAAgABAyAaH/jnn7FFsfiyWNhxhKafyONDebWiJ+ZSnL04TX/EKQBAQEpi52gSpXwddzm4Jy7BAHsVqaQTFJGrHkTjxAgnpEywuDcOsa59k+n9AowBiNf/6hUcToGgB5PyhxPgo3A+lgAiIJ8cnlM9H+yEO4/QmyWxdA1L5cAsIEXL4BOwPDjc3jpBAEBAQzRsonJLZylzf5yCEJv5GRWWoyDu4O6npkMos+yHDn2Ed5mI4+V2FamM9dVUE0Tu/73ZCbEWqPyJow6+7GEpDCAVUZzuE3CA4+2j7RT3p0Mdsoif14mJuMoVWrTi/hy4OSCzKZEJQnwyw5KyASrItV10dKrD62yf+Kt/Kyuta7jjWw==",
+                "mls_epoch": 0,
+                "mls_group_info": "AAEABAABAAEQ93Iw7G/in28pB7UWP5Ul7wAAAAAAAAABIBEAsJW7fM+W1JDivRfx5nqst79ftSAd7/S2ZAhzuVHCIODHB7bpuQcjyZhD9eb5/k9HPFzmfzMNfyg0a3kShlezAEIwAAJCCEIGAQEgRolZgBP0leXdZ8WG1SAgjBYliAZ21ssEKMiBxRyJtmQgiojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1wAAT1kaWQ6amlnOnpya2VvaHhsdWJoeXpsN2tzM213dHpvczVvbGZnb2NuN2R3a2JlZzd0b3NlYWRuYXBuNW9hAgABBgABAAIAAwAAAgABAyAaH/jnn7FFsfiyWNhxhKafyONDebWiJ+ZSnL04TX/EKQBAQEpi52gSpXwddzm4Jy7BAHsVqaQTFJGrHkTjxAgnpEywuDcOsa59k+n9AowBiNf/6hUcToGgB5PyhxPgo3A+lgABAiCfHJ5TPR/shDuP0JslsXQNS+XALCBFy+ATsDw43N46QQAAAQEgNR/TuucWLSwK90dsCUhgnh6NOewJSNDywUsINsgKsgIggTl3Dqh9F19Wo1Rmw0x+zMuNipG07jeiXfYPW4/Js5QAAT1kaWQ6amlnOnpxZTR4b2R2aXB1bHY2dnZka3J0bWd0ZDZ6dGZ5M2N1cnd0eGRwaXM1NnlodnhkNmp3b2thAgABBgABAAIAAwIACgACAAEBAAAAAGrUeVcAAAABJWQtwABAQNoTxvQigO8wLdVZo8pFuCU0WXxe9SKFLJ+DLEmuon6UM5cK2VHXUEfwFLc+f3eT1RXXhmwdGR6DUkTOcSF0hwEABCEgJNOKaDC0U4xMYxUl/Kt51jfU3VGZTSlEYX+EXKVSQxMgFVGc7hNwgOPto+0U96dDHbKIn9eJibjKFVq04v4cuDkAAAAAQEAJTxWOxlBRGS8gMFhG5tBhCC+XBWo1GAafg4wapjoPB/5/osPZXoPF3DDIIAd+O/Aj2CMiLwFOsYlWEsPdqkIB",
+                "mls_welcome": "AAEAAwABQJggBveXVaDC7l/YrzBo+ANOLTLzAdgS+DODRNIrLTeICX4guxpRJwhFXIiFgu/MjGRL4JMs8q3rnCuHnDzQ3491bR9AVJXnYQGLYT11ev/o5b4jLaNCve7hspzjG0cC1Mjd96HAGKDmgiDkrZxxn4aEUTI5fZRQpx3Oi7ovecMrgCvixF2oHHUBGUlYjD+8aK4NRg1OLqNYKkLlqlYfysS/k62kmeZY1/77r9Li7W8JFRmNJmsMHsH30NZT+UUuZKoaHEmJGwwmzB30ez356Kmb9HMSHB0N/ktYipBbvt97qUnw4GZ6qu47St8TQwlPI8OtC/GsYdWX+dqE5GQM2uz2Dze0UzT3VQ/a4JYMJaT6/2bzZR1nxZ0uMDFQ0vDW9W8YiHMN2OBLjT8Mo6SXkSbr26YQNZTqOdvuRhTrQjwOIqn8luWAhhbsKDCHbdshcVIiEzzErHPEMK9xGaaKb4jeQ1UUyK7vW3u1yxD7n2b0KXLC4C4/qaHsfanhS0UdN+xcrfRfoJUrMUPMluky+zzsh89R3tUykFb3ERjQFXAUqbqytdX7SzLynemEJl5kjgzDGFYS3R+6gu8+7yfsyYJk3dcYPhO1vwnWKWnCdOhFsKg3dRI8Wfc3bUY+A37I8AEeX+GylTg3GP6ajWNAz4YNLiLdSOhw3QWpS/qJKfV2z9PNDwc+OSog78UVkG9eqZuBueNXN9rNNOINwSb2OfiRT2fVISkfKpdYCw21IlPNP17ieIG17yuhKVpMLGFZ5vfSM3Jc0+2yNS96S51K8C+WX1n6ipgGrXa/zLnV0gF5IHcIPvgW8UNPL9c4dX5JeT43WT7MZhlqX6IPhXjaSXkjJwZpZnFpbvxP5I1CQBwf/HAJvdYqsz1PD42xgdKcLpK4Xp2lbp6HFFXiEPNVc/1HgD+a2g8z5oAPNisGxO4aGg3E8+pNQ7VadW7HWaie0TBwLrcc8o12psR+ul5Q5HypBCE2l437HFycKPdIN/oWBF89rNlDBy8Q/7cZQxcHQN9fqtF2V6M9uXwGqlFV5vTV0qxPFTYGHxZzBZbIuP6K2MTMVtguUaUEy24pnqr1DyIu/YPsjEa5DQJdlPq9IjeW9NniyamPDI2IZXnL0B7LCRJUPqfMH5zWGgN1zN9Mw8t6iozB64bCOpQvarpQg9Uek1l6MKsGn3hjfNrW9XIT"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": {
+              "refuse": "MLS_REJECTED"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "a member leaves without a commit",
+      "steps": [
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "channel-create",
+              "metadata": {
+                "mls_group_info": "AAEABAABAAEQLjN22sHcw1RW0lc+zXbqYAAAAAAAAAAAIJdAN7WczXJjAYj8BQhuzUHvIhOQMyAe47ftF02lxdCYAABBEQACQOlA5wEBIECSa+NWsiYpMQKaiFvmEpN+aM5tgykCx8GEPcDoobpiIIqI4910CfGV/VLbLTy6XXLKZwm/HZQSG/N0iAG0D29cAAE9ZGlkOmppZzp6cmtlb2h4bHViaHl6bDdrczNtd3R6b3M1b2xmZ29jbjdkd2tiZWc3dG9zZWFkbmFwbjVvYQIAAQYAAQACAAMAAAIAAQEAAAAAatR5VwAAAAElZC3AAEBAy4CSmGmTMHrC62Zgo1X90t4QdnEKXURvLevYvqhw+Hdxkp6Bma55OglpKYXz1c7k8QpjrpeZdNlYt05PgwrRAQAEISACgHpu0WShrdVX4BrBokVrB7FdEqg9B0e07v3xnOduCyAJ9RTolUWNyCPTOElE6aZx1DoYYn7R1ez+1qZ8E5eyxQAAAABAQK4AvvW0hRPJtm/gDkLltTsIRawSKRzlrq8DZQz5JofjqWtW/n4qxUo/3fiLq+jzK+j/Hb0vVHvtcJZwlu1vUQw=",
+                "mls_ratchet_tree": "QOcBASBAkmvjVrImKTECmohb5hKTfmjObYMpAsfBhD3A6KG6YiCKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXAABPWRpZDpqaWc6enJrZW9oeGx1Ymh5emw3a3MzbXd0em9zNW9sZmdvY243ZHdrYmVnN3Rvc2VhZG5hcG41b2ECAAEGAAEAAgADAAACAAEBAAAAAGrUeVcAAAABJWQtwABAQMuAkphpkzB6wutmYKNV/dLeEHZxCl1Eby3r2L6ocPh3cZKegZmueToJaSmF89XO5PEKY66XmXTZWLdOT4MK0QE=",
+                "slug": "#v",
+                "suite": "mls",
+                "visibility": "open"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": "accept"
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "member-add",
+              "metadata": {
+                "channel": "#v",
+                "member_did": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka",
+                "mls_commit": "AAEAARAuM3bawdzDVFbSVz7NdupgAAAAAAAAAAAEAAMkAQAGIPHrt0KDQ2bW3+ddRrfTjZOlXxOZTnGu3czde5impEJFASBhIuNUtgxXzt3sYgsOtPo3LaAwExMjLXexF3o3PPO8fSCBOXcOqH0XX1ajVGbDTH7My42KkbTuN6Jd9g9bj8mzlAABPWRpZDpqaWc6enFlNHhvZHZpcHVsdjZ2dmRrcnRtZ3RkNnp0ZnkzY3Vyd3R4ZHBpczU2eWh2eGQ2andva2ECAAEGAAEAAgADAAACAAEDICRqa9YF74IF5hBbqlID+R7LQLOhxAYOXgAUHKrCxvGLAEBAMyD86GKIaNKWJliGl2JVgGI5QwezBJWg/bFYagNKrXenLdKb9bhI2eOGNkki/SczEoXeNNebOGYlP26suwwbBUB1INP2VQomdC2aom9epp2Ojg09tV8Vjlk2iMncB/uj0bxcQFIgRrb4+Emz+h7i/wZUoqMBXyC/jtJbufIIAA+68edE2R0wWbpCS3b65d/PnXcAMQwD9ZQ/rjFdewqf07XzTy/Q2wSkqjX4+o+BSxsUcRWDP+IBQEDDxusALLRUXXqn9LLFn1CvkpyJOo2XmLChf1DKE9cVqwnlt5xdVWC/FtmWd7t/dMP9oLqSYJOe+DZ5UKOm2fwHICDMIsu73x6QHfeFXQF6l9HiwZ8IETFhsr1opnmyGXau",
+                "mls_epoch": 0,
+                "mls_group_info": "AAEABAABAAEQLjN22sHcw1RW0lc+zXbqYAAAAAAAAAABIGJwI0deW6uAeZIDJFOGSlBsN2ykYOT7tGcUBUG8bkoDIJMrYjqknPFZAFSXYzHlmrUhfA4OYJKXTys4qpTeoqFsAEIuAAJCBkIEAQEgQJJr41ayJikxApqIW+YSk35ozm2DKQLHwYQ9wOihumIgiojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1wAAT1kaWQ6amlnOnpya2VvaHhsdWJoeXpsN2tzM213dHpvczVvbGZnb2NuN2R3a2JlZzd0b3NlYWRuYXBuNW9hAgABBgABAAIAAwAAAgABAQAAAABq1HlXAAAAASVkLcAAQEDLgJKYaZMwesLrZmCjVf3S3hB2cQpdRG8t69i+qHD4d3GSnoGZrnk6CWkphfPVzuTxCmOul5l02Vi3Tk+DCtEBAQIg0/ZVCiZ0LZqib16mnY6ODT21XxWOWTaIydwH+6PRvFwAAAEBIGEi41S2DFfO3exiCw60+jctoDATEyMtd7EXejc887x9IIE5dw6ofRdfVqNUZsNMfszLjYqRtO43ol32D1uPybOUAAE9ZGlkOmppZzp6cWU0eG9kdmlwdWx2NnZ2ZGtydG1ndGQ2enRmeTNjdXJ3dHhkcGlzNTZ5aHZ4ZDZqd29rYQIAAQYAAQACAAMAAAIAAQMgJGpr1gXvggXmEFuqUgP5HstAs6HEBg5eABQcqsLG8YsAQEAzIPzoYoho0pYmWIaXYlWAYjlDB7MElaD9sVhqA0qtd6ct0pv1uEjZ44Y2SSL9JzMShd4015s4ZiU/bqy7DBsFAAQhIEhdzw/jxJMI5C7FY8Bb35mEQYuMI2Wzx8JK74BsQVM1ICDMIsu73x6QHfeFXQF6l9HiwZ8IETFhsr1opnmyGXauAAAAAUBA7jPNeDIAdKk2ln4Dic3NuJd3uJMCluNUr1pHRPcezmQeK80flhmEFEduxTjS/uGA641SNcbt2ieMbkl3PQStDA=="
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": "accept"
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "member-remove",
+              "metadata": {
+                "channel": "#v",
+                "member_did": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka",
+                "mls_commit": "AAAA"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": {
+              "refuse": "MLS_REJECTED"
+            }
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "member-remove",
+              "metadata": {
+                "channel": "#v",
+                "member_did": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": "accept"
+          }
+        }
+      ]
+    },
+    {
+      "name": "content is an application message for this group, with no plaintext",
+      "steps": [
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "channel-create",
+              "metadata": {
+                "mls_group_info": "AAEABAABAAEQKoU+00Fn6Qn1K12J3sxBFQAAAAAAAAAAIJcL6gDWlgjxWlMKZCMaXd1yIdA8xpkU3pU7BsN7B29+AABBEQACQOlA5wEBILPhczeex0Lz90xCdPvY9nVPMW5LY/ijBv6Ie0EnS1MkIIqI4910CfGV/VLbLTy6XXLKZwm/HZQSG/N0iAG0D29cAAE9ZGlkOmppZzp6cmtlb2h4bHViaHl6bDdrczNtd3R6b3M1b2xmZ29jbjdkd2tiZWc3dG9zZWFkbmFwbjVvYQIAAQYAAQACAAMAAAIAAQEAAAAAatR5VwAAAAElZC3AAEBAJIn0po4OrJ2v+lWVxj3ykpTJHi//SHF9DlK/mGyPaw9SUNCMABcdU9F58ExYOXj3ZwHQBiHjP34YNZO1VfrnAQAEISDhw4pHTU0Ieme4gyHYZ8xBlqWeJU0utlZAo9AeujAceSBarowKP91D+Usv6bJcwKSXk9c6OKzdrzbXoFDTVLV5gwAAAABAQPr2MiKuz1PFI+CVEaZCo5ppA3gTW/rQzgoNiZZAoTxkq30u9cmvjcCpQf0GcJgjh2lOFSwDT59bQQcrs2usxQw=",
+                "mls_ratchet_tree": "QOcBASCz4XM3nsdC8/dMQnT72PZ1TzFuS2P4owb+iHtBJ0tTJCCKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXAABPWRpZDpqaWc6enJrZW9oeGx1Ymh5emw3a3MzbXd0em9zNW9sZmdvY243ZHdrYmVnN3Rvc2VhZG5hcG41b2ECAAEGAAEAAgADAAACAAEBAAAAAGrUeVcAAAABJWQtwABAQCSJ9KaODqydr/pVlcY98pKUyR4v/0hxfQ5Sv5hsj2sPUlDQjAAXHVPRefBMWDl492cB0AYh4z9+GDWTtVX65wE=",
+                "slug": "#v",
+                "suite": "mls",
+                "visibility": "restricted"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": "accept"
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "text-render",
+              "metadata": {
+                "channel": "#v",
+                "mls_epoch": 0,
+                "mls_message": "AAEAAhDeCMK+zXk/Rn0P3Q+ttULgAAAAAAAAAAABAByWo0HJ3X4QLj+1cBs/hasCHAOXJaNLZyy1B8+0QFzA19Yq2qipBOh9FnnOgSTsquL0+Qoym2qwJfRKmUc74FmjKnPu5Tt1z7D9tsg9qz0NoGBnJo6dhGw0z3R6kFyEeyYwiPlJnPPlxOWZk/D0ayPfxon3l1oQtLeVTQ=="
+              },
+              "parents": [],
+              "privacy": {
+                "encryption": "mls",
+                "metadata_visibility": "public",
+                "recipients": []
+              },
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": {
+              "refuse": "MLS_REJECTED"
+            }
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "text-render",
+              "metadata": {
+                "body": "hello",
+                "channel": "#v",
+                "mls_epoch": 0,
+                "mls_message": "AAEAAhAqhT7TQWfpCfUrXYnezEEVAAAAAAAAAAABAByjXCwu0179lcPpAOgb3/5LOqI3sWgjT7liYQe1QFg8gnZpKZHrfYY1LFrMKYJUDC63RZ92zrS26x6tOrMVpBR0gAnM8shTlYCgfL4wMK9I5LfiE9HF0Rk3FpQyFDzULB9/26ttOLhg2z01dHYcjJcXnD/aJoxO"
+              },
+              "parents": [],
+              "privacy": {
+                "encryption": "mls",
+                "metadata_visibility": "public",
+                "recipients": []
+              },
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": {
+              "refuse": "SUITE_MISMATCH"
+            }
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "text-render",
+              "metadata": {
+                "channel": "#v"
+              },
+              "parents": [],
+              "privacy": {
+                "encryption": "mls",
+                "metadata_visibility": "public",
+                "recipients": []
+              },
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": {
+              "refuse": "MISSING_METADATA"
+            }
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "text-render",
+              "metadata": {
+                "body": "hello",
+                "channel": "#v"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": {
+              "refuse": "SUITE_MISMATCH"
+            }
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "text-render",
+              "metadata": {
+                "channel": "#v",
+                "mls_epoch": 0,
+                "mls_message": "AAEAAhAqhT7TQWfpCfUrXYnezEEVAAAAAAAAAAABAByjXCwu0179lcPpAOgb3/5LOqI3sWgjT7liYQe1QFg8gnZpKZHrfYY1LFrMKYJUDC63RZ92zrS26x6tOrMVpBR0gAnM8shTlYCgfL4wMK9I5LfiE9HF0Rk3FpQyFDzULB9/26ttOLhg2z01dHYcjJcXnD/aJoxO"
+              },
+              "parents": [],
+              "privacy": {
+                "encryption": "mls",
+                "metadata_visibility": "public",
+                "recipients": []
+              },
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": "accept"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a direct message is created only under its pair's slug",
+      "steps": [
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "channel-create",
+              "metadata": {
+                "dm_peer": "did:jig:z5vesrrri2hbmn2xjam4jawmvmeuvsjz2lrr7snrwyfdbjlehg7iq",
+                "locked": true,
+                "mls_group_info": "AAEABAABAAEQ4NzK1jLkh4iaWAAAa0ITpwAAAAAAAAAAIGn03UkE16fF9Igvg/pYQyhEOQqEH11hVQoebBGMeuBAAABBEQACQOlA5wEBIFMSSstwVV0fjJzhbe83vFGIiXJ3fdoiqX24WbfaPT1lIIqI4910CfGV/VLbLTy6XXLKZwm/HZQSG/N0iAG0D29cAAE9ZGlkOmppZzp6cmtlb2h4bHViaHl6bDdrczNtd3R6b3M1b2xmZ29jbjdkd2tiZWc3dG9zZWFkbmFwbjVvYQIAAQYAAQACAAMAAAIAAQEAAAAAatR5VwAAAAElZC3AAEBAGLEWCbOKe50LFlbxptrunJmV2yG8niRftbTfPRji8isVnmCvl5ta3Bww6iNGsxD+7Ea/533Ys6d/ANV8QDtRBwAEISACt9r5jnqOoiAcrcPF1uLbcIWGIGvCt7aPCCHUKs+1EyDg8BqKX46PTRTzH+iX1Wvdca+2lEHiMqray3+gy0nLkwAAAABAQGfD6yG+twdXxr5ksY689uSWk04XHTLO1g1OtmCnWSyHf7wc4gxekw3SdoQQzzML5ClYZpXP18pKDdBQT/cZuwc=",
+                "mls_ratchet_tree": "QOcBASBTEkrLcFVdH4yc4W3vN7xRiIlyd33aIql9uFm32j09ZSCKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXAABPWRpZDpqaWc6enJrZW9oeGx1Ymh5emw3a3MzbXd0em9zNW9sZmdvY243ZHdrYmVnN3Rvc2VhZG5hcG41b2ECAAEGAAEAAgADAAACAAEBAAAAAGrUeVcAAAABJWQtwABAQBixFgmzinudCxZW8aba7pyZldshvJ4kX7W03z0Y4vIrFZ5gr5ebWtwcMOojRrMQ/uxGv+d92LOnfwDVfEA7UQc=",
+                "slug": "#dm/91ff3bd7e0ffa26f",
+                "suite": "mls",
+                "visibility": "restricted"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": {
+              "refuse": "MLS_REJECTED"
+            }
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "channel-create",
+              "metadata": {
+                "dm_peer": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka",
+                "locked": true,
+                "mls_group_info": "AAEABAABAAEQ4NzK1jLkh4iaWAAAa0ITpwAAAAAAAAAAIGn03UkE16fF9Igvg/pYQyhEOQqEH11hVQoebBGMeuBAAABBEQACQOlA5wEBIFMSSstwVV0fjJzhbe83vFGIiXJ3fdoiqX24WbfaPT1lIIqI4910CfGV/VLbLTy6XXLKZwm/HZQSG/N0iAG0D29cAAE9ZGlkOmppZzp6cmtlb2h4bHViaHl6bDdrczNtd3R6b3M1b2xmZ29jbjdkd2tiZWc3dG9zZWFkbmFwbjVvYQIAAQYAAQACAAMAAAIAAQEAAAAAatR5VwAAAAElZC3AAEBAGLEWCbOKe50LFlbxptrunJmV2yG8niRftbTfPRji8isVnmCvl5ta3Bww6iNGsxD+7Ea/533Ys6d/ANV8QDtRBwAEISACt9r5jnqOoiAcrcPF1uLbcIWGIGvCt7aPCCHUKs+1EyDg8BqKX46PTRTzH+iX1Wvdca+2lEHiMqray3+gy0nLkwAAAABAQGfD6yG+twdXxr5ksY689uSWk04XHTLO1g1OtmCnWSyHf7wc4gxekw3SdoQQzzML5ClYZpXP18pKDdBQT/cZuwc=",
+                "mls_ratchet_tree": "QOcBASBTEkrLcFVdH4yc4W3vN7xRiIlyd33aIql9uFm32j09ZSCKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXAABPWRpZDpqaWc6enJrZW9oeGx1Ymh5emw3a3MzbXd0em9zNW9sZmdvY243ZHdrYmVnN3Rvc2VhZG5hcG41b2ECAAEGAAEAAgADAAACAAEBAAAAAGrUeVcAAAABJWQtwABAQBixFgmzinudCxZW8aba7pyZldshvJ4kX7W03z0Y4vIrFZ5gr5ebWtwcMOojRrMQ/uxGv+d92LOnfwDVfEA7UQc=",
+                "slug": "#dm/91ff3bd7e0ffa26f",
+                "suite": "mls",
+                "visibility": "restricted"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": "accept"
+          }
+        }
+      ]
+    },
+    {
+      "name": "control blocks are never encrypted",
+      "steps": [
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "channel-create",
+              "metadata": {
+                "mls_group_info": "AAEABAABAAEQty9JOWoL2JkgYVPgRaCZUgAAAAAAAAAAILoNHDywzobpYwMrTp41FLV4qPjtwbXQbrVi1X4vIxvrAABBEQACQOlA5wEBIBoaL4Fp+rwu/JtRtOBPp/lONY7YMqqyUXfXJUvbaNpoIIqI4910CfGV/VLbLTy6XXLKZwm/HZQSG/N0iAG0D29cAAE9ZGlkOmppZzp6cmtlb2h4bHViaHl6bDdrczNtd3R6b3M1b2xmZ29jbjdkd2tiZWc3dG9zZWFkbmFwbjVvYQIAAQYAAQACAAMAAAIAAQEAAAAAatR5VwAAAAElZC3AAEBA/sNvW9cTTcVJpwLZNFrxsFxeAgtmf743RTBKPolLiGxi8X1mnEyBpmf/kJROzoS2iPtZKdHbhAcwUYG97Mf3DAAEISCKus6S1+/zxSaHVFkA5mirh0DEIKa/xd27I/AKMpAnQyAivPHs/7DSJZIkLxOQG43JkV1ciW4dGbpvTiAbl1NeGQAAAABAQGNtdy5MmV2sfB9sAbwq2up340PqZjMGDgPGEcOBPKNFa+FcCYIAH5zJw1PsQOSRuejIBCmXgb5Q2BmSpEur6wM=",
+                "mls_ratchet_tree": "QOcBASAaGi+Bafq8LvybUbTgT6f5TjWO2DKqslF31yVL22jaaCCKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXAABPWRpZDpqaWc6enJrZW9oeGx1Ymh5emw3a3MzbXd0em9zNW9sZmdvY243ZHdrYmVnN3Rvc2VhZG5hcG41b2ECAAEGAAEAAgADAAACAAEBAAAAAGrUeVcAAAABJWQtwABAQP7Db1vXE03FSacC2TRa8bBcXgILZn++N0UwSj6JS4hsYvF9ZpxMgaZn/5CUTs6Etoj7WSnR24QHMFGBvezH9ww=",
+                "slug": "#v",
+                "suite": "mls"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": "accept"
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "member-add",
+              "metadata": {
+                "channel": "#v",
+                "member_did": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka"
+              },
+              "parents": [],
+              "privacy": {
+                "encryption": "mls",
+                "metadata_visibility": "public",
+                "recipients": []
+              },
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": {
+              "refuse": "SUITE_MISMATCH"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

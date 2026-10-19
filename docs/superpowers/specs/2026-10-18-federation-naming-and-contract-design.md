@@ -356,13 +356,14 @@ the witnessed logs (C2SP style).
 
 **Proposed**, so that 4.3 and 4.5 can work at all:
 
-- **Canonical, domain-separated signatures.** An attestation is signed over the labelled
-  BLAKE3 hash jig uses elsewhere (`hash_labeled_parts`): (`domain`,
-  `jig-alias-attestation-v1`), then `did`, `alias`, `ns_did`, `valid_from`, `valid_until`,
-  in that order. `profile_ttl_seconds` either joins that list or leaves the signed body.
-  JSON map order stops mattering.
-- **Proof of control binds the action.** The DID signs (`domain`,
-  `jig-alias-register-v1`), (`ns_did`), (`alias`), (`challenge`). The same applies to
+- **Canonical, domain-separated signatures.** Decided (DJ): every new signed object is a
+  `COSE_Sign1` (EdDSA) over deterministic CBOR (RFC 8949 section 4.2.1). An attestation's
+  payload is the text-keyed map `{domain: "jig-alias-attestation-v1", did, alias, ns_did,
+  valid_from, valid_until}`. `profile_ttl_seconds` either joins that map or leaves the
+  signed body. JSON map order stops mattering, and anything hashed is hashed over the
+  deterministic encoding.
+- **Proof of control binds the action.** The DID signs the payload `{domain:
+  "jig-alias-register-v1", ns_did, alias, challenge}`. The same applies to
   renew, with its own domain. This closes AB-01 for this flow. Rotation proves control
   through lane I's link instead.
 - **Rotation links are kept and served** with the attestation that resulted from them
