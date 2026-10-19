@@ -441,8 +441,16 @@ so a rebooted box catches up). It snapshots:
 | What | Why |
 | --- | --- |
 | `/var/lib/jig/jig_v002.db` | **the v0.0.2 block store — where the actual messages are** |
-| `/var/lib/jig/nameserver.db` | alias registry |
+| `/var/lib/jig/nameserver.db` | the nameserver's legacy registry |
+| `/var/lib/jig/nameserver_v002.db` | **the nameserver's alias bindings** |
 | `/var/lib/jig/server.key` | server identity |
+| `/var/lib/jig/nameserver_v002.key` | **the nameserver's signing key** (set `JIG_NAMESERVER_KEYFILE` if `[v0_0_2.server] server_did_keyfile` puts it elsewhere) |
+
+The nameserver files are skipped on a box that doesn't run the nameserver, but
+a snapshot is refused if `nameserver_v002.db` exists without its key. **A
+restore without `nameserver_v002.key` loses the nameserver's DID**: the
+nameserver mints a new key, and every attestation the old one signed stops
+verifying for servers and clients whose delegation names the old DID.
 
 **The `_v002` suffix is not a typo.** `jig-server` derives its store path from
 `database_path` by appending `_v002` to the file stem, so a configured
@@ -470,17 +478,20 @@ journalctl -u jig-backup.service -n 50
 
 `/var/backups/jig` is **on the same disk as the thing it is backing up**. Ship
 it elsewhere — `tailscale file cp`, `rsync` to another tailnet node, or restic
-to object storage. At minimum, get `server.key` off the box (top of this file).
+to object storage. At minimum, get `server.key` and `nameserver_v002.key` off the box (top of this
+file).
 
 ### Restore
 
 ```bash
 sudo systemctl stop jig-server jig-nameserver
-sudo cp /path/to/snapshot/{jig_v002.db,nameserver.db} /var/lib/jig/
+sudo cp /path/to/snapshot/{jig_v002.db,nameserver.db,nameserver_v002.db} /var/lib/jig/
 sudo cp /path/to/snapshot/server.key /var/lib/jig/server.key
+sudo cp /path/to/snapshot/nameserver_v002.key /var/lib/jig/nameserver_v002.key
 sudo chown -R jig:jig /var/lib/jig          # -R, not /var/lib/jig/* — see the
                                             # glob note in the TLS section above
 sudo chmod 600 /var/lib/jig/server.key      # or the server refuses to start
+sudo chmod 600 /var/lib/jig/nameserver_v002.key
 sudo systemctl start jig-server jig-nameserver
 curl -k https://100.x.y.z:7117/.well-known/jig  # server_did MUST match the old one
 ```
