@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -366,8 +367,26 @@ fn describe_slots(slots: &[SlotKind]) -> String {
 /// Keys already opened by this process, by key file. `jig` loads one identity
 /// several times per command, and each load would otherwise ask the keychain
 /// or the person again, and pay for Argon2id again.
-static OPENED: LazyLock<Mutex<HashMap<PathBuf, Arc<Opened>>>> =
+static OPENED: LazyLock<Mutex<HashMap<PathBuf, Arc<AtRest>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// An opened key file: the key, the file it came from, and whether the
+/// identity's local state is sealed under it (`JigKey::state_sealed`).
+pub(crate) struct AtRest {
+    opened: Opened,
+    path: PathBuf,
+    state_sealed: AtomicBool,
+}
+
+impl AtRest {
+    fn new(opened: Opened, path: &Path, state_sealed: bool) -> Arc<Self> {
+        Arc::new(Self {
+            opened,
+            path: path.to_path_buf(),
+            state_sealed: AtomicBool::new(state_sealed),
+        })
+    }
+}
 
 /// A loaded ed25519 identity. Wraps the signing key + derived DID.
 ///
@@ -378,7 +397,7 @@ pub struct Identity {
     signing: SigningKey,
     /// The opened key file, whose data key seals this identity's MLS state.
     /// `None` for an identity that was never stored, or one stored raw.
-    at_rest: Option<Arc<Opened>>,
+    at_rest: Option<Arc<AtRest>>,
     migrated_from: Option<PathBuf>,
 }
 
@@ -414,11 +433,20 @@ impl Identity {
         // data key, and the keychain keeps only the last secret stored, so the
         // file that wins the rename may not open. One migrates; the other
         // waits, then opens what the first wrote.
-        let lock = if access.storage == Storage::Sealed && raw.exists() {
+        let stale = stale_temporaries(keys_dir, did_str);
+        let lock = if (access.storage == Storage::Sealed && raw.exists()) || !stale.is_empty() {
             Some(lock_did(keys_dir, did_str)?)
         } else {
             None
         };
+        // Temporary files a crash left behind; one written in plaintext mode
+        // holds the raw seed. Every writer of this DID's files holds the
+        // lock, so none of these is still being written.
+        if lock.is_some() {
+            for tmp in stale_temporaries(keys_dir, did_str) {
+                std::fs::remove_file(&tmp)?;
+            }
+        }
         if path.exists() {
             let opened = open_cached(&path, did_str, access)?;
             let mut identity = Self::from_opened(did_str, &path, opened, None)?;
@@ -545,13 +573,13 @@ impl Identity {
     fn from_opened(
         did_str: &str,
         path: &Path,
-        opened: Arc<Opened>,
+        opened: Arc<AtRest>,
         migrated_from: Option<PathBuf>,
     ) -> Result<Self, IdentityError> {
         // The header names a DID, but only the seed is authenticated by the
         // slot that opened it. Check the key really is the DID asked for.
-        check_did(path, did_str, &opened.seed)?;
-        let signing = SigningKey::from_bytes(&opened.seed);
+        check_did(path, did_str, &opened.opened.seed)?;
+        let signing = SigningKey::from_bytes(&opened.opened.seed);
         let did = Did::from_ed25519_pubkey(signing.verifying_key().as_bytes());
         Ok(Self {
             did,
@@ -600,7 +628,48 @@ impl Identity {
     /// The key that seals one kind of this identity's local files, or `None`
     /// when the identity is not sealed at rest.
     pub(crate) fn file_key(&self, context: &str) -> Option<FileKey> {
-        self.at_rest.as_ref().map(|o| o.file_key(context))
+        self.at_rest.as_ref().map(|o| o.opened.file_key(context))
+    }
+
+    /// Whether this identity's local state has been sealed under its key, as
+    /// the key file on disk says now. The flag is authenticated: the file
+    /// is checked against this identity's data key before it is believed.
+    /// A key file that is gone (rotated away) keeps what was known at open.
+    pub(crate) fn state_sealed(&self) -> Result<bool, IdentityError> {
+        let Some(at) = &self.at_rest else {
+            return Ok(false);
+        };
+        let bytes = match std::fs::read(&at.path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(at.state_sealed.load(Ordering::SeqCst));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let key = JigKey::from_bytes(&bytes)?;
+        // Builds a flagged copy, which first checks the file opens with this
+        // data key: the flag read below is then the file's own.
+        key.with_state_sealed(&at.opened)?;
+        let sealed = key.state_sealed() || at.state_sealed.load(Ordering::SeqCst);
+        at.state_sealed.store(sealed, Ordering::SeqCst);
+        Ok(sealed)
+    }
+
+    /// Record in the key file that this identity's local state is sealed, so
+    /// content found in clear is refused from now on.
+    pub(crate) fn mark_state_sealed(&self) -> Result<(), IdentityError> {
+        let Some(at) = &self.at_rest else {
+            return Ok(());
+        };
+        let keys_dir = at.path.parent().unwrap_or(Path::new("."));
+        let _lock = lock_did(keys_dir, &self.did_string())?;
+        let key = JigKey::from_bytes(&std::fs::read(&at.path)?)?;
+        let flagged = key.with_state_sealed(&at.opened)?;
+        if !key.state_sealed() {
+            write_private_atomic(&at.path, &flagged.to_bytes())?;
+        }
+        at.state_sealed.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     /// The DID's own key as an MLS group member. The same key signs blocks
@@ -674,7 +743,7 @@ fn open_cached(
     path: &Path,
     did_str: &str,
     access: &KeyAccess,
-) -> Result<Arc<Opened>, IdentityError> {
+) -> Result<Arc<AtRest>, IdentityError> {
     if let Some(hit) = OPENED.lock().expect("key cache poisoned").get(path) {
         return Ok(hit.clone());
     }
@@ -689,7 +758,7 @@ fn open_cached(
     // Cache only a key that is the DID asked for: a later open of this path
     // takes the cached key without opening the file again.
     check_did(path, did_str, &opened.seed)?;
-    let opened = Arc::new(opened);
+    let opened = AtRest::new(opened, path, key.state_sealed());
     OPENED
         .lock()
         .expect("key cache poisoned")
@@ -702,7 +771,7 @@ fn seal_to(
     did_str: &str,
     seed: &[u8; 32],
     access: &KeyAccess,
-) -> Result<Arc<Opened>, IdentityError> {
+) -> Result<Arc<AtRest>, IdentityError> {
     let slot = access.new_slot(did_str)?;
     let check = match &slot {
         NewSlot::Passphrase { passphrase, .. } => Some(Unlock::Passphrase(passphrase.clone())),
@@ -712,7 +781,7 @@ fn seal_to(
         } => None,
         NewSlot::Secret { secret, .. } => Some(Unlock::Secret(secret.clone())),
     };
-    let (key, opened) = JigKey::seal(did_str, seed, &[slot])?;
+    let (key, _) = JigKey::seal(did_str, seed, &[slot])?;
     write_private_atomic(path, &key.to_bytes())?;
     // Open what is now on disk the way the next run will, keychain included:
     // the caller may be about to delete the only other copy of this key.
@@ -720,32 +789,55 @@ fn seal_to(
         path: path.to_path_buf(),
         reason,
     };
+    let reopened = match reopen_as_written(path, did_str, seed, check, access) {
+        Ok(reopened) => reopened,
+        Err(e) => {
+            // A key file that does not open is worse than none: every later
+            // open would try it, fail, and never fall back to the raw key.
+            let _ = std::fs::remove_file(path);
+            return Err(not_verified(e));
+        }
+    };
+    // Cache the key as it was read back, not the one in memory.
+    let opened = AtRest::new(reopened, path, false);
+    OPENED
+        .lock()
+        .expect("key cache poisoned")
+        .insert(path.to_path_buf(), opened.clone());
+    Ok(opened)
+}
+
+/// Open the key just written at `path` with what sealed it, the keychain read
+/// back rather than trusted, and check it holds `seed`.
+fn reopen_as_written(
+    path: &Path,
+    did_str: &str,
+    seed: &[u8; 32],
+    check: Option<Unlock>,
+    access: &KeyAccess,
+) -> Result<Opened, String> {
     let unlock = match check {
         Some(unlock) => unlock,
         None => {
             let keychain = access
                 .keychain
                 .as_ref()
-                .ok_or_else(|| not_verified("the keychain went away".into()))?;
+                .ok_or_else(|| "the keychain went away".to_string())?;
             let secret = keychain
                 .get(did_str)
-                .map_err(|e| not_verified(e.to_string()))?
-                .ok_or_else(|| not_verified(format!("{} kept no secret", keychain.name())))?;
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("{} kept no secret", keychain.name()))?;
             Unlock::Secret(secret)
         }
     };
-    let reopened = JigKey::from_bytes(&std::fs::read(path)?)?
-        .open(&[unlock])
-        .map_err(|e| not_verified(e.to_string()))?;
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let reopened = JigKey::from_bytes(&bytes)
+        .and_then(|key| key.open(&[unlock]))
+        .map_err(|e| e.to_string())?;
     if *reopened.seed != *seed {
-        return Err(not_verified("it opens to another key".into()));
+        return Err("it opens to another key".into());
     }
-    let opened = Arc::new(opened);
-    OPENED
-        .lock()
-        .expect("key cache poisoned")
-        .insert(path.to_path_buf(), opened.clone());
-    Ok(opened)
+    Ok(reopened)
 }
 
 /// Write `bytes` to `path` through an owner-only temporary file and a rename,
@@ -801,6 +893,23 @@ pub(crate) fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+/// `<did>.*.tmp.*` files in `keys_dir`: temporary files of this DID's.
+fn stale_temporaries(keys_dir: &Path, did_str: &str) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(keys_dir) else {
+        return Vec::new();
+    };
+    let prefix = format!("{did_str}.");
+    entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(&prefix) && name.contains(".tmp.")
+        })
+        .map(|e| e.path())
+        .collect()
 }
 
 /// Hold `<did>.lock` in `keys_dir` until the returned file drops. Blocks.
@@ -1108,6 +1217,44 @@ mod tests {
         let err = Identity::open(dir.path(), &did_str, &access).unwrap_err();
         assert!(matches!(err, IdentityError::NotVerified { .. }), "{err}");
         assert!(raw.exists(), "the only working copy of the key was removed");
+        assert!(
+            !key_path(dir.path(), &did_str).exists(),
+            "a key file that does not open was left to shadow the raw key"
+        );
+        // So the next run, with a keychain that works, still has the key.
+        clear_cache();
+        let k = Arc::new(MemoryKeychain::default());
+        let id = Identity::open(dir.path(), &did_str, &keychain_only(k)).unwrap();
+        assert_eq!(id.did_string(), did_str);
+        assert!(!raw.exists());
+    }
+
+    #[test]
+    fn temporary_key_files_a_crash_left_are_removed() {
+        let dir = tempdir().unwrap();
+        let id = Identity::generate_for_tests(dir.path());
+        let did_str = id.did_string();
+        // As plaintext mode would leave it: the raw seed, under a temp name.
+        let stale = dir
+            .path()
+            .join(format!("{did_str}.key.tmp.0123456789abcdef"));
+        std::fs::write(&stale, [7u8; 32]).unwrap();
+        clear_cache();
+        Identity::load_for_tests(dir.path(), &did_str);
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn the_state_sealed_flag_is_kept_in_the_key_file() {
+        let dir = tempdir().unwrap();
+        let id = Identity::generate_for_tests(dir.path());
+        assert!(!id.state_sealed().unwrap());
+        id.mark_state_sealed().unwrap();
+        clear_cache();
+        let again = Identity::load_for_tests(dir.path(), &id.did_string());
+        assert!(again.state_sealed().unwrap());
+        // Another handle, opened before the flag was set, reads it from disk.
+        assert!(id.duplicate().state_sealed().unwrap());
     }
 
     #[test]

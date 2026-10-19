@@ -22,9 +22,11 @@
 //! `plaintext.jsonl` one record per line, so appends stay appends. Each is
 //! bound to the DID and its own file name, so a sealed file cannot be moved
 //! to another identity or another role. Files written in clear by an earlier
-//! version are sealed when the session opens, once: the session then writes a
-//! sealed marker (`sealed`), and from then on content in clear is an error, so
-//! history cannot be slipped in by writing a file in clear. An identity that is
+//! version are sealed when the session opens, once: the identity's key file
+//! then records that its state is sealed (`JigKey::state_sealed`, covered by
+//! the key file's authentication), and from then on content in clear is an
+//! error, so history cannot be slipped in by writing a file in clear. Putting
+//! back an older copy of the key file, from before that, undoes it. An identity that is
 //! not sealed at rest ([`Identity::from_signing_key`], plaintext key storage)
 //! keeps its state in clear.
 //!
@@ -65,6 +67,23 @@ pub enum SecureError {
     Field(&'static str),
     #[error("MLS state at {path:?} does not open: {reason}")]
     Sealed { path: PathBuf, reason: String },
+    #[error(
+        "{}{} is in clear, but this identity's MLS state is sealed (its key file says so), \
+         so it was not written by this identity: an older jig, or someone else, wrote it. \
+         It is not read. To go on, move it aside: mv '{}' '{}.clear'. {}",
+        path.display(),
+        line.map(|l| format!(" line {l}")).unwrap_or_default(),
+        path.display(),
+        path.display(),
+        if path.ends_with(PLAINTEXT) {
+            "History read before then cannot be decrypted again."
+        } else {
+            "This device then has no groups and must rejoin its encrypted channels."
+        }
+    )]
+    InClear { path: PathBuf, line: Option<usize> },
+    #[error(transparent)]
+    Identity(#[from] crate::identity::IdentityError),
 }
 
 pub type Result<T> = std::result::Result<T, SecureError>;
@@ -135,11 +154,6 @@ const PLAINTEXT: &str = "plaintext.jsonl";
 /// The prefix of a sealed `plaintext.jsonl` record. A record in clear is JSON
 /// and starts with `{`.
 const SEALED_LINE: &str = "s1:";
-/// Written once a directory's state is sealed; its presence makes content in
-/// clear an error. Sealed itself, so it cannot be made by someone without the
-/// key.
-const MARKER: &str = "sealed";
-const MARKER_CONTENT: &[u8] = b"jig mls state sealed v1";
 
 /// The key-derivation context for one of this module's files.
 fn file_context(file: &str) -> String {
@@ -213,47 +227,25 @@ impl Session {
     }
 
     /// Seal any file an earlier version wrote in clear, under the lock, and
-    /// say whether this directory is sealed (so that clear content is
+    /// say whether this identity's state is sealed (so that clear content is
     /// refused from now on).
+    ///
+    /// Whether it is sealed is recorded in the identity's key file
+    /// (`JigKey::state_sealed`), where it is authenticated: someone who can
+    /// write files here cannot clear it, as they could a file of its own.
     fn seal_clear_files(&self) -> Result<bool> {
         let _lock = self.lock()?;
         self.remove_stale_temporaries()?;
         if !self.identity.is_sealed() {
             return Ok(false);
         }
-        let io = |path: &Path| {
-            let path = path.to_path_buf();
-            move |source| SecureError::Io { path, source }
-        };
-        let marker = self.dir.join(MARKER);
-        let sealed_already = match std::fs::read(&marker) {
-            Ok(bytes) => {
-                if *self.unseal(MARKER, &marker, bytes)? != *MARKER_CONTENT {
-                    return Err(SecureError::Sealed {
-                        path: marker,
-                        reason: "the marker does not say what it should".into(),
-                    });
-                }
-                true
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(source) => {
-                return Err(SecureError::Io {
-                    path: marker,
-                    source,
-                });
-            }
-        };
-        let in_clear = |path: &Path| SecureError::Sealed {
-            path: path.to_path_buf(),
-            reason: "it is in clear, but this identity's state was sealed already".into(),
-        };
+        let sealed_already = self.identity.state_sealed()?;
         for file in [STATE, GROUPS] {
             let path = self.dir.join(file);
             match std::fs::read(&path) {
                 Ok(bytes) if !jig_core::keystore::is_sealed(&bytes) => {
                     if sealed_already {
-                        return Err(in_clear(&path));
+                        return Err(SecureError::InClear { path, line: None });
                     }
                     write_atomic(&path, &self.seal(file, &bytes))?;
                 }
@@ -266,29 +258,33 @@ impl Session {
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => Some(zeroize::Zeroizing::new(text)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(source) => return Err(io(&path)(source)),
+            Err(source) => return Err(SecureError::Io { path, source }),
         };
-        if let Some(text) = text
-            && !text
+        if let Some(text) = text {
+            let clear = text
                 .lines()
-                .all(|l| l.is_empty() || l.starts_with(SEALED_LINE))
-        {
-            if sealed_already {
-                return Err(in_clear(&path));
-            }
-            let mut sealed = String::new();
-            for line in text.lines().filter(|l| !l.is_empty()) {
-                if line.starts_with(SEALED_LINE) {
-                    sealed.push_str(line);
-                } else {
-                    sealed.push_str(&self.seal_line(line));
+                .position(|l| !l.is_empty() && !l.starts_with(SEALED_LINE));
+            if let Some(index) = clear {
+                if sealed_already {
+                    return Err(SecureError::InClear {
+                        path,
+                        line: Some(index + 1),
+                    });
                 }
-                sealed.push('\n');
+                let mut sealed = String::new();
+                for line in text.lines().filter(|l| !l.is_empty()) {
+                    if line.starts_with(SEALED_LINE) {
+                        sealed.push_str(line);
+                    } else {
+                        sealed.push_str(&self.seal_line(line));
+                    }
+                    sealed.push('\n');
+                }
+                write_atomic(&path, sealed.as_bytes())?;
             }
-            write_atomic(&path, sealed.as_bytes())?;
         }
         if !sealed_already {
-            write_atomic(&marker, &self.seal(MARKER, MARKER_CONTENT))?;
+            self.identity.mark_state_sealed()?;
         }
         Ok(true)
     }
@@ -339,9 +335,10 @@ impl Session {
         };
         if !jig_core::keystore::is_sealed(&bytes) {
             if self.sealed_only {
-                return Err(sealed_err(
-                    "it is in clear, but this identity's state is sealed".into(),
-                ));
+                return Err(SecureError::InClear {
+                    path: path.to_path_buf(),
+                    line: None,
+                });
             }
             return Ok(zeroize::Zeroizing::new(bytes));
         }
@@ -735,7 +732,7 @@ impl Session {
             tracing::warn!("{}: ignoring a record that was cut short", path.display());
         }
         let mut read = self.read.lock().expect("plaintext cache poisoned");
-        for line in complete.lines().filter(|l| !l.is_empty()) {
+        for (index, line) in complete.lines().enumerate().filter(|(_, l)| !l.is_empty()) {
             // A sealed record that does not open is an error, never skipped:
             // skipping would hide tampering, and the next write would bury it.
             let line = match line.strip_prefix(SEALED_LINE) {
@@ -753,9 +750,9 @@ impl Session {
                     })?)
                 }
                 None if self.sealed_only => {
-                    return Err(SecureError::Sealed {
+                    return Err(SecureError::InClear {
                         path: path.clone(),
-                        reason: "a record is in clear, but this identity's state is sealed".into(),
+                        line: Some(index + 1),
                     });
                 }
                 None => zeroize::Zeroizing::new(line.to_string()),
@@ -1450,10 +1447,14 @@ mod tests {
             b"{\"cid\":\"cid-2\",\"sender\":\"did:jig:zx\",\"text\":\"forged\"}\n",
         );
         std::fs::write(&plaintext, &forged).unwrap();
-        assert!(matches!(
-            Session::open(root.path(), alice.identity.duplicate()),
-            Err(SecureError::Sealed { .. })
-        ));
+        let err = Session::open(root.path(), alice.identity.duplicate())
+            .err()
+            .expect("a clear line is refused");
+        assert!(
+            matches!(err, SecureError::InClear { line: Some(2), .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("mv "), "{err}");
         std::fs::write(&plaintext, &real).unwrap();
 
         // A group map in clear.
@@ -1461,7 +1462,21 @@ mod tests {
         std::fs::write(&groups, b"{\"groups\":{}}").unwrap();
         assert!(matches!(
             Session::open(root.path(), alice.identity.duplicate()),
-            Err(SecureError::Sealed { .. })
+            Err(SecureError::InClear { line: None, .. })
+        ));
+
+        // Wiping the directory and starting it over in clear does not help:
+        // the key file says this identity's state is sealed.
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(PLAINTEXT),
+            b"{\"cid\":\"cid-9\",\"sender\":\"did:jig:zx\",\"text\":\"forged\"}\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            Session::open(root.path(), alice.identity.duplicate()),
+            Err(SecureError::InClear { .. })
         ));
     }
 
