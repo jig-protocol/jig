@@ -57,11 +57,55 @@ pub struct NameServerConfig {
     pub alias_rate_limits: AliasRateLimitConfig,
 }
 
+/// `JIG_NS_*` variables a removed feature read, with what removed it. Setting
+/// one has no effect any more, so loading warns about it rather than ignoring
+/// it silently.
+const REMOVED_ENV_VARS: &[(&str, &str)] = &[
+    (
+        "JIG_NS_FEDERATION_ENABLED",
+        "nameserver federation was removed",
+    ),
+    ("JIG_NS_ALLOW_DOMAINS", "nameserver federation was removed"),
+    ("JIG_NS_DENY_DOMAINS", "nameserver federation was removed"),
+    ("JIG_NS_SEED_PEERS", "nameserver federation was removed"),
+    ("JIG_NS_MAX_PEERS", "nameserver federation was removed"),
+    ("JIG_NS_CACHE_TTL", "nameserver federation was removed"),
+    (
+        "JIG_NS_GOSSIP_INTERVAL",
+        "nameserver federation was removed",
+    ),
+    (
+        "JIG_NS_HANDSHAKE_TIMEOUT",
+        "nameserver federation was removed",
+    ),
+    (
+        "JIG_NS_GOSSIP_BATCH_SIZE",
+        "nameserver federation was removed",
+    ),
+];
+
+/// The removed variables set in this process's environment, with why each is
+/// ignored.
+fn removed_env_vars_set() -> Vec<(&'static str, &'static str)> {
+    REMOVED_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|(var, _)| std::env::var_os(var).is_some())
+        .collect()
+}
+
+fn warn_removed_env_vars() {
+    for (var, why) in removed_env_vars_set() {
+        tracing::warn!("{var} is set, but {why}; it is ignored. Unset it.");
+    }
+}
+
 impl NameServerConfig {
     /// Load configuration from disk if available, otherwise fall back to env
     /// defaults. The result is [`validate`](Self::validate)d, so a
     /// misconfiguration surfaces as an `Err` the caller can log.
     pub fn load() -> Result<Self> {
+        warn_removed_env_vars();
         let cfg = Self::load_unvalidated()?;
         cfg.validate()?;
         Ok(cfg)
@@ -109,6 +153,7 @@ impl NameServerConfig {
 
     /// Load configuration from the given path. Validated like [`load`](Self::load).
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
+        warn_removed_env_vars();
         let cfg = Self::load_from_path_with_profile(path, std::env::var("JIG_NS_PROFILE").ok())?;
         cfg.validate()?;
         Ok(cfg)
@@ -1494,8 +1539,8 @@ federation_enabled = true
 
     #[test]
     fn retired_sections_are_ignored() {
-        // Configs written before `[pow]` and `[rate_limits]` were removed must
-        // keep loading.
+        // Configs written before `[pow]`, `[rate_limits]` and `[federation]`
+        // were removed must keep loading.
         let doc = r#"
 [pow]
 server_secret = "old"
@@ -1504,9 +1549,35 @@ base_difficulty = 18
 [rate_limits]
 per_key_per_min = 60
 per_ip_per_min = 120
+
+[federation]
+enabled = true
+seed_peers = ["https://ns.example.org"]
 "#;
         let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
         cfg.validate().expect("valid");
+    }
+
+    /// Mutates the environment. Safe under `cargo nextest`, which runs every
+    /// test in its own process.
+    #[test]
+    fn a_removed_env_var_is_reported_not_silently_ignored() {
+        unsafe {
+            std::env::set_var("JIG_NS_FEDERATION_ENABLED", "true");
+            std::env::remove_var("JIG_NS_SEED_PEERS");
+        }
+        let set = removed_env_vars_set();
+        assert!(
+            set.iter()
+                .any(|(var, why)| *var == "JIG_NS_FEDERATION_ENABLED" && why.contains("removed")),
+            "{set:?}"
+        );
+        assert!(
+            set.iter().all(|(var, _)| *var != "JIG_NS_SEED_PEERS"),
+            "{set:?}"
+        );
+        // Loading still succeeds: the variable is ignored, with a warning.
+        NameServerConfig::load().expect("loads");
     }
 
     #[test]
