@@ -111,12 +111,12 @@ impl ProgramManifest {
     /// A built-in renderer: requesting nothing and pinning nothing, so a default operator policy
     /// allows it by component hash (JEP-0011 §5.1).
     ///
-    /// JEP-0011 has each server author its built-ins (`author` is the server's DID, signed at
+    /// JEP-0011 has each server author its built-ins (`author_did` is the server's DID, signed at
     /// start), so the program CID differs between servers and comparison keys on the component.
-    /// If built-ins move to one project-signed manifest shipped in the binary, `author` is the
+    /// If built-ins move to one project-signed manifest shipped in the binary, `author_did` is the
     /// project's DID and the call is the same.
     pub fn builtin_renderer(
-        author: impl Into<String>,
+        author_did: impl Into<String>,
         name: impl Into<String>,
         version: impl Into<String>,
         world: impl Into<String>,
@@ -124,7 +124,7 @@ impl ProgramManifest {
         limits: Limits,
     ) -> Self {
         Self {
-            author: author.into(),
+            author: author_did.into(),
             name: name.into(),
             version: version.into(),
             world: world.into(),
@@ -314,11 +314,11 @@ pub struct SignedProgram {
 
 #[cfg(feature = "ed25519")]
 impl SignedProgram {
-    /// Sign `manifest` as its author. `key` must be the key of `manifest.author`, or
+    /// Sign `manifest` as its author. `author_key` must be the key of `manifest.author`, or
     /// [`Self::open`] refuses the envelope.
     pub fn sign(
         manifest: ProgramManifest,
-        key: &ed25519_dalek::SigningKey,
+        author_key: &ed25519_dalek::SigningKey,
         component_bytes: &[u8],
     ) -> Result<Self, ProgramError> {
         if *blake3::hash(component_bytes).as_bytes() != manifest.component {
@@ -326,7 +326,7 @@ impl SignedProgram {
         }
         let payload = manifest.to_payload()?;
         Ok(Self {
-            envelope: crate::cose::sign1(key, &payload),
+            envelope: crate::cose::sign1(author_key, &payload),
             cid: program_cid(&payload, component_bytes),
             manifest,
         })
