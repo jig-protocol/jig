@@ -500,7 +500,7 @@ reputation, tribunal, transparency and federation) were removed:
 | `/v1/health` | GET | liveness |
 | `/v1/challenge` | GET | issues a 64-hex nonce |
 | `/v1/register` | POST | consumes a GET-issued challenge, returns an attestation |
-| `/v1/resolve/:alias` | GET | alias → DID |
+| `/v1/resolve/:alias` | GET | the signed alias attestation, plus transitional unsigned hints (`did`, `alias`, `valid_until`) |
 | `/v1/suffixes` | GET | suffixes served, their registration mode, and this nameserver's DID |
 | `/.well-known/jig-ns-delegation` | GET | signed delegation for a DNS-rooted suffix (`?suffix=`, else the `Host`) |
 | `/v1/rotate`, `/v1/renew` | POST | key rotation / renewal |

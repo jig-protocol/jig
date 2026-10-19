@@ -1418,7 +1418,7 @@ impl SqliteStore {
     }
 
     /// The alias `did` holds under `suffix` at `ns_did` with a binding valid at
-    /// `as_of`, if any.
+    /// `as_of`, if any. `suffix` is matched case-insensitively, like the key.
     pub fn alias_held_by(
         &self,
         did: &str,
@@ -1430,7 +1430,7 @@ impl SqliteStore {
         conn.query_row(
             "SELECT alias FROM alias_attestations
              WHERE did = ? AND ns_did = ? AND suffix = ? AND valid_from <= ? AND valid_until > ?",
-            params![did, ns_did, suffix, as_of, as_of],
+            params![did, ns_did, suffix.to_ascii_lowercase(), as_of, as_of],
             |r| r.get(0),
         )
         .optional()
@@ -2886,6 +2886,7 @@ mod tests {
         assert_eq!(held("a.example").as_deref(), Some("deejay@a.example"));
         assert_eq!(held("b.example").as_deref(), Some("dj@b.example"));
         assert_eq!(held("c.example"), None);
+        assert_eq!(held("B.Example").as_deref(), Some("dj@b.example"));
     }
 
     #[test]
