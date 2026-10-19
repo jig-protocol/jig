@@ -390,8 +390,9 @@ read_passphrase() {
     printf '[jig] passphrase: ' >/dev/tty
     IFS= read -rs first </dev/tty || die "could not read a passphrase"
     printf '\n' >/dev/tty
-    if [ -z "$first" ]; then
-      printf '[jig] the passphrase cannot be empty\n' >/dev/tty
+    # The same minimum jig enforces on a new passphrase.
+    if [ "${#first}" -lt 8 ]; then
+      printf '[jig] the passphrase needs at least 8 characters\n' >/dev/tty
       continue
     fi
     printf '[jig] repeat it: ' >/dev/tty

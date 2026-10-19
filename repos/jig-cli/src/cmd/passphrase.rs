@@ -9,7 +9,7 @@ use std::sync::{Arc, OnceLock};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
-use jig_client::identity::{KeyAccess, Prompt, PromptPurpose};
+use jig_client::identity::{KeyAccess, MIN_PASSPHRASE_CHARS, Prompt, PromptPurpose};
 use zeroize::Zeroizing;
 
 /// The key access every command uses, built once per process: finding the OS
@@ -100,8 +100,11 @@ impl Prompt for TerminalPrompt {
                 )?;
                 for _ in 0..3 {
                     let first = read_hidden("new passphrase: ")?;
-                    if first.is_empty() {
-                        writeln!(terminal_writer(), "the passphrase cannot be empty")?;
+                    if first.chars().count() < MIN_PASSPHRASE_CHARS {
+                        writeln!(
+                            terminal_writer(),
+                            "the passphrase needs at least {MIN_PASSPHRASE_CHARS} characters"
+                        )?;
                         continue;
                     }
                     let second = read_hidden("repeat it: ")?;

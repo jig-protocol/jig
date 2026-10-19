@@ -62,6 +62,11 @@ pub enum IdentityError {
     NoWayToSeal { did: String },
     #[error("{var}: {reason}")]
     BadEnv { var: &'static str, reason: String },
+    #[error(
+        "a new passphrase needs at least {MIN_PASSPHRASE_CHARS} characters (JIG_KEY_PASSPHRASE \
+         or the prompt). An existing key still opens with the passphrase it has"
+    )]
+    ShortPassphrase,
     #[error("sealed {path:?}, but it does not open again: {reason}")]
     NotVerified { path: PathBuf, reason: String },
     #[error(transparent)]
@@ -122,6 +127,11 @@ pub struct KeyAccess {
 
 /// Where [`KeyAccess`] says that it fell back from one slot to another.
 pub type Notice = dyn Fn(&str) + Send + Sync;
+
+/// The fewest characters a passphrase may have when a key is sealed with it.
+/// Only new passphrases are held to it: a key sealed with a shorter one before
+/// this rule still opens.
+pub const MIN_PASSPHRASE_CHARS: usize = 8;
 
 /// A fixed secret for [`KeyAccess::insecure_for_tests`]. Public on purpose:
 /// anything sealed with it is as good as plaintext.
@@ -255,11 +265,17 @@ impl KeyAccess {
             },
         };
         match passphrase {
-            Some(passphrase) if !passphrase.is_empty() => Ok(NewSlot::Passphrase {
+            Some(passphrase) if passphrase.is_empty() => Err(IdentityError::NoWayToSeal {
+                did: did.to_string(),
+            }),
+            Some(passphrase) if passphrase.chars().count() < MIN_PASSPHRASE_CHARS => {
+                Err(IdentityError::ShortPassphrase)
+            }
+            Some(passphrase) => Ok(NewSlot::Passphrase {
                 passphrase,
                 params: self.kdf,
             }),
-            _ => Err(IdentityError::NoWayToSeal {
+            None => Err(IdentityError::NoWayToSeal {
                 did: did.to_string(),
             }),
         }
@@ -1131,9 +1147,9 @@ mod tests {
     #[test]
     fn without_a_keychain_a_passphrase_seals_and_a_wrong_one_is_refused() {
         let dir = tempdir().unwrap();
-        let id = Identity::create(dir.path(), &passphrase_only("hunter2")).unwrap();
+        let id = Identity::create(dir.path(), &passphrase_only("hunter2!")).unwrap();
         clear_cache();
-        assert!(Identity::open(dir.path(), &id.did_string(), &passphrase_only("hunter2")).is_ok());
+        assert!(Identity::open(dir.path(), &id.did_string(), &passphrase_only("hunter2!")).is_ok());
         clear_cache();
         let err =
             Identity::open(dir.path(), &id.did_string(), &passphrase_only("wrong")).unwrap_err();
@@ -1179,13 +1195,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut access = passphrase_only("unused");
         access.passphrase = None;
-        let access = access.with_prompt(Arc::new(Answers(Mutex::new(vec!["right"]))));
+        let access = access.with_prompt(Arc::new(Answers(Mutex::new(vec!["the right one"]))));
         let id = Identity::create(dir.path(), &access).unwrap();
         clear_cache();
         // Answers pop from the end: wrong, then right.
         let mut access = passphrase_only("unused");
         access.passphrase = None;
-        let access = access.with_prompt(Arc::new(Answers(Mutex::new(vec!["right", "wrong"]))));
+        let access = access.with_prompt(Arc::new(Answers(Mutex::new(vec![
+            "the right one",
+            "the wrong one",
+        ]))));
         assert!(Identity::open(dir.path(), &id.did_string(), &access).is_ok());
     }
 
@@ -1337,7 +1356,7 @@ mod tests {
     fn a_keychain_that_fails_is_reported_not_only_logged() {
         let dir = tempdir().unwrap();
         let said = Arc::new(Mutex::new(Vec::<String>::new()));
-        let mut access = passphrase_only("pw");
+        let mut access = passphrase_only("a passphrase");
         access.keychain = Some(Arc::new(BrokenKeychain));
         let heard = said.clone();
         let access = access.with_notice(Arc::new(move |m| heard.lock().unwrap().push(m.into())));
@@ -1385,7 +1404,7 @@ mod tests {
     #[test]
     fn a_failing_keychain_falls_back_to_the_passphrase() {
         let dir = tempdir().unwrap();
-        let mut access = passphrase_only("pw");
+        let mut access = passphrase_only("a passphrase");
         access.keychain = Some(Arc::new(BrokenKeychain));
         // Sealing skips the keychain that refuses, and uses the passphrase.
         let id = Identity::create(dir.path(), &access).unwrap();
@@ -1422,7 +1441,7 @@ mod tests {
         let mut access = passphrase_only("unused");
         access.passphrase = None;
         access.keychain = Some(Arc::new(stuck));
-        let access = access.with_prompt(Arc::new(Answers(Mutex::new(vec!["typed"]))));
+        let access = access.with_prompt(Arc::new(Answers(Mutex::new(vec!["typed in full"]))));
         let id = Identity::create(dir.path(), &access).unwrap();
         assert!(id.is_sealed());
         let key =
@@ -1433,6 +1452,31 @@ mod tests {
             vec![SlotKind::Passphrase(KdfParams::insecure_for_tests())]
         );
         assert!(!raw_key_path(dir.path(), &id.did_string()).exists());
+    }
+
+    #[test]
+    fn a_new_passphrase_needs_eight_characters_but_an_old_key_still_opens() {
+        let dir = tempdir().unwrap();
+        let err = Identity::create(dir.path(), &passphrase_only("seven77")).unwrap_err();
+        assert!(matches!(err, IdentityError::ShortPassphrase), "{err}");
+        // Characters, not bytes: eight of them, in sixteen bytes.
+        assert!(Identity::create(dir.path(), &passphrase_only("ééééééé1")).is_ok());
+
+        // A key sealed with a short passphrase before the rule opens as before.
+        let seed = [3u8; 32];
+        let did = Identity::from_signing_key(SigningKey::from_bytes(&seed)).did_string();
+        let (key, _) = JigKey::seal(
+            &did,
+            &seed,
+            &[NewSlot::Passphrase {
+                passphrase: Zeroizing::new("pw".into()),
+                params: KdfParams::insecure_for_tests(),
+            }],
+        )
+        .unwrap();
+        write_private_atomic(&key_path(dir.path(), &did), &key.to_bytes()).unwrap();
+        let old = Identity::open(dir.path(), &did, &passphrase_only("pw")).unwrap();
+        assert_eq!(old.did_string(), did);
     }
 
     #[test]

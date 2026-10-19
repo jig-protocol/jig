@@ -37,8 +37,10 @@ RUN
 fail() { echo "FAIL: $*" >&2; cat "$t/log" >&2 || true; exit 1; }
 
 echo "== terminal present, keychain fails: passphrase, never plaintext"
-printf 'pw\rpw\r' | PATH="$t/fakebin:$PATH" DBUS_SESSION_BUS_ADDRESS=unix:path=/x \
-  script -qec "bash $t/run.sh" /dev/null > "$t/tty.out"
+# A passphrase under 8 characters is refused and asked for again.
+printf 'short\rcorrect horse\rcorrect horse\r' | PATH="$t/fakebin:$PATH" \
+  DBUS_SESSION_BUS_ADDRESS=unix:path=/x script -qec "bash $t/run.sh" /dev/null > "$t/tty.out"
+grep -q "at least 8 characters" "$t/tty.out" || fail "a short passphrase was not refused"
 grep -q "init sealed" "$t/log" || fail "init was not sealed with the passphrase"
 grep -q "plaintext" "$t/log" && fail "fell back to plaintext with a person present"
 grep -q "send pass=set" "$t/log" || fail "later jig calls did not get the passphrase"
