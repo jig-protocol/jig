@@ -90,6 +90,18 @@ pub async fn run(args: InitArgs) -> Result<()> {
     write_cli_config(&id, &nickname, &cfg_path, args.server_url.as_deref())?;
     println!("wrote {} (nickname: {nickname})", cfg_path.display());
 
+    // 3b. With no server of their own, offer the hub (dormant until its URL
+    //     and DID are real; never without a terminal). Its DID is pinned
+    //     before anything connects to it.
+    if let Some(hub) = crate::cmd::hub::offer(args.server_url.is_some())? {
+        let mut cfg = config::load_config(Some(&cfg_path))?;
+        cfg.server.base_url = hub.url.clone();
+        config::save_config(&cfg, Some(&cfg_path))
+            .with_context(|| format!("writing {}", cfg_path.display()))?;
+        crate::cmd::hub::pin(&hub, &jig_client::pins::Pins::default_path())?;
+        println!("server: {} (pinned to {})", hub.url, hub.did);
+    }
+
     // 4. Optional alias registration.
     if let Some(alias_local) = args.request_alias {
         let ns_url = args
