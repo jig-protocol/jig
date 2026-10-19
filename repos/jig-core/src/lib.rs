@@ -15,6 +15,8 @@ pub mod capability_scope;
 pub mod capability_validation;
 pub mod component_validation;
 #[cfg(feature = "ed25519")]
+pub mod contract;
+#[cfg(feature = "ed25519")]
 pub mod cose;
 pub mod crypto;
 pub mod dcbor;

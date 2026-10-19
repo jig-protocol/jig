@@ -42,6 +42,9 @@ multihash-codetable.workspace = true
 time = { version = "0.3", features = ["serde"] }
 
 [dev-dependencies]
+# Pulley, for tests/block_abi_vectors.rs, which runs every vector on both backends. Test builds
+# only: nothing in the shipped runtime selects Pulley yet.
+wasmtime = { version = "49.0.2", features = ["pulley"] }
 wat = "1.0"
 # For tests/text_block_payload.rs, which runs the real canonical module through
 # the byte-payload convention. text-block depends on no workspace crate, so this

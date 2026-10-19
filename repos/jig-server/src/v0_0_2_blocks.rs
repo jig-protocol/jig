@@ -185,8 +185,16 @@ pub async fn get_block_by_cid(
             )
         })?;
 
-    if let (Some(caller), Some(slug)) = (caller_did.as_ref(), stored.channel_id.as_deref()) {
-        authorize_channel_read(&state, slug, caller, started)?;
+    // `channel_id` is the channel's id (its creation-block CID); the read
+    // gate goes by the channel row it names.
+    if let (Some(caller), Some(channel_id)) = (caller_did.as_ref(), stored.channel_id.as_deref())
+        && let Some(channel) = state
+            .ingest_ctx
+            .store
+            .get_channel_by_id_including_archived(channel_id)
+            .map_err(persist_err)?
+    {
+        authorize_channel_read(&state, &channel.slug, caller, started)?;
     }
 
     let receipts = state
@@ -670,7 +678,7 @@ mod tests {
     fn test_identity() -> Identity {
         let dir = tempdir().unwrap();
         let path = dir.keep();
-        Identity::generate_and_save(&path).unwrap()
+        Identity::generate_for_tests(&path)
     }
 
     fn test_hlc(id: &Identity) -> HlcTimestamp {

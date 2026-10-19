@@ -306,7 +306,7 @@ mod tests {
         let dir = tempdir().unwrap();
         // Keep the tempdir on disk so the keyfile survives — tests only.
         let dir_path = dir.keep();
-        Identity::generate_and_save(&dir_path).unwrap()
+        Identity::generate_for_tests(&dir_path)
     }
 
     fn test_hlc(id: &Identity) -> HlcTimestamp {

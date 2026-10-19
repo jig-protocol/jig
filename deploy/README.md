@@ -172,16 +172,11 @@ sudoedit /etc/jig/config.toml
 sudo install -m 0644 deploy/jig-nameserver.example.toml /etc/jig/jig-nameserver.toml
 sudoedit /etc/jig/jig-nameserver.toml
 
-# 4. nameserver secret (MANDATORY — it exits non-zero at startup without one)
-printf 'JIG_NS_SECRET=%s\n' "$(openssl rand -hex 32)" \
-  | sudo tee /etc/jig/jig-nameserver.env >/dev/null
-sudo chown root:jig /etc/jig/jig-nameserver.env
-sudo chmod 600 /etc/jig/jig-nameserver.env      # <- 600. it is a secret.
-
-# 5. optional server secrets (bridge tokens etc.), same treatment
+# 4. optional env files (bridge tokens etc.): chmod 600 root:jig
 #    sudo chmod 600 /etc/jig/jig-server.env
+#    /etc/jig/jig-nameserver.env is optional too; the nameserver needs no secret
 
-# 6. units
+# 5. units
 sudo install -m 0644 deploy/jig-server.service deploy/jig-nameserver.service \
                      deploy/jig-backup.service deploy/jig-backup.timer \
                      /etc/systemd/system/
@@ -220,7 +215,10 @@ the root keys and every section in one file.
 > **Upgrading a server that ran without `[tls]`:** it comes back on TLS. Every
 > client re-runs `jig server set https://…`; their pins and encrypted-channel
 > state carry over, because neither is keyed by the scheme. To keep plaintext
-> (behind a proxy that terminates TLS, say), set `[tls] enabled = false`.
+> (behind a proxy that terminates TLS, say), set `[tls] enabled = false`. The
+> server then lists `tls.enabled=false` in `/.well-known/jig`'s
+> `unsafe_options_active` and logs a startup warning (#120). A `jig` CLI refuses a
+> plaintext `http://` server that is not on its own machine (#142).
 >
 > The nameserver on `:7070` is **not** covered by `[tls]` — that section belongs
 > to `jig-server` only — so its rows stay `http://` unless you terminate TLS in
@@ -444,16 +442,25 @@ so a rebooted box catches up). It snapshots:
 
 | What | Why |
 | --- | --- |
-| `/var/lib/jig/jig.db` | v0.0.1 store |
 | `/var/lib/jig/jig_v002.db` | **the v0.0.2 block store — where the actual messages are** |
-| `/var/lib/jig/nameserver.db` | alias registry |
+| `/var/lib/jig/nameserver.db` | the nameserver's legacy registry |
+| `/var/lib/jig/nameserver_v002.db` | **the nameserver's alias bindings** |
 | `/var/lib/jig/server.key` | server identity |
+| `/var/lib/jig/nameserver_v002.key` | **the nameserver's signing key** (set `JIG_NAMESERVER_KEYFILE` if `[v0_0_2.server] server_did_keyfile` puts it elsewhere) |
 
-**The `_v002` suffix is not a typo.** `jig-server` derives the v0.0.2 store path
-from `database_path` by appending `_v002` to the file stem, so a configured
-`/var/lib/jig/jig.db` means blocks live in `/var/lib/jig/jig_v002.db`. **Both
-files exist and both matter** — a backup of only `jig.db` backs up essentially
-nothing anyone typed.
+The nameserver files are skipped on a box that doesn't run the nameserver, but
+a snapshot is refused if `nameserver_v002.db` exists without its key. **A
+restore without `nameserver_v002.key` loses the nameserver's DID**: the
+nameserver mints a new key, and every attestation the old one signed stops
+verifying for servers and clients whose delegation names the old DID.
+
+**The `_v002` suffix is not a typo.** `jig-server` derives its store path from
+`database_path` by appending `_v002` to the file stem, so a configured
+`/var/lib/jig/jig.db` means blocks live in `/var/lib/jig/jig_v002.db`.
+`jig.db` itself is no longer opened: the v0.0.1 store it held was removed
+(#196). On a box upgraded from an older release the file is still there and
+unused; delete it yourself once no backup you keep needs it. Nothing deletes
+it for you.
 
 Databases are copied with `sqlite3 … 'VACUUM INTO …'`, which takes a read lock
 and writes one consistent file, so snapshots are safe while the server is
@@ -473,17 +480,20 @@ journalctl -u jig-backup.service -n 50
 
 `/var/backups/jig` is **on the same disk as the thing it is backing up**. Ship
 it elsewhere — `tailscale file cp`, `rsync` to another tailnet node, or restic
-to object storage. At minimum, get `server.key` off the box (top of this file).
+to object storage. At minimum, get `server.key` and `nameserver_v002.key` off the box (top of this
+file).
 
 ### Restore
 
 ```bash
 sudo systemctl stop jig-server jig-nameserver
-sudo cp /path/to/snapshot/{jig.db,jig_v002.db,nameserver.db} /var/lib/jig/
+sudo cp /path/to/snapshot/{jig_v002.db,nameserver.db,nameserver_v002.db} /var/lib/jig/
 sudo cp /path/to/snapshot/server.key /var/lib/jig/server.key
+sudo cp /path/to/snapshot/nameserver_v002.key /var/lib/jig/nameserver_v002.key
 sudo chown -R jig:jig /var/lib/jig          # -R, not /var/lib/jig/* — see the
                                             # glob note in the TLS section above
 sudo chmod 600 /var/lib/jig/server.key      # or the server refuses to start
+sudo chmod 600 /var/lib/jig/nameserver_v002.key
 sudo systemctl start jig-server jig-nameserver
 curl -k https://100.x.y.z:7117/.well-known/jig  # server_did MUST match the old one
 ```
@@ -560,10 +570,14 @@ can be recorded on an offline machine before any server exists. Point
   vars instead, which is still correct and still applied after any TOML load.
   *(The comment inside `jig-nameserver.service` still says the flags are parsed
   and ignored; that comment is stale.)*
-- **`JIG_NS_SECRET` is mandatory** — the nameserver refuses to start without it,
-  logging through tracing *and* stderr before exiting non-zero. It is in a
-  required (no leading `-`) `EnvironmentFile` so a missing secret fails loudly
-  instead of booting with a default PoW secret.
+- **The nameserver needs no secret.** `JIG_NS_SECRET` and the `[pow]` section
+  went with the legacy proof-of-work routes (#192), and `[rate_limits]` with the
+  legacy rate limits (#197). An env file that still sets `JIG_NS_SECRET`,
+  `JIG_NS_POW_*` or `JIG_NS_RATE_*`, or a config that still has `[pow]` or
+  `[rate_limits]`, is harmless: nothing reads them, so remove them at your own
+  pace. The unit's
+  `EnvironmentFile=` is optional (leading `-`) and only carries any `JIG_NS_*`
+  settings you choose to put there.
 - **Secrets never go inline in a unit file.** `systemctl cat` is readable by any
   local user. `EnvironmentFile`, `chmod 600 root:jig`, always.
 - **`MemoryDenyWriteExecute` is deliberately absent** from every unit. Blocks

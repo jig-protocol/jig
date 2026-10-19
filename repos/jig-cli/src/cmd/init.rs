@@ -73,13 +73,14 @@ pub async fn run(args: InitArgs) -> Result<()> {
 
     // 2. Generate fresh ed25519 keypair under ~/.jig/keys/.
     let keys_dir = jig_client::identity::default_keys_dir();
-    let id = Identity::generate_and_save(&keys_dir)
+    let id = Identity::create(&keys_dir, super::passphrase::key_access()?)
         .with_context(|| format!("generating identity under {}", keys_dir.display()))?;
+    super::passphrase::warn_if_unsealed(&id);
     let did_string = id.did_string();
     println!("generated DID: {did_string}");
     println!(
         "keyfile: {}",
-        keys_dir.join(format!("{did_string}.key")).display()
+        jig_client::identity::key_path(&keys_dir, &did_string).display()
     );
 
     // 3. Persist nickname + DID binding to ~/.jig/cli.toml.
@@ -209,7 +210,7 @@ mod tests {
     fn build_register_request_signs_an_action_bound_proof() {
         // Generate a fresh identity in a tempdir (separate from ~/.jig/keys/).
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(dir.path()).unwrap();
+        let id = Identity::generate_for_tests(dir.path());
         let name = Name::parse("DJ@Dj.Jig").unwrap();
         let ns_did = "did:jig:zNameserver";
 
@@ -240,7 +241,7 @@ mod tests {
         // Seeding the address book with your own DID is what stops `jig chat`
         // rendering a 61-char DID for every line you write yourself.
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(dir.path()).unwrap();
+        let id = Identity::generate_for_tests(dir.path());
 
         let cfg = build_initial_config(&id, "dj", None);
 
@@ -258,7 +259,7 @@ mod tests {
         // Tests build jig-core with `test-default-authority`; a real build
         // writes no entry while the authority is the placeholder.
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(dir.path()).unwrap();
+        let id = Identity::generate_for_tests(dir.path());
         let cfg = build_initial_config(&id, "dj", None);
         assert_eq!(
             cfg.naming.delegations.get(config::DEFAULT_SUFFIX),
@@ -269,7 +270,7 @@ mod tests {
     #[test]
     fn initial_config_keeps_the_default_server_unless_overridden() {
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(dir.path()).unwrap();
+        let id = Identity::generate_for_tests(dir.path());
         assert_eq!(
             build_initial_config(&id, "dj", None).server.base_url,
             Config::default().server.base_url
@@ -287,7 +288,7 @@ mod tests {
         // The nameserver composes `<local>@<its suffix>`; the request names
         // only the local part, but the proof is over the full name.
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(dir.path()).unwrap();
+        let id = Identity::generate_for_tests(dir.path());
         let name = Name::parse("Alice_42@dj.jig").unwrap();
         let req = build_register_request(&id, &name, "did:jig:zNs", "abc");
         assert_eq!(req.requested_alias, "alice_42");

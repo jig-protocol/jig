@@ -940,7 +940,7 @@ mod tests {
     fn test_identity() -> Identity {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.keep();
-        Identity::generate_and_save(&path).unwrap()
+        Identity::generate_for_tests(&path)
     }
 
     /// Spin up a tiny WS server on an ephemeral port. The handler closure
