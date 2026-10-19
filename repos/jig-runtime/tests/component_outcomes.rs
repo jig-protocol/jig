@@ -10,6 +10,8 @@
 
 use std::time::{Duration, Instant};
 
+use jig_core::grant::{Grant, Scope};
+use jig_runtime::RuntimeError;
 use jig_runtime::component::{
     BlockError, ComponentRuntime, ErrorOutcome, Hlc, IncompleteReason, Invocation, Payload,
     RenderLimits, RunOutcome, TrapCode,
@@ -23,8 +25,13 @@ const MAX_MEMORY_PAGES: u32 = 16;
 /// lowered `result<payload, block-error>`. `realloc` is a bump allocator, enough for the host
 /// to lower the invocation's strings and lists.
 fn renderer(render_body: &str, extra_funcs: &str) -> Vec<u8> {
+    renderer_importing("", render_body, extra_funcs)
+}
+
+fn renderer_importing(imports: &str, render_body: &str, extra_funcs: &str) -> Vec<u8> {
     let wat = format!(
         r#"(component
+            {imports}
             (type $hlc (record (field "wall-ms" u64) (field "logical" u32)))
             (type $payload (record (field "media-type" string) (field "body" (list u8))))
             (type $invocation (record
@@ -97,7 +104,7 @@ fn run(component: &[u8], fuel: u64) -> RunOutcome {
 fn run_with(component: &[u8], limits: RenderLimits) -> RunOutcome {
     let runtime = ComponentRuntime::new().expect("runtime builds");
     let renderer = runtime
-        .compile_renderer(component, MAX_MEMORY_PAGES)
+        .compile_renderer(component, &Grant::empty(), MAX_MEMORY_PAGES)
         .expect("test component validates and compiles");
     runtime.render(&renderer, &invocation(), &limits).outcome
 }
@@ -188,7 +195,7 @@ fn a_component_failing_the_profile_is_refused_before_it_compiles() {
     let body = "f32.const 1 drop (i32.const 0)";
     let runtime = ComponentRuntime::new().expect("runtime builds");
     let err = runtime
-        .compile_renderer(&renderer(body, ""), MAX_MEMORY_PAGES)
+        .compile_renderer(&renderer(body, ""), &Grant::empty(), MAX_MEMORY_PAGES)
         .expect_err("a float instruction must be refused");
     assert!(err.to_string().contains("jig-det-1"), "{err}");
 }
@@ -198,4 +205,32 @@ fn the_engine_identity_names_the_exact_wasmtime_version() {
     let runtime = ComponentRuntime::new().expect("runtime builds");
     let identity = runtime.engine_identity();
     assert_eq!(identity.wasmtime, jig_runtime::WASMTIME_VERSION);
+}
+
+#[test]
+fn a_renderer_may_import_only_what_its_grant_names() {
+    let runtime = ComponentRuntime::new().unwrap();
+    let component = renderer_importing(
+        r#"(import "jig:host/compose@0.1.0" (instance))"#,
+        "(unreachable)",
+        "",
+    );
+
+    let Err(err) = runtime.compile_renderer(&component, &Grant::empty(), MAX_MEMORY_PAGES) else {
+        panic!("an ungranted import is refused");
+    };
+    assert!(
+        matches!(&err, RuntimeError::ValidationError(m) if m.contains("not granted")),
+        "{err:?}"
+    );
+
+    let grant = Grant::from_scopes([Scope::Compose {
+        children: Default::default(),
+        max_depth: 1,
+        max_calls: 1,
+    }])
+    .unwrap();
+    runtime
+        .compile_renderer(&component, &grant, MAX_MEMORY_PAGES)
+        .expect("a granted import passes");
 }

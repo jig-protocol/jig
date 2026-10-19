@@ -18,6 +18,7 @@ pub mod handshake;
 pub mod hlc;
 pub mod identity;
 pub mod ingest;
+pub mod ingest_record;
 pub mod metrics;
 pub mod mls_gate;
 pub mod persist;

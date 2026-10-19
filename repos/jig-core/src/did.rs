@@ -213,20 +213,48 @@ impl<'de> Deserialize<'de> for Did {
     }
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────────
+/// The key behind [`log_tag`], set once per process by [`set_log_tag_key`].
+static LOG_TAG_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
 
-/// A short, stable tag for a DID in logs: the first 12 hex digits of a
-/// domain-separated BLAKE3 hash. The same DID always gets the same tag, so
-/// log lines can be correlated, but the DID itself is never written
-/// (zero-trust, "Logging and metadata retention"). Anyone who already knows a
-/// DID can compute its tag; a keyed tag would need a per-server secret.
-pub fn log_tag(did: &str) -> String {
-    let hash = crate::crypto::hash_labeled_parts(&[
-        ("domain", b"jig-log-did-v1"),
-        ("did", did.as_bytes()),
-    ]);
-    hex::encode(&hash.as_bytes()[..6])
+/// Key [`log_tag`] with a value derived from the server's signing-key seed
+/// (BLAKE3 `derive_key`, context `jig-log-did-v1`), so tags are stable
+/// across restarts of one server but cannot be reversed by hashing a list of
+/// public DIDs, nor linked across servers. Call once at startup, before
+/// anything logs. The key is process-wide and set once: returns `true` when
+/// the key in effect is this seed's (newly set, or set before from the same
+/// seed), and `false` when an earlier, different key stays in effect.
+pub fn set_log_tag_key(seed: &[u8; 32]) -> bool {
+    let key = blake3::derive_key("jig-log-did-v1", seed);
+    *LOG_TAG_KEY.get_or_init(|| key) == key
 }
+
+/// A process-random key, used when nothing called [`set_log_tag_key`]: tags
+/// then correlate within one run only, and still never fall back to an
+/// unkeyed, reversible hash.
+fn random_log_tag_key() -> [u8; 32] {
+    use std::hash::{BuildHasher, Hasher};
+    let mut key = [0u8; 32];
+    for chunk in key.chunks_mut(8) {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u8(0);
+        chunk.copy_from_slice(&h.finish().to_le_bytes());
+    }
+    key
+}
+
+fn log_tag_with(key: &[u8; 32], did: &str) -> String {
+    hex::encode(&blake3::keyed_hash(key, did.as_bytes()).as_bytes()[..6])
+}
+
+/// A short, stable tag for a DID in logs: the first 12 hex digits of a keyed
+/// BLAKE3 hash of the DID. Lines about one DID correlate, but the DID itself
+/// is never written (zero-trust, "Logging and metadata retention"), and
+/// without the server's key a tag cannot be matched to a DID.
+pub fn log_tag(did: &str) -> String {
+    log_tag_with(LOG_TAG_KEY.get_or_init(random_log_tag_key), did)
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -340,5 +368,22 @@ mod tests {
         assert_ne!(tag, log_tag(b));
         assert_eq!(tag.len(), 12);
         assert!(!tag.contains("did:jig"), "a tag never carries the DID");
+    }
+
+    #[test]
+    fn log_tags_need_the_key() {
+        let a = "did:jig:zaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let k1 = blake3::derive_key("jig-log-did-v1", &[1; 32]);
+        let k2 = blake3::derive_key("jig-log-did-v1", &[2; 32]);
+        assert_eq!(log_tag_with(&k1, a), log_tag_with(&k1, a));
+        // Another server's key gives another tag, so tags don't link servers.
+        assert_ne!(log_tag_with(&k1, a), log_tag_with(&k2, a));
+        // Nor does the old public, unkeyed construction reproduce it.
+        let unkeyed = crate::crypto::hash_labeled_parts(&[
+            ("domain", b"jig-log-did-v1"),
+            ("did", a.as_bytes()),
+        ]);
+        assert_ne!(log_tag_with(&k1, a), hex::encode(&unkeyed.as_bytes()[..6]));
+        assert_ne!(random_log_tag_key(), random_log_tag_key());
     }
 }

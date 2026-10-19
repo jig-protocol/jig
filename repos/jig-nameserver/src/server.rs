@@ -292,7 +292,6 @@ mod tests {
     use axum::http::Request;
     use axum::http::StatusCode;
     use axum::{body::Body, http::Response};
-    use ed25519_dalek::Signer;
     use http_body_util::BodyExt as _; // for collect
     use tower::util::ServiceExt; // for `oneshot`
 
@@ -532,7 +531,8 @@ mod tests {
         let dir = ScratchDir::new("alias-rate-limit");
         let mut cfg = scratch_config(&dir, "dj.jig");
         cfg.alias_rate_limits.per_did_per_min = 1;
-        let (router, _) = build_app(&cfg).expect("build_app");
+        let app = build_app_parts(&cfg).expect("build_app_parts");
+        let (router, ns_did) = (app.router, app.v0_0_2_state.ns_did_string());
 
         let key = jig_core::crypto::ed25519::generate_signing_key();
         let did =
@@ -561,8 +561,14 @@ mod tests {
 
         // The key holder's own signed register still gets through.
         let challenge = fresh_challenge(&router).await;
-        let proof = base64::engine::general_purpose::STANDARD
-            .encode(key.sign(challenge.as_bytes()).to_bytes());
+        let proof =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(jig_core::naming::sign_proof(
+                &key,
+                jig_core::naming::Action::Register,
+                &ns_did,
+                "victim@dj.jig",
+                &challenge,
+            ));
         let resp = post_json(
             &router,
             "/v1/register",

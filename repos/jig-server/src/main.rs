@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use jig_config::v0_0_2_server::JigServerConfig;
 use jig_server::{JigServer, ServerConfig};
 
 #[derive(Parser, Debug)]
@@ -30,9 +29,7 @@ struct Args {
     port: Option<u16>,
 }
 
-/// Load the v0.0.2 half of the config (`[server]`, `[identity]`,
-/// `[federation]`, `[bridges]`, `[debug]`) from the same file `ServerConfig`
-/// was read from.
+/// Load the `--config` file.
 ///
 /// An EXPLICIT `--config` that fails to parse is an error, never a silent
 /// fall back to defaults. Swallowing it discards the operator's entire file:
@@ -42,11 +39,14 @@ struct Args {
 /// reverts `[bridges]`, federation peers, and `[debug]`.
 ///
 /// `None` (no `--config` given) legitimately means defaults.
-fn load_v0_0_2_config(config_path: Option<&Path>) -> Result<JigServerConfig, String> {
+fn load_config(config_path: Option<&Path>) -> Result<ServerConfig, String> {
     match config_path {
-        Some(path) => JigServerConfig::load(path)
-            .map_err(|e| format!("v0.0.2 config load from {} failed: {e}", path.display())),
-        None => Ok(JigServerConfig::default()),
+        Some(path) => ServerConfig::load(path)
+            .map_err(|e| format!("config load from {} failed: {e}", path.display())),
+        None => {
+            warn_on_ignored_legacy_config_files();
+            Ok(ServerConfig::default())
+        }
     }
 }
 
@@ -71,6 +71,28 @@ fn listen_disagreement_warning(listen: &str, bind_address: &str, port: u16) -> O
     ))
 }
 
+/// Without `--config` the server used to read `[storage.truth]` from
+/// `./jig-config.toml` or `~/.jig/config.toml` to pick its database path. It no
+/// longer does; a server that relied on that would now open a fresh database
+/// at the default path, so say so when one of those files is present.
+fn warn_on_ignored_legacy_config_files() {
+    let candidates = [
+        std::env::current_dir()
+            .ok()
+            .map(|d| d.join("jig-config.toml")),
+        Some(jig_config::default_config_path()),
+    ];
+    for path in candidates.into_iter().flatten().filter(|p| p.exists()) {
+        let msg = format!(
+            "ignoring {}: jig-server reads only --config; pass --config (or --db-path / \
+             JIG_DB_PATH) to choose the database",
+            path.display()
+        );
+        tracing::warn!("{msg}");
+        eprintln!("[jig-server] WARN: {msg}");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Default to `info` when RUST_LOG is unset: `from_default_env()` alone
@@ -88,12 +110,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let config_path = args.config.clone();
-    let mut config = if let Some(path) = &config_path {
-        ServerConfig::load(path)?
-    } else {
-        // Precedence: jig-config in CWD or ~/.jig/config.toml, then defaults
-        ServerConfig::try_load_jig_config_from_well_known().unwrap_or_default()
+    let mut config = match load_config(args.config.as_deref()) {
+        Ok(cfg) => cfg,
+        Err(msg) => {
+            // Both sinks on purpose: RUST_LOG can filter tracing away
+            // entirely, and an operator who typo'd a key must still be told
+            // why the server refused to start.
+            tracing::error!("{msg}");
+            eprintln!("[jig-server] FATAL: {msg}");
+            std::process::exit(1);
+        }
     };
 
     let env_db = std::env::var("JIG_DB_PATH").ok().map(PathBuf::from);
@@ -105,23 +131,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("unsafe option active: {opt} (loopback or a TLS-terminating proxy only)");
     }
 
-    // Build the v0.0.2 pipeline AppState alongside the existing ServerConfig.
-    // Both halves come from the same --config file: root-level keys drive
-    // ServerConfig (which opens the socket), and [server]/[identity]/
-    // [federation]/[bridges]/[debug] drive JigServerConfig. Neither type uses
-    // deny_unknown_fields, which is what makes one file legal for both.
+    // Build the v0.0.2 pipeline AppState from the config's pipeline sections.
     let v0_0_2_state = {
-        let v002_config = match load_v0_0_2_config(config_path.as_deref()) {
-            Ok(cfg) => cfg,
-            Err(msg) => {
-                // Both sinks on purpose: RUST_LOG can filter tracing away
-                // entirely, and an operator who typo'd a key must still be
-                // told why the server refused to start.
-                tracing::error!("{msg}");
-                eprintln!("[jig-server] FATAL: {msg}");
-                std::process::exit(1);
-            }
-        };
+        let v002_config = config.v0_0_2();
 
         // A plaintext federation peer nobody opted into stops the boot, loudly,
         // rather than surfacing only as "v0.0.2 module failed to initialize".
@@ -168,8 +180,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(state)
             }
             Err(e) => {
-                tracing::warn!("v0.0.2 module failed to initialize, running without it: {e}");
-                None
+                // Fatal: without the v0.0.2 module the server would serve only
+                // /.well-known/jig, /healthz and /metrics, which reads as "up"
+                // to every health check while accepting and serving nothing.
+                let msg = format!("v0.0.2 module failed to initialize: {e}");
+                tracing::error!("{msg}");
+                eprintln!("[jig-server] FATAL: {msg}");
+                std::process::exit(1);
             }
         }
     };
@@ -206,9 +223,13 @@ mod tests {
     #[test]
     fn explicit_config_that_fails_to_parse_is_an_error_naming_the_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write(&dir, "bad.toml", "[identity]\nmode = \"toffu\"\n");
+        let path = write(
+            &dir,
+            "bad.toml",
+            "database_path = \"/tmp/x.db\"\nbind_address = \"127.0.0.1\"\nport = 7117\n\n[identity]\nmode = \"toffu\"\n",
+        );
 
-        let err = load_v0_0_2_config(Some(&path)).unwrap_err();
+        let err = load_config(Some(&path)).unwrap_err();
         assert!(
             err.contains(path.to_str().unwrap()),
             "error must name the offending file, got: {err}"
@@ -225,10 +246,10 @@ mod tests {
         let path = write(
             &dir,
             "good.toml",
-            "[server]\nserver_did_keyfile = \"/srv/keep-me.key\"\n\n[debug]\nlist_handles = true\n",
+            "database_path = \"/tmp/x.db\"\nbind_address = \"127.0.0.1\"\nport = 7117\n\n[server]\nserver_did_keyfile = \"/srv/keep-me.key\"\n\n[debug]\nlist_handles = true\n",
         );
 
-        let cfg = load_v0_0_2_config(Some(&path)).unwrap();
+        let cfg = load_config(Some(&path)).unwrap();
         // The whole point: the operator's keyfile must survive. Falling back to
         // defaults here mints a new server DID and breaks TOFU pinning.
         assert_eq!(cfg.server.server_did_keyfile, "/srv/keep-me.key");
@@ -237,8 +258,8 @@ mod tests {
 
     #[test]
     fn missing_config_flag_uses_defaults() {
-        let cfg = load_v0_0_2_config(None).unwrap();
-        assert_eq!(cfg, JigServerConfig::default());
+        let cfg = load_config(None).unwrap();
+        assert_eq!(cfg.v0_0_2(), ServerConfig::default().v0_0_2());
     }
 
     #[test]
@@ -247,7 +268,7 @@ mod tests {
         let path = dir.path().join("nope.toml");
         // A --config pointing at nothing is a typo'd path, not a request for
         // defaults.
-        assert!(load_v0_0_2_config(Some(&path)).is_err());
+        assert!(load_config(Some(&path)).is_err());
     }
 
     #[test]

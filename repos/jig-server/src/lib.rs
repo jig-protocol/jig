@@ -21,7 +21,7 @@ pub mod v0_0_2_ws;
 
 pub use config::ServerConfig;
 pub use error::{Result, ServerError};
-pub use runtime::{BlockRuntime, ExecutionConfig};
+pub use runtime::ExecutionConfig;
 pub use server::JigServer;
 pub use storage::{
     SqliteBlockStore, StoredBlock, StoredBlockSummary, StoredReceipt, StoredResource,

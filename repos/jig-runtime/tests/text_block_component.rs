@@ -16,6 +16,7 @@
 //! across hosts, so the two are held together by behaviour, not bytes.
 
 use jig_core::component_validation::{BlockWorld, ComponentProfile, validate_component};
+use jig_core::grant::Grant;
 use jig_runtime::Runtime;
 use jig_runtime::component::{
     BlockError, CompiledRenderer, ComponentRuntime, ErrorOutcome, Hlc, Invocation, Payload,
@@ -55,7 +56,7 @@ fn component_bytes() -> std::borrow::Cow<'static, [u8]> {
 fn compiled() -> (ComponentRuntime, CompiledRenderer) {
     let runtime = ComponentRuntime::new().expect("component runtime builds");
     let renderer = runtime
-        .compile_renderer(&component_bytes(), MAX_MEMORY_PAGES)
+        .compile_renderer(&component_bytes(), &Grant::empty(), MAX_MEMORY_PAGES)
         .expect("text-block component validates and compiles");
     (runtime, renderer)
 }

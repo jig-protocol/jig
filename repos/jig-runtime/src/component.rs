@@ -33,6 +33,7 @@
 
 use jig_core::block_abi::{self, WitValue};
 use jig_core::component_validation::{BlockWorld, ComponentProfile, validate_component};
+use jig_core::grant::Grant;
 use std::time::Duration;
 
 use wasmtime::component::{Component, Linker};
@@ -330,17 +331,23 @@ impl ComponentRuntime {
         EngineIdentity::of(&self.engine)
     }
 
-    /// Validate `bytes` against `jig-det-1` for the `renderer` world, then compile it.
+    /// Validate `bytes` against `jig-det-1` for the `renderer` world and `grant`, then compile it.
+    ///
+    /// Only `grant`'s imports may be imported. This linker defines none of them yet, so a renderer
+    /// that calls a granted import passes validation and then fails to instantiate.
     pub fn compile_renderer(
         &self,
         bytes: &[u8],
+        grant: &Grant,
         max_memory_pages: u32,
     ) -> Result<CompiledRenderer> {
+        let import_names = grant.import_names();
+        let granted: Vec<&str> = import_names.iter().map(String::as_str).collect();
         let report = validate_component(
             bytes,
             &ComponentProfile {
                 world: BlockWorld::Renderer,
-                granted: &[],
+                granted: &granted,
                 max_memory_pages,
             },
         )
