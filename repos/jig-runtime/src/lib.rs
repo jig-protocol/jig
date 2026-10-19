@@ -34,6 +34,7 @@
 
 // Public API modules
 pub mod api;
+pub mod component;
 pub mod config;
 pub mod error;
 pub mod payload;
