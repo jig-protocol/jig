@@ -65,18 +65,19 @@ impl Reader {
     }
 
     /// The channel's recent history, read. Departed members still in the
-    /// tree come back for tidying.
+    /// tree come back for tidying. Fails only when the server contradicts
+    /// the history this device pinned.
     pub async fn backlog(
         &self,
         who: &Identity,
         server_url: &str,
-    ) -> (Vec<DecodedBlock>, Vec<String>) {
+    ) -> Result<(Vec<DecodedBlock>, Vec<String>)> {
         let Some(secure) = &self.secure else {
-            return (
+            return Ok((
                 history::backfill(who, server_url, &self.slug, history::DEFAULT_HISTORY_LIMIT)
-                    .await,
+                    .await?,
                 Vec::new(),
-            );
+            ));
         };
         match secure.sync(&self.slug).await {
             Ok(synced) => {
@@ -87,11 +88,11 @@ impl Reader {
                     .filter(|d| d.is_message())
                     .collect();
                 lines.drain(..lines.len().saturating_sub(history::DEFAULT_HISTORY_LIMIT));
-                (lines, synced.tidy)
+                Ok((lines, synced.tidy))
             }
             Err(e) => {
                 eprintln!("warning: could not load history for {}: {e:#}", self.slug);
-                (Vec::new(), Vec::new())
+                Ok((Vec::new(), Vec::new()))
             }
         }
     }

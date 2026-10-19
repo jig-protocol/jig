@@ -80,9 +80,15 @@ F1 this means:
 Roles across a channel `key-link`, and one key package per device at custodians, are F2
 work (JEP-0005 items 7b and 21).
 
-**Open decision carried into the build:** the reference default suffix (`gigue.jig`) is not a DNS
-name. Until DJ decides, it works only through a `config` delegation, and every test uses an
-explicit config delegation.
+**Default suffix (decided by DJ, 2026-10-19):**
+- `@jig` is the default. It is `config`-rooted: clients ship a default delegation pinning the
+  project nameserver's DID.
+- `gigue.jig` is retired as the default.
+- A single-label suffix never uses `dns` discovery (JEP-0004 rule 4). The client resolver
+  refuses one without a `config` delegation (#201).
+- Tests keep using explicit config delegations.
+- Shipping the default `jig` delegation in the client config, and changing the nameserver's
+  `alias_suffix` default, belong to slice 6 (L3) and L6.
 
 ---
 

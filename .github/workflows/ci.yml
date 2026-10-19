@@ -34,11 +34,6 @@ defaults:
   run:
     working-directory: repos
 
-# jig-nameserver's config tests require this env var to construct.
-# Test value is fine; CI doesn't talk to a real nameserver.
-env:
-  JIG_NS_SECRET: ci_dummy_jig_ns_secret_not_a_real_value
-
 jobs:
   # Pull requests only: does this PR change anything a build could see? Docs
   # (`*.md` anywhere, `docs/**`) and repo metadata do not; everything else does,
@@ -249,6 +244,12 @@ jobs:
       - name: Committed artifact behaves correctly
         working-directory: repos
         run: cargo test -p jig-runtime --test text_block_payload
+      # The same check for the jig:block/renderer component (JEP-0006): it passes jig-core's
+      # component validator, agrees with `execute_pure`, and keeps the module's render_hash.
+      # build-artifact.sh rebuilds it too, so it is exercised here first for the same reason.
+      - name: Committed component behaves correctly
+        working-directory: repos
+        run: cargo test -p jig-runtime --test text_block_component
       - name: Rebuild the canonical artifact (enforces structural invariants)
         working-directory: repos
         run: ./text-block/build-artifact.sh
@@ -257,6 +258,11 @@ jobs:
         env:
           JIG_TEXT_BLOCK_WASM: target/wasm32-unknown-unknown/release/text_block.wasm
         run: cargo test -p jig-runtime --test text_block_payload
+      - name: Fresh component behaves identically
+        working-directory: repos
+        env:
+          JIG_TEXT_BLOCK_COMPONENT: target/wasm32-unknown-unknown/release/text_block.component.wasm
+        run: cargo test -p jig-runtime --test text_block_component
 
   # Nightly checks that `workspace` leaves out to keep pull request and queue
   # runs short. The nightly skips itself when no Rust source changed in the

@@ -13,14 +13,24 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use ed25519_dalek::{Signer, SigningKey};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as b64u;
+use ed25519_dalek::SigningKey;
 use jig_core::Did;
+use jig_core::naming::{self, Action, SuffixDelegation};
 use jig_nameserver::config::NameServerConfig;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-const ALIAS_SUFFIX: &str = "h10.jig";
+const ALIAS_SUFFIX: &str = "h10.example.org";
+
+/// The verified attestation in a register or resolve response body.
+fn attestation_in(body: &serde_json::Value) -> naming::Attestation {
+    let envelope = b64u
+        .decode(body["attestation"].as_str().expect("attestation field"))
+        .expect("attestation is base64url");
+    naming::Attestation::from_envelope(&envelope).expect("attestation verifies")
+}
 
 struct BinarySurface {
     addr: SocketAddr,
@@ -37,22 +47,17 @@ impl BinarySurface {
 
         let mut cfg = NameServerConfig::default();
         cfg.storage.database_path = tempdir.path().join("nameserver.db");
-        cfg.pow.server_secret = "h10-test-secret".to_string();
-        cfg.federation.enabled = false;
         cfg.v0_0_2.server.server_did_keyfile = tempdir
             .path()
             .join("nameserver.key")
             .to_string_lossy()
             .into_owned();
-        cfg.v0_0_2.nameserver.alias_suffix = ALIAS_SUFFIX.to_string();
+        cfg.v0_0_2.nameserver.alias_suffixes =
+            vec![jig_config::v0_0_2_server::SuffixConfig::new(ALIAS_SUFFIX)];
         cfg.v0_0_2.debug.list_handles = list_handles;
         cfg.validate().context("config must be valid")?;
 
-        let (router, coordinator) = jig_nameserver::server::build_app(&cfg).context("build_app")?;
-        assert!(
-            coordinator.is_none(),
-            "federation disabled — build_app must not hand back a coordinator"
-        );
+        let router = jig_nameserver::server::build_app(&cfg).context("build_app")?;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.context("bind")?;
         let addr = listener.local_addr().context("local_addr")?;
@@ -113,15 +118,39 @@ async fn build_app_serves_the_v0_0_2_alias_lifecycle() {
     assert_eq!(challenge.len(), 64, "expected a 32-byte hex nonce");
 
     // 2. POST /v1/register
+    // The nameserver's DID, from its signed suffix delegation.
+    let resp = ns
+        .client
+        .get(ns.url("/.well-known/jig-ns-delegation"))
+        .send()
+        .await
+        .expect("GET /.well-known/jig-ns-delegation");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "delegation must be mounted"
+    );
+    let body: serde_json::Value = resp.json().await.expect("delegation json");
+    let envelopes: Vec<Vec<u8>> = body["envelopes"]
+        .as_array()
+        .expect("envelopes array")
+        .iter()
+        .map(|e| b64u.decode(e.as_str().unwrap()).unwrap())
+        .collect();
+    let delegation = SuffixDelegation::from_envelopes(&envelopes).expect("delegation verifies");
+    assert_eq!(delegation.suffix, ALIAS_SUFFIX);
+    let ns_did = delegation.authorities[0].clone();
+
     let (did, key) = fresh_identity();
-    let sig = key.sign(challenge.as_bytes());
+    let expected_alias = format!("alice@{ALIAS_SUFFIX}");
+    let proof = naming::sign_proof(&key, Action::Register, &ns_did, &expected_alias, &challenge);
     let resp = ns
         .client
         .post(ns.url("/v1/register"))
         .json(&serde_json::json!({
             "did": did,
             "requested_alias": "alice",
-            "proof_of_control": base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()),
+            "proof_of_control": b64u.encode(proof),
             "challenge": challenge,
         }))
         .send()
@@ -132,13 +161,13 @@ async fn build_app_serves_the_v0_0_2_alias_lifecycle() {
         reqwest::StatusCode::OK,
         "register must be mounted"
     );
-    let attestation: serde_json::Value = resp.json().await.expect("attestation json");
-    let expected_alias = format!("alice@{ALIAS_SUFFIX}");
+    let registered: serde_json::Value = resp.json().await.expect("register json");
+    let attestation = attestation_in(&registered);
     assert_eq!(
-        attestation["alias"], expected_alias,
-        "alias suffix must come from [v0_0_2.nameserver].alias_suffix"
+        attestation.alias, expected_alias,
+        "alias suffix must come from [v0_0_2.nameserver].alias_suffixes"
     );
-    assert_eq!(attestation["did"], did);
+    assert_eq!(attestation.did, did);
 
     // 3. GET /v1/resolve/:alias
     let resp = ns
@@ -153,7 +182,15 @@ async fn build_app_serves_the_v0_0_2_alias_lifecycle() {
         "resolve must be mounted"
     );
     let resolved: serde_json::Value = resp.json().await.expect("resolve json");
-    assert_eq!(resolved["did"], did);
+    let attestation = attestation_in(&resolved);
+    assert_eq!(attestation.did, did);
+    naming::verify_binding(
+        &attestation,
+        &delegation,
+        &naming::Name::parse(&expected_alias).unwrap(),
+        chrono::Utc::now().timestamp(),
+    )
+    .expect("the served binding verifies against the served delegation");
 
     // 4. GET /v1/handles
     let resp = ns

@@ -75,8 +75,7 @@ mod tests {
     use super::*;
     use crate::v0_0_2_register::build_register_router;
     use axum::{Router, body::Body, http::Request};
-    use base64::Engine as _;
-    use ed25519_dalek::{Signer, SigningKey};
+    use ed25519_dalek::SigningKey;
     use jig_core::Did;
     use tower::ServiceExt;
 
@@ -139,21 +138,28 @@ mod tests {
     #[tokio::test]
     async fn handles_returns_registered_aliases() {
         let state = Arc::new(AppState::for_test().unwrap());
-        let combined = build_register_router(state.clone()).merge(build_handles_router(state));
+        let combined =
+            build_register_router(state.clone()).merge(build_handles_router(state.clone()));
 
         // Register two aliases
         for nick in ["dj", "deji"] {
             let (_, ch) = get_path(combined.clone(), "/v1/challenge").await;
             let challenge = ch["challenge"].as_str().unwrap().to_string();
             let (did, key) = fresh_did_and_key();
-            let sig = key.sign(challenge.as_bytes());
+            let proof = crate::v0_0_2_register::test_support::proof(
+                &key,
+                &state,
+                jig_core::naming::Action::Register,
+                &format!("{nick}@dj.jig"),
+                &challenge,
+            );
             let (status, _) = post_json(
                 combined.clone(),
                 "/v1/register",
                 serde_json::json!({
                     "did": did,
                     "requested_alias": nick,
-                    "proof_of_control": base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()),
+                    "proof_of_control": proof,
                     "challenge": challenge,
                 }),
             )

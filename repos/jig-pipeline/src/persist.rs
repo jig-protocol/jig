@@ -13,12 +13,23 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::Mutex;
 
+use crate::ingest_record::{GENESIS_PREV, IngestRecord, RecordSigner};
+
 #[derive(Debug, thiserror::Error)]
 pub enum PersistError {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// A stored value this version cannot read back.
+    #[error("corrupt store: {0}")]
+    Corrupt(String),
+    /// [`SqliteStore::normalize_alias_case`] would hand one alias to two DIDs.
+    #[error(
+        "lowercasing aliases would give `{0}` to more than one DID; \
+         resolve the conflicting alias_attestations rows by hand"
+    )]
+    AliasCaseClash(String),
 }
 
 pub type Result<T> = std::result::Result<T, PersistError>;
@@ -116,6 +127,16 @@ pub struct StoredTofuKey {
     pub locked: bool,
 }
 
+/// An alias attestation this server acted on or refused as an equivocation
+/// (JEP-0004 rule 20): the signed bytes, kept as evidence.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StoredNameEvidence {
+    pub name: String,
+    pub root_id: String,
+    pub attestation_bytes: Vec<u8>,
+    pub first_seen: i64,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StoredCursor {
     pub peer_server_url: String,
@@ -195,6 +216,21 @@ fn history_sql(with_cursor: bool) -> String {
     }
 }
 
+/// History of a sequenced channel, newest first: by the sequencer's `seq`,
+/// not the authors' clocks (TM-02). `before_seq` bounds it for paging.
+fn sequenced_history_sql(with_before: bool) -> String {
+    let columns = BLOCK_COLUMNS
+        .split(", ")
+        .map(|c| format!("b.{}", c.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let bound = if with_before { "AND r.seq < ?3" } else { "" };
+    format!(
+        "SELECT {columns} FROM ingest_records r JOIN blocks b ON b.cid = r.block_cid \
+         WHERE r.slug = ?1 {bound} ORDER BY r.seq DESC LIMIT ?2"
+    )
+}
+
 /// The statement behind [`SqliteStore::list_blocks_before`]: the page just
 /// older than a cursor block, newest first, on the same index and order.
 fn history_before_sql() -> String {
@@ -227,6 +263,93 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &st
     Ok(true)
 }
 
+/// The suffix an `alias_attestations` row is keyed by: the lowercased text
+/// after the last `@` of its alias, or `''` for a bare alias (an ingested
+/// `ns-attestation` block may carry one). Lowercased so `Bob@B.example` and
+/// `bob@b.example` share one key: one name per DID per suffix whatever the
+/// case.
+fn alias_suffix_of(alias: &str) -> String {
+    alias
+        .rsplit_once('@')
+        .map_or("", |(_, suffix)| suffix)
+        .to_ascii_lowercase()
+}
+
+/// Re-key `alias_attestations` from `(did, ns_did)` to `(did, ns_did, suffix)`
+/// so one DID can hold a name under each suffix a nameserver serves.
+///
+/// SQLite cannot change a primary key in place, so a database that predates
+/// the `suffix` column has its table rebuilt in one transaction, with each
+/// row's suffix derived from its alias. A table that already has the column is
+/// left alone, which makes this idempotent.
+fn rebuild_alias_attestations_with_suffix(conn: &Connection) -> Result<bool> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('alias_attestations') WHERE name = 'suffix')",
+        [],
+        |r| r.get(0),
+    )?;
+    if present {
+        return Ok(false);
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE alias_attestations_new (
+             did                  TEXT NOT NULL,
+             alias                TEXT NOT NULL,
+             ns_did               TEXT NOT NULL,
+             valid_from           INTEGER NOT NULL,
+             valid_until          INTEGER NOT NULL,
+             attestation_bytes    BLOB NOT NULL,
+             suffix               TEXT NOT NULL DEFAULT '',
+             PRIMARY KEY (did, ns_did, suffix)
+         );",
+    )?;
+    {
+        let mut read = tx.prepare(
+            "SELECT did, alias, ns_did, valid_from, valid_until, attestation_bytes
+             FROM alias_attestations",
+        )?;
+        let mut write = tx.prepare(
+            "INSERT INTO alias_attestations_new
+                 (did, alias, ns_did, valid_from, valid_until, attestation_bytes, suffix)
+             VALUES (?,?,?,?,?,?,?)",
+        )?;
+        let rows = read
+            .query_map([], row_to_stored_alias_attestation)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for a in rows {
+            write.execute(params![
+                a.did,
+                a.alias,
+                a.ns_did,
+                a.valid_from,
+                a.valid_until,
+                a.attestation_bytes,
+                alias_suffix_of(&a.alias)
+            ])?;
+        }
+    }
+    tx.execute_batch(
+        "DROP TABLE alias_attestations;
+         ALTER TABLE alias_attestations_new RENAME TO alias_attestations;",
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+fn row_to_stored_alias_attestation(
+    r: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredAliasAttestation> {
+    Ok(StoredAliasAttestation {
+        did: r.get(0)?,
+        alias: r.get(1)?,
+        ns_did: r.get(2)?,
+        valid_from: r.get(3)?,
+        valid_until: r.get(4)?,
+        attestation_bytes: r.get(5)?,
+    })
+}
+
 fn row_to_stored_channel(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChannel> {
     Ok(StoredChannel {
         id: r.get(0)?,
@@ -250,6 +373,47 @@ pub enum MembershipChange {
         channel_id: String,
         member_did: String,
     },
+}
+
+/// Give `block_cid` the next entry of its channel's chain, signed by
+/// `signer`, inside the caller's transaction. `seq` and `prev` are read from
+/// the chain as stored under the same lock, so two blocks can never share one.
+fn sequence_on(
+    conn: &Connection,
+    slug: &str,
+    block_cid: &str,
+    signer: &RecordSigner<'_>,
+) -> Result<IngestRecord> {
+    let last: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT record FROM ingest_records WHERE channel_id = ? ORDER BY seq DESC LIMIT 1",
+            [signer.channel_id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let (seq, prev) = match last {
+        None => (0, GENESIS_PREV),
+        Some(bytes) => {
+            let last = IngestRecord::decode(&bytes)
+                .map_err(|e| PersistError::Corrupt(format!("ingest record: {e}")))?;
+            (last.seq + 1, last.hash())
+        }
+    };
+    let record = signer
+        .sign(seq, block_cid, prev)
+        .map_err(|e| PersistError::Corrupt(format!("cannot sequence {block_cid}: {e}")))?;
+    conn.execute(
+        "INSERT INTO ingest_records (block_cid, channel_id, slug, seq, record)
+         VALUES (?,?,?,?,?)",
+        params![
+            block_cid,
+            record.channel_id,
+            slug,
+            seq as i64,
+            record.encode()
+        ],
+    )?;
+    Ok(record)
 }
 
 fn insert_block_on(conn: &Connection, b: &StoredBlock) -> Result<()> {
@@ -458,7 +622,16 @@ impl SqliteStore {
                 valid_from           INTEGER NOT NULL,
                 valid_until          INTEGER NOT NULL,
                 attestation_bytes    BLOB NOT NULL,
-                PRIMARY KEY (did, ns_did)
+                suffix               TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (did, ns_did, suffix)
+            );
+
+            CREATE TABLE IF NOT EXISTS name_evidence (
+                name                 TEXT NOT NULL,
+                root_id              TEXT NOT NULL,
+                attestation_bytes    BLOB NOT NULL,
+                first_seen           INTEGER NOT NULL,
+                PRIMARY KEY (name, root_id, attestation_bytes)
             );
 
             CREATE TABLE IF NOT EXISTS tofu_keys (
@@ -487,6 +660,23 @@ impl SqliteStore {
             "#,
         )?;
 
+        // One signed record per block of a channel this server sequences
+        // (JEP-0002 rule 9). `slug` is how blocks name their channel;
+        // `channel_id` is the channel-create CID the record signs.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS ingest_records (
+                block_cid  TEXT PRIMARY KEY REFERENCES blocks(cid),
+                channel_id TEXT NOT NULL,
+                slug       TEXT NOT NULL,
+                seq        INTEGER NOT NULL,
+                record     BLOB NOT NULL,
+                UNIQUE (channel_id, seq)
+            );
+            CREATE INDEX IF NOT EXISTS ingest_records_slug_seq ON ingest_records(slug, seq);
+            "#,
+        )?;
+
         // `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already
         // exists, so columns added after a database was first created must be
         // ALTERed in. Every already-deployed server has a `channels` table
@@ -494,6 +684,7 @@ impl SqliteStore {
         add_column_if_missing(conn, "channels", "archived_at", "INTEGER")?;
         // Every channel created before v0.2 was unencrypted.
         add_column_if_missing(conn, "channels", "suite", "TEXT NOT NULL DEFAULT 'none'")?;
+        rebuild_alias_attestations_with_suffix(conn)?;
         Ok(())
     }
 
@@ -512,6 +703,149 @@ impl SqliteStore {
 
     pub fn insert_block(&self, b: &StoredBlock) -> Result<()> {
         insert_block_on(&self.conn.lock().expect("poisoned"), b)
+    }
+
+    /// Store `b` and the next record of its channel's chain in one
+    /// transaction. `b.channel_id` must be the channel's slug.
+    pub fn insert_block_sequenced(
+        &self,
+        b: &StoredBlock,
+        signer: &RecordSigner<'_>,
+    ) -> Result<IngestRecord> {
+        let slug = b
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| PersistError::Corrupt("a sequenced block names no channel".into()))?;
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        insert_block_on(&tx, b)?;
+        let record = sequence_on(&tx, slug, &b.cid, signer)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    /// The record of `block_cid`, when this server sequenced it.
+    pub fn get_ingest_record(&self, block_cid: &str) -> Result<Option<IngestRecord>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let bytes: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT record FROM ingest_records WHERE block_cid = ?",
+                [block_cid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        bytes
+            .map(|b| {
+                IngestRecord::decode(&b)
+                    .map_err(|e| PersistError::Corrupt(format!("ingest record: {e}")))
+            })
+            .transpose()
+    }
+
+    /// Records of `slug` from `from_seq`, in order, at most `limit`
+    /// ([`MAX_HISTORY_LIMIT`] at most). Records carry no content, so a client
+    /// can check a whole chain without fetching every block.
+    pub fn list_ingest_records(
+        &self,
+        slug: &str,
+        from_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<IngestRecord>> {
+        let limit = limit.min(MAX_HISTORY_LIMIT) as i64;
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT record FROM ingest_records WHERE slug = ?1 AND seq >= ?2
+             ORDER BY seq ASC LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![slug, from_seq as i64, limit], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.iter()
+            .map(|b| {
+                IngestRecord::decode(b)
+                    .map_err(|e| PersistError::Corrupt(format!("ingest record: {e}")))
+            })
+            .collect()
+    }
+
+    /// Give every block of a channel this server holds that has no record
+    /// one, signed by `key`, continuing each channel's chain: the
+    /// channel-create first, then the rest in their old history order.
+    /// Returns how many records it wrote. Run at boot, so a store from
+    /// before records existed is sequenced once.
+    pub fn backfill_ingest_records(&self, key: &ed25519_dalek::SigningKey) -> Result<usize> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let channels: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT id, slug FROM channels")?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        // A channel holding records in an older format is re-signed whole:
+        // its chain cannot mix formats, and pre-release data is re-sequenced
+        // rather than migrated.
+        let stale: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT channel_id, record FROM ingest_records")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut stale: Vec<String> = rows
+                .into_iter()
+                .filter(|(_, record)| {
+                    IngestRecord::decode(record)
+                        .map_or(true, |r| r.format != crate::ingest_record::RECORD_FORMAT)
+                })
+                .map(|(channel_id, _)| channel_id)
+                .collect();
+            stale.sort();
+            stale.dedup();
+            stale
+        };
+        for channel_id in &stale {
+            tx.execute(
+                "DELETE FROM ingest_records WHERE channel_id = ?",
+                [channel_id],
+            )?;
+        }
+        let mut written = 0;
+        for (channel_id, slug) in channels {
+            let unsequenced: Vec<(String, i64)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT b.cid, b.posted_at FROM blocks b
+                       LEFT JOIN ingest_records r ON r.block_cid = b.cid
+                      WHERE b.channel_id = ?1 AND r.block_cid IS NULL
+                      ORDER BY (b.cid = ?2) DESC, b.hlc_wall_ms, b.hlc_logical,
+                               b.hlc_origin, b.cid",
+                )?;
+                stmt.query_map(params![slug, channel_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (cid, posted_at) in unsequenced {
+                let signer = RecordSigner {
+                    channel_id: channel_id.clone(),
+                    key,
+                    ingest_wall_ms: u64::try_from(posted_at).unwrap_or(0).saturating_mul(1000),
+                    ingest_logical: 0,
+                };
+                sequence_on(&tx, &slug, &cid, &signer)?;
+                written += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// Whether `slug`'s history is sequenced, and so ordered by `seq`.
+    fn is_sequenced(conn: &Connection, slug: &str) -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ingest_records WHERE slug = ?)",
+            [slug],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn get_block(&self, cid: &str) -> Result<Option<StoredBlock>> {
@@ -552,6 +886,17 @@ impl SqliteStore {
     ) -> Result<Vec<StoredBlock>> {
         let limit = limit.min(MAX_HISTORY_LIMIT) as i64;
         let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
+        // A sequenced channel's newest window is by `seq`. The HLC cursor
+        // keeps its old meaning (forward paging in author-clock order) until
+        // its callers move to `seq`.
+        if since_hlc.is_none() && Self::is_sequenced(&conn, slug)? {
+            let mut stmt = conn.prepare(&sequenced_history_sql(false))?;
+            let mut newest_first = stmt
+                .query_map(params![slug, limit], row_to_stored_block)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            newest_first.reverse();
+            return Ok(newest_first);
+        }
         let mut stmt = conn.prepare(&history_sql(since_hlc.is_some()))?;
 
         let blocks = match since_hlc {
@@ -580,9 +925,10 @@ impl SqliteStore {
     /// is unknown or belongs to another channel, so a caller cannot use the
     /// cursor to learn where a CID lives.
     ///
-    /// Older and newer are history order — (HLC wall, logical, origin, CID) —
-    /// the same total order [`Self::list_blocks_by_channel`] returns, so pages
-    /// join up with no gap and no overlap.
+    /// Older and newer are history order — `seq` on a sequenced channel, else
+    /// (HLC wall, logical, origin, CID) — the same total order
+    /// [`Self::list_blocks_by_channel`] returns, so pages join up with no gap
+    /// and no overlap.
     pub fn list_blocks_before(
         &self,
         slug: &str,
@@ -596,7 +942,16 @@ impl SqliteStore {
             return Ok(None);
         }
         let limit = limit.min(MAX_HISTORY_LIMIT) as i64;
+        let cursor_seq = self.get_ingest_record(&cursor.cid)?.map(|r| r.seq);
         let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
+        if let Some(cursor_seq) = cursor_seq {
+            let mut stmt = conn.prepare(&sequenced_history_sql(true))?;
+            let mut newest_first = stmt
+                .query_map(params![slug, limit, cursor_seq as i64], row_to_stored_block)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            newest_first.reverse();
+            return Ok(Some(newest_first));
+        }
         let mut stmt = conn.prepare(&history_before_sql())?;
         let mut newest_first = stmt
             .query_map(
@@ -882,8 +1237,11 @@ impl SqliteStore {
     /// as stale; a block stored without the advance is a commit members apply
     /// and the server never did. Either wedges the channel for good.
     ///
-    /// Returns `false` — with nothing written — when another commit moved the
-    /// group off `from_epoch` first.
+    /// With `signer`, the block also gets the next record of the channel's
+    /// chain in the same transaction.
+    ///
+    /// Returns `None` — with nothing written — when another commit moved the
+    /// group off `from_epoch` first, else the record written, if any.
     #[allow(clippy::too_many_arguments)]
     pub fn land_mls_commit(
         &self,
@@ -895,7 +1253,8 @@ impl SqliteStore {
         membership: &MembershipChange,
         block: &StoredBlock,
         receipt: &StoredReceipt,
-    ) -> Result<bool> {
+        signer: Option<&RecordSigner<'_>>,
+    ) -> Result<Option<Option<IngestRecord>>> {
         let mut conn = self.conn.lock().expect("poisoned");
         let tx = conn.transaction()?;
         // `group_info` replaces the stored one even when `None`: a group info
@@ -907,7 +1266,7 @@ impl SqliteStore {
             params![slug, from_epoch as i64, state, to_epoch as i64, group_info],
         )?;
         if advanced == 0 {
-            return Ok(false);
+            return Ok(None);
         }
         match membership {
             MembershipChange::None => {}
@@ -924,8 +1283,11 @@ impl SqliteStore {
         }
         insert_block_on(&tx, block)?;
         insert_receipt_on(&tx, receipt)?;
+        let record = signer
+            .map(|signer| sequence_on(&tx, slug, &block.cid, signer))
+            .transpose()?;
         tx.commit()?;
-        Ok(true)
+        Ok(Some(record))
     }
 
     /// Store a validated key package. Returns `false` if this package (by
@@ -1060,11 +1422,14 @@ impl SqliteStore {
 
     // --- alias attestations ---
 
+    /// Insert or replace `a.did`'s binding under `a.alias`'s suffix at
+    /// `a.ns_did`. One DID holds at most one name per suffix per nameserver.
     pub fn upsert_alias_attestation(&self, a: &StoredAliasAttestation) -> Result<()> {
         self.conn.lock().expect("poisoned").execute(
-            "INSERT INTO alias_attestations (did, alias, ns_did, valid_from, valid_until, attestation_bytes)
-             VALUES (?,?,?,?,?,?)
-             ON CONFLICT(did, ns_did) DO UPDATE SET
+            "INSERT INTO alias_attestations
+                 (did, alias, ns_did, valid_from, valid_until, attestation_bytes, suffix)
+             VALUES (?,?,?,?,?,?,?)
+             ON CONFLICT(did, ns_did, suffix) DO UPDATE SET
                 alias = excluded.alias,
                 valid_from = excluded.valid_from,
                 valid_until = excluded.valid_until,
@@ -1075,7 +1440,8 @@ impl SqliteStore {
                 a.ns_did,
                 a.valid_from,
                 a.valid_until,
-                a.attestation_bytes
+                a.attestation_bytes,
+                alias_suffix_of(&a.alias)
             ],
         )?;
         Ok(())
@@ -1093,31 +1459,101 @@ impl SqliteStore {
              WHERE alias = ? AND valid_from <= ? AND valid_until > ?
              ORDER BY valid_from DESC LIMIT 1",
             params![alias, as_of, as_of],
-            |r| {
-                Ok(StoredAliasAttestation {
-                    did: r.get(0)?,
-                    alias: r.get(1)?,
-                    ns_did: r.get(2)?,
-                    valid_from: r.get(3)?,
-                    valid_until: r.get(4)?,
-                    attestation_bytes: r.get(5)?,
-                })
-            },
+            row_to_stored_alias_attestation,
         )
         .optional()
         .map_err(Into::into)
     }
 
-    /// Immediately expire an attestation for a specific (did, ns_did) pair by
-    /// setting valid_until = as_of. Called during key rotation to ensure the
-    /// old-DID row no longer appears as a current binding for its alias.
-    pub fn expire_alias_attestation(&self, did: &str, ns_did: &str, as_of: i64) -> Result<()> {
+    /// The alias `did` holds under `suffix` at `ns_did` with a binding valid at
+    /// `as_of`, if any. `suffix` is matched case-insensitively, like the key.
+    pub fn alias_held_by(
+        &self,
+        did: &str,
+        ns_did: &str,
+        suffix: &str,
+        as_of: i64,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("poisoned");
+        conn.query_row(
+            "SELECT alias FROM alias_attestations
+             WHERE did = ? AND ns_did = ? AND suffix = ? AND valid_from <= ? AND valid_until > ?",
+            params![did, ns_did, suffix.to_ascii_lowercase(), as_of, as_of],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Immediately expire `did`'s binding under `alias`'s suffix at `ns_did`
+    /// by setting valid_until = as_of. Called during key rotation so the
+    /// old-DID row no longer appears as a current binding for its alias; the
+    /// same DID's names under other suffixes are untouched.
+    pub fn expire_alias_attestation(
+        &self,
+        did: &str,
+        ns_did: &str,
+        alias: &str,
+        as_of: i64,
+    ) -> Result<()> {
         self.conn.lock().expect("poisoned").execute(
             "UPDATE alias_attestations SET valid_until = ?
-             WHERE did = ? AND ns_did = ?",
-            rusqlite::params![as_of, did, ns_did],
+             WHERE did = ? AND ns_did = ? AND suffix = ?",
+            rusqlite::params![as_of, did, ns_did, alias_suffix_of(alias)],
         )?;
         Ok(())
+    }
+
+    /// Lowercase `alias` on the rows `is_legacy` selects by their
+    /// `attestation_bytes`, in one transaction. Returns how many rows changed.
+    ///
+    /// This store does not know any nameserver's formats: the caller decides
+    /// which rows are safe to rewrite, namely those it re-signs from their
+    /// columns on read. A row's key cannot change, since `suffix` is already
+    /// stored lowercase. Fails, changing nothing, when a lowercased alias
+    /// would then be held by two different DIDs at the same `ns_did` with
+    /// bindings valid at `as_of`. Only the aliases this call rewrote are
+    /// checked, so an unrelated existing conflict does not block it.
+    pub fn normalize_alias_case(
+        &self,
+        is_legacy: impl Fn(&[u8]) -> bool,
+        as_of: i64,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().expect("poisoned");
+        let tx = conn.unchecked_transaction()?;
+        let rows = tx
+            .prepare(
+                "SELECT did, alias, ns_did, valid_from, valid_until, attestation_bytes
+                 FROM alias_attestations",
+            )?
+            .query_map([], row_to_stored_alias_attestation)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut rewritten = Vec::new();
+        for a in rows {
+            let lower = a.alias.to_ascii_lowercase();
+            if lower == a.alias || !is_legacy(&a.attestation_bytes) {
+                continue;
+            }
+            tx.execute(
+                "UPDATE alias_attestations SET alias = ?
+                 WHERE did = ? AND ns_did = ? AND suffix = ?",
+                params![lower, a.did, a.ns_did, alias_suffix_of(&a.alias)],
+            )?;
+            rewritten.push((a.ns_did, lower));
+        }
+        for (ns_did, alias) in &rewritten {
+            let holders: i64 = tx.query_row(
+                "SELECT COUNT(DISTINCT did) FROM alias_attestations
+                 WHERE ns_did = ?1 AND alias = ?2 AND valid_from <= ?3 AND valid_until > ?3",
+                params![ns_did, alias, as_of],
+                |r| r.get(0),
+            )?;
+            if holders > 1 {
+                return Err(PersistError::AliasCaseClash(alias.clone()));
+            }
+        }
+        tx.commit()?;
+        Ok(rewritten.len())
     }
 
     /// List all currently-valid attestations (valid_from <= as_of < valid_until).
@@ -1131,16 +1567,10 @@ impl SqliteStore {
              ORDER BY alias ASC",
         )?;
         let rows = stmt
-            .query_map(rusqlite::params![as_of, as_of], |r| {
-                Ok(StoredAliasAttestation {
-                    did: r.get(0)?,
-                    alias: r.get(1)?,
-                    ns_did: r.get(2)?,
-                    valid_from: r.get(3)?,
-                    valid_until: r.get(4)?,
-                    attestation_bytes: r.get(5)?,
-                })
-            })?
+            .query_map(
+                rusqlite::params![as_of, as_of],
+                row_to_stored_alias_attestation,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -1172,6 +1602,38 @@ impl SqliteStore {
             params![t.local_nickname, t.did, t.first_seen_at, t.locked as i64],
         )?;
         Ok(())
+    }
+
+    // --- name evidence ---
+
+    /// Keep an attestation as evidence. Recording the same bytes again keeps
+    /// the first `first_seen`.
+    pub fn record_name_evidence(&self, e: &StoredNameEvidence) -> Result<()> {
+        self.conn.lock().expect("poisoned").execute(
+            "INSERT OR IGNORE INTO name_evidence (name, root_id, attestation_bytes, first_seen)
+             VALUES (?,?,?,?)",
+            params![e.name, e.root_id, e.attestation_bytes, e.first_seen],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_name_evidence(&self, name: &str) -> Result<Vec<StoredNameEvidence>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT name, root_id, attestation_bytes, first_seen FROM name_evidence
+             WHERE name = ? ORDER BY first_seen, attestation_bytes",
+        )?;
+        let rows = stmt
+            .query_map([name], |r| {
+                Ok(StoredNameEvidence {
+                    name: r.get(0)?,
+                    root_id: r.get(1)?,
+                    attestation_bytes: r.get(2)?,
+                    first_seen: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     // --- subscription cursors ---
@@ -1299,6 +1761,164 @@ mod tests {
         }
     }
 
+    fn test_signer(key: &ed25519_dalek::SigningKey, wall: u64) -> RecordSigner<'_> {
+        RecordSigner {
+            channel_id: c("bafy_create"),
+            key,
+            ingest_wall_ms: wall,
+            ingest_logical: 0,
+        }
+    }
+
+    /// A real CIDv1 standing for `label`: records sign only CIDs.
+    fn c(label: &str) -> String {
+        crate::ingest_record::label_cid(label)
+    }
+
+    fn at_hlc(cid: &str, wall: u64) -> StoredBlock {
+        StoredBlock {
+            hlc_wall_ms: wall,
+            ..sample_block(cid, Some("#seq"))
+        }
+    }
+
+    /// A sequenced channel's chain starts at 0, links each record to the
+    /// last, and orders history by `seq` whatever the authors' clocks say.
+    #[test]
+    fn a_sequenced_channel_is_ordered_by_its_chain() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let did =
+            jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
+        // Each author claims an earlier time than the last.
+        let order = [c("bafy_create"), c("bafy_b"), c("bafy_c"), c("bafy_d")];
+        let mut records = Vec::new();
+        for (i, cid) in order.iter().enumerate() {
+            let block = at_hlc(cid, 1_000 - i as u64 * 10);
+            records.push(
+                store
+                    .insert_block_sequenced(&block, &test_signer(&key, 5_000 + i as u64))
+                    .unwrap(),
+            );
+        }
+        assert!(records[0].is_genesis());
+        for pair in records.windows(2) {
+            assert!(pair[1].follows(&pair[0]));
+        }
+        for record in &records {
+            record.verify(&did).unwrap();
+        }
+        assert_eq!(
+            store.get_ingest_record(&order[2]).unwrap().as_ref(),
+            Some(&records[2])
+        );
+
+        let history = block_cids(store.list_blocks_by_channel("#seq", 50, None).unwrap());
+        assert_eq!(history, order.to_vec(), "history follows seq, not hlc_ts");
+        let newest_two = block_cids(store.list_blocks_by_channel("#seq", 2, None).unwrap());
+        assert_eq!(newest_two, order[2..].to_vec());
+        let older = block_cids(
+            store
+                .list_blocks_before("#seq", 2, &order[2])
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(older, order[..2].to_vec(), "paging back follows seq too");
+
+        let from_one = store.list_ingest_records("#seq", 1, 2).unwrap();
+        assert_eq!(from_one, records[1..3].to_vec());
+    }
+
+    fn block_cids(blocks: Vec<StoredBlock>) -> Vec<String> {
+        blocks.into_iter().map(|b| b.cid).collect()
+    }
+
+    /// Blocks stored before records existed get them once, continuing any
+    /// chain already there, with the channel-create first.
+    #[test]
+    fn backfill_sequences_a_store_once() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        store
+            .upsert_channel(&StoredChannel {
+                id: c("bafy_create"),
+                slug: "#seq".to_string(),
+                visibility: "open".to_string(),
+                created_at: 0,
+                owner_did: "did:jig:zOwner".to_string(),
+                suite: "none".to_string(),
+            })
+            .unwrap();
+        // A post whose author's clock runs before the channel's creation.
+        store
+            .insert_block(&at_hlc(&c("bafy_early_post"), 10))
+            .unwrap();
+        store.insert_block(&at_hlc(&c("bafy_create"), 500)).unwrap();
+        store
+            .insert_block(&at_hlc(&c("bafy_late_post"), 900))
+            .unwrap();
+
+        assert_eq!(store.backfill_ingest_records(&key).unwrap(), 3);
+        assert_eq!(store.backfill_ingest_records(&key).unwrap(), 0, "only once");
+        let chain = store.list_ingest_records("#seq", 0, 50).unwrap();
+        let order: Vec<String> = chain.iter().map(|r| r.block_cid.clone()).collect();
+        assert_eq!(
+            order,
+            [c("bafy_create"), c("bafy_early_post"), c("bafy_late_post")]
+        );
+        assert!(chain[0].is_genesis());
+        assert!(chain[1].follows(&chain[0]) && chain[2].follows(&chain[1]));
+
+        // A later block continues the same chain.
+        let next = store
+            .insert_block_sequenced(&at_hlc(&c("bafy_next"), 1_000), &test_signer(&key, 9_000))
+            .unwrap();
+        assert!(next.follows(&chain[2]));
+    }
+
+    /// Records left in an older format re-sign the channel's whole chain at
+    /// boot, so no chain mixes formats.
+    #[test]
+    fn backfill_re_signs_a_chain_in_an_older_format() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        store
+            .upsert_channel(&StoredChannel {
+                id: c("bafy_create"),
+                slug: "#seq".to_string(),
+                visibility: "open".to_string(),
+                created_at: 0,
+                owner_did: "did:jig:zOwner".to_string(),
+                suite: "none".to_string(),
+            })
+            .unwrap();
+        store.insert_block(&at_hlc(&c("bafy_create"), 500)).unwrap();
+        store.insert_block(&at_hlc(&c("bafy_post"), 900)).unwrap();
+        assert_eq!(store.backfill_ingest_records(&key).unwrap(), 2);
+
+        let mut old = store.list_ingest_records("#seq", 1, 1).unwrap().remove(0);
+        old.format = "jig-ingest-v1".to_string();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE ingest_records SET record = ?1 WHERE block_cid = ?2",
+                rusqlite::params![old.encode(), c("bafy_post")],
+            )
+            .unwrap();
+
+        assert_eq!(store.backfill_ingest_records(&key).unwrap(), 2);
+        let chain = store.list_ingest_records("#seq", 0, 50).unwrap();
+        let did =
+            jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
+        for record in &chain {
+            assert_eq!(record.format, crate::ingest_record::RECORD_FORMAT);
+            record.verify(&did).unwrap();
+        }
+        assert!(chain[1].follows(&chain[0]));
+    }
+
     fn sample_receipt(
         cid: &str,
         block_cid: &str,
@@ -1419,7 +2039,7 @@ mod tests {
         store.insert_block(&block).unwrap();
         assert!(
             store
-                .land_mls_commit("#sealed", 0, b"s1", 1, None, &add, &block, &receipt)
+                .land_mls_commit("#sealed", 0, b"s1", 1, None, &add, &block, &receipt, None)
                 .is_err()
         );
         let g = store.get_mls_group("#sealed").unwrap().unwrap();
@@ -1438,8 +2058,9 @@ mod tests {
         };
         assert!(
             store
-                .land_mls_commit("#sealed", 0, b"s1", 1, None, &add, &fresh, &receipt)
+                .land_mls_commit("#sealed", 0, b"s1", 1, None, &add, &fresh, &receipt, None)
                 .unwrap()
+                .is_some()
         );
         let g = store.get_mls_group("#sealed").unwrap().unwrap();
         assert_eq!(g.epoch, 1);
@@ -1449,9 +2070,10 @@ mod tests {
         );
         assert_eq!(store.list_members("ch").unwrap().len(), 1);
         assert!(
-            !store
-                .land_mls_commit("#sealed", 0, b"sX", 1, None, &add, &fresh, &receipt)
-                .unwrap(),
+            store
+                .land_mls_commit("#sealed", 0, b"sX", 1, None, &add, &fresh, &receipt, None)
+                .unwrap()
+                .is_none(),
             "a commit from a passed epoch writes nothing"
         );
     }
@@ -2291,5 +2913,258 @@ mod tests {
                 "ORDER BY is not satisfied by the index: {plan}\nsql: {sql}"
             );
         }
+    }
+
+    fn att(did: &str, alias: &str, bytes: &[u8]) -> StoredAliasAttestation {
+        StoredAliasAttestation {
+            did: did.into(),
+            alias: alias.into(),
+            ns_did: "did:jig:zNs".into(),
+            valid_from: 0,
+            valid_until: 2000,
+            attestation_bytes: bytes.to_vec(),
+        }
+    }
+
+    fn alias_rows(conn: &Connection) -> Vec<(String, String, String)> {
+        conn.prepare("SELECT did, alias, suffix FROM alias_attestations ORDER BY did, suffix")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    /// A nameserver database from before suffixes keyed its aliases by
+    /// `(did, ns_did)`. Migration rebuilds the table keyed by suffix and keeps
+    /// every row, and running it again changes nothing.
+    #[test]
+    fn migrate_rekeys_a_pre_existing_alias_table_by_suffix() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE alias_attestations (
+                 did TEXT NOT NULL, alias TEXT NOT NULL, ns_did TEXT NOT NULL,
+                 valid_from INTEGER NOT NULL, valid_until INTEGER NOT NULL,
+                 attestation_bytes BLOB NOT NULL,
+                 PRIMARY KEY (did, ns_did)
+             );
+             INSERT INTO alias_attestations VALUES
+                 ('did:jig:zA', 'Alice@dj.jig', 'did:jig:zNs', 0, 2000, x'7b7d'),
+                 ('did:jig:zB', 'bare', 'did:jig:zNs', 0, 2000, x'7b7d');",
+        )
+        .unwrap();
+
+        SqliteStore::migrate(&conn).unwrap();
+        let once = alias_rows(&conn);
+        SqliteStore::migrate(&conn).unwrap();
+        assert_eq!(alias_rows(&conn), once, "a second run is a no-op");
+        assert_eq!(
+            once,
+            [
+                ("did:jig:zA".into(), "Alice@dj.jig".into(), "dj.jig".into()),
+                ("did:jig:zB".into(), "bare".into(), "".into()),
+            ]
+        );
+
+        let pk: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM pragma_table_info('alias_attestations') WHERE pk > 0 ORDER BY pk",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(pk, ["did", "ns_did", "suffix"]);
+    }
+
+    #[test]
+    fn one_did_holds_a_name_per_suffix() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "dj@a.example", b"1"))
+            .unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "dj@b.example", b"2"))
+            .unwrap();
+        // Same suffix again replaces that suffix's row only.
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "deejay@a.example", b"3"))
+            .unwrap();
+
+        assert!(
+            store
+                .find_alias_attestation("dj@a.example", 1000)
+                .unwrap()
+                .is_none()
+        );
+        let a = store
+            .find_alias_attestation("deejay@a.example", 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.attestation_bytes, b"3");
+        let b = store
+            .find_alias_attestation("dj@b.example", 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.attestation_bytes, b"2");
+
+        let held = |suffix| {
+            store
+                .alias_held_by("did:jig:zA", "did:jig:zNs", suffix, 1000)
+                .unwrap()
+        };
+        assert_eq!(held("a.example").as_deref(), Some("deejay@a.example"));
+        assert_eq!(held("b.example").as_deref(), Some("dj@b.example"));
+        assert_eq!(held("c.example"), None);
+        assert_eq!(held("B.Example").as_deref(), Some("dj@b.example"));
+    }
+
+    #[test]
+    fn expiring_a_name_leaves_the_same_did_s_other_suffixes() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "dj@a.example", b"1"))
+            .unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "dj@b.example", b"2"))
+            .unwrap();
+        store
+            .expire_alias_attestation("did:jig:zA", "did:jig:zNs", "dj@a.example", 500)
+            .unwrap();
+        assert!(
+            store
+                .find_alias_attestation("dj@a.example", 1000)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .find_alias_attestation("dj@b.example", 1000)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn normalize_alias_case_rewrites_only_the_rows_the_caller_selects() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "Alice@A.example", b"legacy"))
+            .unwrap();
+        // Signed rows are never rewritten, even if their alias had capitals.
+        store
+            .upsert_alias_attestation(&att("did:jig:zB", "Bob@b.example", b"signed"))
+            .unwrap();
+        let before = store.find_alias_attestation("Bob@b.example", 1000).unwrap();
+
+        let changed = store
+            .normalize_alias_case(|bytes| bytes == b"legacy", 1000)
+            .unwrap();
+        assert_eq!(changed, 1);
+        let alice = store
+            .find_alias_attestation("alice@a.example", 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(alice.attestation_bytes, b"legacy");
+        assert_eq!(
+            store.find_alias_attestation("Bob@b.example", 1000).unwrap(),
+            before,
+            "a signed row comes out byte-identical"
+        );
+        let conn = store.conn.lock().unwrap();
+        assert!(alias_rows(&conn).contains(&(
+            "did:jig:zA".into(),
+            "alice@a.example".into(),
+            "a.example".into()
+        )));
+        assert!(
+            alias_rows(&conn).contains(&(
+                "did:jig:zB".into(),
+                "Bob@b.example".into(),
+                "b.example".into()
+            )),
+            "the signed row's key is lowercase, its alias untouched"
+        );
+        drop(conn);
+        assert_eq!(
+            store.normalize_alias_case(|_| true, 1000).unwrap(),
+            1,
+            "Bob, once allowed"
+        );
+        assert_eq!(
+            store.normalize_alias_case(|_| true, 1000).unwrap(),
+            0,
+            "idempotent"
+        );
+    }
+
+    #[test]
+    fn normalize_alias_case_refuses_to_merge_two_holders() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "Alice@a.example", b"x"))
+            .unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zB", "alice@a.example", b"x"))
+            .unwrap();
+        let conn = store.conn.lock().unwrap();
+        let before = alias_rows(&conn);
+        drop(conn);
+
+        let err = store.normalize_alias_case(|_| true, 1000).unwrap_err();
+        assert!(
+            matches!(&err, PersistError::AliasCaseClash(a) if a == "alice@a.example"),
+            "{err}"
+        );
+        let conn = store.conn.lock().unwrap();
+        assert_eq!(
+            alias_rows(&conn),
+            before,
+            "nothing changed, zB's row included"
+        );
+    }
+
+    #[test]
+    fn normalize_alias_case_ignores_conflicts_it_did_not_create() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        // The same alias at two different nameservers is not a clash.
+        let mut other_ns = att("did:jig:zB", "alice@a.example", b"x");
+        other_ns.ns_did = "did:jig:zOtherNs".into();
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "Alice@a.example", b"x"))
+            .unwrap();
+        store.upsert_alias_attestation(&other_ns).unwrap();
+        // An existing conflict between two rows it does not rewrite.
+        store
+            .upsert_alias_attestation(&att("did:jig:zC", "carol@a.example", b"x"))
+            .unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zD", "carol@a.example", b"x"))
+            .unwrap();
+
+        assert_eq!(store.normalize_alias_case(|_| true, 1000).unwrap(), 1);
+    }
+
+    /// The suffix key is lowercase, so a DID's `Bob@B.example` and
+    /// `bob@b.example` are one name, not two.
+    #[test]
+    fn one_name_per_suffix_holds_whatever_the_case() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "Bob@B.example", b"1"))
+            .unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "bob@b.example", b"2"))
+            .unwrap();
+        let conn = store.conn.lock().unwrap();
+        assert_eq!(
+            alias_rows(&conn),
+            [(
+                "did:jig:zA".into(),
+                "bob@b.example".into(),
+                "b.example".into()
+            )]
+        );
     }
 }

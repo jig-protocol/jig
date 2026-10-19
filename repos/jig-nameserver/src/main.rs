@@ -33,6 +33,15 @@ enum Command {
         port: Option<u16>,
     },
 
+    /// Write a new nameserver signing key and print only its DID. For a key
+    /// ceremony: run it offline and record the DID before any server exists.
+    /// Never overwrites an existing file.
+    Keygen {
+        /// Where to write the key (created 0600)
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+
     /// Analytics commands
     Analyze {
         #[command(subcommand)]
@@ -125,17 +134,33 @@ impl From<TimeRangeArg> for TimeRange {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
+    // Before any logging is set up, so stdout carries the DID and nothing else.
+    if let Some(Command::Keygen { out }) = &cli.command {
+        match jig_nameserver::v0_0_2::keygen(out) {
+            Ok(did) => {
+                println!("{did}");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-
-    let cli = Cli::parse();
 
     match cli.command {
         // If no command specified, run the server
         None => serve(None, None).await,
 
         Some(Command::Serve { bind, port }) => serve(bind, port).await,
+
+        Some(Command::Keygen { .. }) => unreachable!("handled before logging starts"),
 
         Some(Command::Analyze { analyze_cmd }) => {
             handle_analyze(cli.db_path, analyze_cmd).await?;
@@ -155,8 +180,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Start the HTTP server, or exit(1) with an operator-legible reason.
 ///
-/// Startup failures (missing `[pow].server_secret`, a port already in use, an
-/// unreadable DB) used to surface as a panic — which reaches stderr through the
+/// Startup failures (an invalid config, a port already in use, an unreadable
+/// DB) used to surface as a panic — which reaches stderr through the
 /// default panic hook only, so a systemd unit capturing stdout logged nothing
 /// but an exit code. Log through BOTH `tracing` and stderr, then exit non-zero.
 async fn serve(bind: Option<String>, port: Option<u16>) {

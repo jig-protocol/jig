@@ -27,10 +27,11 @@ stores ciphertext; it holds no group secret.
 # Write a config template
 jig-server --init-config jig-config.toml
 
-# Start with defaults (SQLite under ~/.jig/jig.db)
+# Start with defaults (SQLite at ~/.jig/jig_v002.db)
 jig-server
 
-# Start using a specific config file
+# Start using a specific config file. An unknown or removed key stops the
+# boot with an error naming it.
 jig-server --config jig-config.toml
 
 # Override a few fields on the CLI. Bind loopback or a tailnet address —
@@ -51,7 +52,8 @@ The v0.0.2 surface, mounted by default:
 | `/api/v1/blocks` | POST | Submit a signed block bundle (`{bundle_b64, sig_b64}`) |
 | `/api/v1/blocks/{cid}` | GET | One block and its receipts — signed read, channel-gated |
 | `/api/v1/channels` | GET | Channels the caller may read — signed read |
-| `/api/v1/channels/{slug}/blocks` | GET | Channel timeline — signed read, membership-gated |
+| `/api/v1/channels/{slug}/blocks` | GET | Channel timeline in `seq` order, each block with its signed `ingest` record — signed read, membership-gated |
+| `/api/v1/channels/{slug}/records` | GET | The channel's signed `ingest` records in `seq` order, without blocks — signed read, same gate as the timeline |
 | `/api/v1/channels/{slug}/members` | GET | Channel members and roles — signed read, same gate as the timeline |
 | `/api/v1/channels[/{slug}/members\|archive]` | POST | Channel ops as signed blocks (create, add/join, archive). Other ops (`member-remove`, `channel-promote`) go through `POST /api/v1/blocks` |
 | `/api/v1/mls/key-packages` | POST | Publish MLS key packages (`{key_packages_b64: [..]}`); each must be signed by, and name, its DID |
