@@ -537,7 +537,8 @@ impl TestNameserver {
             .to_string_lossy()
             .into_owned();
         config.server.listen = "127.0.0.1:0".to_string();
-        config.nameserver.alias_suffix = alias_suffix.to_string();
+        config.nameserver.alias_suffixes =
+            vec![jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix)];
         // Tests enumerate registered aliases; production leaves this off.
         config.debug.list_handles = true;
 

@@ -1,6 +1,6 @@
 # Deploying jig on a tailnet VPS
 
-Systemd units, a hybrid config template, and a backup job for running
+Systemd units, a config template, and a backup job for running
 `jig-server` + `jig-nameserver` on a single small VPS reachable **only over
 Tailscale**.
 
@@ -8,7 +8,7 @@ Tailscale**.
 | --- | --- |
 | `jig-server.service` | Block server, port **7117** |
 | `jig-nameserver.service` | DID/alias registry, port **7070** |
-| `config.example.toml` | The hybrid `/etc/jig/config.toml` |
+| `config.example.toml` | The `/etc/jig/config.toml` template |
 | `jig-backup.sh` | `VACUUM INTO` snapshots + `server.key` |
 | `jig-backup.service` / `.timer` | Daily 03:17 UTC backup |
 
@@ -168,6 +168,10 @@ sudo install -m 0644 deploy/config.example.toml /etc/jig/config.toml
 tailscale ip -4                     # <- put this address in the config
 sudoedit /etc/jig/config.toml
 
+# 3b. nameserver config — EDIT IT, it must name the suffixes you serve
+sudo install -m 0644 deploy/jig-nameserver.example.toml /etc/jig/jig-nameserver.toml
+sudoedit /etc/jig/jig-nameserver.toml
+
 # 4. optional env files (bridge tokens etc.): chmod 600 root:jig
 #    sudo chmod 600 /etc/jig/jig-server.env
 #    /etc/jig/jig-nameserver.env is optional too; the nameserver needs no secret
@@ -185,7 +189,7 @@ enabling it.
 
 `jig-server --init-config <path>` writes a template equivalent to
 `config.example.toml` if you would rather generate it than copy it. It emits
-**both halves** of the hybrid file.
+the root keys and every section in one file.
 
 ### Verify the deploy
 
@@ -249,32 +253,37 @@ ExecStartPre=/usr/bin/tailscale ip -4
 
 ---
 
-## The hybrid config, in one paragraph
+## The config file, in one paragraph
 
-`main.rs` loads the same `--config` file into **two unrelated structs**.
-Root-level keys (`database_path`, `bind_address`, `port`, `[tls]`, `[execution]`)
-become `ServerConfig` and are **what actually binds**. `[server]`, `[identity]`,
-`[federation]`, `[debug]`, `[bridges]` become `JigServerConfig`. Neither type
-uses `deny_unknown_fields`, so each ignores the other's sections in silence —
-which is exactly why editing the wrong half produces no error and no effect.
+`main.rs` loads `--config` once, into one `ServerConfig`. Root-level keys
+(`database_path`, `bind_address`, `port`, `[tls]`, `[execution]`) are **what
+actually binds**. `[server]`, `[identity]`, `[auth]`, `[federation]`, `[debug]`
+and `[bridges]` configure the pipeline. Every table denies unknown fields, so a
+typo or a key in the wrong section stops the boot with serde's error, which names
+the key and lists the valid ones. A key jig-server used to accept and has since
+removed fails with `` `<key>` is no longer a jig-server config key: <why>. Delete
+it. `` (#199).
 
 **An explicitly-passed `--config` that fails to parse is now FATAL.** The server
-logs `[jig-server] FATAL: v0.0.2 config load from … failed` to both tracing and
+logs `[jig-server] FATAL: config load from <path> failed: …` to both tracing and
 stderr and exits `1`. It no longer falls back to defaults, which used to mint a
 fresh server DID (see the top of this file). A missing `--config` still means
 "use defaults" — that path is legitimate and unchanged.
 
-Three landmines, all called out in `config.example.toml`:
+Three landmines:
 
 - **`[server] listen` is DECORATIVE.** It only builds the `ws://…` origin-tag
   string. It does **not** control the bind address. The server now logs a
   startup `WARN` when `listen` disagrees with the effective `bind_address:port`.
 - **The `/_admin_v0_0_2/*` aliases are gone**, and `[debug] admin_endpoints`
-  with them. Current CLIs use `/api/v1/channels*`, which is always mounted; an
-  old config that still sets the key parses and the key is ignored.
+  with them. Current CLIs use `/api/v1/channels*`, which is always mounted. A
+  config that still sets the key **refuses to boot**: delete the line. Configs
+  written by v0.1.0-alpha.1's installer carry `admin_endpoints = false` and need
+  that one deletion.
 - **The unsigned v0.0.1 REST surface is gone** (D28): `GET`/`POST /blocks`,
   `/blocks/:cid` and `/receipts/:cid` answer `404`, and the
-  `dangerously_enable_v0_0_1_rest` flag no longer exists. `jig read` uses the
+  `dangerously_enable_v0_0_1_rest` flag is a removed key: a config that sets it
+  refuses to boot. `jig read` uses the
   signed history endpoint, `GET /api/v1/channels/<slug>/blocks`.
 
 ### Reading history
@@ -491,7 +500,9 @@ reputation, tribunal, transparency and federation) were removed:
 | `/v1/health` | GET | liveness |
 | `/v1/challenge` | GET | issues a 64-hex nonce |
 | `/v1/register` | POST | consumes a GET-issued challenge, returns an attestation |
-| `/v1/resolve/:alias` | GET | alias → DID |
+| `/v1/resolve/:alias` | GET | the signed alias attestation, plus transitional unsigned hints (`did`, `alias`, `valid_until`) |
+| `/v1/suffixes` | GET | suffixes served, their registration mode, and this nameserver's DID |
+| `/.well-known/jig-ns-delegation` | GET | signed delegation for a DNS-rooted suffix (`?suffix=`, else the `Host`) |
 | `/v1/rotate`, `/v1/renew` | POST | key rotation / renewal |
 | `/v1/handles` | GET | **debug-gated** behind `[debug] list_handles` |
 
@@ -512,9 +523,28 @@ reputation, tribunal, transparency and federation) were removed:
 None of the nameserver's routes asks for proof-of-work.
 
 `/v1/handles` enumerates every registered alias, so it stays off unless you
-explicitly set `list_handles = true`. Alias resolution never touches DNS, so the
-default `alias_suffix` (`gigue.jig`) works on a tailnet and cannot leak
-publicly — `.jig` is not an IANA TLD.
+explicitly set `list_handles = true`.
+
+**Suffixes.** `[[v0_0_2.nameserver.alias_suffixes]]` is required and has no
+default: the nameserver refuses to start until you name at least one suffix
+(see `deploy/jig-nameserver.example.toml`). One DID holds at most one name per
+suffix. Each suffix sets its own policy: `registration = "open" | "closed"`
+(a closed suffix still resolves, renews and rotates), `min_alias_len`
+(default 3), reserved names, and `registration_allow`, a list of DIDs with the
+exact aliases each may register past that policy. A single-label suffix such
+as `jig` also needs `single_label_authority = true`: clients trust it only
+through their own config, so its names verify only for clients whose config
+names this nameserver's DID.
+
+For a DNS-rooted suffix, `/.well-known/jig-ns-delegation` serves this
+nameserver's signed delegation; a resolver treats it as authoritative only when
+fetched from `https://<suffix>/`. `GET /v1/suffixes` lists the suffixes served
+and this nameserver's DID.
+
+**Key ceremony.** `jig-nameserver keygen --out <path>` writes a new signing key
+(0600, never overwriting an existing file) and prints only the DID, so the DID
+can be recorded on an offline machine before any server exists. Point
+`[v0_0_2.server] server_did_keyfile` at the file.
 
 ---
 

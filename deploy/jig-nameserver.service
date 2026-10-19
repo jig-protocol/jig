@@ -45,6 +45,7 @@ EnvironmentFile=-/etc/jig/jig-nameserver.env
 Environment=JIG_NS_BIND=REPLACE_WITH_TAILNET_IPV4
 Environment=JIG_NS_PORT=7070
 Environment=JIG_NS_DB_PATH=/var/lib/jig/nameserver.db
+Environment=JIG_NS_CONFIG=/etc/jig/jig-nameserver.toml
 # Pin HOME so config discovery cannot wander into another account's ~/.jig.
 Environment=HOME=/var/lib/jig
 

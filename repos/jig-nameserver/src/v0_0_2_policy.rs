@@ -1,0 +1,378 @@
+//! Which suffixes this nameserver serves, and who may register what on each:
+//! open or closed registration, a minimum alias length, reserved names with
+//! near-miss matching, and a per-suffix allowlist of DIDs and their names.
+
+use std::collections::HashMap;
+
+use anyhow::{Context, Result, bail};
+use jig_config::v0_0_2_server::{NameserverSection, Registration, SuffixConfig};
+
+/// Every suffix this nameserver serves, in config order.
+#[derive(Debug, Clone)]
+pub struct Suffixes {
+    list: Vec<SuffixPolicy>,
+}
+
+/// One served suffix and its registration policy, checked at boot.
+#[derive(Debug, Clone)]
+pub struct SuffixPolicy {
+    pub suffix: String,
+    pub registration: Registration,
+    pub min_alias_len: usize,
+    reserved: Vec<String>,
+    reserved_contains: Vec<String>,
+    reserved_affixes: Vec<String>,
+    /// Lowercased alias → the one DID that may register it past the policy.
+    allow: HashMap<String, String>,
+}
+
+/// Why a registration was refused by policy, before any proof is checked
+/// against the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    Closed,
+    TooShort { min: usize },
+    Reserved { word: String },
+}
+
+/// How a registration got past the policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    Ordinary,
+    /// Named in the suffix's `registration_allow`; logged.
+    Allowlisted,
+}
+
+impl Suffixes {
+    /// Validate the `[nameserver]` section and compile each suffix's policy.
+    /// Fails on a malformed allowlist entry, so a typo surfaces at boot rather
+    /// than as a refused registration on a closed suffix.
+    pub fn from_config(section: &NameserverSection) -> Result<Self> {
+        section.validate().map_err(anyhow::Error::msg)?;
+        let list = section
+            .alias_suffixes
+            .iter()
+            .map(SuffixPolicy::from_config)
+            .collect::<Result<_>>()?;
+        Ok(Self { list })
+    }
+
+    pub fn get(&self, suffix: &str) -> Option<&SuffixPolicy> {
+        self.list.iter().find(|p| p.suffix == suffix)
+    }
+
+    /// The suffix a request that names none means, when there is only one.
+    pub fn only(&self) -> Option<&SuffixPolicy> {
+        match self.list.as_slice() {
+            [one] => Some(one),
+            _ => None,
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &SuffixPolicy> {
+        self.list.iter()
+    }
+}
+
+impl SuffixPolicy {
+    fn from_config(cfg: &SuffixConfig) -> Result<Self> {
+        jig_core::naming::Name::parse(&format!("x@{}", cfg.suffix)).with_context(|| {
+            format!(
+                "suffix `{}` is not a dotted name of [a-z0-9-] labels",
+                cfg.suffix
+            )
+        })?;
+        let mut allow = HashMap::new();
+        for entry in &cfg.registration_allow {
+            jig_core::Did::from_did_jig_string(&entry.did).with_context(|| {
+                format!(
+                    "suffix `{}`: registration_allow DID `{}` is not did:jig:z<base32>",
+                    cfg.suffix, entry.did
+                )
+            })?;
+            if entry.aliases.is_empty() {
+                bail!(
+                    "suffix `{}`: registration_allow entry for `{}` names no aliases",
+                    cfg.suffix,
+                    entry.did
+                );
+            }
+            for alias in &entry.aliases {
+                let name = jig_core::naming::Name::parse(&format!("{alias}@{}", cfg.suffix))
+                    .with_context(|| {
+                        format!(
+                            "suffix `{}`: registration_allow alias `{alias}` is not a valid alias",
+                            cfg.suffix
+                        )
+                    })?;
+                if let Some(other) = allow.insert(name.alias.clone(), entry.did.clone())
+                    && other != entry.did
+                {
+                    bail!(
+                        "suffix `{}`: registration_allow grants `{}` to both `{other}` and `{}`",
+                        cfg.suffix,
+                        name.alias,
+                        entry.did
+                    );
+                }
+            }
+        }
+        Ok(Self {
+            suffix: cfg.suffix.clone(),
+            registration: cfg.registration,
+            min_alias_len: cfg.min_alias_len,
+            reserved: cfg.reserved.iter().map(|w| fold(w)).collect(),
+            reserved_contains: cfg.reserved_contains.iter().map(|w| fold(w)).collect(),
+            reserved_affixes: cfg.reserved_affixes.iter().map(|w| fold(w)).collect(),
+            allow,
+        })
+    }
+
+    /// May `did` register the lowercased local part `alias` here?
+    pub fn admit(&self, did: &str, alias: &str) -> Result<Admission, Refusal> {
+        if self.allow.get(alias).is_some_and(|d| d == did) {
+            return Ok(Admission::Allowlisted);
+        }
+        if !matches!(self.registration, Registration::Open) {
+            return Err(Refusal::Closed);
+        }
+        if alias.chars().count() < self.min_alias_len {
+            return Err(Refusal::TooShort {
+                min: self.min_alias_len,
+            });
+        }
+        if let Some(word) = self.reserved_hit(alias) {
+            return Err(Refusal::Reserved { word });
+        }
+        Ok(Admission::Ordinary)
+    }
+
+    /// The reserved word `alias` collides with, after normalization:
+    /// - equal to a `reserved` word;
+    /// - containing a `reserved_contains` word anywhere;
+    /// - starting or ending with a `reserved_affixes` word.
+    fn reserved_hit(&self, alias: &str) -> Option<String> {
+        let a: Vec<char> = fold(alias).chars().collect();
+        let word = |w: &String| w.chars().collect::<Vec<char>>();
+        let found = self
+            .reserved
+            .iter()
+            .find(|w| a.len() == w.chars().count() && matches_at(&a, 0, &word(w)))
+            .or_else(|| {
+                self.reserved_contains.iter().find(|w| {
+                    let w = word(w);
+                    (0..a.len()).any(|i| matches_at(&a, i, &w))
+                })
+            })
+            .or_else(|| {
+                self.reserved_affixes.iter().find(|w| {
+                    let w = word(w);
+                    matches_at(&a, 0, &w)
+                        || a.len()
+                            .checked_sub(w.len())
+                            .is_some_and(|start| matches_at(&a, start, &w))
+                })
+            });
+        found.cloned()
+    }
+}
+
+/// Drop separators and fold digit lookalikes: `0→o`, `3→e`, `4→a`, `5→s`,
+/// `7→t`. `1` is kept, and matches both `i` and `l` (see [`matches_at`]).
+fn fold(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '-' | '_' | '.'))
+        .map(|c| match c {
+            '0' => 'o',
+            '3' => 'e',
+            '4' => 'a',
+            '5' => 's',
+            '7' => 't',
+            c => c,
+        })
+        .collect()
+}
+
+/// Does `word` occur in `alias` at `start`? A `1` in the alias matches `i`,
+/// `l` or `1`.
+fn matches_at(alias: &[char], start: usize, word: &[char]) -> bool {
+    alias.len() >= start + word.len()
+        && alias[start..start + word.len()]
+            .iter()
+            .zip(word)
+            .all(|(&a, &w)| a == w || (a == '1' && matches!(w, 'i' | 'l')))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jig_config::v0_0_2_server::AllowEntry;
+
+    fn did(byte: u8) -> String {
+        jig_core::Did::from_ed25519_pubkey(&[byte; 32]).to_did_jig_string()
+    }
+
+    fn policy(cfg: SuffixConfig) -> SuffixPolicy {
+        SuffixPolicy::from_config(&cfg).unwrap()
+    }
+
+    fn default_policy() -> SuffixPolicy {
+        policy(SuffixConfig::new("names.example.org"))
+    }
+
+    fn reserved(alias: &str) -> bool {
+        matches!(
+            default_policy().admit(&did(1), alias),
+            Err(Refusal::Reserved { .. })
+        )
+    }
+
+    #[test]
+    fn the_default_reserved_names_are_refused_exactly() {
+        for alias in [
+            "admin",
+            "root",
+            "help",
+            "abuse",
+            "postmaster",
+            "noreply",
+            "mod",
+        ] {
+            assert!(reserved(alias), "{alias}");
+        }
+        assert!(!reserved("alice"));
+        assert!(
+            !reserved("model"),
+            "`mod` is an exact-match word, not a prefix"
+        );
+    }
+
+    #[test]
+    fn separators_and_digit_lookalikes_do_not_dodge_the_list() {
+        for alias in [
+            "adm1n",
+            "r00t",
+            "h3lp",
+            "4buse",
+            "5ecurity",
+            "sy5tem",
+            "no-reply",
+            "post_master",
+            "secur1ty",
+        ] {
+            assert!(reserved(alias), "{alias}");
+        }
+    }
+
+    #[test]
+    fn a_one_matches_both_i_and_l() {
+        assert!(reserved("he1p"), "1 as l");
+        assert!(reserved("adm1n"), "1 as i");
+    }
+
+    #[test]
+    fn contained_words_are_refused_anywhere() {
+        for alias in [
+            "jig-official",
+            "alicesupport",
+            "supp0rt-team",
+            "rejig",
+            "jigsaw",
+            "j1g",
+        ] {
+            assert!(reserved(alias), "{alias}");
+        }
+    }
+
+    #[test]
+    fn affix_words_are_refused_only_at_either_end() {
+        for alias in [
+            "admin-alice",
+            "alice_admin",
+            "staffer",
+            "5taff",
+            "teamstaff",
+        ] {
+            assert!(reserved(alias), "{alias}");
+        }
+        for alias in ["badminton", "flagstaffs", "upstaffing"] {
+            assert!(!reserved(alias), "{alias} only contains an affix word");
+        }
+    }
+
+    #[test]
+    fn the_minimum_length_counts_the_alias_as_typed() {
+        let p = default_policy();
+        assert_eq!(p.admit(&did(1), "ab"), Err(Refusal::TooShort { min: 3 }));
+        assert_eq!(p.admit(&did(1), "a-b"), Ok(Admission::Ordinary));
+        let mut cfg = SuffixConfig::new("names.example.org");
+        cfg.min_alias_len = 1;
+        assert_eq!(policy(cfg).admit(&did(1), "x"), Ok(Admission::Ordinary));
+    }
+
+    #[test]
+    fn a_closed_suffix_refuses_ordinary_registrations() {
+        let mut cfg = SuffixConfig::new("names.example.org");
+        cfg.registration = Registration::Closed;
+        assert_eq!(policy(cfg).admit(&did(1), "alice"), Err(Refusal::Closed));
+    }
+
+    #[test]
+    fn the_allowlist_admits_only_its_did_and_its_names() {
+        let mut cfg = SuffixConfig::new("names.example.org");
+        cfg.registration = Registration::Closed;
+        cfg.registration_allow = vec![AllowEntry {
+            did: did(1),
+            aliases: vec!["DJ".to_string(), "support".to_string()],
+        }];
+        let p = policy(cfg);
+        // Past closed, short and reserved, for its own names only.
+        assert_eq!(p.admit(&did(1), "dj"), Ok(Admission::Allowlisted));
+        assert_eq!(p.admit(&did(1), "support"), Ok(Admission::Allowlisted));
+        assert_eq!(p.admit(&did(1), "alice"), Err(Refusal::Closed));
+        assert_eq!(p.admit(&did(2), "dj"), Err(Refusal::Closed));
+    }
+
+    #[test]
+    fn a_bad_allowlist_entry_stops_the_boot() {
+        let entry = |did: &str, aliases: &[&str]| AllowEntry {
+            did: did.to_string(),
+            aliases: aliases.iter().map(|a| a.to_string()).collect(),
+        };
+        let boot = |allow: Vec<AllowEntry>| {
+            let mut cfg = SuffixConfig::new("names.example.org");
+            cfg.registration_allow = allow;
+            SuffixPolicy::from_config(&cfg)
+                .map(|_| ())
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(boot(vec![entry("did:key:z6Mk", &["dj"])]).contains("not did:jig"));
+        assert!(boot(vec![entry(&did(1), &[])]).contains("names no aliases"));
+        assert!(boot(vec![entry(&did(1), &["d j"])]).contains("not a valid alias"));
+        let twice = boot(vec![entry(&did(1), &["dj"]), entry(&did(2), &["DJ"])]);
+        assert!(twice.contains("grants `dj` to both"), "{twice}");
+    }
+
+    #[test]
+    fn suffixes_resolve_by_name_and_only_one_means_the_default() {
+        let one = NameserverSection {
+            alias_suffix: None,
+            alias_suffixes: vec![SuffixConfig::new("a.example")],
+        };
+        let s = Suffixes::from_config(&one).unwrap();
+        assert_eq!(s.only().unwrap().suffix, "a.example");
+        assert!(s.get("b.example").is_none());
+
+        let two = NameserverSection {
+            alias_suffix: None,
+            alias_suffixes: vec![
+                SuffixConfig::new("a.example"),
+                SuffixConfig::new("b.example"),
+            ],
+        };
+        let s = Suffixes::from_config(&two).unwrap();
+        assert!(s.only().is_none());
+        assert_eq!(s.get("b.example").unwrap().suffix, "b.example");
+    }
+}
