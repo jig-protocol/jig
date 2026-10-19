@@ -142,6 +142,15 @@ one. A follower that has its own `#ops` and carries A's `#ops` must keep both (d
   goes through the sequencer-local slug lookup.
 - [ ] **Step 4:** commit `refactor(pipeline): key channels by channel_id (JEP-0005 rule 1)`.
 
+**L7's conditions (agreed 2026-10-19).** Once L7's #161 is on main, this slice also moves L7's
+sequencing code to the CID: `backfill_ingest_records`, `is_sequenced`, `sequenced_history_sql`
+and `sequence_on`. The migration runs before the boot backfill, in one transaction, and is
+idempotent. A test starts from a pre-migration store with records and shows that the chain
+survives byte for byte: same `seq`s, same hashes, no re-signing. L7's
+`backfill_sequences_a_store_once` and `backfill_re_signs_a_chain_in_an_older_format` stay green.
+Slug wrappers resolve only channels this server sequences. L7's client (#169) relies on that, so
+a relayed channel's history gets its own route, with its sequencer in the response.
+
 **Coordination:** this touches files several open PRs edit. The orchestrator picks a window
 with few in-flight `jig-pipeline` PRs. The slice keeps every public function signature that
 takes a slug, as a thin wrapper over a sequencer-local lookup, so callers in other lanes'
@@ -231,13 +240,21 @@ the domains rule 0 lists.
 
 ### Task 3: Peer policy in the server manifest
 
-- [ ] Extend L7's `server-manifest` with:
-  - `relayed_kinds`;
-  - `peer_quotas` (blocks per minute and bytes per minute, per peer DID);
-  - `peers`, the DIDs the server chooses to publish;
-  - `attested_suffixes`, `dns`- and `contract`-rooted only.
+- [ ] Extend L7's `server-manifest` with the fields below. The shape was agreed with L7 on
+  2026-10-19, so its slice 7 reserves the keys from the start.
+  - **Every key is always present.** An empty list is an empty array, never an absent key.
+  - **Every list is sorted** bytewise by each element's deterministic CBOR encoding, with no
+    duplicates. A verifier refuses any other order or a repeat, so each state has exactly one
+    encoding.
+  - `uint` is CBOR major type 0.
 
-  `config`-rooted suffixes never appear.
+  | Key | CBOR type | Notes |
+  | --- | --- | --- |
+  | `relayed_kinds` | array of text | one entry per block kind |
+  | `default_peer_quota` | map `{blocks_per_min: uint, bytes_per_min: uint}` | applies to every listed peer without its own entry, so no peer is unquoted |
+  | `peer_quotas` | array of map `{peer: text, blocks_per_min: uint, bytes_per_min: uint}` | `peer` is a did:jig, unique across entries |
+  | `peers` | array of text | did:jig; only the peers the server chooses to publish |
+  | `attested_suffixes` | array of map `{suffix: text, root: text, root_id: text}` | `root` is `dns` or `contract`, never `config`; for `dns`, `root_id` is the lowercased suffix; for `contract`, canonical CID text (JEP-0004 rule 3); `(suffix, root)` unique |
 - [ ] `/.well-known/jig` serves the same fields unsigned.
 - [ ] Contract messages cite the manifest by CID and `seq`.
 - [ ] Commit `feat(server): peer policy in the server manifest (JEP-0005 rule 16)`.
@@ -413,8 +430,11 @@ the domains rule 0 lists.
    operator unless that peer is configured to auto-accept. Auto-accepting from configured peers
    is the alternative. The trade-off is a manual step per share against a configured peer
    committing the operator to carry any channel.
-3. **The cap on writes queued while a sequencer is down,** per channel. The plan proposes a
-   count and a byte cap, configured per server, with defaults of 1000 blocks and 10 MiB.
+3. **The cap on writes queued while a sequencer is down.** The plan proposes two caps,
+   configured per server:
+   - per channel: 1000 blocks or 10 MiB;
+   - per server, across all channels: 100 MiB, so that many carried channels cannot add up to
+     an unbounded total (orchestrator, 2026-10-19).
 
 ## Done when
 
