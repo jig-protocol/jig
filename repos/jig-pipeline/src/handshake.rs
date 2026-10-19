@@ -50,10 +50,10 @@ pub const TLS_EXPORTER_LABEL: &[u8] = b"EXPORTER-jig-handshake";
 pub const TLS_EXPORTER_LEN: usize = 32;
 
 const DOMAIN: &[u8] = b"jig-handshake-welcome-v1";
-/// The format a refusal is signed in, named on the frame and in the signed
-/// bytes. A refusal in any other format is refused by name.
-pub const REFUSAL_FORMAT: &str = "jig-handshake-refusal-v1";
-const REFUSAL_DOMAIN: &[u8] = REFUSAL_FORMAT.as_bytes();
+/// The format a refusal is signed in, named on the frame and as the signed
+/// payload's `domain`: a COSE_Sign1 over deterministic CBOR. A refusal in any
+/// other format is refused by name.
+pub const REFUSAL_FORMAT: &str = "jig-handshake-refusal-v2";
 
 /// WebSocket close codes, one per failure class (JEP-0002 rule 7).
 pub mod close {
@@ -283,7 +283,7 @@ impl HelloRefusal {
     }
 }
 
-/// The bytes a server signs to refuse a hello.
+/// What a server signs to refuse a hello.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefusalStatement {
     pub v: u8,
@@ -297,22 +297,29 @@ pub struct RefusalStatement {
 }
 
 impl RefusalStatement {
-    /// Length-prefixed, domain-separated, like
-    /// [`WelcomeStatement::canonical_bytes`] under its own domain, so neither
-    /// signature can stand in for the other.
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        push(&mut out, REFUSAL_DOMAIN);
-        push(&mut out, &[self.v]);
-        push(&mut out, self.frame_suite.as_bytes());
-        push(&mut out, self.server_did.as_bytes());
-        push(&mut out, self.code.as_bytes());
-        push(&mut out, self.message.as_bytes());
-        let versions: Vec<String> = self.versions.iter().map(u64::to_string).collect();
-        push(&mut out, &canonical_list(&versions));
-        push(&mut out, &canonical_list(&self.suites));
-        push(&mut out, self.nonce.as_bytes());
-        out
+    /// The deterministic CBOR payload of the COSE_Sign1: a text-keyed map
+    /// with `domain` = [`REFUSAL_FORMAT`], so no other signed object's payload
+    /// can stand in for it.
+    pub fn payload(&self) -> Vec<u8> {
+        use jig_core::dcbor::{self, Value};
+        dcbor::encode(&Value::text_map([
+            ("domain", Value::text(REFUSAL_FORMAT)),
+            ("v", Value::Unsigned(u64::from(self.v))),
+            ("frame_suite", Value::text(&self.frame_suite)),
+            ("server_did", Value::text(&self.server_did)),
+            ("code", Value::text(&self.code)),
+            ("message", Value::text(&self.message)),
+            (
+                "versions",
+                Value::Array(self.versions.iter().copied().map(Value::Unsigned).collect()),
+            ),
+            (
+                "suites",
+                Value::Array(self.suites.iter().map(Value::text).collect()),
+            ),
+            ("nonce", Value::text(&self.nonce)),
+        ]))
+        .expect("a refusal of text and integers encodes")
     }
 }
 
@@ -504,7 +511,7 @@ pub fn seal_refusal(key: &SigningKey, refusal: &HelloRefusal, nonce: &str) -> En
         suites: implemented_suite_names(),
         nonce: nonce.to_string(),
     };
-    let sig = STANDARD.encode(key.sign(&statement.canonical_bytes()).to_bytes());
+    let sig = STANDARD.encode(jig_core::cose::sign1(key, &statement.payload()));
     Envelope::new(Frame::Refusal {
         format: REFUSAL_FORMAT.to_string(),
         server_did: statement.server_did,
@@ -574,9 +581,7 @@ fn interpret_refusal(
         suites: suites.clone(),
         nonce: echoed.clone(),
     };
-    if let Err(reason) =
-        verify_key_signature(&statement.server_did, &statement.canonical_bytes(), sig)
-    {
+    if let Err(reason) = verify_refusal_signature(&statement, sig) {
         return fail(reason);
     }
     if let Some(reason) = pin_mismatch(server_did, offer.pinned_server_did.as_deref()) {
@@ -693,6 +698,22 @@ fn interpret_envelope(
 
 fn verify_signature(statement: &WelcomeStatement, sig_b64: &str) -> Result<(), String> {
     verify_key_signature(&statement.server_did, &statement.canonical_bytes(), sig_b64)
+}
+
+/// `sig` is a COSE_Sign1 by `statement.server_did` over exactly
+/// `statement`'s payload.
+fn verify_refusal_signature(statement: &RefusalStatement, sig_b64: &str) -> Result<(), String> {
+    let envelope = STANDARD
+        .decode(sig_b64)
+        .map_err(|_| "sig is not base64".to_string())?;
+    let signed = jig_core::cose::open_sign1(&envelope)
+        .map_err(|err| format!("sig is not a COSE_Sign1: {err}"))?;
+    if signed.payload != statement.payload() {
+        return Err("signature does not verify: it covers other fields".to_string());
+    }
+    signed
+        .verify(&statement.server_did)
+        .map_err(|_| "signature does not verify".to_string())
 }
 
 fn verify_key_signature(server_did: &str, signed: &[u8], sig_b64: &str) -> Result<(), String> {
@@ -1022,7 +1043,7 @@ mod tests {
 
         let mut renamed = refusal_for(&pending, &key);
         if let Frame::Refusal { format, .. } = &mut renamed.frame {
-            *format = "jig-handshake-refusal-cose-v1".to_string();
+            *format = "jig-handshake-refusal-v1".to_string();
         }
         assert!(matches!(
             pending.interpret(&serde_json::to_string(&renamed).unwrap()),
@@ -1082,16 +1103,16 @@ mod tests {
             suites: vec!["none".to_string()],
             nonce: "n".to_string(),
         };
-        let bytes = refusal.canonical_bytes();
-        assert!(
-            bytes
-                .windows(REFUSAL_DOMAIN.len())
-                .any(|w| w == REFUSAL_DOMAIN)
+        let bytes = refusal.payload();
+        let decoded = jig_core::dcbor::decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.get("domain").and_then(|d| d.as_text()),
+            Some(REFUSAL_FORMAT)
         );
         assert!(!bytes.windows(DOMAIN.len()).any(|w| w == DOMAIN));
         let mut other = refusal.clone();
         other.suites.push("mls".to_string());
-        assert_ne!(bytes, other.canonical_bytes());
+        assert_ne!(bytes, other.payload());
     }
 
     #[test]

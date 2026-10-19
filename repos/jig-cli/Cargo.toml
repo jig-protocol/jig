@@ -68,6 +68,8 @@ ratatui = "0.30"
 crossterm = "0.29"
 
 [dev-dependencies]
+# Lets tests resolve `@jig` under the placeholder authority; never in a build.
+jig-core = { path = "../jig-core", features = ["test-default-authority"] }
 tempfile = "3.8"
 time = { version = "0.3", features = ["serde"] }
 ed25519-dalek = { workspace = true }

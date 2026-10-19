@@ -3753,8 +3753,6 @@ dependencies = [
 name = "jig-config"
 version = "0.0.1"
 dependencies = [
- "anyhow",
- "chrono",
  "dirs 7.0.0",
  "serde",
  "serde_json",
@@ -3830,7 +3828,6 @@ dependencies = [
  "jig-config",
  "jig-core",
  "jig-pipeline",
- "jig-runtime",
  "parquet",
  "pprof",
  "rand 0.10.3",
@@ -3864,6 +3861,7 @@ dependencies = [
  "base64 0.23.1",
  "blake3",
  "chrono",
+ "cid",
  "ed25519-dalek 3.0.0",
  "hex",
  "jig-core",

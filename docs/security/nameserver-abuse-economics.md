@@ -22,9 +22,9 @@ unless stated.
 > and 10 per minute), but ask for no proof-of-work. The analysis stays as input to the
 > redesign; read "today" below as "in the removed prototype".
 >
-> Redesign in progress: proof-of-work in JEP-0008 (draft, #162); rulesets, reputation and
-> transparency logs in JEP-0009 (#163); reports and tribunals in JEP-0010 (#166); framing in
-> #152.
+> Redesign in progress, in draft JEPs: proof-of-work in [JEP-0008](../../repos/jig-spec/jep/jep-0008-proof-of-work.md); rulesets,
+> reputation and transparency logs in [JEP-0009](../../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md); reports and tribunals in
+> [JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md); framing in lane R's [framing doc](../superpowers/specs/2026-10-18-reputation-pow-tribunals-framing.md).
 
 ## What the model is for
 
