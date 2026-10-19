@@ -422,15 +422,15 @@ mod tests {
                 "jig:host/compose@0.1.0".into()
             )]
         );
-        let state = component(
-            Some("jig:host/fetch@0.1.0"),
+        let blocks = component(
+            Some("jig:host/blocks@0.1.0"),
             "jig:block/render@0.1.0",
             GOOD_CORE,
         );
         assert_eq!(
-            check(&state, &renderer(&["jig:host/fetch@0.1.0"])),
+            check(&blocks, &renderer(&["jig:host/blocks@0.1.0"])),
             [ComponentViolation::ImportNotInWorld(
-                "jig:host/fetch@0.1.0".into()
+                "jig:host/blocks@0.1.0".into()
             )]
         );
     }
@@ -438,15 +438,15 @@ mod tests {
     #[test]
     fn a_bot_import_must_be_granted() {
         let c = component(
-            Some("jig:host/fetch@0.1.0"),
+            Some("jig:host/blocks@0.1.0"),
             "jig:block/handler@0.1.0",
             GOOD_CORE,
         );
-        assert!(check(&c, &bot(&["jig:host/fetch@0.1.0"])).is_empty());
+        assert!(check(&c, &bot(&["jig:host/blocks@0.1.0"])).is_empty());
         assert_eq!(
             check(&c, &bot(&[])),
             [ComponentViolation::UngrantedImport(
-                "jig:host/fetch@0.1.0".into()
+                "jig:host/blocks@0.1.0".into()
             )]
         );
     }

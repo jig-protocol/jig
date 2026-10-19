@@ -2,18 +2,21 @@
 #
 # jig-backup.sh — consistent, timestamped snapshot of a jig deployment.
 #
-# Backs up three things, because losing any one of them loses something
-# different:
-#   1. jig.db       — the v0.0.1 store (ServerConfig database_path).
-#   2. jig_v002.db  — the v0.0.2 block store. jig-server DERIVES this name from
+# Backs up these, because losing any one of them loses something different:
+#   1. jig_v002.db  — the block store. jig-server DERIVES this name from
 #                     database_path by appending "_v002" to the file stem, so a
 #                     configured /var/lib/jig/jig.db means the blocks people
-#                     actually sent live in /var/lib/jig/jig_v002.db. BOTH exist
-#                     and both matter; backing up only jig.db backs up almost
-#                     nothing of value.
-#   3. server.key   — the ed25519 seed the server DID is derived from. Losing it
+#                     actually sent live in /var/lib/jig/jig_v002.db. jig.db
+#                     itself is no longer used (#196) and is not backed up.
+#   2. server.key   — the ed25519 seed the server DID is derived from. Losing it
 #                     changes the server's identity and breaks TOFU pinning for
 #                     every client that ever connected. See deploy/README.md.
+#   3. nameserver.db, nameserver_v002.db and nameserver_v002.key, when this box
+#                     runs jig-nameserver. nameserver_v002.db holds the alias
+#                     bindings; nameserver_v002.key is the nameserver's signing
+#                     key. Without the key a restore gets a new nameserver DID,
+#                     and every attestation the old one signed stops verifying
+#                     for anyone whose delegation names the old DID.
 #
 # SQLite is copied with `VACUUM INTO`, not `cp`: it takes a read lock and emits
 # a single consistent file, so a snapshot taken while the server is serving is
@@ -82,11 +85,11 @@ snapshot_db() {
     backed_up=$((backed_up + 1))
 }
 
-snapshot_db "$JIG_STATE_DIR/jig.db"
 snapshot_db "$JIG_STATE_DIR/jig_v002.db"
 # Not strictly part of the server's state, but it lives on the same box and a
 # lost registry means every handle has to be re-registered.
 snapshot_db "$JIG_STATE_DIR/nameserver.db"
+snapshot_db "$JIG_STATE_DIR/nameserver_v002.db"
 
 # --- the irreplaceable one --------------------------------------------------
 # The databases can be rebuilt from what people re-send. The key cannot be
@@ -100,6 +103,25 @@ if [ -f "$KEYFILE" ]; then
 else
     die "server keyfile $KEYFILE not found — refusing to record a backup that
     omits the server identity. Set JIG_SERVER_KEYFILE if it lives elsewhere."
+fi
+
+# The nameserver's signing key. The nameserver is optional on a box, so a
+# missing key is fatal only when its alias store exists: bindings without the
+# key that signed them restore into a nameserver with a different DID. The
+# nameserver reads the path from [v0_0_2.server] server_did_keyfile when that
+# is set; set JIG_NAMESERVER_KEYFILE to the same path in that case.
+NS_KEYFILE="${JIG_NAMESERVER_KEYFILE:-$JIG_STATE_DIR/nameserver_v002.key}"
+if [ -f "$NS_KEYFILE" ]; then
+    cp -p "$NS_KEYFILE" "$DEST/nameserver_v002.key"
+    chmod 600 "$DEST/nameserver_v002.key"
+    log "key:  $NS_KEYFILE -> $DEST/nameserver_v002.key"
+    backed_up=$((backed_up + 1))
+elif [ -f "$JIG_STATE_DIR/nameserver_v002.db" ]; then
+    die "nameserver keyfile $NS_KEYFILE not found, but $JIG_STATE_DIR/nameserver_v002.db
+    exists — refusing to record a backup of alias bindings without the key that
+    signed them. Set JIG_NAMESERVER_KEYFILE if it lives elsewhere."
+else
+    log "skip: $NS_KEYFILE not present"
 fi
 
 [ "$backed_up" -gt 0 ] || die "nothing was backed up"

@@ -670,7 +670,7 @@ mod tests {
     fn test_identity() -> Identity {
         let dir = tempdir().unwrap();
         let path = dir.keep();
-        Identity::generate_and_save(&path).unwrap()
+        Identity::generate_for_tests(&path)
     }
 
     fn test_hlc(id: &Identity) -> HlcTimestamp {
@@ -689,7 +689,7 @@ mod tests {
             .ingest_ctx
             .store
             .upsert_channel(&jig_pipeline::persist::StoredChannel {
-                id: format!("bafySeed{slug}"),
+                id: jig_pipeline::ingest_record::label_cid(slug),
                 slug: slug.to_string(),
                 visibility: "open".to_string(),
                 created_at: 0,

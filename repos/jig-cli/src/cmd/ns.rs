@@ -947,7 +947,7 @@ mod tests {
         let ns = key(1);
         let (base, seen) = stub_nameserver(ns.clone(), attest_as(ns.clone(), "dj@dj.jig")).await;
         let dir = tempdir().unwrap();
-        let me = jig_client::Identity::generate_and_save(dir.path()).unwrap();
+        let me = jig_client::Identity::generate_for_tests(dir.path());
 
         let att =
             crate::cmd::init::register_with_nameserver(&me, "DJ", &base, &Delegations::default())
@@ -974,7 +974,7 @@ mod tests {
         let ns = key(1);
         let (base, seen) = stub_nameserver(ns.clone(), attest_as(ns.clone(), "dj@dj.jig")).await;
         let dir = tempdir().unwrap();
-        let me = jig_client::Identity::generate_and_save(dir.path()).unwrap();
+        let me = jig_client::Identity::generate_for_tests(dir.path());
 
         crate::cmd::keys::renew_with_nameserver(&me, "dj@DJ.jig", &base, &Delegations::default())
             .await
@@ -1002,7 +1002,7 @@ mod tests {
         };
         let (base, _) = stub_nameserver(ns, liar).await;
         let dir = tempdir().unwrap();
-        let me = jig_client::Identity::generate_and_save(dir.path()).unwrap();
+        let me = jig_client::Identity::generate_for_tests(dir.path());
 
         let err =
             crate::cmd::init::register_with_nameserver(&me, "dj", &base, &Delegations::default())
@@ -1015,8 +1015,8 @@ mod tests {
     async fn rotate_tells_a_refused_rotation_from_an_unverifiable_reply() {
         let ns = key(1);
         let dir = tempdir().unwrap();
-        let old = jig_client::Identity::generate_and_save(dir.path()).unwrap();
-        let new = jig_client::Identity::generate_and_save(dir.path()).unwrap();
+        let old = jig_client::Identity::generate_for_tests(dir.path());
+        let new = jig_client::Identity::generate_for_tests(dir.path());
 
         // Refused: the outer Err, so the caller may delete the new key.
         let (base, _) = stub_nameserver(ns.clone(), |_: &str, _: &str| {

@@ -43,7 +43,7 @@ pub async fn run(ctx: &CliContext, channel: String) -> Result<()> {
     // (see `history::backfill`) rather than aborting the tail. An encrypted
     // channel replays through the MLS session.
     let reader = Reader::open(ctx, &channel).await?;
-    let (backlog, tidy) = reader.backlog(&id, &server_url).await;
+    let (backlog, tidy) = reader.backlog(&id, &server_url).await?;
     reader.tidy(tidy);
 
     let client = crate::cmd::secure::connect_pinned(&server_url, id)
@@ -60,7 +60,11 @@ pub async fn run(ctx: &CliContext, channel: String) -> Result<()> {
     }
     // No bell for replayed history — the operator was not present for it.
     println!("Tailing {channel} on {server_url}... (Ctrl-C to exit)");
-    pump(&mut stream, &channel, &contacts, &reader).await
+    let ended = pump(&mut stream, &channel, &contacts, &reader).await;
+    match crate::cmd::trust::live_contradiction(&client, &server_url) {
+        Some(e) => Err(e),
+        None => ended,
+    }
 }
 
 /// Apply `jig read <channel>`: print the channel's recent messages and exit.
@@ -83,6 +87,7 @@ pub async fn read(ctx: &CliContext, channel: String, limit: usize, json: bool) -
             .collect()
     } else {
         let blocks = history::fetch_history(&id, &server_url, &channel, limit).await?;
+        crate::cmd::trust::check_history(&id, &server_url, &channel, &blocks).await?;
         history::decode_history(&blocks)
     };
     let skip = lines.len().saturating_sub(limit);
@@ -221,7 +226,7 @@ mod tests {
     fn test_identity() -> Identity {
         let dir = tempdir().unwrap();
         let path = dir.keep();
-        Identity::generate_and_save(&path).unwrap()
+        Identity::generate_for_tests(&path)
     }
 
     fn delivered_for(bundle_b64: String, receipts: Vec<ReceiptRef>) -> DeliveredBlock {
@@ -230,6 +235,7 @@ mod tests {
             bundle_b64,
             receipts,
             delivery_cid: "bafy_test_delivery".into(),
+            ingest: None,
         }
     }
 

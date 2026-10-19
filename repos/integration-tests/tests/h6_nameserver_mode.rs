@@ -19,7 +19,21 @@
 use std::time::Duration;
 
 use integration_tests::harness::*;
+use std::sync::Arc;
+
 use jig_pipeline::identity::{IdentityResolver, NameserverResolver};
+use jig_pipeline::persist::SqliteStore;
+use jig_server::v0_0_2::suffix_authorities;
+
+/// A resolver that takes `ns` as the one authority for its suffix, exactly
+/// as the jig-server boot path builds it from `[identity.delegations]`.
+fn resolver_for(ns: &TestNameserver) -> NameserverResolver {
+    NameserverResolver::new(
+        suffix_authorities(&ns.delegations()),
+        1,
+        Arc::new(SqliteStore::open_in_memory().unwrap()),
+    )
+}
 
 #[tokio::test]
 async fn nameserver_resolves_registered_alias_to_did() {
@@ -29,7 +43,7 @@ async fn nameserver_resolves_registered_alias_to_did() {
 
     // Construct a resolver pointed at the NS, exactly as the jig-server
     // boot path would when identity.mode = "nameserver".
-    let resolver = NameserverResolver::new(vec![ns.http_url()], 1);
+    let resolver = resolver_for(&ns);
     let did = resolver.resolve(&alias_full).await.expect("resolve");
     assert_eq!(did, alice.did_string());
 }
@@ -40,7 +54,7 @@ async fn nameserver_rejects_mismatched_did_claim() {
     let alice = ns.register("alice").await.expect("register alice");
     let alias_full = format!("alice@{}", ns.alias_suffix);
 
-    let resolver = NameserverResolver::new(vec![ns.http_url()], 1);
+    let resolver = resolver_for(&ns);
 
     // Correct DID — accepted.
     resolver
@@ -68,7 +82,7 @@ async fn nameserver_rejects_mismatched_did_claim() {
 #[tokio::test]
 async fn nameserver_returns_not_found_for_unattested_alias() {
     let ns = TestNameserver::start().await.expect("start ns");
-    let resolver = NameserverResolver::new(vec![ns.http_url()], 1);
+    let resolver = resolver_for(&ns);
     let err = resolver
         .resolve("nobody@dj.jig")
         .await
@@ -86,7 +100,7 @@ async fn nameserver_expires_attestation_after_explicit_expiry() {
     let alias_full = format!("alice@{}", ns.alias_suffix);
 
     // Fresh resolver with 1s cache TTL so we don't have to wait long.
-    let resolver = NameserverResolver::new(vec![ns.http_url()], 1);
+    let resolver = resolver_for(&ns);
 
     // Initial resolution succeeds.
     let did = resolver
@@ -131,26 +145,24 @@ async fn jig_server_in_nameserver_mode_resolves_through_authority() {
         .await
         .expect("start server");
 
-    // Confirm config sees nameserver mode + the right URL.
+    // Confirm config sees nameserver mode + a delegation to this NS.
     assert_eq!(
         server.state.config.identity.mode,
         jig_config::v0_0_2_server::IdentityMode::Nameserver
     );
-    assert!(
-        server
-            .state
-            .config
-            .identity
-            .trusted_nameservers
-            .contains(&ns.http_url()),
-        "server's trusted_nameservers must include the test NS URL"
+    assert_eq!(
+        server.state.config.identity.delegations,
+        ns.delegations(),
+        "server's delegations must name the test NS for its suffix"
     );
 
-    // Direct resolver test against the same NS URL — gives us deterministic
-    // results without depending on the server's internal Arc construction.
+    // Direct resolver test against the same delegation — gives us
+    // deterministic results without depending on the server's internal Arc
+    // construction.
     let resolver = NameserverResolver::new(
-        server.state.config.identity.trusted_nameservers.clone(),
+        suffix_authorities(&server.state.config.identity.delegations),
         server.state.config.identity.cache_ttl_seconds,
+        Arc::new(SqliteStore::open_in_memory().unwrap()),
     );
     let did = resolver.resolve(&alias_full).await.expect("resolve via NS");
     assert_eq!(did, alice.did_string());

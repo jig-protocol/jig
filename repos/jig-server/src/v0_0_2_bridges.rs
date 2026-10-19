@@ -626,7 +626,7 @@ mod tests {
         // members (see jig-pipeline ingest bridge-sink dispatch).
         store
             .upsert_channel(&StoredChannel {
-                id: "bafyDmX".to_string(),
+                id: jig_pipeline::ingest_record::label_cid("dm x"),
                 slug: "#dm/x".to_string(),
                 // Bridges carry plaintext, which only an open channel takes (D25).
                 visibility: "open".to_string(),
@@ -637,7 +637,7 @@ mod tests {
             .unwrap();
         store
             .upsert_membership(&StoredMembership {
-                channel_id: "bafyDmX".to_string(),
+                channel_id: jig_pipeline::ingest_record::label_cid("dm x"),
                 member_did: shadow_did.clone(),
                 role: "member".to_string(),
                 joined_at: 0,
@@ -649,10 +649,10 @@ mod tests {
         // is the channel's other member, exactly as the bridge would have
         // enrolled him; delivery to the shadow DID follows membership.
         let dir = tempdir().unwrap();
-        let bob = Identity::generate_and_save(&dir.keep()).unwrap();
+        let bob = Identity::generate_for_tests(&dir.keep());
         store
             .upsert_membership(&StoredMembership {
-                channel_id: "bafyDmX".to_string(),
+                channel_id: jig_pipeline::ingest_record::label_cid("dm x"),
                 member_did: bob.did_string(),
                 role: "member".to_string(),
                 joined_at: 0,

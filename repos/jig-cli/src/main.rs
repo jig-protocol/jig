@@ -138,6 +138,14 @@ enum Commands {
         action: ServerAction,
     },
 
+    /// What this device pinned and trusts: verify and pin a name
+    /// (`verify-name`), or move its pin after its holder confirms a new DID
+    /// (`accept-name`).
+    Trust {
+        #[command(subcommand)]
+        action: TrustAction,
+    },
+
     /// Create, join, delete, or list channels on the configured server via
     /// `/api/v1/channels*`.
     Channel {
@@ -286,6 +294,38 @@ enum NsAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum TrustAction {
+    /// Resolve `name` (alias@suffix), verify it, and pin it on first sight; a
+    /// name that now resolves to another DID than the pinned one is refused.
+    VerifyName {
+        name: String,
+        /// Nameserver to ask (with `--authority`); otherwise the suffix's
+        /// `[naming.delegations]` entry, or DNS discovery.
+        #[arg(long)]
+        nameserver: Vec<String>,
+        /// DID whose attestations count for the suffix.
+        #[arg(long)]
+        authority: Vec<String>,
+    },
+    /// Move the pin for `name` (alias@suffix) to the DID it resolves to now.
+    /// Only after its holder confirms that DID out of band: `--did` must name
+    /// exactly what the nameserver attests, or nothing changes.
+    AcceptName {
+        name: String,
+        /// The DID the holder confirmed.
+        #[arg(long)]
+        did: String,
+        /// Nameserver to ask (with `--authority`); otherwise the suffix's
+        /// `[naming.delegations]` entry, or DNS discovery.
+        #[arg(long)]
+        nameserver: Vec<String>,
+        /// DID whose attestations count for the suffix.
+        #[arg(long)]
+        authority: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum ServerAction {
     /// Persist a new server base URL to `~/.jig/cli.toml`. Accepts
     /// `http://`, `https://`, `ws://`, or `wss://`. v0.0.2 stores
@@ -372,8 +412,8 @@ enum KeysAction {
     },
 
     /// Mint a fresh keypair and rotate the alias binding from the
-    /// current DID to the new one. The old keyfile is preserved as
-    /// `<old_did>.key.rotated` for offline recovery.
+    /// current DID to the new one. The old keyfile is preserved, still
+    /// sealed, as `<old_did>.jigkey.rotated` for offline recovery.
     Rotate {
         /// Fully-qualified alias whose DID binding is being rotated.
         #[arg()]
@@ -404,8 +444,35 @@ enum ReceiptAction {
     },
 }
 
+/// Exit status when no key slot can seal a new identity key: no OS keychain,
+/// no terminal, and no `JIG_KEY_PASSPHRASE` or `JIG_KEY_UNLOCK`. `install.sh`
+/// matches it, not the message, to fall back to plaintext keys. 78 is
+/// `EX_CONFIG` in sysexits.h.
+const EXIT_NO_KEY_SLOT: u8 = 78;
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // The same report `fn main() -> anyhow::Result<()>` prints.
+            eprintln!("Error: {e:?}");
+            let no_slot = e.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<jig_client::IdentityError>(),
+                    Some(jig_client::IdentityError::NoWayToSeal { .. })
+                )
+            });
+            if no_slot {
+                std::process::ExitCode::from(EXIT_NO_KEY_SLOT)
+            } else {
+                std::process::ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // Lift the global flags out of `cli` FIRST. Everything below reads
@@ -489,6 +556,46 @@ async fn main() -> Result<()> {
             }
             ServerAction::Forget { url } => {
                 cmd::server::forget(&ctx, url.as_deref())?;
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(Commands::Trust { action }) = cli.command {
+        match action {
+            TrustAction::VerifyName {
+                name,
+                nameserver,
+                authority,
+            } => {
+                let delegations =
+                    cmd::trust::delegations_for(ctx.effective(), &name, nameserver, authority)?;
+                use jig_client::naming::Verified;
+                match cmd::trust::verify_name(&name, &delegations).await? {
+                    Verified::New(b) => println!(
+                        "{name} → {} (attested by {}); pinned on first contact.",
+                        b.did(),
+                        b.attestation.ns_did
+                    ),
+                    Verified::Pinned(b) | Verified::Rotated { binding: b, .. } => println!(
+                        "{name} → {} (attested by {}); matches this device's pin.",
+                        b.did(),
+                        b.attestation.ns_did
+                    ),
+                }
+            }
+            TrustAction::AcceptName {
+                name,
+                did,
+                nameserver,
+                authority,
+            } => {
+                let delegations =
+                    cmd::trust::delegations_for(ctx.effective(), &name, nameserver, authority)?;
+                match cmd::trust::accept_name(&name, &did, &delegations).await? {
+                    Some(old) => println!("{name} is now pinned to {did} (was {old})."),
+                    None => println!("{name} is now pinned to {did}."),
+                }
             }
         }
         return Ok(());
@@ -638,6 +745,7 @@ async fn main() -> Result<()> {
         Some(Commands::Init { .. }) => unreachable!("init handled earlier"),
         Some(Commands::Keys { .. }) => unreachable!("keys handled earlier"),
         Some(Commands::Server { .. }) => unreachable!("server handled earlier"),
+        Some(Commands::Trust { .. }) => unreachable!("trust handled earlier"),
         Some(Commands::Channel { .. }) => unreachable!("channel handled earlier"),
         Some(Commands::Ns { .. }) => unreachable!("ns handled earlier"),
         // No subcommand. These used to post through the v0.0.1 `POST /blocks`

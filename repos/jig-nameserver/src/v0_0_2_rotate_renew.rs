@@ -50,14 +50,12 @@ pub async fn rotate(
     let name = served_name(&state, &req.alias)?;
     let alias = name.as_alias();
 
-    // 1. Consume challenge
-    consume_challenge(&state, &req.challenge).await?;
-
-    // 2. Verify BOTH signatures
+    // 1. Verify BOTH signatures. The challenge is consumed only once every
+    //    check has passed, so a refused rotation leaves it usable.
     verify_bare_challenge_sig(&req.old_did, &req.challenge, &req.sig_by_old)?;
     verify_bare_challenge_sig(&req.new_did, &req.challenge, &req.sig_by_new)?;
 
-    // 3. Check the alias currently binds to old_did
+    // 2. Check the alias currently binds to old_did
     let current_holder = state.alias_holder(&alias).await.map_err(|e| {
         err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -89,6 +87,11 @@ pub async fn rotate(
     // The new DID must not already hold another name under this suffix, or
     // the rotation would silently drop it.
     refuse_second_name(&state, &req.new_did, &name).await?;
+
+    // 3. Consume the challenge. Of two rotations racing for one challenge,
+    //    only one gets past here. A challenge bound at issue time must name
+    //    the old DID, the one that holds the alias.
+    consume_challenge(&state, &req.challenge, &req.old_did, &alias).await?;
 
     // 4. Expire the old-DID row so it no longer matches alias queries.
     //    Without this, both the old and new rows would be valid for the same
@@ -144,7 +147,7 @@ pub async fn renew(
         &req.challenge,
         &req.proof_of_control,
     )?;
-    consume_challenge(&state, &req.challenge).await?;
+    consume_challenge(&state, &req.challenge, &req.did, &alias).await?;
 
     // 2. Check current holder matches the renewing DID
     let binding = match current_binding(&state, &alias).await? {

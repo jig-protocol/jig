@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     routing::{get, post},
 };
@@ -314,17 +314,23 @@ pub(crate) fn parse_reachability(
     Ok(Some(record))
 }
 
-/// Consume a challenge. Called only after the proof verified, so a bad proof
-/// leaves the challenge usable, and of two proofs racing for one challenge
-/// only one gets `true`.
-pub(crate) async fn consume_challenge(state: &AppState, challenge: &str) -> Result<(), ApiError> {
-    if state.take_challenge(challenge).await {
+/// Consume a challenge for a request by `did` on `alias`. Called only after
+/// the proof verified, so a bad proof leaves the challenge usable, and of two
+/// proofs racing for one challenge only one gets `true`.
+pub(crate) async fn consume_challenge(
+    state: &AppState,
+    challenge: &str,
+    did: &str,
+    alias: &str,
+) -> Result<(), ApiError> {
+    if state.take_challenge(challenge, did, alias).await {
         Ok(())
     } else {
         Err(err(
             StatusCode::UNAUTHORIZED,
             "CHALLENGE_UNKNOWN",
-            "challenge not recognized, expired or already consumed (call GET /v1/challenge first)",
+            "challenge not recognized, expired, already consumed or issued for another \
+             DID or name (call GET /v1/challenge first)",
         ))
     }
 }
@@ -471,15 +477,44 @@ pub(crate) async fn issue_and_persist(
     Ok(Json(binding.response()))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ChallengeQuery {
+    /// The DID that will use the challenge.
+    did: Option<String>,
+    /// The full `alias@suffix` it will be used on.
+    name: Option<String>,
+}
+
 /// GET /v1/challenge — issue a fresh hex nonce. Register and renew sign it
 /// into an action-bound proof of control.
-pub async fn get_challenge(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+///
+/// `?did=` and `?name=` bind it: it is then consumed only by that DID on that
+/// name, and is what proof-of-work (lane R's R1) sets its effort from. Both
+/// are optional until R1, so clients that send neither keep working.
+pub async fn get_challenge(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ChallengeQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let name = query
+        .name
+        .as_deref()
+        .map(|n| parse_name(n).map(|n| n.as_alias()))
+        .transpose()?;
+    if let Some(did) = query.did.as_deref() {
+        jig_core::Did::from_did_jig_string(did).map_err(|_| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "BAD_DID",
+                "DID is not did:jig:z<base32> canonical form",
+            )
+        })?;
+    }
     let mut nonce = [0u8; 32];
     use rand::Rng;
     rand::rng().fill_bytes(&mut nonce);
     let nonce_hex = hex::encode(nonce);
-    state.remember_challenge(&nonce_hex).await;
-    Json(serde_json::json!({ "challenge": nonce_hex }))
+    state.remember_challenge(&nonce_hex, query.did, name).await;
+    Ok(Json(serde_json::json!({ "challenge": nonce_hex })))
 }
 
 /// POST /v1/register
@@ -504,7 +539,7 @@ pub async fn register(
         &req.proof_of_control,
     )?;
     let reachability = parse_reachability(&req.did, req.reachability.as_deref())?;
-    consume_challenge(&state, &req.challenge).await?;
+    consume_challenge(&state, &req.challenge, &req.did, &alias).await?;
 
     // Same DID re-registering is idempotent re-issuance with a fresh TTL.
     if let Some(existing_did) = state
@@ -914,7 +949,7 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "BAD_REACHABILITY");
         // Refused before the challenge was consumed.
-        assert!(state.take_challenge(&challenge).await);
+        assert!(state.take_challenge(&challenge, &did, &alias).await);
     }
 
     #[tokio::test]

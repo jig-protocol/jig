@@ -23,6 +23,13 @@ fn run(home: &Path, args: Vec<String>) -> (bool, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_jig"))
         .args(&args)
         .env("HOME", home)
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .env("JIG_NONINTERACTIVE", "1")
         .env("RUST_BACKTRACE", "0")
         .output()
@@ -130,8 +137,8 @@ async fn register_renew_and_rotate_against_the_real_nameserver() {
         "the old key's alias resolves to the new DID"
     );
     let keys = home.path().join(".jig").join("keys");
-    assert!(keys.join(format!("{second}.key")).exists());
-    assert!(keys.join(format!("{first}.key.rotated")).exists());
+    assert!(keys.join(format!("{second}.jigkey")).exists());
+    assert!(keys.join(format!("{first}.jigkey.rotated")).exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]

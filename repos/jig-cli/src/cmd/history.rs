@@ -95,7 +95,11 @@ pub async fn fetch_history(
     parse_history(&body)
 }
 
-/// Fetch + decode a backlog, degrading to an empty one on any failure.
+/// Fetch + decode a backlog, degrading to an empty one on a failed fetch.
+///
+/// The one error is the server contradicting the channel history this
+/// device pinned ([`crate::cmd::trust::check_history`]): that is not
+/// something to open a pane around.
 ///
 /// Call this before entering raw mode: the warning goes to stderr as plain
 /// text.
@@ -104,13 +108,16 @@ pub async fn backfill(
     base_url: &str,
     channel: &str,
     limit: usize,
-) -> Vec<DecodedBlock> {
+) -> Result<Vec<DecodedBlock>> {
     match fetch_history(who, base_url, channel, limit).await {
-        Ok(blocks) => decode_history(&blocks),
+        Ok(blocks) => {
+            crate::cmd::trust::check_history(who, base_url, channel, &blocks).await?;
+            Ok(decode_history(&blocks))
+        }
         Err(e) => {
             eprintln!("warning: could not load history for {channel}: {e:#}");
             eprintln!("warning: opening with an empty pane.");
-            Vec::new()
+            Ok(Vec::new())
         }
     }
 }
@@ -127,7 +134,7 @@ mod tests {
     /// A text block as a v0.2 server delivers it, signature included.
     fn signed_text(body: &str, delivery: &str) -> DeliveredBlock {
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(&dir.keep()).unwrap();
+        let id = Identity::generate_for_tests(&dir.keep());
         let block = build_text_render(
             &id,
             "#hello",
@@ -143,6 +150,7 @@ mod tests {
             sig_b64: Some(base64::engine::general_purpose::STANDARD.encode(&block.sender_sig)),
             receipts: vec![],
             delivery_cid: delivery.into(),
+            ingest: None,
         }
     }
 
@@ -185,6 +193,7 @@ mod tests {
                 bundle_b64: "not_base64_!!!".into(),
                 receipts: vec![],
                 delivery_cid: "delivery:2".into(),
+                ingest: None,
             },
             signed_text("third", "delivery:3"),
         ];
@@ -201,7 +210,7 @@ mod tests {
         // every freshly opened channel. Backfill is a message replay; only
         // message-shaped kinds belong in it.
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(&dir.keep()).unwrap();
+        let id = Identity::generate_for_tests(&dir.keep());
         let hlc = HlcTimestamp {
             wall_ms: 1_747_680_000_000,
             logical: 0,
@@ -225,8 +234,10 @@ mod tests {
         // Port 1 is refused immediately. A server that has not been upgraded
         // answers 404 here instead; either way the pane must still open.
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(&dir.keep()).unwrap();
-        let backlog = backfill(&id, "http://127.0.0.1:1", "#hello", 10).await;
+        let id = Identity::generate_for_tests(&dir.keep());
+        let backlog = backfill(&id, "http://127.0.0.1:1", "#hello", 10)
+            .await
+            .unwrap();
         assert!(
             backlog.is_empty(),
             "unreachable server must yield no backlog"

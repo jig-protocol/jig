@@ -217,6 +217,7 @@ async fn naively_allow_unknown_handles_fallback_bypasses_lock() {
         trusted_nameservers: vec![],
         cache_ttl_seconds: 300,
         naively_allow_unknown_handles_fallback: true,
+        delegations: Default::default(),
     };
     let server = TestJigServer::start_with_config(config).await.unwrap();
 

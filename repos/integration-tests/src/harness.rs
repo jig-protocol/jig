@@ -112,9 +112,10 @@ impl TestJigServer {
         let mut config = base_config()?;
         config.identity = IdentitySection {
             mode: IdentityMode::Nameserver,
-            trusted_nameservers: vec![ns.http_url()],
+            trusted_nameservers: vec![],
             cache_ttl_seconds: 1, // short for tests so cache misses re-resolve
             naively_allow_unknown_handles_fallback: false,
+            delegations: ns.delegations(),
         };
         Self::start_with_config(config).await
     }
@@ -258,7 +259,7 @@ impl TestJigServer {
     /// [`Self::create_channel`] whenever the test is actually about channel
     /// creation.
     pub fn seed_channel(&self, owner: &Identity, slug: &str) -> Result<String> {
-        let id = format!("seeded-{}", slug.trim_start_matches('#'));
+        let id = jig_pipeline::ingest_record::label_cid(&format!("seeded {slug}"));
         self.state
             .ingest_ctx
             .store
@@ -281,7 +282,7 @@ impl TestJigServer {
         owner: &Identity,
         slug: &str,
     ) -> Result<String> {
-        let id = format!("seeded-{}", slug.trim_start_matches('#'));
+        let id = jig_pipeline::ingest_record::label_cid(&format!("seeded {slug}"));
         let store = &self.state.ingest_ctx.store;
         let now = chrono::Utc::now().timestamp_millis();
         store.upsert_channel(&jig_pipeline::persist::StoredChannel {
@@ -507,6 +508,20 @@ pub struct TestNameserver {
 }
 
 impl TestNameserver {
+    /// An `[identity.delegations]` naming this nameserver as the only
+    /// authority for its suffix, reached at its own URL.
+    pub fn delegations(
+        &self,
+    ) -> std::collections::BTreeMap<String, jig_config::v0_0_2_server::NameDelegation> {
+        std::collections::BTreeMap::from([(
+            self.alias_suffix.clone(),
+            jig_config::v0_0_2_server::NameDelegation {
+                authorities: vec![self.state.ns_did_string()],
+                nameservers: vec![self.http_url()],
+            },
+        )])
+    }
+
     /// Start a nameserver authoritative for the `dj.jig` alias suffix.
     pub async fn start() -> Result<Self> {
         Self::start_with_suffix("dj.jig").await
@@ -652,24 +667,24 @@ pub fn test_identity() -> Identity {
     // Use `keep` so the file lives long enough for the test; we don't
     // explicitly delete because tests are short-lived.
     let path = dir.keep();
-    Identity::generate_and_save(&path).expect("identity generate")
+    Identity::generate_for_tests(&path)
 }
 
 /// Variant that also returns the keyfile directory so the caller can
 /// load the identity multiple times (e.g. once for signing, once to
 /// pass into `Client::connect` which takes ownership).
 ///
-/// Use `Identity::load_from_dir(&keys_dir, &did_str)` to re-load.
+/// Use `Identity::load_for_tests(&keys_dir, &did_str)` to re-load.
 pub fn test_identity_with_dir() -> (Identity, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.keep();
-    let id = Identity::generate_and_save(&path).expect("identity generate");
+    let id = Identity::generate_for_tests(&path);
     (id, path)
 }
 
 /// Re-load an Identity from its keyfile directory, given the DID.
 pub fn load_identity(keys_dir: &std::path::Path, did_str: &str) -> Identity {
-    Identity::load_from_dir(keys_dir, did_str).expect("load identity from dir")
+    Identity::load_for_tests(keys_dir, did_str)
 }
 
 /// Build the JSON body for the `/api/v1/blocks` and `/api/v1/channels*`

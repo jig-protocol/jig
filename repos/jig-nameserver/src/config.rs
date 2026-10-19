@@ -39,9 +39,7 @@ pub struct NameServerConfig {
     pub reputation: ReputationConfig,
     pub useful_work: UsefulWorkConfig,
     pub capabilities: CapabilitiesConfig,
-    pub runtime: RuntimeConfig,     // Phase E: Embedded WASM execution
     pub analytics: AnalyticsConfig, // Phase F: Analytics and insights
-    pub hot: HotConfig,             // Phase F Tier 2/3: Hot state backend (rate limiting, caching)
     /// v0.0.2 alias-API wiring (`[v0_0_2]`), consumed by
     /// [`crate::server::build_app`] to boot `crate::v0_0_2::AppState`.
     ///
@@ -262,9 +260,7 @@ impl NameServerConfig {
             reputation: ReputationConfig::from_env(),
             useful_work: UsefulWorkConfig::from_env(),
             capabilities: CapabilitiesConfig::from_env(),
-            runtime: RuntimeConfig::from_env(),
             analytics: AnalyticsConfig::from_env(),
-            hot: HotConfig::from_env(),
             v0_0_2: jig_config::v0_0_2_server::JigServerConfig::default(),
             alias_rate_limits: AliasRateLimitConfig::default(),
         }
@@ -275,7 +271,6 @@ impl NameServerConfig {
         self.network.merge_env();
         self.storage.merge_env();
         self.analytics.merge_env();
-        self.hot.merge_env();
         self.penalties.merge_env();
         self.anonymous.merge_env();
         self.federation.merge_env();
@@ -284,7 +279,6 @@ impl NameServerConfig {
         self.reputation.merge_env();
         self.useful_work.merge_env();
         self.capabilities.merge_env();
-        self.runtime.merge_env();
     }
 
     fn normalize(&mut self) {
@@ -374,30 +368,12 @@ impl NetworkConfig {
 #[serde(default)]
 pub struct StorageConfig {
     pub database_path: PathBuf,
-
-    /// Storage backend type (truth database)
-    /// - Tier 1 (Potato): "sqlite" (default)
-    /// - Tier 2 (Prosumer): "postgres"
-    /// - Tier 3 (Hyperscale): "cockroachdb", "tidb"
-    #[serde(default = "default_storage_backend")]
-    pub backend: String,
-
-    /// Backend-specific configuration (key-value pairs passed to backend)
-    /// Example for Postgres: {"connection_string": "postgres://localhost/nameserver", "pool_size": "10"}
-    #[serde(default)]
-    pub backend_config: std::collections::HashMap<String, String>,
-}
-
-fn default_storage_backend() -> String {
-    "sqlite".to_string()
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             database_path: default_database_path(),
-            backend: default_storage_backend(),
-            backend_config: std::collections::HashMap::new(),
         }
     }
 }
@@ -408,11 +384,6 @@ impl StorageConfig {
         if let Ok(path) = std::env::var("JIG_NS_DB_PATH") {
             cfg.database_path = PathBuf::from(path);
         }
-        if let Ok(backend) = std::env::var("JIG_NS_STORAGE_BACKEND") {
-            cfg.backend = backend;
-        }
-        // Backend-specific config can be set via JIG_NS_STORAGE_BACKEND_<KEY>
-        // e.g., JIG_NS_STORAGE_BACKEND_CONNECTION_STRING=postgres://...
         cfg
     }
 
@@ -1178,97 +1149,6 @@ impl CapabilitiesConfig {
     }
 }
 
-// Phase E: Runtime Embedding Configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RuntimeConfig {
-    /// Enable embedded WASM execution
-    pub enabled: bool,
-
-    /// Maximum fuel budget (instructions)
-    pub fuel_max: u64,
-
-    /// Maximum linear memory in MB
-    pub memory_max_mb: u32,
-
-    /// Wall-clock execution timeout in milliseconds
-    pub execution_timeout_ms: u64,
-
-    /// Allowed capabilities for nameserver-executed blocks
-    /// Limited to: storage.read:receipts:*, storage.write:attestations:*, net.fetch:federation:*
-    pub allowed_capabilities: Vec<String>,
-
-    /// Enable deterministic execution (strongly recommended)
-    pub deterministic: bool,
-
-    /// Enable WASI preview2
-    pub wasi_preview2: bool,
-}
-
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,            // Opt-in for Phase E
-            fuel_max: 5_000_000,       // 5M instructions
-            memory_max_mb: 32,         // 32MB
-            execution_timeout_ms: 250, // 250ms
-            allowed_capabilities: vec![
-                "storage.read:receipts:*".into(),
-                "storage.write:attestations:*".into(),
-                "net.fetch:federation:*".into(),
-            ],
-            deterministic: true,
-            wasi_preview2: true,
-        }
-    }
-}
-
-impl RuntimeConfig {
-    fn from_env() -> Self {
-        let mut cfg = Self::default();
-        if let Ok(val) = std::env::var("JIG_NS_RUNTIME_ENABLED") {
-            cfg.enabled = val == "true" || val == "1";
-        }
-        if let Ok(val) = std::env::var("JIG_RUNTIME_FUEL_MAX")
-            && let Ok(fuel) = val.parse()
-        {
-            cfg.fuel_max = fuel;
-        }
-        if let Ok(val) = std::env::var("JIG_RUNTIME_MEMORY_MAX_MB")
-            && let Ok(mem) = val.parse()
-        {
-            cfg.memory_max_mb = mem;
-        }
-        if let Ok(val) = std::env::var("JIG_RUNTIME_TIMEOUT_MS")
-            && let Ok(timeout) = val.parse()
-        {
-            cfg.execution_timeout_ms = timeout;
-        }
-        cfg
-    }
-
-    fn merge_env(&mut self) {
-        if let Ok(val) = std::env::var("JIG_NS_RUNTIME_ENABLED") {
-            self.enabled = val == "true" || val == "1";
-        }
-        if let Ok(val) = std::env::var("JIG_RUNTIME_FUEL_MAX")
-            && let Ok(fuel) = val.parse()
-        {
-            self.fuel_max = fuel;
-        }
-        if let Ok(val) = std::env::var("JIG_RUNTIME_MEMORY_MAX_MB")
-            && let Ok(mem) = val.parse()
-        {
-            self.memory_max_mb = mem;
-        }
-        if let Ok(val) = std::env::var("JIG_RUNTIME_TIMEOUT_MS")
-            && let Ok(timeout) = val.parse()
-        {
-            self.execution_timeout_ms = timeout;
-        }
-    }
-}
-
 // Phase F: Analytics Configuration
 
 /// Analytics configuration for nameserver metrics and insights
@@ -1280,17 +1160,6 @@ pub struct AnalyticsConfig {
 
     /// Default time range for analytics queries
     pub default_time_range: String, // "last_hour", "last_day", "last_week", "last_month"
-
-    /// Analytics backend type
-    /// - Tier 1 (Potato): "sqlite" (default)
-    /// - Tier 2 (Prosumer): "duckdb", "parquet"
-    /// - Tier 3 (Hyperscale): "clickhouse" (future)
-    pub backend: String,
-
-    /// Backend-specific configuration (key-value pairs passed to backend factory)
-    /// Example for DuckDB: {"database_path": "analytics.db", "parquet_export_path": "/data/parquet"}
-    #[serde(default)]
-    pub backend_config: std::collections::HashMap<String, String>,
 }
 
 impl Default for AnalyticsConfig {
@@ -1298,8 +1167,6 @@ impl Default for AnalyticsConfig {
         Self {
             enabled: true,
             default_time_range: "last_day".to_string(),
-            backend: "sqlite".to_string(), // Tier 1 default
-            backend_config: std::collections::HashMap::new(),
         }
     }
 }
@@ -1316,65 +1183,6 @@ impl AnalyticsConfig {
         if let Ok(val) = std::env::var("JIG_NS_ANALYTICS_DEFAULT_RANGE") {
             self.default_time_range = val;
         }
-        if let Ok(val) = std::env::var("JIG_NS_ANALYTICS_BACKEND") {
-            self.backend = val;
-        }
-        // Backend-specific config can be set via JIG_NS_ANALYTICS_BACKEND_<KEY>
-        // e.g., JIG_NS_ANALYTICS_BACKEND_DATABASE_PATH=/path/to/db
-    }
-}
-
-// Phase F Tier 2/3: Hot State Backend Configuration
-
-/// Hot state backend configuration for ephemeral data (rate limiting, caching, etc.)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct HotConfig {
-    /// Hot backend type
-    /// - Tier 1 (Potato): "memory" (default - in-memory HashMap)
-    /// - Tier 2 (Prosumer): "redis", "valkey", "dragonfly" (Redis-protocol compatible)
-    /// - Tier 3 (Hyperscale): "scylladb" (distributed persistent cache)
-    pub backend: String,
-
-    /// Backend-specific configuration (key-value pairs passed to backend factory)
-    /// Example for Redis: {"connection_string": "redis://localhost:6379", "pool_size": "5"}
-    /// Example for ScyllaDB: {"nodes": "node1:9042,node2:9042", "keyspace": "jig_hot"}
-    #[serde(default)]
-    pub backend_config: std::collections::HashMap<String, String>,
-
-    /// Fallback to in-memory if backend unavailable (Tier 2/3 only)
-    #[serde(default)]
-    pub fallback_to_memory: bool,
-}
-
-fn default_hot_backend() -> String {
-    "memory".to_string()
-}
-
-impl Default for HotConfig {
-    fn default() -> Self {
-        Self {
-            backend: default_hot_backend(),
-            backend_config: std::collections::HashMap::new(),
-            fallback_to_memory: true, // Safe default for Tier 2/3
-        }
-    }
-}
-
-impl HotConfig {
-    fn from_env() -> Self {
-        Self::default()
-    }
-
-    fn merge_env(&mut self) {
-        if let Ok(val) = std::env::var("JIG_NS_HOT_BACKEND") {
-            self.backend = val;
-        }
-        if let Ok(val) = std::env::var("JIG_NS_HOT_FALLBACK") {
-            self.fallback_to_memory = val == "true" || val == "1";
-        }
-        // Backend-specific config can be set via JIG_NS_HOT_BACKEND_<KEY>
-        // e.g., JIG_NS_HOT_BACKEND_CONNECTION_STRING=redis://localhost
     }
 }
 
@@ -1452,14 +1260,6 @@ proxy_ip_header = "x-forwarded-for"
 [storage]
 database_path = "~/.jig/nameserver.db"
 
-# Truth backend selection (Tier 1: sqlite, Tier 2: postgres, Tier 3: cockroachdb/tidb)
-backend = "sqlite"  # Default: Tier 1
-
-# Backend-specific configuration (example for Postgres)
-# [storage.backend_config]
-# connection_string = "postgres://localhost/nameserver"
-# pool_size = "10"
-# max_connections = "20"
 
 # v0.0.2 register / rotate / renew. Refused requests get HTTP 429 with code
 # RATE_LIMITED and a Retry-After header.
@@ -1539,48 +1339,10 @@ tribunal_enabled = true
 transparency_enabled = true
 federation_enabled = false
 
-[runtime]
-enabled = false  # Phase E: Enable embedded WASM execution (opt-in)
-fuel_max = 5_000_000
-memory_max_mb = 32
-execution_timeout_ms = 250
-allowed_capabilities = [
-  "storage.read:receipts:*",
-  "storage.write:attestations:*",
-  "net.fetch:federation:*"
-]
-deterministic = true
-wasi_preview2 = true
-
 # Phase F: Analytics configuration
 [analytics]
 enabled = true
 default_time_range = "last_day"  # Options: last_hour, last_day, last_week, last_month
-
-# Analytics backend selection (Tier 1: sqlite, Tier 2: duckdb/parquet, Tier 3: clickhouse)
-backend = "sqlite"  # Default: Tier 1
-
-# Backend-specific configuration (example for DuckDB)
-# [analytics.backend_config]
-# database_path = "analytics.db"
-# parquet_export_path = "/data/parquet"
-# parquet_compression = "zstd"
-
-# Phase F Tier 2/3: Hot state backend configuration
-[hot]
-backend = "memory"  # Default: Tier 1 in-memory
-fallback_to_memory = true  # Fallback if Redis/ScyllaDB unavailable
-
-# Backend-specific configuration (examples)
-# For Redis/Valkey/DragonflyDB (Tier 2):
-# [hot.backend_config]
-# connection_string = "redis://localhost:6379"
-# pool_size = "5"
-
-# For ScyllaDB (Tier 3):
-# [hot.backend_config]
-# nodes = "node1:9042,node2:9042,node3:9042"
-# keyspace = "jig_hot"
 
 # v0.0.2 alias API — GET /v1/challenge, POST /v1/register,
 # GET /v1/resolve/:alias, GET /v1/handles, POST /v1/rotate, POST /v1/renew.

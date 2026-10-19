@@ -3,8 +3,10 @@
 > **Status.** This chapter states what the system must do. Where the reference code is
 > behind, a **Status** line says so; the code's current behaviour is not the intent.
 >
-> - **Implemented:** `did:jig` identities, nameserver-attested aliases, TOFU and nameserver
->   resolution in servers, and operator-seeded per-ruleset scores for server admission.
+> - **Implemented:** `did:jig` identities, nameserver-attested aliases, TOFU resolution in
+>   servers, verified name resolution through per-suffix delegations in servers (#200) and
+>   clients (#201), client name pins through `jig trust verify-name` (#213), and
+>   operator-seeded per-ruleset scores for server admission.
 > - **Removed prototype:** the reference nameserver's earlier surface (proof-of-work
 >   challenges with penalties, `/v1/claim`, `/v1/alias`, reputation observations, tribunal
 >   case records, the transparency log, useful work and nameserver federation) is no longer
@@ -88,7 +90,7 @@ key is the DID. No authority issues or revokes one.
 
 ### Aliases
 
-A nameserver attests aliases under the suffix it is authoritative for (`alias_suffix`).
+A nameserver attests aliases under the suffixes it is authoritative for (`alias_suffixes`).
 
 1. `GET /v1/challenge` returns a 32-byte hex nonce.
 2. The client signs the nonce with its DID key and sends `POST /v1/register` with `did`,
@@ -96,6 +98,29 @@ A nameserver attests aliases under the suffix it is authoritative for (`alias_su
 3. The nameserver returns an attestation (`did`, `alias`, `ns_did`, `valid_from`,
    `valid_until`, `profile_ttl_seconds`, `sig`) signed with its own key. The default
    validity is 90 days.
+
+**Status:** the reference nameserver differs from steps 2 and 3 (#210). Register and renew
+take an action-bound `proof_of_control`: a COSE_Sign1 by the DID over `domain`
+(`jig-alias-register-v1` or `jig-alias-renew-v1`), the nameserver's DID, the alias and the
+challenge. A signature over the bare challenge is refused. Rotate still takes bare signatures
+over the challenge from both keys. The attestation is a COSE_Sign1 envelope over `did`,
+`alias`, `ns_did`, `valid_from` and `valid_until`, with no `profile_ttl_seconds`. Register,
+renew, rotate and resolve return it base64url-encoded as `attestation`, beside `links` and
+`reachability`, plus unsigned `did`, `alias` and `valid_until` hints for older clients.
+`GET /.well-known/jig-ns-delegation` serves the nameserver's signed delegation for a
+DNS-rooted suffix (`?suffix=`, else the request's `Host`) as `{"envelopes": [...]}`; a
+single-label suffix has none.
+
+One nameserver serves several suffixes (#224). `[[v0_0_2.nameserver.alias_suffixes]]` is
+required, with no default, and each suffix sets its own policy: `registration` (`open` or
+`closed`; a closed suffix still resolves, renews and rotates), `min_alias_len`, reserved names,
+and `registration_allow`, which lets one DID register exact names past that policy. A
+single-label suffix needs `single_label_authority = true`. Register takes an optional `suffix`
+(required when more than one is served: `SUFFIX_REQUIRED`; unserved: `UNKNOWN_SUFFIX`), and a
+DID holds at most one name per suffix: a second registration, or a rotation onto a DID that
+already holds one, is refused with 409 `DID_HOLDS_NAME`. Policy refusals are
+`REGISTRATION_CLOSED`, `ALIAS_TOO_SHORT` and `ALIAS_RESERVED`. `GET /v1/suffixes` lists the
+suffixes served, their registration mode and the nameserver's DID, unsigned.
 
 `POST /v1/renew` extends an attestation. `POST /v1/rotate` moves an alias from one DID to
 another and requires signatures from both keys, so the nameserver can link the two DIDs.
@@ -123,7 +148,14 @@ A server resolves the alias on an incoming block in one of two modes
 | `nameserver` | The server queries each URL in `trusted_nameservers` in order and refuses the block if the alias resolves to a different DID. Results are cached for `cache_ttl_seconds` (default 300). |
 
 A server MAY trust more than one nameserver. A server in `nameserver` mode MUST verify the
-attestation signature before it uses the binding. **Status:** not yet implemented.
+attestation signature before it uses the binding. **Status:** implemented, configured
+differently from the table above (#200). The server resolves `alias@suffix` only through the
+nameservers listed for its suffix in `[identity.delegations]`, and refuses a suffix with no
+entry. It asks every listed nameserver, and accepts only an attestation signed by one of
+that suffix's `authorities`, inside its validity window, for exactly that alias. Two valid
+answers naming different DIDs are an equivocation: the alias is refused and both answers are
+kept as evidence. A verified binding is cached until the earlier of the cache TTL and the
+attestation's `valid_until`. `trusted_nameservers` is ignored, with a startup warning.
 
 ### Anonymous identities
 
@@ -372,7 +404,7 @@ Rules:
 ## Nameserver mechanics
 
 > **Mostly not served.** The reference nameserver serves `/.well-known/jig-ns`,
-> `/.well-known/jig-ns/capabilities`, `/v1/health` and the alias routes
+> `/.well-known/jig-ns/capabilities`, `/.well-known/jig-ns-delegation`, `/v1/health`, `/v1/suffixes` and the alias routes
 > (`GET /v1/challenge`, `/v1/register`, `/v1/resolve/{alias}`, `/v1/rotate`, `/v1/renew`,
 > and `/v1/handles` behind `[debug] list_handles`). The proof-of-work challenge flow,
 > penalties, rate limiting, `/v1/policy`, `/v1/resolve?name=`, the transparency and admin
@@ -392,6 +424,8 @@ Rules:
 | `/v1/challenge` | GET | Alias registration nonce ([Aliases](#aliases)) |
 | `/v1/register`, `/v1/renew`, `/v1/rotate` | POST | Alias attestations |
 | `/v1/resolve/{alias}` | GET | Alias attestation lookup |
+| `/.well-known/jig-ns-delegation` | GET | Signed delegation for a DNS-rooted suffix |
+| `/v1/suffixes` | GET | Suffixes served, their registration mode, and the nameserver's DID |
 | `/v1/challenge` | POST | Proof-of-work challenge for `claim` or `alias` *(not served)* |
 | `/v1/claim` | POST | Bind a handle to a key, with proof-of-work *(not served)* |
 | `/v1/alias` | POST | Mint a scoped or anonymous alias, with proof-of-work *(not served)* |
@@ -639,8 +673,7 @@ not yet meet.
 **MUST:**
 
 - Use a DID as the sender of every block; treat aliases as nameserver claims.
-- Verify an alias attestation's signature before using it (servers) *(not yet
-  implemented)*.
+- Verify an alias attestation's signature before using it (servers).
 - Scope every reputation score to one ruleset; share it only within the ruleset group, and
   treat what peers send as claims *(partial)*.
 - Report reputation changes for clients to the ruleset group's nameservers (servers) *(not
