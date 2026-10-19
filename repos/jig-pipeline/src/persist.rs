@@ -116,6 +116,16 @@ pub struct StoredTofuKey {
     pub locked: bool,
 }
 
+/// An alias attestation this server acted on or refused as an equivocation
+/// (JEP-0004 rule 20): the signed bytes, kept as evidence.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StoredNameEvidence {
+    pub name: String,
+    pub root_id: String,
+    pub attestation_bytes: Vec<u8>,
+    pub first_seen: i64,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StoredCursor {
     pub peer_server_url: String,
@@ -459,6 +469,14 @@ impl SqliteStore {
                 valid_until          INTEGER NOT NULL,
                 attestation_bytes    BLOB NOT NULL,
                 PRIMARY KEY (did, ns_did)
+            );
+
+            CREATE TABLE IF NOT EXISTS name_evidence (
+                name                 TEXT NOT NULL,
+                root_id              TEXT NOT NULL,
+                attestation_bytes    BLOB NOT NULL,
+                first_seen           INTEGER NOT NULL,
+                PRIMARY KEY (name, root_id, attestation_bytes)
             );
 
             CREATE TABLE IF NOT EXISTS tofu_keys (
@@ -1172,6 +1190,38 @@ impl SqliteStore {
             params![t.local_nickname, t.did, t.first_seen_at, t.locked as i64],
         )?;
         Ok(())
+    }
+
+    // --- name evidence ---
+
+    /// Keep an attestation as evidence. Recording the same bytes again keeps
+    /// the first `first_seen`.
+    pub fn record_name_evidence(&self, e: &StoredNameEvidence) -> Result<()> {
+        self.conn.lock().expect("poisoned").execute(
+            "INSERT OR IGNORE INTO name_evidence (name, root_id, attestation_bytes, first_seen)
+             VALUES (?,?,?,?)",
+            params![e.name, e.root_id, e.attestation_bytes, e.first_seen],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_name_evidence(&self, name: &str) -> Result<Vec<StoredNameEvidence>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT name, root_id, attestation_bytes, first_seen FROM name_evidence
+             WHERE name = ? ORDER BY first_seen, attestation_bytes",
+        )?;
+        let rows = stmt
+            .query_map([name], |r| {
+                Ok(StoredNameEvidence {
+                    name: r.get(0)?,
+                    root_id: r.get(1)?,
+                    attestation_bytes: r.get(2)?,
+                    first_seen: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     // --- subscription cursors ---

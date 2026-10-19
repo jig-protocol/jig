@@ -157,10 +157,26 @@ impl AppState {
 
         let identity: Arc<dyn IdentityResolver> = match config.identity.mode {
             IdentityMode::Tofu => Arc::new(TofuResolver::new(store.clone())),
-            IdentityMode::Nameserver => Arc::new(NameserverResolver::new(
-                config.identity.trusted_nameservers.clone(),
-                config.identity.cache_ttl_seconds,
-            )),
+            IdentityMode::Nameserver => {
+                if !config.identity.trusted_nameservers.is_empty() {
+                    tracing::warn!(
+                        "identity.trusted_nameservers is not used to resolve aliases; \
+                         list each suffix's authorities and nameservers under \
+                         [identity.delegations]"
+                    );
+                }
+                if config.identity.delegations.is_empty() {
+                    tracing::warn!(
+                        "identity.mode = \"nameserver\" with no [identity.delegations]: \
+                         every alias will be refused"
+                    );
+                }
+                Arc::new(NameserverResolver::new(
+                    config.identity.delegations.clone(),
+                    config.identity.cache_ttl_seconds,
+                    store.clone(),
+                ))
+            }
         };
 
         let hlc_clock = Arc::new(

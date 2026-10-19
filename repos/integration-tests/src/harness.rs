@@ -112,9 +112,10 @@ impl TestJigServer {
         let mut config = base_config()?;
         config.identity = IdentitySection {
             mode: IdentityMode::Nameserver,
-            trusted_nameservers: vec![ns.http_url()],
+            trusted_nameservers: vec![],
             cache_ttl_seconds: 1, // short for tests so cache misses re-resolve
             naively_allow_unknown_handles_fallback: false,
+            delegations: ns.delegations(),
         };
         Self::start_with_config(config).await
     }
@@ -507,6 +508,20 @@ pub struct TestNameserver {
 }
 
 impl TestNameserver {
+    /// An `[identity.delegations]` naming this nameserver as the only
+    /// authority for its suffix, reached at its own URL.
+    pub fn delegations(
+        &self,
+    ) -> std::collections::BTreeMap<String, jig_config::v0_0_2_server::NameDelegation> {
+        std::collections::BTreeMap::from([(
+            self.alias_suffix.clone(),
+            jig_config::v0_0_2_server::NameDelegation {
+                authorities: vec![self.state.ns_did_string()],
+                nameservers: vec![self.http_url()],
+            },
+        )])
+    }
+
     /// Start a nameserver authoritative for the `dj.jig` alias suffix.
     pub async fn start() -> Result<Self> {
         Self::start_with_suffix("dj.jig").await
