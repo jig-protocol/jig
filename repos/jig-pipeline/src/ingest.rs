@@ -314,7 +314,11 @@ pub async fn ingest(
         }
     };
     if let Err(refusal) = admitted {
-        tracing::info!(sender = %sender, refusal = %refusal, "write refused at admission");
+        tracing::info!(
+            sender = %jig_core::did::log_tag(sender.as_str()),
+            refusal = %refusal,
+            "write refused at admission"
+        );
         return Err(IngestError::NotAdmitted {
             sender: sender.to_did_jig_string(),
             refusal,
@@ -338,7 +342,7 @@ pub async fn ingest(
                 if ctx.naively_allow_unknown_handles_fallback {
                     tracing::warn!(
                         nickname = %nickname,
-                        sender_did = %sender_did,
+                        sender = %jig_core::did::log_tag(&sender_did),
                         error = %err,
                         "identity.naively_allow_unknown_handles_fallback=true: \
                          admitting block despite identity-resolver rejection \
@@ -743,6 +747,7 @@ pub async fn ingest(
         }
     }
 
+    crate::metrics::block_ingested(&source);
     Ok(block_cid)
 }
 
@@ -778,12 +783,11 @@ pub fn channel_metadata_key(kind: BlockKind) -> &'static str {
 /// a mistyped slug persisted an orphan block and handed the sender a CID, so a
 /// typo was indistinguishable from a delivered message.
 ///
-/// A federated `text-render` is deliberately EXEMPT. A channel's state reaches
-/// a peer only through blocks relayed after peering began, so a peer's message
-/// routinely names a channel this server has no row for; refusing it would
-/// drop legitimate federated traffic. The membership and lifecycle kinds are
-/// not exempt from a peer either: with no channel there is no owner to
-/// authorize them against, and the write gate must not pass them by default.
+/// A federated `text-render` is NOT exempt either: with no channel row there
+/// is no membership or ownership to gate it against, so it used to be stored
+/// as an orphan. A channel reaches a peer through its relayed `channel-create`,
+/// which gives the peer a row first; anything else fails closed. The source no
+/// longer changes the answer.
 ///
 /// Bridges are deliberately NOT exempt. The email bridge awaits
 /// `ensure_dm_channel` (a real channel-create through this same pipeline) before
@@ -798,10 +802,7 @@ pub fn channel_metadata_key(kind: BlockKind) -> &'static str {
 /// which made that route an oracle for channel existence and ownership to
 /// callers who had proved nothing. The typed 404 here is what lets every
 /// surface answer only after the signature and admission have passed.
-fn requires_existing_channel(kind: BlockKind, source: &IngestSource) -> bool {
-    if kind == BlockKind::TextRender && matches!(source, IngestSource::FederatedPeer { .. }) {
-        return false;
-    }
+fn requires_existing_channel(kind: BlockKind, _source: &IngestSource) -> bool {
     matches!(
         kind,
         BlockKind::TextRender
@@ -1185,7 +1186,7 @@ mod tests {
     }
 
     fn seed_channel_owned_by(ctx: &IngestContext, slug: &str, owner_did: &str) -> String {
-        let id = format!("bafySeed_{}", slug.trim_start_matches('#'));
+        let id = crate::ingest_record::label_cid(&format!("seed {slug}"));
         ctx.store
             .upsert_channel(&crate::persist::StoredChannel {
                 id: id.clone(),
@@ -2207,17 +2208,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn federated_text_render_to_unknown_channel_is_admitted() {
-        // Deliberate exemption: a peer's message routinely names a channel
-        // this server has no row for (one created before the two peered).
-        // Rejecting would break federation; we admit and let fanout match on
-        // the slug.
+    async fn federated_text_render_to_unknown_channel_is_refused() {
+        // Fail closed: a relayed post for a channel this server has no row
+        // for has no membership or ownership to be gated against, so it used
+        // to be stored as an orphan. Channels federate by their
+        // channel-create, which gives the receiving server a row first.
         let ctx = test_ctx();
         let sender_key = random_signing_key();
         let (mb, cb, sig) =
             build_bundle_parts_with_channel(&sender_key, BlockKind::TextRender, "#remote-only");
 
-        let cid = do_ingest(
+        let err = do_ingest(
             &ctx,
             mb,
             cb,
@@ -2228,8 +2229,18 @@ mod tests {
             },
         )
         .await
-        .expect("federated blocks must not be gated on local channel state");
-        assert!(ctx.store.get_block(&cid).unwrap().is_some());
+        .unwrap_err();
+        assert!(
+            matches!(&err, IngestError::UnknownChannel { slug } if slug == "#remote-only"),
+            "expected UnknownChannel, got {err:?}"
+        );
+        assert!(
+            ctx.store
+                .list_blocks_by_channel("#remote-only", 10, None)
+                .unwrap()
+                .is_empty(),
+            "a refused relayed post must leave nothing behind"
+        );
     }
 
     #[tokio::test]
@@ -2310,9 +2321,10 @@ mod tests {
         ctx.fanout.register_bridge_did(shadow.clone(), tx);
 
         // Channel "#dm/x" with members [bob, shadow].
+        let channel_cid = crate::ingest_record::label_cid("dm x");
         ctx.store
             .upsert_channel(&StoredChannel {
-                id: "#dm/x".into(),
+                id: channel_cid.clone(),
                 slug: "#dm/x".into(),
                 // Bridges carry plaintext, which only an open channel takes (D25).
                 visibility: "open".into(),
@@ -2324,7 +2336,7 @@ mod tests {
         for did in [bob_did.clone(), shadow.clone()] {
             ctx.store
                 .upsert_membership(&StoredMembership {
-                    channel_id: "#dm/x".into(),
+                    channel_id: channel_cid.clone(),
                     member_did: did,
                     role: "member".into(),
                     joined_at: 0,
@@ -2353,7 +2365,7 @@ mod tests {
         // Regression: memberships are keyed by the channel's CID, not its slug.
         // The prior dispatch used `list_members(slug)` which returns nothing when
         // `channel.id != channel.slug` (the realistic shape from channel-create).
-        // This test stores channel.id = "bafyCID_xyz" and channel.slug = "#dm/z"
+        // This test stores channel.id = a CID and channel.slug = "#dm/z"
         // and verifies the bridge sink still fires.
         use crate::persist::{StoredChannel, StoredMembership};
         let ctx = test_ctx(); // allows "text-render"
@@ -2367,7 +2379,7 @@ mod tests {
 
         // Channel stored with a CID as id (distinct from slug) — realistic
         // shape written by channel-create effect handling.
-        let channel_cid = "bafyCID_xyz".to_string();
+        let channel_cid = crate::ingest_record::label_cid("dm z");
         ctx.store
             .upsert_channel(&StoredChannel {
                 id: channel_cid.clone(),

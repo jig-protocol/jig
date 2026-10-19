@@ -83,12 +83,12 @@ fn build_auth(
 /// Kept as a named function rather than inlined so the mapping is one visible
 /// place: a limit added on either side that is not wired here is the same class
 /// of silent divergence this exists to remove.
-fn runtime_config_from(execution: &ExecutionConfig) -> jig_runtime::RuntimeConfig {
+pub(crate) fn runtime_config_from(execution: &ExecutionConfig) -> jig_runtime::RuntimeConfig {
     jig_runtime::RuntimeConfig {
         // Enumerated rather than assigned onto a default, and deliberately: a
         // limit added to `ResourceLimits` should break this build so somebody
         // decides whether operators can set it, instead of it silently taking a
-        // default here. Same reasoning as `BlockRuntime::new`.
+        // default here.
         limits: jig_runtime::config::ResourceLimits {
             fuel_max: execution.fuel_max,
             memory_max_mb: execution.memory_max_mb,
@@ -147,6 +147,12 @@ impl AppState {
         let store = Arc::new(SqliteStore::open(&db_path).context("opening SqliteStore")?);
         let signing_key = load_or_generate_server_key(&config.server.server_did_keyfile)
             .context("loading server signing key")?;
+        // Before anything logs a DID: tags are keyed by this server's seed.
+        if !jig_core::did::set_log_tag_key(&signing_key.to_bytes()) {
+            tracing::warn!(
+                "a different log tag key is already in effect in this process; DID tags keep using it"
+            );
+        }
         let server_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
         // A store written before `ingest` records existed is sequenced once,
         // here: each local channel's chain starts at its channel-create and
@@ -331,8 +337,8 @@ impl AppState {
 }
 
 /// Load the server's ed25519 signing key from `path`, or generate + write
-/// it if the file doesn't exist. On Unix, generated files are set to mode
-/// 0600. The path supports `~` expansion (e.g. `~/.jig/server/server.key`).
+/// it if the file doesn't exist. A generated file is created owner-only (0600
+/// on Unix) and its key comes from the protocol's one keygen path. The path supports `~` expansion (e.g. `~/.jig/server/server.key`).
 fn load_or_generate_server_key(path: &str) -> Result<SigningKey> {
     let expanded = shellexpand::tilde(path).into_owned();
     let path = Path::new(&expanded);
@@ -366,20 +372,9 @@ fn load_or_generate_server_key(path: &str) -> Result<SigningKey> {
         arr.copy_from_slice(&bytes);
         Ok(SigningKey::from_bytes(&arr))
     } else {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("creating server keyfile parent dir {}", parent.display())
-            })?;
-        }
-        let secret: [u8; 32] = rand::random();
-        let signing = SigningKey::from_bytes(&secret);
-        std::fs::write(path, signing.to_bytes())
+        let signing = jig_core::crypto::ed25519::generate_signing_key();
+        jig_core::crypto::ed25519::write_new_key_file(path, &signing)
             .with_context(|| format!("writing server keyfile to {}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
         Ok(signing)
     }
 }
@@ -495,6 +490,17 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "generated keyfile must be 0600 on Unix");
         }
+    }
+
+    #[test]
+    fn a_new_key_file_never_replaces_an_existing_one() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("server.key");
+        std::fs::write(&path, b"keep me").unwrap();
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let err = jig_core::crypto::ed25519::write_new_key_file(&path, &key).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
     }
 
     #[test]

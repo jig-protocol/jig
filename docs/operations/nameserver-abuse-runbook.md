@@ -1,5 +1,21 @@
 # Nameserver abuse runbook
 
+> **Superseded.** This runbook described the nameserver's legacy prototype. #154 removed the
+> routes most steps below call: `/v1/admin/*`,
+> `/v1/policy`, `/v1/tribunal/*`, `/v1/reputation/*`, `/v1/work/*`, `/v1/hosts/*`,
+> `/v1/resolve?name=`, `/v1/federation/*`, and the proof-of-work challenges for `/v1/claim`
+> and `/v1/alias`. The `JIG_NS_POW_*`, `JIG_NS_PENALTY_*`, `JIG_NS_ANON_*` and
+> `JIG_NS_RATE_*` settings no longer affect any served route. What still applies:
+> - Section 1: steps 1, 2, 5 and 6.
+> - Section 2: step 5 (rate-limit `/v1/register`, `/v1/rotate` and `/v1/renew` at the reverse
+>   proxy).
+> - Section 3, "Compromised nameserver": steps 1 to 3 and 5 to 7. Step 4's attestation-key
+>   rotation also still applies.
+> - Section 4: steps 5 and 6.
+>
+> A new runbook follows lane R's redesign (framing doc #152; draft JEP-0008, JEP-0009 and
+> JEP-0010 in #162, #163 and #166).
+
 What a `jig-nameserver` operator does about harassment reports, registration and relay
 abuse, a compromised nameserver, and a rogue federated instance. Parameters and endpoints
 are the reference implementation's. Settings and defaults are listed in the
@@ -23,8 +39,8 @@ spreads further than the group.
 - **Restrict every write endpoint at the reverse proxy.** The admin token does not cover
   `/v1/reputation/observe`, `/v1/tribunal/cases*`, `/v1/receipts/submit`,
   `/v1/attestations/submit` or `/v1/federation/gossip`, and `/v1/register` has no
-  proof-of-work or rate limit. The shipped unit binds to the tailnet only
-  ([`deploy/README.md`](../../deploy/README.md)). Keep it that way until these are
+  proof-of-work (it is rate-limited per client IP and per DID, `[alias_rate_limits]`). The
+  shipped unit binds to the tailnet only ([`deploy/README.md`](../../deploy/README.md)). Keep it that way until these are
   authenticated.
 - **Know your files.** With the shipped unit: legacy store `/var/lib/jig/nameserver.db`
   (penalties, rate windows, federation cache, reputation, tribunal records, the
@@ -32,8 +48,9 @@ spreads further than the group.
   `/var/lib/jig/nameserver_v002.key` (or `[v0_0_2.server] server_did_keyfile`), and
   `JIG_NS_SECRET` in `/etc/jig/jig-nameserver.env`.
 - **Know that settings are read at start-up.** Every `JIG_NS_*` change below needs
-  `sudo systemctl restart jig-nameserver`. A restart does not reset penalties or rate
-  windows; they live in the database.
+  `sudo systemctl restart jig-nameserver`. A restart does not reset the legacy penalties or
+  rate windows, which live in the database. It does reset the `[alias_rate_limits]`
+  buckets on `/v1/register`, `/v1/rotate` and `/v1/renew`, which are held in memory.
 - **Turn on a default ruleset** (`[reputation] default_ruleset`) if you want reputation
   observations to affect proof-of-work. Without one, they are recorded and ignored.
 
@@ -129,8 +146,10 @@ one scope collecting aliases.
    enough, block `POST /v1/alias` at the reverse proxy until the flood stops. Do **not**
    set `JIG_NS_ANON_ENABLED=false` for this: it removes the anonymous floor but does not
    stop anonymous aliases being minted.
-5. **Abuse of `/v1/register`.** It has no proof-of-work or rate limit. Rate-limit it per
-   address at the reverse proxy, or close it to all but known clients.
+5. **Abuse of `/v1/register`.** It has no proof-of-work. It is rate-limited per client IP
+   and per DID (`[alias_rate_limits]`, defaults 30 and 10 per minute); lower
+   `per_ip_per_min` for the duration, or close it to all but known clients at the reverse
+   proxy.
 6. **Behind a proxy**, set `JIG_NS_TRUST_PROXY=true` and `JIG_NS_PROXY_IP_HEADER` to the
    header your proxy sets, or every request shares the proxy's address and one bucket.
 7. **Griefing.** If a legitimate user's key was pushed to the maximum by someone else's
