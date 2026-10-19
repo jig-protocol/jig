@@ -76,6 +76,8 @@ crossterm = "0.29"
 jig-config = { path = "../jig-config", optional = true }
 
 [dev-dependencies]
+# `TestNameserver`: the real nameserver router, for `tests/nameserver_roundtrip.rs`.
+integration-tests = { path = "../integration-tests" }
 tempfile = "3.8"
 time = { version = "0.3", features = ["serde"] }
 ed25519-dalek = { workspace = true }
