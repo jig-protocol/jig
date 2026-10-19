@@ -56,3 +56,12 @@ semver = { version = "1.0", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3"
+# `naming` tests stand up real TLS servers: one under a test CA, one
+# self-signed, to show `dns` discovery takes a CA-valid certificate only. Same
+# rustls stack as above (0.23, ring), as integration-tests uses.
+rcgen = "0.14"
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "logging",
+    "ring",
+    "tls12",
+] }

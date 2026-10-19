@@ -481,7 +481,20 @@ pub fn verify_binding(
         return Err(NamingError::DelegationExpired(deleg.valid_until));
     }
     deleg.verify()?;
-    if !deleg.authorities.contains(&att.ns_did) {
+    verify_attestation(att, &deleg.authorities, name, now)
+}
+
+/// The attestation half of [`verify_binding`], for a resolver whose
+/// authorities come from its own configuration (a `config` root) rather than
+/// from a signed delegation: the signer is one of `authorities`, and the
+/// attestation's signature, time window and alias.
+pub fn verify_attestation(
+    att: &Attestation,
+    authorities: &[String],
+    name: &Name,
+    now: i64,
+) -> Result<(), NamingError> {
+    if !authorities.contains(&att.ns_did) {
         return Err(NamingError::NotAuthoritative(
             att.ns_did.clone(),
             name.suffix.clone(),
@@ -648,6 +661,31 @@ mod tests {
         assert_eq!(
             verify_binding(&att(&ns(), &alice), &deleg(&[&ns()]), &name(), NOW),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn a_configured_authority_list_stands_in_for_a_delegation() {
+        let alice = did_of(&key(9));
+        let authorities = vec![did_of(&ns())];
+        assert_eq!(
+            verify_attestation(&att(&ns(), &alice), &authorities, &name(), NOW),
+            Ok(())
+        );
+        let stranger = key(42);
+        assert_eq!(
+            verify_attestation(&att(&stranger, &alice), &authorities, &name(), NOW),
+            Err(NamingError::NotAuthoritative(
+                did_of(&stranger),
+                "example.org".into()
+            ))
+        );
+        assert_eq!(
+            verify_attestation(&att(&ns(), &alice), &[], &name(), NOW),
+            Err(NamingError::NotAuthoritative(
+                did_of(&ns()),
+                "example.org".into()
+            ))
         );
     }
 
