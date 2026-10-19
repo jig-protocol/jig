@@ -30,7 +30,8 @@ jig-server --init-config jig-config.toml
 # Start with defaults (SQLite under ~/.jig/jig.db)
 jig-server
 
-# Start using a specific config file
+# Start using a specific config file. An unknown or removed key stops the
+# boot with an error naming it.
 jig-server --config jig-config.toml
 
 # Override a few fields on the CLI. Bind loopback or a tailnet address —
