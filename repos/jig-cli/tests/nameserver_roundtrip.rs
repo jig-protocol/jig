@@ -81,13 +81,21 @@ async fn resolved(ns: &TestNameserver, name: &str) -> Attestation {
 async fn register_renew_and_rotate_against_the_real_nameserver() {
     let ns = TestNameserver::start().await.unwrap();
     let url = ns.http_url();
-    let name = format!("dj@{}", ns.alias_suffix);
+    let name = format!("deji@{}", ns.alias_suffix);
     let home = tempfile::tempdir().unwrap();
 
     // Register. Mixed case on purpose: the proof is over the lowercased name.
+    // Four letters: a nameserver may set a minimum alias length (#224).
     let (ok, out) = jig(
         home.path(),
-        &["init", "dj", "--request-alias", "DJ", "--nameserver", &url],
+        &[
+            "init",
+            "dj",
+            "--request-alias",
+            "DeJi",
+            "--nameserver",
+            &url,
+        ],
     )
     .await;
     assert!(ok, "jig init --request-alias: {out}");
@@ -130,8 +138,8 @@ async fn register_renew_and_rotate_against_the_real_nameserver() {
 async fn renewing_an_alias_held_by_another_key_is_refused() {
     let ns = TestNameserver::start().await.unwrap();
     let url = ns.http_url();
-    let holder = ns.register("dj").await.unwrap();
-    let name = format!("dj@{}", ns.alias_suffix);
+    let holder = ns.register("deji").await.unwrap();
+    let name = format!("deji@{}", ns.alias_suffix);
     let home = tempfile::tempdir().unwrap();
     let (ok, out) = jig(home.path(), &["init", "me"]).await;
     assert!(ok, "{out}");
