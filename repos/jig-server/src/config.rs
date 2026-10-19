@@ -73,9 +73,9 @@ pub const REMOVED_KEYS: &[(&str, &str)] = &[
     (
         "debug.admin_endpoints",
         "channel operations are always served at /api/v1/channels; the /_admin_v0_0_2 \
-         aliases it enabled were removed. v0.1.0-alpha.1's install.sh and \
-         deploy/config.example.toml wrote `admin_endpoints = false` under [debug]; deleting \
-         that one line is all an upgrade needs",
+         aliases it enabled were removed. install.sh (v0.1.0-alpha.1) and \
+         deploy/config.example.toml (through v0.2.0-alpha.1) wrote `admin_endpoints = false` \
+         under [debug]; deleting that one line is all an upgrade needs",
     ),
     (
         "execution.pricing_enabled",
