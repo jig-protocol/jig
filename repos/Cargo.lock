@@ -3944,7 +3944,6 @@ dependencies = [
  "rand 0.10.3",
  "rcgen",
  "reqwest",
- "rusqlite",
  "rustls",
  "rustls-pki-types",
  "semver",
