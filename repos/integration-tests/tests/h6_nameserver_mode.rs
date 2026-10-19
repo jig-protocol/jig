@@ -23,12 +23,13 @@ use std::sync::Arc;
 
 use jig_pipeline::identity::{IdentityResolver, NameserverResolver};
 use jig_pipeline::persist::SqliteStore;
+use jig_server::v0_0_2::suffix_authorities;
 
 /// A resolver that takes `ns` as the one authority for its suffix, exactly
 /// as the jig-server boot path builds it from `[identity.delegations]`.
 fn resolver_for(ns: &TestNameserver) -> NameserverResolver {
     NameserverResolver::new(
-        ns.delegations(),
+        suffix_authorities(&ns.delegations()),
         1,
         Arc::new(SqliteStore::open_in_memory().unwrap()),
     )
@@ -159,7 +160,7 @@ async fn jig_server_in_nameserver_mode_resolves_through_authority() {
     // deterministic results without depending on the server's internal Arc
     // construction.
     let resolver = NameserverResolver::new(
-        server.state.config.identity.delegations.clone(),
+        suffix_authorities(&server.state.config.identity.delegations),
         server.state.config.identity.cache_ttl_seconds,
         Arc::new(SqliteStore::open_in_memory().unwrap()),
     );

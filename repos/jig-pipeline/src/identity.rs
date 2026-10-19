@@ -15,7 +15,6 @@
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use jig_config::v0_0_2_server::NameDelegation;
 use jig_core::naming::{self, Attestation, Name, NamingError};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -159,7 +158,7 @@ impl IdentityResolver for TofuResolver {
 /// evidence. A verified binding is cached until the earlier of `cache_ttl` and
 /// the attestation's `valid_until`.
 pub struct NameserverResolver {
-    delegations: BTreeMap<String, NameDelegation>,
+    delegations: BTreeMap<String, SuffixAuthority>,
     store: Arc<SqliteStore>,
     cache: RwLock<HashMap<String, CachedDid>>,
     cache_ttl: Duration,
@@ -172,6 +171,17 @@ struct CachedDid {
     did: String,
     valid_until: i64,
     cached_at: Instant,
+}
+
+/// Who speaks for one suffix, as the server's `[identity.delegations]`
+/// configures it (a `config` root). jig-server converts its config section
+/// into these at boot, so this crate does not depend on the config crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuffixAuthority {
+    /// The DIDs whose attestations count for the suffix.
+    pub authorities: Vec<String>,
+    /// The nameserver URLs to ask; every one is asked.
+    pub nameservers: Vec<String>,
 }
 
 /// The largest resolve response read. An attestation is a few hundred bytes;
@@ -197,7 +207,7 @@ enum Answer {
 
 impl NameserverResolver {
     pub fn new(
-        delegations: BTreeMap<String, NameDelegation>,
+        delegations: BTreeMap<String, SuffixAuthority>,
         cache_ttl_seconds: u64,
         store: Arc<SqliteStore>,
     ) -> Self {
@@ -578,10 +588,10 @@ mod tests {
         suffix: &str,
         authorities: &[&SigningKey],
         nameservers: &[&MockNameserver],
-    ) -> BTreeMap<String, NameDelegation> {
+    ) -> BTreeMap<String, SuffixAuthority> {
         BTreeMap::from([(
             suffix.to_string(),
-            NameDelegation {
+            SuffixAuthority {
                 authorities: authorities.iter().map(|k| did_of(k)).collect(),
                 nameservers: nameservers.iter().map(|m| m.url.clone()).collect(),
             },
@@ -878,7 +888,7 @@ mod tests {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let delegations = BTreeMap::from([(
             "dj.jig".to_string(),
-            NameDelegation {
+            SuffixAuthority {
                 authorities: vec![did_of(&key(1))],
                 // A localhost port nothing is bound on: connection refused.
                 nameservers: vec!["http://127.0.0.1:1".to_string()],

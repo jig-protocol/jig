@@ -172,7 +172,7 @@ impl AppState {
                     );
                 }
                 Arc::new(NameserverResolver::new(
-                    config.identity.delegations.clone(),
+                    suffix_authorities(&config.identity.delegations),
                     config.identity.cache_ttl_seconds,
                     store.clone(),
                 ))
@@ -384,6 +384,24 @@ fn load_or_generate_server_key(path: &str) -> Result<SigningKey> {
             .with_context(|| format!("writing server keyfile to {}", path.display()))?;
         Ok(signing)
     }
+}
+
+/// `[identity.delegations]` as the pipeline's resolver takes it.
+pub fn suffix_authorities(
+    delegations: &std::collections::BTreeMap<String, jig_config::v0_0_2_server::NameDelegation>,
+) -> std::collections::BTreeMap<String, jig_pipeline::identity::SuffixAuthority> {
+    delegations
+        .iter()
+        .map(|(suffix, d)| {
+            (
+                suffix.clone(),
+                jig_pipeline::identity::SuffixAuthority {
+                    authorities: d.authorities.clone(),
+                    nameservers: d.nameservers.clone(),
+                },
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
