@@ -57,9 +57,6 @@ allowed_block_kinds = ["text-render", "channel-create", "member-add"]
 mode = "tofu"
 trusted_nameservers = []
 cache_ttl_seconds = 300
-
-[debug]
-admin_endpoints = true
 "#,
         db = home.join("jig.db").display(),
         key = home.join("server.key").display(),
@@ -120,6 +117,38 @@ fn valid_explicit_config_still_boots() {
     assert_still_running(&mut child, "a valid --config must boot");
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[test]
+fn a_v0_0_2_module_that_cannot_start_is_fatal() {
+    // A server without the v0.0.2 module serves only /.well-known/jig,
+    // /healthz and /metrics: it passes every health check while accepting and
+    // serving nothing. So a module that cannot start must stop the boot.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(&cfg, valid_hybrid_config(dir.path())).unwrap();
+    // The configured server_did_keyfile exists but holds no key.
+    std::fs::write(dir.path().join("server.key"), b"not a key").unwrap();
+
+    let mut child = spawn(dir.path(), &["--config", cfg.to_str().unwrap()]);
+    let Some(status) = wait_bounded(&mut child, Duration::from_secs(15)) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "a v0.0.2 module that cannot start must be fatal, but the server was still \
+             running\nstderr:\n{}",
+            drain_stderr(&mut child)
+        );
+    };
+    let stderr = drain_stderr(&mut child);
+    assert!(
+        !status.success(),
+        "expected a non-zero exit, got {status:?}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("v0.0.2 module failed to initialize"),
+        "the failure must say what failed; stderr was:\n{stderr}"
+    );
 }
 
 #[test]

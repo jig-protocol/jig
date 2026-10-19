@@ -140,8 +140,10 @@ one. Revisit after v0.2.
 **Status evidence.** v0.2 channels created under `mls` store only MLS ciphertext; the
 server holds no group secret (`jig_mls::delivery` tracks public state only).
 `integration-tests/tests/h12_encrypted_channels.rs` searches every file the server wrote
-after a conversation and finds none of it. Channels created without a suite remain
-plaintext, and encrypted channels do not federate.
+after a conversation and finds none of it. A restricted channel is always `mls`; ingest
+refuses a plaintext one, and one created plaintext before that rule is frozen
+(`CHANNEL_FROZEN` on new content) with its history still readable to the operator. Open
+channels created without a suite remain plaintext, and encrypted channels do not federate.
 
 ### OP-06: dropping, reordering, delaying, replaying, selective censorship
 
@@ -155,8 +157,11 @@ servers and members. Both are design work, so the register says Open for those p
 
 **Status evidence.** `IngestError::DuplicateBlock` refuses a CID seen before, which also
 stops replay of control-plane blocks. Read proofs go through a
-`ReplayGuard` (`jig-server/src/auth/`). The manifest's `hlc_ts` is set by the ingesting
-server, so it does not help a client detect reordering by that server.
+`ReplayGuard` (`jig-server/src/auth/`). The manifest's `hlc_ts` is set by the block's
+author (TM-02), not the server, but it still does not help a client detect reordering or
+omission: nothing binds one author's block to the blocks before it, so the server can
+reorder or withhold blocks whatever their timestamps say, and the server's clock adopts
+block timestamps with no skew bound (TM-01).
 
 ### OP-07: forged or withheld receipts; lying about fuel or execution
 

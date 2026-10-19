@@ -135,10 +135,11 @@ tailnet:
   Only federate with servers you would let post on your behalf.
 - **Channel ops are on by default.** `POST /api/v1/channels*` is always
   mounted and runs the same gates as every other write: anyone who can reach
-  the port can create an open channel. `[debug] admin_endpoints = true` only
-  adds the legacy `/_admin_v0_0_2/*` aliases for pre-v0.1 CLIs.
-- **No end-to-end encryption.** The operator reads every message. See
-  `docs/RELEASE_READINESS.md` §1.3.
+  the port can create an open channel.
+- **End-to-end encryption is per channel.** Restricted channels and DMs are
+  always MLS, and open channels are MLS only when created `--encrypted`. The
+  operator reads every other open channel and sees who posts where and when in
+  all of them. See `docs/RELEASE_READINESS.md` §1.3.
 - The nameserver's `/v1/register` has no auth beyond proof-of-control of a
   self-minted key. Its config default `bind` is `127.0.0.1`, but the unit
   overrides it with `JIG_NS_BIND` — set that to the tailnet IP, not `0.0.0.0`.
@@ -221,7 +222,7 @@ enabling it.
 > to `jig-server` only — so its rows stay `http://` unless you terminate TLS in
 > front of it yourself.
 
-`/healthz` and `/metrics` are deliberately mounted **outside** the v0.0.1 gate,
+`/healthz` and `/metrics` are always mounted and need no signed read,
 so they answer on a default, locked-down deployment. Use `/healthz` — not
 `/.well-known/jig` — as the uptime check: it touches no storage.
 
@@ -273,17 +274,13 @@ Three landmines, all called out in `config.example.toml`:
 - **`[server] listen` is DECORATIVE.** It only builds the `ws://…` origin-tag
   string. It does **not** control the bind address. The server now logs a
   startup `WARN` when `listen` disagrees with the effective `bind_address:port`.
-- **`[debug] admin_endpoints` is no longer required.** Current CLIs use
-  `/api/v1/channels*`, which is always mounted. Set it to `true` only while
-  pre-v0.1 `jig` binaries (which POST to `/_admin_v0_0_2/*`) still talk to this
-  server.
-- **`dangerously_enable_v0_0_1_rest` defaults to `false`, and should stay false.**
-  It gates the unsigned v0.0.1 REST surface (`GET`/`POST /blocks`,
-  `/blocks/:cid`, `/receipts/:cid`), which takes an attacker-chosen author DID
-  with no signature and signs a receipt attesting to it. The visible cost of
-  leaving it off is that **`jig read` 404s** — it still calls `GET /blocks`. Use
-  `jig chat` or `GET /api/v1/channels/<slug>/blocks` instead; do **not** turn the
-  flag on to make `jig read` work.
+- **The `/_admin_v0_0_2/*` aliases are gone**, and `[debug] admin_endpoints`
+  with them. Current CLIs use `/api/v1/channels*`, which is always mounted; an
+  old config that still sets the key parses and the key is ignored.
+- **The unsigned v0.0.1 REST surface is gone** (D28): `GET`/`POST /blocks`,
+  `/blocks/:cid` and `/receipts/:cid` answer `404`, and the
+  `dangerously_enable_v0_0_1_rest` flag no longer exists. `jig read` uses the
+  signed history endpoint, `GET /api/v1/channels/<slug>/blocks`.
 
 ### Reading history
 
@@ -489,18 +486,35 @@ databases without the key.
 
 ## The nameserver
 
-The binary now serves the v0.0.2 alias API alongside the legacy routes:
+The binary serves the alias API and its discovery documents. The legacy routes
+(proof-of-work challenges, `/v1/claim`, `/v1/alias`, `/v1/policy`, admin,
+reputation, tribunal, transparency and federation) were removed:
 
 | Route | Method | Notes |
 | --- | --- | --- |
+| `/.well-known/jig-ns`, `/.well-known/jig-ns/capabilities` | GET | discovery documents |
 | `/v1/health` | GET | liveness |
-| `/v1/challenge` | GET | v0.0.2 — issues a 64-hex nonce |
-| `/v1/challenge` | POST | legacy PoW challenge; method-disjoint from the GET |
+| `/v1/challenge` | GET | issues a 64-hex nonce |
 | `/v1/register` | POST | consumes a GET-issued challenge, returns an attestation |
-| `/v1/resolve/:alias` | GET | v0.0.2 alias → DID |
-| `/v1/resolve?name=` | GET | legacy |
+| `/v1/resolve/:alias` | GET | alias → DID |
 | `/v1/rotate`, `/v1/renew` | POST | key rotation / renewal |
 | `/v1/handles` | GET | **debug-gated** behind `[debug] list_handles` |
+
+> **Rate limits.** The nameserver limits `POST /v1/register`, `/v1/rotate` and
+> `/v1/renew` per client IP (default 30/min) and per DID (default 10/min,
+> counting only requests that succeed, each of which needs that DID's
+> signature). Set them in `[alias_rate_limits]` (`enabled`, `per_ip_per_min`,
+> `per_did_per_min`). Refused requests get HTTP 429 with code `RATE_LIMITED`
+> and a `Retry-After` header. IPv6 clients are limited per /64. If the
+> nameserver runs behind a reverse proxy, set `[network] trust_proxy = true`
+> and `proxy_ip_header` (default `x-forwarded-for`); the nameserver uses the
+> last address in that header, the one your proxy appended. With one proxy in
+> front this is the client's address; behind several, the limit applies to the
+> nearest proxy. Without `trust_proxy`, every client behind the proxy shares
+> the proxy's address and its limit. Limits are in memory and reset when the
+> nameserver restarts.
+
+None of the nameserver's routes asks for proof-of-work.
 
 `/v1/handles` enumerates every registered alias, so it stays off unless you
 explicitly set `list_handles = true`. Alias resolution never touches DNS, so the

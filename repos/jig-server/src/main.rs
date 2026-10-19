@@ -39,7 +39,7 @@ struct Args {
 /// `server_did_keyfile` reverts to the default path, the server mints a FRESH
 /// ed25519 identity, and it comes up under a NEW server DID — which breaks
 /// TOFU pinning for every already-connected client. The same swallow silently
-/// reverts `[bridges]`, federation peers, and `debug.admin_endpoints`.
+/// reverts `[bridges]`, federation peers, and `[debug]`.
 ///
 /// `None` (no `--config` given) legitimately means defaults.
 fn load_v0_0_2_config(config_path: Option<&Path>) -> Result<JigServerConfig, String> {
@@ -71,6 +71,28 @@ fn listen_disagreement_warning(listen: &str, bind_address: &str, port: u16) -> O
     ))
 }
 
+/// Without `--config` the server used to read `[storage.truth]` from
+/// `./jig-config.toml` or `~/.jig/config.toml` to pick its database path. It no
+/// longer does; a server that relied on that would now open a fresh database
+/// at the default path, so say so when one of those files is present.
+fn warn_on_ignored_legacy_config_files() {
+    let candidates = [
+        std::env::current_dir()
+            .ok()
+            .map(|d| d.join("jig-config.toml")),
+        Some(jig_config::default_config_path()),
+    ];
+    for path in candidates.into_iter().flatten().filter(|p| p.exists()) {
+        let msg = format!(
+            "ignoring {}: jig-server reads only --config; pass --config (or --db-path / \
+             JIG_DB_PATH) to choose the database",
+            path.display()
+        );
+        tracing::warn!("{msg}");
+        eprintln!("[jig-server] WARN: {msg}");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Default to `info` when RUST_LOG is unset: `from_default_env()` alone
@@ -92,8 +114,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = if let Some(path) = &config_path {
         ServerConfig::load(path)?
     } else {
-        // Precedence: jig-config in CWD or ~/.jig/config.toml, then defaults
-        ServerConfig::try_load_jig_config_from_well_known().unwrap_or_default()
+        warn_on_ignored_legacy_config_files();
+        ServerConfig::default()
     };
 
     let env_db = std::env::var("JIG_DB_PATH").ok().map(PathBuf::from);
@@ -101,6 +123,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Starting Jig server v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("Database: {}", config.database_path.display());
+    for opt in config.unsafe_options_active() {
+        tracing::warn!("unsafe option active: {opt} (loopback or a TLS-terminating proxy only)");
+    }
 
     // Build the v0.0.2 pipeline AppState alongside the existing ServerConfig.
     // Both halves come from the same --config file: root-level keys drive
@@ -165,8 +190,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(state)
             }
             Err(e) => {
-                tracing::warn!("v0.0.2 module failed to initialize, running without it: {e}");
-                None
+                // Fatal: without the v0.0.2 module the server would serve only
+                // /.well-known/jig, /healthz and /metrics, which reads as "up"
+                // to every health check while accepting and serving nothing.
+                let msg = format!("v0.0.2 module failed to initialize: {e}");
+                tracing::error!("{msg}");
+                eprintln!("[jig-server] FATAL: {msg}");
+                std::process::exit(1);
             }
         }
     };
@@ -222,14 +252,14 @@ mod tests {
         let path = write(
             &dir,
             "good.toml",
-            "[server]\nserver_did_keyfile = \"/srv/keep-me.key\"\n\n[debug]\nadmin_endpoints = true\n",
+            "[server]\nserver_did_keyfile = \"/srv/keep-me.key\"\n\n[debug]\nlist_handles = true\n",
         );
 
         let cfg = load_v0_0_2_config(Some(&path)).unwrap();
         // The whole point: the operator's keyfile must survive. Falling back to
         // defaults here mints a new server DID and breaks TOFU pinning.
         assert_eq!(cfg.server.server_did_keyfile, "/srv/keep-me.key");
-        assert!(cfg.debug.admin_endpoints);
+        assert!(cfg.debug.list_handles);
     }
 
     #[test]

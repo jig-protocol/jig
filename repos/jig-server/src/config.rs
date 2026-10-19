@@ -41,8 +41,12 @@ pub struct ServerConfig {
 /// its DID vouches for it at `/.well-known/jig`: jig clients trust it through
 /// the DID they pinned, not through a CA. Give both paths to serve a
 /// certificate a CA issued (`tailscale cert`, certbot); jig clients accept
-/// either. `enabled = false` serves plaintext HTTP, for loopback development
-/// or behind a proxy that terminates TLS.
+/// either.
+///
+/// `enabled = false` serves plaintext HTTP. It is an unsafe option: use it only
+/// on loopback or behind a proxy that terminates TLS, never on a listener peers
+/// or clients reach directly. The server advertises it as `tls.enabled=false`
+/// in `unsafe_options_active` and warns at startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
     #[serde(default = "default_tls_enabled")]
@@ -148,74 +152,6 @@ impl Default for ServerConfig {
     }
 }
 
-impl ServerConfig {
-    /// Attempt to construct a ServerConfig from a `jig-config` TOML file.
-    /// Maps a minimal subset needed by jig-server:
-    /// - storage.truth.connection_string -> database_path (when backend = sqlite)
-    pub fn load_from_jig_config_path(path: &Path) -> std::io::Result<Self> {
-        #[derive(serde::Deserialize, Default)]
-        struct JigConfigDoc {
-            #[serde(default)]
-            storage: Option<jig_config::storage::MultiTierStorageConfig>,
-        }
-
-        let s = fs::read_to_string(path)?;
-        let doc: JigConfigDoc = toml::from_str(&s)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        let mut cfg = ServerConfig::default();
-
-        // Map storage.truth -> database_path (sqlite path)
-        if let Some(storage) = &doc.storage
-            && let Some(truth) = &storage.truth
-        {
-            use jig_config::storage::Backend;
-            if matches!(truth.backend, Backend::Sqlite)
-                && let Some(path) = &truth.connection_string
-            {
-                cfg.database_path = PathBuf::from(path);
-            }
-        }
-
-        Ok(cfg)
-    }
-
-    /// Try to load jig-config from common locations (cwd ./jig-config.toml or ~/.jig/config.toml).
-    pub fn try_load_jig_config_from_well_known() -> Option<Self> {
-        let cwd = std::env::current_dir().ok();
-        if let Some(mut p) = cwd.clone() {
-            p.push("jig-config.toml");
-            if p.exists()
-                && let Ok(cfg) = Self::load_from_jig_config_path(&p)
-            {
-                return Some(cfg);
-            }
-        }
-        let home_default = jig_config::default_config_path();
-        if home_default.exists()
-            && let Ok(cfg) = Self::load_from_jig_config_path(&home_default)
-        {
-            return Some(cfg);
-        }
-        None
-    }
-
-    /// Pure helper for tests: try to load from exactly these two potential files in order.
-    pub fn try_load_jig_config_from_paths(cwd_config: &Path, home_config: &Path) -> Option<Self> {
-        if cwd_config.exists()
-            && let Ok(cfg) = Self::load_from_jig_config_path(cwd_config)
-        {
-            return Some(cfg);
-        }
-        if home_config.exists()
-            && let Ok(cfg) = Self::load_from_jig_config_path(home_config)
-        {
-            return Some(cfg);
-        }
-        None
-    }
-}
-
 impl Default for ExecutionSection {
     fn default() -> Self {
         Self {
@@ -250,6 +186,17 @@ impl ServerConfig {
         // key/value pair once a table header has been emitted.
         template.push_str(&v0_0_2_template_sections(&defaults));
         fs::write(path, template)
+    }
+
+    /// Unsafe options set in this half of the config, named the way
+    /// `JigServerConfig::unsafe_options_active` names its own, so
+    /// `/.well-known/jig` and the startup log can list both together.
+    pub fn unsafe_options_active(&self) -> Vec<String> {
+        let mut active = Vec::new();
+        if !self.tls.enabled {
+            active.push("tls.enabled=false".to_string());
+        }
+        active
     }
 
     /// Names a self-signed certificate is made for: `localhost`, the bind
@@ -399,9 +346,6 @@ replay_per_did = {replay_per_did}
 max_tracked = {max_tracked}
 
 [debug]
-# Channel ops live on /api/v1/channels and are always mounted. This flag only
-# adds the legacy /_admin_v0_0_2/* aliases that pre-v0.1 `jig` CLIs POST to.
-admin_endpoints = {admin_endpoints}
 # Handle enumeration stays off — it dumps the registry to any caller.
 list_handles = {list_handles}
 "#,
@@ -419,7 +363,6 @@ list_handles = {list_handles}
         kinds = kinds,
         cache_ttl = defaults.identity.cache_ttl_seconds,
         unknown_handles = defaults.identity.naively_allow_unknown_handles_fallback,
-        admin_endpoints = defaults.debug.admin_endpoints,
         list_handles = defaults.debug.list_handles,
     )
 }
@@ -496,6 +439,14 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_listener_is_an_unsafe_option() {
+        assert!(ServerConfig::default().unsafe_options_active().is_empty());
+        let mut cfg = ServerConfig::default();
+        cfg.tls.enabled = false;
+        assert_eq!(cfg.unsafe_options_active(), vec!["tls.enabled=false"]);
+    }
+
+    #[test]
     fn tls_section_parses() {
         let toml_str = r#"
             database_path = "/tmp/x.db"
@@ -528,28 +479,8 @@ mod tests {
 }
 
 #[cfg(test)]
-mod jig_config_bridge_tests {
+mod config_file_tests {
     use super::*;
-    use std::io::Write;
-
-    #[test]
-    fn maps_sqlite_path_from_jig_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("jig-config.toml");
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(
-            f,
-            r#"[storage.truth]
-backend = "sqlite"
-connection_string = "{db}"
-"#,
-            db = dir.path().join("test.db").display()
-        )
-        .unwrap();
-
-        let cfg = ServerConfig::load_from_jig_config_path(&path).unwrap();
-        assert_eq!(cfg.database_path, dir.path().join("test.db"));
-    }
 
     #[test]
     fn apply_overrides_explicit_precedence() {
@@ -587,12 +518,11 @@ connection_string = "{db}"
         // Half 1: the socket-opening half.
         let server = ServerConfig::load(&path).unwrap();
 
-        // Half 2: the v0.0.2 half. Channel ops are not debug-gated, so the
-        // template must not need (or switch on) the debug flag.
+        // Half 2: the v0.0.2 half. It must not switch on any debug option.
         let v002 = JigServerConfig::load(&path).unwrap();
         assert!(
-            !v002.debug.admin_endpoints,
-            "template must not enable the legacy admin aliases"
+            !v002.debug.list_handles,
+            "template must not enable handle enumeration"
         );
         assert_eq!(
             v002.server.listen,
@@ -666,13 +596,9 @@ connection_string = "{db}"
 
         let v002: JigServerConfig = toml::from_str(&rendered).unwrap();
         assert!(
-            !v002.debug.admin_endpoints,
-            "install.sh's default path must not depend on a [debug] flag"
-        );
-        assert!(
             v002.unsafe_options_active()
                 .iter()
-                .all(|o| o != "debug.admin_endpoints"),
+                .all(|o| !o.starts_with("debug.")),
             "install.sh must not advertise debug options"
         );
         assert_eq!(v002.server.listen, "127.0.0.1:7117");
@@ -681,45 +607,5 @@ connection_string = "{db}"
             format!("{}:{}", server.bind_address, server.port),
             "install.sh must keep the decorative `listen` in sync with the real bind address"
         );
-    }
-
-    #[test]
-    fn jig_config_paths_precedence() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd_cfg = dir.path().join("cwd.toml");
-        let home_cfg = dir.path().join("home.toml");
-
-        {
-            let mut f = std::fs::File::create(&cwd_cfg).unwrap();
-            writeln!(
-                f,
-                r#"[storage.truth]
-backend = "sqlite"
-connection_string = "{db}"
-"#,
-                db = dir.path().join("cwd.db").display()
-            )
-            .unwrap();
-        }
-
-        {
-            let mut f = std::fs::File::create(&home_cfg).unwrap();
-            writeln!(
-                f,
-                r#"[storage.truth]
-backend = "sqlite"
-connection_string = "{db}"
-"#,
-                db = dir.path().join("home.db").display()
-            )
-            .unwrap();
-        }
-
-        let cfg1 = ServerConfig::try_load_jig_config_from_paths(&cwd_cfg, &home_cfg).unwrap();
-        assert_eq!(cfg1.database_path, dir.path().join("cwd.db"));
-
-        std::fs::remove_file(&cwd_cfg).unwrap();
-        let cfg2 = ServerConfig::try_load_jig_config_from_paths(&cwd_cfg, &home_cfg).unwrap();
-        assert_eq!(cfg2.database_path, dir.path().join("home.db"));
     }
 }

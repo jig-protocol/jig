@@ -71,6 +71,12 @@ impl AppState {
         let store = Arc::new(SqliteStore::open(&db_path).context("opening SqliteStore")?);
         let signing_key = load_or_generate_server_key(&config.server.server_did_keyfile)
             .context("loading nameserver signing key")?;
+        // Before anything logs a DID: tags are keyed by this nameserver's seed.
+        if !jig_core::did::set_log_tag_key(&signing_key.to_bytes()) {
+            tracing::warn!(
+                "a different log tag key is already in effect in this process; DID tags keep using it"
+            );
+        }
         let ns_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
 
         // Nameservers always run TOFU identity (they don't recurse).
@@ -261,7 +267,6 @@ fn spawn_challenge_sweeper(pending: Arc<RwLock<HashMap<String, Instant>>>, ttl: 
 }
 
 fn load_or_generate_server_key(path: &str) -> Result<SigningKey> {
-    use rand::Rng;
     let expanded = shellexpand::tilde(path).into_owned();
     let path = std::path::Path::new(&expanded);
     if path.exists() {
@@ -278,18 +283,9 @@ fn load_or_generate_server_key(path: &str) -> Result<SigningKey> {
         arr.copy_from_slice(&bytes);
         Ok(SigningKey::from_bytes(&arr))
     } else {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut secret = [0u8; 32];
-        rand::rng().fill_bytes(&mut secret);
-        let signing = SigningKey::from_bytes(&secret);
-        std::fs::write(path, signing.to_bytes())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        let signing = jig_core::crypto::ed25519::generate_signing_key();
+        jig_core::crypto::ed25519::write_new_key_file(path, &signing)
+            .with_context(|| format!("writing nameserver keyfile to {}", path.display()))?;
         Ok(signing)
     }
 }
