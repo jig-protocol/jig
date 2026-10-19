@@ -186,7 +186,9 @@ async fn policy_refusals_leave_the_challenge_usable() {
             "{local}@{suffix}"
         );
         assert!(
-            state.take_challenge(&ch).await,
+            state
+                .take_challenge(&ch, &naming_did(&key), &format!("{local}@{suffix}"))
+                .await,
             "{local}: the challenge was not consumed"
         );
     }
@@ -448,4 +450,86 @@ async fn suffixes_lists_what_is_served() {
             ],
         })
     );
+}
+
+#[tokio::test]
+async fn a_refused_rotation_leaves_the_challenge_usable() {
+    let state = state_with(vec![open(A)]);
+    let r = router(&state);
+    let (old_did, old) = fresh_did_and_key();
+    let (new_did, new) = fresh_did_and_key();
+    register(&r, &state, &old, "alice", None, A).await;
+
+    let ch = challenge(&r).await;
+    let (_, stranger) = fresh_did_and_key();
+    let (status, _) = post(
+        &r,
+        "/v1/rotate",
+        serde_json::json!({
+            "alias": "alice@a.example.org", "old_did": old_did, "new_did": new_did,
+            "challenge": ch, "sig_by_old": bare(&stranger, &ch), "sig_by_new": bare(&new, &ch),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = post(
+        &r,
+        "/v1/rotate",
+        serde_json::json!({
+            "alias": "alice@a.example.org", "old_did": old_did, "new_did": new_did,
+            "challenge": ch, "sig_by_old": bare(&old, &ch), "sig_by_new": bare(&new, &ch),
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the same challenge still works: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_challenge_bound_to_a_did_and_name_serves_only_them() {
+    let state = state_with(vec![open(A)]);
+    let r = router(&state);
+    let (did, key) = fresh_did_and_key();
+    let (_, other) = fresh_did_and_key();
+
+    let (status, body) = get(&r, "/v1/challenge?name=no-suffix").await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("INVALID_NAME"))
+    );
+    let (status, body) = get(&r, "/v1/challenge?did=not-a-did").await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("BAD_DID"))
+    );
+
+    let (_, body) = get(
+        &r,
+        &format!("/v1/challenge?did={did}&name=Alice@A.example.org"),
+    )
+    .await;
+    let ch = body["challenge"].as_str().unwrap().to_string();
+    let attempt = |key: &SigningKey, local: &str| {
+        let alias = format!("{local}@{A}");
+        serde_json::json!({
+            "did": naming_did(key),
+            "requested_alias": local,
+            "proof_of_control": proof(key, &state, Action::Register, &alias, &ch),
+            "challenge": ch,
+        })
+    };
+    for (key, local) in [(&other, "alice"), (&key, "alicia")] {
+        let (status, body) = post(&r, "/v1/register", attempt(key, local)).await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::UNAUTHORIZED, Some("CHALLENGE_UNKNOWN")),
+            "{local}"
+        );
+    }
+    let (status, body) = post(&r, "/v1/register", attempt(&key, "alice")).await;
+    assert_eq!(status, StatusCode::OK, "the bound DID and name: {body}");
 }

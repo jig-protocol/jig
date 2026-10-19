@@ -34,6 +34,17 @@ const DEFAULT_CHALLENGE_TTL: Duration = Duration::from_secs(60);
 #[cfg(test)]
 pub const TEST_SUFFIX: &str = "dj.jig";
 
+/// An issued challenge. `did` and `name` are set when the client named them
+/// at issue time; a challenge so bound is consumed only by a request for that
+/// DID and that `alias@suffix`. Proof-of-work (lane R's R1) sets its effort
+/// from them when the challenge is issued.
+#[derive(Debug, Clone)]
+pub struct PendingChallenge {
+    pub issued_at: Instant,
+    pub did: Option<String>,
+    pub name: Option<String>,
+}
+
 /// Nameserver-scoped v0.0.2 boot state. Identity resolution in a
 /// nameserver is always TOFU — nameservers don't query other
 /// nameservers (recursion is a v0.0.3+ concern).
@@ -44,12 +55,13 @@ pub struct AppState {
     pub ns_did: Did,
     /// The suffixes this nameserver serves and their registration policy.
     pub suffixes: Arc<Suffixes>,
-    /// Recently-issued challenge nonces with their issued-at timestamp.
+    /// Recently-issued challenge nonces with their issued-at timestamp and
+    /// what they were issued for.
     /// A background task started in `new` / `for_test*` sweeps entries
     /// older than `challenge_ttl` every `challenge_ttl / 2`. Without the
     /// sweeper an attacker spamming GET /v1/challenge would grow this
     /// map without bound (issue #6).
-    pub pending_challenges: Arc<RwLock<HashMap<String, Instant>>>,
+    pub pending_challenges: Arc<RwLock<HashMap<String, PendingChallenge>>>,
     /// How long a challenge nonce remains valid before being swept. Configurable
     /// so tests can use a tight TTL instead of waiting 60s.
     pub challenge_ttl: Duration,
@@ -235,28 +247,44 @@ impl AppState {
         &self.suffixes.only().expect("one suffix").suffix
     }
 
-    /// Record a challenge nonce so a later /v1/register can verify it was issued.
+    /// Record a challenge nonce so a later register, renew or rotate can verify
+    /// it was issued, bound to `did` and `name` when the client named them.
     /// The nonce is tagged with the current `Instant` so the background sweeper
     /// can drop it once it's older than `challenge_ttl`.
-    pub async fn remember_challenge(&self, nonce: &str) {
-        self.pending_challenges
-            .write()
-            .await
-            .insert(nonce.to_string(), Instant::now());
+    pub async fn remember_challenge(&self, nonce: &str, did: Option<String>, name: Option<String>) {
+        self.pending_challenges.write().await.insert(
+            nonce.to_string(),
+            PendingChallenge {
+                issued_at: Instant::now(),
+                did,
+                name,
+            },
+        );
     }
 
-    /// Consume a challenge nonce. Returns true if it was registered AND still
-    /// within its TTL; in either failure mode (never-issued, already-consumed,
-    /// or expired-but-not-yet-swept) we return false without distinguishing —
-    /// callers must surface the same "challenge not recognized" error to avoid
-    /// leaking whether a nonce was swept vs never-issued.
-    pub async fn take_challenge(&self, nonce: &str) -> bool {
+    /// Consume a challenge nonce for a request by `did` on `name`. Returns true
+    /// if it was registered, is still within its TTL, and was either issued
+    /// unbound or bound to this `did` and `name`. In every failure mode we
+    /// return false without distinguishing, so callers surface the same
+    /// "challenge not recognized" error and leak nothing about the nonce. A
+    /// mismatched request leaves the challenge in place for its rightful use.
+    pub async fn take_challenge(&self, nonce: &str, did: &str, name: &str) -> bool {
         let mut guard = self.pending_challenges.write().await;
-        match guard.remove(nonce) {
-            Some(issued_at) if issued_at.elapsed() <= self.challenge_ttl => true,
-            // Either no entry or stale entry — fall through to the same false.
-            _ => false,
+        let Some(pending) = guard.get(nonce) else {
+            return false;
+        };
+        let fresh = pending.issued_at.elapsed() <= self.challenge_ttl;
+        let bound_ok = pending.did.as_deref().is_none_or(|d| d == did)
+            && pending.name.as_deref().is_none_or(|n| n == name);
+        if !fresh {
+            guard.remove(nonce);
+            return false;
         }
+        if !bound_ok {
+            return false;
+        }
+        guard.remove(nonce);
+        true
     }
 
     /// Check if a `<local>@<suffix>` alias is already attested. Returns the
@@ -278,7 +306,7 @@ impl AppState {
 /// only constructs `AppState` once per process. No teardown signaling: the
 /// sweeper exits naturally when the map's last `Arc` is dropped (we check
 /// `Arc::strong_count` each tick).
-fn spawn_challenge_sweeper(pending: Arc<RwLock<HashMap<String, Instant>>>, ttl: Duration) {
+fn spawn_challenge_sweeper(pending: Arc<RwLock<HashMap<String, PendingChallenge>>>, ttl: Duration) {
     // Sweep at half the TTL so worst-case expired-but-still-present is bounded
     // by ttl/2. Floor at 1ms so test TTLs near zero don't spin.
     let interval = std::cmp::max(ttl / 2, Duration::from_millis(1));
@@ -296,7 +324,7 @@ fn spawn_challenge_sweeper(pending: Arc<RwLock<HashMap<String, Instant>>>, ttl: 
                 break;
             };
             let mut guard = pending.write().await;
-            guard.retain(|_, issued_at| issued_at.elapsed() <= ttl);
+            guard.retain(|_, c| c.issued_at.elapsed() <= ttl);
         }
     });
 }
@@ -426,10 +454,34 @@ mod tests {
     #[tokio::test]
     async fn challenge_round_trip() {
         let state = AppState::for_test().unwrap();
-        state.remember_challenge("nonce-1").await;
-        assert!(state.take_challenge("nonce-1").await);
+        state.remember_challenge("nonce-1", None, None).await;
+        assert!(state.take_challenge("nonce-1", "did:a", "a@dj.jig").await);
         // Already taken — consumed
-        assert!(!state.take_challenge("nonce-1").await);
+        assert!(!state.take_challenge("nonce-1", "did:a", "a@dj.jig").await);
+    }
+
+    #[tokio::test]
+    async fn a_bound_challenge_is_consumed_only_by_its_did_and_name() {
+        let state = AppState::for_test().unwrap();
+        state
+            .remember_challenge("n", Some("did:a".into()), Some("a@dj.jig".into()))
+            .await;
+        assert!(
+            !state.take_challenge("n", "did:b", "a@dj.jig").await,
+            "other DID"
+        );
+        assert!(
+            !state.take_challenge("n", "did:a", "b@dj.jig").await,
+            "other name"
+        );
+        assert!(
+            state.take_challenge("n", "did:a", "a@dj.jig").await,
+            "still usable"
+        );
+        assert!(
+            !state.take_challenge("n", "did:a", "a@dj.jig").await,
+            "consumed"
+        );
     }
 
     #[tokio::test]
@@ -439,19 +491,19 @@ mod tests {
             AppState::for_test_with_short_challenge_ttl(std::time::Duration::from_millis(50))
                 .unwrap();
 
-        state.remember_challenge("nonce-a").await;
+        state.remember_challenge("nonce-a", None, None).await;
         // Fresh: consume succeeds.
         assert!(
-            state.take_challenge("nonce-a").await,
+            state.take_challenge("nonce-a", "did:a", "a@dj.jig").await,
             "fresh challenge must be accepted"
         );
 
-        state.remember_challenge("nonce-b").await;
+        state.remember_challenge("nonce-b", None, None).await;
         // Wait past the TTL and the sweep interval (sweep = ttl/2 = 25ms,
         // so 200ms guarantees at least one sweep has fired and dropped it).
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(
-            !state.take_challenge("nonce-b").await,
+            !state.take_challenge("nonce-b", "did:a", "a@dj.jig").await,
             "expired challenge must be rejected"
         );
     }
