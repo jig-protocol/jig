@@ -252,9 +252,9 @@ the domains rule 0 lists.
   | --- | --- | --- |
   | `relayed_kinds` | array of text | one entry per block kind |
   | `default_peer_quota` | map `{blocks_per_min: uint, bytes_per_min: uint}` | applies to every listed peer without its own entry, so no peer is unquoted |
-  | `peer_quotas` | array of map `{peer: text, blocks_per_min: uint, bytes_per_min: uint}` | `peer` is a did:jig, unique across entries |
+  | `peer_quotas` | array of map `{peer: text, blocks_per_min: uint, bytes_per_min: uint}` | `peer` is a did:jig, unique across entries, and MUST be in `peers`. A verifier refuses a quota for any other DID, because it would publish that peer anyway. Unpublished peers' quotas come from config only |
   | `peers` | array of text | did:jig; only the peers the server chooses to publish |
-  | `attested_suffixes` | array of map `{suffix: text, root: text, root_id: text}` | `root` is `dns` or `contract`, never `config`; for `dns`, `root_id` is the lowercased suffix; for `contract`, canonical CID text (JEP-0004 rule 3); `(suffix, root)` unique |
+  | `attested_suffixes` | array of map, either `{suffix: text, root: "dns", domain: text}` or `{suffix: text, root: "contract", contract: bytes}` | never `config`. `domain` is the lowercased suffix. `contract` is the contract's CID as an untagged binary CID (JEP-0004 rule 0). Two shapes, so a verifier never guesses a field's type. `(suffix, root)` unique |
 - [ ] `/.well-known/jig` serves the same fields unsigned.
 - [ ] Contract messages cite the manifest by CID and `seq`.
 - [ ] Commit `feat(server): peer policy in the server manifest (JEP-0005 rule 16)`.
