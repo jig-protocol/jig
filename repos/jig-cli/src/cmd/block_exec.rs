@@ -5,9 +5,8 @@
 //! makes the results identical, though: the conformance vectors are. A local run synthesizes its
 //! `invocation`, so it says nothing about any real message.
 //!
-//! The mapping from the bound WIT types to [`WitValue`] below is the one JEP-0006's canonical
-//! encoding fixes. It belongs beside the bindings in jig-runtime, where the server's receipts will
-//! need it too; until it moves there, this is the only copy.
+//! Hashes come from jig-runtime ([`invocation_hash`], [`RunOutcome::hash`]), the one
+//! implementation of JEP-0006's canonical encoding that the server and client also use.
 
 #![cfg(feature = "local-runtime")]
 
@@ -15,11 +14,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use jig_core::block_abi::{self, WitValue};
 use jig_core::grant::Grant;
 use jig_runtime::component::{
     BlockError, ComponentRuntime, ErrorOutcome, Hlc, IncompleteReason, Invocation, Payload,
-    RenderLimits, RunOutcome,
+    RenderLimits, RunOutcome, invocation_hash,
 };
 use serde::{Deserialize, Serialize};
 
@@ -92,12 +90,12 @@ impl InvocationSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Expected {
-    /// `ok`, `error` or `trap`.
+    /// `ok` or `error`.
     pub outcome: String,
-    /// `blake3:<hex>` outcome hash, for `ok` and `error`.
+    /// `blake3:<hex>` outcome hash. Every comparable outcome has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
-    /// The trap code, for `trap`.
+    /// The JEP-0006 trap code, for an `error` that is a trap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trap: Option<String>,
 }
@@ -107,7 +105,7 @@ pub struct Expected {
 pub struct RunReport {
     pub component: String,
     pub invocation_hash: String,
-    /// `ok`, `error`, `trap` or `incomplete`.
+    /// `ok`, `error` or `incomplete`.
     pub outcome: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
@@ -244,8 +242,7 @@ impl Executor {
 
     pub fn run(&self, spec: &InvocationSpec) -> Result<RunReport> {
         let invocation = spec.to_invocation()?;
-        let invocation_hash = block_abi::invocation_hash(&invocation_value(&invocation))
-            .expect("an invocation always encodes");
+        let invocation_hash = invocation_hash(&invocation);
         let run = self
             .runtime
             .render(&self.renderer, &invocation, &self.limits);
@@ -254,11 +251,11 @@ impl Executor {
             component: self.renderer.component_hash().to_string(),
             invocation_hash,
             outcome: String::new(),
-            hash: None,
             trap: None,
             reason: None,
             output: None,
             error: None,
+            hash: run.outcome.hash(),
             fuel_used: run.fuel_used,
             wasmtime: identity.wasmtime,
             config_fingerprint: identity.config_fingerprint,
@@ -266,22 +263,19 @@ impl Executor {
         match &run.outcome {
             RunOutcome::Ok(payload) => {
                 report.outcome = "ok".into();
-                report.hash = Some(result_hash(Ok(payload)));
                 report.output = Some(view(payload));
             }
             RunOutcome::Error(ErrorOutcome::Guest(e)) => {
                 report.outcome = "error".into();
-                report.hash = Some(result_hash(Err(e)));
                 report.error = Some(match e {
                     BlockError::InvalidInput(m) => format!("invalid-input: {m}"),
                     BlockError::Failed(m) => format!("failed: {m}"),
                 });
             }
             RunOutcome::Error(ErrorOutcome::Trap(code)) => {
-                // JEP-0006 hashes a trap over its code, but has not fixed that encoding yet, so
-                // a trap is compared by code alone here.
-                report.outcome = "trap".into();
-                report.trap = Some(code.clone());
+                // JEP-0006: a deterministic trap is an `error` outcome carrying its trap code.
+                report.outcome = "error".into();
+                report.trap = Some(code.as_str().to_string());
             }
             RunOutcome::Incomplete(reason) => {
                 report.outcome = "incomplete".into();
@@ -305,59 +299,6 @@ pub fn limits(fuel: Option<u64>, timeout_ms: Option<u64>) -> RenderLimits {
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_TIMEOUT),
     }
-}
-
-// ---- The canonical WIT values of the renderer world (JEP-0006) ----
-
-fn payload_value(p: &Payload) -> WitValue {
-    WitValue::Record(vec![
-        ("media-type".into(), WitValue::String(p.media_type.clone())),
-        ("body".into(), WitValue::Bytes(p.body.clone())),
-    ])
-}
-
-/// `invocation`, as `invocation_hash` takes it.
-pub fn invocation_value(inv: &Invocation) -> WitValue {
-    WitValue::Record(vec![
-        ("block-cid".into(), WitValue::String(inv.block_cid.clone())),
-        (
-            "sender-did".into(),
-            WitValue::String(inv.sender_did.clone()),
-        ),
-        (
-            "channel-cid".into(),
-            WitValue::String(inv.channel_cid.clone()),
-        ),
-        ("ingest-seq".into(), WitValue::U64(inv.ingest_seq)),
-        (
-            "ingest-hlc".into(),
-            WitValue::Record(vec![
-                ("wall-ms".into(), WitValue::U64(inv.ingest_hlc.wall_ms)),
-                ("logical".into(), WitValue::U32(inv.ingest_hlc.logical)),
-            ]),
-        ),
-        ("input".into(), payload_value(&inv.input)),
-    ])
-}
-
-fn block_error_value(e: &BlockError) -> WitValue {
-    let (case, msg) = match e {
-        BlockError::InvalidInput(m) => ("invalid-input", m),
-        BlockError::Failed(m) => ("failed", m),
-    };
-    WitValue::Variant {
-        case: case.into(),
-        payload: Some(Box::new(WitValue::String(msg.clone()))),
-    }
-}
-
-/// The outcome hash over `render`'s whole return value, `result<payload, block-error>`.
-fn result_hash(r: Result<&Payload, &BlockError>) -> String {
-    let value = match r {
-        Ok(p) => WitValue::Result(Ok(Some(Box::new(payload_value(p))))),
-        Err(e) => WitValue::Result(Err(Some(Box::new(block_error_value(e))))),
-    };
-    block_abi::outcome_hash(&value).expect("a render result always encodes")
 }
 
 fn view(p: &Payload) -> OutputView {
@@ -464,32 +405,96 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_default_invocation_hash_is_stable() {
-        // Pins the canonical mapping above: field names, types and nesting. If this changes,
-        // every vector anyone has blessed changes with it.
-        let inv = InvocationSpec::default().to_invocation().unwrap();
-        let a = block_abi::invocation_hash(&invocation_value(&inv)).unwrap();
-        let b = block_abi::invocation_hash(&invocation_value(&inv)).unwrap();
-        assert_eq!(a, b);
-        assert!(a.starts_with("blake3:"), "{a}");
-
-        let other = InvocationSpec {
-            seq: 1,
-            ..InvocationSpec::default()
+    fn the_spec_fills_every_invocation_field() {
+        let spec = InvocationSpec {
+            block_cid: "b".into(),
+            sender: "did:jig:s".into(),
+            channel: "c".into(),
+            seq: 7,
+            wall_ms: 8,
+            logical: 9,
+            media_type: "text/x".into(),
+            input: "in".into(),
+            input_hex: None,
         };
-        let c =
-            block_abi::invocation_hash(&invocation_value(&other.to_invocation().unwrap())).unwrap();
-        assert_ne!(a, c, "seq is part of the invocation");
+        let inv = spec.to_invocation().unwrap();
+        assert_eq!(
+            (
+                inv.block_cid.as_str(),
+                inv.sender_did.as_str(),
+                inv.channel_cid.as_str()
+            ),
+            ("b", "did:jig:s", "c")
+        );
+        assert_eq!(
+            (
+                inv.ingest_seq,
+                inv.ingest_hlc.wall_ms,
+                inv.ingest_hlc.logical
+            ),
+            (7, 8, 9)
+        );
+        assert_eq!(
+            (inv.input.media_type.as_str(), inv.input.body.as_slice()),
+            ("text/x", &b"in"[..])
+        );
     }
 
+    /// Every JEP-0006 conformance vector, run through this executor, gives the pinned
+    /// invocation hash and outcome. This is what makes `jig block run` agree with the server and
+    /// the client, not the shared code alone.
     #[test]
-    fn ok_and_error_hash_differently_for_the_same_bytes() {
-        let p = Payload {
-            media_type: "text/plain".into(),
-            body: b"x".to_vec(),
-        };
-        let e = BlockError::Failed("x".into());
-        assert_ne!(result_hash(Ok(&p)), result_hash(Err(&e)));
+    fn the_cli_executor_passes_the_block_abi_vectors() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../jig-spec/vectors/block-abi");
+        let file: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{dir}/vectors.json")).expect("vectors.json"),
+        )
+        .unwrap();
+        let vectors = file["vectors"].as_array().expect("a vectors array");
+        assert!(vectors.len() >= 20, "the vector set looks truncated");
+        for v in vectors {
+            let name = v["name"].as_str().unwrap();
+            let inv = &v["invocation"];
+            let spec = InvocationSpec {
+                block_cid: inv["block-cid"].as_str().unwrap().into(),
+                sender: inv["sender-did"].as_str().unwrap().into(),
+                channel: inv["channel-cid"].as_str().unwrap().into(),
+                seq: inv["ingest-seq"].as_u64().unwrap(),
+                wall_ms: inv["ingest-hlc"]["wall-ms"].as_u64().unwrap(),
+                logical: inv["ingest-hlc"]["logical"].as_u64().unwrap() as u32,
+                media_type: inv["input"]["media-type"].as_str().unwrap().into(),
+                input: String::new(),
+                input_hex: Some(inv["input"]["body-hex"].as_str().unwrap().into()),
+            };
+            let target = Target {
+                bytes: std::fs::read(format!("{dir}/{}", v["component"].as_str().unwrap()))
+                    .unwrap_or_else(|e| panic!("{name}: {e}")),
+                max_memory_pages: v["max-memory-pages"].as_u64().unwrap() as u32,
+                project_dir: None,
+            };
+            let lim = limits(v["fuel"].as_u64(), v["timeout-ms"].as_u64());
+            let report = Executor::new(&target, lim)
+                .unwrap_or_else(|e| panic!("{name}: {e:#}"))
+                .run(&spec)
+                .unwrap();
+            assert_eq!(
+                Some(report.invocation_hash.as_str()),
+                v["invocation-hash"].as_str(),
+                "{name}: invocation hash"
+            );
+            let want = &v["expected"];
+            assert_eq!(report.outcome, want["outcome"].as_str().unwrap(), "{name}");
+            assert_eq!(
+                report.hash.as_deref(),
+                want["hash"].as_str(),
+                "{name}: hash"
+            );
+            assert_eq!(
+                report.trap.as_deref(),
+                want["trap"].as_str(),
+                "{name}: trap"
+            );
+        }
     }
 
     /// The committed text-block component, the reference renderer (JEP-0006 step 5).
