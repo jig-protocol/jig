@@ -253,11 +253,16 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &st
     Ok(true)
 }
 
-/// The suffix an `alias_attestations` row is keyed by: the text after the last
-/// `@` of its alias, or `''` for a bare alias (an ingested `ns-attestation`
-/// block may carry one).
-fn alias_suffix_of(alias: &str) -> &str {
-    alias.rsplit_once('@').map_or("", |(_, suffix)| suffix)
+/// The suffix an `alias_attestations` row is keyed by: the lowercased text
+/// after the last `@` of its alias, or `''` for a bare alias (an ingested
+/// `ns-attestation` block may carry one). Lowercased so `Bob@B.example` and
+/// `bob@b.example` share one key: one name per DID per suffix whatever the
+/// case.
+fn alias_suffix_of(alias: &str) -> String {
+    alias
+        .rsplit_once('@')
+        .map_or("", |(_, suffix)| suffix)
+        .to_ascii_lowercase()
 }
 
 /// Re-key `alias_attestations` from `(did, ns_did)` to `(did, ns_did, suffix)`
@@ -1451,15 +1456,16 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Lowercase `alias` (and with it `suffix`) on the rows `is_legacy`
-    /// selects by their `attestation_bytes`, in one transaction. Returns how
-    /// many rows changed.
+    /// Lowercase `alias` on the rows `is_legacy` selects by their
+    /// `attestation_bytes`, in one transaction. Returns how many rows changed.
     ///
     /// This store does not know any nameserver's formats: the caller decides
     /// which rows are safe to rewrite, namely those it re-signs from their
-    /// columns on read. Fails, changing nothing, when lowercasing would leave
-    /// two different DIDs holding the same alias with a binding valid at
-    /// `as_of`, or would collide with another row's key.
+    /// columns on read. A row's key cannot change, since `suffix` is already
+    /// stored lowercase. Fails, changing nothing, when a lowercased alias
+    /// would then be held by two different DIDs at the same `ns_did` with
+    /// bindings valid at `as_of`. Only the aliases this call rewrote are
+    /// checked, so an unrelated existing conflict does not block it.
     pub fn normalize_alias_case(
         &self,
         is_legacy: impl Fn(&[u8]) -> bool,
@@ -1474,40 +1480,32 @@ impl SqliteStore {
             )?
             .query_map([], row_to_stored_alias_attestation)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut changed = 0;
+        let mut rewritten = Vec::new();
         for a in rows {
             let lower = a.alias.to_ascii_lowercase();
             if lower == a.alias || !is_legacy(&a.attestation_bytes) {
                 continue;
             }
             tx.execute(
-                "UPDATE alias_attestations SET alias = ?, suffix = ?
+                "UPDATE alias_attestations SET alias = ?
                  WHERE did = ? AND ns_did = ? AND suffix = ?",
-                params![
-                    lower,
-                    alias_suffix_of(&lower),
-                    a.did,
-                    a.ns_did,
-                    alias_suffix_of(&a.alias)
-                ],
+                params![lower, a.did, a.ns_did, alias_suffix_of(&a.alias)],
             )?;
-            changed += 1;
+            rewritten.push((a.ns_did, lower));
         }
-        let clash: Option<String> = tx
-            .query_row(
-                "SELECT alias FROM alias_attestations
-                 WHERE valid_from <= ?1 AND valid_until > ?1
-                 GROUP BY alias HAVING COUNT(DISTINCT did) > 1
-                 ORDER BY alias LIMIT 1",
-                [as_of],
+        for (ns_did, alias) in &rewritten {
+            let holders: i64 = tx.query_row(
+                "SELECT COUNT(DISTINCT did) FROM alias_attestations
+                 WHERE ns_did = ?1 AND alias = ?2 AND valid_from <= ?3 AND valid_until > ?3",
+                params![ns_did, alias, as_of],
                 |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(alias) = clash {
-            return Err(PersistError::AliasCaseClash(alias));
+            )?;
+            if holders > 1 {
+                return Err(PersistError::AliasCaseClash(alias.clone()));
+            }
         }
         tx.commit()?;
-        Ok(changed)
+        Ok(rewritten.len())
     }
 
     /// List all currently-valid attestations (valid_from <= as_of < valid_until).
@@ -2948,6 +2946,14 @@ mod tests {
             "alice@a.example".into(),
             "a.example".into()
         )));
+        assert!(
+            alias_rows(&conn).contains(&(
+                "did:jig:zB".into(),
+                "Bob@b.example".into(),
+                "b.example".into()
+            )),
+            "the signed row's key is lowercase, its alias untouched"
+        );
         drop(conn);
         assert_eq!(
             store.normalize_alias_case(|_| true, 1000).unwrap(),
@@ -2970,18 +2976,63 @@ mod tests {
         store
             .upsert_alias_attestation(&att("did:jig:zB", "alice@a.example", b"x"))
             .unwrap();
+        let conn = store.conn.lock().unwrap();
+        let before = alias_rows(&conn);
+        drop(conn);
 
         let err = store.normalize_alias_case(|_| true, 1000).unwrap_err();
         assert!(
             matches!(&err, PersistError::AliasCaseClash(a) if a == "alice@a.example"),
             "{err}"
         );
-        assert!(
-            store
-                .find_alias_attestation("Alice@a.example", 1000)
-                .unwrap()
-                .is_some(),
-            "nothing changed"
+        let conn = store.conn.lock().unwrap();
+        assert_eq!(
+            alias_rows(&conn),
+            before,
+            "nothing changed, zB's row included"
+        );
+    }
+
+    #[test]
+    fn normalize_alias_case_ignores_conflicts_it_did_not_create() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        // The same alias at two different nameservers is not a clash.
+        let mut other_ns = att("did:jig:zB", "alice@a.example", b"x");
+        other_ns.ns_did = "did:jig:zOtherNs".into();
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "Alice@a.example", b"x"))
+            .unwrap();
+        store.upsert_alias_attestation(&other_ns).unwrap();
+        // An existing conflict between two rows it does not rewrite.
+        store
+            .upsert_alias_attestation(&att("did:jig:zC", "carol@a.example", b"x"))
+            .unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zD", "carol@a.example", b"x"))
+            .unwrap();
+
+        assert_eq!(store.normalize_alias_case(|_| true, 1000).unwrap(), 1);
+    }
+
+    /// The suffix key is lowercase, so a DID's `Bob@B.example` and
+    /// `bob@b.example` are one name, not two.
+    #[test]
+    fn one_name_per_suffix_holds_whatever_the_case() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "Bob@B.example", b"1"))
+            .unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "bob@b.example", b"2"))
+            .unwrap();
+        let conn = store.conn.lock().unwrap();
+        assert_eq!(
+            alias_rows(&conn),
+            [(
+                "did:jig:zA".into(),
+                "bob@b.example".into(),
+                "b.example".into()
+            )]
         );
     }
 }
