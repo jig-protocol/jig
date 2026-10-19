@@ -1,24 +1,17 @@
 # /etc/jig/config.toml — jig-server, tailnet deployment
 #
-# ############################################################################
-# # THIS IS ONE FILE FEEDING TWO DIFFERENT CONFIG STRUCTS. READ THIS PART.   #
-# ############################################################################
-#
-# jig-server's main.rs loads the SAME --config path twice, into two unrelated
-# types:
+# Every key in this file is checked. jig-server refuses to start on a key it
+# does not know, naming the key, so a typo or a key in the wrong section fails
+# loudly instead of silently keeping a default. A key jig-server used to accept
+# and no longer does fails with a message saying so.
 #
 #   * ROOT-LEVEL keys (database_path, bind_address, port, [tls], [execution])
-#       -> jig_server::ServerConfig      <- THIS IS WHAT ACTUALLY BINDS
-#   * [server] / [identity] / [federation] / [debug] / [bridges]
-#       -> jig_config::v0_0_2_server::JigServerConfig
-#
-# Neither type uses serde(deny_unknown_fields), so each one silently ignores
-# the other's sections. That is what makes one file legal — and it is also why
-# a typo or a value set in the wrong place fails SILENTLY instead of erroring.
-# When something "isn't taking effect", check which of the two halves you edited.
+#       open the socket and size the block runtime.
+#   * [server] / [identity] / [auth] / [debug] / [federation] / [bridges]
+#       configure identity, auth, federation and bridges.
 
 # ============================================================================
-# ServerConfig  —  the half that actually opens the socket
+# Root keys  —  what actually opens the socket
 # ============================================================================
 
 database_path = "/var/lib/jig/jig.db"
@@ -52,7 +45,7 @@ port = 7117
 # public_url = "https://<host>.<tailnet>.ts.net:7117"
 
 # ============================================================================
-# JigServerConfig  —  the v0.0.2 half
+# Pipeline sections  —  identity, auth, federation, bridges
 # ============================================================================
 
 [server]
@@ -139,10 +132,6 @@ per_ip_per_second = 100
 replay_per_did = 2000
 
 [debug]
-# Channel ops (`jig channel create/join/delete`) live on /api/v1/channels and
-# are always mounted. This flag only adds the legacy /_admin_v0_0_2/* aliases
-# that pre-v0.1 `jig` CLIs POST to; turn it on while such clients remain.
-admin_endpoints = false
 # Handle enumeration stays off — it dumps the registry to any caller.
 list_handles = false
 

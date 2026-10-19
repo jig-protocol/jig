@@ -1,9 +1,6 @@
-//! v0.0.2 hello-world `jig-server` configuration.
-//!
-//! Standalone config type used by `jig-server`'s Phase B/D AppState boot path.
-//! Intentionally independent of the existing Profile / NameserverNetworkConfig
-//! systems in this crate — those serve other deployment targets and will be
-//! reconciled with this module in v0.0.3+.
+//! v0.0.2 `jig-server` configuration: the sections the pipeline `AppState`
+//! reads. jig-server's `ServerConfig` carries each of these as a field of the
+//! one `--config` file and hands them over as a [`JigServerConfig`].
 //!
 //! ## Sections
 //! - `[server]`     — bind address, server DID keyfile, allowed block kinds
@@ -14,7 +11,8 @@
 //!
 //! Every section carries a container-level `#[serde(default)]`, so a config
 //! file may omit a section entirely or set only the keys it cares about; the
-//! rest come from that section's `impl Default`.
+//! rest come from that section's `impl Default`. Every section also denies
+//! unknown fields: a misspelled key is a parse error, not a silent default.
 //!
 //! All antipattern flags follow the project convention (`dangerously_`,
 //! `naively_`, `unsafe_`, `debug_`-prefixed) and are listed by
@@ -22,11 +20,11 @@
 //! `GET /.well-known/jig`.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct JigServerConfig {
     #[serde(default)]
     pub server: ServerSection,
@@ -49,7 +47,7 @@ pub struct JigServerConfig {
 // keep the documented defaults for the keys the operator omitted, rather than
 // failing to parse. Container-level reuses the hand-written `impl Default`
 // below, which per-field `#[serde(default)]` cannot do.
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerSection {
     pub listen: String,
     pub server_did_keyfile: String,
@@ -104,7 +102,7 @@ pub enum IdentityMode {
 // (neither variant is a safe automatic pick), so per-field `#[serde(default)]`
 // on `mode` would not compile. The container form takes `mode` from the
 // hand-written `impl Default` below instead.
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct IdentitySection {
     pub mode: IdentityMode,
     pub trusted_nameservers: Vec<String>,
@@ -150,9 +148,8 @@ impl Default for IdentitySection {
 // turning authentication off for anyone who set only the window. Verified: with
 // per-field defaults, `a_partial_auth_section_keeps_the_safe_default` fails.
 //
-// `deny_unknown_fields` for the same reason `[auth.admission]` has it: nothing
-// else reads `[auth]`, and a misspelled sub-table (`[auth.admision]`) must not
-// silently leave the permissive defaults in place.
+// `deny_unknown_fields`, like every section: a misspelled sub-table
+// (`[auth.admision]`) must not silently leave the permissive defaults in place.
 #[serde(default, deny_unknown_fields)]
 pub struct AuthSection {
     /// Require a valid proof of possession on read requests.
@@ -250,12 +247,10 @@ impl Default for RateLimitSection {
 /// applies to, and a DID with no score under that ruleset is *unknown* for
 /// it — decided by `unknown_dids`, never by comparing an absent score against
 /// `minimum`.
-// `deny_unknown_fields`, unlike the sections around it: the hybrid config
-// file tolerates unknown keys at the top level because two types read it, but
-// nothing else reads `[auth.admission]`, and a misspelled key in a section
-// whose whole job is to NARROW access would silently leave the permissive
-// default in place. A members-only server whose operator wrote `unknown_did`
-// (singular) must not boot as an open one.
+// `deny_unknown_fields`, like every section, and it matters most here: a
+// misspelled key in a section whose whole job is to NARROW access would
+// silently leave the permissive default in place. A members-only server whose
+// operator wrote `unknown_did` (singular) must not boot as an open one.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdmissionSection {
@@ -320,7 +315,7 @@ pub struct ReputationRecord {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FederationSection {
     pub peers: Vec<FederationPeer>,
     pub dangerously_disable_federation_tls: bool,
@@ -336,6 +331,7 @@ pub struct FederationSection {
 /// `expected_did`, and only a DID listed here may subscribe to this server's
 /// federation stream.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FederationPeer {
     pub url: String,
     pub expected_did: String,
@@ -344,7 +340,7 @@ pub struct FederationPeer {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DebugSection {
     pub list_handles: bool,
 }
@@ -354,6 +350,7 @@ pub struct DebugSection {
 ///
 /// Defaults to deny-all: no bridges loaded unless explicitly allowlisted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct BridgesSection {
     /// Allowlist: if non-empty, only these bridges may load. If empty, all
     /// bridges with `per_bridge.<name>.enabled = true` (and not in deny_list)
@@ -374,6 +371,7 @@ pub struct BridgesSection {
 
 /// Per-bridge policy + configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct BridgeSection {
     /// Kill-switch independent of allow_list / deny_list. A bridge with
     /// `enabled = false` does NOT load even if it's in allow_list.
@@ -407,12 +405,11 @@ pub struct BridgeSection {
 /// when constructing the v0.0.2 `AppState`, covered by
 /// `build_app_uses_the_configured_alias_suffix`.
 ///
-/// [`NameserverSection::validate`] is NOT yet called on any production path —
-/// `JigServerConfig::load` is a bare `toml::from_str` with no validation hook,
+/// [`NameserverSection::validate`] is NOT yet called on any production path,
 /// so a malformed suffix reaches the router instead of failing at load. Call it
-/// from `load` to close that gap.
+/// from jig-server's `ServerConfig::load` to close that gap.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NameserverSection {
     /// The alias suffix this nameserver is authoritative for — the part after
     /// the `@` in `dj@gigue.jig`. Stored WITHOUT the `@` so callers can
@@ -462,15 +459,6 @@ impl NameserverSection {
 }
 
 impl JigServerConfig {
-    /// Load the v0.0.2 server config from a TOML file. The file MAY also carry
-    /// root-level jig-server `ServerConfig` keys (database_path/bind_address/
-    /// port/[tls]/[execution]) — serde ignores unknown fields, so one
-    /// production config.toml can drive both `ServerConfig::load` and this.
-    pub fn load(path: &Path) -> std::io::Result<Self> {
-        let s = std::fs::read_to_string(path)?;
-        toml::from_str(&s).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-    }
-
     /// List of active antipattern flags. Returned by `GET /.well-known/jig`
     /// so federated peers can detect a misconfigured node. A block's clock is
     /// bounded by `[server] max_future_skew_ms`, so there is no unbounded
@@ -888,24 +876,33 @@ mod tests {
         assert!(cfg.debug.list_handles);
     }
 
-    /// `[debug] admin_endpoints` is gone, but configs written by older
-    /// install.sh runs still carry it. Until removed keys are rejected with
-    /// a named error, it must keep parsing, and must not show up as active.
+    /// Every section denies unknown keys: a typo is a parse error naming the
+    /// key, never a silent default.
     #[test]
-    fn removed_admin_endpoints_key_still_parses() {
-        let cfg: JigServerConfig = toml::from_str(
-            r#"
-            [debug]
-            admin_endpoints = true
-        "#,
-        )
-        .expect("a config with the removed key must still deserialize");
-        assert!(!cfg.debug.list_handles);
-        assert!(
-            !cfg.unsafe_options_active()
-                .iter()
-                .any(|o| o.contains("admin_endpoints"))
-        );
+    fn unknown_keys_are_rejected_in_every_section() {
+        for (section, key) in [
+            ("server", "lisen"),
+            ("identity", "mod"),
+            ("federation", "peer"),
+            ("debug", "admin_endpoints"),
+            ("bridges", "allowlist"),
+            ("nameserver", "suffix"),
+            ("auth", "require_authenticated_read"),
+            ("auth.rate_limit", "per_did"),
+            ("auth.admission", "unknown_did"),
+        ] {
+            let toml_str = format!("[{section}]\n{key} = true\n");
+            let err = toml::from_str::<JigServerConfig>(&toml_str)
+                .expect_err(&format!("[{section}] {key} must be rejected"));
+            assert!(
+                err.to_string().contains(key),
+                "the error must name `{key}`, got: {err}"
+            );
+        }
+        let err = toml::from_str::<JigServerConfig>("[bridges.per_bridge.email]\nenabeld = true\n")
+            .expect_err("a misspelled per-bridge key must be rejected");
+        assert!(err.to_string().contains("enabeld"), "got: {err}");
+        assert!(toml::from_str::<JigServerConfig>("[sever]\n").is_err());
     }
 
     #[test]
@@ -1175,37 +1172,5 @@ mod tests {
                 .contains(&"naively_single_backend_bridge_storage".to_string()),
             "disabled bridge is not permitted -> flag absent"
         );
-    }
-
-    #[test]
-    fn load_reads_bridges_from_hybrid_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            r#"
-database_path = "/var/lib/jig/jig.db"
-bind_address = "0.0.0.0"
-port = 443
-
-[tls]
-enabled = true
-cert_path = "/etc/jig/tls/fullchain.pem"
-key_path = "/etc/jig/tls/privkey.pem"
-
-[bridges.per_bridge.email]
-enabled = true
-
-[bridges.per_bridge.email.config]
-bridge_domain = "mail.jig.onl"
-provider = "resend"
-bridge_secret = "literal-secret"
-"#,
-        )
-        .unwrap();
-
-        let cfg = JigServerConfig::load(&path).expect("load");
-        assert!(cfg.bridge_permitted("email"));
-        assert!(cfg.bridges.per_bridge.contains_key("email"));
     }
 }
