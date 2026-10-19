@@ -75,7 +75,7 @@ loopback and private tailnets.
 | Clients verify every delivered block's author signature | Works: a block a server altered is refused, not shown |
 | History backfill on joining a channel (the client asks for the last 100 blocks; the server caps a request at 200; `?before=<cid>` pages further back) | Works. On an encrypted channel, only messages sent after you joined decrypt; a member who was away pages back to where it left off |
 | `GET /api/v1/channels/:slug/blocks`, `/healthz`, `/metrics` | Works |
-| Nameserver: alias register / resolve / rotate / renew | Works (`jig-nameserver`, `jig ns …`) |
+| Nameserver: alias register / resolve / rotate / renew | Works (`jig-nameserver`, `jig ns …`). `jig ns resolve` prints only verified answers, so the suffix needs a `[naming.delegations]` entry in `cli.toml` or a DNS-rooted delegation |
 | Server-to-server federation over WSS | Implemented for open, unencrypted channels and covered by [`h3_federation.rs`](repos/integration-tests/tests/h3_federation.rs); never run between two hosts on the public internet |
 | Email bridge (Resend) | Implemented in-process, but inbound mail is refused until the bridge can join a thread's MLS group (D25); see [`bridges/email/README.md`](repos/bridges/email/README.md) |
 | Wasm block execution **on the server** | `text-render` executes for real on plaintext channels: the server runs its canonical module and signs the `render_hash` ([`jig-pipeline/src/ingest.rs`](repos/jig-pipeline/src/ingest.rs), step 4). Encrypted content is never executed and gets a `sealed` receipt; control-plane kinds take a synthetic one |
