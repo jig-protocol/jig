@@ -195,7 +195,6 @@ and lives at the repo root.
 | [`bridges/core`](repos/bridges/core/) | Common `Bridge` trait and context types |
 | [`bridges/email`](repos/bridges/email/) | In-process email bridge (Resend provider) |
 | [`text-block`](repos/text-block/) | The canonical `text-render` Wasm block (`wasm32-unknown-unknown`, embedded in the server; release tarballs also ship a `wasm32-wasip1` build) |
-| [`hello-wasm`](repos/hello-wasm/) | Minimal WASI hello-world used for runtime measurements |
 | [`integration-tests`](repos/integration-tests/) | Cross-component scenario tests: federation, TOFU mismatch, nameserver modes, persistence across restart, email bridge, TLS, encrypted channels |
 
 Not a Cargo member: [`repos/jig-spec/`](repos/jig-spec/), an mdBook protocol spec, still
@@ -217,7 +216,7 @@ the default port is unreachable, so it fails against your own running server.
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs four jobs on pull
 requests and the merge queue: `changes` (skips the build jobs on drafts and docs-only PRs),
-`workspace` (fmt, clippy, nextest on every workspace crate but `hello-wasm`),
+`workspace` (fmt, clippy, nextest on every workspace crate),
 `wasm-build` (`text-block` for `wasm32-unknown-unknown`), and `dependency-policy`
 (`cargo deny check` — advisories, bans, licenses, sources). A fifth job, `nightly`, runs
 on the daily schedule: doc tests, which nextest does not run, and clippy on

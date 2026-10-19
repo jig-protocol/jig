@@ -220,7 +220,10 @@ the root keys and every section in one file.
 > **Upgrading a server that ran without `[tls]`:** it comes back on TLS. Every
 > client re-runs `jig server set https://…`; their pins and encrypted-channel
 > state carry over, because neither is keyed by the scheme. To keep plaintext
-> (behind a proxy that terminates TLS, say), set `[tls] enabled = false`.
+> (behind a proxy that terminates TLS, say), set `[tls] enabled = false`. The
+> server then lists `tls.enabled=false` in `/.well-known/jig`'s
+> `unsafe_options_active` and logs a startup warning (#120). A `jig` CLI refuses a
+> plaintext `http://` server that is not on its own machine (#142).
 >
 > The nameserver on `:7070` is **not** covered by `[tls]` — that section belongs
 > to `jig-server` only — so its rows stay `http://` unless you terminate TLS in
