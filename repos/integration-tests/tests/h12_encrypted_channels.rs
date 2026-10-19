@@ -320,7 +320,7 @@ async fn an_encrypted_channel_round_trip_leaves_no_plaintext_on_the_server() {
             sig_b64,
             receipts,
             delivery_cid,
-            ..
+            ingest,
         } = env.frame
         {
             break DeliveredBlock {
@@ -328,6 +328,7 @@ async fn an_encrypted_channel_round_trip_leaves_no_plaintext_on_the_server() {
                 sig_b64,
                 receipts,
                 delivery_cid,
+                ingest,
             };
         }
     };
@@ -383,6 +384,7 @@ async fn an_encrypted_channel_round_trip_leaves_no_plaintext_on_the_server() {
         sig_b64: Some(STANDARD.encode(&stored.sender_sig)),
         receipts: vec![],
         delivery_cid: cid.clone(),
+        ingest: None,
     };
     let seen_kick = bob
         .session
@@ -413,6 +415,7 @@ fn build_delivered(b: &BuiltBlock) -> DeliveredBlock {
         sig_b64: Some(STANDARD.encode(&b.sender_sig)),
         receipts: vec![],
         delivery_cid: b.cid(),
+        ingest: None,
     }
 }
 
