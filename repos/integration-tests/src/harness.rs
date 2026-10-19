@@ -258,7 +258,7 @@ impl TestJigServer {
     /// [`Self::create_channel`] whenever the test is actually about channel
     /// creation.
     pub fn seed_channel(&self, owner: &Identity, slug: &str) -> Result<String> {
-        let id = format!("seeded-{}", slug.trim_start_matches('#'));
+        let id = jig_pipeline::ingest_record::label_cid(&format!("seeded {slug}"));
         self.state
             .ingest_ctx
             .store
@@ -281,7 +281,7 @@ impl TestJigServer {
         owner: &Identity,
         slug: &str,
     ) -> Result<String> {
-        let id = format!("seeded-{}", slug.trim_start_matches('#'));
+        let id = jig_pipeline::ingest_record::label_cid(&format!("seeded {slug}"));
         let store = &self.state.ingest_ctx.store;
         let now = chrono::Utc::now().timestamp_millis();
         store.upsert_channel(&jig_pipeline::persist::StoredChannel {
