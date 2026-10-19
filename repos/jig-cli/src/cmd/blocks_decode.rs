@@ -174,6 +174,7 @@ mod tests {
             bundle_b64,
             receipts,
             delivery_cid: "bafy_test_delivery".into(),
+            ingest: None,
         }
     }
 
@@ -184,6 +185,7 @@ mod tests {
             sig_b64: Some(base64::engine::general_purpose::STANDARD.encode(&block.sender_sig)),
             receipts,
             delivery_cid: "bafy_test_delivery".into(),
+            ingest: None,
         }
     }
 

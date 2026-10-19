@@ -23,6 +23,8 @@ pub mod dm;
 pub mod error;
 pub mod grant;
 pub mod hlc;
+#[cfg(feature = "ed25519")]
+pub mod key_link;
 #[cfg(feature = "keystore")]
 pub mod keystore;
 pub mod manifest;
