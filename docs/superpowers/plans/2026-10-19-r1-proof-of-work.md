@@ -55,7 +55,7 @@ and run `scripts/clean-build-artifacts.sh --here --yes` when a slice is done (`A
 | Server admission PoW | `repos/jig-core/src/admission_pow.rs`; `repos/jig-server/src/v0_0_2_admission.rs`; `repos/jig-server/src/auth/{admission,state}.rs`; `AdmissionSection` in `repos/jig-config/src/v0_0_2_server.rs` | `jig-admission-pow-v1`, a bit count (1–28, default 20), off by default. Advertised unsigned as `admission_pow_bits` at `/.well-known/jig` (`repos/jig-server/src/handler.rs`) |
 | Client solver | `repos/jig-client/src/admission.rs`; `repos/jig-cli/src/cmd/admission.rs` | Solves the admission PoW only. The register, renew and rotate builders (`repos/jig-cli/src/cmd/{init,keys}.rs`) send no `pow` |
 | Server rate limits | `repos/jig-server/src/auth/rate.rs` | Token buckets per DID and per address. No capacity partition |
-| L6's namespace policy | not found on `main` or in open PRs at the time of writing | The orchestrator describes it as: per-suffix `registration = closed \| open`, alias length ≥ 3, reserved and near-miss names, a per-DID allowlist. **This plan composes with that shape and must be re-checked when the PR lands** |
+| L6's namespace policy | #224 (`feat/nameserver-multi-suffix`, draft, at `0a9b87a`): `SuffixConfig` in `repos/jig-config/src/v0_0_2_server.rs`; `Suffixes`, `SuffixPolicy::admit` in `repos/jig-nameserver/src/v0_0_2_policy.rs` | `[[v0_0_2.nameserver.alias_suffixes]]`, one entry per suffix: `registration = "open" \| "closed"` (`#[non_exhaustive]`), `single_label_authority`, `min_alias_len` (default 3), `reserved`, `reserved_contains`, `reserved_affixes` (matched after normalization), `registration_allow = [{did, aliases}]`. `admit(did, alias)` returns `Admission::{Ordinary, Allowlisted}` or `Refusal::{Closed, TooShort, Reserved}` (`REGISTRATION_CLOSED`, `ALIAS_TOO_SHORT`, `ALIAS_RESERVED`). One name per DID per suffix: a second gets `409 DID_HOLDS_NAME`. `RegisterReq.suffix` is optional (`SUFFIX_REQUIRED` when several are served). **Confirmed against #224; re-check if it changes before merge** |
 
 ---
 
@@ -86,18 +86,21 @@ follow `@jig`'s opening. They are not on its path.
 Nothing below is a constant in code. Every value is a config key with a documented default, so an
 operator, and later a ruleset (JEP-0009), sets it.
 
-Proposed nameserver keys, one table per suffix. They sit beside L6's `registration` policy, in
-whichever struct that PR uses:
+Proposed nameserver keys: two optional tables on each `[[v0_0_2.nameserver.alias_suffixes]]`
+entry, beside L6's policy fields (#224). `SuffixConfig` is `deny_unknown_fields`, so slice 1
+adds `pow: PowPolicy` and slice 3 adds `pool: PoolPolicy` to the struct, both
+`#[serde(default)]`:
 
 ```toml
-[suffixes."jig".registration]          # L6's namespace PR (shape to confirm)
-mode = "closed"                        # closed | open
+[[v0_0_2.nameserver.alias_suffixes]]   # L6's fields (#224)
+suffix = "jig"
+registration = "closed"                # open | closed
+single_label_authority = true
 min_alias_len = 3
-reserved = ["admin", "root", "jig", "…"]
-near_miss = "default"                  # L6's list or a path
-allow_dids = ["did:jig:z…"]            # admitted while mode = "closed"
+# reserved, reserved_contains, reserved_affixes: L6's defaults
+registration_allow = [{ did = "did:jig:z…", aliases = ["dj"] }]
 
-[suffixes."jig".registration.pow]      # this plan
+[v0_0_2.nameserver.alias_suffixes.pow] # this plan, slice 1
 alg = 1                                # JEP-0008 rule 8
 min_effort = 1_048_576                 # 2^20; the floor for strangers (rule 19)
 max_effort = 268_435_456               # 2^28; the cap, and the client's refusal point
@@ -106,15 +109,18 @@ short_name_len = 5                     # names shorter than this pay the length 
 short_name_factor = 4                  # effort × factor^(short_name_len − len)
 renew_effort = 1                       # rule 31: renew and rotate by the holder pay the minimum
 
-[suffixes."jig".registration.pool]     # slice 3: the stranger cap
+[v0_0_2.nameserver.alias_suffixes.pool] # slice 3: the stranger cap
 strangers_per_hour = 120               # admitted stranger registrations per hour; compute cannot raise it
 burst = 20
 controller = "doubling"                # how effort follows the queue (slice 3)
 controller_window_secs = 300
 ```
 
-- **Per suffix.** The nameserver serves one `alias_suffix` per process today. Keying the tables
-  by suffix costs nothing now and keeps a multi-suffix nameserver from needing a config break.
+- **Per suffix.** #224 serves several suffixes per process, so each suffix carries its own
+  `pow` and `pool`, and `Suffixes::from_config` validates them at boot (`min_effort ≤
+  max_effort`, `max_effort` solvable in `max_solve_secs` on the benchmark from slice 0).
+  `SuffixPolicy` gains `pow()` and `pool()` accessors; slice 3 keeps its controller state per
+  suffix.
 - **How effort adapts (slice 3).** Rule 17 lets the controller be local. The proposed
   `doubling` controller works per window:
   - **Raise:** when admitted stranger registrations reached the pool's cap and requests were
@@ -123,8 +129,10 @@ controller_window_secs = 300
     `min_effort`.
   - **Floor:** registration never drops below `min_effort`, because a registration creates a
     binding (D23).
-- **Allowlisted DIDs** (L6's `allow_dids`) are member requests (rule 24). They skip the pool and
-  pay `min_effort`, not the length multiplier (DJ question 3).
+- **Allowlisted registrations** (`Admission::Allowlisted`, from `registration_allow`) are member
+  requests (rule 24). They skip the pool and pay `min_effort`, not the length multiplier (DJ
+  question 3). The allowlist is per (DID, exact alias), not per DID, so the effort cannot be
+  known until the alias is: see the challenge below.
 - **Server admission (slice 4).** `[auth.admission] pow_bits` becomes `min_effort` and
   `max_effort`, plus the same controller keys. `pow_bits` stays accepted for one release and
   maps to `min_effort = 2^pow_bits`.
@@ -180,22 +188,32 @@ What it holds (JEP-0008 rules 6–10):
   bound the challenge map by count)
 - Modify: `repos/jig-nameserver/src/v0_0_2_rate_limit.rs` (limit `GET /v1/challenge` per IP:
   rule 31)
-- Modify: `repos/jig-nameserver/src/config.rs` (the `pow` table above, if L6's policy lives
-  here)
+- Modify: `repos/jig-config/src/v0_0_2_server.rs` (`PowPolicy` on `SuffixConfig`, defaults and
+  boot validation)
+- Modify: `repos/jig-nameserver/src/v0_0_2_policy.rs` (`SuffixPolicy::pow()`, and
+  `effort_for(Admission, alias)`; `admit` itself is unchanged)
 
 Wire changes:
-- **`GET /v1/challenge?action=register|renew|rotate`** returns
+- **`GET /v1/challenge?action=register|renew|rotate&alias=<local>@<suffix>&did=<did>`** returns
   `{challenge, pow: {alg, effort, expires_at}, sig}`.
+  - The alias is required because the effort depends on it: length scaling (slice 3) and the
+    per-alias allowlist both need it. The DID is required for register because
+    `registration_allow` is keyed on (DID, alias). Neither is authenticated here; both are
+    bound into the challenge record, and the proof later has to match them.
+  - For `action=register` the endpoint runs the cheap refusals first, so nobody solves work for
+    nothing: `SuffixPolicy::admit` (`REGISTRATION_CLOSED`, `ALIAS_TOO_SHORT`,
+    `ALIAS_RESERVED`), `ALIAS_TAKEN` by another DID, and `DID_HOLDS_NAME`. These are hints,
+    not authority: `register` repeats every one, since the store can change while a client
+    solves.
   - `sig` is a COSE_Sign1 by the nameserver's DID over the deterministic-CBOR map
-    `{challenge, action, alg, effort, expires_at}`. This is rule 16's signed effort; JEP-0009
-    rule 1 sets the encoding.
-  - The nameserver records `(challenge → action, effort)`. It checks a proof against the effort
-    it promised, not against whatever the controller says when the proof arrives, so a client
-    is never refused for an effort rise mid-solve.
-  - **A closed suffix answers `403 REGISTRATION_CLOSED` here** for `action=register` from a DID
-    not on the allowlist, so nobody solves work for nothing. Without a DID (the request is
-    unauthenticated), a closed suffix still issues the challenge, and the register call
-    refuses. The response says so.
+    `{challenge, action, alias, did, alg, effort, expires_at}`. This is rule 16's signed
+    effort; JEP-0009 rule 1 sets the encoding.
+  - The nameserver records `(challenge → action, alias, did, effort)`. It checks a proof
+    against the effort it promised, not against whatever the controller says when the proof
+    arrives, so a client is never refused for an effort rise mid-solve. A challenge used for
+    another action, alias or DID is refused `CHALLENGE_MISMATCH` before any crypto.
+  - Today's bare `GET /v1/challenge` keeps working for one release for clients that predate
+    slice 2; on a suffix whose `pow.min_effort > 0` it can only lead to `428 POW_REQUIRED`.
 - **`pow`** on register, renew and rotate is `{alg, effort, nonce}`. The salt is empty (rule 13,
   challenge mode).
 - **The binding (rule 11):**
@@ -206,16 +224,27 @@ Wire changes:
     `proof_hash(Rotate, …)` like the other two. **JEP-0008 rule 11 needs this interim stated**
     (DJ question 4).
   - The subject is `did` for register and renew, and `old_did` for rotate.
-- **Order of checks in `register`** (rule 10; framing 5.10's "refuse before working"):
-  1. Parse and validate the local part (length, charset).
-  2. Apply L6's suffix policy: `mode`, `min_alias_len`, `reserved`, `near_miss`, allowlist.
-     These are cheap and refuse without crypto.
-  3. The challenge is known, unexpired, for this action, and has a promised effort.
-  4. **Proof-of-work:** one digest; refuse `POW_INVALID` or `POW_INSUFFICIENT` (effort below
-     the promised one).
-  5. The proof-of-control signature.
-  6. Reachability.
-  7. Consume the challenge (`take_challenge`; a `false` refuses, as today).
+- **Order of checks in `register`** (rule 10; framing 5.10's "refuse before working"). Steps 1,
+  2 and 5–7 are #224's `register` as it stands; this plan inserts 3 and 4 between
+  `policy.admit(...)` and `verify_action_proof(...)`, the pre-proof spot L6 asked for, so a
+  refusal there leaves the challenge usable:
+  1. `validate_local_part`, `requested_suffix`, `parse_name`.
+  2. `SuffixPolicy::admit` → `Admission` or `Refusal`. Cheap, no crypto.
+  3. The challenge is known, unexpired, and recorded for this action, alias and DID, with a
+     promised effort.
+  4. **Proof-of-work:** one digest; refuse `POW_INVALID`, or `POW_INSUFFICIENT` when below the
+     promised effort. An `Allowlisted` admission was promised `min_effort`.
+  5. `verify_action_proof` (proof of control).
+  6. `parse_reachability`.
+  7. `consume_challenge`; then #224's `ALIAS_TAKEN` and `refuse_second_name`
+     (`DID_HOLDS_NAME`), which read the store and so stay after the consume. The challenge
+     endpoint's early copies of those two keep honest clients from paying for them.
+- **Renew** already verifies before it consumes; PoW goes before `verify_action_proof` there
+  too.
+- **Rotate** consumes the challenge *first* (#224's `rotate`, step 1), then verifies the two
+  signatures. Slice 1 moves the consume after the PoW and both signature checks, matching
+  register and renew, so a bad `pow` cannot burn a holder's challenge. This touches lane I's
+  rotate code; coordinate with I3.
 - **Refusals:** `428 POW_REQUIRED`, carrying the signed effort as in `get_challenge`;
   `400 POW_INVALID`; `400 POW_INSUFFICIENT`. A refused or invalid proof charges a penalty point
   to (target alias, requesting DID) and to the IP (rule 26). The points feed slice 3's
@@ -233,9 +262,16 @@ Wire changes:
   - A register `pow` replayed on renew, or for another alias or challenge → `POW_INVALID`.
   - A bad `pow` with a bad signature fails on the `pow`, and no signature check runs (asserted
     with a counter or a mock).
-  - A closed suffix: `GET /v1/challenge?action=register` → `REGISTRATION_CLOSED`; an
-    allowlisted DID → 200.
-  - A reserved or near-miss alias is refused before any `pow` is checked.
+  - A closed suffix: `GET /v1/challenge?action=register` for a DID and alias not in
+    `registration_allow` → `REGISTRATION_CLOSED`; the listed (DID, alias) → 200 at
+    `min_effort`; the listed DID with another alias → `REGISTRATION_CLOSED`.
+  - A reserved alias (including a normalized match, e.g. `4dm1n-x`) and a too-short alias are
+    refused at the challenge and at register, before any `pow` is checked.
+  - A DID that already holds a name on the suffix → `409 DID_HOLDS_NAME` at the challenge.
+  - A challenge issued for alias A, used to register alias B → `CHALLENGE_MISMATCH`, and no
+    signature check runs.
+  - Rotate with a bad `pow` → refused, and the challenge is still usable.
+  - Two suffixes with different `pow.min_effort` promise different efforts.
   - `GET /v1/challenge` beyond the per-IP limit → 429.
   - With the challenge map at its cap → `503 BUSY`, and existing challenges still work.
 - [ ] **Step 2: Implement** in the order of checks above. `PowProof` deserialises strictly
@@ -403,18 +439,21 @@ In the implementing lanes' PRs (spec rows) and L1's (docs), after task 6:
 ## What opening `@jig` requires
 
 A checklist for DJ to sign off. Every box is checked against `main` and a deployed nameserver
-before `mode` changes to `open`.
+before the `jig` entry's `registration` changes to `"open"`.
 
 - [ ] **Naming is verified end to end.**
   - F1: action-bound proofs, the nameserver over TLS, the `@jig` delegation published and
     built in (#214, #218), clients pinning names.
   - JEP-0004's done-when holds for `@jig`.
-- [ ] **L6's namespace policy is merged.**
-  - Minimum length 3.
-  - The reserved list is reviewed by DJ: protocol words, project and operator names, abuse-prone
-    words.
-  - The near-miss check covers confusables (case, `0/o`, `1/l`, `-/_`) of every reserved name.
-  - The per-DID allowlist works while closed.
+- [ ] **L6's namespace policy (#224) is merged.**
+  - `jig` entry: `single_label_authority = true`, `min_alias_len = 3`.
+  - The reserved lists are reviewed by DJ (`reserved`, `reserved_contains`,
+    `reserved_affixes`): protocol words, project and operator names, abuse-prone words.
+  - Normalization covers the confusables of every reserved name (case, `-_.`, `0/o`, `1/i/l`,
+    `3/e`, `4/a`, `5/s`, `7/t`). Not covered: Unicode confusables, which the local-part
+    charset rules out today.
+  - `registration_allow` works while closed, and every allowlisted registration is logged.
+  - One name per DID per suffix (`DID_HOLDS_NAME`) holds across register and rotate.
 - [ ] **Tasks 0–3 and 6 are merged and released together with task 2's CLI.**
   - Every register, renew and rotate carries valid `pow`.
   - The effort is signed.
