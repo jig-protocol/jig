@@ -111,11 +111,18 @@ the chain.
 ## Forks
 
 Two verified links with the same `old` and different `new` are a **fork**. The old key
-signed both, so someone other than its holder has it. A verifier that holds both:
+signed both, so someone other than its holder has it. Every verifier that holds both
+SHOULD keep both envelopes as evidence and SHOULD tell the person it acts for. What else
+it does depends on whether the links come in an order:
 
-- MUST NOT follow either automatically;
-- SHOULD keep both envelopes as evidence;
-- SHOULD tell the person it acts for.
+- **In an ordered log**, such as a channel's chain, where a link takes effect at its
+  position: the first link from `old` takes effect, and what it moved stays moved, so
+  that what a DID held has one answer at each position. A later link from the same `old`
+  to a different `new` MUST be refused, because `old` holds nothing any more. Undoing the
+  first move is the log owner's call: in a channel, the owner can unassign the moved
+  roles by hand.
+- **With no order**, such as a pin or a server's `expected_did` that has seen both links:
+  the verifier MUST NOT follow either automatically.
 
 Two links with the same `old` and the same `new` (for two audiences, or signed twice) are
 not a fork.

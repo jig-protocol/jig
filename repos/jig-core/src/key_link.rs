@@ -10,7 +10,13 @@
 //! A link is a COSE_Sign ([`crate::cose`]) with two signatures, `old`'s then
 //! `new`'s, over a text-keyed deterministic CBOR map ([`crate::dcbor`]) with a
 //! `domain` entry, as every signed object in [`crate::naming`] has. The
-//! envelope bytes are what travels and what a verifier keeps as evidence. The
+//! envelope bytes are what travels and what a verifier keeps as evidence.
+//!
+//! In an ordered log, such as a channel's chain, the first link from a DID
+//! takes effect at its place in the log. A later link from the same DID to
+//! another is refused, since the DID holds nothing any more, and both are kept
+//! as fork evidence ([`fork`]). A verifier with no order to go by follows
+//! neither. The
 //! encoding is JEP-0012; its test vectors live in `repos/jig-spec/jep/vectors/0012/`.
 
 use ed25519_dalek::SigningKey;
@@ -243,7 +249,9 @@ impl SignedKeyLink {
 
 /// Two links from one DID to two different DIDs: the old key signed both, so
 /// someone other than its holder has it. A verifier holding both keeps them as
-/// evidence and follows neither.
+/// evidence. With no order to go by, it follows neither; in an ordered log,
+/// the first link has already taken effect and the later one is refused (see
+/// the module docs).
 pub fn fork(a: &SignedKeyLink, b: &SignedKeyLink) -> bool {
     a.link.old == b.link.old && a.link.new != b.link.new
 }
