@@ -262,14 +262,15 @@ enum ChannelAction {
 
 #[derive(Subcommand, Debug)]
 enum NsAction {
-    /// Resolve an alias (e.g. `dj@dj.jig`) to the DID it is attested to.
+    /// Resolve a name (e.g. `dj@jig`) to the DID its suffix's authority attests.
     Resolve {
-        /// Fully-qualified alias to look up.
+        /// Name to look up, as `alias@suffix`. Only an attestation from the
+        /// suffix's delegated authority is printed.
         #[arg()]
         alias: String,
 
-        /// Nameserver base URL. Defaults to `[server] nameserver_url`
-        /// in cli.toml.
+        /// Ask this nameserver instead of the ones the suffix's
+        /// `[naming.delegations]` entry lists. The authorities stay the same.
         #[arg(long)]
         nameserver: Option<String>,
     },

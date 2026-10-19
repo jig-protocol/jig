@@ -9,6 +9,11 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     pub server: ServerSection,
     pub user: UserSection,
+    /// Which DIDs speak for which name suffixes (JEP-0004 `config` roots).
+    /// Skipped when empty, so an existing `cli.toml` neither needs it nor
+    /// grows it.
+    #[serde(default, skip_serializing_if = "NamingSection::is_empty")]
+    pub naming: NamingSection,
     /// Local address book: DID → display name, rendered by `jig chat` and
     /// `jig tail` in place of the 61-character DID.
     ///
@@ -32,6 +37,92 @@ pub struct ServerSection {
     pub nameserver_url: Option<String>,
 }
 
+/// `[naming]`: the suffix delegations this client holds itself.
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NamingSection {
+    /// `[naming.delegations.<suffix>]`. A suffix with no entry is looked up
+    /// through `dns` discovery, except [`DEFAULT_SUFFIX`], which falls back
+    /// to [`default_jig_delegation`].
+    #[serde(default)]
+    pub delegations: BTreeMap<String, DelegationEntry>,
+}
+
+impl NamingSection {
+    fn is_empty(&self) -> bool {
+        self.delegations.is_empty()
+    }
+}
+
+/// One `[naming.delegations.<suffix>]` entry. Mirrors
+/// `jig_client::naming::ConfigDelegation`, which has no `Serialize`.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationEntry {
+    /// The DIDs whose attestations count for this suffix.
+    pub authorities: Vec<String>,
+    /// The nameserver URLs to ask.
+    pub nameservers: Vec<String>,
+}
+
+pub use jig_core::naming::DEFAULT_SUFFIX;
+
+/// The built-in delegation for [`DEFAULT_SUFFIX`]: the authority this build
+/// ships (`jig_core::naming::default_jig_authority`), asked at
+/// `[server] nameserver_url` or else `jig_core::naming::DEFAULT_JIG_NAMESERVER`.
+/// `Err`, and so no built-in delegation, while the authority is the
+/// placeholder, whatever the nameserver.
+pub fn default_jig_delegation(cfg: &Config) -> Result<DelegationEntry> {
+    delegation_for(jig_core::naming::default_jig_authority(), cfg)
+}
+
+fn delegation_for(
+    authority: Result<&str, jig_core::naming::NamingError>,
+    cfg: &Config,
+) -> Result<DelegationEntry> {
+    let authority = authority.map_err(|e| {
+        anyhow::anyhow!(
+            "{e}; add a [naming.delegations.{DEFAULT_SUFFIX}] entry to cli.toml to resolve \
+             `@{DEFAULT_SUFFIX}` names"
+        )
+    })?;
+    let nameserver = cfg
+        .server
+        .nameserver_url
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or(jig_core::naming::DEFAULT_JIG_NAMESERVER);
+    Ok(DelegationEntry {
+        authorities: vec![authority.to_string()],
+        nameservers: vec![nameserver.trim_end_matches('/').to_string()],
+    })
+}
+
+/// The delegations a resolver uses: `cli.toml`'s, plus the built-in one for
+/// [`DEFAULT_SUFFIX`] when `cli.toml` has none for it and this build has one.
+pub fn delegations(cfg: &Config) -> jig_client::naming::Delegations {
+    let mut entries = cfg.naming.delegations.clone();
+    if !entries.contains_key(DEFAULT_SUFFIX)
+        && let Ok(default) = default_jig_delegation(cfg)
+    {
+        entries.insert(DEFAULT_SUFFIX.to_string(), default);
+    }
+    jig_client::naming::Delegations {
+        config: entries
+            .into_iter()
+            .map(|(suffix, e)| {
+                (
+                    suffix,
+                    jig_client::naming::ConfigDelegation {
+                        authorities: e.authorities,
+                        nameservers: e.nameservers,
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserSection {
     pub did: String,
@@ -52,6 +143,7 @@ impl Default for Config {
                 display_name: os_username(),
                 default_channel: "#general".to_string(),
             },
+            naming: NamingSection::default(),
             contacts: BTreeMap::new(),
         }
     }
@@ -118,6 +210,106 @@ pub fn default_config_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn with_nameserver(url: &str) -> Config {
+        let mut cfg = Config::default();
+        cfg.server.nameserver_url = Some(url.to_string());
+        cfg
+    }
+
+    #[test]
+    fn the_built_in_jig_delegation_asks_the_configured_nameserver() {
+        // Tests build jig-core with `test-default-authority`.
+        let d = default_jig_delegation(&with_nameserver("https://ns.example/")).unwrap();
+        assert_eq!(d.authorities, [jig_core::naming::DEFAULT_JIG_AUTHORITY]);
+        assert_eq!(d.nameservers, ["https://ns.example"]);
+    }
+
+    #[test]
+    fn without_a_configured_nameserver_the_built_in_one_is_asked() {
+        let d = default_jig_delegation(&Config::default()).unwrap();
+        assert_eq!(d.nameservers, [jig_core::naming::DEFAULT_JIG_NAMESERVER]);
+    }
+
+    #[test]
+    fn a_real_nameserver_with_the_placeholder_authority_is_still_refused() {
+        // What every build without `test-default-authority` gets today.
+        let refused = || Err(jig_core::naming::NamingError::NoDefaultAuthority);
+        for cfg in [Config::default(), with_nameserver("https://ns.example")] {
+            let err = delegation_for(refused(), &cfg).unwrap_err();
+            assert!(err.to_string().contains("placeholder"), "{err}");
+        }
+        let mut no_entry = with_nameserver("https://ns.example");
+        no_entry.naming.delegations.clear();
+        assert!(
+            delegation_for(refused(), &no_entry).is_err(),
+            "no built-in @jig delegation without a real authority"
+        );
+    }
+
+    #[test]
+    fn an_old_config_with_no_naming_section_gets_the_built_in_jig_delegation() {
+        let cfg: Config = toml::from_str(
+            "[server]\nbase_url = \"https://127.0.0.1:7117\"\n\
+             nameserver_url = \"https://ns.example\"\n\n\
+             [user]\ndid = \"did:jig:zA\"\ndisplay_name = \"dj\"\n\
+             default_channel = \"#general\"\n",
+        )
+        .unwrap();
+        assert!(cfg.naming.delegations.is_empty());
+        let d = delegations(&cfg);
+        assert_eq!(d.config[DEFAULT_SUFFIX].nameservers, ["https://ns.example"]);
+    }
+
+    #[test]
+    fn delegations_round_trip_through_cli_toml_and_back_the_default_suffix() {
+        let mut cfg = Config::default();
+        cfg.naming.delegations.insert(
+            "example.org".into(),
+            DelegationEntry {
+                authorities: vec!["did:jig:zA".into()],
+                nameservers: vec!["https://ns.example.org".into()],
+            },
+        );
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            text.contains("[naming.delegations.\"example.org\"]"),
+            "{text}"
+        );
+        let mut back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.naming, cfg.naming);
+
+        // cli.toml's own entries, plus the built-in `jig` one.
+        back.server.nameserver_url = Some("https://ns.example".into());
+        let d = delegations(&back);
+        assert_eq!(d.config["example.org"].authorities, ["did:jig:zA"]);
+        assert_eq!(
+            d.config[DEFAULT_SUFFIX].authorities,
+            [jig_core::naming::DEFAULT_JIG_AUTHORITY]
+        );
+    }
+
+    #[test]
+    fn a_jig_entry_in_cli_toml_wins_over_the_built_in_one() {
+        let mut cfg = with_nameserver("https://ns.example");
+        let mine = DelegationEntry {
+            authorities: vec!["did:jig:zMine".into()],
+            nameservers: vec!["http://127.0.0.1:7399".into()],
+        };
+        cfg.naming
+            .delegations
+            .insert(DEFAULT_SUFFIX.into(), mine.clone());
+        assert_eq!(
+            delegations(&cfg).config[DEFAULT_SUFFIX].authorities,
+            mine.authorities
+        );
+    }
+
+    #[test]
+    fn a_config_without_naming_writes_no_naming_table() {
+        let text = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!text.contains("naming"), "{text}");
+    }
 
     #[test]
     fn default_server_is_the_local_server_over_tls() {

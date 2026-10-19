@@ -99,12 +99,13 @@ jobs:
           workspaces: repos
       - name: Test-only suites stay out of every build
         # `test-aead` (jig-core `test-suite`) and long-lived MLS leaves
-        # (jig-mls `conformance`) exist for the conformance vectors only.
+        # (jig-mls `conformance`) exist for the conformance vectors only, and
+        # jig-core `test-default-authority` trusts a public test seed for `@jig`.
         # Dev-dependencies may enable them; no crate's normal or build graph
         # may, or a release binary would register a test suite (JEP-0001).
         run: |
           if cargo tree --workspace -e normal,build,features \
-              | grep -E 'jig-core feature "test-suite"|jig-mls feature "conformance"'; then
+              | grep -E 'jig-core feature "(test-suite|test-default-authority)"|jig-mls feature "conformance"'; then
             echo "::error::a normal dependency enables a test-only feature"
             exit 1
           fi
