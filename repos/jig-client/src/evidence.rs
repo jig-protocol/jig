@@ -6,7 +6,9 @@
 //! ([`crate::naming::NameEvidence`]): every attestation and link exactly as
 //! served, one file per resolution under `~/.jig/evidence/names/`. The signed
 //! bytes are what make a file hold offline; the JSON around them is only an
-//! index. Bundles against servers, and the `jig-evidence-v1` export, follow.
+//! index. Each file names its format ([`INTERIM_FORMAT`]): when the
+//! `jig-evidence-v1` store arrives (D11 slice 6), it imports every such file
+//! on first run, so nothing kept here is lost. Bundles against servers follow.
 
 use std::path::{Path, PathBuf};
 
@@ -16,6 +18,9 @@ use serde::Serialize;
 
 use crate::naming::{NameEvidence, NameEvidenceBundle};
 
+/// The format this module writes, named in every file it writes.
+pub const INTERIM_FORMAT: &str = "jig-name-evidence-interim";
+
 /// Name evidence kept as files in one directory.
 pub struct NameEvidenceDir {
     dir: PathBuf,
@@ -24,6 +29,7 @@ pub struct NameEvidenceDir {
 /// One kept resolution, as written to disk.
 #[derive(Serialize)]
 struct Kept<'a> {
+    format: &'static str,
     kind: &'static str,
     name: String,
     root: &'static str,
@@ -57,6 +63,7 @@ impl NameEvidenceDir {
 impl NameEvidence for NameEvidenceDir {
     fn record(&self, bundle: &NameEvidenceBundle) -> Result<(), String> {
         let kept = Kept {
+            format: INTERIM_FORMAT,
             kind: "name-resolution",
             name: format!("{}@{}", bundle.key.alias, bundle.key.suffix),
             root: bundle.key.root.as_str(),
@@ -112,6 +119,7 @@ mod tests {
         let kept: serde_json::Value =
             serde_json::from_slice(&std::fs::read(files[0].as_ref().unwrap().path()).unwrap())
                 .unwrap();
+        assert_eq!(kept["format"], INTERIM_FORMAT);
         assert_eq!(kept["name"], "alice@example.org");
         assert_eq!(kept["attestations"][1], STANDARD.encode(b"second"));
         assert_eq!(kept["ns_dids"][1], "did:jig:zB");
