@@ -55,7 +55,7 @@ and run `scripts/clean-build-artifacts.sh --here --yes` when a slice is done (`A
 | Server admission PoW | `repos/jig-core/src/admission_pow.rs`; `repos/jig-server/src/v0_0_2_admission.rs`; `repos/jig-server/src/auth/{admission,state}.rs`; `AdmissionSection` in `repos/jig-config/src/v0_0_2_server.rs` | `jig-admission-pow-v1`, a bit count (1–28, default 20), off by default. Advertised unsigned as `admission_pow_bits` at `/.well-known/jig` (`repos/jig-server/src/handler.rs`) |
 | Client solver | `repos/jig-client/src/admission.rs`; `repos/jig-cli/src/cmd/admission.rs` | Solves the admission PoW only. The register, renew and rotate builders (`repos/jig-cli/src/cmd/{init,keys}.rs`) send no `pow` |
 | Server rate limits | `repos/jig-server/src/auth/rate.rs` | Token buckets per DID and per address. No capacity partition |
-| L6's namespace policy | #224 (`feat/nameserver-multi-suffix`, draft, at `0a9b87a`): `SuffixConfig` in `repos/jig-config/src/v0_0_2_server.rs`; `Suffixes`, `SuffixPolicy::admit` in `repos/jig-nameserver/src/v0_0_2_policy.rs` | `[[v0_0_2.nameserver.alias_suffixes]]`, one entry per suffix: `registration = "open" \| "closed"` (`#[non_exhaustive]`), `single_label_authority`, `min_alias_len` (default 3), `reserved`, `reserved_contains`, `reserved_affixes` (matched after normalization), `registration_allow = [{did, aliases}]`. `admit(did, alias)` returns `Admission::{Ordinary, Allowlisted}` or `Refusal::{Closed, TooShort, Reserved}` (`REGISTRATION_CLOSED`, `ALIAS_TOO_SHORT`, `ALIAS_RESERVED`). One name per DID per suffix: a second gets `409 DID_HOLDS_NAME`. `RegisterReq.suffix` is optional (`SUFFIX_REQUIRED` when several are served). **Confirmed against #224; re-check if it changes before merge** |
+| L6's namespace policy | #224 (`feat/nameserver-multi-suffix`, draft, at `8936481`): `SuffixConfig` in `repos/jig-config/src/v0_0_2_server.rs`; `Suffixes`, `SuffixPolicy::admit` in `repos/jig-nameserver/src/v0_0_2_policy.rs` | `[[v0_0_2.nameserver.alias_suffixes]]`, one entry per suffix: `registration = "open" \| "closed"` (`#[non_exhaustive]`), `single_label_authority`, `min_alias_len` (default 3), `reserved`, `reserved_contains`, `reserved_affixes` (matched after normalization), `registration_allow = [{did, aliases}]`. `admit(did, alias)` returns `Admission::{Ordinary, Allowlisted}` or `Refusal::{Closed, TooShort, Reserved}` (`REGISTRATION_CLOSED`, `ALIAS_TOO_SHORT`, `ALIAS_RESERVED`). One name per DID per suffix: a second gets `409 DID_HOLDS_NAME`. `GET /v1/challenge?did=&name=` (both optional) binds a challenge as `v0_0_2::PendingChallenge { issued_at, did, name }`; only that DID on that name consumes it, and a mismatch is `CHALLENGE_UNKNOWN` with the challenge left in place. Rotate consumes its challenge last. `RegisterReq.suffix` is optional (`SUFFIX_REQUIRED` when several are served). **Confirmed against #224; re-check if it changes before merge** |
 
 ---
 
@@ -194,24 +194,28 @@ What it holds (JEP-0008 rules 6–10):
   `effort_for(Admission, alias)`; `admit` itself is unchanged)
 
 Wire changes:
-- **`GET /v1/challenge?action=register|renew|rotate&alias=<local>@<suffix>&did=<did>`** returns
+- **`GET /v1/challenge?action=register|renew|rotate&did=<did>&name=<alias@suffix>`** returns
   `{challenge, pow: {alg, effort, expires_at}, sig}`.
-  - The alias is required because the effort depends on it: length scaling (task 3) and the
-    per-alias allowlist both need it. The DID is required for register because
-    `registration_allow` is keyed on (DID, alias). Neither is authenticated here; both are
-    bound into the challenge record, and the proof later has to match them.
+  - #224 already takes `did` and `name` as optional and binds them in `PendingChallenge`.
+    Task 1 adds `action` and the promised effort to that record, and makes all three
+    required on a suffix whose `pow.min_effort > 0`.
+  - The name is needed because the effort depends on it: length scaling (task 3) and the
+    per-alias allowlist both need it. The DID is needed because `registration_allow` is keyed
+    on (DID, alias). Neither is authenticated here; the proof later has to match them. For
+    rotate, the bound DID is the **old** DID, as in #224.
   - For `action=register` the endpoint runs the cheap refusals first, so nobody solves work for
     nothing: `SuffixPolicy::admit` (`REGISTRATION_CLOSED`, `ALIAS_TOO_SHORT`,
     `ALIAS_RESERVED`), `ALIAS_TAKEN` by another DID, and `DID_HOLDS_NAME`. These are hints,
     not authority: `register` repeats every one, since the store can change while a client
     solves.
   - `sig` is a COSE_Sign1 by the nameserver's DID over the deterministic-CBOR map
-    `{challenge, action, alias, did, alg, effort, expires_at}`. This is rule 16's signed
+    `{challenge, action, name, did, alg, effort, expires_at}`. This is rule 16's signed
     effort; JEP-0009 rule 1 sets the encoding.
-  - The nameserver records `(challenge → action, alias, did, effort)`. It checks a proof
+  - The nameserver records `(challenge → action, name, did, effort)`. It checks a proof
     against the effort it promised, not against whatever the controller says when the proof
     arrives, so a client is never refused for an effort rise mid-solve. A challenge used for
-    another action, alias or DID is refused `CHALLENGE_MISMATCH` before any crypto.
+    another DID or name is refused `CHALLENGE_UNKNOWN` (#224's behaviour, challenge kept); one
+    used for another action gets the same refusal, before any crypto.
   - Today's bare `GET /v1/challenge` keeps working for one release for clients that predate
     task 2; on a suffix whose `pow.min_effort > 0` it can only lead to `428 POW_REQUIRED`.
 - **`pow`** on register, renew and rotate is `{alg, effort, nonce}`. The salt is empty (rule 13,
@@ -241,10 +245,9 @@ Wire changes:
      endpoint's early copies of those two keep honest clients from paying for them.
 - **Renew** already verifies before it consumes; PoW goes before `verify_action_proof` there
   too.
-- **Rotate** consumes the challenge *first* (#224's `rotate`, step 1), then verifies the two
-  signatures. Task 1 moves the consume after the PoW and both signature checks, matching
-  register and renew, so a bad `pow` cannot burn a holder's challenge. This touches lane I's
-  rotate code; coordinate with I3.
+- **Rotate** consumes its challenge last on #224 (after both signatures, the holder check and
+  `DID_HOLDS_NAME`). PoW goes before the signature checks, so a bad `pow` cannot burn a
+  holder's challenge.
 - **Refusals:** `428 POW_REQUIRED`, carrying the signed effort as in `get_challenge`;
   `400 POW_INVALID`; `400 POW_INSUFFICIENT`. A refused or invalid proof charges a penalty point
   to (target alias, requesting DID) and to the IP (rule 26). The points feed task 3's
@@ -268,7 +271,7 @@ Wire changes:
   - A reserved alias (including a normalized match, e.g. `4dm1n-x`) and a too-short alias are
     refused at the challenge and at register, before any `pow` is checked.
   - A DID that already holds a name on the suffix → `409 DID_HOLDS_NAME` at the challenge.
-  - A challenge issued for alias A, used to register alias B → `CHALLENGE_MISMATCH`, and no
+  - A challenge issued for alias A, used to register alias B → `CHALLENGE_UNKNOWN`, and no
     signature check runs.
   - Rotate with a bad `pow` → refused, and the challenge is still usable.
   - Two suffixes with different `pow.min_effort` promise different efforts.
