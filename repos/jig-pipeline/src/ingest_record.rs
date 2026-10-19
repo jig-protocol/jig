@@ -98,21 +98,22 @@ impl RecordSigner<'_> {
     }
 }
 
-/// A CID as the binary CIDv1 it names. Text CIDs (any multibase) parse; a
-/// CIDv0 or anything else is refused.
+/// A CID as the binary CID it names, in the one form JEP-0004 rule 0 allows
+/// ([`jig_core::canonical_cid`]: CIDv1, raw, BLAKE3-256). Text CIDs (any
+/// multibase) parse; every other form is refused.
 fn cid_bytes(text: &str) -> Result<Vec<u8>, RecordError> {
     match cid::Cid::try_from(text) {
-        Ok(cid) if cid.version() == cid::Version::V1 => Ok(cid.to_bytes()),
-        _ => Err(RecordError::Malformed("a CID in the record is not a CIDv1")),
+        Ok(cid) if jig_core::canonical_cid::check(&cid).is_ok() => Ok(cid.to_bytes()),
+        _ => Err(RecordError::Malformed(
+            "a CID in the record is not canonical",
+        )),
     }
 }
 
 /// A CIDv1 naming `label`'s bytes, for test fixtures and tools that need a
 /// channel or block id a record can sign: records sign only real CIDs.
 pub fn label_cid(label: &str) -> String {
-    jig_core::bundle::compute_cid(label.as_bytes(), b"", &[])
-        .expect("a CID always computes")
-        .to_string()
+    jig_core::canonical_cid::of(label.as_bytes()).to_string()
 }
 
 impl IngestRecord {
@@ -324,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn cids_are_signed_as_binary_cidv1_and_nothing_else_signs() {
+    fn cids_are_signed_as_canonical_binary_cids_and_nothing_else_signs() {
         let key = generate_signing_key();
         let record = signer(&key)
             .sign(0, &label_cid("Create"), GENESIS_PREV)
@@ -337,7 +338,21 @@ mod tests {
         );
         assert_eq!(
             signer(&key).sign(1, "not-a-cid", record.hash()),
-            Err(RecordError::Malformed("a CID in the record is not a CIDv1"))
+            Err(RecordError::Malformed(
+                "a CID in the record is not canonical"
+            ))
+        );
+        let dag_cbor = cid::Cid::new_v1(
+            0x71,
+            *cid::Cid::try_from(record.block_cid.as_str())
+                .unwrap()
+                .hash(),
+        );
+        assert!(
+            signer(&key)
+                .sign(1, &dag_cbor.to_string(), record.hash())
+                .is_err(),
+            "a CIDv1 with another codec is refused"
         );
         let v0 = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
         assert!(
