@@ -526,9 +526,11 @@ publicly — `.jig` is not an IANA TLD.
   *(The comment inside `jig-nameserver.service` still says the flags are parsed
   and ignored; that comment is stale.)*
 - **The nameserver needs no secret.** `JIG_NS_SECRET` and the `[pow]` section
-  went with the legacy proof-of-work routes (#192). An env file that still sets
-  `JIG_NS_SECRET` or `JIG_NS_POW_*`, or a config that still has `[pow]`, is
-  harmless: nothing reads them, so remove them at your own pace. The unit's
+  went with the legacy proof-of-work routes (#192), and `[rate_limits]` with the
+  legacy rate limits (#197). An env file that still sets `JIG_NS_SECRET`,
+  `JIG_NS_POW_*` or `JIG_NS_RATE_*`, or a config that still has `[pow]` or
+  `[rate_limits]`, is harmless: nothing reads them, so remove them at your own
+  pace. The unit's
   `EnvironmentFile=` is optional (leading `-`) and only carries any `JIG_NS_*`
   settings you choose to put there.
 - **Secrets never go inline in a unit file.** `systemctl cat` is readable by any
