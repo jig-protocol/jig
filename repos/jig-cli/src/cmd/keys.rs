@@ -14,12 +14,13 @@
 //!   2. Mint a fresh identity (seals the new keyfile via
 //!      `Identity::create`).
 //!   3. Sign the same challenge with BOTH keys.
-//!   4. POST /v1/rotate. If the request fails, the new keyfile is
-//!      removed before bailing so we never end up with two valid keys
-//!      and a stale config. If the nameserver accepts the rotation but its
-//!      reply does not verify, both keyfiles and the config stay as they
-//!      are: the alias may already point at the new DID, so its key must
-//!      not be thrown away.
+//!   4. POST /v1/rotate. If the nameserver certainly did not act (the
+//!      request never reached it, or it answered 4xx), the new keyfile is
+//!      removed before bailing. In every other failure (a timeout or
+//!      dropped connection after sending, a 5xx, an unreadable or
+//!      unverifiable reply), both keyfiles and the config stay as they are:
+//!      the alias may already point at the new DID, so its key must not be
+//!      thrown away.
 //!   5. On a verified reply: rename the OLD keyfile to `<old_did>.jigkey.rotated`
 //!      (kept for offline recovery) and rewrite the active config file
 //!      (`--config <path>`, else `~/.jig/cli.toml`) so `[user] did`
@@ -160,10 +161,10 @@ pub async fn rotate(ctx: &CliContext, args: KeysRotateArgs) -> Result<()> {
     let new_did_str = new_id.did_string();
     let new_keyfile = jig_client::identity::key_path(&keys_dir, &new_did_str);
 
-    // 3. Drive the rotate handshake. If the nameserver never accepted it,
-    //    undo the new keyfile so we don't leak an orphaned key. If it
-    //    accepted but the reply doesn't verify, keep everything: the alias
-    //    may already be bound to the new key.
+    // 3. Drive the rotate handshake. If the nameserver certainly did not
+    //    act, undo the new keyfile so we don't leak an orphaned key.
+    //    Otherwise keep everything: the alias may already be bound to the
+    //    new key.
     let delegations = crate::config::delegations(ctx.effective());
     let reply = match rotate_with_nameserver(
         &old_id,
@@ -183,9 +184,9 @@ pub async fn rotate(ctx: &CliContext, args: KeysRotateArgs) -> Result<()> {
     };
     let attestation = reply.with_context(|| {
         format!(
-            "the nameserver accepted the rotation, so {} may now point at {new_did_str}. \
-             Both keyfiles are kept and [user] did still names {old_did_str}; check with \
-             `jig ns resolve {}` before switching keys by hand (new keyfile: {})",
+            "the nameserver may have applied the rotation, so {} may now point at \
+             {new_did_str}. Both keyfiles are kept and [user] did still names \
+             {old_did_str}; check with `jig ns resolve {}` before switching keys by hand (new keyfile: {})",
             args.alias,
             args.alias,
             new_keyfile.display()
@@ -226,8 +227,8 @@ pub async fn rotate(ctx: &CliContext, args: KeysRotateArgs) -> Result<()> {
 }
 
 /// Drive the challenge → dual-sign → rotate handshake. `Err` means the
-/// nameserver did not accept the rotation; `Ok(Err(_))` means it accepted it
-/// but its reply does not verify as an attestation for `new_id`.
+/// nameserver did not apply the rotation; `Ok(Err(_))` means it may have,
+/// but no verified attestation for `new_id` came back.
 pub async fn rotate_with_nameserver(
     old_id: &Identity,
     new_id: &Identity,
