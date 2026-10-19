@@ -440,16 +440,17 @@ so a rebooted box catches up). It snapshots:
 
 | What | Why |
 | --- | --- |
-| `/var/lib/jig/jig.db` | v0.0.1 store |
 | `/var/lib/jig/jig_v002.db` | **the v0.0.2 block store — where the actual messages are** |
 | `/var/lib/jig/nameserver.db` | alias registry |
 | `/var/lib/jig/server.key` | server identity |
 
-**The `_v002` suffix is not a typo.** `jig-server` derives the v0.0.2 store path
-from `database_path` by appending `_v002` to the file stem, so a configured
-`/var/lib/jig/jig.db` means blocks live in `/var/lib/jig/jig_v002.db`. **Both
-files exist and both matter** — a backup of only `jig.db` backs up essentially
-nothing anyone typed.
+**The `_v002` suffix is not a typo.** `jig-server` derives its store path from
+`database_path` by appending `_v002` to the file stem, so a configured
+`/var/lib/jig/jig.db` means blocks live in `/var/lib/jig/jig_v002.db`.
+`jig.db` itself is no longer opened: the v0.0.1 store it held was removed
+(#196). On a box upgraded from an older release the file is still there and
+unused; delete it yourself once no backup you keep needs it. Nothing deletes
+it for you.
 
 Databases are copied with `sqlite3 … 'VACUUM INTO …'`, which takes a read lock
 and writes one consistent file, so snapshots are safe while the server is
@@ -475,7 +476,7 @@ to object storage. At minimum, get `server.key` off the box (top of this file).
 
 ```bash
 sudo systemctl stop jig-server jig-nameserver
-sudo cp /path/to/snapshot/{jig.db,jig_v002.db,nameserver.db} /var/lib/jig/
+sudo cp /path/to/snapshot/{jig_v002.db,nameserver.db} /var/lib/jig/
 sudo cp /path/to/snapshot/server.key /var/lib/jig/server.key
 sudo chown -R jig:jig /var/lib/jig          # -R, not /var/lib/jig/* — see the
                                             # glob note in the TLS section above

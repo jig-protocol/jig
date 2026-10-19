@@ -27,7 +27,7 @@ stores ciphertext; it holds no group secret.
 # Write a config template
 jig-server --init-config jig-config.toml
 
-# Start with defaults (SQLite under ~/.jig/jig.db)
+# Start with defaults (SQLite at ~/.jig/jig_v002.db)
 jig-server
 
 # Start using a specific config file. An unknown or removed key stops the

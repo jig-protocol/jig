@@ -863,10 +863,11 @@ actually shrink it".
 `deploy/jig-backup.sh` already does the local half correctly — `VACUUM INTO`
 snapshots (safe on a live WAL database, unlike `cp`), a `MANIFEST.txt` of sha256
 sums, `umask 077`, partial-snapshot cleanup, and retention pruning that only
-ever touches timestamp-shaped directories. It backs up four things:
-`jig.db`, **`jig_v002.db`** (the v0.0.2 block store — where the messages actually
-are; the `_v002` suffix is derived from `database_path`, not a typo),
-`nameserver.db`, and `server.key`.
+ever touches timestamp-shaped directories. It backs up three things:
+**`jig_v002.db`** (the block store — where the messages actually are; the
+`_v002` suffix is derived from `database_path`, not a typo), `nameserver.db`,
+and `server.key`. The older `jig.db` is no longer used (#196) and is not backed
+up.
 
 Its stated gap is the one this section closes: *"`/var/backups/jig` is on the
 same disk as the thing it is backing up."*
