@@ -369,6 +369,18 @@ async fn handle_socket(
                     },
                     receipts,
                     delivery_cid: format!("delivery:{}", block.cid),
+                    // Stored in the same transaction as the block, so it is
+                    // there by the time fanout delivers it. A store error
+                    // sends the block without one, which the client sees as
+                    // a block it cannot place, not as a forged record.
+                    ingest: state
+                        .ingest_ctx
+                        .store
+                        .get_ingest_record(&block.cid)
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(cid = %block.cid, "ingest record lookup failed: {e}");
+                            None
+                        }),
                 });
                 let Ok(json) = serde_json::to_string(&frame) else {
                     continue;
@@ -1352,7 +1364,14 @@ mod tests {
         let mut got_block = false;
         for _ in 0..2 {
             match next_frame(&mut ws).await.frame {
-                Frame::Block { .. } => got_block = true,
+                Frame::Block { ingest, .. } => {
+                    got_block = true;
+                    let record = ingest.expect("a live block carries its record");
+                    record
+                        .verify(&state.server_did.to_did_jig_string())
+                        .unwrap();
+                    assert!(record.is_genesis(), "the first block of the seeded channel");
+                }
                 Frame::Ack { .. } => {}
                 other => panic!("unexpected frame {other:?}"),
             }

@@ -335,6 +335,7 @@ impl Client {
                             sig_b64,
                             receipts,
                             delivery_cid,
+                            ..
                         } => {
                             // This server's receipts name the key that signed
                             // its welcome; a relayed block arrives with the
@@ -1147,6 +1148,7 @@ mod tests {
                     sig_b64: None,
                     receipts: vec![],
                     delivery_cid: "bafy_delivery_1".to_string(),
+                    ingest: None,
                 })],
                 _ => vec![],
             }
@@ -1412,6 +1414,7 @@ mod tests {
                 receipt_bytes_b64: String::new(),
             }],
             delivery_cid: "delivery:bafy".to_string(),
+            ingest: None,
         }))
         .unwrap();
         let (url, _) = start_scripted_server(vec![block]).await;

@@ -13,12 +13,17 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::Mutex;
 
+use crate::ingest_record::{GENESIS_PREV, IngestRecord, RecordSigner};
+
 #[derive(Debug, thiserror::Error)]
 pub enum PersistError {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// A stored value this version cannot read back.
+    #[error("corrupt store: {0}")]
+    Corrupt(String),
 }
 
 pub type Result<T> = std::result::Result<T, PersistError>;
@@ -195,6 +200,21 @@ fn history_sql(with_cursor: bool) -> String {
     }
 }
 
+/// History of a sequenced channel, newest first: by the sequencer's `seq`,
+/// not the authors' clocks (TM-02). `before_seq` bounds it for paging.
+fn sequenced_history_sql(with_before: bool) -> String {
+    let columns = BLOCK_COLUMNS
+        .split(", ")
+        .map(|c| format!("b.{}", c.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let bound = if with_before { "AND r.seq < ?3" } else { "" };
+    format!(
+        "SELECT {columns} FROM ingest_records r JOIN blocks b ON b.cid = r.block_cid \
+         WHERE r.slug = ?1 {bound} ORDER BY r.seq DESC LIMIT ?2"
+    )
+}
+
 /// The statement behind [`SqliteStore::list_blocks_before`]: the page just
 /// older than a cursor block, newest first, on the same index and order.
 fn history_before_sql() -> String {
@@ -250,6 +270,45 @@ pub enum MembershipChange {
         channel_id: String,
         member_did: String,
     },
+}
+
+/// Give `block_cid` the next entry of its channel's chain, signed by
+/// `signer`, inside the caller's transaction. `seq` and `prev` are read from
+/// the chain as stored under the same lock, so two blocks can never share one.
+fn sequence_on(
+    conn: &Connection,
+    slug: &str,
+    block_cid: &str,
+    signer: &RecordSigner<'_>,
+) -> Result<IngestRecord> {
+    let last: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT record FROM ingest_records WHERE channel_id = ? ORDER BY seq DESC LIMIT 1",
+            [signer.channel_id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let (seq, prev) = match last {
+        None => (0, GENESIS_PREV),
+        Some(bytes) => {
+            let last = IngestRecord::decode(&bytes)
+                .map_err(|e| PersistError::Corrupt(format!("ingest record: {e}")))?;
+            (last.seq + 1, last.hash())
+        }
+    };
+    let record = signer.sign(seq, block_cid, prev);
+    conn.execute(
+        "INSERT INTO ingest_records (block_cid, channel_id, slug, seq, record)
+         VALUES (?,?,?,?,?)",
+        params![
+            block_cid,
+            record.channel_id,
+            slug,
+            seq as i64,
+            record.encode()
+        ],
+    )?;
+    Ok(record)
 }
 
 fn insert_block_on(conn: &Connection, b: &StoredBlock) -> Result<()> {
@@ -487,6 +546,23 @@ impl SqliteStore {
             "#,
         )?;
 
+        // One signed record per block of a channel this server sequences
+        // (JEP-0002 rule 9). `slug` is how blocks name their channel;
+        // `channel_id` is the channel-create CID the record signs.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS ingest_records (
+                block_cid  TEXT PRIMARY KEY REFERENCES blocks(cid),
+                channel_id TEXT NOT NULL,
+                slug       TEXT NOT NULL,
+                seq        INTEGER NOT NULL,
+                record     BLOB NOT NULL,
+                UNIQUE (channel_id, seq)
+            );
+            CREATE INDEX IF NOT EXISTS ingest_records_slug_seq ON ingest_records(slug, seq);
+            "#,
+        )?;
+
         // `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already
         // exists, so columns added after a database was first created must be
         // ALTERed in. Every already-deployed server has a `channels` table
@@ -512,6 +588,121 @@ impl SqliteStore {
 
     pub fn insert_block(&self, b: &StoredBlock) -> Result<()> {
         insert_block_on(&self.conn.lock().expect("poisoned"), b)
+    }
+
+    /// Store `b` and the next record of its channel's chain in one
+    /// transaction. `b.channel_id` must be the channel's slug.
+    pub fn insert_block_sequenced(
+        &self,
+        b: &StoredBlock,
+        signer: &RecordSigner<'_>,
+    ) -> Result<IngestRecord> {
+        let slug = b
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| PersistError::Corrupt("a sequenced block names no channel".into()))?;
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        insert_block_on(&tx, b)?;
+        let record = sequence_on(&tx, slug, &b.cid, signer)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    /// The record of `block_cid`, when this server sequenced it.
+    pub fn get_ingest_record(&self, block_cid: &str) -> Result<Option<IngestRecord>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let bytes: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT record FROM ingest_records WHERE block_cid = ?",
+                [block_cid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        bytes
+            .map(|b| {
+                IngestRecord::decode(&b)
+                    .map_err(|e| PersistError::Corrupt(format!("ingest record: {e}")))
+            })
+            .transpose()
+    }
+
+    /// Records of `slug` from `from_seq`, in order, at most `limit`
+    /// ([`MAX_HISTORY_LIMIT`] at most). Records carry no content, so a client
+    /// can check a whole chain without fetching every block.
+    pub fn list_ingest_records(
+        &self,
+        slug: &str,
+        from_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<IngestRecord>> {
+        let limit = limit.min(MAX_HISTORY_LIMIT) as i64;
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT record FROM ingest_records WHERE slug = ?1 AND seq >= ?2
+             ORDER BY seq ASC LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![slug, from_seq as i64, limit], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.iter()
+            .map(|b| {
+                IngestRecord::decode(b)
+                    .map_err(|e| PersistError::Corrupt(format!("ingest record: {e}")))
+            })
+            .collect()
+    }
+
+    /// Give every block of a channel this server holds that has no record
+    /// one, signed by `key`, continuing each channel's chain: the
+    /// channel-create first, then the rest in their old history order.
+    /// Returns how many records it wrote. Run at boot, so a store from
+    /// before records existed is sequenced once.
+    pub fn backfill_ingest_records(&self, key: &ed25519_dalek::SigningKey) -> Result<usize> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let channels: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT id, slug FROM channels")?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut written = 0;
+        for (channel_id, slug) in channels {
+            let unsequenced: Vec<(String, i64)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT b.cid, b.posted_at FROM blocks b
+                       LEFT JOIN ingest_records r ON r.block_cid = b.cid
+                      WHERE b.channel_id = ?1 AND r.block_cid IS NULL
+                      ORDER BY (b.cid = ?2) DESC, b.hlc_wall_ms, b.hlc_logical,
+                               b.hlc_origin, b.cid",
+                )?;
+                stmt.query_map(params![slug, channel_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (cid, posted_at) in unsequenced {
+                let signer = RecordSigner {
+                    channel_id: channel_id.clone(),
+                    key,
+                    ingest_wall_ms: u64::try_from(posted_at).unwrap_or(0).saturating_mul(1000),
+                    ingest_logical: 0,
+                };
+                sequence_on(&tx, &slug, &cid, &signer)?;
+                written += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// Whether `slug`'s history is sequenced, and so ordered by `seq`.
+    fn is_sequenced(conn: &Connection, slug: &str) -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ingest_records WHERE slug = ?)",
+            [slug],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn get_block(&self, cid: &str) -> Result<Option<StoredBlock>> {
@@ -552,6 +743,17 @@ impl SqliteStore {
     ) -> Result<Vec<StoredBlock>> {
         let limit = limit.min(MAX_HISTORY_LIMIT) as i64;
         let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
+        // A sequenced channel's newest window is by `seq`. The HLC cursor
+        // keeps its old meaning (forward paging in author-clock order) until
+        // its callers move to `seq`.
+        if since_hlc.is_none() && Self::is_sequenced(&conn, slug)? {
+            let mut stmt = conn.prepare(&sequenced_history_sql(false))?;
+            let mut newest_first = stmt
+                .query_map(params![slug, limit], row_to_stored_block)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            newest_first.reverse();
+            return Ok(newest_first);
+        }
         let mut stmt = conn.prepare(&history_sql(since_hlc.is_some()))?;
 
         let blocks = match since_hlc {
@@ -580,9 +782,10 @@ impl SqliteStore {
     /// is unknown or belongs to another channel, so a caller cannot use the
     /// cursor to learn where a CID lives.
     ///
-    /// Older and newer are history order — (HLC wall, logical, origin, CID) —
-    /// the same total order [`Self::list_blocks_by_channel`] returns, so pages
-    /// join up with no gap and no overlap.
+    /// Older and newer are history order — `seq` on a sequenced channel, else
+    /// (HLC wall, logical, origin, CID) — the same total order
+    /// [`Self::list_blocks_by_channel`] returns, so pages join up with no gap
+    /// and no overlap.
     pub fn list_blocks_before(
         &self,
         slug: &str,
@@ -596,7 +799,16 @@ impl SqliteStore {
             return Ok(None);
         }
         let limit = limit.min(MAX_HISTORY_LIMIT) as i64;
+        let cursor_seq = self.get_ingest_record(&cursor.cid)?.map(|r| r.seq);
         let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
+        if let Some(cursor_seq) = cursor_seq {
+            let mut stmt = conn.prepare(&sequenced_history_sql(true))?;
+            let mut newest_first = stmt
+                .query_map(params![slug, limit, cursor_seq as i64], row_to_stored_block)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            newest_first.reverse();
+            return Ok(Some(newest_first));
+        }
         let mut stmt = conn.prepare(&history_before_sql())?;
         let mut newest_first = stmt
             .query_map(
@@ -882,8 +1094,11 @@ impl SqliteStore {
     /// as stale; a block stored without the advance is a commit members apply
     /// and the server never did. Either wedges the channel for good.
     ///
-    /// Returns `false` — with nothing written — when another commit moved the
-    /// group off `from_epoch` first.
+    /// With `signer`, the block also gets the next record of the channel's
+    /// chain in the same transaction.
+    ///
+    /// Returns `None` — with nothing written — when another commit moved the
+    /// group off `from_epoch` first, else the record written, if any.
     #[allow(clippy::too_many_arguments)]
     pub fn land_mls_commit(
         &self,
@@ -895,7 +1110,8 @@ impl SqliteStore {
         membership: &MembershipChange,
         block: &StoredBlock,
         receipt: &StoredReceipt,
-    ) -> Result<bool> {
+        signer: Option<&RecordSigner<'_>>,
+    ) -> Result<Option<Option<IngestRecord>>> {
         let mut conn = self.conn.lock().expect("poisoned");
         let tx = conn.transaction()?;
         // `group_info` replaces the stored one even when `None`: a group info
@@ -907,7 +1123,7 @@ impl SqliteStore {
             params![slug, from_epoch as i64, state, to_epoch as i64, group_info],
         )?;
         if advanced == 0 {
-            return Ok(false);
+            return Ok(None);
         }
         match membership {
             MembershipChange::None => {}
@@ -924,8 +1140,11 @@ impl SqliteStore {
         }
         insert_block_on(&tx, block)?;
         insert_receipt_on(&tx, receipt)?;
+        let record = signer
+            .map(|signer| sequence_on(&tx, slug, &block.cid, signer))
+            .transpose()?;
         tx.commit()?;
-        Ok(true)
+        Ok(Some(record))
     }
 
     /// Store a validated key package. Returns `false` if this package (by
@@ -1299,6 +1518,113 @@ mod tests {
         }
     }
 
+    fn test_signer(key: &ed25519_dalek::SigningKey, wall: u64) -> RecordSigner<'_> {
+        RecordSigner {
+            channel_id: "bafy_create".to_string(),
+            key,
+            ingest_wall_ms: wall,
+            ingest_logical: 0,
+        }
+    }
+
+    fn at_hlc(cid: &str, wall: u64) -> StoredBlock {
+        StoredBlock {
+            hlc_wall_ms: wall,
+            ..sample_block(cid, Some("#seq"))
+        }
+    }
+
+    /// A sequenced channel's chain starts at 0, links each record to the
+    /// last, and orders history by `seq` whatever the authors' clocks say.
+    #[test]
+    fn a_sequenced_channel_is_ordered_by_its_chain() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let did =
+            jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
+        // Each author claims an earlier time than the last.
+        let order = ["bafy_create", "bafy_b", "bafy_c", "bafy_d"];
+        let mut records = Vec::new();
+        for (i, cid) in order.iter().enumerate() {
+            let block = at_hlc(cid, 1_000 - i as u64 * 10);
+            records.push(
+                store
+                    .insert_block_sequenced(&block, &test_signer(&key, 5_000 + i as u64))
+                    .unwrap(),
+            );
+        }
+        assert!(records[0].is_genesis());
+        for pair in records.windows(2) {
+            assert!(pair[1].follows(&pair[0]));
+        }
+        for record in &records {
+            record.verify(&did).unwrap();
+        }
+        assert_eq!(
+            store.get_ingest_record("bafy_c").unwrap().as_ref(),
+            Some(&records[2])
+        );
+
+        let history = block_cids(store.list_blocks_by_channel("#seq", 50, None).unwrap());
+        assert_eq!(history, cids_of(&order), "history follows seq, not hlc_ts");
+        let newest_two = block_cids(store.list_blocks_by_channel("#seq", 2, None).unwrap());
+        assert_eq!(newest_two, cids_of(&order[2..]));
+        let older = block_cids(
+            store
+                .list_blocks_before("#seq", 2, "bafy_c")
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(older, cids_of(&order[..2]), "paging back follows seq too");
+
+        let from_one = store.list_ingest_records("#seq", 1, 2).unwrap();
+        assert_eq!(from_one, records[1..3].to_vec());
+    }
+
+    fn cids_of(cids: &[&str]) -> Vec<String> {
+        cids.iter().map(|c| c.to_string()).collect()
+    }
+
+    fn block_cids(blocks: Vec<StoredBlock>) -> Vec<String> {
+        blocks.into_iter().map(|b| b.cid).collect()
+    }
+
+    /// Blocks stored before records existed get them once, continuing any
+    /// chain already there, with the channel-create first.
+    #[test]
+    fn backfill_sequences_a_store_once() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        store
+            .upsert_channel(&StoredChannel {
+                id: "bafy_create".to_string(),
+                slug: "#seq".to_string(),
+                visibility: "open".to_string(),
+                created_at: 0,
+                owner_did: "did:jig:zOwner".to_string(),
+                suite: "none".to_string(),
+            })
+            .unwrap();
+        // A post whose author's clock runs before the channel's creation.
+        store.insert_block(&at_hlc("bafy_early_post", 10)).unwrap();
+        store.insert_block(&at_hlc("bafy_create", 500)).unwrap();
+        store.insert_block(&at_hlc("bafy_late_post", 900)).unwrap();
+
+        assert_eq!(store.backfill_ingest_records(&key).unwrap(), 3);
+        assert_eq!(store.backfill_ingest_records(&key).unwrap(), 0, "only once");
+        let chain = store.list_ingest_records("#seq", 0, 50).unwrap();
+        let order: Vec<&str> = chain.iter().map(|r| r.block_cid.as_str()).collect();
+        assert_eq!(order, ["bafy_create", "bafy_early_post", "bafy_late_post"]);
+        assert!(chain[0].is_genesis());
+        assert!(chain[1].follows(&chain[0]) && chain[2].follows(&chain[1]));
+
+        // A later block continues the same chain.
+        let next = store
+            .insert_block_sequenced(&at_hlc("bafy_next", 1_000), &test_signer(&key, 9_000))
+            .unwrap();
+        assert!(next.follows(&chain[2]));
+    }
+
     fn sample_receipt(
         cid: &str,
         block_cid: &str,
@@ -1419,7 +1745,7 @@ mod tests {
         store.insert_block(&block).unwrap();
         assert!(
             store
-                .land_mls_commit("#sealed", 0, b"s1", 1, None, &add, &block, &receipt)
+                .land_mls_commit("#sealed", 0, b"s1", 1, None, &add, &block, &receipt, None)
                 .is_err()
         );
         let g = store.get_mls_group("#sealed").unwrap().unwrap();
@@ -1438,8 +1764,9 @@ mod tests {
         };
         assert!(
             store
-                .land_mls_commit("#sealed", 0, b"s1", 1, None, &add, &fresh, &receipt)
+                .land_mls_commit("#sealed", 0, b"s1", 1, None, &add, &fresh, &receipt, None)
                 .unwrap()
+                .is_some()
         );
         let g = store.get_mls_group("#sealed").unwrap().unwrap();
         assert_eq!(g.epoch, 1);
@@ -1449,9 +1776,10 @@ mod tests {
         );
         assert_eq!(store.list_members("ch").unwrap().len(), 1);
         assert!(
-            !store
-                .land_mls_commit("#sealed", 0, b"sX", 1, None, &add, &fresh, &receipt)
-                .unwrap(),
+            store
+                .land_mls_commit("#sealed", 0, b"sX", 1, None, &add, &fresh, &receipt, None)
+                .unwrap()
+                .is_none(),
             "a commit from a passed epoch writes nothing"
         );
     }
