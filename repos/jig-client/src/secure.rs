@@ -1354,7 +1354,18 @@ mod tests {
     fn files_an_older_version_wrote_in_clear_are_sealed_on_open() {
         let root = tempfile::tempdir().unwrap();
         let keys = tempfile::tempdir().unwrap();
-        let sealed = Identity::generate_for_tests(keys.path());
+        // An identity stored raw before, as an earlier version left it: its
+        // key is sealed on first load, and its MLS state is still in clear.
+        let raw = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let did = Identity::from_signing_key(raw.clone()).did_string();
+        let raw_path = keys.path().join(format!("{did}.key"));
+        std::fs::write(&raw_path, raw.to_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&raw_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let sealed = Identity::load_for_tests(keys.path(), &did);
         // The same identity, unsealed: the state an earlier version wrote.
         let clear = Session::open(
             root.path(),

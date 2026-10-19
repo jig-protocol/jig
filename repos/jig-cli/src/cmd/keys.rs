@@ -170,14 +170,13 @@ pub async fn rotate(ctx: &CliContext, args: KeysRotateArgs) -> Result<()> {
     //    want it for offline recovery. The rename keeps it on disk, still
     //    sealed, but out of the DID-load lookup path.
     let old_keyfile = jig_client::identity::key_path(&keys_dir, &old_did_str);
-    let rotated_keyfile = keys_dir.join(format!("{old_did_str}.jigkey.rotated"));
-    std::fs::rename(&old_keyfile, &rotated_keyfile).with_context(|| {
-        format!(
-            "renaming {} -> {} after successful rotation",
-            old_keyfile.display(),
-            rotated_keyfile.display()
-        )
-    })?;
+    let rotated_keyfile =
+        jig_client::identity::retire_key(&keys_dir, &old_did_str).with_context(|| {
+            format!(
+                "moving {} aside after successful rotation",
+                old_keyfile.display()
+            )
+        })?;
 
     // 5. Point the config file at the new DID. Start from the on-disk
     //    config so a one-shot `--server`/`--display-name` override isn't

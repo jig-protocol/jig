@@ -492,7 +492,9 @@ impl Identity {
         }
         // `seal_to` reads the new file back and opens it before this removes
         // the only other copy of the key.
-        let opened = seal_to(&path, did_str, &seed, access)?;
+        // An identity that was stored raw may have MLS state in clear: the
+        // first session seals it and then sets the flag.
+        let opened = seal_to(&path, did_str, &seed, access, false)?;
         std::fs::remove_file(&raw)?;
         Self::from_opened(did_str, &path, opened, Some(raw))
     }
@@ -524,7 +526,9 @@ impl Identity {
             });
         }
         let path = key_path(keys_dir, &did_str);
-        let opened = seal_to(&path, &did_str, &signing.to_bytes(), access)?;
+        // A new identity has no state in clear, so its key says so from the
+        // start, and no copy of its key file ever says otherwise.
+        let opened = seal_to(&path, &did_str, &signing.to_bytes(), access, true)?;
         Ok(Self {
             did,
             signing,
@@ -663,7 +667,16 @@ impl Identity {
         };
         let keys_dir = at.path.parent().unwrap_or(Path::new("."));
         let _lock = lock_did(keys_dir, &self.did_string())?;
-        let key = JigKey::from_bytes(&std::fs::read(&at.path)?)?;
+        let bytes = match std::fs::read(&at.path) {
+            Ok(bytes) => bytes,
+            // Retired by `jig keys rotate` meanwhile: nothing to write back.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                at.state_sealed.store(true, Ordering::SeqCst);
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let key = JigKey::from_bytes(&bytes)?;
         let flagged = key.with_state_sealed(&at.opened)?;
         if !key.state_sealed() {
             write_private_atomic(&at.path, &flagged.to_bytes())?;
@@ -690,6 +703,26 @@ impl Identity {
     ) -> Result<jig_mls::member::Member, jig_mls::MlsError> {
         jig_mls::member::Member::restore(&self.signing.to_bytes(), &self.did, snapshot)
     }
+}
+
+/// Move `<did>.jigkey` out of the load path to `<did>.jigkey.rotated`, as
+/// `jig keys rotate` does with the key it replaced. Under the DID's lock, so
+/// it cannot race a write to the same file; refuses to overwrite an earlier
+/// `.jigkey.rotated`. Returns the new path.
+pub fn retire_key(keys_dir: &Path, did_str: &str) -> Result<PathBuf, IdentityError> {
+    let _lock = lock_did(keys_dir, did_str)?;
+    let from = key_path(keys_dir, did_str);
+    let to = keys_dir.join(format!("{did_str}.jigkey.rotated"));
+    if to.exists() {
+        return Err(IdentityError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} exists already", to.display()),
+        )));
+    }
+    std::fs::rename(&from, &to)?;
+    sync_parent_dir(&to)?;
+    OPENED.lock().expect("key cache poisoned").remove(&from);
+    Ok(to)
 }
 
 /// Seal every `<did>.key.rotated` left by `jig keys rotate` into
@@ -732,7 +765,16 @@ pub fn seal_rotated_keys(
             });
         }
         let path = keys_dir.join(format!("{did_str}.jigkey.rotated"));
-        seal_to(&path, &did_str, &seed, access)?;
+        if path.exists() {
+            // Never overwrite a sealed key, or remove one on a failed check.
+            access.notice(&format!(
+                "{} exists already; leaving {} as it is",
+                path.display(),
+                raw.display()
+            ));
+            continue;
+        }
+        seal_to(&path, &did_str, &seed, access, false)?;
         std::fs::remove_file(&raw)?;
         sealed.push(path);
     }
@@ -771,6 +813,7 @@ fn seal_to(
     did_str: &str,
     seed: &[u8; 32],
     access: &KeyAccess,
+    state_sealed: bool,
 ) -> Result<Arc<AtRest>, IdentityError> {
     let slot = access.new_slot(did_str)?;
     let check = match &slot {
@@ -781,7 +824,11 @@ fn seal_to(
         } => None,
         NewSlot::Secret { secret, .. } => Some(Unlock::Secret(secret.clone())),
     };
-    let (key, _) = JigKey::seal(did_str, seed, &[slot])?;
+    let (mut key, opened) = JigKey::seal(did_str, seed, &[slot])?;
+    if state_sealed {
+        key = key.with_state_sealed(&opened)?;
+    }
+    drop(opened);
     write_private_atomic(path, &key.to_bytes())?;
     // Open what is now on disk the way the next run will, keychain included:
     // the caller may be about to delete the only other copy of this key.
@@ -794,12 +841,18 @@ fn seal_to(
         Err(e) => {
             // A key file that does not open is worse than none: every later
             // open would try it, fail, and never fall back to the raw key.
-            let _ = std::fs::remove_file(path);
-            return Err(not_verified(e));
+            // Removed durably, so a crash cannot bring it back.
+            let removed = std::fs::remove_file(path).and_then(|()| sync_parent_dir(path));
+            return Err(not_verified(match removed {
+                Ok(()) => e,
+                Err(rm) => format!(
+                    "{e}; it could not be removed ({rm}): remove it by hand before running jig again"
+                ),
+            }));
         }
     };
     // Cache the key as it was read back, not the one in memory.
-    let opened = AtRest::new(reopened, path, false);
+    let opened = AtRest::new(reopened, path, state_sealed);
     OPENED
         .lock()
         .expect("key cache poisoned")
@@ -1246,15 +1299,38 @@ mod tests {
 
     #[test]
     fn the_state_sealed_flag_is_kept_in_the_key_file() {
+        // A new identity has no state in clear: its key is flagged from the
+        // start, so no copy of it ever lacks the flag.
         let dir = tempdir().unwrap();
-        let id = Identity::generate_for_tests(dir.path());
+        let new = Identity::generate_for_tests(dir.path());
+        assert!(new.state_sealed().unwrap());
+
+        // One migrated from a raw key may have; the first session sets it.
+        let (_, did_str) = write_golden_raw(dir.path());
+        let id = Identity::open(dir.path(), &did_str, &no_keychain()).unwrap();
         assert!(!id.state_sealed().unwrap());
+        let other = id.duplicate();
         id.mark_state_sealed().unwrap();
         clear_cache();
-        let again = Identity::load_for_tests(dir.path(), &id.did_string());
+        let again = Identity::load_for_tests(dir.path(), &did_str);
         assert!(again.state_sealed().unwrap());
-        // Another handle, opened before the flag was set, reads it from disk.
-        assert!(id.duplicate().state_sealed().unwrap());
+        // A handle opened before the flag was set reads it from disk.
+        assert!(other.state_sealed().unwrap());
+    }
+
+    #[test]
+    fn retiring_a_key_moves_it_aside_and_never_overwrites() {
+        let dir = tempdir().unwrap();
+        let id = Identity::generate_for_tests(dir.path());
+        let did_str = id.did_string();
+        let rotated = retire_key(dir.path(), &did_str).unwrap();
+        assert!(rotated.exists());
+        assert!(!key_path(dir.path(), &did_str).exists());
+        // Marking state sealed on a retired key does not bring it back.
+        id.mark_state_sealed().unwrap();
+        assert!(!key_path(dir.path(), &did_str).exists());
+        std::fs::copy(&rotated, key_path(dir.path(), &did_str)).unwrap();
+        assert!(retire_key(dir.path(), &did_str).is_err());
     }
 
     #[test]
