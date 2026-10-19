@@ -219,8 +219,7 @@ the root keys and every section in one file.
 > (behind a proxy that terminates TLS, say), set `[tls] enabled = false`. The
 > server then lists `tls.enabled=false` in `/.well-known/jig`'s
 > `unsafe_options_active` and logs a startup warning (#120). A `jig` CLI refuses a
-> plaintext `http://` server that is not on its own machine (#142), so remote
-> clients must reach a plaintext server through a TLS-terminating proxy.
+> plaintext `http://` server that is not on its own machine (#142).
 >
 > The nameserver on `:7070` is **not** covered by `[tls]` — that section belongs
 > to `jig-server` only — so its rows stay `http://` unless you terminate TLS in
