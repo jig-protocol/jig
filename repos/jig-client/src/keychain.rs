@@ -52,7 +52,8 @@ pub const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// A keychain whose every call gives up after a deadline. The call runs on its
 /// own thread; one that never returns is abandoned there, and ends with the
-/// process.
+/// process. The Secret Service backend also kills its `secret-tool` child just
+/// before the deadline, so no child outlives the call.
 pub struct Bounded {
     inner: std::sync::Arc<dyn Keychain>,
     timeout: std::time::Duration,
@@ -217,9 +218,112 @@ mod platform {
 
     use super::{Keychain, KeychainError, SERVICE};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
+    use std::io::{Read as _, Write as _};
+    use std::process::{Command, ExitStatus, Stdio};
+    use std::time::{Duration, Instant};
     use zeroize::Zeroizing;
+
+    /// How long one `secret-tool` run may take before it is killed. Shorter
+    /// than [`super::TIMEOUT`], so the child is gone before the caller gives up
+    /// on the call: an abandoned child could still store a secret, or show a
+    /// prompt, after jig has exited.
+    const DEADLINE: Duration = Duration::from_secs(super::TIMEOUT.as_secs() - 2);
+
+    /// `secret-tool` with an environment that holds none of jig's secrets:
+    /// no `JIG_*` variable, and not the variable `JIG_KEY_UNLOCK=env:NAME`
+    /// names. The rest stays, since it is how `secret-tool` finds the session
+    /// bus.
+    fn secret_tool() -> Command {
+        let mut cmd = Command::new("secret-tool");
+        scrub(&mut cmd, std::env::vars_os());
+        cmd
+    }
+
+    fn scrub(
+        cmd: &mut Command,
+        vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    ) {
+        for (name, value) in vars {
+            if name.to_string_lossy().starts_with("JIG_") {
+                cmd.env_remove(&name);
+            }
+            if name == "JIG_KEY_UNLOCK"
+                && let Some(target) = value.to_str().and_then(|v| v.strip_prefix("env:"))
+            {
+                cmd.env_remove(target);
+            }
+        }
+    }
+
+    /// Run `cmd` with `input` on its stdin, killing it at [`DEADLINE`].
+    /// Returns its exit status and stdout.
+    fn run(
+        what: &str,
+        cmd: Command,
+        input: Option<&[u8]>,
+    ) -> Result<(ExitStatus, Zeroizing<Vec<u8>>), KeychainError> {
+        run_within(what, cmd, input, DEADLINE)
+    }
+
+    fn run_within(
+        what: &str,
+        mut cmd: Command,
+        input: Option<&[u8]>,
+        deadline: Duration,
+    ) -> Result<(ExitStatus, Zeroizing<Vec<u8>>), KeychainError> {
+        let mut child = cmd
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| backend(what, e))?;
+        if let Some(input) = input {
+            let mut stdin = child.stdin.take().expect("stdin is piped");
+            if let Err(e) = stdin.write_all(input) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(backend(what, e));
+            }
+        }
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait().map_err(|e| backend(what, e))? {
+                Some(status) => break status,
+                None if started.elapsed() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(backend(
+                        what,
+                        format!(
+                            "no answer within {}s; is it waiting for a prompt?",
+                            deadline.as_secs()
+                        ),
+                    ));
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        // Its output is a few hundred bytes at most, well within a pipe's
+        // buffer, so reading after it exits cannot deadlock.
+        let mut stdout = Zeroizing::new(Vec::new());
+        if let Some(mut out) = child.stdout.take() {
+            out.read_to_end(&mut stdout).map_err(|e| backend(what, e))?;
+        }
+        if !status.success() {
+            let mut stderr = String::new();
+            if let Some(mut err) = child.stderr.take() {
+                let _ = err.read_to_string(&mut stderr);
+            }
+            if !stderr.trim().is_empty() {
+                tracing::debug!("secret-tool {what}: {}", stderr.trim());
+            }
+        }
+        Ok((status, stdout))
+    }
 
     pub fn system() -> Option<Box<dyn Keychain>> {
         // No session bus means no Secret Service: an SSH login or a server.
@@ -230,7 +334,7 @@ mod platform {
         if !bus {
             return None;
         }
-        let found = Command::new("secret-tool")
+        let found = secret_tool()
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -247,15 +351,11 @@ mod platform {
 
     impl Keychain for SecretTool {
         fn get(&self, did: &str) -> Result<Option<Zeroizing<Vec<u8>>>, KeychainError> {
-            let out = Command::new("secret-tool")
-                .args(["lookup", "service", SERVICE, "account", did])
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .output()
-                .map_err(|e| backend("lookup", e))?;
-            let stdout = Zeroizing::new(out.stdout);
+            let mut cmd = secret_tool();
+            cmd.args(["lookup", "service", SERVICE, "account", did]);
+            let (status, stdout) = run("lookup", cmd, None)?;
             // `lookup` exits 1, printing nothing, when there is no such entry.
-            if !out.status.success() || stdout.is_empty() {
+            if !status.success() || stdout.is_empty() {
                 return Ok(None);
             }
             let text = std::str::from_utf8(&stdout).map_err(|e| backend("lookup", e))?;
@@ -267,41 +367,23 @@ mod platform {
 
         fn set(&self, did: &str, secret: &[u8]) -> Result<(), KeychainError> {
             let label = format!("jig identity {did}");
-            let mut child = Command::new("secret-tool")
-                .args([
-                    "store", "--label", &label, "service", SERVICE, "account", did,
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| backend("store", e))?;
+            let mut cmd = secret_tool();
+            cmd.args([
+                "store", "--label", &label, "service", SERVICE, "account", did,
+            ]);
             let encoded = Zeroizing::new(STANDARD.encode(secret));
-            child
-                .stdin
-                .take()
-                .expect("stdin is piped")
-                .write_all(encoded.as_bytes())
-                .map_err(|e| backend("store", e))?;
-            let out = child.wait_with_output().map_err(|e| backend("store", e))?;
-            if !out.status.success() {
-                return Err(backend(
-                    "store",
-                    String::from_utf8_lossy(&out.stderr).trim().to_string(),
-                ));
+            let (status, _) = run("store", cmd, Some(encoded.as_bytes()))?;
+            if !status.success() {
+                return Err(backend("store", status));
             }
             Ok(())
         }
 
         fn delete(&self, did: &str) -> Result<(), KeychainError> {
             // `clear` succeeds whether or not an entry existed.
-            let status = Command::new("secret-tool")
-                .args(["clear", "service", SERVICE, "account", did])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map_err(|e| backend("clear", e))?;
+            let mut cmd = secret_tool();
+            cmd.args(["clear", "service", SERVICE, "account", did]);
+            let (status, _) = run("clear", cmd, None)?;
             if !status.success() {
                 return Err(backend("clear", status));
             }
@@ -310,6 +392,51 @@ mod platform {
 
         fn name(&self) -> &'static str {
             "Secret Service"
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ffi::OsString;
+
+        #[test]
+        fn the_child_gets_none_of_jigs_secrets() {
+            let mut cmd = Command::new("true");
+            let var = |n: &str, v: &str| (OsString::from(n), OsString::from(v));
+            scrub(
+                &mut cmd,
+                [
+                    var("JIG_KEY_PASSPHRASE", "hunter2"),
+                    var("JIG_KEY_UNLOCK", "env:VAULT_TOKEN"),
+                    var("VAULT_TOKEN", "s3cret"),
+                    var("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/bus"),
+                ],
+            );
+            let removed: Vec<_> = cmd
+                .get_envs()
+                .filter(|(_, v)| v.is_none())
+                .map(|(k, _)| k.to_string_lossy().into_owned())
+                .collect();
+            for gone in ["JIG_KEY_PASSPHRASE", "JIG_KEY_UNLOCK", "VAULT_TOKEN"] {
+                assert!(removed.iter().any(|r| r == gone), "{gone} still passed on");
+            }
+            assert!(!removed.iter().any(|r| r == "DBUS_SESSION_BUS_ADDRESS"));
+        }
+
+        #[test]
+        fn a_child_that_does_not_answer_is_killed_not_abandoned() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("finished");
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c")
+                .arg(format!("sleep 2; touch '{}'", marker.display()));
+            let started = Instant::now();
+            let err = run_within("store", cmd, None, Duration::from_millis(200)).unwrap_err();
+            assert!(err.to_string().contains("no answer"), "{err}");
+            assert!(started.elapsed() < Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(2500));
+            assert!(!marker.exists(), "the child ran on after the deadline");
         }
     }
 }

@@ -19,7 +19,11 @@ pub fn key_access() -> anyhow::Result<&'static KeyAccess> {
     if let Some(access) = ACCESS.get() {
         return Ok(access);
     }
-    let access = KeyAccess::from_env()?.with_prompt(Arc::new(TerminalPrompt));
+    let access = KeyAccess::from_env()?
+        .with_prompt(Arc::new(TerminalPrompt))
+        // The CLI installs no tracing subscriber; a keychain that fails and
+        // is replaced by a passphrase slot must still be said out loud.
+        .with_notice(Arc::new(|message| eprintln!("warning: {message}")));
     Ok(ACCESS.get_or_init(|| access))
 }
 
@@ -133,8 +137,14 @@ fn terminal_writer() -> Box<dyn std::io::Write> {
     Box::new(std::io::stderr())
 }
 
+/// The longest passphrase the prompt takes, in bytes. The buffer is allocated
+/// once at this size so it never moves: a `String` that grows leaves copies of
+/// what it held in memory it frees without wiping.
+const MAX_PASSPHRASE: usize = 1024;
+
 fn read_line_raw() -> std::io::Result<Zeroizing<String>> {
-    let mut line = Zeroizing::new(String::new());
+    let mut line = Zeroizing::new(String::with_capacity(MAX_PASSPHRASE));
+    let mut too_long = false;
     loop {
         let Event::Key(KeyEvent {
             code,
@@ -146,6 +156,12 @@ fn read_line_raw() -> std::io::Result<Zeroizing<String>> {
             continue;
         };
         match code {
+            KeyCode::Enter if too_long => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("a passphrase can be at most {MAX_PASSPHRASE} bytes"),
+                ));
+            }
             KeyCode::Enter => return Ok(line),
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
                 return Err(std::io::Error::new(
@@ -156,7 +172,8 @@ fn read_line_raw() -> std::io::Result<Zeroizing<String>> {
             KeyCode::Backspace => {
                 line.pop();
             }
-            KeyCode::Char(c) => line.push(c),
+            KeyCode::Char(c) if line.len() + c.len_utf8() <= MAX_PASSPHRASE => line.push(c),
+            KeyCode::Char(_) => too_long = true,
             _ => {}
         }
     }

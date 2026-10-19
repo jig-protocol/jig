@@ -61,6 +61,8 @@ pub enum IdentityError {
     NoWayToSeal { did: String },
     #[error("{var}: {reason}")]
     BadEnv { var: &'static str, reason: String },
+    #[error("sealed {path:?}, but it does not open again: {reason}")]
+    NotVerified { path: PathBuf, reason: String },
     #[error(transparent)]
     Keystore(#[from] KeystoreError),
     #[error(transparent)]
@@ -114,7 +116,11 @@ pub struct KeyAccess {
     secret: Option<(SecretSource, Zeroizing<Vec<u8>>)>,
     prompt: Option<Arc<dyn Prompt>>,
     kdf: KdfParams,
+    notice: Option<Arc<Notice>>,
 }
+
+/// Where [`KeyAccess`] says that it fell back from one slot to another.
+pub type Notice = dyn Fn(&str) + Send + Sync;
 
 /// A fixed secret for [`KeyAccess::insecure_for_tests`]. Public on purpose:
 /// anything sealed with it is as good as plaintext.
@@ -153,6 +159,7 @@ impl KeyAccess {
             secret,
             prompt: None,
             kdf: KdfParams::default(),
+            notice: None,
         })
     }
 
@@ -174,6 +181,21 @@ impl KeyAccess {
         self
     }
 
+    /// Tell `notice` when a slot is unavailable and another is used instead,
+    /// as well as logging it. A CLI passes something that prints to stderr:
+    /// a keychain that times out must not quietly become a passphrase slot.
+    pub fn with_notice(mut self, notice: Arc<Notice>) -> Self {
+        self.notice = Some(notice);
+        self
+    }
+
+    fn notice(&self, message: &str) {
+        tracing::warn!("{message}");
+        if let Some(notice) = &self.notice {
+            notice(message);
+        }
+    }
+
     /// Argon2id parameters for new passphrase slots.
     pub fn with_kdf(mut self, kdf: KdfParams) -> Self {
         self.kdf = kdf;
@@ -191,6 +213,7 @@ impl KeyAccess {
             secret: Some((SecretSource::Env, Zeroizing::new(TEST_SECRET.to_vec()))),
             prompt: None,
             kdf: KdfParams::insecure_for_tests(),
+            notice: None,
         }
     }
 
@@ -217,7 +240,10 @@ impl KeyAccess {
                         secret,
                     });
                 }
-                Err(e) => tracing::warn!("{} unavailable, not using it: {e}", keychain.name()),
+                Err(e) => self.notice(&format!(
+                    "{} unavailable, sealing {did} another way: {e}",
+                    keychain.name()
+                )),
             }
         }
         let passphrase = match &self.passphrase {
@@ -242,6 +268,7 @@ impl KeyAccess {
         let did = key.did();
         let slots = key.slots();
         let mut offers = Vec::new();
+        let mut unavailable = None;
         if let Some((_, secret)) = &self.secret {
             offers.push(Unlock::Secret(secret.clone()));
         }
@@ -253,7 +280,11 @@ impl KeyAccess {
             match keychain.get(did) {
                 Ok(Some(secret)) => offers.push(Unlock::Secret(secret)),
                 Ok(None) => {}
-                Err(e) => tracing::warn!("{} unavailable: {e}", keychain.name()),
+                Err(e) => {
+                    let why = format!("{} unavailable: {e}", keychain.name());
+                    self.notice(&why);
+                    unavailable = Some(why);
+                }
             }
         }
         if let Some(passphrase) = &self.passphrase {
@@ -275,9 +306,13 @@ impl KeyAccess {
                 }
             }
         }
+        let mut hint = describe_slots(&slots);
+        if let Some(why) = unavailable {
+            hint.push_str(&format!(" ({why})"));
+        }
         Err(IdentityError::Locked {
             did: did.to_string(),
-            hint: describe_slots(&slots),
+            hint,
         })
     }
 }
@@ -294,9 +329,12 @@ fn read_unlock_spec(spec: &str) -> Result<(SecretSource, Zeroizing<Vec<u8>>), Id
         let bytes = std::fs::read(path).map_err(|e| bad(format!("reading {path}: {e}")))?;
         (SecretSource::Credential, Zeroizing::new(bytes))
     } else {
-        return Err(bad(format!(
-            "`{spec}` is neither env:NAME nor credential:PATH"
-        )));
+        // Not the value itself: it may be the secret, pasted in by mistake.
+        return Err(bad(
+            "must be env:NAME or credential:PATH (the value is not shown, in case it is a \
+             secret)"
+                .to_string(),
+        ));
     };
     if secret.len() < jig_core::keystore::MIN_SECRET_LEN {
         return Err(bad(format!(
@@ -371,20 +409,30 @@ impl Identity {
     pub fn open(keys_dir: &Path, did_str: &str, access: &KeyAccess) -> Result<Self, IdentityError> {
         let path = key_path(keys_dir, did_str);
         let raw = raw_key_path(keys_dir, did_str);
+        // Two processes may find the same raw key at once (`jig tail` and
+        // `jig send` just after an upgrade). Each would seal it under its own
+        // data key, and the keychain keeps only the last secret stored, so the
+        // file that wins the rename may not open. One migrates; the other
+        // waits, then opens what the first wrote.
+        let lock = if access.storage == Storage::Sealed && raw.exists() {
+            Some(lock_did(keys_dir, did_str)?)
+        } else {
+            None
+        };
         if path.exists() {
-            let opened = open_cached(&path, access)?;
+            let opened = open_cached(&path, did_str, access)?;
+            let mut identity = Self::from_opened(did_str, &path, opened, None)?;
             // A raw file beside a sealed one is a migration that stopped after
-            // sealing. Finish it, but only for the same key.
-            let leftover = if access.storage == Storage::Sealed
+            // sealing. Finish it, but only for the same key, and only once the
+            // sealed key is known to be this DID's.
+            if lock.is_some()
                 && raw.exists()
-                && *read_raw_seed(&raw)? == *opened.seed
+                && *read_raw_seed(&raw)? == identity.signing.to_bytes()
             {
                 std::fs::remove_file(&raw)?;
-                Some(raw)
-            } else {
-                None
-            };
-            return Self::from_opened(did_str, &path, opened, leftover);
+                identity.migrated_from = Some(raw);
+            }
+            return Ok(identity);
         }
         if !raw.exists() {
             return Err(IdentityError::KeyfileNotFound {
@@ -414,6 +462,8 @@ impl Identity {
                 migrated_from: None,
             });
         }
+        // `seal_to` reads the new file back and opens it before this removes
+        // the only other copy of the key.
         let opened = seal_to(&path, did_str, &seed, access)?;
         std::fs::remove_file(&raw)?;
         Self::from_opened(did_str, &path, opened, Some(raw))
@@ -498,17 +548,11 @@ impl Identity {
         opened: Arc<Opened>,
         migrated_from: Option<PathBuf>,
     ) -> Result<Self, IdentityError> {
-        let signing = SigningKey::from_bytes(&opened.seed);
-        let did = Did::from_ed25519_pubkey(signing.verifying_key().as_bytes());
         // The header names a DID, but only the seed is authenticated by the
         // slot that opened it. Check the key really is the DID asked for.
-        if did.to_did_jig_string() != did_str {
-            return Err(IdentityError::WrongDid {
-                path: path.to_path_buf(),
-                expected: did_str.to_string(),
-                found: did.to_did_jig_string(),
-            });
-        }
+        check_did(path, did_str, &opened.seed)?;
+        let signing = SigningKey::from_bytes(&opened.seed);
+        let did = Did::from_ed25519_pubkey(signing.verifying_key().as_bytes());
         Ok(Self {
             did,
             signing,
@@ -602,6 +646,11 @@ pub fn seal_rotated_keys(
         else {
             continue;
         };
+        let _lock = lock_did(keys_dir, &did_str)?;
+        if !raw.exists() {
+            // Another process sealed it while this one waited.
+            continue;
+        }
         let seed = read_raw_seed(&raw)?;
         let signing = SigningKey::from_bytes(&seed);
         let found =
@@ -621,12 +670,26 @@ pub fn seal_rotated_keys(
     Ok(sealed)
 }
 
-fn open_cached(path: &Path, access: &KeyAccess) -> Result<Arc<Opened>, IdentityError> {
+fn open_cached(
+    path: &Path,
+    did_str: &str,
+    access: &KeyAccess,
+) -> Result<Arc<Opened>, IdentityError> {
     if let Some(hit) = OPENED.lock().expect("key cache poisoned").get(path) {
         return Ok(hit.clone());
     }
+    if let Some(mode) = loose_mode(path)? {
+        access.notice(&format!(
+            "{} has permissions {mode:o}; it is sealed, but should be 0600",
+            path.display()
+        ));
+    }
     let key = JigKey::from_bytes(&std::fs::read(path)?)?;
-    let opened = Arc::new(access.open(&key)?);
+    let opened = access.open(&key)?;
+    // Cache only a key that is the DID asked for: a later open of this path
+    // takes the cached key without opening the file again.
+    check_did(path, did_str, &opened.seed)?;
+    let opened = Arc::new(opened);
     OPENED
         .lock()
         .expect("key cache poisoned")
@@ -641,8 +704,42 @@ fn seal_to(
     access: &KeyAccess,
 ) -> Result<Arc<Opened>, IdentityError> {
     let slot = access.new_slot(did_str)?;
+    let check = match &slot {
+        NewSlot::Passphrase { passphrase, .. } => Some(Unlock::Passphrase(passphrase.clone())),
+        NewSlot::Secret {
+            source: SecretSource::Keychain,
+            ..
+        } => None,
+        NewSlot::Secret { secret, .. } => Some(Unlock::Secret(secret.clone())),
+    };
     let (key, opened) = JigKey::seal(did_str, seed, &[slot])?;
     write_private_atomic(path, &key.to_bytes())?;
+    // Open what is now on disk the way the next run will, keychain included:
+    // the caller may be about to delete the only other copy of this key.
+    let not_verified = |reason: String| IdentityError::NotVerified {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let unlock = match check {
+        Some(unlock) => unlock,
+        None => {
+            let keychain = access
+                .keychain
+                .as_ref()
+                .ok_or_else(|| not_verified("the keychain went away".into()))?;
+            let secret = keychain
+                .get(did_str)
+                .map_err(|e| not_verified(e.to_string()))?
+                .ok_or_else(|| not_verified(format!("{} kept no secret", keychain.name())))?;
+            Unlock::Secret(secret)
+        }
+    };
+    let reopened = JigKey::from_bytes(&std::fs::read(path)?)?
+        .open(&[unlock])
+        .map_err(|e| not_verified(e.to_string()))?;
+    if *reopened.seed != *seed {
+        return Err(not_verified("it opens to another key".into()));
+    }
     let opened = Arc::new(opened);
     OPENED
         .lock()
@@ -656,15 +753,21 @@ fn seal_to(
 /// directory is synced too, so the new name survives a crash: a caller that
 /// removes the file it replaced (the raw-key migration) can do so safely.
 pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    replace_private(path, bytes)?;
+    sync_parent_dir(path)
+}
+
+/// [`write_private_atomic`] without the directory sync, for a caller that
+/// replaces several files and then calls [`sync_parent_dir`] once.
+pub(crate) fn replace_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // A name of its own: another process may be writing the same file, and
+    // its temporary file is not this one's to remove.
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(
+        ".tmp.{}",
+        hex::encode(jig_core::crypto::ed25519::random_array::<8>())
+    ));
     let tmp = PathBuf::from(tmp);
-    // A temporary file left by a crash is ours to replace.
-    match std::fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -675,13 +778,17 @@ pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result
     let mut file = options.open(&tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    std::fs::rename(&tmp, path)?;
-    sync_parent_dir(path)
+    drop(file);
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Make a rename or removal in `path`'s directory durable. Unix only: Windows
 /// cannot open a directory as a file, and its renames are journalled.
-fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     if let Some(dir) = path.parent() {
         let dir = if dir.as_os_str().is_empty() {
@@ -694,6 +801,45 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+/// Hold `<did>.lock` in `keys_dir` until the returned file drops. Blocks.
+fn lock_did(keys_dir: &Path, did_str: &str) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let f = options.open(keys_dir.join(format!("{did_str}.lock")))?;
+    f.lock()?;
+    Ok(f)
+}
+
+fn check_did(path: &Path, did_str: &str, seed: &[u8; 32]) -> Result<(), IdentityError> {
+    let signing = SigningKey::from_bytes(seed);
+    let found = Did::from_ed25519_pubkey(signing.verifying_key().as_bytes()).to_did_jig_string();
+    if found != did_str {
+        return Err(IdentityError::WrongDid {
+            path: path.to_path_buf(),
+            expected: did_str.to_string(),
+            found,
+        });
+    }
+    Ok(())
+}
+
+/// `path`'s mode, if anyone but its owner may read or write it.
+#[cfg(unix)]
+fn loose_mode(path: &Path) -> std::io::Result<Option<u32>> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+    Ok((mode & 0o077 != 0).then_some(mode))
+}
+#[cfg(not(unix))]
+fn loose_mode(_path: &Path) -> std::io::Result<Option<u32>> {
+    Ok(None)
 }
 
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
@@ -761,6 +907,7 @@ mod tests {
             secret: None,
             prompt: None,
             kdf: KdfParams::insecure_for_tests(),
+            notice: None,
         }
     }
 
@@ -772,6 +919,7 @@ mod tests {
             secret: None,
             prompt: None,
             kdf: KdfParams::insecure_for_tests(),
+            notice: None,
         }
     }
 
@@ -840,6 +988,7 @@ mod tests {
             secret: None,
             prompt: None,
             kdf: KdfParams::insecure_for_tests(),
+            notice: None,
         };
         assert!(matches!(
             Identity::create(dir.path(), &access).unwrap_err(),
@@ -902,6 +1051,96 @@ mod tests {
         let id = Identity::open(dir.path(), &did_str, &no_keychain()).unwrap();
         assert_eq!(id.migrated_from(), Some(raw.as_path()));
         assert!(!raw.exists());
+    }
+
+    #[test]
+    fn processes_migrating_one_raw_key_at_once_leave_a_key_that_opens() {
+        let dir = tempdir().unwrap();
+        let (raw, did_str) = write_golden_raw(dir.path());
+        let k = Arc::new(MemoryKeychain::default());
+        // Without the lock, each would store its own keychain secret and the
+        // last one stored need not be the one in the file that won.
+        let opens: Vec<_> = (0..4)
+            .map(|_| {
+                let (dir, did_str, k) = (dir.path().to_path_buf(), did_str.clone(), k.clone());
+                std::thread::spawn(move || Identity::open(&dir, &did_str, &keychain_only(k)))
+            })
+            .collect();
+        for open in opens {
+            assert_eq!(open.join().unwrap().unwrap().did_string(), did_str);
+        }
+        assert!(!raw.exists());
+        clear_cache();
+        let again = Identity::open(dir.path(), &did_str, &keychain_only(k)).unwrap();
+        assert_eq!(again.did_string(), did_str);
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// Takes the secret and keeps nothing.
+    struct ForgetfulKeychain;
+    impl Keychain for ForgetfulKeychain {
+        fn get(&self, _: &str) -> Result<Option<Zeroizing<Vec<u8>>>, KeychainError> {
+            Ok(None)
+        }
+        fn set(&self, _: &str, _: &[u8]) -> Result<(), KeychainError> {
+            Ok(())
+        }
+        fn delete(&self, _: &str) -> Result<(), KeychainError> {
+            Ok(())
+        }
+        fn name(&self) -> &'static str {
+            "forgetful keychain"
+        }
+    }
+
+    #[test]
+    fn a_raw_key_stays_until_its_sealed_copy_opens_from_disk() {
+        let dir = tempdir().unwrap();
+        let (raw, did_str) = write_golden_raw(dir.path());
+        let mut access = passphrase_only("unused");
+        access.passphrase = None;
+        access.keychain = Some(Arc::new(ForgetfulKeychain));
+        let err = Identity::open(dir.path(), &did_str, &access).unwrap_err();
+        assert!(matches!(err, IdentityError::NotVerified { .. }), "{err}");
+        assert!(raw.exists(), "the only working copy of the key was removed");
+    }
+
+    #[test]
+    fn a_keychain_that_fails_is_reported_not_only_logged() {
+        let dir = tempdir().unwrap();
+        let said = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut access = passphrase_only("pw");
+        access.keychain = Some(Arc::new(BrokenKeychain));
+        let heard = said.clone();
+        let access = access.with_notice(Arc::new(move |m| heard.lock().unwrap().push(m.into())));
+        let id = Identity::create(dir.path(), &access).unwrap();
+        let said = said.lock().unwrap();
+        assert!(
+            said.iter().any(|m| m.contains("broken keychain")),
+            "{said:?}"
+        );
+        drop(said);
+
+        // A key that only the keychain opens names the keychain's failure.
+        let k = Arc::new(MemoryKeychain::default());
+        let kc = Identity::create(dir.path(), &keychain_only(k)).unwrap();
+        clear_cache();
+        let mut broken = keychain_only(Arc::new(MemoryKeychain::default()));
+        broken.keychain = Some(Arc::new(BrokenKeychain));
+        let err = Identity::open(dir.path(), &kc.did_string(), &broken).unwrap_err();
+        assert!(err.to_string().contains("locked"), "{err}");
+        let _ = id;
+    }
+
+    #[test]
+    fn a_bad_unlock_spec_does_not_echo_its_value() {
+        let err = read_unlock_spec("correct-horse-battery-staple-0123456789").unwrap_err();
+        assert!(!err.to_string().contains("correct-horse"), "{err}");
     }
 
     struct BrokenKeychain;

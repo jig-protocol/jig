@@ -22,9 +22,11 @@
 //! `plaintext.jsonl` one record per line, so appends stay appends. Each is
 //! bound to the DID and its own file name, so a sealed file cannot be moved
 //! to another identity or another role. Files written in clear by an earlier
-//! version are sealed when the session opens. An identity that is not sealed
-//! at rest ([`Identity::from_signing_key`], plaintext key storage) keeps its
-//! state in clear.
+//! version are sealed when the session opens, once: the session then writes a
+//! sealed marker (`sealed`), and from then on content in clear is an error, so
+//! history cannot be slipped in by writing a file in clear. An identity that is
+//! not sealed at rest ([`Identity::from_signing_key`], plaintext key storage)
+//! keeps its state in clear.
 //!
 //! # Concurrency
 //!
@@ -36,7 +38,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead as _, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -123,6 +125,8 @@ pub struct Session {
     /// Plaintext already read, by block CID. A cache of `plaintext.jsonl`,
     /// re-read from disk on a miss in case another process wrote it.
     read: Mutex<HashMap<String, (String, String)>>,
+    /// This directory has been sealed: content in clear is refused.
+    sealed_only: bool,
 }
 
 const STATE: &str = "state.bin";
@@ -131,6 +135,11 @@ const PLAINTEXT: &str = "plaintext.jsonl";
 /// The prefix of a sealed `plaintext.jsonl` record. A record in clear is JSON
 /// and starts with `{`.
 const SEALED_LINE: &str = "s1:";
+/// Written once a directory's state is sealed; its presence makes content in
+/// clear an error. Sealed itself, so it cannot be made by someone without the
+/// key.
+const MARKER: &str = "sealed";
+const MARKER_CONTENT: &[u8] = b"jig mls state sealed v1";
 
 /// The key-derivation context for one of this module's files.
 fn file_context(file: &str) -> String {
@@ -191,27 +200,61 @@ impl Session {
                 },
             )?;
         }
-        let session = Self {
+        let mut session = Self {
             identity,
             did,
             dir,
             read: Mutex::new(HashMap::new()),
+            sealed_only: false,
         };
-        session.seal_clear_files()?;
+        session.sealed_only = session.seal_clear_files()?;
         session.reload_read()?;
         Ok(session)
     }
 
-    /// Seal any file an earlier version wrote in clear, under the lock.
-    fn seal_clear_files(&self) -> Result<()> {
-        if !self.identity.is_sealed() {
-            return Ok(());
-        }
+    /// Seal any file an earlier version wrote in clear, under the lock, and
+    /// say whether this directory is sealed (so that clear content is
+    /// refused from now on).
+    fn seal_clear_files(&self) -> Result<bool> {
         let _lock = self.lock()?;
+        self.remove_stale_temporaries()?;
+        if !self.identity.is_sealed() {
+            return Ok(false);
+        }
+        let io = |path: &Path| {
+            let path = path.to_path_buf();
+            move |source| SecureError::Io { path, source }
+        };
+        let marker = self.dir.join(MARKER);
+        let sealed_already = match std::fs::read(&marker) {
+            Ok(bytes) => {
+                if *self.unseal(MARKER, &marker, bytes)? != *MARKER_CONTENT {
+                    return Err(SecureError::Sealed {
+                        path: marker,
+                        reason: "the marker does not say what it should".into(),
+                    });
+                }
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(source) => {
+                return Err(SecureError::Io {
+                    path: marker,
+                    source,
+                });
+            }
+        };
+        let in_clear = |path: &Path| SecureError::Sealed {
+            path: path.to_path_buf(),
+            reason: "it is in clear, but this identity's state was sealed already".into(),
+        };
         for file in [STATE, GROUPS] {
             let path = self.dir.join(file);
             match std::fs::read(&path) {
                 Ok(bytes) if !jig_core::keystore::is_sealed(&bytes) => {
+                    if sealed_already {
+                        return Err(in_clear(&path));
+                    }
                     write_atomic(&path, &self.seal(file, &bytes))?;
                 }
                 Ok(_) => {}
@@ -221,23 +264,51 @@ impl Session {
         }
         let path = self.dir.join(PLAINTEXT);
         let text = match std::fs::read_to_string(&path) {
-            Ok(text) => zeroize::Zeroizing::new(text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(source) => return Err(SecureError::Io { path, source }),
+            Ok(text) => Some(zeroize::Zeroizing::new(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => return Err(io(&path)(source)),
         };
-        if text.lines().all(|l| l.starts_with(SEALED_LINE)) {
-            return Ok(());
-        }
-        let mut sealed = String::new();
-        for line in text.lines().filter(|l| !l.is_empty()) {
-            if line.starts_with(SEALED_LINE) {
-                sealed.push_str(line);
-            } else {
-                sealed.push_str(&self.seal_line(line));
+        if let Some(text) = text
+            && !text
+                .lines()
+                .all(|l| l.is_empty() || l.starts_with(SEALED_LINE))
+        {
+            if sealed_already {
+                return Err(in_clear(&path));
             }
-            sealed.push('\n');
+            let mut sealed = String::new();
+            for line in text.lines().filter(|l| !l.is_empty()) {
+                if line.starts_with(SEALED_LINE) {
+                    sealed.push_str(line);
+                } else {
+                    sealed.push_str(&self.seal_line(line));
+                }
+                sealed.push('\n');
+            }
+            write_atomic(&path, sealed.as_bytes())?;
         }
-        write_atomic(&path, sealed.as_bytes())
+        if !sealed_already {
+            write_atomic(&marker, &self.seal(MARKER, MARKER_CONTENT))?;
+        }
+        Ok(true)
+    }
+
+    /// Remove temporary files a crash left behind: `<file>.tmp.<random>`, and
+    /// `state.tmp` and the like from earlier versions. Callers hold the lock,
+    /// and every writer here does, so none of them is still being written.
+    fn remove_stale_temporaries(&self) -> Result<()> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Ok(());
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.contains(".tmp.") || name.ends_with(".tmp") {
+                let path = entry.path();
+                std::fs::remove_file(&path).map_err(|source| SecureError::Io { path, source })?;
+            }
+        }
+        Ok(())
     }
 
     /// `bytes` sealed for `file`, or as they are when this identity is not
@@ -254,20 +325,26 @@ impl Session {
     }
 
     /// The contents of `file`, opened if sealed. A file in clear is returned
-    /// as it is: written by an earlier version, it is sealed on the next save.
+    /// as it is if this directory has not been sealed yet (an earlier version
+    /// wrote it, and the next save seals it), and refused once it has.
     fn unseal(
         &self,
         file: &str,
         path: &Path,
         bytes: Vec<u8>,
     ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
-        if !jig_core::keystore::is_sealed(&bytes) {
-            return Ok(zeroize::Zeroizing::new(bytes));
-        }
         let sealed_err = |reason: String| SecureError::Sealed {
             path: path.to_path_buf(),
             reason,
         };
+        if !jig_core::keystore::is_sealed(&bytes) {
+            if self.sealed_only {
+                return Err(sealed_err(
+                    "it is in clear, but this identity's state is sealed".into(),
+                ));
+            }
+            return Ok(zeroize::Zeroizing::new(bytes));
+        }
         let key = self.identity.file_key(&file_context(file)).ok_or_else(|| {
             sealed_err("it is sealed, and this identity's key is not sealed at rest".into())
         })?;
@@ -395,14 +472,17 @@ impl Session {
     pub fn remember(&self, cid: &str, sender: &str, text: &str) -> Result<()> {
         let path = self.dir.join(PLAINTEXT);
         let _lock = self.lock()?;
+        let io = |source| SecureError::Io {
+            path: path.clone(),
+            source,
+        };
         let mut f = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&path)
-            .map_err(|source| SecureError::Io {
-                path: path.clone(),
-                source,
-            })?;
+            .map_err(io)?;
+        drop_torn_tail(&mut f).map_err(io)?;
         let line = zeroize::Zeroizing::new(
             serde_json::to_string(&Read {
                 cid: cid.to_string(),
@@ -416,7 +496,10 @@ impl Session {
         } else {
             line.to_string()
         };
-        writeln!(f, "{line}").map_err(|source| SecureError::Io { path, source })?;
+        // One write for the record and its newline: two writes can be cut
+        // between them, and the next record would land on the same line.
+        let record = zeroize::Zeroizing::new(format!("{line}\n"));
+        f.write_all(record.as_bytes()).map_err(io)?;
         self.read
             .lock()
             .expect("plaintext cache poisoned")
@@ -629,15 +712,30 @@ impl Session {
 
     fn reload_read(&self) -> Result<()> {
         let path = self.dir.join(PLAINTEXT);
-        let Ok(f) = File::open(&path) else {
-            return Ok(());
+        let io = |source| SecureError::Io {
+            path: path.clone(),
+            source,
         };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => zeroize::Zeroizing::new(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io(e)),
+        };
+        let text = std::str::from_utf8(&bytes).map_err(|e| SecureError::Sealed {
+            path: path.clone(),
+            reason: e.to_string(),
+        })?;
+        // Every record ends in a newline. A last one without it was cut short
+        // (a kill, a full disk) and is dropped; the next append removes it.
+        let complete = match text.rfind('\n') {
+            Some(end) => &text[..=end],
+            None => "",
+        };
+        if complete.len() < text.len() {
+            tracing::warn!("{}: ignoring a record that was cut short", path.display());
+        }
         let mut read = self.read.lock().expect("plaintext cache poisoned");
-        for line in std::io::BufReader::new(f).lines() {
-            let line = line.map_err(|source| SecureError::Io {
-                path: path.clone(),
-                source,
-            })?;
+        for line in complete.lines().filter(|l| !l.is_empty()) {
             // A sealed record that does not open is an error, never skipped:
             // skipping would hide tampering, and the next write would bury it.
             let line = match line.strip_prefix(SEALED_LINE) {
@@ -654,7 +752,13 @@ impl Session {
                         }
                     })?)
                 }
-                None => zeroize::Zeroizing::new(line),
+                None if self.sealed_only => {
+                    return Err(SecureError::Sealed {
+                        path: path.clone(),
+                        reason: "a record is in clear, but this identity's state is sealed".into(),
+                    });
+                }
+                None => zeroize::Zeroizing::new(line.to_string()),
             };
             if let Ok(r) = serde_json::from_str::<Read>(&line) {
                 read.insert(r.cid, (r.sender, r.text));
@@ -720,14 +824,20 @@ impl Session {
         let out = f(&member, &mut groups);
         // Save even when `f` failed: openmls may have written state (a staged
         // commit, a consumed key package) before the failure.
-        write_atomic(&state_path, &self.seal(STATE, &member.snapshot()))?;
-        write_atomic(
+        // Both files, then one directory sync: a sync that failed after the
+        // first rename must not leave the second file unwritten.
+        replace(&state_path, &self.seal(STATE, &member.snapshot()))?;
+        replace(
             &groups_path,
             &self.seal(
                 GROUPS,
                 &serde_json::to_vec_pretty(&groups).expect("groups serialize"),
             ),
         )?;
+        crate::identity::sync_parent_dir(&state_path).map_err(|source| SecureError::Io {
+            path: self.dir.clone(),
+            source,
+        })?;
         out
     }
 
@@ -836,6 +946,37 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// [`write_atomic`] without the directory sync; see `with_member`.
+fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
+    crate::identity::replace_private(path, bytes).map_err(|source| SecureError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// If `f` does not end in a newline, its last record was cut short: cut it
+/// off, so the next record starts a line of its own.
+fn drop_torn_tail(f: &mut File) -> std::io::Result<()> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let len = f.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    let mut last = [0u8; 1];
+    f.seek(SeekFrom::End(-1))?;
+    f.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+    f.seek(SeekFrom::Start(0))?;
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    f.read_to_end(&mut bytes)?;
+    let keep = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    f.set_len(keep as u64)?;
+    tracing::warn!("dropped a plaintext record that was cut short");
+    Ok(())
 }
 
 /// Whether `blocks` — a channel's history from some point up to now — reach
@@ -1263,6 +1404,81 @@ mod tests {
             Session::open(root.path(), alice.identity.duplicate()),
             Err(SecureError::Sealed { .. })
         ));
+    }
+
+    #[test]
+    fn a_record_cut_short_is_dropped_and_the_next_one_still_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        alice.remember("cid-1", "did:jig:zs", "whole").unwrap();
+        let path = root.path().join(alice.did()).join(PLAINTEXT);
+        // A record killed before its newline was written.
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"s1:AAAAhalf-a-reco").unwrap();
+        drop(f);
+        let again = Session::open(root.path(), alice.identity.duplicate()).unwrap();
+        assert_eq!(
+            again.recall("cid-1").unwrap().map(|(_, t)| t),
+            Some("whole".into())
+        );
+        again.remember("cid-2", "did:jig:zs", "after").unwrap();
+        let third = Session::open(root.path(), alice.identity.duplicate()).unwrap();
+        assert_eq!(
+            third.recall("cid-2").unwrap().map(|(_, t)| t),
+            Some("after".into())
+        );
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("half-a-reco")
+        );
+    }
+
+    #[test]
+    fn once_sealed_content_in_clear_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        alice.create_group(SERVER, "#mine").unwrap();
+        alice.remember("cid-1", "did:jig:zs", "real").unwrap();
+        let dir = root.path().join(alice.did());
+
+        // A history line slipped in, in clear.
+        let plaintext = dir.join(PLAINTEXT);
+        let real = std::fs::read(&plaintext).unwrap();
+        let mut forged = real.clone();
+        forged.extend_from_slice(
+            b"{\"cid\":\"cid-2\",\"sender\":\"did:jig:zx\",\"text\":\"forged\"}\n",
+        );
+        std::fs::write(&plaintext, &forged).unwrap();
+        assert!(matches!(
+            Session::open(root.path(), alice.identity.duplicate()),
+            Err(SecureError::Sealed { .. })
+        ));
+        std::fs::write(&plaintext, &real).unwrap();
+
+        // A group map in clear.
+        let groups = dir.join(GROUPS);
+        std::fs::write(&groups, b"{\"groups\":{}}").unwrap();
+        assert!(matches!(
+            Session::open(root.path(), alice.identity.duplicate()),
+            Err(SecureError::Sealed { .. })
+        ));
+    }
+
+    #[test]
+    fn temporary_files_a_crash_left_are_removed_on_open() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let dir = root.path().join(alice.did());
+        for stale in ["state.tmp", "groups.tmp", "state.bin.tmp.0123456789abcdef"] {
+            std::fs::write(dir.join(stale), b"left by a crash").unwrap();
+        }
+        drop(Session::open(root.path(), alice.identity.duplicate()).unwrap());
+        let names: Vec<_> = files_of(root.path(), &alice)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert!(names.iter().all(|n| !n.contains(".tmp")), "{names:?}");
     }
 
     #[test]
