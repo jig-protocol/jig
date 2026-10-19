@@ -14,7 +14,7 @@ use jig_core::grant::{Grant, Scope};
 use jig_runtime::RuntimeError;
 use jig_runtime::component::{
     BlockError, ComponentRuntime, ErrorOutcome, Hlc, IncompleteReason, Invocation, Payload,
-    RenderLimits, RunOutcome,
+    RenderLimits, RunOutcome, TrapCode,
 };
 
 const MAX_MEMORY_PAGES: u32 = 16;
@@ -132,7 +132,7 @@ fn a_guest_err_is_a_comparable_error() {
 fn unreachable_is_a_comparable_trap() {
     let outcome = run(&renderer("unreachable", ""), 1_000_000);
     assert!(
-        matches!(outcome, RunOutcome::Error(ErrorOutcome::Trap(_))),
+        outcome == RunOutcome::Error(ErrorOutcome::Trap(TrapCode::Unreachable)),
         "{outcome:?}"
     );
     assert!(outcome.is_comparable());

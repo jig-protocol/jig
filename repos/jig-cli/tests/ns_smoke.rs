@@ -29,6 +29,13 @@ fn write_cli_toml(home: &Path) {
 
 fn run_jig(home: &Path, args: &[&str]) -> (bool, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(args)
         .env("HOME", home)
         .output()
@@ -46,6 +53,13 @@ fn run_jig(home: &Path, args: &[&str]) -> (bool, String) {
 #[test]
 fn binary_exposes_ns_subcommands() {
     let out = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["ns", "--help"])
         .output()
         .unwrap();

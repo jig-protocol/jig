@@ -537,7 +537,8 @@ impl TestNameserver {
             .to_string_lossy()
             .into_owned();
         config.server.listen = "127.0.0.1:0".to_string();
-        config.nameserver.alias_suffix = alias_suffix.to_string();
+        config.nameserver.alias_suffixes =
+            vec![jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix)];
         // Tests enumerate registered aliases; production leaves this off.
         config.debug.list_handles = true;
 
@@ -650,24 +651,24 @@ pub fn test_identity() -> Identity {
     // Use `keep` so the file lives long enough for the test; we don't
     // explicitly delete because tests are short-lived.
     let path = dir.keep();
-    Identity::generate_and_save(&path).expect("identity generate")
+    Identity::generate_for_tests(&path)
 }
 
 /// Variant that also returns the keyfile directory so the caller can
 /// load the identity multiple times (e.g. once for signing, once to
 /// pass into `Client::connect` which takes ownership).
 ///
-/// Use `Identity::load_from_dir(&keys_dir, &did_str)` to re-load.
+/// Use `Identity::load_for_tests(&keys_dir, &did_str)` to re-load.
 pub fn test_identity_with_dir() -> (Identity, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.keep();
-    let id = Identity::generate_and_save(&path).expect("identity generate");
+    let id = Identity::generate_for_tests(&path);
     (id, path)
 }
 
 /// Re-load an Identity from its keyfile directory, given the DID.
 pub fn load_identity(keys_dir: &std::path::Path, did_str: &str) -> Identity {
-    Identity::load_from_dir(keys_dir, did_str).expect("load identity from dir")
+    Identity::load_for_tests(keys_dir, did_str)
 }
 
 /// Build the JSON body for the `/api/v1/blocks` and `/api/v1/channels*`

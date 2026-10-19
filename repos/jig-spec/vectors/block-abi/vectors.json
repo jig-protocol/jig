@@ -1,0 +1,712 @@
+{
+  "format": "jig:block vectors v1",
+  "vectors": [
+    {
+      "name": "ok-empty",
+      "component": "guests/ok-empty.wasm",
+      "component-hash": "blake3:80bd29c64013359942ea8cf043f56e97e7376c5a6d49d823038dce83ad6261b1",
+      "world": "renderer",
+      "max-memory-pages": 1,
+      "fuel": 1000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6869"
+        }
+      },
+      "invocation-hash": "blake3:75a8752abb25c0af1177459692a29e3c8612a7c55cb633c0dda646806b988f0b",
+      "expected": {
+        "outcome": "ok",
+        "hash": "blake3:54584d5a256665c609631ba1931267347ed8439f1fc5f41870ac2f3066cc6c4c"
+      }
+    },
+    {
+      "name": "ok-echo",
+      "component": "guests/ok-echo.wasm",
+      "component-hash": "blake3:4793f264436859d5d4c222f3e6e50eb9a24c8567b84b20b3babbc8523e9cf297",
+      "world": "renderer",
+      "max-memory-pages": 1,
+      "fuel": 1000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "68c3a96c6c6f2c2077c3b6726c6400ff"
+        }
+      },
+      "invocation-hash": "blake3:27b9af817164435d8d84799b639875edee0658a4379e26d78e6fef8e3f13961d",
+      "expected": {
+        "outcome": "ok",
+        "hash": "blake3:87f352286fca3abe49d288a189b1741d626e00d1e890b9c5ea33dabdc71a3e58"
+      }
+    },
+    {
+      "name": "ok-integers",
+      "component": "guests/ok-integers.wasm",
+      "component-hash": "blake3:9e3a763c1615cc0a03ca09c9ac3a271f5bb23ecd9581f9d357fa89195f73ca60",
+      "world": "renderer",
+      "max-memory-pages": 1,
+      "fuel": 1000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 18446744073709551615,
+        "ingest-hlc": {
+          "wall-ms": 9223372036854775813,
+          "logical": 4294967295
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6869"
+        }
+      },
+      "invocation-hash": "blake3:d3ae87ae9f632cb122ef8ffa13aa579cb36aa396410ecf6a6458489ae9c0eb30",
+      "expected": {
+        "outcome": "ok",
+        "hash": "blake3:cd3dcf51224cfcc8cbb5daab8ff7fd110b7df5fe45e8ce4d12edf539a6319d86"
+      }
+    },
+    {
+      "name": "ok-binary",
+      "component": "guests/ok-binary.wasm",
+      "component-hash": "blake3:0f8bb2799866c7ff0e0a117d33a5d478808940f5dc16fb28e8de273402ed7c18",
+      "world": "renderer",
+      "max-memory-pages": 1,
+      "fuel": 1000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6869"
+        }
+      },
+      "invocation-hash": "blake3:75a8752abb25c0af1177459692a29e3c8612a7c55cb633c0dda646806b988f0b",
+      "expected": {
+        "outcome": "ok",
+        "hash": "blake3:6057e8832e047a2e72fad5188e2110927b2dbbcc019fcb74401a1f5b27e2d396"
+      }
+    },
+    {
+      "name": "err-invalid-input",
+      "component": "guests/err-invalid-input.wasm",
+      "component-hash": "blake3:042ddba58289b0547e415db891acc869d8a539bc91fb392515e13ebf32f9816e",
+      "world": "renderer",
+      "max-memory-pages": 1,
+      "fuel": 1000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6869"
+        }
+      },
+      "invocation-hash": "blake3:75a8752abb25c0af1177459692a29e3c8612a7c55cb633c0dda646806b988f0b",
+      "expected": {
+        "outcome": "error",
+        "hash": "blake3:e91a26bc6f6a6f009d93d5b8d11fd1c85413dcddc81dc7e81d6e5127b1f694d8"
+      }
+    },
+    {
+      "name": "err-failed",
+      "component": "guests/err-failed.wasm",
+      "component-hash": "blake3:d88c40c69a964cfe0acdae0b404e4be480fa7750b02d1b1d0904f35db75b2312",
+      "world": "renderer",
+      "max-memory-pages": 1,
+      "fuel": 1000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6869"
+        }
+      },
+      "invocation-hash": "blake3:75a8752abb25c0af1177459692a29e3c8612a7c55cb633c0dda646806b988f0b",
+      "expected": {
+        "outcome": "error",
+        "hash": "blake3:6897042c4e46febf2967ee70a6f214b6aafd39010e2f9b0fabb04d760049020b"
+      }
+    },
+    {
+      "name": "trap-unreachable",
+      "component": "guests/trap-unreachable.wasm",
+      "component-hash": "blake3:a40e67f4338b38856ac182468f559a3257669e466011dc5bd01f55f6b36bb3ef",
+      "world": "renderer",
+      "max-memory-pages": 1,
+      "fuel": 1000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6869"
+        }
+      },
+      "invocation-hash": "blake3:75a8752abb25c0af1177459692a29e3c8612a7c55cb633c0dda646806b988f0b",
+      "expected": {
+        "outcome": "error",
+        "trap": "unreachable",
+        "hash": "blake3:3073497c29154b946faa842011e09d6624e62b4b2535535be9b52882ed9e7df6"
+      }
+    },
+    {
+      "name": "trap-memory-out-of-bounds",
+      "component": "guests/trap-memory-out-of-bounds.wasm",
+      "component-hash": "blake3:d390200b235e52dbfa373b5f5de482c184e61fd6416a413567677a3b918de9b2",
+      "world": "renderer",
+      "max-memory-pages": 1,
+      "fuel": 1000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6869"
+        }
+      },
+      "invocation-hash": "blake3:75a8752abb25c0af1177459692a29e3c8612a7c55cb633c0dda646806b988f0b",
+      "expected": {
+        "outcome": "error",
+        "trap": "memory-out-of-bounds",
+        "hash": "blake3:1dc0120a06d3c1cb3f20dec81e4e151010f1b50516361fb0f2aa2b26ea0e1586"
+      }
+    },
+    {
+      "name": "trap-integer-divide-by-zero",
+      "component": "guests/trap-integer-divide-by-zero.wasm",
+      "component-hash": "blake3:314311b13c95d53e5d5ca10604bfb56b1f3403cdb09458ed38d3aa28de5f9648",
+      "world": "renderer",
+      "max-memory-pages": 1,
+      "fuel": 1000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6869"
+        }
+      },
+      "invocation-hash": "blake3:75a8752abb25c0af1177459692a29e3c8612a7c55cb633c0dda646806b988f0b",
+      "expected": {
+        "outcome": "error",
+        "trap": "integer-divide-by-zero",
+        "hash": "blake3:8cf498c559520df0a5cfa8fb08a3734da59f6e0a1f033a5e016d6ae258becdb6"
+      }
+    },
+    {
+      "name": "trap-integer-overflow",
+      "component": "guests/trap-integer-overflow.wasm",
+      "component-hash": "blake3:f130c26319e8582a89ab8354d8856e0155f2e9dbf36b26aa0c44d359db7dc334",
+      "world": "renderer",
+      "max-memory-pages": 1,
+      "fuel": 1000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6869"
+        }
+      },
+      "invocation-hash": "blake3:75a8752abb25c0af1177459692a29e3c8612a7c55cb633c0dda646806b988f0b",
+      "expected": {
+        "outcome": "error",
+        "trap": "integer-overflow",
+        "hash": "blake3:8064edca568a2e801ad68c30d94b25067a9d15ed5444fb31b0423c4f8c812087"
+      }
+    },
+    {
+      "name": "trap-table-out-of-bounds",
+      "component": "guests/trap-table-out-of-bounds.wasm",
+      "component-hash": "blake3:bd789541da1c03325c945eea5a41065553bd48cb673113a3b12b38edfa5f48c9",
+      "world": "renderer",
+      "max-memory-pages": 1,
+      "fuel": 1000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6869"
+        }
+      },
+      "invocation-hash": "blake3:75a8752abb25c0af1177459692a29e3c8612a7c55cb633c0dda646806b988f0b",
+      "expected": {
+        "outcome": "error",
+        "trap": "table-out-of-bounds",
+        "hash": "blake3:f3a773e036df018cabd5146a7ccb1b20bb59eca1452150f7fad6030bf52bea61"
+      }
+    },
+    {
+      "name": "trap-uninitialized-element",
+      "component": "guests/trap-uninitialized-element.wasm",
+      "component-hash": "blake3:e4401e3a5bb2f084b9c665f58bbd0da71b5c2feeccb4e522a1431f69c9551a5c",
+      "world": "renderer",
+      "max-memory-pages": 1,
+      "fuel": 1000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6869"
+        }
+      },
+      "invocation-hash": "blake3:75a8752abb25c0af1177459692a29e3c8612a7c55cb633c0dda646806b988f0b",
+      "expected": {
+        "outcome": "error",
+        "trap": "uninitialized-element",
+        "hash": "blake3:47569ee38c1625382d499c6cdc2fae16a8fb742933777790a25fc493771b84cb"
+      }
+    },
+    {
+      "name": "trap-indirect-call-type-mismatch",
+      "component": "guests/trap-indirect-call-type-mismatch.wasm",
+      "component-hash": "blake3:3fe8fa4498e187a1745ba32100aa6086b8fc6e52ded7d86949dd9fea3e1acf8a",
+      "world": "renderer",
+      "max-memory-pages": 1,
+      "fuel": 1000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6869"
+        }
+      },
+      "invocation-hash": "blake3:75a8752abb25c0af1177459692a29e3c8612a7c55cb633c0dda646806b988f0b",
+      "expected": {
+        "outcome": "error",
+        "trap": "indirect-call-type-mismatch",
+        "hash": "blake3:4acf8cb88d559ffa733203ca0acd3fd05dacd03df63d5d27c03207a905aa238e"
+      }
+    },
+    {
+      "name": "malformed-string-out-of-bounds",
+      "component": "guests/malformed-string-out-of-bounds.wasm",
+      "component-hash": "blake3:5410e5cb5a32bec3c2070850862d6f74d6bdc21b44432c3d45526303cca608ce",
+      "world": "renderer",
+      "max-memory-pages": 1,
+      "fuel": 1000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6869"
+        }
+      },
+      "invocation-hash": "blake3:75a8752abb25c0af1177459692a29e3c8612a7c55cb633c0dda646806b988f0b",
+      "expected": {
+        "outcome": "incomplete",
+        "reason": "host-fault"
+      }
+    },
+    {
+      "name": "malformed-list-out-of-bounds",
+      "component": "guests/malformed-list-out-of-bounds.wasm",
+      "component-hash": "blake3:0d4f128dc9dbbd3941524fe3ac74679e9fa3db523c7488011815cc4010ab0b01",
+      "world": "renderer",
+      "max-memory-pages": 1,
+      "fuel": 1000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6869"
+        }
+      },
+      "invocation-hash": "blake3:75a8752abb25c0af1177459692a29e3c8612a7c55cb633c0dda646806b988f0b",
+      "expected": {
+        "outcome": "incomplete",
+        "reason": "host-fault"
+      }
+    },
+    {
+      "name": "malformed-discriminant",
+      "component": "guests/malformed-discriminant.wasm",
+      "component-hash": "blake3:32391326b9d9380871af234f701e2584f1409a7a4da0270511c2e3f91dff647f",
+      "world": "renderer",
+      "max-memory-pages": 1,
+      "fuel": 1000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6869"
+        }
+      },
+      "invocation-hash": "blake3:75a8752abb25c0af1177459692a29e3c8612a7c55cb633c0dda646806b988f0b",
+      "expected": {
+        "outcome": "incomplete",
+        "reason": "host-fault"
+      }
+    },
+    {
+      "name": "malformed-unaligned-pointer",
+      "component": "guests/malformed-unaligned-pointer.wasm",
+      "component-hash": "blake3:3e14e7c83d5a01719dc14866aa82bc76f2114ff4ca38b621b65b3cecbd4f75dc",
+      "world": "renderer",
+      "max-memory-pages": 1,
+      "fuel": 1000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6869"
+        }
+      },
+      "invocation-hash": "blake3:75a8752abb25c0af1177459692a29e3c8612a7c55cb633c0dda646806b988f0b",
+      "expected": {
+        "outcome": "incomplete",
+        "reason": "host-fault"
+      }
+    },
+    {
+      "name": "incomplete-fuel",
+      "component": "guests/incomplete-fuel.wasm",
+      "component-hash": "blake3:b777c694d8bb7378954069567b83672ff66b54ea9c2511543d2f66e4b3fdc1fc",
+      "world": "renderer",
+      "max-memory-pages": 1,
+      "fuel": 10000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6869"
+        }
+      },
+      "invocation-hash": "blake3:75a8752abb25c0af1177459692a29e3c8612a7c55cb633c0dda646806b988f0b",
+      "expected": {
+        "outcome": "incomplete",
+        "reason": "fuel-exhausted"
+      }
+    },
+    {
+      "name": "incomplete-stack",
+      "component": "guests/incomplete-stack.wasm",
+      "component-hash": "blake3:7d79cb7e4bebc3e801c254093476c214c30a3c72fb41b56f843b6da67b6e2628",
+      "world": "renderer",
+      "max-memory-pages": 1,
+      "fuel": 4611686018427387904,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6869"
+        }
+      },
+      "invocation-hash": "blake3:75a8752abb25c0af1177459692a29e3c8612a7c55cb633c0dda646806b988f0b",
+      "expected": {
+        "outcome": "incomplete",
+        "reason": "stack-exhausted"
+      }
+    },
+    {
+      "name": "text-block-plain",
+      "component": "../../../text-block/artifacts/text_block.component.wasm",
+      "component-hash": "blake3:8ab0a9ebe0261c63973cccabdbb5c5f04ac703486e8de890518bb2c91175b179",
+      "world": "renderer",
+      "max-memory-pages": 256,
+      "fuel": 50000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "68656c6c6f20776f726c64"
+        }
+      },
+      "invocation-hash": "blake3:ec31d7d67fe58a2b3a82343ca58b58d26ef6c20c44cc39f400aed742945106b3",
+      "expected": {
+        "outcome": "ok",
+        "hash": "blake3:ca67984c475d0d64f5ddf6a0dd114bae1f373105d8c8024955e88eb7f06831db"
+      }
+    },
+    {
+      "name": "text-block-empty",
+      "component": "../../../text-block/artifacts/text_block.component.wasm",
+      "component-hash": "blake3:8ab0a9ebe0261c63973cccabdbb5c5f04ac703486e8de890518bb2c91175b179",
+      "world": "renderer",
+      "max-memory-pages": 256,
+      "fuel": 50000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": ""
+        }
+      },
+      "invocation-hash": "blake3:538c99458b886479f4c5dd4e9c965fc86af2b98bfbd1dfa217515a55e04db941",
+      "expected": {
+        "outcome": "ok",
+        "hash": "blake3:87d2727e65f35ec81c61cc69d74bdd9628ff0c2fac59c8fc0cd29841e27abb59"
+      }
+    },
+    {
+      "name": "text-block-mention-and-link",
+      "component": "../../../text-block/artifacts/text_block.component.wasm",
+      "component-hash": "blake3:8ab0a9ebe0261c63973cccabdbb5c5f04ac703486e8de890518bb2c91175b179",
+      "world": "renderer",
+      "max-memory-pages": 256,
+      "fuel": 50000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "68657920406469643a6a69673a7a364d6b667269656e64207365652068747470733a2f2f6578616d706c652e6f72672f613f623d63"
+        }
+      },
+      "invocation-hash": "blake3:86ab348b07514532eaa36f6447ca8dec01bd594efddfec02e42bfadcafdba525",
+      "expected": {
+        "outcome": "ok",
+        "hash": "blake3:46e0d5074224f70bbb7902c0a699b4a1f1e54b5bd69ca46c7f3bdc3723905f84"
+      }
+    },
+    {
+      "name": "text-block-markdown",
+      "component": "../../../text-block/artifacts/text_block.component.wasm",
+      "component-hash": "blake3:8ab0a9ebe0261c63973cccabdbb5c5f04ac703486e8de890518bb2c91175b179",
+      "world": "renderer",
+      "max-memory-pages": 256,
+      "fuel": 50000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "2a2a626f6c642a2a205f656d5f2060636f6465600a0a3e2071756f7465"
+        }
+      },
+      "invocation-hash": "blake3:67b30a57a3a50ea58c11296ffd43ef38f318c13b3c1eeb4203262fde76d96de8",
+      "expected": {
+        "outcome": "ok",
+        "hash": "blake3:efc2619ece23bb21550e2be3e97b6a1c96f385e532cb0eff0093740a8aae68ac"
+      }
+    },
+    {
+      "name": "text-block-unicode",
+      "component": "../../../text-block/artifacts/text_block.component.wasm",
+      "component-hash": "blake3:8ab0a9ebe0261c63973cccabdbb5c5f04ac703486e8de890518bb2c91175b179",
+      "world": "renderer",
+      "max-memory-pages": 256,
+      "fuel": 50000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6e61c3af766520636166c3a920e697a5e69cace8aa9e20f09f8e89"
+        }
+      },
+      "invocation-hash": "blake3:60a3ddb4b28aaf4d0773c093dded7642ed28d777929610bbc1eb0992db13186a",
+      "expected": {
+        "outcome": "ok",
+        "hash": "blake3:2d2127c3bfbfde84dbb80e179ea321e6c550a73322b18c230425a03bccd35a8c"
+      }
+    },
+    {
+      "name": "text-block-invalid-utf8",
+      "component": "../../../text-block/artifacts/text_block.component.wasm",
+      "component-hash": "blake3:8ab0a9ebe0261c63973cccabdbb5c5f04ac703486e8de890518bb2c91175b179",
+      "world": "renderer",
+      "max-memory-pages": 256,
+      "fuel": 50000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "fffe"
+        }
+      },
+      "invocation-hash": "blake3:5ff3df3e0914906218f0ec220c612a5ef1e778d4b44622cc427779b5598edb3d",
+      "expected": {
+        "outcome": "error",
+        "hash": "blake3:d7d665c40df3ea5d6276d9281039bd7a525f4de1a67de31911bc165dde8f232b"
+      }
+    }
+  ]
+}

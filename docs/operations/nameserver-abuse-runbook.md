@@ -176,10 +176,12 @@ issue attestations, and read or change everything in its databases.
 1. **Contain.** Stop the service (`sudo systemctl stop jig-nameserver`) or firewall it. Keep
    copies of both databases, the key file and the logs before changing anything.
 2. **Cut dependent servers loose.** Operators of servers with `[identity] mode =
-   "nameserver"` remove your URL from `trusted_nameservers`, or switch to another nameserver
-   or to `tofu`, and restart. Their cached resolutions expire within `cache_ttl_seconds`
-   (default 300). Servers do not verify attestation signatures yet, so changing the key
-   does not protect them; removing the URL does.
+   "nameserver"` remove your nameserver's `ns_did` from the `authorities` of each suffix
+   under `[identity.delegations]` (and your URL from its `nameservers`), or switch to
+   `tofu`, and restart. Servers accept only attestations an authority signed (#200), so an
+   attestation under the removed key is refused from then on. `trusted_nameservers` is no
+   longer used. Clients that list your suffix under `[naming.delegations]` need the same
+   change.
 3. **Find what changed.** Compare alias bindings in `nameserver_v002.db` and identities in
    `nameserver.db` against your latest backup. List every alias whose DID changed.
 4. **Rotate everything:**
@@ -188,7 +190,8 @@ issue attestations, and read or change everything in its databases.
    - `JIG_NS_ADMIN_TOKEN`: new value.
    - Attestation key: move `nameserver_v002.key` aside and let the service mint a new one,
      which gives the nameserver a new `ns_did`. Every attestation signed by the old key
-     must be treated as untrusted.
+     must be treated as untrusted. Dependent servers and clients accept the new key only
+     once its `ns_did` is in their delegation's `authorities`, so tell them the new DID.
    - `ns_identity` key: delete its row from `nameserver.db` so a new one is generated. This
      changes the `ns_id` in `/.well-known/jig-ns`.
 5. **Restore bindings.** Revert changed aliases from backup. Ask users to renew
