@@ -61,11 +61,7 @@ pub async fn publish(state: &Arc<AppState>) -> anyhow::Result<ManifestRef> {
         // with everything in it, under the reserved prefix, where only the
         // server writes, and start the log. Nothing anyone signed is lost.
         Some(channel) if channel.owner_did != server_did => {
-            let short = channel
-                .id
-                .get(channel.id.len().saturating_sub(12)..)
-                .unwrap_or("old");
-            let quarantine = format!("{QUARANTINE_PREFIX}{short}");
+            let quarantine = quarantine_slug(&channel.id);
             tracing::warn!(
                 owner = %jig_core::did::log_tag(&channel.owner_did),
                 to = %quarantine,
@@ -118,7 +114,16 @@ pub async fn publish(state: &Arc<AppState>) -> anyhow::Result<ManifestRef> {
 }
 
 /// Where a channel that held [`LOG_SLUG`] before it was reserved is moved.
-const QUARANTINE_PREFIX: &str = "#jig/quarantine/";
+const QUARANTINE_PREFIX: &str = "#jig/quarantine-";
+
+/// The slug the channel `channel_id` is moved to: [`QUARANTINE_PREFIX`] and
+/// 12 lowercase hex characters of the BLAKE3 of its id, so two channels
+/// never share one and the slug fits the reserved grammar
+/// (`#jig/[a-z0-9_-]{1,59}`).
+fn quarantine_slug(channel_id: &str) -> String {
+    let hash = hex::encode(blake3::hash(channel_id.as_bytes()).as_bytes());
+    format!("{QUARANTINE_PREFIX}{}", &hash[..12])
+}
 
 /// The manifest log's channel-create.
 fn log_create(state: &AppState) -> anyhow::Result<Vec<u8>> {
@@ -244,7 +249,18 @@ mod tests {
             .into_iter()
             .find(|c| c.owner_did == stranger)
             .expect("the old channel is kept");
-        assert_eq!(moved.slug, format!("{QUARANTINE_PREFIX}ReservedSlug"));
+        assert_eq!(
+            moved.slug,
+            quarantine_slug("bafyOldChannelAtTheReservedSlug")
+        );
+        // What follows `#jig/` fits the reserved grammar: [a-z0-9_-]{1,59}.
+        let rest = moved.slug.strip_prefix("#jig/").unwrap();
+        assert!(rest.len() <= 59, "{rest}");
+        assert!(
+            rest.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-'),
+            "{rest}"
+        );
         assert!(moved.slug.starts_with(QUARANTINE_PREFIX), "{}", moved.slug);
         assert!(
             store.channel_archived_at(&moved.slug).unwrap().is_some(),
