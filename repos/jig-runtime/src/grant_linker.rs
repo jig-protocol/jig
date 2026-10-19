@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use jig_core::grant::{Capability, Grant};
 use wasmtime::Engine;
-use wasmtime::component::{Component, InstancePre, Linker};
+use wasmtime::component::{Component, InstancePre, Linker, LinkerInstance};
 
 use crate::error::{Result, RuntimeError};
 
@@ -37,8 +37,9 @@ pub const TYPES_INTERFACE: &str = "jig:block/types@0.1.0";
 /// How many `InstancePre`s [`GrantLinkers::new`] keeps before evicting the oldest.
 pub const DEFAULT_PRE_CAPACITY: usize = 256;
 
-/// Adds one host interface to a linker.
-pub type Provider<T> = fn(&mut Linker<T>) -> wasmtime::Result<()>;
+/// Defines one host interface's functions. It is handed only that interface's instance, so it
+/// cannot define any other.
+pub type Provider<T> = fn(&mut LinkerInstance<'_, T>) -> wasmtime::Result<()>;
 
 type ImportSet = BTreeSet<Capability>;
 type PreKey = (String, ImportSet);
@@ -121,12 +122,13 @@ impl<T: 'static> GrantLinkers<T> {
                 capability.name()
             )));
         }
-        if self.providers.insert(capability, provider).is_some() {
+        if self.providers.contains_key(&capability) {
             return Err(RuntimeError::InvalidConfig(format!(
                 "{} provided twice",
                 capability.name()
             )));
         }
+        self.providers.insert(capability, provider);
         // A new provider can change what a cached linker would have refused.
         self.linkers.lock().expect("linker cache poisoned").clear();
         self.pres.lock().expect("pre cache poisoned").clear();
@@ -154,9 +156,11 @@ impl<T: 'static> GrantLinkers<T> {
                     .ok_or_else(|| RuntimeError::CapabilityDenied {
                         capability: format!("{} is not provided by this host", capability.name()),
                     })?;
-            provider(&mut linker).map_err(|e| {
+            let link_error = |e: wasmtime::Error| {
                 RuntimeError::InternalError(format!("linking {}: {e:#}", capability.name()))
-            })?;
+            };
+            let mut instance = linker.instance(&capability.name()).map_err(link_error)?;
+            provider(&mut instance).map_err(link_error)?;
         }
         let linker = Arc::new(linker);
         cache.insert(imports, Arc::clone(&linker));
@@ -229,11 +233,12 @@ mod tests {
     }
 
     /// A stand-in for the slice-6 provider: `jig:host/blocks` with one function.
-    fn dummy_blocks(linker: &mut Linker<()>) -> wasmtime::Result<()> {
-        linker
-            .instance("jig:host/blocks@0.1.0")?
-            .func_wrap("probe", |_store, (): ()| Ok((7u32,)))?;
-        Ok(())
+    fn dummy_blocks(instance: &mut LinkerInstance<'_, ()>) -> wasmtime::Result<()> {
+        instance.func_wrap("probe", |_store, (): ()| Ok((7u32,)))
+    }
+
+    fn other_blocks(instance: &mut LinkerInstance<'_, ()>) -> wasmtime::Result<()> {
+        instance.func_wrap("other", |_store, (): ()| Ok((0u32,)))
     }
 
     /// A component that imports `jig:host/blocks@0.1.0#probe` and calls it from a start function.
@@ -350,10 +355,16 @@ mod tests {
         l.for_grant(&Grant::empty()).unwrap();
         assert_eq!(l.linker_count(), 1, "effects add nothing to a linker");
         assert!(l.provide(Capability::State, dummy_blocks).is_err());
-        assert!(
-            l.provide(Capability::Blocks, dummy_blocks).is_err(),
-            "twice"
-        );
+    }
+
+    #[test]
+    fn a_refused_duplicate_provider_changes_nothing() {
+        let mut l = linkers();
+        l.for_grant(&blocks_grant()).unwrap();
+        assert!(l.provide(Capability::Blocks, other_blocks).is_err());
+        assert_eq!(l.linker_count(), 1, "caches kept");
+        l.instantiate_pre("blake3:a", &imports_blocks(), &blocks_grant())
+            .expect("the first provider still defines probe");
     }
 
     #[test]
