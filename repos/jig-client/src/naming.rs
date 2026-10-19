@@ -53,7 +53,9 @@ pub struct Delegations {
 /// What a name means (rule 6), and what a name pin is keyed by.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NameKey {
-    /// The full, normalised `alias@suffix`.
+    /// The normalised local part alone (`alice` in `alice@example.org`),
+    /// never the full name: `suffix` is its own field, so a name has exactly
+    /// one key.
     pub alias: String,
     pub suffix: String,
     pub root: Root,
@@ -81,8 +83,14 @@ pub struct NameEvidenceBundle {
     pub key: NameKey,
     /// Each attestation's COSE_Sign1 bytes. An equivocation carries both.
     pub attestations: Vec<Vec<u8>>,
+    /// The parties the bundle is held against: each attestation's signing
+    /// nameserver, in the same order as `attestations`. Each is also inside
+    /// its attestation's signed bytes, which is what makes it hold offline.
+    pub ns_dids: Vec<String>,
     /// The rotation links served with them, as served.
     pub links: Vec<Vec<u8>>,
+    /// When this client obtained them: Unix seconds on its own clock.
+    pub observed_at: i64,
 }
 
 /// Where evidence goes. Lane L7's `jig-evidence-v1` writer implements this
@@ -306,7 +314,9 @@ impl NameResolver {
                 .iter()
                 .map(|a| a.attestation.envelope.clone())
                 .collect(),
+            ns_dids: valid.iter().map(|a| a.attestation.ns_did.clone()).collect(),
             links: valid.iter().flat_map(|a| a.links.clone()).collect(),
+            observed_at: now,
         };
         evidence.record(&bundle).map_err(ResolveError::Evidence)?;
 
@@ -364,7 +374,7 @@ impl NameResolver {
         now: i64,
     ) -> Result<Authority, ResolveError> {
         let key = |root, root_id: &str| NameKey {
-            alias: name.as_alias(),
+            alias: name.alias.clone(),
             suffix: name.suffix.clone(),
             root,
             root_id: root_id.to_string(),
@@ -706,7 +716,7 @@ mod tests {
 
     fn config_key() -> NameKey {
         NameKey {
-            alias: "dj@dj.jig".into(),
+            alias: "dj".into(),
             suffix: "dj.jig".into(),
             root: Root::Config,
             root_id: "dj.jig".into(),
@@ -910,6 +920,58 @@ mod tests {
         let mut both = vec![a1, a2];
         both.sort();
         assert_eq!(kept, both);
+        let mut accused = bundles[0].ns_dids.clone();
+        accused.sort();
+        let mut want = vec![did_of(&ns1), did_of(&ns2)];
+        want.sort();
+        assert_eq!(accused, want);
+        assert_eq!(bundles[0].observed_at, NOW);
+    }
+
+    async fn resolve_body_as(
+        ns: &SigningKey,
+        body: serde_json::Value,
+    ) -> Result<Verified, ResolveError> {
+        let stub = Stub::start(None).await;
+        stub.route(RESOLVE, body.to_string());
+        resolver()
+            .resolve(
+                "dj@dj.jig",
+                &config(&[ns], &[&stub]),
+                &MemPins::default(),
+                &MemEvidence::default(),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn only_the_signed_attestation_counts_never_the_unsigned_hints() {
+        let (ns, alice, mallory) = (key(1), did_of(&key(9)), did_of(&key(66)));
+        let resolve = |body| resolve_body_as(&ns, body);
+
+        // Transitional hints beside the attestation name another DID: ignored.
+        let got = resolve(serde_json::json!({
+            "attestation": b64(&attest(&ns, &alice, "dj@dj.jig")),
+            "links": [],
+            "reachability": null,
+            "did": mallory,
+            "alias": "dj@dj.jig",
+            "valid_until": NOW + 100,
+        }))
+        .await
+        .unwrap();
+        assert!(
+            matches!(got, Verified::New(ref b) if b.did() == alice),
+            "{got:?}"
+        );
+
+        // Hints alone, with no attestation: refused, never read.
+        let err = resolve(serde_json::json!({
+            "did": alice, "alias": "dj@dj.jig", "valid_until": NOW + 100,
+        }))
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ResolveError::Malformed(_)), "{err:?}");
     }
 
     #[tokio::test]
