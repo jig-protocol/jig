@@ -147,6 +147,15 @@ pub async fn rotate(ctx: &CliContext, args: KeysRotateArgs) -> Result<()> {
     let old_id = ctx.identity()?;
     let old_did_str = old_id.did_string();
     let keys_dir = jig_client::identity::default_keys_dir();
+    // Checked before anything changes: once the nameserver has moved the
+    // alias, failing to move the old key aside would leave cli.toml on it.
+    let rotated = keys_dir.join(format!("{old_did_str}.jigkey.rotated"));
+    if rotated.exists() {
+        anyhow::bail!(
+            "{} exists already; move it somewhere safe before rotating again",
+            rotated.display()
+        );
+    }
 
     // 2. Mint a fresh keypair. This writes the new keyfile to disk.
     let new_id = Identity::create(&keys_dir, super::passphrase::key_access()?)

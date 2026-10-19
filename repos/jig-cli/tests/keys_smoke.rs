@@ -121,3 +121,68 @@ fn keys_renew_fails_loudly_when_no_cli_toml_or_keyfile() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn keys_rotate_refuses_before_changing_anything_when_a_rotated_key_exists() {
+    // A rotate that could not move the old key aside at the end would leave
+    // the nameserver on the new DID and cli.toml on the old one. It must
+    // refuse up front instead, before it mints a key or calls the nameserver.
+    let tmp = tempfile::tempdir().unwrap();
+    let jig = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_jig"))
+            .env("JIG_KEYCHAIN", "none")
+            .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+            .env(
+                "JIG_TEST_KEY_SECRET",
+                "jig cli tests: a fixed, public secret",
+            )
+            .env("HOME", tmp.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let init = jig(&["init", "rotator"]);
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&init.stdout);
+    let did = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("generated DID: "))
+        .expect("init prints the DID")
+        .trim()
+        .to_string();
+    let keys = tmp.path().join(".jig/keys");
+    std::fs::write(
+        keys.join(format!("{did}.jigkey.rotated")),
+        b"an earlier rotation",
+    )
+    .unwrap();
+    let keys_before: Vec<_> = std::fs::read_dir(&keys)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+
+    // An unreachable nameserver: reaching it would fail differently.
+    let out = jig(&[
+        "keys",
+        "rotate",
+        "rotator@x.jig",
+        "--nameserver",
+        "http://127.0.0.1:1",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("exists already"), "{stderr}");
+    let keys_after: Vec<_> = std::fs::read_dir(&keys)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        keys_before.len(),
+        keys_after.len(),
+        "a key was minted: {keys_after:?}"
+    );
+}
