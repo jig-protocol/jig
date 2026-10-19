@@ -138,6 +138,14 @@ enum Commands {
         action: ServerAction,
     },
 
+    /// What this device pinned and trusts: verify and pin a name
+    /// (`verify-name`), or move its pin after its holder confirms a new DID
+    /// (`accept-name`).
+    Trust {
+        #[command(subcommand)]
+        action: TrustAction,
+    },
+
     /// Create, join, delete, or list channels on the configured server via
     /// `/api/v1/channels*`.
     Channel {
@@ -282,6 +290,38 @@ enum NsAction {
         /// in cli.toml.
         #[arg(long)]
         nameserver: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TrustAction {
+    /// Resolve `name` (alias@suffix), verify it, and pin it on first sight; a
+    /// name that now resolves to another DID than the pinned one is refused.
+    VerifyName {
+        name: String,
+        /// Nameserver to ask (with `--authority`); otherwise the suffix's
+        /// delegation is discovered over DNS.
+        #[arg(long)]
+        nameserver: Vec<String>,
+        /// DID whose attestations count for the suffix.
+        #[arg(long)]
+        authority: Vec<String>,
+    },
+    /// Move the pin for `name` (alias@suffix) to the DID it resolves to now.
+    /// Only after its holder confirms that DID out of band: `--did` must name
+    /// exactly what the nameserver attests, or nothing changes.
+    AcceptName {
+        name: String,
+        /// The DID the holder confirmed.
+        #[arg(long)]
+        did: String,
+        /// Nameserver to ask (with `--authority`); otherwise the suffix's
+        /// delegation is discovered over DNS.
+        #[arg(long)]
+        nameserver: Vec<String>,
+        /// DID whose attestations count for the suffix.
+        #[arg(long)]
+        authority: Vec<String>,
     },
 }
 
@@ -494,6 +534,44 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(Commands::Trust { action }) = cli.command {
+        match action {
+            TrustAction::VerifyName {
+                name,
+                nameserver,
+                authority,
+            } => {
+                let delegations = cmd::trust::delegations_for(&name, nameserver, authority)?;
+                use jig_client::naming::Verified;
+                match cmd::trust::verify_name(&name, &delegations).await? {
+                    Verified::New(b) => println!(
+                        "{name} → {} (attested by {}); pinned on first contact.",
+                        b.did(),
+                        b.attestation.ns_did
+                    ),
+                    Verified::Pinned(b) | Verified::Rotated { binding: b, .. } => println!(
+                        "{name} → {} (attested by {}); matches this device's pin.",
+                        b.did(),
+                        b.attestation.ns_did
+                    ),
+                }
+            }
+            TrustAction::AcceptName {
+                name,
+                did,
+                nameserver,
+                authority,
+            } => {
+                let delegations = cmd::trust::delegations_for(&name, nameserver, authority)?;
+                match cmd::trust::accept_name(&name, &did, &delegations).await? {
+                    Some(old) => println!("{name} is now pinned to {did} (was {old})."),
+                    None => println!("{name} is now pinned to {did}."),
+                }
+            }
+        }
+        return Ok(());
+    }
+
     // Handle nameserver lookups early — read-only HTTP GETs against a
     // nameserver, nothing to do with the messaging pipeline.
     if let Some(Commands::Ns { action }) = cli.command {
@@ -638,6 +716,7 @@ async fn main() -> Result<()> {
         Some(Commands::Init { .. }) => unreachable!("init handled earlier"),
         Some(Commands::Keys { .. }) => unreachable!("keys handled earlier"),
         Some(Commands::Server { .. }) => unreachable!("server handled earlier"),
+        Some(Commands::Trust { .. }) => unreachable!("trust handled earlier"),
         Some(Commands::Channel { .. }) => unreachable!("channel handled earlier"),
         Some(Commands::Ns { .. }) => unreachable!("ns handled earlier"),
         // No subcommand. These used to post through the v0.0.1 `POST /blocks`
