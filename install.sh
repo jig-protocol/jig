@@ -274,7 +274,9 @@ allowed_block_kinds = ["text-render", "channel-create", "member-add", "member-re
 
 [identity]
 # TOFU mode: this server trusts whatever DID first claims an alias and pins it.
-# Switch to "nameserver" + populate trusted_nameservers to gate via a nameserver.
+# To gate via a nameserver, switch to "nameserver" and list each alias suffix
+# under [identity.delegations."<suffix>"] with authorities (DIDs) and
+# nameservers (URLs). trusted_nameservers is not used to resolve aliases.
 mode = "tofu"
 trusted_nameservers = []
 cache_ttl_seconds = 300
