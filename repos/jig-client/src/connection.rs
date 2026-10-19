@@ -240,9 +240,11 @@ impl Client {
             None => connect_async(&ws_url).await,
         }
         .map_err(|e| ClientError::Connect(e.to_string()))?;
+        // What the welcome must be bound to (JEP-0002 rule 12).
+        let tls_exporter = tls_exporter_of(ws.get_ref());
         let (mut sink, mut stream) = ws.split();
 
-        let welcome = match drive_handshake(&mut sink, &mut stream, &offer).await {
+        let welcome = match drive_handshake(&mut sink, &mut stream, &offer, &tls_exporter).await {
             Ok(welcome) => welcome,
             Err(err) => {
                 use jig_pipeline::handshake::close;
@@ -653,6 +655,25 @@ fn close_frame(code: u16, reason: &str) -> Message {
 
 /// Send hello and read the first frame. `Err` means the handshake did not
 /// establish: the caller closes with the code the error's class names.
+/// The TLS exporter value of a connection (RFC 9266), or nothing over
+/// plaintext. A TLS session that cannot export one leaves nothing to bind
+/// the welcome to, and the welcome check refuses it.
+fn tls_exporter_of(stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>) -> Vec<u8> {
+    match stream {
+        tokio_tungstenite::MaybeTlsStream::Rustls(tls) => tls
+            .get_ref()
+            .1
+            .export_keying_material(
+                [0u8; jig_pipeline::handshake::TLS_EXPORTER_LEN],
+                jig_pipeline::handshake::TLS_EXPORTER_LABEL,
+                None,
+            )
+            .map(|v| v.to_vec())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 async fn drive_handshake(
     sink: &mut (impl futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
     stream: &mut (
@@ -660,6 +681,7 @@ async fn drive_handshake(
              + Unpin
          ),
     offer: &jig_pipeline::handshake::ClientOffer,
+    tls_exporter: &[u8],
 ) -> Result<jig_pipeline::handshake::VerifiedWelcome, ClientError> {
     use futures_util::SinkExt;
 
@@ -695,7 +717,7 @@ async fn drive_handshake(
         match message {
             Message::Text(text) => {
                 use jig_pipeline::handshake::HandshakeResult;
-                return match pending.interpret(&text) {
+                return match pending.interpret_on(&text, tls_exporter) {
                     HandshakeResult::Established(welcome) => Ok(welcome),
                     HandshakeResult::Incompatible(refusal) => {
                         Err(ClientError::Incompatible(Box::new(refusal)))
@@ -754,6 +776,7 @@ mod tests {
             suites,
             capabilities,
             nonce,
+            peer_did,
         } = env.frame
         else {
             return None;
@@ -764,6 +787,7 @@ mod tests {
                 suites,
                 capabilities,
                 nonce,
+                peer_did,
             },
             &jig_pipeline::handshake::ServerOffer {
                 capabilities: jig_pipeline::handshake::Capabilities {
@@ -772,6 +796,7 @@ mod tests {
                     federation: false,
                     ..Default::default()
                 },
+                ..Default::default()
             },
         ) {
             Ok(statement) => jig_pipeline::handshake::seal(key, statement),
@@ -1287,10 +1312,9 @@ mod tests {
                     suites: vec!["none".to_string()],
                     capabilities: jig_pipeline::handshake::Capabilities::default(),
                     nonce,
+                    peer_did: None,
                 },
-                &jig_pipeline::handshake::ServerOffer {
-                    capabilities: jig_pipeline::handshake::Capabilities::default(),
-                },
+                &jig_pipeline::handshake::ServerOffer::default(),
             )
             .unwrap();
             // Signed, but the frame is carried as `none` while the advertisement
@@ -1387,6 +1411,8 @@ mod tests {
             capabilities: Default::default(),
             reputation: jig_pipeline::handshake::Reputation::none(),
             nonce: "n".to_string(),
+            server_nonce: "s".to_string(),
+            tls_exporter: String::new(),
             sig: String::new(),
         }))
         .unwrap();

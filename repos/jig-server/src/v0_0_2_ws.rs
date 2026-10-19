@@ -215,10 +215,14 @@ pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    exporter: Option<axum::Extension<crate::server::TlsExporter>>,
 ) -> Response {
     let conn_id = CONN_COUNTER.fetch_add(1, Ordering::SeqCst);
     let ip = peer.map(|p| p.0.0.ip());
-    ws.on_upgrade(move |socket| handle_socket(socket, state, conn_id, ip))
+    // What the welcome is bound to: this connection's TLS session, or
+    // nothing over plaintext.
+    let tls_exporter = exporter.map(|e| e.0.0.to_vec()).unwrap_or_default();
+    ws.on_upgrade(move |socket| handle_socket(socket, state, conn_id, ip, tls_exporter))
 }
 
 /// `[auth.rate_limit]` per remote address, on every request this router
@@ -293,14 +297,35 @@ async fn handle_socket(
     state: Arc<AppState>,
     conn_id: u64,
     ip: Option<std::net::IpAddr>,
+    tls_exporter: Vec<u8>,
 ) {
     metrics::connection_opened();
     // Per-connection channel: fanout delivers (StoredBlock, StoredReceipt) here.
     let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
-    let mut session = ConnState::default();
+    let mut session = ConnState {
+        tls_exporter,
+        ..ConnState::default()
+    };
 
     loop {
+        // A dialer that named a peer DID has until here to prove it.
+        let proof_deadline = session.awaiting_peer.as_ref().map(|p| p.deadline);
         tokio::select! {
+            () = async {
+                match proof_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                tracing::info!(conn_id, "closing: no peer_proof within the handshake wait");
+                let _ = socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: close::HANDSHAKE_FAILED,
+                        reason: "no peer_proof".into(),
+                    })))
+                    .await;
+                break;
+            }
             // --- Client → Server ---
             client_msg = socket.recv() => {
                 let Some(Ok(msg)) = client_msg else {
@@ -415,6 +440,22 @@ struct ConnState {
     did: Option<jig_core::did::Did>,
     handshaken: bool,
     close: Option<(u16, &'static str)>,
+    /// The TLS exporter value of this connection; empty over plaintext.
+    tls_exporter: Vec<u8>,
+    /// Set from the welcome until a dialer that named a `peer_did` proves it.
+    awaiting_peer: Option<AwaitingPeer>,
+    /// The server DID the dialer proved in the handshake (JEP-0002 rule 12).
+    /// Authenticated, not authorized: what it may do is the federation
+    /// rules' decision.
+    peer: Option<jig_core::did::Did>,
+}
+
+/// A handshake that ends with the dialer's [`Frame::PeerProof`].
+struct AwaitingPeer {
+    peer_did: String,
+    hello: String,
+    welcome: String,
+    deadline: tokio::time::Instant,
 }
 
 /// Why a channel subscription was not registered.
@@ -523,6 +564,7 @@ async fn handle_client_frame(
             suites,
             capabilities,
             nonce,
+            peer_did,
         } => {
             return complete_hello(
                 state,
@@ -533,12 +575,52 @@ async fn handle_client_frame(
                     suites,
                     capabilities,
                     nonce,
+                    peer_did,
                 },
+                text,
             )
             .await;
         }
         other => other,
     };
+    // A dialer that named a peer DID sends its proof next, and nothing else
+    // (a class 1 failure otherwise). Nobody else sends one.
+    if let Some(awaiting) = session.awaiting_peer.take() {
+        let Frame::PeerProof { sig } = &frame else {
+            session.close = Some((close::HANDSHAKE_FAILED, "expected peer_proof"));
+            return Ok(());
+        };
+        return match jig_pipeline::handshake::verify_peer_proof(
+            &awaiting.peer_did,
+            sig,
+            &awaiting.hello,
+            &awaiting.welcome,
+            &session.tls_exporter,
+        ) {
+            Ok(()) => {
+                session.peer = jig_core::did::Did::from_did_jig_string(&awaiting.peer_did).ok();
+                tracing::debug!(conn_id, peer = %awaiting.peer_did, "peer proved its DID");
+                Ok(())
+            }
+            Err(reason) => {
+                tracing::info!(conn_id, peer = %awaiting.peer_did, "peer_proof refused: {reason}");
+                session.close = Some((close::HANDSHAKE_FAILED, "peer_proof does not verify"));
+                Ok(())
+            }
+        };
+    }
+    if matches!(frame, Frame::PeerProof { .. }) {
+        let _ = send_error(
+            socket,
+            Some(400),
+            jig_pipeline::handshake::PROTOCOL_VIOLATION_CODE,
+            None,
+            "peer_proof answers a hello that named a peer_did",
+        )
+        .await;
+        session.close = Some((close::PROTOCOL_VIOLATION, "unexpected peer_proof"));
+        return Ok(());
+    }
     // A parsed frame that is not hello, before the welcome, is a protocol
     // violation: refused, then closed.
     if !session.handshaken {
@@ -568,7 +650,19 @@ async fn handle_client_frame(
                 let scope_str = scope.canonical_string();
 
                 let outcome = match auth {
-                    None => Some(crate::auth::GateOutcome::AuthMissing),
+                    // A peer that proved its DID in the handshake needs no
+                    // second proof per subscription; it is still admitted
+                    // and charged like any caller.
+                    None => match session.peer.clone() {
+                        Some(did) => match state.auth.admit_and_charge(did.as_str()) {
+                            Ok(()) => {
+                                session.did = Some(did);
+                                None
+                            }
+                            Err(o) => Some(o),
+                        },
+                        None => Some(crate::auth::GateOutcome::AuthMissing),
+                    },
                     Some(a) => {
                         let now_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -808,7 +902,8 @@ async fn handle_client_frame(
         | Frame::Block { .. }
         | Frame::Error { .. }
         | Frame::Welcome { .. }
-        | Frame::Refusal { .. } => Ok(()),
+        | Frame::Refusal { .. }
+        | Frame::PeerProof { .. } => Ok(()),
     }
 }
 
@@ -831,19 +926,37 @@ async fn complete_hello(
     socket: &mut WebSocket,
     session: &mut ConnState,
     hello: jig_pipeline::handshake::HelloView,
+    hello_text: &str,
 ) -> Result<(), String> {
+    if let Some(peer_did) = &hello.peer_did
+        && jig_core::did::Did::from_did_jig_string(peer_did).is_err()
+    {
+        let refusal = HelloRefusal::Malformed("peer_did is not a did:jig".to_string());
+        let _ = send_error(socket, Some(400), refusal.code(), None, refusal.message()).await;
+        session.close = Some((close::PROTOCOL_VIOLATION, "malformed hello"));
+        return Ok(());
+    }
     let offer = jig_pipeline::handshake::ServerOffer {
         capabilities: handshake_capabilities(state),
+        tls_exporter: session.tls_exporter.clone(),
     };
     match jig_pipeline::handshake::negotiate(&hello, &offer) {
         Ok(statement) => {
             let welcome = jig_pipeline::handshake::seal(&state.ingest_ctx.server_key, statement);
             let json = serde_json::to_string(&welcome).map_err(|err| err.to_string())?;
             socket
-                .send(Message::Text(json.into()))
+                .send(Message::Text(json.clone().into()))
                 .await
                 .map_err(|err| err.to_string())?;
             session.handshaken = true;
+            if let Some(peer_did) = hello.peer_did {
+                session.awaiting_peer = Some(AwaitingPeer {
+                    peer_did,
+                    hello: hello_text.to_string(),
+                    welcome: json,
+                    deadline: tokio::time::Instant::now() + jig_pipeline::handshake::WELCOME_WAIT,
+                });
+            }
             Ok(())
         }
         Err(refusal @ HelloRefusal::Malformed(_)) => {
@@ -1794,6 +1907,126 @@ mod tests {
                 "frame: {frame}"
             );
         }
+    }
+
+    /// A dialing server that proves its DID in the handshake (JEP-0002 rule
+    /// 12) is that DID on the connection: a listed peer subscribes to the
+    /// federation stream without a second proof.
+    #[tokio::test]
+    async fn a_peer_that_proves_its_did_needs_no_second_proof() {
+        let (state, url) = start_test_server().await;
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let peer_did =
+            jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
+        state.auth.trust_federation_peer(&peer_did).unwrap();
+        seed_channel(&state, "#hello");
+
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        crate::v0_0_2_federation::complete_peer_handshake(
+            &mut ws,
+            &state.server_did.to_did_jig_string(),
+            &[],
+            &key,
+        )
+        .await
+        .unwrap();
+        let sub = Envelope::new(Frame::Subscribe {
+            scope: Scope::Federation {
+                block_kinds: vec![],
+            },
+            auth: None,
+        });
+        ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let author = test_identity();
+        let block = build_text_render(&author, "#hello", "hi", test_hlc(&author));
+        let submit = Envelope::new(Frame::Submit {
+            bundle_b64: base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
+            sig_b64: base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
+        });
+        ws.send(TMessage::Text(
+            serde_json::to_string(&submit).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+        let mut got_block = false;
+        for _ in 0..2 {
+            match next_frame(&mut ws).await.frame {
+                Frame::Block { .. } => got_block = true,
+                Frame::Ack { .. } => {}
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+        assert!(got_block, "the proven peer's subscription delivers");
+    }
+
+    /// A hello that names a peer DID ends with that DID's proof over this
+    /// connection's transcript, or the connection (class 1, 4001).
+    #[tokio::test]
+    async fn a_dialer_that_does_not_prove_its_did_is_closed() {
+        let (state, url) = start_test_server().await;
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let peer_did =
+            jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
+        state.auth.trust_federation_peer(&peer_did).unwrap();
+
+        // Hello and welcome as the server saw them, for the dialer to sign.
+        async fn dial(
+            url: &str,
+            peer_did: Option<&str>,
+        ) -> (
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            String,
+            String,
+        ) {
+            let (mut ws, _) = connect_async(url).await.unwrap();
+            let (hello, _pending) =
+                jig_pipeline::handshake::begin(&jig_pipeline::handshake::ClientOffer {
+                    peer_did: peer_did.map(str::to_string),
+                    ..Default::default()
+                });
+            let hello = serde_json::to_string(&hello).unwrap();
+            ws.send(TMessage::Text(hello.clone().into())).await.unwrap();
+            let Some(Ok(TMessage::Text(welcome))) = ws.next().await else {
+                panic!("expected a welcome");
+            };
+            (ws, hello, welcome.to_string())
+        }
+        let send = |env: Envelope| TMessage::Text(serde_json::to_string(&env).unwrap().into());
+
+        // Anything but the proof first.
+        let (mut ws, _, _) = dial(&url, Some(&peer_did)).await;
+        let sub = Envelope::new(Frame::Subscribe {
+            scope: Scope::Federation {
+                block_kinds: vec![],
+            },
+            auth: None,
+        });
+        ws.send(send(sub)).await.unwrap();
+        assert_eq!(close_code(&mut ws).await, Some(close::HANDSHAKE_FAILED));
+
+        // A proof by another key, or over another transcript.
+        let stranger = jig_core::crypto::ed25519::generate_signing_key();
+        let (mut ws, hello, welcome) = dial(&url, Some(&peer_did)).await;
+        let proof = jig_pipeline::handshake::peer_proof(&stranger, &hello, &welcome, &[]);
+        ws.send(send(proof)).await.unwrap();
+        assert_eq!(close_code(&mut ws).await, Some(close::HANDSHAKE_FAILED));
+        let (mut ws, hello, _) = dial(&url, Some(&peer_did)).await;
+        let (_, _, other_welcome) = dial(&url, Some(&peer_did)).await;
+        let proof = jig_pipeline::handshake::peer_proof(&key, &hello, &other_welcome, &[]);
+        ws.send(send(proof)).await.unwrap();
+        assert_eq!(close_code(&mut ws).await, Some(close::HANDSHAKE_FAILED));
+
+        // A proof nobody asked for.
+        let (mut ws, hello, welcome) = dial(&url, None).await;
+        let proof = jig_pipeline::handshake::peer_proof(&key, &hello, &welcome, &[]);
+        ws.send(send(proof)).await.unwrap();
+        let _error = next_frame(&mut ws).await;
+        assert_eq!(close_code(&mut ws).await, Some(close::PROTOCOL_VIOLATION));
     }
 
     /// The close code the server ends the connection with.

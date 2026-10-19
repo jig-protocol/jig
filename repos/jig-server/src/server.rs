@@ -314,6 +314,86 @@ mod tests {
         task.abort();
     }
 
+    /// Over TLS a welcome is bound to the session it was signed on (JEP-0002
+    /// rule 12): a client on that session accepts it, a dialer proves its DID
+    /// over it, and a welcome checked against another session's value, as a
+    /// relay that terminates TLS would present it, is refused.
+    #[tokio::test]
+    async fn a_welcome_over_tls_is_bound_to_its_session() {
+        let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()])
+            .expect("self-signed cert");
+        let dir = tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, ck.cert.pem()).unwrap();
+        std::fs::write(&key_path, ck.signing_key.serialize_pem()).unwrap();
+        let (rustls_config, _) = load_rustls_config(&cert_path, &key_path).expect("rustls config");
+
+        let state = Arc::new(crate::v0_0_2::AppState::for_test().unwrap());
+        let server_did = state.server_did.to_did_jig_string();
+        let router = crate::v0_0_2_ws::build_v0_0_2_router(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = serve_tls(listener, router, rustls_config).await;
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ck.cert.der().clone()).unwrap();
+        let client_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+
+        let identity = jig_client::Identity::generate_and_save(dir.path()).unwrap();
+        let client = jig_client::Client::connect_with_tls(
+            &format!("wss://{bound}"),
+            identity,
+            jig_pipeline::handshake::ClientOffer::default(),
+            Some(client_config.clone()),
+        )
+        .await
+        .expect("a client on the session the welcome was signed on accepts it");
+        assert_eq!(
+            client.welcome().unwrap().tls_exporter.len(),
+            jig_pipeline::handshake::TLS_EXPORTER_LEN
+        );
+
+        let dial = || async {
+            let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
+                format!("wss://{bound}/api/v1/ws"),
+                None,
+                false,
+                Some(tokio_tungstenite::Connector::Rustls(client_config.clone())),
+            )
+            .await
+            .unwrap();
+            ws
+        };
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let mut ws = dial().await;
+        let exporter = crate::v0_0_2_federation::tls_exporter_of(ws.get_ref());
+        crate::v0_0_2_federation::complete_peer_handshake(&mut ws, &server_did, &exporter, &key)
+            .await
+            .expect("a dialer proves its DID over the session");
+
+        let mut ws = dial().await;
+        let elsewhere = [7u8; jig_pipeline::handshake::TLS_EXPORTER_LEN];
+        let err = crate::v0_0_2_federation::complete_peer_handshake(
+            &mut ws,
+            &server_did,
+            &elsewhere,
+            &key,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("another TLS session"), "{err}");
+
+        task.abort();
+    }
+
     /// Every request over TLS carries its session's exporter value: one value
     /// per session, so two connections never share one.
     #[tokio::test]
