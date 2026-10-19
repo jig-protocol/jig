@@ -230,7 +230,13 @@ fn a_renderer_may_import_only_what_its_grant_names() {
         max_calls: 1,
     }])
     .unwrap();
-    runtime
-        .compile_renderer(&component, &grant, MAX_MEMORY_PAGES)
-        .expect("a granted import passes");
+    // Validation passes; no host provides `compose` yet, so linking refuses it rather than
+    // stubbing it.
+    let Err(err) = runtime.compile_renderer(&component, &grant, MAX_MEMORY_PAGES) else {
+        panic!("a granted import with no provider is refused");
+    };
+    assert!(
+        matches!(&err, RuntimeError::CapabilityDenied { capability } if capability.contains("jig:host/compose")),
+        "{err:?}"
+    );
 }

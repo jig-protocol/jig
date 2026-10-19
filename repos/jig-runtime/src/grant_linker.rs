@@ -17,8 +17,12 @@
 //! Building a linker and pre-instantiating a component are both cached: linkers by the set of
 //! granted imports, `InstancePre`s by component hash and that set. Running the same block under
 //! the same grant shape costs one cache lookup.
+//!
+//! The linker cache is bounded by construction: its keys are subsets of the import capabilities.
+//! The `InstancePre` cache is keyed by component hashes, which come from untrusted installs, so it
+//! holds at most a fixed number of entries and evicts the oldest first.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use jig_core::grant::{Capability, Grant};
@@ -30,27 +34,81 @@ use crate::error::{Result, RuntimeError};
 /// The version of `jig:block/types` every linker defines as an empty instance.
 pub const TYPES_INTERFACE: &str = "jig:block/types@0.1.0";
 
+/// How many `InstancePre`s [`GrantLinkers::new`] keeps before evicting the oldest.
+pub const DEFAULT_PRE_CAPACITY: usize = 256;
+
 /// Adds one host interface to a linker.
 pub type Provider<T> = fn(&mut Linker<T>) -> wasmtime::Result<()>;
 
 type ImportSet = BTreeSet<Capability>;
+type PreKey = (String, ImportSet);
+
+/// `InstancePre`s with a fixed capacity, evicting in insertion order.
+struct PreCache<T: 'static> {
+    capacity: usize,
+    entries: HashMap<PreKey, InstancePre<T>>,
+    order: VecDeque<PreKey>,
+}
+
+impl<T: 'static> PreCache<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, key: &PreKey) -> Option<InstancePre<T>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: PreKey, pre: InstancePre<T>) {
+        if self.capacity == 0 || self.entries.contains_key(&key) {
+            return;
+        }
+        while self.entries.len() >= self.capacity {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, pre);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 /// The per-grant linkers of one engine.
 pub struct GrantLinkers<T: 'static> {
     engine: Engine,
     providers: BTreeMap<Capability, Provider<T>>,
     linkers: Mutex<HashMap<ImportSet, Arc<Linker<T>>>>,
-    pres: Mutex<HashMap<(String, ImportSet), InstancePre<T>>>,
+    pres: Mutex<PreCache<T>>,
 }
 
 impl<T: 'static> GrantLinkers<T> {
-    /// Linkers for `engine` with no host interfaces provided yet.
+    /// Linkers for `engine` with no host interfaces provided yet, keeping up to
+    /// [`DEFAULT_PRE_CAPACITY`] `InstancePre`s.
     pub fn new(engine: &Engine) -> Self {
+        Self::with_pre_capacity(engine, DEFAULT_PRE_CAPACITY)
+    }
+
+    /// As [`new`](Self::new), keeping up to `capacity` `InstancePre`s (0 caches none).
+    pub fn with_pre_capacity(engine: &Engine, capacity: usize) -> Self {
         Self {
             engine: engine.clone(),
             providers: BTreeMap::new(),
             linkers: Mutex::new(HashMap::new()),
-            pres: Mutex::new(HashMap::new()),
+            pres: Mutex::new(PreCache::new(capacity)),
         }
     }
 
@@ -119,7 +177,7 @@ impl<T: 'static> GrantLinkers<T> {
         let imports: ImportSet = grant.imports().collect();
         let key = (component_hash.to_string(), imports.clone());
         if let Some(pre) = self.pres.lock().expect("pre cache poisoned").get(&key) {
-            return Ok(pre.clone());
+            return Ok(pre);
         }
         let linker = self.for_imports(imports)?;
         let pre = linker
@@ -135,6 +193,11 @@ impl<T: 'static> GrantLinkers<T> {
     /// How many distinct linkers have been built (for tests and metrics).
     pub fn linker_count(&self) -> usize {
         self.linkers.lock().expect("linker cache poisoned").len()
+    }
+
+    /// How many `InstancePre`s are cached (for tests and metrics).
+    pub fn pre_count(&self) -> usize {
+        self.pres.lock().expect("pre cache poisoned").len()
     }
 }
 
@@ -303,6 +366,28 @@ mod tests {
         l.instantiate_pre("blake3:a", &c, &blocks_grant()).unwrap();
         l.instantiate_pre("blake3:a", &c, &blocks_grant()).unwrap();
         assert_eq!(l.linker_count(), 1);
-        assert_eq!(l.pres.lock().unwrap().len(), 1);
+        assert_eq!(l.pre_count(), 1);
+    }
+
+    #[test]
+    fn the_pre_cache_evicts_the_oldest_past_its_capacity() {
+        let mut l = GrantLinkers::with_pre_capacity(&engine_cache(), 2);
+        l.provide(Capability::Blocks, dummy_blocks).unwrap();
+        let c = imports_types_only();
+        let key = |h: &str| (h.to_string(), ImportSet::new());
+        for h in ["blake3:1", "blake3:2", "blake3:3"] {
+            l.instantiate_pre(h, &c, &Grant::empty()).unwrap();
+        }
+        assert_eq!(l.pre_count(), 2);
+        let pres = l.pres.lock().unwrap();
+        assert!(pres.get(&key("blake3:1")).is_none(), "oldest evicted");
+        assert!(pres.get(&key("blake3:2")).is_some());
+        assert!(pres.get(&key("blake3:3")).is_some());
+        drop(pres);
+
+        let none = GrantLinkers::<()>::with_pre_capacity(&engine_cache(), 0);
+        none.instantiate_pre("blake3:1", &c, &Grant::empty())
+            .expect("capacity 0 still links");
+        assert_eq!(none.pre_count(), 0);
     }
 }

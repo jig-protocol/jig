@@ -35,12 +35,13 @@ use jig_core::component_validation::{BlockWorld, ComponentProfile, validate_comp
 use jig_core::grant::Grant;
 use std::time::Duration;
 
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::Component;
 use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
 
 use crate::config::RuntimeConfig;
 use crate::engine::{EPOCH_TICK, EpochTicker, deadline_ticks, deterministic_config};
 use crate::error::{Result, RuntimeError};
+use crate::grant_linker::GrantLinkers;
 use crate::identity::EngineIdentity;
 
 wasmtime::component::bindgen!({
@@ -50,9 +51,6 @@ wasmtime::component::bindgen!({
 });
 
 pub use jig::block::types::{BlockError, Hlc, Invocation, Payload};
-
-/// The version of `jig:block/types` the host links as an empty instance.
-const TYPES_INTERFACE: &str = "jig:block/types@0.1.0";
 
 /// Why a run asserts nothing about the block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,7 +135,8 @@ struct HostState {
 /// Compiles and runs `jig:block` components under the `jig-det-1` profile.
 pub struct ComponentRuntime {
     engine: Engine,
-    linker: Linker<HostState>,
+    /// One linker per grant shape; see [`crate::grant_linker`].
+    linkers: GrantLinkers<HostState>,
     /// Advances `engine`'s epoch for render deadlines; stops when the runtime drops.
     _epoch_ticker: EpochTicker,
 }
@@ -152,15 +151,11 @@ impl ComponentRuntime {
         let engine = Engine::new(&config)
             .map_err(|e| RuntimeError::InternalError(format!("component engine: {e}")))?;
 
-        let mut linker = Linker::new(&engine);
-        // `jig:block/types` carries only types; every host links it as an empty instance.
-        linker
-            .instance(TYPES_INTERFACE)
-            .map_err(|e| RuntimeError::InternalError(format!("linking {TYPES_INTERFACE}: {e}")))?;
+        let linkers = GrantLinkers::new(&engine);
         let _epoch_ticker = EpochTicker::start(engine.clone(), EPOCH_TICK)?;
         Ok(Self {
             engine,
-            linker,
+            linkers,
             _epoch_ticker,
         })
     }
@@ -172,8 +167,9 @@ impl ComponentRuntime {
 
     /// Validate `bytes` against `jig-det-1` for the `renderer` world and `grant`, then compile it.
     ///
-    /// Only `grant`'s imports may be imported. This linker defines none of them yet, so a renderer
-    /// that calls a granted import passes validation and then fails to instantiate.
+    /// Only `grant`'s imports may be imported, and the linker defines only those. No host
+    /// interface has a provider yet, so a renderer whose grant names an import is refused at link
+    /// time.
     pub fn compile_renderer(
         &self,
         bytes: &[u8],
@@ -198,15 +194,16 @@ impl ComponentRuntime {
         }
         let component = Component::new(&self.engine, bytes)
             .map_err(|e| RuntimeError::InvalidWasm(e.to_string()))?;
+        let component_hash = format!("blake3:{}", blake3::hash(bytes).to_hex());
         let pre = self
-            .linker
-            .instantiate_pre(&component)
-            .and_then(RendererPre::new)
-            .map_err(|e| RuntimeError::InstantiationError(e.to_string()))?;
+            .linkers
+            .instantiate_pre(&component_hash, &component, grant)?;
+        let pre =
+            RendererPre::new(pre).map_err(|e| RuntimeError::InstantiationError(e.to_string()))?;
         Ok(CompiledRenderer {
             pre,
             max_memory_pages,
-            component_hash: format!("blake3:{}", blake3::hash(bytes).to_hex()),
+            component_hash,
         })
     }
 
@@ -314,7 +311,9 @@ mod tests {
             )
             .expect("store");
         let err = runtime
-            .linker
+            .linkers
+            .for_grant(&Grant::empty())
+            .expect("linker")
             .instantiate(&mut store, &component)
             .map(|_| ())
             .expect_err("an endless loop must stop");
@@ -347,7 +346,9 @@ mod tests {
         };
         let mut capped = runtime.store(1, &limits).expect("store");
         let err = runtime
-            .linker
+            .linkers
+            .for_grant(&Grant::empty())
+            .expect("linker")
             .instantiate(&mut capped, &component)
             .map(|_| ())
             .expect_err("growth past the cap must fail");
@@ -357,7 +358,9 @@ mod tests {
         );
         let mut roomy = runtime.store(16, &limits).expect("store");
         runtime
-            .linker
+            .linkers
+            .for_grant(&Grant::empty())
+            .expect("linker")
             .instantiate(&mut roomy, &component)
             .expect("growth within the cap succeeds");
     }
