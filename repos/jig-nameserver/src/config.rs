@@ -44,10 +44,10 @@ pub struct NameServerConfig {
     /// [`crate::server::build_app`] to boot `crate::v0_0_2::AppState`.
     ///
     /// Reuses jig-server's `JigServerConfig` verbatim so `[v0_0_2.nameserver]
-    /// alias_suffix` and `[v0_0_2.server] server_did_keyfile` mean exactly what
+    /// alias_suffixes` and `[v0_0_2.server] server_did_keyfile` mean exactly what
     /// they mean in a jig-server config. Only the keys the nameserver actually
     /// consumes are honoured (`server.server_did_keyfile`,
-    /// `identity.naively_allow_unknown_handles_fallback`, `nameserver.alias_suffix`);
+    /// `identity.naively_allow_unknown_handles_fallback`, `nameserver.alias_suffixes`);
     /// `server.allowed_block_kinds` is overridden with the ns-only allowlist by
     /// `v0_0_2::AppState::new`.
     #[serde(default)]
@@ -1348,8 +1348,33 @@ default_time_range = "last_day"  # Options: last_hour, last_day, last_week, last
 # GET /v1/resolve/:alias, GET /v1/handles, POST /v1/rotate, POST /v1/renew.
 # Same key names as a jig-server config (`JigServerConfig`).
 [v0_0_2.nameserver]
-# The suffix this nameserver is authoritative for: `<local>@<alias_suffix>`.
-alias_suffix = "gigue.jig"
+#
+# Required: the suffixes this nameserver serves, the part after `@` in
+# `alice@names.example.org`. There is no default; the nameserver refuses to
+# start without at least one. One DID holds at most one name per suffix.
+#
+# [[v0_0_2.nameserver.alias_suffixes]]
+# suffix = "names.example.org"
+# registration = "open"        # or "closed": existing names still resolve,
+#                              # renew and rotate; new ones are refused
+# min_alias_len = 3
+# # A single-label suffix such as `jig` needs `single_label_authority = true`:
+# # clients trust it only through their own config, so its names verify only
+# # for clients whose config names this nameserver's DID.
+# # Refused at registration, compared after dropping `-`, `_`, `.` and
+# # folding 0→o 1→i/l 3→e 4a 5s 7t. Defaults shown.
+# reserved = ["admin", "root", "support", "help", "security", "abuse", "official",
+#             "jig", "foundation", "team", "staff", "mod", "moderator", "system",
+#             "postmaster", "noreply"]
+# reserved_contains = ["official", "support", "jig"]   # anywhere in the alias
+# reserved_affixes = ["admin", "staff"]                # at either end
+#
+# # These DIDs may register exactly these aliases, even when the suffix is
+# # closed and regardless of length and reserved names. Removing an entry does
+# # not affect a name already registered.
+# [[v0_0_2.nameserver.alias_suffixes.registration_allow]]
+# did = "did:jig:z..."
+# aliases = ["alice"]
 
 [v0_0_2.server]
 # Ed25519 key that signs alias attestations. Left at the jig-server default
@@ -1511,13 +1536,6 @@ federation_enabled = true
     // --- [v0_0_2] alias-API section ----------------------------------------
 
     #[test]
-    fn default_config_validates() {
-        NameServerConfig::from_env()
-            .validate()
-            .expect("defaults need no secret");
-    }
-
-    #[test]
     fn retired_sections_are_ignored() {
         // Configs written before `[pow]` and `[rate_limits]` were removed must
         // keep loading.
@@ -1529,28 +1547,58 @@ base_difficulty = 18
 [rate_limits]
 per_key_per_min = 60
 per_ip_per_min = 120
+
+[[v0_0_2.nameserver.alias_suffixes]]
+suffix = "names.example.org"
 "#;
         let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
         cfg.validate().expect("valid");
     }
 
     #[test]
-    fn v0_0_2_alias_suffix_defaults_to_gigue_jig() {
+    fn v0_0_2_has_no_default_suffix() {
         let cfg = NameServerConfig::from_env();
-        assert_eq!(cfg.v0_0_2.nameserver.alias_suffix, "gigue.jig");
+        assert!(cfg.v0_0_2.nameserver.alias_suffixes.is_empty());
+        let err = cfg.validate().expect_err("no suffix, no start");
+        assert!(
+            err.to_string().contains("alias_suffixes is required"),
+            "{err}"
+        );
     }
 
     #[test]
-    fn v0_0_2_alias_suffix_is_operator_settable() {
+    fn the_template_names_no_suffix_and_so_does_not_start_unedited() {
+        let cfg: NameServerConfig = toml::from_str(TEMPLATE).expect("template parses");
+        let err = cfg.validate().expect_err("the operator must name a suffix");
+        assert!(
+            err.to_string().contains("alias_suffixes is required"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn v0_0_2_alias_suffixes_are_operator_settable() {
         let doc = r#"
-[v0_0_2.nameserver]
-alias_suffix = "dj.jig"
+[[v0_0_2.nameserver.alias_suffixes]]
+suffix = "names.example.org"
+
+[[v0_0_2.nameserver.alias_suffixes]]
+suffix = "jig"
+single_label_authority = true
+registration = "closed"
 
 [v0_0_2.server]
 server_did_keyfile = "/var/lib/jig-ns/ns.key"
 "#;
         let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
-        assert_eq!(cfg.v0_0_2.nameserver.alias_suffix, "dj.jig");
+        let suffixes: Vec<&str> = cfg
+            .v0_0_2
+            .nameserver
+            .alias_suffixes
+            .iter()
+            .map(|s| s.suffix.as_str())
+            .collect();
+        assert_eq!(suffixes, ["names.example.org", "jig"]);
         assert_eq!(
             cfg.v0_0_2.server.server_did_keyfile,
             "/var/lib/jig-ns/ns.key"
@@ -1558,14 +1606,41 @@ server_did_keyfile = "/var/lib/jig-ns/ns.key"
         cfg.validate().expect("valid");
     }
 
+    /// The deploy's nameserver config loads through `JIG_NS_CONFIG`'s path.
     #[test]
-    fn validate_rejects_a_malformed_alias_suffix() {
+    fn the_deploy_example_config_loads() {
+        let dir = std::env::temp_dir().join(format!("jig-ns-deploy-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("jig-nameserver.toml");
+        std::fs::write(
+            &path,
+            include_str!("../../../deploy/jig-nameserver.example.toml"),
+        )
+        .unwrap();
+        let cfg = NameServerConfig::load_from_path(&path).expect("loads and validates");
+        assert_eq!(
+            cfg.v0_0_2.nameserver.alias_suffixes[0].suffix,
+            "names.example.org"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_rejects_a_malformed_suffix_and_the_old_key() {
         let doc = r#"
-[v0_0_2.nameserver]
-alias_suffix = "dj@dj.jig"
+[[v0_0_2.nameserver.alias_suffixes]]
+suffix = "dj@dj.example"
 "#;
         let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
         let err = cfg.validate().expect_err("'@' in a suffix must be caught");
-        assert!(err.to_string().contains("alias_suffix"));
+        assert!(err.to_string().contains("'@'"), "{err}");
+
+        let doc = r#"
+[v0_0_2.nameserver]
+alias_suffix = "dj.jig"
+"#;
+        let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
+        let err = cfg.validate().expect_err("old key");
+        assert!(err.to_string().contains("alias_suffixes"), "{err}");
     }
 }
