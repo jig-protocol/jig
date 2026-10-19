@@ -465,8 +465,9 @@ a network layer jig does not provide.
   nameserver still parses rulesets and translation contracts and publishes them in
   `/.well-known/jig-ns`; nothing applies them. Its configuration still models reputation as
   per-user `ReputationZone` tiers, the model obligation 1 supersedes.
-  Redesign in progress: rulesets, reputation and transparency logs in JEP-0009 (draft,
-  #163); proof-of-work in JEP-0008 (#162); framing in #152.
+  Redesign in progress, in draft JEPs: rulesets, reputation and transparency logs in
+  [JEP-0009](../../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md); proof-of-work in [JEP-0008](../../repos/jig-spec/jep/jep-0008-proof-of-work.md); framing in lane R's
+  [framing doc](../superpowers/specs/2026-10-18-reputation-pow-tribunals-framing.md).
 - **None.** Reputation inputs, decay, vouching, numbers for servers and nameservers, and
   ruleset acknowledgement.
 
@@ -604,7 +605,7 @@ flowchart TB
   unknown-DID setting), and the block-kind allow-list. Nothing ties them into a declared
   ruleset, no server declares a level, and nothing is shared between servers.
 - **Removed prototype.** The nameserver's experimental policy-hash exchange and gossip
-  routes were removed in #154 (section 6.2). Redesign in progress: JEP-0009 (draft, #163).
+  routes were removed in #154 (section 6.2). Redesign in progress: [JEP-0009](../../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) (draft).
 
 ### 7.3 To be designed
 
@@ -690,9 +691,9 @@ a high-sec ruleset group, cross-checked.
   were deleted in #157 and #159, except `federation.rs`, which stays but serves no route. It
   explored the shape of obligation 2 and met none of it: its proof-of-work was per identity,
   its reputation model the superseded tier model, and its log kept by one nameserver with
-  nobody cross-checking it. The redesign is lane R's: the framing doc (#152) and the draft
-  JEP-0008 (proof-of-work, #162), JEP-0009 (rulesets, reputation, transparency logs, #163)
-  and JEP-0010 (abuse reports, tribunals, #166), none merged yet.
+  nobody cross-checking it. The redesign is lane R's: the [framing doc](../superpowers/specs/2026-10-18-reputation-pow-tribunals-framing.md) and the draft
+  [JEP-0008](../../repos/jig-spec/jep/jep-0008-proof-of-work.md) (proof-of-work), [JEP-0009](../../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) (rulesets, reputation, transparency
+  logs) and [JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md) (abuse reports, tribunals).
 
 ### 8.3 To be designed
 
@@ -1082,7 +1083,7 @@ some other way. jig chooses provable reporting and states its cost.
   operator decisions (admission bans and floors in `[auth.admission]`) and channel owners'
   kicks.
 - **Removed prototype.** The nameserver's experimental tribunal case records were removed
-  with its other legacy routes (section 8.2). The redesign is the JEP-0010 draft (#166).
+  with its other legacy routes (section 8.2). The redesign is the [JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md) draft.
 
 ### 13.3 To be designed
 
