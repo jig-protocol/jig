@@ -425,7 +425,7 @@ mod tests {
                 versions: vec![1],
                 suites: jig_pipeline::handshake::implemented_suite_names(),
                 capabilities: Default::default(),
-                nonce: "n-welcome".into(),
+                nonce: jig_pipeline::handshake::fresh_nonce(),
             },
             &ServerOffer {
                 capabilities: Default::default(),
@@ -440,7 +440,7 @@ mod tests {
         serde_json::to_string(&seal_refusal(
             key,
             &HelloRefusal::UnsupportedVersion("v1 only".into()),
-            "n-refusal",
+            &jig_pipeline::handshake::fresh_nonce(),
         ))
         .unwrap()
     }
