@@ -22,7 +22,7 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-const ALIAS_SUFFIX: &str = "h10.jig";
+const ALIAS_SUFFIX: &str = "h10.example.org";
 
 /// The verified attestation in a register or resolve response body.
 fn attestation_in(body: &serde_json::Value) -> naming::Attestation {
@@ -52,7 +52,8 @@ impl BinarySurface {
             .join("nameserver.key")
             .to_string_lossy()
             .into_owned();
-        cfg.v0_0_2.nameserver.alias_suffix = ALIAS_SUFFIX.to_string();
+        cfg.v0_0_2.nameserver.alias_suffixes =
+            vec![jig_config::v0_0_2_server::SuffixConfig::new(ALIAS_SUFFIX)];
         cfg.v0_0_2.debug.list_handles = list_handles;
         cfg.validate().context("config must be valid")?;
 
@@ -164,7 +165,7 @@ async fn build_app_serves_the_v0_0_2_alias_lifecycle() {
     let attestation = attestation_in(&registered);
     assert_eq!(
         attestation.alias, expected_alias,
-        "alias suffix must come from [v0_0_2.nameserver].alias_suffix"
+        "alias suffix must come from [v0_0_2.nameserver].alias_suffixes"
     );
     assert_eq!(attestation.did, did);
 

@@ -166,7 +166,7 @@ pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
     let v0_0_2_state = Arc::new(crate::v0_0_2::AppState::new(
         v0_0_2_cfg,
         db_sibling(&cfg.storage.database_path, "_v002.db"),
-        cfg.v0_0_2.nameserver.alias_suffix.clone(),
+        crate::v0_0_2_policy::Suffixes::from_config(&cfg.v0_0_2.nameserver)?,
     )?);
 
     // `merge` is safe here even though both halves register `/v1/challenge`:
@@ -278,7 +278,8 @@ mod tests {
     fn scratch_config(dir: &ScratchDir, alias_suffix: &str) -> NameServerConfig {
         let mut cfg = NameServerConfig::default();
         cfg.storage.database_path = dir.0.join("nameserver.db");
-        cfg.v0_0_2.nameserver.alias_suffix = alias_suffix.to_string();
+        cfg.v0_0_2.nameserver.alias_suffixes =
+            vec![jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix)];
         cfg.v0_0_2.server.server_did_keyfile = dir.0.join("ns.key").to_string_lossy().into_owned();
         // Off by default in production; on here so the route-presence assertions
         // exercise the mounted handler.
@@ -426,9 +427,64 @@ mod tests {
     #[tokio::test]
     async fn build_app_uses_the_configured_alias_suffix() {
         let dir = ScratchDir::new("alias-suffix");
-        let cfg = scratch_config(&dir, "deji.jig");
+        let cfg = scratch_config(&dir, "names.example.org");
         let app = build_app_parts(&cfg).expect("build_app_parts");
-        assert_eq!(app.v0_0_2_state.suffix(), "deji.jig");
+        assert_eq!(app.v0_0_2_state.suffix(), "names.example.org");
+    }
+
+    /// A database from before suffixes and case folding: the old table key and
+    /// a mixed-case alias in the old JSON encoding. Boot rebuilds the table and
+    /// lowercases the alias, so the name resolves as clients now ask for it.
+    #[tokio::test]
+    async fn boot_migrates_a_pre_suffix_database() {
+        let dir = ScratchDir::new("pre-suffix");
+        let cfg = scratch_config(&dir, "dj.jig");
+        let did = jig_core::Did::from_ed25519_pubkey(&[7; 32]).to_did_jig_string();
+        let now = chrono::Utc::now().timestamp();
+        // The nameserver's DID comes from its keyfile, written at first boot;
+        // then the database is replaced by one in the old shape.
+        let ns_did = build_app_parts(&cfg)
+            .expect("first boot")
+            .v0_0_2_state
+            .ns_did_string();
+        let db = db_sibling(&cfg.storage.database_path, "_v002.db");
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", db.display()));
+        }
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE alias_attestations (
+                     did TEXT NOT NULL, alias TEXT NOT NULL, ns_did TEXT NOT NULL,
+                     valid_from INTEGER NOT NULL, valid_until INTEGER NOT NULL,
+                     attestation_bytes BLOB NOT NULL, PRIMARY KEY (did, ns_did));",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO alias_attestations VALUES (?, 'DJ@dj.jig', ?, ?, ?, ?)",
+                rusqlite::params![
+                    did,
+                    ns_did,
+                    now - 10,
+                    now + 1000,
+                    br#"{"legacy":true}"#.to_vec()
+                ],
+            )
+            .unwrap();
+        }
+
+        let app = build_app_parts(&cfg).expect("second boot");
+        let router = crate::v0_0_2_resolve::build_resolve_router(app.v0_0_2_state.clone());
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/resolve/dj@dj.jig")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// Pins the well-known `policy` keys, and that the published rate limits

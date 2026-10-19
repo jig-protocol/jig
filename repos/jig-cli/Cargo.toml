@@ -68,6 +68,8 @@ ratatui = "0.30"
 crossterm = "0.29"
 
 [dev-dependencies]
+# `TestNameserver`: the real nameserver router, for `tests/nameserver_roundtrip.rs`.
+integration-tests = { path = "../integration-tests" }
 # Lets tests resolve `@jig` under the placeholder authority; never in a build.
 jig-core = { path = "../jig-core", features = ["test-default-authority"] }
 tempfile = "3.8"
