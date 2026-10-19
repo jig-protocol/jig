@@ -1096,6 +1096,7 @@ mod tests {
             sig_b64: Some(STANDARD.encode(&b.sender_sig)),
             receipts: vec![],
             delivery_cid: format!("delivery:{}", b.cid()),
+            ingest: None,
         })
         .unwrap()
     }
@@ -1229,6 +1230,7 @@ mod tests {
             sig_b64: None,
             receipts: vec![],
             delivery_cid: format!("delivery:{}", b.cid()),
+            ingest: None,
         })
         .unwrap()
     }

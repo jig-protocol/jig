@@ -4,7 +4,6 @@ pub mod analytics;
 pub mod config;
 pub mod error;
 pub mod federation;
-pub mod hot;
 pub mod identity;
 pub mod server;
 pub mod storage;
