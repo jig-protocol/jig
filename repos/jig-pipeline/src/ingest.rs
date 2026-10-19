@@ -3464,7 +3464,7 @@ mod tests {
             serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
         );
         let unassign = StoredBlock {
-            cid: "bafy_unassign_in_the_window".to_string(),
+            cid: crate::ingest_record::label_cid("unassign in the window"),
             channel_id: Some(chan.clone()),
             block_kind: "role-unassign".to_string(),
             sender_did: owner.did.clone(),
@@ -3519,7 +3519,7 @@ mod tests {
         let chain = ctx.store.list_ingest_records_by_id(&chan, 0, 50).unwrap();
         assert_eq!(
             chain.last().map(|r| r.block_cid.as_str()),
-            Some("bafy_unassign_in_the_window"),
+            Some(crate::ingest_record::label_cid("unassign in the window").as_str()),
             "the refused add got no record and the chain has no gap"
         );
         assert_eq!(chain.len(), 3);
