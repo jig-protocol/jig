@@ -115,6 +115,11 @@ Non-goals:
    - It MUST surface, not silently resolve, a `contract` delegation that disagrees with
      `dns` for the same suffix.
    - A party MUST NOT assert a `config` delegation to anyone else.
+   - A suffix of a single label (no `.`, such as `jig`) MUST NOT be `dns`-rooted. A resolver
+     MUST NOT run `dns` discovery for it, and MUST refuse a `dns` delegation for it. Such a
+     name is resolved through local DNS search domains, so `https://<suffix>/` would reach
+     whatever host the local network gives that name, under a certificate a local CA can
+     issue. A single-label suffix is `config`- or `contract`-rooted only.
 5. A resolver MUST NOT accept an attestation signed by a DID outside the suffix's
    authorities.
 6. A name means (alias, suffix, root, root_id), and a client pin is keyed by all four
