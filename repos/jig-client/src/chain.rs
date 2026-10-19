@@ -35,6 +35,11 @@ pub struct ChainHead {
     pub hash: String,
     pub ingest_wall_ms: u64,
     pub ingest_logical: u32,
+    /// The record itself, exactly as signed, so that a later record which
+    /// contradicts it can be shown with both halves ([`ChainProof`]). `None`
+    /// in a pin written before heads were kept whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<IngestRecord>,
 }
 
 impl ChainHead {
@@ -52,6 +57,7 @@ impl ChainHead {
             hash: hex::encode(record.hash()),
             ingest_wall_ms: record.ingest_wall_ms,
             ingest_logical: record.ingest_logical,
+            record: Some(record.clone()),
         }
     }
 }
@@ -89,6 +95,71 @@ pub enum ChainBreak {
     BadGenesis,
 }
 
+impl ChainBreak {
+    /// A stable name for the break, as evidence bundles file it.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Unsigned(_) => "chain-unsigned",
+            Self::OtherChannel { .. } => "chain-other-channel",
+            Self::OtherBlock { .. } => "chain-other-block",
+            Self::Forked { .. } => "chain-forked",
+            Self::Rewritten { .. } => "chain-rewritten",
+            Self::ClockBackwards { .. } => "chain-clock-backwards",
+            Self::BadGenesis => "chain-bad-genesis",
+        }
+    }
+
+    /// Whether the break is the sequencer signing two things that cannot both
+    /// hold, provable from its records alone: two records at one `seq`, a
+    /// `prev` that names another history, a clock that runs backwards, a
+    /// record 0 that names a previous one. A record that does not verify, or
+    /// one delivered with another block or on another channel, proves nothing
+    /// against the sequencer: anyone can sign with their own key, and which
+    /// record came with which block is not signed.
+    pub fn is_signed_proof(&self) -> bool {
+        matches!(
+            self,
+            Self::Forked { .. }
+                | Self::Rewritten { .. }
+                | Self::ClockBackwards { .. }
+                | Self::BadGenesis
+        )
+    }
+}
+
+/// A chain break as anyone can check it later: the records that contradict
+/// each other, exactly as the sequencer signed them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainProof {
+    pub channel_id: String,
+    pub sequencer: String,
+    /// The record the chain stood at; `None` for a bad record 0.
+    pub head: Option<IngestRecord>,
+    pub record: IngestRecord,
+}
+
+impl ChainProof {
+    /// Re-run the check that broke: both records must verify as the
+    /// sequencer's, on the channel, and break in a way
+    /// [`ChainBreak::is_signed_proof`] counts.
+    pub fn verify(&self) -> Result<ChainBreak, String> {
+        let mut chain = ChannelChain::new(&self.channel_id, &self.sequencer, None);
+        if let Some(head) = &self.head {
+            head.verify(&self.sequencer)
+                .map_err(|e| format!("the head record does not verify: {e}"))?;
+            if head.channel_id != self.channel_id {
+                return Err("the head record is for another channel".to_string());
+            }
+            chain.head = Some(ChainHead::of(head));
+        }
+        match chain.accept(&self.record, None) {
+            Err(e) if e.is_signed_proof() => Ok(e),
+            Err(e) => Err(format!("the records break, but prove nothing: {e}")),
+            Ok(_) => Err("the records do not contradict each other".to_string()),
+        }
+    }
+}
+
 /// One channel's chain as this client has verified it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelChain {
@@ -110,6 +181,26 @@ impl ChannelChain {
 
     pub fn head(&self) -> Option<&ChainHead> {
         self.head.as_ref()
+    }
+
+    /// What shows `broke`, which [`Self::accept`] returned for `record`, to
+    /// someone who does not trust this client: `None` when the break proves
+    /// nothing against the sequencer, or when the head it broke against was
+    /// pinned without its record.
+    pub fn proof(&self, record: &IngestRecord, broke: &ChainBreak) -> Option<ChainProof> {
+        if !broke.is_signed_proof() {
+            return None;
+        }
+        let head = match broke {
+            ChainBreak::BadGenesis => None,
+            _ => Some(self.head.as_ref()?.record.clone()?),
+        };
+        Some(ChainProof {
+            channel_id: self.channel_id.clone(),
+            sequencer: self.sequencer.clone(),
+            head,
+            record: record.clone(),
+        })
     }
 
     /// Check `record`, delivered with the block whose CID is `block_cid`
@@ -360,5 +451,74 @@ mod tests {
             other_channel.accept(&first, None),
             Err(ChainBreak::OtherChannel { .. })
         ));
+    }
+
+    #[test]
+    fn a_signed_break_carries_a_proof_anyone_can_check() {
+        let mut honest = Seq::new();
+        let did = honest.did();
+        let first = honest.push("bafyCreate", 10);
+        let second = honest.push("bafyPost", 20);
+        let mut fork = Seq {
+            key: honest.key.clone(),
+            records: vec![first.clone()],
+        };
+        let other_second = fork.push("bafyOther", 20);
+
+        let mut chain = ChannelChain::new(&label_cid("bafyCreate"), &did, None);
+        chain.accept(&first, None).unwrap();
+        chain.accept(&second, None).unwrap();
+        let broke = chain.accept(&other_second, None).unwrap_err();
+        let proof = chain
+            .proof(&other_second, &broke)
+            .expect("two records at seq 1");
+        assert_eq!(proof.head.as_ref(), Some(&second));
+        assert_eq!(proof.verify(), Ok(broke));
+
+        // Round-trips as kept, and fails once either half is not the
+        // sequencer's or the halves agree.
+        let kept: ChainProof =
+            serde_json::from_str(&serde_json::to_string(&proof).unwrap()).unwrap();
+        assert_eq!(kept.verify(), Ok(ChainBreak::Rewritten { seq: 1 }));
+        let mut agreeing = proof.clone();
+        agreeing.record = second.clone();
+        assert!(agreeing.verify().is_err());
+        let mut stranger = proof.clone();
+        stranger.sequencer = Seq::new().did();
+        assert!(stranger.verify().is_err());
+        let mut elsewhere = proof;
+        elsewhere.channel_id = label_cid("bafyElsewhere");
+        assert!(elsewhere.verify().is_err());
+    }
+
+    #[test]
+    fn a_break_that_proves_nothing_has_no_proof() {
+        let mut server = Seq::new();
+        let did = server.did();
+        let first = server.push("bafyCreate", 50);
+        let mut chain = ChannelChain::new(&label_cid("bafyCreate"), &did, None);
+        chain.accept(&first, None).unwrap();
+        let next = server.push("bafyPost", 60);
+        let broke = chain
+            .clone()
+            .accept(&next, Some(label_cid("bafyNotThisOne").as_str()))
+            .unwrap_err();
+        assert!(matches!(broke, ChainBreak::OtherBlock { .. }));
+        assert_eq!(chain.proof(&next, &broke), None);
+
+        // A head pinned without its record cannot show the other half.
+        let mut bare = chain.head().unwrap().clone();
+        bare.record = None;
+        let mut pinned = ChannelChain::new(&label_cid("bafyCreate"), &did, Some(bare));
+        let slow = {
+            let mut s = Seq {
+                key: server.key.clone(),
+                records: vec![first],
+            };
+            s.push("bafySlow", 10)
+        };
+        let broke = pinned.accept(&slow, None).unwrap_err();
+        assert!(broke.is_signed_proof());
+        assert_eq!(pinned.proof(&slow, &broke), None);
     }
 }

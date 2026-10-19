@@ -535,6 +535,42 @@ pub fn same_did(a: &str, b: &str) -> bool {
     matches!((key(a), key(b)), (Some(a), Some(b)) if a == b)
 }
 
+/// Check a kept welcome or refusal frame, long after its connection, as
+/// signed by `server_did`: its format, its signature and its own
+/// consistency, as [`PendingHello::interpret`] does, except that the nonce is
+/// taken from the frame. That proves the server signed it, not when or to
+/// whom: evidence bundles hold frames this way.
+pub fn verify_offline(text: &str, server_did: &str) -> HandshakeResult {
+    let env = match Envelope::parse(text) {
+        Ok(env) => env,
+        Err(e) => {
+            return HandshakeResult::FailClosed {
+                reason: format!("not a frame this build reads: {e}"),
+                evidence: Some(text.to_string()),
+            };
+        }
+    };
+    let nonce = match &env.frame {
+        Frame::Welcome { nonce, .. } | Frame::Refusal { nonce, .. } => nonce.clone(),
+        other => {
+            return HandshakeResult::FailClosed {
+                reason: format!("{} is not a signed handshake frame", frame_name(other)),
+                evidence: Some(text.to_string()),
+            };
+        }
+    };
+    let mut offer = ClientOffer {
+        versions: vec![u64::from(env.v)],
+        suites: vec![env.suite.as_str().to_string()],
+        pinned_server_did: Some(server_did.to_string()),
+        ..ClientOffer::default()
+    };
+    if let Frame::Welcome { suites, .. } = &env.frame {
+        offer.suites.extend(suites.iter().cloned());
+    }
+    interpret_envelope(&env, text, &nonce, &offer)
+}
+
 fn interpret_refusal(
     env: &Envelope,
     text: &str,
@@ -1089,6 +1125,47 @@ mod tests {
             }
             other => panic!("expected a contradiction, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_kept_frame_verifies_offline_against_its_signer_only() {
+        let key = generate_signing_key();
+        let did = Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
+        let other = Did::from_ed25519_pubkey(generate_signing_key().verifying_key().as_bytes())
+            .to_did_jig_string();
+        let (hello, pending) = begin(&ClientOffer::default());
+        let Frame::Hello { nonce, .. } = hello.frame else {
+            panic!("hello");
+        };
+        let welcome = serde_json::to_string(&seal(
+            &key,
+            negotiate(&hello_view(&nonce), &offer_server()).unwrap(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            verify_offline(&welcome, &did),
+            HandshakeResult::Established(w) if w.evidence == welcome
+        ));
+        let refusal = serde_json::to_string(&refusal_for(&pending, &key)).unwrap();
+        assert!(matches!(
+            verify_offline(&refusal, &did),
+            HandshakeResult::Incompatible(r) if r.evidence == refusal
+        ));
+        for text in [&welcome, &refusal] {
+            assert!(matches!(
+                verify_offline(text, &other),
+                HandshakeResult::FailClosed { .. }
+            ));
+        }
+        let tampered = welcome.replace("text-render", "text-rendex");
+        assert!(matches!(
+            verify_offline(&tampered, &did),
+            HandshakeResult::FailClosed { reason, .. } if reason.contains("signature")
+        ));
+        assert!(matches!(
+            verify_offline("{}", &did),
+            HandshakeResult::FailClosed { .. }
+        ));
     }
 
     #[test]

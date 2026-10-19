@@ -121,12 +121,32 @@ pub struct ServerPin {
     pub suites: BTreeSet<String>,
     #[serde(default)]
     pub channels: BTreeMap<String, ChannelPin>,
+    /// A welcome from this server that advertised [`Self::suites`],
+    /// verbatim, so a later signed refusal that drops one can be shown with
+    /// both halves ([`crate::evidence::Proof::Downgrade`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welcome: Option<String>,
+}
+
+/// A server this device refuses until its user accepts it again, after it
+/// signed a contradiction (JEP-0002 rule 16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StickyRefusal {
+    /// The bundle that shows it ([`crate::evidence::EvidenceStore`] id).
+    pub bundle: String,
+    pub reason: String,
+    pub at_ms: u64,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PinFile {
     #[serde(default)]
     servers: BTreeMap<String, ServerPin>,
+    /// Servers refused after a signed contradiction, by server key. Kept
+    /// apart from `servers` so that forgetting a server's pin does not lift
+    /// its refusal: only [`Pins::accept_server`] does.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    refused: BTreeMap<String, StickyRefusal>,
     /// Name pins (JEP-0004 rule 17), one per [`NameKey`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     names: Vec<NamePinEntry>,
@@ -278,10 +298,14 @@ impl Pins {
                     suite: dropped.clone(),
                 });
             }
-            let changed = first || pin.suites != advertised || pin.server_did != welcome.server_did;
+            let changed = first
+                || pin.suites != advertised
+                || pin.server_did != welcome.server_did
+                || pin.welcome.is_none();
             if changed {
                 pin.suites = advertised;
                 pin.server_did.clone_from(&welcome.server_did);
+                pin.welcome = Some(welcome.evidence.clone());
             }
             Ok(((), changed))
         })
@@ -373,6 +397,36 @@ impl Pins {
     }
 
     /// Drop everything pinned for `server`. Returns whether there was any.
+    /// Why `server` is refused, if it is: a contradiction it signed, kept as
+    /// a bundle. Every connection to it, WebSocket or REST, stops here until
+    /// [`Self::accept_server`].
+    pub fn refusal(&self, server: &str) -> Option<&StickyRefusal> {
+        self.file.refused.get(&server_key(server))
+    }
+
+    /// Refuse `server` from now on. A second contradiction keeps the first
+    /// refusal, which is what its user has to answer.
+    pub fn refuse(&mut self, server: &str, refusal: StickyRefusal) -> Result<(), PinError> {
+        self.update(|file| {
+            let key = server_key(server);
+            if file.refused.contains_key(&key) {
+                return Ok(((), false));
+            }
+            file.refused.insert(key, refusal);
+            Ok(((), true))
+        })
+    }
+
+    /// Lift `server`'s refusal (`jig trust accept`), returning it. Its pins
+    /// stay: the server is held to them again from the next connection.
+    pub fn accept_server(&mut self, server: &str) -> Result<Option<StickyRefusal>, PinError> {
+        self.update(|file| {
+            let lifted = file.refused.remove(&server_key(server));
+            let changed = lifted.is_some();
+            Ok((lifted, changed))
+        })
+    }
+
     pub fn forget(&mut self, server: &str) -> Result<bool, PinError> {
         self.update(|file| {
             let had = file.servers.remove(&server_key(server)).is_some();
@@ -895,6 +949,7 @@ mod tests {
             hash: format!("{seq:064x}"),
             ingest_wall_ms: seq,
             ingest_logical: 0,
+            record: None,
         };
         assert!(
             !pins.advance_chain(server, "#ops", &head(1)).unwrap(),
@@ -933,6 +988,48 @@ mod tests {
                 .chain_head,
             Some(head(2))
         );
+    }
+
+    #[test]
+    fn a_refused_server_stays_refused_until_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let server = "https://host:7117";
+        let mut pins = Pins::load(&path).unwrap();
+        let mut w = welcome("did:jig:zS", &["none", "mls"]);
+        w.evidence = "first".into();
+        pins.check_welcome(server, &w).unwrap();
+        w.evidence = "second".into();
+        pins.check_welcome(server, &w).unwrap();
+        assert_eq!(
+            pins.server(server).unwrap().welcome.as_deref(),
+            Some("first"),
+            "a welcome that changes nothing is not written again"
+        );
+
+        let refusal = |bundle: &str| StickyRefusal {
+            bundle: bundle.into(),
+            reason: "forked".into(),
+            at_ms: 1,
+        };
+        pins.refuse("wss://HOST:7117/", refusal("a")).unwrap();
+        pins.refuse(server, refusal("b")).unwrap();
+        let pins = Pins::load(&path).unwrap();
+        assert_eq!(
+            pins.refusal(server).unwrap().bundle,
+            "a",
+            "the first stands"
+        );
+
+        let mut pins = pins;
+        assert!(pins.forget(server).unwrap());
+        assert!(
+            pins.refusal(server).is_some(),
+            "forgetting the pin does not lift the refusal"
+        );
+        assert_eq!(pins.accept_server(server).unwrap().unwrap().bundle, "a");
+        assert!(Pins::load(&path).unwrap().refusal(server).is_none());
+        assert_eq!(pins.accept_server(server).unwrap(), None);
     }
 
     #[test]

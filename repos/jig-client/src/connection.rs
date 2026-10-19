@@ -85,6 +85,7 @@ pub struct Client {
     /// Set once the server contradicts its welcome. The connection is then
     /// closed, and every later call returns it.
     contradiction: Arc<StdMutex<Option<Contradiction>>>,
+    on_contradiction: Option<ContradictionHook>,
     /// Ranges of channel chains this session skipped over, for the caller to
     /// fill from the records endpoint.
     gaps: Arc<StdMutex<Vec<ChainGap>>>,
@@ -131,14 +132,36 @@ fn block_cid_of(bundle_b64: &str) -> Option<String> {
 
 /// The server contradicted something it signed (JEP-0002 rule 8).
 ///
-/// `evidence` holds the frames as received: the signed welcome or refusal
-/// first, then what contradicts it. Every item that proves the contradiction
-/// is signed by the server, so it can be checked without trusting this
-/// client.
+/// Every frame involved is kept as received. Only [`Self::proof`] is checked
+/// later without trusting this client: frames themselves are not signed, so
+/// a contradiction without one is evidence of what this client saw, not of
+/// what the server did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contradiction {
+    /// A stable name for what was contradicted, as evidence bundles file it.
+    pub code: &'static str,
     pub reason: String,
+    /// The signed welcome of the connection, verbatim; `None` when the
+    /// handshake itself was the contradiction.
+    pub welcome: Option<String>,
+    /// The frames that contradict it, as received.
     pub evidence: Vec<String>,
+    /// Server-signed items that show the contradiction on their own, when
+    /// there are any ([`crate::evidence::verify`]).
+    pub proof: Option<Box<crate::evidence::Proof>>,
+}
+
+/// Called once, from the connection's reader, when the server contradicts
+/// itself: the place to keep the evidence before anything else can fail.
+pub type ContradictionHook = Arc<dyn Fn(&Contradiction) + Send + Sync>;
+
+/// How [`Client::connect_with_options`] connects.
+#[derive(Default, Clone)]
+pub struct ConnectOptions {
+    pub offer: jig_pipeline::handshake::ClientOffer,
+    /// `None` uses the system's CA roots alone ([`Client::connect_with_tls`]).
+    pub tls: Option<std::sync::Arc<rustls::ClientConfig>>,
+    pub on_contradiction: Option<ContradictionHook>,
 }
 
 /// Per-channel delivery senders, keyed by channel slug.
@@ -260,6 +283,30 @@ impl Client {
         offer: jig_pipeline::handshake::ClientOffer,
         tls: Option<std::sync::Arc<rustls::ClientConfig>>,
     ) -> Result<Self, ClientError> {
+        Self::connect_with_options(
+            server_url,
+            identity,
+            ConnectOptions {
+                offer,
+                tls,
+                on_contradiction: None,
+            },
+        )
+        .await
+    }
+
+    /// [`Client::connect_with_tls`], calling `options.on_contradiction` with
+    /// any contradiction the server signs, in the handshake or after it.
+    pub async fn connect_with_options(
+        server_url: &str,
+        identity: Identity,
+        options: ConnectOptions,
+    ) -> Result<Self, ClientError> {
+        let ConnectOptions {
+            offer,
+            tls,
+            on_contradiction,
+        } = options;
         let url = Url::parse(server_url).map_err(|e| ClientError::BadUrl(e.to_string()))?;
         // Map http(s) → ws(s) if user gave HTTP scheme; otherwise leave alone.
         let scheme = match url.scheme() {
@@ -301,6 +348,9 @@ impl Client {
                 if let Some(code) = code {
                     let _ = sink.send(close_frame(code, "handshake failed")).await;
                 }
+                if let (ClientError::Contradiction(c), Some(hook)) = (&err, &on_contradiction) {
+                    hook(c);
+                }
                 let _ = sink.close().await;
                 return Err(err);
             }
@@ -339,18 +389,32 @@ impl Client {
         let chains_for_reader = chains.clone();
         let gaps_for_reader = gaps.clone();
         let write_tx_for_reader = write_tx.clone();
+        let hook_for_reader = on_contradiction.clone();
         tokio::spawn(async move {
             let _cleanup = ReaderCleanup {
                 pending_subscriptions: pending_subs_for_reader.clone(),
                 closed: closed_for_reader,
             };
-            let contradict = |reason: String, frame: &str| {
-                contradicted(
-                    &contradiction_for_reader,
-                    &write_tx_for_reader,
-                    reason,
-                    vec![welcome_text.clone(), frame.to_string()],
-                );
+            let contradict_with =
+                |code: &'static str,
+                 reason: String,
+                 frame: &str,
+                 proof: Option<Box<crate::evidence::Proof>>| {
+                    contradicted(
+                        &contradiction_for_reader,
+                        &write_tx_for_reader,
+                        hook_for_reader.as_ref(),
+                        Contradiction {
+                            code,
+                            reason,
+                            welcome: Some(welcome_text.clone()),
+                            evidence: vec![frame.to_string()],
+                            proof,
+                        },
+                    );
+                };
+            let contradict = |code: &'static str, reason: String, frame: &str| {
+                contradict_with(code, reason, frame, None);
             };
             while let Some(Ok(msg)) = stream.next().await {
                 if let Message::Text(text) = msg {
@@ -362,6 +426,7 @@ impl Client {
                         Ok(env) => env,
                         Err(EnvelopeParseError::Gate(gate)) => {
                             contradict(
+                                "frame-outside-welcome",
                                 format!("a frame outside the signed welcome: {gate}"),
                                 &text,
                             );
@@ -375,6 +440,7 @@ impl Client {
                     match env.frame {
                         Frame::Welcome { .. } | Frame::Refusal { .. } => {
                             contradict(
+                                "second-handshake-answer",
                                 "a second handshake answer on one connection".to_string(),
                                 &text,
                             );
@@ -394,6 +460,7 @@ impl Client {
                                 !jig_pipeline::handshake::same_did(&r.server_did, &welcome_did)
                             }) {
                                 contradict(
+                                    "receipt-other-server",
                                     format!(
                                         "a receipt names {}, not the server that signed the welcome",
                                         other.server_did
@@ -427,10 +494,15 @@ impl Client {
                                     }
                                     Ok(_) => {}
                                     Err(chain_break) => {
+                                        let proof = chain.proof(record, &chain_break).map(|p| {
+                                            Box::new(crate::evidence::Proof::Chain(Box::new(p)))
+                                        });
                                         drop(chains);
-                                        contradict(
+                                        contradict_with(
+                                            chain_break.code(),
                                             format!("the channel's history broke: {chain_break}"),
                                             &text,
+                                            proof,
                                         );
                                         break;
                                     }
@@ -492,6 +564,7 @@ impl Client {
             submit_ack_timeout_seconds: 5,
             welcome: Some(welcome),
             contradiction,
+            on_contradiction,
             gaps,
         })
     }
@@ -657,16 +730,16 @@ impl Client {
                         contradicted(
                             &self.contradiction,
                             &self.write_tx,
-                            format!(
-                                "the server refused `{kind}`, a block kind its welcome advertises"
-                            ),
-                            vec![
-                                self.welcome
-                                    .as_ref()
-                                    .map(|w| w.evidence.clone())
-                                    .unwrap_or_default(),
-                                serde_json::to_string(&error)?,
-                            ],
+                            self.on_contradiction.as_ref(),
+                            Contradiction {
+                                code: "kind-refused",
+                                reason: format!(
+                                    "the server refused `{kind}`, a block kind its welcome advertises"
+                                ),
+                                welcome: self.welcome.as_ref().map(|w| w.evidence.clone()),
+                                evidence: vec![serde_json::to_string(&error)?],
+                                proof: None,
+                            },
                         );
                         return Err(ClientError::Contradiction(
                             self.contradiction().expect("just recorded"),
@@ -720,15 +793,23 @@ fn lock_contradiction(
 fn contradicted(
     slot: &StdMutex<Option<Contradiction>>,
     write_tx: &mpsc::UnboundedSender<Message>,
-    reason: String,
-    evidence: Vec<String>,
+    hook: Option<&ContradictionHook>,
+    contradiction: Contradiction,
 ) {
     let mut guard = lock_contradiction(slot);
     if guard.is_some() {
         return;
     }
-    tracing::warn!("closing: the server contradicted what it signed: {reason}");
-    *guard = Some(Contradiction { reason, evidence });
+    tracing::warn!(
+        "closing: the server contradicted what it signed: {}",
+        contradiction.reason
+    );
+    *guard = Some(contradiction.clone());
+    drop(guard);
+    // Outside the lock: the hook may ask the client what happened.
+    if let Some(hook) = hook {
+        hook(&contradiction);
+    }
     let _ = write_tx.send(close_frame(
         jig_pipeline::handshake::close::CONTRADICTION,
         "contradiction",
@@ -797,8 +878,11 @@ async fn drive_handshake(
                     }
                     HandshakeResult::Contradiction { reason, evidence } => {
                         Err(ClientError::Contradiction(Contradiction {
+                            code: "refusal-downgrade",
                             reason,
+                            welcome: None,
                             evidence: vec![evidence],
+                            proof: None,
                         }))
                     }
                 };
@@ -1464,11 +1548,16 @@ mod tests {
         let client = Client::connect(&url, test_identity()).await.unwrap();
         let contradiction = await_contradiction(&client).await;
         assert!(contradiction.reason.contains("outside the signed welcome"));
-        assert_eq!(contradiction.evidence[1], v2);
+        assert_eq!(contradiction.code, "frame-outside-welcome");
+        assert_eq!(contradiction.evidence, [v2]);
         assert_eq!(
-            contradiction.evidence[0],
-            client.welcome().unwrap().evidence,
-            "the evidence starts with the signed welcome"
+            contradiction.welcome.as_deref(),
+            Some(client.welcome().unwrap().evidence.as_str()),
+            "the signed welcome is kept with it"
+        );
+        assert_eq!(
+            contradiction.proof, None,
+            "an unsigned frame proves nothing"
         );
         assert!(matches!(
             client.subscribe_channel("#hello").await,
@@ -1624,12 +1713,54 @@ mod tests {
             block_frame(&fork[1], &blocks[2].0),
         ];
         let (url, close_code) = start_scripted_server_with_key(key, frames).await;
-        let client = Client::connect(&url, test_identity()).await.unwrap();
+        let seen: Arc<StdMutex<Vec<Contradiction>>> = Arc::default();
+        let seen_by_hook = seen.clone();
+        let client = Client::connect_with_options(
+            &url,
+            test_identity(),
+            ConnectOptions {
+                on_contradiction: Some(Arc::new(move |c: &Contradiction| {
+                    seen_by_hook.lock().unwrap().push(c.clone());
+                })),
+                ..ConnectOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         let contradiction = await_contradiction(&client).await;
         assert!(
             contradiction.reason.contains("history broke"),
             "{}",
             contradiction.reason
+        );
+        assert_eq!(contradiction.code, "chain-rewritten");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            std::slice::from_ref(&contradiction),
+            "the hook ran once"
+        );
+
+        // What the hook was handed holds offline, against the welcome's key.
+        let server_did = client.welcome().unwrap().server_did.clone();
+        let bundle = crate::evidence::Bundle {
+            format: crate::evidence::BUNDLE_FORMAT.to_string(),
+            class: 3,
+            code: contradiction.code.to_string(),
+            reason: contradiction.reason.clone(),
+            server: url.clone(),
+            server_did,
+            observed_at_ms: 0,
+            welcome: contradiction.welcome.clone(),
+            items: contradiction.evidence.clone(),
+            proof: contradiction.proof.clone().map(|p| *p),
+        };
+        let checked = crate::evidence::verify(&bundle).unwrap();
+        assert!(
+            checked
+                .proven
+                .as_deref()
+                .is_some_and(|p| p.contains("record 1")),
+            "{checked:?}"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
