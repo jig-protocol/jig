@@ -541,12 +541,19 @@ async fn main() -> Result<()> {
                 authority,
             } => {
                 let delegations = cmd::trust::delegations_for(&name, nameserver, authority)?;
-                let binding = cmd::trust::verify_name(&name, &delegations).await?;
-                println!(
-                    "{name} → {} (attested by {})",
-                    binding.did(),
-                    binding.attestation.ns_did
-                );
+                use jig_client::naming::Verified;
+                match cmd::trust::verify_name(&name, &delegations).await? {
+                    Verified::New(b) => println!(
+                        "{name} → {} (attested by {}); pinned on first contact.",
+                        b.did(),
+                        b.attestation.ns_did
+                    ),
+                    Verified::Pinned(b) | Verified::Rotated { binding: b, .. } => println!(
+                        "{name} → {} (attested by {}); matches this device's pin.",
+                        b.did(),
+                        b.attestation.ns_did
+                    ),
+                }
             }
             TrustAction::AcceptName {
                 name,
