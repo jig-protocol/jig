@@ -147,12 +147,9 @@ impl AnalyticsBackend for SqliteAnalytics {
 
                 Ok(csv.into_bytes())
             }
-            ExportFormat::Parquet => {
-                // Parquet export requires tier2-analytics feature
-                Err(crate::error::NameServerError::Other(anyhow::anyhow!(
-                    "Parquet export requires tier2-analytics feature"
-                )))
-            }
+            ExportFormat::Parquet => Err(crate::error::NameServerError::Other(anyhow::anyhow!(
+                "Parquet export is not supported"
+            ))),
         }
     }
 

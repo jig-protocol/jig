@@ -105,7 +105,7 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
     // text, not into the alternate screen we would otherwise already own.
     // On an encrypted channel the reader replays it through the MLS session.
     let reader = Arc::new(Reader::open(&ctx, &args.channel).await?);
-    let (backlog, tidy) = reader.backlog(&id, &server_url).await;
+    let (backlog, tidy) = reader.backlog(&id, &server_url).await?;
     reader.tidy(tidy);
 
     let client = crate::cmd::secure::connect_pinned(&server_url, id)
@@ -187,6 +187,9 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
     // and prefer the explicit-teardown error over the loop's error
     // only if the loop itself succeeded.
     let leave_result = guard.leave();
+    if let Some(e) = crate::cmd::trust::live_contradiction(&client, &server_url) {
+        return Err(e);
+    }
     result.and(leave_result)
 }
 

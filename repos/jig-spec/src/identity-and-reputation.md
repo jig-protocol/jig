@@ -10,9 +10,10 @@
 >   case records, the transparency log, useful work and nameserver federation) is no longer
 >   served. Its routes were deleted in #154. Status lines below that described it now say
 >   so.
-> - **Being redesigned** (drafts, not yet merged): lane R's framing doc (#152), JEP-0008
->   proof-of-work and capacity pools (#162), JEP-0009 rulesets, reputation and transparency
->   logs (#163), and JEP-0010 abuse reports, tribunals and server lists (#166).
+> - **Being redesigned** (draft JEPs): lane R's [framing doc](https://github.com/jig-protocol/jig/blob/main/docs/superpowers/specs/2026-10-18-reputation-pow-tribunals-framing.md),
+>   [JEP-0008](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0008-proof-of-work.md) proof-of-work and capacity pools,
+>   [JEP-0009](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) rulesets, reputation and transparency logs, and
+>   [JEP-0010](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md) abuse reports, tribunals and server lists.
 > - **Required, not yet implemented or partial:** proof-of-work enforced by servers as a
 >   ruleset-set cost (only one-time admission proof-of-work exists, off by default) and on
 >   every nameserver binding endpoint, reputation reports from servers to nameservers and
@@ -218,7 +219,7 @@ carries `score`, `weight` (default 1.0), `observer`, optional `evidence` and opt
 legacy routes, so it records and returns no scores. Servers keep operator-seeded scores
 per ruleset for admission floors (`[auth.admission] records`) and report nothing to
 nameservers. Net computation across a ruleset group is not implemented; its redesign is the
-JEP-0009 draft (#163).
+[JEP-0009](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) draft.
 
 ### Rulesets and translation contracts
 
@@ -376,8 +377,8 @@ Rules:
 > and `/v1/handles` behind `[debug] list_handles`). The proof-of-work challenge flow,
 > penalties, rate limiting, `/v1/policy`, `/v1/resolve?name=`, the transparency and admin
 > routes, and federation below described a prototype whose routes were removed (#154). They
-> stay here as the design input that prototype explored; their redesign is the JEP-0008
-> draft (#162). `/.well-known/jig-ns` still publishes the `pow`, `rate_limit` and
+> stay here as the design input that prototype explored; their redesign is the
+> [JEP-0008](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0008-proof-of-work.md) draft. `/.well-known/jig-ns` still publishes the `pow`, `rate_limit` and
 > `automation` parameters; nothing enforces them.
 
 ### Endpoints
@@ -562,7 +563,7 @@ enforced. The nameserver's log:
 
 **Status:** not implemented. Servers keep no log. The nameserver's read endpoints
 (`GET /v1/transparency/entries`, `/hashes`, `/verify`) were removed with the legacy routes;
-it never wrote entries. Redesign: the JEP-0009 draft (#163).
+it never wrote entries. Redesign: the [JEP-0009](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) draft.
 
 ## Useful work
 
@@ -606,7 +607,7 @@ Panel selection and appeal mechanics need a JEP.
 **Status:** not implemented. The prototype's case records (`POST /v1/tribunal/cases`,
 `/v1/tribunal/cases/{id}/decision`) were removed with the legacy routes. Panels,
 signatures, appeals, penalties, logging and propagation were never implemented. Redesign:
-the JEP-0010 draft (#166).
+the [JEP-0010](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md) draft.
 
 ### Reporting abuse in encrypted channels
 

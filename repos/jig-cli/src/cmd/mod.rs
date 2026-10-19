@@ -9,6 +9,7 @@ pub mod common;
 pub mod display;
 pub mod dm;
 pub mod history;
+pub mod hub;
 pub mod init;
 pub mod keys;
 pub mod ns;

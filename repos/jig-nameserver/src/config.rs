@@ -1,7 +1,6 @@
 //! Configuration for the Jig Nameserver.
 
 use crate::error::{NameServerError, Result};
-use crate::types::ReputationScore;
 use jig_config;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -32,8 +31,6 @@ fn merge_tables(target: &mut toml::value::Table, source: &toml::value::Table) {
 pub struct NameServerConfig {
     pub network: NetworkConfig,
     pub storage: StorageConfig,
-    pub pow: PowConfig,
-    pub rate_limits: RateLimitConfig,
     pub penalties: PenaltyConfig,
     pub anonymous: AnonymousPolicy,
     pub federation: FederationConfig,
@@ -42,9 +39,7 @@ pub struct NameServerConfig {
     pub reputation: ReputationConfig,
     pub useful_work: UsefulWorkConfig,
     pub capabilities: CapabilitiesConfig,
-    pub runtime: RuntimeConfig,     // Phase E: Embedded WASM execution
     pub analytics: AnalyticsConfig, // Phase F: Analytics and insights
-    pub hot: HotConfig,             // Phase F Tier 2/3: Hot state backend (rate limiting, caching)
     /// v0.0.2 alias-API wiring (`[v0_0_2]`), consumed by
     /// [`crate::server::build_app`] to boot `crate::v0_0_2::AppState`.
     ///
@@ -58,17 +53,14 @@ pub struct NameServerConfig {
     #[serde(default)]
     pub v0_0_2: jig_config::v0_0_2_server::JigServerConfig,
     /// Per-IP and per-DID limits on the v0.0.2 `register`, `rotate` and
-    /// `renew` routes (`[alias_rate_limits]`). Separate from the legacy
-    /// `[rate_limits]`, which only the v0.0.1 challenge route read.
+    /// `renew` routes (`[alias_rate_limits]`).
     pub alias_rate_limits: AliasRateLimitConfig,
 }
 
 impl NameServerConfig {
     /// Load configuration from disk if available, otherwise fall back to env
-    /// defaults. The result is [`validate`](Self::validate)d, so a missing
-    /// `[pow].server_secret` surfaces as an `Err` the caller can log — it used
-    /// to panic inside `Default` during deserialization, which reached stderr
-    /// via the panic hook only and looked like a silent death under systemd.
+    /// defaults. The result is [`validate`](Self::validate)d, so a
+    /// misconfiguration surfaces as an `Err` the caller can log.
     pub fn load() -> Result<Self> {
         let cfg = Self::load_unvalidated()?;
         cfg.validate()?;
@@ -79,14 +71,6 @@ impl NameServerConfig {
     /// (and callers who want to patch a field before booting) can build an
     /// unvalidated config, and so failures are errors rather than panics.
     pub fn validate(&self) -> Result<()> {
-        if self.pow.server_secret.trim().is_empty() {
-            return Err(NameServerError::Other(anyhow::anyhow!(
-                "JIG_NS_SECRET env var is required. \
-                 Set it to a strong random secret (e.g. `openssl rand -hex 32`), \
-                 or set [pow].server_secret in the nameserver config file. \
-                 See .env.example for all required variables."
-            )));
-        }
         self.v0_0_2
             .nameserver
             .validate()
@@ -268,8 +252,6 @@ impl NameServerConfig {
         Self {
             network: NetworkConfig::from_env(),
             storage: StorageConfig::from_env(),
-            pow: PowConfig::from_env(),
-            rate_limits: RateLimitConfig::from_env(),
             penalties: PenaltyConfig::from_env(),
             anonymous: AnonymousPolicy::from_env(),
             federation: FederationConfig::from_env(),
@@ -278,9 +260,7 @@ impl NameServerConfig {
             reputation: ReputationConfig::from_env(),
             useful_work: UsefulWorkConfig::from_env(),
             capabilities: CapabilitiesConfig::from_env(),
-            runtime: RuntimeConfig::from_env(),
             analytics: AnalyticsConfig::from_env(),
-            hot: HotConfig::from_env(),
             v0_0_2: jig_config::v0_0_2_server::JigServerConfig::default(),
             alias_rate_limits: AliasRateLimitConfig::default(),
         }
@@ -290,10 +270,7 @@ impl NameServerConfig {
         // Allow env vars to override settings after TOML load for quick tweaks.
         self.network.merge_env();
         self.storage.merge_env();
-        self.pow.merge_env();
-        self.rate_limits.merge_env();
         self.analytics.merge_env();
-        self.hot.merge_env();
         self.penalties.merge_env();
         self.anonymous.merge_env();
         self.federation.merge_env();
@@ -302,7 +279,6 @@ impl NameServerConfig {
         self.reputation.merge_env();
         self.useful_work.merge_env();
         self.capabilities.merge_env();
-        self.runtime.merge_env();
     }
 
     fn normalize(&mut self) {
@@ -315,69 +291,6 @@ impl NameServerConfig {
             .iter_mut()
             .for_each(|d| *d = d.trim().to_lowercase());
         self.reputation.normalize();
-    }
-
-    pub fn compute_pow_difficulty(
-        &self,
-        base_bits: u16,
-        penalty_points: u32,
-        zone: ReputationZone,
-        reputation: Option<&ReputationScore>,
-        witness_weight: Option<f64>,
-    ) -> u16 {
-        let mut effective = base_bits;
-        let constrained_points = penalty_points.min(self.penalties.max_points);
-        let penalty_bits = self
-            .penalties
-            .step_bits
-            .saturating_mul(constrained_points as u16);
-        effective = effective.saturating_add(penalty_bits);
-
-        let mut multiplier = 1.0;
-        if let Some(score) = reputation {
-            multiplier *= self.reputation_multiplier(score);
-        }
-        let witness = witness_weight
-            .unwrap_or_else(|| self.automation.score_hint_from_penalty(constrained_points));
-        multiplier *= self.automation.multiplier(witness);
-        effective = ((effective as f64) * multiplier).round() as u16;
-
-        let minimum_zone = match zone {
-            ReputationZone::Anonymous if self.anonymous.enabled => self.anonymous.min_difficulty,
-            ReputationZone::High => self.pow.min_difficulty.saturating_add(2),
-            _ => self.pow.min_difficulty,
-        };
-        if effective < minimum_zone {
-            effective = minimum_zone;
-        }
-        if effective < self.pow.min_difficulty {
-            effective = self.pow.min_difficulty;
-        }
-        if effective > self.pow.max_difficulty {
-            effective = self.pow.max_difficulty;
-        }
-        effective
-    }
-
-    fn reputation_multiplier(&self, score: &ReputationScore) -> f64 {
-        let mut multiplier = 1.0;
-        if let Some(rule) = self
-            .reputation
-            .local_rulesets
-            .iter()
-            .find(|r| r.key == score.ruleset)
-            && let Some(rule_mult) = rule.pow_policy.multiplier
-        {
-            multiplier *= rule_mult;
-        }
-        let bounded_score = score.score.clamp(-1.0, 1.0);
-        let trust_factor = (1.0 - bounded_score * 0.25).clamp(0.25, 4.0);
-        multiplier *= trust_factor;
-        let weight = score.weight.clamp(0.0, 1.0);
-        if weight < 1.0 {
-            multiplier = 1.0 + (multiplier - 1.0) * weight;
-        }
-        multiplier.clamp(0.1, 8.0)
     }
 }
 
@@ -455,30 +368,12 @@ impl NetworkConfig {
 #[serde(default)]
 pub struct StorageConfig {
     pub database_path: PathBuf,
-
-    /// Storage backend type (truth database)
-    /// - Tier 1 (Potato): "sqlite" (default)
-    /// - Tier 2 (Prosumer): "postgres"
-    /// - Tier 3 (Hyperscale): "cockroachdb", "tidb"
-    #[serde(default = "default_storage_backend")]
-    pub backend: String,
-
-    /// Backend-specific configuration (key-value pairs passed to backend)
-    /// Example for Postgres: {"connection_string": "postgres://localhost/nameserver", "pool_size": "10"}
-    #[serde(default)]
-    pub backend_config: std::collections::HashMap<String, String>,
-}
-
-fn default_storage_backend() -> String {
-    "sqlite".to_string()
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             database_path: default_database_path(),
-            backend: default_storage_backend(),
-            backend_config: std::collections::HashMap::new(),
         }
     }
 }
@@ -489,83 +384,12 @@ impl StorageConfig {
         if let Ok(path) = std::env::var("JIG_NS_DB_PATH") {
             cfg.database_path = PathBuf::from(path);
         }
-        if let Ok(backend) = std::env::var("JIG_NS_STORAGE_BACKEND") {
-            cfg.backend = backend;
-        }
-        // Backend-specific config can be set via JIG_NS_STORAGE_BACKEND_<KEY>
-        // e.g., JIG_NS_STORAGE_BACKEND_CONNECTION_STRING=postgres://...
         cfg
     }
 
     fn merge_env(&mut self) {
         if let Ok(path) = std::env::var("JIG_NS_DB_PATH") {
             self.database_path = PathBuf::from(path);
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PowConfig {
-    pub server_secret: String,
-    pub base_difficulty: u16,
-    pub min_difficulty: u16,
-    pub max_difficulty: u16,
-}
-
-impl Default for PowConfig {
-    fn default() -> Self {
-        Self {
-            server_secret: default_server_secret(),
-            base_difficulty: default_base_pow(),
-            min_difficulty: default_min_pow(),
-            max_difficulty: default_max_pow(),
-        }
-    }
-}
-
-impl PowConfig {
-    fn from_env() -> Self {
-        let mut cfg = Self::default();
-        if let Ok(secret) = std::env::var("JIG_NS_SECRET") {
-            cfg.server_secret = secret;
-        }
-        if let Ok(bits) = std::env::var("JIG_NS_POW_DIFFICULTY")
-            && let Ok(parsed) = bits.parse::<u16>()
-        {
-            cfg.base_difficulty = parsed;
-        }
-        if let Ok(bits) = std::env::var("JIG_NS_POW_MIN")
-            && let Ok(parsed) = bits.parse::<u16>()
-        {
-            cfg.min_difficulty = parsed;
-        }
-        if let Ok(bits) = std::env::var("JIG_NS_POW_MAX")
-            && let Ok(parsed) = bits.parse::<u16>()
-        {
-            cfg.max_difficulty = parsed;
-        }
-        cfg
-    }
-
-    fn merge_env(&mut self) {
-        if let Ok(secret) = std::env::var("JIG_NS_SECRET") {
-            self.server_secret = secret;
-        }
-        if let Ok(bits) = std::env::var("JIG_NS_POW_DIFFICULTY")
-            && let Ok(parsed) = bits.parse::<u16>()
-        {
-            self.base_difficulty = parsed;
-        }
-        if let Ok(bits) = std::env::var("JIG_NS_POW_MIN")
-            && let Ok(parsed) = bits.parse::<u16>()
-        {
-            self.min_difficulty = parsed;
-        }
-        if let Ok(bits) = std::env::var("JIG_NS_POW_MAX")
-            && let Ok(parsed) = bits.parse::<u16>()
-        {
-            self.max_difficulty = parsed;
         }
     }
 }
@@ -589,54 +413,6 @@ impl Default for AliasRateLimitConfig {
             enabled: true,
             per_ip_per_min: 30,
             per_did_per_min: 10,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RateLimitConfig {
-    pub per_key_per_min: u32,
-    pub per_ip_per_min: u32,
-    pub global_per_min: Option<u32>,
-}
-
-impl Default for RateLimitConfig {
-    fn default() -> Self {
-        Self {
-            per_key_per_min: default_per_key_limit(),
-            per_ip_per_min: default_per_ip_limit(),
-            global_per_min: None,
-        }
-    }
-}
-
-impl RateLimitConfig {
-    fn from_env() -> Self {
-        let mut cfg = Self::default();
-        if let Ok(limit) = std::env::var("JIG_NS_RATE_PER_MIN")
-            && let Ok(parsed) = limit.parse::<u32>()
-        {
-            cfg.per_key_per_min = parsed;
-        }
-        if let Ok(limit) = std::env::var("JIG_NS_RATE_PER_IP_PER_MIN")
-            && let Ok(parsed) = limit.parse::<u32>()
-        {
-            cfg.per_ip_per_min = parsed;
-        }
-        cfg
-    }
-
-    fn merge_env(&mut self) {
-        if let Ok(limit) = std::env::var("JIG_NS_RATE_PER_MIN")
-            && let Ok(parsed) = limit.parse::<u32>()
-        {
-            self.per_key_per_min = parsed;
-        }
-        if let Ok(limit) = std::env::var("JIG_NS_RATE_PER_IP_PER_MIN")
-            && let Ok(parsed) = limit.parse::<u32>()
-        {
-            self.per_ip_per_min = parsed;
         }
     }
 }
@@ -1373,97 +1149,6 @@ impl CapabilitiesConfig {
     }
 }
 
-// Phase E: Runtime Embedding Configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RuntimeConfig {
-    /// Enable embedded WASM execution
-    pub enabled: bool,
-
-    /// Maximum fuel budget (instructions)
-    pub fuel_max: u64,
-
-    /// Maximum linear memory in MB
-    pub memory_max_mb: u32,
-
-    /// Wall-clock execution timeout in milliseconds
-    pub execution_timeout_ms: u64,
-
-    /// Allowed capabilities for nameserver-executed blocks
-    /// Limited to: storage.read:receipts:*, storage.write:attestations:*, net.fetch:federation:*
-    pub allowed_capabilities: Vec<String>,
-
-    /// Enable deterministic execution (strongly recommended)
-    pub deterministic: bool,
-
-    /// Enable WASI preview2
-    pub wasi_preview2: bool,
-}
-
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,            // Opt-in for Phase E
-            fuel_max: 5_000_000,       // 5M instructions
-            memory_max_mb: 32,         // 32MB
-            execution_timeout_ms: 250, // 250ms
-            allowed_capabilities: vec![
-                "storage.read:receipts:*".into(),
-                "storage.write:attestations:*".into(),
-                "net.fetch:federation:*".into(),
-            ],
-            deterministic: true,
-            wasi_preview2: true,
-        }
-    }
-}
-
-impl RuntimeConfig {
-    fn from_env() -> Self {
-        let mut cfg = Self::default();
-        if let Ok(val) = std::env::var("JIG_NS_RUNTIME_ENABLED") {
-            cfg.enabled = val == "true" || val == "1";
-        }
-        if let Ok(val) = std::env::var("JIG_RUNTIME_FUEL_MAX")
-            && let Ok(fuel) = val.parse()
-        {
-            cfg.fuel_max = fuel;
-        }
-        if let Ok(val) = std::env::var("JIG_RUNTIME_MEMORY_MAX_MB")
-            && let Ok(mem) = val.parse()
-        {
-            cfg.memory_max_mb = mem;
-        }
-        if let Ok(val) = std::env::var("JIG_RUNTIME_TIMEOUT_MS")
-            && let Ok(timeout) = val.parse()
-        {
-            cfg.execution_timeout_ms = timeout;
-        }
-        cfg
-    }
-
-    fn merge_env(&mut self) {
-        if let Ok(val) = std::env::var("JIG_NS_RUNTIME_ENABLED") {
-            self.enabled = val == "true" || val == "1";
-        }
-        if let Ok(val) = std::env::var("JIG_RUNTIME_FUEL_MAX")
-            && let Ok(fuel) = val.parse()
-        {
-            self.fuel_max = fuel;
-        }
-        if let Ok(val) = std::env::var("JIG_RUNTIME_MEMORY_MAX_MB")
-            && let Ok(mem) = val.parse()
-        {
-            self.memory_max_mb = mem;
-        }
-        if let Ok(val) = std::env::var("JIG_RUNTIME_TIMEOUT_MS")
-            && let Ok(timeout) = val.parse()
-        {
-            self.execution_timeout_ms = timeout;
-        }
-    }
-}
-
 // Phase F: Analytics Configuration
 
 /// Analytics configuration for nameserver metrics and insights
@@ -1475,17 +1160,6 @@ pub struct AnalyticsConfig {
 
     /// Default time range for analytics queries
     pub default_time_range: String, // "last_hour", "last_day", "last_week", "last_month"
-
-    /// Analytics backend type
-    /// - Tier 1 (Potato): "sqlite" (default)
-    /// - Tier 2 (Prosumer): "duckdb", "parquet"
-    /// - Tier 3 (Hyperscale): "clickhouse" (future)
-    pub backend: String,
-
-    /// Backend-specific configuration (key-value pairs passed to backend factory)
-    /// Example for DuckDB: {"database_path": "analytics.db", "parquet_export_path": "/data/parquet"}
-    #[serde(default)]
-    pub backend_config: std::collections::HashMap<String, String>,
 }
 
 impl Default for AnalyticsConfig {
@@ -1493,8 +1167,6 @@ impl Default for AnalyticsConfig {
         Self {
             enabled: true,
             default_time_range: "last_day".to_string(),
-            backend: "sqlite".to_string(), // Tier 1 default
-            backend_config: std::collections::HashMap::new(),
         }
     }
 }
@@ -1511,65 +1183,6 @@ impl AnalyticsConfig {
         if let Ok(val) = std::env::var("JIG_NS_ANALYTICS_DEFAULT_RANGE") {
             self.default_time_range = val;
         }
-        if let Ok(val) = std::env::var("JIG_NS_ANALYTICS_BACKEND") {
-            self.backend = val;
-        }
-        // Backend-specific config can be set via JIG_NS_ANALYTICS_BACKEND_<KEY>
-        // e.g., JIG_NS_ANALYTICS_BACKEND_DATABASE_PATH=/path/to/db
-    }
-}
-
-// Phase F Tier 2/3: Hot State Backend Configuration
-
-/// Hot state backend configuration for ephemeral data (rate limiting, caching, etc.)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct HotConfig {
-    /// Hot backend type
-    /// - Tier 1 (Potato): "memory" (default - in-memory HashMap)
-    /// - Tier 2 (Prosumer): "redis", "valkey", "dragonfly" (Redis-protocol compatible)
-    /// - Tier 3 (Hyperscale): "scylladb" (distributed persistent cache)
-    pub backend: String,
-
-    /// Backend-specific configuration (key-value pairs passed to backend factory)
-    /// Example for Redis: {"connection_string": "redis://localhost:6379", "pool_size": "5"}
-    /// Example for ScyllaDB: {"nodes": "node1:9042,node2:9042", "keyspace": "jig_hot"}
-    #[serde(default)]
-    pub backend_config: std::collections::HashMap<String, String>,
-
-    /// Fallback to in-memory if backend unavailable (Tier 2/3 only)
-    #[serde(default)]
-    pub fallback_to_memory: bool,
-}
-
-fn default_hot_backend() -> String {
-    "memory".to_string()
-}
-
-impl Default for HotConfig {
-    fn default() -> Self {
-        Self {
-            backend: default_hot_backend(),
-            backend_config: std::collections::HashMap::new(),
-            fallback_to_memory: true, // Safe default for Tier 2/3
-        }
-    }
-}
-
-impl HotConfig {
-    fn from_env() -> Self {
-        Self::default()
-    }
-
-    fn merge_env(&mut self) {
-        if let Ok(val) = std::env::var("JIG_NS_HOT_BACKEND") {
-            self.backend = val;
-        }
-        if let Ok(val) = std::env::var("JIG_NS_HOT_FALLBACK") {
-            self.fallback_to_memory = val == "true" || val == "1";
-        }
-        // Backend-specific config can be set via JIG_NS_HOT_BACKEND_<KEY>
-        // e.g., JIG_NS_HOT_BACKEND_CONNECTION_STRING=redis://localhost
     }
 }
 
@@ -1598,52 +1211,6 @@ fn default_database_path() -> PathBuf {
     std::env::var("JIG_NS_DB_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("nameserver.db"))
-}
-
-/// Empty when `JIG_NS_SECRET` is unset — deliberately NOT auto-generated and
-/// deliberately not a panic. A `Default` impl runs during deserialization of
-/// any config lacking `[pow].server_secret`, so panicking here killed the
-/// process before `tracing` was ever consulted. The empty value is caught by
-/// [`NameServerConfig::validate`]. Auto-generating would be worse: the secret
-/// is security-relevant, and a fresh one per restart invalidates every
-/// outstanding PoW challenge.
-fn default_server_secret() -> String {
-    std::env::var("JIG_NS_SECRET").unwrap_or_default()
-}
-
-fn default_base_pow() -> u16 {
-    std::env::var("JIG_NS_POW_DIFFICULTY")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(18)
-}
-
-fn default_min_pow() -> u16 {
-    std::env::var("JIG_NS_POW_MIN")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(8)
-}
-
-fn default_max_pow() -> u16 {
-    std::env::var("JIG_NS_POW_MAX")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(28)
-}
-
-fn default_per_key_limit() -> u32 {
-    std::env::var("JIG_NS_RATE_PER_MIN")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(60)
-}
-
-fn default_per_ip_limit() -> u32 {
-    std::env::var("JIG_NS_RATE_PER_IP_PER_MIN")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(120)
 }
 
 fn default_penalty_decay() -> i64 {
@@ -1693,24 +1260,6 @@ proxy_ip_header = "x-forwarded-for"
 [storage]
 database_path = "~/.jig/nameserver.db"
 
-# Truth backend selection (Tier 1: sqlite, Tier 2: postgres, Tier 3: cockroachdb/tidb)
-backend = "sqlite"  # Default: Tier 1
-
-# Backend-specific configuration (example for Postgres)
-# [storage.backend_config]
-# connection_string = "postgres://localhost/nameserver"
-# pool_size = "10"
-# max_connections = "20"
-
-[pow]
-server_secret = "replace-me"
-base_difficulty = 18
-min_difficulty = 8
-max_difficulty = 28
-
-[rate_limits]
-per_key_per_min = 60
-per_ip_per_min = 120
 
 # v0.0.2 register / rotate / renew. Refused requests get HTTP 429 with code
 # RATE_LIMITED and a Retry-After header.
@@ -1790,48 +1339,10 @@ tribunal_enabled = true
 transparency_enabled = true
 federation_enabled = false
 
-[runtime]
-enabled = false  # Phase E: Enable embedded WASM execution (opt-in)
-fuel_max = 5_000_000
-memory_max_mb = 32
-execution_timeout_ms = 250
-allowed_capabilities = [
-  "storage.read:receipts:*",
-  "storage.write:attestations:*",
-  "net.fetch:federation:*"
-]
-deterministic = true
-wasi_preview2 = true
-
 # Phase F: Analytics configuration
 [analytics]
 enabled = true
 default_time_range = "last_day"  # Options: last_hour, last_day, last_week, last_month
-
-# Analytics backend selection (Tier 1: sqlite, Tier 2: duckdb/parquet, Tier 3: clickhouse)
-backend = "sqlite"  # Default: Tier 1
-
-# Backend-specific configuration (example for DuckDB)
-# [analytics.backend_config]
-# database_path = "analytics.db"
-# parquet_export_path = "/data/parquet"
-# parquet_compression = "zstd"
-
-# Phase F Tier 2/3: Hot state backend configuration
-[hot]
-backend = "memory"  # Default: Tier 1 in-memory
-fallback_to_memory = true  # Fallback if Redis/ScyllaDB unavailable
-
-# Backend-specific configuration (examples)
-# For Redis/Valkey/DragonflyDB (Tier 2):
-# [hot.backend_config]
-# connection_string = "redis://localhost:6379"
-# pool_size = "5"
-
-# For ScyllaDB (Tier 3):
-# [hot.backend_config]
-# nodes = "node1:9042,node2:9042,node3:9042"
-# keyspace = "jig_hot"
 
 # v0.0.2 alias API — GET /v1/challenge, POST /v1/register,
 # GET /v1/resolve/:alias, GET /v1/handles, POST /v1/rotate, POST /v1/renew.
@@ -1853,38 +1364,12 @@ mod tests {
 
     #[test]
     fn default_config_is_sane() {
-        // Set required env var for test environment. Edition 2024 makes
-        // set_var unsafe; this test is single-threaded and runs once, so
-        // the requirements (no concurrent env access from other threads)
-        // are satisfied trivially.
-        unsafe {
-            std::env::set_var("JIG_NS_SECRET", "test-secret-for-unit-tests");
-        }
         let cfg = NameServerConfig::from_env();
-        assert!(!cfg.pow.server_secret.is_empty());
-        assert!(cfg.pow.base_difficulty >= cfg.pow.min_difficulty);
         assert_eq!(cfg.network.port, default_port());
         assert!(cfg.reputation.local_rulesets.is_empty());
         assert!(cfg.reputation.translation_contracts.is_empty());
         assert!(cfg.useful_work.assignment_ttl_secs > 0);
         assert!(cfg.useful_work.max_queue_depth > 0);
-    }
-
-    #[test]
-    fn compute_pow_respects_bounds() {
-        unsafe {
-            std::env::set_var("JIG_NS_SECRET", "test-secret-for-unit-tests");
-        }
-        let mut cfg = NameServerConfig::from_env();
-        cfg.pow.base_difficulty = 18;
-        cfg.pow.min_difficulty = 8;
-        cfg.pow.max_difficulty = 28;
-        cfg.penalties.step_bits = 3;
-        cfg.automation.enabled = true;
-        cfg.automation.max_multiplier = 4.0;
-        let diff = cfg.compute_pow_difficulty(18, 10, ReputationZone::Low, None, None);
-        assert!(diff >= cfg.pow.min_difficulty);
-        assert!(diff <= cfg.pow.max_difficulty);
     }
 
     #[test]
@@ -1914,8 +1399,8 @@ profile = "prod"
 bind = "127.0.0.1"
 port = 7070
 
-[nameserver.profiles.default.rate_limits]
-per_key_per_min = 10
+[nameserver.profiles.default.alias_rate_limits]
+per_ip_per_min = 10
 
 [nameserver.profiles.prod.network]
 bind = "0.0.0.0"
@@ -1935,7 +1420,7 @@ default_ruleset = "prod"
         let cfg = NameServerConfig::from_table(table, None).unwrap();
         assert_eq!(cfg.network.bind, "0.0.0.0");
         assert_eq!(cfg.network.port, 8080);
-        assert_eq!(cfg.rate_limits.per_key_per_min, 10);
+        assert_eq!(cfg.alias_rate_limits.per_ip_per_min, 10);
         assert_eq!(cfg.reputation.default_ruleset.as_deref(), Some("prod"));
     }
 
@@ -2023,52 +1508,34 @@ federation_enabled = true
         assert!(!cfg.capabilities.federation_enabled);
     }
 
-    // --- startup validation -------------------------------------------------
-    //
-    // These two tests mutate JIG_NS_SECRET. Safe under `cargo nextest`, which
-    // runs every test in its own process; they would race under `cargo test`'s
-    // shared-process threads.
-
-    #[test]
-    fn missing_secret_yields_empty_default_instead_of_panicking() {
-        unsafe {
-            std::env::remove_var("JIG_NS_SECRET");
-        }
-        // A `Default` impl must never panic — the panic used to fire during
-        // *deserialization* of any config lacking `[pow].server_secret`.
-        let cfg = NameServerConfig::from_env();
-        assert!(cfg.pow.server_secret.is_empty());
-
-        let err = cfg
-            .validate()
-            .expect_err("empty server_secret must fail validation");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("JIG_NS_SECRET"),
-            "operator-facing message must name the env var, got: {msg}"
-        );
-        assert!(
-            msg.contains("openssl rand -hex 32"),
-            "operator-facing message must keep the remediation hint, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn configured_secret_passes_validation() {
-        unsafe {
-            std::env::set_var("JIG_NS_SECRET", "test-secret-for-unit-tests");
-        }
-        let cfg = NameServerConfig::from_env();
-        cfg.validate().expect("a configured secret validates");
-    }
-
     // --- [v0_0_2] alias-API section ----------------------------------------
 
     #[test]
+    fn default_config_validates() {
+        NameServerConfig::from_env()
+            .validate()
+            .expect("defaults need no secret");
+    }
+
+    #[test]
+    fn retired_sections_are_ignored() {
+        // Configs written before `[pow]` and `[rate_limits]` were removed must
+        // keep loading.
+        let doc = r#"
+[pow]
+server_secret = "old"
+base_difficulty = 18
+
+[rate_limits]
+per_key_per_min = 60
+per_ip_per_min = 120
+"#;
+        let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
+        cfg.validate().expect("valid");
+    }
+
+    #[test]
     fn v0_0_2_alias_suffix_defaults_to_gigue_jig() {
-        unsafe {
-            std::env::set_var("JIG_NS_SECRET", "test-secret-for-unit-tests");
-        }
         let cfg = NameServerConfig::from_env();
         assert_eq!(cfg.v0_0_2.nameserver.alias_suffix, "gigue.jig");
     }
@@ -2081,9 +1548,6 @@ alias_suffix = "dj.jig"
 
 [v0_0_2.server]
 server_did_keyfile = "/var/lib/jig-ns/ns.key"
-
-[pow]
-server_secret = "s"
 "#;
         let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
         assert_eq!(cfg.v0_0_2.nameserver.alias_suffix, "dj.jig");
@@ -2099,9 +1563,6 @@ server_secret = "s"
         let doc = r#"
 [v0_0_2.nameserver]
 alias_suffix = "dj@dj.jig"
-
-[pow]
-server_secret = "s"
 "#;
         let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
         let err = cfg.validate().expect_err("'@' in a suffix must be caught");

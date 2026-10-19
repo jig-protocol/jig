@@ -34,9 +34,6 @@ tokio = { workspace = true }
 tokio-util = "0.7"
 futures = "0.3"
 
-# Database
-rusqlite = { workspace = true }
-
 # Web framework
 axum = { version = "0.8", features = ["ws"] }
 # tower 0.5 to match the dev-deps entry below; having both 0.4 and 0.5 in the

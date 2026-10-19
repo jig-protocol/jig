@@ -799,7 +799,7 @@ mod tests {
             .ingest_ctx
             .store
             .upsert_channel(&StoredChannel {
-                id: "bafyChanX".into(),
+                id: jig_pipeline::ingest_record::label_cid("chan x"),
                 slug: "#dm/x".into(),
                 // Open: in v0.2 only open, unencrypted channels federate; see
                 // `peer_blocks_for_channels_that_do_not_federate_are_dropped`.
@@ -813,7 +813,7 @@ mod tests {
             .ingest_ctx
             .store
             .upsert_membership(&StoredMembership {
-                channel_id: "bafyChanX".into(),
+                channel_id: jig_pipeline::ingest_record::label_cid("chan x"),
                 member_did: managed_did.clone(),
                 role: "member".into(),
                 joined_at: 0,
@@ -870,7 +870,10 @@ mod tests {
             .await
             .expect("bridge sink should receive the federated block")
             .expect("delivery present");
-        assert_eq!(got.0.channel_id.as_deref(), Some("bafyChanX"));
+        assert_eq!(
+            got.0.channel_id.as_deref(),
+            Some(jig_pipeline::ingest_record::label_cid("chan x").as_str())
+        );
         assert_eq!(got.0.sender_did, sender_did.to_did_jig_string());
     }
 
@@ -898,7 +901,7 @@ mod tests {
                 .ingest_ctx
                 .store
                 .upsert_channel(&StoredChannel {
-                    id: format!("bafy{slug}"),
+                    id: jig_pipeline::ingest_record::label_cid(slug),
                     slug: slug.into(),
                     visibility: visibility.into(),
                     created_at: 0,
@@ -1165,7 +1168,7 @@ mod tests {
             .ingest_ctx
             .store
             .upsert_channel(&StoredChannel {
-                id: "bafyOpen".into(),
+                id: jig_pipeline::ingest_record::label_cid("#open"),
                 slug: "#open".into(),
                 visibility: "open".into(),
                 created_at: 0,
@@ -1190,7 +1193,7 @@ mod tests {
             state
                 .ingest_ctx
                 .store
-                .list_members("bafyOpen")
+                .list_members(&jig_pipeline::ingest_record::label_cid("#open"))
                 .unwrap()
                 .is_empty(),
             "a refused member-add must add nobody"
@@ -1212,7 +1215,7 @@ mod tests {
             .ingest_ctx
             .store
             .upsert_channel(&jig_pipeline::persist::StoredChannel {
-                id: "bafyRemote".into(),
+                id: jig_pipeline::ingest_record::label_cid("#remote"),
                 slug: "#remote".into(),
                 visibility: "open".into(),
                 created_at: 0,
