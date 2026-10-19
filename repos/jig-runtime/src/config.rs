@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{Result, RuntimeError};
@@ -11,9 +10,6 @@ use crate::error::{Result, RuntimeError};
 pub struct RuntimeConfig {
     /// Resource limits for execution
     pub limits: ResourceLimits,
-
-    /// Capability allowlist and quotas
-    pub capabilities: CapabilityConfig,
 
     /// Fuel metering configuration
     pub fuel: FuelConfig,
@@ -145,48 +141,6 @@ impl Default for ResourceLimits {
     }
 }
 
-/// Capability configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CapabilityConfig {
-    /// Explicitly allowed capabilities (canonical names)
-    pub allowed: Vec<String>,
-
-    /// Per-capability quotas (optional)
-    pub quotas: HashMap<String, CapabilityQuota>,
-
-    /// Optional map of scopes supported by this host; used to validate usage keys.
-    #[serde(default)]
-    pub scope_policies: HashMap<String, Vec<String>>,
-
-    /// Deny all capabilities by default
-    pub deny_by_default: bool,
-}
-
-impl Default for CapabilityConfig {
-    fn default() -> Self {
-        Self {
-            allowed: vec![],
-            quotas: HashMap::new(),
-            scope_policies: HashMap::new(),
-            deny_by_default: true,
-        }
-    }
-}
-
-/// Quota limits for a specific capability
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CapabilityQuota {
-    /// Maximum calls per execution
-    pub max_calls: Option<u32>,
-
-    /// Maximum bytes transferred (in/out)
-    pub max_bytes: Option<u64>,
-
-    /// Capability-specific fuel allocation
-    pub fuel_allocation: Option<u64>,
-}
-
 /// Fuel metering configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -301,7 +255,6 @@ mod tests {
         let config = RuntimeConfig::default();
         assert!(config.validate().is_ok());
         assert_eq!(config.limits.fuel_max, 5_000_000);
-        assert!(config.capabilities.deny_by_default);
         assert!(config.fuel.enabled);
         assert!(config.engine.deterministic);
     }
@@ -313,10 +266,6 @@ mod tests {
             fuel_max = 1000000
             memory_max_mb = 16
 
-            [capabilities]
-            allowed = ["http", "kv"]
-            deny_by_default = true
-
             [fuel]
             enabled = true
 
@@ -327,7 +276,6 @@ mod tests {
         let config = RuntimeConfig::from_toml_str(toml).unwrap();
         assert_eq!(config.limits.fuel_max, 1_000_000);
         assert_eq!(config.limits.memory_max_mb, 16);
-        assert_eq!(config.capabilities.allowed.len(), 2);
     }
 
     #[test]

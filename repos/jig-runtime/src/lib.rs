@@ -31,7 +31,6 @@
 //! - `wasi-preview2` (default): Enable WASI preview1 with minimal surfaces (name kept for compatibility)
 //! - `component-model`: Enable WebAssembly Component Model support
 //! - `tracing`: Enable structured logging with tracing
-//! - `receipt-signing`: Enable receipt signing with ed25519
 
 // Public API modules
 pub mod api;

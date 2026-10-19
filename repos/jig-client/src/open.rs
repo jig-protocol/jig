@@ -124,6 +124,7 @@ mod tests {
             sig_b64: Some(STANDARD.encode(&block.sender_sig)),
             receipts: vec![],
             delivery_cid: format!("delivery:{}", block.cid()),
+            ingest: None,
         }
     }
 

@@ -133,7 +133,6 @@ fn test_config_deterministic_defaults() {
     assert!(config.fuel.enabled);
     assert!(config.engine.deterministic);
     assert!(config.engine.canonicalize_nans);
-    assert!(config.capabilities.deny_by_default);
 }
 
 #[test]
