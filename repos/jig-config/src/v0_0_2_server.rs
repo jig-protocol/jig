@@ -108,6 +108,23 @@ pub struct IdentitySection {
     pub trusted_nameservers: Vec<String>,
     pub cache_ttl_seconds: u64,
     pub naively_allow_unknown_handles_fallback: bool,
+    /// Who speaks for each alias suffix, keyed by suffix (JEP-0004 rule 3,
+    /// `config` root). In nameserver mode an alias whose suffix has no entry
+    /// here is refused when it is looked up; there is no discovery on the
+    /// server side.
+    pub delegations: BTreeMap<String, NameDelegation>,
+}
+
+/// One suffix's entry in `[identity.delegations]`.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+// A misspelt key must not leave a suffix with no authorities: refuse it.
+#[serde(deny_unknown_fields)]
+pub struct NameDelegation {
+    /// The DIDs whose attestations count for this suffix.
+    pub authorities: Vec<String>,
+    /// The nameserver URLs to ask. Every one is asked; which DID signed an
+    /// answer, not which URL served it, decides whether it counts.
+    pub nameservers: Vec<String>,
 }
 
 impl Default for IdentitySection {
@@ -117,6 +134,7 @@ impl Default for IdentitySection {
             trusted_nameservers: vec![],
             cache_ttl_seconds: 300,
             naively_allow_unknown_handles_fallback: false,
+            delegations: BTreeMap::new(),
         }
     }
 }
@@ -961,6 +979,43 @@ mod tests {
         assert_eq!(cfg.identity.mode, IdentityMode::Tofu);
         assert!(cfg.identity.trusted_nameservers.is_empty());
         assert!(!cfg.identity.naively_allow_unknown_handles_fallback);
+    }
+
+    #[test]
+    fn identity_delegations_parse_keyed_by_suffix() {
+        let cfg: JigServerConfig = toml::from_str(
+            r#"
+            [identity]
+            mode = "nameserver"
+
+            [identity.delegations."gigue.jig"]
+            authorities = ["did:jig:zA", "did:jig:zB"]
+            nameservers = ["https://ns1.example", "https://ns2.example"]
+        "#,
+        )
+        .expect("[identity.delegations] must deserialize");
+        let d = &cfg.identity.delegations["gigue.jig"];
+        assert_eq!(d.authorities, vec!["did:jig:zA", "did:jig:zB"]);
+        assert_eq!(
+            d.nameservers,
+            vec!["https://ns1.example", "https://ns2.example"]
+        );
+        assert_eq!(cfg.identity.delegations.len(), 1);
+        assert!(IdentitySection::default().delegations.is_empty());
+    }
+
+    #[test]
+    fn a_delegation_with_a_misspelt_or_missing_key_is_refused() {
+        for body in [
+            "authorites = [\"did:jig:zA\"]\nnameservers = []",
+            "nameservers = [\"https://ns.example\"]",
+        ] {
+            let toml_input = format!("[identity.delegations.\"gigue.jig\"]\n{body}\n");
+            assert!(
+                toml::from_str::<JigServerConfig>(&toml_input).is_err(),
+                "must refuse: {body}"
+            );
+        }
     }
 
     #[test]

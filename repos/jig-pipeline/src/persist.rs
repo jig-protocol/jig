@@ -127,6 +127,16 @@ pub struct StoredTofuKey {
     pub locked: bool,
 }
 
+/// An alias attestation this server acted on or refused as an equivocation
+/// (JEP-0004 rule 20): the signed bytes, kept as evidence.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StoredNameEvidence {
+    pub name: String,
+    pub root_id: String,
+    pub attestation_bytes: Vec<u8>,
+    pub first_seen: i64,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StoredCursor {
     pub peer_server_url: String,
@@ -389,7 +399,9 @@ fn sequence_on(
             (last.seq + 1, last.hash())
         }
     };
-    let record = signer.sign(seq, block_cid, prev);
+    let record = signer
+        .sign(seq, block_cid, prev)
+        .map_err(|e| PersistError::Corrupt(format!("cannot sequence {block_cid}: {e}")))?;
     conn.execute(
         "INSERT INTO ingest_records (block_cid, channel_id, slug, seq, record)
          VALUES (?,?,?,?,?)",
@@ -614,6 +626,14 @@ impl SqliteStore {
                 PRIMARY KEY (did, ns_did, suffix)
             );
 
+            CREATE TABLE IF NOT EXISTS name_evidence (
+                name                 TEXT NOT NULL,
+                root_id              TEXT NOT NULL,
+                attestation_bytes    BLOB NOT NULL,
+                first_seen           INTEGER NOT NULL,
+                PRIMARY KEY (name, root_id, attestation_bytes)
+            );
+
             CREATE TABLE IF NOT EXISTS tofu_keys (
                 local_nickname  TEXT PRIMARY KEY,
                 did             TEXT NOT NULL,
@@ -763,6 +783,34 @@ impl SqliteStore {
             stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
+        // A channel holding records in an older format is re-signed whole:
+        // its chain cannot mix formats, and pre-release data is re-sequenced
+        // rather than migrated.
+        let stale: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT channel_id, record FROM ingest_records")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut stale: Vec<String> = rows
+                .into_iter()
+                .filter(|(_, record)| {
+                    IngestRecord::decode(record)
+                        .map_or(true, |r| r.format != crate::ingest_record::RECORD_FORMAT)
+                })
+                .map(|(channel_id, _)| channel_id)
+                .collect();
+            stale.sort();
+            stale.dedup();
+            stale
+        };
+        for channel_id in &stale {
+            tx.execute(
+                "DELETE FROM ingest_records WHERE channel_id = ?",
+                [channel_id],
+            )?;
+        }
         let mut written = 0;
         for (channel_id, slug) in channels {
             let unsequenced: Vec<(String, i64)> = {
@@ -1556,6 +1604,38 @@ impl SqliteStore {
         Ok(())
     }
 
+    // --- name evidence ---
+
+    /// Keep an attestation as evidence. Recording the same bytes again keeps
+    /// the first `first_seen`.
+    pub fn record_name_evidence(&self, e: &StoredNameEvidence) -> Result<()> {
+        self.conn.lock().expect("poisoned").execute(
+            "INSERT OR IGNORE INTO name_evidence (name, root_id, attestation_bytes, first_seen)
+             VALUES (?,?,?,?)",
+            params![e.name, e.root_id, e.attestation_bytes, e.first_seen],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_name_evidence(&self, name: &str) -> Result<Vec<StoredNameEvidence>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT name, root_id, attestation_bytes, first_seen FROM name_evidence
+             WHERE name = ? ORDER BY first_seen, attestation_bytes",
+        )?;
+        let rows = stmt
+            .query_map([name], |r| {
+                Ok(StoredNameEvidence {
+                    name: r.get(0)?,
+                    root_id: r.get(1)?,
+                    attestation_bytes: r.get(2)?,
+                    first_seen: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     // --- subscription cursors ---
 
     pub fn upsert_cursor(&self, c: &StoredCursor) -> Result<()> {
@@ -1683,11 +1763,16 @@ mod tests {
 
     fn test_signer(key: &ed25519_dalek::SigningKey, wall: u64) -> RecordSigner<'_> {
         RecordSigner {
-            channel_id: "bafy_create".to_string(),
+            channel_id: c("bafy_create"),
             key,
             ingest_wall_ms: wall,
             ingest_logical: 0,
         }
+    }
+
+    /// A real CIDv1 standing for `label`: records sign only CIDs.
+    fn c(label: &str) -> String {
+        crate::ingest_record::label_cid(label)
     }
 
     fn at_hlc(cid: &str, wall: u64) -> StoredBlock {
@@ -1706,7 +1791,7 @@ mod tests {
         let did =
             jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
         // Each author claims an earlier time than the last.
-        let order = ["bafy_create", "bafy_b", "bafy_c", "bafy_d"];
+        let order = [c("bafy_create"), c("bafy_b"), c("bafy_c"), c("bafy_d")];
         let mut records = Vec::new();
         for (i, cid) in order.iter().enumerate() {
             let block = at_hlc(cid, 1_000 - i as u64 * 10);
@@ -1724,28 +1809,24 @@ mod tests {
             record.verify(&did).unwrap();
         }
         assert_eq!(
-            store.get_ingest_record("bafy_c").unwrap().as_ref(),
+            store.get_ingest_record(&order[2]).unwrap().as_ref(),
             Some(&records[2])
         );
 
         let history = block_cids(store.list_blocks_by_channel("#seq", 50, None).unwrap());
-        assert_eq!(history, cids_of(&order), "history follows seq, not hlc_ts");
+        assert_eq!(history, order.to_vec(), "history follows seq, not hlc_ts");
         let newest_two = block_cids(store.list_blocks_by_channel("#seq", 2, None).unwrap());
-        assert_eq!(newest_two, cids_of(&order[2..]));
+        assert_eq!(newest_two, order[2..].to_vec());
         let older = block_cids(
             store
-                .list_blocks_before("#seq", 2, "bafy_c")
+                .list_blocks_before("#seq", 2, &order[2])
                 .unwrap()
                 .unwrap(),
         );
-        assert_eq!(older, cids_of(&order[..2]), "paging back follows seq too");
+        assert_eq!(older, order[..2].to_vec(), "paging back follows seq too");
 
         let from_one = store.list_ingest_records("#seq", 1, 2).unwrap();
         assert_eq!(from_one, records[1..3].to_vec());
-    }
-
-    fn cids_of(cids: &[&str]) -> Vec<String> {
-        cids.iter().map(|c| c.to_string()).collect()
     }
 
     fn block_cids(blocks: Vec<StoredBlock>) -> Vec<String> {
@@ -1760,7 +1841,7 @@ mod tests {
         let key = jig_core::crypto::ed25519::generate_signing_key();
         store
             .upsert_channel(&StoredChannel {
-                id: "bafy_create".to_string(),
+                id: c("bafy_create"),
                 slug: "#seq".to_string(),
                 visibility: "open".to_string(),
                 created_at: 0,
@@ -1769,23 +1850,73 @@ mod tests {
             })
             .unwrap();
         // A post whose author's clock runs before the channel's creation.
-        store.insert_block(&at_hlc("bafy_early_post", 10)).unwrap();
-        store.insert_block(&at_hlc("bafy_create", 500)).unwrap();
-        store.insert_block(&at_hlc("bafy_late_post", 900)).unwrap();
+        store
+            .insert_block(&at_hlc(&c("bafy_early_post"), 10))
+            .unwrap();
+        store.insert_block(&at_hlc(&c("bafy_create"), 500)).unwrap();
+        store
+            .insert_block(&at_hlc(&c("bafy_late_post"), 900))
+            .unwrap();
 
         assert_eq!(store.backfill_ingest_records(&key).unwrap(), 3);
         assert_eq!(store.backfill_ingest_records(&key).unwrap(), 0, "only once");
         let chain = store.list_ingest_records("#seq", 0, 50).unwrap();
-        let order: Vec<&str> = chain.iter().map(|r| r.block_cid.as_str()).collect();
-        assert_eq!(order, ["bafy_create", "bafy_early_post", "bafy_late_post"]);
+        let order: Vec<String> = chain.iter().map(|r| r.block_cid.clone()).collect();
+        assert_eq!(
+            order,
+            [c("bafy_create"), c("bafy_early_post"), c("bafy_late_post")]
+        );
         assert!(chain[0].is_genesis());
         assert!(chain[1].follows(&chain[0]) && chain[2].follows(&chain[1]));
 
         // A later block continues the same chain.
         let next = store
-            .insert_block_sequenced(&at_hlc("bafy_next", 1_000), &test_signer(&key, 9_000))
+            .insert_block_sequenced(&at_hlc(&c("bafy_next"), 1_000), &test_signer(&key, 9_000))
             .unwrap();
         assert!(next.follows(&chain[2]));
+    }
+
+    /// Records left in an older format re-sign the channel's whole chain at
+    /// boot, so no chain mixes formats.
+    #[test]
+    fn backfill_re_signs_a_chain_in_an_older_format() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        store
+            .upsert_channel(&StoredChannel {
+                id: c("bafy_create"),
+                slug: "#seq".to_string(),
+                visibility: "open".to_string(),
+                created_at: 0,
+                owner_did: "did:jig:zOwner".to_string(),
+                suite: "none".to_string(),
+            })
+            .unwrap();
+        store.insert_block(&at_hlc(&c("bafy_create"), 500)).unwrap();
+        store.insert_block(&at_hlc(&c("bafy_post"), 900)).unwrap();
+        assert_eq!(store.backfill_ingest_records(&key).unwrap(), 2);
+
+        let mut old = store.list_ingest_records("#seq", 1, 1).unwrap().remove(0);
+        old.format = "jig-ingest-v1".to_string();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE ingest_records SET record = ?1 WHERE block_cid = ?2",
+                rusqlite::params![old.encode(), c("bafy_post")],
+            )
+            .unwrap();
+
+        assert_eq!(store.backfill_ingest_records(&key).unwrap(), 2);
+        let chain = store.list_ingest_records("#seq", 0, 50).unwrap();
+        let did =
+            jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
+        for record in &chain {
+            assert_eq!(record.format, crate::ingest_record::RECORD_FORMAT);
+            record.verify(&did).unwrap();
+        }
+        assert!(chain[1].follows(&chain[0]));
     }
 
     fn sample_receipt(

@@ -99,12 +99,13 @@ jobs:
           workspaces: repos
       - name: Test-only suites stay out of every build
         # `test-aead` (jig-core `test-suite`) and long-lived MLS leaves
-        # (jig-mls `conformance`) exist for the conformance vectors only.
+        # (jig-mls `conformance`) exist for the conformance vectors only, and
+        # jig-core `test-default-authority` trusts a public test seed for `@jig`.
         # Dev-dependencies may enable them; no crate's normal or build graph
         # may, or a release binary would register a test suite (JEP-0001).
         run: |
           if cargo tree --workspace -e normal,build,features \
-              | grep -E 'jig-core feature "test-suite"|jig-mls feature "conformance"'; then
+              | grep -E 'jig-core feature "(test-suite|test-default-authority)"|jig-mls feature "conformance"'; then
             echo "::error::a normal dependency enables a test-only feature"
             exit 1
           fi
@@ -243,6 +244,12 @@ jobs:
       - name: Committed artifact behaves correctly
         working-directory: repos
         run: cargo test -p jig-runtime --test text_block_payload
+      # The same check for the jig:block/renderer component (JEP-0006): it passes jig-core's
+      # component validator, agrees with `execute_pure`, and keeps the module's render_hash.
+      # build-artifact.sh rebuilds it too, so it is exercised here first for the same reason.
+      - name: Committed component behaves correctly
+        working-directory: repos
+        run: cargo test -p jig-runtime --test text_block_component
       - name: Rebuild the canonical artifact (enforces structural invariants)
         working-directory: repos
         run: ./text-block/build-artifact.sh
@@ -251,6 +258,11 @@ jobs:
         env:
           JIG_TEXT_BLOCK_WASM: target/wasm32-unknown-unknown/release/text_block.wasm
         run: cargo test -p jig-runtime --test text_block_payload
+      - name: Fresh component behaves identically
+        working-directory: repos
+        env:
+          JIG_TEXT_BLOCK_COMPONENT: target/wasm32-unknown-unknown/release/text_block.component.wasm
+        run: cargo test -p jig-runtime --test text_block_component
 
   # Nightly checks that `workspace` leaves out to keep pull request and queue
   # runs short. The nightly skips itself when no Rust source changed in the

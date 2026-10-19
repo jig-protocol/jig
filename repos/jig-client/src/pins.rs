@@ -28,6 +28,7 @@ use jig_core::{BlockKind, BlockManifest, Did};
 use jig_pipeline::handshake::{ClientOffer, VerifiedWelcome};
 use serde::{Deserialize, Serialize};
 
+use crate::naming::{Binding, NameKey, NamePin, NamePins};
 use crate::secure::server_key;
 
 /// A refusal to go on with a server or channel that is not what was pinned.
@@ -60,6 +61,24 @@ pub enum PinError {
     },
     #[error("the creation block for {slug} does not prove its suite: {reason}")]
     Unproven { slug: String, reason: String },
+    #[error(
+        "{name} is pinned to {pinned}, but now resolves to {presented}; if its holder confirms \
+         the change, `jig trust accept-name {name} --did {presented}` moves the pin"
+    )]
+    NameReplaced {
+        name: String,
+        pinned: String,
+        presented: String,
+    },
+    #[error(
+        "{name} resolves to {presented}, not the {confirmed} given; nothing was pinned (accept \
+         only the DID its holder confirmed)"
+    )]
+    NameUnconfirmed {
+        name: String,
+        presented: String,
+        confirmed: String,
+    },
     #[error("pin store {path}: {source}")]
     Io {
         path: String,
@@ -104,6 +123,49 @@ pub struct ServerPin {
 struct PinFile {
     #[serde(default)]
     servers: BTreeMap<String, ServerPin>,
+    /// Name pins (JEP-0004 rule 17), one per [`NameKey`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    names: Vec<NamePinEntry>,
+}
+
+/// One pinned name: what it is keyed by (rule 6) and what it was bound to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamePinEntry {
+    pub alias: String,
+    pub suffix: String,
+    /// `config`, `dns` or `contract`.
+    pub root: String,
+    pub root_id: String,
+    pub did: String,
+    pub ns_did: String,
+    /// When the pinned attestation stops being valid: Unix seconds.
+    pub valid_until: i64,
+}
+
+impl NamePinEntry {
+    fn of(binding: &Binding) -> Self {
+        Self {
+            alias: binding.key.alias.clone(),
+            suffix: binding.key.suffix.clone(),
+            root: binding.key.root.as_str().to_string(),
+            root_id: binding.key.root_id.clone(),
+            did: binding.did().to_string(),
+            ns_did: binding.attestation.ns_did.clone(),
+            valid_until: binding.attestation.valid_until,
+        }
+    }
+
+    fn is(&self, key: &NameKey) -> bool {
+        self.alias == key.alias
+            && self.suffix == key.suffix
+            && self.root == key.root.as_str()
+            && self.root_id == key.root_id
+    }
+
+    /// `alias@suffix`, as people write it.
+    pub fn name(&self) -> String {
+        format!("{}@{}", self.alias, self.suffix)
+    }
 }
 
 /// The store at `path`; a missing file is an empty store. A file that does
@@ -283,6 +345,64 @@ impl Pins {
         })
     }
 
+    /// Pin the name `binding` verified, on first sight ([`crate::naming::Verified::New`]),
+    /// or refresh a pin it matches (a renewed attestation). A different DID
+    /// under a pinned name is refused: only [`Self::accept_name`] moves a pin.
+    pub fn pin_name(&mut self, binding: &Binding) -> Result<(), PinError> {
+        let entry = NamePinEntry::of(binding);
+        self.update(
+            |file| match file.names.iter_mut().find(|e| e.is(&binding.key)) {
+                None => {
+                    file.names.push(entry);
+                    Ok(((), true))
+                }
+                Some(pinned) if pinned.did == entry.did => {
+                    let changed = *pinned != entry;
+                    *pinned = entry;
+                    Ok(((), changed))
+                }
+                Some(pinned) => Err(PinError::NameReplaced {
+                    name: pinned.name(),
+                    pinned: pinned.did.clone(),
+                    presented: entry.did,
+                }),
+            },
+        )
+    }
+
+    /// Move `binding`'s name to the DID it now resolves to, because its holder
+    /// confirmed `confirmed` out of band (rule 9). Refused unless the two
+    /// agree, so a pin never moves to a DID nobody typed. Returns the DID the
+    /// name was pinned to before, if any.
+    pub fn accept_name(
+        &mut self,
+        binding: &Binding,
+        confirmed: &str,
+    ) -> Result<Option<String>, PinError> {
+        let entry = NamePinEntry::of(binding);
+        if entry.did != confirmed {
+            return Err(PinError::NameUnconfirmed {
+                name: entry.name(),
+                presented: entry.did,
+                confirmed: confirmed.to_string(),
+            });
+        }
+        self.update(|file| {
+            let old = file
+                .names
+                .iter()
+                .position(|e| e.is(&binding.key))
+                .map(|i| file.names.remove(i).did);
+            file.names.push(entry);
+            Ok((old, true))
+        })
+    }
+
+    /// Every pinned name, for listing and expiry warnings.
+    pub fn names(&self) -> &[NamePinEntry] {
+        &self.file.names
+    }
+
     /// Apply `change` to the store as it is on disk now, holding an exclusive
     /// lock from the read to the write, and save it when `change` reports a
     /// change. Two processes for one device (a `jig chat` beside a `jig
@@ -425,6 +545,17 @@ pub fn prove_channel(
         suite: suite.as_str().to_string(),
         owner_did: Did::from_ed25519_pubkey(&key_bytes).to_did_jig_string(),
     })
+}
+
+/// The resolver's view of the pins (JEP-0004 rule 17): lookup only; the
+/// caller pins with [`Pins::pin_name`] on a new binding.
+impl NamePins for Pins {
+    fn name_pin(&self, key: &NameKey) -> Option<NamePin> {
+        self.file.names.iter().find(|e| e.is(key)).map(|e| NamePin {
+            did: e.did.clone(),
+            ns_did: e.ns_did.clone(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -719,5 +850,82 @@ mod tests {
         let path = dir.path().join("pins.json");
         std::fs::write(&path, b"{not json").unwrap();
         assert!(matches!(Pins::load(&path), Err(PinError::Corrupt { .. })));
+    }
+
+    fn binding(did: &str, valid_until: i64) -> crate::naming::Binding {
+        crate::naming::Binding {
+            key: NameKey {
+                alias: "alice".into(),
+                suffix: "example.org".into(),
+                root: jig_core::naming::Root::Dns,
+                root_id: "example.org".into(),
+            },
+            attestation: jig_core::naming::Attestation {
+                did: did.into(),
+                alias: "alice@example.org".into(),
+                ns_did: "did:jig:zNs".into(),
+                valid_from: 0,
+                valid_until,
+                envelope: vec![],
+            },
+            reachability: None,
+        }
+    }
+
+    #[test]
+    fn a_name_is_pinned_once_and_only_accepted_onto_another_did() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let mut pins = Pins::load(&path).unwrap();
+        let first = binding("did:jig:zAlice", 100);
+        assert_eq!(pins.name_pin(&first.key), None);
+        pins.pin_name(&first).unwrap();
+        // A renewed attestation for the same DID refreshes the pin.
+        pins.pin_name(&binding("did:jig:zAlice", 200)).unwrap();
+        let reloaded = Pins::load(&path).unwrap();
+        assert_eq!(
+            reloaded.name_pin(&first.key),
+            Some(NamePin {
+                did: "did:jig:zAlice".into(),
+                ns_did: "did:jig:zNs".into()
+            })
+        );
+        assert_eq!(reloaded.names()[0].valid_until, 200);
+
+        // Another DID under the pinned name is refused, not pinned.
+        let other = binding("did:jig:zMallory", 300);
+        assert!(matches!(
+            pins.pin_name(&other),
+            Err(PinError::NameReplaced { .. })
+        ));
+        // Accepting needs the DID the holder confirmed, exactly.
+        assert!(matches!(
+            pins.accept_name(&other, "did:jig:zSomeoneElse"),
+            Err(PinError::NameUnconfirmed { .. })
+        ));
+        assert_eq!(
+            Pins::load(&path).unwrap().name_pin(&first.key).unwrap().did,
+            "did:jig:zAlice"
+        );
+        assert_eq!(
+            pins.accept_name(&other, "did:jig:zMallory").unwrap(),
+            Some("did:jig:zAlice".into())
+        );
+        let moved = Pins::load(&path).unwrap();
+        assert_eq!(moved.name_pin(&first.key).unwrap().did, "did:jig:zMallory");
+        assert_eq!(moved.names().len(), 1, "one pin per name");
+    }
+
+    #[test]
+    fn a_name_under_another_root_is_another_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pins = Pins::load(&dir.path().join("pins.json")).unwrap();
+        let dns = binding("did:jig:zAlice", 100);
+        let mut config = binding("did:jig:zOther", 100);
+        config.key.root = jig_core::naming::Root::Config;
+        pins.pin_name(&dns).unwrap();
+        pins.pin_name(&config).unwrap();
+        assert_eq!(pins.name_pin(&dns.key).unwrap().did, "did:jig:zAlice");
+        assert_eq!(pins.name_pin(&config.key).unwrap().did, "did:jig:zOther");
     }
 }
