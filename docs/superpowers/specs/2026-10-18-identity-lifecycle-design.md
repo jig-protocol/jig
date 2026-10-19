@@ -283,6 +283,45 @@ Any verifier that holds both keeps them as evidence and accepts neither automati
   `verify_rotation_chain` checks alias moves without knowing the encoding.
 - This is the same stack as the v0.3 receipts.
 
+#### The link, byte for byte
+
+Implemented in `jig_core::key_link`. Test vectors, one per audience, are in
+`repos/jig-spec/jep/vectors/key-link/vectors.json`. Field names and the `domain` entry
+follow JEP-0004's signed objects.
+
+The payload is a text-keyed map in RFC 8949 section 4.2 deterministic CBOR:
+
+| Key | Type | Value |
+| --- | --- | --- |
+| `domain` | text | `jig-key-link-v1` |
+| `old` | text | The DID being left (`did:jig:z…`) |
+| `new` | text | The DID taking over. Must differ from `old` |
+| `audience` | map | One of the four below |
+| `issued_at` | integer | When it was signed, in Unix seconds |
+
+| `audience.kind` | Other keys | Meaning |
+| --- | --- | --- |
+| `channel` | `channel_id`: bytes, the channel's binary canonical CIDv1 (raw codec, BLAKE3-256), as ingest records carry it | The old DID's roles and membership in that channel |
+| `alias` | `ns_did`: text; `alias`: text, the full lowercased `local@suffix` | That alias at that nameserver (JEP-0004 rule 9) |
+| `contact` | `did`: text | That contact's pin of the old DID |
+| `public` | none | A server's own key change |
+
+The envelope is a COSE_Sign (RFC 9052) with an empty body header and exactly two
+signatures, each with protected header `{1: -8}` (EdDSA) and no `kid`: first by `old`,
+then by `new`. A verifier:
+
+1. parses the envelope and refuses any other shape;
+2. decodes the payload, checks `domain`, and checks every field: DIDs are `did:jig`
+   keys, `old` ≠ `new`, a `channel_id` is a canonical CIDv1 in its canonical encoding,
+   an `alias` is a full name in its canonical spelling;
+3. re-encodes the fields and requires the exact payload bytes, which refuses unknown keys
+   and non-canonical encodings;
+4. checks the first signature against `old` and the second against `new`.
+
+A verifier acts on a link only for the audience it names. Two verified links with the same
+`old` and different `new` are a fork (`key_link::fork`): evidence of a stolen key, followed
+by neither.
+
 ## Q3. Revocation
 
 **Decided (DJ, 2026-10-18): self-revocation.**
@@ -414,7 +453,7 @@ These are applied in implementation PRs, not in this one.
 
   PV-03 gains a sentence: a link is the one message that ties two DIDs, and only the
   holder makes one.
-- **New JEP-0006, "Key links and revocation":** the objects, their encoding, the
+- **A new JEP, "Key links and revocation"** (its number is still to be assigned: 0006 went to the block ABI): the objects, their encoding, the
   `key-link`, `key-revoke`, `server-rekey` and `sequencer-rekey` records, and who acts
   on each.
 - **JEP-0001 Q4:** a leaf per device, under leaf certificates. A rotation is a new DID
