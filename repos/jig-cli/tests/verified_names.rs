@@ -132,6 +132,13 @@ fn run(home: &Path, args: &[&str]) -> (bool, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_jig"))
         .args(args)
         .env("HOME", home)
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .env("JIG_NONINTERACTIVE", "1")
         .env("RUST_BACKTRACE", "0")
         .output()
