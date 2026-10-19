@@ -59,6 +59,46 @@ pub struct AppState {
     /// The `server-manifest` every welcome cites, once
     /// [`crate::v0_0_2_manifest_log::publish`] has run. Shared by every clone.
     pub manifest: Arc<std::sync::RwLock<Option<jig_pipeline::handshake::ManifestRef>>>,
+    /// During a key change: the public link from this server's old DID to
+    /// its current one (JEP-0012), served in every welcome and at
+    /// `/.well-known/jig`, so clients and peers that pinned the old DID
+    /// follow it. Read from [`key_link_path`] at boot.
+    pub key_link: Option<Vec<u8>>,
+}
+
+/// Where the server's key link is read from: beside its key file, with
+/// `.link` appended. The file holds the link's COSE_Sign bytes.
+pub fn key_link_path(keyfile: &std::path::Path) -> PathBuf {
+    let mut name = keyfile.as_os_str().to_owned();
+    name.push(".link");
+    PathBuf::from(name)
+}
+
+/// The key link at `path`, if there is one. A link that does not verify, is
+/// not public, or does not move to `server_did` is a boot error: serving it
+/// would make every client that pinned the old DID refuse this server.
+fn load_key_link(path: &std::path::Path, server_did: &Did) -> Result<Option<Vec<u8>>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow::anyhow!("reading {}: {e}", path.display())),
+    };
+    let signed = jig_core::key_link::SignedKeyLink::from_envelope(&bytes)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    let link = signed.link();
+    anyhow::ensure!(
+        link.audience == jig_core::key_link::Audience::Public,
+        "{}: the key link is not a public one",
+        path.display()
+    );
+    anyhow::ensure!(
+        jig_pipeline::handshake::same_did(&link.new, &server_did.to_did_jig_string()),
+        "{}: the key link moves to {}, not to this server's DID",
+        path.display(),
+        link.new
+    );
+    tracing::info!(from = %link.old, "serving the key link from this server's old DID");
+    Ok(Some(bytes))
 }
 
 /// Gates 1 and 2 from `[auth]`, plus the federation peers from `[federation]`:
@@ -157,6 +197,12 @@ impl AppState {
             );
         }
         let server_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
+        let key_link = load_key_link(
+            &key_link_path(Path::new(
+                shellexpand::tilde(&config.server.server_did_keyfile).as_ref(),
+            )),
+            &server_did,
+        )?;
         // A store written before `ingest` records existed is sequenced once,
         // here: each local channel's chain starts at its channel-create and
         // follows the old history order (JEP-0002 rule 9).
@@ -249,6 +295,7 @@ impl AppState {
             auth,
             tls_binding: Default::default(),
             manifest: Default::default(),
+            key_link,
         })
     }
 
@@ -303,6 +350,7 @@ impl AppState {
             auth,
             tls_binding: Default::default(),
             manifest: Default::default(),
+            key_link: None,
         })
     }
 
@@ -354,6 +402,7 @@ impl AppState {
             auth,
             tls_binding: Default::default(),
             manifest: Default::default(),
+            key_link: None,
         })
     }
 }
@@ -421,6 +470,43 @@ pub fn suffix_authorities(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_key_link_beside_the_key_is_served_only_if_it_moves_to_this_server() {
+        use jig_core::key_link::{Audience, SignedKeyLink};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.key.link");
+        let (old, new) = (
+            jig_core::crypto::ed25519::generate_signing_key(),
+            jig_core::crypto::ed25519::generate_signing_key(),
+        );
+        let server_did = Did::from_ed25519_pubkey(new.verifying_key().as_bytes());
+        assert_eq!(
+            load_key_link(&path, &server_did).unwrap(),
+            None,
+            "no file, no link"
+        );
+        assert_eq!(
+            key_link_path(Path::new("/k/server.key")),
+            Path::new("/k/server.key.link")
+        );
+
+        let good = SignedKeyLink::sign(&old, &new, Audience::Public, 1).unwrap();
+        std::fs::write(&path, good.envelope()).unwrap();
+        assert_eq!(
+            load_key_link(&path, &server_did).unwrap().as_deref(),
+            Some(good.envelope())
+        );
+        let elsewhere = SignedKeyLink::sign(&new, &old, Audience::Public, 1).unwrap();
+        std::fs::write(&path, elsewhere.envelope()).unwrap();
+        assert!(
+            load_key_link(&path, &server_did).is_err(),
+            "moves to another DID"
+        );
+        std::fs::write(&path, b"not a link").unwrap();
+        assert!(load_key_link(&path, &server_did).is_err());
+    }
+
     /// The configured bound is what ingest enforces and the welcome signs; one
     /// outside the protocol's range stops the boot.
     #[test]

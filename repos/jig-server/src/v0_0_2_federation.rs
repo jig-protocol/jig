@@ -259,6 +259,14 @@ where
     };
     match pending.interpret_on(&text, tls_exporter) {
         HandshakeResult::Established(welcome) => {
+            if let Some(from) = &welcome.moved_from {
+                warn!(
+                    peer = %welcome.server_did,
+                    from = %from,
+                    "peer moved its key along a public link both keys signed; \
+                     update its expected_did"
+                );
+            }
             if let Some(key) = key {
                 let proof =
                     jig_pipeline::handshake::peer_proof(key, &hello_text, &text, tls_exporter);

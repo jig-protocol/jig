@@ -217,6 +217,9 @@ pub struct ServerOffer {
     pub capabilities: Capabilities,
     /// The current manifest; `None` until the server has published one.
     pub manifest: Option<ManifestRef>,
+    /// During a key change: the dual-signed public link from the server's
+    /// old DID to this one (JEP-0012), as COSE_Sign bytes.
+    pub key_link: Option<Vec<u8>>,
     /// The TLS exporter value of the connection being answered; empty over
     /// plaintext.
     pub tls_exporter: Vec<u8>,
@@ -247,6 +250,8 @@ pub struct WelcomeStatement {
     /// base64, as on the wire; empty over plaintext.
     pub tls_exporter: String,
     pub manifest: Option<ManifestRef>,
+    /// base64 COSE_Sign of a public key link to `server_did`.
+    pub key_link: Option<String>,
 }
 
 impl WelcomeStatement {
@@ -270,6 +275,13 @@ impl WelcomeStatement {
                 push(&mut out, &[1]);
                 push(&mut out, m.cid.as_bytes());
                 push(&mut out, &m.seq.to_le_bytes());
+            }
+        }
+        match &self.key_link {
+            None => push(&mut out, &[0]),
+            Some(link) => {
+                push(&mut out, &[1]);
+                push(&mut out, link.as_bytes());
             }
         }
         out
@@ -384,6 +396,10 @@ pub struct VerifiedWelcome {
     /// The TLS exporter value the welcome is bound to; empty over plaintext.
     pub tls_exporter: Vec<u8>,
     pub manifest: Option<ManifestRef>,
+    /// Set when the welcome is signed by another DID than the pinned one and
+    /// carries a public key link from the pinned DID to it, signed by both
+    /// keys: the pinned DID it moved from. The caller moves its pin.
+    pub moved_from: Option<String>,
     /// The frame text, kept so a later contradiction has something to show.
     pub evidence: String,
 }
@@ -527,6 +543,7 @@ pub fn negotiate(
         server_nonce: fresh_nonce(),
         tls_exporter: STANDARD.encode(&server.tls_exporter),
         manifest: server.manifest.clone(),
+        key_link: server.key_link.as_ref().map(|l| STANDARD.encode(l)),
     })
 }
 
@@ -547,6 +564,7 @@ pub fn seal(key: &SigningKey, mut statement: WelcomeStatement) -> Envelope {
         server_nonce: statement.server_nonce,
         tls_exporter: statement.tls_exporter,
         manifest: statement.manifest,
+        key_link: statement.key_link,
         sig,
     })
 }
@@ -716,6 +734,7 @@ fn interpret_envelope(
         server_nonce,
         tls_exporter: bound_to,
         manifest,
+        key_link,
         sig,
     } = &env.frame
     else {
@@ -740,6 +759,7 @@ fn interpret_envelope(
         server_nonce: server_nonce.clone(),
         tls_exporter: bound_to.clone(),
         manifest: manifest.clone(),
+        key_link: key_link.clone(),
     };
 
     if echoed != nonce {
@@ -776,11 +796,29 @@ fn interpret_envelope(
             evidence: Some(text.to_string()),
         };
     }
+    // Another DID than the pinned one only through a public link the pinned
+    // key signed to it (JEP-0002 rule 14, JEP-0012).
+    let mut moved_from = None;
     if let Some(reason) = pin_mismatch(server_did, offer.pinned_server_did.as_deref()) {
-        return HandshakeResult::FailClosed {
-            reason,
-            evidence: Some(text.to_string()),
-        };
+        let pinned = offer.pinned_server_did.as_deref().unwrap_or_default();
+        match key_link
+            .as_deref()
+            .map(|l| link_moves(l, pinned, server_did))
+        {
+            Some(Ok(())) => moved_from = Some(pinned.to_string()),
+            Some(Err(why)) => {
+                return HandshakeResult::FailClosed {
+                    reason: format!("{reason}, and its key link does not move it: {why}"),
+                    evidence: Some(text.to_string()),
+                };
+            }
+            None => {
+                return HandshakeResult::FailClosed {
+                    reason,
+                    evidence: Some(text.to_string()),
+                };
+            }
+        }
     }
     let Ok(bound) = STANDARD.decode(bound_to) else {
         return HandshakeResult::FailClosed {
@@ -812,6 +850,7 @@ fn interpret_envelope(
         server_nonce: server_nonce.clone(),
         tls_exporter: bound,
         manifest: manifest.clone(),
+        moved_from,
         evidence: text.to_string(),
     })
 }
@@ -873,6 +912,34 @@ fn outside_offer(statement: &WelcomeStatement, offer: &ClientOffer) -> Option<&'
         return Some("every advertised suite is outside what the client offered");
     }
     None
+}
+
+/// Whether the base64 key link `link_b64` moves `pinned` to `presented`: it
+/// verifies under both keys, it is for everyone, and it runs from exactly the
+/// pinned DID to exactly the presented one.
+pub fn link_moves(link_b64: &str, pinned: &str, presented: &str) -> Result<(), String> {
+    use jig_core::key_link::{Audience, SignedKeyLink};
+    let bytes = STANDARD
+        .decode(link_b64)
+        .map_err(|_| "the key link is not base64".to_string())?;
+    let signed = SignedKeyLink::from_envelope(&bytes).map_err(|e| e.to_string())?;
+    let link = signed.link();
+    if link.audience != Audience::Public {
+        return Err("the key link is not a public one".to_string());
+    }
+    if !same_did(&link.old, pinned) {
+        return Err(format!(
+            "the key link leaves {}, not the pinned DID",
+            link.old
+        ));
+    }
+    if !same_did(&link.new, presented) {
+        return Err(format!(
+            "the key link moves to {}, not to the welcome's DID",
+            link.new
+        ));
+    }
+    Ok(())
 }
 
 fn pin_mismatch(server_did: &str, pinned: Option<&str>) -> Option<String> {
@@ -1309,6 +1376,77 @@ mod tests {
             hello.frame,
             Frame::Hello { peer_did: Some(ref d), .. } if d == "did:jig:zPeer"
         ));
+    }
+
+    #[test]
+    fn a_new_key_is_followed_only_along_a_link_the_pinned_key_signed() {
+        use jig_core::key_link::{Audience, SignedKeyLink};
+        let old = generate_signing_key();
+        let new = generate_signing_key();
+        let did = |k: &SigningKey| {
+            Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let welcome_with = |link: Option<Vec<u8>>| {
+            let (hello, pending) = begin(&ClientOffer {
+                pinned_server_did: Some(did(&old)),
+                ..ClientOffer::default()
+            });
+            let Frame::Hello { nonce, .. } = hello.frame else {
+                panic!("hello");
+            };
+            let offer = ServerOffer {
+                key_link: link,
+                ..offer_server()
+            };
+            let text =
+                serde_json::to_string(&seal(&new, negotiate(&hello_view(&nonce), &offer).unwrap()))
+                    .unwrap();
+            pending.interpret(&text)
+        };
+        let link = |a: &SigningKey, b: &SigningKey, audience| {
+            SignedKeyLink::sign(a, b, audience, 1_700_000_000)
+                .unwrap()
+                .envelope()
+                .to_vec()
+        };
+
+        match welcome_with(Some(link(&old, &new, Audience::Public))) {
+            HandshakeResult::Established(w) => {
+                assert_eq!(w.server_did, did(&new));
+                assert_eq!(w.moved_from, Some(did(&old)));
+            }
+            other => panic!("expected the move to be followed, got {other:?}"),
+        }
+        let refused = |result: HandshakeResult, why: &str| {
+            assert!(
+                matches!(&result, HandshakeResult::FailClosed { reason, .. } if reason.contains(why)),
+                "{why}: {result:?}"
+            );
+        };
+        refused(welcome_with(None), "does not match the pinned DID");
+        let stranger = generate_signing_key();
+        refused(
+            welcome_with(Some(link(&stranger, &new, Audience::Public))),
+            "not the pinned DID",
+        );
+        refused(
+            welcome_with(Some(link(&old, &stranger, Audience::Public))),
+            "not to the welcome's DID",
+        );
+        refused(
+            welcome_with(Some(link(
+                &old,
+                &new,
+                Audience::Contact {
+                    did: did(&stranger),
+                },
+            ))),
+            "not a public one",
+        );
+        let mut tampered = link(&old, &new, Audience::Public);
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        refused(welcome_with(Some(tampered)), "key link does not move it");
     }
 
     #[test]

@@ -308,6 +308,35 @@ impl Pins {
         })
     }
 
+    /// Move `server`'s pin from `from` to `to` along `key_link` (base64, as
+    /// served), which must be a public link the pinned key signed to `to`
+    /// (JEP-0012). Checked here, whoever calls: a pin moves only along a link
+    /// that verifies from it. Its channel pins stay; they name channels, not
+    /// keys.
+    pub fn move_server(
+        &mut self,
+        server: &str,
+        from: &str,
+        to: &str,
+        key_link: &str,
+    ) -> Result<(), PinError> {
+        self.update(|file| {
+            let pin = file.servers.entry(server_key(server)).or_default();
+            let replaced = || PinError::ServerReplaced {
+                server: server.to_string(),
+                pinned: pin.server_did.clone(),
+                presented: to.to_string(),
+            };
+            if !jig_pipeline::handshake::same_did(&pin.server_did, from)
+                || jig_pipeline::handshake::link_moves(key_link, &pin.server_did, to).is_err()
+            {
+                return Err(replaced());
+            }
+            pin.server_did = to.to_string();
+            Ok(((), true))
+        })
+    }
+
     /// The pin for `slug` on `server`, if this device has one.
     pub fn channel(&self, server: &str, slug: &str) -> Option<&ChannelPin> {
         self.server(server).and_then(|p| p.channels.get(slug))
@@ -617,6 +646,7 @@ mod tests {
             server_nonce: String::new(),
             tls_exporter: Vec::new(),
             manifest: None,
+            moved_from: None,
             evidence: String::new(),
         }
     }
@@ -936,6 +966,46 @@ mod tests {
                 .chain_head,
             Some(head(2))
         );
+    }
+
+    #[test]
+    fn a_server_pin_moves_only_along_a_link_from_the_pinned_key() {
+        use base64::Engine as _;
+        use jig_core::key_link::{Audience, SignedKeyLink};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let server = "https://host:7117";
+        let key = jig_core::crypto::ed25519::generate_signing_key;
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let (old, new, stranger) = (key(), key(), key());
+        let link = |a, b| {
+            base64::engine::general_purpose::STANDARD.encode(
+                SignedKeyLink::sign(a, b, Audience::Public, 1)
+                    .unwrap()
+                    .envelope(),
+            )
+        };
+        let mut pins = Pins::load(&path).unwrap();
+        pins.check_server_did(server, &did(&old)).unwrap();
+
+        // From a key nobody pinned, or claiming to leave one it does not.
+        for (from, link) in [
+            (did(&stranger), link(&stranger, &new)),
+            (did(&old), link(&stranger, &new)),
+        ] {
+            assert!(matches!(
+                pins.move_server(server, &from, &did(&new), &link),
+                Err(PinError::ServerReplaced { .. })
+            ));
+        }
+        assert_eq!(pins.server(server).unwrap().server_did, did(&old));
+
+        pins.move_server(server, &did(&old), &did(&new), &link(&old, &new))
+            .unwrap();
+        let pins = Pins::load(&path).unwrap();
+        assert_eq!(pins.server(server).unwrap().server_did, did(&new));
     }
 
     #[test]

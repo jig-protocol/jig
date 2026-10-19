@@ -51,6 +51,7 @@ Draft. Field names are provisional. The design behind this revision is
    | `capabilities` | Allowed block kinds, limits (including `max_future_skew_ms`), features (execution, federation) | OP-02, TM-01 |
    | `reputation` | Placeholder object; `null` until JEP-0003 | OP-10 |
    | `manifest` | CID and `seq` of the server's current `server-manifest` block | OP-02, OP-03 |
+   | `key_link` | During a key change: the public key link (JEP-0012) from the server's old DID to `server_did`, signed by both keys; absent otherwise | OP-08 |
    | `nonce` | Echo of the client's nonce | replayed `welcome` |
    | `server_nonce` | A fresh random value from the server | replayed `peer_proof` |
    | `tls_exporter` | 32 bytes exported from the TLS session (RFC 9266, label `EXPORTER-jig-handshake`); empty over plaintext | relayed handshake |
@@ -168,7 +169,10 @@ Draft. Field names are provisional. The design behind this revision is
 
 14. A client SHOULD pin, on its first verified `welcome` from a server, the
     `server_did`, the suites it advertised and its manifest-log chain. It MUST then
-    close on a `welcome` from another `server_did` (rule 7), and MUST treat a `welcome`
+    close on a `welcome` from another `server_did` (rule 7), unless the `welcome`
+    carries a `key_link` with audience `public` from exactly the pinned DID to exactly
+    that `server_did`, which it MUST verify under both keys; it then moves its pin.
+    The server serves the same link at `/.well-known/jig`. It MUST treat a `welcome`
     that no longer advertises a pinned suite as a downgrade and refuse it. A server
     adding a suite is not a downgrade.
 15. A pinned name moves to a new DID automatically only with a rotation signed by the
