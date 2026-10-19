@@ -3162,7 +3162,6 @@ dependencies = [
  "text-block",
  "thiserror 2.0.21",
  "time",
- "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
