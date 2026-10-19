@@ -629,6 +629,11 @@ pub const DEFAULT_SUFFIX: &str = "jig";
 /// to assert `Ok`: that test is what keeps the swap from going unnoticed.
 pub const DEFAULT_JIG_AUTHORITY: &str = PLACEHOLDER_JIG_AUTHORITY;
 
+/// Where [`DEFAULT_SUFFIX`] names are asked by default; config overrides it.
+/// Integrity rests on [`DEFAULT_JIG_AUTHORITY`], not on this URL: whatever
+/// answers here must still be signed by the authority.
+pub const DEFAULT_JIG_NAMESERVER: &str = "https://ns.jig-protocol.org";
+
 /// The DID of the ed25519 key with the public seed `[0x4a; 32]`. Anyone can
 /// sign as it, so only a build with the `test-default-authority` feature
 /// (dev-dependencies only, guarded in CI) accepts it as an authority.
