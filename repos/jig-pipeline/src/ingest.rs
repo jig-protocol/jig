@@ -792,7 +792,8 @@ fn manifest_log_write(
 ) -> Result<bool, IngestError> {
     use crate::server_manifest::{LOG_SLUG, METADATA_KEY, RESERVED_PREFIX, ServerManifest};
     let slug = channel_slug_of(kind, manifest);
-    let reserved = slug.is_some_and(|s| s.starts_with(RESERVED_PREFIX));
+    // Case-insensitive, so `#JIG/manifest` is reserved too.
+    let reserved = slug.is_some_and(|s| s.to_ascii_lowercase().starts_with(RESERVED_PREFIX));
     if !reserved && kind != BlockKind::ServerManifest {
         return Ok(false);
     }

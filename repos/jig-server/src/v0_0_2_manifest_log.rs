@@ -53,21 +53,33 @@ pub async fn publish(state: &Arc<AppState>) -> anyhow::Result<ManifestRef> {
     let server_did = state.server_did.to_did_jig_string();
     match store.get_channel_by_slug_including_archived(LOG_SLUG)? {
         None => {
-            submit(
-                state,
-                block(state, BlockKind::ChannelCreate, |m| {
-                    m.metadata_entry("slug", serde_json::json!(LOG_SLUG))
-                        .metadata_entry("visibility", serde_json::json!("open"))
-                })?,
-            )
-            .await
-            .context("creating the manifest log")?;
+            submit(state, log_create(state)?)
+                .await
+                .context("creating the manifest log")?;
         }
-        Some(channel) if channel.owner_did != server_did => anyhow::bail!(
-            "{LOG_SLUG} exists and belongs to {}, not this server: the slug is reserved for \
-             the manifest log",
-            channel.owner_did
-        ),
+        // A channel created at the slug before it was reserved: move it,
+        // with everything in it, under the reserved prefix, where only the
+        // server writes, and start the log. Nothing anyone signed is lost.
+        Some(channel) if channel.owner_did != server_did => {
+            let short = channel
+                .id
+                .get(channel.id.len().saturating_sub(12)..)
+                .unwrap_or("old");
+            let quarantine = format!("{QUARANTINE_PREFIX}{short}");
+            tracing::warn!(
+                owner = %jig_core::did::log_tag(&channel.owner_did),
+                to = %quarantine,
+                "an existing channel held the manifest log's reserved slug; moved it"
+            );
+            store.quarantine_channel(
+                LOG_SLUG,
+                &quarantine,
+                chrono::Utc::now().timestamp_millis(),
+            )?;
+            submit(state, log_create(state)?)
+                .await
+                .context("creating the manifest log")?;
+        }
         Some(_) => {}
     }
 
@@ -103,6 +115,17 @@ pub async fn publish(state: &Arc<AppState>) -> anyhow::Result<ManifestRef> {
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(current.clone());
     Ok(current)
+}
+
+/// Where a channel that held [`LOG_SLUG`] before it was reserved is moved.
+const QUARANTINE_PREFIX: &str = "#jig/quarantine/";
+
+/// The manifest log's channel-create.
+fn log_create(state: &AppState) -> anyhow::Result<Vec<u8>> {
+    block(state, BlockKind::ChannelCreate, |m| {
+        m.metadata_entry("slug", serde_json::json!(LOG_SLUG))
+            .metadata_entry("visibility", serde_json::json!("open"))
+    })
 }
 
 /// A block of `kind` in the manifest log, authored by this server.
@@ -196,6 +219,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_channel_already_at_the_reserved_slug_is_moved_not_lost() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let store = &state.ingest_ctx.store;
+        let stranger = jig_core::Did::from_ed25519_pubkey(&[7u8; 32]).to_did_jig_string();
+        store
+            .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                id: "bafyOldChannelAtTheReservedSlug".into(),
+                slug: LOG_SLUG.into(),
+                visibility: "open".into(),
+                created_at: 1,
+                owner_did: stranger.clone(),
+                suite: "none".into(),
+            })
+            .unwrap();
+
+        let current = publish(&state).await.expect("boot goes on");
+        let log = store.get_channel_by_slug(LOG_SLUG).unwrap().unwrap();
+        assert_eq!(log.owner_did, state.server_did.to_did_jig_string());
+        assert_eq!(current.seq, 1);
+        let moved = store
+            .list_channels_including_archived()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.owner_did == stranger)
+            .expect("the old channel is kept");
+        assert_eq!(moved.slug, format!("{QUARANTINE_PREFIX}ReservedSlug"));
+        assert!(moved.slug.starts_with(QUARANTINE_PREFIX), "{}", moved.slug);
+        assert!(
+            store.channel_archived_at(&moved.slug).unwrap().is_some(),
+            "frozen"
+        );
+    }
+
+    #[tokio::test]
     async fn every_welcome_cites_the_current_manifest() {
         let state = Arc::new(AppState::for_test().unwrap());
         let current = publish(&state).await.unwrap();
@@ -247,6 +304,8 @@ mod tests {
             (BlockKind::TextRender, "channel", LOG_SLUG),
             (BlockKind::ServerManifest, "channel", LOG_SLUG),
             (BlockKind::ChannelCreate, "slug", "#jig/other"),
+            // The prefix is reserved whatever its case.
+            (BlockKind::ChannelCreate, "slug", "#JIG/manifest"),
         ] {
             let (manifest, sig) = as_stranger(kind, key, slug);
             let err = ingest(
