@@ -369,6 +369,18 @@ async fn handle_socket(
                     },
                     receipts,
                     delivery_cid: format!("delivery:{}", block.cid),
+                    // Stored in the same transaction as the block, so it is
+                    // there by the time fanout delivers it. A store error
+                    // sends the block without one, which the client sees as
+                    // a block it cannot place, not as a forged record.
+                    ingest: state
+                        .ingest_ctx
+                        .store
+                        .get_ingest_record(&block.cid)
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(cid = %block.cid, "ingest record lookup failed: {e}");
+                            None
+                        }),
                 });
                 let Ok(json) = serde_json::to_string(&frame) else {
                     continue;
@@ -661,7 +673,27 @@ async fn handle_client_frame(
             }
 
             let sub_scope = match scope {
-                Scope::Channel { slug } => SubscriptionScope::Channel(slug),
+                // Clients name a channel by slug; fanout keys channels by
+                // their id (the channel-create CID). A slug with no row yet
+                // stays as it is until that channel is created (see
+                // `Fanout::bind_pending_channel`).
+                Scope::Channel { slug } => {
+                    match state
+                        .ingest_ctx
+                        .store
+                        .get_channel_by_slug_including_archived(&slug)
+                    {
+                        Ok(channel) => {
+                            SubscriptionScope::Channel(channel.map(|c| c.id).unwrap_or(slug))
+                        }
+                        Err(e) => {
+                            let detail = e.to_string();
+                            let _ =
+                                send_error(socket, Some(500), "PERSIST_ERROR", None, &detail).await;
+                            return Ok(());
+                        }
+                    }
+                }
                 Scope::Federation { block_kinds } => SubscriptionScope::Federation { block_kinds },
             };
             // A connection holds ONE subscription. A re-Subscribe replaces it,
@@ -1056,7 +1088,7 @@ mod tests {
     fn test_identity() -> jig_client::Identity {
         let dir = tempdir().unwrap();
         let path = dir.keep();
-        jig_client::Identity::generate_and_save(&path).unwrap()
+        jig_client::Identity::generate_for_tests(&path)
     }
 
     fn test_hlc(id: &jig_client::Identity) -> HlcTimestamp {
@@ -1075,7 +1107,7 @@ mod tests {
             .ingest_ctx
             .store
             .upsert_channel(&jig_pipeline::persist::StoredChannel {
-                id: format!("bafySeed{slug}"),
+                id: jig_pipeline::ingest_record::label_cid(slug),
                 slug: slug.to_string(),
                 visibility: "open".to_string(),
                 created_at: 0,
@@ -1352,7 +1384,14 @@ mod tests {
         let mut got_block = false;
         for _ in 0..2 {
             match next_frame(&mut ws).await.frame {
-                Frame::Block { .. } => got_block = true,
+                Frame::Block { ingest, .. } => {
+                    got_block = true;
+                    let record = ingest.expect("a live block carries its record");
+                    record
+                        .verify(&state.server_did.to_did_jig_string())
+                        .unwrap();
+                    assert!(record.is_genesis(), "the first block of the seeded channel");
+                }
                 Frame::Ack { .. } => {}
                 other => panic!("unexpected frame {other:?}"),
             }
@@ -1566,7 +1605,7 @@ mod tests {
                 .ingest_ctx
                 .store
                 .upsert_channel(&jig_pipeline::persist::StoredChannel {
-                    id: format!("bafySeed{slug}"),
+                    id: jig_pipeline::ingest_record::label_cid(slug),
                     slug: slug.to_string(),
                     visibility: visibility.to_string(),
                     created_at: 0,
@@ -1608,7 +1647,7 @@ mod tests {
             .ingest_ctx
             .store
             .upsert_channel(&jig_pipeline::persist::StoredChannel {
-                id: "bafySeed#open".to_string(),
+                id: jig_pipeline::ingest_record::label_cid("#open"),
                 slug: "#open".to_string(),
                 visibility: "open".to_string(),
                 created_at: 0,

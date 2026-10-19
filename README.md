@@ -75,7 +75,7 @@ loopback and private tailnets.
 | Clients verify every delivered block's author signature | Works: a block a server altered is refused, not shown |
 | History backfill on joining a channel (the client asks for the last 100 blocks; the server caps a request at 200; `?before=<cid>` pages further back) | Works. On an encrypted channel, only messages sent after you joined decrypt; a member who was away pages back to where it left off |
 | `GET /api/v1/channels/:slug/blocks`, `/healthz`, `/metrics` | Works |
-| Nameserver: alias register / resolve / rotate / renew | Works (`jig-nameserver`, `jig ns …`) |
+| Nameserver: alias register / resolve / rotate / renew | Works (`jig-nameserver`, `jig ns …`). `jig ns resolve` prints only verified answers, so the suffix needs a `[naming.delegations]` entry in `cli.toml` or a DNS-rooted delegation |
 | Server-to-server federation over WSS | Implemented for open, unencrypted channels and covered by [`h3_federation.rs`](repos/integration-tests/tests/h3_federation.rs); never run between two hosts on the public internet |
 | Email bridge (Resend) | Implemented in-process, but inbound mail is refused until the bridge can join a thread's MLS group (D25); see [`bridges/email/README.md`](repos/bridges/email/README.md) |
 | Wasm block execution **on the server** | `text-render` executes for real on plaintext channels: the server runs its canonical module and signs the `render_hash` ([`jig-pipeline/src/ingest.rs`](repos/jig-pipeline/src/ingest.rs), step 4). Encrypted content is never executed and gets a `sealed` receipt; control-plane kinds take a synthetic one |
@@ -195,7 +195,6 @@ and lives at the repo root.
 | [`bridges/core`](repos/bridges/core/) | Common `Bridge` trait and context types |
 | [`bridges/email`](repos/bridges/email/) | In-process email bridge (Resend provider) |
 | [`text-block`](repos/text-block/) | The canonical `text-render` Wasm block (`wasm32-unknown-unknown`, embedded in the server; release tarballs also ship a `wasm32-wasip1` build) |
-| [`hello-wasm`](repos/hello-wasm/) | Minimal WASI hello-world used for runtime measurements |
 | [`integration-tests`](repos/integration-tests/) | Cross-component scenario tests: federation, TOFU mismatch, nameserver modes, persistence across restart, email bridge, TLS, encrypted channels |
 
 Not a Cargo member: [`repos/jig-spec/`](repos/jig-spec/), an mdBook protocol spec, still
@@ -209,11 +208,7 @@ cargo build --workspace
 cargo nextest run --workspace     # no environment variables required
 ```
 
-`cargo nextest run --workspace` works from a clean checkout with nothing exported:
-[`repos/.config/nextest.toml`](repos/.config/nextest.toml) injects a throwaway
-`JIG_NS_SECRET` test fixture that `jig-nameserver`'s config defaults would otherwise panic
-without. That value is a public, source-controlled fixture and must never appear in a
-deployment.
+`cargo nextest run --workspace` works from a clean checkout with nothing exported.
 
 One environment caveat: stop any local `jig-server` on `127.0.0.1:7117` first.
 `jig-cli::global_flags missing_implicit_config_still_falls_back_to_defaults` asserts that
@@ -221,7 +216,7 @@ the default port is unreachable, so it fails against your own running server.
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs four jobs on pull
 requests and the merge queue: `changes` (skips the build jobs on drafts and docs-only PRs),
-`workspace` (fmt, clippy, nextest on every workspace crate but `hello-wasm`),
+`workspace` (fmt, clippy, nextest on every workspace crate),
 `wasm-build` (`text-block` for `wasm32-unknown-unknown`), and `dependency-policy`
 (`cargo deny check` — advisories, bans, licenses, sources). A fifth job, `nightly`, runs
 on the daily schedule: doc tests, which nextest does not run, and clippy on

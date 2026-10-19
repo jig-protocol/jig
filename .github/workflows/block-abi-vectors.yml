@@ -1,0 +1,124 @@
+name: block-abi-vectors
+
+# The `jig:block` conformance vectors (JEP-0006) on aarch64.
+#
+# `tests/block_abi_vectors.rs` runs every vector on native Cranelift and on Pulley, and the
+# `workspace` job in ci.yml already runs it on x86_64 Linux. This workflow adds the other
+# architecture: two architectures and two backends have to agree on every comparable outcome,
+# which is the first slice's exit gate.
+#
+# - Pull requests: aarch64 Linux, only when a change could move an outcome (paths below).
+# - Nightly: aarch64 Linux, skipped when none of those paths changed in the last day.
+# - Manual dispatch: aarch64 Linux and aarch64 macOS.
+#
+# Not a required check. Making it one at the exit gate is the maintainer's call.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '41 6 * * *'  # daily 06:41 UTC; off the hour to dodge cron peak queueing
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'repos/jig-runtime/**'
+      - 'repos/jig-core/src/block_abi.rs'
+      - 'repos/jig-core/src/component_validation.rs'
+      - 'repos/jig-core/src/dcbor.rs'
+      - 'repos/jig-spec/wit/**'
+      - 'repos/jig-spec/vectors/block-abi/**'
+      - 'repos/text-block/**'
+      - 'repos/Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/block-abi-vectors.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+# A new push supersedes the previous run rather than racing it.
+concurrency:
+  group: block-abi-vectors-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  select-platforms:
+    name: select platforms
+    # Drafts skip the vectors; marking the PR ready runs them.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      include: ${{ steps.pick.outputs.include }}
+    steps:
+      - id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+          LINUX: '[{"label":"aarch64-linux","runner":"ubuntu-24.04-arm"}]'
+          WITH_MACOS: >-
+            [{"label":"aarch64-linux","runner":"ubuntu-24.04-arm"},
+             {"label":"aarch64-macos","runner":"macos-latest"}]
+        run: |
+          if [ "$EVENT" = workflow_dispatch ]; then
+            SET="$WITH_MACOS"
+          else
+            SET="$LINUX"
+          fi
+          # Collapse to one line: GITHUB_OUTPUT is line-oriented.
+          printf 'include=%s\n' "$(printf '%s' "$SET" | tr -d '\n ')" >>"$GITHUB_OUTPUT"
+
+  vectors:
+    name: vectors (${{ matrix.label }})
+    needs: select-platforms
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.select-platforms.outputs.include) }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      # Swatinem/rust-cache saves to the Actions cache API.
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The nightly's skip check reads the last day of history.
+          fetch-depth: 0
+      - name: Did anything the vectors depend on change since the previous nightly?
+        id: changed
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != schedule ]; then
+            echo "run=true" | tee -a "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 25h, not 24h, so a late-starting cron run never misses a commit.
+          if git log --since='25 hours ago' --format=%H -- \
+              repos/jig-runtime \
+              repos/jig-core/src/block_abi.rs \
+              repos/jig-core/src/component_validation.rs \
+              repos/jig-core/src/dcbor.rs \
+              repos/jig-spec/wit \
+              repos/jig-spec/vectors/block-abi \
+              repos/text-block \
+              repos/Cargo.lock \
+              rust-toolchain.toml \
+              .github/workflows/block-abi-vectors.yml | grep -q .; then
+            echo "run=true" | tee -a "$GITHUB_OUTPUT"
+          else
+            echo "Nothing the vectors depend on changed since the previous nightly; skipping."
+            echo "run=false" | tee -a "$GITHUB_OUTPUT"
+          fi
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        if: steps.changed.outputs.run == 'true'
+        run: rustup toolchain install && rustc --version && cargo --version
+      - uses: Swatinem/rust-cache@v2
+        if: steps.changed.outputs.run == 'true'
+        with:
+          workspaces: repos
+          key: block-abi-vectors-${{ matrix.label }}
+      - name: Conformance vectors, native and Pulley
+        if: steps.changed.outputs.run == 'true'
+        working-directory: repos
+        run: cargo test -p jig-runtime --test block_abi_vectors

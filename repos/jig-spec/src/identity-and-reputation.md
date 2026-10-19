@@ -3,16 +3,19 @@
 > **Status.** This chapter states what the system must do. Where the reference code is
 > behind, a **Status** line says so; the code's current behaviour is not the intent.
 >
-> - **Implemented:** `did:jig` identities, nameserver-attested aliases, TOFU and nameserver
->   resolution in servers, and operator-seeded per-ruleset scores for server admission.
+> - **Implemented:** `did:jig` identities, nameserver-attested aliases, TOFU resolution in
+>   servers, verified name resolution through per-suffix delegations in servers (#200) and
+>   clients (#201), client name pins through `jig trust verify-name` (#213), and
+>   operator-seeded per-ruleset scores for server admission.
 > - **Removed prototype:** the reference nameserver's earlier surface (proof-of-work
 >   challenges with penalties, `/v1/claim`, `/v1/alias`, reputation observations, tribunal
 >   case records, the transparency log, useful work and nameserver federation) is no longer
 >   served. Its routes were deleted in #154. Status lines below that described it now say
 >   so.
-> - **Being redesigned** (drafts, not yet merged): lane R's framing doc (#152), JEP-0008
->   proof-of-work and capacity pools (#162), JEP-0009 rulesets, reputation and transparency
->   logs (#163), and JEP-0010 abuse reports, tribunals and server lists (#166).
+> - **Being redesigned** (draft JEPs): lane R's [framing doc](https://github.com/jig-protocol/jig/blob/main/docs/superpowers/specs/2026-10-18-reputation-pow-tribunals-framing.md),
+>   [JEP-0008](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0008-proof-of-work.md) proof-of-work and capacity pools,
+>   [JEP-0009](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) rulesets, reputation and transparency logs, and
+>   [JEP-0010](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md) abuse reports, tribunals and server lists.
 > - **Required, not yet implemented or partial:** proof-of-work enforced by servers as a
 >   ruleset-set cost (only one-time admission proof-of-work exists, off by default) and on
 >   every nameserver binding endpoint, reputation reports from servers to nameservers and
@@ -83,11 +86,16 @@ key is the DID. No authority issues or revokes one.
   example in different ruleset groups.
 - A new keypair is a new identity with no reputation. The protocol has no mechanism that
   links two DIDs, except [alias rotation](#aliases), which both keys must sign.
+  **Status:** the [JEP-0012](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0012-key-links.md)
+  draft specifies a key link, signed by both keys, that moves one DID's standing to another
+  for one audience (a channel, an alias at one nameserver, a contact, or the public), and
+  `jig_core::key_link` implements it as a library (#235). No record carries a link yet, and
+  `/v1/rotate` still takes signatures over the challenge.
 - Losing the private key loses the identity. Clients SHOULD make key backup explicit.
 
 ### Aliases
 
-A nameserver attests aliases under the suffix it is authoritative for (`alias_suffix`).
+A nameserver attests aliases under the suffixes it is authoritative for (`alias_suffixes`).
 
 1. `GET /v1/challenge` returns a 32-byte hex nonce.
 2. The client signs the nonce with its DID key and sends `POST /v1/register` with `did`,
@@ -95,6 +103,29 @@ A nameserver attests aliases under the suffix it is authoritative for (`alias_su
 3. The nameserver returns an attestation (`did`, `alias`, `ns_did`, `valid_from`,
    `valid_until`, `profile_ttl_seconds`, `sig`) signed with its own key. The default
    validity is 90 days.
+
+**Status:** the reference nameserver differs from steps 2 and 3 (#210). Register and renew
+take an action-bound `proof_of_control`: a COSE_Sign1 by the DID over `domain`
+(`jig-alias-register-v1` or `jig-alias-renew-v1`), the nameserver's DID, the alias and the
+challenge. A signature over the bare challenge is refused. Rotate still takes bare signatures
+over the challenge from both keys. The attestation is a COSE_Sign1 envelope over `did`,
+`alias`, `ns_did`, `valid_from` and `valid_until`, with no `profile_ttl_seconds`. Register,
+renew, rotate and resolve return it base64url-encoded as `attestation`, beside `links` and
+`reachability`, plus unsigned `did`, `alias` and `valid_until` hints for older clients.
+`GET /.well-known/jig-ns-delegation` serves the nameserver's signed delegation for a
+DNS-rooted suffix (`?suffix=`, else the request's `Host`) as `{"envelopes": [...]}`; a
+single-label suffix has none.
+
+One nameserver serves several suffixes (#224). `[[v0_0_2.nameserver.alias_suffixes]]` is
+required, with no default, and each suffix sets its own policy: `registration` (`open` or
+`closed`; a closed suffix still resolves, renews and rotates), `min_alias_len`, reserved names,
+and `registration_allow`, which lets one DID register exact names past that policy. A
+single-label suffix needs `single_label_authority = true`. Register takes an optional `suffix`
+(required when more than one is served: `SUFFIX_REQUIRED`; unserved: `UNKNOWN_SUFFIX`), and a
+DID holds at most one name per suffix: a second registration, or a rotation onto a DID that
+already holds one, is refused with 409 `DID_HOLDS_NAME`. Policy refusals are
+`REGISTRATION_CLOSED`, `ALIAS_TOO_SHORT` and `ALIAS_RESERVED`. `GET /v1/suffixes` lists the
+suffixes served, their registration mode and the nameserver's DID, unsigned.
 
 `POST /v1/renew` extends an attestation. `POST /v1/rotate` moves an alias from one DID to
 another and requires signatures from both keys, so the nameserver can link the two DIDs.
@@ -122,7 +153,14 @@ A server resolves the alias on an incoming block in one of two modes
 | `nameserver` | The server queries each URL in `trusted_nameservers` in order and refuses the block if the alias resolves to a different DID. Results are cached for `cache_ttl_seconds` (default 300). |
 
 A server MAY trust more than one nameserver. A server in `nameserver` mode MUST verify the
-attestation signature before it uses the binding. **Status:** not yet implemented.
+attestation signature before it uses the binding. **Status:** implemented, configured
+differently from the table above (#200). The server resolves `alias@suffix` only through the
+nameservers listed for its suffix in `[identity.delegations]`, and refuses a suffix with no
+entry. It asks every listed nameserver, and accepts only an attestation signed by one of
+that suffix's `authorities`, inside its validity window, for exactly that alias. Two valid
+answers naming different DIDs are an equivocation: the alias is refused and both answers are
+kept as evidence. A verified binding is cached until the earlier of the cache TTL and the
+attestation's `valid_until`. `trusted_nameservers` is ignored, with a startup warning.
 
 ### Anonymous identities
 
@@ -218,7 +256,7 @@ carries `score`, `weight` (default 1.0), `observer`, optional `evidence` and opt
 legacy routes, so it records and returns no scores. Servers keep operator-seeded scores
 per ruleset for admission floors (`[auth.admission] records`) and report nothing to
 nameservers. Net computation across a ruleset group is not implemented; its redesign is the
-JEP-0009 draft (#163).
+[JEP-0009](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) draft.
 
 ### Rulesets and translation contracts
 
@@ -291,7 +329,7 @@ servers are usually the only ones that admit `--anon` identities.
 
 **Status:** security levels and ruleset groups are not yet configuration settings. The
 nameserver's anonymous proof-of-work floor (`JIG_NS_ANON_MIN_POW`) went with the legacy
-alias challenges; it is still published in `/.well-known/jig-ns` but nothing applies it.
+alias challenges; it is still parsed, no longer published (#192), and nothing applies it.
 
 ### Admission proof-of-work (servers)
 
@@ -371,14 +409,16 @@ Rules:
 ## Nameserver mechanics
 
 > **Mostly not served.** The reference nameserver serves `/.well-known/jig-ns`,
-> `/.well-known/jig-ns/capabilities`, `/v1/health` and the alias routes
+> `/.well-known/jig-ns/capabilities`, `/.well-known/jig-ns-delegation`, `/v1/health`, `/v1/suffixes` and the alias routes
 > (`GET /v1/challenge`, `/v1/register`, `/v1/resolve/{alias}`, `/v1/rotate`, `/v1/renew`,
 > and `/v1/handles` behind `[debug] list_handles`). The proof-of-work challenge flow,
 > penalties, rate limiting, `/v1/policy`, `/v1/resolve?name=`, the transparency and admin
 > routes, and federation below described a prototype whose routes were removed (#154). They
-> stay here as the design input that prototype explored; their redesign is the JEP-0008
-> draft (#162). `/.well-known/jig-ns` still publishes the `pow`, `rate_limit` and
-> `automation` parameters; nothing enforces them.
+> stay here as the design input that prototype explored; their redesign is the
+> [JEP-0008](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0008-proof-of-work.md) draft. `/.well-known/jig-ns` no longer publishes proof-of-work
+> parameters (#192). It publishes the alias routes' enforced limits as
+> `policy.alias_rate_limits` (`enabled`, `per_ip_per_min`, `per_did_per_min`) (#197), and still
+> publishes the legacy `automation` parameters, which nothing enforces.
 
 ### Endpoints
 
@@ -391,6 +431,8 @@ Rules:
 | `/v1/challenge` | GET | Alias registration nonce ([Aliases](#aliases)) |
 | `/v1/register`, `/v1/renew`, `/v1/rotate` | POST | Alias attestations |
 | `/v1/resolve/{alias}` | GET | Alias attestation lookup |
+| `/.well-known/jig-ns-delegation` | GET | Signed delegation for a DNS-rooted suffix |
+| `/v1/suffixes` | GET | Suffixes served, their registration mode, and the nameserver's DID |
 | `/v1/challenge` | POST | Proof-of-work challenge for `claim` or `alias` *(not served)* |
 | `/v1/claim` | POST | Bind a handle to a key, with proof-of-work *(not served)* |
 | `/v1/alias` | POST | Mint a scoped or anonymous alias, with proof-of-work *(not served)* |
@@ -465,8 +507,8 @@ Challenge issuance is limited per client IP and per rate key, in fixed one-minut
 
 | Limit | Default | Key |
 | --- | --- | --- |
-| Per IP | 120 per minute (`JIG_NS_RATE_PER_IP_PER_MIN`) | `ip:<address>` |
-| Per key | 60 per minute (`JIG_NS_RATE_PER_MIN`) | `claim:subject:<handle>` or `alias:scope:<scope>:subject:<subject>` |
+| Per IP | 120 per minute (`JIG_NS_RATE_PER_IP_PER_MIN`, *removed in #197*) | `ip:<address>` |
+| Per key | 60 per minute (`JIG_NS_RATE_PER_MIN`, *removed in #197*) | `claim:subject:<handle>` or `alias:scope:<scope>:subject:<subject>` |
 
 The client IP is the socket address, or the first entry of `JIG_NS_PROXY_IP_HEADER`
 (default `x-forwarded-for`) when `JIG_NS_TRUST_PROXY` is set. A refused request gets
@@ -497,8 +539,8 @@ misbehaving does not decay.
 
 | Parameter | Default | Setting |
 | --- | --- | --- |
-| `base_difficulty` | 18 | `JIG_NS_POW_DIFFICULTY` |
-| `min_difficulty` / `max_difficulty` | 8 / 28 | `JIG_NS_POW_MIN` / `JIG_NS_POW_MAX` |
+| `base_difficulty` | 18 | `JIG_NS_POW_DIFFICULTY` *(removed in #192)* |
+| `min_difficulty` / `max_difficulty` | 8 / 28 | `JIG_NS_POW_MIN` / `JIG_NS_POW_MAX` *(removed in #192)* |
 | `anonymous_min` | 12 | `JIG_NS_ANON_MIN_POW` |
 | `step_bits` | 2 per point | `JIG_NS_PENALTY_STEP_BITS` |
 | `max_points` | 64 | `[penalties] max_points` |
@@ -518,8 +560,10 @@ A nameserver publishes its policy at three paths:
 
 - **`GET /.well-known/jig-ns`** (JSON): `version`, `ns_id` (BLAKE3 of the nameserver's
   public key, hex), `endpoints`, and `policy` with `pow` (`base`, `min`, `max`,
-  `anonymous_min`), `rate_limit` (`per_key_per_min`, `per_ip_per_min`, `global_per_min`),
-  `automation`, `allow_domains`, `deny_domains`, `cache_ttl_secs`, `reputation` and
+  `anonymous_min`) *(not served: removed in #192)*, `rate_limit` (`per_key_per_min`,
+  `per_ip_per_min`, `global_per_min`) *(not served: replaced by `alias_rate_limits` in #197)*,
+  `alias_rate_limits` (`enabled`, `per_ip_per_min`, `per_did_per_min`; the limits the alias
+  routes enforce), `automation` (legacy; nothing enforces it), `allow_domains`, `deny_domains`, `cache_ttl_secs`, `reputation` and
   `public_key`.
 - **`GET /.well-known/jig-ns/capabilities`** (plain text): `version`, optional `domain`,
   one `work:` line per useful-work type, `tribunal:`, `transparency:` and `federation:`
@@ -562,7 +606,7 @@ enforced. The nameserver's log:
 
 **Status:** not implemented. Servers keep no log. The nameserver's read endpoints
 (`GET /v1/transparency/entries`, `/hashes`, `/verify`) were removed with the legacy routes;
-it never wrote entries. Redesign: the JEP-0009 draft (#163).
+it never wrote entries. Redesign: the [JEP-0009](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) draft.
 
 ## Useful work
 
@@ -606,7 +650,7 @@ Panel selection and appeal mechanics need a JEP.
 **Status:** not implemented. The prototype's case records (`POST /v1/tribunal/cases`,
 `/v1/tribunal/cases/{id}/decision`) were removed with the legacy routes. Panels,
 signatures, appeals, penalties, logging and propagation were never implemented. Redesign:
-the JEP-0010 draft (#166).
+the [JEP-0010](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md) draft.
 
 ### Reporting abuse in encrypted channels
 
@@ -638,8 +682,7 @@ not yet meet.
 **MUST:**
 
 - Use a DID as the sender of every block; treat aliases as nameserver claims.
-- Verify an alias attestation's signature before using it (servers) *(not yet
-  implemented)*.
+- Verify an alias attestation's signature before using it (servers).
 - Scope every reputation score to one ruleset; share it only within the ruleset group, and
   treat what peers send as claims *(partial)*.
 - Report reputation changes for clients to the ruleset group's nameservers (servers) *(not

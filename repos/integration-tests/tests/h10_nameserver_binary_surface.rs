@@ -22,7 +22,7 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-const ALIAS_SUFFIX: &str = "h10.jig";
+const ALIAS_SUFFIX: &str = "h10.example.org";
 
 /// The verified attestation in a register or resolve response body.
 fn attestation_in(body: &serde_json::Value) -> naming::Attestation {
@@ -47,22 +47,17 @@ impl BinarySurface {
 
         let mut cfg = NameServerConfig::default();
         cfg.storage.database_path = tempdir.path().join("nameserver.db");
-        cfg.pow.server_secret = "h10-test-secret".to_string();
-        cfg.federation.enabled = false;
         cfg.v0_0_2.server.server_did_keyfile = tempdir
             .path()
             .join("nameserver.key")
             .to_string_lossy()
             .into_owned();
-        cfg.v0_0_2.nameserver.alias_suffix = ALIAS_SUFFIX.to_string();
+        cfg.v0_0_2.nameserver.alias_suffixes =
+            vec![jig_config::v0_0_2_server::SuffixConfig::new(ALIAS_SUFFIX)];
         cfg.v0_0_2.debug.list_handles = list_handles;
         cfg.validate().context("config must be valid")?;
 
-        let (router, coordinator) = jig_nameserver::server::build_app(&cfg).context("build_app")?;
-        assert!(
-            coordinator.is_none(),
-            "federation disabled — build_app must not hand back a coordinator"
-        );
+        let router = jig_nameserver::server::build_app(&cfg).context("build_app")?;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.context("bind")?;
         let addr = listener.local_addr().context("local_addr")?;
@@ -170,7 +165,7 @@ async fn build_app_serves_the_v0_0_2_alias_lifecycle() {
     let attestation = attestation_in(&registered);
     assert_eq!(
         attestation.alias, expected_alias,
-        "alias suffix must come from [v0_0_2.nameserver].alias_suffix"
+        "alias suffix must come from [v0_0_2.nameserver].alias_suffixes"
     );
     assert_eq!(attestation.did, did);
 

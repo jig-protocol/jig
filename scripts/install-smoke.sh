@@ -14,6 +14,20 @@
 #
 # Writes the measured seconds to $JIG_SMOKE_RESULT (if set) and, on GitHub
 # Actions, to the job summary.
+#
+# Identity keys (I1): the timed run seals the key with a random secret
+# (JIG_KEY_UNLOCK), the sealed path without a prompt, and an untimed second
+# install with nothing to seal with checks install.sh's plaintext fallback.
+# The OS keychain is switched off (JIG_KEYCHAIN=none): HOME here is a fresh
+# directory, and on macOS that means no login keychain to write to.
+#
+# JIG_SMOKE_KEYCHAIN=1 (macOS only) instead installs into the real HOME, so
+# the key is sealed in the login keychain, the path a Mac user gets. It fails
+# if the key ends up anywhere else, and removes ~/.jig and the keychain item
+# afterwards. It is untimed: the budget argument is ignored. It refuses to run
+# if ~/.jig already exists. Once past that check
+# it creates the file $JIG_SMOKE_KEYCHAIN_MARKER (if set), so a cleanup that
+# runs after a killed run knows ~/.jig was this run's.
 set -euo pipefail
 
 budget="${1:-60}"
@@ -36,18 +50,49 @@ case "$JIG_INSTALL_SH_URL" in
     ;;
 esac
 
+keychain="${JIG_SMOKE_KEYCHAIN:-0}"
+if [ "$keychain" = 1 ]; then
+  if [ "$(uname -s)" != "Darwin" ]; then
+    echo "JIG_SMOKE_KEYCHAIN=1 needs macOS" >&2
+    exit 2
+  fi
+  if [ -e "$HOME/.jig" ]; then
+    echo "refusing: $HOME/.jig exists, and JIG_SMOKE_KEYCHAIN=1 installs into the real HOME" >&2
+    exit 2
+  fi
+  # Tells a later cleanup step that ~/.jig is ours to remove.
+  if [ -n "${JIG_SMOKE_KEYCHAIN_MARKER:-}" ]; then : > "$JIG_SMOKE_KEYCHAIN_MARKER"; fi
+fi
+
 sandbox="$(mktemp -d "${TMPDIR:-/tmp}/jig-smoke.XXXXXX")"
 port=$(( 20000 + RANDOM % 20000 ))
-export HOME="$sandbox/home"
+[ "$keychain" = 1 ] || export HOME="$sandbox/home"
 export JIG_HOME="$HOME/.jig"
 export JIG_SERVER_LISTEN="127.0.0.1:$port"
 export JIG_NONINTERACTIVE=1
 export USER="${USER:-smoke}"
 mkdir -p "$HOME"
+if [ "$keychain" = 1 ]; then
+  unset JIG_KEYCHAIN JIG_KEY_UNLOCK JIG_KEY_PASSPHRASE JIG_KEYS_STORAGE
+else
+  JIG_SMOKE_KEY_SECRET="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+  export JIG_SMOKE_KEY_SECRET
+  export JIG_KEY_UNLOCK="env:JIG_SMOKE_KEY_SECRET"
+  export JIG_KEYCHAIN=none
+fi
 
 cleanup() {
-  [ -f "$JIG_HOME/jig-server.pid" ] && kill "$(cat "$JIG_HOME/jig-server.pid")" 2>/dev/null || true
+  for pidfile in "$sandbox"/home*/.jig/jig-server.pid "$JIG_HOME/jig-server.pid"; do
+    [ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null || true
+  done
   [ -n "${tail_pid:-}" ] && kill "$tail_pid" 2>/dev/null || true
+  if [ "$keychain" = 1 ]; then
+    for keyfile in "$JIG_HOME"/keys/*.jigkey; do
+      [ -f "$keyfile" ] || continue
+      security delete-generic-password -s jig -a "$(basename "$keyfile" .jigkey)" >/dev/null 2>&1 || true
+    done
+    rm -rf "$JIG_HOME"
+  fi
   rm -rf "$sandbox"
 }
 trap cleanup EXIT
@@ -58,29 +103,87 @@ curl "${curl_args[@]}" "$JIG_INSTALL_SH_URL" | bash
 end=$(now)
 elapsed=$(awk -v a="$start" -v b="$end" 'BEGIN { printf "%.1f", b - a }')
 
-# Round trip: a fresh subscriber's backfill must contain the installer's post.
-jig="$JIG_HOME/bin/jig"
-"$jig" tail '#hello' > "$sandbox/tail.out" 2>&1 &
-tail_pid=$!
-for _ in $(seq 1 50); do
-  grep -q "hello, world" "$sandbox/tail.out" && break
-  sleep 0.2
-done
-if ! grep -q "hello, world" "$sandbox/tail.out"; then
-  echo "FAIL: 'hello, world' not readable back from #hello. jig tail said:" >&2
-  cat "$sandbox/tail.out" >&2
-  tail -30 "$JIG_HOME/logs/jig-server.log" >&2 || true
-  exit 1
+# Keychain mode: the key must be sealed in the login keychain and nowhere else.
+# A plaintext fallback leaves a .key file; a passphrase slot means it asked.
+# Checked before the read-back, which then opens the key through the keychain.
+if [ "$keychain" = 1 ]; then
+  echo "== checking the key is sealed in the login keychain"
+  keyfiles=("$JIG_HOME"/keys/*.jigkey)
+  if [ "${#keyfiles[@]}" -ne 1 ] || [ ! -f "${keyfiles[0]}" ] || compgen -G "$JIG_HOME/keys/*.key" >/dev/null; then
+    echo "FAIL: expected exactly one sealed key and no unencrypted one in $JIG_HOME/keys:" >&2
+    ls -l "$JIG_HOME/keys" >&2 || true
+    exit 1
+  fi
+  did="$(basename "${keyfiles[0]}" .jigkey)"
+  if ! grep -q '"source":"keychain"' "${keyfiles[0]}" || grep -q '"kind":"passphrase"' "${keyfiles[0]}"; then
+    echo "FAIL: $did's key file has no keychain slot, or has a passphrase slot" >&2
+    exit 1
+  fi
+  if ! security find-generic-password -s jig -a "$did" >/dev/null 2>&1; then
+    echo "FAIL: no login keychain item for service jig, account $did" >&2
+    exit 1
+  fi
 fi
+
+# Round trip: a fresh subscriber's backfill must contain the installer's post.
+read_back() {
+  local jig="$JIG_HOME/bin/jig" out="$1"
+  "$jig" tail '#hello' > "$out" 2>&1 &
+  tail_pid=$!
+  for _ in $(seq 1 50); do
+    grep -q "hello, world" "$out" && break
+    sleep 0.2
+  done
+  kill "$tail_pid" 2>/dev/null || true
+  tail_pid=
+  if ! grep -q "hello, world" "$out"; then
+    echo "FAIL: 'hello, world' not readable back from #hello. jig tail said:" >&2
+    cat "$out" >&2
+    tail -30 "$JIG_HOME/logs/jig-server.log" >&2 || true
+    exit 1
+  fi
+}
+read_back "$sandbox/tail.out"
 
 # Idempotency: a second run over the same HOME, with the server still up and
 # #hello already there, must succeed too (untimed).
 echo "== re-running install.sh over the existing install"
 curl "${curl_args[@]}" "$JIG_INSTALL_SH_URL" | bash
 
-[ -n "${JIG_SMOKE_RESULT:-}" ] && echo "$elapsed" > "$JIG_SMOKE_RESULT"
-verdict=$(awk -v e="$elapsed" -v b="$budget" 'BEGIN { print (e <= b) ? "PASS" : "FAIL" }')
-line="install → hello-world: ${elapsed}s (budget ${budget}s) on $(uname -s)/$(uname -m): $verdict"
+# Plaintext fallback (untimed): a fresh install with no keychain, no terminal
+# and nothing in the environment to seal with must still reach hello-world,
+# say loudly that the key is unencrypted, and leave a key that jig reads with JIG_KEYS_STORAGE=plaintext.
+if [ "$keychain" != 1 ]; then
+  echo "== install with nothing to seal the key with (plaintext fallback)"
+  export HOME="$sandbox/home-plain"
+  export JIG_HOME="$HOME/.jig"
+  export JIG_SERVER_LISTEN="127.0.0.1:$(( port + 1 ))"
+  mkdir -p "$HOME"
+  unset JIG_KEY_UNLOCK JIG_SMOKE_KEY_SECRET
+  curl "${curl_args[@]}" "$JIG_INSTALL_SH_URL" | bash 2> "$sandbox/plain.err"
+  if ! grep -q "stored UNENCRYPTED" "$sandbox/plain.err"; then
+    echo "FAIL: the plaintext fallback did not warn. install.sh said:" >&2
+    cat "$sandbox/plain.err" >&2
+    exit 1
+  fi
+  export JIG_KEYS_STORAGE=plaintext
+  read_back "$sandbox/tail-plain.out"
+  unset JIG_KEYS_STORAGE
+  if ! grep -q "stored unencrypted" "$sandbox/tail-plain.out"; then
+    echo "FAIL: jig did not warn that it loaded an unencrypted key" >&2
+    exit 1
+  fi
+fi
+
+# Keychain mode is untimed: it checks where the key went, not the 60s KPI.
+if [ "$keychain" = 1 ]; then
+  verdict=PASS
+  line="install → hello-world (login keychain, untimed): ${elapsed}s on $(uname -s)/$(uname -m): $verdict"
+else
+  [ -n "${JIG_SMOKE_RESULT:-}" ] && echo "$elapsed" > "$JIG_SMOKE_RESULT"
+  verdict=$(awk -v e="$elapsed" -v b="$budget" 'BEGIN { print (e <= b) ? "PASS" : "FAIL" }')
+  line="install → hello-world: ${elapsed}s (budget ${budget}s) on $(uname -s)/$(uname -m): $verdict"
+fi
 echo "== $line"
 [ -n "${GITHUB_STEP_SUMMARY:-}" ] && echo "- $line" >> "$GITHUB_STEP_SUMMARY"
 [ "$verdict" = "PASS" ]

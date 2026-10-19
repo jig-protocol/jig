@@ -568,15 +568,8 @@ tailscale ip -4
 sudoedit /etc/jig/config.toml
 #   set root-level  bind_address = "<the 100.x address>"   <- this is what binds
 #   set [server]    listen = "<the 100.x address>:7117"    <- decorative, but keep in sync
-#   [debug] admin_endpoints = true only while pre-v0.1 jig CLIs still connect
 
-# 4. nameserver secret — MANDATORY, it panics at startup without one
-printf 'JIG_NS_SECRET=%s\n' "$(openssl rand -hex 32)" \
-  | sudo tee /etc/jig/jig-nameserver.env >/dev/null
-sudo chown root:jig /etc/jig/jig-nameserver.env
-sudo chmod 600 /etc/jig/jig-nameserver.env
-
-# 5. units — EDIT jig-nameserver.service's Environment=JIG_NS_BIND first
+# 4. units (the nameserver needs no secret or env file) — EDIT jig-nameserver.service's Environment=JIG_NS_BIND first
 sudoedit deploy/jig-nameserver.service        # JIG_NS_BIND=<the 100.x address>
 sudo install -m 0644 deploy/jig-server.service deploy/jig-nameserver.service \
                      deploy/jig-backup.service deploy/jig-backup.timer \
@@ -864,10 +857,12 @@ actually shrink it".
 `deploy/jig-backup.sh` already does the local half correctly — `VACUUM INTO`
 snapshots (safe on a live WAL database, unlike `cp`), a `MANIFEST.txt` of sha256
 sums, `umask 077`, partial-snapshot cleanup, and retention pruning that only
-ever touches timestamp-shaped directories. It backs up four things:
-`jig.db`, **`jig_v002.db`** (the v0.0.2 block store — where the messages actually
-are; the `_v002` suffix is derived from `database_path`, not a typo),
-`nameserver.db`, and `server.key`.
+ever touches timestamp-shaped directories. It backs up **`jig_v002.db`** (the
+block store — where the messages actually are; the `_v002` suffix is derived
+from `database_path`, not a typo) and `server.key`, plus, when the box runs the
+nameserver, `nameserver.db`, `nameserver_v002.db` (the alias bindings) and
+`nameserver_v002.key` (the nameserver's signing key). The older `jig.db` is no longer used (#196) and is not backed
+up.
 
 Its stated gap is the one this section closes: *"`/var/backups/jig` is on the
 same disk as the thing it is backing up."*

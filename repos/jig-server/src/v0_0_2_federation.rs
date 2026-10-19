@@ -427,27 +427,38 @@ pub async fn ingest_peer_block(
         warn!(peer_url = %peer.url, %delivery_cid, "rejecting peer block: encrypted content does not federate");
         return Ok(());
     }
-    if let Some(slug) = manifest
-        .kind
-        .and_then(|kind| jig_pipeline::ingest::channel_slug_of(kind, &manifest))
+    let bundle = jig_core::BlockBundle {
+        manifest_bytes: &manifest_bytes,
+        code_bytes: &code_bytes,
+        resources: vec![],
+    };
+    // The same resolver ingest gates with, so a block naming its channel by
+    // `channel_id` is held to the same rule as one naming it by slug.
+    let block_cid = bundle
+        .block_cid()
+        .map(|c| c.to_string())
+        .unwrap_or_default();
+    if let Some(kind) = manifest.kind
+        && let Some(named) = jig_pipeline::ingest::channel_id_of(
+            &state.ingest_ctx.store,
+            kind,
+            &manifest,
+            &block_cid,
+        )?
+        && let Some(id) = named.id.as_deref()
         && let Some(chan) = state
             .ingest_ctx
             .store
-            .get_channel_by_slug_including_archived(slug)?
+            .get_channel_by_id_including_archived(id)?
         && !DeliveryPolicy::for_channel(&chan, vec![]).federates
     {
-        warn!(peer_url = %peer.url, %delivery_cid, slug, "rejecting peer block: the local channel does not federate");
+        warn!(peer_url = %peer.url, %delivery_cid, slug = %chan.slug, "rejecting peer block: the local channel does not federate");
         return Ok(());
     }
 
     let sig = sig_b64
         .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
         .unwrap_or_default();
-    let bundle = jig_core::BlockBundle {
-        manifest_bytes: &manifest_bytes,
-        code_bytes: &code_bytes,
-        resources: vec![],
-    };
     let source = jig_pipeline::ingest::IngestSource::FederatedPeer {
         peer_did: jig_core::Did::from_str_unchecked(jig_pipeline::effect::canonical_did_string(
             &peer.expected_did,
@@ -501,6 +512,7 @@ async fn forward_outbound(
                 .encode(&receipt.receipt_bytes),
         }],
         delivery_cid: format!("delivery:{}", block.cid),
+        ingest: None,
     });
     let json = serde_json::to_string(&frame)?;
     sink.send(Message::Text(json.into())).await?;
@@ -787,7 +799,7 @@ mod tests {
             .ingest_ctx
             .store
             .upsert_channel(&StoredChannel {
-                id: "bafyChanX".into(),
+                id: jig_pipeline::ingest_record::label_cid("chan x"),
                 slug: "#dm/x".into(),
                 // Open: in v0.2 only open, unencrypted channels federate; see
                 // `peer_blocks_for_channels_that_do_not_federate_are_dropped`.
@@ -801,7 +813,7 @@ mod tests {
             .ingest_ctx
             .store
             .upsert_membership(&StoredMembership {
-                channel_id: "bafyChanX".into(),
+                channel_id: jig_pipeline::ingest_record::label_cid("chan x"),
                 member_did: managed_did.clone(),
                 role: "member".into(),
                 joined_at: 0,
@@ -858,7 +870,10 @@ mod tests {
             .await
             .expect("bridge sink should receive the federated block")
             .expect("delivery present");
-        assert_eq!(got.0.channel_id.as_deref(), Some("#dm/x"));
+        assert_eq!(
+            got.0.channel_id.as_deref(),
+            Some(jig_pipeline::ingest_record::label_cid("chan x").as_str())
+        );
         assert_eq!(got.0.sender_did, sender_did.to_did_jig_string());
     }
 
@@ -886,7 +901,7 @@ mod tests {
                 .ingest_ctx
                 .store
                 .upsert_channel(&StoredChannel {
-                    id: format!("bafy{slug}"),
+                    id: jig_pipeline::ingest_record::label_cid(slug),
                     slug: slug.into(),
                     visibility: visibility.into(),
                     created_at: 0,
@@ -1153,7 +1168,7 @@ mod tests {
             .ingest_ctx
             .store
             .upsert_channel(&StoredChannel {
-                id: "bafyOpen".into(),
+                id: jig_pipeline::ingest_record::label_cid("#open"),
                 slug: "#open".into(),
                 visibility: "open".into(),
                 created_at: 0,
@@ -1178,7 +1193,7 @@ mod tests {
             state
                 .ingest_ctx
                 .store
-                .list_members("bafyOpen")
+                .list_members(&jig_pipeline::ingest_record::label_cid("#open"))
                 .unwrap()
                 .is_empty(),
             "a refused member-add must add nobody"
@@ -1200,7 +1215,7 @@ mod tests {
             .ingest_ctx
             .store
             .upsert_channel(&jig_pipeline::persist::StoredChannel {
-                id: "bafyRemote".into(),
+                id: jig_pipeline::ingest_record::label_cid("#remote"),
                 slug: "#remote".into(),
                 visibility: "open".into(),
                 created_at: 0,

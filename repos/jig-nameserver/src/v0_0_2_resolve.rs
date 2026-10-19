@@ -1,19 +1,23 @@
 //! GET /v1/resolve/{name} and GET /.well-known/jig-ns-delegation for the
 //! v0.0.2 nameserver. Both serve signed objects a resolver verifies itself
 //! (JEP-0004 rules 3 and 8), as unpadded base64url COSE_Sign1 envelopes.
+//! GET /v1/suffixes lists what this nameserver serves, unsigned.
 
 use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode, header::HOST},
     routing::get,
 };
+use jig_config::v0_0_2_server::Registration;
 use jig_core::naming::{Root, SuffixDelegation};
+use serde::Deserialize;
 
 use crate::v0_0_2::AppState;
-use crate::v0_0_2_register::{ApiError, b64u, current_binding, err, parse_name};
+use crate::v0_0_2_policy::SuffixPolicy;
+use crate::v0_0_2_register::{ApiError, b64u, current_binding, err, served_name};
 
 /// How long a served suffix delegation stays valid. It is re-signed on every
 /// request, so this only bounds how long a resolver may cache it.
@@ -25,7 +29,7 @@ pub async fn resolve(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let alias = parse_name(&name)?.as_alias();
+    let alias = served_name(&state, &name)?.as_alias();
     match current_binding(&state, &alias).await? {
         Some(binding) => Ok(Json(binding.response())),
         None => Err(err(
@@ -36,26 +40,96 @@ pub async fn resolve(
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DelegationQuery {
+    suffix: Option<String>,
+}
+
+/// A suffix whose names a resolver finds through DNS. A single-label suffix
+/// is trusted only through client config (JEP-0004 rule 4), so it has none.
+fn dns_rooted(p: &SuffixPolicy) -> bool {
+    p.suffix.contains('.')
+}
+
+/// Which suffix a delegation request means: `?suffix=`, else the one the
+/// `Host` names, else the only DNS-rooted suffix served.
+fn delegated_suffix<'a>(
+    state: &'a AppState,
+    query: Option<&str>,
+    headers: &HeaderMap,
+) -> Option<&'a SuffixPolicy> {
+    let dns = |s: &str| state.suffixes.get(s).filter(|p| dns_rooted(p));
+    if let Some(s) = query {
+        return dns(&s.to_ascii_lowercase());
+    }
+    let host = headers
+        .get(HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(|h| h.rsplit_once(':').map_or(h, |(name, _port)| name))
+        .map(str::to_ascii_lowercase);
+    if let Some(p) = host.as_deref().and_then(dns) {
+        return Some(p);
+    }
+    let mut rooted = state.suffixes.iter().filter(|p| dns_rooted(p));
+    match (rooted.next(), rooted.next()) {
+        (Some(one), None) => Some(one),
+        _ => None,
+    }
+}
+
 /// GET /.well-known/jig-ns-delegation — this nameserver's single-authority
-/// delegation for its suffix, rooted in DNS (JEP-0004 rule 3). It is
+/// delegation for one of its DNS-rooted suffixes (JEP-0004 rule 3). It is
 /// authoritative only when served from `https://<suffix>/`.
-pub async fn delegation(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let suffix = state.suffix().to_ascii_lowercase();
+pub async fn delegation(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<DelegationQuery>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Some(policy) = delegated_suffix(&state, query.suffix.as_deref(), &headers) else {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            "NO_DELEGATION",
+            "no DNS-rooted suffix matches; pass ?suffix=<suffix>. A single-label suffix \
+             has no DNS delegation",
+        ));
+    };
     let deleg = SuffixDelegation::sign(
         &[&state.ingest_ctx.server_key],
-        &suffix,
+        &policy.suffix,
         Root::Dns,
-        &suffix,
+        &policy.suffix,
         chrono::Utc::now().timestamp() + DELEGATION_VALIDITY_SECS,
     );
     let envelopes: Vec<String> = deleg.envelopes.iter().map(|e| b64u(e)).collect();
-    Json(serde_json::json!({ "envelopes": envelopes }))
+    Ok(Json(serde_json::json!({ "envelopes": envelopes })))
+}
+
+/// GET /v1/suffixes — this nameserver's DID and the suffixes it serves.
+/// Unsigned: a client uses it to address a registration, and a wrong
+/// `ns_did` only makes its proof fail here.
+pub async fn suffixes(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let list: Vec<serde_json::Value> = state
+        .suffixes
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "suffix": p.suffix,
+                "registration": match p.registration {
+                    Registration::Open => "open",
+                    _ => "closed",
+                },
+                "dns_delegation": dns_rooted(p),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "ns_did": state.ns_did_string(), "suffixes": list }))
 }
 
 pub fn build_resolve_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/resolve/{alias}", get(resolve))
         .route("/.well-known/jig-ns-delegation", get(delegation))
+        .route("/v1/suffixes", get(suffixes))
         .with_state(state)
 }
 

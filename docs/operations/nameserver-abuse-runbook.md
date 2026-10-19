@@ -13,8 +13,8 @@
 >   rotation also still applies.
 > - Section 4: steps 5 and 6.
 >
-> A new runbook follows lane R's redesign (framing doc #152; draft JEP-0008, JEP-0009 and
-> JEP-0010 in #162, #163 and #166).
+> A new runbook follows lane R's redesign: the [framing doc](../superpowers/specs/2026-10-18-reputation-pow-tribunals-framing.md) and the draft
+> [JEP-0008](../../repos/jig-spec/jep/jep-0008-proof-of-work.md), [JEP-0009](../../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) and [JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md).
 
 What a `jig-nameserver` operator does about harassment reports, registration and relay
 abuse, a compromised nameserver, and a rogue federated instance. Parameters and endpoints
@@ -45,8 +45,9 @@ spreads further than the group.
 - **Know your files.** With the shipped unit: legacy store `/var/lib/jig/nameserver.db`
   (penalties, rate windows, federation cache, reputation, tribunal records, the
   `ns_identity` key), alias store `/var/lib/jig/nameserver_v002.db`, attestation signing key
-  `/var/lib/jig/nameserver_v002.key` (or `[v0_0_2.server] server_did_keyfile`), and
-  `JIG_NS_SECRET` in `/etc/jig/jig-nameserver.env`.
+  `/var/lib/jig/nameserver_v002.key` (or `[v0_0_2.server] server_did_keyfile`), and any
+  `JIG_NS_*` settings in the optional `/etc/jig/jig-nameserver.env`. The nameserver has no
+  `JIG_NS_SECRET` any more (#192).
 - **Know that settings are read at start-up.** Every `JIG_NS_*` change below needs
   `sudo systemctl restart jig-nameserver`. A restart does not reset the legacy penalties or
   rate windows, which live in the database. It does reset the `[alias_rate_limits]`
@@ -176,19 +177,20 @@ issue attestations, and read or change everything in its databases.
 1. **Contain.** Stop the service (`sudo systemctl stop jig-nameserver`) or firewall it. Keep
    copies of both databases, the key file and the logs before changing anything.
 2. **Cut dependent servers loose.** Operators of servers with `[identity] mode =
-   "nameserver"` remove your URL from `trusted_nameservers`, or switch to another nameserver
-   or to `tofu`, and restart. Their cached resolutions expire within `cache_ttl_seconds`
-   (default 300). Servers do not verify attestation signatures yet, so changing the key
-   does not protect them; removing the URL does.
+   "nameserver"` remove your nameserver's `ns_did` from the `authorities` of each suffix
+   under `[identity.delegations]` (and your URL from its `nameservers`), or switch to
+   `tofu`, and restart. Servers accept only attestations an authority signed (#200), so an
+   attestation under the removed key is refused from then on. `trusted_nameservers` is no
+   longer used. Clients that list your suffix under `[naming.delegations]` need the same
+   change.
 3. **Find what changed.** Compare alias bindings in `nameserver_v002.db` and identities in
    `nameserver.db` against your latest backup. List every alias whose DID changed.
 4. **Rotate everything:**
-   - `JIG_NS_SECRET`: new value from `openssl rand -hex 32`. Outstanding challenges become
-     invalid; there is no overlap window.
    - `JIG_NS_ADMIN_TOKEN`: new value.
    - Attestation key: move `nameserver_v002.key` aside and let the service mint a new one,
      which gives the nameserver a new `ns_did`. Every attestation signed by the old key
-     must be treated as untrusted.
+     must be treated as untrusted. Dependent servers and clients accept the new key only
+     once its `ns_did` is in their delegation's `authorities`, so tell them the new DID.
    - `ns_identity` key: delete its row from `nameserver.db` so a new one is generated. This
      changes the `ns_id` in `/.well-known/jig-ns`.
 5. **Restore bindings.** Revert changed aliases from backup. Ask users to renew

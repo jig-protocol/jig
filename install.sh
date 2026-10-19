@@ -26,6 +26,12 @@
 #   JIG_INSTALL_FROM      release (default) | source (cargo build; only from a checkout).
 #   JIG_NONINTERACTIVE=1  never exec into the chat TUI.
 #   JIG_NO_START=1        install binaries + config only.
+#   JIG_KEY_PASSPHRASE / JIG_KEY_UNLOCK
+#                         seal the new identity key with a passphrase or a
+#                         secret (see `jig init`). Without them, and with no OS
+#                         keychain and no terminal to ask, the key is stored
+#                         unencrypted (JIG_KEYS_STORAGE=plaintext) and a warning
+#                         says so.
 #   JIG_HOME, JIG_SERVER_LISTEN, JIG_DEFAULT_CHANNEL.
 
 set -euo pipefail
@@ -175,7 +181,6 @@ install_from_release() {
   tarball="${name}.tar.gz"
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/jig-install.XXXXXX")"
   INSTALL_TMP="$tmp"
-  trap 'rm -rf "$INSTALL_TMP"' EXIT
 
   if [ -z "$JIG_RELEASES_BASE" ]; then
     resolve_release "$tmp"
@@ -338,13 +343,135 @@ start_server_background() {
   die "jig-server did not answer /healthz within 10s"
 }
 
+# On exit: remove the download directory, and drop the passphrase this script
+# may have read, so nothing it started later inherits it.
+on_exit() {
+  if [ -n "${INSTALL_TMP:-}" ]; then rm -rf "$INSTALL_TMP"; fi
+  # `read -s` turns echo back on when it returns, and bash restores it on
+  # Ctrl-C too; this covers any other way out of the prompt.
+  if [ "${INSTALL_PROMPTING:-0}" = "1" ]; then stty echo </dev/tty 2>/dev/null || true; fi
+  forget_passphrase
+}
+
+# Set when this script read the passphrase itself, so it only ever unsets its
+# own, never one the person exported.
+INSTALL_READ_PASSPHRASE=0
+forget_passphrase() {
+  if [ "$INSTALL_READ_PASSPHRASE" = "1" ]; then
+    unset JIG_KEY_PASSPHRASE
+    INSTALL_READ_PASSPHRASE=0
+  fi
+}
+
+# Where jig will find no OS keychain but a person is at the terminal, ask for
+# the new key's passphrase once, here, and hand it to every jig command this
+# script runs. Otherwise each command would ask again (unlocked keys are cached
+# per process). It lives only in this script's environment: never on disk, and
+# unset before the script ends.
+#
+# `read_passphrase force` asks even where a keychain should exist: jig could not
+# seal with it (it timed out, or refused), and a person is still here, so the
+# answer is a passphrase, never plaintext.
+read_passphrase() {
+  [ -n "${JIG_KEY_PASSPHRASE:-}${JIG_KEY_UNLOCK:-}" ] && return 0
+  [ "${JIG_KEYS_STORAGE:-}" = "plaintext" ] && return 0
+  if [ "${1:-}" != "force" ]; then
+    # The checks jig makes for a keychain (jig-client/src/keychain.rs).
+    [ "$(uname -s)" = "Darwin" ] && [ "${JIG_KEYCHAIN:-}" != "none" ] && return 0
+    if [ "${JIG_KEYCHAIN:-}" != "none" ] && command -v secret-tool >/dev/null 2>&1 \
+      && { [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || [ -S "${XDG_RUNTIME_DIR:-/nonexistent}/bus" ]; }; then
+      return 0
+    fi
+  fi
+  { : </dev/tty; } 2>/dev/null || return 0
+  local first second
+  INSTALL_PROMPTING=1
+  # INT and TERM leave through `exit`, so the EXIT trap restores the terminal.
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if [ "${1:-}" = "force" ]; then
+    printf '[jig] The OS keychain could not seal your identity key: choose a passphrase instead.\n' >/dev/tty
+  else
+    printf '[jig] No OS keychain here: choose a passphrase to seal your identity key.\n' >/dev/tty
+  fi
+  for _ in 1 2 3; do
+    printf '[jig] passphrase: ' >/dev/tty
+    IFS= read -rs first </dev/tty || die "could not read a passphrase"
+    printf '\n' >/dev/tty
+    # The same minimum jig enforces on a new passphrase.
+    if [ "${#first}" -lt 8 ]; then
+      printf '[jig] the passphrase needs at least 8 characters\n' >/dev/tty
+      continue
+    fi
+    printf '[jig] repeat it: ' >/dev/tty
+    IFS= read -rs second </dev/tty || die "could not read a passphrase"
+    printf '\n' >/dev/tty
+    if [ "$first" = "$second" ]; then
+      export JIG_KEY_PASSPHRASE="$first"
+      INSTALL_READ_PASSPHRASE=1
+      INSTALL_PROMPTING=0
+      trap - INT TERM
+      return 0
+    fi
+    printf '[jig] the two did not match\n' >/dev/tty
+  done
+  die "no passphrase chosen"
+}
+
+# The identity key could not be sealed: no OS keychain, no terminal to ask for
+# a passphrase, and none in the environment. Say so loudly, and keep using the
+# unencrypted key for the rest of this script (DJ, 2026-10-18: the CLI never
+# weakens storage on its own; the installer opts in, visibly).
+plaintext_keys() {
+  warn "========================================================================"
+  warn "Your identity key is stored UNENCRYPTED in ~/.jig/keys/."
+  warn "No OS keychain was available and there was no terminal to ask for a"
+  warn "passphrase. Anyone who can read your home directory, or a backup of it,"
+  warn "has your identity."
+  warn "Until you seal it, run jig with JIG_KEYS_STORAGE=plaintext. To seal it,"
+  warn "run any jig command from a terminal without that variable (you will be"
+  warn "asked for a passphrase), or set JIG_KEY_PASSPHRASE for that run."
+  warn "========================================================================"
+  export JIG_KEYS_STORAGE=plaintext
+}
+
 hello_world() {
-  local jig="$JIG_HOME/bin/jig" nickname="${USER:-jig-user}"
+  local jig="$JIG_HOME/bin/jig" nickname="${USER:-jig-user}" init_err
   if [ ! -f "$HOME/.jig/cli.toml" ]; then
+    read_passphrase
     log "generating your DID (nickname: $nickname)"
-    "$jig" init "$nickname" >/dev/null
+    # Exit status 78: no key slot could seal the key (jig-cli's
+    # EXIT_NO_KEY_SLOT). The passphrase prompt, if any, is on /dev/tty, so
+    # capturing stderr does not hide it.
+    local rc=0
+    init_err="$("$jig" init "$nickname" 2>&1 >/dev/null)" || rc=$?
+    case "$rc" in
+      0) ;;
+      78)
+        # Nothing could seal the key. With a person at the terminal, that is a
+        # passphrase (jig may have been told not to prompt, or the keychain
+        # gave up on them); plaintext is only for when nobody can be asked.
+        if { : </dev/tty; } 2>/dev/null; then
+          read_passphrase force
+        fi
+        if [ -z "${JIG_KEY_PASSPHRASE:-}" ]; then
+          plaintext_keys
+        fi
+        "$jig" init "$nickname" >/dev/null || die "jig init failed"
+        ;;
+      *) printf '%s\n' "$init_err" >&2; die "jig init failed" ;;
+    esac
   else
     log "reusing identity in ~/.jig/cli.toml"
+  fi
+  # A key stored raw (by an earlier version, or above) is sealed the next time
+  # jig loads it, which needs a way to seal. Where there is none, keep it raw for
+  # this script rather than fail, and say so.
+  if [ "${JIG_KEYS_STORAGE:-}" != "plaintext" ] \
+    && compgen -G "$HOME/.jig/keys/*.key" >/dev/null \
+    && ! { : </dev/tty; } 2>/dev/null \
+    && [ -z "${JIG_KEY_PASSPHRASE:-}${JIG_KEY_UNLOCK:-}" ]; then
+    plaintext_keys
   fi
   local scheme
   scheme="$(server_scheme)" || die "jig-server stopped answering on $JIG_SERVER_LISTEN"
@@ -357,6 +484,7 @@ hello_world() {
 }
 
 main() {
+  trap on_exit EXIT
   log "installing jig into $JIG_HOME"
   case "$JIG_INSTALL_FROM" in
     release) install_from_release ;;
@@ -372,6 +500,7 @@ main() {
   start_server_background
   hello_world
 
+  forget_passphrase
   log "add jig to your PATH:  export PATH=\"$JIG_HOME/bin:\$PATH\""
   log "stop the server:       kill \$(cat $JIG_HOME/jig-server.pid)"
   if [ "$JIG_NONINTERACTIVE" != "1" ] && [ -t 1 ] && { : </dev/tty; } 2>/dev/null; then
