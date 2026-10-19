@@ -300,8 +300,12 @@ the domains rule 0 lists.
     obtain that record from the owner.
   - The follower applies no local ownership write gate to the owner's stream (rule 22a), but
     still verifies the author's signature.
+  - The follower relays the owner's `ingest` record to its clients unchanged and never
+    re-signs it (rule 12). A client on the follower receives the record and signature
+    byte-identical to what the owner sent, and checks that the sequencer signed it.
 - [ ] **Step 2: Implement.**
-  - A new `IngestSource::Sequenced { sequencer }` path.
+  - A new `IngestSource::Sequenced { sequencer }` path. It stores the owner's record bytes
+    as received and serves them as stored. Nothing on this path signs an `ingest` record.
   - The follower keeps the chain head per `channel_id`.
   - Catch-up after a reconnect uses the owner's records from the follower's head. This is the
     reader `subscription_cursors` never had.
