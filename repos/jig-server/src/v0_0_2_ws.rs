@@ -910,7 +910,7 @@ async fn handle_client_frame(
 /// Capabilities the welcome may honestly claim. Block kinds and execution come
 /// from the running server. Federation is on because this process accepts
 /// peer relays on the same socket; MLS is not a capability and is not listed.
-fn handshake_capabilities(state: &AppState) -> jig_pipeline::handshake::Capabilities {
+pub(crate) fn handshake_capabilities(state: &AppState) -> jig_pipeline::handshake::Capabilities {
     jig_pipeline::handshake::Capabilities {
         block_kinds: state.config.server.allowed_block_kinds.clone(),
         execution: state.ingest_ctx.executor.is_some(),
@@ -939,6 +939,11 @@ async fn complete_hello(
     let offer = jig_pipeline::handshake::ServerOffer {
         capabilities: handshake_capabilities(state),
         tls_exporter: session.tls_exporter.clone(),
+        manifest: state
+            .manifest
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
     };
     match jig_pipeline::handshake::negotiate(&hello, &offer) {
         Ok(statement) => {

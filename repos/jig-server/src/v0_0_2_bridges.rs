@@ -264,6 +264,9 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         IngestError::DisallowedBlockKind { kind } => SubmitDenied::PolicyBlocked {
             reason: format!("disallowed block kind: {kind}"),
         },
+        IngestError::ManifestLog { reason } => SubmitDenied::PolicyBlocked {
+            reason: reason.clone(),
+        },
         IngestError::KindRequired => SubmitDenied::PolicyBlocked {
             reason: "block kind required".into(),
         },

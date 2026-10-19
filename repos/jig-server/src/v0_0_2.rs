@@ -56,6 +56,9 @@ pub struct AppState {
     /// once the listener has its certificate ([`Self::bind_tls_certificate`])
     /// and published at `/.well-known/jig`. Shared by every clone.
     pub tls_binding: Arc<std::sync::OnceLock<jig_core::tls_binding::TlsBinding>>,
+    /// The `server-manifest` every welcome cites, once
+    /// [`crate::v0_0_2_manifest_log::publish`] has run. Shared by every clone.
+    pub manifest: Arc<std::sync::RwLock<Option<jig_pipeline::handshake::ManifestRef>>>,
 }
 
 /// Gates 1 and 2 from `[auth]`, plus the federation peers from `[federation]`:
@@ -245,6 +248,7 @@ impl AppState {
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
             tls_binding: Default::default(),
+            manifest: Default::default(),
         })
     }
 
@@ -298,6 +302,7 @@ impl AppState {
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
             tls_binding: Default::default(),
+            manifest: Default::default(),
         })
     }
 
@@ -348,6 +353,7 @@ impl AppState {
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
             tls_binding: Default::default(),
+            manifest: Default::default(),
         })
     }
 }

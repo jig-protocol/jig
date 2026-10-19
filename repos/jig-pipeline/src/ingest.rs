@@ -135,6 +135,10 @@ pub enum IngestError {
     InvalidSignature,
     #[error("disallowed block kind: `{kind}`")]
     DisallowedBlockKind { kind: String },
+    /// A write into the server's manifest log, or under its reserved slugs,
+    /// that is not the server's own (JEP-0002 rule 12).
+    #[error("refused for the manifest log: {reason}")]
+    ManifestLog { reason: String },
     #[error("malformed bundle: {0}")]
     BundleMalformed(String),
     #[error("manifest missing kind field — v0.0.2 blocks must declare kind")]
@@ -305,7 +309,11 @@ pub async fn ingest(
     // the identity resolver, the kind whitelist and every channel lookup: a
     // caller this server will not deal with gets exactly one answer, whatever
     // they asked.
+    // The server always admits itself: its own blocks (the manifest log,
+    // fed-hello) are signed with its key.
+    let own = sender.to_did_jig_string() == ctx.server_did.to_did_jig_string();
     let admitted = match source {
+        _ if own => Ok(()),
         IngestSource::FederatedPeer { .. } | IngestSource::Bridge => {
             ctx.admission.admit_relayed(sender.as_str())
         }
@@ -355,10 +363,12 @@ pub async fn ingest(
         }
     }
 
-    // Step 3: block-kind whitelist
+    // Step 3: block-kind whitelist, after the manifest log's own gate: the
+    // server's writes into its log pass whatever kinds it relays.
     let kind = manifest.kind.ok_or(IngestError::KindRequired)?;
     let kind_str = kind.as_str();
-    if !ctx.allowed_block_kinds.iter().any(|k| k == kind_str) {
+    let own_log = manifest_log_write(ctx, kind, &manifest, &sender)?;
+    if !own_log && !ctx.allowed_block_kinds.iter().any(|k| k == kind_str) {
         return Err(IngestError::DisallowedBlockKind {
             kind: kind_str.to_string(),
         });
@@ -769,6 +779,55 @@ pub fn channel_slug_of(kind: BlockKind, manifest: &jig_core::BlockManifest) -> O
 
 /// The metadata key under which a block of `kind` names its channel. See
 /// [`channel_slug_of`]; exposed for callers that peek at raw metadata.
+/// Whether this is the server's own write into its manifest log, which then
+/// skips the kind whitelist. Refuses everything else under the reserved
+/// slugs, and a `server-manifest` anywhere else or one that does not decode:
+/// only the server's DID writes its log, and only its channel-create and
+/// `server-manifest` blocks.
+fn manifest_log_write(
+    ctx: &IngestContext,
+    kind: BlockKind,
+    manifest: &jig_core::BlockManifest,
+    sender: &jig_core::did::Did,
+) -> Result<bool, IngestError> {
+    use crate::server_manifest::{LOG_SLUG, METADATA_KEY, RESERVED_PREFIX, ServerManifest};
+    let slug = channel_slug_of(kind, manifest);
+    let reserved = slug.is_some_and(|s| s.starts_with(RESERVED_PREFIX));
+    if !reserved && kind != BlockKind::ServerManifest {
+        return Ok(false);
+    }
+    let refuse = |reason: &str| {
+        Err(IngestError::ManifestLog {
+            reason: reason.to_string(),
+        })
+    };
+    if sender.to_did_jig_string() != ctx.server_did.to_did_jig_string() {
+        return refuse("only this server writes its manifest log and its reserved channels");
+    }
+    if slug != Some(LOG_SLUG) {
+        return refuse(
+            "a server-manifest goes only into the manifest log, which is the only reserved channel",
+        );
+    }
+    match kind {
+        BlockKind::ChannelCreate => Ok(true),
+        BlockKind::ServerManifest => {
+            use base64::Engine as _;
+            let decoded = manifest
+                .metadata
+                .get(METADATA_KEY)
+                .and_then(|v| v.as_str())
+                .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok());
+            match decoded.map(|bytes: Vec<u8>| ServerManifest::decode(&bytes)) {
+                Some(Ok(_)) => Ok(true),
+                Some(Err(e)) => refuse(&format!("the server-manifest does not decode: {e}")),
+                None => refuse("a server-manifest carries its document"),
+            }
+        }
+        _ => refuse("the manifest log takes only server-manifest blocks"),
+    }
+}
+
 pub fn channel_metadata_key(kind: BlockKind) -> &'static str {
     match kind {
         BlockKind::ChannelCreate => "slug",

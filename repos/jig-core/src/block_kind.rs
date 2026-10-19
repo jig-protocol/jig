@@ -50,6 +50,10 @@ pub enum BlockKind {
     EmailEncrypted,
     /// Reserved for v0.0.3+ receipt-as-block consolidation.
     Receipt,
+    /// What a server advertises (JEP-0002 rule 12), written only by that
+    /// server, only into its manifest log. Synthetic: the document is in its
+    /// metadata (`jig_pipeline::server_manifest`).
+    ServerManifest,
 }
 
 impl BlockKind {
@@ -71,6 +75,7 @@ impl BlockKind {
             Self::EmailRender => "email-render",
             Self::EmailEncrypted => "email-encrypted",
             Self::Receipt => "receipt",
+            Self::ServerManifest => "server-manifest",
         }
     }
 
@@ -101,6 +106,7 @@ impl std::str::FromStr for BlockKind {
             "email-render" => Ok(Self::EmailRender),
             "email-encrypted" => Ok(Self::EmailEncrypted),
             "receipt" => Ok(Self::Receipt),
+            "server-manifest" => Ok(Self::ServerManifest),
             _ => Err(BlockKindError::Unknown(s.to_string())),
         }
     }
@@ -135,6 +141,7 @@ mod tests {
             ("email-render", BlockKind::EmailRender),
             ("email-encrypted", BlockKind::EmailEncrypted),
             ("receipt", BlockKind::Receipt),
+            ("server-manifest", BlockKind::ServerManifest),
         ];
         for (s, k) in kinds {
             assert_eq!(k.as_str(), s);

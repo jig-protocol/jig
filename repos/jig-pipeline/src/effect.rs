@@ -42,7 +42,9 @@ pub async fn apply_effect(
         | BlockKind::TimeAttestation
         | BlockKind::EmailRender
         | BlockKind::EmailEncrypted
-        | BlockKind::Receipt => Ok(()),
+        | BlockKind::Receipt
+        // The log is the state: the current manifest is its newest block.
+        | BlockKind::ServerManifest => Ok(()),
 
         BlockKind::ChannelCreate => apply_channel_create(store, &manifest, block_cid),
         BlockKind::MemberAdd => apply_member_add(store, &manifest, block_cid),

@@ -31,6 +31,9 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
             "DISALLOWED_BLOCK_KIND",
             format!("kind not in allow list: {kind}"),
         ),
+        IngestError::ManifestLog { reason } => {
+            (StatusCode::FORBIDDEN, "MANIFEST_LOG", reason.clone())
+        }
         IngestError::KindRequired => (
             StatusCode::BAD_REQUEST,
             "KIND_REQUIRED",
@@ -168,6 +171,9 @@ mod tests {
             IngestError::InvalidSignature,
             IngestError::DisallowedBlockKind {
                 kind: "widget".to_string(),
+            },
+            IngestError::ManifestLog {
+                reason: "not the server".to_string(),
             },
             IngestError::KindRequired,
             IngestError::BundleMalformed("bad tuple".to_string()),

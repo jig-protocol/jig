@@ -183,6 +183,10 @@ pub enum Frame {
         /// answered on ([`crate::handshake::TLS_EXPORTER_LABEL`]); empty over
         /// plaintext. Signed, so the welcome holds only on that TLS session.
         tls_exporter: String,
+        /// The server's current `server-manifest` (JEP-0002 rule 12). Absent
+        /// only before the server has published one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manifest: Option<crate::handshake::ManifestRef>,
         /// base64 ed25519 over [`crate::handshake::WelcomeStatement::canonical_bytes`].
         sig: String,
     },
