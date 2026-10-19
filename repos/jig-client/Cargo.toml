@@ -10,7 +10,6 @@ description = "Client library for jig-protocol: WSS connection, identity loading
 # `keystore`: identity keys and MLS state sealed at rest (I1).
 jig-core = { workspace = true, features = ["keystore"] }
 jig-pipeline = { path = "../jig-pipeline" }
-jig-config = { workspace = true }
 # The client half of MLS: group state, encrypt/decrypt (`secure`).
 jig-mls = { workspace = true }
 serde = { workspace = true }
