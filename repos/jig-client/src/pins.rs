@@ -121,6 +121,10 @@ pub struct ServerPin {
     pub suites: BTreeSet<String>,
     #[serde(default)]
     pub channels: BTreeMap<String, ChannelPin>,
+    /// The `server-manifest` this device last checked a welcome against
+    /// ([`crate::manifest`]); a welcome citing it needs no second check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<jig_pipeline::handshake::ManifestRef>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -334,6 +338,20 @@ impl Pins {
             }
             pin.server_did = to.to_string();
             Ok(((), true))
+        })
+    }
+
+    /// Record that `server`'s welcome was checked against `manifest`.
+    pub fn set_manifest(
+        &mut self,
+        server: &str,
+        manifest: &jig_pipeline::handshake::ManifestRef,
+    ) -> Result<(), PinError> {
+        self.update(|file| {
+            let pin = file.servers.entry(server_key(server)).or_default();
+            let changed = pin.manifest.as_ref() != Some(manifest);
+            pin.manifest = Some(manifest.clone());
+            Ok(((), changed))
         })
     }
 

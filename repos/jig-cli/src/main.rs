@@ -295,6 +295,11 @@ enum NsAction {
 
 #[derive(Subcommand, Debug)]
 enum TrustAction {
+    /// What this device pinned for a server, and the server's manifest log.
+    Show {
+        /// The server; the configured one when omitted.
+        server: Option<String>,
+    },
     /// Resolve `name` (alias@suffix), verify it, and pin it on first sight; a
     /// name that now resolves to another DID than the pinned one is refused.
     VerifyName {
@@ -536,6 +541,13 @@ async fn main() -> Result<()> {
 
     if let Some(Commands::Trust { action }) = cli.command {
         match action {
+            TrustAction::Show { server } => {
+                let server = match server {
+                    Some(s) => s,
+                    None => ctx.server_url()?,
+                };
+                cmd::trust::show(&ctx.identity()?, &server).await?;
+            }
             TrustAction::VerifyName {
                 name,
                 nameserver,

@@ -121,6 +121,7 @@ pub async fn connect_pinned(server: &str, identity: Identity) -> Result<Client> 
         })?;
     if let Some(welcome) = client.welcome() {
         pins.check_welcome(server, welcome)?;
+        crate::cmd::trust::check_manifest(client.identity(), server, welcome).await?;
     }
     Ok(client)
 }
