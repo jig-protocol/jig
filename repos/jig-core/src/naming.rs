@@ -56,6 +56,11 @@ pub enum NamingError {
     Expired(i64),
     #[error("the delegation expired at {0}")]
     DelegationExpired(i64),
+    #[error(
+        "this build has no authority for `@{DEFAULT_SUFFIX}` names: the project nameserver's \
+         DID is still a placeholder"
+    )]
+    NoDefaultAuthority,
     #[error("the rotation chain does not lead from {0} to {1}")]
     BrokenChain(String, String),
     #[error("a rotation was accepted by {0}, not by {1}")]
@@ -606,6 +611,94 @@ fn verify_envelope(envelope: &[u8], payload: &[u8], did: &str) -> Result<(), Nam
         return Err(NamingError::BadSignature(did.to_string()));
     }
     Ok(opened.verify(did)?)
+}
+
+// ----------------------------------------------------------------------------
+// The default suffix
+// ----------------------------------------------------------------------------
+
+/// The suffix default names live under: `alice@jig`. Single-label, so JEP-0004
+/// rule 4 makes it `config`-rooted only: its authority comes from this crate,
+/// never from discovery.
+pub const DEFAULT_SUFFIX: &str = "jig";
+
+/// The authority for [`DEFAULT_SUFFIX`], read through [`default_jig_authority`].
+///
+/// TODO(DJ): set this to the project nameserver's DID from the key ceremony.
+/// The same change must flip `the_default_authority_is_refused_while_it_is_the_placeholder`
+/// to assert `Ok`: that test is what keeps the swap from going unnoticed.
+pub const DEFAULT_JIG_AUTHORITY: &str = PLACEHOLDER_JIG_AUTHORITY;
+
+/// Where [`DEFAULT_SUFFIX`] names are asked by default; config overrides it.
+/// Integrity rests on [`DEFAULT_JIG_AUTHORITY`], not on this URL: whatever
+/// answers here must still be signed by the authority.
+pub const DEFAULT_JIG_NAMESERVER: &str = "https://ns.jig-protocol.org";
+
+/// The DID of the ed25519 key with the public seed `[0x4a; 32]`. Anyone can
+/// sign as it, so only a build with the `test-default-authority` feature
+/// (dev-dependencies only, guarded in CI) accepts it as an authority.
+pub const PLACEHOLDER_JIG_AUTHORITY: &str =
+    "did:jig:zgu6iu77ozi4lfrctnyf5ewdp3mmna4hfbycz6hkd7c767ol2ptqq";
+
+/// [`DEFAULT_JIG_AUTHORITY`], or [`NamingError::NoDefaultAuthority`] while it
+/// is the placeholder in any build without `test-default-authority`, debug
+/// builds included. Callers then add no `@jig` delegation, and `@jig` names
+/// fail closed at lookup.
+pub fn default_jig_authority() -> Result<&'static str, NamingError> {
+    unless_placeholder(
+        DEFAULT_JIG_AUTHORITY,
+        cfg!(feature = "test-default-authority"),
+    )
+}
+
+fn unless_placeholder(authority: &'static str, allowed: bool) -> Result<&'static str, NamingError> {
+    if authority == PLACEHOLDER_JIG_AUTHORITY && !allowed {
+        return Err(NamingError::NoDefaultAuthority);
+    }
+    Ok(authority)
+}
+
+#[cfg(test)]
+mod default_authority_tests {
+    use super::*;
+
+    #[test]
+    fn the_placeholder_is_the_did_of_the_public_test_seed() {
+        // A typo here would be a silent "no delegation", not a failure.
+        assert_eq!(
+            did_of(&SigningKey::from_bytes(&[0x4a; 32])),
+            PLACEHOLDER_JIG_AUTHORITY
+        );
+    }
+
+    #[test]
+    fn the_placeholder_is_accepted_only_where_allowed() {
+        assert_eq!(
+            unless_placeholder(PLACEHOLDER_JIG_AUTHORITY, false),
+            Err(NamingError::NoDefaultAuthority)
+        );
+        assert_eq!(
+            unless_placeholder(PLACEHOLDER_JIG_AUTHORITY, true),
+            Ok(PLACEHOLDER_JIG_AUTHORITY)
+        );
+        assert_eq!(
+            unless_placeholder("did:jig:zReal", false),
+            Ok("did:jig:zReal")
+        );
+    }
+
+    /// What every build without `test-default-authority` gets. It checks
+    /// that case directly rather than under `cfg(not(feature = ...))`: CI
+    /// runs jig-core's tests together with crates that enable the feature
+    /// from dev-dependencies, which would unify it in and skip a cfg-gated
+    /// test silently. Flip it to `Ok` with the real DID.
+    #[test]
+    fn the_default_authority_is_refused_while_it_is_the_placeholder() {
+        assert_eq!(
+            unless_placeholder(DEFAULT_JIG_AUTHORITY, false),
+            Err(NamingError::NoDefaultAuthority)
+        );
+    }
 }
 
 #[cfg(test)]
