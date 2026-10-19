@@ -251,12 +251,16 @@ impl SignedKeyLink {
     }
 
     /// Whether this is a `public` link from the DID a peer has pinned to the
-    /// DID it now presents: a server's own key change. The two DIDs come from
-    /// outside the link, so they are compared by key, not by spelling.
+    /// DID it now presents: a server's own key change.
+    ///
+    /// `presented` comes from the server's signed welcome, so it must be the
+    /// link's `new` exactly, canonical spelling and all. `pinned` is this
+    /// peer's own state (a pin, or an operator's `expected_did`), so it is
+    /// compared by key.
     pub fn moves_public(&self, pinned: &str, presented: &str) -> bool {
         self.link.audience == Audience::Public
             && same_key(&self.link.old, pinned)
-            && same_key(&self.link.new, presented)
+            && self.link.new == presented
     }
 }
 
@@ -566,6 +570,8 @@ mod tests {
         assert!(!link.moves_public(&presented, &pinned));
         assert!(!link.moves_public(&pinned, &did_of(&key(3))));
         assert!(!link.moves_public(&pinned, "did:jig:alice"));
+        // A presented DID is signed data: another spelling of `new` is refused.
+        assert!(!link.moves_public(&pinned, &shouted(&presented)));
         let contact = SignedKeyLink::sign(
             &old,
             &new,
