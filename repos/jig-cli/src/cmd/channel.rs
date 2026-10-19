@@ -325,14 +325,12 @@ pub(crate) fn resolve_who(ctx: &CliContext, who: &str) -> Result<String> {
     }
 }
 
-/// The canonical spelling of a key-derived `did:jig`: the one the server
-/// writes into rows and the one DM slugs are derived from.
+/// The canonical spelling of a key-derived `did:jig` a person typed: the one
+/// the server writes into rows and the one DM slugs are derived from.
 fn canonical_did(did: &str) -> Result<String> {
-    jig_core::Did::from_did_jig_string(did)
-        .ok()
-        .and_then(|d| d.as_bytes().ok())
-        .map(|k| jig_core::Did::from_ed25519_pubkey(&k).to_did_jig_string())
-        .ok_or_else(|| anyhow::anyhow!("`{did}` is not a valid did:jig"))
+    jig_core::Did::canonicalize(did)
+        .map(|d| d.to_did_jig_string())
+        .map_err(|_| anyhow::anyhow!("`{did}` is not a valid did:jig"))
 }
 
 // ============================================================================

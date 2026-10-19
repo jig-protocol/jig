@@ -77,6 +77,13 @@ Non-goals:
      that carries an unknown key, or whose `domain` is not the one expected.
    - The signer is named inside the payload, not in the envelope, and the receiver
      verifies against that DID.
+   - Every DID in a payload, signer or not, is a `did:jig` key in its canonical lowercase
+     spelling, the one the key encodes to. A receiver MUST refuse any other spelling,
+     even one that decodes to the same key. One key then has one spelling, and DIDs
+     compare as strings. Otherwise a re-spelled DID would look like another DID: two
+     attestations for one name could seem to name different DIDs and fake equivocation
+     (rule 15), and one nameserver's attestations could be split under two `ns_did`
+     spellings and hide it.
    - Anything hashed is hashed over the deterministic encoding, never over a re-encoding.
    - The envelope bytes are what travels and what a resolver keeps as evidence (rule 20).
 

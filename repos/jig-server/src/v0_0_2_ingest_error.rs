@@ -36,6 +36,9 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
             "KIND_REQUIRED",
             "manifest must declare block kind".to_string(),
         ),
+        IngestError::NonCanonicalDid { .. } => {
+            (StatusCode::BAD_REQUEST, "NON_CANONICAL_DID", e.to_string())
+        }
         IngestError::BundleMalformed(m) => (StatusCode::BAD_REQUEST, "BUNDLE_MALFORMED", m.clone()),
         IngestError::ManifestGate(gate) => (
             StatusCode::BAD_REQUEST,
@@ -170,6 +173,9 @@ mod tests {
                 kind: "widget".to_string(),
             },
             IngestError::KindRequired,
+            IngestError::NonCanonicalDid {
+                field: "member_did".to_string(),
+            },
             IngestError::BundleMalformed("bad tuple".to_string()),
             IngestError::ManifestGate(jig_core::ManifestGateError::UnsupportedSchema(
                 "https://example.com/v9".to_string(),

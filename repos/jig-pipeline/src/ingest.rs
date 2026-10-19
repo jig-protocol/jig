@@ -139,6 +139,11 @@ pub enum IngestError {
     BundleMalformed(String),
     #[error("manifest missing kind field — v0.0.2 blocks must declare kind")]
     KindRequired,
+    /// A DID in the manifest decodes to a key but is not spelled the way that
+    /// key encodes (an upper-cased body, say). The block is signed, so this
+    /// server cannot re-spell it, and a peer would refuse it anyway.
+    #[error("`{field}` is not a did:jig in its canonical lowercase spelling")]
+    NonCanonicalDid { field: String },
     /// The manifest's schema or encryption suite is one this server does not
     /// speak. Checked before the signature: what the signature covers is
     /// defined by the schema.
@@ -298,7 +303,9 @@ pub async fn ingest(
     // Parse the manifest from canonical bytes on the bundle.
     let manifest = parse_manifest(bundle.manifest_bytes)?;
 
-    // Step 1: signature verification
+    // Step 1: signature verification, after the DIDs it and every later step
+    // compare are known to be in their one spelling.
+    check_manifest_dids(&manifest)?;
     let sender = verify_sig(bundle.manifest_bytes, bundle.code_bytes, &manifest, &sig)?;
 
     // Step 1b: admission, on the DID the signature just established. Before
@@ -910,16 +917,45 @@ fn bundle_canonical_bytes(manifest_bytes: &[u8], code_bytes: &[u8]) -> Result<Ve
     serde_json::to_vec(&payload).map_err(|e| e.to_string())
 }
 
+/// The manifest's DID fields that this pipeline reads, by the name an error
+/// reports them under.
+const MANIFEST_DID_FIELDS: &[&str] = &["member_did", "ns_did"];
+
+/// Refuse a manifest carrying a key-derived DID in any spelling but the key's
+/// own. Legacy, non-key-derived DIDs (`did:jig:alice`) are opaque labels and
+/// are left to the steps that read them.
+fn check_manifest_dids(manifest: &jig_core::BlockManifest) -> Result<(), IngestError> {
+    let respelled = |did: &str| {
+        matches!(
+            Did::from_str_unchecked(did).as_bytes(),
+            Err(jig_core::did::DidError::NotLowercase)
+        )
+    };
+    if let Some(author) = manifest.authors.iter().find(|a| respelled(&a.did)) {
+        return Err(IngestError::NonCanonicalDid {
+            field: format!("authors[].did `{}`", author.did),
+        });
+    }
+    for field in MANIFEST_DID_FIELDS {
+        if let Some(did) = manifest.metadata.get(*field).and_then(|v| v.as_str())
+            && respelled(did)
+        {
+            return Err(IngestError::NonCanonicalDid {
+                field: (*field).to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Verify the sender's ed25519 signature over the bundle's canonical bytes.
 ///
 /// The signer is the first author in the manifest. If the DID is not in
 /// canonical `did:jig:z<base32>` form (e.g. a legacy test DID), decoding
 /// fails and we return `InvalidSignature` — no opaque-label fallback,
 /// because the ingest pipeline must never accept an unverifiable signature.
-/// Verify the author's signature and return the author's DID in canonical
-/// form — rebuilt from the key the signature verified against, not the
-/// spelling the manifest carried, so every downstream comparison sees one
-/// form.
+/// Verify the author's signature and return the author's DID. Its spelling
+/// is canonical: [`check_manifest_dids`] refused any other.
 fn verify_sig(
     manifest_bytes: &[u8],
     code_bytes: &[u8],

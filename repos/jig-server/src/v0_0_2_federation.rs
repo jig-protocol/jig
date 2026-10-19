@@ -136,7 +136,12 @@ static FED_SUBSCRIBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// reconnect loop and persists across the server's lifetime.
 pub fn spawn_federation_peers(state: Arc<AppState>) {
     let peers = state.config.federation.peers.clone();
-    for peer in peers {
+    for mut peer in peers {
+        // An operator typed `expected_did`, so it may be in any letter case;
+        // the welcome, the TLS binding and ingest compare the one spelling.
+        if let Ok(did) = jig_core::Did::canonicalize(&peer.expected_did) {
+            peer.expected_did = did.to_did_jig_string();
+        }
         // `AppState` refuses this at boot; repeated so no caller can spawn
         // a plaintext dialer the operator did not opt into.
         if let Err(reason) = check_peer_transport(&peer, &state.config.federation) {

@@ -49,6 +49,12 @@ pub enum DidError {
     /// DID is not in canonical key-derived form and cannot provide raw bytes.
     #[error("DID is not a canonical key-derived `did:jig:z…` identifier")]
     NotCanonical,
+    /// The body decodes to a key, but not in the one spelling that key
+    /// encodes to (lowercase). Two spellings of one key would compare unequal
+    /// as strings, so signed data carrying one is refused; human input goes
+    /// through [`Did::canonicalize`] instead.
+    #[error("DID is not in its canonical lowercase spelling")]
+    NotLowercase,
 }
 
 impl Did {
@@ -70,6 +76,9 @@ impl Did {
     /// - [`DidError::WrongLength`] — the `did:jig:z` prefix is present and the body
     ///   decodes, but the result is not exactly 32 bytes.
     ///
+    /// - [`DidError::NotLowercase`] — the body decodes to a key, but is not
+    ///   spelled the way that key encodes (an upper-cased body, say).
+    ///
     /// Note: a z-prefixed-but-corrupted DID returns `BadEncoding` or `WrongLength`,
     /// NOT `NotCanonical`. Callers that pattern-match on `NotCanonical` to "fall back
     /// to opaque-label handling" will miss z-prefixed corrupted DIDs — those are
@@ -79,15 +88,11 @@ impl Did {
             .0
             .strip_prefix("did:jig:z")
             .ok_or(DidError::NotCanonical)?;
-        let bytes = BASE32_NOPAD
-            .decode(body.to_uppercase().as_bytes())
-            .map_err(|_| DidError::BadEncoding)?;
-        if bytes.len() != 32 {
-            return Err(DidError::WrongLength);
+        let key = decode_body(body)?;
+        if Self::from_ed25519_pubkey(&key).0 != self.0 {
+            return Err(DidError::NotLowercase);
         }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        Ok(arr)
+        Ok(key)
     }
 
     /// Return the full `did:jig:…` string representation.
@@ -99,15 +104,29 @@ impl Did {
     ///
     /// Only accepts the canonical key-derived form. Use `From<&str>` for
     /// accepting arbitrary DID strings (including legacy forms).
+    /// A key spelled any other way is refused with [`DidError::NotLowercase`].
     pub fn from_did_jig_string(s: &str) -> Result<Self, DidError> {
         let body = s.strip_prefix("did:jig:z").ok_or(DidError::BadPrefix)?;
-        let bytes = BASE32_NOPAD
-            .decode(body.to_uppercase().as_bytes())
-            .map_err(|_| DidError::BadEncoding)?;
-        if bytes.len() != 32 {
-            return Err(DidError::WrongLength);
+        let did = Self::from_ed25519_pubkey(&decode_body(body)?);
+        if did.0 != s {
+            return Err(DidError::NotLowercase);
         }
-        Ok(Self(s.to_string()))
+        Ok(did)
+    }
+
+    /// Parse a DID a person typed or configured: surrounding whitespace is
+    /// dropped and the body may be in any letter case. Returns the canonical
+    /// DID for the key.
+    ///
+    /// Only for human input (command-line arguments, operator config). A DID
+    /// inside signed data must already be canonical: use
+    /// [`Did::from_did_jig_string`], which refuses any other spelling.
+    pub fn canonicalize(s: &str) -> Result<Self, DidError> {
+        let body = s
+            .trim()
+            .strip_prefix("did:jig:z")
+            .ok_or(DidError::BadPrefix)?;
+        Ok(Self::from_ed25519_pubkey(&decode_body(body)?))
     }
 
     /// Create a Did directly from any string without validation.
@@ -135,6 +154,14 @@ impl Did {
         arr.copy_from_slice(hash.as_bytes());
         Self::from_ed25519_pubkey(&arr)
     }
+}
+
+/// Decode a DID body in either letter case to its 32-byte key.
+fn decode_body(body: &str) -> Result<[u8; 32], DidError> {
+    let bytes = BASE32_NOPAD
+        .decode(body.to_uppercase().as_bytes())
+        .map_err(|_| DidError::BadEncoding)?;
+    bytes.try_into().map_err(|_| DidError::WrongLength)
 }
 
 // ── Conversions ────────────────────────────────────────────────────────────
@@ -357,6 +384,34 @@ mod tests {
             "z-prefixed corrupted DID returned NotCanonical, which would let \
              callers silently fall back to legacy-label handling. err: {err:?}"
         );
+    }
+
+    #[test]
+    fn one_key_has_one_spelling() {
+        let did = Did::from_ed25519_pubkey(&[42u8; 32]).to_did_jig_string();
+        let body = &did["did:jig:z".len()..];
+        let shouted = format!("did:jig:z{}", body.to_uppercase());
+        let mixed = format!("did:jig:z{}{}", &body[..1].to_uppercase(), &body[1..]);
+        for other in [&shouted, &mixed] {
+            assert!(matches!(
+                Did::from_did_jig_string(other),
+                Err(DidError::NotLowercase)
+            ));
+            assert!(matches!(
+                Did::from_str_unchecked(other.as_str()).as_bytes(),
+                Err(DidError::NotLowercase)
+            ));
+            // A person may type it that way; the result is the one spelling.
+            assert_eq!(Did::canonicalize(other).unwrap().to_did_jig_string(), did);
+        }
+        assert_eq!(
+            Did::canonicalize(&format!("  {did}\n"))
+                .unwrap()
+                .to_did_jig_string(),
+            did
+        );
+        assert!(Did::canonicalize("did:jig:alice").is_err());
+        assert!(Did::canonicalize("DID:JIG:Z").is_err());
     }
 
     #[test]
