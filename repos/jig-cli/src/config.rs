@@ -65,44 +65,29 @@ pub struct DelegationEntry {
     pub nameservers: Vec<String>,
 }
 
-/// The suffix default names live under: `alice@jig`.
-pub const DEFAULT_SUFFIX: &str = "jig";
+pub use jig_core::naming::DEFAULT_SUFFIX;
 
-/// The authority DID for [`DEFAULT_SUFFIX`].
-///
-/// TODO(DJ): replace with the DID from the project nameserver's key ceremony.
-/// Until then this is [`PLACEHOLDER_JIG_AUTHORITY`], a test DID whose key
-/// nobody holds, and a release build refuses to use it.
-pub const DEFAULT_JIG_AUTHORITY: &str = PLACEHOLDER_JIG_AUTHORITY;
-
-/// The project nameserver for [`DEFAULT_SUFFIX`].
-///
-/// TODO(DJ): confirm the URL alongside [`DEFAULT_JIG_AUTHORITY`].
-pub const DEFAULT_JIG_NAMESERVER: &str = "https://ns.jig-protocol.org";
-
-/// The DID of the ed25519 key with seed `[0x4a; 32]` ("J"). Only tests and
-/// debug builds may resolve under it.
-pub const PLACEHOLDER_JIG_AUTHORITY: &str =
-    "did:jig:zgu6iu77ozi4lfrctnyf5ewdp3mmna4hfbycz6hkd7c767ol2ptqq";
-
-/// The built-in delegation for [`DEFAULT_SUFFIX`], or why this build has
-/// none: a release build fails closed while the authority is the
-/// placeholder.
-pub fn default_jig_delegation() -> Result<DelegationEntry> {
-    default_delegation_for(DEFAULT_JIG_AUTHORITY, cfg!(debug_assertions))
-}
-
-fn default_delegation_for(authority: &str, debug_build: bool) -> Result<DelegationEntry> {
-    if authority == PLACEHOLDER_JIG_AUTHORITY && !debug_build {
+/// The built-in delegation for [`DEFAULT_SUFFIX`]: the authority this build
+/// ships (`jig_core::naming::default_jig_authority`), asked at the configured
+/// `[server] nameserver_url`. The source names no nameserver host. `Err`, and
+/// so no built-in delegation, while the authority is the placeholder or no
+/// nameserver is configured.
+pub fn default_jig_delegation(cfg: &Config) -> Result<DelegationEntry> {
+    let authority = jig_core::naming::default_jig_authority().map_err(|e| {
+        anyhow::anyhow!(
+            "{e}; add a [naming.delegations.{DEFAULT_SUFFIX}] entry to cli.toml to resolve \
+             `@{DEFAULT_SUFFIX}` names"
+        )
+    })?;
+    let Some(nameserver) = cfg.server.nameserver_url.as_deref().map(str::trim) else {
         anyhow::bail!(
-            "this build has no authority for `@{DEFAULT_SUFFIX}` names yet (the project \
-             nameserver's DID is still a placeholder); add a \
-             [naming.delegations.{DEFAULT_SUFFIX}] entry to cli.toml to resolve them"
+            "no nameserver to ask for `@{DEFAULT_SUFFIX}` names: set [server] nameserver_url, \
+             or add a [naming.delegations.{DEFAULT_SUFFIX}] entry to cli.toml"
         );
-    }
+    };
     Ok(DelegationEntry {
         authorities: vec![authority.to_string()],
-        nameservers: vec![DEFAULT_JIG_NAMESERVER.to_string()],
+        nameservers: vec![nameserver.trim_end_matches('/').to_string()],
     })
 }
 
@@ -111,7 +96,7 @@ fn default_delegation_for(authority: &str, debug_build: bool) -> Result<Delegati
 pub fn delegations(cfg: &Config) -> jig_client::naming::Delegations {
     let mut entries = cfg.naming.delegations.clone();
     if !entries.contains_key(DEFAULT_SUFFIX)
-        && let Ok(default) = default_jig_delegation()
+        && let Ok(default) = default_jig_delegation(cfg)
     {
         entries.insert(DEFAULT_SUFFIX.to_string(), default);
     }
@@ -219,22 +204,43 @@ pub fn default_config_path() -> PathBuf {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_placeholder_authority_is_the_did_of_the_test_seed() {
-        let key = ed25519_dalek::SigningKey::from_bytes(&[0x4a; 32]);
-        let did =
-            jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
-        assert_eq!(PLACEHOLDER_JIG_AUTHORITY, did);
+    fn with_nameserver(url: &str) -> Config {
+        let mut cfg = Config::default();
+        cfg.server.nameserver_url = Some(url.to_string());
+        cfg
     }
 
     #[test]
-    fn a_release_build_refuses_the_placeholder_authority() {
-        let err = default_delegation_for(PLACEHOLDER_JIG_AUTHORITY, false).unwrap_err();
-        assert!(err.to_string().contains("placeholder"), "{err}");
-        assert!(default_delegation_for(PLACEHOLDER_JIG_AUTHORITY, true).is_ok());
-        let real = default_delegation_for("did:jig:zReal", false).unwrap();
-        assert_eq!(real.authorities, ["did:jig:zReal"]);
-        assert_eq!(real.nameservers, [DEFAULT_JIG_NAMESERVER]);
+    fn the_built_in_jig_delegation_asks_the_configured_nameserver() {
+        // Tests build jig-core with `test-default-authority`.
+        let d = default_jig_delegation(&with_nameserver("https://ns.example/")).unwrap();
+        assert_eq!(d.authorities, [jig_core::naming::DEFAULT_JIG_AUTHORITY]);
+        assert_eq!(d.nameservers, ["https://ns.example"]);
+    }
+
+    #[test]
+    fn without_a_nameserver_there_is_no_built_in_jig_delegation() {
+        let err = default_jig_delegation(&Config::default()).unwrap_err();
+        assert!(err.to_string().contains("nameserver_url"), "{err}");
+        assert!(
+            !delegations(&Config::default())
+                .config
+                .contains_key(DEFAULT_SUFFIX)
+        );
+    }
+
+    #[test]
+    fn an_old_config_with_no_naming_section_gets_the_built_in_jig_delegation() {
+        let cfg: Config = toml::from_str(
+            "[server]\nbase_url = \"https://127.0.0.1:7117\"\n\
+             nameserver_url = \"https://ns.example\"\n\n\
+             [user]\ndid = \"did:jig:zA\"\ndisplay_name = \"dj\"\n\
+             default_channel = \"#general\"\n",
+        )
+        .unwrap();
+        assert!(cfg.naming.delegations.is_empty());
+        let d = delegations(&cfg);
+        assert_eq!(d.config[DEFAULT_SUFFIX].nameservers, ["https://ns.example"]);
     }
 
     #[test]
@@ -252,21 +258,22 @@ mod tests {
             text.contains("[naming.delegations.\"example.org\"]"),
             "{text}"
         );
-        let back: Config = toml::from_str(&text).unwrap();
+        let mut back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.naming, cfg.naming);
 
         // cli.toml's own entries, plus the built-in `jig` one.
+        back.server.nameserver_url = Some("https://ns.example".into());
         let d = delegations(&back);
         assert_eq!(d.config["example.org"].authorities, ["did:jig:zA"]);
         assert_eq!(
             d.config[DEFAULT_SUFFIX].authorities,
-            [DEFAULT_JIG_AUTHORITY]
+            [jig_core::naming::DEFAULT_JIG_AUTHORITY]
         );
     }
 
     #[test]
     fn a_jig_entry_in_cli_toml_wins_over_the_built_in_one() {
-        let mut cfg = Config::default();
+        let mut cfg = with_nameserver("https://ns.example");
         let mine = DelegationEntry {
             authorities: vec!["did:jig:zMine".into()],
             nameservers: vec!["http://127.0.0.1:7399".into()],
