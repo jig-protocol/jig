@@ -130,6 +130,9 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
             (StatusCode::CONFLICT, "ROOT_OWNER_ROLE", e.to_string())
         }
         IngestError::UnknownRole { .. } => (StatusCode::BAD_REQUEST, "UNKNOWN_ROLE", e.to_string()),
+        // 400: the slug is outside the canonical grammar or in a reserved
+        // namespace (`#dm/`, `#jig/`, `#email/`) the author may not use.
+        IngestError::InvalidSlug { .. } => (StatusCode::BAD_REQUEST, "INVALID_SLUG", e.to_string()),
         // Same code as the envelope and manifest gates: a suite nobody speaks.
         IngestError::UnknownSuite { .. } => {
             (StatusCode::BAD_REQUEST, "UNSUPPORTED_SUITE", e.to_string())
@@ -280,6 +283,10 @@ mod tests {
             },
             IngestError::UnknownRole {
                 role: "owner".to_string(),
+            },
+            IngestError::InvalidSlug {
+                slug: "#General".to_string(),
+                reason: "uppercase".to_string(),
             },
         ]
     }

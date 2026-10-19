@@ -240,6 +240,11 @@ pub enum IngestError {
     /// A role block named a role this version does not define.
     #[error("unknown role `{role}`: the only role that can be assigned is `admin`")]
     UnknownRole { role: String },
+    /// A `channel-create` whose slug is outside the slug grammar, or in a
+    /// reserved namespace its author may not create in
+    /// ([`jig_core::slug::check_create`]).
+    #[error("channel slug {slug:?} is refused: {reason}")]
+    InvalidSlug { slug: String, reason: String },
     /// A `channel-create` named a suite that is not in the registry.
     #[error("unknown encryption suite `{suite}`")]
     UnknownSuite { suite: String },
@@ -553,6 +558,15 @@ pub async fn ingest(
     // server creates only channels it sequences; the co-owners are fixed
     // here for the channel's life.
     if kind == BlockKind::ChannelCreate {
+        // The slug's canonical grammar applies to new channels only; rows
+        // from before it keep their slugs (lookups stay exact-match). Then
+        // who may create each class.
+        check_create_slug(
+            channel_slug_of(kind, &manifest).unwrap_or_default(),
+            &sender.to_did_jig_string(),
+            &server_did,
+            &source,
+        )?;
         channel_terms(&manifest, &server_did)?;
     }
 
@@ -1079,6 +1093,45 @@ fn requires_existing_channel(kind: BlockKind, _source: &IngestSource) -> bool {
             | BlockKind::RoleAssign
             | BlockKind::RoleUnassign
     )
+}
+
+/// Check a new channel's slug ([`jig_core::slug::classify_slug`]) and that
+/// its creator may create that class:
+/// - `User`: anyone;
+/// - `Dm`: anyone here; the DM rule in [`crate::mls_gate`] then limits it to
+///   one of the pair that derives the slug;
+/// - `Email`: only the email bridge (`IngestSource::Bridge`), so nobody can
+///   take a DID pair's mail-thread slug before the bridge does. A relayed
+///   create (`IngestSource::FederatedPeer`) is refused on purpose: bridge
+///   threads are local-only. The bridge creates them restricted
+///   (`bridges/email/src/channel.rs`, `ensure_thread_channel`), and v0.2
+///   federates only open, unencrypted channels (`DeliveryPolicy::federates`),
+///   so no peer legitimately relays one. A future peer-policy field naming a
+///   peer's bridge DIDs could relax this;
+/// - `Server`: only this server's own DID.
+pub fn check_create_slug(
+    slug: &str,
+    creator: &str,
+    server_did: &str,
+    source: &IngestSource,
+) -> Result<jig_core::slug::SlugClass, IngestError> {
+    use jig_core::slug::SlugClass;
+    let refuse = |reason: String| IngestError::InvalidSlug {
+        slug: slug.to_string(),
+        reason,
+    };
+    let class = jig_core::slug::classify_slug(slug).map_err(|e| refuse(e.to_string()))?;
+    match class {
+        SlugClass::Email if !matches!(source, IngestSource::Bridge) => Err(refuse(format!(
+            "`{}` is reserved for the email bridge's mail threads",
+            jig_core::slug::EMAIL_PREFIX
+        ))),
+        SlugClass::Server if creator != server_did => Err(refuse(format!(
+            "`{}` is reserved for this server's own channels",
+            jig_core::slug::JIG_PREFIX
+        ))),
+        class => Ok(class),
+    }
 }
 
 /// The metadata key a `channel-create` names its sequencer under.
@@ -3548,5 +3601,181 @@ mod tests {
                 .unwrap_or_else(|| panic!("{did} must be a member"));
             assert_eq!(m.role, "owner");
         }
+    }
+
+    // ---- Slug grammar (jig_core::slug) ------------------------------------
+
+    async fn create_from(
+        ctx: &IngestContext,
+        key: &SigningKey,
+        slug: &str,
+        source: IngestSource,
+    ) -> Result<String, IngestError> {
+        let (mb, cb, sig) = signed_parts(
+            key,
+            BlockKind::ChannelCreate,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"slug": slug, "visibility": "open"}),
+        );
+        do_ingest(ctx, mb, cb, sig, source).await
+    }
+
+    fn local() -> IngestSource {
+        IngestSource::LocalClient { conn_id: 1 }
+    }
+
+    fn invalid_slug(r: &Result<String, IngestError>) -> bool {
+        matches!(r, Err(IngestError::InvalidSlug { .. }))
+    }
+
+    #[tokio::test]
+    async fn a_create_outside_the_slug_grammar_is_refused_never_lowercased() {
+        let ctx = roles_ctx();
+        let who = random_signing_key();
+        let max = format!("#{}", "a".repeat(64));
+        for slug in ["#general", "#dev-ops", "#a", max.as_str()] {
+            create_from(&ctx, &who, slug, local())
+                .await
+                .unwrap_or_else(|e| panic!("{slug}: {e}"));
+        }
+        let too_long = format!("#{}", "a".repeat(65));
+        for slug in [
+            "#General",
+            "#café",
+            "＃x",
+            "#a\u{200d}b",
+            "#a b",
+            too_long.as_str(),
+            "#",
+            "#-lead",
+            "#team/ops",
+        ] {
+            let r = create_from(&ctx, &who, slug, local()).await;
+            assert!(invalid_slug(&r), "{slug:?}: {r:?}");
+        }
+        assert!(
+            ctx.store.get_channel_by_slug("#general").unwrap().is_some()
+                && ctx.store.get_channel_by_slug("#General").unwrap().is_none(),
+            "a refused slug is not created under a lowercased spelling"
+        );
+    }
+
+    /// `#email/` threads are the email bridge's: only a bridge-sourced create
+    /// is taken. Not from a client, which could otherwise squat a DID pair's
+    /// thread before the bridge; not from a peer either, since bridge threads
+    /// are local-only (restricted, so they never federate).
+    #[tokio::test]
+    async fn an_email_thread_is_created_only_through_the_bridge() {
+        let ctx = roles_ctx();
+        let who = random_signing_key();
+        let thread = "#email/0011223344556677";
+        let r = create_from(&ctx, &who, thread, local()).await;
+        assert!(invalid_slug(&r), "client: {r:?}");
+        let r = create_from(&ctx, &who, thread, IngestSource::AdminEndpoint).await;
+        assert!(invalid_slug(&r), "admin endpoint: {r:?}");
+        let peer = IngestSource::FederatedPeer {
+            peer_did: Did::from_ed25519_pubkey(random_signing_key().verifying_key().as_bytes()),
+            peer_url: "wss://peer.invalid".to_string(),
+        };
+        let r = create_from(&ctx, &who, thread, peer).await;
+        assert!(invalid_slug(&r), "peer: {r:?}");
+        assert!(ctx.store.get_channel_by_slug(thread).unwrap().is_none());
+
+        create_from(&ctx, &who, thread, IngestSource::Bridge)
+            .await
+            .expect("the bridge creates its thread");
+        for bad in ["#EMAIL/0011223344556677", "#email/xyz"] {
+            let r = create_from(&ctx, &who, bad, IngestSource::Bridge).await;
+            assert!(invalid_slug(&r), "{bad}: {r:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_jig_slug_is_the_servers_alone() {
+        let ctx = roles_ctx();
+        let user = random_signing_key();
+        for slug in ["#jig/manifest", "#JIG/manifest", "#Jig/manifest"] {
+            let r = create_from(&ctx, &user, slug, local()).await;
+            assert!(invalid_slug(&r), "{slug}: {r:?}");
+        }
+        let server_key = ctx.server_key.clone();
+        let r = create_from(&ctx, &server_key, "#JIG/manifest", local()).await;
+        assert!(
+            invalid_slug(&r),
+            "not canonical, even for the server: {r:?}"
+        );
+        create_from(&ctx, &server_key, "#jig/manifest", local())
+            .await
+            .expect("the server creates its own #jig/ channel");
+    }
+
+    #[tokio::test]
+    async fn a_dm_slug_is_created_only_through_the_dm_rule() {
+        let ctx = roles_ctx();
+        let alice = person();
+        let bob = person();
+        let r = create_from(&ctx, &alice.key, "#dm/xyz", local()).await;
+        assert!(invalid_slug(&r), "{r:?}");
+        let r = create_from(&ctx, &alice.key, "#Dm/0011223344556677", local()).await;
+        assert!(invalid_slug(&r), "{r:?}");
+
+        // A well-formed DM slug still answers to the DM rule: an open,
+        // plaintext create of it is refused there.
+        let slug = jig_core::dm::dm_slug(&alice.did, &bob.did);
+        let r = create_from(&ctx, &alice.key, &slug, local()).await;
+        assert!(
+            matches!(
+                r,
+                Err(IngestError::MissingMetadata { .. }) | Err(IngestError::MlsRejected { .. })
+            ),
+            "{r:?}"
+        );
+
+        let created = alice.mls.create_group().unwrap();
+        submit(
+            &ctx,
+            &alice,
+            BlockKind::ChannelCreate,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"slug": slug, "visibility": "restricted", "suite": "mls",
+                "dm_peer": bob.did,
+                "mls_group_info": b64(&created.group_info),
+                "mls_ratchet_tree": b64(&created.ratchet_tree)}),
+        )
+        .await
+        .expect("one of the pair creates their DM");
+    }
+
+    /// The grammar is for new channels. A row from before it keeps its slug
+    /// and stays reachable by exact match.
+    #[tokio::test]
+    async fn a_grandfathered_slug_stays_readable_and_writable() {
+        let ctx = roles_ctx();
+        let id = seed_channel(&ctx, "#Old");
+        assert_eq!(
+            ctx.store.get_channel_by_slug("#Old").unwrap().map(|c| c.id),
+            Some(id.clone())
+        );
+        assert!(ctx.store.get_channel_by_slug("#old").unwrap().is_none());
+        let who = person();
+        let post = plain(
+            &ctx,
+            &who,
+            BlockKind::TextRender,
+            serde_json::json!({"channel": "#Old", "body": "still here"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ctx.store.get_block(&post).unwrap().unwrap().channel_id,
+            Some(id.clone())
+        );
+        assert_eq!(
+            ctx.store
+                .list_blocks_by_channel_id(&id, 10, None)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

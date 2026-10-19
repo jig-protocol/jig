@@ -35,6 +35,7 @@ pub mod receipt;
 pub mod request_auth;
 mod serde_helpers;
 pub mod signing;
+pub mod slug;
 pub mod suite;
 #[cfg(feature = "ed25519")]
 pub mod tls_binding;

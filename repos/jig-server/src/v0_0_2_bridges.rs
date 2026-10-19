@@ -309,7 +309,8 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         | IngestError::InvalidTerms { .. }
         | IngestError::MissingRight { .. }
         | IngestError::RootOwnerRole { .. }
-        | IngestError::UnknownRole { .. }) => SubmitDenied::PolicyBlocked {
+        | IngestError::UnknownRole { .. }
+        | IngestError::InvalidSlug { .. }) => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },
         // Retrying sends the same bytes, which is what was refused.
