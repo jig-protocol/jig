@@ -1293,7 +1293,7 @@ gap.
 | A peer is a transport; relayed blocks pass every gate | Built: relayed blocks run through `ingest` and the write gate (authors not asked for admission proof-of-work); peers listed and pinned in configuration | Peer DID in the contract; per-peer limits |
 | Pluggable suites, MLS default and first (D1, D13) | Built: MLS per channel; validating delivery service | Non-MLS plug-in shape (D13); per-suite conformance |
 | End-to-end encryption by default | Partial: DMs and restricted channels always encrypted; open channels plaintext unless created `mls` | Encryption on by default |
-| Mandatory signed handshake; clients fail closed and pin | Partial: signed welcome with nonce; CLI pins server DIDs, suites and channel suites; later frames checked against the welcome | Close semantics; pins; real reputation (D11) |
+| Mandatory signed handshake; clients fail closed and pin | Partial: signed welcome with nonce; CLI pins server DIDs, suites and channel suites; later frames checked against the welcome; refusals close with 4002 | Mutual server-to-server handshake; pins; real reputation (D11) |
 | No backdoors, no scanning, no default escrow | Holds: no backdoor, scanning or escrow exists | Keep it so as reporting is designed |
 | Provable abuse reports from encrypted channels, by participants only (D22) | None: signature exists; no tooling | Delegation or proof mechanism (AB-06) |
 | Tribunals per ruleset group, held by its nameservers; penalties only under an acknowledged ruleset | None | Tribunal process, eligibility (GV-01 to GV-03) |
@@ -1374,7 +1374,7 @@ Each item names what it must satisfy and the register entries it closes.
     server pins. Closes PV-03, OP-08, NS-01.
 12. **Suites.** The non-MLS plug-in shape (D13), per-suite conformance, multi-device and
     recovery, encryption on by default. Feeds OP-03, OP-05.
-13. **The handshake.** Close semantics and JEP-0002's other open questions. Closes OP-01 to
+13. **The handshake.** JEP-0002's open questions; close classes landed in #140. Closes OP-01 to
     OP-03.
 14. **Anchors.** Replacement procedure, and the signed, versioned defaults document.
 15. **The nameserver prototype.** Removed in #154; its proof-of-work, claim and transparency
