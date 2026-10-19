@@ -180,7 +180,7 @@ pub enum Frame {
     /// signed its own downgrade.
     Refusal {
         /// How `sig` is made: [`crate::handshake::REFUSAL_FORMAT`]. A
-        /// verifier refuses any other format by this name, so a later
+        /// verifier refuses any other format by this name, so another
         /// encoding is told apart from a damaged frame.
         format: String,
         server_did: String,
@@ -190,7 +190,8 @@ pub enum Frame {
         versions: Vec<u64>,
         suites: Vec<String>,
         nonce: String,
-        /// base64 ed25519 over [`crate::handshake::RefusalStatement::canonical_bytes`].
+        /// base64 COSE_Sign1 by `server_did` over
+        /// [`crate::handshake::RefusalStatement::payload`].
         sig: String,
     },
     /// Subscribe to a scope (channel or federation).

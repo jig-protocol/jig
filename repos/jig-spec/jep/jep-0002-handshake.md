@@ -56,10 +56,11 @@ Draft. Field names are provisional. The design behind this revision is
    | `sig` | ed25519 over the above | OP-02 |
 
 3. If the server shares no version or suite with the `hello`, it sends a `refusal`
-   instead of a `welcome`, signed under domain `jig-handshake-refusal-v1` over the
-   client's `nonce`, the refusal code (`UNSUPPORTED_VERSION` or `UNSUPPORTED_SUITE`),
-   and the versions and suites it supports. It then closes the connection. The frame's
-   `format` field names the signature format (`jig-handshake-refusal-v1`); a client
+   instead of a `welcome`: a COSE_Sign1 (EdDSA) by `server_did` over a deterministic
+   CBOR map with `domain` = `jig-handshake-refusal-v2`, the client's `nonce`, the
+   refusal code (`UNSUPPORTED_VERSION` or `UNSUPPORTED_SUITE`), and the versions and
+   suites it supports. It then closes the connection. The frame's `format` field
+   names the signature format (`jig-handshake-refusal-v2`); a client
    MUST treat a refusal in a format it does not verify as a handshake failure, by
    that name, not by trying to parse it.
 4. When the `hello` carried `peer_did`, the dialer's next frame is `peer_proof`: an
@@ -111,10 +112,12 @@ Draft. Field names are provisional. The design behind this revision is
 ## Channel history
 
 9. Every block in a channel has an `ingest` record, signed by the channel's sequencer
-   under domain `jig-ingest-v1`, which its `format` field names (a client MUST refuse
-   a record in a format it does not verify by that name): `channel_id` (the CID of the channel's
+   as a COSE_Sign1 (EdDSA) over a deterministic CBOR map with `domain` =
+   `jig-ingest-v2`, which its `format` field names (a client MUST refuse a record in
+   a format it does not verify by that name; CIDs in the payload are binary CIDv1
+   byte strings, per JEP-0004 rule 0): `channel_id` (the CID of the channel's
    `channel-create` block), `seq` (0 for that block, then +1 per accepted block),
-   `ingest_hlc`, `block_cid`, `prev` (BLAKE3 of the previous record's canonical bytes;
+   `ingest_hlc`, `block_cid`, `prev` (BLAKE3 of the previous record's COSE_Sign1 envelope;
    zero at `seq` 0) and `sequencer`. The sequencer is the channel's owning server from
    `seq` 0. An owner-signed `sequencer-set` block names a new sequencer and the last
    record the old one signed (the cited head); its own record is always signed by the
