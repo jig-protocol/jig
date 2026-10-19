@@ -451,35 +451,45 @@ mod tests {
         assert!(state.alias_holder("victim@dj.jig").await.unwrap().is_none());
     }
 
+    /// A nonce as GET /v1/challenge issues one.
+    fn fresh_nonce() -> String {
+        use rand::Rng;
+        let mut nonce = [0u8; 32];
+        rand::rng().fill_bytes(&mut nonce);
+        hex::encode(nonce)
+    }
+
     #[tokio::test]
     async fn challenge_round_trip() {
         let state = AppState::for_test().unwrap();
-        state.remember_challenge("nonce-1", None, None).await;
-        assert!(state.take_challenge("nonce-1", "did:a", "a@dj.jig").await);
+        let n1 = fresh_nonce();
+        state.remember_challenge(&n1, None, None).await;
+        assert!(state.take_challenge(&n1, "did:a", "a@dj.jig").await);
         // Already taken — consumed
-        assert!(!state.take_challenge("nonce-1", "did:a", "a@dj.jig").await);
+        assert!(!state.take_challenge(&n1, "did:a", "a@dj.jig").await);
     }
 
     #[tokio::test]
     async fn a_bound_challenge_is_consumed_only_by_its_did_and_name() {
         let state = AppState::for_test().unwrap();
+        let n = fresh_nonce();
         state
-            .remember_challenge("n", Some("did:a".into()), Some("a@dj.jig".into()))
+            .remember_challenge(&n, Some("did:a".into()), Some("a@dj.jig".into()))
             .await;
         assert!(
-            !state.take_challenge("n", "did:b", "a@dj.jig").await,
+            !state.take_challenge(&n, "did:b", "a@dj.jig").await,
             "other DID"
         );
         assert!(
-            !state.take_challenge("n", "did:a", "b@dj.jig").await,
+            !state.take_challenge(&n, "did:a", "b@dj.jig").await,
             "other name"
         );
         assert!(
-            state.take_challenge("n", "did:a", "a@dj.jig").await,
+            state.take_challenge(&n, "did:a", "a@dj.jig").await,
             "still usable"
         );
         assert!(
-            !state.take_challenge("n", "did:a", "a@dj.jig").await,
+            !state.take_challenge(&n, "did:a", "a@dj.jig").await,
             "consumed"
         );
     }
@@ -491,19 +501,20 @@ mod tests {
             AppState::for_test_with_short_challenge_ttl(std::time::Duration::from_millis(50))
                 .unwrap();
 
-        state.remember_challenge("nonce-a", None, None).await;
+        let (na, nb) = (fresh_nonce(), fresh_nonce());
+        state.remember_challenge(&na, None, None).await;
         // Fresh: consume succeeds.
         assert!(
-            state.take_challenge("nonce-a", "did:a", "a@dj.jig").await,
+            state.take_challenge(&na, "did:a", "a@dj.jig").await,
             "fresh challenge must be accepted"
         );
 
-        state.remember_challenge("nonce-b", None, None).await;
+        state.remember_challenge(&nb, None, None).await;
         // Wait past the TTL and the sweep interval (sweep = ttl/2 = 25ms,
         // so 200ms guarantees at least one sweep has fired and dropped it).
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(
-            !state.take_challenge("nonce-b", "did:a", "a@dj.jig").await,
+            !state.take_challenge(&nb, "did:a", "a@dj.jig").await,
             "expired challenge must be rejected"
         );
     }
