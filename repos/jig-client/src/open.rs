@@ -113,7 +113,7 @@ mod tests {
 
     fn identity() -> Identity {
         let dir = tempfile::tempdir().unwrap();
-        Identity::generate_and_save(&dir.keep()).unwrap()
+        Identity::generate_for_tests(&dir.keep())
     }
 
     fn delivered(id: &Identity, body: &str) -> DeliveredBlock {
@@ -124,6 +124,7 @@ mod tests {
             sig_b64: Some(STANDARD.encode(&block.sender_sig)),
             receipts: vec![],
             delivery_cid: format!("delivery:{}", block.cid()),
+            ingest: None,
         }
     }
 

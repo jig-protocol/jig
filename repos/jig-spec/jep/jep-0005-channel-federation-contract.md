@@ -106,6 +106,13 @@ Non-goals for v0.2:
    - the owner's current `server-manifest`, by CID and `seq` (16);
    - any `config`-rooted suffixes the owner attests, which are never published (JEP-0004
      rule 7).
+
+   Its payload is `{domain, owner, to, channel_id, grant, creation_block, ingest_head,
+   manifest: {cid, seq}, private_suffixes, offer_id}`. `owner` is the signing server and
+   `to` the offered one, so an offer cannot be replayed to a third server. `channel_id` and
+   `manifest.cid` are CIDs as rule 0 states. `creation_block` and `ingest_head` are byte
+   strings carrying the block and the record as they travel, and the receiver checks that
+   the block's CID is `channel_id`.
 7a. A grant is one of:
     - `read`: the follower relays only protocol traffic (MLS self-updates, self-leave) and
       no content;
@@ -131,21 +138,24 @@ Non-goals for v0.2:
       DID's roles and membership as the new DID's. The creator rule carries across the
       link. A link scoped to another channel, alias or contact moves nothing here.
 8. The offered server MUST answer, signed by its DID, with exactly one of:
-   - `contract-accept {channel_id, offer_id, sequencer, manifest, private_suffixes}`.
+   - `contract-accept {server, channel_id, offer_id, sequencer, manifest, private_suffixes,
+     bot_dids}`, where `server` is the signing server and `bot_dids` is empty except on a
+     sequencer move (11a).
      - `offer_id` names the exact offer accepted, under the follower's signature. An
        accept binds only the grant in that offer.
      - `manifest` names its current `server-manifest`.
      - `private_suffixes` lists its `config`-rooted suffixes.
      - The accept states that the server implements the suite and will enforce the
        membership rule.
-   - `contract-refuse {channel_id, offer_id, code}`, where `code` is one of `UNSUPPORTED_SUITE`,
+   - `contract-refuse {server, channel_id, offer_id, code}`, where `code` is one of `UNSUPPORTED_SUITE`,
      `UNSUPPORTED_VERSION`, `POLICY_REFUSED`, `NOT_A_PEER` or `SUFFIX_CONFLICT` (the two
      servers claim one name suffix under different authorities, JEP-0004).
 9. A server MUST refuse when it does not implement the suite. It MUST NOT fall back to
    another suite or relay plaintext.
 10. The owner MUST append each accept to the channel's log as a block, so members can see
     which servers carry the channel.
-11. Either side ends a share with a signed `contract-end`. Members then commit removals
+11. Either side ends a share with a signed `contract-end {server, channel_id, offer_id}`,
+    naming the accepted offer it ends. Members then commit removals
     for any leaves reachable only through that follower. A grant changes by a new offer
     and accept.
 
@@ -304,13 +314,17 @@ Non-goals for v0.2:
 
 # Reference Implementation
 
-None yet. Milestone F2 of the design.
+In progress (milestone F2): the contract messages are `jig_core::contract`.
 
 # Test Vectors
 
+`vectors/0005/vectors.json`: a `contract-offer` with its `offer_id`, and the
+`contract-accept`, `contract-refuse` and `contract-end` answering it, each as its
+deterministic payload and its `COSE_Sign1`, in hex, under fixed test keys. The offer's
+`creation_block` and `ingest_head` are placeholder bytes.
+
 To be added with F2:
 
-- a `contract-offer`, a `contract-accept`, a `contract-refuse`;
 - a three-entry sequence chain;
 - a `server-manifest` carrying peer policy.
 

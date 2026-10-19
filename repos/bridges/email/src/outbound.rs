@@ -108,7 +108,7 @@ mod tests {
 
     fn delivered_from_body(body: &str) -> DeliveredBlock {
         let dir = tempfile::tempdir().unwrap();
-        let id = jig_client::Identity::generate_and_save(dir.path()).unwrap();
+        let id = jig_client::Identity::generate_for_tests(dir.path());
         let hlc = jig_core::HlcTimestamp::now_wall(id.did().clone());
         let blk = jig_client::blocks::build_text_render(&id, "#email/x", body, hlc);
         DeliveredBlock {

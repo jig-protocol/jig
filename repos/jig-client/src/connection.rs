@@ -85,6 +85,48 @@ pub struct Client {
     /// Set once the server contradicts its welcome. The connection is then
     /// closed, and every later call returns it.
     contradiction: Arc<StdMutex<Option<Contradiction>>>,
+    /// Ranges of channel chains this session skipped over, for the caller to
+    /// fill from the records endpoint.
+    gaps: Arc<StdMutex<Vec<ChainGap>>>,
+}
+
+/// Entries of a channel's chain a live stream did not deliver: `from..to`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainGap {
+    pub channel_id: String,
+    pub from: u64,
+    pub to: u64,
+}
+
+/// Each channel's chain as this session has verified it, by channel id.
+type ChainMap = Arc<StdMutex<HashMap<String, crate::chain::ChannelChain>>>;
+
+fn lock_chains(
+    map: &StdMutex<HashMap<String, crate::chain::ChannelChain>>,
+) -> MutexGuard<'_, HashMap<String, crate::chain::ChannelChain>> {
+    map.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_gaps(gaps: &StdMutex<Vec<ChainGap>>) -> MutexGuard<'_, Vec<ChainGap>> {
+    gaps.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The CID of a delivered bundle, or `None` when it does not decode; opening
+/// the block refuses it then, so the record check has nothing to compare.
+fn block_cid_of(bundle_b64: &str) -> Option<String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(bundle_b64)
+        .ok()?;
+    let (manifest_bytes, code_bytes): (Vec<u8>, Vec<u8>) = serde_json::from_slice(&bytes).ok()?;
+    jig_core::BlockBundle {
+        manifest_bytes: &manifest_bytes,
+        code_bytes: &code_bytes,
+        resources: vec![],
+    }
+    .block_cid()
+    .ok()
+    .map(|cid| cid.to_string())
 }
 
 /// The server contradicted something it signed (JEP-0002 rule 8).
@@ -153,6 +195,10 @@ pub struct DeliveredBlock {
     pub sig_b64: Option<String>,
     pub receipts: Vec<ReceiptRef>,
     pub delivery_cid: String,
+    /// The block's record in its channel's chain, when the server sequences
+    /// the channel (JEP-0002 rule 9). [`crate::chain`] checks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest: Option<jig_pipeline::ingest_record::IngestRecord>,
 }
 
 /// Stream of [`DeliveredBlock`] items for a subscribed channel. Returned
@@ -290,6 +336,10 @@ impl Client {
         let cursors_for_reader = last_cursors.clone();
         let closed_for_reader = closed.clone();
         let contradiction_for_reader = contradiction.clone();
+        let chains: ChainMap = Arc::new(StdMutex::new(HashMap::new()));
+        let gaps: Arc<StdMutex<Vec<ChainGap>>> = Arc::new(StdMutex::new(Vec::new()));
+        let chains_for_reader = chains.clone();
+        let gaps_for_reader = gaps.clone();
         let write_tx_for_reader = write_tx.clone();
         tokio::spawn(async move {
             let _cleanup = ReaderCleanup {
@@ -337,7 +387,7 @@ impl Client {
                             sig_b64,
                             receipts,
                             delivery_cid,
-                            ..
+                            ingest,
                         } => {
                             // This server's receipts name the key that signed
                             // its welcome; a relayed block arrives with the
@@ -354,6 +404,40 @@ impl Client {
                                 );
                                 break;
                             }
+                            // The block's record must continue its channel's
+                            // chain as this session has seen it, signed by the
+                            // server that signed the welcome. A break is a
+                            // contradiction; a gap is the caller's to fill.
+                            if let Some(record) = &ingest {
+                                let cid = block_cid_of(&bundle_b64);
+                                let mut chains = lock_chains(&chains_for_reader);
+                                let chain =
+                                    chains.entry(record.channel_id.clone()).or_insert_with(|| {
+                                        crate::chain::ChannelChain::new(
+                                            &record.channel_id,
+                                            &welcome_did,
+                                            None,
+                                        )
+                                    });
+                                match chain.accept_live(record, cid.as_deref()) {
+                                    Ok(crate::chain::Step::Gap { from, to }) => {
+                                        lock_gaps(&gaps_for_reader).push(ChainGap {
+                                            channel_id: record.channel_id.clone(),
+                                            from,
+                                            to,
+                                        });
+                                    }
+                                    Ok(_) => {}
+                                    Err(chain_break) => {
+                                        drop(chains);
+                                        contradict(
+                                            format!("the channel's history broke: {chain_break}"),
+                                            &text,
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
                             // Track HLC cursor from receipts (best-effort —
                             // receipts may carry render_hash but not HLC; the
                             // bundle_b64 contains the manifest with hlc_ts).
@@ -365,6 +449,7 @@ impl Client {
                                 sig_b64,
                                 receipts,
                                 delivery_cid: delivery_cid.clone(),
+                                ingest,
                             };
                             // Dispatch to ALL pending channel subs (server-side
                             // filtering means we only get blocks for our subs;
@@ -409,12 +494,19 @@ impl Client {
             submit_ack_timeout_seconds: 5,
             welcome: Some(welcome),
             contradiction,
+            gaps,
         })
     }
 
     /// The signed welcome, once the handshake has succeeded.
     pub fn welcome(&self) -> Option<&jig_pipeline::handshake::VerifiedWelcome> {
         self.welcome.as_ref()
+    }
+
+    /// Take the chain gaps this session has seen so far: ranges the server
+    /// skipped, to fill from the records endpoint before trusting what follows.
+    pub fn take_chain_gaps(&self) -> Vec<ChainGap> {
+        std::mem::take(&mut *lock_gaps(&self.gaps))
     }
 
     /// Set once the server has contradicted its signed welcome. The
@@ -818,6 +910,14 @@ mod tests {
     async fn start_scripted_server(
         after_welcome: Vec<String>,
     ) -> (String, Arc<StdMutex<Option<u16>>>) {
+        start_scripted_server_with_key(test_signing_key(), after_welcome).await
+    }
+
+    /// [`start_scripted_server`], signing its welcome with `key`.
+    async fn start_scripted_server_with_key(
+        key: ed25519_dalek::SigningKey,
+        after_welcome: Vec<String>,
+    ) -> (String, Arc<StdMutex<Option<u16>>>) {
         use tokio::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
@@ -830,7 +930,6 @@ mod tests {
             let Ok(mut ws) = accept_async(stream).await else {
                 return;
             };
-            let key = test_signing_key();
             while let Some(Ok(msg)) = ws.next().await {
                 if let Message::Text(text) = msg
                     && let Some(reply) = welcome_reply(&text, &key)
@@ -866,7 +965,7 @@ mod tests {
     fn test_identity() -> Identity {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.keep();
-        Identity::generate_and_save(&path).unwrap()
+        Identity::generate_for_tests(&path)
     }
 
     /// Spin up a tiny WS server on an ephemeral port. The handler closure
@@ -1204,6 +1303,7 @@ mod tests {
                 receipt_bytes_b64: "cmVjZWlwdA==".to_string(),
             }],
             delivery_cid: "bafy_delivery_1".to_string(),
+            ingest: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let decoded: DeliveredBlock = serde_json::from_str(&json).unwrap();
@@ -1226,12 +1326,14 @@ mod tests {
                 bundle_b64: "YQ==".to_string(),
                 receipts: vec![],
                 delivery_cid: "bafy_a".to_string(),
+                ingest: None,
             },
             DeliveredBlock {
                 sig_b64: None,
                 bundle_b64: "Yg==".to_string(),
                 receipts: vec![],
                 delivery_cid: "bafy_b".to_string(),
+                ingest: None,
             },
         ];
         let json = serde_json::to_string(&blocks).unwrap();
@@ -1450,6 +1552,137 @@ mod tests {
                 .await
                 .reason
                 .contains(&stranger)
+        );
+    }
+
+    /// A block frame carrying `record`, for a real text-render bundle whose
+    /// CID is `record`'s block.
+    fn block_frame(record: &jig_pipeline::ingest_record::IngestRecord, bundle_b64: &str) -> String {
+        serde_json::to_string(&Envelope::new(Frame::Block {
+            bundle_b64: bundle_b64.to_string(),
+            sig_b64: None,
+            receipts: vec![],
+            delivery_cid: format!("delivery:{}", record.block_cid),
+            ingest: Some(record.clone()),
+        }))
+        .unwrap()
+    }
+
+    /// Bundles and their CIDs, `n` of them.
+    fn bundles(n: usize) -> Vec<(String, String)> {
+        use base64::Engine as _;
+        let id = test_identity();
+        (0..n)
+            .map(|i| {
+                let hlc = jig_core::HlcTimestamp::now_wall(id.did().clone());
+                let b = crate::blocks::build_text_render(&id, "#hello", &format!("m{i}"), hlc);
+                (
+                    base64::engine::general_purpose::STANDARD.encode(b.canonical_bytes()),
+                    b.cid(),
+                )
+            })
+            .collect()
+    }
+
+    fn records_for(
+        key: &ed25519_dalek::SigningKey,
+        cids: &[&str],
+    ) -> Vec<jig_pipeline::ingest_record::IngestRecord> {
+        let mut out: Vec<jig_pipeline::ingest_record::IngestRecord> = Vec::new();
+        for (seq, cid) in cids.iter().enumerate() {
+            let prev = out
+                .last()
+                .map_or(jig_pipeline::ingest_record::GENESIS_PREV, |r| r.hash());
+            out.push(
+                jig_pipeline::ingest_record::RecordSigner {
+                    channel_id: crate::chain::label_cid("bafyCreate"),
+                    key,
+                    ingest_wall_ms: seq as u64,
+                    ingest_logical: 0,
+                }
+                .sign(seq as u64, cid, prev)
+                .unwrap(),
+            );
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_chain_that_continues_is_delivered_and_a_gap_is_reported() {
+        let key = test_signing_key();
+        let blocks = bundles(4);
+        let cids: Vec<&str> = blocks.iter().map(|(_, c)| c.as_str()).collect();
+        let records = records_for(&key, &cids);
+        // Seq 0, 1, then 3: entry 2 is never sent.
+        let frames = [0, 1, 3]
+            .iter()
+            .map(|&i| block_frame(&records[i], &blocks[i].0))
+            .collect();
+        let (url, close_code) = start_scripted_server_with_key(key, frames).await;
+        let client = Client::connect(&url, test_identity()).await.unwrap();
+        let mut stream = client.subscribe_channel("#hello").await.unwrap();
+        for expected in [0u64, 1, 3] {
+            let got = stream.next().await.expect("delivered");
+            assert_eq!(got.ingest.unwrap().seq, expected);
+        }
+        assert!(client.contradiction().is_none());
+        assert_eq!(
+            client.take_chain_gaps(),
+            vec![ChainGap {
+                channel_id: crate::chain::label_cid("bafyCreate"),
+                from: 2,
+                to: 3
+            }]
+        );
+        assert_eq!(*close_code.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_forked_chain_is_a_contradiction() {
+        let key = test_signing_key();
+        let blocks = bundles(3);
+        let records = records_for(&key, &[&blocks[0].1, &blocks[1].1]);
+        // The same key signs another entry 1, then an entry 2 after it.
+        let fork = records_for(&key, &[&blocks[0].1, &blocks[2].1]);
+        let frames = vec![
+            block_frame(&records[0], &blocks[0].0),
+            block_frame(&records[1], &blocks[1].0),
+            block_frame(&fork[1], &blocks[2].0),
+        ];
+        let (url, close_code) = start_scripted_server_with_key(key, frames).await;
+        let client = Client::connect(&url, test_identity()).await.unwrap();
+        let contradiction = await_contradiction(&client).await;
+        assert!(
+            contradiction.reason.contains("history broke"),
+            "{}",
+            contradiction.reason
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            *close_code.lock().unwrap(),
+            Some(jig_pipeline::handshake::close::CONTRADICTION)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_for_another_block_or_from_another_key_is_a_contradiction() {
+        let key = test_signing_key();
+        let blocks = bundles(2);
+        let records = records_for(&key, &[&blocks[0].1]);
+        // Record 0 delivered with block 1's bundle.
+        let (url, _) =
+            start_scripted_server_with_key(key, vec![block_frame(&records[0], &blocks[1].0)]).await;
+        let client = Client::connect(&url, test_identity()).await.unwrap();
+        assert!(await_contradiction(&client).await.reason.contains("block"));
+
+        let stranger = records_for(&test_signing_key(), &[&blocks[0].1]);
+        let (url, _) = start_scripted_server(vec![block_frame(&stranger[0], &blocks[0].0)]).await;
+        let client = Client::connect(&url, test_identity()).await.unwrap();
+        assert!(
+            await_contradiction(&client)
+                .await
+                .reason
+                .contains("sequencer")
         );
     }
 

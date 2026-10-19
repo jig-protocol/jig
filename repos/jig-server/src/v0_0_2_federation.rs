@@ -499,27 +499,38 @@ pub async fn ingest_peer_block(
         warn!(peer_url = %peer.url, %delivery_cid, "rejecting peer block: encrypted content does not federate");
         return Ok(());
     }
-    if let Some(slug) = manifest
-        .kind
-        .and_then(|kind| jig_pipeline::ingest::channel_slug_of(kind, &manifest))
+    let bundle = jig_core::BlockBundle {
+        manifest_bytes: &manifest_bytes,
+        code_bytes: &code_bytes,
+        resources: vec![],
+    };
+    // The same resolver ingest gates with, so a block naming its channel by
+    // `channel_id` is held to the same rule as one naming it by slug.
+    let block_cid = bundle
+        .block_cid()
+        .map(|c| c.to_string())
+        .unwrap_or_default();
+    if let Some(kind) = manifest.kind
+        && let Some(named) = jig_pipeline::ingest::channel_id_of(
+            &state.ingest_ctx.store,
+            kind,
+            &manifest,
+            &block_cid,
+        )?
+        && let Some(id) = named.id.as_deref()
         && let Some(chan) = state
             .ingest_ctx
             .store
-            .get_channel_by_slug_including_archived(slug)?
+            .get_channel_by_id_including_archived(id)?
         && !DeliveryPolicy::for_channel(&chan, vec![]).federates
     {
-        warn!(peer_url = %peer.url, %delivery_cid, slug, "rejecting peer block: the local channel does not federate");
+        warn!(peer_url = %peer.url, %delivery_cid, slug = %chan.slug, "rejecting peer block: the local channel does not federate");
         return Ok(());
     }
 
     let sig = sig_b64
         .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
         .unwrap_or_default();
-    let bundle = jig_core::BlockBundle {
-        manifest_bytes: &manifest_bytes,
-        code_bytes: &code_bytes,
-        resources: vec![],
-    };
     let source = jig_pipeline::ingest::IngestSource::FederatedPeer {
         peer_did: jig_core::Did::from_str_unchecked(jig_pipeline::effect::canonical_did_string(
             &peer.expected_did,
@@ -931,7 +942,10 @@ mod tests {
             .await
             .expect("bridge sink should receive the federated block")
             .expect("delivery present");
-        assert_eq!(got.0.channel_id.as_deref(), Some("#dm/x"));
+        assert_eq!(
+            got.0.channel_id.as_deref(),
+            Some(jig_pipeline::ingest_record::label_cid("chan x").as_str())
+        );
         assert_eq!(got.0.sender_did, sender_did.to_did_jig_string());
     }
 

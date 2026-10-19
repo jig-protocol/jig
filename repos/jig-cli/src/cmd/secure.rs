@@ -146,9 +146,6 @@ pub struct Secure {
     /// Set once this process has held the server to its pin
     /// ([`Self::ensure_pinned`]).
     pinned: tokio::sync::OnceCell<()>,
-    /// Where `identity` was loaded from, to load it again for that handshake,
-    /// which takes it by value.
-    identity_dir: std::path::PathBuf,
 }
 
 impl Secure {
@@ -162,7 +159,6 @@ impl Secure {
             base: base_http_url(&server),
             server,
             pinned: tokio::sync::OnceCell::new(),
-            identity_dir: jig_client::identity::default_keys_dir(),
         })
     }
 
@@ -175,9 +171,9 @@ impl Secure {
     async fn ensure_pinned(&self) -> Result<()> {
         self.pinned
             .get_or_try_init(|| async {
-                let identity =
-                    Identity::load_from_dir(&self.identity_dir, &self.identity.did_string())?;
-                connect_pinned(&self.server, identity).await.map(drop)
+                connect_pinned(&self.server, self.identity.duplicate())
+                    .await
+                    .map(drop)
             })
             .await
             .map(|_| ())
