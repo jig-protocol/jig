@@ -3,7 +3,6 @@
 pub mod analytics;
 pub mod config;
 pub mod error;
-pub mod hot;
 pub mod identity;
 pub mod server;
 pub mod storage;
