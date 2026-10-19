@@ -28,11 +28,11 @@ nameserver's registration path. This plan is that path, plus the checklist for o
 **What PoW does and does not buy here:**
 - PoW is a price on strangers' capacity, never an identity price (framing, section 4).
 - Against a GPU or a botnet, no effort a phone can afford stops a squatter. 2^20 digests take a
-  GPU about a millisecond (an estimate; slice 0 measures it).
-- What actually bounds squatting is the **registration pool** (slice 3). It is a per-suffix cap
+  GPU about a millisecond (an estimate; task 0 measures it).
+- What actually bounds squatting is the **registration pool** (task 3). It is a per-suffix cap
   on stranger registrations per unit of time, ordered by effort. Compute cannot raise the cap.
 - PoW orders and prices the requests that fit under it.
-- Short names, which are scarce, cost more (slice 3).
+- Short names, which are scarce, cost more (task 3).
 
 **Tech stack:** Rust 2024, axum 0.7, serde, `jig_core::{cose, dcbor}`, `cargo nextest`,
 `cargo clippy`.
@@ -87,8 +87,8 @@ Nothing below is a constant in code. Every value is a config key with a document
 operator, and later a ruleset (JEP-0009), sets it.
 
 Proposed nameserver keys: two optional tables on each `[[v0_0_2.nameserver.alias_suffixes]]`
-entry, beside L6's policy fields (#224). `SuffixConfig` is `deny_unknown_fields`, so slice 1
-adds `pow: PowPolicy` and slice 3 adds `pool: PoolPolicy` to the struct, both
+entry, beside L6's policy fields (#224). `SuffixConfig` is `deny_unknown_fields`, so task 1
+adds `pow: PowPolicy` and task 3 adds `pool: PoolPolicy` to the struct, both
 `#[serde(default)]`:
 
 ```toml
@@ -100,7 +100,7 @@ min_alias_len = 3
 # reserved, reserved_contains, reserved_affixes: L6's defaults
 registration_allow = [{ did = "did:jig:z…", aliases = ["dj"] }]
 
-[v0_0_2.nameserver.alias_suffixes.pow] # this plan, slice 1
+[v0_0_2.nameserver.alias_suffixes.pow] # this plan, task 1
 alg = 1                                # JEP-0008 rule 8
 min_effort = 1_048_576                 # 2^20; the floor for strangers (rule 19)
 max_effort = 268_435_456               # 2^28; the cap, and the client's refusal point
@@ -109,19 +109,19 @@ short_name_len = 5                     # names shorter than this pay the length 
 short_name_factor = 4                  # effort × factor^(short_name_len − len)
 renew_effort = 1                       # rule 31: renew and rotate by the holder pay the minimum
 
-[v0_0_2.nameserver.alias_suffixes.pool] # slice 3: the stranger cap
-strangers_per_hour = 120               # admitted stranger registrations per hour; compute cannot raise it
-burst = 20
-controller = "doubling"                # how effort follows the queue (slice 3)
+[v0_0_2.nameserver.alias_suffixes.pool] # task 3: the stranger cap
+strangers_per_hour = 60                # admitted stranger registrations per hour; compute cannot raise it (decision 2)
+burst = 10
+controller = "doubling"                # how effort follows the queue (task 3)
 controller_window_secs = 300
 ```
 
 - **Per suffix.** #224 serves several suffixes per process, so each suffix carries its own
   `pow` and `pool`, and `Suffixes::from_config` validates them at boot (`min_effort ≤
-  max_effort`, `max_effort` solvable in `max_solve_secs` on the benchmark from slice 0).
-  `SuffixPolicy` gains `pow()` and `pool()` accessors; slice 3 keeps its controller state per
+  max_effort`, `max_effort` solvable in `max_solve_secs` on the benchmark from task 0).
+  `SuffixPolicy` gains `pow()` and `pool()` accessors; task 3 keeps its controller state per
   suffix.
-- **How effort adapts (slice 3).** Rule 17 lets the controller be local. The proposed
+- **How effort adapts (task 3).** Rule 17 lets the controller be local. The proposed
   `doubling` controller works per window:
   - **Raise:** when admitted stranger registrations reached the pool's cap and requests were
     refused for capacity, double the suggested effort, up to `max_effort`.
@@ -130,10 +130,10 @@ controller_window_secs = 300
   - **Floor:** registration never drops below `min_effort`, because a registration creates a
     binding (D23).
 - **Allowlisted registrations** (`Admission::Allowlisted`, from `registration_allow`) are member
-  requests (rule 24). They skip the pool and pay `min_effort`, not the length multiplier (DJ
-  question 3). The allowlist is per (DID, exact alias), not per DID, so the effort cannot be
+  requests (rule 24). They skip the pool and pay `min_effort`, not the length multiplier (decision
+  3). The allowlist is per (DID, exact alias), not per DID, so the effort cannot be
   known until the alias is: see the challenge below.
-- **Server admission (slice 4).** `[auth.admission] pow_bits` becomes `min_effort` and
+- **Server admission (task 4).** `[auth.admission] pow_bits` becomes `min_effort` and
   `max_effort`, plus the same controller keys. `pow_bits` stays accepted for one release and
   maps to `min_effort = 2^pow_bits`.
 
@@ -196,7 +196,7 @@ What it holds (JEP-0008 rules 6–10):
 Wire changes:
 - **`GET /v1/challenge?action=register|renew|rotate&alias=<local>@<suffix>&did=<did>`** returns
   `{challenge, pow: {alg, effort, expires_at}, sig}`.
-  - The alias is required because the effort depends on it: length scaling (slice 3) and the
+  - The alias is required because the effort depends on it: length scaling (task 3) and the
     per-alias allowlist both need it. The DID is required for register because
     `registration_allow` is keyed on (DID, alias). Neither is authenticated here; both are
     bound into the challenge record, and the proof later has to match them.
@@ -213,7 +213,7 @@ Wire changes:
     arrives, so a client is never refused for an effort rise mid-solve. A challenge used for
     another action, alias or DID is refused `CHALLENGE_MISMATCH` before any crypto.
   - Today's bare `GET /v1/challenge` keeps working for one release for clients that predate
-    slice 2; on a suffix whose `pow.min_effort > 0` it can only lead to `428 POW_REQUIRED`.
+    task 2; on a suffix whose `pow.min_effort > 0` it can only lead to `428 POW_REQUIRED`.
 - **`pow`** on register, renew and rotate is `{alg, effort, nonce}`. The salt is empty (rule 13,
   challenge mode).
 - **The binding (rule 11):**
@@ -222,7 +222,7 @@ Wire changes:
     the labelled BLAKE3 of (`domain`, `jig-alias-rotate-pow-v1`), (`ns_did`), (`alias`),
     (`old_did`), (`new_did`), (`challenge`). When I3 adds `Action::Rotate`, it becomes
     `proof_hash(Rotate, …)` like the other two. **JEP-0008 rule 11 needs this interim stated**
-    (DJ question 4).
+    (decision 4).
   - The subject is `did` for register and renew, and `old_did` for rotate.
 - **Order of checks in `register`** (rule 10; framing 5.10's "refuse before working"). Steps 1,
   2 and 5–7 are #224's `register` as it stands; this plan inserts 3 and 4 between
@@ -242,12 +242,12 @@ Wire changes:
 - **Renew** already verifies before it consumes; PoW goes before `verify_action_proof` there
   too.
 - **Rotate** consumes the challenge *first* (#224's `rotate`, step 1), then verifies the two
-  signatures. Slice 1 moves the consume after the PoW and both signature checks, matching
+  signatures. Task 1 moves the consume after the PoW and both signature checks, matching
   register and renew, so a bad `pow` cannot burn a holder's challenge. This touches lane I's
   rotate code; coordinate with I3.
 - **Refusals:** `428 POW_REQUIRED`, carrying the signed effort as in `get_challenge`;
   `400 POW_INVALID`; `400 POW_INSUFFICIENT`. A refused or invalid proof charges a penalty point
-  to (target alias, requesting DID) and to the IP (rule 26). The points feed slice 3's
+  to (target alias, requesting DID) and to the IP (rule 26). The points feed task 3's
   multiplier.
 - **Challenge map:** cap the number of pending challenges (config, default 100 000). When it is
   full, refuse new challenges with `503 BUSY` rather than evict live ones.
@@ -461,14 +461,14 @@ before the `jig` entry's `registration` changes to `"open"`.
 - [ ] **Parameters are set from measurements.**
   - Task 0's benchmark numbers are in the PR.
   - `min_effort` fits `max_solve_secs` on the reference potato.
-  - `strangers_per_hour`, `burst` and the short-name factor are chosen by DJ (question 2).
+  - `strangers_per_hour`, `burst` and the short-name factor are set by decisions 1 and 2.
 - [ ] **Old clients fail clearly** (task 6), and the release notes say that registration needs
   the new CLI.
 - [ ] **Operations.**
   - The pool and effort metrics are scraped.
   - The runbook covers closing the suffix, adjusting the pool, and handling a squatting
     complaint.
-  - A squatting-complaint path exists until tribunals do (question 5).
+  - A squatting-complaint path exists until tribunals do (decision 5: signed, logged operator removal).
 - [ ] **Threat register and spec updated** (task 7). The release notes list AB-01 and AB-02 as
   mitigated for the nameserver path.
 - [ ] **A staged opening.**
@@ -478,36 +478,27 @@ before the `jig` entry's `registration` changes to `"open"`.
 
 ---
 
-## Questions for DJ, with recommendations
+## Decisions (DJ, 2026-10-19)
 
-1. **Length-scaled effort for short names.** Short aliases are the scarce part of the namespace.
-   - *Recommended:* yes. Effort × 4^(5 − len) for names under 5 characters: a 3-letter name
-     costs 16× a 5-letter one.
-   - Alternatives: flat effort, or reserve all names under 4 characters for allowlisted DIDs.
-2. **Opening values for the registration pool.**
-   - *Recommended:* `strangers_per_hour = 60`, `burst = 10` for the first week open, then
-     review against the metrics.
-   - At 60 an hour, registering every 3-letter name (about 55 000) takes over five weeks, and
-     shows on the metrics within an hour.
-3. **Allowlisted DIDs.**
-   - *Recommended:* they skip the pool and the length multiplier but still pay `min_effort`,
-     so every request takes one code path and an allowlist leak is still priced.
-   - Alternative: no work at all for allowlisted DIDs.
-4. **Rotate before lane I's I3.** `Action` has no `Rotate` yet.
-   - *Recommended:* the interim rotate binding above (labelled hash over the alias, both DIDs,
-     the nameserver and the challenge), switched to `proof_hash(Rotate, …)` in I3, with a
-     one-line amendment to JEP-0008 rule 11.
-   - Alternative: exempt rotate from PoW until I3 (it is dual-signed by keys that already hold
-     the name). That is cheaper to build but leaves rule 31 unmet in the meantime.
-5. **Squatting complaints before tribunals (JEP-0010) exist.**
-   - *Recommended:* an operator-only, signed and logged removal of a binding, with a published
-     reason, as a stopgap removed when R6's tribunal can decide name disputes.
-   - Alternative: no removal; rely on the 90-day expiry, the reserved list and the pool.
-6. **Legacy admission proofs at servers.**
-   - *Recommended:* accept `jig-admission-pow-v1` for exactly one release after task 4, then
-     refuse it.
-   - Alternative: keep it indefinitely as a second algorithm. That costs a second verifier
-     forever.
+1. **Short names: length-scaled effort, plus a flat reserve below 3 characters.**
+   - 3 and 4 characters pay effort × 4^(5 − len): 16× and 4× a 5-character name.
+   - 1 and 2 characters are reserved: only a `registration_allow` entry can register them. #224
+     already does this, since `min_alias_len = 3` refuses them and the allowlist bypasses the
+     minimum length. Task 6 pins it with a test, so a later change to `min_alias_len` cannot
+     silently open them.
+2. **Pool on `@jig` at opening:** `strangers_per_hour = 60` and `burst = 10` for the first week,
+   then a review against the metrics. These are the values in the config sketch above.
+3. **Allowlisted registrations pay `min_effort`.** They skip the pool and the length multiplier,
+   so every request takes one code path and a leaked entry still costs work.
+4. **Rotate before I3: the interim binding.** Use the labelled hash over (`jig-alias-rotate-pow-v1`,
+   ns_did, alias, old_did, new_did, challenge), switching to `proof_hash(Rotate, …)` in I3.
+   Task 7 adds a one-line amendment to JEP-0008 rule 11.
+5. **Squatting before tribunals: signed, logged operator removal.** The nameserver operator
+   alone removes a binding, signed and logged, with a published reason. It is a stopgap,
+   retired once R6's tribunal can rule on name disputes. Scoped as a follow-up slice after 6
+   (owner: L6), since it adds an admin endpoint and a log record.
+6. **Legacy admission proofs:** `jig-admission-pow-v1` is accepted for exactly one release
+   after task 4, then refused.
 
 ---
 
