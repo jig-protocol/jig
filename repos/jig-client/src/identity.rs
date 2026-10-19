@@ -652,8 +652,10 @@ fn seal_to(
 }
 
 /// Write `bytes` to `path` through an owner-only temporary file and a rename,
-/// so a reader sees the old file or the new one, never a partial one.
-fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// so a reader sees the old file or the new one, never a partial one. The
+/// directory is synced too, so the new name survives a crash: a caller that
+/// removes the file it replaced (the raw-key migration) can do so safely.
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
@@ -673,7 +675,25 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = options.open(&tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    sync_parent_dir(path)
+}
+
+/// Make a rename or removal in `path`'s directory durable. Unix only: Windows
+/// cannot open a directory as a file, and its renames are journalled.
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {

@@ -832,18 +832,10 @@ fn b64(s: &str, field: &'static str) -> Result<Vec<u8>> {
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    let io = |source| SecureError::Io {
+    crate::identity::write_private_atomic(path, bytes).map_err(|source| SecureError::Io {
         path: path.to_path_buf(),
         source,
-    };
-    std::fs::write(&tmp, bytes).map_err(io)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(io)?;
-    }
-    std::fs::rename(&tmp, path).map_err(io)
+    })
 }
 
 /// Whether `blocks` — a channel's history from some point up to now — reach
@@ -1196,6 +1188,17 @@ mod tests {
                 "{name}"
             );
             assert!(!contains(bytes, b"#sealed-at-rest"), "{name}");
+            assert!(!name.ends_with(".tmp"), "{name} left behind");
+        }
+        // Whole-file writes are owner-only from the moment they exist.
+        #[cfg(unix)]
+        for name in [STATE, GROUPS] {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(root.path().join(alice.did()).join(name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{name}");
         }
         // And it reads back, in a fresh session.
         let again = Session::open(root.path(), alice.identity.duplicate()).unwrap();
