@@ -915,8 +915,11 @@ fn outside_offer(statement: &WelcomeStatement, offer: &ClientOffer) -> Option<&'
 }
 
 /// Whether the base64 key link `link_b64` moves `pinned` to `presented`: it
-/// verifies under both keys, it is for everyone, and it runs from exactly the
-/// pinned DID to exactly the presented one.
+/// verifies under both keys, it is for everyone, it leaves the pinned DID's
+/// key, and it moves to exactly the presented DID. `presented` comes from
+/// something the server signed, and a link's DIDs are canonical (JEP-0012),
+/// so it is compared as written: another spelling of the same key is
+/// refused. `pinned` may be a local spelling, so it is compared by key.
 pub fn link_moves(link_b64: &str, pinned: &str, presented: &str) -> Result<(), String> {
     use jig_core::key_link::{Audience, SignedKeyLink};
     let bytes = STANDARD
@@ -933,7 +936,7 @@ pub fn link_moves(link_b64: &str, pinned: &str, presented: &str) -> Result<(), S
             link.old
         ));
     }
-    if !same_did(&link.new, presented) {
+    if link.new != presented {
         return Err(format!(
             "the key link moves to {}, not to the welcome's DID",
             link.new
@@ -1447,6 +1450,14 @@ mod tests {
         let last = tampered.len() - 1;
         tampered[last] ^= 1;
         refused(welcome_with(Some(tampered)), "key link does not move it");
+
+        // Another spelling of the new key is not the DID the link names.
+        let canonical = did(&new);
+        let recased = format!("did:jig:z{}", canonical["did:jig:z".len()..].to_uppercase());
+        assert!(same_did(&recased, &canonical), "the same key");
+        let b64 = STANDARD.encode(link(&old, &new, Audience::Public));
+        assert!(link_moves(&b64, &did(&old), &canonical).is_ok());
+        assert!(link_moves(&b64, &did(&old), &recased).is_err());
     }
 
     #[test]
