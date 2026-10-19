@@ -135,8 +135,8 @@ impl AppState {
     /// generation.
     ///
     /// `execution` carries the operator's `[execution]` limits, which live on
-    /// `ServerConfig` rather than `JigServerConfig` under the hybrid config
-    /// split. Passing them explicitly is what makes the ingest render path honour
+    /// `ServerConfig` rather than in the `JigServerConfig` sections. Passing
+    /// them explicitly is what makes the ingest render path honour
     /// configured fuel, memory, timeout and concurrency instead of running on
     /// library defaults.
     pub fn new(
@@ -177,8 +177,8 @@ impl AppState {
         // `Result` instead of aborting the process.
         //
         // Limits come from the operator's `[execution]` settings, which live on
-        // `ServerConfig` — a different type in the hybrid config split, so they
-        // are passed in rather than read from `JigServerConfig`. Without this the
+        // `ServerConfig`, outside the `JigServerConfig` sections, so they are
+        // passed in rather than read from `config`. Without this the
         // ingest render path ran on library defaults and silently ignored every
         // configured limit.
         //
