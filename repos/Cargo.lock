@@ -3154,7 +3154,6 @@ dependencies = [
  "blake3",
  "chrono",
  "cid",
- "ed25519-dalek 3.0.0",
  "jig-core",
  "multihash-codetable",
  "postcard",

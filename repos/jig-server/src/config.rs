@@ -451,11 +451,11 @@ unknown_dids = "admit"
 # pow_bits = 20
 banned_dids = []
 # [[auth.admission.floors]]
-# ruleset_key = "gigue.highsec.v1"
+# ruleset_key = "jig.highsec.v1"
 # minimum = 0
 # [[auth.admission.records]]
 # did = "did:jig:z..."
-# ruleset_key = "gigue.highsec.v1"
+# ruleset_key = "jig.highsec.v1"
 # score = 5
 
 # Token buckets in front of the gates: per verified DID (reads, subscriptions,

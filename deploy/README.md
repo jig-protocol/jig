@@ -168,6 +168,10 @@ sudo install -m 0644 deploy/config.example.toml /etc/jig/config.toml
 tailscale ip -4                     # <- put this address in the config
 sudoedit /etc/jig/config.toml
 
+# 3b. nameserver config — EDIT IT, it must name the suffixes you serve
+sudo install -m 0644 deploy/jig-nameserver.example.toml /etc/jig/jig-nameserver.toml
+sudoedit /etc/jig/jig-nameserver.toml
+
 # 4. nameserver secret (MANDATORY — it exits non-zero at startup without one)
 printf 'JIG_NS_SECRET=%s\n' "$(openssl rand -hex 32)" \
   | sudo tee /etc/jig/jig-nameserver.env >/dev/null
@@ -216,7 +220,10 @@ the root keys and every section in one file.
 > **Upgrading a server that ran without `[tls]`:** it comes back on TLS. Every
 > client re-runs `jig server set https://…`; their pins and encrypted-channel
 > state carry over, because neither is keyed by the scheme. To keep plaintext
-> (behind a proxy that terminates TLS, say), set `[tls] enabled = false`.
+> (behind a proxy that terminates TLS, say), set `[tls] enabled = false`. The
+> server then lists `tls.enabled=false` in `/.well-known/jig`'s
+> `unsafe_options_active` and logs a startup warning (#120). A `jig` CLI refuses a
+> plaintext `http://` server that is not on its own machine (#142).
 >
 > The nameserver on `:7070` is **not** covered by `[tls]` — that section belongs
 > to `jig-server` only — so its rows stay `http://` unless you terminate TLS in
@@ -501,7 +508,9 @@ reputation, tribunal, transparency and federation) were removed:
 | `/v1/health` | GET | liveness |
 | `/v1/challenge` | GET | issues a 64-hex nonce |
 | `/v1/register` | POST | consumes a GET-issued challenge, returns an attestation |
-| `/v1/resolve/:alias` | GET | alias → DID |
+| `/v1/resolve/:alias` | GET | the signed alias attestation, plus transitional unsigned hints (`did`, `alias`, `valid_until`) |
+| `/v1/suffixes` | GET | suffixes served, their registration mode, and this nameserver's DID |
+| `/.well-known/jig-ns-delegation` | GET | signed delegation for a DNS-rooted suffix (`?suffix=`, else the `Host`) |
 | `/v1/rotate`, `/v1/renew` | POST | key rotation / renewal |
 | `/v1/handles` | GET | **debug-gated** behind `[debug] list_handles` |
 
@@ -522,9 +531,28 @@ reputation, tribunal, transparency and federation) were removed:
 None of the nameserver's routes asks for proof-of-work.
 
 `/v1/handles` enumerates every registered alias, so it stays off unless you
-explicitly set `list_handles = true`. Alias resolution never touches DNS, so the
-default `alias_suffix` (`gigue.jig`) works on a tailnet and cannot leak
-publicly — `.jig` is not an IANA TLD.
+explicitly set `list_handles = true`.
+
+**Suffixes.** `[[v0_0_2.nameserver.alias_suffixes]]` is required and has no
+default: the nameserver refuses to start until you name at least one suffix
+(see `deploy/jig-nameserver.example.toml`). One DID holds at most one name per
+suffix. Each suffix sets its own policy: `registration = "open" | "closed"`
+(a closed suffix still resolves, renews and rotates), `min_alias_len`
+(default 3), reserved names, and `registration_allow`, a list of DIDs with the
+exact aliases each may register past that policy. A single-label suffix such
+as `jig` also needs `single_label_authority = true`: clients trust it only
+through their own config, so its names verify only for clients whose config
+names this nameserver's DID.
+
+For a DNS-rooted suffix, `/.well-known/jig-ns-delegation` serves this
+nameserver's signed delegation; a resolver treats it as authoritative only when
+fetched from `https://<suffix>/`. `GET /v1/suffixes` lists the suffixes served
+and this nameserver's DID.
+
+**Key ceremony.** `jig-nameserver keygen --out <path>` writes a new signing key
+(0600, never overwriting an existing file) and prints only the DID, so the DID
+can be recorded on an offline machine before any server exists. Point
+`[v0_0_2.server] server_did_keyfile` at the file.
 
 ---
 

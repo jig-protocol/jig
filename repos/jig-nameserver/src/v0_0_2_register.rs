@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     routing::{get, post},
 };
@@ -19,6 +19,7 @@ use jig_pipeline::persist::StoredAliasAttestation;
 use serde::{Deserialize, Serialize};
 
 use crate::v0_0_2::AppState;
+use crate::v0_0_2_policy::{Admission, Refusal, SuffixPolicy};
 
 /// v0.0.2 attestation default TTL: 90 days, per the design spec.
 pub(crate) const DEFAULT_TTL_SECONDS: i64 = 90 * 24 * 60 * 60;
@@ -27,6 +28,10 @@ pub(crate) const DEFAULT_TTL_SECONDS: i64 = 90 * 24 * 60 * 60;
 pub struct RegisterReq {
     pub did: String,
     pub requested_alias: String,
+    /// Which served suffix to register under. May be left out when the
+    /// nameserver serves exactly one.
+    #[serde(default)]
+    pub suffix: Option<String>,
     /// Unpadded base64url of the DID's COSE_Sign1 over
     /// `naming::proof_payload(Register, ns_did, alias@suffix, challenge)`.
     pub proof_of_control: String,
@@ -101,6 +106,102 @@ fn validate_local_part(s: &str) -> Result<(), ApiError> {
 /// Parse and lowercase a full `alias@suffix` (JEP-0004 rule 1).
 pub(crate) fn parse_name(full: &str) -> Result<Name, ApiError> {
     Name::parse(full).map_err(|e| err(StatusCode::BAD_REQUEST, "INVALID_NAME", e.to_string()))
+}
+
+fn unknown_suffix(suffix: &str) -> ApiError {
+    err(
+        StatusCode::NOT_FOUND,
+        "UNKNOWN_SUFFIX",
+        format!("this nameserver does not serve the suffix `{suffix}`"),
+    )
+}
+
+/// Parse a full name and check this nameserver serves its suffix.
+pub(crate) fn served_name(state: &AppState, full: &str) -> Result<Name, ApiError> {
+    let name = parse_name(full)?;
+    if state.suffixes.get(&name.suffix).is_none() {
+        return Err(unknown_suffix(&name.suffix));
+    }
+    Ok(name)
+}
+
+/// The suffix a registration asks for, or the only one served.
+fn requested_suffix<'a>(
+    state: &'a AppState,
+    suffix: Option<&str>,
+) -> Result<&'a SuffixPolicy, ApiError> {
+    match suffix {
+        Some(s) => {
+            let s = s.to_ascii_lowercase();
+            state.suffixes.get(&s).ok_or_else(|| unknown_suffix(&s))
+        }
+        None => state.suffixes.only().ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "SUFFIX_REQUIRED",
+                "this nameserver serves several suffixes; name one in `suffix`",
+            )
+        }),
+    }
+}
+
+fn refused(refusal: Refusal, policy: &SuffixPolicy) -> ApiError {
+    match refusal {
+        Refusal::Closed => err(
+            StatusCode::FORBIDDEN,
+            "REGISTRATION_CLOSED",
+            format!("registration on `{}` is closed", policy.suffix),
+        ),
+        Refusal::TooShort { min } => err(
+            StatusCode::BAD_REQUEST,
+            "ALIAS_TOO_SHORT",
+            format!(
+                "aliases on `{}` are at least {min} characters",
+                policy.suffix
+            ),
+        ),
+        Refusal::Reserved { word } => err(
+            StatusCode::FORBIDDEN,
+            "ALIAS_RESERVED",
+            format!(
+                "alias is reserved on `{}` (matches `{word}`)",
+                policy.suffix
+            ),
+        ),
+    }
+}
+
+/// The alias `did` already holds under `suffix` here, if any.
+pub(crate) async fn name_held_by(
+    state: &AppState,
+    did: &str,
+    suffix: &str,
+) -> Result<Option<String>, ApiError> {
+    let now = chrono::Utc::now().timestamp();
+    let store = state.ingest_ctx.store.clone();
+    let (did, ns_did, suffix) = (did.to_string(), state.ns_did_string(), suffix.to_string());
+    tokio::task::spawn_blocking(move || store.alias_held_by(&did, &ns_did, &suffix, now))
+        .await
+        .map_err(|e| internal("JOIN_ERROR")(e.to_string()))?
+        .map_err(|e| internal("PERSIST_ERROR")(e.to_string()))
+}
+
+/// Refuse to bind a second name under one suffix to `did`: the store keeps
+/// one name per DID per suffix, so the first would be silently dropped.
+pub(crate) async fn refuse_second_name(
+    state: &AppState,
+    did: &str,
+    name: &Name,
+) -> Result<(), ApiError> {
+    let alias = name.as_alias();
+    match name_held_by(state, did, &name.suffix).await? {
+        Some(held) if held != alias => Err(err(
+            StatusCode::CONFLICT,
+            "DID_HOLDS_NAME",
+            format!("this DID already holds `{held}`; one name per DID per suffix"),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Check that `did` signed a proof of control for `action` on `alias` at this
@@ -213,17 +314,23 @@ pub(crate) fn parse_reachability(
     Ok(Some(record))
 }
 
-/// Consume a challenge. Called only after the proof verified, so a bad proof
-/// leaves the challenge usable, and of two proofs racing for one challenge
-/// only one gets `true`.
-pub(crate) async fn consume_challenge(state: &AppState, challenge: &str) -> Result<(), ApiError> {
-    if state.take_challenge(challenge).await {
+/// Consume a challenge for a request by `did` on `alias`. Called only after
+/// the proof verified, so a bad proof leaves the challenge usable, and of two
+/// proofs racing for one challenge only one gets `true`.
+pub(crate) async fn consume_challenge(
+    state: &AppState,
+    challenge: &str,
+    did: &str,
+    alias: &str,
+) -> Result<(), ApiError> {
+    if state.take_challenge(challenge, did, alias).await {
         Ok(())
     } else {
         Err(err(
             StatusCode::UNAUTHORIZED,
             "CHALLENGE_UNKNOWN",
-            "challenge not recognized, expired or already consumed (call GET /v1/challenge first)",
+            "challenge not recognized, expired, already consumed or issued for another \
+             DID or name (call GET /v1/challenge first)",
         ))
     }
 }
@@ -240,6 +347,13 @@ pub(crate) struct Binding {
 struct StoredBinding {
     attestation: String,
     reachability: Option<String>,
+}
+
+/// A stored row in the encoding from before attestations were COSE
+/// envelopes. [`Binding::from_row`] re-signs these from the row's columns,
+/// which is what makes rewriting those columns safe.
+pub(crate) fn is_legacy_row(attestation_bytes: &[u8]) -> bool {
+    serde_json::from_slice::<StoredBinding>(attestation_bytes).is_err()
 }
 
 impl Binding {
@@ -363,15 +477,44 @@ pub(crate) async fn issue_and_persist(
     Ok(Json(binding.response()))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ChallengeQuery {
+    /// The DID that will use the challenge.
+    did: Option<String>,
+    /// The full `alias@suffix` it will be used on.
+    name: Option<String>,
+}
+
 /// GET /v1/challenge — issue a fresh hex nonce. Register and renew sign it
 /// into an action-bound proof of control.
-pub async fn get_challenge(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+///
+/// `?did=` and `?name=` bind it: it is then consumed only by that DID on that
+/// name, and is what proof-of-work (lane R's R1) sets its effort from. Both
+/// are optional until R1, so clients that send neither keep working.
+pub async fn get_challenge(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ChallengeQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let name = query
+        .name
+        .as_deref()
+        .map(|n| parse_name(n).map(|n| n.as_alias()))
+        .transpose()?;
+    if let Some(did) = query.did.as_deref() {
+        jig_core::Did::from_did_jig_string(did).map_err(|_| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "BAD_DID",
+                "DID is not did:jig:z<base32> canonical form",
+            )
+        })?;
+    }
     let mut nonce = [0u8; 32];
     use rand::Rng;
     rand::rng().fill_bytes(&mut nonce);
     let nonce_hex = hex::encode(nonce);
-    state.remember_challenge(&nonce_hex).await;
-    Json(serde_json::json!({ "challenge": nonce_hex }))
+    state.remember_challenge(&nonce_hex, query.did, name).await;
+    Ok(Json(serde_json::json!({ "challenge": nonce_hex })))
 }
 
 /// POST /v1/register
@@ -380,7 +523,12 @@ pub async fn register(
     Json(req): Json<RegisterReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     validate_local_part(&req.requested_alias)?;
-    let alias = parse_name(&format!("{}@{}", req.requested_alias, state.suffix()))?.as_alias();
+    let policy = requested_suffix(&state, req.suffix.as_deref())?;
+    let name = parse_name(&format!("{}@{}", req.requested_alias, policy.suffix))?;
+    let alias = name.as_alias();
+    let admission = policy
+        .admit(&req.did, &name.alias)
+        .map_err(|r| refused(r, policy))?;
 
     verify_action_proof(
         &state,
@@ -391,7 +539,7 @@ pub async fn register(
         &req.proof_of_control,
     )?;
     let reachability = parse_reachability(&req.did, req.reachability.as_deref())?;
-    consume_challenge(&state, &req.challenge).await?;
+    consume_challenge(&state, &req.challenge, &req.did, &alias).await?;
 
     // Same DID re-registering is idempotent re-issuance with a fresh TTL.
     if let Some(existing_did) = state
@@ -406,7 +554,15 @@ pub async fn register(
             format!("alias `{alias}` is already attested to a different DID"),
         ));
     }
+    refuse_second_name(&state, &req.did, &name).await?;
 
+    if admission == Admission::Allowlisted {
+        tracing::info!(
+            alias = %alias,
+            did_tag = %jig_core::did::log_tag(&req.did),
+            "registered an allowlisted alias"
+        );
+    }
     issue_and_persist(&state, &req.did, &alias, reachability).await
 }
 
@@ -793,7 +949,7 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "BAD_REACHABILITY");
         // Refused before the challenge was consumed.
-        assert!(state.take_challenge(&challenge).await);
+        assert!(state.take_challenge(&challenge, &did, &alias).await);
     }
 
     #[tokio::test]
