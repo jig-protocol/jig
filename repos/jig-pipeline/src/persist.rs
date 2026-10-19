@@ -506,6 +506,83 @@ fn sequence_on(
     Ok(record)
 }
 
+/// A right a block's signer must still hold at the block's own position in
+/// the chain, checked inside the transaction that gives it that position.
+#[derive(Debug, Clone, Copy)]
+pub struct RightGuard<'a> {
+    /// The channel the block lands in: its root owners, and its chain.
+    pub channel: &'a StoredChannel,
+    /// The signer, canonical.
+    pub did: &'a str,
+    pub right: crate::roles::Right,
+}
+
+/// How a guarded landing ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Landing {
+    /// Written, with the record it was given, if any.
+    Landed(Option<IngestRecord>),
+    /// Another commit moved the MLS group first; nothing was written.
+    LostRace,
+    /// The guarded right no longer held at the block's seq; nothing was
+    /// written.
+    Unauthorized,
+}
+
+fn role_blocks_before_on(
+    conn: &Connection,
+    channel_id: &str,
+    before_seq: u64,
+) -> Result<Vec<(jig_core::BlockKind, jig_core::BlockManifest)>> {
+    let rows: Vec<(String, Vec<u8>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT b.block_kind, b.bundle_bytes
+               FROM ingest_records r JOIN blocks b ON b.cid = r.block_cid
+              WHERE r.channel_id = ?1 AND r.seq < ?2
+                AND b.block_kind IN ('role-assign', 'role-unassign')
+              ORDER BY r.seq ASC",
+        )?;
+        let before = i64::try_from(before_seq).unwrap_or(i64::MAX);
+        stmt.query_map(params![channel_id, before], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    rows.into_iter()
+        .map(|(kind, bundle)| {
+            let kind = kind
+                .parse::<jig_core::BlockKind>()
+                .map_err(|e| PersistError::Corrupt(format!("role block kind: {e}")))?;
+            let (manifest_bytes, _code): (Vec<u8>, Vec<u8>) = serde_json::from_slice(&bundle)
+                .map_err(|e| PersistError::Corrupt(format!("role block bundle: {e}")))?;
+            let manifest = serde_json::from_slice(&manifest_bytes)
+                .map_err(|e| PersistError::Corrupt(format!("role block manifest: {e}")))?;
+            Ok((kind, manifest))
+        })
+        .collect()
+}
+
+/// Whether `guard`'s right holds at position `seq` of its channel's chain.
+fn guard_holds_on(conn: &Connection, guard: &RightGuard<'_>, seq: u64) -> Result<bool> {
+    let blocks = role_blocks_before_on(conn, &guard.channel.id, seq)?;
+    Ok(crate::roles::fold(guard.channel, guard.did, blocks).has(guard.right))
+}
+
+fn apply_membership_on(conn: &Connection, membership: &MembershipChange) -> Result<()> {
+    match membership {
+        MembershipChange::None => {}
+        MembershipChange::Upsert(m) => upsert_membership_on(conn, m)?,
+        MembershipChange::Remove {
+            channel_id,
+            member_did,
+        } => {
+            conn.execute(
+                "DELETE FROM memberships WHERE channel_id = ? AND member_did = ?",
+                [channel_id.as_str(), member_did.as_str()],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn insert_block_on(conn: &Connection, b: &StoredBlock) -> Result<()> {
     conn.execute(
         "INSERT INTO blocks
@@ -963,32 +1040,44 @@ impl SqliteStore {
         channel_id: &str,
         before_seq: u64,
     ) -> Result<Vec<(jig_core::BlockKind, jig_core::BlockManifest)>> {
-        let rows: Vec<(String, Vec<u8>)> = {
-            let conn = self.conn.lock().expect("poisoned");
-            let mut stmt = conn.prepare(
-                "SELECT b.block_kind, b.bundle_bytes
-                   FROM ingest_records r JOIN blocks b ON b.cid = r.block_cid
-                  WHERE r.channel_id = ?1 AND r.seq < ?2
-                    AND b.block_kind IN ('role-assign', 'role-unassign')
-                  ORDER BY r.seq ASC",
-            )?;
-            let before = i64::try_from(before_seq).unwrap_or(i64::MAX);
-            stmt.query_map(params![channel_id, before], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        rows.into_iter()
-            .map(|(kind, bundle)| {
-                let kind = kind
-                    .parse::<jig_core::BlockKind>()
-                    .map_err(|e| PersistError::Corrupt(format!("role block kind: {e}")))?;
-                let (manifest_bytes, _code): (Vec<u8>, Vec<u8>) =
-                    serde_json::from_slice(&bundle)
-                        .map_err(|e| PersistError::Corrupt(format!("role block bundle: {e}")))?;
-                let manifest = serde_json::from_slice(&manifest_bytes)
-                    .map_err(|e| PersistError::Corrupt(format!("role block manifest: {e}")))?;
-                Ok((kind, manifest))
-            })
-            .collect()
+        role_blocks_before_on(&self.conn.lock().expect("poisoned"), channel_id, before_seq)
+    }
+
+    /// Store `b` and the next record of its channel's chain, as
+    /// [`Self::insert_block_sequenced`] does, applying `membership` in the
+    /// same transaction — and, with `guard`, only if the guarded right still
+    /// holds at the `seq` this block is given (JEP-0005 rule 7b).
+    ///
+    /// The guard is the authoritative rights check. It is read under the
+    /// store's lock, inside the transaction that assigns the seq, from the
+    /// role blocks sequenced before that seq: a role-unassign that lands
+    /// between ingest's early check and this call is in the chain by now, so
+    /// the block is refused and nothing of it is written.
+    pub fn insert_block_sequenced_guarded(
+        &self,
+        b: &StoredBlock,
+        signer: &RecordSigner<'_>,
+        membership: &MembershipChange,
+        guard: Option<&RightGuard<'_>>,
+    ) -> Result<Landing> {
+        if b.channel_id.is_none() {
+            return Err(PersistError::Corrupt(
+                "a sequenced block names no channel".into(),
+            ));
+        }
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        insert_block_on(&tx, b)?;
+        let record = sequence_on(&tx, &b.cid, signer)?;
+        if let Some(guard) = guard
+            && !guard_holds_on(&tx, guard, record.seq)?
+        {
+            // Dropping `tx` rolls back the block and its record.
+            return Ok(Landing::Unauthorized);
+        }
+        apply_membership_on(&tx, membership)?;
+        tx.commit()?;
+        Ok(Landing::Landed(Some(record)))
     }
 
     /// Whether the channel's history is sequenced, and so ordered by `seq`.
@@ -1569,6 +1658,36 @@ impl SqliteStore {
         receipt: &StoredReceipt,
         signer: Option<&RecordSigner<'_>>,
     ) -> Result<Option<Option<IngestRecord>>> {
+        Ok(
+            match self.land_mls_commit_guarded(
+                channel_id, from_epoch, state, to_epoch, group_info, membership, block, receipt,
+                signer, None,
+            )? {
+                Landing::Landed(record) => Some(record),
+                Landing::LostRace | Landing::Unauthorized => None,
+            },
+        )
+    }
+
+    /// [`Self::land_mls_commit_by_id`], and with `guard`, only if the
+    /// guarded right still holds at the block's position, checked in the
+    /// same transaction as the epoch compare-and-swap and the record (see
+    /// [`Self::insert_block_sequenced_guarded`]). A block landed without a
+    /// record is checked against every role block stored so far.
+    #[allow(clippy::too_many_arguments)]
+    pub fn land_mls_commit_guarded(
+        &self,
+        channel_id: &str,
+        from_epoch: u64,
+        state: &[u8],
+        to_epoch: u64,
+        group_info: Option<&[u8]>,
+        membership: &MembershipChange,
+        block: &StoredBlock,
+        receipt: &StoredReceipt,
+        signer: Option<&RecordSigner<'_>>,
+        guard: Option<&RightGuard<'_>>,
+    ) -> Result<Landing> {
         let mut conn = self.conn.lock().expect("poisoned");
         let tx = conn.transaction()?;
         // `group_info` replaces the stored one even when `None`: a group info
@@ -1586,28 +1705,24 @@ impl SqliteStore {
             ],
         )?;
         if advanced == 0 {
-            return Ok(None);
+            return Ok(Landing::LostRace);
         }
-        match membership {
-            MembershipChange::None => {}
-            MembershipChange::Upsert(m) => upsert_membership_on(&tx, m)?,
-            MembershipChange::Remove {
-                channel_id,
-                member_did,
-            } => {
-                tx.execute(
-                    "DELETE FROM memberships WHERE channel_id = ? AND member_did = ?",
-                    [channel_id.as_str(), member_did.as_str()],
-                )?;
-            }
-        }
+        apply_membership_on(&tx, membership)?;
         insert_block_on(&tx, block)?;
         insert_receipt_on(&tx, receipt)?;
         let record = signer
             .map(|signer| sequence_on(&tx, &block.cid, signer))
             .transpose()?;
+        if let Some(guard) = guard {
+            let at = record.as_ref().map_or(crate::roles::NEXT, |r| r.seq);
+            if !guard_holds_on(&tx, guard, at)? {
+                // Dropping `tx` rolls back the advance, the membership
+                // change, the block and its record.
+                return Ok(Landing::Unauthorized);
+            }
+        }
         tx.commit()?;
-        Ok(Some(record))
+        Ok(Landing::Landed(record))
     }
 
     /// Store a validated key package. Returns `false` if this package (by

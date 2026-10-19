@@ -158,12 +158,30 @@ pub fn rights_at_channel(
     did: &str,
     seq: u64,
 ) -> crate::persist::Result<Rights> {
-    let root = Rights::of_root(channel, did);
-    if root.owner {
-        return Ok(root);
+    if channel.is_root_owner(did) {
+        return Ok(Rights::OWNER);
+    }
+    Ok(fold(
+        channel,
+        did,
+        store.list_role_blocks_before(&channel.id, seq)?,
+    ))
+}
+
+/// Fold `role_blocks` (the channel's role blocks before some position, in
+/// chain order) into `did`'s rights, starting from the channel's terms.
+/// Shared by [`rights_at`] and the in-transaction check that lands a block
+/// ([`crate::persist::RightGuard`]), so the two can never disagree.
+pub fn fold(
+    channel: &StoredChannel,
+    did: &str,
+    role_blocks: impl IntoIterator<Item = (BlockKind, BlockManifest)>,
+) -> Rights {
+    if channel.is_root_owner(did) {
+        return Rights::OWNER;
     }
     let mut role: Option<Role> = None;
-    for (kind, manifest) in store.list_role_blocks_before(&channel.id, seq)? {
+    for (kind, manifest) in role_blocks {
         let Some(target) = role_target(&manifest) else {
             continue;
         };
@@ -176,10 +194,10 @@ pub fn rights_at_channel(
             _ => {}
         }
     }
-    Ok(match role {
+    match role {
         Some(Role::Admin) => Rights::ADMIN,
         None => Rights::NONE,
-    })
+    }
 }
 
 /// The position after every block stored so far: what [`rights_at`] takes

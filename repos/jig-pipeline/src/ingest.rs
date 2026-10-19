@@ -521,6 +521,34 @@ pub async fn ingest(
         });
     }
 
+    // Whether that decision rested on a role rather than on the channel's
+    // terms alone. If so, the role must still hold at the seq the block is
+    // given: the landing below re-checks it inside the transaction that
+    // assigns that seq, which is the authoritative check (JEP-0005 rule 7b).
+    // Only `membership` is granted by a role and can be taken away; the
+    // owner role is fixed by the terms.
+    let guard_refusal = match resolved_channel.as_ref() {
+        Some(chan)
+            if matches!(kind, BlockKind::MemberAdd | BlockKind::MemberRemove)
+                && crate::authorize_write::authorize_block_with(
+                    kind,
+                    sender.as_str(),
+                    &manifest,
+                    Some(chan),
+                    membership,
+                    crate::roles::Rights::of_root(chan, sender.as_str()),
+                )
+                .is_err() =>
+        {
+            Some(IngestError::NotChannelOwner {
+                kind: kind_str.to_string(),
+                slug: chan.slug.clone(),
+                sender: sender.as_str().to_string(),
+            })
+        }
+        _ => None,
+    };
+
     // Step 3c': a channel-create's terms (JEP-0005 rules 5 and 6). This
     // server creates only channels it sequences; the co-owners are fixed
     // here for the channel's life.
@@ -680,6 +708,18 @@ pub async fn ingest(
         ingest_logical: ingest_hlc.logical,
     });
     let signer = signer.filter(|_| stored_block.channel_id.is_some());
+    let sender_did = sender.to_did_jig_string();
+    let guard = match (&guard_refusal, resolved_channel.as_ref()) {
+        (Some(_), Some(chan)) => Some(crate::persist::RightGuard {
+            channel: chan,
+            did: &sender_did,
+            right: crate::roles::Right::Membership,
+        }),
+        _ => None,
+    };
+
+    #[cfg(test)]
+    run_before_landing_hook();
 
     match mls_plan {
         // Step 5/6 for a commit on an encrypted channel: the group's advance,
@@ -697,21 +737,22 @@ pub async fn ingest(
                 membership_change(kind, &manifest, resolved_channel.as_ref(), &block_cid);
             // An advance needs the channel's row, so `channel_id` is set.
             let group_key = channel_id.unwrap_or_default();
-            if ctx
-                .store
-                .land_mls_commit_by_id(
-                    group_key,
-                    from_epoch,
-                    &state,
-                    to_epoch,
-                    group_info.as_deref(),
-                    &membership,
-                    &stored_block,
-                    &stored_receipt,
-                    signer.as_ref(),
-                )?
-                .is_none()
-            {
+            let landing = ctx.store.land_mls_commit_guarded(
+                group_key,
+                from_epoch,
+                &state,
+                to_epoch,
+                group_info.as_deref(),
+                &membership,
+                &stored_block,
+                &stored_receipt,
+                signer.as_ref(),
+                guard.as_ref(),
+            )?;
+            if landing == crate::persist::Landing::Unauthorized {
+                return Err(refused_at_landing(guard_refusal, kind_str));
+            }
+            if landing == crate::persist::Landing::LostRace {
                 let current = ctx
                     .store
                     .get_mls_group_by_id(group_key)?
@@ -723,6 +764,32 @@ pub async fn ingest(
                     got: from_epoch,
                 });
             }
+        }
+        // A membership block whose authority rests on a role: its effect,
+        // block and record land in one transaction, and only if the role
+        // still holds at the seq it is given.
+        _ if guard.is_some() => {
+            let Some(signer) = signer.as_ref() else {
+                return Err(refused_at_landing(guard_refusal, kind_str));
+            };
+            if !manifest.metadata.contains_key("member_did") {
+                return Err(IngestError::MissingMetadata {
+                    kind: kind_str.to_string(),
+                    field: "member_did".to_string(),
+                });
+            }
+            let membership =
+                membership_change(kind, &manifest, resolved_channel.as_ref(), &block_cid);
+            match ctx.store.insert_block_sequenced_guarded(
+                &stored_block,
+                signer,
+                &membership,
+                guard.as_ref(),
+            )? {
+                crate::persist::Landing::Landed(_) => {}
+                _ => return Err(refused_at_landing(guard_refusal, kind_str)),
+            }
+            ctx.store.insert_receipt(&stored_receipt)?;
         }
         plan => {
             if let crate::mls_gate::MlsPlan::Genesis(mut group) = plan {
@@ -842,6 +909,31 @@ pub async fn ingest(
 
     crate::metrics::block_ingested(&source);
     Ok(block_cid)
+}
+
+/// The refusal a block gets when its role no longer held at the seq it was
+/// to be given: the one the write gate would have returned.
+fn refused_at_landing(refusal: Option<IngestError>, kind: &str) -> IngestError {
+    tracing::info!(
+        kind,
+        "write refused at landing: the signer's role was taken away first"
+    );
+    refusal.unwrap_or_else(|| IngestError::Other(anyhow::anyhow!("refused at landing")))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once, between the write gate and the landing transaction, so a
+    /// test can sequence another block in exactly that window.
+    static BEFORE_LANDING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_before_landing_hook() {
+    if let Some(hook) = BEFORE_LANDING.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
 }
 
 /// The metadata key under which a block names its channel by id: the CID of
@@ -3280,5 +3372,181 @@ mod tests {
         )
         .await
         .expect("role-assign on an mls channel");
+    }
+
+    /// The rights check is atomic with sequencing (JEP-0005 rule 7b): an
+    /// admin's member-add passes the write gate, then a role-unassign for
+    /// that admin is sequenced before the add lands. The landing transaction
+    /// folds the chain up to the seq the add would get, finds the role gone,
+    /// and refuses it with the gate's own error. Nothing of it is written.
+    #[tokio::test]
+    async fn a_role_taken_away_before_landing_refuses_the_block() {
+        let ctx = roles_ctx();
+        let owner = person();
+        let admin = person();
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#team"}),
+        )
+        .await
+        .unwrap();
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::RoleAssign,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
+        )
+        .await
+        .unwrap();
+
+        // The interleaving: between the gate and the landing, the owner's
+        // role-unassign is sequenced.
+        let (mb, cb, sig) = signed_parts(
+            &owner.key,
+            BlockKind::RoleUnassign,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
+        );
+        let unassign = StoredBlock {
+            cid: "bafy_unassign_in_the_window".to_string(),
+            channel_id: Some(chan.clone()),
+            block_kind: "role-unassign".to_string(),
+            sender_did: owner.did.clone(),
+            sender_sig: sig,
+            bundle_bytes: serde_json::to_vec(&(&mb, &cb)).unwrap(),
+            is_synthetic: true,
+            hlc_wall_ms: 0,
+            hlc_logical: 0,
+            hlc_origin: String::new(),
+            posted_at: 0,
+            origin_server: String::new(),
+            federated_from: None,
+        };
+        let store = ctx.store.clone();
+        let key = ctx.server_key.clone();
+        let channel_id = chan.clone();
+        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+        let ran_in_hook = ran.clone();
+        super::BEFORE_LANDING.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                ran_in_hook.set(true);
+                store
+                    .insert_block_sequenced(
+                        &unassign,
+                        &crate::ingest_record::RecordSigner {
+                            channel_id,
+                            key: &key,
+                            ingest_wall_ms: 0,
+                            ingest_logical: 0,
+                        },
+                    )
+                    .unwrap();
+            }));
+        });
+
+        let add = plain(
+            &ctx,
+            &admin,
+            BlockKind::MemberAdd,
+            serde_json::json!({"channel_id": chan, "member_did": "did:jig:zRacer"}),
+        )
+        .await;
+        assert!(ran.get(), "the add passed the write gate's early check");
+        match add {
+            Err(IngestError::NotChannelOwner { kind, sender, .. }) => {
+                assert_eq!(kind, "member-add");
+                assert_eq!(sender, admin.did);
+            }
+            other => panic!("the add must be refused at landing; got {other:?}"),
+        }
+        assert!(!ctx.store.is_member_by_id(&chan, "did:jig:zRacer").unwrap());
+        let chain = ctx.store.list_ingest_records_by_id(&chan, 0, 50).unwrap();
+        assert_eq!(
+            chain.last().map(|r| r.block_cid.as_str()),
+            Some("bafy_unassign_in_the_window"),
+            "the refused add got no record and the chain has no gap"
+        );
+        assert_eq!(chain.len(), 3);
+
+        // An owner's add needs no role and is not guarded.
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::MemberAdd,
+            serde_json::json!({"channel_id": chan, "member_did": "did:jig:zRacer"}),
+        )
+        .await
+        .unwrap();
+        assert!(ctx.store.is_member_by_id(&chan, "did:jig:zRacer").unwrap());
+    }
+
+    /// A role that still holds at landing lets the guarded block through,
+    /// with its effect applied in the same transaction.
+    #[tokio::test]
+    async fn a_guarded_member_remove_by_an_admin_lands_with_its_effect() {
+        let ctx = roles_ctx();
+        let owner = person();
+        let admin = person();
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#team"}),
+        )
+        .await
+        .unwrap();
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::MemberAdd,
+            serde_json::json!({"channel_id": chan, "member_did": "did:jig:zGone"}),
+        )
+        .await
+        .unwrap();
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::RoleAssign,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
+        )
+        .await
+        .unwrap();
+        let rm = plain(
+            &ctx,
+            &admin,
+            BlockKind::MemberRemove,
+            serde_json::json!({"channel_id": chan, "member_did": "did:jig:zGone"}),
+        )
+        .await
+        .unwrap();
+        assert!(!ctx.store.is_member_by_id(&chan, "did:jig:zGone").unwrap());
+        assert!(ctx.store.get_ingest_record(&rm).unwrap().is_some());
+        assert!(!ctx.store.get_receipts_for_block(&rm).unwrap().is_empty());
+    }
+
+    /// Co-owners are members, with role `owner`, like the creator.
+    #[tokio::test]
+    async fn a_co_owner_is_a_member_from_the_creation_block() {
+        let ctx = roles_ctx();
+        let owner = person();
+        let co = person();
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#team", "co_owners": [co.did]}),
+        )
+        .await
+        .unwrap();
+        let members = ctx.store.list_members(&chan).unwrap();
+        for did in [&owner.did, &co.did] {
+            let m = members
+                .iter()
+                .find(|m| &m.member_did == did)
+                .unwrap_or_else(|| panic!("{did} must be a member"));
+            assert_eq!(m.role, "owner");
+        }
     }
 }

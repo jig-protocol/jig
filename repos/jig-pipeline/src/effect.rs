@@ -152,15 +152,20 @@ fn apply_channel_create(
         owner_did: owner_did.clone(),
         suite: suite.as_str().to_string(),
         sequencer_did: terms.sequencer,
-        co_owners: terms.co_owners,
+        co_owners: terms.co_owners.clone(),
     })?;
-    store.upsert_membership(&StoredMembership {
-        channel_id: block_cid.to_string(),
-        member_did: owner_did,
-        role: "owner".to_string(),
-        joined_at: now,
-        source_block_cid: block_cid.to_string(),
-    })?;
+    // The creator and every co-owner are members, with role `owner`: a
+    // co-owner holds every right, so it can read what it can write and
+    // manage.
+    for member_did in std::iter::once(owner_did).chain(terms.co_owners) {
+        store.upsert_membership(&StoredMembership {
+            channel_id: block_cid.to_string(),
+            member_did,
+            role: "owner".to_string(),
+            joined_at: now,
+            source_block_cid: block_cid.to_string(),
+        })?;
+    }
     Ok(())
 }
 
