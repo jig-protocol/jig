@@ -300,7 +300,7 @@ enum TrustAction {
     VerifyName {
         name: String,
         /// Nameserver to ask (with `--authority`); otherwise the suffix's
-        /// delegation is discovered over DNS.
+        /// `[naming.delegations]` entry, or DNS discovery.
         #[arg(long)]
         nameserver: Vec<String>,
         /// DID whose attestations count for the suffix.
@@ -316,7 +316,7 @@ enum TrustAction {
         #[arg(long)]
         did: String,
         /// Nameserver to ask (with `--authority`); otherwise the suffix's
-        /// delegation is discovered over DNS.
+        /// `[naming.delegations]` entry, or DNS discovery.
         #[arg(long)]
         nameserver: Vec<String>,
         /// DID whose attestations count for the suffix.
@@ -541,7 +541,8 @@ async fn main() -> Result<()> {
                 nameserver,
                 authority,
             } => {
-                let delegations = cmd::trust::delegations_for(&name, nameserver, authority)?;
+                let delegations =
+                    cmd::trust::delegations_for(ctx.effective(), &name, nameserver, authority)?;
                 use jig_client::naming::Verified;
                 match cmd::trust::verify_name(&name, &delegations).await? {
                     Verified::New(b) => println!(
@@ -562,7 +563,8 @@ async fn main() -> Result<()> {
                 nameserver,
                 authority,
             } => {
-                let delegations = cmd::trust::delegations_for(&name, nameserver, authority)?;
+                let delegations =
+                    cmd::trust::delegations_for(ctx.effective(), &name, nameserver, authority)?;
                 match cmd::trust::accept_name(&name, &did, &delegations).await? {
                     Some(old) => println!("{name} is now pinned to {did} (was {old})."),
                     None => println!("{name} is now pinned to {did}."),
