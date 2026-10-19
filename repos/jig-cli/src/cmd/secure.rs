@@ -83,8 +83,10 @@ fn none_suite() -> String {
 }
 
 impl ChannelInfo {
+    /// Anything but `none` is encrypted, including a suite this CLI does not
+    /// speak; [`Secure::channel`] refuses those before anything is sent.
     pub fn encrypted(&self) -> bool {
-        self.suite == "mls"
+        self.suite != "none"
     }
 }
 
@@ -279,6 +281,15 @@ impl Secure {
             );
         }
         info.suite = pin.suite;
+        // The CLI speaks `none` and `mls`. Another suite's channel can be
+        // neither posted to nor managed from here, and is never treated as
+        // plaintext.
+        if !matches!(info.suite.as_str(), "none" | "mls") {
+            anyhow::bail!(
+                "{slug} uses encryption suite `{}`, which this client does not support",
+                info.suite
+            );
+        }
         Ok(Some(info))
     }
 

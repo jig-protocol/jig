@@ -11,6 +11,7 @@ pub mod blocks;
 pub mod connection;
 pub mod identity;
 pub mod keychain;
+pub mod naming;
 pub mod open;
 pub mod pins;
 pub mod read_auth;

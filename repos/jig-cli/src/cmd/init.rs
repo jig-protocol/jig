@@ -4,8 +4,9 @@
 //!   1. Generate a fresh ed25519 identity under `~/.jig/keys/<did>.key`.
 //!   2. Write `~/.jig/cli.toml` (or the global `--config <path>`) binding
 //!      the new DID to a nickname.
-//!   3. Optionally `--request-alias <local> --nameserver <url>`:
-//!      GET `/v1/challenge` → sign → POST `/v1/register` → print attestation.
+//!   3. Optionally `--request-alias <local> --nameserver <url>`: read the
+//!      nameserver's delegation → GET `/v1/challenge` → sign an action-bound
+//!      proof of control → POST `/v1/register` → verify the attestation.
 //!
 //! The nameserver wire-shape (`requested_alias` + `proof_of_control` +
 //! `challenge`) is defined by `jig-nameserver::v0_0_2_register`. Keep
@@ -14,10 +15,11 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
-use base64::Engine as _;
 use jig_client::Identity;
-use serde::{Deserialize, Serialize};
+use jig_core::naming::{Action, Attestation, Name};
+use serde::Serialize;
 
+use crate::cmd::ns::{Nameserver, b64u};
 use crate::config::{self, Config};
 
 /// Parsed flags for `jig init`. Construct directly from `clap`-parsed args
@@ -46,12 +48,6 @@ pub struct InitArgs {
     pub server_url: Option<String>,
 }
 
-/// Body of GET `/v1/challenge` (we only consume the `challenge` field).
-#[derive(Debug, Deserialize)]
-pub(crate) struct ChallengeResponse {
-    pub challenge: String,
-}
-
 /// Body of POST `/v1/register`. Must mirror
 /// `jig_nameserver::v0_0_2_register::RegisterReq` exactly.
 #[derive(Debug, Serialize)]
@@ -60,19 +56,6 @@ pub(crate) struct RegisterRequest {
     pub requested_alias: String,
     pub proof_of_control: String,
     pub challenge: String,
-}
-
-/// Response from POST `/v1/register`. Mirrors
-/// `jig_nameserver::v0_0_2_register::Attestation` (subset we display).
-#[derive(Debug, Deserialize, Serialize)]
-pub struct AttestationResponse {
-    pub did: String,
-    pub alias: String,
-    pub ns_did: String,
-    pub valid_from: i64,
-    pub valid_until: i64,
-    pub profile_ttl_seconds: u64,
-    pub sig: String,
 }
 
 pub async fn run(args: InitArgs) -> Result<()> {
@@ -116,7 +99,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         let attestation = register_with_nameserver(&id, &alias_local, &ns_url).await?;
         let ttl_days = (attestation.valid_until - attestation.valid_from) / 86_400;
         println!(
-            "alias attestation received: {} (valid {ttl_days}d, ns={})",
+            "alias attestation verified: {} (valid {ttl_days}d, ns={})",
             attestation.alias, attestation.ns_did
         );
     }
@@ -144,7 +127,12 @@ fn write_cli_config(
 ///
 /// Split out from the file write so it can be unit-tested without touching
 /// `~/.jig`. Seeds `[contacts]` with the operator's own DID so their own
-/// messages render as their nickname from the very first `jig chat`.
+/// messages render as their nickname from the very first `jig chat`, and
+/// pins the `@jig` delegation this build ships (JEP-0004 `config` root) when
+/// it has one, so a later binary with another default does not change whose
+/// answers count. Nothing depends on that entry: without it the built-in
+/// delegation applies. A build whose authority is still the placeholder
+/// writes none.
 fn build_initial_config(id: &Identity, nickname: &str, server_url: Option<&str>) -> Config {
     let mut cfg = Config::default();
     cfg.user.did = id.did_string();
@@ -153,83 +141,48 @@ fn build_initial_config(id: &Identity, nickname: &str, server_url: Option<&str>)
         cfg.server.base_url = url.to_string();
     }
     config::remember_contact(&mut cfg, &id.did_string(), nickname);
+    if let Ok(jig) = config::default_jig_delegation(&cfg) {
+        cfg.naming
+            .delegations
+            .insert(config::DEFAULT_SUFFIX.to_string(), jig);
+    }
     cfg
 }
 
-/// Run the challenge → sign → register handshake against a nameserver.
+/// Register `alias_local` under the nameserver's suffix for `id`.
 ///
-/// Returns the parsed attestation on success. Errors propagate as
-/// `anyhow::Error` with context describing the failed step.
+/// Returns the attestation once it verifies: signed by the nameserver's
+/// delegated authority, for the lowercased `alias_local@suffix`, valid now,
+/// and naming `id`'s DID.
 pub async fn register_with_nameserver(
     id: &Identity,
     alias_local: &str,
     ns_url: &str,
-) -> Result<AttestationResponse> {
-    let base = ns_url.trim_end_matches('/');
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .context("building HTTP client for nameserver")?;
-
-    // 1. Fetch a challenge nonce.
-    let ch_url = format!("{base}/v1/challenge");
-    let ch_resp = http
-        .get(&ch_url)
-        .send()
-        .await
-        .with_context(|| format!("GET {ch_url}"))?;
-    if !ch_resp.status().is_success() {
-        anyhow::bail!(
-            "GET {ch_url} returned {}: {}",
-            ch_resp.status(),
-            ch_resp.text().await.unwrap_or_default()
-        );
-    }
-    let challenge: ChallengeResponse = ch_resp
-        .json()
-        .await
-        .context("decoding /v1/challenge response")?;
-
-    // 2. Sign the challenge bytes (UTF-8) and base64-encode the signature.
-    let body = build_register_request(id, alias_local, &challenge.challenge);
-
-    // 3. POST /v1/register.
-    let reg_url = format!("{base}/v1/register");
-    let reg_resp = http
-        .post(&reg_url)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("POST {reg_url}"))?;
-    if !reg_resp.status().is_success() {
-        anyhow::bail!(
-            "POST {reg_url} returned {}: {}",
-            reg_resp.status(),
-            reg_resp.text().await.unwrap_or_default()
-        );
-    }
-    let attestation: AttestationResponse = reg_resp
-        .json()
-        .await
-        .context("decoding /v1/register response")?;
-    Ok(attestation)
+) -> Result<Attestation> {
+    let ns = Nameserver::connect(ns_url).await?;
+    let name = Name::parse(&format!("{alias_local}@{}", ns.suffix()))
+        .with_context(|| format!("`{alias_local}` is not a valid alias"))?;
+    let challenge = ns.challenge().await?;
+    let body = build_register_request(id, &name, ns.ns_did(), &challenge);
+    ns.post_binding("/v1/register", &body, &name, &id.did_string())
+        .await?
 }
 
-/// Build the POST /v1/register body for a given identity, requested
-/// alias local-part, and server-issued challenge string. Factored out
-/// so unit tests can exercise the signing-and-encoding step without an
-/// HTTP transport.
+/// Build the POST /v1/register body: the proof of control is bound to the
+/// register action, this nameserver, the full lowercased name and the
+/// challenge (JEP-0004 rule 10). Factored out so unit tests can exercise the
+/// signing step without an HTTP transport.
 pub(crate) fn build_register_request(
     id: &Identity,
-    alias_local: &str,
+    name: &Name,
+    ns_did: &str,
     challenge: &str,
 ) -> RegisterRequest {
-    let sig = id.sign(challenge.as_bytes());
-    let proof_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+    let proof = id.sign_name_proof(Action::Register, ns_did, &name.as_alias(), challenge);
     RegisterRequest {
         did: id.did_string(),
-        requested_alias: alias_local.to_string(),
-        proof_of_control: proof_b64,
+        requested_alias: name.alias.clone(),
+        proof_of_control: b64u(&proof),
         challenge: challenge.to_string(),
     }
 }
@@ -237,36 +190,38 @@ pub(crate) fn build_register_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::Verifier;
+    use base64::Engine as _;
+    use jig_core::naming;
     use tempfile::tempdir;
 
     #[test]
-    fn build_register_request_signs_challenge_and_uses_canonical_did() {
+    fn build_register_request_signs_an_action_bound_proof() {
         // Generate a fresh identity in a tempdir (separate from ~/.jig/keys/).
         let dir = tempdir().unwrap();
         let id = Identity::generate_for_tests(dir.path());
-        let challenge = "deadbeef".to_string();
+        let name = Name::parse("DJ@Dj.Jig").unwrap();
+        let ns_did = "did:jig:zNameserver";
 
-        let req = build_register_request(&id, "dj", &challenge);
+        let req = build_register_request(&id, &name, ns_did, "deadbeef");
 
         assert_eq!(req.did, id.did_string(), "DID must match identity");
-        assert!(
-            req.did.starts_with("did:jig:z"),
-            "DID must be canonical: {}",
-            req.did
-        );
-        assert_eq!(req.requested_alias, "dj");
-        assert_eq!(req.challenge, challenge);
+        assert!(req.did.starts_with("did:jig:z"), "{}", req.did);
+        assert_eq!(req.requested_alias, "dj", "the local part, lowercased");
+        assert_eq!(req.challenge, "deadbeef");
 
-        // Signature must verify against the identity's public key over the
-        // raw challenge bytes (matching what jig-nameserver does).
-        let sig_bytes = base64::engine::general_purpose::STANDARD
+        // The proof verifies for exactly this action, nameserver, full name
+        // and challenge, which is what jig-nameserver checks.
+        let proof = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(&req.proof_of_control)
-            .unwrap();
-        let sig = ed25519_dalek::Signature::from_slice(&sig_bytes).unwrap();
-        id.public_key()
-            .verify(challenge.as_bytes(), &sig)
-            .expect("proof_of_control must verify under the identity's pubkey");
+            .expect("proof_of_control is unpadded base64url");
+        let check = |action, ns: &str, alias: &str, ch: &str| {
+            naming::verify_proof(&req.did, &proof, action, ns, alias, ch)
+        };
+        check(Action::Register, ns_did, "dj@dj.jig", "deadbeef").expect("the proof verifies");
+        assert!(check(Action::Renew, ns_did, "dj@dj.jig", "deadbeef").is_err());
+        assert!(check(Action::Register, "did:jig:zOther", "dj@dj.jig", "deadbeef").is_err());
+        assert!(check(Action::Register, ns_did, "dj", "deadbeef").is_err());
+        assert!(check(Action::Register, ns_did, "dj@dj.jig", "other").is_err());
     }
 
     #[test]
@@ -288,6 +243,19 @@ mod tests {
     }
 
     #[test]
+    fn initial_config_pins_the_jig_delegation_this_build_ships() {
+        // Tests build jig-core with `test-default-authority`; a real build
+        // writes no entry while the authority is the placeholder.
+        let dir = tempdir().unwrap();
+        let id = Identity::generate_for_tests(dir.path());
+        let cfg = build_initial_config(&id, "dj", None);
+        assert_eq!(
+            cfg.naming.delegations.get(config::DEFAULT_SUFFIX),
+            Some(&config::default_jig_delegation(&Config::default()).unwrap())
+        );
+    }
+
+    #[test]
     fn initial_config_keeps_the_default_server_unless_overridden() {
         let dir = tempdir().unwrap();
         let id = Identity::generate_for_tests(dir.path());
@@ -304,17 +272,13 @@ mod tests {
     }
 
     #[test]
-    fn build_register_request_passes_local_part_through_unchanged() {
+    fn build_register_request_sends_the_local_part_without_the_suffix() {
+        // The nameserver composes `<local>@<its suffix>`; the request names
+        // only the local part, but the proof is over the full name.
         let dir = tempdir().unwrap();
         let id = Identity::generate_for_tests(dir.path());
-        // Local part should not be uppercased, suffixed, or rewritten —
-        // the nameserver owns suffix composition (`<local>@<ns_suffix>`).
-        let req = build_register_request(&id, "Alice_42", "abc");
-        assert_eq!(req.requested_alias, "Alice_42");
+        let name = Name::parse("Alice_42@dj.jig").unwrap();
+        let req = build_register_request(&id, &name, "did:jig:zNs", "abc");
+        assert_eq!(req.requested_alias, "alice_42");
     }
-
-    // TODO(F1): integration test against a real jig-nameserver instance
-    // — the H-phase end-to-end tests in `integration-tests/` cover the
-    // challenge → sign → register round-trip against an in-process
-    // nameserver, so this module only unit-tests the request-builder.
 }

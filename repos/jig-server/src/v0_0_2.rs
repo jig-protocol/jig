@@ -83,12 +83,12 @@ fn build_auth(
 /// Kept as a named function rather than inlined so the mapping is one visible
 /// place: a limit added on either side that is not wired here is the same class
 /// of silent divergence this exists to remove.
-fn runtime_config_from(execution: &ExecutionConfig) -> jig_runtime::RuntimeConfig {
+pub(crate) fn runtime_config_from(execution: &ExecutionConfig) -> jig_runtime::RuntimeConfig {
     jig_runtime::RuntimeConfig {
         // Enumerated rather than assigned onto a default, and deliberately: a
         // limit added to `ResourceLimits` should break this build so somebody
         // decides whether operators can set it, instead of it silently taking a
-        // default here. Same reasoning as `BlockRuntime::new`.
+        // default here.
         limits: jig_runtime::config::ResourceLimits {
             fuel_max: execution.fuel_max,
             memory_max_mb: execution.memory_max_mb,
@@ -135,8 +135,8 @@ impl AppState {
     /// generation.
     ///
     /// `execution` carries the operator's `[execution]` limits, which live on
-    /// `ServerConfig` rather than `JigServerConfig` under the hybrid config
-    /// split. Passing them explicitly is what makes the ingest render path honour
+    /// `ServerConfig` rather than in the `JigServerConfig` sections. Passing
+    /// them explicitly is what makes the ingest render path honour
     /// configured fuel, memory, timeout and concurrency instead of running on
     /// library defaults.
     pub fn new(
@@ -147,7 +147,22 @@ impl AppState {
         let store = Arc::new(SqliteStore::open(&db_path).context("opening SqliteStore")?);
         let signing_key = load_or_generate_server_key(&config.server.server_did_keyfile)
             .context("loading server signing key")?;
+        // Before anything logs a DID: tags are keyed by this server's seed.
+        if !jig_core::did::set_log_tag_key(&signing_key.to_bytes()) {
+            tracing::warn!(
+                "a different log tag key is already in effect in this process; DID tags keep using it"
+            );
+        }
         let server_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
+        // A store written before `ingest` records existed is sequenced once,
+        // here: each local channel's chain starts at its channel-create and
+        // follows the old history order (JEP-0002 rule 9).
+        let backfilled = store
+            .backfill_ingest_records(&signing_key)
+            .context("sequencing stored blocks")?;
+        if backfilled > 0 {
+            tracing::info!(backfilled, "gave stored blocks their ingest records");
+        }
 
         let identity: Arc<dyn IdentityResolver> = match config.identity.mode {
             IdentityMode::Tofu => Arc::new(TofuResolver::new(store.clone())),
@@ -171,8 +186,8 @@ impl AppState {
         // `Result` instead of aborting the process.
         //
         // Limits come from the operator's `[execution]` settings, which live on
-        // `ServerConfig` — a different type in the hybrid config split, so they
-        // are passed in rather than read from `JigServerConfig`. Without this the
+        // `ServerConfig`, outside the `JigServerConfig` sections, so they are
+        // passed in rather than read from `config`. Without this the
         // ingest render path ran on library defaults and silently ignored every
         // configured limit.
         //

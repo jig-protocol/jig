@@ -31,6 +31,9 @@ pub struct Member {
     signer: SignatureKeyPair,
     credential: CredentialWithKey,
     did: String,
+    /// The lifetime of this member's own leaves, when not openmls's default
+    /// (about three months from now). See [`Member::with_lifetime_until`].
+    lifetime: Option<openmls::prelude::Lifetime>,
 }
 
 /// A new group: its id, and the epoch-0 public state a `channel-create` block
@@ -89,7 +92,26 @@ impl Member {
             signer,
             credential,
             did,
+            lifetime: None,
         })
+    }
+
+    /// Give this member's key packages and new groups a leaf lifetime that
+    /// runs until `not_after` (seconds since the Unix epoch) instead of
+    /// openmls's three months. openmls checks leaf lifetimes against the
+    /// clock, so the checked-in conformance vectors are generated with a
+    /// long one; nothing else may mint leaves like that.
+    #[cfg(feature = "conformance")]
+    pub fn with_lifetime_until(mut self, not_after: u64) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.lifetime = Some(openmls::prelude::Lifetime::init(
+            now.saturating_sub(3600),
+            not_after,
+        ));
+        self
     }
 
     /// A member restored from [`Member::snapshot`] bytes.
@@ -123,6 +145,9 @@ impl Member {
                 if last_resort {
                     builder = builder.mark_as_last_resort();
                 }
+                if let Some(lifetime) = self.lifetime {
+                    builder = builder.key_package_lifetime(lifetime);
+                }
                 builder
                     .build(
                         CIPHERSUITE,
@@ -143,7 +168,7 @@ impl Member {
         let group = MlsGroup::new(
             &self.provider,
             &self.signer,
-            &crate::create_config(),
+            &crate::create_config(self.lifetime),
             self.credential.clone(),
         )
         .map_err(internal)?;

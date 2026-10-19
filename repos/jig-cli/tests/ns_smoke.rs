@@ -3,8 +3,8 @@
 //! The response formatting and 404 explanations are unit-tested in
 //! `src/cmd/ns.rs`; this suite covers the wiring that unit tests cannot
 //! see: that clap exposes the subcommands at all, and that a lookup with
-//! nowhere to look fails loudly (non-zero) with an actionable message
-//! rather than silently succeeding.
+//! nowhere to look, or nobody answering, fails loudly (non-zero) with an
+//! actionable message rather than silently succeeding.
 //!
 //! Every invocation redirects `HOME` at a tempdir so nothing here can read
 //! or write the developer's real `~/.jig`.
@@ -78,17 +78,15 @@ fn binary_exposes_ns_subcommands() {
 }
 
 #[test]
-fn resolve_without_a_nameserver_fails_with_an_actionable_message() {
+fn resolve_without_a_delegation_fails_with_an_actionable_message() {
     let home = tempfile::tempdir().unwrap();
     write_cli_toml(home.path());
 
-    let (ok, output) = run_jig(home.path(), &["ns", "resolve", "dj@dj.jig"]);
+    // `.invalid` never resolves (RFC 6761), so dns discovery fails at once.
+    let (ok, output) = run_jig(home.path(), &["ns", "resolve", "dj@dj.invalid"]);
+    assert!(!ok, "must exit non-zero with no delegation: {output}");
     assert!(
-        !ok,
-        "must exit non-zero when there is no nameserver: {output}"
-    );
-    assert!(
-        output.contains("--nameserver"),
+        output.contains("[naming.delegations"),
         "error must say how to supply one: {output}"
     );
 }
@@ -98,15 +96,10 @@ fn resolve_against_a_dead_nameserver_exits_non_zero() {
     let home = tempfile::tempdir().unwrap();
     write_cli_toml(home.path());
 
+    // `@jig` has a built-in delegation; `--nameserver` moves where to ask.
     let (ok, output) = run_jig(
         home.path(),
-        &[
-            "ns",
-            "resolve",
-            "dj@dj.jig",
-            "--nameserver",
-            CLOSED_PORT_URL,
-        ],
+        &["ns", "resolve", "dj@jig", "--nameserver", CLOSED_PORT_URL],
     );
     assert!(!ok, "unreachable nameserver must not exit 0: {output}");
     assert!(

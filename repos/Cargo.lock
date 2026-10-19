@@ -2908,10 +2908,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hello-wasm"
-version = "0.0.1"
-
-[[package]]
 name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3716,7 +3712,6 @@ dependencies = [
  "dirs 7.0.0",
  "ed25519-dalek 3.0.0",
  "jig-client",
- "jig-config",
  "jig-core",
  "jig-mls",
  "jig-runtime",
@@ -3748,11 +3743,11 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "futures-util",
  "hex",
- "jig-config",
  "jig-core",
  "jig-mls",
  "jig-pipeline",
  "keyring-core",
+ "rcgen",
  "reqwest",
  "rustls",
  "rustls-native-certs",
@@ -3762,6 +3757,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite 0.30.0",
  "tracing",
  "url",
@@ -3772,8 +3768,6 @@ dependencies = [
 name = "jig-config"
 version = "0.0.1"
 dependencies = [
- "anyhow",
- "chrono",
  "dirs 7.0.0",
  "serde",
  "serde_json",
@@ -3804,6 +3798,7 @@ dependencies = [
  "time",
  "wasmparser 0.261.0",
  "wat",
+ "wit-parser 0.258.3",
  "zeroize",
 ]
 
@@ -3848,7 +3843,6 @@ dependencies = [
  "jig-config",
  "jig-core",
  "jig-pipeline",
- "jig-runtime",
  "parquet",
  "pprof",
  "rand 0.10.3",
@@ -3884,7 +3878,6 @@ dependencies = [
  "chrono",
  "ed25519-dalek 3.0.0",
  "hex",
- "jig-config",
  "jig-core",
  "jig-mls",
  "jig-runtime",

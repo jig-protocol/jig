@@ -10,7 +10,6 @@ description = "Client library for jig-protocol: WSS connection, identity loading
 # `keystore`: identity keys and MLS state sealed at rest (I1).
 jig-core = { workspace = true, features = ["keystore"] }
 jig-pipeline = { path = "../jig-pipeline" }
-jig-config = { workspace = true }
 # The client half of MLS: group state, encrypt/decrypt (`secure`).
 jig-mls = { workspace = true }
 serde = { workspace = true }
@@ -66,3 +65,12 @@ apple-native-keyring-store = { version = "1", features = ["keychain"] }
 
 [dev-dependencies]
 tempfile = "3"
+# `naming` tests stand up real TLS servers: one under a test CA, one
+# self-signed, to show `dns` discovery takes a CA-valid certificate only. Same
+# rustls stack as above (0.23, ring), as integration-tests uses.
+rcgen = "0.14"
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "logging",
+    "ring",
+    "tls12",
+] }

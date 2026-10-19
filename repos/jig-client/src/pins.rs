@@ -84,8 +84,10 @@ pub struct ChannelPin {
 }
 
 impl ChannelPin {
+    /// Anything but `none` is encrypted, including a suite this build does
+    /// not know: a pin is never a reason to send in the clear.
     pub fn encrypted(&self) -> bool {
-        self.suite == jig_core::EncryptionSuite::Mls.as_str()
+        self.suite != jig_core::EncryptionSuite::Unencrypted.as_str()
     }
 }
 
@@ -407,6 +409,17 @@ pub fn prove_channel(
 
     let suite = jig_pipeline::mls_gate::requested_suite(&manifest)
         .map_err(|_| unproven("it names a suite this client does not know"))?;
+    // A restricted channel's content is confidential from the operator (D25),
+    // so a restricted creation under a suite the operator can read (`none`, or
+    // `test-aead`, whose key is published) is no channel this client will post
+    // to. A suite this client does not know was refused above. Anything but
+    // `open` is restricted, as the server reads it.
+    let open = manifest.metadata.get("visibility").and_then(|v| v.as_str()) == Some("open");
+    if !open && !suite.is_operator_confidential() {
+        return Err(unproven(
+            "it creates a restricted channel under a suite the server's operator can read",
+        ));
+    }
     Ok(ChannelPin {
         create_cid: cid.to_string(),
         suite: suite.as_str().to_string(),
@@ -476,6 +489,63 @@ mod tests {
                 .unwrap()
                 .encrypted()
         );
+    }
+
+    /// A suite this build does not know is never read as plaintext.
+    #[test]
+    fn any_suite_but_none_is_encrypted() {
+        let pin = |suite: &str| ChannelPin {
+            create_cid: "bafy".into(),
+            suite: suite.into(),
+            owner_did: "did:jig:zA".into(),
+        };
+        assert!(!pin("none").encrypted());
+        assert!(pin("mls").encrypted());
+        assert!(pin("test-aead").encrypted());
+        assert!(pin("signal-pqxdh").encrypted());
+    }
+
+    #[test]
+    fn a_restricted_channel_is_proven_only_as_mls() {
+        let owner = identity();
+        let hlc = HlcTimestamp::now_wall(owner.did().clone());
+        let served_as = |visibility: &str, suite: Option<&str>| {
+            let mut metadata = json!({"slug": "#ops", "visibility": visibility});
+            if let Some(suite) = suite {
+                metadata["suite"] = json!(suite);
+            }
+            let block =
+                build_with_metadata(&owner, BlockKind::ChannelCreate, hlc.clone(), metadata);
+            let cid = jig_core::BlockBundle {
+                manifest_bytes: &block.manifest_bytes,
+                code_bytes: &block.code_bytes,
+                resources: vec![],
+            }
+            .block_cid()
+            .unwrap()
+            .to_string();
+            prove_channel(
+                "#ops",
+                &cid,
+                &STANDARD.encode(block.canonical_bytes()),
+                &STANDARD.encode(&block.sender_sig),
+            )
+        };
+        assert!(served_as("restricted", Some("mls")).unwrap().encrypted());
+        for (visibility, suite) in [
+            ("restricted", None),
+            ("restricted", Some("none")),
+            ("secret", Some("none")),
+        ] {
+            assert!(
+                matches!(
+                    served_as(visibility, suite),
+                    Err(PinError::Unproven { reason, .. }) if reason.contains("restricted")
+                ),
+                "{visibility} {suite:?}"
+            );
+        }
+        assert!(!served_as("open", None).unwrap().encrypted());
     }
 
     #[test]

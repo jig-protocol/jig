@@ -4,9 +4,23 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use jig_config::v0_0_2_server::{
+    AuthSection, BridgesSection, DebugSection, FederationSection, IdentitySection, JigServerConfig,
+    NameserverSection, ServerSection,
+};
+
 use crate::runtime::ExecutionConfig;
 
+/// The whole `jig-server --config` file, in one type.
+///
+/// Root keys and `[execution]`/`[tls]` open the socket and size the runtime;
+/// the other sections are the pipeline's, handed over as a
+/// [`JigServerConfig`] by [`ServerConfig::v0_0_2`]. Every key is accounted
+/// for: an unknown key at any level is a parse error, and a key that jig-server
+/// used to accept fails with a message saying it was removed
+/// ([`REMOVED_KEYS`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub database_path: PathBuf,
     pub bind_address: String,
@@ -23,16 +37,59 @@ pub struct ServerConfig {
     /// that follows the advertisement gets a certificate-name mismatch rather
     /// than a useful error. Set this to whatever name the cert actually covers.
     ///
-    /// Must stay ahead of the `[execution]` / `[tls]` tables: `write_template`
-    /// serializes this struct in declaration order, and TOML forbids a bare
-    /// value after a table.
+    /// Must stay ahead of the `[execution]` / `[tls]` tables in `TemplateRoot`:
+    /// `write_template` serializes in declaration order, and TOML forbids a
+    /// bare value after a table.
     #[serde(default)]
     pub public_url: Option<String>,
     #[serde(default)]
     pub execution: ExecutionSection,
     #[serde(default)]
     pub tls: TlsConfig,
+    #[serde(default)]
+    pub server: ServerSection,
+    #[serde(default)]
+    pub identity: IdentitySection,
+    #[serde(default)]
+    pub federation: FederationSection,
+    #[serde(default)]
+    pub debug: DebugSection,
+    #[serde(default)]
+    pub bridges: BridgesSection,
+    #[serde(default)]
+    pub nameserver: NameserverSection,
+    #[serde(default)]
+    pub auth: AuthSection,
 }
+
+/// Keys jig-server once accepted and no longer does, as a dotted path and the
+/// reason. A config that still carries one fails to load with that reason
+/// rather than serde's bare "unknown field".
+pub const REMOVED_KEYS: &[(&str, &str)] = &[
+    (
+        "dangerously_enable_v0_0_1_rest",
+        "the v0.0.1 REST API it enabled was removed",
+    ),
+    (
+        "debug.admin_endpoints",
+        "channel operations are always served at /api/v1/channels; the /_admin_v0_0_2 \
+         aliases it enabled were removed. v0.1.0-alpha.1's install.sh and \
+         deploy/config.example.toml wrote `admin_endpoints = false` under [debug]; deleting \
+         that one line is all an upgrade needs",
+    ),
+    (
+        "execution.pricing_enabled",
+        "executions are never priced; the key had no effect",
+    ),
+    (
+        "execution.cost_per_fuel",
+        "executions are never priced; the key had no effect",
+    ),
+    (
+        "storage",
+        "jig-server never read it; the database lives at the root-level database_path",
+    ),
+];
 
 /// TLS for the listener. On by default.
 ///
@@ -41,9 +98,14 @@ pub struct ServerConfig {
 /// its DID vouches for it at `/.well-known/jig`: jig clients trust it through
 /// the DID they pinned, not through a CA. Give both paths to serve a
 /// certificate a CA issued (`tailscale cert`, certbot); jig clients accept
-/// either. `enabled = false` serves plaintext HTTP, for loopback development
-/// or behind a proxy that terminates TLS.
+/// either.
+///
+/// `enabled = false` serves plaintext HTTP. It is an unsafe option: use it only
+/// on loopback or behind a proxy that terminates TLS, never on a listener peers
+/// or clients reach directly. The server advertises it as `tls.enabled=false`
+/// in `unsafe_options_active` and warns at startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     #[serde(default = "default_tls_enabled")]
     pub enabled: bool,
@@ -110,6 +172,7 @@ fn self_signed(dir: &Path, names: &[String]) -> Result<(PathBuf, PathBuf), Strin
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionSection {
     #[serde(default = "default_fuel_max")]
     pub fuel_max: u64,
@@ -117,10 +180,6 @@ pub struct ExecutionSection {
     pub memory_max_mb: u32,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
-    #[serde(default)]
-    pub pricing_enabled: bool,
-    #[serde(default)]
-    pub cost_per_fuel: Option<f64>,
     /// How many block executions may run at once.
     ///
     /// Sizes wasmtime's instance pool. Past it, execution does not queue inside
@@ -144,75 +203,14 @@ impl Default for ServerConfig {
             public_url: None,
             execution: ExecutionSection::default(),
             tls: TlsConfig::default(),
+            server: ServerSection::default(),
+            identity: IdentitySection::default(),
+            federation: FederationSection::default(),
+            debug: DebugSection::default(),
+            bridges: BridgesSection::default(),
+            nameserver: NameserverSection::default(),
+            auth: AuthSection::default(),
         }
-    }
-}
-
-impl ServerConfig {
-    /// Attempt to construct a ServerConfig from a `jig-config` TOML file.
-    /// Maps a minimal subset needed by jig-server:
-    /// - storage.truth.connection_string -> database_path (when backend = sqlite)
-    pub fn load_from_jig_config_path(path: &Path) -> std::io::Result<Self> {
-        #[derive(serde::Deserialize, Default)]
-        struct JigConfigDoc {
-            #[serde(default)]
-            storage: Option<jig_config::storage::MultiTierStorageConfig>,
-        }
-
-        let s = fs::read_to_string(path)?;
-        let doc: JigConfigDoc = toml::from_str(&s)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        let mut cfg = ServerConfig::default();
-
-        // Map storage.truth -> database_path (sqlite path)
-        if let Some(storage) = &doc.storage
-            && let Some(truth) = &storage.truth
-        {
-            use jig_config::storage::Backend;
-            if matches!(truth.backend, Backend::Sqlite)
-                && let Some(path) = &truth.connection_string
-            {
-                cfg.database_path = PathBuf::from(path);
-            }
-        }
-
-        Ok(cfg)
-    }
-
-    /// Try to load jig-config from common locations (cwd ./jig-config.toml or ~/.jig/config.toml).
-    pub fn try_load_jig_config_from_well_known() -> Option<Self> {
-        let cwd = std::env::current_dir().ok();
-        if let Some(mut p) = cwd.clone() {
-            p.push("jig-config.toml");
-            if p.exists()
-                && let Ok(cfg) = Self::load_from_jig_config_path(&p)
-            {
-                return Some(cfg);
-            }
-        }
-        let home_default = jig_config::default_config_path();
-        if home_default.exists()
-            && let Ok(cfg) = Self::load_from_jig_config_path(&home_default)
-        {
-            return Some(cfg);
-        }
-        None
-    }
-
-    /// Pure helper for tests: try to load from exactly these two potential files in order.
-    pub fn try_load_jig_config_from_paths(cwd_config: &Path, home_config: &Path) -> Option<Self> {
-        if cwd_config.exists()
-            && let Ok(cfg) = Self::load_from_jig_config_path(cwd_config)
-        {
-            return Some(cfg);
-        }
-        if home_config.exists()
-            && let Ok(cfg) = Self::load_from_jig_config_path(home_config)
-        {
-            return Some(cfg);
-        }
-        None
     }
 }
 
@@ -223,8 +221,6 @@ impl Default for ExecutionSection {
             memory_max_mb: default_memory_max_mb(),
             timeout_ms: default_timeout_ms(),
             max_concurrent_executions: default_max_concurrent_executions(),
-            pricing_enabled: false,
-            cost_per_fuel: None,
         }
     }
 }
@@ -232,24 +228,70 @@ impl Default for ExecutionSection {
 impl ServerConfig {
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let contents = fs::read_to_string(path)?;
-        let config = toml::from_str(&contents)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        Ok(config)
+        Self::from_toml_str(&contents)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    /// Write a config template covering BOTH halves of the hybrid file.
-    ///
-    /// `jig-server --config <file>` loads the same file into two unrelated
-    /// types, so a template with only `ServerConfig` keys leaves
-    /// `JigServerConfig` on `::default()` and gives the operator nothing to
-    /// edit for identity, auth or admission.
+    /// Parse a config file's contents. A key listed in [`REMOVED_KEYS`] is
+    /// reported by name and reason; any other unknown key fails with serde's
+    /// error, which names it.
+    pub fn from_toml_str(contents: &str) -> Result<Self, String> {
+        let table: toml::Table = toml::from_str(contents).map_err(|e| e.to_string())?;
+        if let Some((key, why)) = REMOVED_KEYS
+            .iter()
+            .find(|(key, _)| has_dotted_key(&table, key))
+        {
+            return Err(format!(
+                "`{key}` is no longer a jig-server config key: {why}. Delete it."
+            ));
+        }
+        toml::from_str(contents).map_err(|e| e.to_string())
+    }
+
+    /// The pipeline's sections, as the [`JigServerConfig`] its `AppState`
+    /// takes.
+    pub fn v0_0_2(&self) -> JigServerConfig {
+        JigServerConfig {
+            server: self.server.clone(),
+            identity: self.identity.clone(),
+            federation: self.federation.clone(),
+            debug: self.debug.clone(),
+            bridges: self.bridges.clone(),
+            nameserver: self.nameserver.clone(),
+            auth: self.auth.clone(),
+        }
+    }
+
+    /// Write a commented config template: the root keys, `[execution]` and
+    /// `[tls]` as serialized defaults, then the pipeline's sections as
+    /// hand-commented TOML with the same defaults.
     pub fn write_template(path: impl AsRef<Path>) -> std::io::Result<()> {
         let defaults = Self::default();
-        let mut template = toml::to_string_pretty(&defaults).map_err(std::io::Error::other)?;
-        // Appended after the serialized struct because TOML forbids a bare
+        let root = TemplateRoot {
+            database_path: &defaults.database_path,
+            bind_address: &defaults.bind_address,
+            port: defaults.port,
+            host_id: &defaults.host_id,
+            public_url: &defaults.public_url,
+            execution: &defaults.execution,
+            tls: &defaults.tls,
+        };
+        let mut template = toml::to_string_pretty(&root).map_err(std::io::Error::other)?;
+        // Appended after the serialized part because TOML forbids a bare
         // key/value pair once a table header has been emitted.
         template.push_str(&v0_0_2_template_sections(&defaults));
         fs::write(path, template)
+    }
+
+    /// Unsafe options set by the root keys and `[tls]`, named the way
+    /// `JigServerConfig::unsafe_options_active` names its own, so
+    /// `/.well-known/jig` and the startup log can list both together.
+    pub fn unsafe_options_active(&self) -> Vec<String> {
+        let mut active = Vec::new();
+        if !self.tls.enabled {
+            active.push("tls.enabled=false".to_string());
+        }
+        active
     }
 
     /// Names a self-signed certificate is made for: `localhost`, the bind
@@ -280,8 +322,10 @@ impl ServerConfig {
             timeout_ms: self.execution.timeout_ms,
             max_concurrent_executions: self.execution.max_concurrent_executions,
             host_id: self.host_id.clone(),
-            pricing_enabled: self.execution.pricing_enabled,
-            cost_per_fuel: self.execution.cost_per_fuel,
+            // No operator setting: the v0.0.2 render path never prices
+            // executions (`v0_0_2::runtime_config_from` maps no pricing).
+            pricing_enabled: false,
+            cost_per_fuel: None,
         }
     }
 
@@ -305,11 +349,43 @@ impl ServerConfig {
     }
 }
 
-/// The `[server]`/`[identity]`/`[debug]` half of the hybrid config file, as
+/// Whether `table` holds the dotted `key`, e.g. `debug.admin_endpoints`.
+fn has_dotted_key(table: &toml::Table, key: &str) -> bool {
+    let mut parts = key.split('.');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let mut value = match table.get(first) {
+        Some(v) => v,
+        None => return false,
+    };
+    for part in parts {
+        match value.as_table().and_then(|t| t.get(part)) {
+            Some(v) => value = v,
+            None => return false,
+        }
+    }
+    true
+}
+
+/// The part of [`ServerConfig`] `write_template` serializes; the pipeline's
+/// sections are written by hand with comments instead.
+#[derive(Serialize)]
+struct TemplateRoot<'a> {
+    database_path: &'a PathBuf,
+    bind_address: &'a str,
+    port: u16,
+    host_id: &'a str,
+    public_url: &'a Option<String>,
+    execution: &'a ExecutionSection,
+    tls: &'a TlsConfig,
+}
+
+/// The pipeline's sections (`[server]`, `[identity]`, `[auth]`, `[debug]`) as
 /// commented TOML. Values track `JigServerConfig`'s own defaults so the
 /// template can't drift from them.
 fn v0_0_2_template_sections(server: &ServerConfig) -> String {
-    let defaults = jig_config::v0_0_2_server::JigServerConfig::default();
+    let defaults = JigServerConfig::default();
     let kinds = defaults
         .server
         .allowed_block_kinds
@@ -322,12 +398,9 @@ fn v0_0_2_template_sections(server: &ServerConfig) -> String {
     format!(
         r#"
 # ============================================================================
-# JigServerConfig — the v0.0.2 half of this file.
-#
-# jig-server loads THIS SAME PATH into a second type. The keys above open the
-# socket; the sections below configure identity, federation, bridges and the
-# admin surface. Neither type rejects the other's keys, which is what makes
-# one file legal for both.
+# The keys above open the socket; the sections below configure identity, auth,
+# federation and bridges. jig-server rejects any key it does not know, so a
+# typo fails the boot instead of silently keeping a default.
 # ============================================================================
 
 [server]
@@ -492,6 +565,14 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_listener_is_an_unsafe_option() {
+        assert!(ServerConfig::default().unsafe_options_active().is_empty());
+        let mut cfg = ServerConfig::default();
+        cfg.tls.enabled = false;
+        assert_eq!(cfg.unsafe_options_active(), vec!["tls.enabled=false"]);
+    }
+
+    #[test]
     fn tls_section_parses() {
         let toml_str = r#"
             database_path = "/tmp/x.db"
@@ -524,28 +605,8 @@ mod tests {
 }
 
 #[cfg(test)]
-mod jig_config_bridge_tests {
+mod config_file_tests {
     use super::*;
-    use std::io::Write;
-
-    #[test]
-    fn maps_sqlite_path_from_jig_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("jig-config.toml");
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(
-            f,
-            r#"[storage.truth]
-backend = "sqlite"
-connection_string = "{db}"
-"#,
-            db = dir.path().join("test.db").display()
-        )
-        .unwrap();
-
-        let cfg = ServerConfig::load_from_jig_config_path(&path).unwrap();
-        assert_eq!(cfg.database_path, dir.path().join("test.db"));
-    }
 
     #[test]
     fn apply_overrides_explicit_precedence() {
@@ -574,17 +635,13 @@ connection_string = "{db}"
 
     #[test]
     fn write_template_emits_a_bootable_v0_0_2_half() {
-        use jig_config::v0_0_2_server::JigServerConfig;
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server-config.toml");
         ServerConfig::write_template(&path).unwrap();
 
-        // Half 1: the socket-opening half.
         let server = ServerConfig::load(&path).unwrap();
-
-        // Half 2: the v0.0.2 half. It must not switch on any debug option.
-        let v002 = JigServerConfig::load(&path).unwrap();
+        // The pipeline's sections must not switch on any debug option.
+        let v002 = server.v0_0_2();
         assert!(
             !v002.debug.list_handles,
             "template must not enable handle enumeration"
@@ -632,20 +689,18 @@ connection_string = "{db}"
     }
 
     /// The installer's own output must boot the server it just installed.
-    /// This is the test that stops `install.sh` from silently rotting: the
-    /// config it writes feeds BOTH config structs, and omitting either half
-    /// ships a first-run flow that dies on `jig-server --config`.
+    /// This is the test that stops `install.sh` from silently rotting: every
+    /// key it writes must be one jig-server knows, and it must fill in both the
+    /// socket keys and the pipeline's sections.
     #[test]
     fn install_sh_writes_a_config_that_boots_both_halves() {
-        use jig_config::v0_0_2_server::JigServerConfig;
-
         let rendered = install_sh_config("/opt/jig-home", "127.0.0.1:7117");
         assert!(
             !rendered.contains('$'),
             "unexpanded shell variable in install.sh's config heredoc:\n{rendered}"
         );
 
-        let server: ServerConfig = toml::from_str(&rendered)
+        let server = ServerConfig::from_toml_str(&rendered)
             .expect("install.sh's config must parse as ServerConfig — this is what binds");
         assert_eq!(server.bind_address, "127.0.0.1");
         assert_eq!(server.port, 7117);
@@ -659,7 +714,7 @@ connection_string = "{db}"
             server.database_path.display()
         );
 
-        let v002: JigServerConfig = toml::from_str(&rendered).unwrap();
+        let v002 = server.v0_0_2();
         assert!(
             v002.unsafe_options_active()
                 .iter()
@@ -674,43 +729,93 @@ connection_string = "{db}"
         );
     }
 
+    /// The example operators copy must stay loadable as the config surface
+    /// tightens.
     #[test]
-    fn jig_config_paths_precedence() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd_cfg = dir.path().join("cwd.toml");
-        let home_cfg = dir.path().join("home.toml");
+    fn deploy_example_config_loads() {
+        let example =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/config.example.toml");
+        ServerConfig::load(&example).expect("deploy/config.example.toml must load");
+    }
 
-        {
-            let mut f = std::fs::File::create(&cwd_cfg).unwrap();
-            writeln!(
-                f,
-                r#"[storage.truth]
-backend = "sqlite"
-connection_string = "{db}"
+    #[test]
+    fn one_file_carries_the_socket_keys_and_the_pipeline_sections() {
+        let cfg = ServerConfig::from_toml_str(
+            r#"
+database_path = "/var/lib/jig/jig.db"
+bind_address = "0.0.0.0"
+port = 443
+
+[tls]
+enabled = true
+cert_path = "/etc/jig/tls/fullchain.pem"
+key_path = "/etc/jig/tls/privkey.pem"
+
+[server]
+server_did_keyfile = "/srv/keep-me.key"
+
+[bridges.per_bridge.email]
+enabled = true
+
+[bridges.per_bridge.email.config]
+bridge_domain = "mail.jig.onl"
+provider = "resend"
+bridge_secret = "literal-secret"
 "#,
-                db = dir.path().join("cwd.db").display()
-            )
-            .unwrap();
+        )
+        .unwrap();
+        assert_eq!(cfg.port, 443);
+        let v002 = cfg.v0_0_2();
+        assert_eq!(v002.server.server_did_keyfile, "/srv/keep-me.key");
+        assert!(v002.bridge_permitted("email"));
+    }
+
+    #[test]
+    fn an_unknown_key_is_an_error_naming_it() {
+        for (body, key) in [
+            ("databse_path = \"/tmp/x.db\"\n", "databse_path"),
+            ("[execution]\nfuel = 1\n", "fuel"),
+            ("[tls]\nenable = false\n", "enable"),
+            ("[identity]\nmod = \"tofu\"\n", "mod"),
+            ("[sever]\nlisten = \"x\"\n", "sever"),
+        ] {
+            let err = ServerConfig::from_toml_str(&format!(
+                "database_path = \"/tmp/x.db\"\nbind_address = \"127.0.0.1\"\nport = 7117\n{body}"
+            ))
+            .expect_err(&format!("`{key}` must be rejected"));
+            assert!(err.contains(key), "the error must name `{key}`, got: {err}");
         }
+    }
 
-        {
-            let mut f = std::fs::File::create(&home_cfg).unwrap();
-            writeln!(
-                f,
-                r#"[storage.truth]
-backend = "sqlite"
-connection_string = "{db}"
-"#,
-                db = dir.path().join("home.db").display()
-            )
-            .unwrap();
+    #[test]
+    fn a_removed_key_is_an_error_saying_so() {
+        for (body, key) in [
+            (
+                "dangerously_enable_v0_0_1_rest = false\n",
+                "dangerously_enable_v0_0_1_rest",
+            ),
+            (
+                "[debug]\nadmin_endpoints = false\n",
+                "debug.admin_endpoints",
+            ),
+            (
+                "[execution]\npricing_enabled = false\n",
+                "execution.pricing_enabled",
+            ),
+            (
+                "[execution]\ncost_per_fuel = 0.1\n",
+                "execution.cost_per_fuel",
+            ),
+            ("[storage.truth]\npath = \"/tmp/x.db\"\n", "storage"),
+        ] {
+            let err = ServerConfig::from_toml_str(&format!(
+                "database_path = \"/tmp/x.db\"\nbind_address = \"127.0.0.1\"\nport = 7117\n{body}"
+            ))
+            .expect_err(&format!("`{key}` must be rejected"));
+            assert!(
+                err.contains(&format!("`{key}` is no longer a jig-server config key")),
+                "got: {err}"
+            );
         }
-
-        let cfg1 = ServerConfig::try_load_jig_config_from_paths(&cwd_cfg, &home_cfg).unwrap();
-        assert_eq!(cfg1.database_path, dir.path().join("cwd.db"));
-
-        std::fs::remove_file(&cwd_cfg).unwrap();
-        let cfg2 = ServerConfig::try_load_jig_config_from_paths(&cwd_cfg, &home_cfg).unwrap();
-        assert_eq!(cfg2.database_path, dir.path().join("home.db"));
     }
 }

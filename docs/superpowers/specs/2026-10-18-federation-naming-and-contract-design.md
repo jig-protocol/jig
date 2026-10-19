@@ -93,8 +93,9 @@ is a small fix PR, not part of this design.
   separation and no binding to the alias or the nameserver (`register.rs:82`). A signature
   made for any other purpose over the same 64 hex characters would pass. This is AB-01's
   "proofs are not bound to an action or DID".
-- **One suffix per nameserver.** `alias_suffix` is a config string, default `gigue.jig`.
-  `.jig` is not a DNS top-level domain. There is no delegation of any kind.
+- **One suffix per nameserver.** `alias_suffix` is a config string, default `gigue.jig`
+  (retired as the default on 2026-10-19; see 4.2). `.jig` is not a DNS top-level domain.
+  There is no delegation of any kind.
 - **The nameserver serves plaintext HTTP** (`server.rs:1572`).
 - **The server's resolver verifies nothing** (`jig-pipeline/src/identity.rs:168-205`). It
   reads only `json["did"]`, asks every configured nameserver in order whatever the
@@ -266,9 +267,18 @@ global, secure and human-meaningful without an anchor. DNS or a contract is that
    So a federated isolated server cannot impersonate a peer's names. At worst its names
    show as unverified on the peer.
 
-**`gigue.jig`.** `.jig` is not a DNS name, so it can only be config-rooted (B) or
-contract-rooted. **Open:** pick a real domain as the reference default, or keep `gigue.jig`
-and accept that it is local.
+**The default suffix is `@jig` (decided by DJ, 2026-10-19).**
+- `jig` is the generic default suffix. It is `config`-rooted: clients ship a default
+  delegation that pins the project nameserver's DID. In v0.3 it moves to a ruleset-group
+  delegation (4.2 C, JEP-0009), with DJ's "highsec" group as the first.
+- `jig.onl` (the OSS dev team), `jig-protocol.org` (the onboarding hub) and `jig.foundation` are
+  ordinary `dns`-rooted suffixes. They get no special treatment and no shipped pins, and
+  neither does any gigue namespace.
+- `gigue.jig` is retired as the default.
+- **A single-label suffix is never `dns`-rooted.** Without a `config` delegation, `jig` would
+  send a resolver to `https://jig/`. The local DNS search domains resolve that name to
+  whatever host the local network calls `jig`, under a certificate a local CA can issue. A
+  suffix of one label is therefore `config` or `contract` only (JEP-0004 rule 4).
 
 The delegation document is signed by every authority DID it lists. A CA or web host that
 serves a forged list without those keys produces an unsigned or wrongly signed document.
@@ -356,13 +366,14 @@ the witnessed logs (C2SP style).
 
 **Proposed**, so that 4.3 and 4.5 can work at all:
 
-- **Canonical, domain-separated signatures.** An attestation is signed over the labelled
-  BLAKE3 hash jig uses elsewhere (`hash_labeled_parts`): (`domain`,
-  `jig-alias-attestation-v1`), then `did`, `alias`, `ns_did`, `valid_from`, `valid_until`,
-  in that order. `profile_ttl_seconds` either joins that list or leaves the signed body.
-  JSON map order stops mattering.
-- **Proof of control binds the action.** The DID signs (`domain`,
-  `jig-alias-register-v1`), (`ns_did`), (`alias`), (`challenge`). The same applies to
+- **Canonical, domain-separated signatures.** Decided (DJ): every new signed object is a
+  `COSE_Sign1` (EdDSA) over deterministic CBOR (RFC 8949 section 4.2.1). An attestation's
+  payload is the text-keyed map `{domain: "jig-alias-attestation-v1", did, alias, ns_did,
+  valid_from, valid_until}`. `profile_ttl_seconds` either joins that map or leaves the
+  signed body. JSON map order stops mattering, and anything hashed is hashed over the
+  deterministic encoding.
+- **Proof of control binds the action.** The DID signs the payload `{domain:
+  "jig-alias-register-v1", ns_did, alias, challenge}`. The same applies to
   renew, with its own domain. This closes AB-01 for this flow. Rotation proves control
   through lane I's link instead.
 - **Rotation links are kept and served** with the attestation that resulted from them
@@ -880,8 +891,8 @@ Updated in the implementation PRs, not here.
 
 1. ~~Suffix authority (4.2)~~ **Decided:** A with a B override; A and C are one delegation
    mechanism with different roots; servers without a nameserver are their own authority;
-   suffix conflicts across a federation link refuse the contract. Still open: the
-   reference default suffix.
+   suffix conflicts across a federation link refuse the contract. The reference default
+   suffix is `@jig`, `config`-rooted (DJ, 2026-10-19; see 4.2).
 2. ~~Remote writes (5.2)~~ **Decided:** a client writes through whatever server it is
    authenticated to, if that server carries the channel. Shares carry grants; a read-only
    share forces writers to the owner.
