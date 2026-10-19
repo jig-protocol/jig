@@ -84,8 +84,10 @@ pub struct ChannelPin {
 }
 
 impl ChannelPin {
+    /// Anything but `none` is encrypted, including a suite this build does
+    /// not know: a pin is never a reason to send in the clear.
     pub fn encrypted(&self) -> bool {
-        self.suite == jig_core::EncryptionSuite::Mls.as_str()
+        self.suite != jig_core::EncryptionSuite::Unencrypted.as_str()
     }
 }
 
@@ -476,6 +478,20 @@ mod tests {
                 .unwrap()
                 .encrypted()
         );
+    }
+
+    /// A suite this build does not know is never read as plaintext.
+    #[test]
+    fn any_suite_but_none_is_encrypted() {
+        let pin = |suite: &str| ChannelPin {
+            create_cid: "bafy".into(),
+            suite: suite.into(),
+            owner_did: "did:jig:zA".into(),
+        };
+        assert!(!pin("none").encrypted());
+        assert!(pin("mls").encrypted());
+        assert!(pin("test-aead").encrypted());
+        assert!(pin("signal-pqxdh").encrypted());
     }
 
     #[test]

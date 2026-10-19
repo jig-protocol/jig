@@ -70,8 +70,12 @@ pub enum MlsError {
 
 pub type Result<T> = std::result::Result<T, MlsError>;
 
-pub(crate) fn create_config() -> MlsGroupCreateConfig {
-    MlsGroupCreateConfig::builder()
+pub(crate) fn create_config(lifetime: Option<openmls::prelude::Lifetime>) -> MlsGroupCreateConfig {
+    let mut builder = MlsGroupCreateConfig::builder();
+    if let Some(lifetime) = lifetime {
+        builder = builder.lifetime(lifetime);
+    }
+    builder
         .ciphersuite(CIPHERSUITE)
         .use_ratchet_tree_extension(true)
         .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)

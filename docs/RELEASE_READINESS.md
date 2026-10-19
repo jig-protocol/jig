@@ -258,7 +258,7 @@ registry, or copied code may appear anywhere under `repos/`. This belongs in
 | Discussion / support channel | dev@jig.onl and issues; security reports go to security@jig.onl or GitHub private reporting. No public chat. | GAP |
 | Triage owner | DJ, named in `SECURITY.md` for vulnerability reports. No rotation or SLA for ordinary issues. | GAP |
 | Release cadence | Undefined. `release.yml` is tag-triggered and marks every v0.x tag a prerelease; no release has been published. | GAP |
-| CI coverage | `changes`, `workspace` (fmt, clippy and nextest on every workspace crate but `hello-wasm`), `wasm-build` and `dependency-policy` (also daily at 07:17 UTC against `main`). Drafts and docs-only PRs skip the build jobs; the merge queue runs everything. Linux only for the workspace job; macOS runs in the install smoke test inside `release.yml` and after each release, and in `fuel-portability.yml` on manual dispatch only. | GAP |
+| CI coverage | `changes`, `workspace` (fmt, clippy and nextest on every workspace crate but `hello-wasm`), `wasm-build` and `dependency-policy` (also daily at 07:17 UTC against `main`). A `nightly` job on the same schedule runs doc tests and clippy on `jig-runtime --features tracing`, skips nights when nothing under `repos/` (Markdown aside) and not `rust-toolchain.toml` changed, and does not gate merges. Drafts and docs-only PRs skip the build jobs; the merge queue runs everything. Linux only for the workspace job; macOS runs in the install smoke test inside `release.yml` and after each release, and in `fuel-portability.yml` on manual dispatch only. | GAP |
 
 **Test counts, measured at `1fa5681`** (`cargo nextest list`, stable 1.97.1): 1,054 tests in
 the CI-gated package set, plus 87 in `jig-runtime` + `hello-wasm` = **1,141**.

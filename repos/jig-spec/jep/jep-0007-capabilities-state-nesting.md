@@ -6,7 +6,7 @@ type = "Standards Track"
 category = "Core"
 authors = ["DJ <dev@jig.onl>"]
 created = "2026-10-18"
-requires = ["0006"]
+requires = ["0006", "0011"]
 replaces = []
 superseded_by = []
 discussions_to = "https://github.com/jig-protocol/jig/issues"
@@ -77,12 +77,15 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 ## 2. Authority
 
 1. A block's **effective authority** is `request ⊓ grant ⊓ policy`:
-   - *request*: the capabilities in its signed manifest;
+   - *request*: the `requests` of its signed program manifest (JEP-0011);
    - *grant*: for a root bot, the `grant` of its `block-install` (§4); for a child, its parent's
      offer (§7);
    - *policy*: what the host's operator allows (JEP-0006 Q7: empty by default).
 2. For a child, `effective(child) = request(child) ⊓ offer(parent → child) ⊓ effective(parent)`.
 3. A manifest request alone grants nothing.
+4. Execution policies (the operator's, a channel's `channel-policy` and a client's own allow and
+   deny lists; JEP-0011) decide only whether code runs. They grant no authority, and none of them
+   can make another party's host execute anything.
 
 ## 3. Enforcement
 
@@ -103,12 +106,31 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 
 ## 4. Installs and bot identity
 
-1. A `block-install` block is authored and signed by the channel's owner. Its manifest names:
-   `block` (the bot's block CID), `channel` (a `channel-id`), `grant`, `bot_did`, `bot_key`,
-   `triggers` (what invokes the bot), and optionally `inherits_state_from` (an earlier install).
-2. The hosting server MUST countersign the install, stating that it holds `bot_key` as custodian.
+1. A `block-install` is signed by the channel's owner alone, as a COSE_Sign1, and carries the
+   owner's `seq` and `prev`. Nobody else can sign one. Its payload names: `block` (the bot's
+   program CID, JEP-0011), `channel` (a `channel-id`), `grant`, `bot_did`, `bot_key`, `triggers`
+   (what invokes the bot), and optionally `inherits_state_from` (an earlier install).
+2. The hosting server approves it with a separate **`policy-approval`** (JEP-0011 §5.3, the same
+   object it issues for a `channel-policy`): a COSE_Sign1 of `{domain: "jig-policy-approval-v1",
+   server, channel, object_cid, restrictions_cid, operator_policy_cid?, bot_did?}`.
+   - `object_cid` is the install's CID. `restrictions_cid` names the `server-restrictions` it was
+     checked against.
+   - `operator_policy_cid` and `bot_did` MUST be present when the approved object is a
+     `block-install`, and absent otherwise. `operator_policy_cid` names the `operator-policy`
+     (§2.1) the install's program was checked against.
+   - `bot_did` states that the server holds the private key for `bot_did` (SC-04). A verifier
+     MUST check that it equals the install's `bot_did`, and treat the approval as invalid if not.
+   - A `policy-withdrawn` is `{…, restrictions_cid, operator_policy_cid?, conflicts}`, naming the
+     rule versions the install now fails.
+   - The **current** approval is read from the channel's `ingest` chain: the latest
+     `policy-approval` or `policy-withdrawn` for that install CID, in ingest order, wins, and a
+     withdrawal stands until a newer approval. The approval carries no `seq` or `prev` of its own.
+   - The server MUST withdraw the approval of an install that no longer passes its restrictions.
+     Withdrawal and re-approval need nothing from the owner.
+   - A host MUST NOT invoke a bot whose install has no current approval, and a client MUST treat
+     such an install as absent.
 3. The install's CID is the **instance id**. A host MUST refuse an install whose `grant` is not
-   `⊑` the block's request, or whose block is outside operator policy.
+   `⊑` the program's `requests`, or whose program is outside operator policy.
 4. A bot's posts are blocks authored by `bot_did` and MUST go through `ingest` like any write.
    Their manifest carries `produced_by: {instance, invocation}`.
 5. A host MUST NOT invoke a bot on its own posts, and MUST NOT invoke a bot from a post whose
@@ -169,8 +191,9 @@ author's `hlc_ts`.
 
 1. `invoke(cid, input: payload) -> result<payload, invoke-error>`, where `invoke-error` is
    `not-declared`, `failed(hash)` or `trapped`.
-2. A parent's manifest declares `children: [cid…]` and `offers: {cid: grant}`. A host MUST refuse
-   to invoke an undeclared CID, and MUST compile and validate the whole declared closure before
+2. A parent's program manifest declares `children: [cid…]` (program CIDs) and `offers: {cid:
+   grant}`, so the parent's program CID pins the whole tree. A host MUST refuse to invoke an
+   undeclared CID, and MUST compile and validate the whole declared closure before
    the root's first run.
 3. A child is a separate component instance linked per §3 with its own effective authority
    (§2.2). Children are stateless in v0.3 and return a payload, not effects. A `renderer` MAY
@@ -204,7 +227,10 @@ author's `hlc_ts`.
 When the owner moves a channel's sequencer with `sequencer-set` *(F)*:
 
 1. The new sequencer names freshly minted bot DIDs in its `contract-accept`, and `sequencer-set`
-   carries an owner-signed reinstall for each bot that continues, with `inherits_state_from`.
+   carries an owner-proposed reinstall for each bot that continues, with `inherits_state_from`.
+   The new home server issues fresh `policy-approval`s for the live `block-install`s and the
+   channel's `channel-policy` (JEP-0005 rule 11b). An approval by the old home server does not
+   carry over; until the new one approves, the install is absent (§4.2).
 2. The new sequencer takes the state whose CID is the last `state_after` at or before the handover
    head, or replays the instance from its receipts. If both fail, the reinstall starts empty and
    says so.
