@@ -84,7 +84,7 @@ jig-server --config server.toml
 ### Prerequisites
 
 - Rust 1.75+ (edition 2024)
-- WASM target: `rustup target add wasm32-wasi`
+- Wasm target for blocks: `rustup target add wasm32-unknown-unknown` (`jig block new` sets it in each block project)
 
 ### Workspace Structure
 
