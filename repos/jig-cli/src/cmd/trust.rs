@@ -187,7 +187,9 @@ pub async fn accept_name(
         Verified::New(b) | Verified::Pinned(b) | Verified::Rotated { binding: b, .. } => b,
     };
     let mut pins = Pins::load(&Pins::default_path())?;
-    Ok(pins.accept_name(&binding, confirmed)?)
+    let old = pins.accept_name(&binding, confirmed)?;
+    warn_if_expiring(name, &binding, chrono::Utc::now().timestamp());
+    Ok(old)
 }
 
 /// How long before an attestation expires the CLI starts saying so.
