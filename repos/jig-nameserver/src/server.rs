@@ -53,10 +53,10 @@ async fn well_known(State(state): State<AppState>) -> Result<Json<WellKnownNsInf
         "health": "/v1/health",
     });
     let policy = serde_json::json!({
-        "rate_limit": {
-            "per_key_per_min": state.cfg.rate_limits.per_key_per_min,
-            "per_ip_per_min": state.cfg.rate_limits.per_ip_per_min,
-            "global_per_min": state.cfg.rate_limits.global_per_min,
+        "alias_rate_limits": {
+            "enabled": state.cfg.alias_rate_limits.enabled,
+            "per_ip_per_min": state.cfg.alias_rate_limits.per_ip_per_min,
+            "per_did_per_min": state.cfg.alias_rate_limits.per_did_per_min,
         },
         "automation": {
             "enabled": state.cfg.automation.enabled,
@@ -489,6 +489,39 @@ mod tests {
         let cfg = scratch_config(&dir, "deji.jig");
         let app = build_app_parts(&cfg).expect("build_app_parts");
         assert_eq!(app.v0_0_2_state.suffix(), "deji.jig");
+    }
+
+    /// Pins the well-known `policy` keys, and that the published rate limits
+    /// are the ones the alias routes enforce.
+    #[tokio::test]
+    async fn well_known_publishes_the_enforced_alias_rate_limits() {
+        let dir = ScratchDir::new("well-known");
+        let mut cfg = scratch_config(&dir, "dj.jig");
+        cfg.alias_rate_limits.per_ip_per_min = 7;
+        cfg.alias_rate_limits.per_did_per_min = 3;
+        let (router, _) = build_app(&cfg).expect("build_app");
+
+        let (status, body) = get(&router, "/.well-known/jig-ns").await;
+        assert_eq!(status, StatusCode::OK);
+        let policy = body["policy"].as_object().expect("policy object");
+        let mut keys: Vec<&str> = policy.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "alias_rate_limits",
+                "allow_domains",
+                "automation",
+                "cache_ttl_secs",
+                "deny_domains",
+                "public_key",
+                "reputation",
+            ]
+        );
+        assert_eq!(
+            policy["alias_rate_limits"],
+            serde_json::json!({ "enabled": true, "per_ip_per_min": 7, "per_did_per_min": 3 })
+        );
     }
 
     async fn post_json(router: &Router, uri: &str, body: serde_json::Value) -> Response<Body> {

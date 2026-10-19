@@ -31,7 +31,6 @@ fn merge_tables(target: &mut toml::value::Table, source: &toml::value::Table) {
 pub struct NameServerConfig {
     pub network: NetworkConfig,
     pub storage: StorageConfig,
-    pub rate_limits: RateLimitConfig,
     pub penalties: PenaltyConfig,
     pub anonymous: AnonymousPolicy,
     pub federation: FederationConfig,
@@ -56,8 +55,7 @@ pub struct NameServerConfig {
     #[serde(default)]
     pub v0_0_2: jig_config::v0_0_2_server::JigServerConfig,
     /// Per-IP and per-DID limits on the v0.0.2 `register`, `rotate` and
-    /// `renew` routes (`[alias_rate_limits]`). Separate from the legacy
-    /// `[rate_limits]`, which only the v0.0.1 challenge route read.
+    /// `renew` routes (`[alias_rate_limits]`).
     pub alias_rate_limits: AliasRateLimitConfig,
 }
 
@@ -256,7 +254,6 @@ impl NameServerConfig {
         Self {
             network: NetworkConfig::from_env(),
             storage: StorageConfig::from_env(),
-            rate_limits: RateLimitConfig::from_env(),
             penalties: PenaltyConfig::from_env(),
             anonymous: AnonymousPolicy::from_env(),
             federation: FederationConfig::from_env(),
@@ -277,7 +274,6 @@ impl NameServerConfig {
         // Allow env vars to override settings after TOML load for quick tweaks.
         self.network.merge_env();
         self.storage.merge_env();
-        self.rate_limits.merge_env();
         self.analytics.merge_env();
         self.hot.merge_env();
         self.penalties.merge_env();
@@ -446,54 +442,6 @@ impl Default for AliasRateLimitConfig {
             enabled: true,
             per_ip_per_min: 30,
             per_did_per_min: 10,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RateLimitConfig {
-    pub per_key_per_min: u32,
-    pub per_ip_per_min: u32,
-    pub global_per_min: Option<u32>,
-}
-
-impl Default for RateLimitConfig {
-    fn default() -> Self {
-        Self {
-            per_key_per_min: default_per_key_limit(),
-            per_ip_per_min: default_per_ip_limit(),
-            global_per_min: None,
-        }
-    }
-}
-
-impl RateLimitConfig {
-    fn from_env() -> Self {
-        let mut cfg = Self::default();
-        if let Ok(limit) = std::env::var("JIG_NS_RATE_PER_MIN")
-            && let Ok(parsed) = limit.parse::<u32>()
-        {
-            cfg.per_key_per_min = parsed;
-        }
-        if let Ok(limit) = std::env::var("JIG_NS_RATE_PER_IP_PER_MIN")
-            && let Ok(parsed) = limit.parse::<u32>()
-        {
-            cfg.per_ip_per_min = parsed;
-        }
-        cfg
-    }
-
-    fn merge_env(&mut self) {
-        if let Ok(limit) = std::env::var("JIG_NS_RATE_PER_MIN")
-            && let Ok(parsed) = limit.parse::<u32>()
-        {
-            self.per_key_per_min = parsed;
-        }
-        if let Ok(limit) = std::env::var("JIG_NS_RATE_PER_IP_PER_MIN")
-            && let Ok(parsed) = limit.parse::<u32>()
-        {
-            self.per_ip_per_min = parsed;
         }
     }
 }
@@ -1457,20 +1405,6 @@ fn default_database_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("nameserver.db"))
 }
 
-fn default_per_key_limit() -> u32 {
-    std::env::var("JIG_NS_RATE_PER_MIN")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(60)
-}
-
-fn default_per_ip_limit() -> u32 {
-    std::env::var("JIG_NS_RATE_PER_IP_PER_MIN")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(120)
-}
-
 fn default_penalty_decay() -> i64 {
     std::env::var("JIG_NS_PENALTY_DECAY")
         .ok()
@@ -1526,10 +1460,6 @@ backend = "sqlite"  # Default: Tier 1
 # connection_string = "postgres://localhost/nameserver"
 # pool_size = "10"
 # max_connections = "20"
-
-[rate_limits]
-per_key_per_min = 60
-per_ip_per_min = 120
 
 # v0.0.2 register / rotate / renew. Refused requests get HTTP 429 with code
 # RATE_LIMITED and a Retry-After header.
@@ -1707,8 +1637,8 @@ profile = "prod"
 bind = "127.0.0.1"
 port = 7070
 
-[nameserver.profiles.default.rate_limits]
-per_key_per_min = 10
+[nameserver.profiles.default.alias_rate_limits]
+per_ip_per_min = 10
 
 [nameserver.profiles.prod.network]
 bind = "0.0.0.0"
@@ -1728,7 +1658,7 @@ default_ruleset = "prod"
         let cfg = NameServerConfig::from_table(table, None).unwrap();
         assert_eq!(cfg.network.bind, "0.0.0.0");
         assert_eq!(cfg.network.port, 8080);
-        assert_eq!(cfg.rate_limits.per_key_per_min, 10);
+        assert_eq!(cfg.alias_rate_limits.per_ip_per_min, 10);
         assert_eq!(cfg.reputation.default_ruleset.as_deref(), Some("prod"));
     }
 
@@ -1826,12 +1756,17 @@ federation_enabled = true
     }
 
     #[test]
-    fn retired_pow_section_is_ignored() {
-        // Configs written before `[pow]` was removed must keep loading.
+    fn retired_sections_are_ignored() {
+        // Configs written before `[pow]` and `[rate_limits]` were removed must
+        // keep loading.
         let doc = r#"
 [pow]
 server_secret = "old"
 base_difficulty = 18
+
+[rate_limits]
+per_key_per_min = 60
+per_ip_per_min = 120
 "#;
         let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
         cfg.validate().expect("valid");

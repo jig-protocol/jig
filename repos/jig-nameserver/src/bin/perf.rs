@@ -186,9 +186,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn start_inproc_server() -> anyhow::Result<(String, JoinHandle<()>)> {
-    let mut cfg = NameServerConfig::default();
-    cfg.rate_limits.per_key_per_min = u32::MAX / 2;
-    cfg.rate_limits.per_ip_per_min = u32::MAX / 2;
+    let cfg = NameServerConfig::default();
     let storage: Arc<dyn NamesStorage> = Arc::new(MemoryStorage::default());
     let app = app_router(jig_nameserver::server::AppState {
         cfg: cfg.clone(),
