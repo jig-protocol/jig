@@ -8,6 +8,7 @@
 
 pub mod admission;
 pub mod blocks;
+pub mod chain;
 pub mod connection;
 pub mod evidence;
 pub mod identity;

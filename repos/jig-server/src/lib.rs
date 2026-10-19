@@ -6,7 +6,6 @@ pub mod error;
 pub mod handler;
 pub mod runtime;
 pub mod server;
-pub mod storage;
 pub mod v0_0_2;
 pub mod v0_0_2_admin;
 pub mod v0_0_2_admission;
@@ -24,7 +23,3 @@ pub use config::ServerConfig;
 pub use error::{Result, ServerError};
 pub use runtime::ExecutionConfig;
 pub use server::JigServer;
-pub use storage::{
-    SqliteBlockStore, StoredBlock, StoredBlockSummary, StoredReceipt, StoredResource,
-    encode_resource_data,
-};
