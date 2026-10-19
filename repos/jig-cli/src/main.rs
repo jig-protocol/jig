@@ -354,6 +354,8 @@ enum ServerAction {
     },
 }
 
+// Parsed once per process; boxing `Run`'s fields would buy nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum BlockAction {
     /// Create a block project from a template
@@ -388,11 +390,38 @@ enum BlockAction {
         max_memory_pages: u32,
     },
 
-    /// Run a WASM block locally and generate a receipt
+    /// Run a block once, locally. A component (a block project, or a .wasm component) runs
+    /// through the same component path as the server and client; a core module runs on the
+    /// legacy ABI and gets a v0.2 receipt.
     #[cfg(feature = "local-runtime")]
     Run {
-        /// Path to WASM file
+        /// A block project directory, or a .wasm file
+        #[arg(default_value = ".")]
         wasm: String,
+
+        /// Component input: the message text
+        #[arg(long, conflicts_with = "input_file")]
+        input: Option<String>,
+
+        /// Component input: read the message body from this file
+        #[arg(long)]
+        input_file: Option<std::path::PathBuf>,
+
+        /// Component input: the body's media type
+        #[arg(long, default_value = "text/plain")]
+        media_type: String,
+
+        /// Component input: the sender's DID
+        #[arg(long)]
+        sender: Option<String>,
+
+        /// Component input: the channel CID
+        #[arg(long)]
+        channel: Option<String>,
+
+        /// Component input: the ingest sequence number
+        #[arg(long)]
+        seq: Option<u64>,
 
         /// Deterministic seed for RNG (for reproducible execution)
         #[arg(long)]
@@ -425,6 +454,26 @@ enum BlockAction {
         /// Enable pricing in receipt
         #[arg(long)]
         pricing: bool,
+    },
+
+    /// Run a block project's vectors (tests/vectors/*.toml) and compare their outcomes
+    #[cfg(feature = "local-runtime")]
+    Test {
+        /// The project directory
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+
+        /// Record the outcome of every vector that has none, or whose outcome changed
+        #[arg(long)]
+        bless: bool,
+
+        /// Maximum fuel per run
+        #[arg(long)]
+        fuel: Option<u64>,
+
+        /// Wall-clock limit per run, in milliseconds
+        #[arg(long)]
+        timeout: Option<u64>,
     },
 }
 
@@ -476,7 +525,9 @@ enum ReceiptAction {
 }
 
 /// `jig block new`, `build` and `lint`, or `None` for the block actions that need a config.
-fn run_local_block_action(action: &BlockAction) -> Option<Result<()>> {
+// `global_json` is read only by `run`, which needs the `local-runtime` feature.
+#[cfg_attr(not(feature = "local-runtime"), allow(unused_variables))]
+fn run_local_block_action(action: &BlockAction, global_json: bool) -> Option<Result<()>> {
     Some(match action {
         BlockAction::New {
             name,
@@ -508,7 +559,49 @@ fn run_local_block_action(action: &BlockAction) -> Option<Result<()>> {
             }
         }),
         #[cfg(feature = "local-runtime")]
-        BlockAction::Run { .. } => return None,
+        BlockAction::Run {
+            wasm,
+            input,
+            input_file,
+            media_type,
+            sender,
+            channel,
+            seq,
+            fuel,
+            timeout,
+            json,
+            ..
+        } => {
+            let target = match cmd::block_exec::load_target(std::path::Path::new(wasm)) {
+                Ok(t) => t,
+                Err(e) => return Some(Err(e)),
+            };
+            // A core module takes the legacy path, after the config is loaded.
+            if !cmd::block_exec::is_component(&target.bytes) {
+                return None;
+            }
+            cmd::block_run::run_component(
+                &target,
+                cmd::block_run::ComponentRunArgs {
+                    input: input.as_deref(),
+                    input_file: input_file.as_deref(),
+                    media_type,
+                    sender: sender.as_deref(),
+                    channel: channel.as_deref(),
+                    seq: *seq,
+                    fuel: *fuel,
+                    timeout_ms: *timeout,
+                    json: *json || global_json,
+                },
+            )
+        }
+        #[cfg(feature = "local-runtime")]
+        BlockAction::Test {
+            path,
+            bless,
+            fuel,
+            timeout,
+        } => cmd::block_run::run_vectors(path, *bless, *fuel, *timeout),
     })
 }
 
@@ -519,7 +612,7 @@ async fn main() -> Result<()> {
     // Writing, building and linting a block touch only local files: they need no config,
     // identity or server, so they run before any of those is loaded.
     if let Some(Commands::Block { action }) = &cli.command
-        && let Some(result) = run_local_block_action(action)
+        && let Some(result) = run_local_block_action(action, cli.json)
     {
         return result;
     }
@@ -765,6 +858,8 @@ async fn main() -> Result<()> {
                 unreachable!("handled before the config is loaded")
             }
             #[cfg(feature = "local-runtime")]
+            BlockAction::Test { .. } => unreachable!("handled before the config is loaded"),
+            #[cfg(feature = "local-runtime")]
             BlockAction::Run {
                 wasm,
                 seed,
@@ -775,8 +870,25 @@ async fn main() -> Result<()> {
                 receipt,
                 json,
                 pricing,
+                input,
+                input_file,
+                sender,
+                channel,
+                seq,
+                ..
             } => {
                 use cmd::block_run::{RunBlockArgs, run_block};
+                if input.is_some()
+                    || input_file.is_some()
+                    || sender.is_some()
+                    || channel.is_some()
+                    || seq.is_some()
+                {
+                    anyhow::bail!(
+                        "{wasm} is a core module; --input, --input-file, --sender, --channel and \
+                         --seq apply only to components (`jig block build` makes one)"
+                    );
+                }
                 run_block(RunBlockArgs {
                     wasm_path: &wasm,
                     seed,
