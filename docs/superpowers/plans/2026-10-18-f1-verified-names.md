@@ -53,7 +53,8 @@ owning lane builds the slice, or agrees in writing (through the orchestrator) th
 
 | Slice | What | Files | Owner | Depends on |
 | --- | --- | --- | --- | --- |
-| 0 | Fail closed on orphan relayed posts and on fanout with no policy | `jig-pipeline/src/ingest.rs`, `jig-pipeline/src/fanout.rs` | To be confirmed by the orchestrator (asked 2026-10-18) | nothing |
+| 0 | Fail closed on orphan relayed posts and on fanout with no policy; hash DIDs in logs (#172) | `jig-pipeline/src/ingest.rs`, `jig-pipeline/src/fanout.rs`, `jig-core/src/did.rs`, `jig-server/src/v0_0_2_admission.rs` | F | nothing |
+| 0b | Key `log_tag` with a value derived from the server's signing key, so a leaked log can't be reversed by enumerating public DIDs or linked across servers | `jig-core/src/did.rs` and its callers | F, scheduled by the orchestrator | 0 |
 | 1 | `jig_core::naming`: types, signed bytes, verification, test vectors | `jig-core/src/naming.rs` (new), `jig-core/src/lib.rs`, `jig-spec/jep/vectors/0004/` (new) | F | nothing |
 | 2 | The nameserver issues the new objects and takes action-bound proofs for register and renew. Rotate stays as it is until lane I's I3 moves `/v1/rotate` onto links | `jig-nameserver/src/v0_0_2*.rs`, alias storage in `jig-pipeline/src/persist.rs` | L6 (nameserver); persistence change agreed with whoever owns `persist.rs` | 1 |
 | 3 | TLS on the nameserver | `jig-nameserver/src/server.rs` | L6 | nothing |
@@ -109,6 +110,16 @@ encrypted content today, but both will matter once channels are keyed by CID in 
   report: that test encodes the bug.
 - [ ] **Step 5:** commit `fix(federation): refuse relayed posts for unknown channels; no policy means no federation`.
 
+Release note: a channel federates only if a peer saw its `channel-create`, that is, it was
+created after the two servers peered and while their link was up. Nothing replays it at peering
+today (the peer loop ignores `CatchUp`). F2's `contract-offer` carries the creation block and
+closes this.
+
+**Follow-up (slice 0b).** `log_tag` hashes the DID under a public domain tag. DIDs are public
+through nameservers, so a leaked log plus a DID list reverses every tag. Key it instead:
+`blake3::derive_key("jig-log-did-v1", server_seed)` as the key of a keyed BLAKE3 over the DID.
+No new secret, and tags stop being reversible or linkable across servers without that key.
+
 ---
 
 ### Task 1: `jig_core::naming`
@@ -117,37 +128,44 @@ Pure types and signed bytes, so the nameserver, the server and the client all co
 signature input.
 
 **Files:**
+- Depends on: `repos/jig-core/src/dcbor.rs` and `repos/jig-core/src/cose.rs`, the shared
+  layer every lane signs with (#175, no new dependencies)
 - Create: `repos/jig-core/src/naming.rs`
-- Modify: `repos/jig-core/src/lib.rs` (`pub mod naming;`)
-- Create: `repos/jig-spec/jep/vectors/0004/{attestation,rotation,delegation,reachability}.json`
+- Modify: `repos/jig-core/src/lib.rs`
+- Create: `repos/jig-spec/jep/vectors/0004/vectors.json`
 
 **Interface:**
 
 ```rust
+// dcbor: RFC 8949 section 4.2.1; decode refuses non-deterministic input, floats and tags.
+pub fn dcbor::encode(&dcbor::Value) -> Result<Vec<u8>, DcborError>;
+pub fn dcbor::decode(&[u8]) -> Result<Value, DcborError>;
+// cose: COSE_Sign1, protected {1: -8}, empty unprotected header.
+pub fn cose::sign1(key: &SigningKey, payload: &[u8]) -> Vec<u8>;
+pub fn cose::open_sign1(envelope: &[u8]) -> Result<Sign1, CoseError>;   // then Sign1::verify(did)
+pub fn cose::sign_all(keys: &[&SigningKey], payload: &[u8]) -> Vec<u8>; // COSE_Sign, all must sign
+
 pub struct Name { pub alias: String, pub suffix: String }           // parsed, normalised
 pub enum Root { Config, Dns, Contract }
-pub struct RootId(pub String);                                      // rule 3
-pub struct Attestation { did, alias, ns_did, valid_from: i64, valid_until: i64, sig: String }
-pub struct RotationStatement { alias, ns_did, old_did, new_did, at: i64, sig_old, sig_new }
-pub struct SuffixDelegation { suffix, authorities: Vec<String>, root: Root, root_id: RootId,
-                              valid_until: i64, sigs: Vec<(String, String)> }
+pub struct Attestation { did, alias, ns_did, valid_from: i64, valid_until: i64, envelope: Vec<u8> }
+pub struct SuffixDelegation { suffix, authorities: Vec<String>, root: Root, root_id: String,
+                              valid_until: i64, envelopes: Vec<Vec<u8>> }  // one per authority
 pub struct ReachabilityRecord { did, servers: Vec<(String /*server_did*/, String /*url*/)>,
-                                seq: u64, sig: String }
+                                seq: u64, envelope: Vec<u8> }
+pub trait AliasLink { old_did, new_did, audience_ns_did, audience_alias, verify_signatures }
 
-impl Attestation        { pub fn signed_hash(&self) -> Hash; pub fn verify(&self) -> Result<(), NamingError>; }
-impl RotationStatement  { pub fn signed_hash(&self) -> Hash; pub fn verify(&self) -> Result<(), NamingError>; }
-impl SuffixDelegation   { pub fn signed_hash(&self) -> Hash; pub fn verify(&self) -> Result<(), NamingError>; }
-impl ReachabilityRecord { pub fn signed_hash(&self) -> Hash; pub fn verify(&self) -> Result<(), NamingError>; }
-
-pub fn proof_hash(action: Action, ns_did: &str, alias: &str, challenge: &str) -> Hash; // rule 10
+// Each object: payload() -> deterministic CBOR; sign(..); from_envelope(s)(..); verify().
+pub fn proof_payload(action: Action, ns_did: &str, alias: &str, challenge: &str) -> Vec<u8>;
+pub fn proof_hash(action: Action, ns_did: &str, alias: &str, challenge: &str) -> [u8; 32]; // BLAKE3 of the payload
 pub fn verify_binding(att: &Attestation, deleg: &SuffixDelegation, name: &Name, now: i64)
-    -> Result<(), NamingError>;                                                         // rule 13
-pub fn verify_rotation_chain(pinned: &str, chain: &[RotationStatement], new: &str)
-    -> Result<(), NamingError>;                                                         // rule 18
+    -> Result<(), NamingError>;                                                             // rule 13
+pub fn verify_rotation_chain<L: AliasLink>(alias: &str, ns_did: &str, pinned: &str, chain: &[L],
+    new: &str) -> Result<(), NamingError>;                                                  // rule 18
 ```
 
-Every hash is `jig_core::crypto::hash_labeled_parts` with the labels and order JEP-0004 lists.
-Times, counts and `seq` are decimal ASCII. Authorities are sorted bytewise before hashing.
+Every payload is the text-keyed map JEP-0004 lists, with its `domain`, in deterministic CBOR.
+Times and `seq` are CBOR integers. Authorities are sorted bytewise. Verification re-encodes the
+fields and requires the signed bytes, so an unknown key is refused.
 
 - [ ] **Step 1: Name parsing tests.**
   - The alias is 1–24 characters of `[A-Za-z0-9_-]`, and is lowercased.
@@ -156,7 +174,7 @@ Times, counts and `seq` are decimal ASCII. Authorities are sorted bytewise befor
 - [ ] **Step 2: Signed-bytes tests against fixed vectors.**
   - Use a fixed seed `[7u8; 32]` for the nameserver key and `[9u8; 32]` and `[11u8; 32]` for
     user keys.
-  - Write each vector as JSON: inputs, the hex hash and the base64 signature. Commit the vectors
+  - Write each vector as JSON: the hex payload and the hex `COSE_Sign1`. Commit the vectors
     under `jig-spec/jep/vectors/0004/`. The test loads them with `include_str!`, so a change to
     the encoding fails CI.
 - [ ] **Step 3: Verification tests.** Each must fail for exactly one reason:
@@ -184,10 +202,10 @@ Times, counts and `seq` are decimal ASCII. Authorities are sorted bytewise befor
 - Modify: `repos/jig-nameserver/src/v0_0_2_register.rs`
   - `Attestation` now uses `jig_core::naming::Attestation`.
   - `verify_proof_of_control` takes an `Action` and checks `proof_hash`.
-- Modify: `repos/jig-nameserver/src/v0_0_2_rotate_renew.rs` (action-bound proofs; store the
-  `RotationStatement`)
-- Modify: `repos/jig-nameserver/src/v0_0_2_resolve.rs` (serve `{attestation, rotations: [...],
-  reachability?}`)
+- Modify: `repos/jig-nameserver/src/v0_0_2_rotate_renew.rs` (action-bound renew proofs;
+  rotation waits for lane I's links, I3)
+- Modify: `repos/jig-nameserver/src/v0_0_2_resolve.rs` (serve `{attestation, links: [...],
+  reachability?}`; each object as its `COSE_Sign1` bytes, base64url in JSON)
 - Modify: `repos/jig-nameserver/src/v0_0_2.rs`
   - `take_challenge` runs only after the proof verifies;
   - serve the nameserver's own signed `SuffixDelegation` at `/.well-known/jig-ns-delegation`.

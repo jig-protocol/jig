@@ -83,12 +83,12 @@ fn build_auth(
 /// Kept as a named function rather than inlined so the mapping is one visible
 /// place: a limit added on either side that is not wired here is the same class
 /// of silent divergence this exists to remove.
-fn runtime_config_from(execution: &ExecutionConfig) -> jig_runtime::RuntimeConfig {
+pub(crate) fn runtime_config_from(execution: &ExecutionConfig) -> jig_runtime::RuntimeConfig {
     jig_runtime::RuntimeConfig {
         // Enumerated rather than assigned onto a default, and deliberately: a
         // limit added to `ResourceLimits` should break this build so somebody
         // decides whether operators can set it, instead of it silently taking a
-        // default here. Same reasoning as `BlockRuntime::new`.
+        // default here.
         limits: jig_runtime::config::ResourceLimits {
             fuel_max: execution.fuel_max,
             memory_max_mb: execution.memory_max_mb,
@@ -147,6 +147,12 @@ impl AppState {
         let store = Arc::new(SqliteStore::open(&db_path).context("opening SqliteStore")?);
         let signing_key = load_or_generate_server_key(&config.server.server_did_keyfile)
             .context("loading server signing key")?;
+        // Before anything logs a DID: tags are keyed by this server's seed.
+        if !jig_core::did::set_log_tag_key(&signing_key.to_bytes()) {
+            tracing::warn!(
+                "a different log tag key is already in effect in this process; DID tags keep using it"
+            );
+        }
         let server_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
         // A store written before `ingest` records existed is sequenced once,
         // here: each local channel's chain starts at its channel-create and

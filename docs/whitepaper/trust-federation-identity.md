@@ -680,14 +680,14 @@ a high-sec ruleset group, cross-checked.
 - **Partial.** Servers can require one-time admission proof-of-work of unknown DIDs, off by
   default (D26). They report no reputation changes to nameservers and keep no transparency
   log.
-- **None.** Registration through the alias flow (`/v1/register`, which `jig init` and
-  `jig ns` use) has no proof-of-work and no rate limit. No nameserver endpoint requires
-  proof-of-work.
+- **Partial.** Registration through the alias flow (`/v1/register`, which `jig init` and
+  `jig ns` use), and rotation and renewal, are rate-limited per client IP and per DID by
+  default (`[alias_rate_limits]`). No nameserver endpoint requires proof-of-work.
 - **Removed prototype.** The nameserver binary used to serve an earlier, experimental surface
   beside the alias routes: proof-of-work challenges with penalty-adjusted difficulty,
   reputation observations, tribunal case records, transparency-log reads, policy-hash
   exchange and peer gossip. Its routes were removed in #154; the modules behind them
-  (`pow.rs`, `transparency.rs`, `federation.rs`) are unreachable and slated for removal. It
+  were deleted in #157 and #159, except `federation.rs`, which stays but serves no route. It
   explored the shape of obligation 2 and met none of it: its proof-of-work was per identity,
   its reputation model the superseded tier model, and its log kept by one nameserver with
   nobody cross-checking it. The redesign is lane R's: the framing doc (#152) and the draft
@@ -959,8 +959,10 @@ every member. It can withhold, delay and reorder blocks (OP-06).
   refuses any frame before `hello`. The client closes when the first frame is not a welcome,
   the signature or nonce does not verify, a pinned DID does not match, or the welcome
   contradicts itself or falls outside what the client offered.
-- **Partial.** Version and suite refusals leave the connection open. Later frames are not
-  checked against the welcome. The CLI pins each server's DID and the suites its welcome
+- **Partial.** A version or suite mismatch gets a signed refusal and the server closes
+  (4002). The client checks every later frame against the welcome and closes on a
+  contradiction (4003), keeping the signed frames as evidence it does not yet store (#140).
+  The CLI pins each server's DID and the suites its welcome
   advertised, and each channel's suite from its signed creation block, but a server can
   still answer a device's first look at a channel with one it made up. `reputation` is
   `null`. Each gap is a Partial or Open entry in the register
@@ -1131,8 +1133,9 @@ gap.
   only gate and never on its own evidence that an identity is one person (D23). *Today:*
   servers rate-limit every verified DID and, on their v0.0.2 routes, every remote address by default, and can
   require one-time admission proof-of-work of unknown DIDs, off by default (D26); the
-  nameserver's binding endpoints (register, rotate, renew) have neither proof-of-work nor a
-  rate limit, and the nameserver's legacy proof-of-work routes are removed. *To design:*
+  nameserver's binding endpoints (register, rotate, renew) are rate-limited per client IP and
+  per DID but ask for no proof-of-work, and the nameserver's legacy proof-of-work routes are
+  removed. *To design:*
   reputation-scaled difficulty, per action as well as per identity.
 - **AB-03, relay and bridge quota abuse.** Bridges and relays connect unidentified sources to
   identified users; a botnet emailing a known jig user through a bridge is the canonical
@@ -1257,9 +1260,9 @@ gap.
   claimant's clock. *Obligation:* time-based limits use the verifier's clock, and age is
   measured from the first signed observation by someone other than the subject. *Today:*
   replay windows use the server's clock; there are no time-based reputation limits; the
-  server's hybrid logical clock adopts timestamps from blocks without a skew bound, which it
-  advertises as `naively_unbounded_clock_skew` in `/.well-known/jig`. *To design:* a skew
-  bound, and age as observed by the group.
+  server refuses a block whose timestamp runs more than `[server] max_future_skew_ms` ahead
+  of its clock (default five minutes, signed in the welcome; #149). *To design:* age as
+  observed by the group.
 - **TM-02, self-asserted timestamps.** *Obligation:* a signer's own timestamp is a claim, so
   ordering and age come from others. *Today:* a block's `hlc_ts` is set by its author, inside
   the signed manifest, and the server orders history by it; the only server-signed time is
@@ -1290,11 +1293,11 @@ gap.
 | A peer is a transport; relayed blocks pass every gate | Built: relayed blocks run through `ingest` and the write gate (authors not asked for admission proof-of-work); peers listed and pinned in configuration | Peer DID in the contract; per-peer limits |
 | Pluggable suites, MLS default and first (D1, D13) | Built: MLS per channel; validating delivery service | Non-MLS plug-in shape (D13); per-suite conformance |
 | End-to-end encryption by default | Partial: DMs and restricted channels always encrypted; open channels plaintext unless created `mls` | Encryption on by default |
-| Mandatory signed handshake; clients fail closed and pin | Partial: signed welcome with nonce; CLI pins server DIDs, suites and channel suites; later frames unchecked | Close semantics; pins; real reputation (D11) |
+| Mandatory signed handshake; clients fail closed and pin | Partial: signed welcome with nonce; CLI pins server DIDs, suites and channel suites; later frames checked against the welcome | Close semantics; pins; real reputation (D11) |
 | No backdoors, no scanning, no default escrow | Holds: no backdoor, scanning or escrow exists | Keep it so as reporting is designed |
 | Provable abuse reports from encrypted channels, by participants only (D22) | None: signature exists; no tooling | Delegation or proof mechanism (AB-06) |
 | Tribunals per ruleset group, held by its nameservers; penalties only under an acknowledged ruleset | None | Tribunal process, eligibility (GV-01 to GV-03) |
-| Time-based limits use the verifier's clock | Partial: replay windows only; unbounded skew in the HLC | Skew bound; observed age (TM-01, TM-02) |
+| Time-based limits use the verifier's clock | Partial: replay windows; a future-skew bound on block timestamps (#149) | Observed age (TM-01, TM-02) |
 
 ---
 
@@ -1374,6 +1377,7 @@ Each item names what it must satisfy and the register entries it closes.
 13. **The handshake.** Close semantics and JEP-0002's other open questions. Closes OP-01 to
     OP-03.
 14. **Anchors.** Replacement procedure, and the signed, versioned defaults document.
-15. **The nameserver prototype.** Removed in #154; its unreachable modules follow.
+15. **The nameserver prototype.** Removed in #154; its proof-of-work, claim and transparency
+    modules were deleted in #157 and #159, and `federation.rs` remains.
     The obligations it explored stay, and items 1, 2, 5 and 7 design them afresh.
 16. **Housekeeping.** Confirm the obligations still marked *derived*.

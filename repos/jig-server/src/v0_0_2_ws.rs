@@ -53,11 +53,11 @@ static CONN_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Hand-rolled Prometheus text on purpose: the exposition format is a dozen
 /// lines and a metrics crate would be a new dependency.
 ///
-/// SCOPE — read before trusting a number. Every counter here is bumped from
-/// the WebSocket path in THIS module only. Blocks arriving over federation or
-/// from a bridge are NOT counted; those paths live in other modules and are
-/// not instrumented yet. Counters reset to zero on restart, which is normal
-/// for Prometheus counters.
+/// SCOPE — read before trusting a number. The `jig_ws_*` counters are bumped
+/// from the WebSocket path in THIS module only. `jig_blocks_ingested_total`
+/// comes from [`jig_pipeline::metrics`], which counts every accepted block by
+/// source (local, federation, admin, bridge). Counters reset to zero on
+/// restart, which is normal for Prometheus counters.
 pub mod metrics {
     use std::collections::BTreeMap;
     use std::sync::RwLock;
@@ -144,6 +144,7 @@ pub mod metrics {
             snap.subscribers_active,
             snap.blocks_ingested,
             &snap.channels,
+            &jig_pipeline::metrics::ingested_by_source(),
         )
     }
 
@@ -154,6 +155,7 @@ pub mod metrics {
         subscribers: u64,
         blocks: u64,
         channels: &BTreeMap<String, u64>,
+        by_source: &[(&str, u64)],
     ) -> String {
         let mut out = String::new();
         out.push_str(
@@ -168,7 +170,7 @@ pub mod metrics {
         out.push_str(&format!("jig_ws_subscribers_active {subscribers}\n"));
         out.push_str(
             "# HELP jig_ws_blocks_ingested_total Blocks accepted over WebSocket since start \
-             (excludes federation and bridge ingest).\n\
+             (see jig_blocks_ingested_total for every source).\n\
              # TYPE jig_ws_blocks_ingested_total counter\n",
         );
         out.push_str(&format!("jig_ws_blocks_ingested_total {blocks}\n"));
@@ -181,6 +183,16 @@ pub mod metrics {
             out.push_str(&format!(
                 "jig_ws_channel_messages_total{{channel=\"{}\"}} {count}\n",
                 escape_label(slug)
+            ));
+        }
+        out.push_str(
+            "# HELP jig_blocks_ingested_total Blocks accepted since start, by source: local \
+             (WebSocket and REST clients), federation, admin, bridge.\n\
+             # TYPE jig_blocks_ingested_total counter\n",
+        );
+        for (source, count) in by_source {
+            out.push_str(&format!(
+                "jig_blocks_ingested_total{{source=\"{source}\"}} {count}\n"
             ));
         }
         out
@@ -1505,7 +1517,13 @@ mod tests {
         let mut channels = std::collections::BTreeMap::new();
         channels.insert("#hello".to_string(), 3u64);
         channels.insert("weird\"name".to_string(), 1u64);
-        let text = metrics::render(2, 1, 4, &channels);
+        let text = metrics::render(
+            2,
+            1,
+            4,
+            &channels,
+            &[("local", 5), ("federation", 6), ("bridge", 7)],
+        );
 
         assert!(text.contains("# TYPE jig_ws_connections_active gauge"));
         assert!(text.contains("# TYPE jig_ws_blocks_ingested_total counter"));
@@ -1513,6 +1531,10 @@ mod tests {
         assert!(text.contains("\njig_ws_subscribers_active 1\n"));
         assert!(text.contains("\njig_ws_blocks_ingested_total 4\n"));
         assert!(text.contains("jig_ws_channel_messages_total{channel=\"#hello\"} 3"));
+        assert!(text.contains("# TYPE jig_blocks_ingested_total counter"));
+        assert!(text.contains("\njig_blocks_ingested_total{source=\"local\"} 5\n"));
+        assert!(text.contains("\njig_blocks_ingested_total{source=\"federation\"} 6\n"));
+        assert!(text.contains("\njig_blocks_ingested_total{source=\"bridge\"} 7\n"));
         // An unescaped quote in a label value corrupts the whole exposition.
         assert!(
             text.contains(r#"jig_ws_channel_messages_total{channel="weird\"name"} 1"#),

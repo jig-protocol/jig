@@ -106,7 +106,8 @@ saw for a name and surface any change.
 
 Registering an alias creates a binding, so it MUST carry
 [proof-of-work](#proof-of-work) and be rate-limited like any other binding endpoint.
-**Status:** not yet implemented. This path has neither proof-of-work nor a rate limit. No
+**Status:** *(partial)*. `/v1/register`, `/v1/rotate` and `/v1/renew` are rate-limited per
+client IP and per DID (`[alias_rate_limits]`, see [Rate limiting](#rate-limiting)). No
 nameserver endpoint requires proof-of-work since the legacy claim and alias routes were
 removed.
 
@@ -472,8 +473,13 @@ The client IP is the socket address, or the first entry of `JIG_NS_PROXY_IP_HEAD
 HTTP 429 and adds one penalty point to the key that refused it, so retrying raises the next
 difficulty.
 
-**Status:** not served. These limits applied only to the removed challenge route; the alias
-routes have no rate limit.
+**Status:** not served. These limits applied only to the removed challenge route. The alias
+routes have their own limits instead: `POST /v1/register`, `/v1/rotate` and `/v1/renew` are
+limited per client IP (default 30 per minute; IPv6 per /64) and per DID (default 10 per
+minute, charged only when the request succeeds, which needs that DID's signature), in fixed
+one-minute windows held in memory (`[alias_rate_limits]`). Behind a proxy
+(`[network] trust_proxy`), the client IP is the last entry of `proxy_ip_header`. A refusal is
+HTTP 429 with code `RATE_LIMITED` and a `Retry-After` header, and adds no penalty.
 
 ### Penalties
 
