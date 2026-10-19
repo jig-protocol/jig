@@ -1,111 +1,79 @@
-# jig-nameserver Operator Guide (PoW, Rate Limits, Federation)
+# jig-nameserver Operator Guide
 
-This guide helps operators tune PoW difficulty, rate limits, penalties, and federation behavior for resilient deployments.
+This guide covers what an operator configures on a v0.0.2 nameserver: the routes it serves, the alias rate limits, and running it behind a reverse proxy.
 
-- Incident response (harassment reports, registration and relay abuse, a compromised nameserver, a rogue federated instance): [nameserver abuse runbook](../../docs/operations/nameserver-abuse-runbook.md).
-- Why the parameters work the way they do: [nameserver abuse economics](../../docs/security/nameserver-abuse-economics.md).
 - Normative behaviour: the spec's [Identity and Reputation](../jig-spec/src/identity-and-reputation.md) chapter.
+- Why the parameters work the way they do: [nameserver abuse economics](../../docs/security/nameserver-abuse-economics.md).
+- The [nameserver abuse runbook](../../docs/operations/nameserver-abuse-runbook.md) is historical. It was written for the v0.0.1 surface (proof-of-work challenges, penalties, admin, reputation, tribunal and federation routes), which has been removed.
 
-## Key Concepts
+## Routes
 
-- PoW Difficulty: Hashcash-style blake3 keyed work with leading-zero bits. Expected trials ≈ 2^bits.
-- Rate Limiting: Per-key and per-IP counters in fixed one-minute windows on challenge issuance (`POST /v1/challenge`). A refused request returns HTTP 429 and adds one penalty point to the refusing key.
-- Penalties: Points per key increase effective PoW by `step_bits` per point (at most `max_points` = 64 count), then the automation multiplier applies, then the result is clamped to `[min, max]`. With the defaults one point reaches the maximum. Decay is linear: one point per `decay_secs` of quiet; a new penalty restarts the clock. Points on `ip:` keys are recorded but do not change difficulty.
-- Scope: PoW, rate limits and penalties apply to the legacy `POST /v1/challenge`, `/v1/claim` and `/v1/alias` endpoints. The alias registration path the CLI uses (`GET /v1/challenge`, `POST /v1/register`) has neither; rate-limit it at the reverse proxy.
-- Federation: `_jig-ns._tcp` SRV discovery with allow/deny domain gates and TTL caching.
+`jig-nameserver serve` mounts these routes and nothing else:
 
-## Configuration (Env Vars)
+| Route | Method | Purpose |
+|---|---|---|
+| `/.well-known/jig-ns` | GET | discovery document |
+| `/.well-known/jig-ns/capabilities` | GET | capabilities (plain text) |
+| `/v1/health` | GET | liveness |
+| `/v1/challenge` | GET | one-time challenge for register and renew |
+| `/v1/register` | POST | bind an alias to a DID |
+| `/v1/resolve/{alias}` | GET | look up an alias |
+| `/v1/rotate` | POST | move an alias to a new key |
+| `/v1/renew` | POST | renew an alias |
+| `/v1/handles` | GET | list every alias; **debug-gated** behind `[v0_0_2.debug] list_handles` |
 
-- `JIG_NS_POW_DIFFICULTY` (u16, default 18): Base PoW difficulty.
-- `JIG_NS_POW_MIN` / `JIG_NS_POW_MAX` (u16): Clamp effective PoW.
-- `JIG_NS_PENALTY_STEP_BITS` (u16, default 2): Bits added per penalty point.
-- `[penalties] max_points` (TOML only, default 64): Most penalty points that count towards difficulty.
-- `JIG_NS_PENALTY_DECAY` (secs, default 300): One penalty point decays per interval.
-- `JIG_NS_AUTOMATION_ENABLED` (bool, default true), `JIG_NS_AUTOMATION_ALPHA` (default 1.4), `JIG_NS_AUTOMATION_PILE_ON` (default 0.5), `JIG_NS_AUTOMATION_MAX` (default 8.0): Penalty amplifier `1 + points^alpha × pile_on`, capped at max. Disable it, or lower `PILE_ON`, for a graded response instead of jumping to the maximum.
-- `JIG_NS_RATE_PER_MIN` (u32, default 60): Per-key challenges per minute.
-- `JIG_NS_RATE_PER_IP_PER_MIN` (u32, default 120): Per-IP challenges per minute.
-- `JIG_NS_ANON_ENABLED` (bool, default true): Apply the anonymous floor to alias challenges without a subject. Setting it to false removes the floor; it does not stop anonymous aliases being minted (block `POST /v1/alias` at the proxy for that).
-- `JIG_NS_ANON_MIN_POW` (u16, default 12): Floor for anonymous alias challenges. It has no effect unless it is above the base difficulty.
-- `JIG_NS_ALLOW_DOMAINS` / `JIG_NS_DENY_DOMAINS` (CSV lowercased): Federation gates.
-- `JIG_NS_CACHE_TTL` (secs, default 300): Federated identity cache TTL. Cached entries are served before the allow/deny check.
-- `JIG_NS_ADMIN_TOKEN`: When set, admin endpoints require the `x-admin-token` header. When unset, they are open.
-- `JIG_NS_TRUST_PROXY` (bool) and `JIG_NS_PROXY_IP_HEADER` (default `x-forwarded-for`): Take the client IP from the proxy header instead of the socket.
+`register` and `renew` need a signature by the DID's key over the challenge; `rotate` needs signatures by both the old and the new key. `/v1/handles` enumerates every registered alias, so leave it off unless you need it. None of the routes asks for proof-of-work, and none needs a server secret.
 
-Settings are read at start-up; restart the service after changing them. Penalties and rate windows are stored in the database and survive restarts.
+A future feature that needs a symmetric server secret will add a purpose-named, optional key; none is needed today.
 
-## Recommended Defaults
+## Configuration
 
-- Open instances: `JIG_NS_POW_DIFFICULTY=18`, `JIG_NS_ANON_MIN_POW=24`, `JIG_NS_RATE_PER_MIN=60`, `JIG_NS_RATE_PER_IP_PER_MIN=120`, `JIG_NS_PENALTY_STEP_BITS=2`, `JIG_NS_PENALTY_DECAY=600`.
-- Closed/enterprise: Block `POST /v1/alias` at the proxy if you do not want anonymous aliases, or raise `JIG_NS_ANON_MIN_POW` to 26–28 (keep `JIG_NS_POW_MAX` at or above it).
+Settings come from the config file (`JIG_NS_CONFIG`, or the default path), then environment variables override them. Settings are read at start-up; restart the service after changing them.
 
-## Introspection and Admin Endpoints
+- `[v0_0_2.nameserver] alias_suffix` (default `gigue.jig`): the suffix aliases are registered under.
+- `[v0_0_2.server] server_did_keyfile`: the nameserver's signing key. Created on first start if missing. Back it up; a new key is a new nameserver identity.
+- `[v0_0_2.debug] list_handles` (default `false`): mounts `/v1/handles`.
+- `[storage] database_path` / `JIG_NS_DB_PATH`: the alias database.
+- `[network] bind` / `JIG_NS_BIND` and `[network] port` / `JIG_NS_PORT`: listen address.
+- `[network] trust_proxy` / `JIG_NS_TRUST_PROXY` and `[network] proxy_ip_header` / `JIG_NS_PROXY_IP_HEADER`: see [Behind a reverse proxy](#behind-a-reverse-proxy).
 
-Admin endpoints require `x-admin-token` only when `JIG_NS_ADMIN_TOKEN` is set. Other write endpoints (`/v1/reputation/observe`, `/v1/tribunal/cases*`, `/v1/receipts/submit`, `/v1/attestations/submit`, `/v1/federation/gossip`, `/v1/register`) have no auth: restrict them with network policy or reverse-proxy ACLs.
+Older configs that still set `[pow]`, or environments that still export `JIG_NS_SECRET` or `JIG_NS_POW_*`, keep starting: those settings are ignored. Remove them at your next change.
 
-- Policy snapshot: `GET /v1/policy`
-- Well-known (discovery): `GET /.well-known/jig-ns`
-- Capabilities (plain text): `GET /.well-known/jig-ns/capabilities`
-- Penalty points: `GET /v1/admin/penalties?key=<k>`
-- Reset penalty: `POST /v1/admin/penalties` with `{ "key": "<k>" }`
-- Rate info: `GET /v1/admin/rate?key=<k>`
-- Reset rate: `POST /v1/admin/rate` with `{ "key": "<k>" }`
+## Rate limits
 
-Keys:
-- Claim subject: `claim:subject:<handle>`
-- Alias scope+subject: `alias:scope:<scope>:subject:<subject-or-empty>`
-- IP bucket: `ip:<ip-address>`
+The nameserver limits `POST /v1/register`, `/v1/rotate` and `/v1/renew`:
 
-## Operations Playbook
-
-Quick reference. Step-by-step incident runbooks are in [nameserver abuse runbook](../../docs/operations/nameserver-abuse-runbook.md).
-
-- Spike in abuse (global):
-  - Temporarily raise `JIG_NS_POW_DIFFICULTY` and lower `JIG_NS_RATE_PER_IP_PER_MIN`.
-  - Add denylist for offending domains, then gradually remove.
-- Targeted scope abuse:
-  - Inspect `alias:scope:<scope>:subject:<subject>` penalty/rate; reset, or raise `JIG_NS_ANON_MIN_POW` above the base.
-  - To stop anonymous aliasing temporarily, block `POST /v1/alias` at the proxy.
-- Chronic subject abuse:
-  - Clear penalties upon remediation; keep rate low until behavior stabilizes.
-- Federation latency/cache:
-  - Increase `JIG_NS_CACHE_TTL` during high latency periods; maintain allowlist for trusted peers.
-
-## Test Snippets
-
-Issue challenge (claim):
-
-```bash
-curl -s http://127.0.0.1:7070/v1/challenge \
-  -H 'content-type: application/json' \
-  -d '{"action":"claim","subject":"alice@example.com"}' | jq .
+```toml
+[alias_rate_limits]
+enabled = true
+per_ip_per_min = 30   # requests per client IP, across the three routes
+per_did_per_min = 10  # successful requests naming a DID
 ```
 
-Check penalty:
+- **Per client IP.** Every admitted request is counted against its client IP before the handler runs. IPv6 clients are counted per /64, so one host cannot rotate through its own addresses to escape the limit.
+- **Per DID.** A request naming a DID (`did`, `old_did` or `new_did`) is refused if that DID's bucket is full, but it is counted only when it succeeds. Each successful request needs that DID's signature, so only the key holder can use up a DID's limit. A forged request naming someone else's DID costs the sender's IP bucket and leaves the victim's untouched.
+- A refused request is not counted. It gets HTTP 429 with code `RATE_LIMITED` and a `Retry-After` header.
+- Windows are fixed, one minute long and held in memory. They reset when the nameserver restarts and are not shared between processes.
+- A limit of `0` refuses every request on that bucket. `enabled = false` turns both limits off.
+- `GET /.well-known/jig-ns` publishes these three values under `policy.alias_rate_limits`.
 
-```bash
-curl -s 'http://127.0.0.1:7070/v1/admin/penalties?key=claim:subject:alice@example.com' | jq .
+## Behind a reverse proxy
+
+Without `trust_proxy`, the nameserver takes the client IP from the socket, so every client behind a proxy shares the proxy's address and its rate limit.
+
+If the nameserver runs behind a reverse proxy, set:
+
+```toml
+[network]
+trust_proxy = true
+proxy_ip_header = "x-forwarded-for"   # the default
 ```
 
-Reset penalty:
+The nameserver uses the **last** address in that header, the one your proxy appended. Earlier entries are whatever the client sent and are ignored. With one proxy in front this is the client's address; behind several, the limit applies to the nearest proxy. Only set `trust_proxy` when the nameserver is reachable through the proxy alone, since anyone who can connect directly can otherwise choose the address they are counted under.
 
-```bash
-curl -sX POST http://127.0.0.1:7070/v1/admin/penalties \
-  -H 'content-type: application/json' \
-  -d '{"key":"claim:subject:alice@example.com"}'
-```
+## Security notes
 
-## Security Notes
-
-- Protect admin endpoints behind an authenticated reverse proxy.
-- Rotate `JIG_NS_SECRET` periodically. There is no overlap window: rotation invalidates every outstanding challenge, so rotate at a quiet time.
+- Back up `server_did_keyfile` and keep it readable by the service user only.
+- Keep `[v0_0_2.debug] list_handles` off on any nameserver reachable by people you do not trust.
+- `[federation] enabled` (off by default) still starts an outbound gossip loop, but no peer can reach this nameserver's federation routes because they were removed. Leave it off.
 - Keep instance logs minimal; avoid storing sensitive metadata.
-
-## Federation SRV
-
-Configure DNS SRV for nameserver discovery:
-
-```
-_jig-ns._tcp.example.com.  3600 IN SRV 10 5 7070 ns1.example.com.
-ns1.example.com.          3600 IN A   203.0.113.10
-```
-

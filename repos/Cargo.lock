@@ -3701,7 +3701,6 @@ dependencies = [
  "dirs 7.0.0",
  "ed25519-dalek 3.0.0",
  "jig-client",
- "jig-config",
  "jig-core",
  "jig-mls",
  "jig-runtime",
@@ -3754,8 +3753,6 @@ dependencies = [
 name = "jig-config"
 version = "0.0.1"
 dependencies = [
- "anyhow",
- "chrono",
  "dirs 7.0.0",
  "serde",
  "serde_json",

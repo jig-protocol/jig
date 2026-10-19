@@ -13,8 +13,8 @@
 >   rotation also still applies.
 > - Section 4: steps 5 and 6.
 >
-> A new runbook follows lane R's redesign (framing doc #152; draft JEP-0008, JEP-0009 and
-> JEP-0010 in #162, #163 and #166).
+> A new runbook follows lane R's redesign: the [framing doc](../superpowers/specs/2026-10-18-reputation-pow-tribunals-framing.md) and the draft
+> [JEP-0008](../../repos/jig-spec/jep/jep-0008-proof-of-work.md), [JEP-0009](../../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) and [JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md).
 
 What a `jig-nameserver` operator does about harassment reports, registration and relay
 abuse, a compromised nameserver, and a rogue federated instance. Parameters and endpoints
