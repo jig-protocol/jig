@@ -16,7 +16,6 @@ use tower::ServiceExt; // oneshot
 use crate::config::ServerConfig;
 use crate::error::{Result, ServerError};
 use crate::handler::{self, AppState};
-use crate::runtime::BlockRuntime;
 
 /// The TLS session's exporter value for the jig handshake (JEP-0002 rule 2,
 /// RFC 9266). [`serve_tls`] puts it in every request it serves, so the
@@ -47,7 +46,10 @@ pub struct JigServer {
 /// the `[execution]` limits make a valid runtime. Kept so that removing those
 /// routes does not also change which configs boot.
 fn boot_checks(config: &ServerConfig) -> Result<()> {
-    BlockRuntime::new(config.execution_config())?;
+    jig_runtime::Runtime::with_config(crate::v0_0_2::runtime_config_from(
+        &config.execution_config(),
+    ))
+    .map_err(|e| ServerError::Runtime(format!("failed to create jig-runtime: {e}")))?;
     Ok(())
 }
 
