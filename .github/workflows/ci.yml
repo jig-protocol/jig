@@ -34,11 +34,6 @@ defaults:
   run:
     working-directory: repos
 
-# jig-nameserver's config tests require this env var to construct.
-# Test value is fine; CI doesn't talk to a real nameserver.
-env:
-  JIG_NS_SECRET: ci_dummy_jig_ns_secret_not_a_real_value
-
 jobs:
   # Pull requests only: does this PR change anything a build could see? Docs
   # (`*.md` anywhere, `docs/**`) and repo metadata do not; everything else does,
@@ -104,12 +99,13 @@ jobs:
           workspaces: repos
       - name: Test-only suites stay out of every build
         # `test-aead` (jig-core `test-suite`) and long-lived MLS leaves
-        # (jig-mls `conformance`) exist for the conformance vectors only.
+        # (jig-mls `conformance`) exist for the conformance vectors only, and
+        # jig-core `test-default-authority` trusts a public test seed for `@jig`.
         # Dev-dependencies may enable them; no crate's normal or build graph
         # may, or a release binary would register a test suite (JEP-0001).
         run: |
           if cargo tree --workspace -e normal,build,features \
-              | grep -E 'jig-core feature "test-suite"|jig-mls feature "conformance"'; then
+              | grep -E 'jig-core feature "(test-suite|test-default-authority)"|jig-mls feature "conformance"'; then
             echo "::error::a normal dependency enables a test-only feature"
             exit 1
           fi

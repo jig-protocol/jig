@@ -155,8 +155,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Start the HTTP server, or exit(1) with an operator-legible reason.
 ///
-/// Startup failures (missing `[pow].server_secret`, a port already in use, an
-/// unreadable DB) used to surface as a panic — which reaches stderr through the
+/// Startup failures (an invalid config, a port already in use, an unreadable
+/// DB) used to surface as a panic — which reaches stderr through the
 /// default panic hook only, so a systemd unit capturing stdout logged nothing
 /// but an exit code. Log through BOTH `tracing` and stderr, then exit non-zero.
 async fn serve(bind: Option<String>, port: Option<u16>) {

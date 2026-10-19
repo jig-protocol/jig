@@ -52,3 +52,8 @@ keystore = ["ed25519", "chacha20poly1305", "argon2", "zeroize"]
 # must refuse every `test-` suite as unregistered. CI checks that no binary's
 # normal dependency graph turns it on.
 test-suite = ["chacha20poly1305"]
+# Accepts `naming::PLACEHOLDER_JIG_AUTHORITY`, the DID of a public test seed,
+# as the `@jig` authority. Enable it only from `[dev-dependencies]`: with it, a
+# build trusts attestations anyone can forge. CI checks that no binary's
+# normal dependency graph turns it on.
+test-default-authority = []

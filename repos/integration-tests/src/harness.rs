@@ -531,7 +531,6 @@ impl TestNameserver {
         // none of them mounted while these tests stayed green.
         let mut ns_config = jig_nameserver::config::NameServerConfig::default();
         ns_config.storage.database_path = tempdir.path().join("nameserver.db");
-        ns_config.pow.server_secret = "harness-test-secret".to_string();
         ns_config.federation.enabled = false;
         ns_config.v0_0_2 = config;
 
@@ -847,6 +846,7 @@ async fn spawn_one_peer_loop(state: Arc<jig_server::v0_0_2::AppState>, peer: Fed
                                 .encode(&receipt.receipt_bytes),
                         }],
                         delivery_cid: format!("delivery:{}", block.cid),
+                        ingest: None,
                     });
                     let json = serde_json::to_string(&frame).unwrap();
                     if sink.send(Message::Text(json.into())).await.is_err() {
