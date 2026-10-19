@@ -359,9 +359,11 @@ impl Session {
             .unwrap_or_default();
 
         match kind {
-            BlockKind::ChannelCreate | BlockKind::ChannelPromote | BlockKind::ChannelArchive => {
-                Ok(Seen::Control)
-            }
+            BlockKind::ChannelCreate
+            | BlockKind::ChannelPromote
+            | BlockKind::ChannelArchive
+            | BlockKind::RoleAssign
+            | BlockKind::RoleUnassign => Ok(Seen::Control),
             BlockKind::MemberAdd => {
                 let Some(commit) = commit else {
                     return Ok(Seen::Control);

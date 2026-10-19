@@ -303,6 +303,15 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         ref e @ IngestError::NotChannelMember { .. } => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },
+        // Channel terms and roles: the same signed block is refused again on
+        // retry, so the bridge bounces it.
+        ref e @ (IngestError::NotSequencer { .. }
+        | IngestError::InvalidTerms { .. }
+        | IngestError::MissingRight { .. }
+        | IngestError::RootOwnerRole { .. }
+        | IngestError::UnknownRole { .. }) => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
         // Retrying sends the same bytes, which is what was refused.
         ref e @ IngestError::DuplicateBlock { .. } => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
@@ -633,6 +642,8 @@ mod tests {
                 created_at: 0,
                 owner_did: shadow_did.clone(),
                 suite: "none".to_string(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })
             .unwrap();
         store

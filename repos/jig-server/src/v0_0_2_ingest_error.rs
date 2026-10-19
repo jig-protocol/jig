@@ -114,6 +114,22 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         IngestError::OwnerCannotLeave { .. } => {
             (StatusCode::CONFLICT, "OWNER_CANNOT_LEAVE", e.to_string())
         }
+        // 403: this server creates only the channels it sequences (JEP-0005
+        // rule 5). Policy, not a malformed request: the same block is fine
+        // on the server it names.
+        IngestError::NotSequencer { .. } => (StatusCode::FORBIDDEN, "NOT_SEQUENCER", e.to_string()),
+        IngestError::InvalidTerms { .. } => {
+            (StatusCode::BAD_REQUEST, "INVALID_TERMS", e.to_string())
+        }
+        // 403: the signer lacks a right as of the block's position in the
+        // channel's chain (JEP-0005 rule 7b).
+        IngestError::MissingRight { .. } => (StatusCode::FORBIDDEN, "MISSING_RIGHT", e.to_string()),
+        // 409: well-formed, but a root owner's role is fixed by the
+        // channel's terms.
+        IngestError::RootOwnerRole { .. } => {
+            (StatusCode::CONFLICT, "ROOT_OWNER_ROLE", e.to_string())
+        }
+        IngestError::UnknownRole { .. } => (StatusCode::BAD_REQUEST, "UNKNOWN_ROLE", e.to_string()),
         // Same code as the envelope and manifest gates: a suite nobody speaks.
         IngestError::UnknownSuite { .. } => {
             (StatusCode::BAD_REQUEST, "UNSUPPORTED_SUITE", e.to_string())
@@ -243,6 +259,27 @@ mod tests {
                 ahead_ms: 600_000,
                 bound_ms: 300_000,
                 server_ms: 1,
+            },
+            IngestError::NotSequencer {
+                sequencer: "did:jig:zElsewhere".to_string(),
+                server: "did:jig:zHere".to_string(),
+            },
+            IngestError::InvalidTerms {
+                field: "co_owners".to_string(),
+                detail: "not an array".to_string(),
+            },
+            IngestError::MissingRight {
+                kind: "role-assign".to_string(),
+                slug: "#room".to_string(),
+                sender: "did:jig:zAdmin".to_string(),
+                right: "owner".to_string(),
+            },
+            IngestError::RootOwnerRole {
+                slug: "#room".to_string(),
+                member: "did:jig:zOwner".to_string(),
+            },
+            IngestError::UnknownRole {
+                role: "owner".to_string(),
             },
         ]
     }
