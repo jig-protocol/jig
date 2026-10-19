@@ -55,6 +55,13 @@ url = "2"
 cid.workspace = true
 semver = "1.0"
 
+# `jig block build` and `lint`: wrap a core module as a component in-process (the version
+# wasmtime 49 already uses), and read core modules to explain determinism violations.
+wit-component = "0.258"
+wasmparser = "0.261"
+rustc-demangle = "0.1"
+blake3.workspace = true
+
 # Utils
 dirs = "7.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -71,5 +78,6 @@ crossterm = "0.29"
 # Lets tests resolve `@jig` under the placeholder authority; never in a build.
 jig-core = { path = "../jig-core", features = ["test-default-authority"] }
 tempfile = "3.8"
+wat = "1.0"
 time = { version = "0.3", features = ["serde"] }
 ed25519-dalek = { workspace = true }
