@@ -397,6 +397,15 @@ impl NameResolver {
             suffix: suffix.clone(),
             reason,
         };
+        // A single-label suffix (`jig`) has no `dns` root (JEP-0004 rule 4):
+        // `https://jig/` is resolved through the local DNS search domains, to
+        // whatever host the local network calls `jig`, under a certificate a
+        // local CA may issue. Such a suffix is `config` or `contract` only.
+        if !suffix.contains('.') {
+            return Err(no("a single-label suffix has no dns root; it needs a \
+                 config delegation"
+                .into()));
+        }
         let url = format!("https://{suffix}/.well-known/jig-ns-delegation");
         let body = match fetch(&self.discovery, &url).await {
             Ok(Some(body)) => body,
@@ -1164,6 +1173,60 @@ mod tests {
             "{got:?}"
         );
         assert_eq!(tls.hits(), 0, "dns is not consulted");
+    }
+
+    #[tokio::test]
+    async fn a_single_label_suffix_is_never_discovered_through_dns() {
+        let (roots, cert, cert_key) = ca_issued();
+        let stub = Stub::start(Some((cert, cert_key))).await;
+        // Even a host the resolver would reach as `jig`, under a CA it trusts.
+        let addr = stub.addr;
+        let mut r = NameResolver::with_roots(roots, move |b| b.no_proxy().resolve("jig", addr));
+        r.now = Arc::new(|| NOW);
+        let err = r
+            .resolve(
+                "dj@jig",
+                &Delegations::default(),
+                &MemPins::default(),
+                &MemEvidence::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ResolveError::NoDelegation { ref suffix, .. } if suffix == "jig"),
+            "{err:?}"
+        );
+        assert_eq!(stub.hits(), 0);
+
+        // With a config delegation, the same suffix resolves.
+        let (ns, alice) = (key(1), did_of(&key(9)));
+        let plain = Stub::start(None).await;
+        plain.route(
+            "/v1/resolve/dj@jig",
+            resolve_body(&attest(&ns, &alice, "dj@jig"), &[], None),
+        );
+        let delegations = Delegations {
+            config: BTreeMap::from([(
+                "jig".to_string(),
+                ConfigDelegation {
+                    authorities: vec![did_of(&ns)],
+                    nameservers: vec![plain.url()],
+                },
+            )]),
+        };
+        let got = r
+            .resolve(
+                "dj@jig",
+                &delegations,
+                &MemPins::default(),
+                &MemEvidence::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(got, Verified::New(ref b) if b.did() == alice),
+            "{got:?}"
+        );
     }
 
     #[tokio::test]
