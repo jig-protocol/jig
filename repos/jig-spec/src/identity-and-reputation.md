@@ -90,7 +90,7 @@ key is the DID. No authority issues or revokes one.
 
 ### Aliases
 
-A nameserver attests aliases under the suffix it is authoritative for (`alias_suffix`).
+A nameserver attests aliases under the suffixes it is authoritative for (`alias_suffixes`).
 
 1. `GET /v1/challenge` returns a 32-byte hex nonce.
 2. The client signs the nonce with its DID key and sends `POST /v1/register` with `did`,
@@ -107,8 +107,20 @@ over the challenge from both keys. The attestation is a COSE_Sign1 envelope over
 `alias`, `ns_did`, `valid_from` and `valid_until`, with no `profile_ttl_seconds`. Register,
 renew, rotate and resolve return it base64url-encoded as `attestation`, beside `links` and
 `reachability`, plus unsigned `did`, `alias` and `valid_until` hints for older clients.
-`GET /.well-known/jig-ns-delegation` serves the nameserver's signed delegation for its suffix
-as `{"envelopes": [...]}`.
+`GET /.well-known/jig-ns-delegation` serves the nameserver's signed delegation for a
+DNS-rooted suffix (`?suffix=`, else the request's `Host`) as `{"envelopes": [...]}`; a
+single-label suffix has none.
+
+One nameserver serves several suffixes (#224). `[[v0_0_2.nameserver.alias_suffixes]]` is
+required, with no default, and each suffix sets its own policy: `registration` (`open` or
+`closed`; a closed suffix still resolves, renews and rotates), `min_alias_len`, reserved names,
+and `registration_allow`, which lets one DID register exact names past that policy. A
+single-label suffix needs `single_label_authority = true`. Register takes an optional `suffix`
+(required when more than one is served: `SUFFIX_REQUIRED`; unserved: `UNKNOWN_SUFFIX`), and a
+DID holds at most one name per suffix: a second registration, or a rotation onto a DID that
+already holds one, is refused with 409 `DID_HOLDS_NAME`. Policy refusals are
+`REGISTRATION_CLOSED`, `ALIAS_TOO_SHORT` and `ALIAS_RESERVED`. `GET /v1/suffixes` lists the
+suffixes served, their registration mode and the nameserver's DID, unsigned.
 
 `POST /v1/renew` extends an attestation. `POST /v1/rotate` moves an alias from one DID to
 another and requires signatures from both keys, so the nameserver can link the two DIDs.
@@ -392,7 +404,7 @@ Rules:
 ## Nameserver mechanics
 
 > **Mostly not served.** The reference nameserver serves `/.well-known/jig-ns`,
-> `/.well-known/jig-ns/capabilities`, `/.well-known/jig-ns-delegation`, `/v1/health` and the alias routes
+> `/.well-known/jig-ns/capabilities`, `/.well-known/jig-ns-delegation`, `/v1/health`, `/v1/suffixes` and the alias routes
 > (`GET /v1/challenge`, `/v1/register`, `/v1/resolve/{alias}`, `/v1/rotate`, `/v1/renew`,
 > and `/v1/handles` behind `[debug] list_handles`). The proof-of-work challenge flow,
 > penalties, rate limiting, `/v1/policy`, `/v1/resolve?name=`, the transparency and admin
@@ -412,7 +424,8 @@ Rules:
 | `/v1/challenge` | GET | Alias registration nonce ([Aliases](#aliases)) |
 | `/v1/register`, `/v1/renew`, `/v1/rotate` | POST | Alias attestations |
 | `/v1/resolve/{alias}` | GET | Alias attestation lookup |
-| `/.well-known/jig-ns-delegation` | GET | Signed delegation for the nameserver's suffix |
+| `/.well-known/jig-ns-delegation` | GET | Signed delegation for a DNS-rooted suffix |
+| `/v1/suffixes` | GET | Suffixes served, their registration mode, and the nameserver's DID |
 | `/v1/challenge` | POST | Proof-of-work challenge for `claim` or `alias` *(not served)* |
 | `/v1/claim` | POST | Bind a handle to a key, with proof-of-work *(not served)* |
 | `/v1/alias` | POST | Mint a scoped or anonymous alias, with proof-of-work *(not served)* |
