@@ -685,7 +685,28 @@ mod tests {
             origin_server: "ws://test".into(),
             federated_from: None,
         };
-        state.ingest_ctx.store.insert_block(&msg).unwrap();
+        // Sequenced as ingest would: every block of a channel this server holds
+        // has its record, and history is read through the chain.
+        let channel_id = state
+            .ingest_ctx
+            .store
+            .get_channel_by_slug("#scratch")
+            .unwrap()
+            .expect("the channel exists")
+            .id;
+        state
+            .ingest_ctx
+            .store
+            .insert_block_sequenced(
+                &msg,
+                &jig_pipeline::ingest_record::RecordSigner {
+                    channel_id,
+                    key: &state.ingest_ctx.server_key,
+                    ingest_wall_ms: 1,
+                    ingest_logical: 0,
+                },
+            )
+            .unwrap();
 
         let block = build_channel_archive(&owner, "#scratch", test_hlc(&owner));
         let (status, _) =

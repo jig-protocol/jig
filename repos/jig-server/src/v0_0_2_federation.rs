@@ -512,6 +512,7 @@ async fn forward_outbound(
                 .encode(&receipt.receipt_bytes),
         }],
         delivery_cid: format!("delivery:{}", block.cid),
+        ingest: None,
     });
     let json = serde_json::to_string(&frame)?;
     sink.send(Message::Text(json.into())).await?;

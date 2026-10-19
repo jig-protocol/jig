@@ -387,6 +387,19 @@ pub struct TimelineBlock {
     pub sig_b64: Option<String>,
     pub receipts: Vec<ReceiptRef>,
     pub delivery_cid: String,
+    /// The block's record in its channel's chain (JEP-0002 rule 9), when this
+    /// server sequences the channel. History is checkable on any transport.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingest: Option<jig_pipeline::ingest_record::IngestRecord>,
+}
+
+/// Query string for [`get_channel_records`].
+#[derive(Debug, Deserialize)]
+pub struct RecordsQuery {
+    /// The first `seq` wanted; omitted means the start of the chain.
+    pub from: Option<u64>,
+    /// At most this many; the store clamps to `MAX_HISTORY_LIMIT`.
+    pub limit: Option<usize>,
 }
 
 pub(crate) fn persist_err(e: impl std::fmt::Display) -> (StatusCode, Json<ErrorBody>) {
@@ -589,9 +602,38 @@ pub async fn get_channel_history(
             // that dedupes on delivery_cid sees replay and live delivery of
             // the same block as one identity.
             delivery_cid: format!("delivery:{}", block.cid),
+            ingest: store.get_ingest_record(&block.cid).map_err(persist_err)?,
         });
     }
     Ok(Json(timeline))
+}
+
+/// A channel's `ingest` records alone, in `seq` order: what a client needs to
+/// check its chain from `seq` 0, or across a gap, without fetching blocks it
+/// may not even be allowed to read. Gated like history: a record carries no
+/// content, but who posted when is still the channel's to disclose.
+pub async fn get_channel_records(
+    State(state): State<Arc<AppState>>,
+    Path(slug): Path<String>,
+    Query(query): Query<RecordsQuery>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Vec<jig_pipeline::ingest_record::IngestRecord>>, (StatusCode, Json<ErrorBody>)> {
+    let started = std::time::Instant::now();
+    let caller_did = admit_caller(&state, &headers, "GET", uri.path(), started)?;
+    if let Some(caller) = caller_did.as_ref() {
+        authorize_channel_read(&state, &slug, caller, started)?;
+    }
+    let records = state
+        .ingest_ctx
+        .store
+        .list_ingest_records(
+            &slug,
+            query.from.unwrap_or(0),
+            query.limit.unwrap_or(MAX_HISTORY_LIMIT),
+        )
+        .map_err(persist_err)?;
+    Ok(Json(records))
 }
 
 /// Construct the REST sub-router. Merged into the v0.0.2 router by
@@ -603,6 +645,7 @@ pub fn build_blocks_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/blocks/{cid}", get(get_block_by_cid))
         .route("/api/v1/channels", get(list_channels))
         .route("/api/v1/channels/{slug}/blocks", get(get_channel_history))
+        .route("/api/v1/channels/{slug}/records", get(get_channel_records))
         .route("/api/v1/channels/{slug}/members", get(list_members))
         .with_state(state)
 }
@@ -1013,6 +1056,38 @@ mod tests {
         assert_eq!(text_of(&history[0].bundle_b64), "one");
         assert_eq!(text_of(&history[1].bundle_b64), "two");
         assert!(!history[0].delivery_cid.is_empty());
+    }
+
+    /// History carries each block's signed record, and the records endpoint
+    /// serves the same chain alone, from any `seq`.
+    #[tokio::test]
+    async fn channel_history_and_records_carry_the_signed_chain() {
+        use jig_pipeline::ingest_record::IngestRecord;
+        let state = Arc::new(unauthenticated_state());
+        let router = build_blocks_router(state.clone());
+        let id = test_identity();
+        submit_texts(&state, &router, &id, "#hello", &["one", "two", "three"]).await;
+
+        let (status, body) = get_path(router.clone(), "/api/v1/channels/%23hello/blocks").await;
+        assert_eq!(status, StatusCode::OK);
+        let records: Vec<IngestRecord> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_value(b["ingest"].clone()).expect("every block has one"))
+            .collect();
+        let server = state.server_did.to_did_jig_string();
+        assert_eq!(records.iter().map(|r| r.seq).collect::<Vec<_>>(), [0, 1, 2]);
+        for pair in records.windows(2) {
+            pair[1].verify(&server).unwrap();
+            assert!(pair[1].follows(&pair[0]));
+        }
+
+        let (status, body) =
+            get_path(router, "/api/v1/channels/%23hello/records?from=1&limit=5").await;
+        assert_eq!(status, StatusCode::OK);
+        let alone: Vec<IngestRecord> = serde_json::from_value(body).unwrap();
+        assert_eq!(alone, records[1..].to_vec());
     }
 
     #[tokio::test]

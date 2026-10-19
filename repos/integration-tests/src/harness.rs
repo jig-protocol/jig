@@ -567,17 +567,17 @@ impl TestNameserver {
     /// Register `alias_local@<suffix>` with a fresh identity. Returns the
     /// identity so the caller can sign blocks with it.
     pub async fn register(&self, alias_local: &str) -> Result<Identity> {
-        let identity = test_identity();
-        self.register_with_identity(alias_local, &identity).await?;
-        Ok(identity)
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        self.register_with_key(alias_local, &key).await?;
+        Ok(Identity::from_signing_key(key))
     }
 
-    /// Register an alias with an existing identity (used in H6 tests
-    /// where the same identity is shared between NS and a jig-server).
-    pub async fn register_with_identity(
+    /// Register an alias for `key`'s DID with an action-bound proof of
+    /// control (JEP-0004 rule 10).
+    pub async fn register_with_key(
         &self,
         alias_local: &str,
-        identity: &Identity,
+        key: &ed25519_dalek::SigningKey,
     ) -> Result<serde_json::Value> {
         let client = reqwest::Client::new();
         // 1. Get challenge
@@ -592,14 +592,22 @@ impl TestNameserver {
             .ok_or_else(|| anyhow::anyhow!("challenge missing"))?
             .to_string();
 
-        // 2. Sign challenge
-        let sig = identity.sign(challenge.as_bytes());
+        // 2. Prove control for this action, alias and nameserver
+        let alias = format!("{alias_local}@{}", self.alias_suffix).to_ascii_lowercase();
+        let proof = jig_core::naming::sign_proof(
+            key,
+            jig_core::naming::Action::Register,
+            &self.state.ns_did_string(),
+            &alias,
+            &challenge,
+        );
 
         // 3. Register
         let body = serde_json::json!({
-            "did": identity.did_string(),
+            "did": jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes())
+                .to_did_jig_string(),
             "requested_alias": alias_local,
-            "proof_of_control": base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()),
+            "proof_of_control": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(proof),
             "challenge": challenge,
         });
         let resp = client
@@ -839,6 +847,7 @@ async fn spawn_one_peer_loop(state: Arc<jig_server::v0_0_2::AppState>, peer: Fed
                                 .encode(&receipt.receipt_bytes),
                         }],
                         delivery_cid: format!("delivery:{}", block.cid),
+                        ingest: None,
                     });
                     let json = serde_json::to_string(&frame).unwrap();
                     if sink.send(Message::Text(json.into())).await.is_err() {
