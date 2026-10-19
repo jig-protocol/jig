@@ -391,7 +391,7 @@ mod tests {
         let did = Did::from_ed25519_pubkey(&[42u8; 32]).to_did_jig_string();
         let body = &did["did:jig:z".len()..];
         let shouted = format!("did:jig:z{}", body.to_uppercase());
-        let mixed = format!("did:jig:z{}{}", &body[..1].to_uppercase(), &body[1..]);
+        let mixed = format!("did:jig:z{}{}", body[..1].to_uppercase(), &body[1..]);
         for other in [&shouted, &mixed] {
             assert!(matches!(
                 Did::from_did_jig_string(other),

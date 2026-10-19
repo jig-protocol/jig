@@ -713,13 +713,12 @@ async fn a_channel_created_with_a_recased_did_is_refused() {
     assert_eq!(body["code"], "NON_CANONICAL_DID");
 
     // Nothing was created under the re-spelled DID.
-    let (status, body) = server
-        .send(&server.sign_get(&owner, &history_path("#mine")))
+    let (_, listing) = server
+        .send(&server.sign_get(&owner, "/api/v1/channels"))
         .await;
-    assert_eq!(
-        status,
-        StatusCode::NOT_FOUND,
-        "no channel was created: {body}"
+    assert!(
+        !listing.to_string().contains("#mine"),
+        "no channel was created: {listing}"
     );
 }
 

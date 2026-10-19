@@ -1007,7 +1007,7 @@ mod tests {
         let alice = did_of(&alice_key);
         let own = ReachabilityRecord::sign(
             &alice_key,
-            vec![("did:jig:zS".into(), "https://s.example".into())],
+            vec![(did_of(&key(13)), "https://s.example".into())],
             1,
         );
         let foreign = ReachabilityRecord::sign(&key(66), vec![], 1);
