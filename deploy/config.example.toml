@@ -84,8 +84,14 @@ allowed_block_kinds = ["text-render", "channel-create", "member-add", "member-re
 
 [identity]
 # tofu = trust the first key seen for a DID and pin it. No nameserver required.
-# Switch to "nameserver" (and populate trusted_nameservers) once the tailnet
-# nameserver on :7070 is the source of truth for handles.
+# Switch to "nameserver" once a nameserver is the source of truth for handles,
+# and list each alias suffix under [identity.delegations]: the DIDs whose
+# attestations count for it and the nameserver URLs to ask, e.g.
+#   [identity.delegations."gigue.jig"]
+#   authorities = ["did:jig:..."]
+#   nameservers = ["https://ns.example"]
+# An alias whose suffix has no entry is refused. trusted_nameservers is not
+# used to resolve aliases.
 mode = "tofu"
 trusted_nameservers = []
 cache_ttl_seconds = 300
