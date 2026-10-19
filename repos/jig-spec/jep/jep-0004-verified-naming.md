@@ -68,6 +68,11 @@ Non-goals:
      jig computes CIDs. No tag 42, no multibase text. A receiver MUST refuse any other
      version, codec or hash. The schema says which fields are CIDs, so one CID has one
      encoding. Admitting another codec is an explicit change to this rule.
+   - **One exception:** a suffix delegation's `root_id` (rule 3) is text under every root,
+     so a `contract` root's CID appears there as text. Only the canonical form is allowed:
+     base32 lowercase with the `b` prefix, of a CID this rule admits. A receiver MUST
+     refuse any other spelling, so that CID still has exactly one encoding. Every other
+     CID in a payload is binary.
    - A receiver MUST refuse an envelope or payload that is not in deterministic form,
      that carries an unknown key, or whose `domain` is not the one expected.
    - The signer is named inside the payload, not in the envelope, and the receiver
