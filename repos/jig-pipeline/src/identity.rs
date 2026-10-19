@@ -843,6 +843,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_the_signed_attestation_counts_never_the_unsigned_hints() {
+        let (ns, alice, mallory) = (key(1), did_of(&key(9)), did_of(&key(66)));
+        let mock = MockNameserver::start().await;
+        let (r, _, _) = resolver(&[&ns], &[&mock]);
+        // The transitional hints name another DID beside a valid attestation.
+        mock.serve_raw(
+            "dj@dj.jig",
+            serde_json::json!({
+                "attestation": URL_SAFE_NO_PAD.encode(attest(&ns, &alice, "dj@dj.jig", NOW + 100)),
+                "links": [],
+                "reachability": null,
+                "did": mallory,
+                "alias": "dj@dj.jig",
+                "valid_until": NOW + 100,
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(r.resolve("dj@dj.jig").await.unwrap(), alice);
+        r.verify("dj@dj.jig", &mallory).await.unwrap_err();
+    }
+
+    #[tokio::test]
     async fn nameserver_resolver_not_found_for_unknown_alias() {
         let mock = MockNameserver::start().await;
         let (r, _, _) = resolver(&[&key(1)], &[&mock]);
