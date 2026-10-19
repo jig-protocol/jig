@@ -354,23 +354,103 @@ the domains rule 0 lists.
 
 ### Task 8: Custodians
 
-- [ ] Release policy and request objects in `jig_core::contract` (`jig-kp-release-policy-v1`,
-  `jig-kp-request-v1`).
-- [ ] The custodian's routes, which L3 owns:
-  - upload stock and a last-resort package;
-  - set the policy;
-  - request, signed and naming a channel;
-  - list held requests, approve or refuse;
-  - read the release log.
-- [ ] Releases are one package per stocked device. A DID whose revocation the custodian holds
-  gets no releases.
-- [ ] The Welcome mailbox is for DIDs no carrying server reaches.
+Decided by DJ on 2026-10-19: key packages come from custodians, never through the channel's
+owner or sequencer (design 5.4, JEP-0005 rule 21).
+
+**Definition.** A **custodian of a DID `D`** is a server that meets both conditions:
+1. **It is listed in `D`'s reachability record.** The record is JEP-0004 rule 21, and the
+   highest `seq` wins. The server appears as one `(server_did, url)` entry in `servers`.
+2. **It holds a release policy `D` signed.** The policy is `jig-kp-release-policy-v1`, and
+   it names that server's DID.
+
+Both conditions are needed. A listed server without `D`'s policy is not a custodian, and
+neither is a server holding a policy but missing from the record.
+
+A custodian is identified by its **server DID**, never by its URL. The URL is a hint, and
+the requester checks the TLS connection against the DID (DID-bound TLS, or a CA certificate
+plus the server's `/.well-known/jig` naming that DID).
+
+**Scope.** Custody is **per DID, not per channel**:
+- one stock and one policy for each `(D, custodian)` pair;
+- every request names a channel, and the policy's scopes may match on it, but the stock and
+  the policy are not per channel.
+
+**Who can be a custodian, and who cannot:**
+
+| Role | Custodian? | Identified by | Where it serves custody | How a requester finds it |
+| --- | --- | --- | --- | --- |
+| A jig-server `D` uses as a client, listed in `D`'s record | **Yes**, once `D` uploads a policy there | that server's DID (`server_did` in the record) | `https://<url>/api/v1/custody/{D}/…` on that jig-server | `D`'s reachability record |
+| A nameserver that took custody at registration, listed in `D`'s record | **Yes**, once `D` uploads a policy there | the nameserver's DID (its `ns_did`, also `server_did` in the record) | `https://<url>/v1/custody/{D}/…` on that nameserver | `D`'s reachability record |
+| The channel's owner or sequencer | **No**, unless it is also one of the two rows above in its own right | n/a | n/a | n/a |
+| A follower carrying the channel | **No**, same condition | n/a | n/a | n/a |
+| The requester's own server | **No**. It may only **relay** a signed request unchanged when the requester cannot reach the custodian directly | n/a | relays to the custodian's route over the server-to-server link | n/a |
+| A delegate DID acting for `D` | **No such role in F2.** Only servers hold custody. Delegated custody waits for v0.3 roles | n/a | n/a | n/a |
+| One of `D`'s devices | **No.** A device's key packages are stocked at `D`'s custodians, one per device (lane I) | n/a | n/a | n/a |
+
+**Discovery, step by step:**
+1. **Get `D`'s reachability record.** In order of preference:
+   - from the nameserver's resolve response (`reachability`, beside the attestation, #201);
+   - embedded in a `member-add` or other block that carries it;
+   - from any server that serves it.
+
+   Verify it: `D` signed it, and it has the highest `seq` the requester has seen.
+2. **Try each `servers` entry in record order.** Connect to its URL, bind the connection to
+   its `server_did`, and `POST` the signed request to its custody route.
+3. **Read the answer.**
+   - `404 NO_CUSTODY`: that server holds no policy from `D`. Try the next entry.
+   - `200` with packages: released.
+   - `202` with a `request_id`: held for `D`'s approval.
+   - `403 OUT_OF_POLICY`: refused (a revoked DID gets the same answer).
+4. **If no entry can be reached directly,** send the same signed request through the
+   requester's own server, which relays it unchanged.
+5. **If no entry holds custody,** `D` cannot be added remotely. This is the design's "a DID
+   MAY publish no record" case.
+
+**Routes.** These are on jig-server; L3 owns them. The nameserver serves the same set under
+`/v1/custody/` (L6).
+
+| Route | Who calls it | Authentication | Body or answer |
+| --- | --- | --- | --- |
+| `PUT /api/v1/custody/{D}/policy` | `D` | the policy is signed by `D` and names this server's DID | `jig-kp-release-policy-v1` |
+| `POST /api/v1/custody/{D}/stock` | `D` | a read-auth proof by `D` (`read_auth`) | key packages, each self-signed by `D`, tagged with its device, plus one last-resort package per device |
+| `POST /api/v1/custody/{D}/requests` | any requester | the request is signed by the requester's DID | `jig-kp-request-v1`, naming `channel_id`, the requester and this custodian's DID. Answers `200`, `202`, `403` or `404` as above |
+| `GET /api/v1/custody/{D}/requests?state=held` | `D` | a read-auth proof by `D` | held requests |
+| `POST /api/v1/custody/{D}/requests/{request_id}/decision` | `D` | the decision is signed by `D` | approve or refuse |
+| `GET /api/v1/custody/{D}/releases` | `D` | a read-auth proof by `D` | the release log: each release with its signed request |
+| `POST /api/v1/custody/{D}/mailbox` | an adder | the deposit is signed by the adder's DID | an MLS Welcome for `D`, kept until `D` fetches it |
+| `GET /api/v1/custody/{D}/mailbox` | `D` | a read-auth proof by `D` | the Welcomes held for `D` |
+
+**Rules the routes enforce:**
+- One package is released **per stocked device**. The last-resort package for a device is
+  handed out only when that device's stock is empty, and is never consumed.
+- A request outside every scope of the policy is held, never refused silently. Every
+  release and every hold is logged.
+- Requests are rate-limited per requester DID.
+- A custodian holding `D`'s revocation (lane I) answers `403` to every request for `D`.
+- **No policy, no release.** A DID that has stocked packages but uploaded no policy gets the
+  design default: contacts are released automatically and everyone else is held. With no
+  contacts listed, every request is held. The client uploads its policy together with its
+  first stock.
+- Today's `/api/v1/mls/key-packages` routes remain, for a server's own channels, until slice
+  8 moves the client to the custody routes. They are then removed.
+
+- [ ] `jig_core::contract` gains the release policy, request, decision and mailbox-deposit
+  objects (`jig-kp-release-policy-v1`, `jig-kp-request-v1`, and two domains added to JEP-0005
+  rule 0 in this slice), with vectors.
+- [ ] Custody tables in `persist.rs`, additive (agreed with L7, 2026-10-19).
+- [ ] The routes above, with L3, and the nameserver's copy, with L6.
+- [ ] The client: upload stock and policy to every server in its own record, and run
+  discovery as above to request packages.
 - [ ] Tests:
-  - a contact gets a package automatically;
-  - a stranger's request is held, then released on approval;
-  - an unsigned request, or one naming no channel, is refused;
+  - a contact gets one package per device automatically;
+  - a stranger's request is held, then released on approval, and the release is logged;
+  - an unsigned request, one naming no channel, or one naming another custodian's DID is
+    refused;
+  - a server listed in the record but holding no policy answers `NO_CUSTODY`, and discovery
+    moves to the next entry;
   - a revoked DID gets nothing;
-  - the last-resort package is never consumed.
+  - the last-resort package is never consumed;
+  - a request relayed through the requester's server arrives byte for byte unchanged.
 - [ ] Commit `feat(mls): key-package custodians under a signed release policy (JEP-0005 rule 21)`.
 
 ---
@@ -400,8 +480,9 @@ the domains rule 0 lists.
   duplicate frames.
 - [ ] Handshake attempts are limited per source address, and no block processing happens
   before the mutual handshake.
-- [ ] Writes queued while the sequencer is down are capped. Head gossip is rate-limited and
-  deduplicated.
+- [ ] Writes queued while the sequencer is down are capped at 1000 blocks or 10 MiB per channel
+  and 100 MiB per server (DJ, 2026-10-19). A write past a cap is refused with a code, never
+  dropped. Head gossip is rate-limited and deduplicated.
 - [ ] Commit `feat(federation): layered abuse defences on peer links`.
 
 ---
@@ -425,20 +506,18 @@ the domains rule 0 lists.
 
 ---
 
-## Questions for DJ
+## Decisions (DJ, 2026-10-19)
 
-1. **The F2 milestone row says "key packages through the owner under consent"**, but section
-   5.4 and rule 21 settle custodians, with the sequencer taking no part. This plan follows 5.4
-   and rule 21. The row should be corrected in the design doc.
-2. **The follower's default for incoming offers:** this plan holds every offer for the
-   operator unless that peer is configured to auto-accept. Auto-accepting from configured peers
-   is the alternative. The trade-off is a manual step per share against a configured peer
-   committing the operator to carry any channel.
-3. **The cap on writes queued while a sequencer is down.** The plan proposes two caps,
-   configured per server:
-   - per channel: 1000 blocks or 10 MiB;
-   - per server, across all channels: 100 MiB, so that many carried channels cannot add up to
-     an unbounded total (orchestrator, 2026-10-19).
+1. **Custodians, not the owner** (Task 8). The design doc's F2 milestone row is corrected to
+   match.
+2. **A follower holds every incoming offer for its operator by default.** It auto-accepts only
+   from peers explicitly configured to auto-accept (Task 4).
+3. **Caps on writes queued while a sequencer is down** (Task 10), configured per server:
+   - per channel: 1000 blocks or 10 MiB, whichever comes first;
+   - per server, across every channel: 100 MiB.
+
+   A write past either cap is refused back to the client with a clear code. It is never
+   dropped silently.
 
 ## Done when
 

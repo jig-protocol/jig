@@ -174,7 +174,7 @@ Sources and how each fact was checked are in [Appendix A](#appendix-a-sources).
 2. **Followers relay for their own users.** MIMI, MIX and ActivityPub all route a remote
    member's write through the member's own server.
 3. **The owner is the MLS delivery service.** That is jig's single-server rule, extended.
-4. **Fetch key packages through the owner, under the target's consent.**
+4. **Fetch key packages from the target's custodians, under a release policy the target signed** (5.4; the owner takes no part).
 5. **Names: delegation tells you whom to ask, transparency tells you whether they lied.**
    v0.2 needs the first, plus client pinning and retained evidence. The second is v0.3+.
 6. **Nothing in the prior art protects against a hostile owner's censorship.** MLS
@@ -841,7 +841,7 @@ Updated in the implementation PRs, not here.
 | --- | --- | --- | --- |
 | **F0** | now | This design and the two JEP drafts. L1 adds a banner to `federation.md`. A small PR makes the orphan-post and no-policy paths fail closed | nothing |
 | **F1: verified names** | v0.2.x | Canonical attestation and proof encodings (4.6); nameserver TLS; suffix delegation by config and `.well-known` (4.2 A+B); verification in the client and the server's resolver (4.3); client name pins and the change rule (4.4); retained attestations (4.5); `jig dm`/`channel add` accept names; reachability records (4.7) | L7 for `jig trust` UX; L6 for nameserver code |
-| **F2: the contract between two jig servers** | v0.2.x, gate G3 | Channels keyed by CID (6); `sequencer` in the creation block and `sequencer-set`; offer, accept, refuse and end (5.5); signed peer policy (5.6); relay through the client's server under share grants (5.2); owner sequencing with a signed chain, and follower validation (5.3); key packages through the owner under consent (5.4); restricted MLS channels federate between configured peers; the `federation.md` rewrite | **L7's mutual server-to-server handshake**; F1's reachability records |
+| **F2: the contract between two jig servers** | v0.2.x, gate G3 | Channels keyed by CID (6); `sequencer` in the creation block and `sequencer-set`; offer, accept, refuse and end (5.5); signed peer policy (5.6); relay through the client's server under share grants (5.2); owner sequencing with a signed chain, and follower validation (5.3); key packages from custodians under a release policy the DID signed (5.4); restricted MLS channels federate between configured peers; the `federation.md` rewrite | **L7's mutual server-to-server handshake**; F1's reachability records |
 | **F3** | v0.3+ | Ruleset-group delegation with thresholds (4.2 C); replicated registry (NS-03); name bindings published to lane R's witnessed transparency logs (NS-02; R's second JEP owns the logs); nameserver-led contract templates (D12); MIMI-style consent; ownership handover; open federation with reputation; interop with other implementations by contract | lane R; ruleset groups |
 | **F4: high-security federation** | post-MVP | Consensus on channel heads, so a channel with one poster is protected too: carriers co-sign `ingest` heads, and a head counts only at the ruleset's threshold. Merkle-tree logs plus gossip as the long-term direction, in the style of CT and KEYTRANS (DJ, 2026-10-18) | F3, lane R |
 | **F5: nameserver server-lists** | post-MVP | The signed, advisory list of abandoned or compromised servers (5.8), with lane R's evidence and appeal process | lane R |
