@@ -108,12 +108,15 @@ pub enum ProgramError {
 }
 
 impl ProgramManifest {
-    /// A built-in renderer a server ships: authored by the server, requesting nothing, pinning
-    /// nothing. A server signs one of these at start for each component it ships (JEP-0011
-    /// §5.1); its operator policy allows it by component hash, not by this CID, which differs
-    /// between servers.
+    /// A built-in renderer: requesting nothing and pinning nothing, so a default operator policy
+    /// allows it by component hash (JEP-0011 §5.1).
+    ///
+    /// JEP-0011 has each server author its built-ins (`author` is the server's DID, signed at
+    /// start), so the program CID differs between servers and comparison keys on the component.
+    /// If built-ins move to one project-signed manifest shipped in the binary, `author` is the
+    /// project's DID and the call is the same.
     pub fn builtin_renderer(
-        server_did: impl Into<String>,
+        author: impl Into<String>,
         name: impl Into<String>,
         version: impl Into<String>,
         world: impl Into<String>,
@@ -121,7 +124,7 @@ impl ProgramManifest {
         limits: Limits,
     ) -> Self {
         Self {
-            author: server_did.into(),
+            author: author.into(),
             name: name.into(),
             version: version.into(),
             world: world.into(),
