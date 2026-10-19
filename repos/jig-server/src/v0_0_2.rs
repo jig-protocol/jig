@@ -135,8 +135,8 @@ impl AppState {
     /// generation.
     ///
     /// `execution` carries the operator's `[execution]` limits, which live on
-    /// `ServerConfig` rather than `JigServerConfig` under the hybrid config
-    /// split. Passing them explicitly is what makes the ingest render path honour
+    /// `ServerConfig` rather than in the `JigServerConfig` sections. Passing
+    /// them explicitly is what makes the ingest render path honour
     /// configured fuel, memory, timeout and concurrency instead of running on
     /// library defaults.
     pub fn new(
@@ -154,13 +154,38 @@ impl AppState {
             );
         }
         let server_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
+        // A store written before `ingest` records existed is sequenced once,
+        // here: each local channel's chain starts at its channel-create and
+        // follows the old history order (JEP-0002 rule 9).
+        let backfilled = store
+            .backfill_ingest_records(&signing_key)
+            .context("sequencing stored blocks")?;
+        if backfilled > 0 {
+            tracing::info!(backfilled, "gave stored blocks their ingest records");
+        }
 
         let identity: Arc<dyn IdentityResolver> = match config.identity.mode {
             IdentityMode::Tofu => Arc::new(TofuResolver::new(store.clone())),
-            IdentityMode::Nameserver => Arc::new(NameserverResolver::new(
-                config.identity.trusted_nameservers.clone(),
-                config.identity.cache_ttl_seconds,
-            )),
+            IdentityMode::Nameserver => {
+                if !config.identity.trusted_nameservers.is_empty() {
+                    tracing::warn!(
+                        "identity.trusted_nameservers is not used to resolve aliases; \
+                         list each suffix's authorities and nameservers under \
+                         [identity.delegations]"
+                    );
+                }
+                if config.identity.delegations.is_empty() {
+                    tracing::warn!(
+                        "identity.mode = \"nameserver\" with no [identity.delegations]: \
+                         every alias will be refused"
+                    );
+                }
+                Arc::new(NameserverResolver::new(
+                    suffix_authorities(&config.identity.delegations),
+                    config.identity.cache_ttl_seconds,
+                    store.clone(),
+                ))
+            }
         };
 
         let hlc_clock = Arc::new(
@@ -177,8 +202,8 @@ impl AppState {
         // `Result` instead of aborting the process.
         //
         // Limits come from the operator's `[execution]` settings, which live on
-        // `ServerConfig` — a different type in the hybrid config split, so they
-        // are passed in rather than read from `JigServerConfig`. Without this the
+        // `ServerConfig`, outside the `JigServerConfig` sections, so they are
+        // passed in rather than read from `config`. Without this the
         // ingest render path ran on library defaults and silently ignored every
         // configured limit.
         //
@@ -368,6 +393,24 @@ fn load_or_generate_server_key(path: &str) -> Result<SigningKey> {
             .with_context(|| format!("writing server keyfile to {}", path.display()))?;
         Ok(signing)
     }
+}
+
+/// `[identity.delegations]` as the pipeline's resolver takes it.
+pub fn suffix_authorities(
+    delegations: &std::collections::BTreeMap<String, jig_config::v0_0_2_server::NameDelegation>,
+) -> std::collections::BTreeMap<String, jig_pipeline::identity::SuffixAuthority> {
+    delegations
+        .iter()
+        .map(|(suffix, d)| {
+            (
+                suffix.clone(),
+                jig_pipeline::identity::SuffixAuthority {
+                    authorities: d.authorities.clone(),
+                    nameservers: d.nameservers.clone(),
+                },
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]

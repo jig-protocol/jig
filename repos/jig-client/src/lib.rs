@@ -9,7 +9,9 @@
 pub mod admission;
 pub mod blocks;
 pub mod connection;
+pub mod evidence;
 pub mod identity;
+pub mod naming;
 pub mod open;
 pub mod pins;
 pub mod read_auth;

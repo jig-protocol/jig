@@ -180,7 +180,7 @@ pub enum Frame {
     /// signed its own downgrade.
     Refusal {
         /// How `sig` is made: [`crate::handshake::REFUSAL_FORMAT`]. A
-        /// verifier refuses any other format by this name, so a later
+        /// verifier refuses any other format by this name, so another
         /// encoding is told apart from a damaged frame.
         format: String,
         server_did: String,
@@ -190,7 +190,8 @@ pub enum Frame {
         versions: Vec<u64>,
         suites: Vec<String>,
         nonce: String,
-        /// base64 ed25519 over [`crate::handshake::RefusalStatement::canonical_bytes`].
+        /// base64 COSE_Sign1 by `server_did` over
+        /// [`crate::handshake::RefusalStatement::payload`].
         sig: String,
     },
     /// Subscribe to a scope (channel or federation).
@@ -222,6 +223,11 @@ pub enum Frame {
         sig_b64: Option<String>,
         receipts: Vec<ReceiptRef>,
         delivery_cid: String,
+        /// The block's record in its channel's chain, signed by the channel's
+        /// sequencer (JEP-0002 rule 9). Absent for a block with no channel,
+        /// or one this server does not sequence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ingest: Option<crate::ingest_record::IngestRecord>,
     },
     /// Report an error in reply to a prior frame.
     ///
@@ -367,6 +373,7 @@ mod tests {
                 receipt_bytes_b64: "cmI=".into(),
             }],
             delivery_cid: "bafy".into(),
+            ingest: None,
         });
         let json = serde_json::to_string(&env).unwrap();
         let parsed: Envelope = serde_json::from_str(&json).unwrap();

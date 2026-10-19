@@ -579,6 +579,26 @@ pub async fn ingest(
         produced_at: chrono::Utc::now().timestamp(),
     };
 
+    // Step 5b: the block's `ingest` record (JEP-0002 rule 9), when this server
+    // holds the channel and so sequences it. A channel-create starts its own
+    // chain; a block for a channel this server has no row for (a relayed
+    // post for a remote channel) carries its owner's record, not one of ours.
+    let record_channel = if kind == BlockKind::ChannelCreate {
+        Some(block_cid.clone())
+    } else {
+        resolved_channel.as_ref().map(|chan| chan.id.clone())
+    };
+    let ingest_hlc = ctx
+        .hlc_clock
+        .tick(chrono::Utc::now().timestamp_millis() as u64);
+    let signer = record_channel.map(|channel_id| crate::ingest_record::RecordSigner {
+        channel_id,
+        key: &ctx.server_key,
+        ingest_wall_ms: ingest_hlc.wall_ms,
+        ingest_logical: ingest_hlc.logical,
+    });
+    let signer = signer.filter(|_| stored_block.channel_id.is_some());
+
     match mls_plan {
         // Step 5/6 for a commit on an encrypted channel: the group's advance,
         // the membership change and the block land in one transaction (see
@@ -593,16 +613,21 @@ pub async fn ingest(
         } => {
             let membership =
                 membership_change(kind, &manifest, resolved_channel.as_ref(), &block_cid);
-            if !ctx.store.land_mls_commit(
-                &slug,
-                from_epoch,
-                &state,
-                to_epoch,
-                group_info.as_deref(),
-                &membership,
-                &stored_block,
-                &stored_receipt,
-            )? {
+            if ctx
+                .store
+                .land_mls_commit(
+                    &slug,
+                    from_epoch,
+                    &state,
+                    to_epoch,
+                    group_info.as_deref(),
+                    &membership,
+                    &stored_block,
+                    &stored_receipt,
+                    signer.as_ref(),
+                )?
+                .is_none()
+            {
                 let current = ctx
                     .store
                     .get_mls_group(&slug)?
@@ -629,8 +654,13 @@ pub async fn ingest(
                 &block_cid,
             )
             .await?;
-            // Step 6: persist block + receipt
-            ctx.store.insert_block(&stored_block)?;
+            // Step 6: persist block (+ its record) + receipt
+            match signer.as_ref() {
+                Some(signer) => {
+                    ctx.store.insert_block_sequenced(&stored_block, signer)?;
+                }
+                None => ctx.store.insert_block(&stored_block)?,
+            }
             ctx.store.insert_receipt(&stored_receipt)?;
         }
     }
@@ -1158,7 +1188,7 @@ mod tests {
     }
 
     fn seed_channel_owned_by(ctx: &IngestContext, slug: &str, owner_did: &str) -> String {
-        let id = format!("bafySeed_{}", slug.trim_start_matches('#'));
+        let id = crate::ingest_record::label_cid(&format!("seed {slug}"));
         ctx.store
             .upsert_channel(&crate::persist::StoredChannel {
                 id: id.clone(),
@@ -1615,6 +1645,39 @@ mod tests {
         .await
         .unwrap();
         created.group_id
+    }
+
+    /// Every block of a channel this server holds gets the next record of
+    /// one chain, signed by the server: the channel-create at 0, then a
+    /// commit carried through the MLS transaction, in arrival order.
+    #[tokio::test]
+    async fn a_channels_blocks_form_one_signed_chain() {
+        let ctx = all_channel_kinds();
+        let owner = person();
+        let gid = create_sealed(&ctx, &owner).await;
+        let bob = person();
+        add_to_sealed(&ctx, &owner, &bob, &gid).await;
+
+        let chain = ctx.store.list_ingest_records("#sealed", 0, 50).unwrap();
+        assert_eq!(chain.len(), 2, "{chain:?}");
+        let server = ctx.server_did.to_did_jig_string();
+        for record in &chain {
+            record.verify(&server).unwrap();
+        }
+        assert!(chain[0].is_genesis());
+        assert_eq!(
+            chain[0].block_cid, chain[0].channel_id,
+            "the chain is named by its creation"
+        );
+        assert!(
+            chain[1].follows(&chain[0]),
+            "the commit's record is carried in its transaction"
+        );
+        assert!(
+            (chain[1].ingest_wall_ms, chain[1].ingest_logical)
+                > (chain[0].ingest_wall_ms, chain[0].ingest_logical),
+            "the sequencer's clock moves forward along the chain"
+        );
     }
 
     async fn add_to_sealed(
@@ -2260,9 +2323,10 @@ mod tests {
         ctx.fanout.register_bridge_did(shadow.clone(), tx);
 
         // Channel "#dm/x" with members [bob, shadow].
+        let channel_cid = crate::ingest_record::label_cid("dm x");
         ctx.store
             .upsert_channel(&StoredChannel {
-                id: "#dm/x".into(),
+                id: channel_cid.clone(),
                 slug: "#dm/x".into(),
                 // Bridges carry plaintext, which only an open channel takes (D25).
                 visibility: "open".into(),
@@ -2274,7 +2338,7 @@ mod tests {
         for did in [bob_did.clone(), shadow.clone()] {
             ctx.store
                 .upsert_membership(&StoredMembership {
-                    channel_id: "#dm/x".into(),
+                    channel_id: channel_cid.clone(),
                     member_did: did,
                     role: "member".into(),
                     joined_at: 0,
@@ -2303,7 +2367,7 @@ mod tests {
         // Regression: memberships are keyed by the channel's CID, not its slug.
         // The prior dispatch used `list_members(slug)` which returns nothing when
         // `channel.id != channel.slug` (the realistic shape from channel-create).
-        // This test stores channel.id = "bafyCID_xyz" and channel.slug = "#dm/z"
+        // This test stores channel.id = a CID and channel.slug = "#dm/z"
         // and verifies the bridge sink still fires.
         use crate::persist::{StoredChannel, StoredMembership};
         let ctx = test_ctx(); // allows "text-render"
@@ -2317,7 +2381,7 @@ mod tests {
 
         // Channel stored with a CID as id (distinct from slug) — realistic
         // shape written by channel-create effect handling.
-        let channel_cid = "bafyCID_xyz".to_string();
+        let channel_cid = crate::ingest_record::label_cid("dm z");
         ctx.store
             .upsert_channel(&StoredChannel {
                 id: channel_cid.clone(),

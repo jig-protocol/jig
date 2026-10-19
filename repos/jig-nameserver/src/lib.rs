@@ -5,7 +5,6 @@ pub mod config;
 pub mod error;
 pub mod federation;
 pub mod identity;
-pub mod runtime;
 pub mod server;
 pub mod storage;
 pub mod types;

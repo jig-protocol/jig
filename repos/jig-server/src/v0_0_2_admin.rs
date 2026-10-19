@@ -662,8 +662,9 @@ mod tests {
 
         // Seed one message directly through the store (the admin router has no
         // text-render endpoint; the history-retention claim is about storage).
+        let msg_cid = jig_pipeline::ingest_record::label_cid("msg 1");
         let msg = jig_pipeline::persist::StoredBlock {
-            cid: "bafy_msg_1".into(),
+            cid: msg_cid.clone(),
             channel_id: Some("#scratch".into()),
             block_kind: "text-render".into(),
             sender_did: owner.did_string(),
@@ -677,7 +678,28 @@ mod tests {
             origin_server: "ws://test".into(),
             federated_from: None,
         };
-        state.ingest_ctx.store.insert_block(&msg).unwrap();
+        // Sequenced as ingest would: every block of a channel this server holds
+        // has its record, and history is read through the chain.
+        let channel_id = state
+            .ingest_ctx
+            .store
+            .get_channel_by_slug("#scratch")
+            .unwrap()
+            .expect("the channel exists")
+            .id;
+        state
+            .ingest_ctx
+            .store
+            .insert_block_sequenced(
+                &msg,
+                &jig_pipeline::ingest_record::RecordSigner {
+                    channel_id,
+                    key: &state.ingest_ctx.server_key,
+                    ingest_wall_ms: 1,
+                    ingest_logical: 0,
+                },
+            )
+            .unwrap();
 
         let block = build_channel_archive(&owner, "#scratch", test_hlc(&owner));
         let (status, _) =
@@ -688,7 +710,7 @@ mod tests {
             state
                 .ingest_ctx
                 .store
-                .get_block("bafy_msg_1")
+                .get_block(&msg_cid)
                 .unwrap()
                 .is_some(),
             "archive must not delete blocks"
@@ -702,7 +724,7 @@ mod tests {
             .list_blocks_by_channel("#scratch", 100, None)
             .unwrap();
         assert!(
-            timeline.iter().any(|b| b.cid == "bafy_msg_1"),
+            timeline.iter().any(|b| b.cid == msg_cid),
             "channel history must still be readable from storage; got {:?}",
             timeline.iter().map(|b| &b.cid).collect::<Vec<_>>()
         );
