@@ -750,9 +750,16 @@ mod tests {
             "sig_b64": base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
         });
 
+        let local = || jig_pipeline::metrics::ingested_by_source()[0];
+        let before = local();
         let (status, body) = post_json(router, "/api/v1/blocks", submission).await;
         assert_eq!(status, StatusCode::OK, "body={body}");
         assert!(!body["block_cid"].as_str().unwrap_or("").is_empty());
+        // REST ingest used to be invisible to /metrics. Other tests ingest
+        // concurrently, so assert growth, not an exact value.
+        let after = local();
+        assert_eq!(after.0, "local");
+        assert!(after.1 > before.1, "REST ingest must count as local");
     }
 
     #[tokio::test]

@@ -9,8 +9,7 @@ repository = "https://github.com/jig-protocol/repos"
 keywords = ["wasm", "runtime", "wasi", "capabilities", "deterministic"]
 
 [features]
-default = ["deterministic", "wasi-preview2"]
-deterministic = []
+default = ["wasi-preview2"]
 component-model = ["wasmtime/component-model"]
 wasi-preview2 = ["wasmtime-wasi"]
 tracing = ["dep:tracing", "dep:tracing-subscriber"]

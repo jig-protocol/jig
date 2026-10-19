@@ -1196,6 +1196,19 @@ mod tests {
         let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
         config.auth.admission.banned_dids = vec![banned_did];
         let state = Arc::new(AppState::for_test_with_config(config).unwrap());
+        // A relayed post needs a channel this server holds.
+        state
+            .ingest_ctx
+            .store
+            .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                id: "bafyRemote".into(),
+                slug: "#remote".into(),
+                visibility: "open".into(),
+                created_at: 0,
+                owner_did: "did:jig:zOwner".into(),
+                suite: "none".into(),
+            })
+            .unwrap();
 
         let (bundle_bytes, bundle_b64, sig_b64) = relayed(
             &banned,
