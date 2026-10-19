@@ -1,7 +1,6 @@
 //! Jig Nameserver: provides distributed identity verification and localized anonymity.
 
 pub mod analytics;
-pub mod anomaly;
 pub mod config;
 pub mod error;
 pub mod federation;
