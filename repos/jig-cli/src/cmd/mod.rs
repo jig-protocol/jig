@@ -22,6 +22,3 @@ pub mod trust;
 
 #[cfg(feature = "local-runtime")]
 pub mod block_run;
-
-// Block authoring commands (don't require runtime)
-pub mod block_init;

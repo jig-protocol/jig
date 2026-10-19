@@ -20,5 +20,10 @@ openmls_basic_credential = "0.6"
 openmls_memory_storage = "0.6"
 thiserror = { workspace = true }
 
+[features]
+# `Member::with_lifetime_until`, for generating the checked-in conformance
+# vectors (jig-spec/vectors/suites/mls.json). Dev-dependencies only.
+conformance = []
+
 [dev-dependencies]
 ed25519-dalek = { workspace = true }

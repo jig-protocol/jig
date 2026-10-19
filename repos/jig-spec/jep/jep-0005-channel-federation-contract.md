@@ -56,6 +56,16 @@ Non-goals for v0.2:
 
 # Specification
 
+## Encoding
+
+0. Every message this JEP defines and signs (`contract-offer`, `contract-accept`,
+   `contract-refuse`, `contract-end`, a custodian release policy and a key-package
+   request) is a `COSE_Sign1` over deterministic CBOR, exactly as JEP-0004 rule 0 states,
+   with `domain` `jig-contract-offer-v1`, `jig-contract-accept-v1`,
+   `jig-contract-refuse-v1`, `jig-contract-end-v1`, `jig-kp-release-policy-v1` and
+   `jig-kp-request-v1` respectively. Blocks (`channel-share`, `role-assign`,
+   `sequencer-set` and the rest) and the `ingest` record are signed as JEP-0002 defines.
+
 ## Roles and addressing
 
 1. A channel is identified by `channel_id`, the CID of its `channel-create` block.
@@ -88,7 +98,8 @@ Non-goals for v0.2:
    that point in the `ingest` chain (7b). The owning server MUST then check that the
    target is on its configured peer list, and sends the target a `contract-offer`, signed
    by the owner. Only the owning server sends offers. The offer carries:
-   - `offer_id`, unique per offer: the BLAKE3 hash of the offer's signed bytes;
+   - `offer_id`, unique per offer: the BLAKE3 hash of the deterministic encoding of the
+     offer's payload, without `offer_id` itself;
    - the grant (7a);
    - the creation block;
    - the current `ingest` head (12);
@@ -158,6 +169,28 @@ Non-goals for v0.2:
      - A `sequencer-set` MAY carry owner-signed bot reinstalls (lane C's install format,
        with new bot DIDs and `inherits_state_from`). By default it carries one per current
        bot. The new sequencer MUST name the new bot DIDs in its `contract-accept`.
+
+11b. When the sequencer moves (11a), the new sequencer issues, as part of its
+     `contract-accept`, a `policy-approval` for the channel's current `channel-policy`
+     and for every live `block-install`.
+     - A `policy-approval` is a `COSE_Sign1` by the hosting server (JEP-0004 rule 0). It
+       names the server, the channel, the CID of the policy or install it approves, and
+       the CID of the server's restrictions. An approval of a `block-install` also
+       carries the required `operator_policy_cid`, naming the operator policy the
+       install's program was checked against, and the required `bot_did`, stating that the
+       server holds that bot's key.
+       The owner's `channel-policy` and `block-install` stay `COSE_Sign1`s by the owner.
+     - Which approval is current is decided by the channel's `ingest` order: the latest
+       `policy-approval` or `policy-withdrawn` for an object CID wins.
+     - Clients MUST treat a policy or install without a current approval from the hosting
+       server as absent. A move without these approvals therefore leaves the channel with
+       no policy.
+     - Because the approval is separate from the owner's object, a server can re-approve
+       or withdraw one when its restrictions change, and a new sequencer can approve on a
+       move, without the owner signing again.
+
+     JEP-0011 defines `channel-policy`, `block-install`, `policy-approval` and
+     `policy-withdrawn`.
 
 ## Ordering
 

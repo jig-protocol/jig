@@ -18,8 +18,8 @@ unless stated.
 > whose routes were removed in #154. Today the nameserver serves discovery
 > (`/.well-known/jig-ns`), health and the alias routes. `/v1/register`, `/v1/rotate` and
 > `/v1/renew` need a proof-of-control signature (rotate needs one from the old and the new
-> DID) but have no proof-of-work and no rate
-> limit. The analysis stays as input to the
+> DID) and are rate-limited per client IP and per DID (`[alias_rate_limits]`, defaults 30
+> and 10 per minute), but ask for no proof-of-work. The analysis stays as input to the
 > redesign; read "today" below as "in the removed prototype".
 >
 > Redesign in progress: proof-of-work in JEP-0008 (draft, #162); rulesets, reputation and
@@ -108,8 +108,9 @@ What does not limit one:
   misbehaves on any one key.
 - Reputation, as above.
 - The alias registration path the CLI uses (`POST /v1/register`). The spec requires
-  proof-of-work and rate limits there; the code has neither yet. Until it does, Sybil
-  resistance for aliases rests on the reverse proxy in front of the nameserver.
+  proof-of-work and rate limits there; the code has the rate limits (per client IP and per
+  DID, `[alias_rate_limits]`) but no proof-of-work. A per-IP limit prices an attacker by
+  addresses, not identities, so Sybil resistance for aliases is still thin.
 
 Summary: proof-of-work turns Sybils from free into linearly priced, and linear is not
 enough. Fresh keys must stay cheap, because `--anon` depends on them. What must stop being
@@ -243,7 +244,8 @@ Each of these is a gap in today's design or code, not an accepted property:
 
 - **Linear Sybil cost.** Standing (aliases, reputation under a ruleset) must cost an
   attacker more per identity than hashing, without linking identities (OP-10, JEP-0003).
-- **No proof-of-work or rate limit on alias registration** (`POST /v1/register`).
+- **No proof-of-work on alias registration** (`POST /v1/register`). It is rate-limited per
+  client IP and per DID, which does not price identities.
 - **Griefing.** Penalties keyed on the target alone let a third party raise a victim's
   price. Key them on (target, requester).
 - **Forgetful decay.** A chronic abuser is fully forgiven after a few quiet hours. Decay

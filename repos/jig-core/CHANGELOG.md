@@ -6,6 +6,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+### Removed
+- Capability DSL macros (`capability!`, `capabilities!`, `build_capability`, `parse_scopes`), lint helpers (`lint_block`, `allowlist_from_manifest`, `BlockLintResult`), `check_manifest_capabilities`, `CapabilityReport`, and `CapabilityDefinition.required_imports`. Nothing outside their own tests called them, and no `jig_host` import is linked anywhere. Manifest capability validation (`validate_capability_request`) is unchanged.
+
 ## [0.0.1] - 2025-11-05
 
 ### Added
