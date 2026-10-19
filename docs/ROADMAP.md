@@ -175,7 +175,8 @@ Still to do in this phase:
 ### Phase 2: executable blocks (`v0.3`)
 
 - The **Wasm Component Model + WIT** as the block ABI.
-- Host functions granted strictly through manifest capabilities (the existing `capability_dsl`):
+- Host functions granted strictly through manifest capabilities (the capability names, scopes and
+  attenuation order are defined in `jig-core/src/grant.rs`, #205, but nothing checks them yet):
   storage, fetch-block-by-CID, post-message, timer.
 - Per-block persistent state, CID-addressed.
 - The client runs the same runtime (`jig-client` embeds `jig-runtime`).
