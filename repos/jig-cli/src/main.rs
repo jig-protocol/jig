@@ -89,7 +89,8 @@ enum Commands {
     /// the two of you in it, created on first use. With a message, sends it
     /// and exits; without, opens the chat.
     Dm {
-        /// A did:jig, or a name from `[contacts]` in cli.toml.
+        /// A did:jig, a name from `[contacts]` in cli.toml, or an
+        /// `alias@suffix`, verified and pinned on first use.
         #[arg()]
         who: String,
         #[arg()]
@@ -198,7 +199,7 @@ enum ChannelAction {
     Add {
         #[arg()]
         slug: String,
-        /// A did:jig, or a name from `[contacts]`.
+        /// A did:jig, a name from `[contacts]`, or a verified `alias@suffix`.
         #[arg()]
         who: String,
     },
@@ -209,7 +210,7 @@ enum ChannelAction {
     Kick {
         #[arg()]
         slug: String,
-        /// A did:jig, or a name from `[contacts]`.
+        /// A did:jig, a name from `[contacts]`, or a verified `alias@suffix`.
         #[arg()]
         who: String,
     },
