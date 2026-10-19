@@ -364,41 +364,47 @@ pub async fn ingest(
         });
     }
 
+    // The block's CID, needed this early because a channel-create's channel
+    // IS that block: its `channel_id` is its own CID (JEP-0005 rule 1).
+    let block_cid = bundle
+        .block_cid()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|_| "bafy_invalid".to_string());
+
     // Step 3b: channel-existence guard for channel-scoped kinds.
     //
     // Resolved once here and reused for the bridge-sink member lookup after
-    // persist, so the guard costs no extra query. `channel_slug_of` is the ONE
-    // rule for which metadata key names a block's channel; the persisted
-    // `channel_id` below uses the same call, so the channel that is gated is
-    // the channel the block lands in.
-    let channel_slug = channel_slug_of(kind, &manifest);
-    let mut resolved_channel = match channel_slug {
-        Some(slug) => ctx.store.get_channel_by_slug(slug)?,
+    // persist, so the guard costs no extra query. `channel_id_of` is the ONE
+    // rule for which channel a block names; the persisted `channel_id` below
+    // is its answer, so the channel that is gated is the channel the block
+    // lands in.
+    let block_channel = channel_id_of(&ctx.store, kind, &manifest, &block_cid)?;
+    let channel_id = block_channel.as_ref().and_then(|c| c.id.as_deref());
+    let channel_named = block_channel.as_ref().map(|c| c.named.as_str());
+    let mut resolved_channel = match channel_id {
+        Some(id) => ctx.store.get_channel_by_id(id)?,
         None => None,
     };
-    // A live row is what writes need. No live row but an archived one means
-    // the channel was retired: nothing goes into it, from any source, of any
-    // kind — otherwise a kind the write gate does not know would resolve to
-    // "no channel", pass the gate, and land in the archived timeline the read
-    // gate still guards.
-    if let Some(slug) = channel_slug
+    // A live row is what writes need. An id with no live row means the
+    // channel was retired (`channel_id_of` resolves archived rows too):
+    // nothing goes into it, from any source, of any kind — otherwise a kind
+    // the write gate does not know would resolve to "no channel", pass the
+    // gate, and land in the archived timeline the read gate still guards.
+    if let Some(named) = channel_named
+        && channel_id.is_some()
         && resolved_channel.is_none()
         && kind != BlockKind::ChannelCreate
-        && ctx
-            .store
-            .get_channel_by_slug_including_archived(slug)?
-            .is_some()
     {
         return Err(IngestError::ChannelArchived {
-            slug: slug.to_string(),
+            slug: named.to_string(),
         });
     }
-    if let Some(slug) = channel_slug
-        && resolved_channel.is_none()
+    if let Some(named) = channel_named
+        && channel_id.is_none()
         && requires_existing_channel(kind, &source)
     {
         return Err(IngestError::UnknownChannel {
-            slug: slug.to_string(),
+            slug: named.to_string(),
         });
     }
 
@@ -411,13 +417,13 @@ pub async fn ingest(
     // this server's signature. The membership query runs only when the
     // decision can turn on it (content into a restricted channel).
     let membership = if crate::authorize_write::needs_membership(kind, resolved_channel.as_ref()) {
-        match channel_slug {
-            Some(slug) => crate::authorize_write::Membership {
-                sender: ctx.store.is_member(slug, sender.as_str())?,
+        match channel_id {
+            Some(id) => crate::authorize_write::Membership {
+                sender: ctx.store.is_member_by_id(id, sender.as_str())?,
                 target: match manifest.metadata.get("member_did").and_then(|v| v.as_str()) {
                     Some(target) if kind == BlockKind::MemberRemove => ctx
                         .store
-                        .is_member(slug, &crate::effect::canonical_did_string(target))?,
+                        .is_member_by_id(id, &crate::effect::canonical_did_string(target))?,
                     _ => false,
                 },
             },
@@ -482,10 +488,6 @@ pub async fn ingest(
     // blocks (channel-create, member-add, …) whose effect is applied by
     // `apply_effect`; they have no rendered output to hash. Promoting them is a
     // separate piece of work, not an oversight.
-    let block_cid = bundle
-        .block_cid()
-        .map(|c| c.to_string())
-        .unwrap_or_else(|_| "bafy_invalid".to_string());
 
     // Step 3d: a block is ingested once. The `blocks.cid` primary key would
     // refuse the second insert anyway, but `apply_effect` runs BEFORE that
@@ -499,7 +501,7 @@ pub async fn ingest(
     // After the signature, admission and write gates, so an unauthenticated
     // caller cannot use it to probe which slugs exist.
     if kind == BlockKind::ChannelCreate
-        && let Some(slug) = channel_slug
+        && let Some(slug) = channel_slug_of(kind, &manifest)
         && ctx
             .store
             .get_channel_by_slug_including_archived(slug)?
@@ -513,12 +515,19 @@ pub async fn ingest(
     // payload. After every authorization gate, so validating a commit is work
     // done only for a sender who may make the change; before the receipt, so
     // a refused block never carries this server's signature.
-    let mls_group = match (&resolved_channel, channel_slug) {
-        (Some(chan), Some(slug)) if chan.suite == jig_core::EncryptionSuite::Mls.as_str() => {
-            ctx.store.get_mls_group(slug)?
+    let mls_group = match &resolved_channel {
+        Some(chan) if chan.suite == jig_core::EncryptionSuite::Mls.as_str() => {
+            ctx.store.get_mls_group_by_id(&chan.id)?
         }
         _ => None,
     };
+    // How errors name the channel: its slug when this server holds it,
+    // otherwise whatever the block's metadata said.
+    let channel_label = resolved_channel
+        .as_ref()
+        .map(|c| c.slug.clone())
+        .or_else(|| channel_named.map(str::to_string))
+        .unwrap_or_default();
     let mls_plan = crate::mls_gate::plan(
         kind,
         &sender.to_did_jig_string(),
@@ -526,7 +535,7 @@ pub async fn ingest(
         resolved_channel.as_ref(),
         mls_group.as_ref(),
     )
-    .map_err(|refusal| suite_refusal(refusal, channel_slug.unwrap_or_default()))?;
+    .map_err(|refusal| suite_refusal(refusal, &channel_label))?;
 
     let (receipt_bytes, render_hash, is_synthetic) = match (&mls_plan, kind) {
         // Ciphertext cannot be executed, and the server does not pretend to.
@@ -546,11 +555,11 @@ pub async fn ingest(
     let hlc = manifest.hlc_ts.as_ref();
     let stored_block = StoredBlock {
         cid: block_cid.clone(),
-        // Lift the channel slug from manifest metadata into the first-class
-        // column so channel-scoped fanout + the bridge sink can find it. Same
-        // rule as step 3b, by construction: a block is stored under exactly
-        // the channel the write gate examined.
-        channel_id: channel_slug.map(|s| s.to_string()),
+        // The channel's id (its creation-block CID), so channel-scoped
+        // fanout, history and the bridge sink find it. Step 3b's answer, by
+        // construction: a block is stored under exactly the channel the write
+        // gate examined.
+        channel_id: channel_id.map(str::to_string),
         block_kind: kind_str.to_string(),
         sender_did: sender_did_str,
         sender_sig: sig,
@@ -593,8 +602,10 @@ pub async fn ingest(
         } => {
             let membership =
                 membership_change(kind, &manifest, resolved_channel.as_ref(), &block_cid);
-            if !ctx.store.land_mls_commit(
-                &slug,
+            // An advance needs the channel's row, so `channel_id` is set.
+            let group_key = channel_id.unwrap_or_default();
+            if !ctx.store.land_mls_commit_by_id(
+                group_key,
                 from_epoch,
                 &state,
                 to_epoch,
@@ -605,7 +616,7 @@ pub async fn ingest(
             )? {
                 let current = ctx
                     .store
-                    .get_mls_group(&slug)?
+                    .get_mls_group_by_id(group_key)?
                     .map(|g| g.epoch)
                     .unwrap_or_default();
                 return Err(IngestError::StaleEpoch {
@@ -616,9 +627,11 @@ pub async fn ingest(
             }
         }
         plan => {
-            if let crate::mls_gate::MlsPlan::Genesis(group) = plan {
+            if let crate::mls_gate::MlsPlan::Genesis(mut group) = plan {
+                // The group is keyed by the channel's id: this block's CID.
                 // A channel-create that fails after this leaves a row its
                 // retry overwrites (`put_mls_group` replaces).
+                group.channel_id = block_cid.clone();
                 ctx.store.put_mls_group(&group)?;
             }
             // Step 5: apply effect
@@ -635,10 +648,8 @@ pub async fn ingest(
         }
     }
 
-    // Channel membership for bridge-sink dispatch. `channel_id` here is the
-    // channel SLUG (lifted from manifest metadata), but memberships are keyed
-    // by the channel's CID (its channel-create block CID). Step 3b resolved
-    // the row BEFORE `apply_effect`; a control-plane block has just changed
+    // Channel membership for bridge-sink dispatch. Step 3b resolved the row
+    // BEFORE `apply_effect`; a control-plane block has just changed
     // that row (channel-create wrote it, channel-promote flipped its
     // visibility), so it is resolved again for those kinds. Content kinds
     // change nothing and keep the row already in hand.
@@ -654,16 +665,16 @@ pub async fn ingest(
         BlockKind::TextRender | BlockKind::EmailRender | BlockKind::EmailEncrypted
     );
     if (resolved_channel.is_none() || effect_may_have_changed_the_row)
-        && let Some(slug) = stored_block.channel_id.as_deref()
+        && let Some(id) = stored_block.channel_id.as_deref()
     {
         // Archived rows included: a channel-archive has just set
         // `archived_at`, and its own block must still be delivered under the
         // channel's policy rather than to everyone because the live lookup
         // stopped finding it.
-        match ctx.store.get_channel_by_slug_including_archived(slug) {
+        match ctx.store.get_channel_by_id_including_archived(id) {
             Ok(row) => resolved_channel = row,
             Err(e) => {
-                tracing::warn!(slug, error = %e, "channel lookup failed at fanout; denying");
+                tracing::warn!(channel_id = id, error = %e, "channel lookup failed at fanout; denying");
                 lookup_failed = true;
             }
         }
@@ -696,6 +707,15 @@ pub async fn ingest(
             .push(crate::effect::canonical_did_string(target));
     }
 
+    // A subscription made by slug before this channel existed waits under
+    // that slug; from now on it follows the channel's id, starting with this
+    // very block.
+    if kind == BlockKind::ChannelCreate
+        && let Some(slug) = channel_slug_of(kind, &manifest)
+    {
+        ctx.fanout.bind_pending_channel(slug, &block_cid).await;
+    }
+
     // Step 7: fanout — broadcast policy depends on source
     match source {
         IngestSource::FederatedPeer { .. } => {
@@ -721,9 +741,90 @@ pub async fn ingest(
     Ok(block_cid)
 }
 
-/// The channel a block belongs to, from its manifest metadata — the one rule
-/// shared by the write gate, the persisted `channel_id` column, fanout and
-/// the metrics label.
+/// The metadata key under which a block names its channel by id: the CID of
+/// the channel's channel-create block, in canonical text.
+pub const CHANNEL_ID_KEY: &str = "channel_id";
+
+/// A block's channel: the name its metadata gave, and the id that name
+/// resolves to. What [`channel_id_of`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockChannel {
+    /// The channel's id — the CID of its channel-create block (JEP-0005
+    /// rule 1). For a channel-create, the block's own CID; otherwise the id
+    /// of the channel row the metadata names, archived or not. `None` when
+    /// the name resolves to no channel this server holds.
+    pub id: Option<String>,
+    /// The name as the block carried it — the slug, or the `channel_id` text
+    /// — for errors and logs.
+    pub named: String,
+}
+
+/// The channel a block belongs to — the ONE rule shared by the write gate,
+/// the persisted `blocks.channel_id` column, fanout and the effect layer.
+/// `None` when the block names no channel at all.
+///
+/// - A `channel-create` is its channel: the id is `block_cid`, its own CID.
+/// - Any other kind names the channel it acts on by metadata `channel_id`
+///   (the canonical CID text) when present, else by metadata `channel` (the
+///   slug), which is looked up among this server's channels.
+/// - A block carrying both must have them agree: a `channel` slug naming
+///   any other channel (or none) leaves the id unresolved, so the block is
+///   refused as naming an unknown channel. Otherwise a reader going by the
+///   slug would file the block under a channel it was never gated against.
+///
+/// Archived channels resolve too, so the caller can tell "retired" from "no
+/// such channel".
+pub fn channel_id_of(
+    store: &SqliteStore,
+    kind: BlockKind,
+    manifest: &jig_core::BlockManifest,
+    block_cid: &str,
+) -> crate::persist::Result<Option<BlockChannel>> {
+    if kind == BlockKind::ChannelCreate {
+        return Ok(Some(BlockChannel {
+            id: Some(block_cid.to_string()),
+            named: channel_slug_of(kind, manifest)
+                .unwrap_or(block_cid)
+                .to_string(),
+        }));
+    }
+    if let Some(id) = manifest
+        .metadata
+        .get(CHANNEL_ID_KEY)
+        .and_then(|v| v.as_str())
+    {
+        let mut resolved = store
+            .get_channel_by_id_including_archived(id)?
+            .map(|c| c.id);
+        if let Some(slug) = channel_slug_of(kind, manifest)
+            && resolved.is_some()
+            && store
+                .get_channel_by_slug_including_archived(slug)?
+                .map(|c| c.id)
+                != resolved
+        {
+            resolved = None;
+        }
+        return Ok(Some(BlockChannel {
+            id: resolved,
+            named: id.to_string(),
+        }));
+    }
+    if let Some(slug) = channel_slug_of(kind, manifest) {
+        return Ok(Some(BlockChannel {
+            id: store
+                .get_channel_by_slug_including_archived(slug)?
+                .map(|c| c.id),
+            named: slug.to_string(),
+        }));
+    }
+    Ok(None)
+}
+
+/// The slug a block's manifest metadata names, if any. Ingest keys channels
+/// by [`channel_id_of`]; this is for callers that only have the manifest (a
+/// client deciding how to decrypt, a metrics label) and for the
+/// slug-uniqueness check on channel-create.
 ///
 /// `channel-create` names the channel it creates under `slug`; every other
 /// kind names the channel it acts on under `channel`. The key is chosen by
@@ -1904,6 +2005,191 @@ mod tests {
         assert!(ctx.store.get_channel_by_slug("#first").unwrap().is_some());
     }
 
+    /// A channel-create is its own channel: its `channel_id` is its own CID,
+    /// the id the channel row carries (JEP-0005 rule 1).
+    #[tokio::test]
+    async fn a_channel_create_is_stored_under_its_own_cid() {
+        let ctx = test_ctx_allowing(&["channel-create"]);
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &random_signing_key(),
+            BlockKind::ChannelCreate,
+            &[("slug", "#first"), ("visibility", "open")],
+        );
+        let cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap();
+        let stored = ctx.store.get_block(&cid).unwrap().unwrap();
+        assert_eq!(stored.channel_id.as_deref(), Some(cid.as_str()));
+        assert_eq!(
+            ctx.store.get_channel_by_slug("#first").unwrap().unwrap().id,
+            cid
+        );
+    }
+
+    /// A subscription made by slug before the channel exists follows the
+    /// channel once it is created: it receives the creation block and what
+    /// is posted after it, both keyed by the channel's CID.
+    #[tokio::test]
+    async fn a_subscription_waiting_on_a_slug_follows_the_channel_once_created() {
+        let ctx = test_ctx_allowing(&["channel-create", "text-render"]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.fanout
+            .subscribe_local(
+                crate::fanout::SubscriptionScope::Channel("#later".to_string()),
+                crate::fanout::SubscriberIdentity::Unchecked,
+                tx,
+            )
+            .await;
+        let owner = random_signing_key();
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &owner,
+            BlockKind::ChannelCreate,
+            &[("slug", "#later"), ("visibility", "open")],
+        );
+        let channel_cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap();
+        let (mb, cb, sig) =
+            build_bundle_parts_with_channel(&owner, BlockKind::TextRender, "#later");
+        do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap();
+        for kind in ["channel-create", "text-render"] {
+            let got = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .expect("the waiting subscription should receive")
+                .expect("a delivery");
+            assert_eq!(got.0.block_kind, kind);
+            assert_eq!(got.0.channel_id.as_deref(), Some(channel_cid.as_str()));
+        }
+    }
+
+    /// A block may name its channel by `channel_id`, the CID of the
+    /// channel-create, and lands under that CID.
+    #[tokio::test]
+    async fn a_block_naming_channel_id_lands_under_that_cid() {
+        let ctx = test_ctx();
+        let channel_id = seed_channel(&ctx, "#hello");
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &random_signing_key(),
+            BlockKind::TextRender,
+            &[("channel_id", channel_id.as_str()), ("body", TEST_BODY)],
+        );
+        let cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap();
+        let stored = ctx.store.get_block(&cid).unwrap().unwrap();
+        assert_eq!(stored.channel_id.as_deref(), Some(channel_id.as_str()));
+        assert_eq!(
+            ctx.store
+                .list_blocks_by_channel("#hello", 10, None)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// A `channel_id` that names no channel here is refused exactly as an
+    /// unknown slug is, and leaves nothing behind.
+    #[tokio::test]
+    async fn a_block_naming_an_unknown_channel_id_is_refused_like_an_unknown_slug() {
+        let ctx = test_ctx_allowing(&["text-render", "member-add"]);
+        // The slug of a real channel is not its id.
+        seed_channel(&ctx, "#hello");
+        for (kind, named) in [
+            (BlockKind::TextRender, "bafyNoSuchChannel"),
+            (BlockKind::TextRender, "#hello"),
+            (BlockKind::MemberAdd, "bafyNoSuchChannel"),
+        ] {
+            let (mb, cb, sig) = build_bundle_parts_with_meta(
+                &random_signing_key(),
+                kind,
+                &[
+                    ("channel_id", named),
+                    ("body", TEST_BODY),
+                    ("member_did", "did:jig:zX"),
+                ],
+            );
+            let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, IngestError::UnknownChannel { slug } if slug == named),
+                "{kind:?} naming {named}: expected UnknownChannel, got {err:?}"
+            );
+        }
+        assert!(
+            ctx.store
+                .list_blocks_by_channel("#hello", 10, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// `channel_id` and `channel` must name the same channel; a pair that
+    /// disagrees is refused as naming an unknown channel. A pair that agrees
+    /// lands under the id.
+    #[tokio::test]
+    async fn a_channel_id_and_slug_that_disagree_are_refused() {
+        let ctx = test_ctx();
+        let hello = seed_channel(&ctx, "#hello");
+        seed_channel(&ctx, "#other");
+        for slug in ["#other", "#nowhere"] {
+            let (mb, cb, sig) = build_bundle_parts_with_meta(
+                &random_signing_key(),
+                BlockKind::TextRender,
+                &[
+                    ("channel_id", hello.as_str()),
+                    ("channel", slug),
+                    ("body", TEST_BODY),
+                ],
+            );
+            let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, IngestError::UnknownChannel { slug } if *slug == hello),
+                "channel {slug}: expected UnknownChannel, got {err:?}"
+            );
+        }
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &random_signing_key(),
+            BlockKind::TextRender,
+            &[
+                ("channel_id", hello.as_str()),
+                ("channel", "#hello"),
+                ("body", TEST_BODY),
+            ],
+        );
+        let cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.store.get_block(&cid).unwrap().unwrap().channel_id,
+            Some(hello)
+        );
+    }
+
+    /// An archived channel named by its id refuses like one named by slug.
+    #[tokio::test]
+    async fn an_archived_channel_named_by_id_refuses() {
+        let ctx = test_ctx();
+        let channel_id = seed_channel(&ctx, "#retired");
+        assert!(ctx.store.archive_channel_by_id(&channel_id, 1).unwrap());
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &random_signing_key(),
+            BlockKind::TextRender,
+            &[("channel_id", channel_id.as_str()), ("body", TEST_BODY)],
+        );
+        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, IngestError::ChannelArchived { .. }),
+            "expected ChannelArchived, got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn member_add_by_the_owner_against_existing_channel_still_ingests() {
         let ctx = test_ctx_allowing(&["member-add"]);
@@ -2235,8 +2521,10 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_lifts_channel_id_from_metadata() {
+        // A block naming its channel only by slug is stored under the
+        // channel's CID, never the slug (JEP-0005 rule 1).
         let ctx = test_ctx(); // allows "text-render"
-        seed_channel(&ctx, "#hello");
+        let channel_id = seed_channel(&ctx, "#hello");
         let sender_key = random_signing_key();
         let (mb, cb, sig) =
             build_bundle_parts_with_channel(&sender_key, BlockKind::TextRender, "#hello");
@@ -2244,7 +2532,7 @@ mod tests {
             .await
             .unwrap();
         let stored = ctx.store.get_block(&cid).unwrap().unwrap();
-        assert_eq!(stored.channel_id.as_deref(), Some("#hello"));
+        assert_eq!(stored.channel_id.as_deref(), Some(channel_id.as_str()));
     }
 
     #[tokio::test]
@@ -2353,7 +2641,7 @@ mod tests {
             .await
             .expect("bridge sink should receive within timeout — slug->CID resolution must fire")
             .expect("a delivery");
-        assert_eq!(got.0.channel_id.as_deref(), Some("#dm/z"));
+        assert_eq!(got.0.channel_id.as_deref(), Some(channel_cid.as_str()));
         assert_eq!(got.0.sender_did, bob_did);
     }
 
@@ -2362,11 +2650,11 @@ mod tests {
         // A block ingested with IngestSource::Bridge should reach a local
         // channel subscriber (full broadcast), same as LocalClient.
         let ctx = test_ctx();
-        seed_channel(&ctx, "#dm/y");
+        let channel_id = seed_channel(&ctx, "#dm/y");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         ctx.fanout
             .subscribe_local(
-                crate::fanout::SubscriptionScope::Channel("#dm/y".to_string()),
+                crate::fanout::SubscriptionScope::Channel(channel_id.clone()),
                 crate::fanout::SubscriberIdentity::Unchecked,
                 tx,
             )
@@ -2380,6 +2668,6 @@ mod tests {
             .await
             .expect("local sub should receive")
             .expect("a delivery");
-        assert_eq!(got.0.channel_id.as_deref(), Some("#dm/y"));
+        assert_eq!(got.0.channel_id.as_deref(), Some(channel_id.as_str()));
     }
 }

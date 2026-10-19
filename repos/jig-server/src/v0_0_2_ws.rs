@@ -661,7 +661,27 @@ async fn handle_client_frame(
             }
 
             let sub_scope = match scope {
-                Scope::Channel { slug } => SubscriptionScope::Channel(slug),
+                // Clients name a channel by slug; fanout keys channels by
+                // their id (the channel-create CID). A slug with no row yet
+                // stays as it is until that channel is created (see
+                // `Fanout::bind_pending_channel`).
+                Scope::Channel { slug } => {
+                    match state
+                        .ingest_ctx
+                        .store
+                        .get_channel_by_slug_including_archived(&slug)
+                    {
+                        Ok(channel) => {
+                            SubscriptionScope::Channel(channel.map(|c| c.id).unwrap_or(slug))
+                        }
+                        Err(e) => {
+                            let detail = e.to_string();
+                            let _ =
+                                send_error(socket, Some(500), "PERSIST_ERROR", None, &detail).await;
+                            return Ok(());
+                        }
+                    }
+                }
                 Scope::Federation { block_kinds } => SubscriptionScope::Federation { block_kinds },
             };
             // A connection holds ONE subscription. A re-Subscribe replaces it,

@@ -662,9 +662,17 @@ mod tests {
 
         // Seed one message directly through the store (the admin router has no
         // text-render endpoint; the history-retention claim is about storage).
+        // Blocks are keyed by the channel's id, its creation-block CID.
+        let channel_id = state
+            .ingest_ctx
+            .store
+            .get_channel_by_slug("#scratch")
+            .unwrap()
+            .unwrap()
+            .id;
         let msg = jig_pipeline::persist::StoredBlock {
             cid: "bafy_msg_1".into(),
-            channel_id: Some("#scratch".into()),
+            channel_id: Some(channel_id),
             block_kind: "text-render".into(),
             sender_did: owner.did_string(),
             sender_sig: vec![0u8; 64],

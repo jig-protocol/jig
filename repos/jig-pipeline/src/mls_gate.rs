@@ -137,7 +137,9 @@ pub fn plan(
         let tree = meta_bytes(manifest, keys::RATCHET_TREE)?;
         let genesis = delivery::genesis(&info, &tree, sender).map_err(SuiteRefusal::Mls)?;
         return Ok(MlsPlan::Genesis(StoredMlsGroup {
-            slug,
+            // The channel's id is the creation block's CID, which this gate
+            // does not see; ingest keys the group when it stores it.
+            channel_id: String::new(),
             group_id: genesis.group_id,
             state: genesis.state,
             epoch: 0,
