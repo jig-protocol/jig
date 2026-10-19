@@ -153,3 +153,168 @@ mod tests {
         }
     }
 }
+
+/// A name's delegation as given on the command line: the nameservers to ask
+/// and the authorities whose attestations count. Without any, the suffix's
+/// delegation is discovered over `dns`.
+pub fn delegations_for(
+    name: &str,
+    nameservers: Vec<String>,
+    authorities: Vec<String>,
+) -> Result<jig_client::naming::Delegations> {
+    let mut delegations = jig_client::naming::Delegations::default();
+    if nameservers.is_empty() && authorities.is_empty() {
+        return Ok(delegations);
+    }
+    anyhow::ensure!(
+        !nameservers.is_empty() && !authorities.is_empty(),
+        "a delegation needs both --nameserver and --authority"
+    );
+    let suffix = jig_core::naming::Name::parse(name)?.suffix;
+    delegations.config.insert(
+        suffix,
+        jig_client::naming::ConfigDelegation {
+            authorities,
+            nameservers,
+        },
+    );
+    Ok(delegations)
+}
+
+/// Resolve `name` and hold it to this device's pin (JEP-0004 rule 17): a new
+/// name is pinned, a pinned one must still match, and a change is refused
+/// with the reason, both DIDs and the `jig trust accept-name` command that
+/// moves the pin. Everything the resolution acted on is kept as evidence; a
+/// failure to keep it fails the resolution. Warns when the pinned
+/// attestation is close to expiring. Returns the resolver's verdict, after
+/// pinning, so a caller can say "first contact" only on [`Verified::New`].
+///
+/// [`Verified::New`]: jig_client::naming::Verified::New
+pub async fn verify_name(
+    name: &str,
+    delegations: &jig_client::naming::Delegations,
+) -> Result<jig_client::naming::Verified> {
+    use jig_client::naming::{NameResolver, ResolveError, Verified};
+    let mut pins = Pins::load(&Pins::default_path())?;
+    let evidence = jig_client::evidence::NameEvidenceDir::new(
+        &jig_client::evidence::NameEvidenceDir::default_path(),
+    );
+    let verified = match NameResolver::new()
+        .resolve(name, delegations, &pins, &evidence)
+        .await
+    {
+        Ok(verified) => verified,
+        Err(e) => {
+            let hint = match &e {
+                ResolveError::PinMismatch { new, .. } => Some(format!(
+                    "if its holder confirms the change, `jig trust accept-name {name} --did {new}` \
+                     moves the pin"
+                )),
+                _ => None,
+            };
+            let e = anyhow::Error::new(e);
+            return Err(match hint {
+                Some(hint) => e.context(hint),
+                None => e,
+            });
+        }
+    };
+    let binding = match &verified {
+        Verified::New(binding) | Verified::Pinned(binding) => {
+            pins.pin_name(binding)?;
+            binding
+        }
+        Verified::Rotated { binding, from } => {
+            pins.accept_name(binding, binding.did())?;
+            eprintln!(
+                "note: {name} moved from {from} to {} along rotation links its old key signed.",
+                binding.did()
+            );
+            binding
+        }
+    };
+    warn_if_expiring(name, binding, chrono::Utc::now().timestamp());
+    Ok(verified)
+}
+
+/// Move `name`'s pin to `confirmed`, the DID its holder confirmed out of
+/// band (rule 9). The name is resolved afresh and must attest exactly that
+/// DID. Returns the DID it was pinned to before.
+pub async fn accept_name(
+    name: &str,
+    confirmed: &str,
+    delegations: &jig_client::naming::Delegations,
+) -> Result<Option<String>> {
+    use jig_client::naming::{NameResolver, Verified};
+    // Resolve as if nothing were pinned: the point is to replace the pin.
+    struct Unpinned;
+    impl jig_client::naming::NamePins for Unpinned {
+        fn name_pin(&self, _: &jig_client::naming::NameKey) -> Option<jig_client::naming::NamePin> {
+            None
+        }
+    }
+    let evidence = jig_client::evidence::NameEvidenceDir::new(
+        &jig_client::evidence::NameEvidenceDir::default_path(),
+    );
+    let binding = match NameResolver::new()
+        .resolve(name, delegations, &Unpinned, &evidence)
+        .await?
+    {
+        Verified::New(b) | Verified::Pinned(b) | Verified::Rotated { binding: b, .. } => b,
+    };
+    let mut pins = Pins::load(&Pins::default_path())?;
+    let old = pins.accept_name(&binding, confirmed)?;
+    warn_if_expiring(name, &binding, chrono::Utc::now().timestamp());
+    Ok(old)
+}
+
+/// How long before an attestation expires the CLI starts saying so.
+const EXPIRY_WARNING_SECS: i64 = 7 * 24 * 3600;
+
+fn warn_if_expiring(name: &str, binding: &jig_client::naming::Binding, now: i64) {
+    if let Some(message) = expiry_warning(name, binding.attestation.valid_until, now) {
+        eprintln!("warning: {message}");
+    }
+}
+
+fn expiry_warning(name: &str, valid_until: i64, now: i64) -> Option<String> {
+    let left = valid_until - now;
+    (left < EXPIRY_WARNING_SECS).then(|| {
+        format!(
+            "{name}'s attestation expires in {} day(s); its holder should renew it, or it stops \
+             resolving",
+            left.max(0) / (24 * 3600)
+        )
+    })
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    #[test]
+    fn an_attestation_near_expiry_is_warned_about() {
+        let day = 24 * 3600;
+        assert!(expiry_warning("alice@example.org", 30 * day, 0).is_none());
+        let soon = expiry_warning("alice@example.org", 3 * day, 0).unwrap();
+        assert!(soon.contains("3 day"), "{soon}");
+    }
+
+    #[test]
+    fn a_delegation_needs_both_halves() {
+        assert!(
+            delegations_for("alice@example.org", vec![], vec![])
+                .unwrap()
+                .config
+                .is_empty()
+        );
+        assert!(delegations_for("alice@example.org", vec!["https://ns".into()], vec![]).is_err());
+        let d = delegations_for(
+            "alice@example.org",
+            vec!["https://ns".into()],
+            vec!["did:jig:zNs".into()],
+        )
+        .unwrap();
+        assert_eq!(d.config["example.org"].authorities, ["did:jig:zNs"]);
+    }
+}
