@@ -324,7 +324,7 @@ servers are usually the only ones that admit `--anon` identities.
 
 **Status:** security levels and ruleset groups are not yet configuration settings. The
 nameserver's anonymous proof-of-work floor (`JIG_NS_ANON_MIN_POW`) went with the legacy
-alias challenges; it is still published in `/.well-known/jig-ns` but nothing applies it.
+alias challenges; it is still parsed, no longer published (#192), and nothing applies it.
 
 ### Admission proof-of-work (servers)
 
@@ -410,8 +410,10 @@ Rules:
 > penalties, rate limiting, `/v1/policy`, `/v1/resolve?name=`, the transparency and admin
 > routes, and federation below described a prototype whose routes were removed (#154). They
 > stay here as the design input that prototype explored; their redesign is the
-> [JEP-0008](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0008-proof-of-work.md) draft. `/.well-known/jig-ns` still publishes the `pow`, `rate_limit` and
-> `automation` parameters; nothing enforces them.
+> [JEP-0008](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0008-proof-of-work.md) draft. `/.well-known/jig-ns` no longer publishes proof-of-work
+> parameters (#192). It publishes the alias routes' enforced limits as
+> `policy.alias_rate_limits` (`enabled`, `per_ip_per_min`, `per_did_per_min`) (#197), and still
+> publishes the legacy `automation` parameters, which nothing enforces.
 
 ### Endpoints
 
@@ -500,8 +502,8 @@ Challenge issuance is limited per client IP and per rate key, in fixed one-minut
 
 | Limit | Default | Key |
 | --- | --- | --- |
-| Per IP | 120 per minute (`JIG_NS_RATE_PER_IP_PER_MIN`) | `ip:<address>` |
-| Per key | 60 per minute (`JIG_NS_RATE_PER_MIN`) | `claim:subject:<handle>` or `alias:scope:<scope>:subject:<subject>` |
+| Per IP | 120 per minute (`JIG_NS_RATE_PER_IP_PER_MIN`, *removed in #197*) | `ip:<address>` |
+| Per key | 60 per minute (`JIG_NS_RATE_PER_MIN`, *removed in #197*) | `claim:subject:<handle>` or `alias:scope:<scope>:subject:<subject>` |
 
 The client IP is the socket address, or the first entry of `JIG_NS_PROXY_IP_HEADER`
 (default `x-forwarded-for`) when `JIG_NS_TRUST_PROXY` is set. A refused request gets
@@ -532,8 +534,8 @@ misbehaving does not decay.
 
 | Parameter | Default | Setting |
 | --- | --- | --- |
-| `base_difficulty` | 18 | `JIG_NS_POW_DIFFICULTY` |
-| `min_difficulty` / `max_difficulty` | 8 / 28 | `JIG_NS_POW_MIN` / `JIG_NS_POW_MAX` |
+| `base_difficulty` | 18 | `JIG_NS_POW_DIFFICULTY` *(removed in #192)* |
+| `min_difficulty` / `max_difficulty` | 8 / 28 | `JIG_NS_POW_MIN` / `JIG_NS_POW_MAX` *(removed in #192)* |
 | `anonymous_min` | 12 | `JIG_NS_ANON_MIN_POW` |
 | `step_bits` | 2 per point | `JIG_NS_PENALTY_STEP_BITS` |
 | `max_points` | 64 | `[penalties] max_points` |
@@ -553,8 +555,10 @@ A nameserver publishes its policy at three paths:
 
 - **`GET /.well-known/jig-ns`** (JSON): `version`, `ns_id` (BLAKE3 of the nameserver's
   public key, hex), `endpoints`, and `policy` with `pow` (`base`, `min`, `max`,
-  `anonymous_min`), `rate_limit` (`per_key_per_min`, `per_ip_per_min`, `global_per_min`),
-  `automation`, `allow_domains`, `deny_domains`, `cache_ttl_secs`, `reputation` and
+  `anonymous_min`) *(not served: removed in #192)*, `rate_limit` (`per_key_per_min`,
+  `per_ip_per_min`, `global_per_min`) *(not served: replaced by `alias_rate_limits` in #197)*,
+  `alias_rate_limits` (`enabled`, `per_ip_per_min`, `per_did_per_min`; the limits the alias
+  routes enforce), `automation` (legacy; nothing enforces it), `allow_domains`, `deny_domains`, `cache_ttl_secs`, `reputation` and
   `public_key`.
 - **`GET /.well-known/jig-ns/capabilities`** (plain text): `version`, optional `domain`,
   one `work:` line per useful-work type, `tribunal:`, `transparency:` and `federation:`

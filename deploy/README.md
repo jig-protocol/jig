@@ -172,16 +172,11 @@ sudoedit /etc/jig/config.toml
 sudo install -m 0644 deploy/jig-nameserver.example.toml /etc/jig/jig-nameserver.toml
 sudoedit /etc/jig/jig-nameserver.toml
 
-# 4. nameserver secret (MANDATORY — it exits non-zero at startup without one)
-printf 'JIG_NS_SECRET=%s\n' "$(openssl rand -hex 32)" \
-  | sudo tee /etc/jig/jig-nameserver.env >/dev/null
-sudo chown root:jig /etc/jig/jig-nameserver.env
-sudo chmod 600 /etc/jig/jig-nameserver.env      # <- 600. it is a secret.
-
-# 5. optional server secrets (bridge tokens etc.), same treatment
+# 4. optional env files (bridge tokens etc.): chmod 600 root:jig
 #    sudo chmod 600 /etc/jig/jig-server.env
+#    /etc/jig/jig-nameserver.env is optional too; the nameserver needs no secret
 
-# 6. units
+# 5. units
 sudo install -m 0644 deploy/jig-server.service deploy/jig-nameserver.service \
                      deploy/jig-backup.service deploy/jig-backup.timer \
                      /etc/systemd/system/
@@ -575,10 +570,14 @@ can be recorded on an offline machine before any server exists. Point
   vars instead, which is still correct and still applied after any TOML load.
   *(The comment inside `jig-nameserver.service` still says the flags are parsed
   and ignored; that comment is stale.)*
-- **`JIG_NS_SECRET` is mandatory** — the nameserver refuses to start without it,
-  logging through tracing *and* stderr before exiting non-zero. It is in a
-  required (no leading `-`) `EnvironmentFile` so a missing secret fails loudly
-  instead of booting with a default PoW secret.
+- **The nameserver needs no secret.** `JIG_NS_SECRET` and the `[pow]` section
+  went with the legacy proof-of-work routes (#192), and `[rate_limits]` with the
+  legacy rate limits (#197). An env file that still sets `JIG_NS_SECRET`,
+  `JIG_NS_POW_*` or `JIG_NS_RATE_*`, or a config that still has `[pow]` or
+  `[rate_limits]`, is harmless: nothing reads them, so remove them at your own
+  pace. The unit's
+  `EnvironmentFile=` is optional (leading `-`) and only carries any `JIG_NS_*`
+  settings you choose to put there.
 - **Secrets never go inline in a unit file.** `systemctl cat` is readable by any
   local user. `EnvironmentFile`, `chmod 600 root:jig`, always.
 - **`MemoryDenyWriteExecute` is deliberately absent** from every unit. Blocks
