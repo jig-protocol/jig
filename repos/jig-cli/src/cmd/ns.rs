@@ -125,6 +125,13 @@ struct BindingResponse {
     attestation: String,
 }
 
+/// How long a nameserver request may take. Short in tests, which wait it out.
+const REQUEST_TIMEOUT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_secs(2)
+} else {
+    std::time::Duration::from_secs(15)
+};
+
 /// A nameserver to register, renew or rotate an alias with: its base URL and
 /// the suffix delegation it publishes, whose single authority is the DID that
 /// proofs of control are bound to.
@@ -146,7 +153,7 @@ impl Nameserver {
     pub(crate) async fn connect(ns_url: &str) -> Result<Self> {
         let base = ns_url.trim().trim_end_matches('/').to_string();
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .context("building HTTP client for nameserver")?;
         let url = format!("{base}/.well-known/jig-ns-delegation");
@@ -191,9 +198,13 @@ impl Nameserver {
     }
 
     /// POST `body` to `path` and return the attestation from a 2xx reply.
-    /// A transport error or non-2xx status is `Err`. A 2xx is `Ok`, with the
-    /// inner `Err` saying why the reply does not verify; the two are kept
-    /// apart because after a 2xx the nameserver may already have acted.
+    ///
+    /// The outer `Err` means the nameserver did not act: the request never
+    /// reached it, or it answered with a 4xx. The inner `Err` means it may
+    /// have: a timeout or dropped connection after the request went out, a
+    /// 5xx (a proxy's 502 can follow an applied change), a 2xx whose body
+    /// could not be read, or a reply that does not verify. Rotate keeps the
+    /// new key in that case, because the name may already point at it.
     pub(crate) async fn post_binding(
         &self,
         path: &str,
@@ -202,20 +213,32 @@ impl Nameserver {
         expected_did: &str,
     ) -> Result<Result<Attestation>> {
         let url = format!("{}{path}", self.base);
-        let resp = self
-            .http
-            .post(&url)
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?;
+        let resp = match self.http.post(&url).json(body).send().await {
+            Ok(resp) => resp,
+            // Nothing was sent: no connection, or no request to send.
+            Err(e) if e.is_connect() || e.is_builder() => {
+                return Err(anyhow::Error::new(e).context(format!("POST {url}")));
+            }
+            Err(e) => {
+                return Ok(Err(anyhow::Error::new(e)
+                    .context(format!("POST {url} was sent, but no reply came back"))));
+            }
+        };
         let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .with_context(|| format!("reading body of POST {url}"))?;
-        if !status.is_success() {
+        if status.is_client_error() {
+            let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("POST {url} returned {status}: {text}");
+        }
+        let text = match resp.text().await {
+            Ok(text) => text,
+            Err(e) => {
+                return Ok(Err(anyhow::Error::new(e).context(format!(
+                    "POST {url} returned {status}, but its body could not be read"
+                ))));
+            }
+        };
+        if !status.is_success() {
+            return Ok(Err(anyhow::anyhow!("POST {url} returned {status}: {text}")));
         }
         let now = chrono::Utc::now().timestamp();
         Ok(
@@ -596,6 +619,28 @@ mod tests {
         ns: SigningKey,
         post: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 'static,
     ) -> (String, Seen) {
+        stub_nameserver_raw(ns, move |p, b| {
+            let (status, out) = post(p, b);
+            Answer::Full(status, out)
+        })
+        .await
+    }
+
+    /// How the stub answers a request.
+    #[derive(Clone)]
+    enum Answer {
+        /// A complete response.
+        Full(u16, String),
+        /// No response: the connection stays open past the client's timeout.
+        Stall,
+        /// The status line and headers, then half the promised body.
+        Truncated(u16, String),
+    }
+
+    async fn stub_nameserver_raw(
+        ns: SigningKey,
+        post: impl Fn(&str, &str) -> Answer + Send + Sync + 'static,
+    ) -> (String, Seen) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let seen: Seen = Arc::default();
@@ -639,19 +684,36 @@ mod tests {
                     log.lock()
                         .unwrap()
                         .push((method.into(), path.into(), body.clone()));
-                    let (status, out) = match (method, path) {
-                        ("GET", "/.well-known/jig-ns-delegation") => (200, deleg),
-                        ("GET", "/v1/challenge") => (200, r#"{"challenge":"c0ffee"}"#.into()),
+                    let answer = match (method, path) {
+                        ("GET", "/.well-known/jig-ns-delegation") => Answer::Full(200, deleg),
+                        ("GET", "/v1/challenge") => {
+                            Answer::Full(200, r#"{"challenge":"c0ffee"}"#.into())
+                        }
                         ("POST", p) => post(p, &body),
                         ("GET", p) if p.starts_with("/v1/resolve/") => post(p, ""),
-                        _ => (404, "{}".into()),
+                        _ => Answer::Full(404, "{}".into()),
+                    };
+                    let (status, out, sent) = match answer {
+                        Answer::Full(status, out) => {
+                            let len = out.len();
+                            (status, out, len)
+                        }
+                        Answer::Truncated(status, out) => {
+                            let half = out.len() / 2;
+                            (status, out, half)
+                        }
+                        Answer::Stall => {
+                            tokio::time::sleep(REQUEST_TIMEOUT * 2).await;
+                            return;
+                        }
                     };
                     let resp = format!(
                         "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
-                         content-length: {}\r\nconnection: close\r\n\r\n{out}",
-                        out.len()
+                         content-length: {}\r\nconnection: close\r\n\r\n{}",
+                        out.len(),
+                        &out[..sent]
                     );
-                    sock.write_all(resp.as_bytes()).await.unwrap();
+                    let _ = sock.write_all(resp.as_bytes()).await;
                 });
             }
         });
@@ -793,6 +855,75 @@ mod tests {
             .expect("accepted")
             .expect("verifies");
         assert_eq!(att.did, new.did_string());
+    }
+
+    /// Every way a rotation can fail after the request went out leaves its
+    /// outcome unknown (the inner `Err`, so rotate keeps the new key); only
+    /// a 4xx or a request that never connected is a definite refusal.
+    #[tokio::test]
+    async fn rotate_counts_only_a_4xx_or_no_connection_as_not_applied() {
+        let ns = key(1);
+        let dir = tempdir().unwrap();
+        let old = jig_client::Identity::generate_for_tests(dir.path());
+        let new = jig_client::Identity::generate_for_tests(dir.path());
+        let rotate = |base: String| {
+            let (old, new) = (&old, &new);
+            async move { crate::cmd::keys::rotate_with_nameserver(old, new, "dj@dj.jig", &base).await }
+        };
+        let now = chrono::Utc::now().timestamp();
+        let applied = reply(&Attestation::sign(
+            &key(1),
+            &new.did_string(),
+            "dj@dj.jig",
+            now - 1,
+            now + DAY,
+        ));
+
+        let unknown = [
+            ("a stall past the timeout", Answer::Stall),
+            (
+                "a 2xx with a truncated body",
+                Answer::Truncated(200, applied),
+            ),
+            (
+                "a 502 from a proxy",
+                Answer::Full(502, "bad gateway".into()),
+            ),
+            ("a 500", Answer::Full(500, r#"{"code":"INTERNAL"}"#.into())),
+        ];
+        for (what, answer) in unknown {
+            let (base, _) = stub_nameserver_raw(ns.clone(), move |_, _| answer.clone()).await;
+            let outcome = rotate(base).await.unwrap_or_else(|e| {
+                panic!("{what}: the rotation may have applied, so not a refusal: {e:#}")
+            });
+            assert!(outcome.is_err(), "{what}: no verified attestation");
+        }
+
+        let (base, _) = stub_nameserver_raw(ns.clone(), |_, _| {
+            Answer::Full(409, r#"{"code":"DID_HOLDS_NAME"}"#.into())
+        })
+        .await;
+        assert!(rotate(base).await.is_err(), "a 4xx is a refusal");
+
+        // A port nothing listens on: the request never connects.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        let (base, _) = stub_nameserver(ns, attest_as(key(1), "dj@dj.jig")).await;
+        let ns_conn = Nameserver::connect(&base).await.unwrap();
+        let moved = Nameserver {
+            base: format!("http://{addr}"),
+            ..ns_conn
+        };
+        let name = Name::parse("dj@dj.jig").unwrap();
+        let body = crate::cmd::keys::build_rotate_request(&old, &new, "dj@dj.jig", "c0ffee");
+        assert!(
+            moved
+                .post_binding("/v1/rotate", &body, &name, &new.did_string())
+                .await
+                .is_err(),
+            "nothing was sent, so nothing was applied"
+        );
     }
 
     #[tokio::test]
