@@ -209,11 +209,7 @@ cargo build --workspace
 cargo nextest run --workspace     # no environment variables required
 ```
 
-`cargo nextest run --workspace` works from a clean checkout with nothing exported:
-[`repos/.config/nextest.toml`](repos/.config/nextest.toml) injects a throwaway
-`JIG_NS_SECRET` test fixture that `jig-nameserver`'s config defaults would otherwise panic
-without. That value is a public, source-controlled fixture and must never appear in a
-deployment.
+`cargo nextest run --workspace` works from a clean checkout with nothing exported.
 
 One environment caveat: stop any local `jig-server` on `127.0.0.1:7117` first.
 `jig-cli::global_flags missing_implicit_config_still_falls_back_to_defaults` asserts that
