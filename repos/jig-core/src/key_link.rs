@@ -10,8 +10,8 @@
 //! A link is a COSE_Sign ([`crate::cose`]) with two signatures, `old`'s then
 //! `new`'s, over a text-keyed deterministic CBOR map ([`crate::dcbor`]) with a
 //! `domain` entry, as every signed object in [`crate::naming`] has. The
-//! envelope bytes are what travels and what a verifier keeps as evidence. Test
-//! vectors live in `repos/jig-spec/jep/vectors/key-link/`.
+//! envelope bytes are what travels and what a verifier keeps as evidence. The
+//! encoding is JEP-0012; its test vectors live in `repos/jig-spec/jep/vectors/0012/`.
 
 use ed25519_dalek::SigningKey;
 
@@ -535,10 +535,9 @@ mod tests {
 
     #[test]
     fn signed_bytes_match_the_committed_vectors() {
-        let v: serde_json::Value = serde_json::from_str(include_str!(
-            "../../jig-spec/jep/vectors/key-link/vectors.json"
-        ))
-        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../../jig-spec/jep/vectors/0012/vectors.json"))
+                .unwrap();
         assert_eq!(vectors(), v);
         // And every committed envelope opens.
         for kind in ["channel", "alias", "contact", "public"] {
