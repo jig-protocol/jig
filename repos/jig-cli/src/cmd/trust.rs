@@ -377,7 +377,7 @@ mod tests {
     #[tokio::test]
     async fn history_that_continues_the_pin_moves_it() {
         let dir = tempfile::tempdir().unwrap();
-        let who = jig_client::Identity::generate_and_save(dir.path()).unwrap();
+        let who = jig_client::Identity::generate_for_tests(dir.path());
         let key = jig_core::crypto::ed25519::generate_signing_key();
         let r0 = sign(&key, 0, "bafyCreate", GENESIS_PREV);
         let r1 = sign(&key, 1, "bafyA", r0.hash());
@@ -394,7 +394,7 @@ mod tests {
     #[tokio::test]
     async fn history_that_forks_from_the_pin_is_refused_and_the_pin_holds() {
         let dir = tempfile::tempdir().unwrap();
-        let who = jig_client::Identity::generate_and_save(dir.path()).unwrap();
+        let who = jig_client::Identity::generate_for_tests(dir.path());
         let key = jig_core::crypto::ed25519::generate_signing_key();
         let r0 = sign(&key, 0, "bafyCreate", GENESIS_PREV);
         let r1 = sign(&key, 1, "bafyA", r0.hash());
@@ -411,7 +411,7 @@ mod tests {
     #[tokio::test]
     async fn a_gap_the_server_does_not_fill_is_reported_not_trusted() {
         let dir = tempfile::tempdir().unwrap();
-        let who = jig_client::Identity::generate_and_save(dir.path()).unwrap();
+        let who = jig_client::Identity::generate_for_tests(dir.path());
         let key = jig_core::crypto::ed25519::generate_signing_key();
         let r0 = sign(&key, 0, "bafyCreate", GENESIS_PREV);
         let r1 = sign(&key, 1, "bafyA", r0.hash());
@@ -427,7 +427,7 @@ mod tests {
     #[tokio::test]
     async fn a_pin_in_an_older_format_is_re_pinned_not_called_a_fork() {
         let dir = tempfile::tempdir().unwrap();
-        let who = jig_client::Identity::generate_and_save(dir.path()).unwrap();
+        let who = jig_client::Identity::generate_for_tests(dir.path());
         let key = jig_core::crypto::ed25519::generate_signing_key();
         let r0 = sign(&key, 0, "bafyCreate", GENESIS_PREV);
         let r1 = sign(&key, 1, "bafyA", r0.hash());
@@ -462,7 +462,7 @@ mod tests {
         // The guard is gated on the format: a server cannot use it to escape
         // a pin this build wrote.
         let dir = tempfile::tempdir().unwrap();
-        let who = jig_client::Identity::generate_and_save(dir.path()).unwrap();
+        let who = jig_client::Identity::generate_for_tests(dir.path());
         let key = jig_core::crypto::ed25519::generate_signing_key();
         let r0 = sign(&key, 0, "bafyCreate", GENESIS_PREV);
         let r1 = sign(&key, 1, "bafyA", r0.hash());
@@ -479,7 +479,7 @@ mod tests {
     #[tokio::test]
     async fn an_unpinned_channel_has_nothing_to_hold_the_server_to() {
         let dir = tempfile::tempdir().unwrap();
-        let who = jig_client::Identity::generate_and_save(dir.path()).unwrap();
+        let who = jig_client::Identity::generate_for_tests(dir.path());
         let key = jig_core::crypto::ed25519::generate_signing_key();
         let r0 = sign(&key, 0, "bafyCreate", GENESIS_PREV);
         let path = dir.path().join("pins.json");

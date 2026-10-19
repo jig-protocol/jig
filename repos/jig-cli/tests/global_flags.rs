@@ -46,6 +46,13 @@ fn write_cli_toml(home: &Path, base_url: &str, did: &str) {
 /// kill-and-report path turns that into a normal assertion failure.
 fn run_jig(home: &Path, args: &[&str], timeout: Duration) -> (bool, String, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(args)
         .env("HOME", home)
         .stdout(Stdio::piped())

@@ -1068,7 +1068,7 @@ mod tests {
     fn test_identity() -> jig_client::Identity {
         let dir = tempdir().unwrap();
         let path = dir.keep();
-        jig_client::Identity::generate_and_save(&path).unwrap()
+        jig_client::Identity::generate_for_tests(&path)
     }
 
     fn test_hlc(id: &jig_client::Identity) -> HlcTimestamp {

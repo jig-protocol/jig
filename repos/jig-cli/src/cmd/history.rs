@@ -134,7 +134,7 @@ mod tests {
     /// A text block as a v0.2 server delivers it, signature included.
     fn signed_text(body: &str, delivery: &str) -> DeliveredBlock {
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(&dir.keep()).unwrap();
+        let id = Identity::generate_for_tests(&dir.keep());
         let block = build_text_render(
             &id,
             "#hello",
@@ -210,7 +210,7 @@ mod tests {
         // every freshly opened channel. Backfill is a message replay; only
         // message-shaped kinds belong in it.
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(&dir.keep()).unwrap();
+        let id = Identity::generate_for_tests(&dir.keep());
         let hlc = HlcTimestamp {
             wall_ms: 1_747_680_000_000,
             logical: 0,
@@ -234,7 +234,7 @@ mod tests {
         // Port 1 is refused immediately. A server that has not been upgraded
         // answers 404 here instead; either way the pane must still open.
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(&dir.keep()).unwrap();
+        let id = Identity::generate_for_tests(&dir.keep());
         let backlog = backfill(&id, "http://127.0.0.1:1", "#hello", 10)
             .await
             .unwrap();

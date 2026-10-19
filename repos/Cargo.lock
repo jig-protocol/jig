@@ -170,6 +170,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "apple-native-keyring-store"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b350bfd03649e07aa05c0a81b3e15934374e585c98204a57e20b9d49f49bb9a"
+dependencies = [
+ "keyring-core",
+ "log",
+ "security-framework",
+]
+
+[[package]]
 name = "approx"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2987,6 +2998,7 @@ dependencies = [
  "toml",
  "url",
  "whoami",
+ "zeroize",
 ]
 
 [[package]]
@@ -2994,6 +3006,7 @@ name = "jig-client"
 version = "0.0.2"
 dependencies = [
  "anyhow",
+ "apple-native-keyring-store",
  "base64 0.23.1",
  "blake3",
  "chrono",
@@ -3004,6 +3017,7 @@ dependencies = [
  "jig-core",
  "jig-mls",
  "jig-pipeline",
+ "keyring-core",
  "rcgen",
  "reqwest",
  "rustls",
@@ -3018,6 +3032,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tracing",
  "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -3354,6 +3369,15 @@ checksum = "01737161ba802849cfd486b5bd209d38ba4943494c249a8126005170c7621edd"
 dependencies = [
  "crypto-common 0.2.2",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "keyring-core"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29fbf4b551298c67925f38cf341a1ada797a75f1837bdf8ae1fc8e2ebc6efb59"
+dependencies = [
+ "log",
 ]
 
 [[package]]
