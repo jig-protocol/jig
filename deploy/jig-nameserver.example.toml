@@ -1,7 +1,6 @@
 # jig-nameserver config. Install as /etc/jig/jig-nameserver.toml; the unit
-# points JIG_NS_CONFIG at it. Bind address, port, database path and the
-# secret stay in the unit and /etc/jig/jig-nameserver.env, which win over
-# anything here.
+# points JIG_NS_CONFIG at it. Bind address, port and database path stay in
+# the unit's environment, which wins over anything here.
 #
 # Required: the suffixes this nameserver serves. There is no default, and the
 # nameserver refuses to start without one. Replace the example name with a

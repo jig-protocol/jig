@@ -64,7 +64,6 @@ impl AppState {
             "ns-register".to_string(),
             "ns-rotate".to_string(),
             "ns-renew".to_string(),
-            "ns-attestation".to_string(),
             "fed-hello".to_string(),
         ];
 
@@ -193,7 +192,6 @@ impl AppState {
             "ns-register".to_string(),
             "ns-rotate".to_string(),
             "ns-renew".to_string(),
-            "ns-attestation".to_string(),
             "fed-hello".to_string(),
         ];
 
@@ -361,12 +359,63 @@ mod tests {
         let state = AppState::for_test().unwrap();
         let kinds = &state.ingest_ctx.allowed_block_kinds;
         assert!(kinds.contains(&"ns-register".to_string()));
-        assert!(kinds.contains(&"ns-attestation".to_string()));
+        assert!(
+            !kinds.contains(&"ns-attestation".to_string()),
+            "an ns-attestation block would write an alias row the resolve path re-signs"
+        );
         assert!(kinds.contains(&"fed-hello".to_string()));
         assert!(
             !kinds.contains(&"text-render".to_string()),
             "nameserver should NOT ingest text-render blocks"
         );
+    }
+
+    /// An `ns-attestation` block writes an alias row from its own metadata,
+    /// and `Binding::from_row` re-signs a non-COSE row naming this nameserver.
+    /// Accepting the kind would let any block author get a binding signed.
+    #[tokio::test]
+    async fn an_ns_attestation_block_is_refused() {
+        use ed25519_dalek::Signer;
+        use jig_core::{Author, BlockBundle, BlockKind, BlockManifest};
+        use jig_pipeline::ingest::{IngestError, IngestSource, ingest};
+
+        let state = AppState::for_test().unwrap();
+        let key = SigningKey::from_bytes(&[9; 32]);
+        let mut manifest = BlockManifest::builder()
+            .version(semver::Version::new(0, 1, 0))
+            .author(Author {
+                did: Did::from_ed25519_pubkey(key.verifying_key().as_bytes()),
+                public_key: None,
+                roles: vec![],
+            })
+            .build()
+            .unwrap()
+            .with_kind(BlockKind::NsAttestation);
+        for (k, v) in [
+            ("alias", "victim@dj.jig".to_string()),
+            ("ns_did", state.ns_did_string()),
+        ] {
+            manifest.metadata.insert(k.to_string(), serde_json::json!(v));
+        }
+        let manifest_bytes = manifest.to_canonical_bytes().unwrap();
+        let canonical = serde_json::to_vec(&(&manifest_bytes, &Vec::<u8>::new())).unwrap();
+        let sig = key.sign(&canonical).to_bytes().to_vec();
+        let bundle = BlockBundle {
+            manifest_bytes: &manifest_bytes,
+            code_bytes: &[],
+            resources: vec![],
+        };
+
+        let err = ingest(
+            &state.ingest_ctx,
+            bundle,
+            sig,
+            IngestSource::LocalClient { conn_id: 1 },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, IngestError::DisallowedBlockKind { .. }), "{err:?}");
+        assert!(state.alias_holder("victim@dj.jig").await.unwrap().is_none());
     }
 
     #[tokio::test]

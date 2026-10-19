@@ -34,11 +34,6 @@ defaults:
   run:
     working-directory: repos
 
-# jig-nameserver's config tests require this env var to construct.
-# Test value is fine; CI doesn't talk to a real nameserver.
-env:
-  JIG_NS_SECRET: ci_dummy_jig_ns_secret_not_a_real_value
-
 jobs:
   # Pull requests only: does this PR change anything a build could see? Docs
   # (`*.md` anywhere, `docs/**`) and repo metadata do not; everything else does,
