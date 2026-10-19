@@ -17,12 +17,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-pub mod backends;
 pub mod sqlite;
 pub use sqlite::SqliteStorage;
-
-// Re-export backend factory function for convenience
-pub use backends::create_storage_backend;
 
 #[async_trait]
 pub trait NamesStorage: Send + Sync + 'static {
