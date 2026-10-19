@@ -180,6 +180,42 @@ mod tests {
         }
     }
 
+    /// Remove `did`, `alias` and `valid_until` once nothing reads them: after
+    /// F1 slice 6 (L3) moves the CLI to the verified resolver, and the email
+    /// bridge's `address_book.rs` moves to the verified client resolver (#201).
+    #[tokio::test]
+    async fn the_response_keys_are_pinned() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let router = router_for(&state);
+        let did = register(&router, &state, "dj").await;
+
+        let (_, body) = get_path(router, "/v1/resolve/dj@dj.jig").await;
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "alias",
+                "attestation",
+                "did",
+                "links",
+                "reachability",
+                "valid_until"
+            ]
+        );
+        // The unsigned hints say what the signed attestation says.
+        let att = attestation_of(&body);
+        assert_eq!(body["did"], did);
+        assert_eq!(body["did"], att.did);
+        assert_eq!(body["alias"], att.alias);
+        assert_eq!(body["valid_until"], att.valid_until);
+    }
+
     #[tokio::test]
     async fn a_row_in_the_old_json_encoding_is_served_re_signed() {
         let state = Arc::new(AppState::for_test().unwrap());

@@ -245,11 +245,20 @@ struct StoredBinding {
 impl Binding {
     /// The body of resolve, register, renew and rotate. `links` stays empty
     /// until lane I's I3 defines rotation links.
+    ///
+    /// `did`, `alias` and `valid_until` are unsigned, transitional hints,
+    /// removed after F1 slice 6: they keep today's readers working, which
+    /// already trust an unsigned `did`. A verified client reads only
+    /// `attestation`. The test `the_response_keys_are_pinned` names the
+    /// removal condition.
     pub fn response(&self) -> serde_json::Value {
         serde_json::json!({
             "attestation": b64u(&self.attestation.envelope),
             "links": [],
             "reachability": self.reachability.as_ref().map(|r| b64u(&r.envelope)),
+            "did": self.attestation.did,
+            "alias": self.attestation.alias,
+            "valid_until": self.attestation.valid_until,
         })
     }
 
