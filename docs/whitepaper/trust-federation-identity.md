@@ -959,8 +959,10 @@ every member. It can withhold, delay and reorder blocks (OP-06).
   refuses any frame before `hello`. The client closes when the first frame is not a welcome,
   the signature or nonce does not verify, a pinned DID does not match, or the welcome
   contradicts itself or falls outside what the client offered.
-- **Partial.** Version and suite refusals leave the connection open. Later frames are not
-  checked against the welcome. The CLI pins each server's DID and the suites its welcome
+- **Partial.** A version or suite mismatch gets a signed refusal and the server closes
+  (4002). The client checks every later frame against the welcome and closes on a
+  contradiction (4003), keeping the signed frames as evidence it does not yet store (#140).
+  The CLI pins each server's DID and the suites its welcome
   advertised, and each channel's suite from its signed creation block, but a server can
   still answer a device's first look at a channel with one it made up. `reputation` is
   `null`. Each gap is a Partial or Open entry in the register
@@ -1258,9 +1260,9 @@ gap.
   claimant's clock. *Obligation:* time-based limits use the verifier's clock, and age is
   measured from the first signed observation by someone other than the subject. *Today:*
   replay windows use the server's clock; there are no time-based reputation limits; the
-  server's hybrid logical clock adopts timestamps from blocks without a skew bound, which it
-  advertises as `naively_unbounded_clock_skew` in `/.well-known/jig`. *To design:* a skew
-  bound, and age as observed by the group.
+  server refuses a block whose timestamp runs more than `[server] max_future_skew_ms` ahead
+  of its clock (default five minutes, signed in the welcome; #149). *To design:* age as
+  observed by the group.
 - **TM-02, self-asserted timestamps.** *Obligation:* a signer's own timestamp is a claim, so
   ordering and age come from others. *Today:* a block's `hlc_ts` is set by its author, inside
   the signed manifest, and the server orders history by it; the only server-signed time is
@@ -1291,11 +1293,11 @@ gap.
 | A peer is a transport; relayed blocks pass every gate | Built: relayed blocks run through `ingest` and the write gate (authors not asked for admission proof-of-work); peers listed and pinned in configuration | Peer DID in the contract; per-peer limits |
 | Pluggable suites, MLS default and first (D1, D13) | Built: MLS per channel; validating delivery service | Non-MLS plug-in shape (D13); per-suite conformance |
 | End-to-end encryption by default | Partial: DMs and restricted channels always encrypted; open channels plaintext unless created `mls` | Encryption on by default |
-| Mandatory signed handshake; clients fail closed and pin | Partial: signed welcome with nonce; CLI pins server DIDs, suites and channel suites; later frames unchecked | Close semantics; pins; real reputation (D11) |
+| Mandatory signed handshake; clients fail closed and pin | Partial: signed welcome with nonce; CLI pins server DIDs, suites and channel suites; later frames checked against the welcome | Close semantics; pins; real reputation (D11) |
 | No backdoors, no scanning, no default escrow | Holds: no backdoor, scanning or escrow exists | Keep it so as reporting is designed |
 | Provable abuse reports from encrypted channels, by participants only (D22) | None: signature exists; no tooling | Delegation or proof mechanism (AB-06) |
 | Tribunals per ruleset group, held by its nameservers; penalties only under an acknowledged ruleset | None | Tribunal process, eligibility (GV-01 to GV-03) |
-| Time-based limits use the verifier's clock | Partial: replay windows only; unbounded skew in the HLC | Skew bound; observed age (TM-01, TM-02) |
+| Time-based limits use the verifier's clock | Partial: replay windows; a future-skew bound on block timestamps (#149) | Observed age (TM-01, TM-02) |
 
 ---
 

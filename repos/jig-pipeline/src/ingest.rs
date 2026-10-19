@@ -818,7 +818,9 @@ fn membership_change(
 
 /// Map a suite-gate refusal onto the typed ingest error every surface
 /// classifies.
-fn suite_refusal(refusal: crate::mls_gate::SuiteRefusal, slug: &str) -> IngestError {
+/// The ingest error a suite-gate refusal answers with. Public so the
+/// suite conformance vectors check the same codes live traffic gets.
+pub fn suite_refusal(refusal: crate::mls_gate::SuiteRefusal, slug: &str) -> IngestError {
     use crate::mls_gate::SuiteRefusal;
     match refusal {
         SuiteRefusal::UnknownSuite(suite) => IngestError::UnknownSuite { suite },
@@ -831,9 +833,9 @@ fn suite_refusal(refusal: crate::mls_gate::SuiteRefusal, slug: &str) -> IngestEr
             channel,
             block,
         },
-        SuiteRefusal::Plaintext { slug } => IngestError::SuiteMismatch {
+        SuiteRefusal::Plaintext { slug, suite } => IngestError::SuiteMismatch {
             slug,
-            channel: "mls".to_string(),
+            channel: suite.to_string(),
             block: "plaintext body".to_string(),
         },
         SuiteRefusal::Missing { field } => IngestError::MissingMetadata {

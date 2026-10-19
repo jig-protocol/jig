@@ -121,10 +121,6 @@ pub struct ExecutionSection {
     pub memory_max_mb: u32,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
-    #[serde(default)]
-    pub pricing_enabled: bool,
-    #[serde(default)]
-    pub cost_per_fuel: Option<f64>,
     /// How many block executions may run at once.
     ///
     /// Sizes wasmtime's instance pool. Past it, execution does not queue inside
@@ -152,74 +148,6 @@ impl Default for ServerConfig {
     }
 }
 
-impl ServerConfig {
-    /// Attempt to construct a ServerConfig from a `jig-config` TOML file.
-    /// Maps a minimal subset needed by jig-server:
-    /// - storage.truth.connection_string -> database_path (when backend = sqlite)
-    pub fn load_from_jig_config_path(path: &Path) -> std::io::Result<Self> {
-        #[derive(serde::Deserialize, Default)]
-        struct JigConfigDoc {
-            #[serde(default)]
-            storage: Option<jig_config::storage::MultiTierStorageConfig>,
-        }
-
-        let s = fs::read_to_string(path)?;
-        let doc: JigConfigDoc = toml::from_str(&s)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        let mut cfg = ServerConfig::default();
-
-        // Map storage.truth -> database_path (sqlite path)
-        if let Some(storage) = &doc.storage
-            && let Some(truth) = &storage.truth
-        {
-            use jig_config::storage::Backend;
-            if matches!(truth.backend, Backend::Sqlite)
-                && let Some(path) = &truth.connection_string
-            {
-                cfg.database_path = PathBuf::from(path);
-            }
-        }
-
-        Ok(cfg)
-    }
-
-    /// Try to load jig-config from common locations (cwd ./jig-config.toml or ~/.jig/config.toml).
-    pub fn try_load_jig_config_from_well_known() -> Option<Self> {
-        let cwd = std::env::current_dir().ok();
-        if let Some(mut p) = cwd.clone() {
-            p.push("jig-config.toml");
-            if p.exists()
-                && let Ok(cfg) = Self::load_from_jig_config_path(&p)
-            {
-                return Some(cfg);
-            }
-        }
-        let home_default = jig_config::default_config_path();
-        if home_default.exists()
-            && let Ok(cfg) = Self::load_from_jig_config_path(&home_default)
-        {
-            return Some(cfg);
-        }
-        None
-    }
-
-    /// Pure helper for tests: try to load from exactly these two potential files in order.
-    pub fn try_load_jig_config_from_paths(cwd_config: &Path, home_config: &Path) -> Option<Self> {
-        if cwd_config.exists()
-            && let Ok(cfg) = Self::load_from_jig_config_path(cwd_config)
-        {
-            return Some(cfg);
-        }
-        if home_config.exists()
-            && let Ok(cfg) = Self::load_from_jig_config_path(home_config)
-        {
-            return Some(cfg);
-        }
-        None
-    }
-}
-
 impl Default for ExecutionSection {
     fn default() -> Self {
         Self {
@@ -227,8 +155,6 @@ impl Default for ExecutionSection {
             memory_max_mb: default_memory_max_mb(),
             timeout_ms: default_timeout_ms(),
             max_concurrent_executions: default_max_concurrent_executions(),
-            pricing_enabled: false,
-            cost_per_fuel: None,
         }
     }
 }
@@ -295,8 +221,10 @@ impl ServerConfig {
             timeout_ms: self.execution.timeout_ms,
             max_concurrent_executions: self.execution.max_concurrent_executions,
             host_id: self.host_id.clone(),
-            pricing_enabled: self.execution.pricing_enabled,
-            cost_per_fuel: self.execution.cost_per_fuel,
+            // No operator setting: the v0.0.2 render path never prices
+            // executions (`v0_0_2::runtime_config_from` maps no pricing).
+            pricing_enabled: false,
+            cost_per_fuel: None,
         }
     }
 
@@ -547,28 +475,8 @@ mod tests {
 }
 
 #[cfg(test)]
-mod jig_config_bridge_tests {
+mod config_file_tests {
     use super::*;
-    use std::io::Write;
-
-    #[test]
-    fn maps_sqlite_path_from_jig_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("jig-config.toml");
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(
-            f,
-            r#"[storage.truth]
-backend = "sqlite"
-connection_string = "{db}"
-"#,
-            db = dir.path().join("test.db").display()
-        )
-        .unwrap();
-
-        let cfg = ServerConfig::load_from_jig_config_path(&path).unwrap();
-        assert_eq!(cfg.database_path, dir.path().join("test.db"));
-    }
 
     #[test]
     fn apply_overrides_explicit_precedence() {
@@ -695,45 +603,5 @@ connection_string = "{db}"
             format!("{}:{}", server.bind_address, server.port),
             "install.sh must keep the decorative `listen` in sync with the real bind address"
         );
-    }
-
-    #[test]
-    fn jig_config_paths_precedence() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd_cfg = dir.path().join("cwd.toml");
-        let home_cfg = dir.path().join("home.toml");
-
-        {
-            let mut f = std::fs::File::create(&cwd_cfg).unwrap();
-            writeln!(
-                f,
-                r#"[storage.truth]
-backend = "sqlite"
-connection_string = "{db}"
-"#,
-                db = dir.path().join("cwd.db").display()
-            )
-            .unwrap();
-        }
-
-        {
-            let mut f = std::fs::File::create(&home_cfg).unwrap();
-            writeln!(
-                f,
-                r#"[storage.truth]
-backend = "sqlite"
-connection_string = "{db}"
-"#,
-                db = dir.path().join("home.db").display()
-            )
-            .unwrap();
-        }
-
-        let cfg1 = ServerConfig::try_load_jig_config_from_paths(&cwd_cfg, &home_cfg).unwrap();
-        assert_eq!(cfg1.database_path, dir.path().join("cwd.db"));
-
-        std::fs::remove_file(&cwd_cfg).unwrap();
-        let cfg2 = ServerConfig::try_load_jig_config_from_paths(&cwd_cfg, &home_cfg).unwrap();
-        assert_eq!(cfg2.database_path, dir.path().join("home.db"));
     }
 }

@@ -42,9 +42,8 @@ pub struct NameServerConfig {
     pub reputation: ReputationConfig,
     pub useful_work: UsefulWorkConfig,
     pub capabilities: CapabilitiesConfig,
-    pub runtime: RuntimeConfig, // Phase E: Embedded WASM execution
-    pub anomaly_detection: AnomalyDetectionConfig, // Phase D: Anomaly detection and cross-validation
-    pub analytics: AnalyticsConfig,                // Phase F: Analytics and insights
+    pub runtime: RuntimeConfig,     // Phase E: Embedded WASM execution
+    pub analytics: AnalyticsConfig, // Phase F: Analytics and insights
     /// v0.0.2 alias-API wiring (`[v0_0_2]`), consumed by
     /// [`crate::server::build_app`] to boot `crate::v0_0_2::AppState`.
     ///
@@ -279,7 +278,6 @@ impl NameServerConfig {
             useful_work: UsefulWorkConfig::from_env(),
             capabilities: CapabilitiesConfig::from_env(),
             runtime: RuntimeConfig::from_env(),
-            anomaly_detection: AnomalyDetectionConfig::from_env(),
             analytics: AnalyticsConfig::from_env(),
             v0_0_2: jig_config::v0_0_2_server::JigServerConfig::default(),
             alias_rate_limits: AliasRateLimitConfig::default(),
@@ -1440,153 +1438,6 @@ impl RuntimeConfig {
     }
 }
 
-// Phase D: Anomaly Detection Configuration
-// TODO: Migrate to jig-config/src/nameserver.rs once cross-validation config is upstreamed
-
-/// Anomaly detection configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AnomalyDetectionConfig {
-    /// Enable anomaly detection
-    pub enabled: bool,
-
-    /// Maximum fuel threshold for network operations
-    pub max_network_fuel: u64,
-
-    /// Fuel usage anomaly detection settings
-    pub fuel_anomaly: FuelAnomalyConfig,
-
-    /// Hard failure detection settings
-    pub hard_failure: HardFailureConfig,
-
-    /// Auto-escalation settings
-    pub auto_escalation: AutoEscalationConfig,
-
-    /// Cross-nameserver validation settings (Phase D)
-    pub cross_validation: CrossValidationConfig,
-}
-
-impl Default for AnomalyDetectionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            max_network_fuel: 500_000,
-            fuel_anomaly: FuelAnomalyConfig::default(),
-            hard_failure: HardFailureConfig::default(),
-            auto_escalation: AutoEscalationConfig::default(),
-            cross_validation: CrossValidationConfig::default(),
-        }
-    }
-}
-
-/// Fuel anomaly detection configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct FuelAnomalyConfig {
-    pub enabled: bool,
-    /// Excessive threshold multiplier (vs historical avg, e.g. 3.0 = 300%)
-    pub excessive_threshold: f64,
-    /// Suspicious threshold multiplier (vs historical avg, e.g. 0.3 = 30%)
-    pub suspicious_threshold: f64,
-    /// Minimum sample size for baseline
-    pub min_sample_size: usize,
-}
-
-impl Default for FuelAnomalyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            excessive_threshold: 3.0,
-            suspicious_threshold: 0.3,
-            min_sample_size: 10,
-        }
-    }
-}
-
-/// Hard failure detection configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct HardFailureConfig {
-    pub enabled: bool,
-    /// Consecutive failures to trigger alert
-    pub consecutive_threshold: u32,
-    /// Time window for failure counting (seconds)
-    pub time_window_secs: u32,
-}
-
-impl Default for HardFailureConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            consecutive_threshold: 5,
-            time_window_secs: 300, // 5 minutes
-        }
-    }
-}
-
-/// Auto-escalation configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AutoEscalationConfig {
-    pub enabled: bool,
-    /// Severity levels that trigger auto-escalation
-    pub severities: Vec<String>,
-    /// PoW penalty bits for each severity (low, medium, high, critical)
-    pub pow_penalties: std::collections::HashMap<String, u32>,
-}
-
-impl Default for AutoEscalationConfig {
-    fn default() -> Self {
-        let mut pow_penalties = std::collections::HashMap::new();
-        pow_penalties.insert("low".into(), 0);
-        pow_penalties.insert("medium".into(), 2);
-        pow_penalties.insert("high".into(), 4);
-        pow_penalties.insert("critical".into(), 8);
-
-        Self {
-            enabled: true,
-            severities: vec!["high".into(), "critical".into()],
-            pow_penalties,
-        }
-    }
-}
-
-/// Cross-nameserver validation configuration (Phase D)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CrossValidationConfig {
-    /// Enable cross-validation for suspicious receipts
-    pub enabled: bool,
-
-    /// HTTP timeout for peer requests (seconds)
-    pub validation_timeout_secs: u32,
-
-    /// Maximum peers to query for validation
-    pub max_validation_peers: usize,
-
-    /// Fuel tolerance percentage (e.g., 5.0 = ±5%)
-    pub fuel_tolerance_pct: f64,
-
-    /// Consensus threshold (e.g., 0.5 = >50% agreement required)
-    pub consensus_threshold: f64,
-
-    /// Minimum peers required for validation
-    pub min_peers: usize,
-}
-
-impl Default for CrossValidationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            validation_timeout_secs: 5,
-            max_validation_peers: 3,
-            fuel_tolerance_pct: 5.0,
-            consensus_threshold: 0.5,
-            min_peers: 2,
-        }
-    }
-}
-
 // Phase F: Analytics Configuration
 
 /// Analytics configuration for nameserver metrics and insights
@@ -1621,41 +1472,6 @@ impl AnalyticsConfig {
         if let Ok(val) = std::env::var("JIG_NS_ANALYTICS_DEFAULT_RANGE") {
             self.default_time_range = val;
         }
-    }
-}
-
-// from_env() implementations for anomaly detection configs
-impl AnomalyDetectionConfig {
-    fn from_env() -> Self {
-        Self::default()
-    }
-}
-
-impl FuelAnomalyConfig {
-    #[allow(dead_code)]
-    fn from_env() -> Self {
-        Self::default()
-    }
-}
-
-impl HardFailureConfig {
-    #[allow(dead_code)]
-    fn from_env() -> Self {
-        Self::default()
-    }
-}
-
-impl AutoEscalationConfig {
-    #[allow(dead_code)]
-    fn from_env() -> Self {
-        Self::default()
-    }
-}
-
-impl CrossValidationConfig {
-    #[allow(dead_code)]
-    fn from_env() -> Self {
-        Self::default()
     }
 }
 
@@ -1879,39 +1695,6 @@ allowed_capabilities = [
 ]
 deterministic = true
 wasi_preview2 = true
-
-[anomaly_detection]  # Phase D: Anomaly detection and cross-validation
-enabled = true
-max_network_fuel = 500_000
-
-[anomaly_detection.fuel_anomaly]
-enabled = true
-excessive_threshold = 3.0  # Flag if fuel > 3x historical average
-suspicious_threshold = 0.3  # Flag if fuel < 30% historical average
-min_sample_size = 10
-
-[anomaly_detection.hard_failure]
-enabled = true
-consecutive_threshold = 5  # Trigger alert after 5 consecutive failures
-time_window_secs = 300  # 5 minutes
-
-[anomaly_detection.auto_escalation]
-enabled = true
-severities = ["high", "critical"]
-
-[anomaly_detection.auto_escalation.pow_penalties]
-low = 0
-medium = 2
-high = 4
-critical = 8
-
-[anomaly_detection.cross_validation]
-enabled = true
-validation_timeout_secs = 5  # HTTP timeout for peer requests
-max_validation_peers = 3  # Max peers to query
-fuel_tolerance_pct = 5.0  # ±5% fuel variance allowed
-consensus_threshold = 0.5  # >50% peers must agree
-min_peers = 2  # Minimum 2 peers required
 
 # Phase F: Analytics configuration
 [analytics]

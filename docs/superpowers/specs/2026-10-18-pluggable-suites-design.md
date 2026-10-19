@@ -173,6 +173,9 @@ is not registered. No new CI job.
 
 ## 4a. Report profile (added for lane R)
 
+> **Superseded** by JEP-0010 rule 8a (message franking, draft in PR #166) and the "Reporting"
+> section of JEP-0001: there is no per-suite report profile, only faithful delivery.
+
 DJ decided in lane R (Q7) that every suite defines a report profile: what a member
 discloses about one message so a tribunal can verify its authorship and content, opening no
 other message. JEP-0001 (in the build PR) records it:
