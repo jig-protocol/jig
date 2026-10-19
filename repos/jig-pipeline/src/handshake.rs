@@ -396,12 +396,13 @@ impl PendingHello {
 }
 
 /// Content suites this implementation can carry: what a channel may be
-/// created under. v0.2 advertises `none` and `mls`.
+/// created under. v0.2 advertises `none` and `mls`; a test suite compiled
+/// into a test build is never advertised.
 pub fn implemented_suite_names() -> Vec<String> {
     EncryptionSuite::REGISTERED
         .iter()
         .copied()
-        .filter(|suite| suite.is_implemented())
+        .filter(|suite| suite.is_implemented() && suite.is_advertised())
         .map(|suite| suite.as_str().to_string())
         .collect()
 }

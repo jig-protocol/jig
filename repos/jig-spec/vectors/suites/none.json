@@ -1,0 +1,355 @@
+{
+  "format": 1,
+  "suite": "none",
+  "description": "No encryption: open channels only, plaintext `body`.",
+  "cases": [
+    {
+      "name": "an open channel takes plaintext",
+      "steps": [
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "channel-create",
+              "metadata": {
+                "slug": "#v"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": "accept"
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "text-render",
+              "metadata": {
+                "body": "hello",
+                "channel": "#v"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": "accept"
+          }
+        },
+        {
+          "read": {
+            "step": 1,
+            "expect": {
+              "plaintext": "hello"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "a restricted channel is never plaintext",
+      "steps": [
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "channel-create",
+              "metadata": {
+                "slug": "#v",
+                "visibility": "restricted"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": {
+              "refuse": "RESTRICTED_REQUIRES_MLS"
+            }
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "channel-create",
+              "metadata": {
+                "slug": "#v",
+                "suite": "none",
+                "visibility": "restricted"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": {
+              "refuse": "RESTRICTED_REQUIRES_MLS"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "an unregistered suite is refused at creation",
+      "steps": [
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "channel-create",
+              "metadata": {
+                "slug": "#v",
+                "suite": "test-unregistered"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": {
+              "refuse": "UNSUPPORTED_SUITE"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "content under another suite is refused",
+      "steps": [
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "channel-create",
+              "metadata": {
+                "slug": "#v"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": "accept"
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "text-render",
+              "metadata": {
+                "channel": "#v",
+                "mls_message": "AAAA"
+              },
+              "parents": [],
+              "privacy": {
+                "encryption": "mls",
+                "metadata_visibility": "public",
+                "recipients": []
+              },
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": {
+              "refuse": "SUITE_MISMATCH"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "control blocks are never encrypted",
+      "steps": [
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "channel-create",
+              "metadata": {
+                "slug": "#v"
+              },
+              "parents": [],
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": "accept"
+          }
+        },
+        {
+          "submit": {
+            "sender": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+            "manifest": {
+              "attestations": [],
+              "attested_by": [],
+              "authors": [
+                {
+                  "did": "did:jig:zrkeohxlubhyzl7ks3mwtzos5olfgocn7dwkbeg7toseadnapn5oa",
+                  "public_key": null,
+                  "roles": []
+                }
+              ],
+              "capabilities": [],
+              "constraints": {
+                "deterministic": true,
+                "execution_timeout_ms": 250,
+                "fuel_max": 5000000,
+                "memory_max_mb": 32
+              },
+              "kind": "member-add",
+              "metadata": {
+                "channel": "#v",
+                "member_did": "did:jig:zqe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwoka"
+              },
+              "parents": [],
+              "privacy": {
+                "encryption": "mls",
+                "metadata_visibility": "public",
+                "recipients": []
+              },
+              "resources": [],
+              "schema": "https://jig.dev/schema/block-manifest/v0.1",
+              "version": "0.1.0"
+            },
+            "expect": {
+              "refuse": "SUITE_MISMATCH"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

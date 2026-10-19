@@ -98,7 +98,6 @@ repos/
 ├── jig-nameserver/     # DNS/discovery
 ├── jig-config/         # Shared config
 ├── integration-tests/  # Cross-component tests
-├── hello-wasm/         # Example WASM block
 └── (archived repos)    # See individual READMEs
 ```
 
