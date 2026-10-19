@@ -39,14 +39,12 @@ pub struct NameServerConfig {
     pub federation: FederationConfig,
     pub admin: AdminConfig,
     pub automation: AutomationPolicy,
-    pub transparency: TransparencyConfig,
     pub reputation: ReputationConfig,
     pub useful_work: UsefulWorkConfig,
     pub capabilities: CapabilitiesConfig,
-    pub runtime: RuntimeConfig, // Phase E: Embedded WASM execution
-    pub anomaly_detection: AnomalyDetectionConfig, // Phase D: Anomaly detection and cross-validation
-    pub analytics: AnalyticsConfig,                // Phase F: Analytics and insights
-    pub hot: HotConfig, // Phase F Tier 2/3: Hot state backend (rate limiting, caching)
+    pub runtime: RuntimeConfig,     // Phase E: Embedded WASM execution
+    pub analytics: AnalyticsConfig, // Phase F: Analytics and insights
+    pub hot: HotConfig,             // Phase F Tier 2/3: Hot state backend (rate limiting, caching)
     /// v0.0.2 alias-API wiring (`[v0_0_2]`), consumed by
     /// [`crate::server::build_app`] to boot `crate::v0_0_2::AppState`.
     ///
@@ -59,6 +57,10 @@ pub struct NameServerConfig {
     /// `v0_0_2::AppState::new`.
     #[serde(default)]
     pub v0_0_2: jig_config::v0_0_2_server::JigServerConfig,
+    /// Per-IP and per-DID limits on the v0.0.2 `register`, `rotate` and
+    /// `renew` routes (`[alias_rate_limits]`). Separate from the legacy
+    /// `[rate_limits]`, which only the v0.0.1 challenge route read.
+    pub alias_rate_limits: AliasRateLimitConfig,
 }
 
 impl NameServerConfig {
@@ -273,15 +275,14 @@ impl NameServerConfig {
             federation: FederationConfig::from_env(),
             admin: AdminConfig::from_env(),
             automation: AutomationPolicy::from_env(),
-            transparency: TransparencyConfig::from_env(),
             reputation: ReputationConfig::from_env(),
             useful_work: UsefulWorkConfig::from_env(),
             capabilities: CapabilitiesConfig::from_env(),
             runtime: RuntimeConfig::from_env(),
-            anomaly_detection: AnomalyDetectionConfig::from_env(),
             analytics: AnalyticsConfig::from_env(),
             hot: HotConfig::from_env(),
             v0_0_2: jig_config::v0_0_2_server::JigServerConfig::default(),
+            alias_rate_limits: AliasRateLimitConfig::default(),
         }
     }
 
@@ -298,7 +299,6 @@ impl NameServerConfig {
         self.federation.merge_env();
         self.admin.merge_env();
         self.automation.merge_env();
-        self.transparency.merge_env();
         self.reputation.merge_env();
         self.useful_work.merge_env();
         self.capabilities.merge_env();
@@ -566,6 +566,29 @@ impl PowConfig {
             && let Ok(parsed) = bits.parse::<u16>()
         {
             self.max_difficulty = parsed;
+        }
+    }
+}
+
+/// Limits for the v0.0.2 alias-mutating routes, enforced by
+/// [`crate::v0_0_2_rate_limit`]. Each counts requests in a fixed one-minute
+/// window; a limit of `0` refuses every request on that bucket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AliasRateLimitConfig {
+    pub enabled: bool,
+    /// Requests per client IP per minute, across register, rotate and renew.
+    pub per_ip_per_min: u32,
+    /// Requests naming a given DID per minute (`did`, `old_did` or `new_did`).
+    pub per_did_per_min: u32,
+}
+
+impl Default for AliasRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            per_ip_per_min: 30,
+            per_did_per_min: 10,
         }
     }
 }
@@ -966,48 +989,6 @@ impl AutomationPolicy {
         let growth = (base - 1.0).powf(self.power_law_alpha).max(0.0);
         let amplification = 1.0 + growth * self.pile_on_factor;
         amplification.clamp(1.0, self.max_multiplier.max(1.0))
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct TransparencyConfig {
-    pub log_path: PathBuf,
-    pub publish_interval_secs: i64,
-}
-
-impl Default for TransparencyConfig {
-    fn default() -> Self {
-        Self {
-            log_path: default_transparency_path(),
-            publish_interval_secs: 3600,
-        }
-    }
-}
-
-impl TransparencyConfig {
-    fn from_env() -> Self {
-        let mut cfg = Self::default();
-        if let Ok(path) = std::env::var("JIG_NS_TRANSPARENCY_PATH") {
-            cfg.log_path = PathBuf::from(path);
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_TRANSPARENCY_INTERVAL")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            cfg.publish_interval_secs = parsed;
-        }
-        cfg
-    }
-
-    fn merge_env(&mut self) {
-        if let Ok(path) = std::env::var("JIG_NS_TRANSPARENCY_PATH") {
-            self.log_path = PathBuf::from(path);
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_TRANSPARENCY_INTERVAL")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            self.publish_interval_secs = parsed;
-        }
     }
 }
 
@@ -1483,153 +1464,6 @@ impl RuntimeConfig {
     }
 }
 
-// Phase D: Anomaly Detection Configuration
-// TODO: Migrate to jig-config/src/nameserver.rs once cross-validation config is upstreamed
-
-/// Anomaly detection configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AnomalyDetectionConfig {
-    /// Enable anomaly detection
-    pub enabled: bool,
-
-    /// Maximum fuel threshold for network operations
-    pub max_network_fuel: u64,
-
-    /// Fuel usage anomaly detection settings
-    pub fuel_anomaly: FuelAnomalyConfig,
-
-    /// Hard failure detection settings
-    pub hard_failure: HardFailureConfig,
-
-    /// Auto-escalation settings
-    pub auto_escalation: AutoEscalationConfig,
-
-    /// Cross-nameserver validation settings (Phase D)
-    pub cross_validation: CrossValidationConfig,
-}
-
-impl Default for AnomalyDetectionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            max_network_fuel: 500_000,
-            fuel_anomaly: FuelAnomalyConfig::default(),
-            hard_failure: HardFailureConfig::default(),
-            auto_escalation: AutoEscalationConfig::default(),
-            cross_validation: CrossValidationConfig::default(),
-        }
-    }
-}
-
-/// Fuel anomaly detection configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct FuelAnomalyConfig {
-    pub enabled: bool,
-    /// Excessive threshold multiplier (vs historical avg, e.g. 3.0 = 300%)
-    pub excessive_threshold: f64,
-    /// Suspicious threshold multiplier (vs historical avg, e.g. 0.3 = 30%)
-    pub suspicious_threshold: f64,
-    /// Minimum sample size for baseline
-    pub min_sample_size: usize,
-}
-
-impl Default for FuelAnomalyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            excessive_threshold: 3.0,
-            suspicious_threshold: 0.3,
-            min_sample_size: 10,
-        }
-    }
-}
-
-/// Hard failure detection configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct HardFailureConfig {
-    pub enabled: bool,
-    /// Consecutive failures to trigger alert
-    pub consecutive_threshold: u32,
-    /// Time window for failure counting (seconds)
-    pub time_window_secs: u32,
-}
-
-impl Default for HardFailureConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            consecutive_threshold: 5,
-            time_window_secs: 300, // 5 minutes
-        }
-    }
-}
-
-/// Auto-escalation configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AutoEscalationConfig {
-    pub enabled: bool,
-    /// Severity levels that trigger auto-escalation
-    pub severities: Vec<String>,
-    /// PoW penalty bits for each severity (low, medium, high, critical)
-    pub pow_penalties: std::collections::HashMap<String, u32>,
-}
-
-impl Default for AutoEscalationConfig {
-    fn default() -> Self {
-        let mut pow_penalties = std::collections::HashMap::new();
-        pow_penalties.insert("low".into(), 0);
-        pow_penalties.insert("medium".into(), 2);
-        pow_penalties.insert("high".into(), 4);
-        pow_penalties.insert("critical".into(), 8);
-
-        Self {
-            enabled: true,
-            severities: vec!["high".into(), "critical".into()],
-            pow_penalties,
-        }
-    }
-}
-
-/// Cross-nameserver validation configuration (Phase D)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CrossValidationConfig {
-    /// Enable cross-validation for suspicious receipts
-    pub enabled: bool,
-
-    /// HTTP timeout for peer requests (seconds)
-    pub validation_timeout_secs: u32,
-
-    /// Maximum peers to query for validation
-    pub max_validation_peers: usize,
-
-    /// Fuel tolerance percentage (e.g., 5.0 = ±5%)
-    pub fuel_tolerance_pct: f64,
-
-    /// Consensus threshold (e.g., 0.5 = >50% agreement required)
-    pub consensus_threshold: f64,
-
-    /// Minimum peers required for validation
-    pub min_peers: usize,
-}
-
-impl Default for CrossValidationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            validation_timeout_secs: 5,
-            max_validation_peers: 3,
-            fuel_tolerance_pct: 5.0,
-            consensus_threshold: 0.5,
-            min_peers: 2,
-        }
-    }
-}
-
 // Phase F: Analytics Configuration
 
 /// Analytics configuration for nameserver metrics and insights
@@ -1736,41 +1570,6 @@ impl HotConfig {
         }
         // Backend-specific config can be set via JIG_NS_HOT_BACKEND_<KEY>
         // e.g., JIG_NS_HOT_BACKEND_CONNECTION_STRING=redis://localhost
-    }
-}
-
-// from_env() implementations for anomaly detection configs
-impl AnomalyDetectionConfig {
-    fn from_env() -> Self {
-        Self::default()
-    }
-}
-
-impl FuelAnomalyConfig {
-    #[allow(dead_code)]
-    fn from_env() -> Self {
-        Self::default()
-    }
-}
-
-impl HardFailureConfig {
-    #[allow(dead_code)]
-    fn from_env() -> Self {
-        Self::default()
-    }
-}
-
-impl AutoEscalationConfig {
-    #[allow(dead_code)]
-    fn from_env() -> Self {
-        Self::default()
-    }
-}
-
-impl CrossValidationConfig {
-    #[allow(dead_code)]
-    fn from_env() -> Self {
-        Self::default()
     }
 }
 
@@ -1882,16 +1681,6 @@ fn default_federation_cache_ttl() -> i64 {
         .unwrap_or(300)
 }
 
-fn default_transparency_path() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        home.join(".jig")
-            .join("nameserver")
-            .join("transparency.log")
-    } else {
-        PathBuf::from("transparency.log")
-    }
-}
-
 const TEMPLATE: &str = r#"
 # Jig Nameserver configuration
 
@@ -1923,6 +1712,13 @@ max_difficulty = 28
 per_key_per_min = 60
 per_ip_per_min = 120
 
+# v0.0.2 register / rotate / renew. Refused requests get HTTP 429 with code
+# RATE_LIMITED and a Retry-After header.
+[alias_rate_limits]
+enabled = true
+per_ip_per_min = 30
+per_did_per_min = 10
+
 [penalties]
 decay_secs = 300
 step_bits = 2
@@ -1949,10 +1745,6 @@ max_multiplier = 8.0
 quorum = 3
 evidence_window_secs = 600
 human_review_window_secs = 3600
-
-[transparency]
-log_path = "~/.jig/nameserver/transparency.log"
-publish_interval_secs = 3600
 
 [reputation]
 default_ruleset = "high-sec"
@@ -2010,39 +1802,6 @@ allowed_capabilities = [
 ]
 deterministic = true
 wasi_preview2 = true
-
-[anomaly_detection]  # Phase D: Anomaly detection and cross-validation
-enabled = true
-max_network_fuel = 500_000
-
-[anomaly_detection.fuel_anomaly]
-enabled = true
-excessive_threshold = 3.0  # Flag if fuel > 3x historical average
-suspicious_threshold = 0.3  # Flag if fuel < 30% historical average
-min_sample_size = 10
-
-[anomaly_detection.hard_failure]
-enabled = true
-consecutive_threshold = 5  # Trigger alert after 5 consecutive failures
-time_window_secs = 300  # 5 minutes
-
-[anomaly_detection.auto_escalation]
-enabled = true
-severities = ["high", "critical"]
-
-[anomaly_detection.auto_escalation.pow_penalties]
-low = 0
-medium = 2
-high = 4
-critical = 8
-
-[anomaly_detection.cross_validation]
-enabled = true
-validation_timeout_secs = 5  # HTTP timeout for peer requests
-max_validation_peers = 3  # Max peers to query
-fuel_tolerance_pct = 5.0  # ±5% fuel variance allowed
-consensus_threshold = 0.5  # >50% peers must agree
-min_peers = 2  # Minimum 2 peers required
 
 # Phase F: Analytics configuration
 [analytics]

@@ -84,8 +84,10 @@ pub struct ChannelPin {
 }
 
 impl ChannelPin {
+    /// Anything but `none` is encrypted, including a suite this build does
+    /// not know: a pin is never a reason to send in the clear.
     pub fn encrypted(&self) -> bool {
-        self.suite == jig_core::EncryptionSuite::Mls.as_str()
+        self.suite != jig_core::EncryptionSuite::Unencrypted.as_str()
     }
 }
 
@@ -172,13 +174,17 @@ impl Pins {
     }
 
     /// The handshake offer for `server`: the default offer, with the pinned
-    /// DID when there is one, so a welcome signed by another key fails closed.
+    /// DID when there is one, so a welcome signed by another key fails closed,
+    /// and the pinned suites, so a signed refusal that drops one is caught.
     pub fn offer(&self, server: &str) -> ClientOffer {
+        let pin = self.server(server);
         ClientOffer {
-            pinned_server_did: self
-                .server(server)
+            pinned_server_did: pin
                 .map(|p| p.server_did.clone())
                 .filter(|did| !did.is_empty()),
+            pinned_suites: pin
+                .map(|p| p.suites.iter().cloned().collect())
+                .unwrap_or_default(),
             ..ClientOffer::default()
         }
     }
@@ -483,6 +489,20 @@ mod tests {
         );
     }
 
+    /// A suite this build does not know is never read as plaintext.
+    #[test]
+    fn any_suite_but_none_is_encrypted() {
+        let pin = |suite: &str| ChannelPin {
+            create_cid: "bafy".into(),
+            suite: suite.into(),
+            owner_did: "did:jig:zA".into(),
+        };
+        assert!(!pin("none").encrypted());
+        assert!(pin("mls").encrypted());
+        assert!(pin("test-aead").encrypted());
+        assert!(pin("signal-pqxdh").encrypted());
+    }
+
     #[test]
     fn a_restricted_channel_is_proven_only_as_mls() {
         let owner = identity();
@@ -576,6 +596,11 @@ mod tests {
         assert_eq!(
             pins.offer("http://host:7117").pinned_server_did.as_deref(),
             Some("did:jig:zA")
+        );
+        assert_eq!(
+            pins.offer(server).pinned_suites,
+            vec!["mls".to_string(), "none".to_string()],
+            "the offer carries the pinned suites, so a refusal cannot drop one"
         );
         let mut pins = pins;
         // Dropping `mls` is a downgrade.

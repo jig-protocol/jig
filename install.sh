@@ -288,7 +288,6 @@ dangerously_disable_federation_tls = false
 [debug]
 # Channel ops are on /api/v1/channels and always mounted; nothing here is
 # needed for the default path.
-admin_endpoints = false
 list_handles = false
 EOF
   log "wrote $cfg"

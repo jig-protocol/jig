@@ -5,19 +5,29 @@
 //! dependencies so other crates can embed these primitives directly.
 
 pub mod admission_pow;
+pub mod block_abi;
 pub mod block_kind;
+pub mod block_receipt;
 pub mod bundle;
-pub mod capability_dsl;
+pub mod canonical_cid;
 pub mod capability_registry;
 pub mod capability_scope;
 pub mod capability_validation;
+pub mod component_validation;
+#[cfg(feature = "ed25519")]
+pub mod cose;
 pub mod crypto;
+pub mod dcbor;
 pub mod did;
 pub mod dm;
 pub mod error;
 pub mod hlc;
-pub mod lint;
+#[cfg(feature = "keystore")]
+pub mod keystore;
 pub mod manifest;
+#[cfg(feature = "ed25519")]
+pub mod naming;
+pub mod operator_policy;
 #[cfg(test)]
 pub mod proptest_generators;
 pub mod receipt;
@@ -31,19 +41,15 @@ pub mod wasm_validation;
 
 pub use block_kind::{BlockKind, BlockKindError};
 pub use bundle::{Artifact, BlockBundle};
-pub use capability_dsl::{build_capability, parse_scopes};
 pub use capability_registry::{CapabilityDefinition, CapabilityRegistry};
 pub use capability_scope::{
     CAPABILITY_SCOPE_SEPARATOR, CapabilityScopePattern, CapabilityUsageKey,
 };
-pub use capability_validation::{
-    CapabilityReport, check_manifest_capabilities, validate_capability_request,
-};
+pub use capability_validation::validate_capability_request;
 pub use crypto::{HashBuilder, blake3_hash, hash_labeled_parts};
 pub use did::{Did, DidError};
 pub use error::{JigError, Result};
 pub use hlc::HlcTimestamp;
-pub use lint::{BlockLintResult, allowlist_from_manifest, lint_block};
 pub use manifest::{
     Attestation, Author, BlockManifest, BlockManifestBuilder, Capability, Constraints,
     ManifestGateError, MetadataVisibility, Privacy, Provenance, RenderDescriptor, Resource,
@@ -502,39 +508,5 @@ mod tests {
             .build();
 
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn capability_report_tracks_imports() {
-        use crate::manifest::Capability;
-
-        let manifest = BlockManifest::builder()
-            .version(Version::new(0, 1, 0))
-            .author(Author {
-                did: "did:jig:test".into(),
-                public_key: None,
-                roles: vec![],
-            })
-            .capability(Capability {
-                name: "log:emit".into(),
-                ..Default::default()
-            })
-            .build()
-            .unwrap();
-
-        // Code uses exactly what manifest declares
-        let imports = vec![("jig_host".into(), "log".into())];
-        let report = check_manifest_capabilities(&manifest, &imports).unwrap();
-        assert!(report.is_valid());
-        assert!(report.is_least_privilege());
-
-        // Code uses more than declared (over-privileged)
-        let extra_imports = vec![
-            ("jig_host".into(), "log".into()),
-            ("jig_host".into(), "http_fetch".into()),
-        ];
-        let report2 = check_manifest_capabilities(&manifest, &extra_imports).unwrap();
-        assert!(!report2.is_least_privilege());
-        assert_eq!(report2.over_privileged.len(), 1);
     }
 }

@@ -30,11 +30,25 @@ rand = { version = "0.10", optional = true }
 # Clears the seed buffer in `crypto::ed25519::generate_signing_key`. Already in
 # the tree via curve25519-dalek, so this adds a Cargo.toml line, not a build.
 zeroize = { version = "1", optional = true }
+# Keys and local state at rest (`keystore`), and the `test-aead` conformance
+# suite (`test-suite`). chacha20poly1305 is already in the tree through openmls;
+# argon2 is the passphrase KDF.
+chacha20poly1305 = { version = "0.10", optional = true, default-features = false, features = ["alloc"] }
+argon2 = { version = "0.5", optional = true, default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 proptest = "1.0"
 wat = "1.0"
+# Parses the jig:block WIT package in tests/wit_package.rs. 0.258 matches the wasm-tools
+# release wasmtime 49 already pulls in, so it adds no new crates to the lockfile.
+wit-parser = "0.258"
 
 [features]
 default = []
 ed25519 = ["ed25519-dalek", "rand", "zeroize"]
+keystore = ["ed25519", "chacha20poly1305", "argon2", "zeroize"]
+# Registers `test-aead`, the suite reserved for conformance testing
+# (JEP-0001). Enable it only from `[dev-dependencies]`: a production build
+# must refuse every `test-` suite as unregistered. CI checks that no binary's
+# normal dependency graph turns it on.
+test-suite = ["chacha20poly1305"]

@@ -308,10 +308,13 @@ name the DID, the attestation and the nameserver DID.
 - **First use.** The client shows the DID's fingerprint and the nameserver that vouched
   for it, then pins. A non-interactive `jig dm alice@example.org` pins and prints the
   fingerprint.
-- **A change is accepted automatically only with proof from the old key.** The nameserver
-  already requires both keys to sign a rotation (`/v1/rotate`). The nameserver keeps that
-  rotation statement and serves it with the new attestation. A client that holds the old
-  pin and sees a valid rotation signed by the old DID moves the pin and says so.
+- **A change is accepted automatically only with proof from the old key.** A rotation is
+  lane I's dual-signed link (DJ, 2026-10-18: a DID is bound to its key, and a rotation is a
+  new DID). Its audience is this nameserver and this alias. `/v1/rotate` takes the link,
+  and the nameserver keeps it and serves it with the new attestation. A client that holds
+  the old pin and sees a valid link from the pinned DID, with that audience, moves the pin
+  and says so. Until links exist (lane I's I3), every change needs the holder's
+  acceptance.
 - **Any other change is refused until the holder accepts it.** That covers expiry
   followed by re-registration to another DID, a different nameserver, and a nameserver
   that simply answers differently. It is surfaced the way a changed server DID is, with
@@ -346,22 +349,25 @@ transparency or out-of-band comparison (v0.3) closes first contact.
 least their validity window plus a grace period. Two valid attestations binding one alias
 to different DIDs with overlapping windows are a complete proof of equivocation. In v0.2
 the evidence is local and exportable (`jig ns evidence`, a name to settle later). Feeding
-it to a tribunal or a transparency log is v0.3 (lane R).
+it to a tribunal or a transparency log is v0.3. Lane R owns both: its second JEP specifies
+the witnessed logs (C2SP style).
 
 ### 4.6 Attestation and registration wire changes
 
 **Proposed**, so that 4.3 and 4.5 can work at all:
 
-- **Canonical, domain-separated signatures.** An attestation is signed over the labelled
-  BLAKE3 hash jig uses elsewhere (`hash_labeled_parts`): (`domain`,
-  `jig-alias-attestation-v1`), then `did`, `alias`, `ns_did`, `valid_from`, `valid_until`,
-  in that order. `profile_ttl_seconds` either joins that list or leaves the signed body.
-  JSON map order stops mattering.
-- **Proof of control binds the action.** The DID signs (`domain`,
-  `jig-alias-register-v1`), (`ns_did`), (`alias`), (`challenge`). The same applies to
-  renew and rotate, each with its own domain. This closes AB-01 for this flow.
-- **Rotation statements are kept and served** with the attestation that resulted from
-  them (4.4).
+- **Canonical, domain-separated signatures.** Decided (DJ): every new signed object is a
+  `COSE_Sign1` (EdDSA) over deterministic CBOR (RFC 8949 section 4.2.1). An attestation's
+  payload is the text-keyed map `{domain: "jig-alias-attestation-v1", did, alias, ns_did,
+  valid_from, valid_until}`. `profile_ttl_seconds` either joins that map or leaves the
+  signed body. JSON map order stops mattering, and anything hashed is hashed over the
+  deterministic encoding.
+- **Proof of control binds the action.** The DID signs the payload `{domain:
+  "jig-alias-register-v1", ns_did, alias, challenge}`. The same applies to
+  renew, with its own domain. This closes AB-01 for this flow. Rotation proves control
+  through lane I's link instead.
+- **Rotation links are kept and served** with the attestation that resulted from them
+  (4.4).
 - **The nameserver serves TLS**, CA-issued or DID-bound like the server (#95). Plaintext
   HTTP stays only behind an antipattern flag. The attestation's signature does not depend
   on the transport, but discovery under option A does.
@@ -559,6 +565,10 @@ key packages and hand them out while she is offline. Alice still controls who ge
    release beyond the policy, which means unwanted invites and a drained stock, not
    decryption. A release outside the policy is provable: the custodian logs it, and the
    request is signed by its requester and checkable against Alice's signed policy.
+6. **One key package per device, and none after revocation (lane I, decided 2026-10-18).**
+   - A custodian releases one package for each device Alice has stocked, so an add covers
+     all her devices. Each package carries a fresh leaf key certified by her DID.
+   - A custodian that holds Alice's revocation releases none of that DID's packages.
 
 **Default policy (decided):** automatic release to Alice's contacts; everyone else held
 for approval. That is privacy-first and spam-resistant, and it costs latency on first
@@ -674,6 +684,11 @@ F's caveats:
    This is the price of liveness. It is bounded because only the `owner` can trigger it.
 3. **Channel identity must not include the sequencer** (section 6), or every move would
    rename the channel.
+3a. **The owner's `sequencer-set` beats the server's `sequencer-rekey`** (L7, for lane I's
+   server-key ceremony). A server that rotates its key signs a `sequencer-rekey` in each
+   channel it sequences, moving sequencing to its own new DID under a public link. An
+   owner's `sequencer-set` overrides it. Otherwise a thief with a leaked server key could
+   rekey channels the owner never agreed to.
 4. **Bots move in the same action (lane C's question; F's answer: one action).**
    - `sequencer-set` carries the bot reinstalls: for each bot, the owner-signed install
      lane C defines, with a new bot DID and `inherits_state_from`.
@@ -714,6 +729,11 @@ an interface lane R builds on).**
   assign and unassign policies. "The owner shares" generalises to "the owner delegates":
   the owner assigns roles, and a role carries rights such as `share` and `membership`.
 - **The grant set is `read`, `write` and `member`** (5.2).
+- **Roles follow a channel-scoped key-link (lane I, decided 2026-10-18).** A rotation is a
+  new DID. A `key-link` block in the channel, authored by the new DID and carrying a link
+  whose audience is this channel, moves the old DID's roles and membership to the new DID
+  from that block's `seq`. The creator rule carries across. A link scoped elsewhere moves
+  nothing in this channel.
 
 **Proposed, for the build:**
 - **Role assignments are signed blocks in the channel's log** (`role-assign`,
@@ -822,7 +842,7 @@ Updated in the implementation PRs, not here.
 | **F0** | now | This design and the two JEP drafts. L1 adds a banner to `federation.md`. A small PR makes the orphan-post and no-policy paths fail closed | nothing |
 | **F1: verified names** | v0.2.x | Canonical attestation and proof encodings (4.6); nameserver TLS; suffix delegation by config and `.well-known` (4.2 A+B); verification in the client and the server's resolver (4.3); client name pins and the change rule (4.4); retained attestations (4.5); `jig dm`/`channel add` accept names; reachability records (4.7) | L7 for `jig trust` UX; L6 for nameserver code |
 | **F2: the contract between two jig servers** | v0.2.x, gate G3 | Channels keyed by CID (6); `sequencer` in the creation block and `sequencer-set`; offer, accept, refuse and end (5.5); signed peer policy (5.6); relay through the client's server under share grants (5.2); owner sequencing with a signed chain, and follower validation (5.3); key packages through the owner under consent (5.4); restricted MLS channels federate between configured peers; the `federation.md` rewrite | **L7's mutual server-to-server handshake**; F1's reachability records |
-| **F3** | v0.3+ | Ruleset-group delegation with thresholds (4.2 C); replicated registry and transparency log (NS-02, NS-03, with lane R); nameserver-led contract templates (D12); MIMI-style consent; ownership handover; open federation with reputation; interop with other implementations by contract | lane R; ruleset groups |
+| **F3** | v0.3+ | Ruleset-group delegation with thresholds (4.2 C); replicated registry (NS-03); name bindings published to lane R's witnessed transparency logs (NS-02; R's second JEP owns the logs); nameserver-led contract templates (D12); MIMI-style consent; ownership handover; open federation with reputation; interop with other implementations by contract | lane R; ruleset groups |
 | **F4: high-security federation** | post-MVP | Consensus on channel heads, so a channel with one poster is protected too: carriers co-sign `ingest` heads, and a head counts only at the ruleset's threshold. Merkle-tree logs plus gossip as the long-term direction, in the style of CT and KEYTRANS (DJ, 2026-10-18) | F3, lane R |
 | **F5: nameserver server-lists** | post-MVP | The signed, advisory list of abandoned or compromised servers (5.8), with lane R's evidence and appeal process | lane R |
 
@@ -854,7 +874,7 @@ Updated in the implementation PRs, not here.
 - **R (reputation, PoW, tribunals).** R builds on the nameserver server-list interface
   (5.8, F5), 4.5 (retained evidence), 4.2 C
   (ruleset-group delegation) and 5.7 (open federation).
-- **I (identity lifecycle).** Reachability records (4.7) and rotation statements (4.4) are inputs
+- **I (identity lifecycle).** Reachability records (4.7) and rotation links (4.4) are inputs
   to multi-device and key rotation.
 
 ## 11. Questions for DJ, in the order they will be asked

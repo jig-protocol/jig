@@ -5,11 +5,13 @@
 //!
 //! ## Usage
 //!
-//! ```no_run
+//! ```
 //! use jig_config::validation::ConfigValidator;
 //!
-//! let validator = ConfigValidator::new();
-//! match validator.validate_all() {
+//! let mut validator = ConfigValidator::new();
+//! validator.validate_runtime_constraints(10_000_000, 64, 250);
+//! validator.validate_telemetry(0.1, "info");
+//! match validator.result() {
 //!     Ok(()) => println!("Configuration is valid"),
 //!     Err(errors) => {
 //!         for error in errors {

@@ -4,8 +4,15 @@
 > behind, a **Status** line says so; the code's current behaviour is not the intent.
 >
 > - **Implemented:** `did:jig` identities, nameserver-attested aliases, TOFU and nameserver
->   resolution in servers, per-ruleset reputation scores, proof-of-work with penalties on
->   the nameserver's claim and alias challenges, and tribunal case records.
+>   resolution in servers, and operator-seeded per-ruleset scores for server admission.
+> - **Removed prototype:** the reference nameserver's earlier surface (proof-of-work
+>   challenges with penalties, `/v1/claim`, `/v1/alias`, reputation observations, tribunal
+>   case records, the transparency log, useful work and nameserver federation) is no longer
+>   served. Its routes were deleted in #154. Status lines below that described it now say
+>   so.
+> - **Being redesigned** (drafts, not yet merged): lane R's framing doc (#152), JEP-0008
+>   proof-of-work and capacity pools (#162), JEP-0009 rulesets, reputation and transparency
+>   logs (#163), and JEP-0010 abuse reports, tribunals and server lists (#166).
 > - **Required, not yet implemented or partial:** proof-of-work enforced by servers as a
 >   ruleset-set cost (only one-time admission proof-of-work exists, off by default) and on
 >   every nameserver binding endpoint, reputation reports from servers to nameservers and
@@ -99,9 +106,10 @@ saw for a name and surface any change.
 
 Registering an alias creates a binding, so it MUST carry
 [proof-of-work](#proof-of-work) and be rate-limited like any other binding endpoint.
-**Status:** not yet implemented. This path has neither; proof-of-work and penalties apply
-only to the older claim and alias endpoints described under
-[Nameserver mechanics](#nameserver-mechanics).
+**Status:** *(partial)*. `/v1/register`, `/v1/rotate` and `/v1/renew` are rate-limited per
+client IP and per DID (`[alias_rate_limits]`, see [Rate limiting](#rate-limiting)). No
+nameserver endpoint requires proof-of-work since the legacy claim and alias routes were
+removed.
 
 ### Resolution by servers
 
@@ -140,7 +148,8 @@ identities.
   `@` for an alias).
 
 `--anon` needs no alias. Separately, the nameserver can mint short-lived anonymous aliases
-(`anon-` plus 12 hex characters) through `POST /v1/alias`. An alias minted **with** a
+(`anon-` plus 12 hex characters) through `POST /v1/alias` *(not served: removed with the
+legacy routes)*. An alias minted **with** a
 `subject` is a pseudonym, not an anonymous identity: the nameserver stores the link to the
 subject. It MUST NOT be presented to users as anonymous.
 
@@ -205,11 +214,11 @@ carries `score`, `weight` (default 1.0), `observer`, optional `evidence` and opt
 
 `{subject}` is `user`, `server` or `nameserver`.
 
-**Status:** partial. The nameserver keeps scores per subject and ruleset, each computed
-from its own observations only. Servers keep operator-seeded scores per ruleset for
-admission floors (`[auth.admission] records`) and report nothing to nameservers. Net
-computation across a ruleset group is not implemented: reputation gossip is received and
-stored, not applied.
+**Status:** not served by the nameserver. Its observation endpoints were removed with the
+legacy routes, so it records and returns no scores. Servers keep operator-seeded scores
+per ruleset for admission floors (`[auth.admission] records`) and report nothing to
+nameservers. Net computation across a ruleset group is not implemented; its redesign is the
+JEP-0009 draft (#163).
 
 ### Rulesets and translation contracts
 
@@ -224,9 +233,8 @@ or `table` transform. A contract is a data contract between the two parties. Nei
 is bound by the other's ruleset without one. Interop between ruleset groups this way is
 possible but not a first priority; the priority is a shared ruleset within a group (D21).
 
-**Status:** rulesets and contracts are parsed and published in `/.well-known/jig-ns`.
-Only `pow_policy.multiplier` is applied (see [Proof-of-work](#proof-of-work)). Contracts
-are not yet applied to incoming scores.
+**Status:** rulesets and contracts are parsed and published in `/.well-known/jig-ns`, and
+nothing applies them: the nameserver serves no proof-of-work and no scores.
 
 ### Reputation is not a protocol gate
 
@@ -282,10 +290,8 @@ High-sec servers are more likely to require a higher local reputation to join. N
 servers are usually the only ones that admit `--anon` identities.
 
 **Status:** security levels and ruleset groups are not yet configuration settings. The
-nameserver applies the anonymous floor (`JIG_NS_ANON_MIN_POW`) to alias challenges without
-a subject, unless `JIG_NS_ANON_ENABLED` is false, and treats every other challenge as
-low-sec. Turning the setting off removes the floor; it does not stop anonymous aliases
-being minted.
+nameserver's anonymous proof-of-work floor (`JIG_NS_ANON_MIN_POW`) went with the legacy
+alias challenges; it is still published in `/.well-known/jig-ns` but nothing applies it.
 
 ### Admission proof-of-work (servers)
 
@@ -340,10 +346,9 @@ member under the group's ruleset. This shared registry is what makes a group hig
 A nameserver MUST NOT resolve another nameserver's aliases as its own unless that
 nameserver agrees to federate.
 
-**Status:** not yet implemented. The nameserver resolves remote handles through
-`_jig-ns._tcp` SRV discovery, gated by `JIG_NS_ALLOW_DOMAINS` and `JIG_NS_DENY_DOMAINS` and
-cached for `JIG_NS_CACHE_TTL` seconds, without asking for agreement and without verifying
-remote records. Reputation and tribunal gossip is received and stored, not applied.
+**Status:** not yet implemented. The nameserver resolves only its own aliases
+(`/v1/resolve/{alias}`). Its earlier SRV-based remote resolution (`/v1/resolve?name=`) and
+its gossip endpoints were removed with the legacy routes.
 
 ### Anchor nameservers
 
@@ -365,23 +370,33 @@ Rules:
 
 ## Nameserver mechanics
 
+> **Mostly not served.** The reference nameserver serves `/.well-known/jig-ns`,
+> `/.well-known/jig-ns/capabilities`, `/v1/health` and the alias routes
+> (`GET /v1/challenge`, `/v1/register`, `/v1/resolve/{alias}`, `/v1/rotate`, `/v1/renew`,
+> and `/v1/handles` behind `[debug] list_handles`). The proof-of-work challenge flow,
+> penalties, rate limiting, `/v1/policy`, `/v1/resolve?name=`, the transparency and admin
+> routes, and federation below described a prototype whose routes were removed (#154). They
+> stay here as the design input that prototype explored; their redesign is the JEP-0008
+> draft (#162). `/.well-known/jig-ns` still publishes the `pow`, `rate_limit` and
+> `automation` parameters; nothing enforces them.
+
 ### Endpoints
 
 | Path | Method | Purpose |
 | --- | --- | --- |
 | `/.well-known/jig-ns` | GET | Discovery document (JSON) |
 | `/.well-known/jig-ns/capabilities` | GET | Capability document (plain text) |
-| `/v1/policy` | GET | Policy snapshot (JSON) |
+| `/v1/policy` | GET | Policy snapshot (JSON) *(not served)* |
 | `/v1/health` | GET | Liveness |
 | `/v1/challenge` | GET | Alias registration nonce ([Aliases](#aliases)) |
 | `/v1/register`, `/v1/renew`, `/v1/rotate` | POST | Alias attestations |
 | `/v1/resolve/{alias}` | GET | Alias attestation lookup |
-| `/v1/challenge` | POST | Proof-of-work challenge for `claim` or `alias` |
-| `/v1/claim` | POST | Bind a handle to a key, with proof-of-work |
-| `/v1/alias` | POST | Mint a scoped or anonymous alias, with proof-of-work |
-| `/v1/resolve?name=` | GET | Handle lookup: local, then cache, then federated |
-| `/v1/transparency/entries`, `/hashes`, `/verify` | GET | [Transparency log](#transparency-log) |
-| `/v1/admin/penalties`, `/v1/admin/rate` | GET, POST | Inspect or reset a penalty or rate key |
+| `/v1/challenge` | POST | Proof-of-work challenge for `claim` or `alias` *(not served)* |
+| `/v1/claim` | POST | Bind a handle to a key, with proof-of-work *(not served)* |
+| `/v1/alias` | POST | Mint a scoped or anonymous alias, with proof-of-work *(not served)* |
+| `/v1/resolve?name=` | GET | Handle lookup: local, then cache, then federated *(not served)* |
+| `/v1/transparency/entries`, `/hashes`, `/verify` | GET | [Transparency log](#transparency-log) *(not served)* |
+| `/v1/admin/penalties`, `/v1/admin/rate` | GET, POST | Inspect or reset a penalty or rate key *(not served)* |
 
 ### Challenge flow
 
@@ -411,10 +426,10 @@ a rate cost the ruleset sets. See [Admission proof-of-work](#admission-proof-of-
 A solution is valid when `BLAKE3(challenge_id|action|subject|scope|nonce)` has at least
 `difficulty` leading zero bits. Expected work is about 2^`difficulty` hashes.
 
-**Status:** partial. Only `/v1/claim` and `/v1/alias` require it (not `/v1/register`). The
-reference nameserver keys this hash with `BLAKE3(server_secret)`, which clients do not
-hold, so only a holder of the secret can solve a challenge today. The key must become
-public, or be removed, before third-party clients can use these endpoints.
+**Status:** not served. No nameserver endpoint requires proof-of-work; `/v1/claim` and
+`/v1/alias`, the only ones that did, were removed. Their hash was keyed with
+`BLAKE3(server_secret)`, which clients do not hold; a replacement must be solvable from
+public information.
 
 The difficulty for a challenge is computed per rate key:
 
@@ -439,8 +454,7 @@ pulled towards 1.0 when the score's weight is below 1, and clamped to [0.1, 8]. 
 ruleset multiplier of 1.0, a good score lowers difficulty by at most a quarter and a bad
 one raises it by at most a quarter.
 
-**Status:** partial. Only `pow_policy.multiplier` is applied; `min_bits` and `max_bits` are
-not.
+**Status:** not served (see above).
 
 With the default parameters and no reputation score, a single penalty point raises `d` to
 `max_difficulty` (see [Penalties](#penalties)).
@@ -459,7 +473,13 @@ The client IP is the socket address, or the first entry of `JIG_NS_PROXY_IP_HEAD
 HTTP 429 and adds one penalty point to the key that refused it, so retrying raises the next
 difficulty.
 
-**Status:** `global_per_min` is published in policy documents but not enforced.
+**Status:** not served. These limits applied only to the removed challenge route. The alias
+routes have their own limits instead: `POST /v1/register`, `/v1/rotate` and `/v1/renew` are
+limited per client IP (default 30 per minute; IPv6 per /64) and per DID (default 10 per
+minute, charged only when the request succeeds, which needs that DID's signature), in fixed
+one-minute windows held in memory (`[alias_rate_limits]`). Behind a proxy
+(`[network] trust_proxy`), the client IP is the last entry of `proxy_ip_header`. A refusal is
+HTTP 429 with code `RATE_LIMITED` and a `Retry-After` header, and adds no penalty.
 
 ### Penalties
 
@@ -488,10 +508,8 @@ misbehaving does not decay.
 A nameserver MUST raise difficulty monotonically with penalty points up to its maximum, and
 MUST let points decay to zero when no new penalties arrive.
 
-**Status:** points on `ip:` keys are recorded but do not affect difficulty, which is read
-from the action key only. Penalties for misbehaving hosts (receipt anomalies: 2, 4 or 8
-bits by severity) are a separate ledger at `GET /v1/hosts/{did}/penalties` and do not
-decay. Known weaknesses the design must close are listed in the
+**Status:** not served. No route records or reads penalties since the legacy routes were
+removed, including the host-penalty ledger (`GET /v1/hosts/{did}/penalties`). Known weaknesses the design must close are listed in the
 [abuse economics](https://github.com/jig-protocol/jig/blob/main/docs/security/nameserver-abuse-economics.md#known-weaknesses-the-design-must-close).
 
 ### Policy and discovery documents
@@ -506,7 +524,7 @@ A nameserver publishes its policy at three paths:
 - **`GET /.well-known/jig-ns/capabilities`** (plain text): `version`, optional `domain`,
   one `work:` line per useful-work type, `tribunal:`, `transparency:` and `federation:`
   (`enabled` or `disabled`), and optional `affordance:` lines.
-- **`GET /v1/policy`** (JSON): `pow` (`base_difficulty`, `min_difficulty`,
+- **`GET /v1/policy`** (JSON) *(not served: removed with the legacy routes)*: `pow` (`base_difficulty`, `min_difficulty`,
   `max_difficulty`, `anonymous_min_difficulty`), `rate_limits`, `automation` and
   `reputation`.
 
@@ -523,7 +541,8 @@ Without an SRV record, a resolver falls back to the domain's addresses on port 7
 A nameserver chooses its peers. Deny takes precedence over allow, and an empty allow list
 admits every domain not denied. With `[federation] enabled`, peers exchange policy hashes
 (`GET /v1/federation/policy`) and gossip (`POST /v1/federation/gossip`). A nameserver MUST
-treat gossip as claims by the sending peer, not as facts.
+treat gossip as claims by the sending peer, not as facts. *(not served: both routes were
+removed with the legacy routes.)*
 
 ## Transparency log
 
@@ -541,15 +560,14 @@ enforced. The nameserver's log:
   data;
 - MUST NOT record anything that links an anonymous identity to a DID.
 
-**Status:** partial. Servers keep no log. On the nameserver, the log's storage, a
-hash-chain verifier and the read endpoints (`GET /v1/transparency/entries`, `/hashes`,
-`/verify`) exist; the running service writes no entries and does not compute periodic chain
-hashes.
+**Status:** not implemented. Servers keep no log. The nameserver's read endpoints
+(`GET /v1/transparency/entries`, `/hashes`, `/verify`) were removed with the legacy routes;
+it never wrote entries. Redesign: the JEP-0009 draft (#163).
 
 ## Useful work
 
-*Partial.* An operator queues work (`POST /v1/work/enqueue`, admin), workers claim it
-(`POST /v1/work/assign`) and submit results (`POST /v1/work/{id}/result`). Kinds:
+*Not served.* The prototype's routes were removed. Under them an operator queued work (`POST /v1/work/enqueue`, admin), workers claimed it
+(`POST /v1/work/assign`) and submitted results (`POST /v1/work/{id}/result`). Kinds:
 `validate_block`, `verify_observation`, `audit_ruleset`, `custom`,
 `process_executable_block`, `validate_fuel_counts`, `cross_validate_receipt`,
 `resolve_receipt_dispute`.
@@ -585,13 +603,10 @@ groups is voluntary. There is no tribunal above the groups.
 
 Panel selection and appeal mechanics need a JEP.
 
-**Status:** partial. Case records exist. `POST /v1/tribunal/cases` opens a case (`subject`,
-`subject_id`, `ruleset`, `reason`, optional `reporter`, `severity`, `metadata`).
-`POST /v1/tribunal/cases/{id}/decision` records an outcome (`sustain`, `modify`,
-`overturn`, `dismiss` or `escalate`) with optional `penalty_delta` and `notes`. The anomaly
-detector opens cases automatically for high and critical receipt anomalies. Panels,
-signatures, appeals, application of `penalty_delta`, logging and propagation are not
-implemented.
+**Status:** not implemented. The prototype's case records (`POST /v1/tribunal/cases`,
+`/v1/tribunal/cases/{id}/decision`) were removed with the legacy routes. Panels,
+signatures, appeals, penalties, logging and propagation were never implemented. Redesign:
+the JEP-0010 draft (#166).
 
 ### Reporting abuse in encrypted channels
 

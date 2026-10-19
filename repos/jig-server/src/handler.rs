@@ -64,11 +64,10 @@ async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok\n")
 }
 
-/// Prometheus text exposition of the v0.0.2 WebSocket counters.
+/// Prometheus text exposition of the v0.0.2 counters.
 ///
-/// The numbers are hand-rolled `AtomicU64`s living in
-/// [`crate::v0_0_2_ws::metrics`] — see that module for what is and is not
-/// counted (federation and bridge ingest are NOT).
+/// The numbers are hand-rolled `AtomicU64`s rendered by
+/// [`crate::v0_0_2_ws::metrics`] — see that module for what each one counts.
 async fn metrics() -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -87,8 +86,8 @@ struct ServerInfoResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     server_did: Option<String>,
     /// v0.0.2: active antipattern flags so peers can refuse federation with
-    /// misconfigured neighbors. Always includes `naively_unbounded_clock_skew`
-    /// in v0.0.2. Absent (not serialized) when v0.0.2 module is not active.
+    /// misconfigured neighbors. Absent (not serialized) when the v0.0.2 module
+    /// is not active or no flag is set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     unsafe_options_active: Vec<String>,
     /// v0.0.2: block kinds this server accepts on ingest. Absent when v0.0.2
@@ -167,13 +166,23 @@ async fn server_info(State(state): State<AppState>) -> Json<ServerInfoResponse> 
                 .collect();
             (
                 Some(v002.server_did.to_did_jig_string()),
-                v002.config.unsafe_options_active(),
+                [
+                    v002.config.unsafe_options_active(),
+                    state.config.unsafe_options_active(),
+                ]
+                .concat(),
                 v002.config.server.allowed_block_kinds.clone(),
                 peers,
                 v002.bridges.permitted_names().to_vec(),
             )
         } else {
-            (None, vec![], vec![], vec![], vec![])
+            (
+                None,
+                state.config.unsafe_options_active(),
+                vec![],
+                vec![],
+                vec![],
+            )
         };
 
     Json(ServerInfoResponse {
@@ -357,6 +366,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_info_advertises_a_plaintext_listener() {
+        let dir = tempdir().unwrap();
+        let mut config = ServerConfig {
+            database_path: dir.path().join("test.db"),
+            ..Default::default()
+        };
+        config.tls.enabled = false;
+        let v002 = Arc::new(crate::v0_0_2::AppState::for_test().unwrap());
+
+        for v0_0_2 in [None, Some(v002)] {
+            let state = AppState {
+                config: config.clone(),
+                v0_0_2,
+            };
+            let body = server_info(State(state)).await.0;
+            assert!(
+                body.unsafe_options_active
+                    .contains(&"tls.enabled=false".to_string()),
+                "got {:?}",
+                body.unsafe_options_active
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn server_info_includes_v0_0_2_fields_when_v0_0_2_state_present() {
         let dir = tempdir().unwrap();
         let config = ServerConfig {
@@ -379,11 +413,11 @@ mod tests {
 
         // server_did must be present and match the v0.0.2 state's DID
         assert_eq!(body.server_did.as_deref(), Some(v002_did.as_str()));
-        // naively_unbounded_clock_skew is always present in v0.0.2
+        // A default install sets no unsafe option; the clock is bounded.
         assert!(
+            body.unsafe_options_active.is_empty(),
+            "expected no unsafe option, got {:?}",
             body.unsafe_options_active
-                .contains(&"naively_unbounded_clock_skew".to_string()),
-            "expected naively_unbounded_clock_skew in unsafe_options_active"
         );
         // default config includes "text-render" in allowed_block_kinds
         assert!(

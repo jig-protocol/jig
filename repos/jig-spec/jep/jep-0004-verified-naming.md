@@ -18,7 +18,8 @@ A name `alias@suffix` maps to a `did:jig` through an attestation signed by a nam
 authoritative for the suffix. This JEP specifies:
 
 - how a resolver learns which nameservers are authoritative for a suffix;
-- the canonical form of attestations and registration proofs;
+- the encoding of attestations, delegations, reachability records and registration
+  proofs: COSE_Sign1 over deterministic CBOR;
 - how whoever acts on a binding verifies it;
 - how clients pin names and accept changes;
 - what resolvers keep as evidence;
@@ -52,6 +53,28 @@ Non-goals:
 
 # Specification
 
+## Encoding
+
+0. Every object this JEP signs is a `COSE_Sign1` (RFC 9052) whose payload is a CBOR map
+   with text keys, encoded under the core deterministic encoding of RFC 8949
+   section 4.2.1.
+   - The protected header is exactly `{1: -8}` (alg EdDSA, Ed25519). The unprotected
+     header is empty. The envelope itself is deterministically encoded.
+   - Every payload has a `domain` entry naming the object, listed with each object below.
+   - Times and sequence numbers are CBOR unsigned or negative integers (Unix seconds for
+     times). Floating-point values and tags MUST NOT appear.
+   - A CID is an untagged CBOR byte string (major type 2) holding a binary CIDv1 with
+     codec `raw` (0x55) and multihash `blake3-256` (0x1e, 32-byte digest), the one way
+     jig computes CIDs. No tag 42, no multibase text. A receiver MUST refuse any other
+     version, codec or hash. The schema says which fields are CIDs, so one CID has one
+     encoding. Admitting another codec is an explicit change to this rule.
+   - A receiver MUST refuse an envelope or payload that is not in deterministic form,
+     that carries an unknown key, or whose `domain` is not the one expected.
+   - The signer is named inside the payload, not in the envelope, and the receiver
+     verifies against that DID.
+   - Anything hashed is hashed over the deterministic encoding, never over a re-encoding.
+   - The envelope bytes are what travels and what a resolver keeps as evidence (rule 20).
+
 ## Names
 
 1. A name is `alias@suffix`.
@@ -62,8 +85,10 @@ Non-goals:
 
 ## Suffix authority
 
-3. A **suffix delegation** is
-   `{suffix, authorities: [did], root, root_id, valid_until, sigs: [{did, sig}]}`.
+3. A **suffix delegation** is the payload
+   `{domain: "jig-suffix-delegation-v1", suffix, authorities: [did], root, root_id, valid_until}`,
+   with `authorities` in bytewise ascending order, and one `COSE_Sign1` over that same
+   payload per authority.
    - An authority is a nameserver, or a server attesting names under its own suffix.
    - `root` says what makes the delegation authoritative:
      - `config`: the resolver's own configuration;
@@ -73,16 +98,11 @@ Non-goals:
    - `root_id` names the specific root:
      - for `config`, a local identifier the resolver chooses, never sent to anyone;
      - for `dns`, the suffix's domain name, lowercased;
-     - for `contract`, the contract's CID.
-   - Every listed authority MUST sign. Each `sig` is by that authority over the labelled
-     hash (rule 8) of these parts, in order:
-     - (`domain`, `jig-suffix-delegation-v1`);
-     - (`suffix`);
-     - (`root`);
-     - (`root_id`);
-     - (`count`, the number of authorities as decimal ASCII);
-     - one (`authority`, did) part per authority, in bytewise ascending order;
-     - (`valid_until`).
+     - for `contract`, the contract's CID, as the canonical text form (base32 lowercase,
+       `b` prefix) of a CID that rule 0 admits, because `root_id` is text under every root. A resolver
+       MUST refuse any other spelling.
+   - Every listed authority MUST sign. An envelope over other bytes, or signed by a DID
+     outside `authorities`, counts for nothing.
 4. A resolver MUST determine a suffix's delegation before it accepts an attestation under
    it, with precedence `config` > `contract` > `dns`.
    - A resolver MUST refuse a delegation where any listed DID's signature is missing or
@@ -103,28 +123,30 @@ Non-goals:
 
 ## Attestations
 
-8. An attestation is `{did, alias, ns_did, valid_from, valid_until, sig}`.
+8. An attestation is a `COSE_Sign1` by `ns_did` over the payload
+   `{domain: "jig-alias-attestation-v1", did, alias, ns_did, valid_from, valid_until}`.
    - `alias` is the full name.
    - Times are Unix seconds.
-   - `sig` is the Ed25519 signature by `ns_did` over the labelled BLAKE3 hash of
-     (`domain`, `jig-alias-attestation-v1`), (`did`), (`alias`), (`ns_did`),
-     (`valid_from`), (`valid_until`). Times and counts are encoded as decimal ASCII.
-   - **Labelled hashing**, as in the admission proof-of-work: for each part, the label's
-     UTF-8 bytes, then the value's length as a little-endian u64, then the value's bytes.
-     Every signature in this JEP uses it.
-9. A **rotation statement** is `{alias, ns_did, old_did, new_did, at, sig_old, sig_new}`.
-   - `ns_did` is the nameserver that accepted the rotation. It MUST equal the `ns_did` of
-     the attestation the rotation produced.
-   - Both keys sign over (`domain`, `jig-alias-rotate-v1`), (`alias`), (`ns_did`),
-     (`old_did`), (`new_did`), (`at`).
-   - A nameserver MUST keep every rotation statement it accepted, and MUST serve the chain
-     of them with the attestation that resulted.
+9. A **rotation** is a link as defined by the identity-lifecycle design (lane I): from
+   `old` to `new`, signed by both keys, COSE over deterministic CBOR, with its audience set
+   to one nameserver DID and one alias.
+   - The audience's nameserver MUST equal the `ns_did` of the attestation the rotation
+     produced, and its alias MUST equal that attestation's `alias`. A link with any other
+     audience moves no alias.
+   - `/v1/rotate` takes the link, in place of two challenge signatures.
+   - A nameserver MUST keep every link it accepted, and MUST serve the chain of them with
+     the attestation that resulted.
+   - Until links exist (lane I's milestone I3), no alias can be rotated, and every change
+     of DID behind a pinned name needs the holder's acceptance (rule 18).
 
 ## Registration
 
-10. Proof of control for register, renew and rotate MUST be a signature by the DID over
-    (`domain`, `jig-alias-<action>-v1`), (`ns_did`), (`alias`), (`challenge`). A
-    nameserver MUST refuse a proof over the bare challenge.
+10. Proof of control for register and renew MUST be a `COSE_Sign1` by the DID over the
+    payload `{domain: "jig-alias-<action>-v1", ns_did, alias, challenge}`, with the
+    challenge as the text the nameserver issued. A nameserver MUST refuse a proof over
+    any other payload, the bare challenge included.
+    - `proof_hash` is the BLAKE3 hash of that payload's deterministic encoding. An
+      admission proof-of-work on registration binds to it.
     - A challenge MUST be fresh: at least 32 random bytes, issued by the nameserver, and
       valid for a short window it sets (at most 300 s).
     - A nameserver MUST consume a challenge atomically, on the first proof that verifies.
@@ -159,7 +181,7 @@ Non-goals:
     use. When it pins, it shows the DID's fingerprint and the vouching nameserver.
 18. A client MUST NOT act on a binding that differs from its pin unless one of these
     holds:
-    1. a chain of valid rotation statements leads from the pinned DID to the new DID; or
+    1. a chain of valid rotation links (rule 9) leads from the pinned DID to the new DID; or
     2. the holder explicitly accepts the change.
 
     That covers expiry followed by re-registration to another DID, a change of
@@ -169,18 +191,14 @@ Non-goals:
 
 ## Evidence
 
-20. A resolver SHOULD keep every attestation and rotation statement it acted on until at
+20. A resolver SHOULD keep every attestation and rotation link it acted on until at
     least its `valid_until` plus 30 days, and SHOULD let the holder export them.
 
 ## Reachability records
 
-21. A reachability record is `{did, servers: [{server_did, url}], seq, sig}`.
-    - `sig` is by `did` over the labelled hash of these parts, in order:
-      - (`domain`, `jig-reach-v1`);
-      - (`did`);
-      - (`seq`);
-      - (`count`, the number of servers);
-      - for each server in the order listed, (`server_did`) then (`url`).
+21. A reachability record is a `COSE_Sign1` by `did` over the payload
+    `{domain: "jig-reach-v1", did, servers: [{server_did, url}], seq}`. The array keeps
+    the order the DID signed.
     - A DID has no home server. The record lists the servers where the DID wants to be
       found, in no order of preference. The DID MAY leave servers out, or publish no
       record at all.
@@ -216,7 +234,7 @@ Non-goals:
 
 - Lookups through the server hide the client's address from the nameserver.
 - Direct lookups hide them from the server.
-- No message links two user DIDs except a rotation statement, which both keys sign
+- No message links two user DIDs except a rotation link, which both keys sign
   (PV-03). Service links are by design: an attestation links a user's DID to the
   nameserver's, and a reachability record links it to the servers the user chose to list.
 
@@ -230,18 +248,15 @@ Non-goals:
 
 # Reference Implementation
 
-None yet. Milestone F1 of the design.
+In progress (milestone F1): `jig_core::naming` (pull request #147), on the shared
+`jig_core::dcbor` and `jig_core::cose` (pull request #175).
 
 # Test Vectors
 
-To be added with F1:
-
-- an attestation;
-- a rotation statement;
-- a delegation document;
-- a reachability record;
-
-each as inputs, hash and signature, under a fixed test key.
+`vectors/0004/vectors.json` (added by #147): an attestation, a delegation, a
+reachability record and a register proof, each as its deterministic payload and its
+`COSE_Sign1`, in hex, under fixed test keys. The proof also gives its `proof_hash`.
+Rotation links use lane I's vectors.
 
 # Rejected Alternatives
 
