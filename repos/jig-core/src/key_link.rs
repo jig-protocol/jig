@@ -249,6 +249,15 @@ impl SignedKeyLink {
     pub fn envelope(&self) -> &[u8] {
         &self.envelope
     }
+
+    /// Whether this is a `public` link from the DID a peer has pinned to the
+    /// DID it now presents: a server's own key change. The two DIDs come from
+    /// outside the link, so they are compared by key, not by spelling.
+    pub fn moves_public(&self, pinned: &str, presented: &str) -> bool {
+        self.link.audience == Audience::Public
+            && same_key(&self.link.old, pinned)
+            && same_key(&self.link.new, presented)
+    }
 }
 
 /// Two links from one DID to two different DIDs: the old key signed both, so
@@ -296,6 +305,11 @@ impl AliasLink for SignedKeyLink {
 
 fn did_of(key: &SigningKey) -> String {
     Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string()
+}
+
+fn same_key(a: &str, b: &str) -> bool {
+    let key = |s: &str| Did::from_did_jig_string(s).and_then(|d| d.as_bytes()).ok();
+    matches!((key(a), key(b)), (Some(a), Some(b)) if a == b)
 }
 
 fn check_did(did: &str) -> Result<(), KeyLinkError> {
@@ -541,6 +555,27 @@ mod tests {
         assert!(!fork(&a, &again), "the same move twice is not a fork");
         let elsewhere = SignedKeyLink::sign(&key(4), &key(3), Audience::Public, AT).unwrap();
         assert!(!fork(&a, &elsewhere));
+    }
+
+    #[test]
+    fn a_public_link_moves_a_pin_from_old_to_new() {
+        let (old, new) = (key(1), key(2));
+        let (pinned, presented) = (did_of(&old), did_of(&new));
+        let link = SignedKeyLink::sign(&old, &new, Audience::Public, AT).unwrap();
+        assert!(link.moves_public(&pinned, &presented));
+        assert!(!link.moves_public(&presented, &pinned));
+        assert!(!link.moves_public(&pinned, &did_of(&key(3))));
+        assert!(!link.moves_public(&pinned, "did:jig:alice"));
+        let contact = SignedKeyLink::sign(
+            &old,
+            &new,
+            Audience::Contact {
+                did: did_of(&key(3)),
+            },
+            AT,
+        )
+        .unwrap();
+        assert!(!contact.moves_public(&pinned, &presented));
     }
 
     #[test]

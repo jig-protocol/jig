@@ -161,7 +161,8 @@ at `/v1/rotate`. Moving it onto links is a change to that endpoint, specified wi
 # Reference Implementation
 
 `jig_core::key_link` (`repos/jig-core/src/key_link.rs`): `KeyLink`, `Audience`,
-`SignedKeyLink::sign`, `SignedKeyLink::from_envelope` and `fork`. `SignedKeyLink`
+`SignedKeyLink::sign`, `SignedKeyLink::from_envelope`, `SignedKeyLink::moves_public`
+(a server's own key change, for a peer's pin) and `fork`. `SignedKeyLink`
 implements `jig_core::naming::AliasLink`, so `verify_rotation_chain` follows alias links.
 
 # Test Vectors
