@@ -27,7 +27,7 @@ fn merge_tables(target: &mut toml::value::Table, source: &toml::value::Table) {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct NameServerConfig {
     pub network: NetworkConfig,
     pub storage: StorageConfig,
@@ -58,8 +58,30 @@ pub struct NameServerConfig {
 
 /// `JIG_NS_*` variables a removed feature read, with what removed it. Setting
 /// one has no effect any more, so loading warns about it rather than ignoring
-/// it silently.
+/// it silently. An entry ending in `*` matches every variable with that prefix.
 const REMOVED_ENV_VARS: &[(&str, &str)] = &[
+    ("JIG_NS_SECRET", "the nameserver needs no secret"),
+    (
+        "JIG_NS_POW_*",
+        "nameserver proof-of-work settings were removed",
+    ),
+    ("JIG_NS_RATE_PER_MIN", "use [alias_rate_limits] instead"),
+    (
+        "JIG_NS_RATE_PER_IP_PER_MIN",
+        "use [alias_rate_limits] instead",
+    ),
+    (
+        "JIG_NS_TRANSPARENCY_PATH",
+        "the transparency log was removed",
+    ),
+    (
+        "JIG_NS_TRANSPARENCY_INTERVAL",
+        "the transparency log was removed",
+    ),
+    ("JIG_NS_RUNTIME_ENABLED", "the embedded runtime was removed"),
+    ("JIG_NS_STORAGE_BACKEND", "only SQLite storage remains"),
+    ("JIG_NS_ANALYTICS_BACKEND", "only SQLite analytics remain"),
+    ("JIG_NS_HOT_*", "the hot-state backends were removed"),
     (
         "JIG_NS_FEDERATION_ENABLED",
         "nameserver federation was removed",
@@ -83,20 +105,70 @@ const REMOVED_ENV_VARS: &[(&str, &str)] = &[
     ),
 ];
 
-/// The removed variables set in this process's environment, with why each is
-/// ignored.
-fn removed_env_vars_set() -> Vec<(&'static str, &'static str)> {
-    REMOVED_ENV_VARS
-        .iter()
-        .copied()
-        .filter(|(var, _)| std::env::var_os(var).is_some())
-        .collect()
+/// The removed variables set in `env`, each with why it is ignored, sorted by
+/// name.
+fn removed_env_vars_in(env: impl Iterator<Item = String>) -> Vec<(String, &'static str)> {
+    let mut found: Vec<(String, &'static str)> = env
+        .filter_map(|var| {
+            REMOVED_ENV_VARS
+                .iter()
+                .find(|(pattern, _)| match pattern.strip_suffix('*') {
+                    Some(prefix) => var.starts_with(prefix),
+                    None => var == *pattern,
+                })
+                .map(|(_, why)| (var, *why))
+        })
+        .collect();
+    found.sort();
+    found
 }
 
 fn warn_removed_env_vars() {
-    for (var, why) in removed_env_vars_set() {
+    let names = std::env::vars_os().filter_map(|(k, _)| k.into_string().ok());
+    for (var, why) in removed_env_vars_in(names) {
         tracing::warn!("{var} is set, but {why}; it is ignored. Unset it.");
     }
+}
+
+/// Config sections and keys the nameserver used to accept, with why each went.
+/// Every config struct denies unknown fields, so these would fail anyway; this
+/// names the fix instead of serde's generic "unknown field".
+const REMOVED_KEYS: &[(&str, &str)] = &[
+    ("pow", "the nameserver no longer runs proof-of-work"),
+    ("rate_limits", "use [alias_rate_limits] instead"),
+    ("transparency", "the transparency log was removed"),
+    ("runtime", "the embedded runtime was removed"),
+    ("anomaly_detection", "the anomaly detector was removed"),
+    ("hot", "the hot-state backends were removed"),
+    ("federation", "nameserver federation was removed"),
+    ("storage.backend", "only SQLite storage remains"),
+    ("storage.backend_config", "only SQLite storage remains"),
+    ("analytics.backend", "only SQLite analytics remain"),
+    ("analytics.backend_config", "only SQLite analytics remain"),
+];
+
+/// Refuse a config that sets a removed key, naming it and the fix.
+fn reject_removed_keys(table: &toml::value::Table) -> Result<()> {
+    for (path, why) in REMOVED_KEYS {
+        let found = match path.split_once('.') {
+            None => table.contains_key(*path),
+            Some((section, key)) => table
+                .get(section)
+                .and_then(TomlValue::as_table)
+                .is_some_and(|t| t.contains_key(key)),
+        };
+        if found {
+            let what = if path.contains('.') {
+                format!("`{path}` is no longer a nameserver config key")
+            } else {
+                format!("`[{path}]` is no longer a nameserver config section")
+            };
+            return Err(NameServerError::Other(anyhow::anyhow!(
+                "{what}: {why}. Delete it."
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl NameServerConfig {
@@ -265,6 +337,7 @@ impl NameServerConfig {
             }
         }
 
+        reject_removed_keys(&table)?;
         let cfg_value = TomlValue::Table(table);
         let cfg: NameServerConfig = cfg_value.try_into().map_err(|e| {
             NameServerError::Other(anyhow::anyhow!(format!("parse nameserver config: {e}")))
@@ -337,7 +410,7 @@ impl Default for NameServerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct NetworkConfig {
     pub bind: String,
     pub port: u16,
@@ -399,7 +472,7 @@ impl NetworkConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct StorageConfig {
     pub database_path: PathBuf,
 }
@@ -432,7 +505,7 @@ impl StorageConfig {
 /// [`crate::v0_0_2_rate_limit`]. Each counts requests in a fixed one-minute
 /// window; a limit of `0` refuses every request on that bucket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct AliasRateLimitConfig {
     pub enabled: bool,
     /// Requests per client IP per minute, across register, rotate and renew.
@@ -452,7 +525,7 @@ impl Default for AliasRateLimitConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct PenaltyConfig {
     pub decay_secs: i64,
     pub step_bits: u16,
@@ -500,7 +573,7 @@ impl PenaltyConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct AnonymousPolicy {
     pub enabled: bool,
     pub min_difficulty: u16,
@@ -546,7 +619,7 @@ impl AnonymousPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct AdminConfig {
     pub token: Option<String>,
 }
@@ -570,7 +643,7 @@ impl AdminConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct AutomationPolicy {
     pub enabled: bool,
     pub power_law_alpha: f64,
@@ -688,7 +761,7 @@ pub enum ReputationZone {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct ReputationConfig {
     pub default_ruleset: Option<String>,
     #[serde(default)]
@@ -724,6 +797,7 @@ impl ReputationConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RulesetDefinition {
     pub key: String,
     #[serde(default)]
@@ -755,7 +829,7 @@ impl Default for RulesetDefinition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct RulePowPolicy {
     pub min_bits: Option<u16>,
     pub max_bits: Option<u16>,
@@ -773,7 +847,7 @@ impl Default for RulePowPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 #[derive(Default)]
 pub struct RuleTribunalPolicy {
     pub quorum: Option<u32>,
@@ -782,6 +856,7 @@ pub struct RuleTribunalPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReputationTranslation {
     pub from: String,
     pub to: String,
@@ -837,6 +912,7 @@ impl Default for TranslationKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TranslationTableEntry {
     pub min: f64,
     pub max: f64,
@@ -844,7 +920,7 @@ pub struct TranslationTableEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct UsefulWorkConfig {
     pub assignment_ttl_secs: i64,
     pub max_assignments_per_worker: usize,
@@ -922,7 +998,7 @@ impl UsefulWorkConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct CapabilitiesConfig {
     pub version: String,
     pub domain: Option<String>,
@@ -1064,7 +1140,7 @@ impl CapabilitiesConfig {
 
 /// Analytics configuration for nameserver metrics and insights
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct AnalyticsConfig {
     /// Enable analytics collection and queries
     pub enabled: bool,
@@ -1424,50 +1500,93 @@ federation_enabled = true
 
     // --- [v0_0_2] alias-API section ----------------------------------------
 
-    #[test]
-    fn retired_sections_are_ignored() {
-        // Configs written before `[pow]`, `[rate_limits]` and `[federation]`
-        // were removed must keep loading.
-        let doc = r#"
-[pow]
-server_secret = "old"
-base_difficulty = 18
-
-[rate_limits]
-per_key_per_min = 60
-per_ip_per_min = 120
-
-[federation]
-enabled = true
-seed_peers = ["https://ns.example.org"]
-
-[[v0_0_2.nameserver.alias_suffixes]]
-suffix = "names.example.org"
-"#;
-        let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
-        cfg.validate().expect("valid");
+    fn from_doc(doc: &str) -> Result<NameServerConfig> {
+        let value: TomlValue = toml::from_str(doc).expect("valid TOML");
+        NameServerConfig::from_table(value.as_table().unwrap().clone(), None)
     }
 
-    /// Mutates the environment. Safe under `cargo nextest`, which runs every
-    /// test in its own process.
+    /// Each removed section and key fails to load, naming itself and the fix.
     #[test]
-    fn a_removed_env_var_is_reported_not_silently_ignored() {
-        unsafe {
-            std::env::set_var("JIG_NS_FEDERATION_ENABLED", "true");
-            std::env::remove_var("JIG_NS_SEED_PEERS");
+    fn removed_sections_and_keys_are_named_errors() {
+        for (path, _) in REMOVED_KEYS {
+            let doc = match path.split_once('.') {
+                None => format!("[{path}]\nenabled = true\n"),
+                Some((section, key)) => format!("[{section}]\n{key} = \"x\"\n"),
+            };
+            let err = from_doc(&doc).expect_err(path).to_string();
+            assert!(err.contains(path), "{path}: {err}");
+            assert!(err.contains("Delete it"), "{path}: {err}");
         }
-        let set = removed_env_vars_set();
-        assert!(
-            set.iter()
-                .any(|(var, why)| *var == "JIG_NS_FEDERATION_ENABLED" && why.contains("removed")),
-            "{set:?}"
+    }
+
+    /// Every config struct denies unknown fields: a typo fails to load and
+    /// serde's error names the key.
+    #[test]
+    fn an_unknown_key_in_any_section_is_an_error_naming_it() {
+        for (section, key) in [
+            ("network", "bnid"),
+            ("storage", "databse_path"),
+            ("alias_rate_limits", "per_ip"),
+            ("penalties", "decay"),
+            ("anonymous", "enable"),
+            ("admin", "tokn"),
+            ("automation", "alpha"),
+            ("reputation", "default"),
+            ("useful_work", "queue"),
+            ("capabilities", "versoin"),
+            ("analytics", "enable"),
+        ] {
+            let err = from_doc(&format!("[{section}]\n{key} = 1\n"))
+                .expect_err(section)
+                .to_string();
+            assert!(err.contains(key), "[{section}] {key}: {err}");
+        }
+        let err = from_doc("lisen = 1\n").expect_err("root").to_string();
+        assert!(err.contains("lisen"), "{err}");
+    }
+
+    #[test]
+    fn the_template_and_examples_parse_strictly() {
+        from_doc(TEMPLATE).expect("template");
+        for example in [
+            include_str!("../examples/config/profile_federated.toml"),
+            include_str!("../examples/config/profile_potato.toml"),
+        ] {
+            let value: TomlValue = toml::from_str(example).expect("valid TOML");
+            let ns = value["nameserver"]
+                .as_table()
+                .expect("[nameserver]")
+                .clone();
+            NameServerConfig::from_table(ns, None).expect("example parses");
+        }
+    }
+
+    #[test]
+    fn removed_env_vars_are_reported_by_name_and_prefix() {
+        let env = [
+            "JIG_NS_SECRET",
+            "JIG_NS_POW_DIFFICULTY",
+            "JIG_NS_HOT_BACKEND",
+            "JIG_NS_FEDERATION_ENABLED",
+            "JIG_NS_BIND",
+            "JIG_NS_POWER",
+            "HOME",
+        ]
+        .map(String::from);
+        let found: Vec<String> = removed_env_vars_in(env.into_iter())
+            .into_iter()
+            .map(|(var, _)| var)
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "JIG_NS_FEDERATION_ENABLED",
+                "JIG_NS_HOT_BACKEND",
+                "JIG_NS_POW_DIFFICULTY",
+                "JIG_NS_SECRET"
+            ],
+            "live variables and near-miss names are not reported"
         );
-        assert!(
-            set.iter().all(|(var, _)| *var != "JIG_NS_SEED_PEERS"),
-            "{set:?}"
-        );
-        // Parsing still succeeds: the variable is ignored, with a warning.
-        NameServerConfig::load_unvalidated().expect("parses");
     }
 
     #[test]
