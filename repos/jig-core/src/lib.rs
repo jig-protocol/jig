@@ -7,6 +7,7 @@
 pub mod admission_pow;
 pub mod block_abi;
 pub mod block_kind;
+pub mod block_receipt;
 pub mod bundle;
 pub mod canonical_cid;
 pub mod capability_registry;
