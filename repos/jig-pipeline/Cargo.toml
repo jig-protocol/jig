@@ -8,6 +8,7 @@ description = "Shared block ingest/effect/persist pipeline for jig-server and ji
 
 [dependencies]
 jig-core = { workspace = true }
+jig-config = { workspace = true }
 jig-runtime = { workspace = true }
 # Validates the MLS payload of blocks on encrypted channels (`mls_gate`).
 jig-mls = { workspace = true }

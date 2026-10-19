@@ -3865,6 +3865,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek 3.0.0",
  "hex",
+ "jig-config",
  "jig-core",
  "jig-mls",
  "jig-runtime",
