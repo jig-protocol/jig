@@ -111,6 +111,20 @@ impl Identity {
         self.signing.sign(msg)
     }
 
+    /// This DID's proof of control for `action` on `alias` (the full,
+    /// lowercased `alias@suffix`) at the nameserver `ns_did`, over
+    /// `challenge`: the COSE_Sign1 envelope `jig_core::naming::sign_proof`
+    /// makes (JEP-0004 rule 10).
+    pub fn sign_name_proof(
+        &self,
+        action: jig_core::naming::Action,
+        ns_did: &str,
+        alias: &str,
+        challenge: &str,
+    ) -> Vec<u8> {
+        jig_core::naming::sign_proof(&self.signing, action, ns_did, alias, challenge)
+    }
+
     /// The DID's own key as an MLS group member. The same key signs blocks
     /// and MLS messages — see `jig_mls::credential`. Crate-private so the
     /// seed never leaves this crate.
