@@ -1569,12 +1569,13 @@ mod tests {
                 .map_or(jig_pipeline::ingest_record::GENESIS_PREV, |r| r.hash());
             out.push(
                 jig_pipeline::ingest_record::RecordSigner {
-                    channel_id: "bafyCreate".into(),
+                    channel_id: crate::chain::label_cid("bafyCreate"),
                     key,
                     ingest_wall_ms: seq as u64,
                     ingest_logical: 0,
                 }
-                .sign(seq as u64, cid, prev),
+                .sign(seq as u64, cid, prev)
+                .unwrap(),
             );
         }
         out
@@ -1602,7 +1603,7 @@ mod tests {
         assert_eq!(
             client.take_chain_gaps(),
             vec![ChainGap {
-                channel_id: "bafyCreate".into(),
+                channel_id: crate::chain::label_cid("bafyCreate"),
                 from: 2,
                 to: 3
             }]

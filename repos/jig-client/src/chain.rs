@@ -18,7 +18,7 @@
 //! records in between yet.
 
 /// For tests and tools that need a chain to check against.
-pub use jig_pipeline::ingest_record::{GENESIS_PREV, RecordSigner};
+pub use jig_pipeline::ingest_record::{GENESIS_PREV, RECORD_FORMAT, RecordSigner, label_cid};
 pub use jig_pipeline::ingest_record::{IngestRecord, RecordError};
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +26,10 @@ use serde::{Deserialize, Serialize};
 /// sessions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainHead {
+    /// The record format the head was verified in ([`IngestRecord::format`]).
+    /// Empty for a pin written before formats were named.
+    #[serde(default)]
+    pub format: String,
     pub seq: u64,
     /// Hex hash of the record ([`IngestRecord::hash`]).
     pub hash: String,
@@ -34,8 +38,16 @@ pub struct ChainHead {
 }
 
 impl ChainHead {
+    /// Whether this head is in the record format this build signs and
+    /// verifies. A head in another format cannot be compared with records
+    /// in this one: its hash covers different bytes.
+    pub fn is_current(&self) -> bool {
+        self.format == RECORD_FORMAT
+    }
+
     pub fn of(record: &IngestRecord) -> Self {
         Self {
+            format: record.format.clone(),
             seq: record.seq,
             hash: hex::encode(record.hash()),
             ingest_wall_ms: record.ingest_wall_ms,
@@ -216,12 +228,13 @@ mod tests {
             let seq = self.records.len() as u64;
             let prev = self.records.last().map_or(GENESIS_PREV, IngestRecord::hash);
             let record = RecordSigner {
-                channel_id: "bafyCreate".into(),
+                channel_id: label_cid("bafyCreate"),
                 key: &self.key,
                 ingest_wall_ms: wall,
                 ingest_logical: 0,
             }
-            .sign(seq, block, prev);
+            .sign(seq, &label_cid(block), prev)
+            .unwrap();
             self.records.push(record.clone());
             record
         }
@@ -230,11 +243,17 @@ mod tests {
     #[test]
     fn a_chain_read_in_order_moves_its_head() {
         let mut server = Seq::new();
-        let mut chain = ChannelChain::new("bafyCreate", &server.did(), None);
+        let mut chain = ChannelChain::new(&label_cid("bafyCreate"), &server.did(), None);
         let first = server.push("bafyCreate", 10);
-        assert_eq!(chain.accept(&first, Some("bafyCreate")), Ok(Step::Next));
+        assert_eq!(
+            chain.accept(&first, Some(label_cid("bafyCreate").as_str())),
+            Ok(Step::Next)
+        );
         let second = server.push("bafyPost", 20);
-        assert_eq!(chain.accept(&second, Some("bafyPost")), Ok(Step::Next));
+        assert_eq!(
+            chain.accept(&second, Some(label_cid("bafyPost").as_str())),
+            Ok(Step::Next)
+        );
         assert_eq!(chain.head().unwrap().seq, 1);
         assert_eq!(
             chain.accept(&first, None),
@@ -251,7 +270,7 @@ mod tests {
     #[test]
     fn a_skipped_entry_is_a_gap_to_fill_not_a_contradiction() {
         let mut server = Seq::new();
-        let mut chain = ChannelChain::new("bafyCreate", &server.did(), None);
+        let mut chain = ChannelChain::new(&label_cid("bafyCreate"), &server.did(), None);
         let records: Vec<_> = (0..4).map(|i| server.push(&format!("b{i}"), i)).collect();
         chain.accept(&records[0], None).unwrap();
         assert_eq!(
@@ -262,7 +281,7 @@ mod tests {
             assert_eq!(chain.accept(r, None), Ok(Step::Next));
         }
         // Joining late: everything before the first record seen is a gap.
-        let mut late = ChannelChain::new("bafyCreate", &server.did(), None);
+        let mut late = ChannelChain::new(&label_cid("bafyCreate"), &server.did(), None);
         assert_eq!(
             late.accept(&records[2], None),
             Ok(Step::Gap { from: 0, to: 2 })
@@ -273,7 +292,7 @@ mod tests {
     fn a_live_gap_moves_on_and_keeps_checking() {
         let mut server = Seq::new();
         let records: Vec<_> = (0..4).map(|i| server.push(&format!("b{i}"), i)).collect();
-        let mut chain = ChannelChain::new("bafyCreate", &server.did(), None);
+        let mut chain = ChannelChain::new(&label_cid("bafyCreate"), &server.did(), None);
         chain.accept_live(&records[0], None).unwrap();
         assert_eq!(
             chain.accept_live(&records[2], None),
@@ -297,7 +316,7 @@ mod tests {
         };
         let other_second = fork.push("bafyOther", 20);
 
-        let mut chain = ChannelChain::new("bafyCreate", &did, None);
+        let mut chain = ChannelChain::new(&label_cid("bafyCreate"), &did, None);
         chain.accept(&first, None).unwrap();
         chain.accept(&second, None).unwrap();
         assert_eq!(
@@ -316,7 +335,7 @@ mod tests {
         let mut server = Seq::new();
         let did = server.did();
         let first = server.push("bafyCreate", 50);
-        let mut chain = ChannelChain::new("bafyCreate", &did, None);
+        let mut chain = ChannelChain::new(&label_cid("bafyCreate"), &did, None);
         chain.accept(&first, None).unwrap();
 
         let slow = server.push("bafyPost", 10);
@@ -325,15 +344,18 @@ mod tests {
             Err(ChainBreak::ClockBackwards { head: 0, seq: 1 })
         );
         assert!(matches!(
-            chain.clone().accept(&slow, Some("bafyNotThisOne")),
+            chain
+                .clone()
+                .accept(&slow, Some(label_cid("bafyNotThisOne").as_str())),
             Err(ChainBreak::OtherBlock { .. })
         ));
-        let mut stranger_chain = ChannelChain::new("bafyCreate", &Seq::new().did(), None);
+        let mut stranger_chain =
+            ChannelChain::new(&label_cid("bafyCreate"), &Seq::new().did(), None);
         assert!(matches!(
             stranger_chain.accept(&first, None),
             Err(ChainBreak::Unsigned(RecordError::WrongSequencer { .. }))
         ));
-        let mut other_channel = ChannelChain::new("bafyElsewhere", &did, None);
+        let mut other_channel = ChannelChain::new(&label_cid("bafyElsewhere"), &did, None);
         assert!(matches!(
             other_channel.accept(&first, None),
             Err(ChainBreak::OtherChannel { .. })

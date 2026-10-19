@@ -109,7 +109,28 @@ async fn check_chain_in(
     ) else {
         return Ok(ChainCheck::Unpinned);
     };
-    let mut chain = ChannelChain::new(&channel.create_cid, &sequencer, channel.chain_head);
+    // A pin in an older record format hashes other bytes, so nothing can be
+    // compared with it. Start the chain again from what the server serves
+    // now, and say so: only a pin this build wrote is held to.
+    let head = match channel.chain_head {
+        Some(head) if !head.is_current() => {
+            let format = if head.format.is_empty() {
+                "an unnamed older format"
+            } else {
+                head.format.as_str()
+            };
+            eprintln!(
+                "warning: this device pinned {slug} on {server} in {format}, up to record {}. \
+                 The server now signs `{}`, so history up to there is NOT checked against \
+                 the old pin; re-pinning at what it serves now.",
+                head.seq,
+                jig_client::chain::RECORD_FORMAT,
+            );
+            None
+        }
+        head => head,
+    };
+    let mut chain = ChannelChain::new(&channel.create_cid, &sequencer, head);
     let mut sorted: Vec<_> = records.iter().collect();
     sorted.sort_by_key(|r| r.seq);
     let mut outcome = ChainCheck::Verified;
@@ -265,7 +286,7 @@ async fn hint_if_tls(server: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jig_client::chain::{GENESIS_PREV, IngestRecord, RecordSigner};
+    use jig_client::chain::{GENESIS_PREV, IngestRecord, RecordSigner, label_cid};
     use jig_client::pins::ChannelPin;
 
     // Port 1 refuses at once, so a gap fill fails fast and offline.
@@ -278,12 +299,13 @@ mod tests {
         prev: [u8; 32],
     ) -> IngestRecord {
         RecordSigner {
-            channel_id: "bafyCreate".into(),
+            channel_id: label_cid("bafyCreate"),
             key,
             ingest_wall_ms: 1_000 + seq,
             ingest_logical: 0,
         }
-        .sign(seq, block, prev)
+        .sign(seq, &label_cid(block), prev)
+        .unwrap()
     }
 
     /// A pin store holding `#ops` on [`SERVER`], sequenced by `key`, verified
@@ -302,7 +324,7 @@ mod tests {
             SERVER,
             "#ops",
             ChannelPin {
-                create_cid: "bafyCreate".into(),
+                create_cid: label_cid("bafyCreate"),
                 suite: "none".into(),
                 owner_did: did,
                 chain_head: None,
@@ -372,6 +394,58 @@ mod tests {
             .unwrap();
         assert_eq!(got, ChainCheck::Unfilled { from: 1, to: 2 });
         assert_eq!(head_seq(&path), Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_pin_in_an_older_format_is_re_pinned_not_called_a_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let who = jig_client::Identity::generate_and_save(dir.path()).unwrap();
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let r0 = sign(&key, 0, "bafyCreate", GENESIS_PREV);
+        let r1 = sign(&key, 1, "bafyA", r0.hash());
+        let path = pinned(dir.path(), &key, None);
+        // What a build before named formats pinned: another hash at seq 3.
+        let mut pins = Pins::load(&path).unwrap();
+        pins.advance_chain(
+            SERVER,
+            "#ops",
+            &jig_client::chain::ChainHead {
+                format: String::new(),
+                seq: 3,
+                hash: "00".repeat(32),
+                ingest_wall_ms: 0,
+                ingest_logical: 0,
+            },
+        )
+        .unwrap();
+        let got = check_chain_in(&path, &who, SERVER, "#ops", &[r0, r1])
+            .await
+            .unwrap();
+        assert_eq!(got, ChainCheck::Verified);
+        assert_eq!(
+            head_seq(&path),
+            Some(1),
+            "re-pinned at what the server serves"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_current_format_pin_is_never_re_pinned() {
+        // The guard is gated on the format: a server cannot use it to escape
+        // a pin this build wrote.
+        let dir = tempfile::tempdir().unwrap();
+        let who = jig_client::Identity::generate_and_save(dir.path()).unwrap();
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let r0 = sign(&key, 0, "bafyCreate", GENESIS_PREV);
+        let r1 = sign(&key, 1, "bafyA", r0.hash());
+        let path = pinned(dir.path(), &key, Some(&r1));
+        let rewritten = sign(&key, 1, "bafyOther", r0.hash());
+        assert!(
+            check_chain_in(&path, &who, SERVER, "#ops", &[r0, rewritten])
+                .await
+                .is_err()
+        );
+        assert_eq!(head_seq(&path), Some(1));
     }
 
     #[tokio::test]

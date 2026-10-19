@@ -295,7 +295,12 @@ impl Pins {
             else {
                 return Ok((false, false));
             };
-            let ahead = pin.chain_head.as_ref().is_none_or(|h| head.seq > h.seq);
+            // A head in another record format is replaced, never compared:
+            // see `ChainHead::is_current`.
+            let ahead = pin
+                .chain_head
+                .as_ref()
+                .is_none_or(|h| head.seq > h.seq || h.format != head.format);
             if ahead {
                 pin.chain_head = Some(head.clone());
             }
@@ -683,6 +688,7 @@ mod tests {
         let server = "https://host:7117";
         let mut pins = Pins::load(&path).unwrap();
         let head = |seq: u64| crate::chain::ChainHead {
+            format: crate::chain::RECORD_FORMAT.to_string(),
             seq,
             hash: format!("{seq:064x}"),
             ingest_wall_ms: seq,
@@ -710,6 +716,20 @@ mod tests {
             reloaded.channel(server, "#ops").unwrap().chain_head,
             Some(head(5)),
             "a head behind the pinned one is ignored"
+        );
+        // A head pinned in an older format is replaced even from behind:
+        // it cannot be compared with records in this one.
+        let mut old = head(9);
+        old.format = String::new();
+        pins.advance_chain(server, "#ops", &old).unwrap();
+        pins.advance_chain(server, "#ops", &head(2)).unwrap();
+        assert_eq!(
+            Pins::load(&path)
+                .unwrap()
+                .channel(server, "#ops")
+                .unwrap()
+                .chain_head,
+            Some(head(2))
         );
     }
 
