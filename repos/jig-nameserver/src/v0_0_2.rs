@@ -395,7 +395,9 @@ mod tests {
             ("alias", "victim@dj.jig".to_string()),
             ("ns_did", state.ns_did_string()),
         ] {
-            manifest.metadata.insert(k.to_string(), serde_json::json!(v));
+            manifest
+                .metadata
+                .insert(k.to_string(), serde_json::json!(v));
         }
         let manifest_bytes = manifest.to_canonical_bytes().unwrap();
         let canonical = serde_json::to_vec(&(&manifest_bytes, &Vec::<u8>::new())).unwrap();
@@ -414,7 +416,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, IngestError::DisallowedBlockKind { .. }), "{err:?}");
+        assert!(
+            matches!(err, IngestError::DisallowedBlockKind { .. }),
+            "{err:?}"
+        );
         assert!(state.alias_holder("victim@dj.jig").await.unwrap().is_none());
     }
 
