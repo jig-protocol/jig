@@ -55,6 +55,7 @@ per_did_per_min = 10  # successful requests naming a DID
 - A refused request is not counted. It gets HTTP 429 with code `RATE_LIMITED` and a `Retry-After` header.
 - Windows are fixed, one minute long and held in memory. They reset when the nameserver restarts and are not shared between processes.
 - A limit of `0` refuses every request on that bucket. `enabled = false` turns both limits off.
+- `GET /.well-known/jig-ns` publishes these three values under `policy.alias_rate_limits`.
 
 ## Behind a reverse proxy
 
