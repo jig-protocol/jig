@@ -511,25 +511,28 @@ mod tests {
     }
 }
 
-/// A name's delegation as given on the command line: the nameservers to ask
-/// and the authorities whose attestations count. Without any, the suffix's
-/// delegation is discovered over `dns`.
+/// The delegations for resolving `name`. A `--nameserver`/`--authority` pair
+/// given on the command line replaces the suffix's entry: the nameservers to
+/// ask and the authorities whose attestations count. Without one, it is
+/// `cli.toml`'s `[naming.delegations]` (or the built-in `@jig` one), and any
+/// other suffix is discovered over `dns`, as for `jig ns resolve`.
 pub fn delegations_for(
+    cfg: &crate::config::Config,
     name: &str,
     nameservers: Vec<String>,
     authorities: Vec<String>,
 ) -> Result<jig_client::naming::Delegations> {
-    let mut delegations = jig_client::naming::Delegations::default();
+    let parsed = jig_core::naming::Name::parse(name)?;
     if nameservers.is_empty() && authorities.is_empty() {
-        return Ok(delegations);
+        return crate::cmd::ns::resolve_delegations(cfg, &parsed, None);
     }
     anyhow::ensure!(
         !nameservers.is_empty() && !authorities.is_empty(),
         "a delegation needs both --nameserver and --authority"
     );
-    let suffix = jig_core::naming::Name::parse(name)?.suffix;
+    let mut delegations = crate::config::delegations(cfg);
     delegations.config.insert(
-        suffix,
+        parsed.suffix,
         jig_client::naming::ConfigDelegation {
             authorities,
             nameservers,
@@ -659,19 +662,50 @@ mod name_tests {
 
     #[test]
     fn a_delegation_needs_both_halves() {
+        let cfg = crate::config::Config::default();
         assert!(
-            delegations_for("alice@example.org", vec![], vec![])
+            !delegations_for(&cfg, "alice@example.org", vec![], vec![])
                 .unwrap()
                 .config
-                .is_empty()
+                .contains_key("example.org"),
+            "a dns suffix with no flags is discovered, not configured"
         );
-        assert!(delegations_for("alice@example.org", vec!["https://ns".into()], vec![]).is_err());
+        assert!(
+            delegations_for(&cfg, "alice@example.org", vec!["https://ns".into()], vec![]).is_err()
+        );
         let d = delegations_for(
+            &cfg,
             "alice@example.org",
             vec!["https://ns".into()],
             vec!["did:jig:zNs".into()],
         )
         .unwrap();
         assert_eq!(d.config["example.org"].authorities, ["did:jig:zNs"]);
+    }
+
+    #[test]
+    fn without_flags_the_configured_delegation_counts() {
+        let mut cfg = crate::config::Config::default();
+        cfg.naming.delegations.insert(
+            "example.org".into(),
+            crate::config::DelegationEntry {
+                authorities: vec!["did:jig:zCfg".into()],
+                nameservers: vec!["https://ns.example.org".into()],
+            },
+        );
+        let d = delegations_for(&cfg, "alice@example.org", vec![], vec![]).unwrap();
+        assert_eq!(d.config["example.org"].authorities, ["did:jig:zCfg"]);
+        let d = delegations_for(
+            &cfg,
+            "alice@example.org",
+            vec!["https://other".into()],
+            vec!["did:jig:zFlag".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            d.config["example.org"].authorities,
+            ["did:jig:zFlag"],
+            "flags replace the entry"
+        );
     }
 }
