@@ -409,13 +409,15 @@ pub fn prove_channel(
 
     let suite = jig_pipeline::mls_gate::requested_suite(&manifest)
         .map_err(|_| unproven("it names a suite this client does not know"))?;
-    // A restricted channel is always MLS (D25), so a restricted creation that
-    // says otherwise is no channel this client will post to. Anything but
+    // A restricted channel's content is confidential from the operator (D25),
+    // so a restricted creation under a suite the operator can read (`none`, or
+    // `test-aead`, whose key is published) is no channel this client will post
+    // to. A suite this client does not know was refused above. Anything but
     // `open` is restricted, as the server reads it.
     let open = manifest.metadata.get("visibility").and_then(|v| v.as_str()) == Some("open");
-    if !open && suite != jig_core::EncryptionSuite::Mls {
+    if !open && !suite.is_operator_confidential() {
         return Err(unproven(
-            "it creates a restricted channel without encryption, which no restricted channel is",
+            "it creates a restricted channel under a suite the server's operator can read",
         ));
     }
     Ok(ChannelPin {

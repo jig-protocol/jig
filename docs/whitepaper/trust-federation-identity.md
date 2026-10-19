@@ -465,8 +465,9 @@ a network layer jig does not provide.
   nameserver still parses rulesets and translation contracts and publishes them in
   `/.well-known/jig-ns`; nothing applies them. Its configuration still models reputation as
   per-user `ReputationZone` tiers, the model obligation 1 supersedes.
-  Redesign in progress: rulesets, reputation and transparency logs in JEP-0009 (draft,
-  #163); proof-of-work in JEP-0008 (#162); framing in #152.
+  Redesign in progress, in draft JEPs: rulesets, reputation and transparency logs in
+  [JEP-0009](../../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md); proof-of-work in [JEP-0008](../../repos/jig-spec/jep/jep-0008-proof-of-work.md); framing in lane R's
+  [framing doc](../superpowers/specs/2026-10-18-reputation-pow-tribunals-framing.md).
 - **None.** Reputation inputs, decay, vouching, numbers for servers and nameservers, and
   ruleset acknowledgement.
 
@@ -604,7 +605,7 @@ flowchart TB
   unknown-DID setting), and the block-kind allow-list. Nothing ties them into a declared
   ruleset, no server declares a level, and nothing is shared between servers.
 - **Removed prototype.** The nameserver's experimental policy-hash exchange and gossip
-  routes were removed in #154 (section 6.2). Redesign in progress: JEP-0009 (draft, #163).
+  routes were removed in #154 (section 6.2). Redesign in progress: [JEP-0009](../../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) (draft).
 
 ### 7.3 To be designed
 
@@ -690,9 +691,9 @@ a high-sec ruleset group, cross-checked.
   were deleted in #157 and #159, except `federation.rs`, which stays but serves no route. It
   explored the shape of obligation 2 and met none of it: its proof-of-work was per identity,
   its reputation model the superseded tier model, and its log kept by one nameserver with
-  nobody cross-checking it. The redesign is lane R's: the framing doc (#152) and the draft
-  JEP-0008 (proof-of-work, #162), JEP-0009 (rulesets, reputation, transparency logs, #163)
-  and JEP-0010 (abuse reports, tribunals, #166), none merged yet.
+  nobody cross-checking it. The redesign is lane R's: the [framing doc](../superpowers/specs/2026-10-18-reputation-pow-tribunals-framing.md) and the draft
+  [JEP-0008](../../repos/jig-spec/jep/jep-0008-proof-of-work.md) (proof-of-work), [JEP-0009](../../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) (rulesets, reputation, transparency
+  logs) and [JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md) (abuse reports, tribunals).
 
 ### 8.3 To be designed
 
@@ -1082,7 +1083,7 @@ some other way. jig chooses provable reporting and states its cost.
   operator decisions (admission bans and floors in `[auth.admission]`) and channel owners'
   kicks.
 - **Removed prototype.** The nameserver's experimental tribunal case records were removed
-  with its other legacy routes (section 8.2). The redesign is the JEP-0010 draft (#166).
+  with its other legacy routes (section 8.2). The redesign is the [JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md) draft.
 
 ### 13.3 To be designed
 
@@ -1293,7 +1294,7 @@ gap.
 | A peer is a transport; relayed blocks pass every gate | Built: relayed blocks run through `ingest` and the write gate (authors not asked for admission proof-of-work); peers listed and pinned in configuration | Peer DID in the contract; per-peer limits |
 | Pluggable suites, MLS default and first (D1, D13) | Built: MLS per channel; validating delivery service | Non-MLS plug-in shape (D13); per-suite conformance |
 | End-to-end encryption by default | Partial: DMs and restricted channels always encrypted; open channels plaintext unless created `mls` | Encryption on by default |
-| Mandatory signed handshake; clients fail closed and pin | Partial: signed welcome with nonce; CLI pins server DIDs, suites and channel suites; later frames checked against the welcome | Close semantics; pins; real reputation (D11) |
+| Mandatory signed handshake; clients fail closed and pin | Partial: signed welcome with nonce; CLI pins server DIDs, suites and channel suites; later frames checked against the welcome; refusals close with 4002 | Mutual server-to-server handshake; pins; real reputation (D11) |
 | No backdoors, no scanning, no default escrow | Holds: no backdoor, scanning or escrow exists | Keep it so as reporting is designed |
 | Provable abuse reports from encrypted channels, by participants only (D22) | None: signature exists; no tooling | Delegation or proof mechanism (AB-06) |
 | Tribunals per ruleset group, held by its nameservers; penalties only under an acknowledged ruleset | None | Tribunal process, eligibility (GV-01 to GV-03) |
@@ -1374,7 +1375,7 @@ Each item names what it must satisfy and the register entries it closes.
     server pins. Closes PV-03, OP-08, NS-01.
 12. **Suites.** The non-MLS plug-in shape (D13), per-suite conformance, multi-device and
     recovery, encryption on by default. Feeds OP-03, OP-05.
-13. **The handshake.** Close semantics and JEP-0002's other open questions. Closes OP-01 to
+13. **The handshake.** JEP-0002's open questions; close classes landed in #140. Closes OP-01 to
     OP-03.
 14. **Anchors.** Replacement procedure, and the signed, versioned defaults document.
 15. **The nameserver prototype.** Removed in #154; its proof-of-work, claim and transparency

@@ -23,6 +23,7 @@ pub mod dcbor;
 pub mod did;
 pub mod dm;
 pub mod error;
+pub mod grant;
 pub mod hlc;
 #[cfg(feature = "keystore")]
 pub mod keystore;
