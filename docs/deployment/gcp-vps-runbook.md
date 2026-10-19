@@ -569,13 +569,7 @@ sudoedit /etc/jig/config.toml
 #   set root-level  bind_address = "<the 100.x address>"   <- this is what binds
 #   set [server]    listen = "<the 100.x address>:7117"    <- decorative, but keep in sync
 
-# 4. nameserver secret — MANDATORY, it panics at startup without one
-printf 'JIG_NS_SECRET=%s\n' "$(openssl rand -hex 32)" \
-  | sudo tee /etc/jig/jig-nameserver.env >/dev/null
-sudo chown root:jig /etc/jig/jig-nameserver.env
-sudo chmod 600 /etc/jig/jig-nameserver.env
-
-# 5. units — EDIT jig-nameserver.service's Environment=JIG_NS_BIND first
+# 4. units (the nameserver needs no secret or env file) — EDIT jig-nameserver.service's Environment=JIG_NS_BIND first
 sudoedit deploy/jig-nameserver.service        # JIG_NS_BIND=<the 100.x address>
 sudo install -m 0644 deploy/jig-server.service deploy/jig-nameserver.service \
                      deploy/jig-backup.service deploy/jig-backup.timer \

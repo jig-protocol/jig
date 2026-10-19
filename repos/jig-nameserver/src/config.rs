@@ -33,7 +33,6 @@ pub struct NameServerConfig {
     pub storage: StorageConfig,
     pub penalties: PenaltyConfig,
     pub anonymous: AnonymousPolicy,
-    pub federation: FederationConfig,
     pub admin: AdminConfig,
     pub automation: AutomationPolicy,
     pub reputation: ReputationConfig,
@@ -57,11 +56,55 @@ pub struct NameServerConfig {
     pub alias_rate_limits: AliasRateLimitConfig,
 }
 
+/// `JIG_NS_*` variables a removed feature read, with what removed it. Setting
+/// one has no effect any more, so loading warns about it rather than ignoring
+/// it silently.
+const REMOVED_ENV_VARS: &[(&str, &str)] = &[
+    (
+        "JIG_NS_FEDERATION_ENABLED",
+        "nameserver federation was removed",
+    ),
+    ("JIG_NS_ALLOW_DOMAINS", "nameserver federation was removed"),
+    ("JIG_NS_DENY_DOMAINS", "nameserver federation was removed"),
+    ("JIG_NS_SEED_PEERS", "nameserver federation was removed"),
+    ("JIG_NS_MAX_PEERS", "nameserver federation was removed"),
+    ("JIG_NS_CACHE_TTL", "nameserver federation was removed"),
+    (
+        "JIG_NS_GOSSIP_INTERVAL",
+        "nameserver federation was removed",
+    ),
+    (
+        "JIG_NS_HANDSHAKE_TIMEOUT",
+        "nameserver federation was removed",
+    ),
+    (
+        "JIG_NS_GOSSIP_BATCH_SIZE",
+        "nameserver federation was removed",
+    ),
+];
+
+/// The removed variables set in this process's environment, with why each is
+/// ignored.
+fn removed_env_vars_set() -> Vec<(&'static str, &'static str)> {
+    REMOVED_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|(var, _)| std::env::var_os(var).is_some())
+        .collect()
+}
+
+fn warn_removed_env_vars() {
+    for (var, why) in removed_env_vars_set() {
+        tracing::warn!("{var} is set, but {why}; it is ignored. Unset it.");
+    }
+}
+
 impl NameServerConfig {
     /// Load configuration from disk if available, otherwise fall back to env
     /// defaults. The result is [`validate`](Self::validate)d, so a
     /// misconfiguration surfaces as an `Err` the caller can log.
     pub fn load() -> Result<Self> {
+        warn_removed_env_vars();
         let cfg = Self::load_unvalidated()?;
         cfg.validate()?;
         Ok(cfg)
@@ -109,6 +152,7 @@ impl NameServerConfig {
 
     /// Load configuration from the given path. Validated like [`load`](Self::load).
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
+        warn_removed_env_vars();
         let cfg = Self::load_from_path_with_profile(path, std::env::var("JIG_NS_PROFILE").ok())?;
         cfg.validate()?;
         Ok(cfg)
@@ -254,7 +298,6 @@ impl NameServerConfig {
             storage: StorageConfig::from_env(),
             penalties: PenaltyConfig::from_env(),
             anonymous: AnonymousPolicy::from_env(),
-            federation: FederationConfig::from_env(),
             admin: AdminConfig::from_env(),
             automation: AutomationPolicy::from_env(),
             reputation: ReputationConfig::from_env(),
@@ -273,7 +316,6 @@ impl NameServerConfig {
         self.analytics.merge_env();
         self.penalties.merge_env();
         self.anonymous.merge_env();
-        self.federation.merge_env();
         self.admin.merge_env();
         self.automation.merge_env();
         self.reputation.merge_env();
@@ -282,14 +324,6 @@ impl NameServerConfig {
     }
 
     fn normalize(&mut self) {
-        self.federation
-            .allow_domains
-            .iter_mut()
-            .for_each(|d| *d = d.trim().to_lowercase());
-        self.federation
-            .deny_domains
-            .iter_mut()
-            .for_each(|d| *d = d.trim().to_lowercase());
         self.reputation.normalize();
     }
 }
@@ -507,129 +541,6 @@ impl AnonymousPolicy {
             && let Ok(parsed) = bits.parse::<u16>()
         {
             self.min_difficulty = parsed;
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct FederationConfig {
-    pub enabled: bool,
-    pub allow_domains: Vec<String>,
-    pub deny_domains: Vec<String>,
-    pub seed_peers: Vec<String>, // Initial peer endpoints
-    pub max_peers: usize,
-    pub cache_ttl_secs: i64,
-    pub gossip_interval_secs: i64,
-    pub handshake_timeout_secs: i64,
-    pub gossip_batch_size: usize, // Max items per gossip message
-}
-
-impl Default for FederationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            allow_domains: Vec::new(),
-            deny_domains: Vec::new(),
-            seed_peers: Vec::new(),
-            max_peers: 50,
-            cache_ttl_secs: default_federation_cache_ttl(),
-            gossip_interval_secs: 300,
-            handshake_timeout_secs: 30,
-            gossip_batch_size: 100,
-        }
-    }
-}
-
-impl FederationConfig {
-    fn from_env() -> Self {
-        let mut cfg = Self::default();
-        if let Ok(val) = std::env::var("JIG_NS_FEDERATION_ENABLED") {
-            cfg.enabled = val == "true" || val == "1";
-        }
-        if let Ok(domains) = std::env::var("JIG_NS_ALLOW_DOMAINS") {
-            cfg.allow_domains = split_domains(&domains);
-        }
-        if let Ok(domains) = std::env::var("JIG_NS_DENY_DOMAINS") {
-            cfg.deny_domains = split_domains(&domains);
-        }
-        if let Ok(peers) = std::env::var("JIG_NS_SEED_PEERS") {
-            cfg.seed_peers = split_domains(&peers);
-        }
-        if let Ok(max) = std::env::var("JIG_NS_MAX_PEERS")
-            && let Ok(parsed) = max.parse::<usize>()
-        {
-            cfg.max_peers = parsed;
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_CACHE_TTL")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            cfg.cache_ttl_secs = parsed;
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_GOSSIP_INTERVAL")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            cfg.gossip_interval_secs = parsed;
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_HANDSHAKE_TIMEOUT")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            cfg.handshake_timeout_secs = parsed;
-        }
-        if let Ok(size) = std::env::var("JIG_NS_GOSSIP_BATCH_SIZE")
-            && let Ok(parsed) = size.parse::<usize>()
-        {
-            cfg.gossip_batch_size = parsed;
-        }
-        cfg
-    }
-
-    fn merge_env(&mut self) {
-        if let Ok(val) = std::env::var("JIG_NS_FEDERATION_ENABLED") {
-            self.enabled = val == "true" || val == "1";
-        }
-        if let Ok(domains) = std::env::var("JIG_NS_ALLOW_DOMAINS") {
-            let parsed = split_domains(&domains);
-            if !parsed.is_empty() {
-                self.allow_domains = parsed;
-            }
-        }
-        if let Ok(domains) = std::env::var("JIG_NS_DENY_DOMAINS") {
-            let parsed = split_domains(&domains);
-            if !parsed.is_empty() {
-                self.deny_domains = parsed;
-            }
-        }
-        if let Ok(peers) = std::env::var("JIG_NS_SEED_PEERS") {
-            let parsed = split_domains(&peers);
-            if !parsed.is_empty() {
-                self.seed_peers = parsed;
-            }
-        }
-        if let Ok(max) = std::env::var("JIG_NS_MAX_PEERS")
-            && let Ok(parsed) = max.parse::<usize>()
-        {
-            self.max_peers = parsed;
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_CACHE_TTL")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            self.cache_ttl_secs = parsed;
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_GOSSIP_INTERVAL")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            self.gossip_interval_secs = parsed;
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_HANDSHAKE_TIMEOUT")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            self.handshake_timeout_secs = parsed;
-        }
-        if let Ok(size) = std::env::var("JIG_NS_GOSSIP_BATCH_SIZE")
-            && let Ok(parsed) = size.parse::<usize>()
-        {
-            self.gossip_batch_size = parsed;
         }
     }
 }
@@ -1186,15 +1097,6 @@ impl AnalyticsConfig {
     }
 }
 
-fn split_domains(input: &str) -> Vec<String> {
-    input
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_lowercase())
-        .collect()
-}
-
 fn default_bind() -> String {
     "127.0.0.1".to_string()
 }
@@ -1241,13 +1143,6 @@ fn default_anon_min_pow() -> u16 {
         .unwrap_or(12)
 }
 
-fn default_federation_cache_ttl() -> i64 {
-    std::env::var("JIG_NS_CACHE_TTL")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(300)
-}
-
 const TEMPLATE: &str = r#"
 # Jig Nameserver configuration
 
@@ -1276,12 +1171,6 @@ max_points = 64
 [anonymous]
 enabled = true
 min_difficulty = 16
-
-[federation]
-allow_domains = []
-deny_domains = []
-cache_ttl_secs = 300
-gossip_interval_secs = 300
 
 [admin]
 token = ""
@@ -1537,8 +1426,8 @@ federation_enabled = true
 
     #[test]
     fn retired_sections_are_ignored() {
-        // Configs written before `[pow]` and `[rate_limits]` were removed must
-        // keep loading.
+        // Configs written before `[pow]`, `[rate_limits]` and `[federation]`
+        // were removed must keep loading.
         let doc = r#"
 [pow]
 server_secret = "old"
@@ -1548,11 +1437,37 @@ base_difficulty = 18
 per_key_per_min = 60
 per_ip_per_min = 120
 
+[federation]
+enabled = true
+seed_peers = ["https://ns.example.org"]
+
 [[v0_0_2.nameserver.alias_suffixes]]
 suffix = "names.example.org"
 "#;
         let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
         cfg.validate().expect("valid");
+    }
+
+    /// Mutates the environment. Safe under `cargo nextest`, which runs every
+    /// test in its own process.
+    #[test]
+    fn a_removed_env_var_is_reported_not_silently_ignored() {
+        unsafe {
+            std::env::set_var("JIG_NS_FEDERATION_ENABLED", "true");
+            std::env::remove_var("JIG_NS_SEED_PEERS");
+        }
+        let set = removed_env_vars_set();
+        assert!(
+            set.iter()
+                .any(|(var, why)| *var == "JIG_NS_FEDERATION_ENABLED" && why.contains("removed")),
+            "{set:?}"
+        );
+        assert!(
+            set.iter().all(|(var, _)| *var != "JIG_NS_SEED_PEERS"),
+            "{set:?}"
+        );
+        // Parsing still succeeds: the variable is ignored, with a warning.
+        NameServerConfig::load_unvalidated().expect("parses");
     }
 
     #[test]

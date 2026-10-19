@@ -56,17 +56,3 @@ entries = [
   { min = 0.4, max = 1.0, mapped = 0.4 }
 ]
 default = 0.0
-
-[nameserver.federation]
-enabled = true
-seed_peers = [
-  "https://ns-alpha.example.com",
-  "https://ns-beta.example.org"
-]
-max_peers = 50
-allow_domains = []  # Empty = allow all
-deny_domains = []   # Block specific domains
-cache_ttl_secs = 3600
-gossip_interval_secs = 300  # 5 minutes
-handshake_timeout_secs = 30
-gossip_batch_size = 100

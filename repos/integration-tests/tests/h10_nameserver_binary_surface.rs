@@ -47,7 +47,6 @@ impl BinarySurface {
 
         let mut cfg = NameServerConfig::default();
         cfg.storage.database_path = tempdir.path().join("nameserver.db");
-        cfg.federation.enabled = false;
         cfg.v0_0_2.server.server_did_keyfile = tempdir
             .path()
             .join("nameserver.key")
@@ -58,11 +57,7 @@ impl BinarySurface {
         cfg.v0_0_2.debug.list_handles = list_handles;
         cfg.validate().context("config must be valid")?;
 
-        let (router, coordinator) = jig_nameserver::server::build_app(&cfg).context("build_app")?;
-        assert!(
-            coordinator.is_none(),
-            "federation disabled — build_app must not hand back a coordinator"
-        );
+        let router = jig_nameserver::server::build_app(&cfg).context("build_app")?;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.context("bind")?;
         let addr = listener.local_addr().context("local_addr")?;

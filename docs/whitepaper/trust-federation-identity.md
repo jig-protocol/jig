@@ -929,7 +929,9 @@ every member. It can withhold, delay and reorder blocks (OP-06).
   key distribution, conformance vectors), and whether post-quantum protection arrives as its
   own suite, as a hybrid MLS cipher suite, or both.
 - **Open.** Making encryption the default for channels, not only for DMs.
-- **Open.** Multi-device membership and key rotation (JEP-0001, open question 4).
+- **Open.** Multi-device membership and key rotation (JEP-0001, open question 4). The
+  [JEP-0012](../../repos/jig-spec/jep/jep-0012-key-links.md) draft specifies the key link a
+  rotation hands over with; which records carry it is still to be specified.
 - **Open.** Binding the handshake transcript into MLS group joins (JEP-0002, open
   question 4).
 - **Open.** Client-side execution of decrypted content (JEP-0001, open question 7).
