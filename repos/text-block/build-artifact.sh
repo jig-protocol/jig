@@ -50,6 +50,38 @@ fi
 
 mkdir -p "$CRATE_DIR/artifacts"
 
+# --- The jig:block/renderer@0.1.0 component (JEP-0006) ---------------------------------------
+#
+# Built FIRST, so that the byte-payload build below is the last thing written to
+# target/$TARGET/release/text_block.wasm: CI's "Fresh build behaves identically" step reads
+# that path and must find the byte-payload module there.
+#
+# The core module comes from the same crate with `--features component`, which swaps the
+# byte-payload exports for the wit-bindgen ones, and the same two settings as below.
+# `wasm-tools component new` then wraps it. Like the module, the component is held to its
+# source by functional equivalence, not bytes: jig-runtime's text_block_component suite runs
+# against the committed artifact and against this fresh build (JIG_TEXT_BLOCK_COMPONENT), and
+# checks it against jig-core's component validator.
+COMPONENT_OUT="$CRATE_DIR/artifacts/text_block.component.wasm"
+COMPONENT_FRESH="$WORKSPACE_DIR/target/$TARGET/release/text_block.component.wasm"
+if ! command -v wasm-tools >/dev/null 2>&1; then
+	echo "error: the component build needs wasm-tools." >&2
+	echo "       install with: cargo install wasm-tools --locked" >&2
+	exit 1
+fi
+echo "building the text-block component for $TARGET ..."
+(
+	cd "$WORKSPACE_DIR"
+	RUSTFLAGS="-C link-arg=--max-memory=16777216" \
+		cargo build --release --target "$TARGET" -p text-block --features component
+)
+wasm-tools component new "$WORKSPACE_DIR/target/$TARGET/release/text_block.wasm" \
+	-o "$COMPONENT_FRESH"
+install -m 0644 "$COMPONENT_FRESH" "$COMPONENT_OUT"
+echo "wrote $COMPONENT_OUT"
+
+# --- The byte-payload module ----------------------------------------------------------------
+
 echo "building text-block for $TARGET ..."
 (
 	cd "$WORKSPACE_DIR"
