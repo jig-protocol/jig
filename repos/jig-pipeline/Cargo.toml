@@ -8,7 +8,6 @@ description = "Shared block ingest/effect/persist pipeline for jig-server and ji
 
 [dependencies]
 jig-core = { workspace = true }
-jig-config = { workspace = true }
 jig-runtime = { workspace = true }
 # Validates the MLS payload of blocks on encrypted channels (`mls_gate`).
 jig-mls = { workspace = true }
@@ -37,6 +36,8 @@ chrono = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
+# Registers the `test-aead` conformance suite for this crate's tests only.
+jig-core = { workspace = true, features = ["test-suite"] }
 tempfile = "3"
 proptest = "1.4"
 rand = { workspace = true }

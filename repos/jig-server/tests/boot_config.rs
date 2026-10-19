@@ -40,8 +40,8 @@ fn drain_stderr(child: &mut Child) -> String {
     buf
 }
 
-/// Config file that parses cleanly as BOTH halves of the hybrid shape.
-fn valid_hybrid_config(home: &Path) -> String {
+/// A config file with the socket keys and the pipeline sections.
+fn valid_config(home: &Path) -> String {
     format!(
         r#"
 database_path = "{db}"
@@ -67,8 +67,8 @@ cache_ttl_seconds = 300
 fn explicit_config_with_a_typo_is_fatal_and_names_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("config.toml");
-    // Root keys are valid ServerConfig, so the ONLY thing that can fail here
-    // is the v0.0.2 half — `toffu` is not an IdentityMode.
+    // The root keys are valid, so the ONLY thing that can fail here is
+    // `[identity]` — `toffu` is not an IdentityMode.
     std::fs::write(
         &cfg,
         format!(
@@ -111,7 +111,7 @@ fn explicit_config_with_a_typo_is_fatal_and_names_the_file() {
 fn valid_explicit_config_still_boots() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("config.toml");
-    std::fs::write(&cfg, valid_hybrid_config(dir.path())).unwrap();
+    std::fs::write(&cfg, valid_config(dir.path())).unwrap();
 
     let mut child = spawn(dir.path(), &["--config", cfg.to_str().unwrap()]);
     assert_still_running(&mut child, "a valid --config must boot");
@@ -126,7 +126,7 @@ fn a_v0_0_2_module_that_cannot_start_is_fatal() {
     // serving nothing. So a module that cannot start must stop the boot.
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("config.toml");
-    std::fs::write(&cfg, valid_hybrid_config(dir.path())).unwrap();
+    std::fs::write(&cfg, valid_config(dir.path())).unwrap();
     // The configured server_did_keyfile exists but holds no key.
     std::fs::write(dir.path().join("server.key"), b"not a key").unwrap();
 
