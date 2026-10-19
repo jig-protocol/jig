@@ -168,7 +168,7 @@ async fn a_new_name_is_pinned_a_pinned_one_is_used_and_a_changed_one_is_refused(
     let home = tempfile::tempdir().unwrap();
     set_up(home.path(), &server, &did_of(&ns), &nameserver);
 
-    // New: verified, pinned, and printed with who vouched. The DM itself
+    // New: verified, pinned, and printed once with who vouched. The DM itself
     // then fails against the stub server, which is fine: only the name is
     // under test.
     let (_, out) = run_async(home.path(), &["dm", "DJ@jig", "hi"]).await;
@@ -179,9 +179,19 @@ async fn a_new_name_is_pinned_a_pinned_one_is_used_and_a_changed_one_is_refused(
     let pins = std::fs::read_to_string(home.path().join(".jig").join("pins.json")).unwrap();
     assert!(pins.contains(&dj), "the name is pinned: {pins}");
 
-    // Pinned: the same DID resolves again.
+    // Pinned: the same DID resolves again, quietly, and the DM goes on to
+    // the server.
+    seen.lock().unwrap().clear();
     let (_, out) = run_async(home.path(), &["dm", "dj@jig", "hi"]).await;
-    assert!(out.contains(&format!("dj@jig is {dj}")), "{out}");
+    assert!(
+        !out.contains("pinned on first use"),
+        "printed only once: {out}"
+    );
+    assert!(!out.contains("nothing was sent"), "{out}");
+    assert!(
+        !beyond_admission(&seen).is_empty(),
+        "a pinned name lets the DM proceed: {out}"
+    );
 
     // Changed: refused before anything reaches the server.
     let other = did_of(&key(3));
@@ -191,7 +201,7 @@ async fn a_new_name_is_pinned_a_pinned_one_is_used_and_a_changed_one_is_refused(
     assert!(!ok, "a changed DID is refused: {out}");
     assert!(out.contains("nothing was sent to dj@jig"), "{out}");
     assert!(
-        out.contains(&format!("jig trust accept-name dj@jig {other}")),
+        out.contains(&format!("jig trust accept-name dj@jig --did {other}")),
         "says how to accept it: {out}"
     );
     assert_eq!(

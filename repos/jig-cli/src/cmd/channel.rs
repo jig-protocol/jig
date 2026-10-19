@@ -340,32 +340,25 @@ pub(crate) async fn resolve_who(ctx: &CliContext, who: &str) -> Result<String> {
     let name = jig_core::naming::Name::parse(who)
         .with_context(|| format!("`{who}` is not a valid alias@suffix"))?;
     let delegations = crate::config::delegations(ctx.effective());
-    let binding = crate::cmd::trust::verify_name(&name.as_alias(), &delegations)
+    // On a changed DID, verify_name's error already names both DIDs and the
+    // `jig trust accept-name` command; this adds only that nothing went out.
+    let verified = crate::cmd::trust::verify_name(&name.as_alias(), &delegations)
         .await
-        .map_err(|e| explain_name_refusal(&name, e))?;
-    eprintln!(
-        "{} is {} (vouched for by {})",
-        name.as_alias(),
-        binding.did(),
-        binding.attestation.ns_did
-    );
-    canonical_did(binding.did())
-}
-
-/// Add what to do next to a refused name: a changed DID is accepted only once
-/// its holder confirms it.
-fn explain_name_refusal(name: &jig_core::naming::Name, e: anyhow::Error) -> anyhow::Error {
-    match e.downcast_ref::<jig_client::naming::ResolveError>() {
-        Some(jig_client::naming::ResolveError::PinMismatch { new, .. }) => {
-            let hint = format!(
-                "nothing was sent to {name}. If its holder confirms the change, run \
-                 `jig trust accept-name {name} {new}`",
-                name = name.as_alias()
+        .with_context(|| format!("nothing was sent to {}", name.as_alias()))?;
+    let binding = match verified {
+        jig_client::naming::Verified::New(binding) => {
+            eprintln!(
+                "{} is {} (vouched for by {}); pinned on first use",
+                name.as_alias(),
+                binding.did(),
+                binding.attestation.ns_did
             );
-            e.context(hint)
+            binding
         }
-        _ => e.context(format!("resolving {}", name.as_alias())),
-    }
+        jig_client::naming::Verified::Pinned(binding)
+        | jig_client::naming::Verified::Rotated { binding, .. } => binding,
+    };
+    canonical_did(binding.did())
 }
 
 /// The canonical spelling of a key-derived `did:jig`: the one the server
