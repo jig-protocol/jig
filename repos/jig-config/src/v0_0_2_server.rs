@@ -7,7 +7,7 @@
 //! - `[identity]`   — TOFU vs nameserver mode + trusted nameservers
 //! - `[federation]` — peers + TLS toggle
 //! - `[debug]`      — antipattern-flag-gated REST endpoints + nameserver enumeration
-//! - `[nameserver]` — alias suffix this node is authoritative for (nameserver mode)
+//! - `[nameserver]` — alias suffixes this node serves (nameserver mode)
 //!
 //! Every section carries a container-level `#[serde(default)]`, so a config
 //! file may omit a section entirely or set only the keys it cares about; the
@@ -401,58 +401,212 @@ pub struct BridgeSection {
 /// Nameserver-mode settings. Only meaningful when this process runs as a
 /// jig-nameserver; a plain chat server parses and ignores the section.
 ///
-/// `alias_suffix` IS wired: `jig_nameserver::server::build_app_parts` reads it
-/// when constructing the v0.0.2 `AppState`, covered by
-/// `build_app_uses_the_configured_alias_suffix`.
-///
-/// [`NameserverSection::validate`] is NOT yet called on any production path,
-/// so a malformed suffix reaches the router instead of failing at load. Call it
-/// from jig-server's `ServerConfig::load` to close that gap.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+/// `alias_suffixes` has no default: a nameserver must name the suffixes it
+/// serves. [`NameserverSection::validate`] enforces that, and jig-nameserver
+/// calls it at load; jig-server never does, so a chat server's config needs no
+/// `[nameserver]` table.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct NameserverSection {
-    /// The alias suffix this nameserver is authoritative for — the part after
-    /// the `@` in `dj@gigue.jig`. Stored WITHOUT the `@` so callers can
-    /// `format!("{local}@{alias_suffix}")` without stripping.
-    pub alias_suffix: String,
+    /// The removed single-suffix key. Parsed only so `validate` can name its
+    /// replacement instead of failing on an unknown field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias_suffix: Option<String>,
+    /// The suffixes this nameserver serves, the part after the `@` in
+    /// `dj@names.example.org`. Each one is stored without the `@`.
+    pub alias_suffixes: Vec<SuffixConfig>,
 }
 
-impl Default for NameserverSection {
-    fn default() -> Self {
+/// Whether a suffix accepts new registrations. A closed suffix still resolves,
+/// renews and rotates the names it already holds.
+///
+/// Non-exhaustive so a later mode (an operator approval queue) is an added
+/// variant, not a config break.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum Registration {
+    #[default]
+    Open,
+    Closed,
+}
+
+/// One DID and the exact aliases it may register on a suffix, closed or not,
+/// regardless of the minimum length and the reserved names. Removing an entry
+/// does not affect a name already registered.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllowEntry {
+    pub did: String,
+    pub aliases: Vec<String>,
+}
+
+/// One served suffix and its registration policy.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuffixConfig {
+    pub suffix: String,
+    #[serde(default)]
+    pub registration: Registration,
+    /// Required to serve a single-label suffix such as `jig`. Clients trust a
+    /// single-label suffix only through their own config, so its names verify
+    /// only for clients whose config names this nameserver's DID.
+    #[serde(default)]
+    pub single_label_authority: bool,
+    /// Shortest alias accepted, counted on the lowercased alias as typed.
+    #[serde(default = "default_min_alias_len")]
+    pub min_alias_len: usize,
+    /// Refused when the normalized alias equals one of these.
+    #[serde(default = "default_reserved")]
+    pub reserved: Vec<String>,
+    /// Refused when the normalized alias contains one of these.
+    #[serde(default = "default_reserved_contains")]
+    pub reserved_contains: Vec<String>,
+    /// Refused when the normalized alias starts or ends with one of these.
+    #[serde(default = "default_reserved_affixes")]
+    pub reserved_affixes: Vec<String>,
+    #[serde(default)]
+    pub registration_allow: Vec<AllowEntry>,
+}
+
+fn default_min_alias_len() -> usize {
+    3
+}
+
+fn strings(xs: &[&str]) -> Vec<String> {
+    xs.iter().map(|x| x.to_string()).collect()
+}
+
+fn default_reserved() -> Vec<String> {
+    strings(&[
+        "admin",
+        "root",
+        "support",
+        "help",
+        "security",
+        "abuse",
+        "official",
+        "jig",
+        "foundation",
+        "team",
+        "staff",
+        "mod",
+        "moderator",
+        "system",
+        "postmaster",
+        "noreply",
+    ])
+}
+
+fn default_reserved_contains() -> Vec<String> {
+    strings(&["official", "support", "jig"])
+}
+
+fn default_reserved_affixes() -> Vec<String> {
+    strings(&["admin", "staff"])
+}
+
+impl SuffixConfig {
+    /// A suffix with the default policy.
+    pub fn new(suffix: &str) -> Self {
         Self {
-            // gigue runs the default nameserver for the `.jig` protocol
-            // namespace, so an unconfigured install lands there.
-            alias_suffix: "gigue.jig".to_string(),
+            suffix: suffix.to_string(),
+            registration: Registration::default(),
+            single_label_authority: false,
+            min_alias_len: default_min_alias_len(),
+            reserved: default_reserved(),
+            reserved_contains: default_reserved_contains(),
+            reserved_affixes: default_reserved_affixes(),
+            registration_allow: Vec::new(),
         }
+    }
+
+    /// `jig`, as opposed to `names.example.org`.
+    pub fn is_single_label(&self) -> bool {
+        !self.suffix.contains('.')
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let s = &self.suffix;
+        if s.is_empty() {
+            return Err("a nameserver.alias_suffixes entry has an empty suffix".to_string());
+        }
+        if s.contains('@') {
+            return Err(format!(
+                "nameserver suffix must not contain '@'; it is the suffix alone \
+                 (e.g. `names.example.org`), not a full alias; got `{s}`"
+            ));
+        }
+        if s.chars().any(|c| c.is_uppercase()) {
+            return Err(format!("nameserver suffix must be lowercase; got `{s}`"));
+        }
+        if s.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "nameserver suffix must not contain whitespace; got `{s}`"
+            ));
+        }
+        if self.is_single_label() && !self.single_label_authority {
+            return Err(format!(
+                "suffix `{s}` is a single label. Clients trust a single-label suffix only \
+                 through their own config, so names registered here verify only for clients \
+                 whose config names this nameserver's DID. Set `single_label_authority = true` \
+                 on this suffix if that is intended."
+            ));
+        }
+        if self.min_alias_len == 0 {
+            return Err(format!("suffix `{s}`: min_alias_len must be at least 1"));
+        }
+        for list in [
+            &self.reserved,
+            &self.reserved_contains,
+            &self.reserved_affixes,
+        ] {
+            if let Some(bad) = list.iter().find(|w| {
+                w.is_empty()
+                    || w.chars()
+                        .any(|c| !c.is_ascii_lowercase() && !c.is_ascii_digit())
+            }) {
+                return Err(format!(
+                    "suffix `{s}`: reserved entry `{bad}` must be non-empty lowercase letters \
+                     and digits"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
 impl NameserverSection {
-    /// Reject alias suffixes that would produce unresolvable aliases. Aliases
-    /// are compared byte-wise downstream, so a suffix that differs only in
-    /// case or padding silently fails to resolve — catch it at boot instead.
+    /// Reject a nameserver config that would serve no suffix, or suffixes that
+    /// would produce unresolvable aliases. Aliases are compared byte-wise
+    /// downstream, so a suffix that differs only in case or padding silently
+    /// fails to resolve; catch it at boot instead.
     pub fn validate(&self) -> Result<(), String> {
-        if self.alias_suffix.is_empty() {
-            return Err("nameserver.alias_suffix must not be empty".to_string());
+        if self.alias_suffix.is_some() {
+            return Err(
+                "nameserver.alias_suffix was replaced by nameserver.alias_suffixes, a list of \
+                 tables: [[nameserver.alias_suffixes]] with suffix = \"...\". There is no \
+                 default suffix."
+                    .to_string(),
+            );
         }
-        if self.alias_suffix.contains('@') {
-            return Err(format!(
-                "nameserver.alias_suffix must not contain '@' — it is the suffix alone \
-                 (e.g. `gigue.jig`), not a full alias; got `{}`",
-                self.alias_suffix
-            ));
+        if self.alias_suffixes.is_empty() {
+            return Err(
+                "nameserver.alias_suffixes is required: name each suffix this nameserver \
+                 serves, e.g. [[nameserver.alias_suffixes]] with suffix = \"names.example.org\". \
+                 There is no default suffix."
+                    .to_string(),
+            );
         }
-        if self.alias_suffix.chars().any(|c| c.is_uppercase()) {
-            return Err(format!(
-                "nameserver.alias_suffix must be lowercase; got `{}`",
-                self.alias_suffix
-            ));
-        }
-        if self.alias_suffix.chars().any(char::is_whitespace) {
-            return Err(format!(
-                "nameserver.alias_suffix must not contain whitespace; got `{}`",
-                self.alias_suffix
-            ));
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in &self.alias_suffixes {
+            entry.validate()?;
+            if !seen.insert(entry.suffix.as_str()) {
+                return Err(format!(
+                    "suffix `{}` is listed twice in nameserver.alias_suffixes",
+                    entry.suffix
+                ));
+            }
         }
         Ok(())
     }
@@ -570,12 +724,12 @@ mod tests {
             banned_dids = ["did:jig:zBad"]
 
             [[auth.admission.floors]]
-            ruleset_key = "gigue.highsec.v1"
+            ruleset_key = "jig.highsec.v1"
             minimum = 0
 
             [[auth.admission.records]]
             did = "did:jig:zGood"
-            ruleset_key = "gigue.highsec.v1"
+            ruleset_key = "jig.highsec.v1"
             score = 5
             "#,
         )
@@ -583,7 +737,7 @@ mod tests {
         let a = &cfg.auth.admission;
         assert_eq!(a.unknown_dids, UnknownDidsPolicy::Refuse);
         assert_eq!(a.banned_dids, vec!["did:jig:zBad".to_string()]);
-        assert_eq!(a.floors[0].ruleset_key, "gigue.highsec.v1");
+        assert_eq!(a.floors[0].ruleset_key, "jig.highsec.v1");
         assert_eq!(a.floors[0].minimum, 0);
         assert_eq!(a.records[0].did, "did:jig:zGood");
         assert_eq!(a.records[0].score, 5);
@@ -950,48 +1104,138 @@ mod tests {
 
     // --- [nameserver] --------------------------------------------------
 
-    #[test]
-    fn nameserver_alias_suffix_defaults_to_gigue_jig() {
-        assert_eq!(
-            JigServerConfig::default().nameserver.alias_suffix,
-            "gigue.jig"
-        );
-        let cfg: JigServerConfig = toml::from_str("[nameserver]").unwrap();
-        assert_eq!(cfg.nameserver.alias_suffix, "gigue.jig");
+    fn ns(doc: &str) -> Result<NameserverSection, String> {
+        let cfg: JigServerConfig = toml::from_str(doc).map_err(|e| e.to_string())?;
+        cfg.nameserver.validate()?;
+        Ok(cfg.nameserver)
     }
 
     #[test]
-    fn nameserver_alias_suffix_round_trips_explicit_value() {
-        let cfg: JigServerConfig = toml::from_str(
-            r#"
-            [nameserver]
-            alias_suffix = "dj.jig"
-        "#,
-        )
-        .unwrap();
-        assert_eq!(cfg.nameserver.alias_suffix, "dj.jig");
-        cfg.nameserver.validate().expect("dj.jig is valid");
+    fn nameserver_has_no_default_suffix() {
+        assert!(
+            JigServerConfig::default()
+                .nameserver
+                .alias_suffixes
+                .is_empty()
+        );
+        let err = JigServerConfig::default()
+            .nameserver
+            .validate()
+            .expect_err("a nameserver with no suffix must not start");
+        assert!(err.contains("alias_suffixes is required"), "{err}");
+    }
 
+    #[test]
+    fn a_chat_server_config_needs_no_nameserver_table() {
+        // jig-server parses the section but never validates it.
+        let cfg: JigServerConfig = toml::from_str("[server]\n").unwrap();
+        assert_eq!(cfg.nameserver, NameserverSection::default());
+    }
+
+    #[test]
+    fn the_old_single_suffix_key_names_its_replacement() {
+        let err = ns("[nameserver]\nalias_suffix = \"dj.jig\"\n").expect_err("old key");
+        assert!(
+            err.contains("replaced by nameserver.alias_suffixes"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_suffix_entry_round_trips_with_the_default_policy() {
+        let section = ns(r#"
+            [[nameserver.alias_suffixes]]
+            suffix = "names.example.org"
+        "#)
+        .unwrap();
+        assert_eq!(
+            section.alias_suffixes,
+            vec![SuffixConfig::new("names.example.org")]
+        );
+        let entry = &section.alias_suffixes[0];
+        assert_eq!(entry.registration, Registration::Open);
+        assert_eq!(entry.min_alias_len, 3);
+        assert!(entry.reserved.contains(&"postmaster".to_string()));
+        assert_eq!(entry.reserved_contains, ["official", "support", "jig"]);
+        assert_eq!(entry.reserved_affixes, ["admin", "staff"]);
+
+        let cfg = JigServerConfig {
+            nameserver: section,
+            ..Default::default()
+        };
         let reparsed: JigServerConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(reparsed, cfg);
     }
 
     #[test]
-    fn nameserver_validate_rejects_the_four_malformed_suffixes() {
+    fn a_full_suffix_entry_parses() {
+        let section = ns(r#"
+            [[nameserver.alias_suffixes]]
+            suffix = "names.example.org"
+            registration = "closed"
+            min_alias_len = 2
+            reserved = ["boss"]
+            reserved_contains = []
+            reserved_affixes = ["ops"]
+
+            [[nameserver.alias_suffixes.registration_allow]]
+            did = "did:jig:zexample"
+            aliases = ["dj", "ana"]
+
+            [[nameserver.alias_suffixes]]
+            suffix = "other.example.org"
+        "#)
+        .unwrap();
+        let first = &section.alias_suffixes[0];
+        assert_eq!(first.registration, Registration::Closed);
+        assert_eq!(first.min_alias_len, 2);
+        assert_eq!(first.reserved, ["boss"]);
+        assert!(first.reserved_contains.is_empty());
+        assert_eq!(first.registration_allow[0].aliases, ["dj", "ana"]);
+        assert_eq!(section.alias_suffixes[1].registration, Registration::Open);
+    }
+
+    #[test]
+    fn an_unknown_registration_mode_is_a_parse_error() {
+        let err = ns(r#"
+            [[nameserver.alias_suffixes]]
+            suffix = "names.example.org"
+            registration = "moderated"
+        "#)
+        .expect_err("not built yet");
+        assert!(err.contains("moderated"), "{err}");
+    }
+
+    #[test]
+    fn a_single_label_suffix_needs_the_acknowledgement() {
+        let err = ns("[[nameserver.alias_suffixes]]\nsuffix = \"jig\"\n").expect_err("no ack");
+        assert!(err.contains("single_label_authority"), "{err}");
+        assert!(
+            err.contains("only for clients"),
+            "the error must say why: {err}"
+        );
+
+        ns("[[nameserver.alias_suffixes]]\nsuffix = \"jig\"\nsingle_label_authority = true\n")
+            .expect("acknowledged");
+    }
+
+    #[test]
+    fn nameserver_validate_rejects_the_malformed_suffixes() {
         let cases = [
             ("", "empty"),
-            ("alice@dj.jig", "'@'"),
-            ("DJ.jig", "lowercase"),
-            ("dj .jig", "whitespace"),
+            ("alice@dj.example", "'@'"),
+            ("DJ.example", "lowercase"),
+            ("dj .example", "whitespace"),
         ];
         let mut messages = Vec::new();
         for (suffix, expected_fragment) in cases {
             let section = NameserverSection {
-                alias_suffix: suffix.to_string(),
+                alias_suffix: None,
+                alias_suffixes: vec![SuffixConfig::new(suffix)],
             };
             let err = section
                 .validate()
-                .expect_err("malformed alias_suffix must be rejected");
+                .expect_err("malformed suffix must be rejected");
             assert!(
                 err.contains(expected_fragment),
                 "message for {suffix:?} should mention {expected_fragment}; got {err}"
@@ -1005,11 +1249,31 @@ mod tests {
     }
 
     #[test]
-    fn nameserver_default_suffix_validates() {
-        JigServerConfig::default()
-            .nameserver
-            .validate()
-            .expect("shipped default must be valid");
+    fn nameserver_validate_rejects_bad_policy() {
+        let dup = NameserverSection {
+            alias_suffix: None,
+            alias_suffixes: vec![
+                SuffixConfig::new("a.example"),
+                SuffixConfig::new("a.example"),
+            ],
+        };
+        assert!(dup.validate().unwrap_err().contains("listed twice"));
+
+        let mut zero = SuffixConfig::new("a.example");
+        zero.min_alias_len = 0;
+        let section = NameserverSection {
+            alias_suffix: None,
+            alias_suffixes: vec![zero],
+        };
+        assert!(section.validate().unwrap_err().contains("min_alias_len"));
+
+        let mut upper = SuffixConfig::new("a.example");
+        upper.reserved_contains = vec!["Admin".to_string()];
+        let section = NameserverSection {
+            alias_suffix: None,
+            alias_suffixes: vec![upper],
+        };
+        assert!(section.validate().unwrap_err().contains("reserved entry"));
     }
 
     #[test]

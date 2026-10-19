@@ -21,7 +21,13 @@ use crate::persist::{StoredBlock, StoredChannel, StoredReceipt};
 /// What scope a local subscriber is interested in.
 #[derive(Debug, Clone)]
 pub enum SubscriptionScope {
-    /// A specific channel by slug (e.g. `"#hello"`).
+    /// A specific channel by its id: the CID of its channel-create block,
+    /// which is what `StoredBlock::channel_id` holds (JEP-0005 rule 1).
+    ///
+    /// A subscription made by slug for a channel this server does not hold
+    /// yet carries that slug instead (slugs start with `#`, CIDs never do),
+    /// which matches no block until [`Fanout::bind_pending_channel`] rewrites
+    /// it to the channel's id when the channel is created.
     Channel(String),
     /// Federation-level subscription, filtered to specific block kinds.
     /// Empty `block_kinds` means "all kinds".
@@ -134,6 +140,20 @@ impl Fanout {
 
     pub async fn unsubscribe_local(&self, id: u64) {
         self.local.write().await.remove(&id);
+    }
+
+    /// Point every channel subscription still waiting under `slug` at the
+    /// channel's id, now that a channel-create for that slug has landed.
+    /// Called by ingest before the creation block is broadcast, so a waiting
+    /// subscriber receives that block too.
+    pub async fn bind_pending_channel(&self, slug: &str, channel_id: &str) {
+        for sub in self.local.write().await.values_mut() {
+            if let SubscriptionScope::Channel(key) = &mut sub.scope
+                && key == slug
+            {
+                *key = channel_id.to_string();
+            }
+        }
     }
 
     /// How many local subscriptions are registered. For tests and gauges; the
@@ -272,8 +292,8 @@ impl Fanout {
         let subs = self.local.read().await;
         for sub in subs.values() {
             let matches = match &sub.scope {
-                SubscriptionScope::Channel(slug) => {
-                    block.channel_id.as_deref() == Some(slug.as_str())
+                SubscriptionScope::Channel(channel_id) => {
+                    block.channel_id.as_deref() == Some(channel_id.as_str())
                 }
                 SubscriptionScope::Federation { block_kinds } => {
                     (block_kinds.is_empty() || block_kinds.iter().any(|k| k == &block.block_kind))

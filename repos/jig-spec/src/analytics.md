@@ -1,5 +1,10 @@
 # Analytics
 
+> **Status: not implemented.** This chapter describes a design. `jig-server` stores no
+> receipt analytics, and the `jig-config` profile modules this chapter's backend selection
+> and configuration examples refer to were deleted (#133). The nameserver's own `analytics`
+> module, which queries nameserver data, is separate from what this chapter describes.
+
 **Audience:** This chapter is primarily for **server operators** (setting up analytics backends), **developers building analytics tools**, and **compliance teams** (understanding retention and privacy). **End users** don't need to read this unless they're curious how servers track performance and costs.
 
 ---

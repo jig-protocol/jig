@@ -313,7 +313,7 @@ mod tests {
     fn test_identity() -> Identity {
         let dir = tempdir().unwrap();
         let path = dir.keep();
-        Identity::generate_and_save(&path).unwrap()
+        Identity::generate_for_tests(&path)
     }
 
     fn test_hlc(id: &Identity) -> HlcTimestamp {
@@ -663,10 +663,18 @@ mod tests {
 
         // Seed one message directly through the store (the admin router has no
         // text-render endpoint; the history-retention claim is about storage).
+        // Blocks are keyed by the channel's id, its creation-block CID.
+        let channel_id = state
+            .ingest_ctx
+            .store
+            .get_channel_by_slug("#scratch")
+            .unwrap()
+            .expect("the channel exists")
+            .id;
         let msg_cid = jig_pipeline::ingest_record::label_cid("msg 1");
         let msg = jig_pipeline::persist::StoredBlock {
             cid: msg_cid.clone(),
-            channel_id: Some("#scratch".into()),
+            channel_id: Some(channel_id.clone()),
             block_kind: "text-render".into(),
             sender_did: owner.did_string(),
             sender_sig: vec![0u8; 64],
@@ -681,13 +689,6 @@ mod tests {
         };
         // Sequenced as ingest would: every block of a channel this server holds
         // has its record, and history is read through the chain.
-        let channel_id = state
-            .ingest_ctx
-            .store
-            .get_channel_by_slug("#scratch")
-            .unwrap()
-            .expect("the channel exists")
-            .id;
         state
             .ingest_ctx
             .store

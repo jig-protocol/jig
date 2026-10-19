@@ -16,7 +16,6 @@ use tower::ServiceExt; // oneshot
 use crate::config::ServerConfig;
 use crate::error::{Result, ServerError};
 use crate::handler::{self, AppState};
-use crate::storage::SqliteBlockStore;
 
 /// The TLS session's exporter value for the jig handshake (JEP-0002 rule 2,
 /// RFC 9266). [`serve_tls`] puts it in every request it serves, so the
@@ -43,12 +42,10 @@ pub struct JigServer {
     v0_0_2: Option<Arc<crate::v0_0_2::AppState>>,
 }
 
-/// Boot-time checks that used to run while building the v0.0.1 REST state:
-/// the v0.0.1 store at `database_path` opens and answers, and the `[execution]`
-/// limits make a valid runtime. Kept so that removing those routes does not
-/// also change which configs boot.
+/// Boot-time check that used to run while building the v0.0.1 REST state:
+/// the `[execution]` limits make a valid runtime. Kept so that removing those
+/// routes does not also change which configs boot.
 fn boot_checks(config: &ServerConfig) -> Result<()> {
-    SqliteBlockStore::new(&config.database_path)?.health_check()?;
     jig_runtime::Runtime::with_config(crate::v0_0_2::runtime_config_from(
         &config.execution_config(),
     ))
@@ -346,7 +343,7 @@ mod tests {
                 .with_no_client_auth(),
         );
 
-        let identity = jig_client::Identity::generate_and_save(dir.path()).unwrap();
+        let identity = jig_client::Identity::generate_for_tests(dir.path());
         let client = jig_client::Client::connect_with_tls(
             &format!("wss://{bound}"),
             identity,
