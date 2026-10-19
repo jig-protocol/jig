@@ -34,7 +34,6 @@ async-trait = { workspace = true }
 hex = { workspace = true }
 
 reqwest = { workspace = true }
-hickory-resolver = { version = "0.26", default-features = false, features = ["dnssec-ring", "tokio"] }
 urlencoding = "2"
 toml = "1.1"
 

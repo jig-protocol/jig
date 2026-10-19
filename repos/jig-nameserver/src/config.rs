@@ -33,7 +33,6 @@ pub struct NameServerConfig {
     pub storage: StorageConfig,
     pub penalties: PenaltyConfig,
     pub anonymous: AnonymousPolicy,
-    pub federation: FederationConfig,
     pub admin: AdminConfig,
     pub automation: AutomationPolicy,
     pub reputation: ReputationConfig,
@@ -255,7 +254,6 @@ impl NameServerConfig {
             storage: StorageConfig::from_env(),
             penalties: PenaltyConfig::from_env(),
             anonymous: AnonymousPolicy::from_env(),
-            federation: FederationConfig::from_env(),
             admin: AdminConfig::from_env(),
             automation: AutomationPolicy::from_env(),
             reputation: ReputationConfig::from_env(),
@@ -276,7 +274,6 @@ impl NameServerConfig {
         self.hot.merge_env();
         self.penalties.merge_env();
         self.anonymous.merge_env();
-        self.federation.merge_env();
         self.admin.merge_env();
         self.automation.merge_env();
         self.reputation.merge_env();
@@ -285,14 +282,6 @@ impl NameServerConfig {
     }
 
     fn normalize(&mut self) {
-        self.federation
-            .allow_domains
-            .iter_mut()
-            .for_each(|d| *d = d.trim().to_lowercase());
-        self.federation
-            .deny_domains
-            .iter_mut()
-            .for_each(|d| *d = d.trim().to_lowercase());
         self.reputation.normalize();
     }
 }
@@ -533,129 +522,6 @@ impl AnonymousPolicy {
             && let Ok(parsed) = bits.parse::<u16>()
         {
             self.min_difficulty = parsed;
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct FederationConfig {
-    pub enabled: bool,
-    pub allow_domains: Vec<String>,
-    pub deny_domains: Vec<String>,
-    pub seed_peers: Vec<String>, // Initial peer endpoints
-    pub max_peers: usize,
-    pub cache_ttl_secs: i64,
-    pub gossip_interval_secs: i64,
-    pub handshake_timeout_secs: i64,
-    pub gossip_batch_size: usize, // Max items per gossip message
-}
-
-impl Default for FederationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            allow_domains: Vec::new(),
-            deny_domains: Vec::new(),
-            seed_peers: Vec::new(),
-            max_peers: 50,
-            cache_ttl_secs: default_federation_cache_ttl(),
-            gossip_interval_secs: 300,
-            handshake_timeout_secs: 30,
-            gossip_batch_size: 100,
-        }
-    }
-}
-
-impl FederationConfig {
-    fn from_env() -> Self {
-        let mut cfg = Self::default();
-        if let Ok(val) = std::env::var("JIG_NS_FEDERATION_ENABLED") {
-            cfg.enabled = val == "true" || val == "1";
-        }
-        if let Ok(domains) = std::env::var("JIG_NS_ALLOW_DOMAINS") {
-            cfg.allow_domains = split_domains(&domains);
-        }
-        if let Ok(domains) = std::env::var("JIG_NS_DENY_DOMAINS") {
-            cfg.deny_domains = split_domains(&domains);
-        }
-        if let Ok(peers) = std::env::var("JIG_NS_SEED_PEERS") {
-            cfg.seed_peers = split_domains(&peers);
-        }
-        if let Ok(max) = std::env::var("JIG_NS_MAX_PEERS")
-            && let Ok(parsed) = max.parse::<usize>()
-        {
-            cfg.max_peers = parsed;
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_CACHE_TTL")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            cfg.cache_ttl_secs = parsed;
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_GOSSIP_INTERVAL")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            cfg.gossip_interval_secs = parsed;
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_HANDSHAKE_TIMEOUT")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            cfg.handshake_timeout_secs = parsed;
-        }
-        if let Ok(size) = std::env::var("JIG_NS_GOSSIP_BATCH_SIZE")
-            && let Ok(parsed) = size.parse::<usize>()
-        {
-            cfg.gossip_batch_size = parsed;
-        }
-        cfg
-    }
-
-    fn merge_env(&mut self) {
-        if let Ok(val) = std::env::var("JIG_NS_FEDERATION_ENABLED") {
-            self.enabled = val == "true" || val == "1";
-        }
-        if let Ok(domains) = std::env::var("JIG_NS_ALLOW_DOMAINS") {
-            let parsed = split_domains(&domains);
-            if !parsed.is_empty() {
-                self.allow_domains = parsed;
-            }
-        }
-        if let Ok(domains) = std::env::var("JIG_NS_DENY_DOMAINS") {
-            let parsed = split_domains(&domains);
-            if !parsed.is_empty() {
-                self.deny_domains = parsed;
-            }
-        }
-        if let Ok(peers) = std::env::var("JIG_NS_SEED_PEERS") {
-            let parsed = split_domains(&peers);
-            if !parsed.is_empty() {
-                self.seed_peers = parsed;
-            }
-        }
-        if let Ok(max) = std::env::var("JIG_NS_MAX_PEERS")
-            && let Ok(parsed) = max.parse::<usize>()
-        {
-            self.max_peers = parsed;
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_CACHE_TTL")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            self.cache_ttl_secs = parsed;
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_GOSSIP_INTERVAL")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            self.gossip_interval_secs = parsed;
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_HANDSHAKE_TIMEOUT")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            self.handshake_timeout_secs = parsed;
-        }
-        if let Ok(size) = std::env::var("JIG_NS_GOSSIP_BATCH_SIZE")
-            && let Ok(parsed) = size.parse::<usize>()
-        {
-            self.gossip_batch_size = parsed;
         }
     }
 }
@@ -1284,15 +1150,6 @@ impl HotConfig {
     }
 }
 
-fn split_domains(input: &str) -> Vec<String> {
-    input
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_lowercase())
-        .collect()
-}
-
 fn default_bind() -> String {
     "127.0.0.1".to_string()
 }
@@ -1339,13 +1196,6 @@ fn default_anon_min_pow() -> u16 {
         .unwrap_or(12)
 }
 
-fn default_federation_cache_ttl() -> i64 {
-    std::env::var("JIG_NS_CACHE_TTL")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(300)
-}
-
 const TEMPLATE: &str = r#"
 # Jig Nameserver configuration
 
@@ -1382,12 +1232,6 @@ max_points = 64
 [anonymous]
 enabled = true
 min_difficulty = 16
-
-[federation]
-allow_domains = []
-deny_domains = []
-cache_ttl_secs = 300
-gossip_interval_secs = 300
 
 [admin]
 token = ""

@@ -2,7 +2,6 @@
 
 use crate::config::NameServerConfig;
 use crate::error::{NameServerError, Result};
-use crate::federation::{DefaultFederationResolver, FederationCoordinator, FederationResolver};
 use crate::identity::{get_or_create as ns_get_or_create, ns_id_from_pubkey};
 use crate::storage::{MemoryStorage, NamesStorage, SqliteStorage};
 use axum::{Json, Router, extract::State, routing::get};
@@ -14,8 +13,6 @@ pub struct AppState {
     pub storage: Arc<dyn NamesStorage>,
     pub ns_id: String,
     pub ns_pubkey_hex: String,
-    pub federation: Option<Arc<dyn FederationResolver>>,
-    pub federation_coordinator: Option<Arc<FederationCoordinator>>,
 }
 
 impl Clone for AppState {
@@ -25,8 +22,6 @@ impl Clone for AppState {
             storage: Arc::clone(&self.storage),
             ns_id: self.ns_id.clone(),
             ns_pubkey_hex: self.ns_pubkey_hex.clone(),
-            federation: self.federation.clone(),
-            federation_coordinator: self.federation_coordinator.clone(),
         }
     }
 }
@@ -67,9 +62,6 @@ async fn well_known(State(state): State<AppState>) -> Result<Json<WellKnownNsInf
             "evidence_window_secs": state.cfg.automation.evidence_window_secs,
             "human_review_window_secs": state.cfg.automation.human_review_window_secs,
         },
-        "allow_domains": state.cfg.federation.allow_domains.clone(),
-        "deny_domains": state.cfg.federation.deny_domains.clone(),
-        "cache_ttl_secs": state.cfg.federation.cache_ttl_secs,
         "reputation": state.cfg.reputation.clone(),
         "public_key": state.ns_pubkey_hex,
     });
@@ -96,16 +88,13 @@ async fn health() -> Result<Json<HealthResponse>> {
 
 /// Everything [`build_app_parts`] assembles.
 ///
-/// [`build_app`] returns only the two pieces the binary needs. This superset
+/// [`build_app`] returns only the router the binary serves. This superset
 /// exists so tests can reach the v0.0.2 store the mounted routers write to —
 /// without it, a test harness would have to hand-assemble its own `AppState`,
 /// which is exactly the divergence that let the binary ship with the alias
 /// routers unmounted while the harness tests stayed green.
 pub struct NameServerApp {
     pub router: Router,
-    /// `Some` only when `[federation].enabled`. Construction only — the gossip
-    /// loop is spawned by [`run_http_server`], never here.
-    pub federation_coordinator: Option<Arc<FederationCoordinator>>,
     pub v0_0_2_state: Arc<crate::v0_0_2::AppState>,
 }
 
@@ -144,9 +133,9 @@ fn db_sibling(database_path: &std::path::Path, suffix: &str) -> std::path::PathB
 /// Spawns no background work of its own, so callers control when — and
 /// whether — the gossip loop starts. (`v0_0_2::AppState::new` does spawn its
 /// own challenge-nonce sweeper internally, so a tokio runtime must be live.)
-pub fn build_app(cfg: &NameServerConfig) -> Result<(Router, Option<Arc<FederationCoordinator>>)> {
+pub fn build_app(cfg: &NameServerConfig) -> Result<Router> {
     let app = build_app_parts(cfg)?;
-    Ok((app.router, app.federation_coordinator))
+    Ok(app.router)
 }
 
 /// [`build_app`] plus the v0.0.2 state — see [`NameServerApp`].
@@ -165,32 +154,11 @@ pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
     let ns_pubkey_hex = hex::encode(ns_identity.public_key.as_bytes());
     let ns_id = ns_id_from_pubkey(&ns_identity.public_key);
 
-    // Initialize federation coordinator if enabled. Constructed only; see
-    // `run_http_server` for the gossip spawn.
-    let federation_coordinator = if cfg.federation.enabled {
-        let our_domain = cfg
-            .capabilities
-            .domain
-            .clone()
-            .unwrap_or_else(|| format!("{}:{}", cfg.network.bind, cfg.network.port));
-
-        Some(Arc::new(FederationCoordinator::new(
-            cfg.federation.clone(),
-            storage.clone(),
-            our_domain,
-            cfg.capabilities.version.clone(),
-        )))
-    } else {
-        None
-    };
-
     let state = AppState {
         cfg: cfg.clone(),
         storage,
         ns_id,
         ns_pubkey_hex,
-        federation: Some(Arc::new(DefaultFederationResolver::new())),
-        federation_coordinator: federation_coordinator.clone(),
     };
 
     let mut v0_0_2_cfg = cfg.v0_0_2.clone();
@@ -238,7 +206,6 @@ pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
 
     Ok(NameServerApp {
         router,
-        federation_coordinator,
         v0_0_2_state,
     })
 }
@@ -259,15 +226,7 @@ pub async fn run_http_server(
         cfg.network.port = port;
     }
 
-    let (app, federation_coordinator) = build_app(&cfg)?;
-
-    // The only background task the binary owns. Kept out of `build_app` so a
-    // test can build the router without any live tasks.
-    if let Some(coordinator) = federation_coordinator {
-        tokio::spawn(async move {
-            coordinator.start_gossip_loop().await;
-        });
-    }
+    let app = build_app(&cfg)?;
 
     let addr = format!("{}:{}", cfg.network.bind, cfg.network.port);
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -319,7 +278,6 @@ mod tests {
     fn scratch_config(dir: &ScratchDir, alias_suffix: &str) -> NameServerConfig {
         let mut cfg = NameServerConfig::default();
         cfg.storage.database_path = dir.0.join("nameserver.db");
-        cfg.federation.enabled = false;
         cfg.v0_0_2.nameserver.alias_suffix = alias_suffix.to_string();
         cfg.v0_0_2.server.server_did_keyfile = dir.0.join("ns.key").to_string_lossy().into_owned();
         // Off by default in production; on here so the route-presence assertions
@@ -358,8 +316,6 @@ mod tests {
             storage: Arc::new(MemoryStorage::default()),
             ns_id: "test".into(),
             ns_pubkey_hex: String::new(),
-            federation: None,
-            federation_coordinator: None,
         });
 
         let (status, _) = get(&router, "/v1/health").await;
@@ -374,11 +330,7 @@ mod tests {
     async fn build_app_mounts_the_v0_0_2_alias_routers() {
         let dir = ScratchDir::new("build-app-surface");
         let cfg = scratch_config(&dir, "dj.jig");
-        let (router, coordinator) = build_app(&cfg).expect("build_app");
-        assert!(
-            coordinator.is_none(),
-            "federation is off by default — nothing to gossip with"
-        );
+        let router = build_app(&cfg).expect("build_app");
 
         let (status, body) = get(&router, "/v1/challenge").await;
         assert_eq!(status, StatusCode::OK, "GET /v1/challenge must be served");
@@ -403,7 +355,7 @@ mod tests {
         let dir = ScratchDir::new("handles-gated");
         let mut cfg = scratch_config(&dir, "dj.jig");
         cfg.v0_0_2.debug.list_handles = false;
-        let (router, _) = build_app(&cfg).expect("build_app");
+        let router = build_app(&cfg).expect("build_app");
 
         let (status, _) = get(&router, "/v1/handles").await;
         assert_eq!(
@@ -424,7 +376,7 @@ mod tests {
     async fn legacy_routes_are_not_served() {
         let dir = ScratchDir::new("challenge-merge");
         let cfg = scratch_config(&dir, "dj.jig");
-        let (router, _) = build_app(&cfg).expect("build_app");
+        let router = build_app(&cfg).expect("build_app");
 
         let (status, _) = get(&router, "/v1/challenge").await;
         assert_eq!(status, StatusCode::OK, "v0.0.2 GET handler");
@@ -472,18 +424,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_app_constructs_a_coordinator_without_starting_gossip() {
-        let dir = ScratchDir::new("federation-on");
-        let mut cfg = scratch_config(&dir, "dj.jig");
-        cfg.federation.enabled = true;
-        let app = build_app_parts(&cfg).expect("build_app_parts");
-        assert!(
-            app.federation_coordinator.is_some(),
-            "[federation].enabled must yield a coordinator for run_http_server to spawn"
-        );
-    }
-
-    #[tokio::test]
     async fn build_app_uses_the_configured_alias_suffix() {
         let dir = ScratchDir::new("alias-suffix");
         let cfg = scratch_config(&dir, "deji.jig");
@@ -499,7 +439,7 @@ mod tests {
         let mut cfg = scratch_config(&dir, "dj.jig");
         cfg.alias_rate_limits.per_ip_per_min = 7;
         cfg.alias_rate_limits.per_did_per_min = 3;
-        let (router, _) = build_app(&cfg).expect("build_app");
+        let router = build_app(&cfg).expect("build_app");
 
         let (status, body) = get(&router, "/.well-known/jig-ns").await;
         assert_eq!(status, StatusCode::OK);
@@ -510,10 +450,7 @@ mod tests {
             keys,
             [
                 "alias_rate_limits",
-                "allow_domains",
                 "automation",
-                "cache_ttl_secs",
-                "deny_domains",
                 "public_key",
                 "reputation",
             ]
