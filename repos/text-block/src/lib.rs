@@ -6,6 +6,8 @@
 //! the federation-side parity check.
 
 pub mod canonical;
+#[cfg(feature = "component")]
+mod component;
 
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
@@ -172,6 +174,7 @@ fn render_safe_html(text: &str) -> String {
 /// SAME length that was passed to [`jig_alloc`]: the allocation is made with an
 /// explicit `Layout`, so a mismatched size is undefined behaviour rather than a
 /// tolerated leak.
+#[cfg(not(feature = "component"))]
 mod abi {
     use std::alloc::{Layout, alloc, dealloc};
 
@@ -243,6 +246,7 @@ mod abi {
 /// - `out_len_ptr` must be a valid mutable pointer to a `usize`.
 /// - All pointers must remain valid for the duration of this call.
 /// - Caller is responsible for allocating and freeing the output buffer.
+#[cfg(not(feature = "component"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn execute(
     input_ptr: *const u8,

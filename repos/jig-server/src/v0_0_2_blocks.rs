@@ -697,7 +697,7 @@ mod tests {
             .ingest_ctx
             .store
             .upsert_channel(&jig_pipeline::persist::StoredChannel {
-                id: format!("bafySeed{slug}"),
+                id: jig_pipeline::ingest_record::label_cid(slug),
                 slug: slug.to_string(),
                 visibility: "open".to_string(),
                 created_at: 0,

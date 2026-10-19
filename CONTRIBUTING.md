@@ -43,7 +43,7 @@ cargo nextest run --workspace
 
 Each git worktree has its own `repos/target/`, which grows to tens of GB. `scripts/clean-build-artifacts.sh` lists the build output in every worktree of your clone, and deletes it with `--yes`. Agents working in this repository follow [AGENTS.md](AGENTS.md).
 
-`cargo nextest run --workspace` needs no exported secrets. [`repos/.config/nextest.toml`](repos/.config/nextest.toml) injects a throwaway `JIG_NS_SECRET` fixture. Stop any local `jig-server` on `127.0.0.1:7117` first: one CLI test expects that port to be closed.
+`cargo nextest run --workspace` needs no exported secrets. Stop any local `jig-server` on `127.0.0.1:7117` first: one CLI test expects that port to be closed.
 
 CI is [`.github/workflows/ci.yml`](.github/workflows/ci.yml). `workspace` runs fmt, clippy, and nextest on the v0.0.2 crate surface. `wasm-build` checks the canonical `text-block` module. `dependency-policy` runs `cargo deny check` (advisories, bans, licenses, sources) from the repository root.
 

@@ -79,12 +79,12 @@ A gate treats a suite by its properties, not by name:
 ## Reporting
 
 Encrypted abuse reports use message franking, which sits above the suite
-(JEP-0010, rules 6–8a; draft, PR #166). A suite contributes one
+([JEP-0010](jep-0010-reports-tribunals-lists.md), rules 6–8a). A suite contributes one
 property, and every suite JEP MUST state it:
 
 - **Faithful delivery.** The suite delivers the plaintext, franking key `k_f` included,
   unchanged to every member of the channel. A ruleset group that holds tribunals MUST NOT
-  admit a suite that does not (JEP-0010 rule 8a).
+  admit a suite that does not ([JEP-0010](jep-0010-reports-tribunals-lists.md) rule 8a).
 
 `none` and `mls` both have this property: every member receives the same plaintext, and
 for `mls` it is authenticated by the sender's MLS content signature. `test-aead` has it too:
@@ -149,7 +149,7 @@ sealed receipt without MLS.
   under its own author.
 - **No group state.** Membership blocks on a `test-aead` channel are plain control blocks.
 - **Faithful delivery** (see Reporting): every member opens the one payload to the same
-  plaintext, so the suite meets JEP-0010 rule 8a.
+  plaintext, so the suite meets [JEP-0010](jep-0010-reports-tribunals-lists.md) rule 8a.
 - **Open channels only.** Anyone can read it, so it may not serve a restricted channel or a
   DM.
 - **Never in a production build.** The `test-` prefix is reserved: a production
