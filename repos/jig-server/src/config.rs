@@ -100,9 +100,11 @@ pub const REMOVED_KEYS: &[(&str, &str)] = &[
 /// certificate a CA issued (`tailscale cert`, certbot); jig clients accept
 /// either.
 ///
-/// `enabled = false` serves plaintext HTTP. It is an unsafe option: use it only
-/// on loopback or behind a proxy that terminates TLS, never on a listener peers
-/// or clients reach directly. The server advertises it as `tls.enabled=false`
+/// `enabled = false` serves plaintext HTTP. It is an unsafe option, for
+/// loopback or local testing only. A remote client over TLS refuses a server
+/// whose welcome is not bound to its TLS session (JEP-0002 rule 4), so
+/// anything in front of jig-server must pass TLS through (TCP or SNI
+/// passthrough), never terminate it. The server advertises it as `tls.enabled=false`
 /// in `unsafe_options_active` and warns at startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
