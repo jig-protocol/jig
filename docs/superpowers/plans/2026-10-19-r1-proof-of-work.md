@@ -114,6 +114,8 @@ strangers_per_hour = 60                # admitted stranger registrations per hou
 burst = 10
 controller = "doubling"                # how effort follows the queue (task 3)
 controller_window_secs = 300
+queue_len = 20                         # stranger requests held for a token, highest effort first (task 3)
+queue_wait_secs = 10                   # longest a held request waits before 503 REGISTRATION_BUSY
 ```
 
 - **Per suffix.** #224 serves several suffixes per process, so each suffix carries its own
@@ -150,7 +152,10 @@ controller_window_secs = 300
 What it holds (JEP-0008 rules 6–10):
 - `digest(alg, verifier, subject, action, binding, salt, nonce)`, the labelled BLAKE3 hash;
 - `meets(digest, effort)`, the rule-7 test, written without overflow as
-  `d <= u64::MAX / effort`;
+  `d <= u64::MAX / effort`. `effort` is a `NonZeroU64` (rule 4: effort is at least 1), so
+  `meets` cannot divide by zero. A suggested effort of zero means no proof is asked (rule 17):
+  the verifier skips the check rather than calling `meets`. Tests: `meets` at effort 1 accepts
+  every digest; a zero `effort` in a received proof fails to deserialise (`POW_INVALID`);
 - `solve(…, effort) -> nonce`;
 - `Proof { alg, effort, nonce, salt_id }`;
 - `Action` labels: `admit`, `post`, `kp-request`, `dial`, `ns-register`, `ns-renew`,
@@ -195,7 +200,10 @@ What it holds (JEP-0008 rules 6–10):
 
 Wire changes:
 - **`GET /v1/challenge?action=register|renew|rotate&did=<did>&name=<alias@suffix>`** returns
-  `{challenge, pow: {alg, effort, expires_at}, sig}`.
+  `{challenge, pow: {alg, effort, salt_id, expires_at}, sig}`.
+  - `salt_id` is `0` for the empty salt that admission and challenge modes use (rule 13); a
+    stamp's `salt_id` is its epoch number, and epochs start at 1. JEP-0008 does not yet name
+    the empty-salt id; task 7 adds it to rule 13.
   - #224 already takes `did` and `name` as optional and binds them in `PendingChallenge`.
     Task 1 adds `action` and the promised effort to that record, and makes all three
     required on a suffix whose `pow.min_effort > 0`.
@@ -209,7 +217,7 @@ Wire changes:
     not authority: `register` repeats every one, since the store can change while a client
     solves.
   - `sig` is a COSE_Sign1 by the nameserver's DID over the deterministic-CBOR map
-    `{challenge, action, name, did, alg, effort, expires_at}`. This is rule 16's signed
+    `{challenge, action, name, did, alg, effort, salt_id, expires_at}`. This is rule 16's signed
     effort; JEP-0009 rule 1 sets the encoding.
   - The nameserver records `(challenge → action, name, did, effort)`. It checks a proof
     against the effort it promised, not against whatever the controller says when the proof
@@ -218,8 +226,8 @@ Wire changes:
     used for another action gets the same refusal, before any crypto.
   - Today's bare `GET /v1/challenge` keeps working for one release for clients that predate
     task 2; on a suffix whose `pow.min_effort > 0` it can only lead to `428 POW_REQUIRED`.
-- **`pow`** on register, renew and rotate is `{alg, effort, nonce}`. The salt is empty (rule 13,
-  challenge mode).
+- **`pow`** on register, renew and rotate is the rule-10 proof `{alg, effort, nonce, salt_id}`,
+  with `salt_id = 0`: the salt is empty (rule 13, challenge mode).
 - **The binding (rule 11):**
   - register and renew: `naming::proof_hash(action, ns_did, alias, challenge)`;
   - rotate (interim): `Action` has no `Rotate` until lane I's I3. Until then the binding is
@@ -249,9 +257,12 @@ Wire changes:
   `DID_HOLDS_NAME`). PoW goes before the signature checks, so a bad `pow` cannot burn a
   holder's challenge.
 - **Refusals:** `428 POW_REQUIRED`, carrying the signed effort as in `get_challenge`;
-  `400 POW_INVALID`; `400 POW_INSUFFICIENT`. A refused or invalid proof charges a penalty point
-  to (target alias, requesting DID) and to the IP (rule 26). The points feed task 3's
-  multiplier.
+  `400 POW_INVALID`; `400 POW_INSUFFICIENT`. The points feed task 3's multiplier.
+  - A `pow` that fails charges a point to the source IP only. PoW is checked before the
+    signature, so the `did` is not yet proven, and charging (alias, DID) would let anyone raise
+    another DID's effort by sending bad work in its name.
+  - Rule 26's (target, requester) point is charged only for a failure after
+    `verify_action_proof` has passed, when the requester is the DID that signed.
 - **Challenge map:** cap the number of pending challenges (config, default 100 000). When it is
   full, refuse new challenges with `503 BUSY` rather than evict live ones.
 
@@ -303,14 +314,17 @@ Behaviour (rules 16 and 20):
   the nameserver is asking more than this client will do.
 - It shows progress for solves expected to take more than 2 s, and gives an estimate up front
   from the effort and its measured rate.
-- On a 428 or `POW_INSUFFICIENT` it fetches a new challenge and retries once at the new effort,
-  then stops and says the nameserver is under load.
+- On a 428, `POW_INSUFFICIENT` or `REGISTRATION_BUSY` it fetches a new challenge and retries
+  once, bidding `min(max_effort, max(new signed effort, 2 × previous bid))` (rule 20), so the
+  retry doubles even when the new challenge states the same effort. Then it stops and says the
+  nameserver is under load.
 
 - [ ] **Step 1: Failing tests.**
   - `build_register_request` carries a `pow` that verifies for the register binding.
   - An effort signed by a key other than the delegation's is refused before solving.
   - An effort above the cap is refused with the cap in the message.
-  - One retry after a 428, then a clear error.
+  - One retry after a 428, at twice the previous bid when the new challenge states the same
+    effort, capped at `max_effort`; then a clear error.
 - [ ] **Step 2: Implement.**
 - [ ] **Step 3:** `cargo nextest run -p jig-client -p jig-cli`.
 - [ ] **Step 4:** commit `feat(cli): solve the nameserver's proof-of-work for register, renew and rotate`.
@@ -327,16 +341,41 @@ What it does, per suffix (rules 17, 18, 21–24, 26–27):
 - **The stranger pool.** A token bucket of `strangers_per_hour`, `burst`. Every `ns-register` by
   a DID that is not allowlisted takes a token when it is about to be admitted, after its
   `pow` verified.
-  - With no token, the request is refused `503 REGISTRATION_BUSY`, with a `Retry-After` and the
-    current signed effort.
-  - Within a window, a request with more effort than required is served first (rule 23). The
-    simple form: a held request that offers ≥ 2× the suggested effort may take the next token
-    ahead of others.
-- **The controller** is `doubling` as above. The suggested effort for each action is recomputed
-  each window and stated in new challenges.
-- **Length-scaled effort:**
-  `effort = max(min_effort, suggested) × short_name_factor^(max(0, short_name_len − len))`,
-  then `× m_penalty`, clamped to `max_effort`.
+  - **The queue (rule 23).** With no token, a request whose `pow` and signature verified waits
+    in a bounded queue served highest effort first, ties in arrival order. Config:
+    `queue_len` (default 20) and `queue_wait_secs` (default 10).
+  - The next token goes to the head of the queue.
+  - When the queue is full, a new request with more effort than the queue's lowest bumps that
+    request out; otherwise the new request is refused.
+  - A request that is bumped, or that waits `queue_wait_secs` without a token, gets
+    `503 REGISTRATION_BUSY`. The refusal carries `Retry-After`, set to the seconds until the
+    next token, and the current signed effort.
+  - The challenge is consumed only on admission, so a client refused here retries with a fresh
+    challenge (task 2).
+  - Rate limits apply before the queue (rule 23).
+- **The controller** is `doubling` as above, and its input is the queue (rule 17):
+  - "at the cap with refusals" means the queue was full during the window;
+  - "below half the cap" means the queue stayed empty.
+  The suggested effort for each action is recomputed each window and stated in new challenges.
+- **Effort for one registration** (rule 18, extended):
+
+  ```
+  E = clamp( max(min_effort, suggested)
+             × m_length(alias)
+             × m_penalty(alias, did)
+             × m_standing(did),
+             min_effort, max_effort )
+  m_length(alias) = short_name_factor ^ max(0, short_name_len − len(alias))
+  ```
+
+  - `m_standing` is 1 until JEP-0009 standing exists. `ns-register` is a stranger action, and
+    rule 28 gives unknown subjects 1.
+  - Two terms go beyond rule 18, and task 7 amends rule 18 for them:
+    - `m_length`, from decision 1;
+    - the inner `max(min_effort, …)`. Without it an idle controller (`suggested = 0`) would
+      price a 3-letter name at the bare floor, the same as a 5-letter one, and decision 1 would
+      lapse whenever the server is quiet.
+  - Allowlisted registrations skip this formula and pay `min_effort` (decision 3).
 - **Penalties** key on (alias, requesting DID) and the IP. Decay doubles per repeat offence
   inside the window (rule 27).
 - **Metrics:** admitted and refused registrations per suffix, the suggested effort, and pool
@@ -346,7 +385,14 @@ What it does, per suffix (rules 17, 18, 21–24, 26–27):
   - With `strangers_per_hour = 2, burst = 2`, a third stranger registration in the hour →
     `REGISTRATION_BUSY`.
   - An allowlisted DID registers while the pool is empty.
-  - A 3-letter alias costs `factor^2 ×` a 5-letter one at the same suggested effort.
+  - A 3-letter alias costs `factor^2 ×` a 5-letter one at the same suggested effort, including
+    an idle controller (`suggested = 0`).
+  - Clamping: with `m_length × m_penalty` large enough, effort stops at `max_effort`.
+  - The queue: with no token, a higher-effort request is admitted before a lower one that
+    arrived first. With the queue full, a request bidding less than the queue's lowest gets
+    `503 REGISTRATION_BUSY` with `Retry-After`. After `queue_wait_secs` without a token → 503.
+  - A bad `pow` sent in another DID's name charges only the IP; that DID's effort is
+    unchanged.
   - After a window at the cap with refusals, the suggested effort doubles; after a quiet window,
     it halves, never below `min_effort`.
   - Penalty points raise effort for (alias, DID) and leave other DIDs on the same alias
@@ -365,7 +411,7 @@ What it does, per suffix (rules 17, 18, 21–24, 26–27):
   and binding (rule 13).
   - It keeps `jig-admission-pow-v1` verification for one release (JEP-0008, Backwards
     Compatibility). A DID already proven stays proven.
-- `/api/v1/admission` accepts `{did, pow: {alg, effort, nonce}, sig_b64}`, and the legacy
+- `/api/v1/admission` accepts `{did, pow: {alg, effort, nonce, salt_id: 0}, sig_b64}`, and the legacy
   `{did, nonce, sig_b64}` for one release.
 - The signed welcome (L7) states `{admit: {alg, effort, salt_id, expires_at}}` (rule 15).
   `/.well-known/jig` keeps `admission_pow_bits` for one release as an unsigned hint, then drops
@@ -434,6 +480,12 @@ In the implementing lanes' PRs (spec rows) and L1's (docs), after task 6:
   - how to close a suffix fast;
   - how to read the pool metrics;
   - how to raise or lower `strangers_per_hour`.
+- `jep-0008-proof-of-work.md` amendments, each one line:
+  - rule 11: the interim rotate binding (decision 4);
+  - rule 13: `salt_id = 0` names the empty salt;
+  - rule 18: the per-action floor taken before the multipliers, and a target-dependent
+    `m_length` term for name actions;
+  - rule 26: a pre-authentication failure charges the address bucket only.
 - `docs/security/nameserver-abuse-economics.md`: rewrite against JEP-0008, replacing the
   penalty-point model of the removed prototype.
 
