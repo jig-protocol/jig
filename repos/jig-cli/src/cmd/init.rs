@@ -130,7 +130,8 @@ fn write_cli_config(
 /// pins the `@jig` delegation this build ships (JEP-0004 `config` root) when
 /// it has one, so a later binary with another default does not change whose
 /// answers count. Nothing depends on that entry: without it the built-in
-/// delegation applies.
+/// delegation applies. A build whose authority is still the placeholder
+/// writes none.
 fn build_initial_config(id: &Identity, nickname: &str, server_url: Option<&str>) -> Config {
     let mut cfg = Config::default();
     cfg.user.did = id.did_string();
@@ -241,13 +242,16 @@ mod tests {
     }
 
     #[test]
-    fn initial_config_writes_no_jig_delegation_without_a_nameserver() {
-        // The source names no nameserver host, so a fresh config has nowhere
-        // to ask for `@jig` names until one is configured.
+    fn initial_config_pins_the_jig_delegation_this_build_ships() {
+        // Tests build jig-core with `test-default-authority`; a real build
+        // writes no entry while the authority is the placeholder.
         let dir = tempdir().unwrap();
         let id = Identity::generate_and_save(dir.path()).unwrap();
         let cfg = build_initial_config(&id, "dj", None);
-        assert!(!cfg.naming.delegations.contains_key(config::DEFAULT_SUFFIX));
+        assert_eq!(
+            cfg.naming.delegations.get(config::DEFAULT_SUFFIX),
+            Some(&config::default_jig_delegation(&Config::default()).unwrap())
+        );
     }
 
     #[test]

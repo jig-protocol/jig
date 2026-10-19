@@ -68,23 +68,30 @@ pub struct DelegationEntry {
 pub use jig_core::naming::DEFAULT_SUFFIX;
 
 /// The built-in delegation for [`DEFAULT_SUFFIX`]: the authority this build
-/// ships (`jig_core::naming::default_jig_authority`), asked at the configured
-/// `[server] nameserver_url`. The source names no nameserver host. `Err`, and
-/// so no built-in delegation, while the authority is the placeholder or no
-/// nameserver is configured.
+/// ships (`jig_core::naming::default_jig_authority`), asked at
+/// `[server] nameserver_url` or else `jig_core::naming::DEFAULT_JIG_NAMESERVER`.
+/// `Err`, and so no built-in delegation, while the authority is the
+/// placeholder, whatever the nameserver.
 pub fn default_jig_delegation(cfg: &Config) -> Result<DelegationEntry> {
-    let authority = jig_core::naming::default_jig_authority().map_err(|e| {
+    delegation_for(jig_core::naming::default_jig_authority(), cfg)
+}
+
+fn delegation_for(
+    authority: Result<&str, jig_core::naming::NamingError>,
+    cfg: &Config,
+) -> Result<DelegationEntry> {
+    let authority = authority.map_err(|e| {
         anyhow::anyhow!(
             "{e}; add a [naming.delegations.{DEFAULT_SUFFIX}] entry to cli.toml to resolve \
              `@{DEFAULT_SUFFIX}` names"
         )
     })?;
-    let Some(nameserver) = cfg.server.nameserver_url.as_deref().map(str::trim) else {
-        anyhow::bail!(
-            "no nameserver to ask for `@{DEFAULT_SUFFIX}` names: set [server] nameserver_url, \
-             or add a [naming.delegations.{DEFAULT_SUFFIX}] entry to cli.toml"
-        );
-    };
+    let nameserver = cfg
+        .server
+        .nameserver_url
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or(jig_core::naming::DEFAULT_JIG_NAMESERVER);
     Ok(DelegationEntry {
         authorities: vec![authority.to_string()],
         nameservers: vec![nameserver.trim_end_matches('/').to_string()],
@@ -219,13 +226,24 @@ mod tests {
     }
 
     #[test]
-    fn without_a_nameserver_there_is_no_built_in_jig_delegation() {
-        let err = default_jig_delegation(&Config::default()).unwrap_err();
-        assert!(err.to_string().contains("nameserver_url"), "{err}");
+    fn without_a_configured_nameserver_the_built_in_one_is_asked() {
+        let d = default_jig_delegation(&Config::default()).unwrap();
+        assert_eq!(d.nameservers, [jig_core::naming::DEFAULT_JIG_NAMESERVER]);
+    }
+
+    #[test]
+    fn a_real_nameserver_with_the_placeholder_authority_is_still_refused() {
+        // What every build without `test-default-authority` gets today.
+        let refused = || Err(jig_core::naming::NamingError::NoDefaultAuthority);
+        for cfg in [Config::default(), with_nameserver("https://ns.example")] {
+            let err = delegation_for(refused(), &cfg).unwrap_err();
+            assert!(err.to_string().contains("placeholder"), "{err}");
+        }
+        let mut no_entry = with_nameserver("https://ns.example");
+        no_entry.naming.delegations.clear();
         assert!(
-            !delegations(&Config::default())
-                .config
-                .contains_key(DEFAULT_SUFFIX)
+            delegation_for(refused(), &no_entry).is_err(),
+            "no built-in @jig delegation without a real authority"
         );
     }
 
