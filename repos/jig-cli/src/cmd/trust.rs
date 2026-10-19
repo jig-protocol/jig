@@ -183,27 +183,49 @@ pub fn delegations_for(
 
 /// Resolve `name` and hold it to this device's pin (JEP-0004 rule 17): a new
 /// name is pinned, a pinned one must still match, and a change is refused
-/// with the reason and both DIDs. Everything the resolution acted on is kept
-/// as evidence. Warns when the pinned attestation is close to expiring.
+/// with the reason, both DIDs and the `jig trust accept-name` command that
+/// moves the pin. Everything the resolution acted on is kept as evidence; a
+/// failure to keep it fails the resolution. Warns when the pinned
+/// attestation is close to expiring. Returns the resolver's verdict, after
+/// pinning, so a caller can say "first contact" only on [`Verified::New`].
+///
+/// [`Verified::New`]: jig_client::naming::Verified::New
 pub async fn verify_name(
     name: &str,
     delegations: &jig_client::naming::Delegations,
-) -> Result<jig_client::naming::Binding> {
-    use jig_client::naming::{NameResolver, Verified};
+) -> Result<jig_client::naming::Verified> {
+    use jig_client::naming::{NameResolver, ResolveError, Verified};
     let mut pins = Pins::load(&Pins::default_path())?;
     let evidence = jig_client::evidence::NameEvidenceDir::new(
         &jig_client::evidence::NameEvidenceDir::default_path(),
     );
-    let binding = match NameResolver::new()
+    let verified = match NameResolver::new()
         .resolve(name, delegations, &pins, &evidence)
-        .await?
+        .await
     {
+        Ok(verified) => verified,
+        Err(e) => {
+            let hint = match &e {
+                ResolveError::PinMismatch { new, .. } => Some(format!(
+                    "if its holder confirms the change, `jig trust accept-name {name} --did {new}` \
+                     moves the pin"
+                )),
+                _ => None,
+            };
+            let e = anyhow::Error::new(e);
+            return Err(match hint {
+                Some(hint) => e.context(hint),
+                None => e,
+            });
+        }
+    };
+    let binding = match &verified {
         Verified::New(binding) | Verified::Pinned(binding) => {
-            pins.pin_name(&binding)?;
+            pins.pin_name(binding)?;
             binding
         }
         Verified::Rotated { binding, from } => {
-            pins.accept_name(&binding, binding.did())?;
+            pins.accept_name(binding, binding.did())?;
             eprintln!(
                 "note: {name} moved from {from} to {} along rotation links its old key signed.",
                 binding.did()
@@ -211,8 +233,8 @@ pub async fn verify_name(
             binding
         }
     };
-    warn_if_expiring(name, &binding, chrono::Utc::now().timestamp());
-    Ok(binding)
+    warn_if_expiring(name, binding, chrono::Utc::now().timestamp());
+    Ok(verified)
 }
 
 /// Move `name`'s pin to `confirmed`, the DID its holder confirmed out of
