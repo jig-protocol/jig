@@ -495,7 +495,7 @@ before the `jig` entry's `registration` changes to `"open"`.
    Task 7 adds a one-line amendment to JEP-0008 rule 11.
 5. **Squatting before tribunals: signed, logged operator removal.** The nameserver operator
    alone removes a binding, signed and logged, with a published reason. It is a stopgap,
-   retired once R6's tribunal can rule on name disputes. Scoped as a follow-up slice after 6
+   retired once R6's tribunal can rule on name disputes. Scoped as a follow-up after task 6
    (owner: L6), since it adds an admin endpoint and a log record.
 6. **Legacy admission proofs:** `jig-admission-pow-v1` is accepted for exactly one release
    after task 4, then refused.
