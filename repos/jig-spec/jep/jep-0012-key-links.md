@@ -93,7 +93,10 @@ A verifier MUST refuse a link unless all of these hold:
 
 1. The envelope parses as the COSE_Sign above, with no other headers or shape.
 2. The payload decodes, and `domain` is `jig-key-link-v1`.
-3. `old`, `new`, and any `ns_did` or `did`, are `did:jig` Ed25519 keys; `old` ≠ `new`.
+3. `old`, `new`, and any `ns_did` or `did`, are `did:jig` Ed25519 keys in their canonical
+   lowercase spelling, the one the key encodes to; `old` ≠ `new`. A key spelled another way
+   would decode to the same key but compare unequal, so a fork or an audience match could
+   be missed.
 4. `audience.kind` is one of the four above. A `channel_id` is a canonical CIDv1 in its
    canonical binary encoding; an `alias` is a full name in its canonical spelling.
 5. Re-encoding the decoded fields gives exactly the payload bytes. This refuses unknown
@@ -126,6 +129,10 @@ it does depends on whether the links come in an order:
 
 Two links with the same `old` and the same `new` (for two audiences, or signed twice) are
 not a fork.
+
+A holder MUST NOT link one `old` DID to two different `new` DIDs, even for different
+audiences: splitting a rotation per audience cannot be told apart from theft. Clients MUST
+refuse to sign a second link from an `old` to a different `new`.
 
 # Security Considerations (Zero-Trust)
 

@@ -16,8 +16,12 @@
 //! takes effect at its place in the log. A later link from the same DID to
 //! another is refused, since the DID holds nothing any more, and both are kept
 //! as fork evidence ([`fork`]). A verifier with no order to go by follows
-//! neither. The
-//! encoding is JEP-0012; its test vectors live in `repos/jig-spec/jep/vectors/0012/`.
+//! neither. A holder never links one DID to two others, even for different
+//! audiences: that is indistinguishable from theft.
+//!
+//! DIDs must be in their canonical lowercase spelling, so that one key is one
+//! string when links are compared. The encoding is JEP-0012; its test vectors
+//! live in `repos/jig-spec/jep/vectors/0012/`.
 
 use ed25519_dalek::SigningKey;
 
@@ -295,10 +299,14 @@ fn did_of(key: &SigningKey) -> String {
 }
 
 fn check_did(did: &str) -> Result<(), KeyLinkError> {
-    let parsed = Did::from_did_jig_string(did).map_err(|_| KeyLinkError::BadDid(did.into()))?;
-    parsed
-        .as_bytes()
+    // `Did` parsing accepts any letter case, so compare against the spelling
+    // the key itself gives: one key, one string, for forks and audience matches.
+    let bytes = Did::from_did_jig_string(did)
+        .and_then(|d| d.as_bytes())
         .map_err(|_| KeyLinkError::BadDid(did.into()))?;
+    if Did::from_ed25519_pubkey(&bytes).to_did_jig_string() != did {
+        return Err(KeyLinkError::BadDid(did.into()));
+    }
     Ok(())
 }
 
@@ -461,6 +469,66 @@ mod tests {
             SignedKeyLink::from_envelope(&cid),
             Err(KeyLinkError::BadChannelId)
         );
+    }
+
+    /// The same key spelled in upper case, which would decode to the same key.
+    fn shouted(did: &str) -> String {
+        let body = did.strip_prefix("did:jig:z").unwrap();
+        format!("did:jig:z{}", body.to_uppercase())
+    }
+
+    #[test]
+    fn a_did_in_another_spelling_is_refused() {
+        // Otherwise a thief's link from a re-spelled `old` would not fork with
+        // the holder's, and an audience DID would not match its own spelling.
+        let (old, new) = (key(1), key(2));
+        let respelled = resigned(&old, &new, |p| {
+            set(p, "old", Value::Text(shouted(&did_of(&old))))
+        });
+        assert!(matches!(
+            SignedKeyLink::from_envelope(&respelled),
+            Err(KeyLinkError::BadDid(_))
+        ));
+        let contact = resigned(&old, &new, |p| {
+            set(
+                p,
+                "audience",
+                Value::text_map([
+                    ("kind", Value::Text("contact".into())),
+                    ("did", Value::Text(shouted(&did_of(&key(3))))),
+                ]),
+            )
+        });
+        assert!(matches!(
+            SignedKeyLink::from_envelope(&contact),
+            Err(KeyLinkError::BadDid(_))
+        ));
+        let ns = resigned(&old, &new, |p| {
+            set(
+                p,
+                "audience",
+                Value::text_map([
+                    ("kind", Value::Text("alias".into())),
+                    ("ns_did", Value::Text(shouted(&did_of(&key(7))))),
+                    ("alias", Value::Text("alice@example.org".into())),
+                ]),
+            )
+        });
+        assert!(matches!(
+            SignedKeyLink::from_envelope(&ns),
+            Err(KeyLinkError::BadDid(_))
+        ));
+        assert!(matches!(
+            SignedKeyLink::sign(
+                &old,
+                &new,
+                Audience::Contact {
+                    did: shouted(&did_of(&key(3)))
+                },
+                AT
+            ),
+            Err(KeyLinkError::BadDid(_))
+        ));
     }
 
     #[test]
