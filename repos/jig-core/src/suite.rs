@@ -17,6 +17,11 @@
 //! unit — it carries blocks, and an encrypted block is encrypted inside its
 //! manifest — so the only frame suite is `none`
 //! ([`EncryptionSuite::ensure_frame_suite`]).
+//!
+//! Identifiers starting `test-` are reserved for conformance testing. The one
+//! such suite, `test-aead` ([`test_aead`]), exists only with the `test-suite`
+//! feature, which only dev-dependencies enable: a production build does not
+//! know the identifier and refuses it as unregistered.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -33,24 +38,84 @@ pub enum EncryptionSuite {
     /// `PrivateMessage` the server cannot read.
     #[serde(rename = "mls")]
     Mls,
+    /// The conformance-test suite: ChaCha20-Poly1305 under a published key.
+    /// Real authenticated encryption that hides nothing, so it is open-only
+    /// and never advertised. See [`test_aead`].
+    #[cfg(feature = "test-suite")]
+    #[serde(rename = "test-aead")]
+    TestAead,
 }
 
 impl EncryptionSuite {
     /// Every registered suite, in registry order.
+    #[cfg(not(feature = "test-suite"))]
     pub const REGISTERED: &'static [EncryptionSuite] =
         &[EncryptionSuite::Unencrypted, EncryptionSuite::Mls];
+    /// Every registered suite, in registry order.
+    #[cfg(feature = "test-suite")]
+    pub const REGISTERED: &'static [EncryptionSuite] = &[
+        EncryptionSuite::Unencrypted,
+        EncryptionSuite::Mls,
+        EncryptionSuite::TestAead,
+    ];
 
     /// The registry identifier, as it appears on the wire.
     pub const fn as_str(self) -> &'static str {
         match self {
             EncryptionSuite::Unencrypted => "none",
             EncryptionSuite::Mls => "mls",
+            #[cfg(feature = "test-suite")]
+            EncryptionSuite::TestAead => "test-aead",
         }
     }
 
     /// Whether this implementation can carry content under the suite.
     pub const fn is_implemented(self) -> bool {
-        matches!(self, EncryptionSuite::Unencrypted | EncryptionSuite::Mls)
+        match self {
+            EncryptionSuite::Unencrypted | EncryptionSuite::Mls => true,
+            #[cfg(feature = "test-suite")]
+            EncryptionSuite::TestAead => true,
+        }
+    }
+
+    /// Whether content under the suite is ciphertext. A server stores and
+    /// relays it, refuses a plaintext `body` beside it, and never executes it.
+    pub const fn is_encrypted(self) -> bool {
+        !matches!(self, EncryptionSuite::Unencrypted)
+    }
+
+    /// Whether the server's operator cannot read content under the suite.
+    /// Only such a suite may serve a restricted channel (ROADMAP D25): content
+    /// the operator can read is not restricted from it. `test-aead` is
+    /// encrypted but not confidential, because its key is published.
+    pub const fn is_operator_confidential(self) -> bool {
+        match self {
+            EncryptionSuite::Mls => true,
+            EncryptionSuite::Unencrypted => false,
+            #[cfg(feature = "test-suite")]
+            EncryptionSuite::TestAead => false,
+        }
+    }
+
+    /// The block-metadata key that carries a content block's ciphertext, for
+    /// an encrypted suite.
+    pub const fn payload_field(self) -> Option<&'static str> {
+        match self {
+            EncryptionSuite::Unencrypted => None,
+            EncryptionSuite::Mls => Some("mls_message"),
+            #[cfg(feature = "test-suite")]
+            EncryptionSuite::TestAead => Some(test_aead::PAYLOAD_FIELD),
+        }
+    }
+
+    /// Whether a server lists the suite in its handshake. A test suite is
+    /// never offered: no client should pick it, even against a test build.
+    pub const fn is_advertised(self) -> bool {
+        match self {
+            EncryptionSuite::Unencrypted | EncryptionSuite::Mls => true,
+            #[cfg(feature = "test-suite")]
+            EncryptionSuite::TestAead => false,
+        }
     }
 
     /// Whether a wire frame may declare this suite. Frames are never
@@ -108,6 +173,95 @@ pub struct UnknownSuite(pub String);
 #[error("encryption suite `{0}` is registered but not implemented in this version")]
 pub struct SuiteNotImplemented(pub EncryptionSuite);
 
+/// `test-aead`: the suite reserved for conformance testing (JEP-0001).
+///
+/// ChaCha20-Poly1305 under one static key published here and in the suite's
+/// vectors. The payload field carries `nonce ‖ ciphertext`; the AAD binds it
+/// to its channel and author, so it does not read anywhere else. It protects
+/// nothing and is not meant to: it shows a second suite running through the
+/// registry, the manifest, the gates and the sealed receipt without MLS.
+#[cfg(feature = "test-suite")]
+pub mod test_aead {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+
+    /// The published key: bytes `0x00..=0x1f`.
+    pub const KEY: [u8; 32] = {
+        let mut k = [0u8; 32];
+        let mut i = 0;
+        while i < 32 {
+            k[i] = i as u8;
+            i += 1;
+        }
+        k
+    };
+
+    /// The metadata key of a content block's payload.
+    pub const PAYLOAD_FIELD: &str = "test_ciphertext";
+
+    /// The nonce length, prefixed to the ciphertext in the payload.
+    pub const NONCE_LEN: usize = 12;
+
+    /// Additional data: `jig-test-aead-v1|<slug>|<sender DID>`.
+    pub fn aad(slug: &str, sender: &str) -> Vec<u8> {
+        format!("jig-test-aead-v1|{slug}|{sender}").into_bytes()
+    }
+
+    /// Seal `plaintext` for `slug` from `sender`, under `nonce`.
+    pub fn seal(slug: &str, sender: &str, nonce: &[u8; NONCE_LEN], plaintext: &[u8]) -> Vec<u8> {
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&KEY));
+        let aad = aad(slug, sender);
+        let ct = cipher
+            .encrypt(
+                Nonce::from_slice(nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+            .expect("ChaCha20-Poly1305 encryption does not fail on in-memory input");
+        let mut out = nonce.to_vec();
+        out.extend_from_slice(&ct);
+        out
+    }
+
+    /// Open a payload sealed by [`seal`]. `None` if it is too short, or was
+    /// sealed for another channel or author, or altered.
+    pub fn open(slug: &str, sender: &str, payload: &[u8]) -> Option<Vec<u8>> {
+        if payload.len() < NONCE_LEN {
+            return None;
+        }
+        let (nonce, ct) = payload.split_at(NONCE_LEN);
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&KEY));
+        let aad = aad(slug, sender);
+        cipher
+            .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad: &aad })
+            .ok()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn seals_and_opens_only_for_its_channel_and_author() {
+            let nonce = [7u8; NONCE_LEN];
+            let sealed = seal("#a", "did:jig:zx", &nonce, b"hello");
+            assert_eq!(sealed.len(), NONCE_LEN + 5 + 16);
+            assert_eq!(
+                open("#a", "did:jig:zx", &sealed).as_deref(),
+                Some(&b"hello"[..])
+            );
+            assert_eq!(open("#b", "did:jig:zx", &sealed), None);
+            assert_eq!(open("#a", "did:jig:zy", &sealed), None);
+            let mut bent = sealed.clone();
+            *bent.last_mut().unwrap() ^= 1;
+            assert_eq!(open("#a", "did:jig:zx", &bent), None);
+            assert_eq!(open("#a", "did:jig:zx", &sealed[..4]), None);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +298,42 @@ mod tests {
         assert_eq!(EncryptionSuite::default(), EncryptionSuite::Unencrypted);
         assert!(EncryptionSuite::Unencrypted.ensure_implemented().is_ok());
         assert!(EncryptionSuite::Mls.ensure_implemented().is_ok());
+    }
+
+    #[test]
+    fn suite_properties() {
+        assert!(!EncryptionSuite::Unencrypted.is_encrypted());
+        assert_eq!(EncryptionSuite::Unencrypted.payload_field(), None);
+        assert!(EncryptionSuite::Mls.is_encrypted());
+        assert_eq!(EncryptionSuite::Mls.payload_field(), Some("mls_message"));
+        assert!(EncryptionSuite::Mls.is_operator_confidential());
+        assert!(!EncryptionSuite::Unencrypted.is_operator_confidential());
+        for suite in EncryptionSuite::REGISTERED {
+            assert_eq!(suite.is_encrypted(), suite.payload_field().is_some());
+            assert_eq!(suite.is_advertised(), !suite.as_str().starts_with("test-"));
+        }
+    }
+
+    /// The `test-` prefix is reserved: without the feature, `test-aead` is
+    /// as unknown as any other identifier.
+    #[cfg(not(feature = "test-suite"))]
+    #[test]
+    fn test_suites_are_unregistered_in_a_production_build() {
+        assert!("test-aead".parse::<EncryptionSuite>().is_err());
+    }
+
+    #[cfg(feature = "test-suite")]
+    #[test]
+    fn test_aead_is_registered_encrypted_and_never_advertised() {
+        let suite: EncryptionSuite = "test-aead".parse().unwrap();
+        assert_eq!(suite, EncryptionSuite::TestAead);
+        assert!(suite.ensure_implemented().is_ok());
+        assert!(suite.ensure_frame_suite().is_err());
+        assert!(suite.is_encrypted());
+        assert!(!suite.is_advertised());
+        // Encrypted is not confidential: anyone holds the key, the operator
+        // included, so it may not serve a restricted channel.
+        assert!(!suite.is_operator_confidential());
     }
 
     #[test]

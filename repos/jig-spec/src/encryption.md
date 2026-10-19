@@ -27,8 +27,15 @@ and conformance vectors. It MUST NOT need a wire-format change.
 | --- | --- | --- |
 | `none` | No encryption. Signatures still apply. | Implemented |
 | `mls` | MLS, [RFC 9420](https://www.rfc-editor.org/rfc/rfc9420), cipher suite `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` | Implemented in v0.2 for single-server channels |
+| `test-aead` | ChaCha20-Poly1305 under a published key ([JEP-0001](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0001-encryption-suites.md#the-test-suite)) | Reserved for conformance testing |
 
-Identifiers are lowercase ASCII and compared byte for byte.
+Identifiers are lowercase ASCII and compared byte for byte. Identifiers starting `test-` are
+reserved for conformance testing. A production implementation MUST NOT implement them and
+refuses them as unregistered (`UNSUPPORTED_SUITE`); a server MUST NOT advertise one.
+
+Every registered suite ships conformance vectors in
+[`vectors/suites/`](https://github.com/jig-protocol/jig/tree/main/repos/jig-spec/vectors/suites),
+in the format JEP-0001 defines.
 
 ### Where the suite is carried
 
