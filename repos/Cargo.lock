@@ -2970,6 +2970,7 @@ dependencies = [
  "crossterm",
  "dirs 7.0.0",
  "ed25519-dalek 3.0.0",
+ "integration-tests",
  "jig-client",
  "jig-core",
  "jig-mls",
