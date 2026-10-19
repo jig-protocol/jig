@@ -22,6 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use jig_core::grant::Grant;
 use jig_runtime::component::{
     Backend, ComponentRuntime, ErrorOutcome, Hlc, IncompleteReason, Invocation, Payload,
     RenderLimits, RunOutcome, invocation_hash,
@@ -195,7 +196,7 @@ impl Vector {
         let bytes = std::fs::read(self.component_path())
             .unwrap_or_else(|e| panic!("{}: {e}", self.component_path().display()));
         let renderer = runtime
-            .compile_renderer(&bytes, self.max_memory_pages)
+            .compile_renderer(&bytes, &Grant::empty(), self.max_memory_pages)
             .unwrap_or_else(|e| panic!("{}: does not compile: {e}", self.name));
         runtime
             .render(&renderer, &self.invocation.to_invocation(), &self.limits())
