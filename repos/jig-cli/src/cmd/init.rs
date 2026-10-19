@@ -19,7 +19,7 @@ use jig_client::Identity;
 use jig_core::naming::{Action, Attestation, Name};
 use serde::Serialize;
 
-use crate::cmd::ns::{Nameserver, b64u};
+use crate::cmd::ns::{Nameserver, Purpose, b64u};
 use crate::config::{self, Config};
 
 /// Parsed flags for `jig init`. Construct directly from `clap`-parsed args
@@ -54,6 +54,9 @@ pub struct InitArgs {
 pub(crate) struct RegisterRequest {
     pub did: String,
     pub requested_alias: String,
+    /// Which of the nameserver's suffixes to register under. Always sent;
+    /// a nameserver that predates multi-suffix serving ignores it.
+    pub suffix: String,
     pub proof_of_control: String,
     pub challenge: String,
 }
@@ -95,7 +98,10 @@ pub async fn run(args: InitArgs) -> Result<()> {
         let ns_url = args
             .nameserver
             .ok_or_else(|| anyhow!("--nameserver <url> is required with --request-alias"))?;
-        let attestation = register_with_nameserver(&id, &alias_local, &ns_url).await?;
+        let cfg = config::load_config(Some(&cfg_path))?;
+        let attestation =
+            register_with_nameserver(&id, &alias_local, &ns_url, &config::delegations(&cfg))
+                .await?;
         let ttl_days = (attestation.valid_until - attestation.valid_from) / 86_400;
         println!(
             "alias attestation verified: {} (valid {ttl_days}d, ns={})",
@@ -148,22 +154,23 @@ fn build_initial_config(id: &Identity, nickname: &str, server_url: Option<&str>)
     cfg
 }
 
-/// Register `alias_local` under the nameserver's suffix for `id`.
+/// Register `who` for `id`: a full `alias@suffix`, or a bare local part when
+/// the nameserver serves exactly one suffix.
 ///
-/// Returns the attestation once it verifies: signed by the nameserver's
-/// delegated authority, for the lowercased `alias_local@suffix`, valid now,
-/// and naming `id`'s DID.
+/// Returns the attestation once it verifies: signed by an authority for the
+/// suffix (`delegations`' for a `config` root, the published delegation's
+/// for a `dns` one), for the lowercased full name, valid now, and naming
+/// `id`'s DID.
 pub async fn register_with_nameserver(
     id: &Identity,
-    alias_local: &str,
+    who: &str,
     ns_url: &str,
+    delegations: &jig_client::naming::Delegations,
 ) -> Result<Attestation> {
-    let ns = Nameserver::connect(ns_url).await?;
-    let name = Name::parse(&format!("{alias_local}@{}", ns.suffix()))
-        .with_context(|| format!("`{alias_local}` is not a valid alias"))?;
+    let ns = Nameserver::connect(ns_url, who, delegations, Purpose::Register).await?;
     let challenge = ns.challenge().await?;
-    let body = build_register_request(id, &name, ns.ns_did(), &challenge);
-    ns.post_binding("/v1/register", &body, &name, &id.did_string())
+    let body = build_register_request(id, ns.name(), ns.ns_did(), &challenge);
+    ns.post_binding("/v1/register", &body, &id.did_string())
         .await?
 }
 
@@ -181,6 +188,7 @@ pub(crate) fn build_register_request(
     RegisterRequest {
         did: id.did_string(),
         requested_alias: name.alias.clone(),
+        suffix: name.suffix.clone(),
         proof_of_control: b64u(&proof),
         challenge: challenge.to_string(),
     }
