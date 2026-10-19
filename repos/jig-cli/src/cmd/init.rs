@@ -127,9 +127,10 @@ fn write_cli_config(
 /// Split out from the file write so it can be unit-tested without touching
 /// `~/.jig`. Seeds `[contacts]` with the operator's own DID so their own
 /// messages render as their nickname from the very first `jig chat`, and
-/// pins the `@jig` delegation this build ships (JEP-0004 `config` root), so a
-/// later binary with another default does not change whose answers count.
-/// A build whose `@jig` authority is still the placeholder writes none.
+/// pins the `@jig` delegation this build ships (JEP-0004 `config` root) when
+/// it has one, so a later binary with another default does not change whose
+/// answers count. Nothing depends on that entry: without it the built-in
+/// delegation applies.
 fn build_initial_config(id: &Identity, nickname: &str, server_url: Option<&str>) -> Config {
     let mut cfg = Config::default();
     cfg.user.did = id.did_string();
@@ -138,7 +139,7 @@ fn build_initial_config(id: &Identity, nickname: &str, server_url: Option<&str>)
         cfg.server.base_url = url.to_string();
     }
     config::remember_contact(&mut cfg, &id.did_string(), nickname);
-    if let Ok(jig) = config::default_jig_delegation() {
+    if let Ok(jig) = config::default_jig_delegation(&cfg) {
         cfg.naming
             .delegations
             .insert(config::DEFAULT_SUFFIX.to_string(), jig);
@@ -240,15 +241,13 @@ mod tests {
     }
 
     #[test]
-    fn initial_config_pins_the_jig_delegation_this_build_ships() {
+    fn initial_config_writes_no_jig_delegation_without_a_nameserver() {
+        // The source names no nameserver host, so a fresh config has nowhere
+        // to ask for `@jig` names until one is configured.
         let dir = tempdir().unwrap();
         let id = Identity::generate_and_save(dir.path()).unwrap();
         let cfg = build_initial_config(&id, "dj", None);
-        // Tests are debug builds, where the placeholder authority is allowed.
-        assert_eq!(
-            cfg.naming.delegations.get(config::DEFAULT_SUFFIX),
-            Some(&config::default_jig_delegation().unwrap())
-        );
+        assert!(!cfg.naming.delegations.contains_key(config::DEFAULT_SUFFIX));
     }
 
     #[test]

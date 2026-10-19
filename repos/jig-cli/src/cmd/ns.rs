@@ -306,7 +306,22 @@ pub(crate) fn resolve_delegations(
     name: &Name,
     nameserver: Option<&str>,
 ) -> Result<Delegations> {
-    let mut delegations = crate::config::delegations(cfg);
+    // For `@jig` with no cli.toml entry, `--nameserver` is where the built-in
+    // delegation asks, as `[server] nameserver_url` would be.
+    let mut cfg = cfg.clone();
+    if let Some(url) = nameserver
+        && name.suffix == DEFAULT_SUFFIX
+        && !cfg.naming.delegations.contains_key(DEFAULT_SUFFIX)
+    {
+        cfg.server.nameserver_url = Some(url.to_string());
+    }
+    let mut delegations = crate::config::delegations(&cfg);
+    if !delegations.config.contains_key(&name.suffix) && name.suffix == DEFAULT_SUFFIX {
+        // Say why the built-in delegation is missing (a placeholder authority,
+        // or no nameserver) rather than falling through to a dns lookup of a
+        // name that is not a domain.
+        crate::config::default_jig_delegation(&cfg)?;
+    }
     if let Some(url) = nameserver {
         let url = url.trim().trim_end_matches('/').to_string();
         let Some(entry) = delegations.config.get_mut(&name.suffix) else {
@@ -317,11 +332,6 @@ pub(crate) fn resolve_delegations(
             );
         };
         entry.nameservers = vec![url];
-    }
-    if !delegations.config.contains_key(&name.suffix) && name.suffix == DEFAULT_SUFFIX {
-        // Say why the built-in delegation is missing rather than falling
-        // through to a dns lookup of a name that is not a domain.
-        crate::config::default_jig_delegation()?;
     }
     Ok(delegations)
 }
