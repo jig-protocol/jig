@@ -12,6 +12,7 @@ pub mod canonical_cid;
 pub mod capability_registry;
 pub mod capability_scope;
 pub mod capability_validation;
+pub mod component_validation;
 #[cfg(feature = "ed25519")]
 pub mod cose;
 pub mod crypto;
