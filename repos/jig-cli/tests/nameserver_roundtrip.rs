@@ -85,6 +85,7 @@ async fn register_renew_and_rotate_against_the_real_nameserver() {
     let home = tempfile::tempdir().unwrap();
 
     // Register. Mixed case on purpose: the proof is over the lowercased name.
+    // Four letters: a nameserver may set a minimum alias length (#224).
     let (ok, out) = jig(
         home.path(),
         &[
