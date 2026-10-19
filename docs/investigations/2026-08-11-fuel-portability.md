@@ -26,7 +26,8 @@ Wasmtime documents fuel as deterministic: most instructions cost 1 unit, `nop` /
 `drop` / `block` / `loop` cost 0, and "wasm always consumes a fixed amount of fuel
 per-operation." Same program, same input, same fuel. The single documented
 cross-architecture exception is **relaxed-SIMD lowering**, and jig-runtime already
-disables both SIMD and relaxed SIMD (`engine.rs:115-116`), so that exception does
+disables both SIMD and relaxed SIMD (deterministic mode in `jig-runtime/src/engine.rs`;
+since #125 it enables exactly WebAssembly 2.0 without SIMD), so that exception does
 not apply to us.
 
 But "deterministic" is not "portable", and this is the important part:
@@ -61,8 +62,8 @@ ceiling on who can implement a conforming server.
 
 I predicted the 10x came from our own wall-clock deadline: jig-runtime enables
 `epoch_interruption(true)` **alongside** fuel with a 250 ms default
-(`config.rs:108`), and wasmtime's guide names epoch interruption as the
-non-deterministic alternative to fuel. **The matrix disproves that as the cause.**
+(`ResourceLimits::default` in `jig-runtime/src/config.rs`), and wasmtime's guide
+names epoch interruption as the non-deterministic alternative to fuel. **The matrix disproves that as the cause.**
 
 Same committed module, generous 30 s budget, `outcome=Success` on every row:
 
@@ -119,12 +120,16 @@ usable local metric rather than noise.
 `execute_with_wasi` classifies traps by string-matching the message for
 `all fuel consumed` / `fuel exhausted` / `out of fuel` → `FuelExhausted`.
 Everything else, **including an epoch/deadline trap**, falls to a generic `else`
-→ `ReasonCode::RuntimeTrap` / `ERR_TRAP` (`api.rs:598-627`).
+→ `ReasonCode::RuntimeTrap` / `ERR_TRAP` (then in `execute_with_wasi`, `api.rs`).
 
 So today you cannot tell from a receipt whether the program failed or the host was
 merely slow — and the partial `fuel_used` is recorded as though it were the
 program's cost. That is a defect independent of Finding 2's cause, and it is the
 one that would quietly corrupt receipt data.
+
+**Since fixed:** `jig-runtime/src/trap.rs` classifies on the typed `wasmtime::Trap`.
+`OutOfFuel` gives `FuelExhausted` and `Interrupt` gives `RuntimeTimeout`, whose fuel
+is not billable.
 
 ## Finding 4 — the load sensitivity reproduces locally, and `execute` can fail outright
 
@@ -239,7 +244,7 @@ code, because the tree already contains more of this than it appears to.
 
 It belongs to `jig_runtime::payload::execute_payload`, **not** to the runtime.
 `Runtime::execute` validates against a `HostImportAllowlist`
-(`jig-core/src/wasm_validation.rs:102`), and the `Default` impl is
+(`jig-core/src/wasm_validation.rs`), and the `Default` impl is
 `default_jig_allowlist()` — which already permits
 `jig_host::{log, emit_message, read_resource}` plus
 `wasi_snapshot_preview1::proc_exit`. There is also
@@ -249,10 +254,12 @@ excludes `random_get`, `clock_*` and `sock_*`.
 `jig-core/src/capability_registry.rs` goes further and already names the effectful
 capabilities — `net:http:fetch`, `storage:read`, `storage:write`,
 `ai:llm:inference`, `log:emit`, `message:emit` — each with `required_imports`, a
-`fuel_cost_estimate`, and `attestation_requirements`.
+`fuel_cost_estimate`, and `attestation_requirements`. (#130 deleted
+`required_imports`, which nothing read.)
 
 **But no `jig_host` function is implemented.** jig-runtime does build a
-`wasmtime::Linker` (`api.rs:494`), and it populates it with exactly one thing —
+`wasmtime::Linker` (`execute_with_wasi` in `jig-runtime/src/api.rs`), and it populates
+it with exactly one thing —
 WASI preview1, via `wasmtime_wasi::p1::add_to_linker_sync`. Nothing anywhere
 provides `jig_host::*`, so a module importing it cannot instantiate however
 thoroughly the allowlist and registry describe it.
@@ -290,13 +297,18 @@ single currency, with in-module work bucketed under the pseudo-capability
 `engine.wasm`.
 
 > **Defect:** `fuel_total` is the **sum** of `fuel_by_capability`
-> (`jig-runtime/src/api.rs:332`). That adds the portable quantity (`engine.wasm`)
+> (then in `jig-runtime/src/api.rs`). That adds the portable quantity (`engine.wasm`)
 > to non-portable host-attributed buckets, producing one number that reads as
 > comparable and is not. For billing, keep the buckets separate.
+>
+> **Since fixed:** #178 removed the host-charge meter. The runtime records one bucket,
+> `engine.wasm`, and `fuel_total` equals it (`wasm_fuel_counters` in `api.rs`).
+> v0.3 drops `fuel_total` and keeps host meters separate from wasm fuel (C8).
 
 Note also three distinct fuel-ish quantities that must not be conflated: measured
 wasm fuel (the `engine.wasm` bucket), the `CapabilityCosts` charging schedule in
-jig-runtime (`call_base` / `per_byte_in` / `per_byte_out` / per-operation), and the
+jig-runtime (`call_base` / `per_byte_in` / `per_byte_out` / per-operation; deleted
+in #178), and the
 advisory `fuel_cost_estimate` per capability in jig-core's registry. Only the first
 is a measurement.
 

@@ -343,7 +343,7 @@ impl Session {
             if matches!(kind, BlockKind::MemberAdd | BlockKind::MemberRemove) {
                 return Ok(Seen::Broken { reason });
             }
-            if block.manifest.content_suite() == EncryptionSuite::Mls {
+            if block.manifest.content_suite().is_encrypted() {
                 return Ok(Seen::Sealed { reason });
             }
         }
@@ -436,8 +436,16 @@ impl Session {
                 })
             }
             _ => {
-                if block.manifest.content_suite() != EncryptionSuite::Mls {
+                let suite = block.manifest.content_suite();
+                if !suite.is_encrypted() {
                     return Ok(Seen::Plain);
+                }
+                // Another encrypted suite is ciphertext this client cannot
+                // read, never something to show as it is.
+                if suite != EncryptionSuite::Mls {
+                    return Ok(Seen::Sealed {
+                        reason: format!("suite `{suite}` is not supported by this client"),
+                    });
                 }
                 if let Some((sender, text)) = self.recall(&block.cid)? {
                     return Ok(Seen::Text { sender, text });

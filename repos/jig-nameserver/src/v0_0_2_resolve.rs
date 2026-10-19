@@ -1,4 +1,6 @@
-//! GET /v1/resolve/:alias for the v0.0.2 nameserver.
+//! GET /v1/resolve/{name} and GET /.well-known/jig-ns-delegation for the
+//! v0.0.2 nameserver. Both serve signed objects a resolver verifies itself
+//! (JEP-0004 rules 3 and 8), as unpadded base64url COSE_Sign1 envelopes.
 
 use std::sync::Arc;
 
@@ -8,76 +10,52 @@ use axum::{
     http::StatusCode,
     routing::get,
 };
-use serde::Serialize;
+use jig_core::naming::{Root, SuffixDelegation};
 
 use crate::v0_0_2::AppState;
+use crate::v0_0_2_register::{ApiError, b64u, current_binding, err, parse_name};
 
-#[derive(Debug, Serialize)]
-pub struct ErrorBody {
-    pub code: String,
-    pub message: String,
-}
+/// How long a served suffix delegation stays valid. It is re-signed on every
+/// request, so this only bounds how long a resolver may cache it.
+const DELEGATION_VALIDITY_SECS: i64 = 24 * 60 * 60;
 
-fn err(
-    status: StatusCode,
-    code: &'static str,
-    msg: impl Into<String>,
-) -> (StatusCode, Json<ErrorBody>) {
-    (
-        status,
-        Json(ErrorBody {
-            code: code.to_string(),
-            message: msg.into(),
-        }),
-    )
-}
-
+/// GET /v1/resolve/{name} — `{attestation, links, reachability}` for the
+/// current binding of `alias@suffix`, or 404 when none is valid now.
 pub async fn resolve(
     State(state): State<Arc<AppState>>,
-    Path(alias): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
-    let now = chrono::Utc::now().timestamp();
-    let store = state.ingest_ctx.store.clone();
-    let alias_for_lookup = alias.clone();
-    let row =
-        tokio::task::spawn_blocking(move || store.find_alias_attestation(&alias_for_lookup, now))
-            .await
-            .map_err(|e| {
-                err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "JOIN_ERROR",
-                    e.to_string(),
-                )
-            })?
-            .map_err(|e| {
-                err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "PERSIST_ERROR",
-                    e.to_string(),
-                )
-            })?;
-    let row = row.ok_or_else(|| {
-        err(
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let alias = parse_name(&name)?.as_alias();
+    match current_binding(&state, &alias).await? {
+        Some(binding) => Ok(Json(binding.response())),
+        None => Err(err(
             StatusCode::NOT_FOUND,
             "NOT_FOUND",
             format!("no valid attestation for `{alias}`"),
-        )
-    })?;
+        )),
+    }
+}
 
-    let attestation_json: serde_json::Value = serde_json::from_slice(&row.attestation_bytes)
-        .map_err(|e| {
-            err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "PARSE_ERROR",
-                e.to_string(),
-            )
-        })?;
-    Ok(Json(attestation_json))
+/// GET /.well-known/jig-ns-delegation — this nameserver's single-authority
+/// delegation for its suffix, rooted in DNS (JEP-0004 rule 3). It is
+/// authoritative only when served from `https://<suffix>/`.
+pub async fn delegation(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let suffix = state.suffix().to_ascii_lowercase();
+    let deleg = SuffixDelegation::sign(
+        &[&state.ingest_ctx.server_key],
+        &suffix,
+        Root::Dns,
+        &suffix,
+        chrono::Utc::now().timestamp() + DELEGATION_VALIDITY_SECS,
+    );
+    let envelopes: Vec<String> = deleg.envelopes.iter().map(|e| b64u(e)).collect();
+    Json(serde_json::json!({ "envelopes": envelopes }))
 }
 
 pub fn build_resolve_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/resolve/{alias}", get(resolve))
+        .route("/.well-known/jig-ns-delegation", get(delegation))
         .with_state(state)
 }
 
@@ -85,20 +63,13 @@ pub fn build_resolve_router(state: Arc<AppState>) -> Router {
 mod tests {
     use super::*;
     use crate::v0_0_2_register::build_register_router;
+    use crate::v0_0_2_register::test_support::{fresh_did_and_key, proof};
     use axum::{Router, body::Body, http::Request};
     use base64::Engine as _;
-    use ed25519_dalek::{Signer, SigningKey};
-    use jig_core::Did;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use jig_core::naming::{self, Action, Name};
+    use jig_pipeline::persist::StoredAliasAttestation;
     use tower::ServiceExt;
-
-    fn fresh_did_and_key() -> (String, SigningKey) {
-        use rand::Rng;
-        let mut secret = [0u8; 32];
-        rand::rng().fill_bytes(&mut secret);
-        let key = SigningKey::from_bytes(&secret);
-        let did = Did::from_ed25519_pubkey(key.verifying_key().as_bytes());
-        (did.to_did_jig_string(), key)
-    }
 
     async fn get_path(router: Router, path: &str) -> (StatusCode, serde_json::Value) {
         let req = Request::builder()
@@ -137,6 +108,37 @@ mod tests {
         (status, json)
     }
 
+    fn router_for(state: &Arc<AppState>) -> Router {
+        build_register_router(state.clone()).merge(build_resolve_router(state.clone()))
+    }
+
+    async fn register(router: &Router, state: &AppState, local: &str) -> String {
+        let (_, ch) = get_path(router.clone(), "/v1/challenge").await;
+        let challenge = ch["challenge"].as_str().unwrap().to_string();
+        let (did, key) = fresh_did_and_key();
+        let alias = format!("{local}@{}", state.suffix()).to_ascii_lowercase();
+        let (status, body) = post_json(
+            router.clone(),
+            "/v1/register",
+            serde_json::json!({
+                "did": did,
+                "requested_alias": local,
+                "proof_of_control": proof(&key, state, Action::Register, &alias, &challenge),
+                "challenge": challenge,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        did
+    }
+
+    fn attestation_of(body: &serde_json::Value) -> naming::Attestation {
+        let envelope = URL_SAFE_NO_PAD
+            .decode(body["attestation"].as_str().expect("attestation field"))
+            .unwrap();
+        naming::Attestation::from_envelope(&envelope).expect("attestation verifies")
+    }
+
     #[tokio::test]
     async fn resolve_returns_404_for_unknown_alias() {
         let state = Arc::new(AppState::for_test().unwrap());
@@ -147,36 +149,130 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_then_resolve_round_trips() {
+    async fn resolve_refuses_a_malformed_name() {
         let state = Arc::new(AppState::for_test().unwrap());
-        // The register and resolve routers share the same state; build both
-        // as separate Router<()>'s after with_state, then merge.
-        let register_router = build_register_router(state.clone());
-        let resolve_router = build_resolve_router(state.clone());
-        let router = register_router.merge(resolve_router);
+        let router = build_resolve_router(state);
+        let (status, body) = get_path(router, "/v1/resolve/no-suffix").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "INVALID_NAME");
+    }
 
-        // 1. Get challenge + register
-        let (_, ch) = get_path(router.clone(), "/v1/challenge").await;
-        let challenge = ch["challenge"].as_str().unwrap().to_string();
-        let (did_str, key) = fresh_did_and_key();
-        let sig = key.sign(challenge.as_bytes());
-        let (status, _) = post_json(
-            router.clone(),
-            "/v1/register",
-            serde_json::json!({
-                "did": did_str.clone(),
-                "requested_alias": "dj",
-                "proof_of_control": base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()),
-                "challenge": challenge,
-            }),
+    #[tokio::test]
+    async fn register_then_resolve_serves_a_verifiable_attestation() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let router = router_for(&state);
+        let did = register(&router, &state, "dj").await;
+
+        // Raw, percent-encoded and mixed-case names all find it.
+        for path in [
+            "/v1/resolve/dj@dj.jig",
+            "/v1/resolve/dj%40dj.jig",
+            "/v1/resolve/DJ@DJ.jig",
+        ] {
+            let (status, body) = get_path(router.clone(), path).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            let att = attestation_of(&body);
+            assert_eq!(att.did, did);
+            assert_eq!(att.alias, "dj@dj.jig");
+            assert_eq!(att.ns_did, state.ns_did_string());
+            assert_eq!(body["links"], serde_json::json!([]));
+            assert_eq!(body["reachability"], serde_json::Value::Null);
+        }
+    }
+
+    /// Remove `did`, `alias` and `valid_until` once nothing reads them: after
+    /// F1 slice 6 (L3) moves the CLI to the verified resolver, and the email
+    /// bridge's `address_book.rs` moves to the verified client resolver (#201).
+    #[tokio::test]
+    async fn the_response_keys_are_pinned() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let router = router_for(&state);
+        let did = register(&router, &state, "dj").await;
+
+        let (_, body) = get_path(router, "/v1/resolve/dj@dj.jig").await;
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "alias",
+                "attestation",
+                "did",
+                "links",
+                "reachability",
+                "valid_until"
+            ]
+        );
+        // The unsigned hints say what the signed attestation says.
+        let att = attestation_of(&body);
+        assert_eq!(body["did"], did);
+        assert_eq!(body["did"], att.did);
+        assert_eq!(body["alias"], att.alias);
+        assert_eq!(body["valid_until"], att.valid_until);
+    }
+
+    #[tokio::test]
+    async fn a_row_in_the_old_json_encoding_is_served_re_signed() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let (did, _) = fresh_did_and_key();
+        let now = chrono::Utc::now().timestamp();
+        state
+            .ingest_ctx
+            .store
+            .upsert_alias_attestation(&StoredAliasAttestation {
+                did: did.clone(),
+                alias: "old@dj.jig".into(),
+                ns_did: state.ns_did_string(),
+                valid_from: now - 10,
+                valid_until: now + 1000,
+                attestation_bytes: br#"{"did":"x","sig":"y"}"#.to_vec(),
+            })
+            .unwrap();
+
+        let (status, body) = get_path(
+            build_resolve_router(state.clone()),
+            "/v1/resolve/old@dj.jig",
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
-
-        // 2. Resolve
-        let (status, body) = get_path(router, "/v1/resolve/dj@dj.jig").await;
         assert_eq!(status, StatusCode::OK, "body={body}");
-        assert_eq!(body["did"], did_str);
-        assert_eq!(body["alias"], "dj@dj.jig");
+        let att = attestation_of(&body);
+        assert_eq!(att.did, did);
+        assert_eq!((att.valid_from, att.valid_until), (now - 10, now + 1000));
+    }
+
+    #[tokio::test]
+    async fn the_delegation_verifies_and_binds_a_served_attestation() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let router = router_for(&state);
+        register(&router, &state, "dj").await;
+
+        let (status, body) = get_path(router.clone(), "/.well-known/jig-ns-delegation").await;
+        assert_eq!(status, StatusCode::OK);
+        let envelopes: Vec<Vec<u8>> = body["envelopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| URL_SAFE_NO_PAD.decode(e.as_str().unwrap()).unwrap())
+            .collect();
+        assert_eq!(envelopes.len(), 1);
+        let deleg = SuffixDelegation::from_envelopes(&envelopes).expect("delegation verifies");
+        assert_eq!(deleg.suffix, "dj.jig");
+        assert_eq!(deleg.authorities, vec![state.ns_did_string()]);
+        assert_eq!(deleg.root, Root::Dns);
+        assert_eq!(deleg.root_id, "dj.jig");
+
+        let (_, resolved) = get_path(router, "/v1/resolve/dj@dj.jig").await;
+        naming::verify_binding(
+            &attestation_of(&resolved),
+            &deleg,
+            &Name::parse("dj@dj.jig").unwrap(),
+            chrono::Utc::now().timestamp(),
+        )
+        .expect("a resolver accepts the binding");
     }
 }
