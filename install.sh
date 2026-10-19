@@ -277,6 +277,12 @@ allowed_block_kinds = ["text-render", "channel-create", "member-add", "member-re
 # To gate via a nameserver, switch to "nameserver" and list each alias suffix
 # under [identity.delegations."<suffix>"] with authorities (DIDs) and
 # nameservers (URLs). trusted_nameservers is not used to resolve aliases.
+# Names under the default suffix, alice@jig, need no entry: the server ships
+# the jig delegation built in (once the project authority DID is published).
+# To override it, add your own:
+#   [identity.delegations.jig]
+#   authorities = ["did:jig:..."]
+#   nameservers = ["https://ns.example"]
 mode = "tofu"
 trusted_nameservers = []
 cache_ttl_seconds = 300
