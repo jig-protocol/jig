@@ -53,7 +53,7 @@ enabled = true                              # the default
 
 - **Neither path set:** on first start the nameserver makes a self-signed certificate in `nameserver/tls/`, next to its database, apart from jig-server's `tls/`. Its DID (the one that signs attestations) vouches for that certificate in `/.well-known/jig-ns`, as `server_did` and `tls_binding`, the same fields jig-server publishes at `/.well-known/jig`. Clients check the certificate against the DIDs the suffix's delegation lists.
 - **Both paths set:** it serves that certificate, for example one a CA issued (`tailscale cert`, certbot), and its DID vouches for it the same way. For a `config` or `contract` suffix, clients accept a certificate only on the DID's word, never a CA's alone. A DNS-rooted suffix is the other way round: its nameserver is reached at `https://<suffix>/` and must hold a CA-valid certificate for that name.
-- **`enabled = false`:** serves plaintext. This is an unsafe option. The nameserver logs a warning and lists `tls.enabled=false` under `unsafe_options_active` in `/.well-known/jig-ns`. Use it only on loopback.
+- **`enabled = false`:** serves plaintext. This is an unsafe option. The nameserver logs a warning and lists `tls.enabled=false` under `unsafe_options_active` in `/.well-known/jig-ns`. Use it only on loopback. Clients refuse an `http://` nameserver unless they opt in, for loopback or local testing only: jig-server with `[identity] dangerously_allow_plaintext_nameservers = true`, which it lists in its own `unsafe_options_active`, and the CLI with `[naming] dangerously_allow_plaintext_nameservers = true` in `cli.toml`.
 
 ## Rate limits
 

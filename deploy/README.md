@@ -233,6 +233,10 @@ the root keys and every section in one file.
 > word of the DID the suffix's delegation lists, not on a CA's alone, so a
 > reverse proxy in front of the nameserver must pass TLS through, not
 > terminate it.
+> An `http://` nameserver is refused unless the client opts in, for loopback
+> or local testing only: `[identity] dangerously_allow_plaintext_nameservers`
+> on jig-server (listed in `unsafe_options_active`), `[naming]
+> dangerously_allow_plaintext_nameservers` in the CLI's `cli.toml`.
 
 `/healthz` and `/metrics` are always mounted and need no signed read,
 so they answer on a default, locked-down deployment. Use `/healthz` — not
