@@ -614,6 +614,8 @@ mod tests {
             capabilities: Default::default(),
             reputation: jig_pipeline::handshake::Reputation::none(),
             nonce: String::new(),
+            server_nonce: String::new(),
+            tls_exporter: Vec::new(),
             evidence: String::new(),
         }
     }

@@ -33,7 +33,10 @@ port = 7117
 # [tls]
 # cert_path = "/var/lib/jig/tls/<host>.<tailnet>.ts.net.crt"
 # key_path  = "/var/lib/jig/tls/<host>.<tailnet>.ts.net.key"
-# Plaintext, only behind a proxy that terminates TLS:
+# Plaintext, for loopback or local testing only. A remote client over TLS
+# refuses a server whose welcome is not bound to its TLS session, so anything
+# in front of jig-server must pass TLS through (TCP or SNI passthrough), not
+# terminate it:
 # enabled = false
 
 # SET THIS WHEN YOU SERVE A CERTIFICATE ISSUED FOR A HOSTNAME. It is the
@@ -83,8 +86,10 @@ allowed_block_kinds = ["text-render", "channel-create", "member-add", "member-re
 #   [identity.delegations."example.org"]
 #   authorities = ["did:jig:..."]
 #   nameservers = ["https://ns.example"]
-# An alias whose suffix has no entry is refused. trusted_nameservers is not
-# used to resolve aliases.
+# An alias whose suffix has no entry is refused, except under the default
+# suffix (alice@jig): the server ships the jig delegation built in, once the
+# project authority DID is published, and an [identity.delegations.jig] entry
+# here overrides it. trusted_nameservers is not used to resolve aliases.
 mode = "tofu"
 trusted_nameservers = []
 cache_ttl_seconds = 300

@@ -30,14 +30,14 @@ A future feature that needs a symmetric server secret will add a purpose-named, 
 
 Settings come from the config file (`JIG_NS_CONFIG`, or the default path), then environment variables override them. Settings are read at start-up; restart the service after changing them.
 
-- `[v0_0_2.nameserver] alias_suffix` (default `gigue.jig`): the suffix aliases are registered under.
+- `[[v0_0_2.nameserver.alias_suffixes]]` (required, no default): each suffix this nameserver serves, with its registration policy. The nameserver refuses to start without one. See `deploy/README.md` for the per-suffix options.
 - `[v0_0_2.server] server_did_keyfile`: the nameserver's signing key. Created on first start if missing. Back it up; a new key is a new nameserver identity.
 - `[v0_0_2.debug] list_handles` (default `false`): mounts `/v1/handles`.
 - `[storage] database_path` / `JIG_NS_DB_PATH`: the alias database.
 - `[network] bind` / `JIG_NS_BIND` and `[network] port` / `JIG_NS_PORT`: listen address.
 - `[network] trust_proxy` / `JIG_NS_TRUST_PROXY` and `[network] proxy_ip_header` / `JIG_NS_PROXY_IP_HEADER`: see [Behind a reverse proxy](#behind-a-reverse-proxy).
 
-Older configs that still set `[pow]`, or environments that still export `JIG_NS_SECRET` or `JIG_NS_POW_*`, keep starting: those settings are ignored. Remove them at your next change.
+Every config section denies unknown keys: a typo, or a key in the wrong section, stops the nameserver at start-up with an error naming the key. A section or key that was removed (`[pow]`, `[rate_limits]`, `[transparency]`, `[runtime]`, `[anomaly_detection]`, `[hot]`, `[federation]`, `storage.backend*`, `analytics.backend*`) fails with a message saying so; delete it. Removed environment variables, such as `JIG_NS_SECRET`, `JIG_NS_POW_*` and the federation `JIG_NS_*` variables, don't stop start-up: the nameserver logs a warning naming each one and ignores it.
 
 ## Rate limits
 
