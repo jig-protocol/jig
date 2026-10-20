@@ -52,6 +52,9 @@ pub struct NameServerConfig {
     /// Per-IP and per-DID limits on the v0.0.2 `register`, `rotate` and
     /// `renew` routes (`[alias_rate_limits]`).
     pub alias_rate_limits: AliasRateLimitConfig,
+    /// TLS for the listener (`[tls]`), on by default with a self-signed
+    /// certificate the nameserver's DID vouches for at `/.well-known/jig-ns`.
+    pub tls: jig_config::tls::TlsConfig,
 }
 
 /// `JIG_NS_*` variables a removed feature read, with what removed it. Setting
@@ -315,7 +318,18 @@ impl NameServerConfig {
             analytics: AnalyticsConfig::from_env(),
             v0_0_2: jig_config::v0_0_2_server::JigServerConfig::default(),
             alias_rate_limits: AliasRateLimitConfig::default(),
+            tls: jig_config::tls::TlsConfig::default(),
         }
+    }
+
+    /// Unsafe options this config sets, as `/.well-known/jig-ns` lists them
+    /// (JEP-0004 rule 12), named the way jig-server names its own.
+    pub fn unsafe_options_active(&self) -> Vec<String> {
+        let mut active = Vec::new();
+        if !self.tls.enabled {
+            active.push("tls.enabled=false".to_string());
+        }
+        active
     }
 
     fn apply_env_overrides(&mut self) {
@@ -1166,6 +1180,16 @@ proxy_ip_header = "x-forwarded-for"
 
 [storage]
 database_path = "~/.jig/nameserver.db"
+
+# TLS, on by default. With neither path set, the nameserver makes a self-signed
+# certificate on first start (in nameserver/tls/ next to the database), and its
+# DID vouches for it at /.well-known/jig-ns. Set both paths to serve a
+# certificate a CA issued. `enabled = false` serves plaintext: an unsafe
+# option, listed in /.well-known/jig-ns under unsafe_options_active.
+[tls]
+enabled = true
+# cert_path = "/etc/jig/nameserver.crt"
+# key_path = "/etc/jig/nameserver.key"
 
 
 # v0.0.2 register / rotate / renew. Refused requests get HTTP 429 with code

@@ -10,3 +10,13 @@
 
 [[v0_0_2.nameserver.alias_suffixes]]
 suffix = "names.example.org"
+
+# TLS is on by default, with a self-signed certificate in
+# /var/lib/jig/nameserver/tls/ that this nameserver's DID vouches for at
+# /.well-known/jig-ns. Today's jig clients trust only a CA-issued nameserver
+# certificate, so give one here (both paths), or set `enabled = false` for
+# plaintext, which /.well-known/jig-ns then advertises as unsafe.
+[tls]
+enabled = true
+# cert_path = "/etc/jig/nameserver.crt"
+# key_path = "/etc/jig/nameserver.key"

@@ -60,7 +60,7 @@ pub struct Probed {
     /// The DID the server names, checked against the one expected when there
     /// was one.
     pub server_did: Option<String>,
-    /// `/.well-known/jig`, as served.
+    /// The well-known document, as served.
     pub well_known: serde_json::Value,
     /// For every later connection: accepts the certificate the DID vouched
     /// for, or one a CA vouches for. `None` for a plaintext server.
@@ -78,8 +78,18 @@ pub struct Probed {
 /// A plaintext (`http://`, `ws://`) server is fetched as is; there is nothing
 /// to bind.
 pub async fn probe(server: &str, expected_did: Option<&str>) -> Result<Probed, TlsError> {
+    probe_at(server, "/.well-known/jig", expected_did).await
+}
+
+/// [`probe`] for a service that publishes `server_did` and `tls_binding` in
+/// another document: a nameserver's `/.well-known/jig-ns`.
+pub async fn probe_at(
+    server: &str,
+    well_known_path: &str,
+    expected_did: Option<&str>,
+) -> Result<Probed, TlsError> {
     let base = http_base(server)?;
-    let url = format!("{base}/.well-known/jig");
+    let url = format!("{base}{well_known_path}");
     let tls = base.starts_with("https://");
     let verifier = Arc::new(DidBoundVerifier::new(None, true));
     let mut http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15));
