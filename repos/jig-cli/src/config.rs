@@ -101,9 +101,24 @@ fn delegation_for(
 /// The delegations a resolver uses: `cli.toml`'s, plus the built-in one for
 /// [`DEFAULT_SUFFIX`] when `cli.toml` has none for it and this build has one.
 pub fn delegations(cfg: &Config) -> jig_client::naming::Delegations {
-    let mut entries = cfg.naming.delegations.clone();
+    delegations_with_authority(cfg, jig_core::naming::default_jig_authority())
+}
+
+/// [`delegations`], with the built-in authority passed in. Suffix keys are
+/// lowercased, as names are, so `[naming.delegations.JIG]` is the `jig`
+/// entry and the built-in one is not added beside it.
+fn delegations_with_authority(
+    cfg: &Config,
+    authority: Result<&str, jig_core::naming::NamingError>,
+) -> jig_client::naming::Delegations {
+    let mut entries: BTreeMap<String, DelegationEntry> = cfg
+        .naming
+        .delegations
+        .iter()
+        .map(|(suffix, e)| (suffix.to_ascii_lowercase(), e.clone()))
+        .collect();
     if !entries.contains_key(DEFAULT_SUFFIX)
-        && let Ok(default) = default_jig_delegation(cfg)
+        && let Ok(default) = delegation_for(authority, cfg)
     {
         entries.insert(DEFAULT_SUFFIX.to_string(), default);
     }
@@ -239,10 +254,11 @@ mod tests {
             let err = delegation_for(refused(), &cfg).unwrap_err();
             assert!(err.to_string().contains("placeholder"), "{err}");
         }
-        let mut no_entry = with_nameserver("https://ns.example");
-        no_entry.naming.delegations.clear();
+        let no_entry = with_nameserver("https://ns.example");
         assert!(
-            delegation_for(refused(), &no_entry).is_err(),
+            !delegations_with_authority(&no_entry, refused())
+                .config
+                .contains_key(DEFAULT_SUFFIX),
             "no built-in @jig delegation without a real authority"
         );
     }
@@ -287,6 +303,28 @@ mod tests {
             d.config[DEFAULT_SUFFIX].authorities,
             [jig_core::naming::DEFAULT_JIG_AUTHORITY]
         );
+    }
+
+    #[test]
+    fn a_mixed_case_suffix_key_is_that_suffix_and_wins_over_the_built_in_one() {
+        let mut cfg = with_nameserver("https://ns.example");
+        let mine = DelegationEntry {
+            authorities: vec!["did:jig:zMine".into()],
+            nameservers: vec!["http://127.0.0.1:7399".into()],
+        };
+        cfg.naming.delegations.insert("JIG".into(), mine.clone());
+        cfg.naming
+            .delegations
+            .insert("Example.org".into(), mine.clone());
+        let d = delegations(&cfg);
+        assert_eq!(
+            d.config.len(),
+            2,
+            "no second, built-in `jig`: {:?}",
+            d.config
+        );
+        assert_eq!(d.config[DEFAULT_SUFFIX].authorities, mine.authorities);
+        assert_eq!(d.config["example.org"].authorities, mine.authorities);
     }
 
     #[test]

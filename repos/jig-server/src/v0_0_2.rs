@@ -17,7 +17,7 @@ use ed25519_dalek::SigningKey;
 use jig_config::v0_0_2_server::{IdentityMode, JigServerConfig, NameDelegation};
 use jig_core::Did;
 use jig_pipeline::{
-    executor::BlockExecutor,
+    executor::{BlockExecutor, text_block_program},
     fanout::Fanout,
     hlc::HlcClock,
     identity::{IdentityResolver, NameserverResolver, TofuResolver},
@@ -57,6 +57,12 @@ pub struct AppState {
     /// once the listener has its certificate ([`Self::bind_tls_certificate`])
     /// and published at `/.well-known/jig`. Shared by every clone.
     pub tls_binding: Arc<std::sync::OnceLock<jig_core::tls_binding::TlsBinding>>,
+    /// What handles frames between proven peers
+    /// ([`crate::v0_0_2_peer::PeerFrames`]), set once at boot by
+    /// [`Self::set_peer_frames`]. Shared by every clone.
+    pub peer_frames: Arc<std::sync::OnceLock<Arc<dyn crate::v0_0_2_peer::PeerFrames>>>,
+    /// The live connections to proven peers, whichever side dialed.
+    pub peers: Arc<crate::v0_0_2_peer::PeerRegistry>,
 }
 
 /// Gates 1 and 2 from `[auth]`, plus the federation peers from `[federation]`:
@@ -121,6 +127,17 @@ fn checked_skew_bound(config: &JigServerConfig) -> Result<u64> {
 }
 
 impl AppState {
+    /// Register the handler for peer frames. Only the first call counts;
+    /// returns whether this one did.
+    pub fn set_peer_frames(&self, handler: Arc<dyn crate::v0_0_2_peer::PeerFrames>) -> bool {
+        self.peer_frames.set(handler).is_ok()
+    }
+
+    /// The registered peer-frame handler, if any.
+    pub fn peer_frame_handler(&self) -> Option<&dyn crate::v0_0_2_peer::PeerFrames> {
+        self.peer_frames.get().map(|h| h.as_ref())
+    }
+
     /// Vouch, with the server DID's key, for the certificate the listener
     /// serves (DER), so clients can trust it without a CA. The first call
     /// wins; the certificate does not change while the server runs.
@@ -187,16 +204,13 @@ impl AppState {
                          [identity.delegations]"
                     );
                 }
-                if config.identity.delegations.is_empty() {
-                    tracing::warn!(
-                        "identity.mode = \"nameserver\" with no [identity.delegations]: \
-                         every alias will be refused"
-                    );
+                let (delegations, warning) =
+                    with_default_jig_delegation(config.identity.delegations.clone());
+                if let Some(warning) = warning {
+                    tracing::warn!("{warning}");
                 }
                 Arc::new(NameserverResolver::new(
-                    suffix_authorities(&with_default_jig_delegation(
-                        config.identity.delegations.clone(),
-                    )),
+                    suffix_authorities(&delegations),
                     config.identity.cache_ttl_seconds,
                     store.clone(),
                 ))
@@ -226,9 +240,17 @@ impl AppState {
         // `JigServerConfig`: both types would then parse the same TOML table under
         // different key names (`timeout_ms` here, `execution_timeout_ms` in
         // jig-config's own type), so one would silently fall back to its default.
+        //
+        // The server signs text-block's program manifest and its default operator
+        // policy here (JEP-0011 §5.1). Who should author built-in manifests (each
+        // server, or one project key) is still open, so the author key is a parameter
+        // of `text_block_program`.
+        let runtime_config = runtime_config_from(&execution);
+        let program = text_block_program(&signing_key, &runtime_config)
+            .context("signing text-block's program manifest")?;
         let executor = Arc::new(
-            BlockExecutor::with_config(runtime_config_from(&execution))
-                .context("compiling the canonical text-render module")?,
+            BlockExecutor::with_config(runtime_config, &signing_key, program)
+                .context("compiling the canonical text-render component")?,
         );
 
         // Built before the ingest context so gate 2 can be installed on it;
@@ -260,6 +282,8 @@ impl AppState {
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
             tls_binding: Default::default(),
+            peer_frames: Default::default(),
+            peers: Default::default(),
         })
     }
 
@@ -313,6 +337,8 @@ impl AppState {
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
             tls_binding: Default::default(),
+            peer_frames: Default::default(),
+            peers: Default::default(),
         })
     }
 
@@ -363,6 +389,8 @@ impl AppState {
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
             tls_binding: Default::default(),
+            peer_frames: Default::default(),
+            peers: Default::default(),
         })
     }
 }
@@ -435,19 +463,22 @@ pub fn suffix_authorities(
 /// own `[identity.delegations.jig]`. While the authority is the placeholder
 /// nothing is added and boot carries on; `@jig` names then fail closed at
 /// lookup, like any suffix without a delegation.
+///
+/// Also returns the one boot warning the result calls for, judged on the
+/// delegations that will actually be used: none at all, or none for `@jig`.
 fn with_default_jig_delegation(
     delegations: BTreeMap<String, NameDelegation>,
-) -> BTreeMap<String, NameDelegation> {
+) -> (BTreeMap<String, NameDelegation>, Option<String>) {
     with_default_delegation(delegations, jig_core::naming::default_jig_authority())
 }
 
 fn with_default_delegation(
     mut delegations: BTreeMap<String, NameDelegation>,
     authority: Result<&str, jig_core::naming::NamingError>,
-) -> BTreeMap<String, NameDelegation> {
+) -> (BTreeMap<String, NameDelegation>, Option<String>) {
     use jig_core::naming::{DEFAULT_JIG_NAMESERVER, DEFAULT_SUFFIX};
     if delegations.contains_key(DEFAULT_SUFFIX) {
-        return delegations;
+        return (delegations, None);
     }
     match authority {
         Ok(authority) => {
@@ -458,13 +489,23 @@ fn with_default_delegation(
                     nameservers: vec![DEFAULT_JIG_NAMESERVER.to_string()],
                 },
             );
+            (delegations, None)
         }
-        Err(e) => tracing::warn!(
-            "no built-in [identity.delegations.{DEFAULT_SUFFIX}]: {e}; `@{DEFAULT_SUFFIX}` \
-             aliases are refused unless the config delegates the suffix"
+        Err(e) if delegations.is_empty() => (
+            delegations,
+            Some(format!(
+                "identity.mode = \"nameserver\" with no [identity.delegations], and no \
+                 built-in `@{DEFAULT_SUFFIX}` delegation ({e}): every alias will be refused"
+            )),
+        ),
+        Err(e) => (
+            delegations,
+            Some(format!(
+                "no built-in [identity.delegations.{DEFAULT_SUFFIX}]: {e}; `@{DEFAULT_SUFFIX}` \
+                 aliases are refused unless the config delegates the suffix"
+            )),
         ),
     }
-    delegations
 }
 
 #[cfg(test)]
@@ -473,26 +514,50 @@ mod tests {
     fn the_built_in_jig_delegation_is_added_only_with_a_real_authority() {
         use super::*;
         use jig_core::naming::{DEFAULT_JIG_NAMESERVER, DEFAULT_SUFFIX, NamingError};
-        let added = with_default_delegation(BTreeMap::new(), Ok("did:jig:zReal"));
+        // With no config of its own, a real authority leaves nothing to warn
+        // about: `@jig` names resolve.
+        let (added, warning) = with_default_delegation(BTreeMap::new(), Ok("did:jig:zReal"));
         assert_eq!(added[DEFAULT_SUFFIX].authorities, ["did:jig:zReal"]);
         assert_eq!(added[DEFAULT_SUFFIX].nameservers, [DEFAULT_JIG_NAMESERVER]);
+        assert_eq!(warning, None);
 
         // What every build without `test-default-authority` gets today:
-        // nothing added, and boot carries on.
-        let refused =
+        // nothing added, boot carries on, and one warning says every alias
+        // is refused.
+        let (refused, warning) =
             with_default_delegation(BTreeMap::new(), Err(NamingError::NoDefaultAuthority));
-        assert!(!refused.contains_key(DEFAULT_SUFFIX));
+        assert!(refused.is_empty());
+        let warning = warning.expect("one warning");
+        assert!(warning.contains("every alias will be refused"), "{warning}");
+
+        // Placeholder, but the config delegates another suffix: only `@jig`
+        // names are refused, and the warning says so.
+        let other = NameDelegation {
+            authorities: vec!["did:jig:zOther".into()],
+            nameservers: vec!["https://ns.other".into()],
+        };
+        let (some, warning) = with_default_delegation(
+            BTreeMap::from([("names.example.org".to_string(), other)]),
+            Err(NamingError::NoDefaultAuthority),
+        );
+        assert!(!some.contains_key(DEFAULT_SUFFIX));
+        let warning = warning.expect("one warning");
+        assert!(warning.contains("`@jig` aliases are refused"), "{warning}");
+        assert!(!warning.contains("every alias"), "{warning}");
 
         // The operator's own entry wins.
         let mine = NameDelegation {
             authorities: vec!["did:jig:zMine".into()],
             nameservers: vec!["https://ns.mine".into()],
         };
-        let kept = with_default_delegation(
-            BTreeMap::from([(DEFAULT_SUFFIX.to_string(), mine.clone())]),
-            Ok("did:jig:zReal"),
-        );
-        assert_eq!(kept[DEFAULT_SUFFIX], mine);
+        for authority in [Ok("did:jig:zReal"), Err(NamingError::NoDefaultAuthority)] {
+            let (kept, warning) = with_default_delegation(
+                BTreeMap::from([(DEFAULT_SUFFIX.to_string(), mine.clone())]),
+                authority,
+            );
+            assert_eq!(kept[DEFAULT_SUFFIX], mine);
+            assert_eq!(warning, None, "the operator delegates `@jig` themselves");
+        }
     }
 
     /// The configured bound is what ingest enforces and the welcome signs; one

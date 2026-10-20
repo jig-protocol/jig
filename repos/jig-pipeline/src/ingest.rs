@@ -652,15 +652,35 @@ pub async fn ingest(
     )
     .map_err(|refusal| suite_refusal(refusal, &channel_label))?;
 
+    let mut render_input = match (&mls_plan, kind) {
+        (crate::mls_gate::MlsPlan::Sealed, _) => None,
+        (_, BlockKind::TextRender) => Some(text_render_input(ctx, &manifest, kind_str)?),
+        _ => None,
+    };
+    if render_input.is_some() && matches!(mls_plan, crate::mls_gate::MlsPlan::Advance { .. }) {
+        return Err(IngestError::MlsRejected {
+            detail: "an MLS commit cannot be a text-render block".to_string(),
+        });
+    }
+    if let Some(input) = &render_input {
+        check_text_render(ctx, input, &block_cid).await?;
+    }
     let (receipt_bytes, render_hash, is_synthetic) = match (&mls_plan, kind) {
         // Ciphertext cannot be executed, and the server does not pretend to.
-        (crate::mls_gate::MlsPlan::Sealed, _) => {
-            build_sealed_receipt(&block_cid, &ctx.server_did, &ctx.server_key)
-        }
-        (_, BlockKind::TextRender) => {
-            build_render_receipt(ctx, &manifest, &block_cid, kind_str).await?
-        }
-        _ => build_synth_receipt(&block_cid, &ctx.server_did, &ctx.server_key),
+        (crate::mls_gate::MlsPlan::Sealed, _) => (
+            crate::receipts::sealed(&block_cid, &ctx.server_key)
+                .map_err(|e| anyhow::anyhow!("signing the sealed receipt: {e}"))?,
+            None,
+            true,
+        ),
+        // Rendered after landing, from the block's ingest record (`render_after_landing`).
+        (_, BlockKind::TextRender) => (Vec::new(), None, false),
+        _ => (
+            crate::receipts::accepted(&block_cid, &ctx.server_key)
+                .map_err(|e| anyhow::anyhow!("signing the accepted receipt: {e}"))?,
+            None,
+            true,
+        ),
     };
 
     let canonical = bundle_canonical_bytes(bundle.manifest_bytes, bundle.code_bytes)
@@ -694,7 +714,7 @@ pub async fn ingest(
         },
     };
     let receipt_cid = format!("r_{}", &block_cid[..16.min(block_cid.len())]);
-    let stored_receipt = StoredReceipt {
+    let mut stored_receipt = StoredReceipt {
         cid: receipt_cid,
         block_cid: block_cid.clone(),
         server_id: ctx.server_did.to_string(),
@@ -794,16 +814,21 @@ pub async fn ingest(
             }
             let membership =
                 membership_change(kind, &manifest, resolved_channel.as_ref(), &block_cid);
-            match ctx.store.insert_block_sequenced_guarded(
+            let record = match ctx.store.insert_block_sequenced_guarded(
                 &stored_block,
                 signer,
                 &membership,
                 guard.as_ref(),
             )? {
-                crate::persist::Landing::Landed(_) => {}
+                crate::persist::Landing::Landed(record) => record,
                 _ => return Err(refused_at_landing(guard_refusal, kind_str)),
+            };
+            if let Some(input) = render_input.take() {
+                stored_receipt = receipt_after_landing(ctx, input, &block_cid, record).await;
             }
-            ctx.store.insert_receipt(&stored_receipt)?;
+            if !stored_receipt.receipt_bytes.is_empty() {
+                ctx.store.insert_receipt_once(&stored_receipt)?;
+            }
         }
         plan => {
             if let crate::mls_gate::MlsPlan::Genesis(mut group) = plan {
@@ -822,13 +847,21 @@ pub async fn ingest(
             )
             .await?;
             // Step 6: persist block (+ its record) + receipt
-            match signer.as_ref() {
-                Some(signer) => {
-                    ctx.store.insert_block_sequenced(&stored_block, signer)?;
+            let record = match signer.as_ref() {
+                Some(signer) => Some(ctx.store.insert_block_sequenced(&stored_block, signer)?),
+                None => {
+                    ctx.store.insert_block(&stored_block)?;
+                    None
                 }
-                None => ctx.store.insert_block(&stored_block)?,
+            };
+            // The receipt is written before fanout below, so no subscriber or peer sees the
+            // block without it.
+            if let Some(input) = render_input.take() {
+                stored_receipt = receipt_after_landing(ctx, input, &block_cid, record).await;
             }
-            ctx.store.insert_receipt(&stored_receipt)?;
+            if !stored_receipt.receipt_bytes.is_empty() {
+                ctx.store.insert_receipt_once(&stored_receipt)?;
+            }
         }
     }
 
@@ -1346,48 +1379,23 @@ fn verify_sig(
     Ok(Did::from_ed25519_pubkey(&pubkey_bytes))
 }
 
-/// Execute the canonical text-render module and build a server-signed receipt
-/// carrying the resulting `render_hash`.
+/// The text-render input for a block, checked before the block lands: the body is required, and
+/// so is an executor.
 ///
-/// Returns `(receipt_bytes, Some(render_hash), is_synthetic = false)`.
-///
-/// # What is signed, and why the shape matters
-///
-/// The payload separates two kinds of claim, because they have different
-/// standing:
-///
-/// - `render` — the `render_hash`, the identity of the module that produced it,
-///   and the rendered length. Reproducible: any conforming runtime executing the
-///   same module over the same body derives the same hash, so this is what
-///   federated servers compare. The module identity is inside the SIGNED bytes
-///   deliberately; an unsigned provenance claim is not worth having, since a
-///   mismatch between peers is only diagnosable if you can trust which code each
-///   one ran.
-/// - `engine` — the engine name, its version, and fuel consumed. **Local
-///   telemetry, never comparable across servers.** There is no cross-runtime
-///   metering standard, no published conversion between engines, and wasmtime has
-///   changed its own cost schedule. Recording the version beside the number is
-///   what keeps it honest; nesting it separately is what stops a future reader
-///   mistaking it for part of the agreed value.
-///
-/// See `docs/investigations/2026-08-11-fuel-portability.md`.
-async fn build_render_receipt(
+/// Only `body_raw` reaches `render_hash`; the rest is passed so the guest has the block's context.
+/// The ingest clock and the channel CID in the invocation come from the block's ingest record, at
+/// render time ([`render_after_landing`]).
+fn text_render_input(
     ctx: &IngestContext,
     manifest: &jig_core::BlockManifest,
-    block_cid: &str,
     kind_str: &str,
-) -> Result<(Vec<u8>, Option<String>, bool), IngestError> {
-    use ed25519_dalek::Signer;
-
-    let executor = ctx
-        .executor
-        .as_ref()
-        .ok_or_else(|| IngestError::NoExecutor {
+) -> Result<text_block::Input, IngestError> {
+    if ctx.executor.is_none() {
+        return Err(IngestError::NoExecutor {
             kind: kind_str.to_string(),
-        })?;
-
-    // The body is required. Rendering the empty string in its absence would hash
-    // a message nobody sent and report it as a successful render.
+        });
+    }
+    // Rendering the empty string in the body's absence would hash a message nobody sent.
     let body = manifest
         .metadata
         .get("body")
@@ -1396,147 +1404,267 @@ async fn build_render_receipt(
             kind: kind_str.to_string(),
             field: "body".to_string(),
         })?;
-
     let channel = manifest
         .metadata
         .get("channel")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let sender_did = manifest
-        .authors
-        .first()
-        .map(|a| a.did.to_string())
-        .unwrap_or_default();
     let hlc = manifest.hlc_ts.as_ref();
-
-    // Only `body_raw` reaches the hash — `text_block::execute_pure` derives
-    // `canonical_text` from it alone. The rest is passed faithfully so the guest
-    // has full context if a future module version wants it, and so a receipt
-    // reader can see what the module was given.
-    let input = text_block::Input {
-        sender_did,
+    Ok(text_block::Input {
+        sender_did: manifest
+            .authors
+            .first()
+            .map(|a| a.did.to_string())
+            .unwrap_or_default(),
         channel_id: channel.to_string(),
         body_raw: body.to_string(),
         hlc_wall_ms: hlc.map(|h| h.wall_ms).unwrap_or(0),
         hlc_logical: hlc.map(|h| h.logical).unwrap_or(0),
         hlc_origin: hlc.map(|h| h.server_did.to_string()).unwrap_or_default(),
         client_version: manifest.version.to_string(),
+    })
+}
+
+/// Render a landed `text-render` block and build its signed v0.3 receipt.
+///
+/// The `jig:block` invocation names the block's ingest record: its sequence, its clock and its
+/// channel. A client re-executing the block rebuilds the same invocation from the same record, so
+/// the receipt's invocation hash is one it can check. That record exists only once the block has
+/// landed, which is why rendering happens after landing and not before (JEP-0006).
+///
+/// A block with no record here (a relayed post for a channel another server sequences) gets an
+/// `accepted` receipt: without the record there is no invocation a client could rebuild.
+///
+/// Every run outcome gets an `exec` receipt, including a guest error, a trap and an incomplete
+/// run; only a successful render has a `render_hash`.
+async fn render_after_landing(
+    ctx: &IngestContext,
+    input: text_block::Input,
+    block_cid: &str,
+    record: Option<crate::ingest_record::IngestRecord>,
+) -> Result<StoredReceipt, IngestError> {
+    let record = match record {
+        Some(record) => Some(record),
+        None => ctx.store.get_ingest_record(block_cid)?,
+    };
+    let Some(record) = record else {
+        let bytes = crate::receipts::accepted(block_cid, &ctx.server_key)
+            .map_err(|e| anyhow::anyhow!("signing the accepted receipt: {e}"))?;
+        return Ok(stored_receipt(ctx, block_cid, bytes, None));
+    };
+    let executor = ctx
+        .executor
+        .as_ref()
+        .ok_or_else(|| IngestError::NoExecutor {
+            kind: BlockKind::TextRender.as_str().to_string(),
+        })?;
+
+    let mut invocation =
+        crate::executor::text_invocation(&input, block_cid.to_string(), record.seq);
+    invocation.channel_cid = record.channel_id.clone();
+    invocation.ingest_hlc = jig_runtime::component::Hlc {
+        wall_ms: record.ingest_wall_ms,
+        logical: record.ingest_logical,
     };
 
-    // Off the async worker: `render_text` is synchronous end to end. It parks on
-    // a condvar waiting for a concurrency slot and then runs the guest on that
-    // same thread, so calling it inline would hold a tokio worker for the whole
-    // wait plus execution. Execution is bounded by the epoch deadline; the slot
-    // wait is NOT bounded, so under load enough workers could park to stall the
-    // runtime — including the tasks that would have freed the slots.
+    let run = run_text_render(executor, invocation).await?;
+
+    let render_hash = run.text_output().ok().map(|o| o.render_hash);
+    let receipt = run.receipt(
+        crate::receipts::block_cid(block_cid)
+            .map_err(|e| anyhow::anyhow!("block CID for the receipt: {e}"))?,
+        crate::receipts::executor(&ctx.server_key),
+        crate::receipts::now_ms(),
+    );
+    let bytes = crate::receipts::sign(receipt, &ctx.server_key)
+        .map_err(|e| anyhow::anyhow!("signing the exec receipt: {e}"))?;
+    Ok(stored_receipt(ctx, block_cid, bytes, render_hash))
+}
+
+/// The receipt of a landed `text-render` block, whatever happens while rendering it.
+///
+/// Once the block and its record have landed, ingest must not report it as refused: it is in the
+/// channel's chain and history serves it. So a failure here (the render task dying, a store
+/// error reading the record, a signing error) is logged and the block gets an `accepted` receipt
+/// instead of an `exec` one. If even that cannot be signed, the receipt is left unwritten: readers
+/// see the block as pending, and the boot backfill tries again.
+async fn receipt_after_landing(
+    ctx: &IngestContext,
+    input: text_block::Input,
+    block_cid: &str,
+    record: Option<crate::ingest_record::IngestRecord>,
+) -> StoredReceipt {
+    #[cfg(test)]
+    let rendered = if FAIL_AFTER_LANDING.with(|f| f.replace(false)) {
+        Err(IngestError::RenderFailed {
+            kind: "text-render".into(),
+            detail: "injected by a test".into(),
+        })
+    } else {
+        render_after_landing(ctx, input, block_cid, record).await
+    };
+    #[cfg(not(test))]
+    let rendered = render_after_landing(ctx, input, block_cid, record).await;
+    match rendered {
+        Ok(receipt) => receipt,
+        Err(e) => {
+            tracing::warn!(block_cid, error = %e, "rendering a landed block failed; writing an accepted receipt");
+            fallback_receipt(ctx, block_cid)
+        }
+    }
+}
+
+/// An `accepted` receipt for a landed block that could not be rendered. Empty bytes if it cannot
+/// be signed; [`SqliteStore::insert_receipt_once`] callers skip those.
+fn fallback_receipt(ctx: &IngestContext, block_cid: &str) -> StoredReceipt {
+    match crate::receipts::accepted(block_cid, &ctx.server_key) {
+        Ok(bytes) => stored_receipt(ctx, block_cid, bytes, None),
+        Err(e) => {
+            tracing::error!(block_cid, error = %e, "signing an accepted receipt failed; the block stays pending");
+            stored_receipt(ctx, block_cid, Vec::new(), None)
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes the next render after landing fail, so a test can check ingest still reports the
+    /// landed block as accepted.
+    static FAIL_AFTER_LANDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run text-render once, off the async worker.
+///
+/// `render` parks on a condvar for a concurrency slot and then runs the guest on the same thread.
+/// Execution is bounded by the epoch deadline; the slot wait is not, so running it inline could
+/// park enough workers to stall the tasks that would free slots.
+async fn run_text_render(
+    executor: &Arc<crate::executor::BlockExecutor>,
+    invocation: jig_runtime::component::Invocation,
+) -> Result<crate::executor::ExecRun, IngestError> {
     let executor = Arc::clone(executor);
-    let kind_owned = kind_str.to_string();
-    let rendered = tokio::task::spawn_blocking(move || executor.render_text(&input))
+    let kind = BlockKind::TextRender.as_str().to_string();
+    tokio::task::spawn_blocking(move || executor.render(&invocation))
         .await
-        // A join error means the blocking task panicked or the pool shut down.
-        // Distinct from a render failure, and worth saying so: it points at the
-        // host, not the block.
+        // A join error points at the host (a panic, a pool shut down), not the block.
         .map_err(|e| IngestError::RenderFailed {
-            kind: kind_owned.clone(),
+            kind: kind.clone(),
             detail: format!("render task did not complete: {e}"),
         })?
         .map_err(|e| IngestError::RenderFailed {
-            kind: kind_owned,
+            kind,
             detail: e.to_string(),
+        })
+}
+
+/// Refuse, before it lands, a `text-render` block whose render runs out of fuel, stack or time,
+/// or faults the host.
+///
+/// An `incomplete` run asserts nothing about the block (JEP-0006), and nothing requires storing
+/// it. Storing it would let one post that exhausts the limits be fanned out and, in step 7,
+/// re-executed by every recipient. The receipt's run needs the block's ingest record, which
+/// exists only after landing, and a landed block cannot be unlanded (its record is in the
+/// channel's hash chain). So this check runs first, on the invocation without the record
+/// (sequence 0, the block's own clock); the receipt's run follows after landing.
+///
+/// Fuel and stack use do not depend on the record's values for a renderer that does not branch on
+/// them, which includes text-block. A deadline can still pass on the second run under load; that
+/// block lands with an `incomplete` receipt, which is never compared.
+async fn check_text_render(
+    ctx: &IngestContext,
+    input: &text_block::Input,
+    block_cid: &str,
+) -> Result<(), IngestError> {
+    let executor = ctx
+        .executor
+        .as_ref()
+        .ok_or_else(|| IngestError::NoExecutor {
+            kind: BlockKind::TextRender.as_str().to_string(),
         })?;
-
-    let canonical = serde_json::to_vec(&serde_json::json!({
-        "v": "0.3-render",
-        "block_cid": block_cid,
-        "server_did": ctx.server_did.to_string(),
-        "synthetic": false,
-        "render": {
-            "hash": rendered.output.render_hash,
-            "module": rendered.module_id,
-            "length_bytes": rendered.output.length_bytes,
-        },
-        "engine": {
-            "name": "wasmtime",
-            "identity": rendered.engine_identity,
-            "fuel_used": rendered.fuel_used,
-        },
-        "produced_at": chrono::Utc::now().timestamp(),
-    }))
-    .expect("render receipt JSON is always valid");
-
-    let sig = ctx.server_key.sign(&canonical);
-    let wrapped = serde_json::json!({
-        "canonical_hex": hex::encode(&canonical),
-        "sig_hex": hex::encode(sig.to_bytes()),
-    });
-    let bytes = serde_json::to_vec(&wrapped).expect("render receipt wrap is always valid");
-
-    Ok((bytes, Some(rendered.output.render_hash), false))
+    let run = run_text_render(
+        executor,
+        crate::executor::text_invocation(input, block_cid.to_string(), 0),
+    )
+    .await?;
+    if let jig_runtime::component::RunOutcome::Incomplete(reason) = &run.outcome {
+        return Err(IngestError::RenderFailed {
+            kind: BlockKind::TextRender.as_str().to_string(),
+            detail: format!("the render is incomplete: {}", reason.as_str()),
+        });
+    }
+    Ok(())
 }
 
-/// Build a server-signed synthetic receipt for blocks that lack a Wasm artifact.
-///
-/// The receipt carries the server DID and a signature over a small JSON
-/// payload so clients can verify the server received and persisted the block.
-/// Phase D replaces this for `TextRender` once text-render.wasm is loaded.
-fn build_synth_receipt(
+fn stored_receipt(
+    ctx: &IngestContext,
     block_cid: &str,
-    server_did: &Did,
-    server_key: &ed25519_dalek::SigningKey,
-) -> (Vec<u8>, Option<String>, bool) {
-    use ed25519_dalek::Signer;
-
-    let canonical = serde_json::to_vec(&serde_json::json!({
-        "v": "0.2-synthetic",
-        "block_cid": block_cid,
-        "server_did": server_did.to_string(),
-        "synthetic": true,
-        "produced_at": chrono::Utc::now().timestamp(),
-    }))
-    .expect("synthetic receipt JSON is always valid");
-
-    let sig = server_key.sign(&canonical);
-
-    let wrapped = serde_json::json!({
-        "canonical_hex": hex::encode(&canonical),
-        "sig_hex": hex::encode(sig.to_bytes()),
-    });
-    let bytes = serde_json::to_vec(&wrapped).expect("synthetic receipt wrap is always valid");
-
-    // render_hash is None for synthetic receipts (no Wasm execution output).
-    (bytes, None, true)
+    receipt_bytes: Vec<u8>,
+    render_hash: Option<String>,
+) -> StoredReceipt {
+    StoredReceipt {
+        cid: format!("r_{}", &block_cid[..16.min(block_cid.len())]),
+        block_cid: block_cid.to_string(),
+        server_id: ctx.server_did.to_string(),
+        receipt_bytes,
+        render_hash,
+        produced_at: chrono::Utc::now().timestamp(),
+    }
 }
 
-/// Build a server-signed receipt for encrypted content.
+/// Write the receipt of every `text-render` block that landed without one: the server stopped
+/// between landing a block and writing its receipt. Run at boot, before serving.
 ///
-/// Attests what the server actually checked — the author's signature, that
-/// the payload is an MLS application message for the channel's group at a
-/// current epoch, and that the block was persisted — and says plainly that
-/// nothing was executed. No `render_hash`: the server never saw the text.
-fn build_sealed_receipt(
-    block_cid: &str,
-    server_did: &Did,
-    server_key: &ed25519_dalek::SigningKey,
-) -> (Vec<u8>, Option<String>, bool) {
-    use ed25519_dalek::Signer;
+/// Rendering is deterministic, so a backfilled receipt states what the straight-through one would
+/// have. Writing is idempotent, so running this twice, or alongside ingest, stores one receipt per
+/// block. Returns how many receipts it wrote.
+pub async fn backfill_render_receipts(ctx: &IngestContext) -> Result<usize, IngestError> {
+    let kind = BlockKind::TextRender.as_str();
+    let mut written = 0;
+    let mut fell_back = 0;
+    for block in ctx
+        .store
+        .blocks_missing_receipt(kind, &ctx.server_did.to_string())?
+    {
+        // One block that cannot be rendered (a damaged bundle, a missing body) gets an
+        // `accepted` receipt and is logged, so it neither stops the blocks after it nor comes
+        // back on every boot.
+        let receipt = match backfill_input(ctx, &block, kind) {
+            Ok(input) => match render_after_landing(ctx, input, &block.cid, None).await {
+                Ok(receipt) => receipt,
+                Err(e) => {
+                    tracing::warn!(block_cid = %block.cid, error = %e, "backfill render failed");
+                    fell_back += 1;
+                    fallback_receipt(ctx, &block.cid)
+                }
+            },
+            Err(e) => {
+                tracing::warn!(block_cid = %block.cid, error = %e, "stored block cannot be rendered");
+                fell_back += 1;
+                fallback_receipt(ctx, &block.cid)
+            }
+        };
+        if !receipt.receipt_bytes.is_empty() && ctx.store.insert_receipt_once(&receipt)? {
+            written += 1;
+        }
+    }
+    if fell_back > 0 {
+        tracing::warn!(
+            fell_back,
+            "backfill wrote accepted receipts for blocks it could not render"
+        );
+    }
+    Ok(written)
+}
 
-    let canonical = serde_json::to_vec(&serde_json::json!({
-        "v": "0.3-sealed",
-        "block_cid": block_cid,
-        "server_did": server_did.to_string(),
-        "synthetic": true,
-        "content": "sealed",
-        "suite": "mls",
-        "produced_at": chrono::Utc::now().timestamp(),
-    }))
-    .expect("sealed receipt JSON is always valid");
-    let sig = server_key.sign(&canonical);
-    let wrapped = serde_json::json!({
-        "canonical_hex": hex::encode(&canonical),
-        "sig_hex": hex::encode(sig.to_bytes()),
-    });
-    let bytes = serde_json::to_vec(&wrapped).expect("sealed receipt wrap is always valid");
-    (bytes, None, true)
+fn backfill_input(
+    ctx: &IngestContext,
+    block: &StoredBlock,
+    kind: &str,
+) -> Result<text_block::Input, IngestError> {
+    let (manifest_bytes, _code): (Vec<u8>, Vec<u8>) =
+        serde_json::from_slice(&block.bundle_bytes)
+            .map_err(|e| IngestError::BundleMalformed(format!("stored bundle: {e}")))?;
+    text_render_input(ctx, &parse_manifest(&manifest_bytes)?, kind)
 }
 
 // ---- Tests ----------------------------------------------------------------
@@ -1691,8 +1819,10 @@ mod tests {
     #[tokio::test]
     async fn ingest_persists_block_and_receipt() {
         let ctx = test_ctx();
+        seed_channel(&ctx, "#hello");
         let sender_key = random_signing_key();
-        let (mb, cb, sig) = build_bundle_parts(&sender_key, BlockKind::TextRender);
+        let (mb, cb, sig) =
+            build_bundle_parts_with_channel(&sender_key, BlockKind::TextRender, "#hello");
 
         let block_cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
             .await
@@ -1733,6 +1863,210 @@ mod tests {
             !stored.is_synthetic,
             "a block that executed must not be marked synthetic"
         );
+    }
+
+    fn exec_receipt(
+        ctx: &IngestContext,
+        block_cid: &str,
+    ) -> jig_core::block_receipt::SignedReceipt {
+        let stored = ctx
+            .store
+            .get_receipts_for_block(block_cid)
+            .unwrap()
+            .remove(0);
+        match crate::receipts::read(&stored.receipt_bytes).expect("the receipt verifies") {
+            crate::receipts::ReadReceipt::V03(r) => r,
+            other => panic!("a new receipt is v0.3, got {other:?}"),
+        }
+    }
+
+    async fn ingest_text(ctx: &IngestContext, body: &str) -> String {
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &random_signing_key(),
+            BlockKind::TextRender,
+            &[("channel", "#hello"), ("body", body)],
+        );
+        do_ingest(ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap()
+    }
+
+    /// The `exec` receipt is signed by this server and names the invocation a client rebuilds
+    /// from the block's ingest record: its seq, clock and channel.
+    #[tokio::test]
+    async fn a_text_render_gets_an_exec_receipt_for_the_invocation_its_record_names() {
+        use jig_core::block_receipt::Body;
+        let ctx = test_ctx();
+        seed_channel(&ctx, "#hello");
+        let cid = ingest_text(&ctx, TEST_BODY).await;
+
+        let signed = exec_receipt(&ctx, &cid);
+        assert_eq!(
+            signed.receipt.executor,
+            crate::receipts::executor(&ctx.server_key)
+        );
+        let Body::Exec(exec) = &signed.receipt.body else {
+            panic!("a rendered block gets an exec receipt");
+        };
+        assert!(matches!(
+            exec.outcome,
+            jig_core::block_receipt::Outcome::Ok { .. }
+        ));
+
+        let record = ctx
+            .store
+            .get_ingest_record(&cid)
+            .unwrap()
+            .expect("sequenced");
+        let block = ctx.store.get_block(&cid).unwrap().unwrap();
+        let (manifest_bytes, _): (Vec<u8>, Vec<u8>) =
+            serde_json::from_slice(&block.bundle_bytes).unwrap();
+        let input = text_render_input(
+            &ctx,
+            &parse_manifest(&manifest_bytes).unwrap(),
+            "text-render",
+        )
+        .unwrap();
+        let mut invocation = crate::executor::text_invocation(&input, cid.clone(), record.seq);
+        invocation.channel_cid = record.channel_id.clone();
+        invocation.ingest_hlc = jig_runtime::component::Hlc {
+            wall_ms: record.ingest_wall_ms,
+            logical: record.ingest_logical,
+        };
+        assert_eq!(
+            exec.invocation_hash,
+            jig_runtime::component::hash_bytes(&jig_runtime::component::invocation_hash(
+                &invocation
+            )),
+            "a client rebuilding the invocation from the record must get the same hash"
+        );
+    }
+
+    /// Without an ingest record there is no invocation a client could rebuild, so the block is
+    /// stored with an `accepted` receipt and no render_hash.
+    #[tokio::test]
+    async fn a_text_render_with_no_ingest_record_gets_an_accepted_receipt() {
+        let ctx = test_ctx();
+        let (mb, cb, sig) = build_bundle_parts(&random_signing_key(), BlockKind::TextRender);
+        let cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap();
+        assert!(ctx.store.get_ingest_record(&cid).unwrap().is_none());
+        let stored = ctx.store.get_receipts_for_block(&cid).unwrap().remove(0);
+        assert_eq!(stored.render_hash, None);
+        assert_eq!(
+            exec_receipt(&ctx, &cid).receipt.body,
+            jig_core::block_receipt::Body::Accepted
+        );
+    }
+
+    /// A render that runs out of fuel is refused before the block lands: nothing is stored,
+    /// sequenced or fanned out.
+    #[tokio::test]
+    async fn a_text_render_that_exhausts_its_fuel_is_refused_before_landing() {
+        let mut ctx = test_ctx();
+        let mut config = jig_runtime::RuntimeConfig::default();
+        config.limits.fuel_max = 100; // far below what a render costs
+        ctx.executor = Some(Arc::new(
+            crate::executor::BlockExecutor::for_tests(config).unwrap(),
+        ));
+        seed_channel(&ctx, "#hello");
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &random_signing_key(),
+            BlockKind::TextRender,
+            &[("channel", "#hello"), ("body", "too expensive")],
+        );
+        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, IngestError::RenderFailed { detail, .. } if detail.contains("fuel-exhausted")),
+            "{err:?}"
+        );
+        assert!(
+            ctx.store
+                .list_blocks_by_channel("#hello", 10, None)
+                .unwrap()
+                .is_empty(),
+            "the refused block must not have landed"
+        );
+    }
+
+    /// A render that fails after the block has landed does not make ingest report the block as
+    /// refused: it is in the chain. It gets an `accepted` receipt and is delivered.
+    #[tokio::test]
+    async fn a_render_failure_after_landing_still_accepts_and_delivers_the_block() {
+        let ctx = test_ctx();
+        let channel_id = seed_channel(&ctx, "#hello");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.fanout
+            .subscribe_local(
+                crate::fanout::SubscriptionScope::Channel(channel_id),
+                crate::fanout::SubscriberIdentity::Unchecked,
+                tx,
+            )
+            .await;
+        super::FAIL_AFTER_LANDING.with(|f| f.set(true));
+        let cid = ingest_text(&ctx, "lands, then the render fails").await;
+
+        assert!(ctx.store.get_ingest_record(&cid).unwrap().is_some());
+        assert_eq!(
+            exec_receipt(&ctx, &cid).receipt.body,
+            jig_core::block_receipt::Body::Accepted
+        );
+        assert!(rx.try_recv().is_ok(), "the landed block must be delivered");
+    }
+
+    /// One stored block the backfill cannot render gets an `accepted` receipt; it does not stop
+    /// the blocks after it.
+    #[tokio::test]
+    async fn the_backfill_skips_past_a_block_it_cannot_render() {
+        let ctx = test_ctx();
+        seed_channel(&ctx, "#hello");
+        let bad = ingest_text(&ctx, "first").await;
+        let good = ingest_text(&ctx, "second").await;
+        ctx.store.delete_receipts_for_block(&bad).unwrap();
+        ctx.store.delete_receipts_for_block(&good).unwrap();
+        ctx.store.corrupt_bundle_for_test(&bad).unwrap();
+
+        assert_eq!(backfill_render_receipts(&ctx).await.unwrap(), 2);
+        assert_eq!(
+            exec_receipt(&ctx, &bad).receipt.body,
+            jig_core::block_receipt::Body::Accepted
+        );
+        assert!(matches!(
+            exec_receipt(&ctx, &good).receipt.body,
+            jig_core::block_receipt::Body::Exec(_)
+        ));
+    }
+
+    /// The server stops after landing a block and before writing its receipt. At the next boot
+    /// the backfill writes the receipt the straight-through path would have, and only once.
+    #[tokio::test]
+    async fn the_boot_backfill_writes_the_receipt_a_crash_skipped() {
+        let ctx = test_ctx();
+        seed_channel(&ctx, "#hello");
+        let cid = ingest_text(&ctx, "written before the crash").await;
+        let straight = exec_receipt(&ctx, &cid);
+        let render_hash = ctx.store.get_receipts_for_block(&cid).unwrap()[0]
+            .render_hash
+            .clone();
+
+        // The crash: the block and its record landed, the receipt did not.
+        ctx.store.delete_receipts_for_block(&cid).unwrap();
+        assert!(ctx.store.get_receipts_for_block(&cid).unwrap().is_empty());
+
+        assert_eq!(backfill_render_receipts(&ctx).await.unwrap(), 1);
+        let backfilled = exec_receipt(&ctx, &cid);
+        assert_eq!(backfilled.receipt.body, straight.receipt.body);
+        assert_eq!(
+            ctx.store.get_receipts_for_block(&cid).unwrap()[0].render_hash,
+            render_hash
+        );
+
+        // Idempotent: nothing left to write, and the receipt is not duplicated.
+        assert_eq!(backfill_render_receipts(&ctx).await.unwrap(), 0);
+        assert_eq!(ctx.store.get_receipts_for_block(&cid).unwrap().len(), 1);
     }
 
     /// Absent `metadata.body`, there is nothing to render. Ingest must say so
@@ -2143,7 +2477,12 @@ mod tests {
         );
         let receipt = ctx.store.get_receipts_for_block(&cid).unwrap().remove(0);
         assert_eq!(receipt.render_hash, None, "nothing was executed");
-        assert!(String::from_utf8_lossy(&receipt.receipt_bytes).contains(&hex::encode("sealed")));
+        let crate::receipts::ReadReceipt::V03(read) =
+            crate::receipts::read(&receipt.receipt_bytes).expect("the sealed receipt verifies")
+        else {
+            panic!("a new receipt is v0.3");
+        };
+        assert_eq!(read.receipt.body, jig_core::block_receipt::Body::Sealed);
         // Bob reads what the server cannot.
         let (_, bundle_msg) = (stored, msg);
         assert_eq!(
