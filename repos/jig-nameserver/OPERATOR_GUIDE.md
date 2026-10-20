@@ -75,7 +75,9 @@ queue_len = 20
 queue_wait_secs = 10
 ```
 
-- A stranger registration whose work and signature verified takes a token. With none left it waits, up to `queue_len` of them, the highest effort bid first; a full queue takes a newcomer only if it bids more than the lowest waiting, which is refused. After `queue_wait_secs` without a token the answer is `503 REGISTRATION_BUSY` with `Retry-After`. The challenge is not consumed, but the client should fetch a fresh one.
+- A stranger registration whose work and signature verified takes a token. With none left it waits, up to `queue_len` of them, the highest effort bid first; a full queue takes a newcomer only if it bids more than the lowest waiting, which is refused. After `queue_wait_secs` without a token the answer is `503 REGISTRATION_BUSY` with `Retry-After`. The challenge is not consumed, but the retry must fetch a fresh one (as `jig` does): the old one may not outlive the wait.
+- `max_solve_secs + queue_wait_secs` must fit the 60 s challenge lifetime (`queue_wait_secs` alone when `min_effort = 0`), or the nameserver refuses to start.
+- On a suffix that asks for no work (`min_effort = 0`), every stranger bids 0, so the queue is first come, first served: a `pow` field the nameserver did not check never orders it.
 - **The controller.** After a window in which the queue filled, the effort asked doubles (up to `max_effort`); after a window in which nothing queued, it halves (never below `min_effort`). New challenges state the current effort.
 - Allowlisted registrations skip the pool and pay `min_effort`.
 - The pool, controller and penalties are in memory and per process.

@@ -854,3 +854,65 @@ async fn futures_join_all<F: std::future::Future>(fs: impl Iterator<Item = F>) -
     .await;
     out
 }
+
+/// On a suffix that asks for no work, `check_pow` never looks at `pow`, so
+/// the effort it claims must not order the queue: an unchecked high bid does
+/// not displace an honest stranger already waiting.
+#[tokio::test]
+async fn unchecked_work_does_not_jump_the_queue() {
+    let mut cfg = pooled(A, 0, 1, 1);
+    cfg.pow = PowPolicy::off();
+    cfg.pool.queue_len = 1;
+    cfg.pool.queue_wait_secs = 30;
+    let state = state_with(vec![cfg]);
+    let r = router(&state);
+    let market = || state.suffixes.get(A).unwrap().market().stats();
+    let body_for =
+        |key: &SigningKey, local: &str, ch: &str| register_body(&state, key, local, A, ch, None);
+    let challenge = |did: String, local: &str| {
+        let (r, name) = (r.clone(), format!("{local}@{A}"));
+        async move {
+            let (status, body) = offer(&r, "register", &did, &name).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body["challenge"].as_str().unwrap().to_string()
+        }
+    };
+
+    // Alice takes the hour's one token.
+    let (alice_did, alice) = fresh_did_and_key();
+    let ch = challenge(alice_did, "alice").await;
+    let (status, body) = post(&r, "/v1/register", body_for(&alice, "alice", &ch)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Bob, honest, waits in the queue's one place.
+    let (bob_did, bob) = fresh_did_and_key();
+    let ch = challenge(bob_did, "bobby").await;
+    let bob_body = body_for(&bob, "bobby", &ch);
+    let bob_router = r.clone();
+    let waiting = tokio::spawn(async move { post(&bob_router, "/v1/register", bob_body).await });
+    while market().queued == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    // Mallory claims the most work there is, and did none.
+    let (mallory_did, mallory) = fresh_did_and_key();
+    let ch = challenge(mallory_did, "mallory").await;
+    let mut body = body_for(&mallory, "mallory", &ch);
+    body["pow"] = serde_json::json!({
+        "alg": 1,
+        "effort": jig_core::pow::MAX_EFFORT,
+        "nonce": "AAAAAAAAAAA",
+        "salt_id": 0,
+    });
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        post(&r, "/v1/register", body),
+    )
+    .await
+    .expect("refused at once, not queued");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "REGISTRATION_BUSY");
+    assert_eq!(market().queued, 1, "Bob keeps his place");
+    assert!(!waiting.is_finished(), "Bob was not bumped");
+    waiting.abort();
+}
