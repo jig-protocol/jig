@@ -63,6 +63,47 @@ async fn an_owner_can_read_their_own_restricted_channel() {
     );
 }
 
+/// A co-owner listed in the channel-create holds every right, so it is a
+/// member too: it passes the read gate and reads the history, and the
+/// channel list shows it the restricted channel.
+#[tokio::test]
+async fn a_co_owner_can_read_a_restricted_channel() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let co_owner = Identity::new(2);
+    let me = owner.as_client();
+    let mut meta = server.mls_genesis(&owner, "#private");
+    meta["slug"] = "#private".into();
+    meta["visibility"] = "restricted".into();
+    meta["co_owners"] = serde_json::json!([co_owner.as_client().did_string()]);
+    let create = jig_client::blocks::build_with_metadata(
+        &me,
+        jig_core::BlockKind::ChannelCreate,
+        jig_core::HlcTimestamp::now_wall(me.did().clone()),
+        meta,
+    );
+    let (status, body) = server.try_submit(&create).await;
+    assert_eq!(status, StatusCode::OK, "create: {body}");
+
+    let (status, body) = server
+        .send(&server.sign_get(&co_owner, &history_path("#private")))
+        .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert!(
+        body.as_array().is_some_and(|blocks| !blocks.is_empty()),
+        "the co-owner reads the history: {body}"
+    );
+
+    let (status, listing) = server
+        .send(&server.sign_get(&co_owner, "/api/v1/channels"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "body={listing}");
+    assert!(
+        listing.to_string().contains("#private"),
+        "listing={listing}"
+    );
+}
+
 #[tokio::test]
 async fn an_open_channel_is_readable_by_any_authenticated_caller() {
     let server = TestServer::authenticated();

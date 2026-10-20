@@ -193,8 +193,6 @@ async fn start_inproc_server() -> anyhow::Result<(String, JoinHandle<()>)> {
         storage,
         ns_id: "perf".into(),
         ns_pubkey_hex: String::new(),
-        federation: None,
-        federation_coordinator: None,
     });
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;

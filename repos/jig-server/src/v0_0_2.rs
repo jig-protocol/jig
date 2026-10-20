@@ -14,7 +14,7 @@
 use crate::runtime::ExecutionConfig;
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
-use jig_config::v0_0_2_server::{IdentityMode, JigServerConfig};
+use jig_config::v0_0_2_server::{IdentityMode, JigServerConfig, NameDelegation};
 use jig_core::Did;
 use jig_pipeline::{
     executor::BlockExecutor,
@@ -24,6 +24,7 @@ use jig_pipeline::{
     ingest::IngestContext,
     persist::SqliteStore,
 };
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -163,6 +164,18 @@ impl AppState {
         if backfilled > 0 {
             tracing::info!(backfilled, "gave stored blocks their ingest records");
         }
+        // Channels from before channel terms (JEP-0005 rules 5-6) were all
+        // this server's: they take its DID as their sequencer, here, where
+        // the key is known. The migration could only mark them "this server".
+        let adopted = store
+            .adopt_local_sequencer(&server_did.to_did_jig_string())
+            .context("recording this server as its channels' sequencer")?;
+        if adopted > 0 {
+            tracing::info!(
+                adopted,
+                "recorded this server as the sequencer of stored channels"
+            );
+        }
 
         let identity: Arc<dyn IdentityResolver> = match config.identity.mode {
             IdentityMode::Tofu => Arc::new(TofuResolver::new(store.clone())),
@@ -181,7 +194,9 @@ impl AppState {
                     );
                 }
                 Arc::new(NameserverResolver::new(
-                    suffix_authorities(&config.identity.delegations),
+                    suffix_authorities(&with_default_jig_delegation(
+                        config.identity.delegations.clone(),
+                    )),
                     config.identity.cache_ttl_seconds,
                     store.clone(),
                 ))
@@ -413,8 +428,73 @@ pub fn suffix_authorities(
         .collect()
 }
 
+/// `[identity.delegations]` plus the built-in delegation for
+/// `jig_core::naming::DEFAULT_SUFFIX`, when the config has none for it and
+/// this build has a real authority: `jig → {authorities: [DEFAULT_JIG_AUTHORITY],
+/// nameservers: [DEFAULT_JIG_NAMESERVER]}`. An operator overrides it with their
+/// own `[identity.delegations.jig]`. While the authority is the placeholder
+/// nothing is added and boot carries on; `@jig` names then fail closed at
+/// lookup, like any suffix without a delegation.
+fn with_default_jig_delegation(
+    delegations: BTreeMap<String, NameDelegation>,
+) -> BTreeMap<String, NameDelegation> {
+    with_default_delegation(delegations, jig_core::naming::default_jig_authority())
+}
+
+fn with_default_delegation(
+    mut delegations: BTreeMap<String, NameDelegation>,
+    authority: Result<&str, jig_core::naming::NamingError>,
+) -> BTreeMap<String, NameDelegation> {
+    use jig_core::naming::{DEFAULT_JIG_NAMESERVER, DEFAULT_SUFFIX};
+    if delegations.contains_key(DEFAULT_SUFFIX) {
+        return delegations;
+    }
+    match authority {
+        Ok(authority) => {
+            delegations.insert(
+                DEFAULT_SUFFIX.to_string(),
+                NameDelegation {
+                    authorities: vec![authority.to_string()],
+                    nameservers: vec![DEFAULT_JIG_NAMESERVER.to_string()],
+                },
+            );
+        }
+        Err(e) => tracing::warn!(
+            "no built-in [identity.delegations.{DEFAULT_SUFFIX}]: {e}; `@{DEFAULT_SUFFIX}` \
+             aliases are refused unless the config delegates the suffix"
+        ),
+    }
+    delegations
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_built_in_jig_delegation_is_added_only_with_a_real_authority() {
+        use super::*;
+        use jig_core::naming::{DEFAULT_JIG_NAMESERVER, DEFAULT_SUFFIX, NamingError};
+        let added = with_default_delegation(BTreeMap::new(), Ok("did:jig:zReal"));
+        assert_eq!(added[DEFAULT_SUFFIX].authorities, ["did:jig:zReal"]);
+        assert_eq!(added[DEFAULT_SUFFIX].nameservers, [DEFAULT_JIG_NAMESERVER]);
+
+        // What every build without `test-default-authority` gets today:
+        // nothing added, and boot carries on.
+        let refused =
+            with_default_delegation(BTreeMap::new(), Err(NamingError::NoDefaultAuthority));
+        assert!(!refused.contains_key(DEFAULT_SUFFIX));
+
+        // The operator's own entry wins.
+        let mine = NameDelegation {
+            authorities: vec!["did:jig:zMine".into()],
+            nameservers: vec!["https://ns.mine".into()],
+        };
+        let kept = with_default_delegation(
+            BTreeMap::from([(DEFAULT_SUFFIX.to_string(), mine.clone())]),
+            Ok("did:jig:zReal"),
+        );
+        assert_eq!(kept[DEFAULT_SUFFIX], mine);
+    }
+
     /// The configured bound is what ingest enforces and the welcome signs; one
     /// outside the protocol's range stops the boot.
     #[test]
