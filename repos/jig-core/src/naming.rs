@@ -24,6 +24,7 @@ use crate::did::Did;
 pub const ATTESTATION_DOMAIN: &str = "jig-alias-attestation-v1";
 pub const DELEGATION_DOMAIN: &str = "jig-suffix-delegation-v1";
 pub const REACHABILITY_DOMAIN: &str = "jig-reach-v1";
+pub const POW_OFFER_DOMAIN: &str = "jig-ns-pow-offer-v1";
 
 /// Longest alias local part, in characters.
 pub const MAX_ALIAS_LEN: usize = 24;
@@ -173,6 +174,48 @@ pub fn proof_hash(action: Action, ns_did: &str, alias: &str, challenge: &str) ->
     *blake3::hash(&proof_payload(action, ns_did, alias, challenge)).as_bytes()
 }
 
+/// The domain of [`rotate_pow_binding`].
+pub const ROTATE_POW_DOMAIN: &str = "jig-alias-rotate-pow-v1";
+
+/// What a rotation's proof-of-work binds to until lane I's I3 gives
+/// [`Action`] a `Rotate` (R1 decision 4): BLAKE3 of the deterministic CBOR
+/// map `{domain, ns_did, alias, old_did, new_did, challenge}`, built like
+/// [`proof_hash`], so I3 changes only its domain. Every DID must be
+/// canonical `did:jig`, and `alias` the normalized `alias@suffix`.
+pub fn rotate_pow_binding(
+    ns_did: &str,
+    alias: &str,
+    old_did: &str,
+    new_did: &str,
+    challenge: &str,
+) -> Result<[u8; 32], NamingError> {
+    canonical_did(ns_did)?;
+    canonical_did(old_did)?;
+    canonical_did(new_did)?;
+    if Name::parse(alias)?.as_alias() != alias {
+        return Err(NamingError::BadName(alias.to_string()));
+    }
+    let payload = encode(Value::text_map([
+        ("domain", Value::Text(ROTATE_POW_DOMAIN.into())),
+        ("ns_did", Value::Text(ns_did.into())),
+        ("alias", Value::Text(alias.into())),
+        ("old_did", Value::Text(old_did.into())),
+        ("new_did", Value::Text(new_did.into())),
+        ("challenge", Value::Text(challenge.into())),
+    ]));
+    Ok(*blake3::hash(&payload).as_bytes())
+}
+
+/// `s` is a `did:jig` in its one canonical spelling: it parses, and prints
+/// back as exactly `s`.
+fn canonical_did(s: &str) -> Result<(), NamingError> {
+    Did::from_did_jig_string(s)
+        .ok()
+        .filter(|d| d.to_did_jig_string() == s)
+        .map(|_| ())
+        .ok_or_else(|| NamingError::BadDid(s.to_string()))
+}
+
 /// Sign a proof of control as `key`: a COSE_Sign1 over [`proof_payload`].
 pub fn sign_proof(
     key: &SigningKey,
@@ -198,6 +241,105 @@ pub fn verify_proof(
         &proof_payload(action, ns_did, alias, challenge),
         did,
     )
+}
+
+/// What a nameserver asks for one challenge: proof-of-work at `effort` for
+/// `action` by `did` on `name` (JEP-0008 rule 16), signed by `ns_did`. The
+/// nameserver checks the proof against this effort, not against what it would
+/// ask when the proof arrives, so a client is never refused for a rise
+/// mid-solve. A client checks the signature and refuses an effort above its
+/// own cap.
+///
+/// Every field has one encoding (JEP-0004 rule 0): `action` is one of the
+/// three nameserver actions, `did` a canonical `did:jig`, `name` the
+/// normalized `alias@suffix`, and the numbers fit `u32`, which every effort
+/// up to [`crate::pow::MAX_EFFORT`] does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PowOffer {
+    pub challenge: String,
+    /// `ns-register`, `ns-renew` or `ns-rotate`.
+    pub action: crate::pow::Action,
+    pub name: String,
+    pub did: String,
+    pub ns_did: String,
+    pub alg: u32,
+    /// `0` when no work is asked.
+    pub effort: u32,
+    pub salt_id: u32,
+    pub expires_at: i64,
+    /// `ns_did`'s COSE_Sign1 over [`PowOffer::payload`].
+    pub envelope: Vec<u8>,
+}
+
+impl PowOffer {
+    const WHAT: &'static str = "proof-of-work offer";
+
+    pub fn payload(&self) -> Vec<u8> {
+        encode(Value::text_map([
+            ("domain", Value::Text(POW_OFFER_DOMAIN.into())),
+            ("challenge", Value::Text(self.challenge.clone())),
+            ("action", Value::Text(self.action.label().into())),
+            ("name", Value::Text(self.name.clone())),
+            ("did", Value::Text(self.did.clone())),
+            ("ns_did", Value::Text(self.ns_did.clone())),
+            ("alg", Value::int(i64::from(self.alg))),
+            ("effort", Value::int(i64::from(self.effort))),
+            ("salt_id", Value::int(i64::from(self.salt_id))),
+            ("expires_at", Value::int(self.expires_at)),
+        ]))
+    }
+
+    /// Sign an offer as `ns_key`; `ns_did` is filled in from the key. Refused
+    /// unless every field is in its one form (see the type).
+    pub fn sign(ns_key: &SigningKey, mut offer: PowOffer) -> Result<Self, NamingError> {
+        offer.ns_did = did_of(ns_key);
+        offer.check()?;
+        offer.envelope = cose::sign1(ns_key, &offer.payload());
+        Ok(offer)
+    }
+
+    /// Parse an envelope and check that its `ns_did` signed it.
+    pub fn from_envelope(envelope: &[u8]) -> Result<Self, NamingError> {
+        let p = open(envelope, POW_OFFER_DOMAIN, Self::WHAT)?;
+        let small = |key| {
+            u32::try_from(uint(&p, key, Self::WHAT)?)
+                .map_err(|_| NamingError::BadPayload(Self::WHAT))
+        };
+        let offer = Self {
+            challenge: text(&p, "challenge", Self::WHAT)?,
+            action: crate::pow::Action::from_label(&text(&p, "action", Self::WHAT)?)
+                .ok_or(NamingError::BadPayload(Self::WHAT))?,
+            name: text(&p, "name", Self::WHAT)?,
+            did: text(&p, "did", Self::WHAT)?,
+            ns_did: text(&p, "ns_did", Self::WHAT)?,
+            alg: small("alg")?,
+            effort: small("effort")?,
+            salt_id: small("salt_id")?,
+            expires_at: int(&p, "expires_at", Self::WHAT)?,
+            envelope: envelope.to_vec(),
+        };
+        offer.check()?;
+        offer.verify()?;
+        Ok(offer)
+    }
+
+    /// The envelope carries exactly these fields and is `ns_did`'s.
+    pub fn verify(&self) -> Result<(), NamingError> {
+        verify_envelope(&self.envelope, &self.payload(), &self.ns_did)
+    }
+
+    fn check(&self) -> Result<(), NamingError> {
+        use crate::pow::Action as A;
+        if !matches!(self.action, A::NsRegister | A::NsRenew | A::NsRotate) {
+            return Err(NamingError::BadPayload(Self::WHAT));
+        }
+        canonical_did(&self.did)?;
+        canonical_did(&self.ns_did)?;
+        if Name::parse(&self.name)?.as_alias() != self.name {
+            return Err(NamingError::BadName(self.name.clone()));
+        }
+        Ok(())
+    }
 }
 
 /// A nameserver's claim that `alias` belongs to `did` (JEP-0004 rule 8).
@@ -727,6 +869,92 @@ mod tests {
         Attestation::sign(ns, did, "alice@example.org", NOW - 10, NOW + 100)
     }
 
+    fn offer() -> PowOffer {
+        PowOffer {
+            challenge: "c0ffee".into(),
+            action: crate::pow::Action::NsRegister,
+            name: "alice@example.org".into(),
+            did: did_of(&key(1)),
+            ns_did: String::new(),
+            alg: 1,
+            effort: 1 << 20,
+            salt_id: 0,
+            expires_at: NOW + 60,
+            envelope: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_pow_offer_round_trips_and_names_its_signer() {
+        let signed = PowOffer::sign(&ns(), offer()).unwrap();
+        assert_eq!(signed.ns_did, did_of(&ns()));
+        let back = PowOffer::from_envelope(&signed.envelope).unwrap();
+        assert_eq!(back, signed);
+    }
+
+    #[test]
+    fn a_pow_offer_with_a_changed_field_does_not_verify() {
+        let mut signed = PowOffer::sign(&ns(), offer()).unwrap();
+        signed.effort = 1;
+        assert!(signed.verify().is_err());
+        // Another object signed by the same key is not an offer.
+        let a = att(&ns(), &did_of(&key(1)));
+        assert!(PowOffer::from_envelope(&a.envelope).is_err());
+    }
+
+    /// Only one spelling of each field signs (JEP-0004 rule 0).
+    #[test]
+    fn a_pow_offer_refuses_a_second_spelling() {
+        let refused = |edit: fn(&mut PowOffer)| {
+            let mut o = offer();
+            edit(&mut o);
+            PowOffer::sign(&ns(), o).is_err()
+        };
+        assert!(refused(|o| o.action = crate::pow::Action::Admit));
+        assert!(refused(|o| o.name = "Alice@example.org".into()));
+        assert!(refused(|o| o.did = o.did.to_uppercase()));
+        assert!(refused(|o| o.did = "did:jig:zfake".into()));
+
+        // An envelope whose numbers are out of range, or whose action is not
+        // a nameserver action, is not an offer, though the signature holds.
+        let signed = PowOffer::sign(&ns(), offer()).unwrap();
+        for (key, value) in [
+            ("effort", Value::int(1 << 40)),
+            ("action", Value::Text("admit".into())),
+            ("action", Value::Text("ns-transfer".into())),
+        ] {
+            let mut p = dcbor::decode(&signed.payload()).unwrap();
+            if let Value::Map(entries) = &mut p {
+                for (k, v) in entries.iter_mut() {
+                    if *k == Value::Text(key.into()) {
+                        *v = value.clone();
+                    }
+                }
+            }
+            let env = cose::sign1(&ns(), &dcbor::encode(&p).unwrap());
+            assert!(PowOffer::from_envelope(&env).is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn the_rotate_binding_is_over_canonical_dids_only() {
+        let (ns, old, new) = (did_of(&key(3)), did_of(&key(1)), did_of(&key(2)));
+        let b = rotate_pow_binding(&ns, "alice@example.org", &old, &new, "c0ffee");
+        assert!(b.is_ok());
+        // The order of the DIDs matters.
+        assert_ne!(
+            b,
+            rotate_pow_binding(&ns, "alice@example.org", &new, &old, "c0ffee")
+        );
+        for (ns, alias, old) in [
+            (ns.as_str(), "alice@example.org", old.to_uppercase()),
+            ("did:jig:zns", "alice@example.org", old.clone()),
+            (ns.as_str(), "Alice@example.org", old.clone()),
+        ] {
+            assert!(rotate_pow_binding(ns, alias, &old, &new, "c0ffee").is_err());
+        }
+    }
+
     #[test]
     fn names_parse_and_normalise() {
         let n = name();
@@ -1031,6 +1259,50 @@ mod tests {
             serde_json::from_str(include_str!("../../jig-spec/jep/vectors/0004/vectors.json"))
                 .unwrap();
         assert_eq!(vectors(), v);
+    }
+
+    /// The nameserver's JEP-0008 objects: a signed offer, and the interim
+    /// rotate binding. Committed in `vectors/0008/ns-pow.json`.
+    fn pow_vectors() -> serde_json::Value {
+        let ns = ns();
+        let signed = PowOffer::sign(&ns, offer()).unwrap();
+        let (old, new) = (did_of(&key(1)), did_of(&key(2)));
+        let binding =
+            rotate_pow_binding(&signed.ns_did, "alice@example.org", &old, &new, "c0ffee").unwrap();
+        serde_json::json!({
+            "pow_offer": {
+                "domain": POW_OFFER_DOMAIN,
+                "ns_seed_hex": hex::encode(ns.to_bytes()),
+                "payload_hex": hex::encode(signed.payload()),
+                "envelope_hex": hex::encode(&signed.envelope),
+            },
+            "rotate_pow_binding": {
+                "domain": ROTATE_POW_DOMAIN,
+                "ns_did": signed.ns_did,
+                "alias": "alice@example.org",
+                "old_did": old,
+                "new_did": new,
+                "challenge": "c0ffee",
+                "digest_hex": hex::encode(binding),
+            },
+        })
+    }
+
+    #[test]
+    fn pow_objects_match_the_committed_vectors() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../../jig-spec/jep/vectors/0008/ns-pow.json"))
+                .unwrap();
+        assert_eq!(pow_vectors(), v);
+        let envelope = hex::decode(v["pow_offer"]["envelope_hex"].as_str().unwrap()).unwrap();
+        assert_eq!(PowOffer::from_envelope(&envelope).unwrap().effort, 1 << 20);
+    }
+
+    /// `cargo test -p jig-core --features ed25519 naming::tests::print_pow_vectors -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn print_pow_vectors() {
+        println!("{}", serde_json::to_string_pretty(&pow_vectors()).unwrap());
     }
 
     /// `cargo test -p jig-core --features ed25519 naming::tests::print_vectors -- --ignored --nocapture`
