@@ -450,10 +450,14 @@ impl FederationSection {
                 }
             }
             let suffix = entry.suffix.to_lowercase();
-            // JEP-0004 rule 4: a single label has no DNS name to root it.
-            if suffix.split('.').count() < 2 || suffix.split('.').any(str::is_empty) {
+            // JEP-0004 rules 1 and 4: a dotted name of `[a-z0-9-]` labels, and
+            // more than one, since a single label has no DNS name to root it.
+            let labels_ok = suffix.split('.').all(|label| {
+                !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            });
+            if suffix.split('.').count() < 2 || !labels_ok {
                 return Err(format!(
-                    "{at}: `{}` is not a multi-label DNS suffix (e.g. `names.example.org`)",
+                    "{at}: `{}` is not a multi-label DNS suffix of `[a-z0-9-]` labels (e.g. `names.example.org`)",
                     entry.suffix
                 ));
             }
@@ -1197,6 +1201,8 @@ mod tests {
             (suffix("names.example.org", "ens"), "unknown root"),
             (suffix("jig", "dns"), "multi-label"),
             (suffix("example.", "dns"), "multi-label"),
+            (suffix("ex ample.org", "dns"), "multi-label"),
+            (suffix("ex_ample.org", "dns"), "multi-label"),
             (
                 suffix("names.example.org", "dns") + &suffix("NAMES.example.org", "dns"),
                 "more than once",
