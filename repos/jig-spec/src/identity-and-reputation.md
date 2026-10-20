@@ -5,8 +5,9 @@
 >
 > - **Implemented:** `did:jig` identities, nameserver-attested aliases, TOFU resolution in
 >   servers, verified name resolution through per-suffix delegations in servers (#200) and
->   clients (#201), client name pins through `jig trust verify-name` (#213), and
->   operator-seeded per-ruleset scores for server admission.
+>   clients (#201), the default `@jig` delegation (#214, #218), client name pins in `jig dm`,
+>   `jig channel add` and `jig trust verify-name` (#213, #215), and operator-seeded
+>   per-ruleset scores for server admission.
 > - **Removed prototype:** the reference nameserver's earlier surface (proof-of-work
 >   challenges with penalties, `/v1/claim`, `/v1/alias`, reputation observations, tribunal
 >   case records, the transparency log, useful work and nameserver federation) is no longer
@@ -95,26 +96,81 @@ key is the DID. No authority issues or revokes one.
 
 ### Aliases
 
-A nameserver attests aliases under the suffixes it is authoritative for (`alias_suffixes`).
+A name is `alias@suffix`. The alias is 1 to 24 characters from `[A-Za-z0-9_-]`, compared
+case-insensitively; the suffix is a domain name. A name says nothing about which server its
+holder uses. [JEP-0004](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0004-verified-naming.md) specifies every object and check
+in this section exactly; this section says what each one is for.
 
-1. `GET /v1/challenge` returns a 32-byte hex nonce.
-2. The client signs the nonce with its DID key and sends `POST /v1/register` with `did`,
-   `requested_alias`, `challenge` and `proof_of_control`.
-3. The nameserver returns an attestation (`did`, `alias`, `ns_did`, `valid_from`,
-   `valid_until`, `profile_ttl_seconds`, `sig`) signed with its own key. The default
-   validity is 90 days.
+**Signed bytes.** Every naming object is a COSE_Sign1 over deterministic CBOR whose payload
+names the object in a `domain` entry (JEP-0004 rule 0), so one value has one encoding and a
+signature made for one object never verifies as another. An attestation is the nameserver's
+signature over `did`, `alias`, `ns_did`, `valid_from` and `valid_until` (rule 8). Its bytes
+are what travels, what a resolver verifies and what it keeps as evidence. The default
+validity is 90 days.
 
-**Status:** the reference nameserver differs from steps 2 and 3 (#210). Register and renew
-take an action-bound `proof_of_control`: a COSE_Sign1 by the DID over `domain`
-(`jig-alias-register-v1` or `jig-alias-renew-v1`), the nameserver's DID, the alias and the
-challenge. A signature over the bare challenge is refused. Rotate still takes bare signatures
-over the challenge from both keys. The attestation is a COSE_Sign1 envelope over `did`,
-`alias`, `ns_did`, `valid_from` and `valid_until`, with no `profile_ttl_seconds`. Register,
-renew, rotate and resolve return it base64url-encoded as `attestation`, beside `links` and
-`reachability`, plus unsigned `did`, `alias` and `valid_until` hints for older clients.
-`GET /.well-known/jig-ns-delegation` serves the nameserver's signed delegation for a
-DNS-rooted suffix (`?suffix=`, else the request's `Host`) as `{"envelopes": [...]}`; a
-single-label suffix has none.
+**Delegation: who may attest a suffix.** A suffix delegation names the DIDs whose
+attestations count for one suffix (rule 3). Its root says what makes it authoritative:
+
+| Root | Authoritative because |
+| --- | --- |
+| `config` | the resolver's own configuration names the authorities; never published |
+| `dns` | the suffix's own host serves it at `https://<suffix>/.well-known/jig-ns-delegation`, under a CA-valid certificate, signed by every authority it lists |
+| `contract` | a threshold of the parties to a shared data contract signs it (v0.3) |
+
+A resolver settles a suffix's delegation before it accepts any attestation under it, with
+precedence `config` > `contract` > `dns`, and refuses an attestation from a DID outside it
+(rules 4 and 5). A single-label suffix such as `jig` is never `dns`-rooted: `https://jig/`
+reaches whatever host the local network calls `jig`. `@jig` is the default suffix. Clients
+and servers ship a `config` delegation for it naming the project nameserver, and an
+operator's own entry for `jig` replaces it.
+
+**Action-bound proofs.** `GET /v1/challenge` returns a fresh nonce. Register and renew carry
+a proof of control: the DID's COSE_Sign1 over the action, the nameserver's DID, the alias
+and that challenge (rule 10). A proof made for one action, name or nameserver does not
+verify for another, and a signature over the bare challenge is refused. The nameserver
+consumes the challenge on the first proof that verifies.
+
+**Rotation by link.** An alias moves to another DID only by a key link
+([JEP-0012](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0012-key-links.md)) from the old DID to the new one, signed by both
+keys and scoped to one nameserver and one alias (rule 9). The nameserver keeps every link it
+accepted and serves the chain with the attestation it produced, so a client follows its pin
+from the old DID to the new one on signatures alone, without trusting the nameserver.
+
+**Reachability.** A DID has no home server. It MAY sign a reachability record listing the
+servers where it wants to be found (rule 21). Nobody but the DID can produce one, and a
+nameserver MAY serve the DID's latest record beside its attestation.
+
+An alias is a claim by the nameserver, not proof ([OP-08](threat-register.md)). Whoever acts
+on a binding verifies it, and a client pins it (see
+[Resolution by clients](#resolution-by-clients)).
+
+Registering an alias creates a binding, so it MUST carry
+[proof-of-work](#proof-of-work) and be rate-limited like any other binding endpoint.
+
+**Status:** *(partial)*.
+
+- **Implemented:** COSE attestations and action-bound register and renew proofs (#210);
+  `config` delegations in servers (#200), which do no `dns` discovery; `config` and `dns`
+  delegations in clients (#201); the built-in `@jig`
+  delegation in the CLI (#214) and the server (#218); reachability records, taken at
+  register and served beside the attestation. The built-in `@jig` delegation fails closed:
+  while its authority is a placeholder (every build without jig-core's
+  `test-default-authority` feature), nothing is added, and `@jig` names are refused like any
+  undelegated suffix.
+- **Wire details:** register, renew, rotate and resolve return the attestation
+  base64url-encoded as `attestation`, beside `links` and `reachability`, plus unsigned `did`,
+  `alias` and `valid_until` hints for older clients. `GET /.well-known/jig-ns-delegation`
+  serves the nameserver's signed delegation for a `dns`-rooted suffix (`?suffix=`, else the
+  request's `Host`) as `{"envelopes": [...]}`; a single-label suffix has none.
+- **Not yet rotation by link:** until lane I's I3, `/v1/rotate` takes two signatures over the
+  bare challenge, one by each key, and `links` is always empty. A client therefore sees a
+  rotation as any other change of DID behind a pinned name, and moves the pin only when its
+  user accepts the new DID (rule 18).
+- **No proof-of-work:** no nameserver endpoint requires it since the legacy claim and alias
+  routes were removed. `/v1/register`, `/v1/rotate` and `/v1/renew` are rate-limited per
+  client IP and per DID (`[alias_rate_limits]`, see [Rate limiting](#rate-limiting)).
+- **Plaintext nameserver:** the reference nameserver serves HTTP, not the TLS rule 12
+  requires (F1 slice 3).
 
 One nameserver serves several suffixes (#224). `[[v0_0_2.nameserver.alias_suffixes]]` is
 required, with no default, and each suffix sets its own policy: `registration` (`open` or
@@ -127,40 +183,59 @@ already holds one, is refused with 409 `DID_HOLDS_NAME`. Policy refusals are
 `REGISTRATION_CLOSED`, `ALIAS_TOO_SHORT` and `ALIAS_RESERVED`. `GET /v1/suffixes` lists the
 suffixes served, their registration mode and the nameserver's DID, unsigned.
 
-`POST /v1/renew` extends an attestation. `POST /v1/rotate` moves an alias from one DID to
-another and requires signatures from both keys, so the nameserver can link the two DIDs.
-`GET /v1/resolve/{alias}` returns the current binding.
-
-The local part is 1 to 24 characters from `[A-Za-z0-9_-]`. An alias is a claim by the
-nameserver, not proof ([OP-08](threat-register.md)): a client SHOULD pin the DID it first
-saw for a name and surface any change.
-
-Registering an alias creates a binding, so it MUST carry
-[proof-of-work](#proof-of-work) and be rate-limited like any other binding endpoint.
-**Status:** *(partial)*. `/v1/register`, `/v1/rotate` and `/v1/renew` are rate-limited per
-client IP and per DID (`[alias_rate_limits]`, see [Rate limiting](#rate-limiting)). No
-nameserver endpoint requires proof-of-work since the legacy claim and alias routes were
-removed.
-
 ### Resolution by servers
 
-A server resolves the alias on an incoming block in one of two modes
-(`[identity] mode`):
+A server resolves the alias on an incoming block in one of two modes (`[identity] mode`). In
+`tofu` mode, the default, the first DID seen for a nickname is locked, and a later block with
+a different DID is refused. In `nameserver` mode the server verifies the name:
 
-| Mode | Behaviour |
-| --- | --- |
-| `tofu` (default) | The first DID seen for a nickname is locked; a later block with a different DID is refused. |
-| `nameserver` | The server queries each URL in `trusted_nameservers` in order and refuses the block if the alias resolves to a different DID. Results are cached for `cache_ttl_seconds` (default 300). |
+- **Suffix binding.** The server resolves `alias@suffix` only through that suffix's entry in
+  `[identity.delegations]` (`authorities` and `nameservers`), plus the built-in `@jig`
+  entry, and refuses a suffix with none. Nothing falls back to another nameserver.
+- **Verification.** It asks every listed nameserver, and accepts an attestation only when one
+  of the suffix's `authorities` signed it, inside its validity window on the server's clock,
+  for exactly that alias (JEP-0004 rule 13).
+- **Equivocation.** Two valid answers naming different DIDs refuse the alias, and both are
+  kept (rule 15).
+- **Caching within validity.** A verified binding is cached until the earlier of
+  `cache_ttl_seconds` (default 300) and the attestation's `valid_until`, and its validity is
+  checked again on every use (rule 14).
+- **Evidence.** Every attestation the resolver acts on is kept (rule 20).
 
-A server MAY trust more than one nameserver. A server in `nameserver` mode MUST verify the
-attestation signature before it uses the binding. **Status:** implemented, configured
-differently from the table above (#200). The server resolves `alias@suffix` only through the
-nameservers listed for its suffix in `[identity.delegations]`, and refuses a suffix with no
-entry. It asks every listed nameserver, and accepts only an attestation signed by one of
-that suffix's `authorities`, inside its validity window, for exactly that alias. Two valid
-answers naming different DIDs are an equivocation: the alias is refused and both answers are
-kept as evidence. A verified binding is cached until the earlier of the cache TTL and the
-attestation's `valid_until`. `trusted_nameservers` is ignored, with a startup warning.
+A server's check serves only the server's own decisions. A client never relies on it
+(rule 13).
+
+**Status:** implemented (#200, #218). Ingest verifies a name only when a block carries one
+(`metadata.nickname`); blocks without one are not checked. Evidence goes to the server's
+`name_evidence` table. `trusted_nameservers` is ignored, with a startup warning.
+
+### Resolution by clients
+
+A client resolves a name through its own delegations (`[naming.delegations]` in `cli.toml`,
+plus the built-in `@jig` entry), else `dns` discovery, and verifies every attestation as a
+server does. It never takes a server's word for a name, and fetching through a server
+changes nothing about verification (rules 13 and 16). Then it holds the answer to its pin:
+
+- A name seen for the first time is pinned, keyed by alias, suffix, root and root
+  identifier (rules 6 and 17), and the client shows the DID and the nameserver that vouched
+  for it.
+- A pinned name that resolves to its pinned DID is used.
+- Any other answer is refused, with both DIDs, unless a chain of rotation links leads from
+  the pinned DID to the new one, or the user accepts the change (rule 18). That covers a
+  nameserver that re-binds the name, a change of nameserver, and re-registration after
+  expiry.
+- Everything a resolution acted on, every attestation and link exactly as served, is kept
+  as evidence (rule 20).
+
+**Status:** implemented in the CLI. `jig dm`, `jig channel add` and `jig channel kick` take
+`alias@suffix`, pin on first use and refuse a changed DID before anything about the peer is
+sent (#215). `jig trust verify-name` resolves and pins, `jig trust accept-name` moves a pin
+to a DID its holder confirmed (#213, #225), and `jig ns resolve` verifies without pinning.
+Evidence goes to `~/.jig/evidence/names/`, one file per resolution. Integration test
+`h13_verified_names` runs each case against real nameservers: an honest name, a re-bound
+name, a rotation, a signer outside the delegation, two authorities that disagree, an expired
+attestation and a forged one. Until rotation links exist, a rotation needs the user's
+acceptance (see [Aliases](#aliases)).
 
 ### Anonymous identities
 
@@ -563,8 +638,9 @@ A nameserver publishes its policy at three paths:
   `anonymous_min`) *(not served: removed in #192)*, `rate_limit` (`per_key_per_min`,
   `per_ip_per_min`, `global_per_min`) *(not served: replaced by `alias_rate_limits` in #197)*,
   `alias_rate_limits` (`enabled`, `per_ip_per_min`, `per_did_per_min`; the limits the alias
-  routes enforce), `automation` (legacy; nothing enforces it), `allow_domains`, `deny_domains`, `cache_ttl_secs`, `reputation` and
-  `public_key`.
+  routes enforce), `automation` (legacy; nothing enforces it), `reputation` and
+  `public_key`. `allow_domains`, `deny_domains` and `cache_ttl_secs` are no longer served
+  (removed with nameserver federation, #237).
 - **`GET /.well-known/jig-ns/capabilities`** (plain text): `version`, optional `domain`,
   one `work:` line per useful-work type, `tribunal:`, `transparency:` and `federation:`
   (`enabled` or `disabled`), and optional `affordance:` lines.
