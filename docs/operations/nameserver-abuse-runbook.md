@@ -218,7 +218,8 @@ suffix's delegation names.
 2. **Cut it off where lookups happen.** Remove or replace that suffix's delegation in
    `[identity.delegations]` (jig-server) or `[naming.delegations]` (`cli.toml`).
    - jig-server refuses a suffix with no entry. The exception is `jig`: without an entry the
-     server falls back to its built-in `@jig` delegation.
+     server falls back to its built-in `@jig` delegation, once a build ships the project's
+     authority. This build ships none, so `@jig` names fail closed.
    - The CLI falls back when `cli.toml` has no entry: to the suffix's DNS-rooted delegation
      for a multi-label suffix, and to the built-in `@jig` delegation for `jig`. If that
      fallback names the same nameserver, replace the entry rather than delete it.
