@@ -1,0 +1,10 @@
+# Written by `jig block new`. `jig block build` and `jig block lint` read it.
+[block]
+name = "{{name}}"
+version = "0.1.0"
+world = "renderer"
+
+[limits]
+# The most memory the block may use, in 64 KiB pages. Must match --max-memory in
+# .cargo/config.toml.
+memory_max_pages = {{memory_pages}}
