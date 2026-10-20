@@ -51,6 +51,9 @@ pub async fn apply_effect(
         BlockKind::MemberRemove => apply_member_remove(store, &manifest, block_cid),
         BlockKind::ChannelPromote => apply_channel_promote(store, &manifest, block_cid),
         BlockKind::ChannelArchive => apply_channel_archive(store, &manifest, block_cid),
+        // A role lives in the channel's ingest chain, which is its record;
+        // `roles::rights_at` reads it from there, so there is no row to keep.
+        BlockKind::RoleAssign | BlockKind::RoleUnassign => Ok(()),
         BlockKind::FedHello => apply_fed_hello(store, &manifest, block_cid),
 
         BlockKind::NsRegister | BlockKind::NsAttestation => apply_ns_attestation(store, &manifest),
@@ -133,6 +136,15 @@ fn apply_channel_create(
         .map_err(|_| anyhow::anyhow!("channel-create names an unknown suite"))?;
     let now = chrono::Utc::now().timestamp();
     let owner_did = sender_did_string(m);
+    // The gate is ingest's (`ingest::channel_terms` refuses a sequencer that
+    // is not this server). Here the row records the terms the block carries:
+    // its declared sequencer, else this store's server (or, before boot
+    // adopts one, the placeholder that means the same).
+    let sequencer = meta_str(m, crate::ingest::SEQUENCER_KEY)
+        .map(canonical_did_string)
+        .unwrap_or_else(|| store.local_sequencer().to_string());
+    let terms = crate::ingest::channel_terms(m, &sequencer)
+        .map_err(|e| anyhow::anyhow!("channel-create terms: {e}"))?;
 
     store.upsert_channel(&StoredChannel {
         id: block_cid.to_string(),
@@ -141,14 +153,21 @@ fn apply_channel_create(
         created_at: now,
         owner_did: owner_did.clone(),
         suite: suite.as_str().to_string(),
+        sequencer_did: terms.sequencer,
+        co_owners: terms.co_owners.clone(),
     })?;
-    store.upsert_membership(&StoredMembership {
-        channel_id: block_cid.to_string(),
-        member_did: owner_did,
-        role: "owner".to_string(),
-        joined_at: now,
-        source_block_cid: block_cid.to_string(),
-    })?;
+    // The creator and every co-owner are members, with role `owner`: a
+    // co-owner holds every right, so it can read what it can write and
+    // manage.
+    for member_did in std::iter::once(owner_did).chain(terms.co_owners) {
+        store.upsert_membership(&StoredMembership {
+            channel_id: block_cid.to_string(),
+            member_did,
+            role: "owner".to_string(),
+            joined_at: now,
+            source_block_cid: block_cid.to_string(),
+        })?;
+    }
     Ok(())
 }
 
@@ -248,7 +267,7 @@ fn apply_channel_archive(
     let sender = sender_did_string(m);
     // An empty owner_did would make an author-less manifest match; refuse
     // rather than treat "we don't know who owns this" as permission.
-    if channel.owner_did.is_empty() || channel.owner_did != sender {
+    if !channel.is_root_owner(&sender) {
         anyhow::bail!("channel-archive rejected: `{sender}` is not the owner of `{channel_slug}`");
     }
 

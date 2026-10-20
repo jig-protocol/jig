@@ -86,8 +86,10 @@ allowed_block_kinds = ["text-render", "channel-create", "member-add", "member-re
 #   [identity.delegations."example.org"]
 #   authorities = ["did:jig:..."]
 #   nameservers = ["https://ns.example"]
-# An alias whose suffix has no entry is refused. trusted_nameservers is not
-# used to resolve aliases.
+# An alias whose suffix has no entry is refused, except under the default
+# suffix (alice@jig): the server ships the jig delegation built in, once the
+# project authority DID is published, and an [identity.delegations.jig] entry
+# here overrides it. trusted_nameservers is not used to resolve aliases.
 mode = "tofu"
 trusted_nameservers = []
 cache_ttl_seconds = 300

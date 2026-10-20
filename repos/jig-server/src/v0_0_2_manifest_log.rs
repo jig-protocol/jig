@@ -236,6 +236,8 @@ mod tests {
                 created_at: 1,
                 owner_did: stranger.clone(),
                 suite: "none".into(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })
             .unwrap();
 
@@ -253,13 +255,12 @@ mod tests {
             moved.slug,
             quarantine_slug("bafyOldChannelAtTheReservedSlug")
         );
-        // What follows `#jig/` fits the reserved grammar: [a-z0-9_-]{1,59}.
-        let rest = moved.slug.strip_prefix("#jig/").unwrap();
-        assert!(rest.len() <= 59, "{rest}");
-        assert!(
-            rest.chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-'),
-            "{rest}"
+        // A slug the grammar (#233) gives to the server.
+        assert_eq!(
+            jig_core::slug::classify_slug(&moved.slug),
+            Ok(jig_core::slug::SlugClass::Server),
+            "{}",
+            moved.slug
         );
         assert!(moved.slug.starts_with(QUARANTINE_PREFIX), "{}", moved.slug);
         assert!(
@@ -336,8 +337,13 @@ mod tests {
             )
             .await
             .unwrap_err();
+            // A create under `#jig/` is the slug grammar's to refuse.
             assert!(
-                matches!(err, jig_pipeline::ingest::IngestError::ManifestLog { .. }),
+                matches!(
+                    err,
+                    jig_pipeline::ingest::IngestError::ManifestLog { .. }
+                        | jig_pipeline::ingest::IngestError::InvalidSlug { .. }
+                ),
                 "{kind:?} into {slug}: {err}"
             );
         }

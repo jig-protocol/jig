@@ -1231,6 +1231,8 @@ mod tests {
                 created_at: 0,
                 owner_did: "did:jig:zSeedOwner".to_string(),
                 suite: "none".to_string(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })
             .unwrap();
     }
@@ -1729,6 +1731,8 @@ mod tests {
                     created_at: 0,
                     owner_did: "did:jig:zSeedOwner".to_string(),
                     suite: "none".to_string(),
+                    sequencer_did: String::new(),
+                    co_owners: Vec::new(),
                 })
                 .unwrap();
         }
@@ -1771,6 +1775,8 @@ mod tests {
                 created_at: 0,
                 owner_did: "did:jig:zSeedOwner".to_string(),
                 suite: "none".to_string(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })
             .unwrap();
         let manifest = serde_json::to_vec(&serde_json::json!({

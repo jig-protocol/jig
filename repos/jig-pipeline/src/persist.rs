@@ -11,7 +11,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use crate::ingest_record::{GENESIS_PREV, IngestRecord, RecordSigner};
 
@@ -38,6 +38,11 @@ pub type Result<T> = std::result::Result<T, PersistError>;
 /// For higher concurrency in v0.0.3+ consider replacing with a connection pool.
 pub struct SqliteStore {
     pub(crate) conn: Mutex<Connection>,
+    /// The DID of the server this store belongs to: the sequencer of its
+    /// local channels. Set once, by [`SqliteStore::adopt_local_sequencer`].
+    /// Until then only rows whose `sequencer_did` is still the empty
+    /// placeholder count as local.
+    local_sequencer: OnceLock<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -77,6 +82,24 @@ pub struct StoredChannel {
     /// The encryption suite fixed at creation (`none` or `mls`). Every post
     /// is checked against it; see `jig_pipeline::mls_gate`.
     pub suite: String,
+    /// The DID of the server that sequences the channel (JEP-0005 rules 5
+    /// and 6), in canonical text. Empty only for a row written before
+    /// channels had terms and not yet adopted at boot
+    /// ([`SqliteStore::adopt_local_sequencer`]); empty means "this server".
+    pub sequencer_did: String,
+    /// The co-owners the `channel-create` listed, canonical, fixed for the
+    /// channel's life. With `owner_did` (the creator) they are the channel's
+    /// root owners: every right, never unassigned (JEP-0005 rule 7b).
+    pub co_owners: Vec<String>,
+}
+
+impl StoredChannel {
+    /// Whether `did` is one of the channel's root owners: its creator or a
+    /// co-owner the creation block listed. An empty DID is nobody's owner:
+    /// "we don't know who owns this" is not permission.
+    pub fn is_root_owner(&self, did: &str) -> bool {
+        !did.is_empty() && (self.owner_did == did || self.co_owners.iter().any(|c| c == did))
+    }
 }
 
 /// An encrypted channel's MLS public state, as the delivery service tracks it.
@@ -444,6 +467,10 @@ fn row_to_stored_alias_attestation(
 }
 
 fn row_to_stored_channel(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChannel> {
+    let co_owners: String = r.get(7)?;
+    let co_owners: Vec<String> = serde_json::from_str(&co_owners).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     Ok(StoredChannel {
         id: r.get(0)?,
         slug: r.get(1)?,
@@ -451,10 +478,92 @@ fn row_to_stored_channel(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChanne
         created_at: r.get(3)?,
         owner_did: r.get(4)?,
         suite: r.get(5)?,
+        sequencer_did: r.get(6)?,
+        co_owners,
     })
 }
 
-const CHANNEL_COLUMNS: &str = "id, slug, visibility, created_at, owner_did, suite";
+const CHANNEL_COLUMNS: &str =
+    "id, slug, visibility, created_at, owner_did, suite, sequencer_did, co_owners";
+
+/// The `WHERE` term that keeps a slug lookup to the channels this server
+/// sequences: a slug is unique only per sequencer (JEP-0005 rule 1), and
+/// the slug routes name local channels. `?2` is bound to
+/// [`SqliteStore::local_sequencer`] (empty when none was adopted). The
+/// empty placeholder is always local: it is what a row from before terms
+/// holds until boot adopts it.
+const LOCAL_SEQUENCER: &str = "(sequencer_did = '' OR sequencer_did = ?2)";
+
+/// Rebuild `channels` so a slug is unique per sequencer, not per server
+/// (JEP-0005 rule 1), adding the channel's terms columns on the way.
+///
+/// - `UNIQUE(slug)` becomes `UNIQUE(sequencer_did, slug)`. SQLite cannot drop
+///   a constraint in place, so the table is rebuilt and its rows copied.
+/// - `sequencer_did` is added as `NOT NULL DEFAULT ''`. The store cannot know
+///   the server's DID here, so existing rows get the empty placeholder,
+///   which every local lookup reads as "this server", and boot replaces it
+///   with the server's DID ([`SqliteStore::adopt_local_sequencer`]).
+/// - `co_owners` is added as a JSON array of DIDs, `'[]'` for existing rows:
+///   a channel created before terms listed none.
+///
+/// One transaction; a no-op on a table that already has the per-sequencer
+/// constraint and both columns.
+fn rebuild_channels_slug_per_sequencer(conn: &Connection) -> Result<()> {
+    let has_sequencer = column_exists(conn, "channels", "sequencer_did")?;
+    let has_co_owners = column_exists(conn, "channels", "co_owners")?;
+    if has_sequencer && has_co_owners && !has_unique_slug_alone(conn)? {
+        return Ok(());
+    }
+    let sequencer = if has_sequencer { "sequencer_did" } else { "''" };
+    let co_owners = if has_co_owners { "co_owners" } else { "'[]'" };
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(&format!(
+        "CREATE TABLE channels_by_sequencer (
+             id            TEXT PRIMARY KEY,
+             slug          TEXT NOT NULL,
+             visibility    TEXT NOT NULL,
+             created_at    INTEGER NOT NULL,
+             owner_did     TEXT NOT NULL,
+             archived_at   INTEGER,
+             suite         TEXT NOT NULL DEFAULT 'none',
+             sequencer_did TEXT NOT NULL DEFAULT '',
+             co_owners     TEXT NOT NULL DEFAULT '[]',
+             UNIQUE (sequencer_did, slug)
+         );
+         INSERT INTO channels_by_sequencer
+             (id, slug, visibility, created_at, owner_did, archived_at, suite,
+              sequencer_did, co_owners)
+         SELECT id, slug, visibility, created_at, owner_did, archived_at, suite,
+                {sequencer}, {co_owners}
+           FROM channels;
+         DROP TABLE channels;
+         ALTER TABLE channels_by_sequencer RENAME TO channels;"
+    ))?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Whether `channels` still carries a unique index on `slug` alone (the
+/// column constraint `slug TEXT UNIQUE` of the old schema).
+fn has_unique_slug_alone(conn: &Connection) -> Result<bool> {
+    let unique: Vec<String> = {
+        let mut stmt =
+            conn.prepare("SELECT name FROM pragma_index_list('channels') WHERE \"unique\" = 1")?;
+        stmt.query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for index in unique {
+        let columns: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?;
+            stmt.query_map([&index], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if columns == ["slug"] {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 /// The membership change a commit-carrying block makes, applied inside
 /// [`SqliteStore::land_mls_commit`]'s transaction.
@@ -500,6 +609,83 @@ fn sequence_on(
         params![block_cid, record.channel_id, seq as i64, record.encode()],
     )?;
     Ok(record)
+}
+
+/// A right a block's signer must still hold at the block's own position in
+/// the chain, checked inside the transaction that gives it that position.
+#[derive(Debug, Clone, Copy)]
+pub struct RightGuard<'a> {
+    /// The channel the block lands in: its root owners, and its chain.
+    pub channel: &'a StoredChannel,
+    /// The signer, canonical.
+    pub did: &'a str,
+    pub right: crate::roles::Right,
+}
+
+/// How a guarded landing ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Landing {
+    /// Written, with the record it was given, if any.
+    Landed(Option<IngestRecord>),
+    /// Another commit moved the MLS group first; nothing was written.
+    LostRace,
+    /// The guarded right no longer held at the block's seq; nothing was
+    /// written.
+    Unauthorized,
+}
+
+fn role_blocks_before_on(
+    conn: &Connection,
+    channel_id: &str,
+    before_seq: u64,
+) -> Result<Vec<(jig_core::BlockKind, jig_core::BlockManifest)>> {
+    let rows: Vec<(String, Vec<u8>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT b.block_kind, b.bundle_bytes
+               FROM ingest_records r JOIN blocks b ON b.cid = r.block_cid
+              WHERE r.channel_id = ?1 AND r.seq < ?2
+                AND b.block_kind IN ('role-assign', 'role-unassign')
+              ORDER BY r.seq ASC",
+        )?;
+        let before = i64::try_from(before_seq).unwrap_or(i64::MAX);
+        stmt.query_map(params![channel_id, before], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    rows.into_iter()
+        .map(|(kind, bundle)| {
+            let kind = kind
+                .parse::<jig_core::BlockKind>()
+                .map_err(|e| PersistError::Corrupt(format!("role block kind: {e}")))?;
+            let (manifest_bytes, _code): (Vec<u8>, Vec<u8>) = serde_json::from_slice(&bundle)
+                .map_err(|e| PersistError::Corrupt(format!("role block bundle: {e}")))?;
+            let manifest = serde_json::from_slice(&manifest_bytes)
+                .map_err(|e| PersistError::Corrupt(format!("role block manifest: {e}")))?;
+            Ok((kind, manifest))
+        })
+        .collect()
+}
+
+/// Whether `guard`'s right holds at position `seq` of its channel's chain.
+fn guard_holds_on(conn: &Connection, guard: &RightGuard<'_>, seq: u64) -> Result<bool> {
+    let blocks = role_blocks_before_on(conn, &guard.channel.id, seq)?;
+    Ok(crate::roles::fold(guard.channel, guard.did, blocks).has(guard.right))
+}
+
+fn apply_membership_on(conn: &Connection, membership: &MembershipChange) -> Result<()> {
+    match membership {
+        MembershipChange::None => {}
+        MembershipChange::Upsert(m) => upsert_membership_on(conn, m)?,
+        MembershipChange::Remove {
+            channel_id,
+            member_did,
+        } => {
+            conn.execute(
+                "DELETE FROM memberships WHERE channel_id = ? AND member_did = ?",
+                [channel_id.as_str(), member_did.as_str()],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn insert_block_on(conn: &Connection, b: &StoredBlock) -> Result<()> {
@@ -591,6 +777,7 @@ impl SqliteStore {
         Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            local_sequencer: OnceLock::new(),
         })
     }
 
@@ -600,7 +787,42 @@ impl SqliteStore {
         Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            local_sequencer: OnceLock::new(),
         })
+    }
+
+    /// Record `server_did` as the sequencer of this store's local channels,
+    /// and give every row still holding the pre-terms placeholder (`''`)
+    /// that DID. Returns how many rows it adopted.
+    ///
+    /// Boot calls this once the server key is loaded; ingest calls it too
+    /// (a no-op after the first time), so a store is never read with a
+    /// sequencer that disagrees with the server writing to it. A store
+    /// belongs to one server: a second, different DID is refused.
+    pub fn adopt_local_sequencer(&self, server_did: &str) -> Result<usize> {
+        let mut first = false;
+        let local = self.local_sequencer.get_or_init(|| {
+            first = true;
+            server_did.to_string()
+        });
+        if local != server_did {
+            return Err(PersistError::Corrupt(format!(
+                "this store's channels are sequenced by `{local}`, not `{server_did}`"
+            )));
+        }
+        if !first {
+            return Ok(0);
+        }
+        let adopted = self.conn.lock().expect("poisoned").execute(
+            "UPDATE channels SET sequencer_did = ?1 WHERE sequencer_did = ''",
+            [server_did],
+        )?;
+        Ok(adopted)
+    }
+
+    /// The DID adopted by [`Self::adopt_local_sequencer`], or `""` before it.
+    pub fn local_sequencer(&self) -> &str {
+        self.local_sequencer.get().map(String::as_str).unwrap_or("")
     }
 
     fn migrate(conn: &Connection) -> Result<()> {
@@ -638,17 +860,25 @@ impl SqliteStore {
                 ON receipts(block_cid, render_hash);
 
             CREATE TABLE IF NOT EXISTS channels (
-                id          TEXT PRIMARY KEY,
-                slug        TEXT UNIQUE NOT NULL,
-                visibility  TEXT NOT NULL,
-                created_at  INTEGER NOT NULL,
-                owner_did   TEXT NOT NULL,
+                id            TEXT PRIMARY KEY,
+                slug          TEXT NOT NULL,
+                visibility    TEXT NOT NULL,
+                created_at    INTEGER NOT NULL,
+                owner_did     TEXT NOT NULL,
                 -- NULL = live. Set by the channel-archive effect (soft delete);
                 -- see `add_column_if_missing` below for why it is also applied
                 -- as an ALTER for databases created before this column existed.
-                archived_at INTEGER,
+                archived_at   INTEGER,
                 -- Encryption suite fixed at creation. Same ALTER story.
-                suite       TEXT NOT NULL DEFAULT 'none'
+                suite         TEXT NOT NULL DEFAULT 'none',
+                -- The sequencing server's DID (JEP-0005 rules 5-6); '' until
+                -- boot adopts a row from before terms. See
+                -- `rebuild_channels_slug_per_sequencer`.
+                sequencer_did TEXT NOT NULL DEFAULT '',
+                -- JSON array of the co-owner DIDs the channel-create listed.
+                co_owners     TEXT NOT NULL DEFAULT '[]',
+                -- A slug is unique per sequencer, not per server (rule 1).
+                UNIQUE (sequencer_did, slug)
             );
 
             -- One row per encrypted channel: the delivery service's view of
@@ -773,6 +1003,7 @@ impl SqliteStore {
         // Every channel created before v0.2 was unencrypted.
         add_column_if_missing(conn, "channels", "suite", "TEXT NOT NULL DEFAULT 'none'")?;
         rekey_channels_by_id(conn)?;
+        rebuild_channels_slug_per_sequencer(conn)?;
         rebuild_alias_attestations_with_suffix(conn)?;
         Ok(())
     }
@@ -942,6 +1173,54 @@ impl SqliteStore {
         }
         tx.commit()?;
         Ok(written)
+    }
+
+    /// The `role-assign` and `role-unassign` blocks of `channel_id` whose
+    /// ingest record `seq` is strictly below `before_seq`, in chain order,
+    /// with their manifests. What [`crate::roles::rights_at`] folds.
+    pub fn list_role_blocks_before(
+        &self,
+        channel_id: &str,
+        before_seq: u64,
+    ) -> Result<Vec<(jig_core::BlockKind, jig_core::BlockManifest)>> {
+        role_blocks_before_on(&self.conn.lock().expect("poisoned"), channel_id, before_seq)
+    }
+
+    /// Store `b` and the next record of its channel's chain, as
+    /// [`Self::insert_block_sequenced`] does, applying `membership` in the
+    /// same transaction — and, with `guard`, only if the guarded right still
+    /// holds at the `seq` this block is given (JEP-0005 rule 7b).
+    ///
+    /// The guard is the authoritative rights check. It is read under the
+    /// store's lock, inside the transaction that assigns the seq, from the
+    /// role blocks sequenced before that seq: a role-unassign that lands
+    /// between ingest's early check and this call is in the chain by now, so
+    /// the block is refused and nothing of it is written.
+    pub fn insert_block_sequenced_guarded(
+        &self,
+        b: &StoredBlock,
+        signer: &RecordSigner<'_>,
+        membership: &MembershipChange,
+        guard: Option<&RightGuard<'_>>,
+    ) -> Result<Landing> {
+        if b.channel_id.is_none() {
+            return Err(PersistError::Corrupt(
+                "a sequenced block names no channel".into(),
+            ));
+        }
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        insert_block_on(&tx, b)?;
+        let record = sequence_on(&tx, &b.cid, signer)?;
+        if let Some(guard) = guard
+            && !guard_holds_on(&tx, guard, record.seq)?
+        {
+            // Dropping `tx` rolls back the block and its record.
+            return Ok(Landing::Unauthorized);
+        }
+        apply_membership_on(&tx, membership)?;
+        tx.commit()?;
+        Ok(Landing::Landed(Some(record)))
     }
 
     /// Whether the channel's history is sequenced, and so ordered by `seq`.
@@ -1158,10 +1437,13 @@ impl SqliteStore {
     /// Insert or update a channel row. Deliberately does NOT touch
     /// `archived_at`: re-applying a channel-create block (federation replay,
     /// restart catch-up) must never resurrect a channel an owner archived.
+    /// Nor the terms (`suite`, `sequencer_did`, `co_owners`): they are fixed
+    /// for the channel's life (JEP-0005 rule 6).
     pub fn upsert_channel(&self, c: &StoredChannel) -> Result<()> {
         self.conn.lock().expect("poisoned").execute(
-            "INSERT INTO channels (id, slug, visibility, created_at, owner_did, suite)
-             VALUES (?,?,?,?,?,?)
+            "INSERT INTO channels
+                 (id, slug, visibility, created_at, owner_did, suite, sequencer_did, co_owners)
+             VALUES (?,?,?,?,?,?,?,?)
              ON CONFLICT(id) DO UPDATE SET
                 slug = excluded.slug,
                 visibility = excluded.visibility,
@@ -1172,7 +1454,10 @@ impl SqliteStore {
                 c.visibility,
                 c.created_at,
                 c.owner_did,
-                c.suite
+                c.suite,
+                c.sequencer_did,
+                serde_json::to_string(&c.co_owners)
+                    .map_err(|e| PersistError::Corrupt(format!("co_owners: {e}")))?,
             ],
         )?;
         Ok(())
@@ -1181,13 +1466,17 @@ impl SqliteStore {
     /// Look up a live channel. Archived channels read as absent so ops that
     /// mutate an active channel (member-add, channel-promote) fail loudly
     /// instead of silently editing a retired one.
+    ///
+    /// A slug names a channel only among those this server sequences: a
+    /// carried channel with the same slug is reached by its id.
     pub fn get_channel_by_slug(&self, slug: &str) -> Result<Option<StoredChannel>> {
         let conn = self.conn.lock().expect("poisoned");
         conn.query_row(
             &format!(
-                "SELECT {CHANNEL_COLUMNS} FROM channels WHERE slug = ? AND archived_at IS NULL"
+                "SELECT {CHANNEL_COLUMNS} FROM channels
+                  WHERE slug = ?1 AND {LOCAL_SEQUENCER} AND archived_at IS NULL"
             ),
-            [slug],
+            params![slug, self.local_sequencer()],
             row_to_stored_channel,
         )
         .optional()
@@ -1203,8 +1492,10 @@ impl SqliteStore {
     ) -> Result<Option<StoredChannel>> {
         let conn = self.conn.lock().expect("poisoned");
         conn.query_row(
-            &format!("SELECT {CHANNEL_COLUMNS} FROM channels WHERE slug = ?"),
-            [slug],
+            &format!(
+                "SELECT {CHANNEL_COLUMNS} FROM channels WHERE slug = ?1 AND {LOCAL_SEQUENCER}"
+            ),
+            params![slug, self.local_sequencer()],
             row_to_stored_channel,
         )
         .optional()
@@ -1541,6 +1832,36 @@ impl SqliteStore {
         receipt: &StoredReceipt,
         signer: Option<&RecordSigner<'_>>,
     ) -> Result<Option<Option<IngestRecord>>> {
+        Ok(
+            match self.land_mls_commit_guarded(
+                channel_id, from_epoch, state, to_epoch, group_info, membership, block, receipt,
+                signer, None,
+            )? {
+                Landing::Landed(record) => Some(record),
+                Landing::LostRace | Landing::Unauthorized => None,
+            },
+        )
+    }
+
+    /// [`Self::land_mls_commit_by_id`], and with `guard`, only if the
+    /// guarded right still holds at the block's position, checked in the
+    /// same transaction as the epoch compare-and-swap and the record (see
+    /// [`Self::insert_block_sequenced_guarded`]). A block landed without a
+    /// record is checked against every role block stored so far.
+    #[allow(clippy::too_many_arguments)]
+    pub fn land_mls_commit_guarded(
+        &self,
+        channel_id: &str,
+        from_epoch: u64,
+        state: &[u8],
+        to_epoch: u64,
+        group_info: Option<&[u8]>,
+        membership: &MembershipChange,
+        block: &StoredBlock,
+        receipt: &StoredReceipt,
+        signer: Option<&RecordSigner<'_>>,
+        guard: Option<&RightGuard<'_>>,
+    ) -> Result<Landing> {
         let mut conn = self.conn.lock().expect("poisoned");
         let tx = conn.transaction()?;
         // `group_info` replaces the stored one even when `None`: a group info
@@ -1558,28 +1879,24 @@ impl SqliteStore {
             ],
         )?;
         if advanced == 0 {
-            return Ok(None);
+            return Ok(Landing::LostRace);
         }
-        match membership {
-            MembershipChange::None => {}
-            MembershipChange::Upsert(m) => upsert_membership_on(&tx, m)?,
-            MembershipChange::Remove {
-                channel_id,
-                member_did,
-            } => {
-                tx.execute(
-                    "DELETE FROM memberships WHERE channel_id = ? AND member_did = ?",
-                    [channel_id.as_str(), member_did.as_str()],
-                )?;
-            }
-        }
+        apply_membership_on(&tx, membership)?;
         insert_block_on(&tx, block)?;
         insert_receipt_on(&tx, receipt)?;
         let record = signer
             .map(|signer| sequence_on(&tx, &block.cid, signer))
             .transpose()?;
+        if let Some(guard) = guard {
+            let at = record.as_ref().map_or(crate::roles::NEXT, |r| r.seq);
+            if !guard_holds_on(&tx, guard, at)? {
+                // Dropping `tx` rolls back the advance, the membership
+                // change, the block and its record.
+                return Ok(Landing::Unauthorized);
+            }
+        }
         tx.commit()?;
-        Ok(Some(record))
+        Ok(Landing::Landed(record))
     }
 
     /// Store a validated key package. Returns `false` if this package (by
@@ -2084,6 +2401,8 @@ mod tests {
             created_at: 0,
             owner_did: "did:jig:zOwner".to_string(),
             suite: "none".to_string(),
+            sequencer_did: String::new(),
+            co_owners: Vec::new(),
         }
     }
 
@@ -2282,6 +2601,7 @@ mod tests {
         SqliteStore::migrate(&conn).unwrap();
         let store = SqliteStore {
             conn: Mutex::new(conn),
+            local_sequencer: Default::default(),
         };
         assert_eq!(
             store.backfill_ingest_records(&key).unwrap(),
@@ -2437,6 +2757,7 @@ mod tests {
 
         let store = SqliteStore {
             conn: Mutex::new(conn),
+            local_sequencer: Default::default(),
         };
         assert_eq!(
             store.list_channels().unwrap().len(),
@@ -2447,6 +2768,203 @@ mod tests {
             store.list_channels().unwrap()[0].suite,
             "none",
             "channels created before v0.2 were unencrypted"
+        );
+    }
+
+    fn unique_index_columns(conn: &Connection) -> Vec<Vec<String>> {
+        let names: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM pragma_index_list('channels')
+                  WHERE \"unique\" = 1 AND origin <> 'pk'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let mut out: Vec<Vec<String>> = names
+            .iter()
+            .map(|n| {
+                conn.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+                    .unwrap()
+                    .query_map([n], |r| r.get(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Every column of a `channels` row, in table order.
+    type ChannelDump = (
+        String,
+        String,
+        String,
+        i64,
+        String,
+        Option<i64>,
+        String,
+        String,
+        String,
+    );
+
+    /// A store from before channel terms: `channels` with `UNIQUE(slug)` and
+    /// no `sequencer_did`. The migration rebuilds it with
+    /// `UNIQUE(sequencer_did, slug)`, keeps every row and column value, gives
+    /// old rows the "this server" placeholder until boot adopts them, and is
+    /// a no-op the second time.
+    #[test]
+    fn the_channels_rebuild_is_idempotent_and_keeps_every_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE channels (
+                 id          TEXT PRIMARY KEY,
+                 slug        TEXT UNIQUE NOT NULL,
+                 visibility  TEXT NOT NULL,
+                 created_at  INTEGER NOT NULL,
+                 owner_did   TEXT NOT NULL,
+                 archived_at INTEGER,
+                 suite       TEXT NOT NULL DEFAULT 'none'
+             );
+             INSERT INTO channels VALUES ('bafy_a', '#a', 'open', 11, 'did:jig:zA', NULL, 'none');
+             INSERT INTO channels VALUES ('bafy_b', '#b', 'restricted', 12, 'did:jig:zB', 99, 'mls');",
+        )
+        .unwrap();
+        assert_eq!(unique_index_columns(&conn), vec![vec!["slug".to_string()]]);
+
+        SqliteStore::migrate(&conn).unwrap();
+        assert_eq!(
+            unique_index_columns(&conn),
+            vec![vec!["sequencer_did".to_string(), "slug".to_string()]],
+            "a slug is unique per sequencer, not per server"
+        );
+        let dump = |conn: &Connection| -> Vec<ChannelDump> {
+            conn.prepare(
+                "SELECT id, slug, visibility, created_at, owner_did, archived_at, suite,
+                        sequencer_did, co_owners FROM channels ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        let once = dump(&conn);
+        assert_eq!(
+            once,
+            vec![
+                (
+                    "bafy_a".into(),
+                    "#a".into(),
+                    "open".into(),
+                    11,
+                    "did:jig:zA".into(),
+                    None,
+                    "none".into(),
+                    String::new(),
+                    "[]".into()
+                ),
+                (
+                    "bafy_b".into(),
+                    "#b".into(),
+                    "restricted".into(),
+                    12,
+                    "did:jig:zB".into(),
+                    Some(99),
+                    "mls".into(),
+                    String::new(),
+                    "[]".into()
+                ),
+            ]
+        );
+        let schema = |conn: &Connection| -> String {
+            conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'channels'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let schema_once = schema(&conn);
+        SqliteStore::migrate(&conn).unwrap();
+        assert_eq!(dump(&conn), once, "a second run changes no row");
+        assert_eq!(schema(&conn), schema_once, "and does not rebuild again");
+
+        let store = SqliteStore {
+            conn: Mutex::new(conn),
+            local_sequencer: Default::default(),
+        };
+        assert_eq!(
+            store.get_channel_by_slug("#a").unwrap().map(|c| c.id),
+            Some("bafy_a".to_string()),
+            "a placeholder row is local before boot adopts it"
+        );
+        assert_eq!(store.adopt_local_sequencer("did:jig:zServer").unwrap(), 2);
+        assert_eq!(store.adopt_local_sequencer("did:jig:zServer").unwrap(), 0);
+        assert!(store.adopt_local_sequencer("did:jig:zSomeoneElse").is_err());
+        let a = store.get_channel_by_slug("#a").unwrap().unwrap();
+        assert_eq!(a.sequencer_did, "did:jig:zServer");
+        assert!(a.co_owners.is_empty());
+    }
+
+    /// JEP-0005 rule 1: a slug is unique only per sequencer. A carried
+    /// channel (sequenced by another server) may share a local channel's
+    /// slug; the slug routes, which name local channels, resolve only the
+    /// one this server sequences, and the carried one is reached by its id.
+    #[test]
+    fn two_sequencers_may_share_a_slug_and_the_slug_route_resolves_the_local_one() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.adopt_local_sequencer("did:jig:zHere").unwrap();
+        let mut carried = sample_channel("bafy_carried", "#shared");
+        carried.sequencer_did = "did:jig:zElsewhere".to_string();
+        store.upsert_channel(&carried).unwrap();
+        assert_eq!(
+            store.get_channel_by_slug("#shared").unwrap(),
+            None,
+            "a carried channel is not this server's #shared"
+        );
+        let mut local = sample_channel("bafy_local", "#shared");
+        local.sequencer_did = "did:jig:zHere".to_string();
+        local.co_owners = vec!["did:jig:zCo".to_string()];
+        store.upsert_channel(&local).unwrap();
+
+        assert_eq!(
+            store.get_channel_by_slug("#shared").unwrap(),
+            Some(local.clone())
+        );
+        assert_eq!(
+            store
+                .get_channel_by_slug_including_archived("#shared")
+                .unwrap()
+                .map(|c| c.id),
+            Some("bafy_local".to_string())
+        );
+        assert_eq!(
+            store.get_channel_by_id("bafy_carried").unwrap(),
+            Some(carried),
+            "the carried channel is still there, by id"
+        );
+        assert_eq!(store.list_channels().unwrap().len(), 2);
+
+        let mut twin = sample_channel("bafy_twin", "#shared");
+        twin.sequencer_did = "did:jig:zHere".to_string();
+        assert!(
+            store.upsert_channel(&twin).is_err(),
+            "one sequencer still has one #shared"
         );
     }
 
@@ -2546,6 +3064,7 @@ mod tests {
 
         let store = SqliteStore {
             conn: Mutex::new(conn),
+            local_sequencer: Default::default(),
         };
         let g = store
             .get_mls_group_by_id("bafy_create_sealed")
@@ -2980,6 +3499,8 @@ mod tests {
             created_at: 0,
             owner_did: "did:jig:zOwner".to_string(),
             suite: "none".to_string(),
+            sequencer_did: String::new(),
+            co_owners: Vec::new(),
         };
         store.upsert_channel(&ch).unwrap();
         let fetched = store.get_channel_by_slug("#hello").unwrap().unwrap();
@@ -3024,6 +3545,8 @@ mod tests {
             created_at: 0,
             owner_did: "did:jig:zOwner".into(),
             suite: "none".to_string(),
+            sequencer_did: String::new(),
+            co_owners: Vec::new(),
         })
         .unwrap();
         s.upsert_membership(&StoredMembership {
@@ -3101,6 +3624,8 @@ mod tests {
             created_at: 0,
             owner_did: "did:jig:zOwner".to_string(),
             suite: "none".to_string(),
+            sequencer_did: String::new(),
+            co_owners: Vec::new(),
         }
     }
 

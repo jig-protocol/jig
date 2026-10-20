@@ -16,19 +16,38 @@
 use jig_core::{BlockKind, BlockManifest};
 
 use crate::persist::StoredChannel;
+use crate::roles::{Right, Rights};
 use crate::visibility::is_open;
 
 /// Why a block was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteRefusal {
-    /// The sender is not `channels.owner_did` for the channel it tried to change.
+    /// The sender holds neither the owner role nor a role granting the right
+    /// this change needs (`membership` for a member-add or member-remove;
+    /// the owner role for promote and archive).
     NotChannelOwner { slug: String, sender: String },
-    /// The sender is neither a member nor the owner of the restricted channel
+    /// The sender is neither a member nor an owner of the restricted channel
     /// it tried to post to.
     NotChannelMember { slug: String, sender: String },
-    /// The owner tried to leave. A channel always has its owner; retiring it
-    /// is `channel-archive`.
+    /// A root owner tried to leave. A channel always has its owners; retiring
+    /// it is `channel-archive`.
     OwnerCannotLeave { slug: String },
+    /// The sender lacks `right` for a block that needs it: today a
+    /// `role-assign` or `role-unassign` from anyone but an owner (JEP-0005
+    /// rule 7b: only owners assign roles; admins cannot make admins).
+    MissingRight {
+        slug: String,
+        sender: String,
+        right: Right,
+    },
+    /// A role block named a root owner (the creator or a listed co-owner),
+    /// whose role is fixed for the channel's life.
+    RootOwnerRole { slug: String, member: String },
+    /// A role block named a role v0.2 does not define (only `admin` can be
+    /// assigned), or none.
+    UnknownRole { role: String },
+    /// A role block named no `member` DID.
+    MissingRoleMember,
 }
 
 /// The membership facts a decision can turn on, resolved by the caller.
@@ -57,7 +76,7 @@ impl From<bool> for Membership {
 /// kinds this gate has never heard of. Enumerating content kinds instead
 /// would leave any newly allowed kind (a fed-hello carrying `channel`, say)
 /// free to land in a restricted timeline.
-fn changes_the_channel(kind: BlockKind) -> bool {
+pub fn changes_the_channel(kind: BlockKind) -> bool {
     matches!(
         kind,
         BlockKind::MemberAdd
@@ -65,6 +84,8 @@ fn changes_the_channel(kind: BlockKind) -> bool {
             | BlockKind::ChannelPromote
             | BlockKind::ChannelCreate
             | BlockKind::ChannelArchive
+            | BlockKind::RoleAssign
+            | BlockKind::RoleUnassign
     )
 }
 
@@ -77,30 +98,53 @@ pub fn needs_membership(kind: BlockKind, channel: Option<&StoredChannel>) -> boo
             || (!changes_the_channel(kind) && channel.is_some_and(|c| !is_open(&c.visibility))))
 }
 
+/// [`authorize_block_with`] with the rights the channel's terms alone give
+/// the sender ([`Rights::of_root`]): a root owner holds every right, anyone
+/// else none. Right for a channel with no role blocks; ingest, which can
+/// read the chain, passes the folded rights instead.
+pub fn authorize_block(
+    kind: BlockKind,
+    sender: &str,
+    manifest: &BlockManifest,
+    channel: Option<&StoredChannel>,
+    membership: impl Into<Membership>,
+) -> Result<(), WriteRefusal> {
+    let rights = channel
+        .map(|c| Rights::of_root(c, sender))
+        .unwrap_or_default();
+    authorize_block_with(kind, sender, manifest, channel, membership, rights)
+}
+
 /// Decide whether the block described by `manifest` may be applied to `channel`.
 ///
-/// Rules:
+/// `rights` are the sender's rights as of this block's position in the
+/// channel's ingest chain ([`crate::roles::rights_at`]). Rules:
 /// - Anything going INTO a **restricted** channel — `text-render`, the email
-///   kinds, and any other kind that names a channel — is for members and the
-///   owner. Into an open channel, anyone.
+///   kinds, and any other kind that names a channel — is for members and
+///   owners. Into an open channel, anyone.
 /// - `member-add` where the sender adds **itself** to an **open** channel is
 ///   allowed — the IRC `/join`, and what `jig channel join` does.
 /// - Every other `member-add` — anyone onto a restricted channel, or someone
-///   else onto any channel — is the owner's call. Membership drives delivery
-///   (fanout and bridge dispatch), so letting strangers enrol third parties
-///   would let them subscribe anyone to anything.
-/// - `channel-promote` (restricted → open) and `channel-archive` are the
-///   owner's call. The archive effect re-checks ownership itself; the check
+///   else onto any channel — needs the `membership` right (an owner or an
+///   admin). Membership drives delivery (fanout and bridge dispatch), so
+///   letting strangers enrol third parties would let them subscribe anyone
+///   to anything.
+/// - `channel-promote` (restricted → open) and `channel-archive` need the
+///   owner role. The archive effect re-checks ownership itself; the check
 ///   here is what turns a stranger's attempt into a typed 403 rather than an
 ///   effect-layer 500.
-/// - `channel-create` names a channel that does not exist yet; the store's
-///   unique slug refuses a duplicate.
-/// - `member-remove`: a member may remove **itself** (leave), except the
-///   owner, who archives instead. The owner may remove anyone else. Nobody
-///   removes the owner. On an encrypted channel, any member may also remove
-///   someone who is **no longer** a member: that block only carries the MLS
-///   commit dropping a departed member's leaf, which the departed member
-///   cannot send themselves (RFC 9420 forbids committing your own removal).
+/// - `role-assign` / `role-unassign` need the owner role (admins cannot make
+///   admins), name a role v0.2 defines (`admin`), and never name a root
+///   owner, whose role is fixed (JEP-0005 rule 7b).
+/// - `channel-create` names a channel that does not exist yet; ingest
+///   refuses a slug this server already sequences.
+/// - `member-remove`: a member may remove **itself** (leave), except a root
+///   owner, who archives instead. A holder of `membership` may remove anyone
+///   else but a root owner. Nobody removes a root owner. On an encrypted
+///   channel, any member may also remove someone who is **no longer** a
+///   member: that block only carries the MLS commit dropping a departed
+///   member's leaf, which the departed member cannot send themselves (RFC
+///   9420 forbids committing your own removal).
 ///
 /// `sender` must be the author DID the signature VERIFIED, in canonical form —
 /// never the spelling the manifest carries, which is the author's choice and
@@ -112,12 +156,13 @@ pub fn needs_membership(kind: BlockKind, channel: Option<&StoredChannel>) -> boo
 /// layer's error to raise, not an authorization decision, so it passes here.
 /// `sender_is_member` is consulted only where [`needs_membership`] says it
 /// matters; callers may pass `false` elsewhere.
-pub fn authorize_block(
+pub fn authorize_block_with(
     kind: BlockKind,
     sender: &str,
     manifest: &BlockManifest,
     channel: Option<&StoredChannel>,
     membership: impl Into<Membership>,
+    rights: Rights,
 ) -> Result<(), WriteRefusal> {
     let Some(channel) = channel else {
         return Ok(());
@@ -125,6 +170,12 @@ pub fn authorize_block(
     let membership = membership.into();
     let sender_is_member = membership.sender;
     let sender = sender.to_string();
+    let refuse = |sender: String| {
+        Err(WriteRefusal::NotChannelOwner {
+            slug: channel.slug.clone(),
+            sender,
+        })
+    };
 
     match kind {
         BlockKind::MemberAdd => {
@@ -133,10 +184,10 @@ pub fn authorize_block(
                 .get("member_did")
                 .and_then(|v| v.as_str())
                 .is_some_and(|member| crate::effect::canonical_did_string(member) == sender);
-            if adding_self && is_open(&channel.visibility) {
+            if (adding_self && is_open(&channel.visibility)) || rights.membership {
                 return Ok(());
             }
-            require_owner(channel, &sender)
+            refuse(sender)
         }
         BlockKind::MemberRemove => {
             let target = manifest
@@ -147,13 +198,10 @@ pub fn authorize_block(
             // No `member_did` removes nobody; refuse rather than let the
             // effect layer fail on it.
             let Some(target) = target else {
-                return Err(WriteRefusal::NotChannelOwner {
-                    slug: channel.slug.clone(),
-                    sender,
-                });
+                return refuse(sender);
             };
             if target == sender {
-                if is_owner(channel, &sender) {
+                if channel.is_root_owner(&sender) {
                     return Err(WriteRefusal::OwnerCannotLeave {
                         slug: channel.slug.clone(),
                     });
@@ -167,31 +215,55 @@ pub fn authorize_block(
                     })
                 };
             }
-            if is_owner(channel, &target) {
-                return Err(WriteRefusal::NotChannelOwner {
-                    slug: channel.slug.clone(),
-                    sender,
-                });
+            if channel.is_root_owner(&target) {
+                return refuse(sender);
             }
-            if is_owner(channel, &sender) {
+            if rights.membership {
                 return Ok(());
             }
             let tidy_up = !membership.target
                 && sender_is_member
                 && channel.suite == jig_core::EncryptionSuite::Mls.as_str();
-            if tidy_up {
+            if tidy_up { Ok(()) } else { refuse(sender) }
+        }
+        BlockKind::ChannelPromote | BlockKind::ChannelArchive => {
+            if rights.owner {
                 Ok(())
             } else {
-                Err(WriteRefusal::NotChannelOwner {
-                    slug: channel.slug.clone(),
-                    sender,
-                })
+                refuse(sender)
             }
         }
-        BlockKind::ChannelPromote | BlockKind::ChannelArchive => require_owner(channel, &sender),
+        BlockKind::RoleAssign | BlockKind::RoleUnassign => {
+            if !rights.owner {
+                return Err(WriteRefusal::MissingRight {
+                    slug: channel.slug.clone(),
+                    sender,
+                    right: Right::Owner,
+                });
+            }
+            let role = manifest
+                .metadata
+                .get(crate::roles::ROLE_KEY)
+                .and_then(|v| v.as_str());
+            if role.and_then(crate::roles::Role::parse).is_none() {
+                return Err(WriteRefusal::UnknownRole {
+                    role: role.unwrap_or_default().to_string(),
+                });
+            }
+            let Some(member) = crate::roles::role_target(manifest) else {
+                return Err(WriteRefusal::MissingRoleMember);
+            };
+            if channel.is_root_owner(&member) {
+                return Err(WriteRefusal::RootOwnerRole {
+                    slug: channel.slug.clone(),
+                    member,
+                });
+            }
+            Ok(())
+        }
         BlockKind::ChannelCreate => Ok(()),
         _ => {
-            if is_open(&channel.visibility) || is_owner(channel, &sender) || sender_is_member {
+            if is_open(&channel.visibility) || rights.owner || sender_is_member {
                 Ok(())
             } else {
                 Err(WriteRefusal::NotChannelMember {
@@ -200,24 +272,6 @@ pub fn authorize_block(
                 })
             }
         }
-    }
-}
-
-/// An empty `owner_did` would match an author-less manifest. It matches
-/// nobody: "we don't know who owns this" is not permission — the same
-/// reasoning as the archive check.
-fn is_owner(channel: &StoredChannel, sender: &str) -> bool {
-    !channel.owner_did.is_empty() && channel.owner_did == sender
-}
-
-fn require_owner(channel: &StoredChannel, sender: &str) -> Result<(), WriteRefusal> {
-    if is_owner(channel, sender) {
-        Ok(())
-    } else {
-        Err(WriteRefusal::NotChannelOwner {
-            slug: channel.slug.clone(),
-            sender: sender.to_string(),
-        })
     }
 }
 
@@ -239,6 +293,8 @@ mod tests {
             created_at: 0,
             owner_did: OWNER.to_string(),
             suite: "none".to_string(),
+            sequencer_did: String::new(),
+            co_owners: Vec::new(),
         }
     }
 
@@ -584,6 +640,198 @@ mod tests {
             ),
             Ok(())
         );
+    }
+
+    // ---- roles (JEP-0005 rule 7b) ----------------------------------------
+
+    const ADMIN: &str = "did:jig:zAdmin";
+    const CO_OWNER: &str = "did:jig:zCoOwner";
+
+    fn role_block(kind: BlockKind, sender: &str, role: &str, member: &str) -> BlockManifest {
+        manifest_with(
+            kind,
+            sender,
+            json!({"channel": "#room", "role": role, "member": member}),
+        )
+    }
+
+    fn with_co_owner(visibility: &str) -> StoredChannel {
+        let mut c = channel(visibility);
+        c.co_owners = vec![CO_OWNER.to_string()];
+        c
+    }
+
+    #[test]
+    fn an_admin_may_add_and_remove_members() {
+        let c = channel("restricted");
+        let add = member_add(ADMIN, "did:jig:zFriend");
+        assert_eq!(
+            authorize_block_with(
+                BlockKind::MemberAdd,
+                ADMIN,
+                &add,
+                Some(&c),
+                false,
+                Rights::ADMIN
+            ),
+            Ok(())
+        );
+        let rm = member_remove(ADMIN, MEMBER);
+        assert_eq!(
+            authorize_block_with(
+                BlockKind::MemberRemove,
+                ADMIN,
+                &rm,
+                Some(&c),
+                Membership {
+                    sender: true,
+                    target: true
+                },
+                Rights::ADMIN
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            authorize_block_with(
+                BlockKind::MemberAdd,
+                ADMIN,
+                &add,
+                Some(&c),
+                false,
+                Rights::NONE
+            ),
+            refused(ADMIN),
+            "without the role, the same block is refused"
+        );
+    }
+
+    #[test]
+    fn an_admin_may_not_promote_archive_or_remove_an_owner() {
+        let c = with_co_owner("restricted");
+        for kind in [BlockKind::ChannelPromote, BlockKind::ChannelArchive] {
+            let m = manifest_with(kind, ADMIN, json!({"channel": "#room"}));
+            assert_eq!(
+                authorize_block_with(kind, ADMIN, &m, Some(&c), false, Rights::ADMIN),
+                refused(ADMIN),
+                "{kind:?} is owner-only"
+            );
+        }
+        for owner in [OWNER, CO_OWNER] {
+            let rm = member_remove(ADMIN, owner);
+            assert_eq!(
+                authorize_block_with(
+                    BlockKind::MemberRemove,
+                    ADMIN,
+                    &rm,
+                    Some(&c),
+                    Membership {
+                        sender: true,
+                        target: true
+                    },
+                    Rights::ADMIN
+                ),
+                refused(ADMIN)
+            );
+        }
+    }
+
+    #[test]
+    fn only_owners_assign_roles() {
+        let c = channel("open");
+        for kind in [BlockKind::RoleAssign, BlockKind::RoleUnassign] {
+            let by_admin = role_block(kind, ADMIN, "admin", MEMBER);
+            assert_eq!(
+                authorize_block_with(kind, ADMIN, &by_admin, Some(&c), false, Rights::ADMIN),
+                Err(WriteRefusal::MissingRight {
+                    slug: "#room".to_string(),
+                    sender: ADMIN.to_string(),
+                    right: Right::Owner,
+                }),
+                "admins cannot make or unmake admins"
+            );
+            let by_owner = role_block(kind, OWNER, "admin", MEMBER);
+            assert_eq!(
+                authorize_block(kind, OWNER, &by_owner, Some(&c), false),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn a_co_owner_holds_every_right_from_the_terms_alone() {
+        let c = with_co_owner("restricted");
+        let assign = role_block(BlockKind::RoleAssign, CO_OWNER, "admin", MEMBER);
+        assert_eq!(
+            authorize_block(BlockKind::RoleAssign, CO_OWNER, &assign, Some(&c), false),
+            Ok(())
+        );
+        let archive = manifest_with(
+            BlockKind::ChannelArchive,
+            CO_OWNER,
+            json!({"channel": "#room"}),
+        );
+        assert_eq!(
+            authorize_block(
+                BlockKind::ChannelArchive,
+                CO_OWNER,
+                &archive,
+                Some(&c),
+                false
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            remove(CO_OWNER, CO_OWNER, &c, true, true),
+            Err(WriteRefusal::OwnerCannotLeave {
+                slug: "#room".to_string()
+            }),
+            "a co-owner is a root owner and cannot leave"
+        );
+    }
+
+    #[test]
+    fn the_creator_and_a_co_owner_cannot_be_unassigned() {
+        let c = with_co_owner("open");
+        for kind in [BlockKind::RoleUnassign, BlockKind::RoleAssign] {
+            for root in [OWNER, CO_OWNER] {
+                let m = role_block(kind, OWNER, "admin", root);
+                assert_eq!(
+                    authorize_block(kind, OWNER, &m, Some(&c), false),
+                    Err(WriteRefusal::RootOwnerRole {
+                        slug: "#room".to_string(),
+                        member: root.to_string(),
+                    }),
+                    "{kind:?} naming root owner {root}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_role_block_names_a_defined_role_and_a_member() {
+        let c = channel("open");
+        let owner_role = role_block(BlockKind::RoleAssign, OWNER, "owner", MEMBER);
+        assert_eq!(
+            authorize_block(BlockKind::RoleAssign, OWNER, &owner_role, Some(&c), false),
+            Err(WriteRefusal::UnknownRole {
+                role: "owner".to_string()
+            }),
+            "owner is conferred by the creation block only"
+        );
+        let no_member = manifest_with(
+            BlockKind::RoleAssign,
+            OWNER,
+            json!({"channel": "#room", "role": "admin"}),
+        );
+        assert_eq!(
+            authorize_block(BlockKind::RoleAssign, OWNER, &no_member, Some(&c), false),
+            Err(WriteRefusal::MissingRoleMember)
+        );
+        assert!(changes_the_channel(BlockKind::RoleAssign));
+        assert!(!needs_membership(
+            BlockKind::RoleAssign,
+            Some(&channel("restricted"))
+        ));
     }
 
     // ---- content ----------------------------------------------------------

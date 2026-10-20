@@ -86,6 +86,11 @@ key is the DID. No authority issues or revokes one.
   example in different ruleset groups.
 - A new keypair is a new identity with no reputation. The protocol has no mechanism that
   links two DIDs, except [alias rotation](#aliases), which both keys must sign.
+  **Status:** the [JEP-0012](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0012-key-links.md)
+  draft specifies a key link, signed by both keys, that moves one DID's standing to another
+  for one audience (a channel, an alias at one nameserver, a contact, or the public), and
+  `jig_core::key_link` implements it as a library (#235). No record carries a link yet, and
+  `/v1/rotate` still takes signatures over the challenge.
 - Losing the private key loses the identity. Clients SHOULD make key backup explicit.
 
 ### Aliases
