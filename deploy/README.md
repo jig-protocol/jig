@@ -449,7 +449,6 @@ so a rebooted box catches up). It snapshots:
 | What | Why |
 | --- | --- |
 | `/var/lib/jig/jig_v002.db` | **the v0.0.2 block store — where the actual messages are** |
-| `/var/lib/jig/nameserver.db` | the nameserver's legacy registry |
 | `/var/lib/jig/nameserver_v002.db` | **the nameserver's alias bindings** |
 | `/var/lib/jig/server.key` | server identity |
 | `/var/lib/jig/nameserver_v002.key` | **the nameserver's signing key** (set `JIG_NAMESERVER_KEYFILE` if `[v0_0_2.server] server_did_keyfile` puts it elsewhere) |
@@ -467,6 +466,15 @@ verifying for servers and clients whose delegation names the old DID.
 (#196). On a box upgraded from an older release the file is still there and
 unused; delete it yourself once no backup you keep needs it. Nothing deletes
 it for you.
+
+**`nameserver.db` is the same story, with a key in it.** `jig-nameserver`
+derives `nameserver_v002.db` and `nameserver_v002.key` from `database_path`
+(`JIG_NS_DB_PATH`) the same way, and no longer opens `nameserver.db` itself:
+its legacy registry, analytics and `analyze`/`export` subcommands were removed.
+That file's `ns_identity` table holds a raw signing seed that signs nothing any
+more. Once `nameserver_v002.db` and `nameserver_v002.key` are in place, delete
+`nameserver.db` **and every old backup that contains it**. Keep
+`JIG_NS_DB_PATH` set: it names where the `_v002` files live.
 
 Databases are copied with `sqlite3 … 'VACUUM INTO …'`, which takes a read lock
 and writes one consistent file, so snapshots are safe while the server is
@@ -493,7 +501,7 @@ file).
 
 ```bash
 sudo systemctl stop jig-server jig-nameserver
-sudo cp /path/to/snapshot/{jig_v002.db,nameserver.db,nameserver_v002.db} /var/lib/jig/
+sudo cp /path/to/snapshot/{jig_v002.db,nameserver_v002.db} /var/lib/jig/
 sudo cp /path/to/snapshot/server.key /var/lib/jig/server.key
 sudo cp /path/to/snapshot/nameserver_v002.key /var/lib/jig/nameserver_v002.key
 sudo chown -R jig:jig /var/lib/jig          # -R, not /var/lib/jig/* — see the

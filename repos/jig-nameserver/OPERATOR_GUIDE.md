@@ -35,7 +35,7 @@ Settings come from the config file named by `--config <path>` or else `JIG_NS_CO
 - `[[v0_0_2.nameserver.alias_suffixes]]` (required, no default): each suffix this nameserver serves, with its registration policy. The nameserver refuses to start without one. See `deploy/README.md` for the per-suffix options.
 - `[v0_0_2.server] server_did_keyfile`: the nameserver's signing key. Created on first start if missing. Back it up; a new key is a new nameserver identity.
 - `[v0_0_2.debug] list_handles` (default `false`): mounts `/v1/handles`.
-- `[storage] database_path` / `JIG_NS_DB_PATH`: the alias database.
+- `[storage] database_path` / `JIG_NS_DB_PATH`: where the alias store and the default signing key live, as `<stem>_v002.db` and `<stem>_v002.key` beside it. The path itself is never created. A `nameserver.db` left by an older release holds a raw key (`ns_identity`) that signs nothing: delete it, and old backups of it.
 - `[network] bind` / `JIG_NS_BIND` and `[network] port` / `JIG_NS_PORT`: listen address.
 - `[network] trust_proxy` / `JIG_NS_TRUST_PROXY` and `[network] proxy_ip_header` / `JIG_NS_PROXY_IP_HEADER`: see [Behind a reverse proxy](#behind-a-reverse-proxy).
 

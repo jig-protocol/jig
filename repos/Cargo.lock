@@ -3088,12 +3088,9 @@ name = "jig-nameserver"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "async-trait",
  "axum",
  "base64 0.23.1",
- "blake3",
  "chrono",
- "cid",
  "clap",
  "dirs 7.0.0",
  "ed25519-dalek 3.0.0",
@@ -3123,7 +3120,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "urlencoding",
- "uuid",
 ]
 
 [[package]]

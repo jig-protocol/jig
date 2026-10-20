@@ -16,7 +16,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 clap = { workspace = true, features = ["derive", "env"] }
 chrono = { workspace = true, features = ["serde"] }
-uuid = { workspace = true, features = ["v7", "serde"] }
 rusqlite = { workspace = true }
 ed25519-dalek = { workspace = true }
 # For challenge nonces and PoW salts only. Identity keygen goes through
@@ -24,13 +23,11 @@ ed25519-dalek = { workspace = true }
 # from this dependency. (`jig-client` has no `rand` at all for that reason; the
 # nameserver still needs it for the non-key randomness above.)
 rand = { workspace = true }
-blake3 = { workspace = true }
 axum = { workspace = true, features = ["macros"] }
 tower = { workspace = true, features = ["make", "util"] }
 tower-http = { workspace = true, features = ["cors", "trace"] }
 hyper = { workspace = true }
 hyper-util = { version = "0.1", features = ["server", "http1", "http2", "tokio"] }
-async-trait = { workspace = true }
 hex = { workspace = true }
 
 reqwest = { workspace = true }
@@ -42,7 +39,6 @@ hdrhistogram = { version = "7", optional = true }
 pprof = { version = "0.15", features = ["flamegraph"], optional = true }
 dirs = "7"
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
-cid.workspace = true
 jig-config = { workspace = true }
 jig-core = { workspace = true }
 

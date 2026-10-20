@@ -860,7 +860,7 @@ sums, `umask 077`, partial-snapshot cleanup, and retention pruning that only
 ever touches timestamp-shaped directories. It backs up **`jig_v002.db`** (the
 block store — where the messages actually are; the `_v002` suffix is derived
 from `database_path`, not a typo) and `server.key`, plus, when the box runs the
-nameserver, `nameserver.db`, `nameserver_v002.db` (the alias bindings) and
+nameserver, `nameserver_v002.db` (the alias bindings) and
 `nameserver_v002.key` (the nameserver's signing key). The older `jig.db` is no longer used (#196) and is not backed
 up.
 

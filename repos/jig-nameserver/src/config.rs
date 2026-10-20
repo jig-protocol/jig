@@ -1163,6 +1163,8 @@ trust_proxy = false
 proxy_ip_header = "x-forwarded-for"
 
 [storage]
+# Names where the nameserver keeps <stem>_v002.db (aliases) and <stem>_v002.key
+# (its signing key). The file itself is never created.
 database_path = "~/.jig/nameserver.db"
 
 

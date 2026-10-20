@@ -11,12 +11,14 @@
 #   2. server.key   — the ed25519 seed the server DID is derived from. Losing it
 #                     changes the server's identity and breaks TOFU pinning for
 #                     every client that ever connected. See deploy/README.md.
-#   3. nameserver.db, nameserver_v002.db and nameserver_v002.key, when this box
-#                     runs jig-nameserver. nameserver_v002.db holds the alias
+#   3. nameserver_v002.db and nameserver_v002.key, when this box runs
+#                     jig-nameserver. nameserver_v002.db holds the alias
 #                     bindings; nameserver_v002.key is the nameserver's signing
 #                     key. Without the key a restore gets a new nameserver DID,
 #                     and every attestation the old one signed stops verifying
 #                     for anyone whose delegation names the old DID.
+#                     nameserver.db, the legacy registry, is no longer used and
+#                     is not backed up: it holds a raw key (`ns_identity`).
 #
 # SQLite is copied with `VACUUM INTO`, not `cp`: it takes a read lock and emits
 # a single consistent file, so a snapshot taken while the server is serving is
@@ -87,8 +89,7 @@ snapshot_db() {
 
 snapshot_db "$JIG_STATE_DIR/jig_v002.db"
 # Not strictly part of the server's state, but it lives on the same box and a
-# lost registry means every handle has to be re-registered.
-snapshot_db "$JIG_STATE_DIR/nameserver.db"
+# lost alias store means every handle has to be re-registered.
 snapshot_db "$JIG_STATE_DIR/nameserver_v002.db"
 
 # --- the irreplaceable one --------------------------------------------------
