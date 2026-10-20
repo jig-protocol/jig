@@ -54,7 +54,7 @@ renew_effort = 1         # renew and rotate by the holder
 ```
 
 - **The offer.** `GET /v1/challenge?action=register|renew|rotate&did=<did>&name=<alias@suffix>` returns the challenge, the effort asked (`pow`), and `pow_offer`: the same, signed by the nameserver's DID. The proof is checked against that promise, so raising `min_effort` never refuses a client mid-solve. For rotate, `did` is the old DID.
-- **Refused before any work.** For `register`, the challenge request already refuses a closed suffix, a short or reserved alias, a taken alias and a second name for the DID. `register` checks them again.
+- **Refused before any work.** For `register`, the challenge request already refuses a closed suffix, a short or reserved alias and a taken alias. `register` checks them again, and refuses a second name for the DID once the DID has signed (not before, since the refusal names the alias it holds).
 - **Order of checks.** The work is checked (one hash) before any signature. Bad work is `400 POW_INVALID`, too little is `400 POW_INSUFFICIENT`, missing work is `428 POW_REQUIRED` with the offer restated. None of them consumes the challenge.
 - **Allowlisted names** (`registration_allow`) pay `min_effort`, with no length multiplier.
 - **Penalties.** Work that does not verify adds a point to the client's address (never to the DID it names, which is unproven at that stage). A signed attempt on a name another DID holds adds a point to that (alias, DID) pair only. Each point doubles the effort asked; it lasts `penalty_decay_secs` (600), and a repeat before it lapses adds a point and doubles its life.
@@ -90,7 +90,7 @@ enabled = true
 per_ip_per_min = 30              # requests per client IP, across the three routes
 per_did_per_min = 10             # successful requests naming a DID
 challenge_per_ip_per_min = 60    # GET /v1/challenge per client IP, a bucket of its own
-max_pending_challenges = 100000  # past it, new challenges get 503 BUSY; live ones are kept
+max_pending_challenges = 100000  # past it, new challenges get 503 BUSY; live ones are kept, and a tenth is kept for renew and rotate
 ```
 
 - **Per client IP.** Every admitted request is counted against its client IP before the handler runs. IPv6 clients are counted per /64, so one host cannot rotate through its own addresses to escape the limit.

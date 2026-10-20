@@ -293,12 +293,18 @@ impl AppState {
 
     /// Record a challenge nonce so a later register, renew or rotate can verify
     /// it was issued, and for what. The background sweeper drops it once it is
-    /// older than `challenge_ttl`. Returns false, recording nothing, when
-    /// `max_pending_challenges` are already pending: live ones are never
-    /// evicted to make room.
+    /// older than `challenge_ttl`. Returns false, recording nothing, when the
+    /// map is full: live challenges are never evicted to make room. A tenth of
+    /// `max_pending_challenges` is kept for renew and rotate, so a flood of
+    /// registrations cannot stop holders keeping their names.
     pub async fn remember_challenge(&self, nonce: &str, pending: PendingChallenge) -> bool {
+        use jig_core::pow::Action;
+        let cap = match pending.action {
+            Some(Action::NsRenew | Action::NsRotate) => self.max_pending_challenges,
+            _ => self.max_pending_challenges - self.max_pending_challenges / 10,
+        };
         let mut guard = self.pending_challenges.write().await;
-        if guard.len() >= self.max_pending_challenges {
+        if guard.len() >= cap {
             return false;
         }
         guard.insert(nonce.to_string(), pending);
