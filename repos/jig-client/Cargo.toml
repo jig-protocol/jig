@@ -63,8 +63,16 @@ zeroize = "1"
 keyring-core = "1"
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 
+[features]
+# Run a block's component here and compare with the server's `exec` receipt
+# (JEP-0006 step 7). The runtime and the text-block component come through
+# jig-pipeline, which already links both.
+verify = []
+
 [dev-dependencies]
 tempfile = "3"
+# `verify` tests sign real exec receipts with the pipeline's test executor.
+jig-pipeline = { path = "../jig-pipeline", features = ["test-support"] }
 # `naming` tests stand up real TLS servers: one under a test CA, one
 # self-signed, to show `dns` discovery takes a CA-valid certificate only. Same
 # rustls stack as above (0.23, ring), as integration-tests uses.

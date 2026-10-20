@@ -12,7 +12,8 @@ path = "src/lib.rs"
 jig-runtime = { workspace = true }
 jig-server = { path = "../jig-server" }
 jig-nameserver = { path = "../jig-nameserver" }
-jig-client = { path = "../jig-client" }
+# `verify`: the client re-executes text-render blocks and checks the receipt.
+jig-client = { path = "../jig-client", features = ["verify"] }
 jig-mls = { workspace = true }
 jig-pipeline = { path = "../jig-pipeline" }
 jig-core = { workspace = true }

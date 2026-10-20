@@ -31,3 +31,8 @@ pub use effect::apply_effect;
 pub use envelope::{Envelope, Frame, HlcCursor, ReceiptRef, Scope};
 pub use fanout::{Fanout, SubscriptionScope};
 pub use ingest::{IngestContext, IngestError, IngestSource, ingest};
+
+/// The block runtime and the text-block component, as this crate links them: a client that
+/// re-executes blocks (`jig-client`'s `verify`) runs exactly the versions the server runs.
+pub use jig_runtime;
+pub use text_block;
