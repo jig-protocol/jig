@@ -71,7 +71,11 @@ LockPersonality=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 ReadWritePaths=/var/lib/jig
 
-# DELIBERATELY NOT SET: MemoryDenyWriteExecute — see jig-server.service.
+# W^X: no page may be writable and executable. jig-server cannot take this (its
+# Wasm JIT maps pages W then X); the nameserver runs no blocks and, built on its
+# own (`cargo build -p jig-nameserver`), links no Wasm engine. CI checks both
+# (jig-nameserver/tests/mdwe.rs and the "links no Wasm engine" step).
+MemoryDenyWriteExecute=yes
 CapabilityBoundingSet=
 
 [Install]

@@ -12,7 +12,17 @@
 pub mod authorize_write;
 pub mod effect;
 pub mod envelope;
+#[cfg(feature = "executor")]
 pub mod executor;
+/// Built without the `executor` feature: the pipeline cannot run blocks, and links no Wasm
+/// engine. Such a build never constructs an `IngestContext` with an executor, so every block that
+/// must execute is refused with [`IngestError::NoExecutor`].
+#[cfg(not(feature = "executor"))]
+pub mod executor {
+    /// No value of this type exists without the `executor` feature.
+    #[derive(Debug)]
+    pub enum BlockExecutor {}
+}
 pub mod fanout;
 pub mod handshake;
 pub mod hlc;

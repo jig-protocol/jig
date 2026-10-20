@@ -47,7 +47,7 @@ jig-config = { workspace = true }
 jig-core = { workspace = true }
 
 # v0.0.2 hello-world milestone
-jig-pipeline = { path = "../jig-pipeline" }
+jig-pipeline = { path = "../jig-pipeline", default-features = false }
 jig-client = { path = "../jig-client" }
 shellexpand = "3"
 base64 = "0.23"
@@ -56,6 +56,10 @@ base64 = "0.23"
 serde_json = { workspace = true }
 http-body-util = { workspace = true }
 semver = { version = "1.0", features = ["serde"] }
+
+# tests/mdwe.rs: start the binary under prctl(PR_SET_MDWE).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
 
 [features]
 default = []

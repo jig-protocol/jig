@@ -1524,7 +1524,18 @@ async fn render_after_landing(
         .ok_or_else(|| IngestError::NoExecutor {
             kind: BlockKind::TextRender.as_str().to_string(),
         })?;
+    exec_receipt(ctx, executor, input, block_cid, record).await
+}
 
+/// The signed `exec` receipt for rendering `input` against its ingest `record`.
+#[cfg(feature = "executor")]
+async fn exec_receipt(
+    ctx: &IngestContext,
+    executor: &Arc<crate::executor::BlockExecutor>,
+    input: text_block::Input,
+    block_cid: &str,
+    record: crate::ingest_record::IngestRecord,
+) -> Result<StoredReceipt, IngestError> {
     let mut invocation =
         crate::executor::text_invocation(&input, block_cid.to_string(), record.seq);
     invocation.channel_cid = record.channel_id.clone();
@@ -1545,6 +1556,18 @@ async fn render_after_landing(
     let bytes = crate::receipts::sign(receipt, &ctx.server_key)
         .map_err(|e| anyhow::anyhow!("signing the exec receipt: {e}"))?;
     Ok(stored_receipt(ctx, block_cid, bytes, render_hash))
+}
+
+/// Built without the `executor` feature, no `BlockExecutor` exists, so this is never reached.
+#[cfg(not(feature = "executor"))]
+async fn exec_receipt(
+    _ctx: &IngestContext,
+    executor: &Arc<crate::executor::BlockExecutor>,
+    _input: text_block::Input,
+    _block_cid: &str,
+    _record: crate::ingest_record::IngestRecord,
+) -> Result<StoredReceipt, IngestError> {
+    match **executor {}
 }
 
 /// The receipt of a landed `text-render` block, whatever happens while rendering it.
@@ -1604,6 +1627,7 @@ thread_local! {
 /// `render` parks on a condvar for a concurrency slot and then runs the guest on the same thread.
 /// Execution is bounded by the epoch deadline; the slot wait is not, so running it inline could
 /// park enough workers to stall the tasks that would free slots.
+#[cfg(feature = "executor")]
 async fn run_text_render(
     executor: &Arc<crate::executor::BlockExecutor>,
     invocation: jig_runtime::component::Invocation,
@@ -1647,6 +1671,15 @@ async fn check_text_render(
         .ok_or_else(|| IngestError::NoExecutor {
             kind: BlockKind::TextRender.as_str().to_string(),
         })?;
+    check_render_complete(executor, input, block_cid).await
+}
+
+#[cfg(feature = "executor")]
+async fn check_render_complete(
+    executor: &Arc<crate::executor::BlockExecutor>,
+    input: &text_block::Input,
+    block_cid: &str,
+) -> Result<(), IngestError> {
     let run = run_text_render(
         executor,
         crate::executor::text_invocation(input, block_cid.to_string(), 0),
@@ -1659,6 +1692,16 @@ async fn check_text_render(
         });
     }
     Ok(())
+}
+
+/// Built without the `executor` feature, no `BlockExecutor` exists, so this is never reached.
+#[cfg(not(feature = "executor"))]
+async fn check_render_complete(
+    executor: &Arc<crate::executor::BlockExecutor>,
+    _input: &text_block::Input,
+    _block_cid: &str,
+) -> Result<(), IngestError> {
+    match **executor {}
 }
 
 fn stored_receipt(
