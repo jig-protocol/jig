@@ -2966,6 +2966,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
+ "blake3",
  "chrono",
  "cid",
  "clap",
@@ -2979,6 +2980,7 @@ dependencies = [
  "jig-runtime",
  "ratatui",
  "reqwest",
+ "rustc-demangle",
  "semver",
  "serde",
  "serde_json",
@@ -2988,7 +2990,10 @@ dependencies = [
  "tokio",
  "toml",
  "url",
+ "wasmparser 0.261.0",
+ "wat",
  "whoami",
+ "wit-component 0.258.3",
  "zeroize",
 ]
 

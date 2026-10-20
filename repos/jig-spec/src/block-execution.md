@@ -499,7 +499,7 @@ When `constraints.deterministic = true` (the default), hosts MUST reject WebAsse
 - **Randomness**: Derived from `BLAKE3(manifest.block_id || host_seed)` (deterministic for replay).
 - **Network**: Responses cached and replayed for deterministic re-execution.
 
-**For developers:** Compile with `--target wasm32-wasi` and avoid `std::time::SystemTime::now()`. Use the Jig SDK's `jig::time()` instead, which gets time from the host as an argument.
+**For developers:** Build with `jig block build`, which compiles for `wasm32-unknown-unknown` (no WASI) and checks the result against `jig-det-1`. A block never reads a clock: time arrives in the invocation (`ingest-hlc`).
 
 ### Canonical Serialization
 
@@ -570,7 +570,7 @@ Hosts MUST support:
 
 Blocks MAY be authored in any language compiling to WebAssembly:
 
-**Rust** (primary, best support): `cargo build --target wasm32-wasi`
+**Rust** (the only language with a template in v0.3): `jig block new <name>`, then `jig block build`
 
 **AssemblyScript** (TypeScript-like): Great for web developers.
 

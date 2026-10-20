@@ -376,6 +376,8 @@ mod tests {
             tls_binding: Default::default(),
             manifest: Default::default(),
             key_link: None,
+            peer_frames: Default::default(),
+            peers: Default::default(),
         })
     }
 

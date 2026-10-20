@@ -161,8 +161,7 @@ enum Commands {
         action: NsAction,
     },
 
-    /// Execute WASM blocks locally
-    #[cfg(feature = "local-runtime")]
+    /// Write, build, check and run blocks
     Block {
         #[command(subcommand)]
         action: BlockAction,
@@ -386,9 +385,41 @@ enum ServerAction {
 }
 
 #[derive(Subcommand, Debug)]
-#[cfg(feature = "local-runtime")]
 enum BlockAction {
+    /// Create a block project from a template
+    New {
+        /// The block's name: lowercase letters, digits and `-`
+        name: String,
+
+        /// The template to start from
+        #[arg(long, value_enum, default_value = "renderer")]
+        template: cmd::block_new::Template,
+
+        /// Write the project here instead of ./<name>
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
+
+    /// Build the block project in the current directory into a component, then lint it
+    Build {
+        /// The project directory
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+    },
+
+    /// Check a component against the determinism profile jig-det-1
+    Lint {
+        /// A block project directory (lints its built component), or a .wasm file
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+
+        /// The memory limit in 64 KiB pages, when linting a .wasm file directly
+        #[arg(long, default_value_t = cmd::block_project::DEFAULT_MEMORY_PAGES)]
+        max_memory_pages: u32,
+    },
+
     /// Run a WASM block locally and generate a receipt
+    #[cfg(feature = "local-runtime")]
     Run {
         /// Path to WASM file
         wasm: String,
@@ -474,6 +505,43 @@ enum ReceiptAction {
     },
 }
 
+/// `jig block new`, `build` and `lint`, or `None` for the block actions that need a config.
+fn run_local_block_action(action: &BlockAction) -> Option<Result<()>> {
+    Some(match action {
+        BlockAction::New {
+            name,
+            template,
+            dir,
+        } => std::env::current_dir()
+            .map_err(anyhow::Error::from)
+            .and_then(|cwd| cmd::block_new::new_block(name, *template, &cwd, dir.as_deref()))
+            .map(|root| print!("{}", cmd::block_new::next_steps(&root))),
+        BlockAction::Build { path } => cmd::block_build::build(path).and_then(|built| {
+            println!("built {}", built.component.display());
+            println!("component {}", built.component_hash);
+            print!("{}", built.lint.render());
+            if built.lint.passes() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("the component does not pass jig-det-1"))
+            }
+        }),
+        BlockAction::Lint {
+            path,
+            max_memory_pages,
+        } => cmd::block_lint::lint_path(path, *max_memory_pages).and_then(|l| {
+            print!("{}", l.render());
+            if l.passes() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("the component does not pass jig-det-1"))
+            }
+        }),
+        #[cfg(feature = "local-runtime")]
+        BlockAction::Run { .. } => return None,
+    })
+}
+
 /// Exit status when no key slot can seal a new identity key: no OS keychain,
 /// no terminal, and no `JIG_KEY_PASSPHRASE` or `JIG_KEY_UNLOCK`. `install.sh`
 /// matches it, not the message, to fall back to plaintext keys. 78 is
@@ -504,6 +572,14 @@ async fn main() -> std::process::ExitCode {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+
+    // Writing, building and linting a block touch only local files: they need no config,
+    // identity or server, so they run before any of those is loaded.
+    if let Some(Commands::Block { action }) = &cli.command
+        && let Some(result) = run_local_block_action(action)
+    {
+        return result;
+    }
 
     // Lift the global flags out of `cli` FIRST. Everything below reads
     // config through the resolved context, so `--server` / `--config` /
@@ -703,12 +779,10 @@ async fn run() -> Result<()> {
     let direct_message = cli.message;
 
     // Every command below but the local ones talks to the server.
-    let local = match &cli.command {
-        Some(Commands::Receipt { .. }) => true,
-        #[cfg(feature = "local-runtime")]
-        Some(Commands::Block { .. }) => true,
-        _ => false,
-    };
+    let local = matches!(
+        &cli.command,
+        Some(Commands::Receipt { .. } | Commands::Block { .. })
+    );
     if !local {
         cmd::admission::ensure(&ctx).await?;
     }
@@ -761,8 +835,11 @@ async fn run() -> Result<()> {
                 cmd::receipt::compare_receipts(&first, &second)?
             }
         },
-        #[cfg(feature = "local-runtime")]
         Some(Commands::Block { action }) => match action {
+            BlockAction::New { .. } | BlockAction::Build { .. } | BlockAction::Lint { .. } => {
+                unreachable!("handled before the config is loaded")
+            }
+            #[cfg(feature = "local-runtime")]
             BlockAction::Run {
                 wasm,
                 seed,
