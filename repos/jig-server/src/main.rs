@@ -203,6 +203,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Done before handing state to JigServer so we hold a clone while the Arc is still
     // available. Tasks are fire-and-forget (reconnect internally on disconnect).
     if let Some(ref state) = v0_0_2_state {
+        // Before anything is served: every welcome cites the current manifest
+        // (JEP-0002 rule 12), and a server that cannot keep its log must not
+        // pretend to.
+        if let Err(e) = jig_server::v0_0_2_manifest_log::publish(state).await {
+            let msg = format!("manifest log: {e:#}");
+            tracing::error!("{msg}");
+            eprintln!("[jig-server] FATAL: {msg}");
+            std::process::exit(1);
+        }
         jig_server::v0_0_2_federation::spawn_federation_peers(state.clone());
         // Start config-permitted bridges before the router is built (they mount
         // their HTTP routes into bridge_router_mount, which build_v0_0_2_router

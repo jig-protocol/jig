@@ -283,8 +283,10 @@ mod tests {
     fn scratch_config(dir: &ScratchDir, alias_suffix: &str) -> NameServerConfig {
         let mut cfg = NameServerConfig::default();
         cfg.storage.database_path = dir.0.join("nameserver.db");
-        cfg.v0_0_2.nameserver.alias_suffixes =
-            vec![jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix)];
+        let mut suffix = jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix);
+        // These tests are about routes and rate limits, not proof-of-work.
+        suffix.pow = jig_config::v0_0_2_server::PowPolicy::off();
+        cfg.v0_0_2.nameserver.alias_suffixes = vec![suffix];
         cfg.v0_0_2.server.server_did_keyfile = dir.0.join("ns.key").to_string_lossy().into_owned();
         // Off by default in production; on here so the route-presence assertions
         // exercise the mounted handler.

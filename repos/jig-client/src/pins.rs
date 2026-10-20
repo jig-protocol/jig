@@ -670,6 +670,7 @@ mod tests {
             nonce: String::new(),
             server_nonce: String::new(),
             tls_exporter: Vec::new(),
+            manifest: None,
             evidence: String::new(),
         }
     }
