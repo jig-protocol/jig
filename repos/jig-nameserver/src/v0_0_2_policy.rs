@@ -260,6 +260,14 @@ fn checked_pow(suffix: &str, pow: &PowPolicy) -> Result<PowPolicy> {
             jig_core::pow::MAX_EFFORT
         );
     }
+    let ttl = crate::v0_0_2::DEFAULT_CHALLENGE_TTL.as_secs();
+    if pow.max_solve_secs.saturating_mul(2) > ttl {
+        bail!(
+            "suffix `{suffix}`: pow.max_solve_secs {} must be at most half the challenge \
+             lifetime of {ttl} s, or slow solves outlive their challenge",
+            pow.max_solve_secs
+        );
+    }
     if pow.max_effort > pow.max_solve_secs.saturating_mul(REFERENCE_DIGESTS_PER_SEC) {
         bail!(
             "suffix `{suffix}`: pow.max_effort {} cannot be solved in pow.max_solve_secs {} at \
@@ -455,6 +463,11 @@ mod tests {
             with(|p| p.max_solve_secs = 1)
                 .unwrap_err()
                 .contains("max_solve_secs")
+        );
+        assert!(
+            with(|p| p.max_solve_secs = 31)
+                .unwrap_err()
+                .contains("half the challenge")
         );
         assert!(
             with(|p| p.short_name_factor = 0)

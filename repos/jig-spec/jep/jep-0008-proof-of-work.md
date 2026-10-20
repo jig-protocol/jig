@@ -109,7 +109,7 @@ Non-goals:
     | `dial` | server | stamp | the dialing server's DID |
     | `ns-register` | nameserver | challenge | `proof_hash("register", ns_did, alias, challenge)` (JEP-0004 rule 10) |
     | `ns-renew` | nameserver | challenge | `proof_hash("renew", ns_did, alias, challenge)` |
-    | `ns-rotate` | nameserver | challenge | `proof_hash("rotate", ns_did, alias, challenge)` |
+    | `ns-rotate` | nameserver | challenge | interim, until JEP-0004 gains a rotate proof: BLAKE3 of the deterministic CBOR map `{domain: "jig-alias-rotate-pow-v1", ns_did, alias, old_did, new_did, challenge}`, every DID canonical `did:jig` |
 
     For `ns-rotate`, the subject is the old DID, the key that holds the name.
 12. A new action MUST be registered here with its mode and binding before any verifier asks for
@@ -296,7 +296,8 @@ verifiers that ask for work are built on it in R1's later tasks.
 - one proof per action in rule 11, with its inputs, digest and effort;
 - the boundary of rule 7 for `E = 2^20` and for an effort that is not a power of two.
 
-A signed `PROOF_OF_WORK_REQUIRED` refusal is added with the first verifier that sends one.
+`vectors/0008/ns-pow.json`: a nameserver's signed offer (`jig-ns-pow-offer-v1`), which it
+returns with a challenge and restates in its `428` refusal, and the interim `ns-rotate` binding.
 
 # Rejected Alternatives
 

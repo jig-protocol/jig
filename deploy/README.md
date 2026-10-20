@@ -535,7 +535,8 @@ reputation, tribunal, transparency and federation) were removed:
 > the proxy's address and its limit. Limits are in memory and reset when the
 > nameserver restarts.
 
-None of the nameserver's routes asks for proof-of-work.
+Register, renew and rotate ask for proof-of-work only on a suffix whose
+`pow.min_effort` is above 0 (see **Proof-of-work** below).
 
 `/v1/handles` enumerates every registered alias, so it stays off unless you
 explicitly set `list_handles = true`.

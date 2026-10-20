@@ -28,7 +28,7 @@ use crate::v0_0_2_policy::Suffixes;
 /// Default time-to-live for an issued challenge nonce. Picked to comfortably
 /// exceed normal HTTP round-trip + signing time while staying small enough
 /// that the in-memory map can't grow without bound under DoS.
-const DEFAULT_CHALLENGE_TTL: Duration = Duration::from_secs(60);
+pub(crate) const DEFAULT_CHALLENGE_TTL: Duration = Duration::from_secs(60);
 
 /// The suffix of [`AppState::for_test`].
 #[cfg(test)]
