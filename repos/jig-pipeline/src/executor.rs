@@ -321,8 +321,9 @@ impl BlockExecutor {
     /// component compile; the executor is immutable after construction, so sharing
     /// is safe.
     ///
-    /// Its operator policy is signed by a fixed test key, and its program identity is a test
-    /// value, so receipts from it are for tests only.
+    /// Its operator policy and program manifest are signed by a fixed, public test key, so it
+    /// exists only under `cfg(test)` or the `test-support` feature, which only
+    /// `[dev-dependencies]` enable.
     ///
     /// **Panics** if the canonical component fails to compile. That is acceptable in
     /// a test binary and not in a server, which is why production code must use
@@ -336,6 +337,7 @@ impl BlockExecutor {
     /// Tests that measure [`BlockExecutor::in_flight_peak`] must build their own:
     /// `peak` is per-executor, so a shared one accumulates other tests' concurrency
     /// and an assertion on it would not be measuring the test that made it.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn shared() -> Arc<Self> {
         static SHARED: OnceLock<Arc<BlockExecutor>> = OnceLock::new();
         SHARED
@@ -352,6 +354,7 @@ impl BlockExecutor {
 
     /// An executor with a test key and test program identity, under `config`. For tests only;
     /// see [`BlockExecutor::shared`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_tests(config: jig_runtime::RuntimeConfig) -> Result<Self, ExecutorError> {
         let key = test_server_key();
         let program = text_block_program(&key, &config)?;
@@ -491,6 +494,7 @@ pub fn text_invocation(
 }
 
 /// The fixed key behind [`BlockExecutor::shared`]'s operator policy. Tests only.
+#[cfg(any(test, feature = "test-support"))]
 fn test_server_key() -> SigningKey {
     SigningKey::from_bytes(&[0x5a; 32])
 }
@@ -665,6 +669,20 @@ mod tests {
             run.exec.limits.timeout_ms,
             tight.limits.execution_timeout_ms
         );
+    }
+
+    /// A memory cap below what the component itself declares would let `memory.grow` fail on one
+    /// executor and succeed on another, both reporting `ok` with different outcomes. The
+    /// validator refuses any memory whose maximum exceeds the cap, so such an executor never
+    /// builds.
+    #[test]
+    fn an_executor_whose_memory_cap_is_below_the_component_declared_maximum_does_not_build() {
+        let mut config = jig_runtime::RuntimeConfig::default();
+        config.limits.memory_max_mb = 1; // 16 pages, below text-block's declared maximum
+        let err = BlockExecutor::for_tests(config)
+            .err()
+            .expect("a cap below the component's own maximum must refuse to build");
+        assert!(matches!(err, ExecutorError::Compile { .. }), "{err:?}");
     }
 
     #[test]
