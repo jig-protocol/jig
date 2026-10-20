@@ -13,6 +13,7 @@ pub mod hub;
 pub mod init;
 pub mod keys;
 pub mod ns;
+pub mod ns_pow;
 pub mod passphrase;
 pub mod reader;
 pub mod receipt;

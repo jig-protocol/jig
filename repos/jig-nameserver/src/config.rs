@@ -1353,9 +1353,9 @@ default_time_range = "last_day"  # Options: last_hour, last_day, last_week, last
 # did = "did:jig:z..."
 # aliases = ["alice"]
 #
-# # Proof-of-work on register, renew and rotate (JEP-0008). Off by default
-# # (min_effort = 0) until jig clients solve it; the recommended values are
-# # shown. An allowlisted registration pays min_effort; an ordinary one pays
+# # Proof-of-work on register, renew and rotate (JEP-0008). On by default
+# # at the values shown, which jig clients solve; min_effort = 0 turns it
+# # off. An allowlisted registration pays min_effort; an ordinary one pays
 # # min_effort x short_name_factor^(short_name_len - length), up to max_effort.
 # [v0_0_2.nameserver.alias_suffixes.pow]
 # alg = 1

@@ -159,3 +159,46 @@ async fn renewing_an_alias_held_by_another_key_is_refused() {
         "the holder's binding is untouched"
     );
 }
+
+/// The same CLI against a nameserver that asks for proof-of-work (JEP-0008):
+/// each command fetches a challenge for its action, solves the effort the
+/// nameserver signed, and the nameserver checks the work before anything
+/// else.
+#[tokio::test(flavor = "multi_thread")]
+async fn register_renew_and_rotate_solve_the_nameservers_proof_of_work() {
+    let pow = integration_tests::harness::PowPolicy {
+        min_effort: 1 << 12,
+        max_effort: 1 << 16,
+        renew_effort: 1 << 8,
+        ..integration_tests::harness::PowPolicy::default()
+    };
+    let ns = TestNameserver::start_with_pow("dj.jig", pow).await.unwrap();
+    let url = ns.http_url();
+    let name = "deji@dj.jig";
+    let home = tempfile::tempdir().unwrap();
+
+    let (ok, out) = jig(
+        home.path(),
+        &[
+            "init",
+            "dj",
+            "--request-alias",
+            "deji",
+            "--nameserver",
+            &url,
+        ],
+    )
+    .await;
+    assert!(ok, "jig init --request-alias with proof-of-work: {out}");
+    let first = configured_did(home.path());
+    assert_eq!(resolved(&ns, name).await.did, first);
+
+    let (ok, out) = jig(home.path(), &["keys", "renew", name, "--nameserver", &url]).await;
+    assert!(ok, "jig keys renew with proof-of-work: {out}");
+
+    let (ok, out) = jig(home.path(), &["keys", "rotate", name, "--nameserver", &url]).await;
+    assert!(ok, "jig keys rotate with proof-of-work: {out}");
+    let second = configured_did(home.path());
+    assert_ne!(second, first);
+    assert_eq!(resolved(&ns, name).await.did, second);
+}

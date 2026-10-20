@@ -222,6 +222,8 @@ impl AppState {
         cfg.reserved_contains.clear();
         cfg.reserved_affixes.clear();
         cfg.single_label_authority = true;
+        // These tests are about naming; proof-of-work tests set their own.
+        cfg.pow = jig_config::v0_0_2_server::PowPolicy::off();
         Self::for_test_with_suffixes(vec![cfg])
     }
 
