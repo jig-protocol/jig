@@ -216,11 +216,15 @@ suffix's delegation names.
    timestamps. The nameserver signed each attestation, so anyone can check them without
    trusting you.
 2. **Cut it off where lookups happen.** Remove or replace that suffix's delegation in
-   `[identity.delegations]` (jig-server) or `[naming.delegations]` (`cli.toml`). The CLI
-   falls back to the suffix's DNS-rooted delegation when `cli.toml` has no entry, so replace
-   the entry rather than delete it if that delegation names the same nameserver. No
-   nameserver can defederate another: each server and client decides whose attestations it
-   accepts.
+   `[identity.delegations]` (jig-server) or `[naming.delegations]` (`cli.toml`).
+   - jig-server refuses a suffix with no entry. The exception is `jig`: without an entry the
+     server falls back to its built-in `@jig` delegation.
+   - The CLI falls back when `cli.toml` has no entry: to the suffix's DNS-rooted delegation
+     for a multi-label suffix, and to the built-in `@jig` delegation for `jig`. If that
+     fallback names the same nameserver, replace the entry rather than delete it.
+
+   No nameserver can defederate another: each server and client decides whose attestations
+   it accepts.
 3. **Tell your peers** what you saw and what you changed. They decide for themselves.
 4. **(not yet implemented)** Shared lists and tribunal outcomes: the draft
    [JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md).
