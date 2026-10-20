@@ -7,13 +7,22 @@
 //! or for another identity. Unlike a keyed scheme, anyone can check it, so the
 //! client can tell when it is done.
 //!
-//! The digest is [`hash_labeled_parts`] over (`domain`, [`DOMAIN`]),
+//! Two forms are accepted. The current one is JEP-0008's `admit` action
+//! ([`puzzle`], [`proof_message`]): a [`crate::pow::Proof`] on the shared
+//! puzzle, with an empty binding and salt. The legacy `jig-admission-pow-v1`
+//! form below is kept for one release (JEP-0008, Backwards Compatibility) so
+//! clients from before it keep working; its `bits` is effort `2^bits`.
+//!
+//! Legacy: the digest is [`hash_labeled_parts`] over (`domain`, [`DOMAIN`]),
 //! (`server`, the server's DID), (`did`, the new DID) and (`nonce`, the
 //! client's nonce). The work is done when the digest has at least `bits`
 //! leading zero bits. The client signs [`signed_message`] with the DID's key, so
 //! nobody can admit an identity whose key they do not hold.
 
+use std::num::NonZeroU64;
+
 use crate::crypto::hash_labeled_parts;
+use crate::pow::{Action, Proof, Puzzle};
 
 pub const DOMAIN: &str = "jig-admission-pow-v1";
 
@@ -71,6 +80,40 @@ pub fn signed_message(server_did: &str, did: &str, nonce: &str) -> [u8; 32] {
     .as_bytes()
 }
 
+/// The JEP-0008 `admit` puzzle: `subject` asks `server_did` to admit it. The
+/// binding and salt are empty (rule 13, admission mode).
+pub fn puzzle<'a>(server_did: &'a str, subject: &'a str) -> Puzzle<'a> {
+    Puzzle::new(server_did, subject, Action::Admit, b"").expect("admit is an admission-mode action")
+}
+
+/// The effort a legacy `bits` setting stands for: `2^bits` (JEP-0008 rule 7).
+/// `bits` above 63 saturates at the largest effort.
+pub fn effort_for_bits(bits: u8) -> NonZeroU64 {
+    NonZeroU64::new(1u64.checked_shl(u32::from(bits)).unwrap_or(u64::MAX))
+        .expect("a power of two is never zero")
+}
+
+/// The whole bits of work `effort` is worth, for the proof store's bit count:
+/// `floor(log2(effort))`.
+pub fn bits_for_effort(effort: NonZeroU64) -> u8 {
+    (63 - effort.leading_zeros()) as u8
+}
+
+/// What the DID signs alongside a JEP-0008 `admit` proof: that whoever did
+/// the work holds the key, for this server, for this exact proof.
+pub fn proof_message(server_did: &str, did: &str, proof: &Proof) -> [u8; 32] {
+    *hash_labeled_parts(&[
+        ("domain", b"jig-admission-v2"),
+        ("server", server_did.as_bytes()),
+        ("did", did.as_bytes()),
+        ("alg", proof.alg.id().to_string().as_bytes()),
+        ("effort", &proof.effort.get().to_be_bytes()),
+        ("nonce", &proof.nonce),
+        ("salt_id", &proof.salt_id.to_be_bytes()),
+    ])
+    .as_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +157,42 @@ mod tests {
             digest("did:jig:zS", "did:jig:zD", &nonce),
             *h.finalize().as_bytes()
         );
+    }
+
+    #[test]
+    fn bits_and_effort_agree() {
+        assert_eq!(effort_for_bits(20).get(), 1 << 20);
+        assert_eq!(bits_for_effort(effort_for_bits(20)), 20);
+        assert_eq!(bits_for_effort(NonZeroU64::new(3).unwrap()), 1);
+        assert_eq!(effort_for_bits(64).get(), u64::MAX);
+    }
+
+    #[test]
+    fn an_admit_proof_is_bound_to_the_server_and_the_did() {
+        let effort = effort_for_bits(10);
+        let proof = puzzle("did:jig:zServer", "did:jig:zAlice").solve(effort);
+        assert_eq!(
+            puzzle("did:jig:zServer", "did:jig:zAlice").check(&proof, effort),
+            Ok(())
+        );
+        assert!(
+            puzzle("did:jig:zOther", "did:jig:zAlice")
+                .check(&proof, effort)
+                .is_err()
+        );
+        assert!(
+            puzzle("did:jig:zServer", "did:jig:zMallory")
+                .check(&proof, effort)
+                .is_err()
+        );
+        // The signed message changes with every part of the proof.
+        let m = proof_message("did:jig:zServer", "did:jig:zAlice", &proof);
+        let mut other = proof.clone();
+        other.effort = effort_for_bits(11);
+        assert_ne!(
+            m,
+            proof_message("did:jig:zServer", "did:jig:zAlice", &other)
+        );
+        assert_ne!(m, proof_message("did:jig:zOther", "did:jig:zAlice", &proof));
     }
 }
