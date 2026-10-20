@@ -11,7 +11,7 @@
 >   proxy).
 > - Section 3, "Compromised nameserver": steps 1 to 3 and 5 to 7. Step 4's attestation-key
 >   rotation also still applies.
-> - Section 4: steps 5 and 6.
+> - Section 4 no longer applies: nameserver federation was removed (#237).
 >
 > A new runbook follows lane R's redesign: the [framing doc](../superpowers/specs/2026-10-18-reputation-pow-tribunals-framing.md) and the draft
 > [JEP-0008](../../repos/jig-spec/jep/jep-0008-proof-of-work.md), [JEP-0009](../../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) and [JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md).

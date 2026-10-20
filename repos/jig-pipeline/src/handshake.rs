@@ -925,6 +925,7 @@ fn frame_name(frame: &Frame) -> &'static str {
         Frame::Block { .. } => "block",
         Frame::Error { .. } => "error",
         Frame::PeerProof { .. } => "peer_proof",
+        Frame::Peer { .. } => "peer",
     }
 }
 
