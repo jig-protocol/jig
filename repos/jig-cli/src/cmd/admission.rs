@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use jig_client::Identity;
-use jig_client::admission::AdmissionProof;
+use jig_client::admission::{AdmissionProof, PowAdmissionProof};
 use jig_client::read_auth::{ReadProof, signable_path};
 use jig_client::tls::TlsError;
 use serde::Deserialize;
@@ -24,6 +24,21 @@ struct Advertised {
     server_did: Option<String>,
     #[serde(default)]
     admission_pow_bits: Option<u8>,
+    /// JEP-0008's form of the same ask. Preferred when present.
+    #[serde(default)]
+    admission_pow: Option<AdvertisedPow>,
+}
+
+#[derive(Deserialize)]
+struct AdvertisedPow {
+    alg: jig_core::pow::Alg,
+    effort: u64,
+}
+
+/// What the server asks a new identity for.
+enum Work {
+    Effort(std::num::NonZeroU64),
+    LegacyBits(u8),
 }
 
 #[derive(Deserialize)]
@@ -58,10 +73,27 @@ pub async fn ensure_for(server: &str, identity: &Identity) -> Result<()> {
     };
     let Some(Advertised {
         server_did: Some(server_did),
-        admission_pow_bits: Some(bits),
+        admission_pow_bits,
+        admission_pow,
     }) = advertised
     else {
         return Ok(());
+    };
+    let work = match (admission_pow, admission_pow_bits) {
+        (Some(AdvertisedPow { alg, effort }), _) => {
+            if alg != jig_core::pow::Alg::Blake3 {
+                anyhow::bail!(
+                    "{server} asks for proof of work under an algorithm this client lacks"
+                );
+            }
+            // Zero means no work is asked (JEP-0008 rule 17).
+            match std::num::NonZeroU64::new(effort) {
+                Some(effort) => Work::Effort(effort),
+                None => return Ok(()),
+            }
+        }
+        (None, Some(bits)) => Work::LegacyBits(bits),
+        (None, None) => return Ok(()),
     };
 
     let url = format!("{}/api/v1/admission", base_http_url(server));
@@ -79,26 +111,52 @@ pub async fn ensure_for(server: &str, identity: &Identity) -> Result<()> {
         _ => return Ok(()),
     }
 
-    if bits > jig_core::admission_pow::MAX_BITS {
-        anyhow::bail!(
-            "{server} asks a new identity for {bits} bits of proof of work, more than the \
-             {} any server may ask; not doing it",
-            jig_core::admission_pow::MAX_BITS
-        );
-    }
-    eprintln!("{server} asks a new identity for {bits} bits of proof of work; working (once)…");
-    let nonce = {
-        let (server_did, did) = (server_did.clone(), identity.did_string());
-        tokio::task::spawn_blocking(move || jig_core::admission_pow::solve(&server_did, &did, bits))
+    let (server_did2, did) = (server_did.clone(), identity.did_string());
+    let resp = match work {
+        Work::Effort(effort) => {
+            if effort.get() > jig_core::pow::MAX_EFFORT {
+                anyhow::bail!(
+                    "{server} asks a new identity for proof of work of effort {effort}, more \
+                     than the {} any server may ask; not doing it",
+                    jig_core::pow::MAX_EFFORT
+                );
+            }
+            eprintln!(
+                "{server} asks a new identity for proof of work (effort {effort}); working (once)…"
+            );
+            let pow = tokio::task::spawn_blocking(move || {
+                jig_core::admission_pow::puzzle(&server_did2, &did).solve(effort)
+            })
             .await
-            .context("proof of work thread")?
-    };
-    let resp = http
-        .post(&url)
-        .json(&AdmissionProof::sign(identity, &server_did, nonce))
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
+            .context("proof of work thread")?;
+            http.post(&url)
+                .json(&PowAdmissionProof::sign(identity, &server_did, pow))
+                .send()
+                .await
+        }
+        Work::LegacyBits(bits) => {
+            if bits > jig_core::admission_pow::MAX_BITS {
+                anyhow::bail!(
+                    "{server} asks a new identity for {bits} bits of proof of work, more than \
+                     the {} any server may ask; not doing it",
+                    jig_core::admission_pow::MAX_BITS
+                );
+            }
+            eprintln!(
+                "{server} asks a new identity for {bits} bits of proof of work; working (once)…"
+            );
+            let nonce = tokio::task::spawn_blocking(move || {
+                jig_core::admission_pow::solve(&server_did2, &did, bits)
+            })
+            .await
+            .context("proof of work thread")?;
+            http.post(&url)
+                .json(&AdmissionProof::sign(identity, &server_did, nonce))
+                .send()
+                .await
+        }
+    }
+    .with_context(|| format!("POST {url}"))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body: serde_json::Value = resp.json().await.unwrap_or_default();

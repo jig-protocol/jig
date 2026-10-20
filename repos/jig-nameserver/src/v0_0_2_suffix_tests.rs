@@ -187,7 +187,12 @@ async fn policy_refusals_leave_the_challenge_usable() {
         );
         assert!(
             state
-                .take_challenge(&ch, &naming_did(&key), &format!("{local}@{suffix}"))
+                .take_challenge(
+                    &ch,
+                    &naming_did(&key),
+                    &format!("{local}@{suffix}"),
+                    jig_core::pow::Action::NsRegister
+                )
                 .await,
             "{local}: the challenge was not consumed"
         );

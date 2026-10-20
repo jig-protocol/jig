@@ -1,0 +1,23 @@
+[package]
+name = "{{crate}}"
+version = "0.1.0"
+edition = "2024"
+
+# A block is its own workspace, so creating one inside another Cargo project does not join it.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Pinned to the version this `jig` is tested with. `jig block lint` warns if the lockfile drifts.
+wit-bindgen = "={{wit_bindgen}}"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+# A panic becomes `unreachable`, a deterministic `error` outcome.
+panic = "abort"
+# Keep function names, so `jig block lint` can say where a float instruction is.
+strip = "debuginfo"

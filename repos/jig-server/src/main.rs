@@ -174,6 +174,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "v0.0.2 module active: server_did = {}",
                     state.server_did.to_did_jig_string()
                 );
+                // Before serving: write the receipt of every text-render block
+                // that landed without one because the server stopped between
+                // landing it and rendering it.
+                match jig_pipeline::ingest::backfill_render_receipts(&state.ingest_ctx).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("wrote {n} receipt(s) owed from before the restart"),
+                    Err(e) => tracing::warn!("receipt backfill failed: {e}"),
+                }
                 for opt in state.config.unsafe_options_active() {
                     tracing::warn!("v0.0.2 unsafe option active: {}", opt);
                 }
@@ -195,6 +203,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Done before handing state to JigServer so we hold a clone while the Arc is still
     // available. Tasks are fire-and-forget (reconnect internally on disconnect).
     if let Some(ref state) = v0_0_2_state {
+        // Before anything is served: every welcome cites the current manifest
+        // (JEP-0002 rule 12), and a server that cannot keep its log must not
+        // pretend to.
+        if let Err(e) = jig_server::v0_0_2_manifest_log::publish(state).await {
+            let msg = format!("manifest log: {e:#}");
+            tracing::error!("{msg}");
+            eprintln!("[jig-server] FATAL: {msg}");
+            std::process::exit(1);
+        }
         jig_server::v0_0_2_federation::spawn_federation_peers(state.clone());
         // Start config-permitted bridges before the router is built (they mount
         // their HTTP routes into bridge_router_mount, which build_v0_0_2_router

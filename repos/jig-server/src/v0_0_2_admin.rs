@@ -374,6 +374,9 @@ mod tests {
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
             tls_binding: Default::default(),
+            manifest: Default::default(),
+            peer_frames: Default::default(),
+            peers: Default::default(),
         })
     }
 
