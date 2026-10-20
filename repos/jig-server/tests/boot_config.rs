@@ -19,17 +19,46 @@ fn server_bin() -> &'static str {
 }
 
 /// Spawn jig-server with an isolated HOME/cwd and an ephemeral port.
-fn spawn(home: &Path, args: &[&str]) -> Child {
-    Command::new(server_bin())
-        .args(args)
-        .args(["--bind", "127.0.0.1", "--port", "0"])
-        .current_dir(home)
+/// A fixed, public secret: test servers seal their keys with an env slot.
+const TEST_SECRET: &str = "jig-server boot tests: a fixed, public secret";
+
+fn server(home: &Path) -> Command {
+    let mut cmd = Command::new(server_bin());
+    cmd.current_dir(home)
         .env("HOME", home)
         .env("RUST_LOG", "info")
+        .env_remove("JIG_KEY_PASSPHRASE")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_SERVER_SECRET")
+        .env("JIG_TEST_SERVER_SECRET", TEST_SECRET)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+fn spawn(home: &Path, args: &[&str]) -> Child {
+    server(home)
+        .args(args)
+        .args(["--bind", "127.0.0.1", "--port", "0"])
         .spawn()
         .expect("spawn jig-server")
+}
+
+/// Run to exit, failing if it outlives a bound; returns (success, stdout+stderr).
+fn run_to_exit(mut child: Child) -> (bool, String) {
+    let Some(status) = wait_bounded(&mut child, Duration::from_secs(15)) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "expected jig-server to exit\nstderr:\n{}",
+            drain_stderr(&mut child)
+        );
+    };
+    let mut out = String::new();
+    if let Some(mut o) = child.stdout.take() {
+        let _ = o.read_to_string(&mut out);
+    }
+    out.push_str(&drain_stderr(&mut child));
+    (status.success(), out)
 }
 
 fn drain_stderr(child: &mut Child) -> String {
@@ -149,6 +178,97 @@ fn a_v0_0_2_module_that_cannot_start_is_fatal() {
         stderr.contains("v0.0.2 module failed to initialize"),
         "the failure must say what failed; stderr was:\n{stderr}"
     );
+}
+
+#[test]
+fn a_first_boot_seals_its_key_and_writes_nothing_in_clear() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(&cfg, valid_config(dir.path())).unwrap();
+    let mut child = spawn(dir.path(), &["--config", cfg.to_str().unwrap()]);
+    assert_still_running(&mut child, "a valid --config must boot");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(dir.path().join("server.jigkey").exists());
+    assert!(
+        !dir.path().join("server.key").exists(),
+        "no raw key on disk"
+    );
+}
+
+#[test]
+fn a_new_key_with_nothing_to_seal_it_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(&cfg, valid_config(dir.path())).unwrap();
+    let child = server(dir.path())
+        .env_remove("JIG_KEY_UNLOCK")
+        .args([
+            "--config",
+            cfg.to_str().unwrap(),
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            "0",
+        ])
+        .spawn()
+        .unwrap();
+    let (ok, out) = run_to_exit(child);
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("[keys] unlock"),
+        "the refusal says what to set: {out}"
+    );
+    assert!(!dir.path().join("server.key").exists() && !dir.path().join("server.jigkey").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_raw_key_is_refused_until_sealed_and_keeps_its_did_after() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(&cfg, valid_config(dir.path())).unwrap();
+    let raw = dir.path().join("server.key");
+    std::fs::write(&raw, [9u8; 32]).unwrap();
+    std::fs::set_permissions(&raw, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let (ok, out) = run_to_exit(spawn(dir.path(), &["--config", cfg.to_str().unwrap()]));
+    assert!(!ok, "a raw key must not boot: {out}");
+    assert!(out.contains("jig-server keys seal"), "{out}");
+
+    let (ok, out) = run_to_exit(
+        server(dir.path())
+            .args(["--config", cfg.to_str().unwrap(), "keys", "seal"])
+            .args(["--slot", "env:JIG_TEST_SERVER_SECRET"])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(ok, "{out}");
+    let did = jig_core::Did::from_ed25519_pubkey(
+        ed25519_dalek::SigningKey::from_bytes(&[9u8; 32])
+            .verifying_key()
+            .as_bytes(),
+    )
+    .to_did_jig_string();
+    assert!(out.contains(&did), "seal keeps the DID: {out}");
+    assert!(!raw.exists(), "the raw key is removed");
+
+    let (ok, out) = run_to_exit(
+        server(dir.path())
+            .args(["--config", cfg.to_str().unwrap(), "keys", "show"])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(
+        ok && out.contains(&did) && out.contains("an env slot"),
+        "{out}"
+    );
+
+    let mut child = spawn(dir.path(), &["--config", cfg.to_str().unwrap()]);
+    assert_still_running(&mut child, "the sealed key boots");
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[test]

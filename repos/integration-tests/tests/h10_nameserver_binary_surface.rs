@@ -53,6 +53,7 @@ impl BinarySurface {
             .join("nameserver.key")
             .to_string_lossy()
             .into_owned();
+        cfg.v0_0_2.keys.unlock = Some(jig_client::server_key::credential_for_tests(tempdir.path()));
         cfg.v0_0_2.nameserver.alias_suffixes =
             vec![jig_config::v0_0_2_server::SuffixConfig::new(ALIAS_SUFFIX)];
         cfg.v0_0_2.debug.list_handles = list_handles;

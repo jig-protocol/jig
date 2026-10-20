@@ -334,7 +334,9 @@ impl KeyAccess {
     }
 }
 
-fn read_unlock_spec(spec: &str) -> Result<(SecretSource, Zeroizing<Vec<u8>>), IdentityError> {
+pub(crate) fn read_unlock_spec(
+    spec: &str,
+) -> Result<(SecretSource, Zeroizing<Vec<u8>>), IdentityError> {
     let bad = |reason: String| IdentityError::BadEnv {
         var: "JIG_KEY_UNLOCK",
         reason,

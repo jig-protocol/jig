@@ -219,6 +219,7 @@ impl TestServer {
         let tmp = tempfile::tempdir().expect("temp dir");
         config.server.server_did_keyfile =
             tmp.path().join("server.key").to_string_lossy().into_owned();
+        config.keys.unlock = Some(jig_client::server_key::credential_for_tests(tmp.path()));
 
         let state = AppState::new(
             config,

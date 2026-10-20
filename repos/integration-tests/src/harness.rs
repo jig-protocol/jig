@@ -154,6 +154,8 @@ impl TestJigServer {
             .join("server.key")
             .to_string_lossy()
             .into_owned();
+        // Sealed, the way a deployed server keeps it: a credential slot.
+        config.keys.unlock = Some(jig_client::server_key::credential_for_tests(tempdir.path()));
         // listen field is informational only (we bind our own listener);
         // overwrite to make federation-peer URLs sensible.
         config.server.listen = "127.0.0.1:0".to_string();
@@ -536,6 +538,7 @@ impl TestNameserver {
             .join("nameserver.key")
             .to_string_lossy()
             .into_owned();
+        config.keys.unlock = Some(jig_client::server_key::credential_for_tests(tempdir.path()));
         config.server.listen = "127.0.0.1:0".to_string();
         config.nameserver.alias_suffixes =
             vec![jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix)];
