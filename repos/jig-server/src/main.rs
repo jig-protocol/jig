@@ -209,7 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting Jig server v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("Database: {}", config.database_path.display());
     for opt in config.unsafe_options_active() {
-        tracing::warn!("unsafe option active: {opt} (loopback or a TLS-terminating proxy only)");
+        tracing::warn!("unsafe option active: {opt} (loopback or local testing only)");
     }
 
     // Build the v0.0.2 pipeline AppState from the config's pipeline sections.

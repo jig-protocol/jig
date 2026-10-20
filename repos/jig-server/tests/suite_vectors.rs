@@ -128,6 +128,8 @@ impl Server {
                     .expect("the gate accepted it")
                     .as_str()
                     .to_string(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             });
         }
         match plan {

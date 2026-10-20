@@ -14,7 +14,7 @@ use jig_core::grant::{Grant, Scope};
 use jig_runtime::RuntimeError;
 use jig_runtime::component::{
     BlockError, ComponentRuntime, ErrorOutcome, Hlc, IncompleteReason, Invocation, Payload,
-    RenderLimits, RunOutcome,
+    RenderLimits, RunOutcome, TrapCode,
 };
 
 const MAX_MEMORY_PAGES: u32 = 16;
@@ -132,7 +132,7 @@ fn a_guest_err_is_a_comparable_error() {
 fn unreachable_is_a_comparable_trap() {
     let outcome = run(&renderer("unreachable", ""), 1_000_000);
     assert!(
-        matches!(outcome, RunOutcome::Error(ErrorOutcome::Trap(_))),
+        outcome == RunOutcome::Error(ErrorOutcome::Trap(TrapCode::Unreachable)),
         "{outcome:?}"
     );
     assert!(outcome.is_comparable());
@@ -230,7 +230,13 @@ fn a_renderer_may_import_only_what_its_grant_names() {
         max_calls: 1,
     }])
     .unwrap();
-    runtime
-        .compile_renderer(&component, &grant, MAX_MEMORY_PAGES)
-        .expect("a granted import passes");
+    // Validation passes; no host provides `compose` yet, so linking refuses it rather than
+    // stubbing it.
+    let Err(err) = runtime.compile_renderer(&component, &grant, MAX_MEMORY_PAGES) else {
+        panic!("a granted import with no provider is refused");
+    };
+    assert!(
+        matches!(&err, RuntimeError::CapabilityDenied { capability } if capability.contains("jig:host/compose")),
+        "{err:?}"
+    );
 }

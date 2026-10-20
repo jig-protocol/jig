@@ -272,6 +272,8 @@ impl TestJigServer {
                 created_at: chrono::Utc::now().timestamp_millis(),
                 owner_did: owner.did().to_did_jig_string(),
                 suite: "none".to_string(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })?;
         Ok(id)
     }
@@ -294,6 +296,8 @@ impl TestJigServer {
             created_at: now,
             owner_did: owner.did().to_did_jig_string(),
             suite: "none".to_string(),
+            sequencer_did: String::new(),
+            co_owners: Vec::new(),
         })?;
         store.upsert_membership(&jig_pipeline::persist::StoredMembership {
             channel_id: id.clone(),
@@ -550,7 +554,6 @@ impl TestNameserver {
         // none of them mounted while these tests stayed green.
         let mut ns_config = jig_nameserver::config::NameServerConfig::default();
         ns_config.storage.database_path = tempdir.path().join("nameserver.db");
-        ns_config.federation.enabled = false;
         ns_config.v0_0_2 = config;
 
         let app = jig_nameserver::server::build_app_parts(&ns_config).context("build_app_parts")?;
@@ -694,6 +697,8 @@ fn base_config() -> Result<JigServerConfig> {
                 "member-add".to_string(),
                 "member-remove".to_string(),
                 "channel-promote".to_string(),
+                "role-assign".to_string(),
+                "role-unassign".to_string(),
                 "fed-hello".to_string(),
             ],
             ..ServerSection::default()

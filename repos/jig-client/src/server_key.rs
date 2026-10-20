@@ -127,7 +127,10 @@ pub fn sealed_path(path: &Path) -> PathBuf {
     }
 }
 
-/// A secret that opens or makes one slot.
+/// A secret that opens or makes one slot. Read once and cloned where it is
+/// needed again: a `credential:` path may be a pipe (`<(systemd-creds
+/// decrypt ...)`), which reads only once.
+#[derive(Clone)]
 enum Spec {
     Secret(SecretSource, Zeroizing<Vec<u8>>),
     Passphrase(Zeroizing<String>),
@@ -257,9 +260,13 @@ pub fn seal_raw(raw: &Path, specs: &[String], kdf: KdfParams) -> Result<(PathBuf
     }
     let seed = read_raw_seed(raw)?;
     let did = did_of(&seed);
-    let slots = specs
+    let parsed = specs
         .iter()
-        .map(|s| Spec::parse(s)?.slot(kdf))
+        .map(|s| Spec::parse(s))
+        .collect::<Result<Vec<_>>>()?;
+    let slots = parsed
+        .iter()
+        .map(|s| s.clone().slot(kdf))
         .collect::<Result<Vec<_>>>()?;
     let (key, _) =
         JigKey::seal(&did, &seed, &slots).map_err(|source| ServerKeyError::Keystore {
@@ -270,8 +277,8 @@ pub fn seal_raw(raw: &Path, specs: &[String], kdf: KdfParams) -> Result<(PathBuf
     // Read back what is on disk, and open it with every slot just named,
     // before the only other copy goes.
     let reopened = read_jigkey(&sealed)?;
-    for spec in specs {
-        let opened = reopened.open(&[Spec::parse(spec)?.offer()]);
+    for spec in parsed {
+        let opened = reopened.open(&[spec.offer()]);
         if !opened.is_ok_and(|o| *o.seed == *seed) {
             return Err(ServerKeyError::NotVerified {
                 path: sealed,
@@ -341,12 +348,13 @@ pub fn add_slot(path: &Path, opts: &ServerKeyOptions, new_spec: &str) -> Result<
         },
         source => keystore(source),
     })?;
+    let new = Spec::parse(new_spec)?;
     let updated = key
-        .with_slot(&opened, &Spec::parse(new_spec)?.slot(opts.kdf)?)
+        .with_slot(&opened, &new.clone().slot(opts.kdf)?)
         .map_err(keystore)?;
     let reopened = JigKey::from_bytes(&updated.to_bytes()).map_err(keystore)?;
     if !reopened
-        .open(&[Spec::parse(new_spec)?.offer()])
+        .open(&[new.offer()])
         .is_ok_and(|o| *o.seed == *opened.seed)
     {
         return Err(ServerKeyError::NotVerified {
@@ -685,6 +693,32 @@ mod tests {
             ),
             Err(ServerKeyError::Exists(_))
         ));
+    }
+
+    /// A `credential:` path may be a pipe that reads once, as with
+    /// `--slot credential:<(systemd-creds decrypt ...)`.
+    #[cfg(unix)]
+    #[test]
+    fn a_credential_that_reads_only_once_still_seals_and_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("server.key");
+        write_raw(&raw, [6u8; 32]);
+        let fifo = dir.path().join("cred.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let writer = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || {
+                std::fs::write(&fifo, "a credential secret of at least 32 bytes, once").unwrap()
+            })
+        };
+        let spec = format!("credential:{}", fifo.display());
+        seal_raw(&raw, &[spec], KdfParams::insecure_for_tests()).unwrap();
+        writer.join().unwrap();
+        assert!(!raw.exists());
     }
 
     #[test]

@@ -40,7 +40,8 @@ Draft. Field names are provisional. The design behind this revision is
    envelope versions it speaks, suites it implements, capabilities it wants, and a fresh
    random `nonce`. A server that dials another server adds `peer_did`, its own DID.
 2. The server's first frame is `welcome`, signed by the server's DID key over its
-   canonical bytes (domain `jig-handshake-welcome-v1`):
+   canonical bytes (domain `jig-handshake-welcome-v2`; v1 had no `server_nonce` or
+   `tls_exporter`):
 
    | Field | Content | Threats |
    | --- | --- | --- |
@@ -69,6 +70,10 @@ Draft. Field names are provisional. The design behind this revision is
    length-prefixed bytes of the `hello` frame, the `welcome` frame and `tls_exporter`.
    Server-to-server connections MUST carry a `peer_did` and a valid `peer_proof`. Client
    connections carry neither; a client proves its DID per subscription.
+   Either side MUST refuse a `welcome` whose `tls_exporter` is not its own connection's
+   value: one signed for another TLS session was relayed by whatever terminated TLS in
+   between. A dialed server closes (4001) if the proof is missing, late (`WELCOME_WAIT`)
+   or does not verify, or if any other frame comes first.
 5. After the handshake, a server-to-server connection is symmetric: either side MAY
    subscribe and push, within what the federation contract (JEP-0005) grants the
    authenticated peer DID.

@@ -10,3 +10,9 @@
 
 [[v0_0_2.nameserver.alias_suffixes]]
 suffix = "names.example.org"
+
+# What opens the nameserver's sealed signing key at boot, as jig-server's
+# [keys] (deploy/README.md, "Sealing the server key"). Uncomment the
+# LoadCredentialEncrypted= line in jig-nameserver.service to match.
+[v0_0_2.keys]
+unlock = "credential:/run/credentials/jig-nameserver.service/jig-nameserver-key"
