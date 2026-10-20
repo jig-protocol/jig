@@ -530,7 +530,10 @@ async fn at_the_cap_new_challenges_are_refused_and_live_ones_still_work() {
     );
     assert!(
         !state
-            .remember_challenge("x", PendingChallenge::unbound())
+            .remember_challenge(
+                &hex::encode(rand::random::<[u8; 32]>()),
+                PendingChallenge::unbound()
+            )
             .await
     );
 
