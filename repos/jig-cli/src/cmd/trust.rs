@@ -50,9 +50,14 @@ pub async fn server_tls(server: &str) -> Result<Config> {
     } else {
         let mut pins = Pins::load(&Pins::default_path())?;
         let expected = pins.offer(server).pinned_server_did;
-        let probed = probe(server, expected.as_deref())
-            .await
-            .map_err(|e| refusal(server, e))?;
+        let probed = match probe(server, expected.as_deref()).await {
+            Ok(probed) => probed,
+            Err(e) => {
+                return Err(
+                    link_fork_in(&Pins::default_path(), server, &e)?.unwrap_or(refusal(server, e))
+                );
+            }
+        };
         match (&probed.server_did, &probed.moved_from, &probed.key_link) {
             (Some(did), Some(from), Some(link)) => {
                 pins.move_server(server, from, did, link)?;
@@ -220,6 +225,21 @@ fn keep_evidence_in(
     server: &str,
     c: &jig_client::connection::Contradiction,
 ) -> Result<Kept> {
+    let server_did = Pins::load(pins_path)?
+        .server(server)
+        .map(|p| p.server_did.clone())
+        .unwrap_or_default();
+    keep_bundle_in(pins_path, server, &server_did, c)
+}
+
+/// [`keep_evidence_in`], against `server_did`: the DID that signed the
+/// evidence, which a key-link fork shows is one the pin has left.
+fn keep_bundle_in(
+    pins_path: &std::path::Path,
+    server: &str,
+    server_did: &str,
+    c: &jig_client::connection::Contradiction,
+) -> Result<Kept> {
     use jig_client::evidence::{BUNDLE_FORMAT, Bundle, EvidenceStore, verify};
     let mut pins = Pins::load(pins_path)?;
     let pin = pins.server(server).cloned().unwrap_or_default();
@@ -241,7 +261,7 @@ fn keep_evidence_in(
         code: c.code.to_string(),
         reason: c.reason.clone(),
         server: server.to_string(),
-        server_did: pin.server_did.clone(),
+        server_did: server_did.to_string(),
         observed_at_ms: now_ms(),
         welcome: c.welcome.clone(),
         items: c.evidence.clone(),
@@ -262,6 +282,52 @@ fn keep_evidence_in(
         )?;
     }
     Ok(Kept { id, sticky })
+}
+
+/// A probe refused because `server` named another DID, when the key link it
+/// served forks one this pin moved along: the key that signed both is held by
+/// someone else, and neither link is to be trusted (JEP-0012). Kept as a
+/// bundle, and `server` is refused until its user accepts it again. `None`
+/// for any other refusal.
+fn link_fork_in(
+    pins_path: &std::path::Path,
+    server: &str,
+    e: &TlsError,
+) -> Result<Option<anyhow::Error>> {
+    let TlsError::OtherServer {
+        key_link: Some(presented),
+        ..
+    } = e
+    else {
+        return Ok(None);
+    };
+    let kept = Pins::load(pins_path)?
+        .server(server)
+        .map(|p| p.links.clone())
+        .unwrap_or_default();
+    let Some((signer, proof)) = jig_client::evidence::key_link_fork(&kept, presented) else {
+        return Ok(None);
+    };
+    let reason = format!(
+        "{signer}, a key {server} moved away from, signed a second key link to another DID; \
+         someone other than the server holds that key"
+    );
+    let c = jig_client::connection::Contradiction {
+        code: "key-link-fork",
+        reason: reason.clone(),
+        welcome: None,
+        evidence: vec![presented.clone()],
+        proof: Some(Box::new(proof)),
+    };
+    let kept = keep_bundle_in(pins_path, server, &signer, &c)?;
+    if !kept.sticky {
+        return Ok(None);
+    }
+    Ok(Some(anyhow::anyhow!(
+        "refusing {server}: {reason}. The evidence is `jig trust evidence show {}`. Every \
+         connection to it is refused until you run `jig trust accept {server}`",
+        kept.id
+    )))
 }
 
 /// The evidence store beside the pin store `pins_path`: `~/.jig/evidence`
@@ -818,6 +884,63 @@ mod tests {
             .channel(SERVER, "#ops")
             .and_then(|c| c.chain_head.as_ref())
             .map(|h| h.seq)
+    }
+
+    #[test]
+    fn a_link_forking_one_the_pin_followed_refuses_the_server() {
+        use base64::Engine as _;
+        use jig_core::key_link::{Audience, SignedKeyLink};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let server = "https://host:7117";
+        let new_key = jig_core::crypto::ed25519::generate_signing_key;
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let link = |a, b| {
+            base64::engine::general_purpose::STANDARD.encode(
+                SignedKeyLink::sign(a, b, Audience::Public, 1)
+                    .unwrap()
+                    .envelope(),
+            )
+        };
+        let (old, new, thief) = (new_key(), new_key(), new_key());
+        let mut pins = Pins::load(&path).unwrap();
+        pins.check_server_did(server, &did(&old)).unwrap();
+        pins.move_server(server, &did(&old), &did(&new), &link(&old, &new))
+            .unwrap();
+        let other = |key_link: Option<String>| TlsError::OtherServer {
+            server: server.into(),
+            expected: did(&new),
+            presented: did(&thief),
+            key_link,
+        };
+
+        // No link, or one that forks nothing followed: an ordinary refusal.
+        for e in [other(None), other(Some(link(&thief, &new)))] {
+            assert!(link_fork_in(&path, server, &e).unwrap().is_none());
+        }
+        assert!(Pins::load(&path).unwrap().refusal(server).is_none());
+
+        // The key the pin left, linked again to another DID.
+        let refused = link_fork_in(&path, server, &other(Some(link(&old, &thief))))
+            .unwrap()
+            .unwrap();
+        let sticky = Pins::load(&path).unwrap().refusal(server).cloned().unwrap();
+        assert!(refused.to_string().contains(&sticky.bundle), "{refused}");
+        let bundle = jig_client::evidence::EvidenceStore::new(&evidence_dir(&path))
+            .get(&sticky.bundle)
+            .unwrap();
+        assert_eq!(
+            (bundle.code.as_str(), bundle.server_did.clone()),
+            ("key-link-fork", did(&old))
+        );
+        assert!(
+            jig_client::evidence::verify(&bundle)
+                .unwrap()
+                .proven
+                .is_some()
+        );
     }
 
     #[tokio::test]

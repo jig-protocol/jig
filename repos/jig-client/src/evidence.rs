@@ -208,14 +208,22 @@ pub fn downgrade_proof(
     })
 }
 
-/// A [`Proof::KeyLinkFork`] from two link envelopes as served; `None` unless
-/// both verify, both are from `server_did`, and they name different new DIDs.
-pub fn key_link_fork_proof(first: &[u8], second: &[u8], server_did: &str) -> Option<Proof> {
-    let a = SignedKeyLink::from_envelope(first).ok()?;
-    let b = SignedKeyLink::from_envelope(second).ok()?;
-    (same_did(&a.link().old, server_did) && key_link::fork(&a, &b)).then(|| Proof::KeyLinkFork {
-        first: STANDARD.encode(first),
-        second: STANDARD.encode(second),
+/// A [`Proof::KeyLinkFork`] from `presented` and the first of `kept` it
+/// forks, all base64 as served, with the DID that signed both; `None` when
+/// `presented` does not verify or forks none of them.
+pub fn key_link_fork(kept: &[String], presented: &str) -> Option<(String, Proof)> {
+    let b = link_of(presented).ok()?;
+    kept.iter().find_map(|first| {
+        let a = link_of(first).ok()?;
+        key_link::fork(&a, &b).then(|| {
+            (
+                a.link().old.clone(),
+                Proof::KeyLinkFork {
+                    first: first.clone(),
+                    second: presented.to_string(),
+                },
+            )
+        })
     })
 }
 
@@ -580,21 +588,26 @@ mod tests {
     }
 
     #[test]
-    fn a_key_link_fork_holds_only_from_the_pinned_did_to_two_others() {
+    fn a_key_link_fork_holds_only_from_one_did_to_two_others() {
         use jig_core::key_link::{Audience, SignedKeyLink};
         let new_key = jig_core::crypto::ed25519::generate_signing_key;
         let (key, one, two) = (new_key(), new_key(), new_key());
         let link = |old, new, audience| {
-            SignedKeyLink::sign(old, new, audience, 1_700_000_000)
-                .unwrap()
-                .envelope()
-                .to_vec()
+            STANDARD.encode(
+                SignedKeyLink::sign(old, new, audience, 1_700_000_000)
+                    .unwrap()
+                    .envelope(),
+            )
         };
         let to_one = link(&key, &one, Audience::Public);
         let to_two = link(&key, &two, Audience::Public);
-        let did = did_of(&key);
+        let onward = link(&one, &two, Audience::Public);
 
-        let proof = key_link_fork_proof(&to_one, &to_two, &did).unwrap();
+        // Found against any link kept, the one it forks named first.
+        let kept = [onward.clone(), to_one.clone()];
+        let (signer, proof) = key_link_fork(&kept, &to_two).unwrap();
+        assert_eq!(signer, did_of(&key));
+        assert!(matches!(&proof, Proof::KeyLinkFork { first, .. } if *first == to_one));
         let proven = verify(&bundle(&key, Some(proof))).unwrap().proven.unwrap();
         assert!(proven.contains(&did_of(&two)), "{proven}");
         // Any audience: one key never links to two DIDs.
@@ -605,31 +618,36 @@ mod tests {
                 did: did_of(&new_key()),
             },
         );
-        let p = key_link_fork_proof(&to_one, &contact, &did).unwrap();
-        assert!(verify(&bundle(&key, Some(p))).unwrap().proven.is_some());
+        assert!(key_link_fork(&kept, &contact).is_some());
 
-        // The same link twice, a chain onward, or another DID's links.
-        let onward = link(&one, &two, Audience::Public);
-        assert_eq!(key_link_fork_proof(&to_one, &to_one, &did), None);
-        assert_eq!(key_link_fork_proof(&to_one, &onward, &did), None);
-        let theirs = link(&one, &key, Audience::Public);
-        assert_eq!(key_link_fork_proof(&theirs, &onward, &did), None);
-
-        // A forged proof fails `verify`, whatever its claim.
-        let b64 = |b: &[u8]| STANDARD.encode(b);
-        let mut tampered = to_two.clone();
+        // The same link again, a chain onward, a link that does not verify.
+        let mut tampered = STANDARD.decode(&to_two).unwrap();
         let last = tampered.len() - 1;
         tampered[last] ^= 1;
+        let tampered = STANDARD.encode(tampered);
+        for presented in [&to_one, &onward, &tampered, &"not base64!".to_string()] {
+            assert_eq!(key_link_fork(&[to_one.clone()], presented), None);
+        }
+
+        // A forged proof fails `verify`, whatever its claim; so does a true
+        // fork kept against another DID than the one that signed it.
         for (first, second) in [
-            (b64(&to_one), b64(&to_one)),
-            (b64(&to_one), b64(&onward)),
-            (b64(&theirs), b64(&onward)),
-            (b64(&to_one), b64(&tampered)),
-            (b64(&to_one), "not base64!".into()),
+            (to_one.clone(), to_one.clone()),
+            (to_one.clone(), onward.clone()),
+            (to_one.clone(), tampered.clone()),
+            (to_one.clone(), "not base64!".into()),
         ] {
             let b = bundle(&key, Some(Proof::KeyLinkFork { first, second }));
             assert!(matches!(verify(&b), Err(BundleError::Proof(_))));
         }
+        let elsewhere = bundle(
+            &one,
+            Some(Proof::KeyLinkFork {
+                first: to_one,
+                second: to_two,
+            }),
+        );
+        assert!(matches!(verify(&elsewhere), Err(BundleError::Proof(_))));
     }
 
     #[test]

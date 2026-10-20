@@ -130,6 +130,11 @@ pub struct ServerPin {
     /// ([`crate::manifest`]); a welcome citing it needs no second check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<jig_pipeline::handshake::ManifestRef>,
+    /// The public key links this pin moved along, base64 as served, oldest
+    /// first: a later link out of one of their DIDs to another is a fork
+    /// ([`crate::evidence::key_link_fork`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<String>,
 }
 
 /// A server this device refuses until its user accepts it again, after it
@@ -361,6 +366,7 @@ impl Pins {
                 return Err(replaced());
             }
             pin.server_did = to.to_string();
+            pin.links.push(key_link.to_string());
             Ok(((), true))
         })
     }
@@ -1121,6 +1127,7 @@ mod tests {
             .unwrap();
         let pins = Pins::load(&path).unwrap();
         assert_eq!(pins.server(server).unwrap().server_did, did(&new));
+        assert_eq!(pins.server(server).unwrap().links, [link(&old, &new)]);
     }
 
     #[test]

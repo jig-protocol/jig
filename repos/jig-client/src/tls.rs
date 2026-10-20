@@ -47,6 +47,9 @@ pub enum TlsError {
         server: String,
         expected: String,
         presented: String,
+        /// The key link it served, base64, if any: one that does not move
+        /// from `expected`, but may fork a link the caller already followed.
+        key_link: Option<String>,
     },
     #[error(
         "{server} presented a certificate no CA vouches for and its DID does not vouch for \
@@ -130,6 +133,7 @@ pub async fn probe(server: &str, expected_did: Option<&str>) -> Result<Probed, T
                 server: server.to_string(),
                 expected: expected.to_string(),
                 presented: presented.to_string(),
+                key_link: advertised.key_link.clone(),
             });
         }
         moved_from = Some(expected.to_string());
