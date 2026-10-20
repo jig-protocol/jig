@@ -66,6 +66,9 @@ pub(crate) struct RenewRequestBody {
     pub did: String,
     pub challenge: String,
     pub proof_of_control: String,
+    /// JEP-0008 proof-of-work, when the suffix asks for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pow: Option<jig_core::pow::Proof>,
 }
 
 /// Body of POST `/v1/rotate`. Mirrors
@@ -78,6 +81,9 @@ pub(crate) struct RotateRequestBody {
     pub challenge: String,
     pub sig_by_old: String,
     pub sig_by_new: String,
+    /// JEP-0008 proof-of-work by the old DID, when the suffix asks for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pow: Option<jig_core::pow::Proof>,
 }
 
 // ============================================================================
@@ -108,10 +114,25 @@ pub async fn renew_with_nameserver(
 ) -> Result<Attestation> {
     let name = parse_full_name(alias)?;
     let ns = Nameserver::connect(ns_url).await?;
-    let challenge = ns.challenge().await?;
-    let body = build_renew_request(id, &name, ns.ns_did(), &challenge);
-    ns.post_binding("/v1/renew", &body, &name, &id.did_string())
-        .await?
+    let did = id.did_string();
+    let full = name.as_alias();
+    crate::cmd::ns_pow::with_pow(
+        &ns,
+        crate::cmd::ns_pow::Work {
+            action: jig_core::pow::Action::NsRenew,
+            subject: &did,
+            name: &name,
+            binding: &|challenge| {
+                jig_core::naming::proof_hash(Action::Renew, ns.ns_did(), &full, challenge)
+            },
+        },
+        async |challenge, pow| {
+            let mut body = build_renew_request(id, &name, ns.ns_did(), &challenge);
+            body.pow = pow;
+            ns.post_binding("/v1/renew", &body, &name, &did).await
+        },
+    )
+    .await?
 }
 
 /// Build the POST /v1/renew body: the proof of control is bound to the renew
@@ -130,6 +151,7 @@ pub(crate) fn build_renew_request(
         did: id.did_string(),
         challenge: challenge.to_string(),
         proof_of_control: b64u(&proof),
+        pow: None,
     }
 }
 
@@ -226,10 +248,31 @@ pub async fn rotate_with_nameserver(
 ) -> Result<Result<Attestation>> {
     let name = parse_full_name(alias)?;
     let ns = Nameserver::connect(ns_url).await?;
-    let challenge = ns.challenge().await?;
-    let body = build_rotate_request(old_id, new_id, &name.as_alias(), &challenge);
-    ns.post_binding("/v1/rotate", &body, &name, &new_id.did_string())
-        .await
+    let (old_did, new_did) = (old_id.did_string(), new_id.did_string());
+    let full = name.as_alias();
+    crate::cmd::ns_pow::with_pow(
+        &ns,
+        crate::cmd::ns_pow::Work {
+            action: jig_core::pow::Action::NsRotate,
+            subject: &old_did,
+            name: &name,
+            binding: &|challenge| {
+                jig_core::naming::rotate_pow_binding(
+                    ns.ns_did(),
+                    &full,
+                    &old_did,
+                    &new_did,
+                    challenge,
+                )
+            },
+        },
+        async |challenge, pow| {
+            let mut body = build_rotate_request(old_id, new_id, &full, &challenge);
+            body.pow = pow;
+            ns.post_binding("/v1/rotate", &body, &name, &new_did).await
+        },
+    )
+    .await
 }
 
 /// Build the POST /v1/rotate body. Factored out for unit testing.
@@ -249,6 +292,7 @@ pub(crate) fn build_rotate_request(
         challenge: challenge.to_string(),
         sig_by_old: encode(sig_old.to_bytes()),
         sig_by_new: encode(sig_new.to_bytes()),
+        pow: None,
     }
 }
 

@@ -502,6 +502,9 @@ impl TestJigServer {
 // TestNameserver
 // ---------------------------------------------------------------------------
 
+/// How much proof-of-work a [`TestNameserver`] asks for.
+pub use jig_config::v0_0_2_server::PowPolicy;
+
 /// A `jig-nameserver` running on `127.0.0.1:<random>` for tests.
 pub struct TestNameserver {
     pub bound_addr: std::net::SocketAddr,
@@ -532,6 +535,15 @@ impl TestNameserver {
     }
 
     pub async fn start_with_suffix(alias_suffix: &str) -> Result<Self> {
+        Self::start_with_pow(alias_suffix, jig_config::v0_0_2_server::PowPolicy::off()).await
+    }
+
+    /// A nameserver for `alias_suffix` that asks for proof-of-work as `pow`
+    /// says (JEP-0008).
+    pub async fn start_with_pow(
+        alias_suffix: &str,
+        pow: jig_config::v0_0_2_server::PowPolicy,
+    ) -> Result<Self> {
         let tempdir = tempfile::tempdir().context("tempdir")?;
 
         let mut config = base_config()?;
@@ -541,8 +553,10 @@ impl TestNameserver {
             .to_string_lossy()
             .into_owned();
         config.server.listen = "127.0.0.1:0".to_string();
-        config.nameserver.alias_suffixes =
-            vec![jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix)];
+        let mut suffix = jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix);
+        // `register` here sends no work, so most tests run with it off.
+        suffix.pow = pow;
+        config.nameserver.alias_suffixes = vec![suffix];
         // Tests enumerate registered aliases; production leaves this off.
         config.debug.list_handles = true;
 
