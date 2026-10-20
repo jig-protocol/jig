@@ -23,9 +23,26 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Duration;
 
-use jig_runtime::{CompiledBlock, Runtime};
+use cid::Cid;
+use ed25519_dalek::SigningKey;
+use jig_core::block_receipt::{self, Body, Exec, Receipt, Role};
+use jig_core::did::Did;
+use jig_core::grant::Grant;
+use jig_core::operator_policy::{ComponentHash, OperatorPolicy, SignedOperatorPolicy};
+use jig_core::program::{self, ProgramManifest, SignedProgram};
+use jig_runtime::component::{
+    self, Backend, CompiledRenderer, ComponentRuntime, Hlc, Invocation, Payload, RenderLimits,
+    RunOutcome,
+};
 use text_block::canonical;
+
+/// The world text-block's program manifest declares.
+pub const RENDERER_WORLD: &str = "jig:block/renderer@0.1.0";
+
+/// The media type of the message text a text-render invocation carries.
+const TEXT_MEDIA_TYPE: &str = "text/plain";
 
 /// Bounds how many executions may be in flight against one engine.
 ///
@@ -95,13 +112,17 @@ impl Drop for SlotGuard<'_> {
 pub enum ExecutorError {
     #[error("runtime construction failed: {0}")]
     Runtime(String),
-    #[error("compiling the {module} module failed: {source_msg}")]
+    #[error("compiling the {module} component failed: {source_msg}")]
     Compile { module: String, source_msg: String },
-    #[error("encoding block input failed: {0}")]
-    EncodeInput(String),
-    #[error("executing the {module} module failed: {source_msg}")]
+    #[error("the operator policy does not allow the {module} program")]
+    NotAllowed { module: String },
+    #[error("the {module} program manifest does not name the compiled component")]
+    WrongProgram { module: String },
+    #[error("signing the {module} program manifest failed: {source_msg}")]
+    Program { module: String, source_msg: String },
+    #[error("executing the {module} component failed: {source_msg}")]
     Execute { module: String, source_msg: String },
-    #[error("the {module} module returned output that did not decode: {source_msg}")]
+    #[error("the {module} component returned output that did not decode: {source_msg}")]
     DecodeOutput { module: String, source_msg: String },
 }
 
@@ -112,7 +133,7 @@ pub struct Rendered {
     /// value — computed *inside* the sandbox, so any conforming runtime on any
     /// host produces it.
     pub output: text_block::Output,
-    /// Fully-qualified identity of the module that produced `output`:
+    /// Fully-qualified identity of the component that produced `output`:
     /// `text-block@<version>/blake3:<hash>`.
     ///
     /// Without this a `render_hash` mismatch between two servers is
@@ -126,7 +147,7 @@ pub struct Rendered {
     /// metering standard and no published conversion between engines, and fuel is
     /// not stable across wasmtime's own versions — so this number is only
     /// comparable against one produced by the same engine at the same version.
-    /// Cross-server agreement rests on `render_hash` alone. See
+    /// Cross-server agreement rests on the outcome hash alone. See
     /// `docs/investigations/2026-08-11-fuel-portability.md`.
     pub fuel_used: u64,
     /// The engine, configuration and fuel schedule `fuel_used` was measured
@@ -134,54 +155,151 @@ pub struct Rendered {
     pub engine_identity: jig_runtime::EngineIdentity,
 }
 
-/// Holds the compiled canonical modules for the lifetime of a server.
+/// One run of the text-render component, whatever its outcome, with everything its `exec`
+/// receipt states.
+#[derive(Debug, Clone)]
+pub struct ExecRun {
+    pub outcome: RunOutcome,
+    /// The receipt body: component, program, world, invocation hash, operator policy, outcome,
+    /// limits and engine.
+    pub exec: Exec,
+}
+
+impl ExecRun {
+    /// The decoded text-render output, if the run returned `ok`.
+    pub fn text_output(&self) -> Result<text_block::Output, ExecutorError> {
+        let module = || canonical::MODULE_NAME.to_string();
+        let payload = match &self.outcome {
+            RunOutcome::Ok(payload) => payload,
+            other => {
+                return Err(ExecutorError::Execute {
+                    module: module(),
+                    source_msg: format!("{other:?}"),
+                });
+            }
+        };
+        if payload.media_type != canonical::COMPONENT_OUTPUT_MEDIA_TYPE {
+            return Err(ExecutorError::DecodeOutput {
+                module: module(),
+                source_msg: format!("unexpected media type {:?}", payload.media_type),
+            });
+        }
+        postcard::from_bytes(&payload.body).map_err(|e| ExecutorError::DecodeOutput {
+            module: module(),
+            source_msg: e.to_string(),
+        })
+    }
+
+    /// The server's `exec` receipt for `block_cid`, unsigned. `executor` must be the DID of the
+    /// key that signs it, and of the server that signed the operator policy it names.
+    pub fn receipt(&self, block_cid: Cid, executor: String, produced_at: u64) -> Receipt {
+        Receipt {
+            block_cid,
+            executor,
+            role: Role::Server,
+            produced_at,
+            body: Body::Exec(Box::new(self.exec.clone())),
+        }
+    }
+}
+
+/// Holds the compiled canonical components for the lifetime of a server.
 pub struct BlockExecutor {
-    runtime: Runtime,
-    text_render: CompiledBlock,
+    runtime: ComponentRuntime,
+    text_render: CompiledRenderer,
+    text_render_component: ComponentHash,
     text_render_module_id: String,
+    program: SignedProgram,
+    policy: SignedOperatorPolicy,
+    render_limits: RenderLimits,
+    receipt_limits: block_receipt::Limits,
     slots: Slots,
 }
 
 impl BlockExecutor {
-    /// Build a runtime and compile the canonical modules. Do this once, at boot.
-    ///
-    /// Uses the default [`jig_runtime::RuntimeConfig`]. A server that lets an
-    /// operator configure execution limits should call
-    /// [`BlockExecutor::with_config`] instead and pass the same config it gives
-    /// every other execution path — otherwise the ingest render path silently
-    /// runs under different limits from the rest of the server.
-    pub fn new() -> Result<Self, ExecutorError> {
-        Self::with_config(jig_runtime::RuntimeConfig::default())
-    }
-
-    /// Build a runtime under operator-supplied limits and compile the canonical
-    /// modules.
+    /// Build a runtime under operator-supplied limits, compile the canonical components, and sign
+    /// the server's default operator policy (JEP-0011 §5.1) with `server_key`. Do this once, at
+    /// boot.
     ///
     /// The concurrency gate is sized from `config.limits.max_concurrent_instances`,
     /// so lowering that in config lowers both the engine's pooling ceiling and the
     /// gate that keeps callers under it. They must move together: a gate wider
     /// than the pool reintroduces the hard instantiation failure the gate exists
     /// to prevent.
-    pub fn with_config(config: jig_runtime::RuntimeConfig) -> Result<Self, ExecutorError> {
+    ///
+    /// The same config sets every run's fuel, deadline and memory cap, so the ingest render path
+    /// runs under the limits the operator configured, and its receipts state them.
+    pub fn with_config(
+        config: jig_runtime::RuntimeConfig,
+        server_key: &SigningKey,
+        program: SignedProgram,
+    ) -> Result<Self, ExecutorError> {
         let concurrency = config.limits.max_concurrent_instances.max(1) as usize;
-        let runtime =
-            Runtime::with_config(config).map_err(|e| ExecutorError::Runtime(e.to_string()))?;
-        let text_render =
-            runtime
-                .precompile(canonical::CANONICAL_WASM)
-                .map_err(|e| ExecutorError::Compile {
-                    module: canonical::MODULE_NAME.to_string(),
-                    source_msg: e.to_string(),
-                })?;
-        Ok(Self {
+        let memory_max_pages = config.limits.memory_max_mb.saturating_mul(16);
+        let render_limits = RenderLimits {
+            fuel: config.limits.fuel_max,
+            timeout: Duration::from_millis(config.limits.execution_timeout_ms),
+        };
+        let receipt_limits = block_receipt::Limits {
+            fuel: config.limits.fuel_max,
+            max_wasm_stack: jig_runtime::MAX_WASM_STACK as u64,
+            memory_max_pages,
+            timeout_ms: config.limits.execution_timeout_ms,
+        };
+        let runtime = ComponentRuntime::with_config(&config, Backend::Native)
+            .map_err(|e| ExecutorError::Runtime(e.to_string()))?;
+        // text-block's manifest requests nothing, so it is compiled against the empty grant.
+        let text_render = runtime
+            .compile_renderer(
+                canonical::CANONICAL_COMPONENT,
+                &Grant::empty(),
+                memory_max_pages,
+            )
+            .map_err(|e| ExecutorError::Compile {
+                module: canonical::MODULE_NAME.to_string(),
+                source_msg: e.to_string(),
+            })?;
+        let text_render_component = component::hash_bytes(text_render.component_hash());
+        if program.manifest.component != text_render_component
+            || program.manifest.world != RENDERER_WORLD
+        {
+            return Err(ExecutorError::WrongProgram {
+                module: canonical::MODULE_NAME.to_string(),
+            });
+        }
+
+        let server = Did::from_ed25519_pubkey(&server_key.verifying_key().to_bytes());
+        let policy = SignedOperatorPolicy::sign(
+            OperatorPolicy::default_for(server.to_did_jig_string(), &[text_render_component]),
+            server_key,
+        );
+
+        let executor = Self {
             runtime,
             text_render,
-            text_render_module_id: canonical::module_id(),
+            text_render_component,
+            text_render_module_id: canonical::component_id(),
+            program,
+            policy,
+            render_limits,
+            receipt_limits,
             // Matched to the engine's pooling ceiling: the gate exists to keep us
             // strictly under it, so a mismatch here reintroduces the failure it
             // prevents.
             slots: Slots::new(concurrency),
-        })
+        };
+        // A server whose own policy refuses its own renderer cannot render anything; say so at
+        // boot rather than on every message.
+        if !executor
+            .policy
+            .policy
+            .allows(&executor.program.manifest.facts(&executor.program.cid))
+        {
+            return Err(ExecutorError::NotAllowed {
+                module: canonical::MODULE_NAME.to_string(),
+            });
+        }
+        Ok(executor)
     }
 
     /// Highest number of simultaneous executions observed. Diagnostic only —
@@ -193,67 +311,181 @@ impl BlockExecutor {
     /// A process-wide executor for **tests**, compiled on first use.
     ///
     /// Exists so the many tests that build an `IngestContext` don't each pay the
-    /// module compile; the executor is immutable after construction, so sharing
+    /// component compile; the executor is immutable after construction, so sharing
     /// is safe.
     ///
-    /// **Panics** if the canonical module fails to compile. That is acceptable in
+    /// Its operator policy is signed by a fixed test key, and its program identity is a test
+    /// value, so receipts from it are for tests only.
+    ///
+    /// **Panics** if the canonical component fails to compile. That is acceptable in
     /// a test binary and not in a server, which is why production code must use
-    /// [`BlockExecutor::new`] or [`BlockExecutor::with_config`] and propagate the
-    /// error — a server that cannot compile its module should report why, not
-    /// abort. `jig-server` does this in `AppState::new`.
+    /// [`BlockExecutor::with_config`] and propagate the error — a server that cannot
+    /// compile its component should report why, not abort. `jig-server` does this in
+    /// `AppState::new`.
     ///
     /// Note the sharing is per-process, so it does not amortize under
     /// `cargo nextest`, which runs a process per test.
     ///
-    /// Tests that measure [`BlockExecutor::in_flight_peak`] must build their own
-    /// via `new()`: `peak` is per-executor, so a shared one accumulates other
-    /// tests' concurrency and an assertion on it would not be measuring the test
-    /// that made it.
+    /// Tests that measure [`BlockExecutor::in_flight_peak`] must build their own:
+    /// `peak` is per-executor, so a shared one accumulates other tests' concurrency
+    /// and an assertion on it would not be measuring the test that made it.
     pub fn shared() -> Arc<Self> {
         static SHARED: OnceLock<Arc<BlockExecutor>> = OnceLock::new();
         SHARED
             .get_or_init(|| {
-                Arc::new(Self::new().expect(
-                    "the canonical text-block module must compile; it is embedded \
-                     at build time and covered by jig-runtime's payload tests",
-                ))
+                Arc::new(
+                    Self::for_tests(jig_runtime::RuntimeConfig::default()).expect(
+                        "the canonical text-block component must compile; it is embedded \
+                     at build time and covered by jig-runtime's component tests",
+                    ),
+                )
             })
             .clone()
     }
 
-    /// Identity of the text-render module this executor will run.
+    /// An executor with a test key and test program identity, under `config`. For tests only;
+    /// see [`BlockExecutor::shared`].
+    pub fn for_tests(config: jig_runtime::RuntimeConfig) -> Result<Self, ExecutorError> {
+        let key = test_server_key();
+        let program = text_block_program(&key, &config)?;
+        Self::with_config(config, &key, program)
+    }
+
+    /// The signed text-block program manifest this executor runs.
+    pub fn program(&self) -> &SignedProgram {
+        &self.program
+    }
+
+    /// Identity of the text-render component this executor will run.
     pub fn text_render_module_id(&self) -> &str {
         &self.text_render_module_id
     }
 
-    /// Render a chat message through the canonical text-render module.
-    pub fn render_text(&self, input: &text_block::Input) -> Result<Rendered, ExecutorError> {
-        let encoded =
-            postcard::to_allocvec(input).map_err(|e| ExecutorError::EncodeInput(e.to_string()))?;
+    /// The signed operator policy every render is checked against.
+    pub fn operator_policy(&self) -> &SignedOperatorPolicy {
+        &self.policy
+    }
+
+    /// Run the text-render component once on `invocation`, after checking the operator policy.
+    ///
+    /// Every outcome, including a guest error, a trap or an incomplete run, comes back as an
+    /// [`ExecRun`], since each one gets an `exec` receipt. Only a refusal by the policy is an
+    /// error.
+    pub fn render(&self, invocation: &Invocation) -> Result<ExecRun, ExecutorError> {
+        if !self
+            .policy
+            .policy
+            .allows(&self.program.manifest.facts(&self.program.cid))
+        {
+            return Err(ExecutorError::NotAllowed {
+                module: canonical::MODULE_NAME.to_string(),
+            });
+        }
+        let invocation_hash = component::hash_bytes(&component::invocation_hash(invocation));
 
         // Held across the execution only; released by Drop on every path.
-        let _slot = self.slots.acquire();
-        let result = self
-            .runtime
-            .execute_precompiled(&self.text_render, canonical::ENTRY_POINT, &encoded)
-            .map_err(|e| ExecutorError::Execute {
-                module: canonical::MODULE_NAME.to_string(),
-                source_msg: e.to_string(),
-            })?;
+        let run = {
+            let _slot = self.slots.acquire();
+            self.runtime
+                .render(&self.text_render, invocation, &self.render_limits)
+        };
 
-        let output: text_block::Output =
-            postcard::from_bytes(&result.bytes).map_err(|e| ExecutorError::DecodeOutput {
-                module: canonical::MODULE_NAME.to_string(),
-                source_msg: e.to_string(),
-            })?;
+        let identity = self.runtime.engine_identity();
+        let exec = Exec {
+            component: self.text_render_component,
+            program: self.program.cid,
+            world: self.program.manifest.world.clone(),
+            invocation_hash,
+            operator_policy_cid: Some(self.policy.cid),
+            outcome: run.outcome.to_receipt(),
+            limits: self.receipt_limits,
+            engine: block_receipt::Engine {
+                name: "wasmtime".to_string(),
+                version: identity.wasmtime,
+                profile: "jig-det-1".to_string(),
+                config_fingerprint: identity.config_fingerprint,
+                fuel_used: run.fuel_used,
+            },
+        };
+        Ok(ExecRun {
+            outcome: run.outcome,
+            exec,
+        })
+    }
 
+    /// Render a chat message through the canonical text-render component, and return its output
+    /// only if the run returned `ok`.
+    ///
+    /// The invocation carries no block CID or ingest sequence, so it is not the one a receipt
+    /// names; use [`BlockExecutor::render`] for that. `render_hash` depends on the body alone, so
+    /// it is unaffected.
+    pub fn render_text(&self, input: &text_block::Input) -> Result<Rendered, ExecutorError> {
+        let run = self.render(&text_invocation(input, String::new(), 0))?;
+        let output = run.text_output()?;
         Ok(Rendered {
             output,
             module_id: self.text_render_module_id.clone(),
-            fuel_used: result.fuel_used,
-            engine_identity: self.runtime.engine_identity().clone(),
+            fuel_used: run.exec.engine.fuel_used,
+            engine_identity: self.runtime.engine_identity(),
         })
     }
+}
+
+/// text-block's program manifest (JEP-0011 §2), built in and signed by `author_key`, with the
+/// limits `config` sets.
+///
+/// Who authors built-ins is the caller's choice. JEP-0011 §5.1 currently has each server sign
+/// its own, which gives a per-server program CID; comparison keys on the component either way.
+pub fn text_block_program(
+    author_key: &SigningKey,
+    config: &jig_runtime::RuntimeConfig,
+) -> Result<SignedProgram, ExecutorError> {
+    let author = Did::from_ed25519_pubkey(&author_key.verifying_key().to_bytes());
+    let manifest = ProgramManifest::builtin_renderer(
+        author.to_did_jig_string(),
+        canonical::MODULE_NAME,
+        canonical::MODULE_VERSION,
+        RENDERER_WORLD,
+        canonical::CANONICAL_COMPONENT,
+        program::Limits {
+            memory_max_pages: config.limits.memory_max_mb.saturating_mul(16),
+            fuel_max: config.limits.fuel_max,
+        },
+    );
+    SignedProgram::sign(manifest, author_key, canonical::CANONICAL_COMPONENT).map_err(|e| {
+        ExecutorError::Program {
+            module: canonical::MODULE_NAME.to_string(),
+            source_msg: e.to_string(),
+        }
+    })
+}
+
+/// The `jig:block` invocation for a chat message: the message text as the input, and the ingest
+/// record's block CID, sequence and clock.
+pub fn text_invocation(
+    input: &text_block::Input,
+    block_cid: String,
+    ingest_seq: u64,
+) -> Invocation {
+    Invocation {
+        block_cid,
+        sender_did: input.sender_did.clone(),
+        channel_cid: input.channel_id.clone(),
+        ingest_seq,
+        ingest_hlc: Hlc {
+            wall_ms: input.hlc_wall_ms,
+            logical: input.hlc_logical,
+        },
+        input: Payload {
+            media_type: TEXT_MEDIA_TYPE.to_string(),
+            body: input.body_raw.as_bytes().to_vec(),
+        },
+    }
+}
+
+/// The fixed key behind [`BlockExecutor::shared`]'s operator policy. Tests only.
+fn test_server_key() -> SigningKey {
+    SigningKey::from_bytes(&[0x5a; 32])
 }
 
 #[cfg(test)]
@@ -314,6 +546,83 @@ mod tests {
             ex.render_text(&other).unwrap().output.render_hash,
             base.output.render_hash,
             "render_hash must depend only on the body, or servers cannot agree"
+        );
+    }
+
+    #[test]
+    fn the_component_renders_what_the_abi_1_module_rendered() {
+        // render_hash must not move across the switch, or servers on mixed versions disagree.
+        let ex = BlockExecutor::shared();
+        for body in ["hello", "", "hi @deji https://jig.onl", "<b>&</b> 'x'"] {
+            let via_component = ex.render_text(&input(body)).expect("render").output;
+            let encoded = postcard::to_allocvec(&input(body)).unwrap();
+            let abi1 = jig_runtime::Runtime::new()
+                .unwrap()
+                .execute_payload(canonical::CANONICAL_WASM, canonical::ENTRY_POINT, &encoded)
+                .expect("ABI 1 render");
+            let abi1: text_block::Output = postcard::from_bytes(&abi1.bytes).unwrap();
+            assert_eq!(via_component.render_hash, abi1.render_hash, "body {body:?}");
+        }
+    }
+
+    #[test]
+    fn a_render_yields_a_server_exec_receipt_that_verifies() {
+        let ex = BlockExecutor::shared();
+        let block_cid = jig_core::canonical_cid::of(b"a block");
+        let run = ex
+            .render(&text_invocation(&input("hello"), block_cid.to_string(), 7))
+            .expect("render");
+        assert!(matches!(run.outcome, RunOutcome::Ok(_)));
+
+        let exec = &run.exec;
+        assert_eq!(exec.world, RENDERER_WORLD);
+        assert_eq!(exec.operator_policy_cid, Some(ex.operator_policy().cid));
+        assert_eq!(
+            exec.limits.max_wasm_stack,
+            jig_runtime::MAX_WASM_STACK as u64
+        );
+        assert!(matches!(exec.outcome, block_receipt::Outcome::Ok { .. }));
+
+        let key = test_server_key();
+        let server = Did::from_ed25519_pubkey(&key.verifying_key().to_bytes()).to_did_jig_string();
+        let signed = block_receipt::SignedReceipt::sign(run.receipt(block_cid, server, 1), &key)
+            .expect("the policy's signer signs the receipt");
+        let opened = block_receipt::SignedReceipt::open(&signed.envelope).expect("verifies");
+        assert_eq!(opened.receipt, signed.receipt);
+    }
+
+    #[test]
+    fn the_operator_policy_allows_text_block_by_component_and_is_signed_by_the_server() {
+        let ex = BlockExecutor::shared();
+        let policy = ex.operator_policy();
+        let reopened = SignedOperatorPolicy::open(&policy.envelope).expect("policy verifies");
+        assert_eq!(reopened.cid, policy.cid);
+        assert_eq!(
+            policy.policy.allow.components,
+            vec![ex.text_render_component]
+        );
+        assert!(policy.policy.allow.programs.is_empty());
+        assert!(policy.policy.allow.authors.is_empty());
+    }
+
+    /// Two servers sign different program manifests for text-block (their own DID as author),
+    /// yet their receipts for the same invocation agree: comparison keys on the component.
+    #[test]
+    fn servers_with_different_program_cids_agree_on_the_same_invocation() {
+        let x = BlockExecutor::shared();
+        let y_key = SigningKey::from_bytes(&[0x17; 32]);
+        let config = jig_runtime::RuntimeConfig::default();
+        let y_program = text_block_program(&y_key, &config).unwrap();
+        let y = BlockExecutor::with_config(config, &y_key, y_program).unwrap();
+        let inv = text_invocation(&input("same message"), "bafyblock".into(), 3);
+        let (rx, ry) = (x.render(&inv).unwrap(), y.render(&inv).unwrap());
+        assert_ne!(rx.exec.program, ry.exec.program);
+        assert_eq!(rx.exec.component, ry.exec.component);
+        assert_eq!(rx.exec.invocation_hash, ry.exec.invocation_hash);
+        assert_eq!(rx.exec.outcome, ry.exec.outcome);
+        assert_eq!(
+            block_receipt::compare(&rx.exec, &ry.exec),
+            block_receipt::Comparison::Agree
         );
     }
 
@@ -430,7 +739,7 @@ mod tests {
     fn executor_without_wall_clock_pressure() -> BlockExecutor {
         let mut config = jig_runtime::RuntimeConfig::default();
         config.limits.execution_timeout_ms = 60_000;
-        BlockExecutor::with_config(config).expect("executor construction")
+        BlockExecutor::for_tests(config).expect("executor construction")
     }
 
     /// `with_config` must actually apply the limits it is handed.
@@ -444,7 +753,7 @@ mod tests {
     fn a_configured_fuel_limit_is_enforced() {
         let mut config = jig_runtime::RuntimeConfig::default();
         config.limits.fuel_max = 100; // far below what a real render costs
-        let ex = BlockExecutor::with_config(config).expect("executor builds");
+        let ex = BlockExecutor::for_tests(config).expect("executor builds");
 
         let err = ex
             .render_text(&input("this render cannot fit in 100 fuel"))
@@ -457,7 +766,7 @@ mod tests {
 
         // And the same executor at a normal budget succeeds, so the failure above
         // is attributable to the limit rather than to anything else.
-        let ok = BlockExecutor::with_config(jig_runtime::RuntimeConfig::default())
+        let ok = BlockExecutor::for_tests(jig_runtime::RuntimeConfig::default())
             .expect("executor builds")
             .render_text(&input("this render cannot fit in 100 fuel"))
             .expect("a default budget must succeed");

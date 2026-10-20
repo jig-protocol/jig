@@ -48,6 +48,7 @@ mod trap;
 // Re-export primary types
 pub use api::{BlockPackage, ExecutionContext, Limits, Outcome, Runtime};
 pub use config::{PricingConfig, RuntimeConfig};
+pub use engine::MAX_WASM_STACK;
 pub use error::{Result, RuntimeError};
 
 pub use identity::{EngineIdentity, FUEL_SCHEDULE_VERSION, WASMTIME_VERSION};
