@@ -1642,6 +1642,37 @@ impl SqliteStore {
         Ok(changed > 0)
     }
 
+    /// Move channel `from` to slug `to`, and archive it there, in one
+    /// transaction: its blocks, records, members and MLS group, keyed by its
+    /// id, go with it, and nothing is deleted. For a channel that holds a slug the server
+    /// has since reserved. Fails, changing nothing, if `to` is taken.
+    pub fn quarantine_channel(&self, from: &str, to: &str, archived_at: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("poisoned");
+        let tx = conn.unchecked_transaction()?;
+        let taken: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM channels WHERE slug = ?1)",
+            [to],
+            |r| r.get(0),
+        )?;
+        if taken {
+            return Err(PersistError::Corrupt(format!(
+                "cannot move {from} to {to}: {to} exists"
+            )));
+        }
+        // Blocks, records, members and MLS groups are keyed by the channel's
+        // id, so they follow the row.
+        tx.execute(
+            "UPDATE channels SET slug = ?2 WHERE slug = ?1",
+            params![from, to],
+        )?;
+        tx.execute(
+            "UPDATE channels SET archived_at = ?2 WHERE slug = ?1 AND archived_at IS NULL",
+            params![to, archived_at],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// When a channel was archived, or `None` if it is live or unknown.
     pub fn channel_archived_at(&self, slug: &str) -> Result<Option<i64>> {
         match self.get_channel_by_slug_including_archived(slug)? {

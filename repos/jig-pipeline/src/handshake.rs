@@ -204,9 +204,19 @@ impl Default for ClientOffer {
 }
 
 /// Facts the server puts in the welcome, aside from the key it signs with.
+/// The `server-manifest` block a welcome cites (JEP-0002 rule 12): its CID
+/// and its `seq` in the server's manifest log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestRef {
+    pub cid: String,
+    pub seq: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServerOffer {
     pub capabilities: Capabilities,
+    /// The current manifest; `None` until the server has published one.
+    pub manifest: Option<ManifestRef>,
     /// The TLS exporter value of the connection being answered; empty over
     /// plaintext.
     pub tls_exporter: Vec<u8>,
@@ -236,6 +246,7 @@ pub struct WelcomeStatement {
     pub server_nonce: String,
     /// base64, as on the wire; empty over plaintext.
     pub tls_exporter: String,
+    pub manifest: Option<ManifestRef>,
 }
 
 impl WelcomeStatement {
@@ -253,6 +264,14 @@ impl WelcomeStatement {
         push(&mut out, self.nonce.as_bytes());
         push(&mut out, self.server_nonce.as_bytes());
         push(&mut out, self.tls_exporter.as_bytes());
+        match &self.manifest {
+            None => push(&mut out, &[0]),
+            Some(m) => {
+                push(&mut out, &[1]);
+                push(&mut out, m.cid.as_bytes());
+                push(&mut out, &m.seq.to_le_bytes());
+            }
+        }
         out
     }
 
@@ -364,6 +383,7 @@ pub struct VerifiedWelcome {
     pub server_nonce: String,
     /// The TLS exporter value the welcome is bound to; empty over plaintext.
     pub tls_exporter: Vec<u8>,
+    pub manifest: Option<ManifestRef>,
     /// The frame text, kept so a later contradiction has something to show.
     pub evidence: String,
 }
@@ -512,6 +532,7 @@ pub fn negotiate(
         nonce: hello.nonce.clone(),
         server_nonce: fresh_nonce(),
         tls_exporter: STANDARD.encode(&server.tls_exporter),
+        manifest: server.manifest.clone(),
     })
 }
 
@@ -531,6 +552,7 @@ pub fn seal(key: &SigningKey, mut statement: WelcomeStatement) -> Envelope {
         nonce: statement.nonce,
         server_nonce: statement.server_nonce,
         tls_exporter: statement.tls_exporter,
+        manifest: statement.manifest,
         sig,
     })
 }
@@ -748,6 +770,7 @@ fn interpret_envelope(
         nonce: echoed,
         server_nonce,
         tls_exporter: bound_to,
+        manifest,
         sig,
     } = &env.frame
     else {
@@ -771,6 +794,7 @@ fn interpret_envelope(
         nonce: echoed.clone(),
         server_nonce: server_nonce.clone(),
         tls_exporter: bound_to.clone(),
+        manifest: manifest.clone(),
     };
 
     if echoed != nonce {
@@ -844,6 +868,7 @@ fn interpret_envelope(
         nonce: echoed.clone(),
         server_nonce: server_nonce.clone(),
         tls_exporter: bound,
+        manifest: manifest.clone(),
         evidence: text.to_string(),
     })
 }
