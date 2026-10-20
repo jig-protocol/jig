@@ -8,8 +8,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use toml::Value as TomlValue;
 
-const DEFAULT_CONFIG_RELATIVE: &str = "config/jig-nameserver/jig-config.toml";
-
 fn merge_tables(target: &mut toml::value::Table, source: &toml::value::Table) {
     for (key, value) in source {
         let mut merged = false;
@@ -171,15 +169,29 @@ fn reject_removed_keys(table: &toml::value::Table) -> Result<()> {
     Ok(())
 }
 
+/// The config file to load: `--config`, else `JIG_NS_CONFIG`.
+fn config_path(explicit: Option<&Path>, env: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    explicit
+        .map(Path::to_path_buf)
+        .or_else(|| env.filter(|v| !v.is_empty()).map(PathBuf::from))
+        .ok_or_else(|| {
+            NameServerError::Other(anyhow::anyhow!(
+                "no nameserver config: pass --config <path> or set JIG_NS_CONFIG. The \
+                 nameserver no longer reads JIG_CONFIG, ~/.jig/config.toml or \
+                 ./config/jig-nameserver/jig-config.toml"
+            ))
+        })
+}
+
 impl NameServerConfig {
-    /// Load configuration from disk if available, otherwise fall back to env
-    /// defaults. The result is [`validate`](Self::validate)d, so a
-    /// misconfiguration surfaces as an `Err` the caller can log.
-    pub fn load() -> Result<Self> {
-        warn_removed_env_vars();
-        let cfg = Self::load_unvalidated()?;
-        cfg.validate()?;
-        Ok(cfg)
+    /// Load the config file named by `explicit` (the binary's `--config`), or
+    /// else by `JIG_NS_CONFIG`, then apply the environment overrides. There is
+    /// no default path: with neither set this fails, naming both. The result
+    /// is [`validate`](Self::validate)d, so a misconfiguration surfaces as an
+    /// `Err` the caller can log.
+    pub fn load(explicit: Option<&Path>) -> Result<Self> {
+        let path = config_path(explicit, std::env::var_os("JIG_NS_CONFIG"))?;
+        Self::load_from_path(path)
     }
 
     /// Operator-fixable-misconfiguration check. Separate from parsing so tests
@@ -191,35 +203,6 @@ impl NameServerConfig {
             .validate()
             .map_err(|e| NameServerError::Other(anyhow::anyhow!("[v0_0_2] {e}")))?;
         Ok(())
-    }
-
-    fn load_unvalidated() -> Result<Self> {
-        let env_profile = std::env::var("JIG_NS_PROFILE").ok();
-
-        if let Ok(explicit) = std::env::var("JIG_NS_CONFIG") {
-            return Self::load_from_path_with_profile(explicit, env_profile.clone());
-        }
-
-        if let Ok(global_path) = std::env::var("JIG_CONFIG")
-            && let Some(cfg) =
-                Self::load_from_global_path(&PathBuf::from(global_path), env_profile.clone())?
-        {
-            return Ok(cfg);
-        }
-
-        if let Some(cfg) =
-            Self::load_from_global_path(&jig_config::default_config_path(), env_profile.clone())?
-        {
-            return Ok(cfg);
-        }
-
-        if Path::new(DEFAULT_CONFIG_RELATIVE).exists() {
-            return Self::load_from_path_with_profile(DEFAULT_CONFIG_RELATIVE, env_profile);
-        }
-
-        let mut cfg = Self::from_env();
-        cfg.normalize();
-        Ok(cfg)
     }
 
     /// Load configuration from the given path. Validated like [`load`](Self::load).
@@ -247,53 +230,6 @@ impl NameServerConfig {
         cfg.apply_env_overrides();
         cfg.normalize();
         Ok(cfg)
-    }
-
-    fn load_from_global_path(
-        path: &Path,
-        profile_override: Option<String>,
-    ) -> Result<Option<Self>> {
-        let data = match fs::read_to_string(path) {
-            Ok(data) => data,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(NameServerError::Other(anyhow::anyhow!(format!(
-                    "read global config {}: {}",
-                    path.display(),
-                    e
-                ))));
-            }
-        };
-        let value: TomlValue = toml::from_str(&data).map_err(|e| {
-            NameServerError::Other(anyhow::anyhow!(format!("parse {}: {}", path.display(), e)))
-        })?;
-        let root = match value.as_table() {
-            Some(table) => table,
-            None => return Ok(None),
-        };
-        let nameserver_value = match root.get("nameserver") {
-            Some(value) => value,
-            None => return Ok(None),
-        };
-        let mut override_profile = profile_override;
-        if override_profile.is_none() {
-            override_profile = root
-                .get("deployment")
-                .and_then(|v| v.as_table())
-                .and_then(|tbl| tbl.get("mode"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-        }
-        let table = nameserver_value.as_table().cloned().ok_or_else(|| {
-            NameServerError::Other(anyhow::anyhow!(
-                "nameserver section in {} must be a table",
-                path.display()
-            ))
-        })?;
-        let mut cfg = Self::from_table(table, override_profile)?;
-        cfg.apply_env_overrides();
-        cfg.normalize();
-        Ok(Some(cfg))
     }
 
     pub(crate) fn from_table(
@@ -512,6 +448,12 @@ pub struct AliasRateLimitConfig {
     pub per_ip_per_min: u32,
     /// Requests naming a given DID per minute (`did`, `old_did` or `new_did`).
     pub per_did_per_min: u32,
+    /// `GET /v1/challenge` requests per client IP per minute (JEP-0008 rule
+    /// 31): each one can make the nameserver sign an effort offer.
+    pub challenge_per_ip_per_min: u32,
+    /// Challenges issued and not yet used or expired. At the cap a new one is
+    /// refused with `503 BUSY`; live ones are never evicted.
+    pub max_pending_challenges: usize,
 }
 
 impl Default for AliasRateLimitConfig {
@@ -520,6 +462,8 @@ impl Default for AliasRateLimitConfig {
             enabled: true,
             per_ip_per_min: 30,
             per_did_per_min: 10,
+            challenge_per_ip_per_min: 60,
+            max_pending_challenges: 100_000,
         }
     }
 }
@@ -1238,6 +1182,10 @@ database_path = "~/.jig/nameserver.db"
 enabled = true
 per_ip_per_min = 30
 per_did_per_min = 10
+# GET /v1/challenge per client IP per minute, and the most challenges pending
+# at once (past it, new ones get 503 BUSY).
+challenge_per_ip_per_min = 60
+max_pending_challenges = 100000
 
 [penalties]
 decay_secs = 300
@@ -1340,6 +1288,19 @@ default_time_range = "last_day"  # Options: last_hour, last_day, last_week, last
 # [[v0_0_2.nameserver.alias_suffixes.registration_allow]]
 # did = "did:jig:z..."
 # aliases = ["alice"]
+#
+# # Proof-of-work on register, renew and rotate (JEP-0008). Off by default
+# # (min_effort = 0) until jig clients solve it; the recommended values are
+# # shown. An allowlisted registration pays min_effort; an ordinary one pays
+# # min_effort x short_name_factor^(short_name_len - length), up to max_effort.
+# [v0_0_2.nameserver.alias_suffixes.pow]
+# alg = 1
+# min_effort = 1048576       # 2^20
+# max_effort = 16777216      # 2^24, about 3 s on one server core
+# max_solve_secs = 10
+# short_name_len = 5
+# short_name_factor = 4
+# renew_effort = 1
 
 [v0_0_2.server]
 # Ed25519 key that signs alias attestations. Left at the jig-server default
@@ -1552,12 +1513,28 @@ federation_enabled = true
             include_str!("../examples/config/profile_federated.toml"),
             include_str!("../examples/config/profile_potato.toml"),
         ] {
-            let value: TomlValue = toml::from_str(example).expect("valid TOML");
-            let ns = value["nameserver"]
-                .as_table()
-                .expect("[nameserver]")
-                .clone();
-            NameServerConfig::from_table(ns, None).expect("example parses");
+            from_doc(example).expect("example parses");
+        }
+    }
+
+    /// `--config` wins over `JIG_NS_CONFIG`; with neither there is no default
+    /// path, and the error names both and the old fallbacks it no longer reads.
+    #[test]
+    fn the_config_path_is_explicit_or_from_jig_ns_config() {
+        let flag = Path::new("/etc/jig/flag.toml");
+        let env = || Some(std::ffi::OsString::from("/etc/jig/env.toml"));
+        assert_eq!(config_path(Some(flag), env()).unwrap(), flag);
+        assert_eq!(
+            config_path(None, env()).unwrap(),
+            Path::new("/etc/jig/env.toml")
+        );
+        for missing in [None, Some(std::ffi::OsString::new())] {
+            let err = config_path(None, missing).unwrap_err().to_string();
+            assert!(
+                err.contains("--config") && err.contains("JIG_NS_CONFIG"),
+                "{err}"
+            );
+            assert!(err.contains("~/.jig/config.toml"), "{err}");
         }
     }
 

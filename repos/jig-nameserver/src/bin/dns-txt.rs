@@ -1,9 +1,12 @@
-//! CLI tool to generate DNS TXT records for nameserver capabilities
+//! CLI tool to generate DNS TXT records for nameserver capabilities.
+//!
+//! Usage: `dns-txt [CONFIG]`; without an argument it reads `JIG_NS_CONFIG`.
 
 use jig_nameserver::NameServerConfig;
 
 fn main() {
-    let cfg = NameServerConfig::load().expect("failed to load config");
+    let path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    let cfg = NameServerConfig::load(path.as_deref()).expect("failed to load config");
 
     println!("# DNS TXT Records for Jig Nameserver Capabilities");
     println!("# Add these records to your DNS zone:\n");

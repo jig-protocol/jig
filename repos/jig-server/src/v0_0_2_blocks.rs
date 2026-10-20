@@ -143,6 +143,10 @@ pub struct BlockView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub federated_from: Option<String>,
     pub receipts: Vec<ReceiptView>,
+    /// True while this server's own receipt is not yet written: the block has landed and is being
+    /// rendered. Pending, not failed; omitted once the receipt exists.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub receipt_pending: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -197,7 +201,7 @@ pub async fn get_block_by_cid(
         authorize_channel_read(&state, &channel, caller, started)?;
     }
 
-    let receipts = state
+    let receipts: Vec<ReceiptView> = state
         .ingest_ctx
         .store
         .get_receipts_for_block(&cid)
@@ -232,6 +236,7 @@ pub async fn get_block_by_cid(
         hlc_origin: stored.hlc_origin,
         origin_server: stored.origin_server,
         federated_from: stored.federated_from,
+        receipt_pending: !receipts.iter().any(|r| state.server_did == r.server_id),
         receipts,
     }))
 }
@@ -392,6 +397,9 @@ pub struct TimelineBlock {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sig_b64: Option<String>,
     pub receipts: Vec<ReceiptRef>,
+    /// True while this server's own receipt is not yet written (see [`BlockView`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub receipt_pending: bool,
     pub delivery_cid: String,
     /// The block's record in its channel's chain (JEP-0002 rule 9), when this
     /// server sequences the channel. History is checkable on any transport.
@@ -624,12 +632,14 @@ pub async fn get_channel_history(
                 receipt_bytes_b64: base64::engine::general_purpose::STANDARD
                     .encode(&r.receipt_bytes),
             })
-            .collect();
+            .collect::<Vec<ReceiptRef>>();
+        let receipt_pending = !receipts.iter().any(|r| state.server_did == r.server_did);
         timeline.push(TimelineBlock {
             bundle_b64: base64::engine::general_purpose::STANDARD.encode(&block.bundle_bytes),
             sig_b64: (!block.sender_sig.is_empty())
                 .then(|| base64::engine::general_purpose::STANDARD.encode(&block.sender_sig)),
             receipts,
+            receipt_pending,
             // Same `delivery:<cid>` shape the WSS fanout emits, so a client
             // that dedupes on delivery_cid sees replay and live delivery of
             // the same block as one identity.

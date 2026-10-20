@@ -103,7 +103,7 @@ registration_allow = [{ did = "did:jig:z…", aliases = ["dj"] }]
 [v0_0_2.nameserver.alias_suffixes.pow] # this plan, task 1
 alg = 1                                # JEP-0008 rule 8
 min_effort = 1_048_576                 # 2^20; the floor for strangers (rule 19)
-max_effort = 268_435_456               # 2^28; the cap, and the client's refusal point
+max_effort = 16_777_216                # 2^24: ~3 s at the 5.5M digests/s task 0's bench measured on one server core; headroom for phones
 max_solve_secs = 10                    # what max_effort must fit, on the slowest client meant to be served
 short_name_len = 5                     # names shorter than this pay the length multiplier
 short_name_factor = 4                  # effort × factor^(short_name_len − len)
@@ -213,9 +213,12 @@ Wire changes:
     rotate, the bound DID is the **old** DID, as in #224.
   - For `action=register` the endpoint runs the cheap refusals first, so nobody solves work for
     nothing: `SuffixPolicy::admit` (`REGISTRATION_CLOSED`, `ALIAS_TOO_SHORT`,
-    `ALIAS_RESERVED`), `ALIAS_TAKEN` by another DID, and `DID_HOLDS_NAME`. These are hints,
-    not authority: `register` repeats every one, since the store can change while a client
-    solves.
+    `ALIAS_RESERVED`) and `ALIAS_TAKEN` by another DID. These are hints, not authority:
+    `register` repeats every one, since the store can change while a client solves.
+  - **Not `DID_HOLDS_NAME`.** The challenge is unauthenticated, so refusing there would tell
+    anyone which name a DID holds: a DID → name oracle that resolution deliberately does not
+    offer. `register` refuses it after `verify_action_proof`, where only the holder learns it.
+    (`ALIAS_TAKEN` is safe early: alias → DID is public through resolution.)
   - `sig` is a COSE_Sign1 by the nameserver's DID over the deterministic-CBOR map
     `{challenge, action, name, did, alg, effort, salt_id, expires_at}`. This is rule 16's signed
     effort; JEP-0009 rule 1 sets the encoding.
@@ -265,6 +268,12 @@ Wire changes:
     `verify_action_proof` has passed, when the requester is the DID that signed.
 - **Challenge map:** cap the number of pending challenges (config, default 100 000). When it is
   full, refuse new challenges with `503 BUSY` rather than evict live ones.
+  - A full map must not stop holders: reserve a share for renew and rotate, and/or cap pending
+    challenges per IP, so a flood of register challenges cannot let names lapse.
+  - **Challenge lifetime ≥ solve time.** The challenge TTL (and so the offer's `expires_at`)
+    must exceed the slowest solve the nameserver asks for: boot refuses a TTL below
+    `max_solve_secs` plus a margin. The client also bounds its bid by `expires_at − now`
+    (task 2), so no work is done for a challenge that will be gone.
 
 - [ ] **Step 1: Failing tests.** Change `an_arbitrary_pow_field_is_accepted_and_ignored` to expect
   refusal; that is the planned break.
@@ -281,7 +290,8 @@ Wire changes:
     `min_effort`; the listed DID with another alias → `REGISTRATION_CLOSED`.
   - A reserved alias (including a normalized match, e.g. `4dm1n-x`) and a too-short alias are
     refused at the challenge and at register, before any `pow` is checked.
-  - A DID that already holds a name on the suffix → `409 DID_HOLDS_NAME` at the challenge.
+  - A DID that already holds a name on the suffix gets a challenge as usual (no oracle), and
+    `409 DID_HOLDS_NAME` from `register` after its signature verifies.
   - A challenge issued for alias A, used to register alias B → `CHALLENGE_UNKNOWN`, and no
     signature check runs.
   - Rotate with a bad `pow` → refused, and the challenge is still usable.
@@ -310,8 +320,9 @@ Wire changes:
 Behaviour (rules 16 and 20):
 - The client verifies the effort's signature against the nameserver DID it learned from the
   suffix delegation (F1). It ignores an unsigned or wrongly signed effort.
-- It refuses an effort above its own cap, `2^28` by default and configurable. The message says
-  the nameserver is asking more than this client will do.
+- It refuses an effort above its own cap, `2^28` (`jig_core::pow::MAX_EFFORT`, rule 19's ceiling)
+  by default and configurable. The message says the nameserver is asking more than this client
+  will do.
 - It shows progress for solves expected to take more than 2 s, and gives an estimate up front
   from the effort and its measured rate.
 - On a 428, `POW_INSUFFICIENT` or `REGISTRATION_BUSY` it fetches a new challenge and retries

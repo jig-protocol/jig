@@ -163,11 +163,13 @@ pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
 
     let mut v0_0_2_cfg = cfg.v0_0_2.clone();
     v0_0_2_cfg.server.server_did_keyfile = resolve_v0_0_2_keyfile(cfg);
-    let v0_0_2_state = Arc::new(crate::v0_0_2::AppState::new(
+    let mut v0_0_2_state = crate::v0_0_2::AppState::new(
         v0_0_2_cfg,
         db_sibling(&cfg.storage.database_path, "_v002.db"),
         crate::v0_0_2_policy::Suffixes::from_config(&cfg.v0_0_2.nameserver)?,
-    )?);
+    )?;
+    v0_0_2_state.max_pending_challenges = cfg.alias_rate_limits.max_pending_challenges;
+    let v0_0_2_state = Arc::new(v0_0_2_state);
 
     // `merge` is safe here even though both halves register `/v1/challenge`:
     // the legacy handler is POST and the v0.0.2 handler is GET, and axum
@@ -210,15 +212,17 @@ pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
     })
 }
 
-/// Load config, apply the CLI overrides, and serve. `bind_override` /
+/// Load config, apply the CLI overrides, and serve. `config` is
+/// `jig-nameserver --config`, else `JIG_NS_CONFIG` is read. `bind_override` /
 /// `port_override` come from `jig-nameserver serve --bind/--port` and win over
 /// both the config file and `JIG_NS_BIND`/`JIG_NS_PORT`, which `load` has
 /// already applied.
 pub async fn run_http_server(
+    config: Option<&std::path::Path>,
     bind_override: Option<String>,
     port_override: Option<u16>,
 ) -> Result<()> {
-    let mut cfg = NameServerConfig::load()?;
+    let mut cfg = NameServerConfig::load(config)?;
     if let Some(bind) = bind_override {
         cfg.network.bind = bind;
     }
@@ -536,6 +540,22 @@ mod tests {
         let (status, body) = get(router, "/v1/challenge").await;
         assert_eq!(status, StatusCode::OK);
         body["challenge"].as_str().unwrap().to_string()
+    }
+
+    /// `GET /v1/challenge` has a per-IP bucket of its own (JEP-0008 rule 31).
+    #[tokio::test]
+    async fn challenges_are_rate_limited_per_ip() {
+        let dir = ScratchDir::new("challenge-rate-limit");
+        let mut cfg = scratch_config(&dir, "dj.jig");
+        cfg.alias_rate_limits.challenge_per_ip_per_min = 2;
+        let router = build_app(&cfg).expect("build_app");
+        fresh_challenge(&router).await;
+        fresh_challenge(&router).await;
+        let (status, body) = get(&router, "/v1/challenge").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert_eq!(body["code"], "RATE_LIMITED");
+        // Other GETs are not counted.
+        assert_eq!(get(&router, "/v1/health").await.0, StatusCode::OK);
     }
 
     /// The limiter sits in front of the mounted register/rotate/renew
