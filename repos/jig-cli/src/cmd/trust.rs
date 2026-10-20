@@ -11,6 +11,11 @@
 //! Plaintext REST is refused, except to this machine (D11 item 10): nothing
 //! ties a plaintext response to the pinned server, and any response may say
 //! what a channel's suite is.
+//!
+//! A contradiction the server signs is kept as an evidence bundle
+//! ([`jig_client::evidence`]). One whose bundle carries a proof that holds
+//! makes the refusal sticky: every later connection to the server, REST or
+//! WebSocket, stops in [`server_tls`] until `jig trust accept` (D11 item 9).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -27,6 +32,7 @@ static PROBED: Mutex<Option<HashMap<String, Config>>> = Mutex::new(None);
 /// The TLS config for connections to `server`: `None` over plaintext, which
 /// has nothing to bind.
 pub async fn server_tls(server: &str) -> Result<Config> {
+    refuse_if_sticky(&Pins::load(&Pins::default_path())?, server)?;
     let key = server_key(server);
     if let Some(config) = PROBED
         .lock()
@@ -75,6 +81,237 @@ pub async fn http(server: &str, timeout: std::time::Duration) -> Result<reqwest:
         builder = builder.use_preconfigured_tls(config.as_ref().clone());
     }
     builder.build().context("building HTTP client")
+}
+
+/// `jig trust evidence list`.
+pub fn evidence_list() -> Result<()> {
+    let store = jig_client::evidence::EvidenceStore::new(&evidence_dir(&Pins::default_path()));
+    let bundles = store.list()?;
+    if bundles.is_empty() {
+        println!("No evidence kept.");
+    }
+    for (id, bundle) in bundles {
+        println!("{id}\t{}\t{}", status_of(&bundle), bundle.reason);
+    }
+    Ok(())
+}
+
+/// `jig trust evidence show <id>`.
+pub fn evidence_show(id: &str) -> Result<()> {
+    let store = jig_client::evidence::EvidenceStore::new(&evidence_dir(&Pins::default_path()));
+    print!("{}", describe(&store.get(id)?));
+    Ok(())
+}
+
+/// `jig trust evidence export <id> [--out <file>]`.
+pub fn evidence_export(id: &str, out: Option<&std::path::Path>) -> Result<()> {
+    let store = jig_client::evidence::EvidenceStore::new(&evidence_dir(&Pins::default_path()));
+    let json = serde_json::to_string_pretty(&store.get(id)?)?;
+    match out {
+        Some(path) => std::fs::write(path, json + "\n")
+            .with_context(|| format!("writing {}", path.display()))?,
+        None => println!("{json}"),
+    }
+    Ok(())
+}
+
+/// `jig trust evidence import <file>`: check and show, nothing else. Someone
+/// else's evidence never refuses a server here (design D11 item 9, rule 4),
+/// or one shared report could turn every client against it.
+pub fn evidence_import(file: &std::path::Path) -> Result<()> {
+    let bytes = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+    let bundle: jig_client::evidence::Bundle = serde_json::from_slice(&bytes)
+        .with_context(|| format!("{} is not a bundle", file.display()))?;
+    print!("{}", describe(&bundle));
+    println!("Imported evidence is only shown: nothing was refused or pinned.");
+    Ok(())
+}
+
+/// `jig trust accept <server>`.
+pub fn accept_server(server: &str) -> Result<()> {
+    match Pins::load(&Pins::default_path())?.accept_server(server)? {
+        Some(lifted) => println!(
+            "{server} is no longer refused (it was for: {}; evidence {} is kept). It is still \
+             held to what this device pinned.",
+            lifted.reason, lifted.bundle
+        ),
+        None => println!("{server} was not refused."),
+    }
+    Ok(())
+}
+
+fn status_of(bundle: &jig_client::evidence::Bundle) -> &'static str {
+    match jig_client::evidence::verify(bundle) {
+        Ok(checked) if checked.proven.is_some() => "proven",
+        Ok(_) => "unproven",
+        Err(_) => "INVALID",
+    }
+}
+
+/// A bundle for a person: what it claims, and what checking it found.
+fn describe(bundle: &jig_client::evidence::Bundle) -> String {
+    let check = match jig_client::evidence::verify(bundle) {
+        Ok(checked) => match checked.proven {
+            Some(what) => format!("proven from what the server signed: {what}"),
+            None => "unproven: it records what this client saw, but nothing in it proves \
+                     the server signed a contradiction"
+                .to_string(),
+        },
+        Err(e) => format!("INVALID: {e}"),
+    };
+    format!(
+        "server:   {} ({})\ncode:     {} (class {})\nreason:   {}\nseen at:  {} ms (the \
+         observer's clock, unsigned)\nitems:    {} frame(s){}\ncheck:    {check}\n",
+        bundle.server,
+        bundle.server_did,
+        bundle.code,
+        bundle.class,
+        bundle.reason,
+        bundle.observed_at_ms,
+        bundle.items.len(),
+        if bundle.welcome.is_some() {
+            ", and the connection's welcome"
+        } else {
+            ""
+        },
+    )
+}
+
+/// Refuse `server` if it signed a contradiction this device has not accepted.
+pub fn refuse_if_sticky(pins: &Pins, server: &str) -> Result<()> {
+    if let Some(refused) = pins.refusal(server) {
+        anyhow::bail!(
+            "refusing {server}: it signed a contradiction ({}). The evidence is \
+             `jig trust evidence show {}`. Every connection to it is refused until you run \
+             `jig trust accept {server}`; if the server is honest and this is a bug, that \
+             bundle is what to report",
+            refused.reason,
+            refused.bundle
+        );
+    }
+    Ok(())
+}
+
+/// The hook a connection to `server` calls when it contradicts itself: keep
+/// the evidence and, when it proves the contradiction, refuse the server.
+pub fn evidence_hook(server: &str) -> jig_client::connection::ContradictionHook {
+    let server = server.to_string();
+    Arc::new(move |c: &jig_client::connection::Contradiction| {
+        if let Err(e) = keep_evidence_in(&Pins::default_path(), &server, c) {
+            eprintln!("warning: could not keep the evidence of {server}'s contradiction: {e:#}");
+        }
+    })
+}
+
+/// What [`keep_evidence_in`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept {
+    /// The bundle's id in the evidence store.
+    pub id: String,
+    /// Whether the server is now refused.
+    pub sticky: bool,
+}
+
+/// Keep `c` as a bundle against `server`, and refuse `server` from now on
+/// when the bundle proves it. A downgrade proof is completed here from the
+/// welcome the pin kept, which the connection does not hold.
+fn keep_evidence_in(
+    pins_path: &std::path::Path,
+    server: &str,
+    c: &jig_client::connection::Contradiction,
+) -> Result<Kept> {
+    use jig_client::evidence::{BUNDLE_FORMAT, Bundle, EvidenceStore, verify};
+    let mut pins = Pins::load(pins_path)?;
+    let pin = pins.server(server).cloned().unwrap_or_default();
+    let mut proof = c.proof.clone().map(|p| *p);
+    if proof.is_none()
+        && c.code == "refusal-downgrade"
+        && let (Some(pinned_welcome), Some(refusal)) = (&pin.welcome, c.evidence.first())
+    {
+        proof = jig_client::evidence::downgrade_proof(
+            pinned_welcome,
+            &pin.suites,
+            refusal,
+            &pin.server_did,
+        );
+    }
+    let bundle = Bundle {
+        format: BUNDLE_FORMAT.to_string(),
+        class: 3,
+        code: c.code.to_string(),
+        reason: c.reason.clone(),
+        server: server.to_string(),
+        server_did: pin.server_did.clone(),
+        observed_at_ms: now_ms(),
+        welcome: c.welcome.clone(),
+        items: c.evidence.clone(),
+        proof,
+    };
+    // Only a proof that holds here, from the bundle alone, makes it sticky.
+    let proven = verify(&bundle).ok().and_then(|checked| checked.proven);
+    let id = EvidenceStore::new(&evidence_dir(pins_path)).keep(&bundle)?;
+    let sticky = proven.is_some();
+    if sticky {
+        pins.refuse(
+            server,
+            jig_client::pins::StickyRefusal {
+                bundle: id.clone(),
+                reason: c.reason.clone(),
+                at_ms: bundle.observed_at_ms,
+            },
+        )?;
+    }
+    Ok(Kept { id, sticky })
+}
+
+/// The evidence store beside the pin store `pins_path`: `~/.jig/evidence`
+/// for the default `~/.jig/pins.json`.
+fn evidence_dir(pins_path: &std::path::Path) -> std::path::PathBuf {
+    pins_path.with_file_name("evidence")
+}
+
+/// A contradiction found over REST, kept like one on a connection, as the
+/// error to stop on.
+fn chain_contradiction(
+    pins_path: &std::path::Path,
+    server: &str,
+    slug: &str,
+    chain: &jig_client::chain::ChannelChain,
+    record: &jig_client::chain::IngestRecord,
+    broke: &jig_client::chain::ChainBreak,
+) -> anyhow::Error {
+    let reason = format!("the history of {slug} broke: {broke}");
+    let c = jig_client::connection::Contradiction {
+        code: broke.code(),
+        reason: reason.clone(),
+        welcome: None,
+        evidence: vec![serde_json::to_string(record).unwrap_or_default()],
+        proof: chain
+            .proof(record, broke)
+            .map(|p| Box::new(jig_client::evidence::Proof::Chain(Box::new(p)))),
+    };
+    let kept = match keep_evidence_in(pins_path, server, &c) {
+        Ok(kept) => format!(
+            " Kept as `jig trust evidence show {}`{}.",
+            kept.id,
+            if kept.sticky {
+                format!("; {server} is refused until `jig trust accept {server}`")
+            } else {
+                String::new()
+            }
+        ),
+        Err(e) => format!(" The evidence could not be kept: {e:#}."),
+    };
+    anyhow::anyhow!(
+        "{server} contradicted the history of {slug} this device verified: {broke}. \
+         Refusing to go on.{kept}"
+    )
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// What [`check_channel_chain`] found.
@@ -148,24 +385,22 @@ async fn check_chain_in(
     sorted.sort_by_key(|r| r.seq);
     let mut outcome = ChainCheck::Verified;
     for record in sorted {
-        let broke = |e: jig_client::chain::ChainBreak| {
-            anyhow::anyhow!(
-                "{server} contradicted the history of {slug} this device verified: {e}. \
-                 It signed both; refusing to go on"
-            )
+        let accept = |chain: &mut ChannelChain,
+                      record: &jig_client::chain::IngestRecord,
+                      block: Option<&str>| {
+            let before = chain.clone();
+            chain
+                .accept(record, block)
+                .map_err(|e| chain_contradiction(pins_path, server, slug, &before, record, &e))
         };
-        let step = chain
-            .accept(record, Some(&record.block_cid))
-            .map_err(broke)?;
+        let step = accept(&mut chain, record, Some(&record.block_cid))?;
         if let Step::Gap { from, to } = step {
             match fetch_records(who, server, slug, from, to).await {
                 Ok(filler) if filler.len() as u64 == to - from => {
                     for missing in &filler {
-                        chain.accept(missing, None).map_err(broke)?;
+                        accept(&mut chain, missing, None)?;
                     }
-                    chain
-                        .accept(record, Some(&record.block_cid))
-                        .map_err(broke)?;
+                    accept(&mut chain, record, Some(&record.block_cid))?;
                 }
                 // Short, refused or unreachable: what follows stays unchecked.
                 _ => {
@@ -210,8 +445,18 @@ pub async fn check_history(
 /// the reader closed with, in place of a bare "connection lost".
 pub fn live_contradiction(client: &jig_client::Client, server: &str) -> Option<anyhow::Error> {
     client.contradiction().map(|c| {
+        let refused = Pins::load(&Pins::default_path())
+            .ok()
+            .and_then(|pins| pins.refusal(server).cloned())
+            .map_or(String::new(), |r| {
+                format!(
+                    ". It is refused until `jig trust accept {server}`; the evidence is \
+                     `jig trust evidence show {}`",
+                    r.bundle
+                )
+            });
         anyhow::anyhow!(
-            "{server} contradicted what it signed: {}. The connection was closed",
+            "{server} contradicted what it signed: {}. The connection was closed{refused}",
             c.reason
         )
     })
@@ -607,6 +852,69 @@ mod tests {
             .unwrap_err();
         assert!(e.to_string().contains("contradicted"), "{e}");
         assert_eq!(head_seq(&path), Some(1), "a break never moves the pin");
+
+        // Both records are kept, they prove the fork, and the server is
+        // refused until accepted.
+        let store = jig_client::evidence::EvidenceStore::new(&evidence_dir(&path));
+        let [(id, bundle)] = store.list().unwrap().try_into().unwrap();
+        assert_eq!(bundle.code, "chain-rewritten");
+        assert!(
+            jig_client::evidence::verify(&bundle)
+                .unwrap()
+                .proven
+                .is_some()
+        );
+        assert!(e.to_string().contains(&id), "{e}");
+        let pins = Pins::load(&path).unwrap();
+        let refused = refuse_if_sticky(&pins, SERVER).unwrap_err().to_string();
+        assert!(refused.contains("jig trust accept"), "{refused}");
+        assert!(refused.contains(&id), "{refused}");
+        let mut pins = pins;
+        pins.accept_server(SERVER).unwrap();
+        refuse_if_sticky(&pins, SERVER).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_break_that_proves_nothing_is_kept_but_not_sticky() {
+        let dir = tempfile::tempdir().unwrap();
+        let who = jig_client::Identity::generate_for_tests(dir.path());
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let r0 = sign(&key, 0, "bafyCreate", GENESIS_PREV);
+        let r1 = sign(&key, 1, "bafyA", r0.hash());
+        let path = pinned(dir.path(), &key, Some(&r0));
+        // Signed by someone else: anyone can do that.
+        let stranger = jig_core::crypto::ed25519::generate_signing_key();
+        let forged = sign(&stranger, 1, "bafyA", r0.hash());
+        assert!(
+            check_chain_in(&path, &who, SERVER, "#ops", &[forged])
+                .await
+                .is_err()
+        );
+
+        // A fork against a head pinned without its record cannot be shown.
+        let mut pins = Pins::load(&path).unwrap();
+        let mut bare = jig_client::chain::ChainHead::of(&r1);
+        bare.record = None;
+        pins.advance_chain(SERVER, "#ops", &bare).unwrap();
+        let other = sign(&key, 1, "bafyOther", r0.hash());
+        assert!(
+            check_chain_in(&path, &who, SERVER, "#ops", &[other])
+                .await
+                .is_err()
+        );
+
+        let store = jig_client::evidence::EvidenceStore::new(&evidence_dir(&path));
+        let codes: Vec<String> = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|(_, b)| b.code)
+            .collect();
+        assert_eq!(codes, ["chain-unsigned", "chain-rewritten"]);
+        for (_, bundle) in store.list().unwrap() {
+            assert_eq!(jig_client::evidence::verify(&bundle).unwrap().proven, None);
+        }
+        refuse_if_sticky(&Pins::load(&path).unwrap(), SERVER).unwrap();
     }
 
     #[tokio::test]
@@ -644,6 +952,7 @@ mod tests {
                 hash: "00".repeat(32),
                 ingest_wall_ms: 0,
                 ingest_logical: 0,
+                record: None,
             },
         )
         .unwrap();

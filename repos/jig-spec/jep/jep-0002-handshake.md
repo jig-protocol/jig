@@ -182,9 +182,12 @@ Draft. Field names are provisional. The design behind this revision is
     records on both sides of any gap, and the class and code. The bundle holds no
     decrypted content, and is not signed by the user's key by default. It stays with the
     user. A client MUST refuse later connections to that server until the user accepts
-    it again. Only items the server signed may cause that refusal: timeouts, closed
-    connections and malformed frames never do, and neither does evidence imported from
-    others.
+    it again. Only items the server signed, and that show the contradiction on their own,
+    may cause that refusal: two `ingest` records that cannot both hold, or a signed
+    `refusal` that drops a suite a signed `welcome` advertised. Frames are not signed, so
+    a frame the welcome did not allow is kept as evidence but does not cause it. Timeouts,
+    closed connections and malformed frames never do, and neither does evidence imported
+    from others.
 17. A nameserver's list of abandoned or compromised servers is advisory. It MUST NOT
     override the sequencer an owner names in `sequencer-set`.
 

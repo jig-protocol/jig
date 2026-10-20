@@ -295,7 +295,31 @@ enum NsAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum EvidenceAction {
+    /// Every bundle kept, oldest first.
+    List,
+    /// One bundle, checked from what it holds.
+    Show { id: String },
+    /// One bundle as JSON, to a file or stdout, for someone else to check.
+    Export {
+        id: String,
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Check a bundle someone else made, and show it. Never refuses a server.
+    Import { file: std::path::PathBuf },
+}
+
+#[derive(Subcommand, Debug)]
 enum TrustAction {
+    /// Evidence kept against servers that contradicted what they signed.
+    Evidence {
+        #[command(subcommand)]
+        action: EvidenceAction,
+    },
+    /// Connect to `server` again after it signed a contradiction. Its pins
+    /// stay, and it is held to them.
+    Accept { server: String },
     /// What this device pinned for a server, and the server's manifest log.
     Show {
         /// The server; the configured one when omitted.
@@ -569,6 +593,15 @@ async fn run() -> Result<()> {
 
     if let Some(Commands::Trust { action }) = cli.command {
         match action {
+            TrustAction::Evidence { action } => match action {
+                EvidenceAction::List => cmd::trust::evidence_list()?,
+                EvidenceAction::Show { id } => cmd::trust::evidence_show(&id)?,
+                EvidenceAction::Export { id, out } => {
+                    cmd::trust::evidence_export(&id, out.as_deref())?;
+                }
+                EvidenceAction::Import { file } => cmd::trust::evidence_import(&file)?,
+            },
+            TrustAction::Accept { server } => cmd::trust::accept_server(&server)?,
             TrustAction::Show { server } => {
                 let server = match server {
                     Some(s) => s,

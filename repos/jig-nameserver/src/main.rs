@@ -15,6 +15,11 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
+    /// Config file (env JIG_NS_CONFIG). Required to serve; there is no
+    /// default path.
+    #[arg(long, global = true)]
+    config: Option<std::path::PathBuf>,
+
     /// Database path (env JIG_NS_DB_PATH)
     #[arg(long, global = true)]
     db_path: Option<std::path::PathBuf>,
@@ -156,14 +161,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         // If no command specified, run the server
-        None => serve(None, None).await,
+        None => serve(cli.config.as_deref(), None, None).await,
 
-        Some(Command::Serve { bind, port }) => serve(bind, port).await,
+        Some(Command::Serve { bind, port }) => serve(cli.config.as_deref(), bind, port).await,
 
         Some(Command::Keygen { .. }) => unreachable!("handled before logging starts"),
 
         Some(Command::Analyze { analyze_cmd }) => {
-            handle_analyze(cli.db_path, analyze_cmd).await?;
+            let db_path = analytics_db_path(cli.config.as_deref(), cli.db_path)?;
+            handle_analyze(db_path, analyze_cmd).await?;
         }
 
         Some(Command::Export {
@@ -171,7 +177,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             range,
             output,
         }) => {
-            handle_export(cli.db_path, format, range, output).await?;
+            let db_path = analytics_db_path(cli.config.as_deref(), cli.db_path)?;
+            handle_export(db_path, format, range, output).await?;
         }
     }
 
@@ -184,21 +191,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// DB) used to surface as a panic — which reaches stderr through the
 /// default panic hook only, so a systemd unit capturing stdout logged nothing
 /// but an exit code. Log through BOTH `tracing` and stderr, then exit non-zero.
-async fn serve(bind: Option<String>, port: Option<u16>) {
-    if let Err(e) = run_http_server(bind, port).await {
+async fn serve(config: Option<&std::path::Path>, bind: Option<String>, port: Option<u16>) {
+    if let Err(e) = run_http_server(config, bind, port).await {
         tracing::error!("jig-nameserver failed to start: {e}");
         eprintln!("error: jig-nameserver failed to start: {e}");
         std::process::exit(1);
     }
 }
 
-async fn handle_analyze(
+/// The database `analyze` and `export` read: `--db-path` if given, so they
+/// need no config file, else the one the config names.
+fn analytics_db_path(
+    config: Option<&std::path::Path>,
     db_path: Option<std::path::PathBuf>,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    match db_path {
+        Some(path) => Ok(path),
+        None => Ok(NameServerConfig::load(config)?.storage.database_path),
+    }
+}
+
+async fn handle_analyze(
+    db_path: std::path::PathBuf,
     cmd: AnalyzeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config = NameServerConfig::load()?;
-    let db_path = db_path.unwrap_or_else(|| config.storage.database_path.clone());
-
     let storage = Arc::new(SqliteStorage::new(db_path)?) as Arc<dyn NamesStorage>;
     let engine = AnalyticsEngine::new(storage);
 
@@ -324,14 +340,11 @@ async fn handle_analyze(
 }
 
 async fn handle_export(
-    db_path: Option<std::path::PathBuf>,
+    db_path: std::path::PathBuf,
     format: ExportFormat,
     range: TimeRangeArg,
     output: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config = NameServerConfig::load()?;
-    let db_path = db_path.unwrap_or_else(|| config.storage.database_path.clone());
-
     let storage = Arc::new(SqliteStorage::new(db_path)?) as Arc<dyn NamesStorage>;
     let engine = AnalyticsEngine::new(storage);
 
