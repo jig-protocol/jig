@@ -185,6 +185,15 @@ async fn challenge(ns: &TestNameserver) -> String {
     body["challenge"].as_str().unwrap().to_string()
 }
 
+/// A nameserver for [`SUFFIX`] without proof-of-work: this file builds
+/// renew and rotate requests by hand, as a client did before JEP-0008, and is
+/// about verified names, not the work (jig-cli's round trips cover that).
+async fn nameserver() -> TestNameserver {
+    TestNameserver::start_with_pow(SUFFIX, PowPolicy::off())
+        .await
+        .unwrap()
+}
+
 async fn post(ns: &TestNameserver, path: &str, body: serde_json::Value) {
     let resp = reqwest::Client::new()
         .post(format!("{}{path}", ns.http_url()))
@@ -296,7 +305,7 @@ fn pair(a: &Person, b: &Person) -> Vec<String> {
 /// the DID it verified to.
 #[tokio::test]
 async fn an_honest_name_is_pinned_and_the_dm_opens() {
-    let ns = TestNameserver::start_with_suffix(SUFFIX).await.unwrap();
+    let ns = nameserver().await;
     let server = TestJigServer::start_with_full_kinds().await.unwrap();
     let alice = Person::new();
     ns.register_with_key("alice", &alice.key).await.unwrap();
@@ -334,7 +343,7 @@ async fn an_honest_name_is_pinned_and_the_dm_opens() {
 /// no rotation. Bob refuses, keeps his pin, and opens nothing to Mallory.
 #[tokio::test]
 async fn a_name_rebound_without_a_rotation_is_refused() {
-    let ns = TestNameserver::start_with_suffix(SUFFIX).await.unwrap();
+    let ns = nameserver().await;
     let server = TestJigServer::start_with_full_kinds().await.unwrap();
     let (alice, mallory) = (Person::new(), Person::new());
     ns.register_with_key("alice", &alice.key).await.unwrap();
@@ -383,7 +392,7 @@ async fn a_name_rebound_without_a_rotation_is_refused() {
 /// here becomes `Verified::Rotated` and the pin moves by itself.
 #[tokio::test]
 async fn a_rotation_moves_the_pin_once_its_holder_confirms_it() {
-    let ns = TestNameserver::start_with_suffix(SUFFIX).await.unwrap();
+    let ns = nameserver().await;
     let server = TestJigServer::start_with_full_kinds().await.unwrap();
     let (alice, alice2) = (Person::new(), Person::new());
     ns.register_with_key("alice", &alice.key).await.unwrap();
@@ -422,8 +431,8 @@ async fn a_rotation_moves_the_pin_once_its_holder_confirms_it() {
 /// authoritative one.
 #[tokio::test]
 async fn a_signer_outside_the_delegation_is_refused() {
-    let ns = TestNameserver::start_with_suffix(SUFFIX).await.unwrap();
-    let rogue = TestNameserver::start_with_suffix(SUFFIX).await.unwrap();
+    let ns = nameserver().await;
+    let rogue = nameserver().await;
     let (alice, mallory) = (Person::new(), Person::new());
     ns.register_with_key("alice", &alice.key).await.unwrap();
     rogue
@@ -461,8 +470,8 @@ async fn a_signer_outside_the_delegation_is_refused() {
 /// holds both signed attestations.
 #[tokio::test]
 async fn two_authorities_that_disagree_are_refused_with_evidence() {
-    let one = TestNameserver::start_with_suffix(SUFFIX).await.unwrap();
-    let two = TestNameserver::start_with_suffix(SUFFIX).await.unwrap();
+    let one = nameserver().await;
+    let two = nameserver().await;
     let (alice, mallory) = (Person::new(), Person::new());
     one.register_with_key("alice", &alice.key).await.unwrap();
     two.register_with_key("alice", &mallory.key).await.unwrap();
@@ -507,7 +516,7 @@ async fn two_authorities_that_disagree_are_refused_with_evidence() {
 /// clock verifies the fresh attestation.
 #[tokio::test]
 async fn an_expired_attestation_is_refused_and_a_renewed_one_is_fetched() {
-    let ns = TestNameserver::start_with_suffix(SUFFIX).await.unwrap();
+    let ns = nameserver().await;
     let alice = Person::new();
     ns.register_with_key("alice", &alice.key).await.unwrap();
     let bob = Bob::new();
@@ -544,7 +553,7 @@ async fn an_expired_attestation_is_refused_and_a_renewed_one_is_fetched() {
 /// real nameserver.
 #[tokio::test]
 async fn a_forged_attestation_from_the_server_is_refused() {
-    let ns = TestNameserver::start_with_suffix(SUFFIX).await.unwrap();
+    let ns = nameserver().await;
     let (alice, mallory) = (Person::new(), Person::new());
     ns.register_with_key("alice", &alice.key).await.unwrap();
 
