@@ -1,0 +1,9 @@
+# Set by `jig block new`. Both settings are needed for the block to pass `jig-det-1`.
+[build]
+# No WASI: blocks import nothing from the host but what their install grants.
+target = "wasm32-unknown-unknown"
+
+[target.wasm32-unknown-unknown]
+# Every memory must declare a maximum. This is {{memory_bytes}} bytes ({{memory_pages}} pages of
+# 64 KiB), the same limit as `memory_max_pages` in jig-block.toml. Change both together.
+rustflags = ["-C", "link-arg=--max-memory={{memory_bytes}}"]
