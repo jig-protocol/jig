@@ -733,6 +733,41 @@ async fn refuse_taken(state: &AppState, did: &str, alias: &str) -> Result<(), Ap
     }
 }
 
+/// A registration's hold on its challenge between the checks and the consume.
+/// Dropped, it gives the challenge back; after the consume that is a no-op.
+struct ChallengeClaim {
+    state: Arc<AppState>,
+    nonce: String,
+}
+
+impl ChallengeClaim {
+    async fn take(
+        state: &Arc<AppState>,
+        nonce: &str,
+        did: &str,
+        alias: &str,
+    ) -> Result<Self, ApiError> {
+        if state
+            .claim_challenge(nonce, did, alias, PowAction::NsRegister)
+            .await
+        {
+            Ok(Self {
+                state: state.clone(),
+                nonce: nonce.to_string(),
+            })
+        } else {
+            Err(challenge_unknown())
+        }
+    }
+}
+
+impl Drop for ChallengeClaim {
+    fn drop(&mut self) {
+        let (state, nonce) = (self.state.clone(), std::mem::take(&mut self.nonce));
+        tokio::spawn(async move { state.release_challenge(&nonce).await });
+    }
+}
+
 /// `503 REGISTRATION_BUSY`, with `Retry-After` until the pool's next token.
 fn registration_busy(busy: crate::v0_0_2_pow_policy::Busy) -> ApiError {
     let (status, mut body) = err(
@@ -824,6 +859,10 @@ async fn register_request(
     refuse_taken(&state, &req.did, &alias)
         .await
         .inspect_err(|_| policy.market().penalize_pair(&name.alias, &req.did))?;
+    // Claim the challenge before a pool token is taken: replays of this
+    // proof, sent at once, find it claimed and take no token. The claim is
+    // given up if this request is refused or dropped before the consume.
+    let _claim = ChallengeClaim::take(&state, &req.challenge, &req.did, &alias).await?;
     // A stranger takes a pool token, or waits for one, before anything is
     // consumed, so a busy refusal leaves the challenge usable.
     if admission == Admission::Ordinary {

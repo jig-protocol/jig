@@ -32,6 +32,13 @@ use tokio::time::Instant;
 /// long before this.
 const MAX_POINTS: u32 = 32;
 
+/// The longest a penalty lives, however often it is repeated.
+const MAX_PENALTY_LIFE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The most (alias, DID) pairs and addresses held under penalty. Past it,
+/// lapsed penalties are swept, then the one nearest lapsing is dropped.
+const MAX_PENALTIES: usize = 100_000;
+
 /// Why a registration was not admitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Busy {
@@ -153,21 +160,36 @@ impl Market {
 
     fn penalize(&self, key: String) {
         let now = Instant::now();
-        let base = Duration::from_secs(self.pow.penalty_decay_secs);
+        let base = Duration::from_secs(self.pow.penalty_decay_secs).min(MAX_PENALTY_LIFE);
         let mut st = self.lock();
-        let next = match st.penalties.get(&key) {
-            Some(p) if p.expires > now => Penalty {
-                points: (p.points + 1).min(MAX_POINTS),
-                life: p.life.saturating_mul(2),
-                expires: now + p.life.saturating_mul(2),
-            },
-            _ => Penalty {
-                points: 1,
-                life: base,
-                expires: now + base,
-            },
+        let (points, life) = match st.penalties.get(&key) {
+            Some(p) if p.expires > now => (
+                (p.points + 1).min(MAX_POINTS),
+                p.life.saturating_mul(2).min(MAX_PENALTY_LIFE),
+            ),
+            _ => (1, base),
         };
-        st.penalties.insert(key, next);
+        if !st.penalties.contains_key(&key) && st.penalties.len() >= MAX_PENALTIES {
+            st.penalties.retain(|_, p| p.expires > now);
+            if st.penalties.len() >= MAX_PENALTIES
+                && let Some(nearest) = st
+                    .penalties
+                    .iter()
+                    .min_by_key(|(_, p)| p.expires)
+                    .map(|(k, _)| k.clone())
+            {
+                st.penalties.remove(&nearest);
+            }
+        }
+        let expires = now.checked_add(life).unwrap_or(now);
+        st.penalties.insert(
+            key,
+            Penalty {
+                points,
+                life,
+                expires,
+            },
+        );
     }
 
     /// Admit a stranger registration that bid `effort`: take a token, or wait
@@ -214,6 +236,9 @@ impl Market {
             st.queue.push(Waiter { id, effort });
             id
         };
+        // A request dropped while it waits (the client hung up) leaves the
+        // queue, or it would hold a place until restart.
+        let _slot = Slot { market: self, id };
         loop {
             let notified = self.changed.notified();
             let wake_at = {
@@ -307,6 +332,22 @@ impl Market {
             st.full_seen = false;
             st.queued_seen = !st.queue.is_empty();
             st.window_start += window;
+        }
+    }
+}
+
+/// A place in the queue, given up when the request holding it is dropped.
+struct Slot<'a> {
+    market: &'a Market,
+    id: u64,
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        let mut st = self.market.lock();
+        if let Some(pos) = st.queue.iter().position(|w| w.id == self.id) {
+            st.queue.remove(pos);
+            self.market.changed.notify_waiters();
         }
     }
 }
@@ -477,6 +518,48 @@ mod tests {
         assert_eq!(m.stats().suggested_effort, 16, "halved");
         tokio::time::advance(Duration::from_secs(300)).await;
         assert_eq!(m.stats().suggested_effort, 16, "never below min_effort");
+    }
+
+    /// A client that hangs up while waiting gives its place back.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_waiter_leaves_the_queue() {
+        let m = std::sync::Arc::new(Market::new(pow(), pool(1, 0)));
+        let waiting = tokio::spawn({
+            let m = m.clone();
+            async move { m.admit(16).await }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(m.stats().queued, 1);
+        waiting.abort();
+        let _ = waiting.await;
+        assert_eq!(
+            m.stats().queued,
+            0,
+            "the aborted request gave its place back"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_penalty_repeated_without_end_lives_at_most_a_day() {
+        let m = Market::new(pow(), pool(60, 10));
+        for _ in 0..200 {
+            m.penalize_ip("1.1.1.1");
+        }
+        assert_eq!(m.register_effort("alice", "did:a", "1.1.1.1"), 1 << 16);
+        tokio::time::advance(MAX_PENALTY_LIFE + Duration::from_secs(1)).await;
+        assert_eq!(m.register_effort("alice", "did:a", "1.1.1.1"), 16, "lapsed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_penalty_map_is_bounded() {
+        let m = Market::new(pow(), pool(60, 10));
+        for i in 0..MAX_PENALTIES + 10 {
+            m.penalize_ip(&format!("ip-{i}"));
+        }
+        assert!(m.lock().penalties.len() <= MAX_PENALTIES);
+        // The newest is kept.
+        let newest = format!("ip-{}", MAX_PENALTIES + 9);
+        assert_eq!(m.register_effort("alice", "did:a", &newest), 32);
     }
 
     #[tokio::test(start_paused = true)]
