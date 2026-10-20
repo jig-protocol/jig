@@ -673,7 +673,10 @@ mod tests {
         tampered[last] ^= 1;
         let tampered = STANDARD.encode(tampered);
         for presented in [&to_one, &onward, &tampered, &"not base64!".to_string()] {
-            assert_eq!(key_link_fork(&[to_one.clone()], presented), None);
+            assert_eq!(
+                key_link_fork(std::slice::from_ref(&to_one), presented),
+                None
+            );
         }
 
         // A forged proof fails `verify`, whatever its claim; so does a true
