@@ -214,11 +214,17 @@ the root keys and every section in one file.
 >
 > **Upgrading a server that ran without `[tls]`:** it comes back on TLS. Every
 > client re-runs `jig server set https://…`; their pins and encrypted-channel
-> state carry over, because neither is keyed by the scheme. To keep plaintext
-> (behind a proxy that terminates TLS, say), set `[tls] enabled = false`. The
-> server then lists `tls.enabled=false` in `/.well-known/jig`'s
-> `unsafe_options_active` and logs a startup warning (#120). A `jig` CLI refuses a
-> plaintext `http://` server that is not on its own machine (#142).
+> state carry over, because neither is keyed by the scheme.
+>
+> **jig-server terminates TLS itself; do not put a TLS-terminating proxy in
+> front of it.** The signed welcome carries the connection's TLS exporter (#234),
+> so a server behind a proxy that terminates TLS signs an empty exporter, and
+> every remote client refuses it. If something must sit in front of jig-server,
+> it passes TLS through (TCP or SNI passthrough). `[tls] enabled = false` serves
+> plaintext for loopback or local testing only: the server lists
+> `tls.enabled=false` in `/.well-known/jig`'s `unsafe_options_active` and logs a
+> startup warning, and a `jig` CLI refuses a plaintext `http://` server that is
+> not on its own machine (#142).
 >
 > The nameserver on `:7070` is **not** covered by `[tls]` — that section belongs
 > to `jig-server` only — so its rows stay `http://` unless you terminate TLS in
@@ -584,12 +590,16 @@ can be recorded on an offline machine before any server exists. Point
   vars instead, which is still correct and still applied after any TOML load.
   *(The comment inside `jig-nameserver.service` still says the flags are parsed
   and ignored; that comment is stale.)*
-- **The nameserver needs no secret.** `JIG_NS_SECRET` and the `[pow]` section
-  went with the legacy proof-of-work routes (#192), and `[rate_limits]` with the
-  legacy rate limits (#197). An env file that still sets `JIG_NS_SECRET`,
-  `JIG_NS_POW_*` or `JIG_NS_RATE_*`, or a config that still has `[pow]` or
-  `[rate_limits]`, is harmless: nothing reads them, so remove them at your own
-  pace. The unit's
+- **The nameserver needs no secret, and its config is strict (#247).**
+  `JIG_NS_SECRET` and `[pow]` went with the legacy proof-of-work routes (#192),
+  `[rate_limits]` with the legacy rate limits (#197), and `[federation]` with
+  nameserver federation (#237). A config that still has any of these sections,
+  or `[transparency]`, `[runtime]`, `[anomaly_detection]`, `[hot]` or a
+  `storage`/`analytics` `backend` key, **stops the nameserver from starting**,
+  with a message naming the key: delete it. An env file that still sets
+  `JIG_NS_SECRET`, `JIG_NS_POW_*`, `JIG_NS_RATE_*`, a federation variable or
+  another removed `JIG_NS_*` variable starts, with a warning naming each one;
+  remove them at your own pace. The unit's
   `EnvironmentFile=` is optional (leading `-`) and only carries any `JIG_NS_*`
   settings you choose to put there.
 - **Secrets never go inline in a unit file.** `systemctl cat` is readable by any

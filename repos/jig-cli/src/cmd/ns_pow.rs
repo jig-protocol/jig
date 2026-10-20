@@ -139,6 +139,7 @@ mod tests {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use ed25519_dalek::SigningKey;
+    use jig_client::naming::Delegations;
     use jig_core::naming::{self, Attestation, PowOffer, Root, SuffixDelegation};
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -387,16 +388,22 @@ mod tests {
             jig_client::Identity::generate_for_tests(dir.path()),
         );
 
-        crate::cmd::init::register_with_nameserver(&me, "DJ", &base)
+        crate::cmd::init::register_with_nameserver(&me, "DJ", &base, &Delegations::default())
             .await
             .expect("registers with work");
-        crate::cmd::keys::renew_with_nameserver(&me, "dj@dj.jig", &base)
+        crate::cmd::keys::renew_with_nameserver(&me, "dj@dj.jig", &base, &Delegations::default())
             .await
             .expect("renews with work");
-        crate::cmd::keys::rotate_with_nameserver(&me, &next, "dj@dj.jig", &base)
-            .await
-            .expect("accepted")
-            .expect("verifies");
+        crate::cmd::keys::rotate_with_nameserver(
+            &me,
+            &next,
+            "dj@dj.jig",
+            &base,
+            &Delegations::default(),
+        )
+        .await
+        .expect("accepted")
+        .expect("verifies");
         let sent = posts(&seen);
         assert_eq!(sent.len(), 3);
         for body in &sent {
@@ -423,9 +430,10 @@ mod tests {
         .await;
         let dir = tempfile::tempdir().unwrap();
         let me = jig_client::Identity::generate_for_tests(dir.path());
-        let err = crate::cmd::init::register_with_nameserver(&me, "dj", &base)
-            .await
-            .unwrap_err();
+        let err =
+            crate::cmd::init::register_with_nameserver(&me, "dj", &base, &Delegations::default())
+                .await
+                .unwrap_err();
         assert!(
             format!("{err:#}").contains("not by this nameserver"),
             "{err:#}"
@@ -448,9 +456,10 @@ mod tests {
         .await;
         let dir = tempfile::tempdir().unwrap();
         let me = jig_client::Identity::generate_for_tests(dir.path());
-        let err = crate::cmd::init::register_with_nameserver(&me, "dj", &base)
-            .await
-            .unwrap_err();
+        let err =
+            crate::cmd::init::register_with_nameserver(&me, "dj", &base, &Delegations::default())
+                .await
+                .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains(&asked.to_string()) && msg.contains("more than this client will do"),
@@ -471,9 +480,10 @@ mod tests {
         let (base, seen) = stub(ns.clone(), ns, 1 << 6, TRUE_CLOCK, required).await;
         let dir = tempfile::tempdir().unwrap();
         let me = jig_client::Identity::generate_for_tests(dir.path());
-        let err = crate::cmd::init::register_with_nameserver(&me, "dj", &base)
-            .await
-            .unwrap_err();
+        let err =
+            crate::cmd::init::register_with_nameserver(&me, "dj", &base, &Delegations::default())
+                .await
+                .unwrap_err();
         assert!(format!("{err:#}").contains("under load"), "{err:#}");
         let bids: Vec<_> = posts(&seen)
             .iter()
@@ -501,7 +511,7 @@ mod tests {
         .await;
         let dir = tempfile::tempdir().unwrap();
         let me = jig_client::Identity::generate_for_tests(dir.path());
-        crate::cmd::init::register_with_nameserver(&me, "dj", &base)
+        crate::cmd::init::register_with_nameserver(&me, "dj", &base, &Delegations::default())
             .await
             .expect("registers: the offer is live where it is checked");
         assert_eq!(posts(&seen).len(), 1);
@@ -522,9 +532,10 @@ mod tests {
         .await;
         let dir = tempfile::tempdir().unwrap();
         let me = jig_client::Identity::generate_for_tests(dir.path());
-        let err = crate::cmd::init::register_with_nameserver(&me, "dj", &base)
-            .await
-            .unwrap_err();
+        let err =
+            crate::cmd::init::register_with_nameserver(&me, "dj", &base, &Delegations::default())
+                .await
+                .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("would expire before this machine finishes")

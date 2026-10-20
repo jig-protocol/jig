@@ -38,7 +38,7 @@ use jig_core::naming::{Action, Attestation, Name};
 use serde::{Deserialize, Serialize};
 
 use crate::cmd::common::CliContext;
-use crate::cmd::ns::{Nameserver, b64u};
+use crate::cmd::ns::{Nameserver, Purpose, b64u};
 
 /// Parsed flags for `jig keys renew`.
 #[derive(Debug, Clone)]
@@ -95,7 +95,9 @@ pub async fn renew(ctx: &CliContext, args: KeysRenewArgs) -> Result<()> {
     let id = ctx.identity()?;
 
     // 2. Run the renew handshake.
-    let attestation = renew_with_nameserver(&id, &args.alias, &args.nameserver).await?;
+    let delegations = crate::config::delegations(ctx.effective());
+    let attestation =
+        renew_with_nameserver(&id, &args.alias, &args.nameserver, &delegations).await?;
 
     let ttl_days = (attestation.valid_until - attestation.valid_from) / 86_400;
     println!(
@@ -111,9 +113,11 @@ pub async fn renew_with_nameserver(
     id: &Identity,
     alias: &str,
     ns_url: &str,
+    delegations: &jig_client::naming::Delegations,
 ) -> Result<Attestation> {
-    let name = parse_full_name(alias)?;
-    let ns = Nameserver::connect(ns_url).await?;
+    parse_full_name(alias)?;
+    let ns = Nameserver::connect(ns_url, alias, delegations, Purpose::Keep).await?;
+    let name = ns.name().clone();
     let did = id.did_string();
     let full = name.as_alias();
     crate::cmd::ns_pow::with_pow(
@@ -134,7 +138,7 @@ pub async fn renew_with_nameserver(
         async |challenge, pow| {
             let mut body = build_renew_request(id, &name, ns.ns_did(), &challenge);
             body.pow = pow;
-            ns.post_binding("/v1/renew", &body, &name, &did).await
+            ns.post_binding("/v1/renew", &body, &did).await
         },
     )
     .await?
@@ -189,7 +193,15 @@ pub async fn rotate(ctx: &CliContext, args: KeysRotateArgs) -> Result<()> {
     //    act, undo the new keyfile so we don't leak an orphaned key.
     //    Otherwise keep everything: the alias may already be bound to the
     //    new key.
-    let reply = match rotate_with_nameserver(&old_id, &new_id, &args.alias, &args.nameserver).await
+    let delegations = crate::config::delegations(ctx.effective());
+    let reply = match rotate_with_nameserver(
+        &old_id,
+        &new_id,
+        &args.alias,
+        &args.nameserver,
+        &delegations,
+    )
+    .await
     {
         Ok(reply) => reply,
         Err(e) => {
@@ -250,11 +262,16 @@ pub async fn rotate_with_nameserver(
     new_id: &Identity,
     alias: &str,
     ns_url: &str,
+    delegations: &jig_client::naming::Delegations,
 ) -> Result<Result<Attestation>> {
-    let name = parse_full_name(alias)?;
-    let ns = Nameserver::connect(ns_url).await?;
+    parse_full_name(alias)?;
+    let ns = Nameserver::connect(ns_url, alias, delegations, Purpose::Keep).await?;
+    let name = ns.name().clone();
     let (old_did, new_did) = (old_id.did_string(), new_id.did_string());
     let full = name.as_alias();
+    // `post_binding`'s outer `Err` is a refusal, the only case `with_pow`
+    // retries; an unknown outcome (a timeout, a 5xx) is its inner `Err`,
+    // returned as is so the caller keeps the new key.
     crate::cmd::ns_pow::with_pow(
         &ns,
         crate::cmd::ns_pow::Work {
@@ -275,7 +292,7 @@ pub async fn rotate_with_nameserver(
         async |challenge, pow| {
             let mut body = build_rotate_request(old_id, new_id, &full, &challenge);
             body.pow = pow;
-            ns.post_binding("/v1/rotate", &body, &name, &new_did).await
+            ns.post_binding("/v1/rotate", &body, &new_did).await
         },
     )
     .await

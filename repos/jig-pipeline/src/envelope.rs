@@ -190,6 +190,15 @@ pub enum Frame {
     /// ed25519 over [`crate::handshake::transcript_hash`]. Sent once, right
     /// after the welcome, and only by a dialer that named a `peer_did`.
     PeerProof { sig: String },
+    /// A frame between two servers that proved their DIDs to each other
+    /// (JEP-0002 rule 5), for the federation contract (JEP-0005) to define.
+    /// `kind` names it; `body` is its own encoding, base64 on the wire. A
+    /// server refuses one on a connection whose peer is not proven.
+    Peer {
+        kind: String,
+        #[serde(with = "body_b64")]
+        body: Vec<u8>,
+    },
     /// Server's signed answer to a [`Frame::Hello`] it shares no version or
     /// suite with (JEP-0002 rule 3). The server closes after sending it.
     /// Signed so that a server refusing a suite it once advertised has
@@ -346,6 +355,22 @@ pub struct HlcCursor {
     pub wall_ms: u64,
     pub logical: u32,
     pub origin: String,
+}
+
+/// `Frame::Peer`'s body as base64 on the wire.
+mod body_b64 {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(body: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(body))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(d)?;
+        STANDARD.decode(text).map_err(serde::de::Error::custom)
+    }
 }
 
 #[cfg(test)]
