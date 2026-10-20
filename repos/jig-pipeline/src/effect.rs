@@ -48,9 +48,12 @@ pub async fn apply_effect(
 
         BlockKind::ChannelCreate => apply_channel_create(store, &manifest, block_cid),
         BlockKind::MemberAdd => apply_member_add(store, &manifest, block_cid),
-        BlockKind::MemberRemove => apply_member_remove(store, &manifest),
-        BlockKind::ChannelPromote => apply_channel_promote(store, &manifest),
-        BlockKind::ChannelArchive => apply_channel_archive(store, &manifest),
+        BlockKind::MemberRemove => apply_member_remove(store, &manifest, block_cid),
+        BlockKind::ChannelPromote => apply_channel_promote(store, &manifest, block_cid),
+        BlockKind::ChannelArchive => apply_channel_archive(store, &manifest, block_cid),
+        // A role lives in the channel's ingest chain, which is its record;
+        // `roles::rights_at` reads it from there, so there is no row to keep.
+        BlockKind::RoleAssign | BlockKind::RoleUnassign => Ok(()),
         BlockKind::FedHello => apply_fed_hello(store, &manifest, block_cid),
 
         BlockKind::NsRegister | BlockKind::NsAttestation => apply_ns_attestation(store, &manifest),
@@ -95,6 +98,30 @@ pub fn canonical_did_string(raw: &str) -> String {
         .unwrap_or_else(|| raw.to_string())
 }
 
+/// The channel a block of `kind` acts on, resolved by the same rule ingest
+/// gated it with ([`crate::ingest::channel_id_of`]), so an effect never lands
+/// on a different channel than the one the write gate examined.
+///
+/// `Ok(None)` when the metadata names a channel this server does not hold
+/// (or, unless `including_archived`, one that is archived). An error when the
+/// metadata names no channel at all.
+fn channel_of(
+    store: &SqliteStore,
+    kind: BlockKind,
+    m: &BlockManifest,
+    block_cid: &str,
+    including_archived: bool,
+) -> anyhow::Result<(String, Option<StoredChannel>)> {
+    let named = crate::ingest::channel_id_of(store, kind, m, block_cid)?
+        .ok_or_else(|| anyhow::anyhow!("{} missing `channel` in metadata", kind.as_str()))?;
+    let row = match named.id.as_deref() {
+        Some(id) if including_archived => store.get_channel_by_id_including_archived(id)?,
+        Some(id) => store.get_channel_by_id(id)?,
+        None => None,
+    };
+    Ok((named.named, row))
+}
+
 fn apply_channel_create(
     store: &Arc<SqliteStore>,
     m: &BlockManifest,
@@ -109,6 +136,15 @@ fn apply_channel_create(
         .map_err(|_| anyhow::anyhow!("channel-create names an unknown suite"))?;
     let now = chrono::Utc::now().timestamp();
     let owner_did = sender_did_string(m);
+    // The gate is ingest's (`ingest::channel_terms` refuses a sequencer that
+    // is not this server). Here the row records the terms the block carries:
+    // its declared sequencer, else this store's server (or, before boot
+    // adopts one, the placeholder that means the same).
+    let sequencer = meta_str(m, crate::ingest::SEQUENCER_KEY)
+        .map(canonical_did_string)
+        .unwrap_or_else(|| store.local_sequencer().to_string());
+    let terms = crate::ingest::channel_terms(m, &sequencer)
+        .map_err(|e| anyhow::anyhow!("channel-create terms: {e}"))?;
 
     store.upsert_channel(&StoredChannel {
         id: block_cid.to_string(),
@@ -117,14 +153,21 @@ fn apply_channel_create(
         created_at: now,
         owner_did: owner_did.clone(),
         suite: suite.as_str().to_string(),
+        sequencer_did: terms.sequencer,
+        co_owners: terms.co_owners.clone(),
     })?;
-    store.upsert_membership(&StoredMembership {
-        channel_id: block_cid.to_string(),
-        member_did: owner_did,
-        role: "owner".to_string(),
-        joined_at: now,
-        source_block_cid: block_cid.to_string(),
-    })?;
+    // The creator and every co-owner are members, with role `owner`: a
+    // co-owner holds every right, so it can read what it can write and
+    // manage.
+    for member_did in std::iter::once(owner_did).chain(terms.co_owners) {
+        store.upsert_membership(&StoredMembership {
+            channel_id: block_cid.to_string(),
+            member_did,
+            role: "owner".to_string(),
+            joined_at: now,
+            source_block_cid: block_cid.to_string(),
+        })?;
+    }
     Ok(())
 }
 
@@ -133,14 +176,12 @@ fn apply_member_add(
     m: &BlockManifest,
     block_cid: &str,
 ) -> anyhow::Result<()> {
-    let channel_slug = meta_str(m, "channel")
-        .ok_or_else(|| anyhow::anyhow!("member-add missing `channel` in metadata"))?;
+    let (named, channel) = channel_of(store, BlockKind::MemberAdd, m, block_cid, false)?;
     let member_did = meta_str(m, "member_did")
         .map(canonical_did_string)
         .ok_or_else(|| anyhow::anyhow!("member-add missing `member_did` in metadata"))?;
-    let channel = store
-        .get_channel_by_slug(channel_slug)?
-        .ok_or_else(|| anyhow::anyhow!("member-add references unknown channel `{channel_slug}`"))?;
+    let channel = channel
+        .ok_or_else(|| anyhow::anyhow!("member-add references unknown channel `{named}`"))?;
     store.upsert_membership(&StoredMembership {
         channel_id: channel.id,
         member_did,
@@ -154,22 +195,29 @@ fn apply_member_add(
 /// Drop a membership. Authorization (owner, self, or tidy-up) was decided by
 /// the write gate; removing someone who is already gone is a no-op, which is
 /// exactly the tidy-up case on an encrypted channel.
-fn apply_member_remove(store: &Arc<SqliteStore>, m: &BlockManifest) -> anyhow::Result<()> {
-    let channel_slug = meta_str(m, "channel")
-        .ok_or_else(|| anyhow::anyhow!("member-remove missing `channel` in metadata"))?;
+fn apply_member_remove(
+    store: &Arc<SqliteStore>,
+    m: &BlockManifest,
+    block_cid: &str,
+) -> anyhow::Result<()> {
+    let (_, channel) = channel_of(store, BlockKind::MemberRemove, m, block_cid, false)?;
     let member_did = meta_str(m, "member_did")
         .map(canonical_did_string)
         .ok_or_else(|| anyhow::anyhow!("member-remove missing `member_did` in metadata"))?;
-    store.remove_membership(channel_slug, &member_did)?;
+    if let Some(channel) = channel {
+        store.remove_membership_by_id(&channel.id, &member_did)?;
+    }
     Ok(())
 }
 
-fn apply_channel_promote(store: &Arc<SqliteStore>, m: &BlockManifest) -> anyhow::Result<()> {
-    let channel_slug = meta_str(m, "channel")
-        .ok_or_else(|| anyhow::anyhow!("channel-promote missing `channel` in metadata"))?;
-    let mut channel = store.get_channel_by_slug(channel_slug)?.ok_or_else(|| {
-        anyhow::anyhow!("channel-promote references unknown channel `{channel_slug}`")
-    })?;
+fn apply_channel_promote(
+    store: &Arc<SqliteStore>,
+    m: &BlockManifest,
+    block_cid: &str,
+) -> anyhow::Result<()> {
+    let (named, channel) = channel_of(store, BlockKind::ChannelPromote, m, block_cid, false)?;
+    let mut channel = channel
+        .ok_or_else(|| anyhow::anyhow!("channel-promote references unknown channel `{named}`"))?;
     channel.visibility = "open".to_string();
     store.upsert_channel(&channel)?;
     Ok(())
@@ -206,23 +254,24 @@ fn apply_channel_promote(store: &Arc<SqliteStore>, m: &BlockManifest) -> anyhow:
 /// runs, which makes `manifest.authors[0].did` a trustworthy identity — and
 /// this runs *before* the block is persisted, so a rejection leaves no trace.
 /// The HTTP handler repeats the check only to return a precise 403/404.
-fn apply_channel_archive(store: &Arc<SqliteStore>, m: &BlockManifest) -> anyhow::Result<()> {
-    let channel_slug = meta_str(m, "channel")
-        .ok_or_else(|| anyhow::anyhow!("channel-archive missing `channel` in metadata"))?;
-    let channel = store
-        .get_channel_by_slug_including_archived(channel_slug)?
-        .ok_or_else(|| {
-            anyhow::anyhow!("channel-archive references unknown channel `{channel_slug}`")
-        })?;
+fn apply_channel_archive(
+    store: &Arc<SqliteStore>,
+    m: &BlockManifest,
+    block_cid: &str,
+) -> anyhow::Result<()> {
+    let (named, channel) = channel_of(store, BlockKind::ChannelArchive, m, block_cid, true)?;
+    let channel = channel
+        .ok_or_else(|| anyhow::anyhow!("channel-archive references unknown channel `{named}`"))?;
+    let channel_slug = channel.slug.as_str();
 
     let sender = sender_did_string(m);
     // An empty owner_did would make an author-less manifest match; refuse
     // rather than treat "we don't know who owns this" as permission.
-    if channel.owner_did.is_empty() || channel.owner_did != sender {
+    if !channel.is_root_owner(&sender) {
         anyhow::bail!("channel-archive rejected: `{sender}` is not the owner of `{channel_slug}`");
     }
 
-    if !store.archive_channel(channel_slug, chrono::Utc::now().timestamp())? {
+    if !store.archive_channel_by_id(&channel.id, chrono::Utc::now().timestamp())? {
         anyhow::bail!("channel `{channel_slug}` is already archived");
     }
     Ok(())

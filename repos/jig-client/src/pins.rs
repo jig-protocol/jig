@@ -650,7 +650,7 @@ mod tests {
     use serde_json::json;
 
     fn identity() -> Identity {
-        Identity::generate_and_save(&tempfile::tempdir().unwrap().keep()).unwrap()
+        Identity::generate_for_tests(&tempfile::tempdir().unwrap().keep())
     }
 
     fn welcome(did: &str, suites: &[&str]) -> VerifiedWelcome {

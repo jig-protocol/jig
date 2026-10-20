@@ -343,7 +343,7 @@ mod tests {
                 .with_no_client_auth(),
         );
 
-        let identity = jig_client::Identity::generate_and_save(dir.path()).unwrap();
+        let identity = jig_client::Identity::generate_for_tests(dir.path());
         let client = jig_client::Client::connect_with_tls(
             &format!("wss://{bound}"),
             identity,

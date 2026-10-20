@@ -89,7 +89,8 @@ enum Commands {
     /// the two of you in it, created on first use. With a message, sends it
     /// and exits; without, opens the chat.
     Dm {
-        /// A did:jig, or a name from `[contacts]` in cli.toml.
+        /// A did:jig, a name from `[contacts]` in cli.toml, or an
+        /// `alias@suffix`, verified and pinned on first use.
         #[arg()]
         who: String,
         #[arg()]
@@ -198,7 +199,7 @@ enum ChannelAction {
     Add {
         #[arg()]
         slug: String,
-        /// A did:jig, or a name from `[contacts]`.
+        /// A did:jig, a name from `[contacts]`, or a verified `alias@suffix`.
         #[arg()]
         who: String,
     },
@@ -209,7 +210,7 @@ enum ChannelAction {
     Kick {
         #[arg()]
         slug: String,
-        /// A did:jig, or a name from `[contacts]`.
+        /// A did:jig, a name from `[contacts]`, or a verified `alias@suffix`.
         #[arg()]
         who: String,
     },
@@ -305,7 +306,7 @@ enum TrustAction {
     VerifyName {
         name: String,
         /// Nameserver to ask (with `--authority`); otherwise the suffix's
-        /// delegation is discovered over DNS.
+        /// `[naming.delegations]` entry, or DNS discovery.
         #[arg(long)]
         nameserver: Vec<String>,
         /// DID whose attestations count for the suffix.
@@ -321,7 +322,7 @@ enum TrustAction {
         #[arg(long)]
         did: String,
         /// Nameserver to ask (with `--authority`); otherwise the suffix's
-        /// delegation is discovered over DNS.
+        /// `[naming.delegations]` entry, or DNS discovery.
         #[arg(long)]
         nameserver: Vec<String>,
         /// DID whose attestations count for the suffix.
@@ -417,8 +418,8 @@ enum KeysAction {
     },
 
     /// Mint a fresh keypair and rotate the alias binding from the
-    /// current DID to the new one. The old keyfile is preserved as
-    /// `<old_did>.key.rotated` for offline recovery.
+    /// current DID to the new one. The old keyfile is preserved, still
+    /// sealed, as `<old_did>.jigkey.rotated` for offline recovery.
     Rotate {
         /// Fully-qualified alias whose DID binding is being rotated.
         #[arg()]
@@ -449,8 +450,35 @@ enum ReceiptAction {
     },
 }
 
+/// Exit status when no key slot can seal a new identity key: no OS keychain,
+/// no terminal, and no `JIG_KEY_PASSPHRASE` or `JIG_KEY_UNLOCK`. `install.sh`
+/// matches it, not the message, to fall back to plaintext keys. 78 is
+/// `EX_CONFIG` in sysexits.h.
+const EXIT_NO_KEY_SLOT: u8 = 78;
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // The same report `fn main() -> anyhow::Result<()>` prints.
+            eprintln!("Error: {e:?}");
+            let no_slot = e.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<jig_client::IdentityError>(),
+                    Some(jig_client::IdentityError::NoWayToSeal { .. })
+                )
+            });
+            if no_slot {
+                std::process::ExitCode::from(EXIT_NO_KEY_SLOT)
+            } else {
+                std::process::ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // Lift the global flags out of `cli` FIRST. Everything below reads
@@ -553,7 +581,8 @@ async fn main() -> Result<()> {
                 nameserver,
                 authority,
             } => {
-                let delegations = cmd::trust::delegations_for(&name, nameserver, authority)?;
+                let delegations =
+                    cmd::trust::delegations_for(ctx.effective(), &name, nameserver, authority)?;
                 use jig_client::naming::Verified;
                 match cmd::trust::verify_name(&name, &delegations).await? {
                     Verified::New(b) => println!(
@@ -574,7 +603,8 @@ async fn main() -> Result<()> {
                 nameserver,
                 authority,
             } => {
-                let delegations = cmd::trust::delegations_for(&name, nameserver, authority)?;
+                let delegations =
+                    cmd::trust::delegations_for(ctx.effective(), &name, nameserver, authority)?;
                 match cmd::trust::accept_name(&name, &did, &delegations).await? {
                     Some(old) => println!("{name} is now pinned to {did} (was {old})."),
                     None => println!("{name} is now pinned to {did}."),

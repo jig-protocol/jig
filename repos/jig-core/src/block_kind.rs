@@ -32,6 +32,13 @@ pub enum BlockKind {
     /// marking it archived — a soft delete. Never destroys blocks; see
     /// `jig_pipeline::effect::apply_channel_archive` for the rationale.
     ChannelArchive,
+    /// Gives a DID a role in a channel (JEP-0005 rule 7b). v0.2 defines one
+    /// assignable role, `admin`. Only an owner may sign it.
+    RoleAssign,
+    /// Takes a role away again (JEP-0005 rule 7b). The channel's root owners
+    /// (its creator and the co-owners its `channel-create` lists) have no
+    /// role to take: they cannot be unassigned.
+    RoleUnassign,
     /// Synthetic in v0.0.2; real Wasm in v0.0.3+. Federation handshake.
     FedHello,
     /// Synthetic in v0.0.2; real Wasm in v0.0.3+. Nameserver registration.
@@ -66,6 +73,8 @@ impl BlockKind {
             Self::MemberRemove => "member-remove",
             Self::ChannelPromote => "channel-promote",
             Self::ChannelArchive => "channel-archive",
+            Self::RoleAssign => "role-assign",
+            Self::RoleUnassign => "role-unassign",
             Self::FedHello => "fed-hello",
             Self::NsRegister => "ns-register",
             Self::NsRotate => "ns-rotate",
@@ -97,6 +106,8 @@ impl std::str::FromStr for BlockKind {
             "member-remove" => Ok(Self::MemberRemove),
             "channel-promote" => Ok(Self::ChannelPromote),
             "channel-archive" => Ok(Self::ChannelArchive),
+            "role-assign" => Ok(Self::RoleAssign),
+            "role-unassign" => Ok(Self::RoleUnassign),
             "fed-hello" => Ok(Self::FedHello),
             "ns-register" => Ok(Self::NsRegister),
             "ns-rotate" => Ok(Self::NsRotate),
@@ -132,6 +143,8 @@ mod tests {
             ("member-remove", BlockKind::MemberRemove),
             ("channel-promote", BlockKind::ChannelPromote),
             ("channel-archive", BlockKind::ChannelArchive),
+            ("role-assign", BlockKind::RoleAssign),
+            ("role-unassign", BlockKind::RoleUnassign),
             ("fed-hello", BlockKind::FedHello),
             ("ns-register", BlockKind::NsRegister),
             ("ns-rotate", BlockKind::NsRotate),
@@ -157,6 +170,8 @@ mod tests {
         assert!(!BlockKind::MemberRemove.is_wasm_executable());
         assert!(!BlockKind::ChannelPromote.is_wasm_executable());
         assert!(!BlockKind::ChannelArchive.is_wasm_executable());
+        assert!(!BlockKind::RoleAssign.is_wasm_executable());
+        assert!(!BlockKind::RoleUnassign.is_wasm_executable());
         assert!(!BlockKind::FedHello.is_wasm_executable());
         assert!(!BlockKind::NsRegister.is_wasm_executable());
         assert!(!BlockKind::NsRotate.is_wasm_executable());

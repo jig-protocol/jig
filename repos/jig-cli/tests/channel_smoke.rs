@@ -21,6 +21,13 @@ use std::process::Command;
 #[test]
 fn binary_exposes_channel_subcommands() {
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["channel", "--help"])
         .output()
         .unwrap();
@@ -41,6 +48,13 @@ fn binary_exposes_channel_subcommands() {
 #[test]
 fn channel_create_help_mentions_visibility_flag() {
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["channel", "create", "--help"])
         .output()
         .unwrap();
@@ -55,6 +69,13 @@ fn channel_create_help_mentions_visibility_flag() {
 #[test]
 fn channel_join_help_mentions_slug_positional() {
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["channel", "join", "--help"])
         .output()
         .unwrap();
@@ -73,6 +94,13 @@ fn channel_list_takes_no_required_args() {
     // this test breaks and we revisit the column-layout assumption in
     // `print_channels`.
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["channel", "list", "--help"])
         .output()
         .unwrap();
@@ -102,6 +130,13 @@ fn channel_join_escapes_hash_in_slug() {
     // here just confirm the CLI doesn't panic on a slug with a `#`.
     let tmp = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["channel", "join", "#hello"])
         .env("HOME", tmp.path())
         .output()
@@ -147,6 +182,13 @@ default_channel = "#general"
     .unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["channel", "list"])
         .env("HOME", tmp.path())
         .output()
@@ -175,6 +217,13 @@ fn channel_create_rejects_invalid_visibility() {
     // must be non-zero and the run must not panic.
     let tmp = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["channel", "create", "#hello", "--visibility", "nonsense"])
         .env("HOME", tmp.path())
         .output()
