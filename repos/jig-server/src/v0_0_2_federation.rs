@@ -330,7 +330,7 @@ async fn connect_and_relay(
     // Same hello/welcome a CLI client speaks. The fed-hello bundle below is a
     // block, not this handshake, and the server now refuses it until welcome.
     let tls_exporter = tls_exporter_of(ws.get_ref());
-    complete_peer_handshake(
+    let welcome = complete_peer_handshake(
         &mut ws,
         &peer.expected_did,
         &tls_exporter,
@@ -338,6 +338,13 @@ async fn connect_and_relay(
     )
     .await?;
     let (mut sink, mut stream) = ws.split();
+    // The handshake proved the peer's DID; peer frames on this connection
+    // are from it and go to it ([`crate::v0_0_2_peer`]).
+    let (peer_sender, mut peer_out) = crate::v0_0_2_peer::PeerSender::new(
+        jig_core::did::Did::from_did_jig_string(&welcome.server_did)
+            .map_err(|e| anyhow::anyhow!("the peer's welcome DID: {e}"))?,
+    );
+    let registration = state.peers.register(peer_sender.clone());
     info!(peer_url = %peer.url, "federation peer connected");
 
     // 1. Send fed-hello synthetic bundle as the handshake.
@@ -394,13 +401,36 @@ async fn connect_and_relay(
                         if let Some(refusal) = subscription_refusal(&text) {
                             break Err(anyhow::anyhow!("peer refused our federation subscription: {refusal}"));
                         }
-                        if let Err(e) = handle_inbound_frame(state, peer, &text).await {
-                            warn!(peer_url = %peer.url, "inbound frame error: {e}");
+                        match handle_inbound_frame(state, peer, &peer_sender, &text).await {
+                            Ok(Some(reason)) => {
+                                let _ = sink
+                                    .send(Message::Close(Some(
+                                        tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                                            code: reason.code.into(),
+                                            reason: reason.reason.clone().into(),
+                                        },
+                                    )))
+                                    .await;
+                                break Err(anyhow::anyhow!(
+                                    "closed by the federation contract: {}",
+                                    reason.reason
+                                ));
+                            }
+                            Ok(None) => {}
+                            Err(e) => warn!(peer_url = %peer.url, "inbound frame error: {e}"),
                         }
                     }
                     Message::Close(_) => break Ok(()),
                     // Ignore Ping/Pong/Binary.
                     _ => {}
+                }
+            }
+
+            // Peer frames this server sends unprompted
+            Some(env) = peer_out.recv() => {
+                let json = serde_json::to_string(&env)?;
+                if let Err(e) = sink.send(Message::Text(json.into())).await {
+                    break Err(anyhow::anyhow!("peer frame send error: {e}"));
                 }
             }
 
@@ -421,16 +451,33 @@ async fn connect_and_relay(
     // 5. On loop exit (peer disconnect, error, or task cancellation), unregister
     //    the peer from Fanout so we don't accumulate dead senders.
     state.ingest_ctx.fanout.unregister_peer(&peer.url).await;
+    state.peers.unregister(registration);
 
     result
 }
 
+/// Handle one frame from a peer this server dialed. `Ok(Some(_))` means the
+/// federation contract closed the connection.
 async fn handle_inbound_frame(
     state: &Arc<AppState>,
     peer: &jig_config::v0_0_2_server::FederationPeer,
+    sender: &crate::v0_0_2_peer::PeerSender,
     text: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<crate::v0_0_2_peer::CloseReason>> {
     let env: Envelope = serde_json::from_str(text)?;
+    if let Frame::Peer { kind, body } = &env.frame {
+        return Ok(
+            crate::v0_0_2_peer::dispatch(state.peer_frame_handler(), sender, kind, body).err(),
+        );
+    }
+    handle_relayed_frame(state, peer, env).await.map(|()| None)
+}
+
+async fn handle_relayed_frame(
+    state: &Arc<AppState>,
+    peer: &jig_config::v0_0_2_server::FederationPeer,
+    env: Envelope,
+) -> anyhow::Result<()> {
     match env.frame {
         Frame::Block {
             bundle_b64,

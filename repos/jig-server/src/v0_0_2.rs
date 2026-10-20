@@ -57,6 +57,12 @@ pub struct AppState {
     /// once the listener has its certificate ([`Self::bind_tls_certificate`])
     /// and published at `/.well-known/jig`. Shared by every clone.
     pub tls_binding: Arc<std::sync::OnceLock<jig_core::tls_binding::TlsBinding>>,
+    /// What handles frames between proven peers
+    /// ([`crate::v0_0_2_peer::PeerFrames`]), set once at boot by
+    /// [`Self::set_peer_frames`]. Shared by every clone.
+    pub peer_frames: Arc<std::sync::OnceLock<Arc<dyn crate::v0_0_2_peer::PeerFrames>>>,
+    /// The live connections to proven peers, whichever side dialed.
+    pub peers: Arc<crate::v0_0_2_peer::PeerRegistry>,
 }
 
 /// Gates 1 and 2 from `[auth]`, plus the federation peers from `[federation]`:
@@ -121,6 +127,17 @@ fn checked_skew_bound(config: &JigServerConfig) -> Result<u64> {
 }
 
 impl AppState {
+    /// Register the handler for peer frames. Only the first call counts;
+    /// returns whether this one did.
+    pub fn set_peer_frames(&self, handler: Arc<dyn crate::v0_0_2_peer::PeerFrames>) -> bool {
+        self.peer_frames.set(handler).is_ok()
+    }
+
+    /// The registered peer-frame handler, if any.
+    pub fn peer_frame_handler(&self) -> Option<&dyn crate::v0_0_2_peer::PeerFrames> {
+        self.peer_frames.get().map(|h| h.as_ref())
+    }
+
     /// Vouch, with the server DID's key, for the certificate the listener
     /// serves (DER), so clients can trust it without a CA. The first call
     /// wins; the certificate does not change while the server runs.
@@ -260,6 +277,8 @@ impl AppState {
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
             tls_binding: Default::default(),
+            peer_frames: Default::default(),
+            peers: Default::default(),
         })
     }
 
@@ -313,6 +332,8 @@ impl AppState {
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
             tls_binding: Default::default(),
+            peer_frames: Default::default(),
+            peers: Default::default(),
         })
     }
 
@@ -363,6 +384,8 @@ impl AppState {
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
             tls_binding: Default::default(),
+            peer_frames: Default::default(),
+            peers: Default::default(),
         })
     }
 }
