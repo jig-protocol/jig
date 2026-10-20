@@ -22,7 +22,8 @@ fn main() {
         "did:jig:zsubject",
         Action::NsRegister,
         &binding,
-    );
+    )
+    .expect("ns-register is a challenge action");
 
     // Time the solver's own loop. At the largest effort almost no digest
     // passes, so the search runs the whole budget.

@@ -195,6 +195,12 @@ pub enum PowError {
     Insufficient { offered: u64, required: u64 },
     #[error("the work does not meet the effort it claims")]
     Invalid,
+    #[error(
+        "{action} is an action of mode {mode:?}; build its puzzle with that mode's constructor"
+    )]
+    WrongMode { action: Action, mode: Mode },
+    #[error("epoch 0 names the empty salt; stamp epochs start at 1")]
+    EpochZero,
 }
 
 /// One puzzle: everything a proof commits to except the nonce.
@@ -210,16 +216,21 @@ pub struct Puzzle<'a> {
 }
 
 impl<'a> Puzzle<'a> {
-    /// A puzzle for an admission or challenge action: the salt is empty.
-    ///
-    /// # Panics
-    /// If `action` is a stamp action, which needs [`Puzzle::stamp`].
-    pub fn new(verifier: &'a str, subject: &'a str, action: Action, binding: &'a [u8]) -> Self {
-        assert!(
-            action.mode() != Mode::Stamp,
-            "{action} is a stamp action and needs an epoch salt"
-        );
-        Self {
+    /// A puzzle for an admission or challenge action: the salt is empty. A
+    /// stamp action is refused; it needs [`Puzzle::stamp`].
+    pub fn new(
+        verifier: &'a str,
+        subject: &'a str,
+        action: Action,
+        binding: &'a [u8],
+    ) -> Result<Self, PowError> {
+        if action.mode() == Mode::Stamp {
+            return Err(PowError::WrongMode {
+                action,
+                mode: Mode::Stamp,
+            });
+        }
+        Ok(Self {
             alg: Alg::Blake3,
             verifier,
             subject,
@@ -227,13 +238,11 @@ impl<'a> Puzzle<'a> {
             binding,
             salt: &[],
             salt_id: EMPTY_SALT_ID,
-        }
+        })
     }
 
-    /// A puzzle for a stamp action under the epoch salt numbered `epoch`.
-    ///
-    /// # Panics
-    /// If `action` is not a stamp action, or `epoch` is 0.
+    /// A puzzle for a stamp action under the epoch salt numbered `epoch`. Any
+    /// other action, and epoch 0, are refused.
     pub fn stamp(
         verifier: &'a str,
         subject: &'a str,
@@ -241,13 +250,17 @@ impl<'a> Puzzle<'a> {
         binding: &'a [u8],
         salt: &'a [u8],
         epoch: u64,
-    ) -> Self {
-        assert!(
-            action.mode() == Mode::Stamp,
-            "{action} is not a stamp action"
-        );
-        assert!(epoch != EMPTY_SALT_ID, "epochs start at 1");
-        Self {
+    ) -> Result<Self, PowError> {
+        if action.mode() != Mode::Stamp {
+            return Err(PowError::WrongMode {
+                action,
+                mode: action.mode(),
+            });
+        }
+        if epoch == EMPTY_SALT_ID {
+            return Err(PowError::EpochZero);
+        }
+        Ok(Self {
             alg: Alg::Blake3,
             verifier,
             subject,
@@ -255,7 +268,7 @@ impl<'a> Puzzle<'a> {
             binding,
             salt,
             salt_id: epoch,
-        }
+        })
     }
 
     /// The digest of rule 6 for `nonce`.
@@ -364,7 +377,7 @@ mod tests {
     }
 
     fn admit() -> Puzzle<'static> {
-        Puzzle::new(VERIFIER, SUBJECT, Action::Admit, b"")
+        Puzzle::new(VERIFIER, SUBJECT, Action::Admit, b"").unwrap()
     }
 
     #[test]
@@ -401,7 +414,7 @@ mod tests {
     #[test]
     fn a_proof_is_bound_to_every_part() {
         let binding = b"binding";
-        let base = Puzzle::new(VERIFIER, SUBJECT, Action::NsRegister, binding);
+        let base = Puzzle::new(VERIFIER, SUBJECT, Action::NsRegister, binding).unwrap();
         let proof = base.solve(e(1 << 16));
         assert_eq!(base.check(&proof, e(1 << 16)), Ok(()));
         // Change any one part and the work is a fresh, unsolved puzzle (at 2^16
@@ -477,11 +490,11 @@ mod tests {
     #[test]
     fn a_stamp_carries_its_epoch() {
         let salt = [7u8; 32];
-        let p = Puzzle::stamp(VERIFIER, SUBJECT, Action::Post, b"cid", &salt, 5);
+        let p = Puzzle::stamp(VERIFIER, SUBJECT, Action::Post, b"cid", &salt, 5).unwrap();
         let proof = p.solve(e(64));
         assert_eq!(proof.salt_id, 5);
         assert_eq!(p.check(&proof, e(64)), Ok(()));
-        let next = Puzzle::stamp(VERIFIER, SUBJECT, Action::Post, b"cid", &salt, 6);
+        let next = Puzzle::stamp(VERIFIER, SUBJECT, Action::Post, b"cid", &salt, 6).unwrap();
         assert_eq!(
             next.check(&proof, e(64)),
             Err(PowError::OtherSalt { asked: 6, got: 5 })
@@ -489,15 +502,38 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "needs an epoch salt")]
     fn a_stamp_action_needs_a_salt() {
-        let _ = Puzzle::new(VERIFIER, SUBJECT, Action::Post, b"");
+        // An action taken from the wire cannot panic a handler.
+        for action in [Action::Post, Action::KpRequest, Action::Dial] {
+            assert_eq!(
+                Puzzle::new(VERIFIER, SUBJECT, action, b""),
+                Err(PowError::WrongMode {
+                    action,
+                    mode: Mode::Stamp
+                })
+            );
+        }
     }
 
     #[test]
-    #[should_panic(expected = "epochs start at 1")]
+    fn only_a_stamp_action_takes_a_salt() {
+        for action in [Action::Admit, Action::NsRegister] {
+            assert_eq!(
+                Puzzle::stamp(VERIFIER, SUBJECT, action, b"", &[1; 32], 1),
+                Err(PowError::WrongMode {
+                    action,
+                    mode: action.mode()
+                })
+            );
+        }
+    }
+
+    #[test]
     fn epoch_zero_is_the_empty_salt() {
-        let _ = Puzzle::stamp(VERIFIER, SUBJECT, Action::Dial, b"", &[1; 32], 0);
+        assert_eq!(
+            Puzzle::stamp(VERIFIER, SUBJECT, Action::Dial, b"", &[1; 32], 0),
+            Err(PowError::EpochZero)
+        );
     }
 
     #[test]
@@ -592,14 +628,17 @@ mod tests {
         const DIALER: &[u8] = b"did:jig:zdialer";
         Action::ALL
             .into_iter()
-            .map(|action| match action {
-                Action::Admit => Puzzle::new(VERIFIER, SUBJECT, action, b""),
-                Action::Post => Puzzle::stamp(VERIFIER, SUBJECT, action, CID, SALT, 7),
-                Action::KpRequest => Puzzle::stamp(VERIFIER, SUBJECT, action, HASH, SALT, 7),
-                Action::Dial => Puzzle::stamp(VERIFIER, SUBJECT, action, DIALER, SALT, 7),
-                Action::NsRegister | Action::NsRenew | Action::NsRotate => {
-                    Puzzle::new(VERIFIER, SUBJECT, action, HASH)
+            .map(|action| {
+                match action {
+                    Action::Admit => Puzzle::new(VERIFIER, SUBJECT, action, b""),
+                    Action::Post => Puzzle::stamp(VERIFIER, SUBJECT, action, CID, SALT, 7),
+                    Action::KpRequest => Puzzle::stamp(VERIFIER, SUBJECT, action, HASH, SALT, 7),
+                    Action::Dial => Puzzle::stamp(VERIFIER, SUBJECT, action, DIALER, SALT, 7),
+                    Action::NsRegister | Action::NsRenew | Action::NsRotate => {
+                        Puzzle::new(VERIFIER, SUBJECT, action, HASH)
+                    }
                 }
+                .unwrap()
             })
             .collect()
     }
