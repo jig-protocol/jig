@@ -568,3 +568,199 @@ async fn an_action_challenge_names_its_did_and_name() {
         (StatusCode::BAD_REQUEST, Some("BAD_ACTION"))
     );
 }
+
+// ---- the stranger pool and penalties (R1 task 3) ----
+
+fn pooled(name: &str, min_effort: u64, per_hour: u32, burst: u32) -> SuffixConfig {
+    let mut cfg = suffix(name, min_effort);
+    cfg.pool = jig_config::v0_0_2_server::PoolPolicy {
+        strangers_per_hour: per_hour,
+        burst,
+        queue_wait_secs: 0,
+        ..jig_config::v0_0_2_server::PoolPolicy::recommended()
+    };
+    cfg
+}
+
+/// A state whose client addresses come from `x-forwarded-for`.
+fn behind_proxy(suffixes: Vec<SuffixConfig>) -> Arc<AppState> {
+    let mut state = AppState::for_test_with_suffixes(suffixes).unwrap();
+    state.network.trust_proxy = true;
+    Arc::new(state)
+}
+
+async fn effort_from(router: &Router, did: &str, name: &str, ip: &str) -> u64 {
+    let req = Request::get(format!(
+        "/v1/challenge?action=register&did={did}&name={name}"
+    ))
+    .header("x-forwarded-for", ip)
+    .body(Body::empty())
+    .unwrap();
+    let (status, body) = send(router, req).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["pow"]["effort"].as_u64().unwrap()
+}
+
+#[tokio::test]
+async fn past_the_pool_a_stranger_is_told_to_come_back() {
+    let state = state_with(vec![pooled(A, 16, 1, 1)]);
+    let r = router(&state);
+    let (_, alice) = fresh_did_and_key();
+    let (_, bob) = fresh_did_and_key();
+    assert_eq!(
+        register(&r, &state, &alice, "alice", A).await.0,
+        StatusCode::OK
+    );
+
+    // Bob's work and signature are good, but the hour's token is gone.
+    let (did, name) = (naming_did(&bob), format!("bobby@{A}"));
+    let (ch, effort) = challenge_for(&r, &state, "register", &did, &name).await;
+    let pow = solve(
+        &state,
+        PowAction::NsRegister,
+        &did,
+        &register_binding(&state, &name, &ch),
+        effort,
+    );
+    let req = Request::post("/v1/register")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&register_body(&state, &bob, "bobby", A, &ch, Some(&pow))).unwrap(),
+        ))
+        .unwrap();
+    let resp = r.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let retry: u64 = resp.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(retry > 0);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["code"], "REGISTRATION_BUSY");
+    assert_eq!(body["retry_after"], retry);
+    // Refused before the consume: the challenge is still Bob's to use.
+    assert!(
+        state
+            .peek_challenge(&ch, &did, &name, PowAction::NsRegister)
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn an_allowlisted_name_skips_an_empty_pool() {
+    let mut cfg = pooled(A, 16, 1, 1);
+    let (listed, listed_key) = fresh_did_and_key();
+    cfg.registration_allow = vec![AllowEntry {
+        did: listed,
+        aliases: vec!["dj".into()],
+    }];
+    let state = state_with(vec![cfg]);
+    let r = router(&state);
+    let (_, stranger) = fresh_did_and_key();
+    assert_eq!(
+        register(&r, &state, &stranger, "alice", A).await.0,
+        StatusCode::OK
+    );
+    let (status, body) = register(&r, &state, &listed_key, "dj", A).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn bad_work_in_another_dids_name_costs_only_the_sender() {
+    let state = behind_proxy(vec![suffix(A, SURE)]);
+    let r = router(&state);
+    let (victim, victim_key) = fresh_did_and_key();
+    let name = format!("alice@{A}");
+    let before = effort_from(&r, &victim, &name, "10.0.0.2").await;
+
+    // Mallory, at 10.0.0.1, sends bad work naming the victim's DID.
+    let ch = {
+        let req = Request::get(format!(
+            "/v1/challenge?action=register&did={victim}&name={name}"
+        ))
+        .header("x-forwarded-for", "10.0.0.1")
+        .body(Body::empty())
+        .unwrap();
+        send(&r, req).await.1["challenge"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let bad = solve(&state, PowAction::NsRegister, &victim, &[0; 32], SURE);
+    let req = Request::post("/v1/register")
+        .header("Content-Type", "application/json")
+        .header("x-forwarded-for", "10.0.0.1")
+        .body(Body::from(
+            serde_json::to_vec(&register_body(
+                &state,
+                &victim_key,
+                "alice",
+                A,
+                &ch,
+                Some(&bad),
+            ))
+            .unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(send(&r, req).await.1["code"], "POW_INVALID");
+
+    assert_eq!(effort_from(&r, &victim, &name, "10.0.0.2").await, before);
+    assert_eq!(
+        effort_from(&r, &victim, &name, "10.0.0.1").await,
+        before * 2
+    );
+}
+
+#[tokio::test]
+async fn reaching_for_a_held_name_costs_that_did_on_that_name_only() {
+    let state = behind_proxy(vec![suffix(A, 16)]);
+    let r = router(&state);
+    let (_, holder) = fresh_did_and_key();
+    let (mallory, mallory_key) = fresh_did_and_key();
+    let (bob, _) = fresh_did_and_key();
+    let name = format!("alice@{A}");
+    assert_eq!(
+        register(&r, &state, &holder, "alice", A).await.0,
+        StatusCode::OK
+    );
+
+    // Mallory signs for the held name; the challenge refuses it up front, so
+    // send the register directly with an unbound challenge's worth of work.
+    let mut pending = PendingChallenge::bound(Some(mallory.clone()), Some(name.clone()));
+    pending.action = Some(PowAction::NsRegister);
+    pending.effort = 16;
+    let ch = hex::encode(rand::random::<[u8; 32]>());
+    assert!(state.remember_challenge(&ch, pending).await);
+    let pow = solve(
+        &state,
+        PowAction::NsRegister,
+        &mallory,
+        &register_binding(&state, &name, &ch),
+        16,
+    );
+    let (status, body) = post(
+        &r,
+        "/v1/register",
+        register_body(&state, &mallory_key, "alice", A, &ch, Some(&pow)),
+    )
+    .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("ALIAS_TAKEN"))
+    );
+
+    // Mallory's price for `alice` doubled; Bob's, and Mallory's for another
+    // name, did not.
+    let other = format!("carol@{A}");
+    let m = state.suffixes.get(A).unwrap().market();
+    assert_eq!(m.register_effort("alice", &mallory, "ip:x"), 32);
+    assert_eq!(m.register_effort("alice", &bob, "ip:x"), 16);
+    assert_eq!(effort_from(&r, &mallory, &other, "10.0.0.3").await, 16);
+}

@@ -102,6 +102,9 @@ pub struct AppState {
     pub challenge_ttl: Duration,
     /// At this many pending challenges, new ones are refused.
     pub max_pending_challenges: usize,
+    /// How a client's address is read (`[network] trust_proxy`), for the
+    /// penalties registration pricing keys on.
+    pub network: crate::config::NetworkConfig,
 }
 
 impl AppState {
@@ -179,6 +182,7 @@ impl AppState {
             pending_challenges,
             challenge_ttl: DEFAULT_CHALLENGE_TTL,
             max_pending_challenges: DEFAULT_MAX_PENDING_CHALLENGES,
+            network: crate::config::NetworkConfig::default(),
         })
     }
 
@@ -273,6 +277,7 @@ impl AppState {
             pending_challenges,
             challenge_ttl: DEFAULT_CHALLENGE_TTL,
             max_pending_challenges: DEFAULT_MAX_PENDING_CHALLENGES,
+            network: crate::config::NetworkConfig::default(),
         })
     }
 

@@ -1365,6 +1365,19 @@ default_time_range = "last_day"  # Options: last_hour, last_day, last_week, last
 # short_name_len = 5
 # short_name_factor = 4
 # renew_effort = 1
+# penalty_decay_secs = 600   # a penalty point's life; a repeat doubles it
+#
+# # The cap on registrations by DIDs registration_allow does not name. Off by
+# # default until jig clients handle 503 REGISTRATION_BUSY; recommended values
+# # shown.
+# [v0_0_2.nameserver.alias_suffixes.pool]
+# enabled = true
+# strangers_per_hour = 60
+# burst = 10
+# controller = "doubling"    # double the effort after a window with the queue
+# controller_window_secs = 300  # full, halve it after a window with none queued
+# queue_len = 20             # held for a token, highest effort first
+# queue_wait_secs = 10       # then 503 REGISTRATION_BUSY with Retry-After
 
 [v0_0_2.server]
 # Ed25519 key that signs alias attestations. Left at the jig-server default

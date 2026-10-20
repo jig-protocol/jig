@@ -473,6 +473,69 @@ pub struct SuffixConfig {
     /// The proof-of-work register, renew and rotate carry (JEP-0008).
     #[serde(default)]
     pub pow: PowPolicy,
+    /// The cap on stranger registrations (JEP-0008 rules 17 and 21–24).
+    #[serde(default)]
+    pub pool: PoolPolicy,
+}
+
+/// `[v0_0_2.nameserver.alias_suffixes.pool]`: how many registrations by DIDs
+/// the allowlist does not name are admitted, however much work they bring
+/// (R1 decision 2), and how effort follows the demand.
+///
+/// Off by default until the client handles `503 REGISTRATION_BUSY` (R1 slice
+/// 2); [`PoolPolicy::recommended`] is the opening value for `@jig`.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PoolPolicy {
+    pub enabled: bool,
+    /// Stranger registrations admitted per hour.
+    pub strangers_per_hour: u32,
+    /// How many may be admitted at once after a quiet spell.
+    pub burst: u32,
+    /// How the suggested effort follows the queue. Only `doubling`.
+    pub controller: Controller,
+    /// One controller window.
+    pub controller_window_secs: u64,
+    /// Requests held for a token, highest effort first.
+    pub queue_len: usize,
+    /// The longest a held request waits before `503 REGISTRATION_BUSY`.
+    pub queue_wait_secs: u64,
+}
+
+/// How the suggested effort adapts (JEP-0008 rule 17).
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum Controller {
+    /// Double after a window with the queue full; halve after a window with
+    /// it empty throughout.
+    #[default]
+    Doubling,
+}
+
+impl Default for PoolPolicy {
+    /// Off, with [`PoolPolicy::recommended`]'s other values.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strangers_per_hour: 60,
+            burst: 10,
+            controller: Controller::Doubling,
+            controller_window_secs: 300,
+            queue_len: 20,
+            queue_wait_secs: 10,
+        }
+    }
+}
+
+impl PoolPolicy {
+    /// R1 decision 2: 60 an hour with a burst of 10 for `@jig`'s first week.
+    pub fn recommended() -> Self {
+        Self {
+            enabled: true,
+            ..Self::default()
+        }
+    }
 }
 
 /// `[v0_0_2.nameserver.alias_suffixes.pow]`: how much work a suffix asks for
@@ -501,6 +564,9 @@ pub struct PowPolicy {
     pub short_name_factor: u64,
     /// What renew and rotate by the holder pay (rule 31). `0` asks none.
     pub renew_effort: u64,
+    /// How long a penalty point lasts; each repeat offence before it lapses
+    /// doubles it (rule 27).
+    pub penalty_decay_secs: u64,
 }
 
 impl Default for PowPolicy {
@@ -526,6 +592,7 @@ impl PowPolicy {
             short_name_len: 5,
             short_name_factor: 4,
             renew_effort: 1,
+            penalty_decay_secs: 600,
         }
     }
 }
@@ -580,6 +647,7 @@ impl SuffixConfig {
             reserved_affixes: default_reserved_affixes(),
             registration_allow: Vec::new(),
             pow: PowPolicy::default(),
+            pool: PoolPolicy::default(),
         }
     }
 
