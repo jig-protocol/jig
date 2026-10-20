@@ -69,7 +69,9 @@ Non-goals:
 
 ## The puzzle
 
-6. The **digest** is the labelled BLAKE3 hash (JEP-0004 rule 8) of these parts, in order:
+6. The **digest** is the labelled BLAKE3 hash of these parts, in order. Each part is fed to one
+   BLAKE3 hasher as its label's bytes, the value's length as an 8-byte little-endian integer,
+   then the value's bytes:
    1. (`domain`, `jig-pow-v1`);
    2. (`alg`, the algorithm id as decimal ASCII);
    3. (`verifier`, the verifier's DID);
@@ -91,6 +93,9 @@ Non-goals:
 10. **The proof** is `{alg, effort, nonce, salt_id}` where `salt_id` names the salt (rule 13). A
     verifier checks it with one evaluation of the algorithm. It MUST check the work before any
     signature verification, database read or other costly step for the same request.
+    - `effort` is the solver's bid, at least the effort asked (rule 20). The verifier checks the
+      work against the bid.
+    - In JSON, `alg`, `effort` and `salt_id` are integers and `nonce` is unpadded base64url.
 
 ## Actions and bindings
 
@@ -115,10 +120,12 @@ Non-goals:
 13. Salts:
     - **Admission:** the salt is empty. One proof admits one subject at one verifier, once.
     - **Stamp:** the salt is the verifier's current **epoch salt**, 32 random bytes that the
-      verifier rotates every `epoch_secs` on its own clock (TM-01). `salt_id` is the epoch number.
+      verifier rotates every `epoch_secs` on its own clock (TM-01). `salt_id` is the epoch number;
+      epochs start at 1.
       The verifier MUST accept the current and the previous epoch, and no other.
     - **Challenge:** the salt is empty. The nameserver's challenge is inside the binding's proof
       hash, and JEP-0004 rule 10 makes it fresh and single-use.
+    - The empty salt's `salt_id` is 0.
 14. **Replay.**
     - Admission: the verifier records the subject as proven (as today). A second proof for a
       proven subject is redundant, not an error.
@@ -279,16 +286,17 @@ a nonce. No message links two DIDs.
 
 # Reference Implementation
 
-None yet. Milestone R1. The existing `jig-core::admission_pow` is the starting point for the
-digest.
+`jig_core::pow` (milestone R1): the digest, the effort test, the solver and the proof. The
+verifiers that ask for work are built on it in R1's later tasks.
 
 # Test Vectors
 
-To be added with R1, under a fixed test key:
+`vectors/0008/vectors.json`:
 
 - one proof per action in rule 11, with its inputs, digest and effort;
-- the boundary of rule 7 for `E = 2^20` and for an effort that is not a power of two;
-- a signed `PROOF_OF_WORK_REQUIRED` refusal.
+- the boundary of rule 7 for `E = 2^20` and for an effort that is not a power of two.
+
+A signed `PROOF_OF_WORK_REQUIRED` refusal is added with the first verifier that sends one.
 
 # Rejected Alternatives
 

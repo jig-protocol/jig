@@ -18,7 +18,7 @@ use jig_client::server_key::ServerKeyOptions;
 use jig_config::v0_0_2_server::{IdentityMode, JigServerConfig, NameDelegation};
 use jig_core::Did;
 use jig_pipeline::{
-    executor::BlockExecutor,
+    executor::{BlockExecutor, text_block_program},
     fanout::Fanout,
     hlc::HlcClock,
     identity::{IdentityResolver, NameserverResolver, TofuResolver},
@@ -227,9 +227,17 @@ impl AppState {
         // `JigServerConfig`: both types would then parse the same TOML table under
         // different key names (`timeout_ms` here, `execution_timeout_ms` in
         // jig-config's own type), so one would silently fall back to its default.
+        //
+        // The server signs text-block's program manifest and its default operator
+        // policy here (JEP-0011 §5.1). Who should author built-in manifests (each
+        // server, or one project key) is still open, so the author key is a parameter
+        // of `text_block_program`.
+        let runtime_config = runtime_config_from(&execution);
+        let program = text_block_program(&signing_key, &runtime_config)
+            .context("signing text-block's program manifest")?;
         let executor = Arc::new(
-            BlockExecutor::with_config(runtime_config_from(&execution))
-                .context("compiling the canonical text-render module")?,
+            BlockExecutor::with_config(runtime_config, &signing_key, program)
+                .context("compiling the canonical text-render component")?,
         );
 
         // Built before the ingest context so gate 2 can be installed on it;
