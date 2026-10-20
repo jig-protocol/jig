@@ -14,11 +14,12 @@ use axum::{
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::Verifier;
-use jig_core::naming::{self, Action, Name, NamingError, ReachabilityRecord};
+use jig_core::naming::{self, Action, Name, NamingError, PowOffer, ReachabilityRecord};
+use jig_core::pow::{self, Action as PowAction, Proof as PowProof};
 use jig_pipeline::persist::StoredAliasAttestation;
 use serde::{Deserialize, Serialize};
 
-use crate::v0_0_2::AppState;
+use crate::v0_0_2::{AppState, PendingChallenge};
 use crate::v0_0_2_policy::{Admission, Refusal, SuffixPolicy};
 
 /// v0.0.2 attestation default TTL: 90 days, per the design spec.
@@ -40,16 +41,20 @@ pub struct RegisterReq {
     /// Optional unpadded base64url of a reachability record signed by `did`.
     #[serde(default)]
     pub reachability: Option<String>,
-    /// Reserved for lane R's admission proof-of-work (R1). Accepted and
-    /// ignored until R1 defines it.
+    /// The JEP-0008 proof-of-work, at the effort the challenge's offer
+    /// promised. Required on a suffix that asks for work.
     #[serde(default)]
-    pub pow: Option<serde_json::Value>,
+    pub pow: Option<PowProof>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
+    /// On `428 POW_REQUIRED`: the signed offer for the challenge sent, as
+    /// `GET /v1/challenge` returned it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pow_offer: Option<String>,
 }
 
 pub(crate) type ApiError = (StatusCode, Json<ErrorBody>);
@@ -60,6 +65,7 @@ pub(crate) fn err(status: StatusCode, code: &'static str, msg: impl Into<String>
         Json(ErrorBody {
             code: code.to_string(),
             message: msg.into(),
+            pow_offer: None,
         }),
     )
 }
@@ -314,7 +320,16 @@ pub(crate) fn parse_reachability(
     Ok(Some(record))
 }
 
-/// Consume a challenge for a request by `did` on `alias`. Called only after
+fn challenge_unknown() -> ApiError {
+    err(
+        StatusCode::UNAUTHORIZED,
+        "CHALLENGE_UNKNOWN",
+        "challenge not recognized, expired, already consumed or issued for another \
+         DID, name or action (call GET /v1/challenge first)",
+    )
+}
+
+/// Consume a challenge for `action` by `did` on `alias`. Called only after
 /// the proof verified, so a bad proof leaves the challenge usable, and of two
 /// proofs racing for one challenge only one gets `true`.
 pub(crate) async fn consume_challenge(
@@ -322,17 +337,75 @@ pub(crate) async fn consume_challenge(
     challenge: &str,
     did: &str,
     alias: &str,
+    action: PowAction,
 ) -> Result<(), ApiError> {
-    if state.take_challenge(challenge, did, alias).await {
+    if state.take_challenge(challenge, did, alias, action).await {
         Ok(())
     } else {
-        Err(err(
-            StatusCode::UNAUTHORIZED,
-            "CHALLENGE_UNKNOWN",
-            "challenge not recognized, expired, already consumed or issued for another \
-             DID or name (call GET /v1/challenge first)",
-        ))
+        Err(challenge_unknown())
     }
+}
+
+/// What one request claims for JEP-0008: `proof`, for `action` by `subject`
+/// on `alias` under `challenge`, over `binding`.
+pub(crate) struct PowClaim<'a> {
+    pub challenge: &'a str,
+    pub action: PowAction,
+    pub subject: &'a str,
+    pub alias: &'a str,
+    pub binding: [u8; 32],
+    pub proof: Option<&'a PowProof>,
+}
+
+/// JEP-0008 for one request on a suffix that asks for work: the challenge
+/// must have been issued for this action by this subject on this alias, and
+/// the proof must meet the effort promised then, over the binding. One
+/// digest, run before any signature is checked; it consumes nothing, so a
+/// refusal leaves the challenge usable.
+pub(crate) async fn check_pow(
+    state: &AppState,
+    policy: &SuffixPolicy,
+    claim: PowClaim<'_>,
+) -> Result<(), ApiError> {
+    if !policy.requires_pow() {
+        return Ok(());
+    }
+    let pending = state
+        .peek_challenge(claim.challenge, claim.subject, claim.alias, claim.action)
+        .await
+        .ok_or_else(challenge_unknown)?;
+    if pending.action.is_none() {
+        return Err(err(
+            StatusCode::PRECONDITION_REQUIRED,
+            "POW_REQUIRED",
+            format!(
+                "`{}` asks for proof-of-work: get a challenge with \
+                 GET /v1/challenge?action=...&did=...&name=... and solve its offer",
+                policy.suffix
+            ),
+        ));
+    }
+    let Some(effort) = std::num::NonZeroU64::new(pending.effort) else {
+        return Ok(());
+    };
+    let Some(proof) = claim.proof else {
+        let (status, mut body) = err(
+            StatusCode::PRECONDITION_REQUIRED,
+            "POW_REQUIRED",
+            format!("this challenge asks for proof-of-work at effort {effort}"),
+        );
+        body.pow_offer = pending.offer.as_deref().map(b64u);
+        return Err((status, body));
+    };
+    let ns_did = state.ns_did_string();
+    let puzzle = pow::Puzzle::new(&ns_did, claim.subject, claim.action, &claim.binding)
+        .expect("ns-* actions are challenge actions");
+    puzzle.check(proof, effort).map_err(|e| match e {
+        pow::PowError::Insufficient { .. } => {
+            err(StatusCode::BAD_REQUEST, "POW_INSUFFICIENT", e.to_string())
+        }
+        _ => err(StatusCode::BAD_REQUEST, "POW_INVALID", e.to_string()),
+    })
 }
 
 /// One alias binding as the nameserver keeps and serves it: the attestation it
@@ -479,27 +552,51 @@ pub(crate) async fn issue_and_persist(
 
 #[derive(Debug, Deserialize)]
 pub struct ChallengeQuery {
-    /// The DID that will use the challenge.
+    /// `register`, `renew` or `rotate`: what the challenge will be used for.
+    action: Option<String>,
+    /// The DID that will use the challenge; for rotate, the old DID.
     did: Option<String>,
     /// The full `alias@suffix` it will be used on.
     name: Option<String>,
 }
 
+fn challenge_action(action: &str) -> Result<PowAction, ApiError> {
+    match action {
+        "register" => Ok(PowAction::NsRegister),
+        "renew" => Ok(PowAction::NsRenew),
+        "rotate" => Ok(PowAction::NsRotate),
+        other => Err(err(
+            StatusCode::BAD_REQUEST,
+            "BAD_ACTION",
+            format!("`{other}` is not register, renew or rotate"),
+        )),
+    }
+}
+
+fn busy() -> ApiError {
+    err(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "BUSY",
+        "too many challenges are pending; retry shortly",
+    )
+}
+
 /// GET /v1/challenge — issue a fresh hex nonce. Register and renew sign it
 /// into an action-bound proof of control.
 ///
-/// `?did=` and `?name=` bind it: it is then consumed only by that DID on that
-/// name, and is what proof-of-work (lane R's R1) sets its effort from. Both
-/// are optional until R1, so clients that send neither keep working.
+/// `?action=&did=&name=` bind it to one request, and on a suffix that asks
+/// for proof-of-work the reply carries the effort asked, signed
+/// (JEP-0008 rule 16): `{challenge, pow: {alg, effort, salt_id, expires_at},
+/// pow_offer}`. For a registration the policy's cheap refusals (closed, too
+/// short, reserved, taken) run first, so nobody solves work for a name they
+/// cannot have; register repeats them.
+/// Without `action` the challenge is bound to `did` and `name` if given, and
+/// on such a suffix it can only lead to `428 POW_REQUIRED`.
 pub async fn get_challenge(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ChallengeQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let name = query
-        .name
-        .as_deref()
-        .map(|n| parse_name(n).map(|n| n.as_alias()))
-        .transpose()?;
+    let action = query.action.as_deref().map(challenge_action).transpose()?;
     if let Some(did) = query.did.as_deref() {
         jig_core::Did::from_did_jig_string(did).map_err(|_| {
             err(
@@ -513,8 +610,103 @@ pub async fn get_challenge(
     use rand::Rng;
     rand::rng().fill_bytes(&mut nonce);
     let nonce_hex = hex::encode(nonce);
-    state.remember_challenge(&nonce_hex, query.did, name).await;
-    Ok(Json(serde_json::json!({ "challenge": nonce_hex })))
+
+    let Some(action) = action else {
+        let name = query
+            .name
+            .as_deref()
+            .map(|n| parse_name(n).map(|n| n.as_alias()))
+            .transpose()?;
+        let pending = PendingChallenge::bound(query.did, name);
+        if !state.remember_challenge(&nonce_hex, pending).await {
+            return Err(busy());
+        }
+        return Ok(Json(serde_json::json!({ "challenge": nonce_hex })));
+    };
+
+    let (Some(did), Some(full)) = (query.did, query.name.as_deref()) else {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "BINDING_REQUIRED",
+            "a challenge for an action names the `did` and the `name` it is for",
+        ));
+    };
+    let name = served_name(&state, full)?;
+    let alias = name.as_alias();
+    let policy = state
+        .suffixes
+        .get(&name.suffix)
+        .expect("served_name checked the suffix");
+    let effort = match action {
+        PowAction::NsRegister => {
+            let admission = policy
+                .admit(&did, &name.alias)
+                .map_err(|r| refused(r, policy))?;
+            // Not `refuse_second_name`: it names the alias the DID holds,
+            // and this is before any proof, so anyone could map a DID to its
+            // name. Register refuses a second name once the DID has signed.
+            refuse_taken(&state, &did, &alias).await?;
+            policy.register_effort(admission, &name.alias)
+        }
+        _ => policy.renew_effort(),
+    };
+    let expires_at = chrono::Utc::now().timestamp() + state.challenge_ttl.as_secs() as i64;
+    let offer = PowOffer::sign(
+        &state.ingest_ctx.server_key,
+        PowOffer {
+            challenge: nonce_hex.clone(),
+            action,
+            name: alias.clone(),
+            did: did.clone(),
+            ns_did: String::new(),
+            alg: u32::from(policy.pow_alg()),
+            // Boot caps every effort at jig_core::pow::MAX_EFFORT (2^28).
+            effort: u32::try_from(effort).expect("efforts are capped at 2^28"),
+            salt_id: 0,
+            expires_at,
+            envelope: Vec::new(),
+        },
+    )
+    .map_err(|e| {
+        err(
+            StatusCode::BAD_REQUEST,
+            "BAD_DID",
+            format!("the challenge cannot be offered for this DID: {e}"),
+        )
+    })?;
+    let mut pending = PendingChallenge::bound(Some(did), Some(alias));
+    pending.action = Some(action);
+    pending.effort = effort;
+    pending.offer = Some(offer.envelope.clone());
+    if !state.remember_challenge(&nonce_hex, pending).await {
+        return Err(busy());
+    }
+    Ok(Json(serde_json::json!({
+        "challenge": nonce_hex,
+        "pow": {
+            "alg": offer.alg,
+            "effort": effort,
+            "salt_id": offer.salt_id,
+            "expires_at": expires_at,
+        },
+        "pow_offer": b64u(&offer.envelope),
+    })))
+}
+
+/// Refuse `alias` when another DID holds it.
+async fn refuse_taken(state: &AppState, did: &str, alias: &str) -> Result<(), ApiError> {
+    match state
+        .alias_holder(alias)
+        .await
+        .map_err(|e| internal("PERSIST_ERROR")(e.to_string()))?
+    {
+        Some(holder) if holder != did => Err(err(
+            StatusCode::CONFLICT,
+            "ALIAS_TAKEN",
+            format!("alias `{alias}` is already attested to a different DID"),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// POST /v1/register
@@ -529,6 +721,24 @@ pub async fn register(
     let admission = policy
         .admit(&req.did, &name.alias)
         .map_err(|r| refused(r, policy))?;
+    check_pow(
+        &state,
+        policy,
+        PowClaim {
+            challenge: &req.challenge,
+            action: PowAction::NsRegister,
+            subject: &req.did,
+            alias: &alias,
+            binding: naming::proof_hash(
+                Action::Register,
+                &state.ns_did_string(),
+                &alias,
+                &req.challenge,
+            ),
+            proof: req.pow.as_ref(),
+        },
+    )
+    .await?;
 
     verify_action_proof(
         &state,
@@ -539,21 +749,17 @@ pub async fn register(
         &req.proof_of_control,
     )?;
     let reachability = parse_reachability(&req.did, req.reachability.as_deref())?;
-    consume_challenge(&state, &req.challenge, &req.did, &alias).await?;
+    consume_challenge(
+        &state,
+        &req.challenge,
+        &req.did,
+        &alias,
+        PowAction::NsRegister,
+    )
+    .await?;
 
     // Same DID re-registering is idempotent re-issuance with a fresh TTL.
-    if let Some(existing_did) = state
-        .alias_holder(&alias)
-        .await
-        .map_err(|e| internal("PERSIST_ERROR")(e.to_string()))?
-        && existing_did != req.did
-    {
-        return Err(err(
-            StatusCode::CONFLICT,
-            "ALIAS_TAKEN",
-            format!("alias `{alias}` is already attested to a different DID"),
-        ));
-    }
+    refuse_taken(&state, &req.did, &alias).await?;
     refuse_second_name(&state, &req.did, &name).await?;
 
     if admission == Admission::Allowlisted {
@@ -949,11 +1155,17 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "BAD_REACHABILITY");
         // Refused before the challenge was consumed.
-        assert!(state.take_challenge(&challenge, &did, &alias).await);
+        assert!(
+            state
+                .take_challenge(&challenge, &did, &alias, PowAction::NsRegister)
+                .await
+        );
     }
 
+    /// `pow` is a JEP-0008 proof now, parsed strictly; anything else in its
+    /// place is refused (R1 slice 1's planned break).
     #[tokio::test]
-    async fn an_arbitrary_pow_field_is_accepted_and_ignored() {
+    async fn an_arbitrary_pow_field_is_refused() {
         let state = Arc::new(AppState::for_test().unwrap());
         let router = build_register_router(state.clone());
         let challenge = challenge(&router).await;
@@ -971,6 +1183,6 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body={body}");
     }
 }

@@ -6,14 +6,24 @@
 use std::sync::Arc;
 
 use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
-use jig_core::naming::Action;
+use jig_core::naming::{self, Action, Name};
+use jig_core::pow::{Action as PowAction, Proof as PowProof};
 use serde::Deserialize;
 
 use crate::v0_0_2::AppState;
+use crate::v0_0_2_policy::SuffixPolicy;
 use crate::v0_0_2_register::{
-    ApiError, consume_challenge, current_binding, err, issue_and_persist, refuse_second_name,
-    served_name, verify_action_proof, verify_bare_challenge_sig,
+    ApiError, PowClaim, check_pow, consume_challenge, current_binding, err, issue_and_persist,
+    refuse_second_name, served_name, verify_action_proof, verify_bare_challenge_sig,
 };
+
+/// The policy of `name`'s suffix, which `served_name` checked is served.
+fn policy_of<'a>(state: &'a AppState, name: &Name) -> &'a SuffixPolicy {
+    state
+        .suffixes
+        .get(&name.suffix)
+        .expect("served_name checked the suffix")
+}
 
 #[derive(Debug, Deserialize)]
 pub struct RotateReq {
@@ -23,9 +33,10 @@ pub struct RotateReq {
     pub challenge: String,
     pub sig_by_old: String,
     pub sig_by_new: String,
-    /// Reserved for lane R's admission proof-of-work (R1).
+    /// The JEP-0008 proof-of-work, by the old DID, over
+    /// `naming::rotate_pow_binding`. Required on a suffix that asks for work.
     #[serde(default)]
-    pub pow: Option<serde_json::Value>,
+    pub pow: Option<PowProof>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,9 +47,9 @@ pub struct RenewReq {
     /// Unpadded base64url of the DID's COSE_Sign1 over
     /// `naming::proof_payload(Renew, ns_did, alias, challenge)`.
     pub proof_of_control: String,
-    /// Reserved for lane R's admission proof-of-work (R1).
+    /// The JEP-0008 proof-of-work. Required on a suffix that asks for work.
     #[serde(default)]
-    pub pow: Option<serde_json::Value>,
+    pub pow: Option<PowProof>,
 }
 
 /// POST /v1/rotate — replace the DID binding for an alias. Requires
@@ -49,6 +60,35 @@ pub async fn rotate(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let name = served_name(&state, &req.alias)?;
     let alias = name.as_alias();
+
+    // 0. Proof-of-work by the old DID, before any signature, so bad work
+    //    costs one digest and leaves the holder's challenge usable.
+    check_pow(
+        &state,
+        policy_of(&state, &name),
+        PowClaim {
+            challenge: &req.challenge,
+            action: PowAction::NsRotate,
+            subject: &req.old_did,
+            alias: &alias,
+            binding: naming::rotate_pow_binding(
+                &state.ns_did_string(),
+                &alias,
+                &req.old_did,
+                &req.new_did,
+                &req.challenge,
+            )
+            .map_err(|_| {
+                err(
+                    StatusCode::BAD_REQUEST,
+                    "BAD_DID",
+                    "old_did and new_did must be did:jig:z<base32> canonical form",
+                )
+            })?,
+            proof: req.pow.as_ref(),
+        },
+    )
+    .await?;
 
     // 1. Verify BOTH signatures. The challenge is consumed only once every
     //    check has passed, so a refused rotation leaves it usable.
@@ -91,7 +131,14 @@ pub async fn rotate(
     // 3. Consume the challenge. Of two rotations racing for one challenge,
     //    only one gets past here. A challenge bound at issue time must name
     //    the old DID, the one that holds the alias.
-    consume_challenge(&state, &req.challenge, &req.old_did, &alias).await?;
+    consume_challenge(
+        &state,
+        &req.challenge,
+        &req.old_did,
+        &alias,
+        PowAction::NsRotate,
+    )
+    .await?;
 
     // 4. Expire the old-DID row so it no longer matches alias queries.
     //    Without this, both the old and new rows would be valid for the same
@@ -135,10 +182,29 @@ pub async fn renew(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RenewReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let alias = served_name(&state, &req.alias)?.as_alias();
+    let name = served_name(&state, &req.alias)?;
+    let alias = name.as_alias();
 
-    // 1. Verify the proof, then consume the challenge, so a bad proof leaves
-    //    the challenge usable.
+    // 1. Proof-of-work, then the proof of control, then consume the
+    //    challenge, so a refusal at either leaves the challenge usable.
+    check_pow(
+        &state,
+        policy_of(&state, &name),
+        PowClaim {
+            challenge: &req.challenge,
+            action: PowAction::NsRenew,
+            subject: &req.did,
+            alias: &alias,
+            binding: naming::proof_hash(
+                Action::Renew,
+                &state.ns_did_string(),
+                &alias,
+                &req.challenge,
+            ),
+            proof: req.pow.as_ref(),
+        },
+    )
+    .await?;
     verify_action_proof(
         &state,
         Action::Renew,
@@ -147,7 +213,7 @@ pub async fn renew(
         &req.challenge,
         &req.proof_of_control,
     )?;
-    consume_challenge(&state, &req.challenge, &req.did, &alias).await?;
+    consume_challenge(&state, &req.challenge, &req.did, &alias, PowAction::NsRenew).await?;
 
     // 2. Check current holder matches the renewing DID
     let binding = match current_binding(&state, &alias).await? {

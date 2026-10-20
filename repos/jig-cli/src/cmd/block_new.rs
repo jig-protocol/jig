@@ -22,6 +22,7 @@ const RENDERER_CARGO_CONFIG: &str = include_str!("../../templates/renderer/cargo
 const RENDERER_PROJECT: &str = include_str!("../../templates/renderer/jig-block.toml.tmpl");
 const RENDERER_LIB: &str = include_str!("../../templates/renderer/lib.rs.tmpl");
 const GITIGNORE: &str = include_str!("../../templates/renderer/gitignore");
+const RENDERER_VECTOR: &str = include_str!("../../templates/renderer/vector.toml");
 
 /// The templates `jig block new` offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -86,6 +87,7 @@ fn renderer_files(name: &str) -> Vec<(&'static str, String)> {
         ("src/lib.rs", fill(RENDERER_LIB)),
         ("wit/block.wit", BLOCK_WIT.to_string()),
         (".gitignore", GITIGNORE.to_string()),
+        ("tests/vectors/hello.toml", RENDERER_VECTOR.to_string()),
     ]
 }
 
