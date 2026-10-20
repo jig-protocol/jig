@@ -376,6 +376,19 @@ mod tests {
         NonZeroU64::new(n).unwrap()
     }
 
+    /// Test salts and nonces are derived, not written as literals, so no
+    /// fixed value stands in where a real verifier draws a fresh one.
+    fn derived(label: &str) -> [u8; 32] {
+        *blake3::hash(label.as_bytes()).as_bytes()
+    }
+
+    /// One byte past the nonce cap.
+    fn overlong_nonce() -> Vec<u8> {
+        (0..=MAX_NONCE_LEN)
+            .map(|i| derived("nonce")[i % 32])
+            .collect()
+    }
+
     fn admit() -> Puzzle<'static> {
         Puzzle::new(VERIFIER, SUBJECT, Action::Admit, b"").unwrap()
     }
@@ -465,7 +478,7 @@ mod tests {
             Err(PowError::OtherSalt { asked: 0, got: 3 })
         );
         let long = Proof {
-            nonce: vec![0; MAX_NONCE_LEN + 1],
+            nonce: overlong_nonce(),
             ..proof
         };
         assert_eq!(admit().check(&long, e(16)), Err(PowError::NonceTooLong));
@@ -489,7 +502,7 @@ mod tests {
 
     #[test]
     fn a_stamp_carries_its_epoch() {
-        let salt = [7u8; 32];
+        let salt = derived("stamp test salt");
         let p = Puzzle::stamp(VERIFIER, SUBJECT, Action::Post, b"cid", &salt, 5).unwrap();
         let proof = p.solve(e(64));
         assert_eq!(proof.salt_id, 5);
@@ -519,7 +532,7 @@ mod tests {
     fn only_a_stamp_action_takes_a_salt() {
         for action in [Action::Admit, Action::NsRegister] {
             assert_eq!(
-                Puzzle::stamp(VERIFIER, SUBJECT, action, b"", &[1; 32], 1),
+                Puzzle::stamp(VERIFIER, SUBJECT, action, b"", &derived("salt"), 1),
                 Err(PowError::WrongMode {
                     action,
                     mode: action.mode()
@@ -531,7 +544,7 @@ mod tests {
     #[test]
     fn epoch_zero_is_the_empty_salt() {
         assert_eq!(
-            Puzzle::stamp(VERIFIER, SUBJECT, Action::Dial, b"", &[1; 32], 0),
+            Puzzle::stamp(VERIFIER, SUBJECT, Action::Dial, b"", &derived("salt"), 0),
             Err(PowError::EpochZero)
         );
     }
@@ -570,7 +583,7 @@ mod tests {
             "padded nonce"
         );
         assert!(
-            bad(serde_json::json!({ "nonce": BASE64URL_NOPAD.encode(&[0; 65]) })),
+            bad(serde_json::json!({ "nonce": BASE64URL_NOPAD.encode(&overlong_nonce()) })),
             "long nonce"
         );
         assert!(bad(serde_json::json!({ "extra": 1 })), "unknown field");
@@ -580,7 +593,8 @@ mod tests {
     /// independent implementation can compute it.
     #[test]
     fn the_digest_is_the_specified_derivation() {
-        let nonce = [1u8, 2, 3];
+        // Any nonce checks the derivation; take the one the solver finds.
+        let nonce = admit().solve(e(2)).nonce;
         let mut h = blake3::Hasher::new();
         for (label, value) in [
             ("domain", DOMAIN.as_bytes()),
@@ -622,7 +636,7 @@ mod tests {
     /// they are fixed stand-ins of the right shape, not derived from real
     /// objects; the consumers' own vectors cover how each binding is built.
     fn vector_cases() -> Vec<Puzzle<'static>> {
-        const SALT: &[u8] = &[0x5a; 32];
+        let salt: &'static [u8] = Box::leak(Box::new(derived("jig-pow-v1 vector salt")));
         const HASH: &[u8] = &[0x11; 32];
         const CID: &[u8] = b"bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy";
         const DIALER: &[u8] = b"did:jig:zdialer";
@@ -631,9 +645,9 @@ mod tests {
             .map(|action| {
                 match action {
                     Action::Admit => Puzzle::new(VERIFIER, SUBJECT, action, b""),
-                    Action::Post => Puzzle::stamp(VERIFIER, SUBJECT, action, CID, SALT, 7),
-                    Action::KpRequest => Puzzle::stamp(VERIFIER, SUBJECT, action, HASH, SALT, 7),
-                    Action::Dial => Puzzle::stamp(VERIFIER, SUBJECT, action, DIALER, SALT, 7),
+                    Action::Post => Puzzle::stamp(VERIFIER, SUBJECT, action, CID, salt, 7),
+                    Action::KpRequest => Puzzle::stamp(VERIFIER, SUBJECT, action, HASH, salt, 7),
+                    Action::Dial => Puzzle::stamp(VERIFIER, SUBJECT, action, DIALER, salt, 7),
                     Action::NsRegister | Action::NsRenew | Action::NsRotate => {
                         Puzzle::new(VERIFIER, SUBJECT, action, HASH)
                     }

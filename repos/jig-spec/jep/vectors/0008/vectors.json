@@ -36,16 +36,16 @@
       "action": "post",
       "alg": 1,
       "binding_hex": "6261666b726569676832616b69736361696c646371616273796733646672366368753366677072656769796d73636b376537617161347335327a79",
-      "digest_hex": "000afcbbc5ee1af83197b54ad948c18d9e72ab1da8238ed0adab7b32fe15f051",
+      "digest_hex": "000866b81010ae265edce0b5fbd91eeba98455c2a585080e77897f881c5a21a2",
       "effort": 4096,
-      "nonce_hex": "0000000000002871",
+      "nonce_hex": "00000000000013ad",
       "proof": {
         "alg": 1,
         "effort": 4096,
-        "nonce": "AAAAAAAAKHE",
+        "nonce": "AAAAAAAAE60",
         "salt_id": 7
       },
-      "salt_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "salt_hex": "d3cbdbf36de71e1f7aa7128a0f0850e2988e6a4c985bab6a8916c5b7ea45457c",
       "salt_id": 7,
       "subject": "did:jig:zsubject",
       "verifier": "did:jig:zverifier"
@@ -54,16 +54,16 @@
       "action": "kp-request",
       "alg": 1,
       "binding_hex": "1111111111111111111111111111111111111111111111111111111111111111",
-      "digest_hex": "00073136584b0f0c6711cdc26bd56c988049c5c68038c6965fda9c4fb8385e26",
+      "digest_hex": "00086c5e73d515a81b787e829e4c177ed7834ee810d0231d6dfa07e46d169ab3",
       "effort": 4096,
-      "nonce_hex": "00000000000005a0",
+      "nonce_hex": "0000000000001dcf",
       "proof": {
         "alg": 1,
         "effort": 4096,
-        "nonce": "AAAAAAAABaA",
+        "nonce": "AAAAAAAAHc8",
         "salt_id": 7
       },
-      "salt_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "salt_hex": "d3cbdbf36de71e1f7aa7128a0f0850e2988e6a4c985bab6a8916c5b7ea45457c",
       "salt_id": 7,
       "subject": "did:jig:zsubject",
       "verifier": "did:jig:zverifier"
@@ -72,16 +72,16 @@
       "action": "dial",
       "alg": 1,
       "binding_hex": "6469643a6a69673a7a6469616c6572",
-      "digest_hex": "000b84529def3b74280cc8a4bdb170325251395a317781a44f079cb324bcf07b",
+      "digest_hex": "00076ea3fce1b24770031e0affcf91268038f0d16c39c41e55b2f2cf464bb7b2",
       "effort": 4096,
-      "nonce_hex": "0000000000003041",
+      "nonce_hex": "0000000000004be0",
       "proof": {
         "alg": 1,
         "effort": 4096,
-        "nonce": "AAAAAAAAMEE",
+        "nonce": "AAAAAAAAS-A",
         "salt_id": 7
       },
-      "salt_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "salt_hex": "d3cbdbf36de71e1f7aa7128a0f0850e2988e6a4c985bab6a8916c5b7ea45457c",
       "salt_id": 7,
       "subject": "did:jig:zsubject",
       "verifier": "did:jig:zverifier"
