@@ -68,8 +68,9 @@ network is the machine: Alan Kay's "objects all the way down".
   anything.
 - **Nameserver federation (target).** Nameservers federate through signed, witnessed
   transparency logs and shared rulesets within a ruleset group: RFC 6962-style logs in C2SP
-  formats, cosigned by witnesses rather than gossiped
+  formats, cosigned by the group's witnesses
   ([JEP-0009](../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) rules 29–33, draft).
+  How checkpoints travel beyond a group, gossip included, is open.
   Aligned nameservers and servers form a high-security ruleset group, so its clients get one set
   of behaviours and expectations. Cross-nameserver lookup takes two forms: inside a group, a
   standard answer to "where do I ask for `@suffix`" (ruleset-group delegation, deferred in
