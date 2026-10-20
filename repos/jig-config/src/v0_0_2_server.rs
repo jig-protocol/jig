@@ -116,6 +116,13 @@ pub struct IdentitySection {
     /// here is refused when it is looked up; there is no discovery on the
     /// server side.
     pub delegations: BTreeMap<String, NameDelegation>,
+    /// Ask `http://` nameservers under `[identity.delegations]`. Off, a
+    /// nameserver is reached only over TLS one of its suffix's authorities
+    /// vouches for (its DID's binding for the certificate). For loopback or
+    /// local testing only: over plaintext anyone on the path sees which
+    /// aliases are looked up and can hide answers, though not forge them.
+    /// Listed in `unsafe_options_active`.
+    pub dangerously_allow_plaintext_nameservers: bool,
 }
 
 /// One suffix's entry in `[identity.delegations]`.
@@ -138,6 +145,7 @@ impl Default for IdentitySection {
             cache_ttl_seconds: 300,
             naively_allow_unknown_handles_fallback: false,
             delegations: BTreeMap::new(),
+            dangerously_allow_plaintext_nameservers: false,
         }
     }
 }
@@ -631,6 +639,9 @@ impl JigServerConfig {
         if self.identity.naively_allow_unknown_handles_fallback {
             active.push("identity.naively_allow_unknown_handles_fallback".to_string());
         }
+        if self.identity.dangerously_allow_plaintext_nameservers {
+            active.push("identity.dangerously_allow_plaintext_nameservers".to_string());
+        }
         if self.debug.list_handles {
             active.push("debug.list_handles".to_string());
         }
@@ -890,6 +901,7 @@ mod tests {
         cfg.federation.dangerously_disable_federation_tls = true;
         cfg.federation.dangerously_allow_plaintext_federation = true;
         cfg.identity.naively_allow_unknown_handles_fallback = true;
+        cfg.identity.dangerously_allow_plaintext_nameservers = true;
         cfg.debug.list_handles = true;
         cfg.auth.require_authenticated_reads = false;
         let active = cfg.unsafe_options_active();
@@ -897,6 +909,7 @@ mod tests {
         assert!(active.contains(&"federation.dangerously_disable_federation_tls".to_string()));
         assert!(active.contains(&"federation.dangerously_allow_plaintext_federation".to_string()));
         assert!(active.contains(&"identity.naively_allow_unknown_handles_fallback".to_string()));
+        assert!(active.contains(&"identity.dangerously_allow_plaintext_nameservers".to_string()));
         assert!(active.contains(&"debug.list_handles".to_string()));
         assert!(!active.contains(&"naively_unbounded_clock_skew".to_string()));
     }

@@ -53,6 +53,19 @@ pub enum TlsError {
          either: {reason}"
     )]
     Unvouched { server: String, reason: String },
+    #[error(
+        "{server} names itself {presented}, which is not one of the authorities for this \
+         suffix: {authorities:?}"
+    )]
+    NotAnAuthority {
+        server: String,
+        presented: String,
+        authorities: Vec<String>,
+    },
+    #[error("{server} is plaintext; a nameserver is reached only over TLS its DID vouches for")]
+    Plaintext { server: String },
+    #[error("{server}'s certificate is not vouched for by its DID: {reason}")]
+    Unbound { server: String, reason: String },
 }
 
 /// What [`probe`] learned.
@@ -91,7 +104,7 @@ pub async fn probe_at(
     let base = http_base(server)?;
     let url = format!("{base}{well_known_path}");
     let tls = base.starts_with("https://");
-    let verifier = Arc::new(DidBoundVerifier::new(None, true));
+    let verifier = Arc::new(DidBoundVerifier::new(None, true, true));
     let mut http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15));
     if tls {
         http = http.use_preconfigured_tls(client_config(verifier.clone()));
@@ -164,7 +177,111 @@ pub async fn probe_at(
         server_did,
         well_known,
         config: Some(Arc::new(client_config(Arc::new(DidBoundVerifier::new(
-            accepted, false,
+            accepted, false, true,
+        ))))),
+    })
+}
+
+/// [`probe_at`] for a server that must be one of `authorities`, vouched for
+/// by its DID and nothing else: a nameserver a `config` (or `contract`)
+/// delegation lists.
+///
+/// The server must name one of `authorities` and publish a `tls_binding`
+/// that DID signed for the certificate it presented. A certificate a CA
+/// vouches for counts for nothing here: whoever can get a CA certificate for
+/// the host is not thereby an authority for the suffix. The returned config
+/// accepts that one certificate and no other, CA-issued or not.
+///
+/// Plaintext is refused with [`TlsError::Plaintext`]; a caller that allows
+/// it, for local testing, does not probe.
+pub async fn probe_bound(
+    server: &str,
+    well_known_path: &str,
+    authorities: &[String],
+) -> Result<Probed, TlsError> {
+    probe_bound_to(server, well_known_path, Some(authorities)).await
+}
+
+/// [`probe_bound`] to whatever DID the server names: its certificate must be
+/// one that DID vouches for, and the caller checks the DID it gets back in
+/// [`Probed::server_did`] against what it trusts (a delegation the server
+/// itself publishes, or nothing, for a diagnostic).
+pub async fn probe_self_bound(server: &str, well_known_path: &str) -> Result<Probed, TlsError> {
+    probe_bound_to(server, well_known_path, None).await
+}
+
+async fn probe_bound_to(
+    server: &str,
+    well_known_path: &str,
+    authorities: Option<&[String]>,
+) -> Result<Probed, TlsError> {
+    let base = http_base(server)?;
+    if !base.starts_with("https://") {
+        return Err(TlsError::Plaintext {
+            server: server.to_string(),
+        });
+    }
+    let url = format!("{base}{well_known_path}");
+    let verifier = Arc::new(DidBoundVerifier::new(None, true, false));
+    let fetch = |reason: String| TlsError::Fetch {
+        url: url.clone(),
+        reason,
+    };
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .use_preconfigured_tls(client_config(verifier.clone()))
+        .build()
+        .map_err(|e| fetch(e.to_string()))?;
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| fetch(error_chain(&e)))?;
+    if !resp.status().is_success() {
+        return Err(fetch(format!("HTTP {}", resp.status())));
+    }
+    let well_known: serde_json::Value = resp.json().await.map_err(|e| fetch(e.to_string()))?;
+
+    #[derive(Deserialize)]
+    struct Advertised {
+        server_did: Option<String>,
+        tls_binding: Option<TlsBinding>,
+    }
+    let advertised: Advertised =
+        serde_json::from_value(well_known.clone()).map_err(|e| fetch(e.to_string()))?;
+    let unbound = |reason: &str| TlsError::Unbound {
+        server: server.to_string(),
+        reason: reason.to_string(),
+    };
+    let did = advertised
+        .server_did
+        .ok_or_else(|| unbound("the server names no DID"))?;
+    if let Some(authorities) = authorities
+        && !authorities.contains(&did)
+    {
+        return Err(TlsError::NotAnAuthority {
+            server: server.to_string(),
+            presented: did,
+            authorities: authorities.to_vec(),
+        });
+    }
+    let cert = verifier
+        .seen()
+        .cert
+        .ok_or_else(|| unbound("no certificate was presented"))?;
+    advertised
+        .tls_binding
+        .ok_or_else(|| unbound("the server publishes no tls_binding"))?
+        .verify(&did, cert.as_ref())
+        .map_err(|e| unbound(&e.to_string()))?;
+    Ok(Probed {
+        server_did: Some(did),
+        well_known,
+        config: Some(Arc::new(client_config(Arc::new(DidBoundVerifier::new(
+            Some(cert_hash(cert.as_ref())),
+            false,
+            false,
         ))))),
     })
 }
@@ -218,9 +335,9 @@ struct Seen {
     ca_valid: bool,
 }
 
-/// Accepts a certificate a CA vouches for, or the one whose [`cert_hash`] is
-/// `accepted`. A probing verifier accepts anything and remembers it; the
-/// decision is made after the fact, from the binding.
+/// Accepts a certificate a CA vouches for (unless `ca_roots` is off), or the
+/// one whose [`cert_hash`] is `accepted`. A probing verifier accepts anything
+/// and remembers it; the decision is made after the fact, from the binding.
 #[derive(Debug)]
 struct DidBoundVerifier {
     roots: Option<Arc<WebPkiServerVerifier>>,
@@ -231,11 +348,13 @@ struct DidBoundVerifier {
 }
 
 impl DidBoundVerifier {
-    fn new(accepted: Option<[u8; 32]>, probing: bool) -> Self {
+    fn new(accepted: Option<[u8; 32]>, probing: bool, ca_roots: bool) -> Self {
         let provider = provider();
         let mut store = RootCertStore::empty();
         // A host with no readable CA store still reaches DID-vouched servers.
-        let _ = store.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+        if ca_roots {
+            let _ = store.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+        }
         let roots = (!store.is_empty())
             .then(|| {
                 WebPkiServerVerifier::builder_with_provider(Arc::new(store), provider.clone())

@@ -96,11 +96,35 @@ pub fn format_handles(entries: &[HandleEntry]) -> String {
         .join("\n")
 }
 
-/// Shared HTTP client for the two lookups. Short timeout: these are
-/// interactive diagnostics, not background jobs.
-fn http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+/// HTTP client for `jig ns list`, a diagnostic. Short timeout: it is
+/// interactive, not a background job. Over TLS it accepts only the
+/// certificate the nameserver's own DID vouches for; there is no authority to
+/// check that DID against, and nothing it returns is acted on. Plaintext
+/// needs `[naming] dangerously_allow_plaintext_nameservers`.
+async fn http_client(base: &str, allow_plaintext: bool) -> Result<reqwest::Client> {
+    let builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
+    let builder = if base.starts_with("http://") {
+        if !allow_plaintext {
+            anyhow::bail!(
+                "{base} is plaintext; a nameserver is reached only over TLS its DID vouches for \
+                 (set [naming] dangerously_allow_plaintext_nameservers in cli.toml only for \
+                 loopback or local testing)"
+            );
+        }
+        builder
+    } else {
+        let probed = jig_client::tls::probe_self_bound(base, "/.well-known/jig-ns")
+            .await
+            .with_context(|| format!("{base}: the nameserver's TLS"))?;
+        builder.use_preconfigured_tls(
+            probed
+                .config
+                .expect("a bound probe over TLS has a config")
+                .as_ref()
+                .clone(),
+        )
+    };
+    builder
         .build()
         .context("building HTTP client for the nameserver")
 }
@@ -414,7 +438,12 @@ pub async fn list(ctx: &CliContext, nameserver: Option<String>) -> Result<()> {
     let base = nameserver_base(ctx, nameserver.as_deref())?;
     let url = format!("{base}/v1/handles");
 
-    let resp = http_client()?
+    let plaintext = ctx
+        .effective()
+        .naming
+        .dangerously_allow_plaintext_nameservers;
+    let resp = http_client(&base, plaintext)
+        .await?
         .get(&url)
         .send()
         .await
@@ -958,6 +987,8 @@ mod tests {
                 nameservers: vec![nameserver.into()],
             },
         );
+        // The stubs are plaintext.
+        cfg.naming.dangerously_allow_plaintext_nameservers = true;
         cfg
     }
 

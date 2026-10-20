@@ -279,8 +279,17 @@ pub async fn run_http_server(
 /// Serve `cfg`'s nameserver on `listener`: over TLS (JEP-0004 rule 12) unless
 /// `[tls] enabled = false`.
 pub async fn serve(cfg: &NameServerConfig, listener: TcpListener) -> Result<()> {
+    serve_app(cfg, build_app_parts(cfg)?, listener).await
+}
+
+/// [`serve`] an app already built from `cfg`, for a caller that keeps a
+/// handle on its state (tests register names through it).
+pub async fn serve_app(
+    cfg: &NameServerConfig,
+    app: NameServerApp,
+    listener: TcpListener,
+) -> Result<()> {
     let other = |e: String| NameServerError::Other(anyhow::anyhow!(e));
-    let app = build_app_parts(cfg)?;
     let addr = listener
         .local_addr()
         .map_err(|e| NameServerError::Other(e.into()))?;
