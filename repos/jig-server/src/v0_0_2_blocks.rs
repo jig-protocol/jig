@@ -194,7 +194,7 @@ pub async fn get_block_by_cid(
             .get_channel_by_id_including_archived(channel_id)
             .map_err(persist_err)?
     {
-        authorize_channel_read(&state, &channel.slug, caller, started)?;
+        authorize_channel_read(&state, &channel, caller, started)?;
     }
 
     let receipts = state
@@ -285,7 +285,7 @@ pub async fn list_channels(
             let is_member = match visibility {
                 crate::auth::Visibility::Open => false,
                 crate::auth::Visibility::Restricted => store
-                    .is_member(&c.slug, caller.as_str())
+                    .is_member_by_id(&c.id, caller.as_str())
                     .map_err(persist_err)?,
             };
             let is_owner = c.owner_did == caller.as_str();
@@ -318,28 +318,31 @@ pub struct MembersResponse {
     pub members: Vec<MemberView>,
 }
 
-/// GET /api/v1/channels/:slug/members — who is in a channel.
+/// GET /api/v1/channels/:channel/members — who is in a channel.
 ///
 /// Whoever may read the channel may see its members: on an open channel that
 /// is anyone admitted, on a restricted one its members and owner. The same
 /// gates, in the same order, as the timeline.
 pub async fn list_members(
     State(state): State<Arc<AppState>>,
-    Path(slug): Path<String>,
+    Path(channel_ref): Path<String>,
     uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<MembersResponse>, (StatusCode, Json<ErrorBody>)> {
     let started = std::time::Instant::now();
     let caller_did = admit_caller(&state, &headers, "GET", uri.path(), started)?;
     if let Some(caller) = caller_did.as_ref() {
-        authorize_channel_read(&state, &slug, caller, started)?;
+        authorize_channel_ref_read(&state, &channel_ref, caller, started)?;
     }
     let store = &state.ingest_ctx.store;
-    let Some(channel) = store.get_channel_by_slug(&slug).map_err(persist_err)? else {
+    let Some(channel) = store
+        .get_channel_by_ref(&channel_ref)
+        .map_err(persist_err)?
+    else {
         return Err(err(
             StatusCode::NOT_FOUND,
             "UNKNOWN_CHANNEL",
-            format!("no live channel '{slug}' on this server"),
+            format!("no live channel '{channel_ref}' on this server"),
         ));
     };
     let members = store
@@ -352,7 +355,10 @@ pub async fn list_members(
             joined_at: m.joined_at,
         })
         .collect();
-    Ok(Json(MembersResponse { slug, members }))
+    Ok(Json(MembersResponse {
+        slug: channel.slug,
+        members,
+    }))
 }
 
 // ---- Channel history endpoint -----------------------------------------------
@@ -410,9 +416,11 @@ pub(crate) fn persist_err(e: impl std::fmt::Display) -> (StatusCode, Json<ErrorB
     )
 }
 
-/// GET /api/v1/channels/:slug/blocks?limit=N — replay a channel's timeline.
+/// GET /api/v1/channels/:channel/blocks?limit=N — replay a channel's timeline.
 ///
-/// Clients percent-encode the leading `#` (`%23hello`); axum's `Path`
+/// `:channel` is the channel's id or, for a channel this server sequences,
+/// its slug ([`jig_pipeline::persist::SqliteStore::get_channel_by_ref`]).
+/// Clients percent-encode a slug's leading `#` (`%23hello`); axum's `Path`
 /// extractor decodes the segment before this handler sees it.
 ///
 /// Blocks come back **oldest-first**, capped to the newest `limit` (see
@@ -474,12 +482,10 @@ pub(crate) fn admit_caller(
     Ok(Some(did))
 }
 
-/// Gate 3 for a single channel: may `caller` read `slug`?
+/// Gate 3 for a channel named by a route: may `caller` read the channel
+/// `channel_ref` resolves to?
 ///
-/// The decision itself is the pure `authorize_read`; this only gathers its
-/// inputs.
-///
-/// A slug with no local row is NOT refused. Channel state does not replicate
+/// A reference with no local row is NOT refused. Channel state does not replicate
 /// between federated servers, so a channel that lives on a peer routinely has
 /// blocks here and no row: refusing would break backfill for every federated
 /// conversation. Live WSS delivery makes the same call for the same reason,
@@ -495,21 +501,39 @@ pub(crate) fn admit_caller(
 /// out (so writes fail loudly), which is exactly why it must not be the
 /// lookup used here: with it, retiring a restricted channel published its
 /// history to anyone with a key.
+pub(crate) fn authorize_channel_ref_read(
+    state: &AppState,
+    channel_ref: &str,
+    caller: &jig_core::did::Did,
+    started: std::time::Instant,
+) -> Result<Option<jig_pipeline::persist::StoredChannel>, (StatusCode, Json<ErrorBody>)> {
+    let Some(channel) = state
+        .ingest_ctx
+        .store
+        .get_channel_by_ref_including_archived(channel_ref)
+        .map_err(persist_err)?
+    else {
+        return Ok(None);
+    };
+    authorize_channel_read(state, &channel, caller, started)?;
+    Ok(Some(channel))
+}
+
+/// Gate 3 for a channel row: may `caller` read `channel`?
+///
+/// The decision itself is the pure `authorize_read`; this only gathers its
+/// inputs, by the channel's id, so a carried channel sharing a local slug is
+/// judged by its own row.
 pub(crate) fn authorize_channel_read(
     state: &AppState,
-    slug: &str,
+    channel: &jig_pipeline::persist::StoredChannel,
     caller: &jig_core::did::Did,
     started: std::time::Instant,
 ) -> Result<(), (StatusCode, Json<ErrorBody>)> {
-    let store = &state.ingest_ctx.store;
-    let Some(channel) = store
-        .get_channel_by_slug_including_archived(slug)
-        .map_err(persist_err)?
-    else {
-        return Ok(());
-    };
-    let is_member = store
-        .is_member(slug, caller.as_str())
+    let is_member = state
+        .ingest_ctx
+        .store
+        .is_member_by_id(&channel.id, caller.as_str())
         .map_err(persist_err)?;
     let is_owner = channel.owner_did == caller.as_str();
 
@@ -548,7 +572,7 @@ pub(crate) fn refuse(
 
 pub async fn get_channel_history(
     State(state): State<Arc<AppState>>,
-    Path(slug): Path<String>,
+    Path(channel_ref): Path<String>,
     Query(query): Query<HistoryQuery>,
     uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
@@ -559,23 +583,31 @@ pub async fn get_channel_history(
 
     // Gate 3, before any block is fetched: a refusal must not be
     // distinguishable from an empty channel by how much work it took.
-    if let Some(caller) = caller_did.as_ref() {
-        authorize_channel_read(&state, &slug, caller, started)?;
-    }
-
-    let limit = query.limit.unwrap_or(MAX_HISTORY_LIMIT);
-    let blocks = match query.before.as_deref() {
+    let channel = match caller_did.as_ref() {
+        Some(caller) => authorize_channel_ref_read(&state, &channel_ref, caller, started)?,
         None => store
-            .list_blocks_by_channel(&slug, limit, None)
+            .get_channel_by_ref_including_archived(&channel_ref)
             .map_err(persist_err)?,
-        Some(before) => store
-            .list_blocks_before(&slug, limit, before)
+    };
+
+    // A reference that names no channel has no history, as the slug
+    // wrappers answer: an empty page, or a cursor that is none of its blocks.
+    let limit = query.limit.unwrap_or(MAX_HISTORY_LIMIT);
+    let blocks = match (query.before.as_deref(), channel.as_ref()) {
+        (None, None) => Vec::new(),
+        (None, Some(channel)) => store
+            .list_blocks_by_channel_id(&channel.id, limit, None)
+            .map_err(persist_err)?,
+        (Some(before), channel) => channel
+            .map(|c| store.list_blocks_before_by_channel_id(&c.id, limit, before))
+            .transpose()
             .map_err(persist_err)?
+            .flatten()
             .ok_or_else(|| {
                 err(
                     StatusCode::BAD_REQUEST,
                     "BAD_CURSOR",
-                    format!("`before` is not a block of {slug}"),
+                    format!("`before` is not a block of {channel_ref}"),
                 )
             })?,
     };
@@ -614,21 +646,27 @@ pub async fn get_channel_history(
 /// content, but who posted when is still the channel's to disclose.
 pub async fn get_channel_records(
     State(state): State<Arc<AppState>>,
-    Path(slug): Path<String>,
+    Path(channel_ref): Path<String>,
     Query(query): Query<RecordsQuery>,
     uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<Vec<jig_pipeline::ingest_record::IngestRecord>>, (StatusCode, Json<ErrorBody>)> {
     let started = std::time::Instant::now();
     let caller_did = admit_caller(&state, &headers, "GET", uri.path(), started)?;
-    if let Some(caller) = caller_did.as_ref() {
-        authorize_channel_read(&state, &slug, caller, started)?;
-    }
-    let records = state
-        .ingest_ctx
-        .store
-        .list_ingest_records(
-            &slug,
+    let store = &state.ingest_ctx.store;
+    let channel = match caller_did.as_ref() {
+        Some(caller) => authorize_channel_ref_read(&state, &channel_ref, caller, started)?,
+        None => store
+            .get_channel_by_ref_including_archived(&channel_ref)
+            .map_err(persist_err)?,
+    };
+    // A reference that names no channel has no records.
+    let Some(channel) = channel else {
+        return Ok(Json(Vec::new()));
+    };
+    let records = store
+        .list_ingest_records_by_id(
+            &channel.id,
             query.from.unwrap_or(0),
             query.limit.unwrap_or(MAX_HISTORY_LIMIT),
         )
@@ -644,9 +682,15 @@ pub fn build_blocks_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/blocks", post(submit_block))
         .route("/api/v1/blocks/{cid}", get(get_block_by_cid))
         .route("/api/v1/channels", get(list_channels))
-        .route("/api/v1/channels/{slug}/blocks", get(get_channel_history))
-        .route("/api/v1/channels/{slug}/records", get(get_channel_records))
-        .route("/api/v1/channels/{slug}/members", get(list_members))
+        .route(
+            "/api/v1/channels/{channel}/blocks",
+            get(get_channel_history),
+        )
+        .route(
+            "/api/v1/channels/{channel}/records",
+            get(get_channel_records),
+        )
+        .route("/api/v1/channels/{channel}/members", get(list_members))
         .with_state(state)
 }
 

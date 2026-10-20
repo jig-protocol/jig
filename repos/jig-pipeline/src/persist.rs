@@ -1531,6 +1531,33 @@ impl SqliteStore {
         .map_err(Into::into)
     }
 
+    /// Resolve a channel reference from a route or frame: the canonical text of
+    /// a channel id, or a `#` slug. A slug is a sequencer-local hint, so it
+    /// resolves only among the channels this server sequences
+    /// ([`Self::get_channel_by_slug`]); only the id names a channel across
+    /// sequencers, so a carried channel is reached by its id alone. Anything
+    /// else is no channel. Archived channels read as absent.
+    pub fn get_channel_by_ref(&self, r: &str) -> Result<Option<StoredChannel>> {
+        if jig_core::canonical_cid::is_canonical_text(r) {
+            self.get_channel_by_id(r)
+        } else if r.starts_with('#') {
+            self.get_channel_by_slug(r)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// [`Self::get_channel_by_ref`], whether or not the channel is archived.
+    pub fn get_channel_by_ref_including_archived(&self, r: &str) -> Result<Option<StoredChannel>> {
+        if jig_core::canonical_cid::is_canonical_text(r) {
+            self.get_channel_by_id_including_archived(r)
+        } else if r.starts_with('#') {
+            self.get_channel_by_slug_including_archived(r)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// List live channels — what `jig channel list` shows.
     pub fn list_channels(&self) -> Result<Vec<StoredChannel>> {
         let conn = self.conn.lock().expect("poisoned");
@@ -2934,6 +2961,67 @@ mod tests {
         assert!(
             store.upsert_channel(&twin).is_err(),
             "one sequencer still has one #shared"
+        );
+    }
+
+    /// A route's channel reference: the id reaches any channel, a slug only
+    /// the one this server sequences, and anything else nothing.
+    #[test]
+    fn a_channel_ref_is_an_id_or_a_local_slug() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.adopt_local_sequencer("did:jig:zHere").unwrap();
+        let local_id = jig_core::canonical_cid::of(b"local").to_string();
+        let carried_id = jig_core::canonical_cid::of(b"carried").to_string();
+        let mut local = sample_channel(&local_id, "#shared");
+        local.sequencer_did = "did:jig:zHere".to_string();
+        store.upsert_channel(&local).unwrap();
+        let mut carried = sample_channel(&carried_id, "#shared");
+        carried.sequencer_did = "did:jig:zElsewhere".to_string();
+        store.upsert_channel(&carried).unwrap();
+
+        assert_eq!(
+            store.get_channel_by_ref(&local_id).unwrap(),
+            store.get_channel_by_ref("#shared").unwrap(),
+        );
+        assert_eq!(
+            store.get_channel_by_ref("#shared").unwrap().map(|c| c.id),
+            Some(local_id.clone()),
+            "the slug names the local channel, never the carried one"
+        );
+        assert_eq!(
+            store.get_channel_by_ref(&carried_id).unwrap(),
+            Some(carried.clone())
+        );
+        assert_eq!(
+            store
+                .get_channel_by_ref_including_archived(&carried_id)
+                .unwrap(),
+            Some(carried)
+        );
+        for garbage in ["notacid", "", "shared", &carried_id.to_uppercase()] {
+            assert_eq!(
+                store.get_channel_by_ref(garbage).unwrap(),
+                None,
+                "{garbage}"
+            );
+            assert_eq!(
+                store
+                    .get_channel_by_ref_including_archived(garbage)
+                    .unwrap(),
+                None,
+                "{garbage}"
+            );
+        }
+
+        store.archive_channel_by_id(&local_id, 1).unwrap();
+        assert_eq!(store.get_channel_by_ref("#shared").unwrap(), None);
+        assert_eq!(store.get_channel_by_ref(&local_id).unwrap(), None);
+        assert_eq!(
+            store
+                .get_channel_by_ref_including_archived("#shared")
+                .unwrap()
+                .map(|c| c.id),
+            Some(local_id)
         );
     }
 
