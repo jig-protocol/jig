@@ -31,10 +31,11 @@ use crate::identity::{
 #[derive(Debug, thiserror::Error)]
 pub enum ServerKeyError {
     #[error(
-        "{path:?} is a raw {role} key, stored in clear. Seal it with `{tool} keys seal \
-         --keyfile {path:?} --slot credential:PATH` (or --slot env:NAME, or --slot passphrase \
-         with JIG_KEY_PASSPHRASE set), or set [keys] storage = \"plaintext\" to keep running \
-         it in clear"
+        "{path:?} is a raw {role} key, stored in clear, and keys are now sealed. Seal it in \
+         place with `{tool} keys seal --keyfile {path:?} --slot credential:PATH` (or --slot \
+         env:NAME, or --slot passphrase with JIG_KEY_PASSPHRASE set): the {role} keeps its DID, \
+         and the raw file is removed. Then set [keys] unlock to the same slot. Or set [keys] \
+         storage = \"plaintext\" to keep running it in clear"
     )]
     RawRefused {
         path: PathBuf,
@@ -70,6 +71,11 @@ pub enum ServerKeyError {
     },
     #[error("{0}")]
     BadUnlock(String),
+    #[error(
+        "{path:?} is outside $CREDENTIALS_DIRECTORY ({dir:?}): under a unit with credentials, \
+         [keys] unlock names one of them, not a file beside the key"
+    )]
+    NotACredential { path: PathBuf, dir: PathBuf },
     #[error("keyfile {path:?} has insecure permissions {mode:o} (must be 0600)")]
     InsecurePermissions { path: PathBuf, mode: u32 },
     #[error("keyfile {path:?} is malformed: expected 32 bytes, got {len}")]
@@ -203,8 +209,54 @@ fn configured(opts: &ServerKeyOptions) -> Result<Vec<Spec>> {
     Ok(specs)
 }
 
+/// At boot, a `credential:` slot should be one systemd hands this unit. Under a
+/// unit with credentials (`$CREDENTIALS_DIRECTORY` set) a path outside it is
+/// refused: it is a secret file on disk, likely beside the key it opens.
+/// Elsewhere it is only warned about. The `keys` commands, run by an operator,
+/// are never checked: they may read a credential through a pipe.
+fn check_boot_credentials(opts: &ServerKeyOptions) -> Result<()> {
+    let specs = opts
+        .unlock
+        .iter()
+        .cloned()
+        .chain(std::env::var("JIG_KEY_UNLOCK").ok());
+    for spec in specs {
+        let Some(path) = spec.strip_prefix("credential:").map(PathBuf::from) else {
+            continue;
+        };
+        match std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from) {
+            Some(dir) if !path.starts_with(&dir) => {
+                return Err(ServerKeyError::NotACredential { path, dir });
+            }
+            Some(_) => {}
+            None => tracing::warn!(
+                "the {} key opens with a secret read from {}, a plain file: it protects the \
+                 key only as far as that file is kept apart from it. A systemd credential \
+                 (LoadCredentialEncrypted=) keeps it encrypted at rest",
+                opts.role,
+                path.display()
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// The message for a key that only one slot opens, if it is one: losing that
+/// one secret (a TPM with its machine) loses the key.
+pub fn single_slot_warning(role: &str, slots: &[SlotKind]) -> Option<String> {
+    (slots.len() == 1).then(|| {
+        format!(
+            "the {role} key has one slot ({}): if that secret is lost, so is the key, and a \
+             TPM-bound credential is lost with its machine. Add a second, such as a passphrase \
+             kept offline: `keys add-slot --slot passphrase`",
+            describe_slots(slots)
+        )
+    })
+}
+
 /// Load the key `path` names, or make and seal one if there is none.
 pub fn load_or_create(path: &Path, opts: &ServerKeyOptions) -> Result<SigningKey> {
+    check_boot_credentials(opts)?;
     let sealed = sealed_path(path);
     let raw = (sealed != path).then_some(path);
     match (sealed.exists(), raw.filter(|r| r.exists())) {
@@ -388,12 +440,16 @@ pub fn run(action: KeysAction, opts: &ServerKeyOptions) -> Result<String> {
     match action {
         KeysAction::Seal { keyfile, slots } => {
             let (sealed, did) = seal_raw(&keyfile, &slots, opts.kdf)?;
-            Ok(format!(
+            let mut out = format!(
                 "sealed {did} into {}\nremoved {}: that unlinks the file but does not erase it \
                  from the disk, nor from backups made before now",
                 sealed.display(),
                 keyfile.display()
-            ))
+            );
+            if let Some(warning) = single_slot_warning(opts.role, &read_jigkey(&sealed)?.slots()) {
+                out.push_str(&format!("\nwarning: {warning}"));
+            }
+            Ok(out)
         }
         KeysAction::AddSlot { keyfile, slot } => {
             let slots = add_slot(&keyfile, opts, &slot)?;
@@ -436,6 +492,9 @@ fn open_sealed(path: &Path, opts: &ServerKeyOptions) -> Result<SigningKey> {
             claimed: key.did().to_string(),
             found,
         });
+    }
+    if let Some(warning) = single_slot_warning(opts.role, &key.slots()) {
+        tracing::warn!("{warning}");
     }
     Ok(SigningKey::from_bytes(&opened.seed))
 }
@@ -561,14 +620,17 @@ fn describe_slots(slots: &[SlotKind]) -> String {
     names.join(", ")
 }
 
-/// For tests: write a fresh credential secret into `dir` and return the
-/// `[keys] unlock` value that names it, so a test server seals its key the
-/// way a deployed one does, with no environment variable to race on.
+/// For tests: the `[keys] unlock` value naming a credential secret in `dir`,
+/// written on first use and reused after, so a test server seals its key the
+/// way a deployed one does, with no environment variable to race on, and
+/// opens it again when it restarts over the same directory.
 #[doc(hidden)]
 pub fn credential_for_tests(dir: &Path) -> String {
     let path = dir.join("server-key.credential");
-    let secret = hex::encode(jig_core::crypto::ed25519::random_array::<32>());
-    std::fs::write(&path, secret).expect("writing a test credential");
+    if !path.exists() {
+        let secret = hex::encode(jig_core::crypto::ed25519::random_array::<32>());
+        std::fs::write(&path, secret).expect("writing a test credential");
+    }
     format!("credential:{}", path.display())
 }
 
@@ -719,6 +781,18 @@ mod tests {
         seal_raw(&raw, &[spec], KdfParams::insecure_for_tests()).unwrap();
         writer.join().unwrap();
         assert!(!raw.exists());
+    }
+
+    #[test]
+    fn a_key_with_one_slot_is_warned_about_and_one_with_two_is_not() {
+        let one = [SlotKind::Secret(SecretSource::Credential)];
+        let warning = single_slot_warning("server", &one).unwrap();
+        assert!(warning.contains("add-slot"), "{warning}");
+        let two = [
+            SlotKind::Secret(SecretSource::Credential),
+            SlotKind::Passphrase(KdfParams::insecure_for_tests()),
+        ];
+        assert!(single_slot_warning("server", &two).is_none());
     }
 
     #[test]

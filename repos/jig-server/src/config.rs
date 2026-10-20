@@ -707,6 +707,7 @@ mod config_file_tests {
             .replace("${JIG_SERVER_LISTEN%%:*}", host)
             .replace("${JIG_SERVER_LISTEN##*:}", port)
             .replace("$JIG_SERVER_LISTEN", listen)
+            .replace("$cred", &format!("{jig_home}/server/server-key.credential"))
             .replace("$JIG_HOME", jig_home)
     }
 
@@ -748,6 +749,15 @@ mod config_file_tests {
             v002.server.listen,
             format!("{}:{}", server.bind_address, server.port),
             "install.sh must keep the decorative `listen` in sync with the real bind address"
+        );
+        // A fresh install boots with no hand editing, and its key is sealed.
+        assert_eq!(
+            v002.keys.unlock.as_deref(),
+            Some("credential:/opt/jig-home/server/server-key.credential")
+        );
+        assert_eq!(
+            v002.keys.storage,
+            jig_config::v0_0_2_server::KeyStorage::Sealed
         );
     }
 

@@ -212,6 +212,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match jig_nameserver::v0_0_2::keygen(out, slots) {
             Ok(did) => {
                 println!("{did}");
+                if slots.len() == 1 {
+                    // stderr: stdout carries the DID and nothing else.
+                    eprintln!(
+                        "warning: the key has one slot; add a second (`jig-nameserver keys \
+                         add-slot`) before relying on it, or losing that secret loses the key"
+                    );
+                }
                 return Ok(());
             }
             Err(e) => {

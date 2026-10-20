@@ -638,11 +638,6 @@ mod tests {
         write_raw(&path, 0o600);
         let key = load_or_generate_server_key(&config).unwrap();
         assert_eq!(key.to_bytes(), [7u8; 32]);
-        assert!(
-            config
-                .unsafe_options_active()
-                .contains(&"keys.storage=plaintext".to_string())
-        );
 
         write_raw(&path, 0o644);
         let msg = load_or_generate_server_key(&config)

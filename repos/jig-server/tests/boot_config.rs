@@ -271,6 +271,58 @@ fn a_raw_key_is_refused_until_sealed_and_keeps_its_did_after() {
     let _ = child.wait();
 }
 
+/// Under a unit with credentials, `[keys] unlock` must name one of them: a
+/// `credential:` file elsewhere is a secret on disk, likely beside the key.
+#[test]
+fn under_a_unit_with_credentials_a_plain_secret_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(&cfg, valid_config(dir.path())).unwrap();
+    let creds = dir.path().join("credentials");
+    std::fs::create_dir(&creds).unwrap();
+    let outside = dir.path().join("beside-the-key");
+    std::fs::write(&outside, TEST_SECRET).unwrap();
+    let child = server(dir.path())
+        .env(
+            "JIG_KEY_UNLOCK",
+            format!("credential:{}", outside.display()),
+        )
+        .env("CREDENTIALS_DIRECTORY", &creds)
+        .args([
+            "--config",
+            cfg.to_str().unwrap(),
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            "0",
+        ])
+        .spawn()
+        .unwrap();
+    let (ok, out) = run_to_exit(child);
+    assert!(!ok, "{out}");
+    assert!(out.contains("CREDENTIALS_DIRECTORY"), "{out}");
+
+    // One that systemd handed over is accepted.
+    let inside = creds.join("jig-server-key");
+    std::fs::write(&inside, TEST_SECRET).unwrap();
+    let mut child = server(dir.path())
+        .env("JIG_KEY_UNLOCK", format!("credential:{}", inside.display()))
+        .env("CREDENTIALS_DIRECTORY", &creds)
+        .args([
+            "--config",
+            cfg.to_str().unwrap(),
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            "0",
+        ])
+        .spawn()
+        .unwrap();
+    assert_still_running(&mut child, "a credential from $CREDENTIALS_DIRECTORY boots");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[test]
 fn no_config_flag_still_uses_defaults() {
     // Defaults are legitimate when the operator never passed --config; only an

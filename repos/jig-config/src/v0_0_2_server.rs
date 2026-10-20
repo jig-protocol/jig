@@ -56,8 +56,9 @@ pub struct KeysSection {
     /// `JIG_KEY_UNLOCK` and `JIG_KEY_PASSPHRASE` are tried too.
     pub unlock: Option<String>,
     /// `sealed` (the default) or `plaintext`, an antipattern: a raw 32-byte
-    /// key in clear, warned about on every boot and listed in
-    /// `unsafe_options_active`.
+    /// key in clear, warned about on every boot. Deliberately not listed in
+    /// `unsafe_options_active`, which `/.well-known/jig` publishes: it would
+    /// mark this server as a soft target, and no client can verify it.
     pub storage: KeyStorage,
 }
 
@@ -661,9 +662,6 @@ impl JigServerConfig {
         if self.debug.list_handles {
             active.push("debug.list_handles".to_string());
         }
-        if self.keys.storage == KeyStorage::Plaintext {
-            active.push("keys.storage=plaintext".to_string());
-        }
         // Switching authentication off also switches authorization off on
         // every surface: with no verified caller there is nobody to
         // authorize, so restricted channels read as open. Advertise it.
@@ -942,7 +940,9 @@ mod tests {
         cfg.auth.require_authenticated_reads = false;
         cfg.keys.storage = KeyStorage::Plaintext;
         let active = cfg.unsafe_options_active();
-        assert!(active.contains(&"keys.storage=plaintext".to_string()));
+        // Not published: it would point attackers at soft targets, and clients
+        // cannot verify an operator's word about it anyway. It warns at boot.
+        assert!(!active.iter().any(|o| o.starts_with("keys.")));
         assert!(active.contains(&"auth.require_authenticated_reads=false".to_string()));
         assert!(active.contains(&"federation.dangerously_disable_federation_tls".to_string()));
         assert!(active.contains(&"federation.dangerously_allow_plaintext_federation".to_string()));

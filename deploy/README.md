@@ -572,7 +572,7 @@ What each choice protects against:
 | `credential:`, host key | a backup of `/var/lib/jig` alone | a copy of the whole disk, which holds the host key too |
 | `env:NAME` from a secret manager | whatever the manager protects; nothing on this disk | anyone who can read the process environment |
 | a secret in a file beside the key | almost nothing: whoever reads one reads both | |
-| `storage = "plaintext"` | nothing; advertised in `unsafe_options_active` | |
+| `storage = "plaintext"` | nothing; warned about on every boot | |
 
 At-rest encryption does not protect a key from code running as the server's
 user while it runs, and does not protect the key in memory.

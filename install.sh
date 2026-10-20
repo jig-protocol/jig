@@ -244,13 +244,47 @@ install_from_source() {
 # Covered by `install_sh_writes_a_config_that_boots_both_halves` in
 # repos/jig-server/src/config.rs — that test parses THIS heredoc.
 # -----------------------------------------------------------------------------
+# The secret the local server's sealed key opens with: a random file beside it.
+# That keeps the key out of clear text on disk and lets the server restart
+# unattended, but whoever can read both files has the key. A server others
+# rely on uses a systemd credential instead (deploy/README.md, "Sealing the
+# server key").
+server_key_credential() {
+  local cred="$JIG_HOME/server/server-key.credential"
+  if [ ! -f "$cred" ]; then
+    (umask 077 && head -c 48 /dev/urandom | base64 > "$cred")
+  fi
+  printf '%s' "$cred"
+}
+
+# A config this script wrote before server keys were sealed has no [keys]
+# section and a raw server.key, which jig-server now refuses. Only for a file
+# this script wrote (its header says so): give it [keys] and seal the key in
+# place, keeping the server's DID. Any other config is the operator's.
+migrate_server_key() {
+  local cfg="$1" cred raw="$JIG_HOME/server/server.key"
+  grep -q '^# jig-server config written by install.sh' "$cfg" || return 0
+  grep -q '^\[keys\]' "$cfg" && return 0
+  cred="$(server_key_credential)"
+  # Seal first: a failure leaves the config as it was, so a rerun tries again.
+  if [ -f "$raw" ] && [ ! -f "$JIG_HOME/server/server.jigkey" ]; then
+    "$JIG_HOME/bin/jig-server" --config "$cfg" keys seal --keyfile "$raw" --slot "credential:$cred" \
+      | while IFS= read -r line; do log "$line"; done
+  fi
+  printf '\n[keys]\n# Added by install.sh: see server_key_credential() there.\nunlock = "credential:%s"\n' \
+    "$cred" >> "$cfg"
+  log "added [keys] to $cfg"
+}
+
 write_server_config() {
-  local cfg="$JIG_HOME/config.toml"
+  local cfg="$JIG_HOME/config.toml" cred
   mkdir -p "$JIG_HOME/server" "$JIG_HOME/logs"
   if [ -f "$cfg" ]; then
     log "found existing $cfg — leaving it alone"
+    migrate_server_key "$cfg"
     return 0
   fi
+  cred="$(server_key_credential)"
   cat > "$cfg" <<EOF
 # jig-server config written by install.sh. One file, two structs — see the
 # install.sh comment above write_server_config() for why.
@@ -302,6 +336,13 @@ dangerously_disable_federation_tls = false
 # Channel ops are on /api/v1/channels and always mounted; nothing here is
 # needed for the default path.
 list_handles = false
+
+[keys]
+# The server's key is sealed in $JIG_HOME/server/server.jigkey and opens with a
+# random secret in the file below, so it restarts unattended. Whoever can read
+# both files has the key: fine for a server on this machine for you, not for one
+# others rely on (deploy/README.md, "Sealing the server key").
+unlock = "credential:$cred"
 EOF
   log "wrote $cfg"
 }
