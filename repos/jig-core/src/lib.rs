@@ -33,6 +33,7 @@ pub mod manifest;
 #[cfg(feature = "ed25519")]
 pub mod naming;
 pub mod operator_policy;
+pub mod pow;
 pub mod program;
 #[cfg(test)]
 pub mod proptest_generators;

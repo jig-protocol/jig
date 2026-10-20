@@ -242,6 +242,13 @@ impl NameResolver {
         Self::with_roots(roots, |b| b)
     }
 
+    /// The same resolver, reading Unix seconds from `now` instead of the
+    /// system clock. Tests move it past an attestation's window.
+    pub fn with_clock(mut self, now: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+        self.now = Arc::new(now);
+        self
+    }
+
     /// `tweak` adjusts both HTTP clients; tests use it to point a suffix at a
     /// local listener.
     fn with_roots(

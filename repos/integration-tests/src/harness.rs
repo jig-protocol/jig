@@ -539,17 +539,26 @@ impl TestNameserver {
     }
 
     pub async fn start_with_suffix(alias_suffix: &str) -> Result<Self> {
-        Self::start_inner(alias_suffix, false).await
+        Self::start_inner(alias_suffix, None, false).await
+    }
+
+    /// Start a nameserver for `alias_suffix` whose DID key has the given
+    /// seed, so a test can name it as an authority before it boots.
+    pub async fn start_with_key(alias_suffix: &str, seed: [u8; 32]) -> Result<Self> {
+        Self::start_inner(alias_suffix, Some(seed), false).await
     }
 
     /// A nameserver for `alias_suffix` as `jig-nameserver serve` runs it by
     /// default: over TLS, with a self-signed certificate its DID vouches for.
     pub async fn start_tls_with_suffix(alias_suffix: &str) -> Result<Self> {
-        Self::start_inner(alias_suffix, true).await
+        Self::start_inner(alias_suffix, None, true).await
     }
 
-    async fn start_inner(alias_suffix: &str, tls: bool) -> Result<Self> {
+    async fn start_inner(alias_suffix: &str, seed: Option<[u8; 32]>, tls: bool) -> Result<Self> {
         let tempdir = tempfile::tempdir().context("tempdir")?;
+        if let Some(seed) = seed {
+            std::fs::write(tempdir.path().join("nameserver.key"), seed).context("keyfile")?;
+        }
 
         let mut config = base_config()?;
         config.server.server_did_keyfile = tempdir
@@ -558,8 +567,11 @@ impl TestNameserver {
             .to_string_lossy()
             .into_owned();
         config.server.listen = "127.0.0.1:0".to_string();
-        config.nameserver.alias_suffixes =
-            vec![jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix)];
+        let mut suffix = jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix);
+        // A single-label suffix is trusted only through clients' own config;
+        // a test that serves one means it.
+        suffix.single_label_authority = !alias_suffix.contains('.');
+        config.nameserver.alias_suffixes = vec![suffix];
         // Tests enumerate registered aliases; production leaves this off.
         config.debug.list_handles = true;
 

@@ -1,6 +1,10 @@
 //! Command implementations
 
 pub mod admission;
+pub mod block_build;
+pub mod block_lint;
+pub mod block_new;
+pub mod block_project;
 pub mod blocks_decode;
 pub mod channel;
 pub mod chat;

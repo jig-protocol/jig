@@ -35,6 +35,12 @@ cid = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
 
+[features]
+# `BlockExecutor::shared` and `for_tests`, which sign operator policies with a fixed, public test
+# key. For other crates' tests only: enable it from `[dev-dependencies]`, never from
+# `[dependencies]`, so no server build can sign with that key.
+test-support = []
+
 [dev-dependencies]
 # Registers the `test-aead` conformance suite for this crate's tests only.
 jig-core = { workspace = true, features = ["test-suite"] }
