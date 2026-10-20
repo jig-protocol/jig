@@ -227,12 +227,12 @@ the root keys and every section in one file.
 > and the nameserver's DID vouches for it at `/.well-known/jig-ns`.
 >
 > **Upgrading a nameserver that served plaintext:** it comes back on TLS, and
-> `http://…:7070` stops answering. Today's `jig` CLI and resolvers trust a
-> nameserver's certificate only if a CA issued it; they do not yet check the
-> DID binding. Until they do, either give the nameserver a CA certificate
-> (`[tls] cert_path` and `key_path`, e.g. from `tailscale cert`) or keep
-> plaintext with `[tls] enabled = false`, which `/.well-known/jig-ns` then
-> lists in `unsafe_options_active`.
+> `http://…:7070` stops answering. Point every client and server at
+> `https://…:7070` instead (`jig --nameserver`, `[server] nameserver_url`, and
+> the nameserver URLs in delegations). Clients accept the certificate on the
+> word of the DID the suffix's delegation lists, not on a CA's alone, so a
+> reverse proxy in front of the nameserver must pass TLS through, not
+> terminate it.
 
 `/healthz` and `/metrics` are always mounted and need no signed read,
 so they answer on a default, locked-down deployment. Use `/healthz` — not

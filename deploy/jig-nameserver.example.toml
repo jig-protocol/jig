@@ -13,9 +13,10 @@ suffix = "names.example.org"
 
 # TLS is on by default, with a self-signed certificate in
 # /var/lib/jig/nameserver/tls/ that this nameserver's DID vouches for at
-# /.well-known/jig-ns. Today's jig clients trust only a CA-issued nameserver
-# certificate, so give one here (both paths), or set `enabled = false` for
-# plaintext, which /.well-known/jig-ns then advertises as unsafe.
+# /.well-known/jig-ns; jig clients accept it on that DID's word. Set both
+# paths to serve a CA-issued certificate instead (the DID vouches for it too).
+# `enabled = false` serves plaintext, which /.well-known/jig-ns advertises as
+# unsafe.
 [tls]
 enabled = true
 # cert_path = "/etc/jig/nameserver.crt"
