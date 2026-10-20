@@ -795,3 +795,62 @@ async fn reaching_for_a_held_name_costs_that_did_on_that_name_only() {
     assert_eq!(m.register_effort("alice", &bob, "ip:x"), 16);
     assert_eq!(effort_from(&r, &mallory, &other, "10.0.0.3").await, 16);
 }
+
+/// One valid proof sent many times at once takes one pool token: the first
+/// copy claims the challenge, the others find it claimed.
+#[tokio::test]
+async fn replays_of_one_proof_take_one_pool_token() {
+    let state = state_with(vec![pooled(A, 16, 60, 5)]);
+    let r = router(&state);
+    let (did, key) = fresh_did_and_key();
+    let name = format!("alice@{A}");
+    let (ch, effort) = challenge_for(&r, &state, "register", &did, &name).await;
+    let pow = solve(
+        &state,
+        PowAction::NsRegister,
+        &did,
+        &register_binding(&state, &name, &ch),
+        effort,
+    );
+    let body = register_body(&state, &key, "alice", A, &ch, Some(&pow));
+    let sends = (0..4).map(|_| post(&r, "/v1/register", body.clone()));
+    let results = futures_join_all(sends).await;
+    let ok = results.iter().filter(|(s, _)| *s == StatusCode::OK).count();
+    assert_eq!(ok, 1, "{results:?}");
+    assert_eq!(
+        state.suffixes.get(A).unwrap().market().stats().admitted,
+        1,
+        "replays took no tokens"
+    );
+}
+
+async fn futures_join_all<F: std::future::Future>(fs: impl Iterator<Item = F>) -> Vec<F::Output> {
+    let mut set = Vec::new();
+    for f in fs {
+        set.push(Box::pin(f));
+    }
+    let mut out = Vec::new();
+    // Poll them together, so they interleave at every await.
+    let mut pending: Vec<_> = set.into_iter().map(Some).collect();
+    std::future::poll_fn(|cx| {
+        let mut done = true;
+        for slot in pending.iter_mut() {
+            if let Some(f) = slot {
+                match f.as_mut().poll(cx) {
+                    std::task::Poll::Ready(v) => {
+                        out.push(v);
+                        *slot = None;
+                    }
+                    std::task::Poll::Pending => done = false,
+                }
+            }
+        }
+        if done {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+    out
+}
