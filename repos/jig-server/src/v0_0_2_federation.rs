@@ -287,12 +287,15 @@ where
     };
     match pending.interpret_on(&text, tls_exporter) {
         HandshakeResult::Established(welcome) => {
+            // A peer is listed by DID, and that DID is what lets it
+            // subscribe here and what its blocks are attributed to, so a
+            // moved peer is not federated with under two DIDs: its
+            // operator lists the new one.
             if let Some(from) = &welcome.moved_from {
-                warn!(
-                    peer = %welcome.server_did,
-                    from = %from,
-                    "peer moved its key along a public link both keys signed; \
-                     update its expected_did"
+                anyhow::bail!(
+                    "the peer moved its key from {from} to {} along a public link both keys \
+                     signed; set its expected_did to the new DID to federate with it",
+                    welcome.server_did
                 );
             }
             if let Some(key) = key {
