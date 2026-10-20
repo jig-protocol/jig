@@ -243,7 +243,7 @@ Even if message content is encrypted, metadata reveals:
 
 ### Ephemeral Secret Handling
 
-**MUST keep ephemeral secrets in memory only.** Zeroize immediately after use. *(partial: the CLI persists each MLS group's current state, epoch secrets included, unencrypted under `~/.jig/`, so it can decrypt across runs; signing keys are zeroized on drop.)*
+**MUST keep ephemeral secrets in memory only.** Zeroize immediately after use. *(partial: the CLI persists each MLS group's current state, epoch secrets included, under `~/.jig/` so it can decrypt across runs; since #177 that state is sealed under keys derived from the identity's data key. Signing keys are zeroized on drop.)*
 
 **What's ephemeral:**
 

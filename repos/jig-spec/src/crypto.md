@@ -3,8 +3,9 @@
 > **Encryption is per channel since v0.2.** This chapter's signature, hashing and key
 > management sections describe the protocol. Confidentiality is specified in
 > [Encryption](encryption.md): channels created under `mls` are end-to-end encrypted;
-> others are signed, not encrypted. Key storage at rest, rotation and revocation are not
-> yet implemented; those sections are marked.
+> others are signed, not encrypted. Key storage at rest is partial (the CLI seals its keys;
+> servers do not), and rotation and revocation are not yet implemented; those sections are
+> marked.
 
 **Audience:** This chapter is primarily for **protocol implementers** and **developers building on Jig**. If you're an **end user** or **server operator**, you don't need to understand the cryptographic details—just know that Jig uses modern, audited crypto that's the same stuff Signal, SSH, and WireGuard use.
 
@@ -58,7 +59,7 @@ did:jig:<base58(public_key)>
 ```
 
 **Storage:**
-- Private keys MUST be stored encrypted at rest (OS keychain, hardware token, or encrypted file) *(not yet implemented: the CLI and server store raw Ed25519 keys in files, unencrypted, with 0600 permissions on Unix)*
+- Private keys MUST be stored encrypted at rest (OS keychain, hardware token, or encrypted file) *(partial: the CLI seals each identity key in `~/.jig/keys/<did>.jigkey` under a data key wrapped for the OS keychain, an Argon2id passphrase or a secret, and converts older raw key files on first load (#177); `JIG_KEYS_STORAGE=plaintext` still allows raw keys, with a warning. The server and the nameserver store their keys raw, with 0600 permissions on Unix)*
 - Backups SHOULD use multiple mechanisms (paper backup + cloud + hardware key)
 
 **Rotation:**
