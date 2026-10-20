@@ -8,11 +8,20 @@
 //! A `428 POW_REQUIRED` or `400 POW_INSUFFICIENT` gets one retry on a fresh
 //! challenge, bidding at least twice the last bid; a second refusal stops
 //! with the nameserver named as under load.
+//!
+//! The work is a lottery, so an unlucky solve can outlive its challenge. It
+//! stops before the challenge expires, and so does a proof the nameserver
+//! answers `CHALLENGE_UNKNOWN` for when it was sent with less than
+//! [`SEND_MARGIN`] to spare. Either way the one retry fetches a fresh
+//! challenge and bids what its offer asks: doubling would only make another
+//! expiry likelier.
 
 use std::num::NonZeroU64;
 
 use anyhow::{Context, Result};
-use jig_client::pow::{Cap, PROGRESS_AFTER, Puzzle, retry_bid};
+use std::time::Instant;
+
+use jig_client::pow::{Cap, PROGRESS_AFTER, PowClientError, Puzzle, SEND_MARGIN, retry_bid};
 use jig_core::naming::Name;
 use jig_core::pow::{Action, Proof};
 
@@ -30,7 +39,8 @@ pub(crate) struct Work<'a> {
 
 /// Fetch a challenge for `work`, solve what its offer asks, and `send` the
 /// challenge with the proof. `send`'s `Err` is the nameserver's refusal; on
-/// a proof-of-work refusal the whole round runs once more.
+/// a proof-of-work refusal, or a challenge that expired on the way, the whole
+/// round runs once more.
 pub(crate) async fn with_pow<T>(
     ns: &Nameserver,
     work: Work<'_>,
@@ -39,6 +49,9 @@ pub(crate) async fn with_pow<T>(
     let mut cap: Option<Cap> = None;
     let mut cap = || *cap.get_or_insert_with(|| Cap::measure(max_solve_secs()));
     let mut bid = 0;
+    // Why the first round failed: the challenge expired, or the nameserver
+    // asked for more work.
+    let mut expired = false;
     for attempt in 0..2 {
         let Challenge {
             challenge,
@@ -57,11 +70,7 @@ pub(crate) async fn with_pow<T>(
             } else {
                 "set JIG_POW_MAX_SOLVE_SECS to allow this machine more time, if you mean to"
             })?;
-            bid = if attempt == 0 {
-                asked
-            } else {
-                retry_bid(asked, bid, cap.effort)
-            };
+            bid = next_bid(attempt, expired, asked, bid, cap.effort);
             if bid == 0 {
                 // A retry with no offer to bid on: there is nothing to solve.
                 None
@@ -72,12 +81,37 @@ pub(crate) async fn with_pow<T>(
                     work.action,
                     (work.binding)(&challenge)?,
                 );
-                Some(solve(puzzle, bid, &cap).await?)
+                match solve(puzzle, bid, deadline, &cap).await {
+                    Ok(proof) => Some(proof),
+                    Err(PowClientError::Expired) if attempt == 0 => {
+                        eprintln!(
+                            "note: the challenge expired before this machine finished; trying \
+                             once more on a fresh one"
+                        );
+                        expired = true;
+                        continue;
+                    }
+                    Err(PowClientError::Expired) => anyhow::bail!(OUTLIVED),
+                    Err(e) => return Err(e.into()),
+                }
             }
         };
+        let sent_at = Instant::now();
         match send(challenge, proof).await {
+            Err(e) if expired_in_flight(&e, sent_at, deadline) => {
+                if attempt == 0 {
+                    eprintln!(
+                        "note: the challenge expired as the proof was sent; trying once more on \
+                         a fresh one"
+                    );
+                    expired = true;
+                } else {
+                    return Err(e.context(OUTLIVED));
+                }
+            }
             Err(e) if pow_refusal(&e) && attempt == 0 => {
                 eprintln!("note: the nameserver asked for more proof-of-work; retrying once");
+                expired = false;
             }
             Err(e) if pow_refusal(&e) => {
                 return Err(e.context(
@@ -89,6 +123,29 @@ pub(crate) async fn with_pow<T>(
         }
     }
     unreachable!("the second attempt always returns")
+}
+
+/// What to bid on `attempt`: the offer, except on the retry after a refusal
+/// (not an expiry), which bids [`retry_bid`].
+fn next_bid(attempt: usize, expired: bool, asked: u64, previous: u64, cap: u64) -> u64 {
+    if attempt == 0 || expired {
+        asked
+    } else {
+        retry_bid(asked, previous, cap)
+    }
+}
+
+const OUTLIVED: &str =
+    "this machine couldn't finish the proof-of-work within the challenge's life; try again later";
+
+/// A `CHALLENGE_UNKNOWN` for a proof sent with less than [`SEND_MARGIN`] of
+/// its challenge left: the challenge most likely expired on the way, which a
+/// fresh one gets past. Sent earlier, it is something else (a challenge
+/// claimed twice, a restarted nameserver) and is not retried.
+fn expired_in_flight(e: &anyhow::Error, sent_at: Instant, deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|d| sent_at + SEND_MARGIN >= d)
+        && e.downcast_ref::<Refusal>()
+            .is_some_and(|r| r.code().as_deref() == Some("CHALLENGE_UNKNOWN"))
 }
 
 /// A refusal that one more round, at more work, may get past.
@@ -110,9 +167,14 @@ fn max_solve_secs() -> u64 {
 }
 
 /// Solve at `bid`, saying how long it should take and how it is going when
-/// that is more than a moment.
-async fn solve(puzzle: Puzzle, bid: u64, cap: &Cap) -> Result<Proof> {
-    let effort = NonZeroU64::new(bid).context("an effort of 0 needs no proof")?;
+/// that is more than a moment, and stopping before `deadline`.
+async fn solve(
+    puzzle: Puzzle,
+    bid: u64,
+    deadline: Option<Instant>,
+    cap: &Cap,
+) -> Result<Proof, PowClientError> {
+    let effort = NonZeroU64::new(bid).expect("a bid of 0 is never solved");
     let estimate = cap.estimate(bid);
     let report = estimate > PROGRESS_AFTER;
     if report {
@@ -121,7 +183,7 @@ async fn solve(puzzle: Puzzle, bid: u64, cap: &Cap) -> Result<Proof> {
             estimate.as_secs().max(1)
         );
     }
-    jig_client::pow::solve(puzzle, effort, move |done| {
+    jig_client::pow::solve(puzzle, effort, deadline, move |done| {
         if report {
             eprintln!(
                 "  … {}% of the expected work",
@@ -130,7 +192,6 @@ async fn solve(puzzle: Puzzle, bid: u64, cap: &Cap) -> Result<Proof> {
         }
     })
     .await
-    .context("building the proof-of-work puzzle")
 }
 
 #[cfg(test)]
@@ -203,6 +264,19 @@ mod tests {
         clock: Clock,
         post: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 'static,
     ) -> (String, Seen) {
+        stub_with(ns, offer_signer, vec![(effort, clock.ttl)], clock, post).await
+    }
+
+    /// [`stub`], whose `n`th challenge (the last one from then on) offers
+    /// `offers[n]`: an effort, and how long the offer lives (s).
+    async fn stub_with(
+        ns: SigningKey,
+        offer_signer: SigningKey,
+        efforts: Vec<(u32, i64)>,
+        clock: Clock,
+        post: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 'static,
+    ) -> (String, Seen) {
+        let efforts = Arc::new(efforts);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let seen: Seen = Arc::default();
@@ -217,12 +291,13 @@ mod tests {
         let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
-                let (log, post, deleg, signer, counter) = (
+                let (log, post, deleg, signer, counter, efforts) = (
                     log.clone(),
                     post.clone(),
                     deleg.clone(),
                     offer_signer.clone(),
                     counter.clone(),
+                    efforts.clone(),
                 );
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
@@ -261,10 +336,9 @@ mod tests {
                                 .filter_map(|kv| kv.split_once('='))
                                 .map(|(k, v)| (k.to_string(), v.to_string()))
                                 .collect();
-                            let challenge = format!(
-                                "c{}",
-                                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                            );
+                            let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let challenge = format!("c{n}");
+                            let (effort, ttl) = efforts[(n as usize).min(efforts.len() - 1)];
                             let offer = PowOffer::sign(
                                 &signer,
                                 PowOffer {
@@ -281,9 +355,7 @@ mod tests {
                                     alg: 1,
                                     effort,
                                     salt_id: 0,
-                                    expires_at: chrono::Utc::now().timestamp()
-                                        + clock.skew
-                                        + clock.ttl,
+                                    expires_at: chrono::Utc::now().timestamp() + clock.skew + ttl,
                                     envelope: Vec::new(),
                                 },
                             )
@@ -543,5 +615,99 @@ mod tests {
             "{msg}"
         );
         assert!(posts(&seen).is_empty(), "nothing was solved or sent");
+    }
+
+    #[test]
+    fn only_a_challenge_unknown_near_the_deadline_counts_as_expired() {
+        let unknown = refusal(401, "CHALLENGE_UNKNOWN");
+        let now = Instant::now();
+        let close = Some(now + SEND_MARGIN - std::time::Duration::from_secs(1));
+        let far = Some(now + SEND_MARGIN * 4);
+        assert!(expired_in_flight(&unknown, now, close));
+        assert!(
+            !expired_in_flight(&unknown, now, far),
+            "a claimed challenge, not expiry"
+        );
+        assert!(!expired_in_flight(&unknown, now, None));
+        assert!(!expired_in_flight(
+            &refusal(428, "POW_REQUIRED"),
+            now,
+            close
+        ));
+    }
+
+    #[test]
+    fn after_an_expiry_the_retry_bids_the_offer_not_double() {
+        assert_eq!(
+            next_bid(0, false, 100, 0, 1000),
+            100,
+            "the first bid is the offer"
+        );
+        assert_eq!(
+            next_bid(1, false, 100, 100, 1000),
+            200,
+            "after a refusal, double"
+        );
+        assert_eq!(
+            next_bid(1, true, 100, 100, 1000),
+            100,
+            "after an expiry, the offer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_challenge_that_expired_in_flight_is_retried_once_on_a_fresh_one() {
+        // The first offer lives 5 s: all of it is the margin to send, so the
+        // nameserver's CHALLENGE_UNKNOWN for its proof is an expiry. The
+        // retry asks a fresh challenge and bids what its offer asks.
+        let ns = key(1);
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let check = checking(ns.clone(), "dj@dj.jig");
+        let post = move |path: &str, body: &str| {
+            if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                (
+                    401,
+                    r#"{"code":"CHALLENGE_UNKNOWN","message":"expired"}"#.to_string(),
+                )
+            } else {
+                check(path, body)
+            }
+        };
+        let (base, seen) =
+            stub_with(ns.clone(), ns, vec![(1, 5), (1 << 6, 60)], TRUE_CLOCK, post).await;
+        let dir = tempfile::tempdir().unwrap();
+        let me = jig_client::Identity::generate_for_tests(dir.path());
+        crate::cmd::init::register_with_nameserver(&me, "dj", &base, &Delegations::default())
+            .await
+            .expect("registers on the second challenge");
+        let bids: Vec<_> = posts(&seen)
+            .iter()
+            .map(|b| b["pow"]["effort"].as_u64().unwrap())
+            .collect();
+        assert_eq!(bids, [1, 1 << 6]);
+    }
+
+    #[tokio::test]
+    async fn a_second_expiry_says_this_machine_could_not_finish_in_time() {
+        let ns = key(1);
+        let unknown = |_: &str, _: &str| {
+            (
+                401,
+                r#"{"code":"CHALLENGE_UNKNOWN","message":"expired"}"#.to_string(),
+            )
+        };
+        let (base, seen) = stub_with(ns.clone(), ns, vec![(1, 5)], TRUE_CLOCK, unknown).await;
+        let dir = tempfile::tempdir().unwrap();
+        let me = jig_client::Identity::generate_for_tests(dir.path());
+        let err =
+            crate::cmd::init::register_with_nameserver(&me, "dj", &base, &Delegations::default())
+                .await
+                .unwrap_err();
+        assert!(
+            format!("{err:#}")
+                .contains("couldn't finish the proof-of-work within the challenge's life"),
+            "{err:#}"
+        );
+        assert_eq!(posts(&seen).len(), 2, "one retry, no more");
     }
 }

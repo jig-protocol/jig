@@ -701,7 +701,7 @@ impl TestNameserver {
                             jig_core::pow::Action::NsRegister,
                             binding,
                         );
-                        Some(jig_client::pow::solve(puzzle, effort, |_| {}).await?)
+                        Some(jig_client::pow::solve(puzzle, effort, None, |_| {}).await?)
                     }
                 }
             }
