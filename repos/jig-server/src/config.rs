@@ -73,9 +73,9 @@ pub const REMOVED_KEYS: &[(&str, &str)] = &[
     (
         "debug.admin_endpoints",
         "channel operations are always served at /api/v1/channels; the /_admin_v0_0_2 \
-         aliases it enabled were removed. v0.1.0-alpha.1's install.sh and \
-         deploy/config.example.toml wrote `admin_endpoints = false` under [debug]; deleting \
-         that one line is all an upgrade needs",
+         aliases it enabled were removed. install.sh (v0.1.0-alpha.1) and \
+         deploy/config.example.toml (through v0.2.0-alpha.1) wrote `admin_endpoints = false` \
+         under [debug]; deleting that one line is all an upgrade needs",
     ),
     (
         "execution.pricing_enabled",
@@ -100,9 +100,11 @@ pub const REMOVED_KEYS: &[(&str, &str)] = &[
 /// certificate a CA issued (`tailscale cert`, certbot); jig clients accept
 /// either.
 ///
-/// `enabled = false` serves plaintext HTTP. It is an unsafe option: use it only
-/// on loopback or behind a proxy that terminates TLS, never on a listener peers
-/// or clients reach directly. The server advertises it as `tls.enabled=false`
+/// `enabled = false` serves plaintext HTTP. It is an unsafe option, for
+/// loopback or local testing only. A remote client over TLS refuses a server
+/// whose welcome is not bound to its TLS session (JEP-0002 rule 4), so
+/// anything in front of jig-server must pass TLS through (TCP or SNI
+/// passthrough), never terminate it. The server advertises it as `tls.enabled=false`
 /// in `unsafe_options_active` and warns at startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -451,11 +453,11 @@ unknown_dids = "admit"
 # pow_bits = 20
 banned_dids = []
 # [[auth.admission.floors]]
-# ruleset_key = "gigue.highsec.v1"
+# ruleset_key = "jig.highsec.v1"
 # minimum = 0
 # [[auth.admission.records]]
 # did = "did:jig:z..."
-# ruleset_key = "gigue.highsec.v1"
+# ruleset_key = "jig.highsec.v1"
 # score = 5
 
 # Token buckets in front of the gates: per verified DID (reads, subscriptions,

@@ -218,6 +218,12 @@ struct Header {
     v: u32,
     did: String,
     slots: Vec<SlotRecord>,
+    /// The identity's local state (MLS groups, read history) has been sealed
+    /// under this key, so content found in clear is not the identity's own.
+    /// Part of the header, so it is authenticated like everything else in
+    /// it. Left out when false, which keeps files without it byte-identical.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    state_sealed: bool,
 }
 
 /// An identity's opened key: its seed, and the data key that derives its file
@@ -288,19 +294,21 @@ impl JigKey {
             .iter()
             .map(|s| wrap_slot(did, &opened.data_key, s, rng))
             .collect::<Result<Vec<_>>>()?;
-        Self::assemble(did, opened, records, rng)
+        Self::assemble(did, opened, records, false, rng)
     }
 
     fn assemble(
         did: &str,
         opened: &Opened,
         slots: Vec<SlotRecord>,
+        state_sealed: bool,
         rng: &mut impl Entropy,
     ) -> Result<Self> {
         let header = Header {
             v: VERSION,
             did: did.to_string(),
             slots,
+            state_sealed,
         };
         let header_bytes = serde_json::to_vec(&header)
             .map_err(|e| KeystoreError::Malformed(format!("header: {e}")))?;
@@ -324,6 +332,27 @@ impl JigKey {
     /// once [`JigKey::open`] succeeds.
     pub fn did(&self) -> &str {
         &self.header.did
+    }
+
+    /// Whether the identity's local state is sealed (see
+    /// [`JigKey::with_state_sealed`]). Authenticated only once
+    /// [`JigKey::open`] succeeds.
+    pub fn state_sealed(&self) -> bool {
+        self.header.state_sealed
+    }
+
+    /// A copy that records that the identity's local state is now sealed.
+    /// Needs the opened key: someone who can only write files cannot set or
+    /// clear it without the file failing to open.
+    pub fn with_state_sealed(&self, opened: &Opened) -> Result<Self> {
+        self.check_opened(opened)?;
+        Self::assemble(
+            &self.header.did,
+            opened,
+            self.header.slots.clone(),
+            true,
+            &mut OsEntropy,
+        )
     }
 
     /// The slots, in order.
@@ -391,7 +420,13 @@ impl JigKey {
             slot,
             &mut OsEntropy,
         )?);
-        Self::assemble(&self.header.did, opened, slots, &mut OsEntropy)
+        Self::assemble(
+            &self.header.did,
+            opened,
+            slots,
+            self.header.state_sealed,
+            &mut OsEntropy,
+        )
     }
 
     /// A copy without the slot at `index`. Refuses to remove the last one.
@@ -414,7 +449,13 @@ impl JigKey {
             .filter(|(i, _)| *i != index)
             .map(|(_, s)| s.clone())
             .collect();
-        Self::assemble(&self.header.did, opened, slots, &mut OsEntropy)
+        Self::assemble(
+            &self.header.did,
+            opened,
+            slots,
+            self.header.state_sealed,
+            &mut OsEntropy,
+        )
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -829,6 +870,36 @@ mod tests {
         assert!(matches!(
             moved.open(&[offer_secret(1)]).unwrap_err(),
             KeystoreError::NoSlotOpened
+        ));
+    }
+
+    #[test]
+    fn the_state_sealed_flag_is_kept_and_cannot_be_flipped_without_the_key() {
+        let (key, opened) = JigKey::seal(DID, &SEED, &[secret(SecretSource::Env, 1)]).unwrap();
+        assert!(!key.state_sealed());
+        // Left out when false: files without it are unchanged.
+        assert!(!String::from_utf8_lossy(&key.header_bytes).contains("state_sealed"));
+        let flagged = key.with_state_sealed(&opened).unwrap();
+        let back = JigKey::from_bytes(&flagged.to_bytes()).unwrap();
+        assert!(back.state_sealed());
+        assert!(back.open(&[offer_secret(1)]).is_ok());
+        // Slot changes keep it.
+        let more = back
+            .with_slot(&opened, &secret(SecretSource::Env, 2))
+            .unwrap();
+        assert!(more.state_sealed());
+        // Clearing it, or setting it, by editing the file breaks the key.
+        let cleared = with_header(&back, |v| {
+            v.as_object_mut().unwrap().remove("state_sealed");
+        });
+        assert!(matches!(
+            cleared.open(&[offer_secret(1)]).unwrap_err(),
+            KeystoreError::Tampered
+        ));
+        let set = with_header(&key, |v| v["state_sealed"] = true.into());
+        assert!(matches!(
+            set.open(&[offer_secret(1)]).unwrap_err(),
+            KeystoreError::Tampered
         ));
     }
 

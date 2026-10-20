@@ -23,6 +23,8 @@ jig-core = { path = "../jig-core" }
 jig-runtime = { workspace = true, optional = true }
 # Shared client library (added v0.0.2 C5).
 jig-client = { path = "../jig-client" }
+# Passphrases typed at the terminal are cleared from memory after use.
+zeroize = "1"
 # MLS commit type, carried between jig-client's session and the blocks the CLI
 # submits for it.
 jig-mls = { workspace = true }
@@ -75,6 +77,8 @@ ratatui = "0.30"
 crossterm = "0.29"
 
 [dev-dependencies]
+# `TestNameserver`: the real nameserver router, for `tests/nameserver_roundtrip.rs`.
+integration-tests = { path = "../integration-tests" }
 # Lets tests resolve `@jig` under the placeholder authority; never in a build.
 jig-core = { path = "../jig-core", features = ["test-default-authority"] }
 tempfile = "3.8"

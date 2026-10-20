@@ -1,11 +1,7 @@
 //! Analytics module for nameserver metrics and insights
 //!
-//! Phase F: Three-tier analytics architecture
-//! - Tier 1 (Potato): SQLite-only queries for local insights
-//! - Tier 2 (Prosumer): DuckDB/Parquet for fast OLAP analysis
-//! - Tier 3 (Hyperscale): ClickHouse streaming for federated analytics
-//!
-//! This module now implements composable backend architecture for database role separation.
+//! SQLite-backed queries over the legacy store, used by the `analyze` and
+//! `export` subcommands.
 
 pub mod backend;
 pub mod backends;
@@ -414,45 +410,6 @@ impl AnalyticsEngine {
         ));
 
         Ok(csv)
-    }
-}
-
-// Phase F Tier 2: Parquet export foundation
-#[cfg(feature = "tier2-analytics")]
-pub mod tier2 {
-    use super::*;
-
-    /// Export analytics to Parquet format for DuckDB analysis
-    pub async fn export_parquet(
-        _engine: &AnalyticsEngine,
-        _range: TimeRange,
-        _output_path: &str,
-    ) -> Result<()> {
-        // Not yet implemented in v0.0.1 - Tier 2 stub
-        eprintln!("warning: Parquet export is not yet implemented in v0.0.1 (Tier 2 feature)");
-        Err(crate::error::NameServerError::Other(anyhow::anyhow!(
-            "Tier 2 Parquet export is not yet implemented in v0.0.1"
-        )))
-    }
-}
-
-// Phase F Tier 3: ClickHouse streaming foundation
-#[cfg(feature = "tier3-analytics")]
-pub mod tier3 {
-    use super::*;
-
-    /// Stream receipts to ClickHouse for real-time analytics
-    pub async fn stream_to_clickhouse(
-        _clickhouse_url: &str,
-        _receipt: &jig_core::BlockReceipt,
-    ) -> Result<()> {
-        // Not yet implemented in v0.0.1 - Tier 3 stub
-        eprintln!(
-            "warning: ClickHouse streaming is not yet implemented in v0.0.1 (Tier 3 feature)"
-        );
-        Err(crate::error::NameServerError::Other(anyhow::anyhow!(
-            "Tier 3 ClickHouse streaming is not yet implemented in v0.0.1"
-        )))
     }
 }
 

@@ -102,7 +102,7 @@ Response:
 
 **Why `.well-known`:** So clients can discover a server's public key and federation endpoints without DNS (useful for IP-based servers or Tor hidden services).
 
-**For server operators:** Host this JSON at `/.well-known/jig` (HTTP, not HTTPS—it's public data anyway). *(superseded: the implemented `/.well-known/jig` carries the server's DID and, when TLS is on (the default), its `tls_binding`; a client's first fetch of it is the TLS probe in [Transports § Server Certificates](transports.md#server-certificates). With `[tls] enabled = false`, for loopback or behind a TLS-terminating proxy, it is served over plain HTTP.)*
+**For server operators:** Host this JSON at `/.well-known/jig` (HTTP, not HTTPS—it's public data anyway). *(superseded: the implemented `/.well-known/jig` carries the server's DID and, when TLS is on (the default), its `tls_binding`; a client's first fetch of it is the TLS probe in [Transports § Server Certificates](transports.md#server-certificates). With `[tls] enabled = false`, for loopback or local testing only, it is served over plain HTTP: a proxy in front of a server must pass TLS through, not terminate it, since a client over TLS refuses a welcome not bound to its TLS session.)*
 
 ## Authentication
 

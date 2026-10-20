@@ -27,28 +27,26 @@ fn merge_tables(target: &mut toml::value::Table, source: &toml::value::Table) {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct NameServerConfig {
     pub network: NetworkConfig,
     pub storage: StorageConfig,
     pub penalties: PenaltyConfig,
     pub anonymous: AnonymousPolicy,
-    pub federation: FederationConfig,
     pub admin: AdminConfig,
     pub automation: AutomationPolicy,
     pub reputation: ReputationConfig,
     pub useful_work: UsefulWorkConfig,
     pub capabilities: CapabilitiesConfig,
     pub analytics: AnalyticsConfig, // Phase F: Analytics and insights
-    pub hot: HotConfig,             // Phase F Tier 2/3: Hot state backend (rate limiting, caching)
     /// v0.0.2 alias-API wiring (`[v0_0_2]`), consumed by
     /// [`crate::server::build_app`] to boot `crate::v0_0_2::AppState`.
     ///
     /// Reuses jig-server's `JigServerConfig` verbatim so `[v0_0_2.nameserver]
-    /// alias_suffix` and `[v0_0_2.server] server_did_keyfile` mean exactly what
+    /// alias_suffixes` and `[v0_0_2.server] server_did_keyfile` mean exactly what
     /// they mean in a jig-server config. Only the keys the nameserver actually
     /// consumes are honoured (`server.server_did_keyfile`,
-    /// `identity.naively_allow_unknown_handles_fallback`, `nameserver.alias_suffix`);
+    /// `identity.naively_allow_unknown_handles_fallback`, `nameserver.alias_suffixes`);
     /// `server.allowed_block_kinds` is overridden with the ns-only allowlist by
     /// `v0_0_2::AppState::new`.
     #[serde(default)]
@@ -58,11 +56,127 @@ pub struct NameServerConfig {
     pub alias_rate_limits: AliasRateLimitConfig,
 }
 
+/// `JIG_NS_*` variables a removed feature read, with what removed it. Setting
+/// one has no effect any more, so loading warns about it rather than ignoring
+/// it silently. An entry ending in `*` matches every variable with that prefix.
+const REMOVED_ENV_VARS: &[(&str, &str)] = &[
+    ("JIG_NS_SECRET", "the nameserver needs no secret"),
+    (
+        "JIG_NS_POW_*",
+        "nameserver proof-of-work settings were removed",
+    ),
+    ("JIG_NS_RATE_PER_MIN", "use [alias_rate_limits] instead"),
+    (
+        "JIG_NS_RATE_PER_IP_PER_MIN",
+        "use [alias_rate_limits] instead",
+    ),
+    (
+        "JIG_NS_TRANSPARENCY_PATH",
+        "the transparency log was removed",
+    ),
+    (
+        "JIG_NS_TRANSPARENCY_INTERVAL",
+        "the transparency log was removed",
+    ),
+    ("JIG_NS_RUNTIME_ENABLED", "the embedded runtime was removed"),
+    ("JIG_NS_STORAGE_BACKEND", "only SQLite storage remains"),
+    ("JIG_NS_ANALYTICS_BACKEND", "only SQLite analytics remain"),
+    ("JIG_NS_HOT_*", "the hot-state backends were removed"),
+    (
+        "JIG_NS_FEDERATION_ENABLED",
+        "nameserver federation was removed",
+    ),
+    ("JIG_NS_ALLOW_DOMAINS", "nameserver federation was removed"),
+    ("JIG_NS_DENY_DOMAINS", "nameserver federation was removed"),
+    ("JIG_NS_SEED_PEERS", "nameserver federation was removed"),
+    ("JIG_NS_MAX_PEERS", "nameserver federation was removed"),
+    ("JIG_NS_CACHE_TTL", "nameserver federation was removed"),
+    (
+        "JIG_NS_GOSSIP_INTERVAL",
+        "nameserver federation was removed",
+    ),
+    (
+        "JIG_NS_HANDSHAKE_TIMEOUT",
+        "nameserver federation was removed",
+    ),
+    (
+        "JIG_NS_GOSSIP_BATCH_SIZE",
+        "nameserver federation was removed",
+    ),
+];
+
+/// The removed variables set in `env`, each with why it is ignored, sorted by
+/// name.
+fn removed_env_vars_in(env: impl Iterator<Item = String>) -> Vec<(String, &'static str)> {
+    let mut found: Vec<(String, &'static str)> = env
+        .filter_map(|var| {
+            REMOVED_ENV_VARS
+                .iter()
+                .find(|(pattern, _)| match pattern.strip_suffix('*') {
+                    Some(prefix) => var.starts_with(prefix),
+                    None => var == *pattern,
+                })
+                .map(|(_, why)| (var, *why))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+fn warn_removed_env_vars() {
+    let names = std::env::vars_os().filter_map(|(k, _)| k.into_string().ok());
+    for (var, why) in removed_env_vars_in(names) {
+        tracing::warn!("{var} is set, but {why}; it is ignored. Unset it.");
+    }
+}
+
+/// Config sections and keys the nameserver used to accept, with why each went.
+/// Every config struct denies unknown fields, so these would fail anyway; this
+/// names the fix instead of serde's generic "unknown field".
+const REMOVED_KEYS: &[(&str, &str)] = &[
+    ("pow", "the nameserver no longer runs proof-of-work"),
+    ("rate_limits", "use [alias_rate_limits] instead"),
+    ("transparency", "the transparency log was removed"),
+    ("runtime", "the embedded runtime was removed"),
+    ("anomaly_detection", "the anomaly detector was removed"),
+    ("hot", "the hot-state backends were removed"),
+    ("federation", "nameserver federation was removed"),
+    ("storage.backend", "only SQLite storage remains"),
+    ("storage.backend_config", "only SQLite storage remains"),
+    ("analytics.backend", "only SQLite analytics remain"),
+    ("analytics.backend_config", "only SQLite analytics remain"),
+];
+
+/// Refuse a config that sets a removed key, naming it and the fix.
+fn reject_removed_keys(table: &toml::value::Table) -> Result<()> {
+    for (path, why) in REMOVED_KEYS {
+        let found = match path.split_once('.') {
+            None => table.contains_key(*path),
+            Some((section, key)) => table
+                .get(section)
+                .and_then(TomlValue::as_table)
+                .is_some_and(|t| t.contains_key(key)),
+        };
+        if found {
+            let what = if path.contains('.') {
+                format!("`{path}` is no longer a nameserver config key")
+            } else {
+                format!("`[{path}]` is no longer a nameserver config section")
+            };
+            return Err(NameServerError::Other(anyhow::anyhow!(
+                "{what}: {why}. Delete it."
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl NameServerConfig {
     /// Load configuration from disk if available, otherwise fall back to env
     /// defaults. The result is [`validate`](Self::validate)d, so a
     /// misconfiguration surfaces as an `Err` the caller can log.
     pub fn load() -> Result<Self> {
+        warn_removed_env_vars();
         let cfg = Self::load_unvalidated()?;
         cfg.validate()?;
         Ok(cfg)
@@ -110,6 +224,7 @@ impl NameServerConfig {
 
     /// Load configuration from the given path. Validated like [`load`](Self::load).
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
+        warn_removed_env_vars();
         let cfg = Self::load_from_path_with_profile(path, std::env::var("JIG_NS_PROFILE").ok())?;
         cfg.validate()?;
         Ok(cfg)
@@ -222,6 +337,7 @@ impl NameServerConfig {
             }
         }
 
+        reject_removed_keys(&table)?;
         let cfg_value = TomlValue::Table(table);
         let cfg: NameServerConfig = cfg_value.try_into().map_err(|e| {
             NameServerError::Other(anyhow::anyhow!(format!("parse nameserver config: {e}")))
@@ -255,14 +371,12 @@ impl NameServerConfig {
             storage: StorageConfig::from_env(),
             penalties: PenaltyConfig::from_env(),
             anonymous: AnonymousPolicy::from_env(),
-            federation: FederationConfig::from_env(),
             admin: AdminConfig::from_env(),
             automation: AutomationPolicy::from_env(),
             reputation: ReputationConfig::from_env(),
             useful_work: UsefulWorkConfig::from_env(),
             capabilities: CapabilitiesConfig::from_env(),
             analytics: AnalyticsConfig::from_env(),
-            hot: HotConfig::from_env(),
             v0_0_2: jig_config::v0_0_2_server::JigServerConfig::default(),
             alias_rate_limits: AliasRateLimitConfig::default(),
         }
@@ -273,10 +387,8 @@ impl NameServerConfig {
         self.network.merge_env();
         self.storage.merge_env();
         self.analytics.merge_env();
-        self.hot.merge_env();
         self.penalties.merge_env();
         self.anonymous.merge_env();
-        self.federation.merge_env();
         self.admin.merge_env();
         self.automation.merge_env();
         self.reputation.merge_env();
@@ -285,14 +397,6 @@ impl NameServerConfig {
     }
 
     fn normalize(&mut self) {
-        self.federation
-            .allow_domains
-            .iter_mut()
-            .for_each(|d| *d = d.trim().to_lowercase());
-        self.federation
-            .deny_domains
-            .iter_mut()
-            .for_each(|d| *d = d.trim().to_lowercase());
         self.reputation.normalize();
     }
 }
@@ -306,7 +410,7 @@ impl Default for NameServerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct NetworkConfig {
     pub bind: String,
     pub port: u16,
@@ -368,33 +472,15 @@ impl NetworkConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct StorageConfig {
     pub database_path: PathBuf,
-
-    /// Storage backend type (truth database)
-    /// - Tier 1 (Potato): "sqlite" (default)
-    /// - Tier 2 (Prosumer): "postgres"
-    /// - Tier 3 (Hyperscale): "cockroachdb", "tidb"
-    #[serde(default = "default_storage_backend")]
-    pub backend: String,
-
-    /// Backend-specific configuration (key-value pairs passed to backend)
-    /// Example for Postgres: {"connection_string": "postgres://localhost/nameserver", "pool_size": "10"}
-    #[serde(default)]
-    pub backend_config: std::collections::HashMap<String, String>,
-}
-
-fn default_storage_backend() -> String {
-    "sqlite".to_string()
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             database_path: default_database_path(),
-            backend: default_storage_backend(),
-            backend_config: std::collections::HashMap::new(),
         }
     }
 }
@@ -405,11 +491,6 @@ impl StorageConfig {
         if let Ok(path) = std::env::var("JIG_NS_DB_PATH") {
             cfg.database_path = PathBuf::from(path);
         }
-        if let Ok(backend) = std::env::var("JIG_NS_STORAGE_BACKEND") {
-            cfg.backend = backend;
-        }
-        // Backend-specific config can be set via JIG_NS_STORAGE_BACKEND_<KEY>
-        // e.g., JIG_NS_STORAGE_BACKEND_CONNECTION_STRING=postgres://...
         cfg
     }
 
@@ -424,7 +505,7 @@ impl StorageConfig {
 /// [`crate::v0_0_2_rate_limit`]. Each counts requests in a fixed one-minute
 /// window; a limit of `0` refuses every request on that bucket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct AliasRateLimitConfig {
     pub enabled: bool,
     /// Requests per client IP per minute, across register, rotate and renew.
@@ -444,7 +525,7 @@ impl Default for AliasRateLimitConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct PenaltyConfig {
     pub decay_secs: i64,
     pub step_bits: u16,
@@ -492,7 +573,7 @@ impl PenaltyConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct AnonymousPolicy {
     pub enabled: bool,
     pub min_difficulty: u16,
@@ -537,131 +618,8 @@ impl AnonymousPolicy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct FederationConfig {
-    pub enabled: bool,
-    pub allow_domains: Vec<String>,
-    pub deny_domains: Vec<String>,
-    pub seed_peers: Vec<String>, // Initial peer endpoints
-    pub max_peers: usize,
-    pub cache_ttl_secs: i64,
-    pub gossip_interval_secs: i64,
-    pub handshake_timeout_secs: i64,
-    pub gossip_batch_size: usize, // Max items per gossip message
-}
-
-impl Default for FederationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            allow_domains: Vec::new(),
-            deny_domains: Vec::new(),
-            seed_peers: Vec::new(),
-            max_peers: 50,
-            cache_ttl_secs: default_federation_cache_ttl(),
-            gossip_interval_secs: 300,
-            handshake_timeout_secs: 30,
-            gossip_batch_size: 100,
-        }
-    }
-}
-
-impl FederationConfig {
-    fn from_env() -> Self {
-        let mut cfg = Self::default();
-        if let Ok(val) = std::env::var("JIG_NS_FEDERATION_ENABLED") {
-            cfg.enabled = val == "true" || val == "1";
-        }
-        if let Ok(domains) = std::env::var("JIG_NS_ALLOW_DOMAINS") {
-            cfg.allow_domains = split_domains(&domains);
-        }
-        if let Ok(domains) = std::env::var("JIG_NS_DENY_DOMAINS") {
-            cfg.deny_domains = split_domains(&domains);
-        }
-        if let Ok(peers) = std::env::var("JIG_NS_SEED_PEERS") {
-            cfg.seed_peers = split_domains(&peers);
-        }
-        if let Ok(max) = std::env::var("JIG_NS_MAX_PEERS")
-            && let Ok(parsed) = max.parse::<usize>()
-        {
-            cfg.max_peers = parsed;
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_CACHE_TTL")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            cfg.cache_ttl_secs = parsed;
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_GOSSIP_INTERVAL")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            cfg.gossip_interval_secs = parsed;
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_HANDSHAKE_TIMEOUT")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            cfg.handshake_timeout_secs = parsed;
-        }
-        if let Ok(size) = std::env::var("JIG_NS_GOSSIP_BATCH_SIZE")
-            && let Ok(parsed) = size.parse::<usize>()
-        {
-            cfg.gossip_batch_size = parsed;
-        }
-        cfg
-    }
-
-    fn merge_env(&mut self) {
-        if let Ok(val) = std::env::var("JIG_NS_FEDERATION_ENABLED") {
-            self.enabled = val == "true" || val == "1";
-        }
-        if let Ok(domains) = std::env::var("JIG_NS_ALLOW_DOMAINS") {
-            let parsed = split_domains(&domains);
-            if !parsed.is_empty() {
-                self.allow_domains = parsed;
-            }
-        }
-        if let Ok(domains) = std::env::var("JIG_NS_DENY_DOMAINS") {
-            let parsed = split_domains(&domains);
-            if !parsed.is_empty() {
-                self.deny_domains = parsed;
-            }
-        }
-        if let Ok(peers) = std::env::var("JIG_NS_SEED_PEERS") {
-            let parsed = split_domains(&peers);
-            if !parsed.is_empty() {
-                self.seed_peers = parsed;
-            }
-        }
-        if let Ok(max) = std::env::var("JIG_NS_MAX_PEERS")
-            && let Ok(parsed) = max.parse::<usize>()
-        {
-            self.max_peers = parsed;
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_CACHE_TTL")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            self.cache_ttl_secs = parsed;
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_GOSSIP_INTERVAL")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            self.gossip_interval_secs = parsed;
-        }
-        if let Ok(secs) = std::env::var("JIG_NS_HANDSHAKE_TIMEOUT")
-            && let Ok(parsed) = secs.parse::<i64>()
-        {
-            self.handshake_timeout_secs = parsed;
-        }
-        if let Ok(size) = std::env::var("JIG_NS_GOSSIP_BATCH_SIZE")
-            && let Ok(parsed) = size.parse::<usize>()
-        {
-            self.gossip_batch_size = parsed;
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct AdminConfig {
     pub token: Option<String>,
 }
@@ -685,7 +643,7 @@ impl AdminConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct AutomationPolicy {
     pub enabled: bool,
     pub power_law_alpha: f64,
@@ -803,7 +761,7 @@ pub enum ReputationZone {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct ReputationConfig {
     pub default_ruleset: Option<String>,
     #[serde(default)]
@@ -839,6 +797,7 @@ impl ReputationConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RulesetDefinition {
     pub key: String,
     #[serde(default)]
@@ -870,7 +829,7 @@ impl Default for RulesetDefinition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct RulePowPolicy {
     pub min_bits: Option<u16>,
     pub max_bits: Option<u16>,
@@ -888,7 +847,7 @@ impl Default for RulePowPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 #[derive(Default)]
 pub struct RuleTribunalPolicy {
     pub quorum: Option<u32>,
@@ -897,6 +856,7 @@ pub struct RuleTribunalPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReputationTranslation {
     pub from: String,
     pub to: String,
@@ -952,6 +912,7 @@ impl Default for TranslationKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TranslationTableEntry {
     pub min: f64,
     pub max: f64,
@@ -959,7 +920,7 @@ pub struct TranslationTableEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct UsefulWorkConfig {
     pub assignment_ttl_secs: i64,
     pub max_assignments_per_worker: usize,
@@ -1037,7 +998,7 @@ impl UsefulWorkConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct CapabilitiesConfig {
     pub version: String,
     pub domain: Option<String>,
@@ -1179,24 +1140,13 @@ impl CapabilitiesConfig {
 
 /// Analytics configuration for nameserver metrics and insights
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 pub struct AnalyticsConfig {
     /// Enable analytics collection and queries
     pub enabled: bool,
 
     /// Default time range for analytics queries
     pub default_time_range: String, // "last_hour", "last_day", "last_week", "last_month"
-
-    /// Analytics backend type
-    /// - Tier 1 (Potato): "sqlite" (default)
-    /// - Tier 2 (Prosumer): "duckdb", "parquet"
-    /// - Tier 3 (Hyperscale): "clickhouse" (future)
-    pub backend: String,
-
-    /// Backend-specific configuration (key-value pairs passed to backend factory)
-    /// Example for DuckDB: {"database_path": "analytics.db", "parquet_export_path": "/data/parquet"}
-    #[serde(default)]
-    pub backend_config: std::collections::HashMap<String, String>,
 }
 
 impl Default for AnalyticsConfig {
@@ -1204,8 +1154,6 @@ impl Default for AnalyticsConfig {
         Self {
             enabled: true,
             default_time_range: "last_day".to_string(),
-            backend: "sqlite".to_string(), // Tier 1 default
-            backend_config: std::collections::HashMap::new(),
         }
     }
 }
@@ -1222,75 +1170,7 @@ impl AnalyticsConfig {
         if let Ok(val) = std::env::var("JIG_NS_ANALYTICS_DEFAULT_RANGE") {
             self.default_time_range = val;
         }
-        if let Ok(val) = std::env::var("JIG_NS_ANALYTICS_BACKEND") {
-            self.backend = val;
-        }
-        // Backend-specific config can be set via JIG_NS_ANALYTICS_BACKEND_<KEY>
-        // e.g., JIG_NS_ANALYTICS_BACKEND_DATABASE_PATH=/path/to/db
     }
-}
-
-// Phase F Tier 2/3: Hot State Backend Configuration
-
-/// Hot state backend configuration for ephemeral data (rate limiting, caching, etc.)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct HotConfig {
-    /// Hot backend type
-    /// - Tier 1 (Potato): "memory" (default - in-memory HashMap)
-    /// - Tier 2 (Prosumer): "redis", "valkey", "dragonfly" (Redis-protocol compatible)
-    /// - Tier 3 (Hyperscale): "scylladb" (distributed persistent cache)
-    pub backend: String,
-
-    /// Backend-specific configuration (key-value pairs passed to backend factory)
-    /// Example for Redis: {"connection_string": "redis://localhost:6379", "pool_size": "5"}
-    /// Example for ScyllaDB: {"nodes": "node1:9042,node2:9042", "keyspace": "jig_hot"}
-    #[serde(default)]
-    pub backend_config: std::collections::HashMap<String, String>,
-
-    /// Fallback to in-memory if backend unavailable (Tier 2/3 only)
-    #[serde(default)]
-    pub fallback_to_memory: bool,
-}
-
-fn default_hot_backend() -> String {
-    "memory".to_string()
-}
-
-impl Default for HotConfig {
-    fn default() -> Self {
-        Self {
-            backend: default_hot_backend(),
-            backend_config: std::collections::HashMap::new(),
-            fallback_to_memory: true, // Safe default for Tier 2/3
-        }
-    }
-}
-
-impl HotConfig {
-    fn from_env() -> Self {
-        Self::default()
-    }
-
-    fn merge_env(&mut self) {
-        if let Ok(val) = std::env::var("JIG_NS_HOT_BACKEND") {
-            self.backend = val;
-        }
-        if let Ok(val) = std::env::var("JIG_NS_HOT_FALLBACK") {
-            self.fallback_to_memory = val == "true" || val == "1";
-        }
-        // Backend-specific config can be set via JIG_NS_HOT_BACKEND_<KEY>
-        // e.g., JIG_NS_HOT_BACKEND_CONNECTION_STRING=redis://localhost
-    }
-}
-
-fn split_domains(input: &str) -> Vec<String> {
-    input
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_lowercase())
-        .collect()
 }
 
 fn default_bind() -> String {
@@ -1339,13 +1219,6 @@ fn default_anon_min_pow() -> u16 {
         .unwrap_or(12)
 }
 
-fn default_federation_cache_ttl() -> i64 {
-    std::env::var("JIG_NS_CACHE_TTL")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(300)
-}
-
 const TEMPLATE: &str = r#"
 # Jig Nameserver configuration
 
@@ -1358,14 +1231,6 @@ proxy_ip_header = "x-forwarded-for"
 [storage]
 database_path = "~/.jig/nameserver.db"
 
-# Truth backend selection (Tier 1: sqlite, Tier 2: postgres, Tier 3: cockroachdb/tidb)
-backend = "sqlite"  # Default: Tier 1
-
-# Backend-specific configuration (example for Postgres)
-# [storage.backend_config]
-# connection_string = "postgres://localhost/nameserver"
-# pool_size = "10"
-# max_connections = "20"
 
 # v0.0.2 register / rotate / renew. Refused requests get HTTP 429 with code
 # RATE_LIMITED and a Retry-After header.
@@ -1382,12 +1247,6 @@ max_points = 64
 [anonymous]
 enabled = true
 min_difficulty = 16
-
-[federation]
-allow_domains = []
-deny_domains = []
-cache_ttl_secs = 300
-gossip_interval_secs = 300
 
 [admin]
 token = ""
@@ -1450,37 +1309,37 @@ federation_enabled = false
 enabled = true
 default_time_range = "last_day"  # Options: last_hour, last_day, last_week, last_month
 
-# Analytics backend selection (Tier 1: sqlite, Tier 2: duckdb/parquet, Tier 3: clickhouse)
-backend = "sqlite"  # Default: Tier 1
-
-# Backend-specific configuration (example for DuckDB)
-# [analytics.backend_config]
-# database_path = "analytics.db"
-# parquet_export_path = "/data/parquet"
-# parquet_compression = "zstd"
-
-# Phase F Tier 2/3: Hot state backend configuration
-[hot]
-backend = "memory"  # Default: Tier 1 in-memory
-fallback_to_memory = true  # Fallback if Redis/ScyllaDB unavailable
-
-# Backend-specific configuration (examples)
-# For Redis/Valkey/DragonflyDB (Tier 2):
-# [hot.backend_config]
-# connection_string = "redis://localhost:6379"
-# pool_size = "5"
-
-# For ScyllaDB (Tier 3):
-# [hot.backend_config]
-# nodes = "node1:9042,node2:9042,node3:9042"
-# keyspace = "jig_hot"
-
 # v0.0.2 alias API — GET /v1/challenge, POST /v1/register,
 # GET /v1/resolve/:alias, GET /v1/handles, POST /v1/rotate, POST /v1/renew.
 # Same key names as a jig-server config (`JigServerConfig`).
 [v0_0_2.nameserver]
-# The suffix this nameserver is authoritative for: `<local>@<alias_suffix>`.
-alias_suffix = "gigue.jig"
+#
+# Required: the suffixes this nameserver serves, the part after `@` in
+# `alice@names.example.org`. There is no default; the nameserver refuses to
+# start without at least one. One DID holds at most one name per suffix.
+#
+# [[v0_0_2.nameserver.alias_suffixes]]
+# suffix = "names.example.org"
+# registration = "open"        # or "closed": existing names still resolve,
+#                              # renew and rotate; new ones are refused
+# min_alias_len = 3
+# # A single-label suffix such as `jig` needs `single_label_authority = true`:
+# # clients trust it only through their own config, so its names verify only
+# # for clients whose config names this nameserver's DID.
+# # Refused at registration, compared after dropping `-`, `_`, `.` and
+# # folding 0→o 1→i/l 3→e 4a 5s 7t. Defaults shown.
+# reserved = ["admin", "root", "support", "help", "security", "abuse", "official",
+#             "jig", "foundation", "team", "staff", "mod", "moderator", "system",
+#             "postmaster", "noreply"]
+# reserved_contains = ["official", "support", "jig"]   # anywhere in the alias
+# reserved_affixes = ["admin", "staff"]                # at either end
+#
+# # These DIDs may register exactly these aliases, even when the suffix is
+# # closed and regardless of length and reserved names. Removing an entry does
+# # not affect a name already registered.
+# [[v0_0_2.nameserver.alias_suffixes.registration_allow]]
+# did = "did:jig:z..."
+# aliases = ["alice"]
 
 [v0_0_2.server]
 # Ed25519 key that signs alias attestations. Left at the jig-server default
@@ -1641,47 +1500,139 @@ federation_enabled = true
 
     // --- [v0_0_2] alias-API section ----------------------------------------
 
+    fn from_doc(doc: &str) -> Result<NameServerConfig> {
+        let value: TomlValue = toml::from_str(doc).expect("valid TOML");
+        NameServerConfig::from_table(value.as_table().unwrap().clone(), None)
+    }
+
+    /// Each removed section and key fails to load, naming itself and the fix.
     #[test]
-    fn default_config_validates() {
-        NameServerConfig::from_env()
-            .validate()
-            .expect("defaults need no secret");
+    fn removed_sections_and_keys_are_named_errors() {
+        for (path, _) in REMOVED_KEYS {
+            let doc = match path.split_once('.') {
+                None => format!("[{path}]\nenabled = true\n"),
+                Some((section, key)) => format!("[{section}]\n{key} = \"x\"\n"),
+            };
+            let err = from_doc(&doc).expect_err(path).to_string();
+            assert!(err.contains(path), "{path}: {err}");
+            assert!(err.contains("Delete it"), "{path}: {err}");
+        }
+    }
+
+    /// Every config struct denies unknown fields: a typo fails to load and
+    /// serde's error names the key.
+    #[test]
+    fn an_unknown_key_in_any_section_is_an_error_naming_it() {
+        for (section, key) in [
+            ("network", "bnid"),
+            ("storage", "databse_path"),
+            ("alias_rate_limits", "per_ip"),
+            ("penalties", "decay"),
+            ("anonymous", "enable"),
+            ("admin", "tokn"),
+            ("automation", "alpha"),
+            ("reputation", "default"),
+            ("useful_work", "queue"),
+            ("capabilities", "versoin"),
+            ("analytics", "enable"),
+        ] {
+            let err = from_doc(&format!("[{section}]\n{key} = 1\n"))
+                .expect_err(section)
+                .to_string();
+            assert!(err.contains(key), "[{section}] {key}: {err}");
+        }
+        let err = from_doc("lisen = 1\n").expect_err("root").to_string();
+        assert!(err.contains("lisen"), "{err}");
     }
 
     #[test]
-    fn retired_sections_are_ignored() {
-        // Configs written before `[pow]` and `[rate_limits]` were removed must
-        // keep loading.
-        let doc = r#"
-[pow]
-server_secret = "old"
-base_difficulty = 18
-
-[rate_limits]
-per_key_per_min = 60
-per_ip_per_min = 120
-"#;
-        let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
-        cfg.validate().expect("valid");
+    fn the_template_and_examples_parse_strictly() {
+        from_doc(TEMPLATE).expect("template");
+        for example in [
+            include_str!("../examples/config/profile_federated.toml"),
+            include_str!("../examples/config/profile_potato.toml"),
+        ] {
+            let value: TomlValue = toml::from_str(example).expect("valid TOML");
+            let ns = value["nameserver"]
+                .as_table()
+                .expect("[nameserver]")
+                .clone();
+            NameServerConfig::from_table(ns, None).expect("example parses");
+        }
     }
 
     #[test]
-    fn v0_0_2_alias_suffix_defaults_to_gigue_jig() {
+    fn removed_env_vars_are_reported_by_name_and_prefix() {
+        let env = [
+            "JIG_NS_SECRET",
+            "JIG_NS_POW_DIFFICULTY",
+            "JIG_NS_HOT_BACKEND",
+            "JIG_NS_FEDERATION_ENABLED",
+            "JIG_NS_BIND",
+            "JIG_NS_POWER",
+            "HOME",
+        ]
+        .map(String::from);
+        let found: Vec<String> = removed_env_vars_in(env.into_iter())
+            .into_iter()
+            .map(|(var, _)| var)
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "JIG_NS_FEDERATION_ENABLED",
+                "JIG_NS_HOT_BACKEND",
+                "JIG_NS_POW_DIFFICULTY",
+                "JIG_NS_SECRET"
+            ],
+            "live variables and near-miss names are not reported"
+        );
+    }
+
+    #[test]
+    fn v0_0_2_has_no_default_suffix() {
         let cfg = NameServerConfig::from_env();
-        assert_eq!(cfg.v0_0_2.nameserver.alias_suffix, "gigue.jig");
+        assert!(cfg.v0_0_2.nameserver.alias_suffixes.is_empty());
+        let err = cfg.validate().expect_err("no suffix, no start");
+        assert!(
+            err.to_string().contains("alias_suffixes is required"),
+            "{err}"
+        );
     }
 
     #[test]
-    fn v0_0_2_alias_suffix_is_operator_settable() {
+    fn the_template_names_no_suffix_and_so_does_not_start_unedited() {
+        let cfg: NameServerConfig = toml::from_str(TEMPLATE).expect("template parses");
+        let err = cfg.validate().expect_err("the operator must name a suffix");
+        assert!(
+            err.to_string().contains("alias_suffixes is required"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn v0_0_2_alias_suffixes_are_operator_settable() {
         let doc = r#"
-[v0_0_2.nameserver]
-alias_suffix = "dj.jig"
+[[v0_0_2.nameserver.alias_suffixes]]
+suffix = "names.example.org"
+
+[[v0_0_2.nameserver.alias_suffixes]]
+suffix = "jig"
+single_label_authority = true
+registration = "closed"
 
 [v0_0_2.server]
 server_did_keyfile = "/var/lib/jig-ns/ns.key"
 "#;
         let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
-        assert_eq!(cfg.v0_0_2.nameserver.alias_suffix, "dj.jig");
+        let suffixes: Vec<&str> = cfg
+            .v0_0_2
+            .nameserver
+            .alias_suffixes
+            .iter()
+            .map(|s| s.suffix.as_str())
+            .collect();
+        assert_eq!(suffixes, ["names.example.org", "jig"]);
         assert_eq!(
             cfg.v0_0_2.server.server_did_keyfile,
             "/var/lib/jig-ns/ns.key"
@@ -1689,14 +1640,41 @@ server_did_keyfile = "/var/lib/jig-ns/ns.key"
         cfg.validate().expect("valid");
     }
 
+    /// The deploy's nameserver config loads through `JIG_NS_CONFIG`'s path.
     #[test]
-    fn validate_rejects_a_malformed_alias_suffix() {
+    fn the_deploy_example_config_loads() {
+        let dir = std::env::temp_dir().join(format!("jig-ns-deploy-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("jig-nameserver.toml");
+        std::fs::write(
+            &path,
+            include_str!("../../../deploy/jig-nameserver.example.toml"),
+        )
+        .unwrap();
+        let cfg = NameServerConfig::load_from_path(&path).expect("loads and validates");
+        assert_eq!(
+            cfg.v0_0_2.nameserver.alias_suffixes[0].suffix,
+            "names.example.org"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_rejects_a_malformed_suffix_and_the_old_key() {
         let doc = r#"
-[v0_0_2.nameserver]
-alias_suffix = "dj@dj.jig"
+[[v0_0_2.nameserver.alias_suffixes]]
+suffix = "dj@dj.example"
 "#;
         let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
         let err = cfg.validate().expect_err("'@' in a suffix must be caught");
-        assert!(err.to_string().contains("alias_suffix"));
+        assert!(err.to_string().contains("'@'"), "{err}");
+
+        let doc = r#"
+[v0_0_2.nameserver]
+alias_suffix = "dj.jig"
+"#;
+        let cfg: NameServerConfig = toml::from_str(doc).expect("parses");
+        let err = cfg.validate().expect_err("old key");
+        assert!(err.to_string().contains("alias_suffixes"), "{err}");
     }
 }

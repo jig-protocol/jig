@@ -303,8 +303,14 @@ pub(crate) async fn create_with(
     }
 }
 
-/// Resolve a DID or a `[contacts]` name to a canonical DID.
-pub(crate) fn resolve_who(ctx: &CliContext, who: &str) -> Result<String> {
+/// Resolve who a command is about to a canonical DID, in order:
+/// 1. a `did:jig:` DID;
+/// 2. a `[contacts]` name;
+/// 3. an `alias@suffix`, verified against the suffix's authority and held to
+///    this device's name pin (JEP-0004). A new name is pinned and the DID and
+///    the nameserver that vouched for it are printed; a name whose DID
+///    changed is refused. There is no fallback to an unverified answer.
+pub(crate) async fn resolve_who(ctx: &CliContext, who: &str) -> Result<String> {
     let who = who.trim();
     if who.starts_with("did:jig:") {
         return canonical_did(who);
@@ -319,10 +325,40 @@ pub(crate) fn resolve_who(ctx: &CliContext, who: &str) -> Result<String> {
     match matches.as_slice() {
         // A hand-edited `[contacts]` entry may spell the DID differently;
         // everything downstream (DM slugs, membership) compares canonical ones.
-        [did] => canonical_did(did).with_context(|| format!("the `[contacts]` entry for `{who}`")),
-        [] => anyhow::bail!("`{who}` is neither a did:jig nor a name in [contacts]; pass the DID"),
+        [did] => {
+            return canonical_did(did)
+                .with_context(|| format!("the `[contacts]` entry for `{who}`"));
+        }
+        [] => {}
         _ => anyhow::bail!("more than one contact is called `{who}`; pass the DID"),
     }
+    if !who.contains('@') {
+        anyhow::bail!(
+            "`{who}` is not a did:jig, a name in [contacts] or an alias@suffix; pass the DID"
+        );
+    }
+    let name = jig_core::naming::Name::parse(who)
+        .with_context(|| format!("`{who}` is not a valid alias@suffix"))?;
+    let delegations = crate::config::delegations(ctx.effective());
+    // On a changed DID, verify_name's error already names both DIDs and the
+    // `jig trust accept-name` command; this adds only that nothing went out.
+    let verified = crate::cmd::trust::verify_name(&name.as_alias(), &delegations)
+        .await
+        .with_context(|| format!("nothing was sent to {}", name.as_alias()))?;
+    let binding = match verified {
+        jig_client::naming::Verified::New(binding) => {
+            eprintln!(
+                "{} is {} (vouched for by {}); pinned on first use",
+                name.as_alias(),
+                binding.did(),
+                binding.attestation.ns_did
+            );
+            binding
+        }
+        jig_client::naming::Verified::Pinned(binding)
+        | jig_client::naming::Verified::Rotated { binding, .. } => binding,
+    };
+    canonical_did(binding.did())
 }
 
 /// The canonical spelling of a key-derived `did:jig`: the one the server
@@ -351,7 +387,7 @@ async fn visible_channel(secure: &Secure, slug: &str) -> Result<ChannelInfo> {
 /// this fetches one of the member's key packages and commits their addition;
 /// the welcome rides the same block.
 pub async fn add(ctx: &CliContext, slug: String, who: String) -> Result<()> {
-    let did = resolve_who(ctx, &who)?;
+    let did = resolve_who(ctx, &who).await?;
     let secure = Secure::open(ctx)?;
     let info = visible_channel(&secure, &slug).await?;
     let id = secure.identity();
@@ -385,7 +421,7 @@ pub async fn add(ctx: &CliContext, slug: String, who: String) -> Result<()> {
 
 /// Apply `jig channel kick <slug> <who>`. Owner only.
 pub async fn kick(ctx: &CliContext, slug: String, who: String) -> Result<()> {
-    let did = resolve_who(ctx, &who)?;
+    let did = resolve_who(ctx, &who).await?;
     let secure = Secure::open(ctx)?;
     let info = visible_channel(&secure, &slug).await?;
     let id = secure.identity();
