@@ -257,6 +257,10 @@ pub struct WasmEngine {
 /// [`WasmEngine::new`] builds on it for core modules and `crate::component` for `jig:block`
 /// components, which adds only the component model. One source keeps the two engines from
 /// drifting apart on fuel, NaN canonicalization, the feature allowlist, stack and allocation.
+/// The wasm stack limit, in bytes, of every engine this crate builds. A receipt states it among
+/// the run's limits.
+pub const MAX_WASM_STACK: usize = 512 * 1024;
+
 pub(crate) fn deterministic_config(config: &RuntimeConfig) -> Result<Config> {
     let mut wasm_config = Config::new();
 
@@ -300,7 +304,7 @@ pub(crate) fn deterministic_config(config: &RuntimeConfig) -> Result<Config> {
     // that thread. At 2 MiB it equalled a spawned thread's whole stack (Rust's and tokio's
     // default), so unbounded recursion overran the thread's guard page and aborted the
     // process instead of trapping.
-    wasm_config.max_wasm_stack(512 * 1024);
+    wasm_config.max_wasm_stack(MAX_WASM_STACK);
 
     // Pooling allocator keeps allocation behaviour predictable.
     //
