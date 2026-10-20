@@ -110,7 +110,12 @@ pub async fn connect_pinned(server: &str, identity: Identity) -> Result<Client> 
     let mut pins = Pins::load(&Pins::default_path())?;
     let pinned = pins.offer(server).pinned_server_did;
     let tls = crate::cmd::trust::server_tls(server).await?;
-    let client = Client::connect_with_tls(server, identity, pins.offer(server), tls)
+    let options = jig_client::connection::ConnectOptions {
+        offer: pins.offer(server),
+        tls,
+        on_contradiction: Some(crate::cmd::trust::evidence_hook(server)),
+    };
+    let client = Client::connect_with_options(server, identity, options)
         .await
         .map_err(|e| match (e, pinned) {
             (ClientError::HandshakeFailed { reason, .. }, Some(did)) => anyhow::anyhow!(
