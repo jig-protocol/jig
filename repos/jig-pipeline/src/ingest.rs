@@ -654,13 +654,21 @@ pub async fn ingest(
 
     let (receipt_bytes, render_hash, is_synthetic) = match (&mls_plan, kind) {
         // Ciphertext cannot be executed, and the server does not pretend to.
-        (crate::mls_gate::MlsPlan::Sealed, _) => {
-            build_sealed_receipt(&block_cid, &ctx.server_did, &ctx.server_key)
-        }
+        (crate::mls_gate::MlsPlan::Sealed, _) => (
+            crate::receipts::sealed(&block_cid, &ctx.server_key)
+                .map_err(|e| anyhow::anyhow!("signing the sealed receipt: {e}"))?,
+            None,
+            true,
+        ),
         (_, BlockKind::TextRender) => {
             build_render_receipt(ctx, &manifest, &block_cid, kind_str).await?
         }
-        _ => build_synth_receipt(&block_cid, &ctx.server_did, &ctx.server_key),
+        _ => (
+            crate::receipts::accepted(&block_cid, &ctx.server_key)
+                .map_err(|e| anyhow::anyhow!("signing the accepted receipt: {e}"))?,
+            None,
+            true,
+        ),
     };
 
     let canonical = bundle_canonical_bytes(bundle.manifest_bytes, bundle.code_bytes)
@@ -1474,71 +1482,6 @@ async fn build_render_receipt(
     Ok((bytes, Some(rendered.output.render_hash), false))
 }
 
-/// Build a server-signed synthetic receipt for blocks that lack a Wasm artifact.
-///
-/// The receipt carries the server DID and a signature over a small JSON
-/// payload so clients can verify the server received and persisted the block.
-/// Phase D replaces this for `TextRender` once text-render.wasm is loaded.
-fn build_synth_receipt(
-    block_cid: &str,
-    server_did: &Did,
-    server_key: &ed25519_dalek::SigningKey,
-) -> (Vec<u8>, Option<String>, bool) {
-    use ed25519_dalek::Signer;
-
-    let canonical = serde_json::to_vec(&serde_json::json!({
-        "v": "0.2-synthetic",
-        "block_cid": block_cid,
-        "server_did": server_did.to_string(),
-        "synthetic": true,
-        "produced_at": chrono::Utc::now().timestamp(),
-    }))
-    .expect("synthetic receipt JSON is always valid");
-
-    let sig = server_key.sign(&canonical);
-
-    let wrapped = serde_json::json!({
-        "canonical_hex": hex::encode(&canonical),
-        "sig_hex": hex::encode(sig.to_bytes()),
-    });
-    let bytes = serde_json::to_vec(&wrapped).expect("synthetic receipt wrap is always valid");
-
-    // render_hash is None for synthetic receipts (no Wasm execution output).
-    (bytes, None, true)
-}
-
-/// Build a server-signed receipt for encrypted content.
-///
-/// Attests what the server actually checked — the author's signature, that
-/// the payload is an MLS application message for the channel's group at a
-/// current epoch, and that the block was persisted — and says plainly that
-/// nothing was executed. No `render_hash`: the server never saw the text.
-fn build_sealed_receipt(
-    block_cid: &str,
-    server_did: &Did,
-    server_key: &ed25519_dalek::SigningKey,
-) -> (Vec<u8>, Option<String>, bool) {
-    use ed25519_dalek::Signer;
-
-    let canonical = serde_json::to_vec(&serde_json::json!({
-        "v": "0.3-sealed",
-        "block_cid": block_cid,
-        "server_did": server_did.to_string(),
-        "synthetic": true,
-        "content": "sealed",
-        "suite": "mls",
-        "produced_at": chrono::Utc::now().timestamp(),
-    }))
-    .expect("sealed receipt JSON is always valid");
-    let sig = server_key.sign(&canonical);
-    let wrapped = serde_json::json!({
-        "canonical_hex": hex::encode(&canonical),
-        "sig_hex": hex::encode(sig.to_bytes()),
-    });
-    let bytes = serde_json::to_vec(&wrapped).expect("sealed receipt wrap is always valid");
-    (bytes, None, true)
-}
-
 // ---- Tests ----------------------------------------------------------------
 
 #[cfg(test)]
@@ -2143,7 +2086,12 @@ mod tests {
         );
         let receipt = ctx.store.get_receipts_for_block(&cid).unwrap().remove(0);
         assert_eq!(receipt.render_hash, None, "nothing was executed");
-        assert!(String::from_utf8_lossy(&receipt.receipt_bytes).contains(&hex::encode("sealed")));
+        let crate::receipts::ReadReceipt::V03(read) =
+            crate::receipts::read(&receipt.receipt_bytes).expect("the sealed receipt verifies")
+        else {
+            panic!("a new receipt is v0.3");
+        };
+        assert_eq!(read.receipt.body, jig_core::block_receipt::Body::Sealed);
         // Bob reads what the server cannot.
         let (_, bundle_msg) = (stored, msg);
         assert_eq!(
