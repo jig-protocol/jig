@@ -95,7 +95,7 @@ This is the encoding layer jig uses for every new signed object (reference imple
    | `requests` | map | JEP-0007 §1 capability names to typed scopes. |
    | `children` | array of CID | Pinned child program CIDs (JEP-0007 §7). |
    | `offers` | map | Child program CID to grant (JEP-0007 §7). |
-   | `limits` | map | `memory_max_pages`, `fuel_max`: what the author tested with. |
+   | `limits` | map | `memory_max_pages`, `fuel_max`: ceilings on every run of the program (§3.2). |
    | `examples` | array | Vectors: `{invocation, outcome, hash}` per JEP-0006. |
    | `supersedes` | CID, optional | An earlier program CID by the same author. |
    | `source` | map, optional | Unverified claim: `repo`, `commit`, `lock_hash`, `rustc`. |
@@ -127,6 +127,15 @@ This is the encoding layer jig uses for every new signed object (reference imple
      issues an `exec` receipt carrying `component`, `program` and `operator_policy_cid`
      (the `operator-policy` that authorised the run). Otherwise it issues
      `accepted`.
+   - **Effective limits.** An executor runs a program under its effective limits: for each of
+     `memory_max_pages` and `fuel_max`, the smaller of the manifest's `limits` and the
+     executor's own configured limit (for a server, the operator's `[execution]` limits). The
+     `exec` receipt carries them as `limits`, a map with the same two keys.
+   - If the effective `memory_max_pages` is below the largest memory maximum the component
+     declares (JEP-0006, "Determinism profile"), the executor MUST NOT run it, and issues `accepted`. Otherwise the
+     result of `memory.grow` would depend on the executor's configuration, and executors could
+     diverge on an `ok` outcome. Running out of fuel is `incomplete` (JEP-0006), so a lower
+     `fuel_max` needs no such rule.
    - Operator policy allowing an author MUST NOT extend to children by other authors.
    - A server MUST NOT execute a `render` in a channel whose suite is not `none`.
 3. **`program-yank`**, signed by a program's author, names a program CID and a reason. It is
