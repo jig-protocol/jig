@@ -556,6 +556,17 @@ impl TestNameserver {
         alias_suffix: &str,
         pow: jig_config::v0_0_2_server::PowPolicy,
     ) -> Result<Self> {
+        let mut suffix = jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix);
+        suffix.pow = pow;
+        Self::start_with_suffix_config(suffix).await
+    }
+
+    /// A nameserver serving one suffix with every policy `suffix` sets:
+    /// registration, allowlist, proof-of-work and pool.
+    pub async fn start_with_suffix_config(
+        suffix: jig_config::v0_0_2_server::SuffixConfig,
+    ) -> Result<Self> {
+        let alias_suffix = suffix.suffix.clone();
         let tempdir = tempfile::tempdir().context("tempdir")?;
 
         let mut config = base_config()?;
@@ -565,8 +576,6 @@ impl TestNameserver {
             .to_string_lossy()
             .into_owned();
         config.server.listen = "127.0.0.1:0".to_string();
-        let mut suffix = jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix);
-        suffix.pow = pow;
         config.nameserver.alias_suffixes = vec![suffix];
         // Tests enumerate registered aliases; production leaves this off.
         config.debug.list_handles = true;
@@ -597,7 +606,7 @@ impl TestNameserver {
         Ok(Self {
             bound_addr,
             state,
-            alias_suffix: alias_suffix.to_string(),
+            alias_suffix,
             _tempdir: tempdir,
             _handle: handle,
         })
@@ -618,6 +627,23 @@ impl TestNameserver {
     /// Register an alias for `key`'s DID with an action-bound proof of
     /// control (JEP-0004 rule 10).
     pub async fn register_with_key(
+        &self,
+        alias_local: &str,
+        key: &ed25519_dalek::SigningKey,
+    ) -> Result<serde_json::Value> {
+        let body = self.prepare_registration(alias_local, key).await?;
+        let attempt = self.submit_registration(&body).await?;
+        if !attempt.status.is_success() {
+            anyhow::bail!("register failed: {} body={}", attempt.status, attempt.body);
+        }
+        Ok(attempt.body)
+    }
+
+    /// Everything `POST /v1/register` takes for `alias_local` and `key`:
+    /// the challenge, the proof of control and the work its offer asks.
+    /// Nothing is sent to `/v1/register`, so a test can solve many and then
+    /// send them at once.
+    pub async fn prepare_registration(
         &self,
         alias_local: &str,
         key: &ed25519_dalek::SigningKey,
@@ -687,27 +713,47 @@ impl TestNameserver {
             }
         };
 
-        // 4. Register
-        let body = serde_json::json!({
+        Ok(serde_json::json!({
             "did": did,
             "requested_alias": alias_local,
             "proof_of_control": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(proof),
             "challenge": challenge,
             "pow": pow,
-        });
-        let resp = client
+        }))
+    }
+
+    /// Send a body from [`Self::prepare_registration`] to `/v1/register`
+    /// and return the answer, whatever its status.
+    pub async fn submit_registration(&self, body: &serde_json::Value) -> Result<RegisterAttempt> {
+        let resp = reqwest::Client::new()
             .post(format!("{}/v1/register", self.http_url()))
-            .json(&body)
+            .json(body)
             .send()
             .await
             .context("POST /v1/register")?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("register failed: {status} body={body}");
-        }
-        Ok(resp.json().await?)
+        let status = resp.status();
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok());
+        let text = resp.text().await.unwrap_or_default();
+        let body = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text));
+        Ok(RegisterAttempt {
+            status,
+            retry_after,
+            body,
+        })
     }
+}
+
+/// What `POST /v1/register` answered.
+#[derive(Debug)]
+pub struct RegisterAttempt {
+    pub status: reqwest::StatusCode,
+    /// The `Retry-After` header, in seconds.
+    pub retry_after: Option<u64>,
+    pub body: serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------
