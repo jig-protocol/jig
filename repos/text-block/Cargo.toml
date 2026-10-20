@@ -19,7 +19,7 @@ unicode-normalization = "0.1"
 blake3 = { workspace = true }
 # Guest bindings for the `jig:block` renderer world, used only by the component build
 # (`--features component`, see build-artifact.sh). 0.51 is the version already in the lockfile.
-wit-bindgen = { version = "0.51", optional = true }
+wit-bindgen = { version = "0.57", optional = true }
 
 [features]
 # Build the `jig:block/renderer@0.1.0` component (JEP-0006) instead of the byte-payload module.
