@@ -581,7 +581,11 @@ async fn a_forged_attestation_from_the_server_is_refused() {
         .verify(&NameResolver::new(), &only_server, &alice_name())
         .await
         .unwrap_err();
-    assert!(matches!(err, ResolveError::Refused(_)), "{err:?}");
+    // Refused for its signature, not for anything about how it was fetched.
+    assert!(
+        matches!(err, ResolveError::Refused(NamingError::BadSignature(_))),
+        "{err:?}"
+    );
     assert_eq!(bob.pinned(&alice_name()), None, "nothing pinned");
 
     let both = delegation(&[&ns], &[lying_server, ns.http_url()]);
