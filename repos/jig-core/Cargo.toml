@@ -43,6 +43,10 @@ wat = "1.0"
 # release wasmtime 49 already pulls in, so it adds no new crates to the lockfile.
 wit-parser = "0.258"
 
+[[bench]]
+name = "pow"
+harness = false
+
 [features]
 default = []
 ed25519 = ["ed25519-dalek", "rand", "zeroize"]

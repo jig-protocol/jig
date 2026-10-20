@@ -11,45 +11,17 @@ The Jig nameserver anchors decentralized identity, reputation, and tribunal gove
 
 ## Configuration
 
-Nameserver configuration is driven by the shared `jig-config` profile system:
+The nameserver reads one config file, named by `--config <path>` or else `JIG_NS_CONFIG`. There is no default path: with neither set it refuses to start. It no longer reads `JIG_CONFIG`, `~/.jig/config.toml` or `./config/jig-nameserver/jig-config.toml`. Environment variables (`JIG_NS_BIND`, `JIG_NS_PORT`, `JIG_NS_DB_PATH`, …) override the file. The file must name the suffixes it serves; see `deploy/jig-nameserver.example.toml` and `OPERATOR_GUIDE.md`.
 
-1. We read `JIG_NS_CONFIG` first (explicit path).
-2. Otherwise we look for `nameserver` sections in the global `jig-config.toml` (honoring profiles + overrides).
-3. Environment variables always win last (`JIG_NS_DB_PATH`, `JIG_NS_POW_DIFFICULTY`, etc.).
-
-Key sections in `jig-config.toml`:
+A minimal file:
 
 ```toml
-[nameserver]
-profile = "high-sec"
+[network]
+bind = "127.0.0.1"
+port = 7070
 
-[nameserver.network]
-bind = "0.0.0.0"
-port = 8070
-
-[nameserver.reputation]
-default_ruleset = "high-sec"
-
-[[nameserver.reputation.local_rulesets]]
-key = "high-sec"
-description = "Baseline high security contract"
-authority = "did:jig:central"
-weight = 1.0
-
-[nameserver.reputation.local_rulesets.pow_policy]
-min_bits = 14
-max_bits = 28
-multiplier = 1.0
-
-[nameserver.reputation.translation_contracts]
-# Translate partner QA scores into our high-sec range
-from = "partner-qa"
-to = "high-sec"
-weight = 0.6
-[nameserver.reputation.translation_contracts.transform]
-type = "linear"
-slope = 0.5
-intercept = 0.0
+[[v0_0_2.nameserver.alias_suffixes]]
+suffix = "names.example.org"
 ```
 
 For more examples, see [`examples/config`](examples/config/).
@@ -337,11 +309,7 @@ This lightweight, TOML-first approach keeps dependencies minimal while enabling 
 ## Running Locally
 
 ```bash
-# With default in-memory storage
-cargo run -p jig-nameserver
-
-# Using a specific config profile
-JIG_CONFIG=./examples/config/profile_potato.toml cargo run -p jig-nameserver
+cargo run -p jig-nameserver -- --config ./my-nameserver.toml serve
 ```
 
 ## Tests

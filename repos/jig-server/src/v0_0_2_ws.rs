@@ -307,10 +307,28 @@ async fn handle_socket(
         ..ConnState::default()
     };
 
+    let mut peer_rx: Option<mpsc::Receiver<Envelope>> = None;
     loop {
         // A dialer that named a peer DID has until here to prove it.
         let proof_deadline = session.awaiting_peer.as_ref().map(|p| p.deadline);
+        if peer_rx.is_none() {
+            peer_rx = session.peer_rx.take();
+        }
         tokio::select! {
+            // --- Peer frames this server sends unprompted → Peer ---
+            Some(env) = async {
+                match peer_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Ok(json) = serde_json::to_string(&env) else {
+                    continue;
+                };
+                if socket.send(Message::Text(json.into())).await.is_err() {
+                    break;
+                }
+            }
             () = async {
                 match proof_deadline {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -422,6 +440,9 @@ async fn handle_socket(
         state.ingest_ctx.fanout.unsubscribe_local(id).await;
         metrics::subscriber_removed();
     }
+    if let Some(registration) = session.peer_registration.take() {
+        state.peers.unregister(registration);
+    }
     metrics::connection_closed();
     tracing::debug!(conn_id, "ws connection closed");
 }
@@ -448,6 +469,12 @@ struct ConnState {
     /// Authenticated, not authorized: what it may do is the federation
     /// rules' decision.
     peer: Option<jig_core::did::Did>,
+    /// Once the peer is proven: sends to it unprompted
+    /// ([`crate::v0_0_2_peer`]), registered in `AppState::peers`.
+    peer_sender: Option<crate::v0_0_2_peer::PeerSender>,
+    /// The other end of `peer_sender`, for the connection loop to take.
+    peer_rx: Option<mpsc::Receiver<Envelope>>,
+    peer_registration: Option<crate::v0_0_2_peer::Registration>,
 }
 
 /// A handshake that ends with the dialer's [`Frame::PeerProof`].
@@ -599,6 +626,12 @@ async fn handle_client_frame(
         ) {
             Ok(()) => {
                 session.peer = jig_core::did::Did::from_did_jig_string(&awaiting.peer_did).ok();
+                if let Some(peer) = session.peer.clone() {
+                    let (sender, rx) = crate::v0_0_2_peer::PeerSender::new(peer);
+                    session.peer_registration = Some(state.peers.register(sender.clone()));
+                    session.peer_sender = Some(sender);
+                    session.peer_rx = Some(rx);
+                }
                 tracing::debug!(conn_id, peer = %awaiting.peer_did, "peer proved its DID");
                 Ok(())
             }
@@ -904,6 +937,30 @@ async fn handle_client_frame(
                         crate::v0_0_2_ingest_error::classify_ingest_error(&e);
                     let _ = send_error(socket, Some(status.as_u16()), code, None, &message).await;
                 }
+            }
+            Ok(())
+        }
+
+        // ------------------------------------------------------------------ Peer
+        // Only between proven peers; F's federation contract handles them.
+        Frame::Peer { kind, body } => {
+            let Some(sender) = session.peer_sender.clone() else {
+                let _ = send_error(
+                    socket,
+                    Some(400),
+                    jig_pipeline::handshake::PROTOCOL_VIOLATION_CODE,
+                    None,
+                    "peer frames are for a server that proved its DID in the handshake",
+                )
+                .await;
+                session.close = Some((close::PROTOCOL_VIOLATION, "peer frame from no peer"));
+                return Ok(());
+            };
+            if let Err(reason) =
+                crate::v0_0_2_peer::dispatch(state.peer_frame_handler(), &sender, &kind, &body)
+            {
+                tracing::info!(conn_id, code = reason.code, reason = %reason.reason, kind, "peer connection closed by its handler");
+                session.close = Some((reason.code, "closed by the federation contract"));
             }
             Ok(())
         }
@@ -2058,6 +2115,319 @@ mod tests {
         ws.send(send(proof)).await.unwrap();
         let _error = next_frame(&mut ws).await;
         assert_eq!(close_code(&mut ws).await, Some(close::PROTOCOL_VIOLATION));
+    }
+
+    /// Frames between proven peers reach the registered handler with the DID
+    /// the handshake proved; it answers on the same connection, the server
+    /// pushes on it unprompted, and a handler's refusal closes it. Nobody
+    /// unproven gets that far.
+    #[tokio::test]
+    async fn peer_frames_flow_both_ways_between_proven_peers_only() {
+        struct Echo(std::sync::Mutex<Vec<(String, String, Vec<u8>)>>);
+        impl crate::v0_0_2_peer::PeerFrames for Echo {
+            fn on_peer_frame(
+                &self,
+                peer: &jig_core::did::Did,
+                kind: &str,
+                body: &[u8],
+                out: &crate::v0_0_2_peer::PeerSender,
+            ) -> Result<(), crate::v0_0_2_peer::CloseReason> {
+                self.0.lock().unwrap().push((
+                    peer.to_did_jig_string(),
+                    kind.to_string(),
+                    body.to_vec(),
+                ));
+                if kind == "contract-end" {
+                    return Err(crate::v0_0_2_peer::CloseReason {
+                        code: 4010,
+                        reason: "ended".into(),
+                    });
+                }
+                out.send("contract-answer", body.to_vec()).unwrap();
+                Ok(())
+            }
+        }
+        let (state, url) = start_test_server().await;
+        let echo = Arc::new(Echo(Default::default()));
+        assert!(state.set_peer_frames(echo.clone()));
+
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let peer_did =
+            jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        crate::v0_0_2_federation::complete_peer_handshake(
+            &mut ws,
+            &state.server_did.to_did_jig_string(),
+            &[],
+            &key,
+        )
+        .await
+        .unwrap();
+        let peer_frame = |kind: &str, body: &[u8]| {
+            TMessage::Text(
+                serde_json::to_string(&Envelope::new(Frame::Peer {
+                    kind: kind.into(),
+                    body: body.to_vec(),
+                }))
+                .unwrap()
+                .into(),
+            )
+        };
+
+        ws.send(peer_frame("contract-offer", b"offer"))
+            .await
+            .unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Peer { kind, body } => {
+                assert_eq!(
+                    (kind.as_str(), body.as_slice()),
+                    ("contract-answer", &b"offer"[..])
+                );
+            }
+            other => panic!("expected the handler's answer, got {other:?}"),
+        }
+        assert_eq!(
+            echo.0.lock().unwrap()[0],
+            (
+                peer_did.clone(),
+                "contract-offer".to_string(),
+                b"offer".to_vec()
+            ),
+            "the handler sees the proven DID"
+        );
+
+        // Unprompted, through the registry, whichever side dialed.
+        let peer = jig_core::did::Did::from_did_jig_string(&peer_did).unwrap();
+        state
+            .peers
+            .sender_for(&peer)
+            .expect("the proven peer is live")
+            .send("contract-offer", b"pushed".to_vec())
+            .unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Peer { body, .. } => assert_eq!(body, b"pushed"),
+            other => panic!("expected the pushed frame, got {other:?}"),
+        }
+
+        ws.send(peer_frame("contract-end", b"")).await.unwrap();
+        assert_eq!(close_code(&mut ws).await, Some(4010));
+
+        // A connection that proved no peer cannot send one.
+        let mut client = established(&url).await;
+        client
+            .send(peer_frame("contract-offer", b"x"))
+            .await
+            .unwrap();
+        let _error = next_frame(&mut client).await;
+        assert_eq!(
+            close_code(&mut client).await,
+            Some(close::PROTOCOL_VIOLATION)
+        );
+        assert_eq!(
+            echo.0.lock().unwrap().len(),
+            2,
+            "the handler saw nothing from it"
+        );
+    }
+
+    /// Records every peer frame; answers `contract-offer`, closes on
+    /// `contract-end`.
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<(String, String, Vec<u8>)>>);
+
+    impl crate::v0_0_2_peer::PeerFrames for Recorder {
+        fn on_peer_frame(
+            &self,
+            peer: &jig_core::did::Did,
+            kind: &str,
+            body: &[u8],
+            out: &crate::v0_0_2_peer::PeerSender,
+        ) -> Result<(), crate::v0_0_2_peer::CloseReason> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((peer.to_did_jig_string(), kind.into(), body.to_vec()));
+            match kind {
+                "contract-end" => Err(crate::v0_0_2_peer::CloseReason {
+                    code: 4010,
+                    reason: "ended".into(),
+                }),
+                "contract-offer" => {
+                    out.send("contract-answer", body.to_vec()).unwrap();
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        }
+    }
+
+    impl Recorder {
+        fn seen(&self) -> Vec<(String, String, Vec<u8>)> {
+            self.0.lock().unwrap().clone()
+        }
+
+        async fn wait_for(&self, n: usize) -> Vec<(String, String, Vec<u8>)> {
+            for _ in 0..300 {
+                if self.seen().len() >= n {
+                    return self.seen();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("expected {n} peer frames, saw {:?}", self.seen());
+        }
+    }
+
+    /// A server state allowed plaintext federation, with `peers`.
+    fn federating(peers: Vec<jig_config::v0_0_2_server::FederationPeer>) -> AppState {
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.federation.dangerously_allow_plaintext_federation = true;
+        config.federation.peers = peers;
+        AppState::for_test_with_config(config).unwrap()
+    }
+
+    /// The peer at `url` (a test server's WebSocket URL), expected to be
+    /// `expected_did`.
+    fn peer_at(url: &str, expected_did: String) -> jig_config::v0_0_2_server::FederationPeer {
+        jig_config::v0_0_2_server::FederationPeer {
+            url: url.trim_end_matches("/api/v1/ws").to_string(),
+            expected_did,
+            alias: None,
+        }
+    }
+
+    /// The side that dialed is held to the same rules: peer frames reach its
+    /// handler with the DID the welcome proved, both ways, and a handler's
+    /// close ends the connection.
+    #[tokio::test]
+    async fn peer_frames_reach_the_dialing_side_too() {
+        let dialing = Arc::new(federating(vec![]));
+        // The dialed side lists the dialer as a peer, so it takes its
+        // federation subscription.
+        let dialed = federating(vec![peer_at(
+            "ws://127.0.0.1:1",
+            dialing.server_did.to_did_jig_string(),
+        )]);
+        let (dialed, url) = start_test_server_with(dialed).await;
+        let dialed_seen = Arc::new(Recorder::default());
+        assert!(dialed.set_peer_frames(dialed_seen.clone()));
+        let peer = peer_at(&url, dialed.server_did.to_did_jig_string());
+        let dialing_seen = Arc::new(Recorder::default());
+        assert!(dialing.set_peer_frames(dialing_seen.clone()));
+        let relay = tokio::spawn({
+            let dialing = dialing.clone();
+            async move { crate::v0_0_2_federation::connect_and_relay(&dialing, &peer).await }
+        });
+
+        let mut to_dialing = None;
+        for _ in 0..300 {
+            to_dialing = dialed.peers.sender_for(&dialing.server_did);
+            if to_dialing.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let to_dialing = to_dialing.expect("the dialing server proved its DID");
+
+        // From the dialed side to the dialer's handler, which answers.
+        to_dialing
+            .send("contract-offer", b"from-dialed".to_vec())
+            .unwrap();
+        let (dialed_did, dialing_did) = (
+            dialed.server_did.to_did_jig_string(),
+            dialing.server_did.to_did_jig_string(),
+        );
+        assert_eq!(
+            dialing_seen.wait_for(1).await[0],
+            (
+                dialed_did.clone(),
+                "contract-offer".into(),
+                b"from-dialed".to_vec()
+            ),
+            "the dialer's handler sees the DID the welcome proved"
+        );
+        assert_eq!(
+            dialed_seen.wait_for(1).await[0],
+            (
+                dialing_did.clone(),
+                "contract-answer".into(),
+                b"from-dialed".to_vec()
+            )
+        );
+
+        // Unprompted from the dialer, through its own registry.
+        dialing
+            .peers
+            .sender_for(&dialed.server_did)
+            .expect("the dialed peer is live on the dialer too")
+            .send("note", b"from-dialing".to_vec())
+            .unwrap();
+        assert_eq!(dialed_seen.wait_for(2).await[1].2, b"from-dialing");
+
+        // The dialer's handler closes; the connection ends as a contract close.
+        to_dialing.send("contract-end", vec![]).unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("the dialer ends the connection")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("closed by the federation contract"),
+            "{err}"
+        );
+        assert!(dialing.peers.sender_for(&dialed.server_did).is_none());
+    }
+
+    /// A peer the dialer has not proven reaches no handler: one that sends a
+    /// peer frame in place of a welcome, and one whose welcome is another
+    /// DID's than the expected one.
+    #[tokio::test]
+    async fn the_dialer_hands_nothing_from_an_unproven_peer_to_its_handler() {
+        // In place of a welcome.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/v1/ws", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _hello = ws.next().await;
+            let frame = Envelope::new(Frame::Peer {
+                kind: "contract-offer".into(),
+                body: b"early".to_vec(),
+            });
+            ws.send(TMessage::Text(
+                serde_json::to_string(&frame).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+            let _ = ws.next().await;
+        });
+        let stranger = jig_core::Did::from_ed25519_pubkey(&[7u8; 32]).to_did_jig_string();
+        let dialing = Arc::new(federating(vec![]));
+        let peer = peer_at(&url, stranger.clone());
+        let seen = Arc::new(Recorder::default());
+        assert!(dialing.set_peer_frames(seen.clone()));
+        assert!(
+            crate::v0_0_2_federation::connect_and_relay(&dialing, &peer)
+                .await
+                .is_err()
+        );
+
+        // A real server, but not the one expected.
+        let (dialed, url) = start_test_server().await;
+        let dialed_seen = Arc::new(Recorder::default());
+        assert!(dialed.set_peer_frames(dialed_seen.clone()));
+        let peer = peer_at(&url, stranger);
+        assert!(
+            crate::v0_0_2_federation::connect_and_relay(&dialing, &peer)
+                .await
+                .is_err()
+        );
+        assert!(seen.seen().is_empty(), "{:?}", seen.seen());
+        assert!(
+            dialed.peers.sender_for(&dialing.server_did).is_none(),
+            "a dialer that refused the welcome proved nothing to the dialed side"
+        );
+        assert!(dialing.peers.sender_for(&dialed.server_did).is_none());
     }
 
     /// The close code the server ends the connection with.
