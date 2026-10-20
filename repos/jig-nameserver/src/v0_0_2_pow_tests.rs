@@ -398,13 +398,18 @@ async fn the_challenge_refuses_what_register_would() {
         assert_eq!((s, c.as_deref()), refused(status, want), "{local}");
     }
 
-    // A DID that holds a name on B is refused a second at the challenge.
+    // A DID that holds a name on B is offered a challenge for a second: the
+    // refusal would name the alias it holds before any proof. Register,
+    // signed by that DID, refuses it.
     let (status, _) = register(&r, &state, &key, "alice", B).await;
     assert_eq!(status, StatusCode::OK);
-    let (s, c) = code(offer(&r, "register", &stranger, &format!("carol@{B}")).await);
+    let (s, body) = offer(&r, "register", &stranger, &format!("carol@{B}")).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert!(!body.to_string().contains("alice"), "{body}");
+    let (status, body) = register(&r, &state, &key, "carol", B).await;
     assert_eq!(
-        (s, c.as_deref()),
-        refused(StatusCode::CONFLICT, "DID_HOLDS_NAME")
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("DID_HOLDS_NAME"))
     );
     // ...and someone else is refused the name taken.
     let (_, other_key) = fresh_did_and_key();
@@ -550,6 +555,32 @@ async fn at_the_cap_new_challenges_are_refused_and_live_ones_still_work() {
         register_body(&state, &key, "alice", A, &ch, Some(&pow)),
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A registration flood fills the map only to nine tenths; renew and rotate
+/// still get challenges.
+#[tokio::test]
+async fn a_registration_flood_leaves_room_to_renew() {
+    let mut state = AppState::for_test_with_suffixes(vec![suffix(A, 16)]).unwrap();
+    state.max_pending_challenges = 10;
+    let state = Arc::new(state);
+    let r = router(&state);
+    let (did, key) = fresh_did_and_key();
+    let name = format!("alice@{A}");
+    assert_eq!(
+        register(&r, &state, &key, "alice", A).await.0,
+        StatusCode::OK
+    );
+
+    let (flooder, _) = fresh_did_and_key();
+    for i in 0..9 {
+        let (status, body) = offer(&r, "register", &flooder, &format!("name{i}@{A}")).await;
+        assert_eq!(status, StatusCode::OK, "{i}: {body}");
+    }
+    let (status, _) = offer(&r, "register", &flooder, &format!("other@{A}")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let (status, body) = offer(&r, "renew", &did, &name).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
