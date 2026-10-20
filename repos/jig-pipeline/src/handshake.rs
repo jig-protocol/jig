@@ -425,7 +425,13 @@ impl PendingHello {
                 };
             }
         };
-        interpret_envelope(&env, text, &self.nonce, &self.offer, Some(tls_exporter))
+        interpret_envelope(
+            &env,
+            text,
+            &self.nonce,
+            &self.offer,
+            Binding::Live(tls_exporter),
+        )
     }
 }
 
@@ -638,7 +644,7 @@ pub fn verify_offline(text: &str, server_did: &str) -> HandshakeResult {
         offer.suites.extend(suites.iter().cloned());
     }
     // The session it was bound to is long gone: only the signature counts.
-    interpret_envelope(&env, text, &nonce, &offer, None)
+    interpret_envelope(&env, text, &nonce, &offer, Binding::OfflineEvidence)
 }
 
 fn interpret_refusal(
@@ -715,12 +721,24 @@ fn interpret_refusal(
     })
 }
 
+/// What a welcome's `tls_exporter` is held to.
+#[derive(Debug, Clone, Copy)]
+enum Binding<'a> {
+    /// A connection being made, whose TLS exporter value (empty over
+    /// plaintext) the welcome must be bound to exactly.
+    Live(&'a [u8]),
+    /// A frame kept as evidence, whose session is long gone: only its
+    /// signature can be checked. [`verify_offline`] alone uses this; a
+    /// connection never does.
+    OfflineEvidence,
+}
+
 fn interpret_envelope(
     env: &Envelope,
     text: &str,
     nonce: &str,
     offer: &ClientOffer,
-    tls_exporter: Option<&[u8]>,
+    binding: Binding<'_>,
 ) -> HandshakeResult {
     let Frame::Welcome {
         server_did,
@@ -803,7 +821,7 @@ fn interpret_envelope(
     };
     // The welcome must be bound to this TLS session: one signed for another
     // session was relayed by whatever terminated TLS in between.
-    if let Some(tls_exporter) = tls_exporter
+    if let Binding::Live(tls_exporter) = binding
         && bound != tls_exporter
     {
         let reason = match (bound.is_empty(), tls_exporter.is_empty()) {
@@ -1266,6 +1284,33 @@ mod tests {
         assert!(matches!(
             verify_offline("{}", &did),
             HandshakeResult::FailClosed { .. }
+        ));
+
+        // A welcome bound to a TLS session: kept, its signature still checks
+        // offline, while a live connection on another session refuses it.
+        let (hello, pending) = begin(&ClientOffer::default());
+        let Frame::Hello { nonce, .. } = hello.frame else {
+            panic!("hello");
+        };
+        let bound = serde_json::to_string(&seal(
+            &key,
+            negotiate(
+                &hello_view(&nonce),
+                &ServerOffer {
+                    tls_exporter: vec![9; TLS_EXPORTER_LEN],
+                    ..offer_server()
+                },
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            verify_offline(&bound, &did),
+            HandshakeResult::Established(_)
+        ));
+        assert!(matches!(
+            pending.interpret_on(&bound, &[8; TLS_EXPORTER_LEN]),
+            HandshakeResult::FailClosed { reason, .. } if reason.contains("another TLS session")
         ));
     }
 
