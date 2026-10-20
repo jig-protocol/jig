@@ -103,7 +103,7 @@ registration_allow = [{ did = "did:jig:z…", aliases = ["dj"] }]
 [v0_0_2.nameserver.alias_suffixes.pow] # this plan, task 1
 alg = 1                                # JEP-0008 rule 8
 min_effort = 1_048_576                 # 2^20; the floor for strangers (rule 19)
-max_effort = 268_435_456               # 2^28; the cap, and the client's refusal point
+max_effort = 16_777_216                # 2^24: ~3 s at the 5.5M digests/s task 0's bench measured on one server core; headroom for phones
 max_solve_secs = 10                    # what max_effort must fit, on the slowest client meant to be served
 short_name_len = 5                     # names shorter than this pay the length multiplier
 short_name_factor = 4                  # effort × factor^(short_name_len − len)
@@ -310,8 +310,9 @@ Wire changes:
 Behaviour (rules 16 and 20):
 - The client verifies the effort's signature against the nameserver DID it learned from the
   suffix delegation (F1). It ignores an unsigned or wrongly signed effort.
-- It refuses an effort above its own cap, `2^28` by default and configurable. The message says
-  the nameserver is asking more than this client will do.
+- It refuses an effort above its own cap, `2^28` (`jig_core::pow::MAX_EFFORT`, rule 19's ceiling)
+  by default and configurable. The message says the nameserver is asking more than this client
+  will do.
 - It shows progress for solves expected to take more than 2 s, and gives an estimate up front
   from the effort and its measured rate.
 - On a 428, `POW_INSUFFICIENT` or `REGISTRATION_BUSY` it fetches a new challenge and retries
