@@ -223,10 +223,6 @@ suffix's delegation names.
    - The CLI falls back when `cli.toml` has no entry: to the suffix's DNS-rooted delegation
      for a multi-label suffix, and to the built-in `@jig` delegation for `jig`. If that
      fallback names the same nameserver, replace the entry rather than delete it.
-   - To refuse every name under the suffix instead, with no fallback, delete its entry and
-     list it in `[identity] refused_suffixes` (jig-server) or `[naming] refused_suffixes`
-     (`cli.toml`), e.g. `refused_suffixes = ["example.org"]`. A suffix that is both
-     delegated and refused is a config error.
 
    No nameserver can defederate another: each server and client decides whose attestations
    it accepts.
