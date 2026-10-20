@@ -638,8 +638,9 @@ A nameserver publishes its policy at three paths:
   `anonymous_min`) *(not served: removed in #192)*, `rate_limit` (`per_key_per_min`,
   `per_ip_per_min`, `global_per_min`) *(not served: replaced by `alias_rate_limits` in #197)*,
   `alias_rate_limits` (`enabled`, `per_ip_per_min`, `per_did_per_min`; the limits the alias
-  routes enforce), `automation` (legacy; nothing enforces it), `allow_domains`, `deny_domains`, `cache_ttl_secs`, `reputation` and
-  `public_key`.
+  routes enforce), `automation` (legacy; nothing enforces it), `reputation` and
+  `public_key`. `allow_domains`, `deny_domains` and `cache_ttl_secs` are no longer served
+  (removed with nameserver federation, #237).
 - **`GET /.well-known/jig-ns/capabilities`** (plain text): `version`, optional `domain`,
   one `work:` line per useful-work type, `tribunal:`, `transparency:` and `federation:`
   (`enabled` or `disabled`), and optional `affordance:` lines.
