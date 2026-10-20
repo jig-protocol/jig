@@ -2,8 +2,7 @@
 
 use crate::error::Result;
 use crate::types::{
-    AnomalyKind, AnomalySeverity, FederationPeer, FederationPeerStatus, GossipMessage,
-    GossipMessageKind, IdentityRecord, LocalAlias, PoWPenalty, PolicyHashExchange, PowChallenge,
+    AnomalyKind, AnomalySeverity, IdentityRecord, LocalAlias, PoWPenalty, PowChallenge,
     ReceiptAnomaly, ReputationObservation, ReputationScore, ReputationSubject,
     TransparencyLogEntry, TransparencyLogEventKind, TransparencyLogHash, TribunalCase,
     TribunalDecision, TribunalDecisionBlock, TribunalStatus, UsefulWorkAssignment,
@@ -33,14 +32,6 @@ pub trait NamesStorage: Send + Sync + 'static {
     async fn create_challenge(&self, ch: PowChallenge) -> Result<()>;
     async fn get_challenge(&self, id: Uuid) -> Result<Option<PowChallenge>>;
     async fn mark_challenge_used(&self, id: Uuid) -> Result<()>;
-
-    // Federation cache for identity records
-    async fn cache_identity(
-        &self,
-        record: IdentityRecord,
-        expires_at: chrono::DateTime<Utc>,
-    ) -> Result<()>;
-    async fn get_cached_identity(&self, handle: &str) -> Result<Option<IdentityRecord>>;
 
     // Rate limiting and penalties
     async fn rate_check_and_increment(&self, key: &str, limit_per_min: u32) -> Result<bool>;
@@ -118,40 +109,6 @@ pub trait NamesStorage: Send + Sync + 'static {
     async fn get_latest_transparency_hash(&self) -> Result<Option<TransparencyLogHash>>;
     async fn list_transparency_hashes(&self, limit: usize) -> Result<Vec<TransparencyLogHash>>;
 
-    // Federation peers and gossip
-    async fn upsert_federation_peer(&self, peer: crate::types::FederationPeer) -> Result<()>;
-    async fn get_federation_peer(
-        &self,
-        domain: &str,
-    ) -> Result<Option<crate::types::FederationPeer>>;
-    async fn list_federation_peers(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<crate::types::FederationPeer>>;
-    async fn update_peer_status(
-        &self,
-        domain: &str,
-        status: crate::types::FederationPeerStatus,
-        last_seen: chrono::DateTime<Utc>,
-    ) -> Result<()>;
-
-    async fn store_gossip_message(&self, message: crate::types::GossipMessage) -> Result<()>;
-    async fn list_gossip_messages(
-        &self,
-        kind: Option<crate::types::GossipMessageKind>,
-        limit: usize,
-    ) -> Result<Vec<crate::types::GossipMessage>>;
-
-    async fn store_policy_hash(&self, policy: crate::types::PolicyHashExchange) -> Result<()>;
-    async fn get_policy_hash(
-        &self,
-        domain: &str,
-    ) -> Result<Option<crate::types::PolicyHashExchange>>;
-    async fn list_policy_hashes(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<crate::types::PolicyHashExchange>>;
-
     // Receipt storage (Phase A)
     async fn store_receipt(&self, receipt: jig_core::BlockReceipt) -> Result<()>;
     async fn get_receipt(&self, block_id: &str) -> Result<Option<jig_core::BlockReceipt>>;
@@ -197,7 +154,6 @@ pub trait NamesStorage: Send + Sync + 'static {
 }
 
 // Type aliases to reduce complexity
-type IdentityCacheEntry = (IdentityRecord, chrono::DateTime<Utc>);
 type ReputationKey = (ReputationSubject, String, String);
 
 /// Simple in-memory storage suitable for tests and dev
@@ -206,7 +162,6 @@ pub struct MemoryStorage {
     identities: Arc<RwLock<HashMap<String, IdentityRecord>>>,
     aliases: Arc<RwLock<HashMap<String, LocalAlias>>>,
     challenges: Arc<RwLock<HashMap<Uuid, PowChallenge>>>,
-    cache: Arc<RwLock<HashMap<String, IdentityCacheEntry>>>,
     rate: Arc<RwLock<HashMap<String, (i64, u32)>>>,
     penalties: Arc<RwLock<HashMap<String, (u32, i64)>>>, // Old penalty system (legacy)
     pow_penalties: Arc<RwLock<Vec<PoWPenalty>>>,         // Phase D: New PoW penalty system
@@ -219,9 +174,6 @@ pub struct MemoryStorage {
     useful_work_results: Arc<RwLock<HashMap<Uuid, UsefulWorkResult>>>,
     transparency_log: Arc<RwLock<Vec<TransparencyLogEntry>>>,
     transparency_hashes: Arc<RwLock<Vec<TransparencyLogHash>>>,
-    federation_peers: Arc<RwLock<HashMap<String, FederationPeer>>>,
-    gossip_messages: Arc<RwLock<Vec<GossipMessage>>>,
-    policy_hashes: Arc<RwLock<HashMap<String, PolicyHashExchange>>>,
     receipts: Arc<RwLock<HashMap<String, jig_core::BlockReceipt>>>,
     attestations: Arc<RwLock<Vec<crate::types::Attestation>>>,
     anomalies: Arc<RwLock<Vec<ReceiptAnomaly>>>, // Phase D: Receipt anomalies
@@ -275,29 +227,6 @@ impl NamesStorage for MemoryStorage {
             ch.used = true;
         }
         Ok(())
-    }
-
-    async fn cache_identity(
-        &self,
-        record: IdentityRecord,
-        expires_at: chrono::DateTime<Utc>,
-    ) -> Result<()> {
-        let mut map = self.cache.write().await;
-        map.insert(record.handle.handle.clone(), (record, expires_at));
-        Ok(())
-    }
-
-    async fn get_cached_identity(&self, handle: &str) -> Result<Option<IdentityRecord>> {
-        let mut map = self.cache.write().await;
-        if let Some((rec, exp)) = map.get(handle).cloned() {
-            if exp > Utc::now() {
-                return Ok(Some(rec));
-            } else {
-                map.remove(handle);
-                return Ok(None);
-            }
-        }
-        Ok(None)
     }
 
     async fn rate_check_and_increment(&self, key: &str, limit_per_min: u32) -> Result<bool> {
@@ -639,77 +568,6 @@ impl NamesStorage for MemoryStorage {
         let len = hashes.len();
         let start = len.saturating_sub(limit);
         Ok(hashes[start..].to_vec())
-    }
-
-    // Federation peers
-    async fn upsert_federation_peer(&self, peer: FederationPeer) -> Result<()> {
-        let mut peers = self.federation_peers.write().await;
-        peers.insert(peer.domain.clone(), peer);
-        Ok(())
-    }
-
-    async fn get_federation_peer(&self, domain: &str) -> Result<Option<FederationPeer>> {
-        let peers = self.federation_peers.read().await;
-        Ok(peers.get(domain).cloned())
-    }
-
-    async fn list_federation_peers(&self, limit: usize) -> Result<Vec<FederationPeer>> {
-        let peers = self.federation_peers.read().await;
-        Ok(peers.values().take(limit).cloned().collect())
-    }
-
-    async fn update_peer_status(
-        &self,
-        domain: &str,
-        status: FederationPeerStatus,
-        last_seen: chrono::DateTime<Utc>,
-    ) -> Result<()> {
-        let mut peers = self.federation_peers.write().await;
-        if let Some(peer) = peers.get_mut(domain) {
-            peer.status = status;
-            peer.last_seen_at = last_seen;
-        }
-        Ok(())
-    }
-
-    // Gossip messages
-    async fn store_gossip_message(&self, message: GossipMessage) -> Result<()> {
-        let mut messages = self.gossip_messages.write().await;
-        messages.push(message);
-        Ok(())
-    }
-
-    async fn list_gossip_messages(
-        &self,
-        kind: Option<GossipMessageKind>,
-        limit: usize,
-    ) -> Result<Vec<GossipMessage>> {
-        let messages = self.gossip_messages.read().await;
-        let filtered: Vec<_> = messages
-            .iter()
-            .filter(|m| kind.is_none() || kind.as_ref() == Some(&m.kind))
-            .rev()
-            .take(limit)
-            .cloned()
-            .collect();
-        Ok(filtered)
-    }
-
-    // Policy hashes
-    async fn store_policy_hash(&self, policy: PolicyHashExchange) -> Result<()> {
-        let mut policies = self.policy_hashes.write().await;
-        policies.insert(policy.domain.clone(), policy);
-        Ok(())
-    }
-
-    async fn get_policy_hash(&self, domain: &str) -> Result<Option<PolicyHashExchange>> {
-        let policies = self.policy_hashes.read().await;
-        Ok(policies.get(domain).cloned())
-    }
-
-    async fn list_policy_hashes(&self, limit: usize) -> Result<Vec<PolicyHashExchange>> {
-        let policies = self.policy_hashes.read().await;
-        Ok(policies.values().take(limit).cloned().collect())
     }
 
     // Receipt storage (Phase A)

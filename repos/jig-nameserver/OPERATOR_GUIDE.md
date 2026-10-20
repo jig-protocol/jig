@@ -20,6 +20,8 @@ This guide covers what an operator configures on a v0.0.2 nameserver: the routes
 | `/v1/resolve/{alias}` | GET | look up an alias |
 | `/v1/rotate` | POST | move an alias to a new key |
 | `/v1/renew` | POST | renew an alias |
+| `/v1/suffixes` | GET | suffixes served and this nameserver's DID |
+| `/.well-known/jig-ns-delegation` | GET | signed delegation for a DNS-rooted suffix |
 | `/v1/handles` | GET | list every alias; **debug-gated** behind `[v0_0_2.debug] list_handles` |
 
 `register` and `renew` need a signature by the DID's key over the challenge; `rotate` needs signatures by both the old and the new key. `/v1/handles` enumerates every registered alias, so leave it off unless you need it. None of the routes asks for proof-of-work, and none needs a server secret.
@@ -37,7 +39,7 @@ Settings come from the config file named by `--config <path>` or else `JIG_NS_CO
 - `[network] bind` / `JIG_NS_BIND` and `[network] port` / `JIG_NS_PORT`: listen address.
 - `[network] trust_proxy` / `JIG_NS_TRUST_PROXY` and `[network] proxy_ip_header` / `JIG_NS_PROXY_IP_HEADER`: see [Behind a reverse proxy](#behind-a-reverse-proxy).
 
-Every config section denies unknown keys: a typo, or a key in the wrong section, stops the nameserver at start-up with an error naming the key. A section or key that was removed (`[pow]`, `[rate_limits]`, `[transparency]`, `[runtime]`, `[anomaly_detection]`, `[hot]`, `[federation]`, `storage.backend*`, `analytics.backend*`) fails with a message saying so; delete it. Removed environment variables, such as `JIG_NS_SECRET`, `JIG_NS_POW_*` and the federation `JIG_NS_*` variables, don't stop start-up: the nameserver logs a warning naming each one and ignores it.
+Every config section denies unknown keys: a typo, or a key in the wrong section, stops the nameserver at start-up with an error naming the key. A section or key that was removed (`[pow]`, `[rate_limits]`, `[transparency]`, `[runtime]`, `[anomaly_detection]`, `[hot]`, `[federation]`, `capabilities.federation_enabled`, `storage.backend*`, `analytics.backend*`) fails with a message saying so; delete it. Removed environment variables, such as `JIG_NS_SECRET`, `JIG_NS_POW_*` and the federation `JIG_NS_*` variables, don't stop start-up: the nameserver logs a warning naming each one and ignores it.
 
 ## Rate limits
 
