@@ -545,17 +545,28 @@ impl TestNameserver {
 
     async fn start_with(alias_suffix: &str, seed: Option<[u8; 32]>) -> Result<Self> {
         let tempdir = tempfile::tempdir().context("tempdir")?;
+        let keyfile = tempdir.path().join("nameserver.key");
+        let unlock = jig_client::server_key::credential_for_tests(tempdir.path());
         if let Some(seed) = seed {
-            std::fs::write(tempdir.path().join("nameserver.key"), seed).context("keyfile")?;
+            // A known key, sealed as an operator would import one: raw at
+            // 0600, then `keys seal`, which keeps its DID.
+            let mut raw = std::fs::OpenOptions::new();
+            raw.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut raw, 0o600);
+            std::io::Write::write_all(&mut raw.open(&keyfile).context("keyfile")?, &seed)
+                .context("keyfile")?;
+            jig_client::server_key::seal_raw(
+                &keyfile,
+                std::slice::from_ref(&unlock),
+                &jig_client::server_key::ServerKeyOptions::new("nameserver", "jig-nameserver"),
+            )
+            .context("sealing the test nameserver key")?;
         }
 
         let mut config = base_config()?;
-        config.server.server_did_keyfile = tempdir
-            .path()
-            .join("nameserver.key")
-            .to_string_lossy()
-            .into_owned();
-        config.keys.unlock = Some(jig_client::server_key::credential_for_tests(tempdir.path()));
+        config.server.server_did_keyfile = keyfile.to_string_lossy().into_owned();
+        config.keys.unlock = Some(unlock);
         config.server.listen = "127.0.0.1:0".to_string();
         let mut suffix = jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix);
         // A single-label suffix is trusted only through clients' own config;
