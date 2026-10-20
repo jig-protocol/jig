@@ -210,15 +210,17 @@ pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
     })
 }
 
-/// Load config, apply the CLI overrides, and serve. `bind_override` /
+/// Load config, apply the CLI overrides, and serve. `config` is
+/// `jig-nameserver --config`, else `JIG_NS_CONFIG` is read. `bind_override` /
 /// `port_override` come from `jig-nameserver serve --bind/--port` and win over
 /// both the config file and `JIG_NS_BIND`/`JIG_NS_PORT`, which `load` has
 /// already applied.
 pub async fn run_http_server(
+    config: Option<&std::path::Path>,
     bind_override: Option<String>,
     port_override: Option<u16>,
 ) -> Result<()> {
-    let mut cfg = NameServerConfig::load()?;
+    let mut cfg = NameServerConfig::load(config)?;
     if let Some(bind) = bind_override {
         cfg.network.bind = bind;
     }
