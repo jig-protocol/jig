@@ -59,7 +59,7 @@ did:jig:<base58(public_key)>
 ```
 
 **Storage:**
-- Private keys MUST be stored encrypted at rest (OS keychain, hardware token, or encrypted file) *(partial: the CLI seals each identity key in `~/.jig/keys/<did>.jigkey` under a data key wrapped for the OS keychain, an Argon2id passphrase or a secret, and converts older raw key files on first load (#177); `JIG_KEYS_STORAGE=plaintext` still allows raw keys, with a warning. The server and the nameserver store their keys raw, with 0600 permissions on Unix)*
+- Private keys MUST be stored encrypted at rest (OS keychain, hardware token, or encrypted file) *(partial: the CLI seals each identity key in `~/.jig/keys/<did>.jigkey` under a data key wrapped for the OS keychain, an Argon2id passphrase or a secret, and converts older raw key files on first load (#177); `JIG_KEYS_STORAGE=plaintext` still allows raw keys, with a warning. The server and the nameserver store their keys raw. New key files are created with 0600 permissions on Unix; the server refuses an existing key file that group or others can access, and the nameserver does not check)*
 - Backups SHOULD use multiple mechanisms (paper backup + cloud + hardware key)
 
 **Rotation:**
