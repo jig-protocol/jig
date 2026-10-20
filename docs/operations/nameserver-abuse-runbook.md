@@ -233,3 +233,7 @@ suffix's delegation names.
 The deny and allow domain lists and the gossip this section used to describe were removed
 in #237. They never exchanged data with peers, and the routes they served were removed in
 #154.
+Where nameserver federation is headed (witnessed logs and rulesets within a ruleset group) is
+in the [roadmap](../ROADMAP.md) under "Nameserver federation (target)", and in the draft
+[JEP-0009](../../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) and
+[JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md).

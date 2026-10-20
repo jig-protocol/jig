@@ -66,6 +66,17 @@ network is the machine: Alan Kay's "objects all the way down".
   handling) so nobody has to bootstrap one from scratch. Joining is opt-in. Anyone can run their own
   zones at any security level, with their own anchors, or just connect to servers without hosting
   anything.
+- **Nameserver federation (target).** Nameservers federate through signed, witnessed
+  transparency logs and shared rulesets within a ruleset group: RFC 6962-style logs in C2SP
+  formats, cosigned by witnesses rather than gossiped
+  ([JEP-0009](../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) rules 29–33, draft).
+  Aligned nameservers and servers form a high-security ruleset group, so its clients get one set
+  of behaviours and expectations. Cross-nameserver lookup takes two forms: inside a group, a
+  standard answer to "where do I ask for `@suffix`" (ruleset-group delegation, deferred in
+  [JEP-0004](../repos/jig-spec/jep/jep-0004-verified-naming.md)); elsewhere, the client's own order
+  of local config, then a `contract`-rooted delegation, then DNS-rooted discovery. The v0.1
+  gossip prototype was removed in #237: it exchanged nothing with peers, and its routes went in
+  #154. Its replacement is this work, not a revival.
 - **Keep the spec small.** `jig-spec` holds final decisions, normative and terse. Modelling,
   alternatives and justifications go in `docs/` and link to the spec.
 
