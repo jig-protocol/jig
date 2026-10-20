@@ -59,3 +59,41 @@ fn keygen_prints_only_the_did_writes_0600_and_never_overwrites() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// On an offline ceremony machine there is no nameserver config: with
+/// `--keyfile`, `keys show` runs without one. Without `--keyfile` it needs the
+/// config `serve` reads, and says so.
+#[test]
+fn keys_show_runs_on_a_ceremony_machine_with_no_config() {
+    let dir = std::env::temp_dir().join(format!("jig-ns-keys-show-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let slot = jig_client::server_key::credential_for_tests(&dir);
+    let key = dir.join("ns.jigkey");
+    let made = keygen(&key, &slot);
+    assert!(made.status.success(), "{made:?}");
+    let did = String::from_utf8(made.stdout).unwrap().trim().to_string();
+
+    let show = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_jig-nameserver"))
+            .args(args)
+            .env_remove("JIG_NS_CONFIG")
+            .output()
+            .expect("runs")
+    };
+    let out = show(&["keys", "show", "--keyfile", key.to_str().unwrap()]);
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&did) && stdout.contains("a credential slot"),
+        "{stdout}"
+    );
+
+    let out = show(&["keys", "show"]);
+    assert!(
+        !out.status.success(),
+        "with no --keyfile a config is needed: {out:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

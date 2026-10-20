@@ -109,17 +109,6 @@ jobs:
             echo "::error::a normal dependency enables a test-only feature"
             exit 1
           fi
-      - name: Test helpers stay out of the release binaries
-        # integration-tests enables jig-client `test-support` as a normal
-        # dependency (its harness is in src/), so a --workspace build unifies
-        # it in. The binaries release.yml ships must never carry it.
-        run: |
-          if cargo tree --locked -e normal,features -i jig-client \
-              -p jig-server -p jig-cli -p jig-nameserver \
-              | grep 'feature "test-support"'; then
-            echo "::error::a release binary's graph enables jig-client test-support"
-            exit 1
-          fi
       - name: Format (v0.0.2 surface)
         # Scoped to v0.0.2-touched crates. jig-spec may still have
         # upstream formatting drift and is not gated. jig-bridge-email is
@@ -172,6 +161,14 @@ jobs:
         # policies with a public test key; only [dev-dependencies] may enable it.
         run: |
           ! cargo tree --locked -e normal,features -i jig-pipeline --workspace \
+            | grep 'feature "test-support"'
+      - name: No release binary enables jig-client's test-support
+        # test-support compiles server_key::credential_for_tests. integration-
+        # tests enables it as a normal dependency (its harness is in src/), so
+        # this is scoped to the binaries release.yml ships, not --workspace.
+        run: |
+          ! cargo tree --locked -e normal,features -i jig-client \
+            -p jig-server -p jig-cli -p jig-nameserver \
             | grep 'feature "test-support"'
       - name: Clippy (jig-bridge-core web feature)
         # The webhook-mount path (RouterMount + cfg'd BridgeContext field) is

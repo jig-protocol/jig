@@ -113,25 +113,35 @@ enum KeysCommand {
     },
 }
 
-/// `jig-nameserver keys ...`: works on the key file only.
-fn run_keys(keys: KeysCommand) -> Result<String, String> {
+/// `jig-nameserver keys ...`: works on the key file only. The keyfile and
+/// `[v0_0_2.keys]` come from the same config `serve` reads (`--config` or
+/// `JIG_NS_CONFIG`). With `--keyfile` and no config named at all, as on an
+/// offline ceremony machine, it runs without one: only the environment
+/// (`JIG_KEY_UNLOCK`, `JIG_KEY_PASSPHRASE`) opens the key. A config that is
+/// named is always loaded, and an error in it is an error here.
+fn run_keys(keys: KeysCommand, config: Option<&std::path::Path>) -> Result<String, String> {
     use jig_client::server_key::KeysAction;
-    let config = NameServerConfig::load().map_err(|e| e.to_string())?;
-    let configured = std::path::PathBuf::from(
-        shellexpand::tilde(&jig_nameserver::server::resolve_v0_0_2_keyfile(&config)).into_owned(),
-    );
+    let keyfile = match &keys {
+        KeysCommand::Seal { keyfile, .. }
+        | KeysCommand::AddSlot { keyfile, .. }
+        | KeysCommand::Show { keyfile } => keyfile.clone(),
+    };
+    let named = config.is_some() || std::env::var_os("JIG_NS_CONFIG").is_some();
+    let config = if keyfile.is_some() && !named {
+        NameServerConfig::default()
+    } else {
+        NameServerConfig::load(config).map_err(|e| e.to_string())?
+    };
+    let keyfile = keyfile.unwrap_or_else(|| {
+        std::path::PathBuf::from(
+            shellexpand::tilde(&jig_nameserver::server::resolve_v0_0_2_keyfile(&config))
+                .into_owned(),
+        )
+    });
     let action = match keys {
-        KeysCommand::Seal { keyfile, slots } => KeysAction::Seal {
-            keyfile: keyfile.unwrap_or(configured),
-            slots,
-        },
-        KeysCommand::AddSlot { keyfile, slot } => KeysAction::AddSlot {
-            keyfile: keyfile.unwrap_or(configured),
-            slot,
-        },
-        KeysCommand::Show { keyfile } => KeysAction::Show {
-            keyfile: keyfile.unwrap_or(configured),
-        },
+        KeysCommand::Seal { slots, .. } => KeysAction::Seal { keyfile, slots },
+        KeysCommand::AddSlot { slot, .. } => KeysAction::AddSlot { keyfile, slot },
+        KeysCommand::Show { .. } => KeysAction::Show { keyfile },
     };
     jig_client::server_key::run(
         action,
@@ -245,7 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Some(Command::Keygen { .. }) => unreachable!("handled before logging starts"),
 
-        Some(Command::Keys { keys }) => match run_keys(keys) {
+        Some(Command::Keys { keys }) => match run_keys(keys, cli.config.as_deref()) {
             Ok(out) => println!("{out}"),
             Err(msg) => {
                 eprintln!("error: {msg}");
