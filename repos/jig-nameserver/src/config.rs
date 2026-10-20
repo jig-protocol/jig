@@ -1367,9 +1367,9 @@ default_time_range = "last_day"  # Options: last_hour, last_day, last_week, last
 # renew_effort = 1
 # penalty_decay_secs = 600   # a penalty point's life; a repeat doubles it
 #
-# # The cap on registrations by DIDs registration_allow does not name. Off by
-# # default until jig clients handle 503 REGISTRATION_BUSY; recommended values
-# # shown.
+# # The cap on registrations by DIDs registration_allow does not name. On by
+# # default at the values shown; jig clients wait out 503 REGISTRATION_BUSY
+# # and retry. enabled = false admits every stranger.
 # [v0_0_2.nameserver.alias_suffixes.pool]
 # enabled = true
 # strangers_per_hour = 60

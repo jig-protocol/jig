@@ -202,3 +202,88 @@ async fn register_renew_and_rotate_solve_the_nameservers_proof_of_work() {
     assert_ne!(second, first);
     assert_eq!(resolved(&ns, name).await.did, second);
 }
+
+/// A nameserver whose registration pool is full answers `503
+/// REGISTRATION_BUSY` with `Retry-After` (JEP-0008 rules 22–24). `jig` waits
+/// that long, says so, and registers on a fresh challenge.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_pool_is_waited_out_and_the_registration_retried() {
+    use integration_tests::harness::PoolPolicy;
+    // One stranger a second, and one token: the harness's own registration
+    // takes it, so the CLI's finds the pool empty for about a second.
+    let pool = PoolPolicy {
+        strangers_per_hour: 3600,
+        burst: 1,
+        queue_wait_secs: 0,
+        ..PoolPolicy::recommended()
+    };
+    let ns = TestNameserver::start_with_policies("dj.jig", TestNameserver::test_pow(), pool)
+        .await
+        .unwrap();
+    ns.register("first").await.expect("takes the one token");
+    let url = ns.http_url();
+    let home = tempfile::tempdir().unwrap();
+
+    let (ok, out) = jig(
+        home.path(),
+        &[
+            "init",
+            "dj",
+            "--request-alias",
+            "deji",
+            "--nameserver",
+            &url,
+        ],
+    )
+    .await;
+    assert!(ok, "jig init after a busy pool: {out}");
+    assert!(
+        out.contains("taking no more new names for now; waiting"),
+        "{out}"
+    );
+    assert_eq!(
+        resolved(&ns, "deji@dj.jig").await.did,
+        configured_did(home.path())
+    );
+}
+
+/// When the pool's next token is further off than the client will wait, it
+/// says when to try again instead of waiting.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pool_full_for_long_is_reported_not_waited_for() {
+    use integration_tests::harness::PoolPolicy;
+    let pool = PoolPolicy {
+        strangers_per_hour: 1,
+        burst: 1,
+        queue_wait_secs: 0,
+        ..PoolPolicy::recommended()
+    };
+    let ns = TestNameserver::start_with_policies("dj.jig", TestNameserver::test_pow(), pool)
+        .await
+        .unwrap();
+    ns.register("first").await.expect("takes the one token");
+    let home = tempfile::tempdir().unwrap();
+
+    let started = std::time::Instant::now();
+    let (ok, out) = jig(
+        home.path(),
+        &[
+            "init",
+            "dj",
+            "--request-alias",
+            "deji",
+            "--nameserver",
+            &ns.http_url(),
+        ],
+    )
+    .await;
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("taking no more new names for now; try again in about"),
+        "{out}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "did not wait an hour"
+    );
+}

@@ -66,7 +66,7 @@ The pool caps registrations by DIDs that `registration_allow` does not name, how
 
 ```toml
 [v0_0_2.nameserver.alias_suffixes.pool]
-enabled = true                 # off by default until jig handles 503 REGISTRATION_BUSY
+enabled = true                 # the default; jig waits out 503 REGISTRATION_BUSY
 strangers_per_hour = 60
 burst = 10
 controller = "doubling"

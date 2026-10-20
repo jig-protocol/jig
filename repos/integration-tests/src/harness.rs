@@ -502,8 +502,9 @@ impl TestJigServer {
 // TestNameserver
 // ---------------------------------------------------------------------------
 
-/// How much proof-of-work a [`TestNameserver`] asks for.
-pub use jig_config::v0_0_2_server::PowPolicy;
+/// How much proof-of-work a [`TestNameserver`] asks for, and how many
+/// strangers it admits.
+pub use jig_config::v0_0_2_server::{PoolPolicy, PowPolicy};
 
 /// A `jig-nameserver` running on `127.0.0.1:<random>` for tests.
 pub struct TestNameserver {
@@ -551,10 +552,21 @@ impl TestNameserver {
     }
 
     /// A nameserver for `alias_suffix` that asks for proof-of-work as `pow`
-    /// says (JEP-0008).
+    /// says (JEP-0008). Its registration pool is off: tests register many
+    /// names within a second, which the recommended 60 an hour would refuse.
     pub async fn start_with_pow(
         alias_suffix: &str,
         pow: jig_config::v0_0_2_server::PowPolicy,
+    ) -> Result<Self> {
+        Self::start_with_policies(alias_suffix, pow, PoolPolicy::off()).await
+    }
+
+    /// A nameserver for `alias_suffix` with these proof-of-work and pool
+    /// policies.
+    pub async fn start_with_policies(
+        alias_suffix: &str,
+        pow: PowPolicy,
+        pool: PoolPolicy,
     ) -> Result<Self> {
         let tempdir = tempfile::tempdir().context("tempdir")?;
 
@@ -567,6 +579,7 @@ impl TestNameserver {
         config.server.listen = "127.0.0.1:0".to_string();
         let mut suffix = jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix);
         suffix.pow = pow;
+        suffix.pool = pool;
         config.nameserver.alias_suffixes = vec![suffix];
         // Tests enumerate registered aliases; production leaves this off.
         config.debug.list_handles = true;
