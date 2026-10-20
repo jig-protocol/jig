@@ -598,14 +598,44 @@ async fn check_manifest_in(
                 cited.seq
             )
         })?;
-    check_cited(
-        welcome,
-        cited,
-        &served.bundle_b64,
-        served.sig_b64.as_deref().unwrap_or_default(),
-        &record,
-    )
-    .map_err(|e| anyhow::anyhow!("{server}: {e}. Refusing to go on"))?;
+    let sig_b64 = served.sig_b64.unwrap_or_default();
+    match check_cited(welcome, cited, &served.bundle_b64, &sig_b64, &record) {
+        Ok(_) => {}
+        Err(e @ jig_client::manifest::ManifestCheck::Unproven(_)) => {
+            anyhow::bail!("{server}: {e}. Refusing to go on")
+        }
+        // Two things the server signed disagree: kept, and the server
+        // refused from now on.
+        Err(e @ jig_client::manifest::ManifestCheck::Contradicts(_)) => {
+            let c = jig_client::connection::Contradiction {
+                code: "manifest-contradiction",
+                reason: e.to_string(),
+                welcome: Some(welcome.evidence.clone()),
+                evidence: vec![],
+                proof: Some(Box::new(
+                    jig_client::evidence::Proof::ManifestContradiction {
+                        welcome: welcome.evidence.clone(),
+                        block: served.bundle_b64,
+                        sig: sig_b64,
+                        record,
+                    },
+                )),
+            };
+            let kept = keep_bundle_in(pins_path, server, &welcome.server_did, &c)?;
+            anyhow::bail!(
+                "{server}: {e}. Refusing to go on. The evidence is `jig trust evidence show {}`{}",
+                kept.id,
+                if kept.sticky {
+                    format!(
+                        "; every connection to it is refused until you run `jig trust accept \
+                         {server}`"
+                    )
+                } else {
+                    String::new()
+                }
+            )
+        }
+    }
 
     // The log is a channel like any other: pinned at first sight, and held
     // to its chain from then on.

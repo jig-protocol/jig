@@ -344,4 +344,86 @@ mod tests {
         // A signature that is not the author's.
         unproven(check_cited(&welcome, &cited, &bundle, &other_sig, &record));
     }
+
+    /// A welcome `server` signs that cites `cited`, and what it advertises.
+    fn signed_welcome(server: &Server, cited: Option<ManifestRef>) -> (String, ServerManifest) {
+        use jig_pipeline::handshake::{HelloView, ServerOffer, implemented_suite_names, negotiate};
+        let mut statement = negotiate(
+            &HelloView {
+                versions: vec![1],
+                suites: implemented_suite_names(),
+                capabilities: Default::default(),
+                nonce: jig_pipeline::handshake::fresh_nonce(),
+                peer_did: None,
+            },
+            &ServerOffer::default(),
+        )
+        .unwrap();
+        let said = ServerManifest {
+            versions: vec![1],
+            suites: statement.suites.clone(),
+            capabilities: statement.capabilities.clone(),
+            peer_policy: PeerPolicy::default(),
+        };
+        statement.manifest = cited;
+        let text =
+            serde_json::to_string(&jig_pipeline::handshake::seal(&server.key, statement)).unwrap();
+        (text, said)
+    }
+
+    #[test]
+    fn a_contradicted_manifest_is_proven_from_the_bundle_alone() {
+        use crate::evidence::{BUNDLE_FORMAT, Bundle, BundleError, Proof, verify};
+        let server = Server::new();
+        let bundle =
+            |welcome: String, published: &(ManifestRef, String, String, IngestRecord)| Bundle {
+                format: BUNDLE_FORMAT.into(),
+                class: 3,
+                code: "manifest-contradiction".into(),
+                reason: String::new(),
+                server: "https://host:7117".into(),
+                server_did: server.did(),
+                observed_at_ms: 1,
+                welcome: None,
+                items: vec![],
+                proof: Some(Proof::ManifestContradiction {
+                    welcome,
+                    block: published.1.clone(),
+                    sig: published.2.clone(),
+                    record: published.3.clone(),
+                }),
+            };
+        let (_, said) = signed_welcome(&server, None);
+        let mut other = said.clone();
+        other.suites.push("rot13".into());
+
+        // Logged one thing, welcomed with another.
+        let logged = server.publish(&other, 1);
+        let (welcome, _) = signed_welcome(&server, Some(logged.0.clone()));
+        let proven = verify(&bundle(welcome, &logged)).unwrap().proven.unwrap();
+        assert!(proven.contains("rot13"), "{proven}");
+
+        // What it logged is what it said: nothing proven.
+        let honest = server.publish(&said, 2);
+        let (welcome, _) = signed_welcome(&server, Some(honest.0.clone()));
+        let refused = |b: Bundle| assert!(matches!(verify(&b), Err(BundleError::Proof(_))));
+        refused(bundle(welcome, &honest));
+        // A welcome citing no manifest, or citing another than the one kept.
+        refused(bundle(signed_welcome(&server, None).0, &logged));
+        refused(bundle(
+            signed_welcome(&server, Some(honest.0.clone())).0,
+            &logged,
+        ));
+        // Another server's welcome, or a manifest another server wrote.
+        let stranger = Server::new();
+        refused(bundle(
+            signed_welcome(&stranger, Some(logged.0.clone())).0,
+            &logged,
+        ));
+        let theirs = stranger.publish(&other, 1);
+        refused(bundle(
+            signed_welcome(&server, Some(theirs.0.clone())).0,
+            &theirs,
+        ));
+    }
 }

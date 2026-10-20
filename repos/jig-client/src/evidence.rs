@@ -29,6 +29,8 @@ use jig_pipeline::handshake::{HandshakeResult, same_did, verify_offline};
 use serde::{Deserialize, Serialize};
 
 use crate::chain::ChainProof;
+use crate::manifest::{ManifestCheck, check_cited};
+use jig_pipeline::ingest_record::IngestRecord;
 
 /// The format of a bundle against a server.
 pub const BUNDLE_FORMAT: &str = "jig-evidence-v1";
@@ -81,6 +83,15 @@ pub enum Proof {
     /// both, so someone other than its holder has it, whichever audience
     /// each names ([`jig_core::key_link::fork`]).
     KeyLinkFork { first: String, second: String },
+    /// A welcome, verbatim, and the `server-manifest` block and `ingest`
+    /// record it cites, as served (base64 bundle and signature), that say
+    /// different things (JEP-0002 rule 12; [`crate::manifest::check_cited`]).
+    ManifestContradiction {
+        welcome: String,
+        block: String,
+        sig: String,
+        record: IngestRecord,
+    },
 }
 
 /// What [`verify`] found.
@@ -180,6 +191,42 @@ pub fn verify(bundle: &Bundle) -> Result<Checked, BundleError> {
                 a.link().new,
                 b.link().new
             ))
+        }
+        Some(Proof::ManifestContradiction {
+            welcome,
+            block,
+            sig,
+            record,
+        }) => {
+            let w = match verify_offline(welcome, &bundle.server_did) {
+                HandshakeResult::Established(w) => w,
+                other => {
+                    return Err(BundleError::Proof(format!(
+                        "the welcome does not verify: {}",
+                        reason_of(&other)
+                    )));
+                }
+            };
+            let cited = w
+                .manifest
+                .clone()
+                .ok_or_else(|| BundleError::Proof("the welcome cites no manifest".into()))?;
+            match check_cited(&w, &cited, block, sig, record) {
+                Err(ManifestCheck::Contradicts(reason)) => Some(format!(
+                    "{} signed a welcome that contradicts entry {} of its manifest log: {reason}",
+                    bundle.server_did, cited.seq
+                )),
+                Err(ManifestCheck::Unproven(reason)) => {
+                    return Err(BundleError::Proof(format!(
+                        "the manifest is not shown to be the server's: {reason}"
+                    )));
+                }
+                Ok(_) => {
+                    return Err(BundleError::Proof(
+                        "the welcome says what the manifest it cites says".into(),
+                    ));
+                }
+            }
         }
     };
     Ok(Checked { proven })
