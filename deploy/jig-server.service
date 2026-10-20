@@ -33,7 +33,8 @@ EnvironmentFile=-/etc/jig/jig-server.env
 # systemd at start (TPM-bound where there is a TPM) and handed over at
 # /run/credentials/jig-server.service/jig-server-key, readable only by this
 # service. Make it once (deploy/README.md, "Sealing the server key"), then
-# uncomment this and set [keys] unlock in /etc/jig/config.toml to match.
+# uncomment this AND [keys] unlock in /etc/jig/config.toml: either one alone
+# fails the boot.
 #LoadCredentialEncrypted=jig-server-key:/etc/credstore.encrypted/jig-server-key
 
 # One config file, parsed strictly: an unknown or removed key stops the boot

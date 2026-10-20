@@ -12,7 +12,10 @@
 suffix = "names.example.org"
 
 # What opens the nameserver's sealed signing key at boot, as jig-server's
-# [keys] (deploy/README.md, "Sealing the server key"). Uncomment the
-# LoadCredentialEncrypted= line in jig-nameserver.service to match.
+# [keys] (deploy/README.md, "Sealing the server key").
+#
+# DO THESE TOGETHER: make the credential (systemd-creds encrypt), uncomment
+# LoadCredentialEncrypted= in jig-nameserver.service, and uncomment this line.
+# Either one alone fails the boot.
 [v0_0_2.keys]
-unlock = "credential:/run/credentials/jig-nameserver.service/jig-nameserver-key"
+# unlock = "credential:/run/credentials/jig-nameserver.service/jig-nameserver-key"

@@ -50,8 +50,8 @@ Environment=JIG_NS_CONFIG=/etc/jig/jig-nameserver.toml
 Environment=HOME=/var/lib/jig
 
 # The secret that opens the nameserver's sealed key (nameserver_v002.jigkey),
-# as for jig-server; set [v0_0_2.keys] unlock in jig-nameserver.toml to
-# credential:/run/credentials/jig-nameserver.service/jig-nameserver-key.
+# as for jig-server. Uncomment this AND [v0_0_2.keys] unlock in
+# jig-nameserver.toml together: either one alone fails the boot.
 #LoadCredentialEncrypted=jig-nameserver-key:/etc/credstore.encrypted/jig-nameserver-key
 
 ExecStart=/opt/jig/bin/jig-nameserver serve

@@ -143,7 +143,11 @@ replay_per_did = 2000
 # the TPM where there is one, is the recommended slot: see deploy/README.md,
 # "Sealing the server key", for what each choice protects against. With none
 # set, a new key is refused rather than written in clear.
-unlock = "credential:/run/credentials/jig-server.service/jig-server-key"
+#
+# DO THESE TOGETHER: make the credential (systemd-creds encrypt), uncomment
+# LoadCredentialEncrypted= in jig-server.service, and uncomment this line.
+# Either one alone fails the boot.
+# unlock = "credential:/run/credentials/jig-server.service/jig-server-key"
 storage = "sealed"
 
 [debug]

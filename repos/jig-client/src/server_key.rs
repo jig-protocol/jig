@@ -25,7 +25,7 @@ use jig_core::keystore::{
 use zeroize::Zeroizing;
 
 use crate::identity::{
-    MIN_PASSPHRASE_CHARS, read_unlock_spec, sync_parent_dir, write_private_atomic,
+    MIN_PASSPHRASE_CHARS, read_unlock_spec_from, sync_parent_dir, write_private_atomic,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -43,10 +43,13 @@ pub enum ServerKeyError {
         tool: &'static str,
     },
     #[error(
-        "{raw:?} and {sealed:?} both exist: the raw key is still in clear beside its sealed \
-         copy. Remove {raw:?} once the server starts from {sealed:?}"
+        "{raw:?} and {sealed:?} both exist, and neither is used while both are there: {verdict}"
     )]
-    BothPresent { raw: PathBuf, sealed: PathBuf },
+    BothPresent {
+        raw: PathBuf,
+        sealed: PathBuf,
+        verdict: String,
+    },
     #[error("{0:?} already exists; it is never overwritten")]
     Exists(PathBuf),
     #[error(
@@ -56,12 +59,14 @@ pub enum ServerKeyError {
     NoWayToSeal { role: &'static str, path: PathBuf },
     #[error(
         "cannot open the {role} key at {path:?}: it has {slots}, and nothing offered opens \
-         one. Set [keys] unlock, JIG_KEY_UNLOCK or JIG_KEY_PASSPHRASE for one of them"
+         one. Set [keys] unlock, JIG_KEY_UNLOCK or JIG_KEY_PASSPHRASE for one of them{skipped}"
     )]
     Locked {
         role: &'static str,
         path: PathBuf,
         slots: String,
+        /// For an operator command: what was configured but could not be read.
+        skipped: String,
     },
     #[error("{path:?} names {claimed} but holds the key for {found}")]
     WrongDid {
@@ -133,6 +138,16 @@ pub fn sealed_path(path: &Path) -> PathBuf {
     }
 }
 
+/// Where a secret is being read for. At boot every configured secret must be
+/// readable and a credential must be one systemd handed this unit (when it
+/// handed it any). An operator command, run by hand with the unit stopped,
+/// skips a configured secret it cannot read and tries the next.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Use {
+    Boot,
+    Operator,
+}
+
 /// A secret that opens or makes one slot. Read once and cloned where it is
 /// needed again: a `credential:` path may be a pipe (`<(systemd-creds
 /// decrypt ...)`), which reads only once.
@@ -143,28 +158,30 @@ enum Spec {
 }
 
 impl Spec {
-    /// `credential:PATH`, `env:NAME` or `passphrase`.
-    fn parse(spec: &str) -> Result<Self> {
+    /// `credential:PATH`, `env:NAME` or `passphrase`, from `source` (named in
+    /// errors: `[keys] unlock`, `JIG_KEY_UNLOCK`, `--slot`).
+    fn parse(spec: &str, source: &'static str, used: Use) -> Result<Self> {
         if spec == "passphrase" {
             let passphrase = std::env::var("JIG_KEY_PASSPHRASE").map_err(|_| {
-                ServerKeyError::BadUnlock(
-                    "the passphrase slot reads JIG_KEY_PASSPHRASE, which is not set; a server \
-                     never prompts"
-                        .to_string(),
-                )
+                ServerKeyError::BadUnlock(format!(
+                    "{source}: the passphrase slot reads JIG_KEY_PASSPHRASE, which is not set; \
+                     a server never prompts"
+                ))
             })?;
             return Ok(Spec::Passphrase(Zeroizing::new(passphrase)));
         }
+        let spec = match spec.strip_prefix("credential:") {
+            Some(path) => format!(
+                "credential:{}",
+                credential_path(path, source, used)?.display()
+            ),
+            None => spec.to_string(),
+        };
         // Name only the slot kind: a value with no kind may be the secret
         // itself, pasted in by mistake.
-        let (source, secret) = read_unlock_spec(spec).map_err(|e| {
-            let kind = match spec.split_once(':') {
-                Some((kind @ ("env" | "credential"), _)) => kind,
-                _ => "the unlock value",
-            };
-            ServerKeyError::BadUnlock(format!("{kind}: {e}"))
-        })?;
-        Ok(Spec::Secret(source, secret))
+        let (kind, secret) = read_unlock_spec_from(&spec, source)
+            .map_err(|e| ServerKeyError::BadUnlock(e.to_string()))?;
+        Ok(Spec::Secret(kind, secret))
     }
 
     fn offer(self) -> Unlock {
@@ -192,60 +209,143 @@ impl Spec {
     }
 }
 
-/// What this process was given, in order: `[keys] unlock`, then
-/// `JIG_KEY_UNLOCK`, then `JIG_KEY_PASSPHRASE`.
-fn configured(opts: &ServerKeyOptions) -> Result<Vec<Spec>> {
-    let mut specs = Vec::new();
-    if let Some(spec) = opts.unlock.as_deref() {
-        specs.push(Spec::parse(spec)?);
+/// The file a `credential:` names, resolved: what is checked is what is read.
+///
+/// At boot, under a unit with credentials (`$CREDENTIALS_DIRECTORY` set), it
+/// must be inside that directory once `..` and symlinks are resolved: anywhere
+/// else it is a secret file on disk, likely beside the key it opens. Without
+/// one, a plain file is only warned about. An operator command may read a
+/// credential through a pipe and is never checked.
+fn credential_path(path: &str, source: &'static str, used: Use) -> Result<PathBuf> {
+    let given = PathBuf::from(path);
+    let resolved = given.canonicalize().ok();
+    if used == Use::Boot {
+        if resolved.is_none() {
+            return Err(ServerKeyError::BadUnlock(format!(
+                "{source}: credential {path} does not exist. Under systemd only the unit sees \
+                 its credentials, and only when its LoadCredentialEncrypted= line names this one"
+            )));
+        }
+        match std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from) {
+            Some(dir)
+                if !resolved.as_ref().is_some_and(|real| {
+                    dir.canonicalize().is_ok_and(|dir| real.starts_with(dir))
+                }) =>
+            {
+                return Err(ServerKeyError::NotACredential { path: given, dir });
+            }
+            Some(_) => {}
+            None => tracing::warn!(
+                "the key opens with a secret read from {path}, a plain file: it protects the \
+                 key only as far as that file is kept apart from it. A systemd credential \
+                 (LoadCredentialEncrypted=) keeps it encrypted at rest"
+            ),
+        }
     }
-    if let Ok(spec) = std::env::var("JIG_KEY_UNLOCK") {
-        specs.push(Spec::parse(&spec)?);
+    Ok(resolved.unwrap_or(given))
+}
+
+/// What this process was given, in order: `[keys] unlock`, then
+/// `JIG_KEY_UNLOCK`, then `JIG_KEY_PASSPHRASE`. At boot any of them that
+/// cannot be read is an error. For an operator command it is skipped, and
+/// the second value says why, for an error if nothing else opens the key.
+fn configured(opts: &ServerKeyOptions, used: Use) -> Result<(Vec<Spec>, String)> {
+    let mut specs = Vec::new();
+    let mut skipped = Vec::new();
+    let given = opts
+        .unlock
+        .iter()
+        .map(|s| ("[keys] unlock", s.clone()))
+        .chain(
+            std::env::var("JIG_KEY_UNLOCK")
+                .ok()
+                .map(|s| ("JIG_KEY_UNLOCK", s)),
+        );
+    for (source, spec) in given {
+        match Spec::parse(&spec, source, used) {
+            Ok(parsed) => specs.push(parsed),
+            Err(e) if used == Use::Operator => skipped.push(e.to_string()),
+            Err(e) => return Err(e),
+        }
     }
     let named_passphrase = opts.unlock.as_deref() == Some("passphrase");
     if !named_passphrase && let Ok(passphrase) = std::env::var("JIG_KEY_PASSPHRASE") {
         specs.push(Spec::Passphrase(Zeroizing::new(passphrase)));
     }
-    Ok(specs)
+    let skipped = if skipped.is_empty() {
+        String::new()
+    } else {
+        format!(" (skipped: {})", skipped.join("; "))
+    };
+    Ok((specs, skipped))
 }
 
-/// At boot, a `credential:` slot should be one systemd hands this unit. Under a
-/// unit with credentials (`$CREDENTIALS_DIRECTORY` set) a path outside it is
-/// refused: it is a secret file on disk, likely beside the key it opens.
-/// Elsewhere it is only warned about. The `keys` commands, run by an operator,
-/// are never checked: they may read a credential through a pipe.
-fn check_boot_credentials(opts: &ServerKeyOptions) -> Result<()> {
-    let specs = opts
-        .unlock
-        .iter()
-        .cloned()
-        .chain(std::env::var("JIG_KEY_UNLOCK").ok());
-    for spec in specs {
-        let Some(path) = spec.strip_prefix("credential:").map(PathBuf::from) else {
-            continue;
-        };
-        match std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from) {
-            // Judged on the resolved paths: `$CREDENTIALS_DIRECTORY/../x`, or
-            // a symlink in it that points out, is a file outside it. A path
-            // that does not resolve is outside too.
-            Some(dir)
-                if !path.canonicalize().is_ok_and(|real| {
-                    dir.canonicalize().is_ok_and(|dir| real.starts_with(dir))
-                }) =>
-            {
-                return Err(ServerKeyError::NotACredential { path, dir });
-            }
-            Some(_) => {}
-            None => tracing::warn!(
-                "the {} key opens with a secret read from {}, a plain file: it protects the \
-                 key only as far as that file is kept apart from it. A systemd credential \
-                 (LoadCredentialEncrypted=) keeps it encrypted at rest",
-                opts.role,
-                path.display()
+/// Open `key`, read from `path`, with what `opts` offers.
+fn open_with(
+    key: &JigKey,
+    path: &Path,
+    opts: &ServerKeyOptions,
+    used: Use,
+) -> Result<jig_core::keystore::Opened> {
+    let (specs, skipped) = configured(opts, used)?;
+    let offers: Vec<Unlock> = specs.into_iter().map(Spec::offer).collect();
+    key.open(&offers).map_err(|e| match e {
+        KeystoreError::NoSlotOpened => ServerKeyError::Locked {
+            role: opts.role,
+            path: path.to_path_buf(),
+            slots: describe_slots(&key.slots()),
+            skipped,
+        },
+        source => ServerKeyError::Keystore {
+            path: path.to_path_buf(),
+            source,
+        },
+    })
+}
+
+/// Why a raw key and its sealed copy are both there, and what to do: only
+/// once the two are known to hold the same key is removing the raw one safe.
+fn both_present(raw: &Path, sealed: &Path, opts: &ServerKeyOptions, used: Use) -> ServerKeyError {
+    let verdict = match (read_raw_seed(raw), read_jigkey(sealed)) {
+        (Err(e), _) => format!(
+            "{} cannot be read ({e}); keep both and look before removing either",
+            raw.display()
+        ),
+        (Ok(_), Err(e)) => format!(
+            "{} is damaged ({e}), perhaps from an interrupted seal: keep {}, move the sealed \
+             file aside, and run `{} keys seal` again",
+            sealed.display(),
+            raw.display(),
+            opts.tool
+        ),
+        (Ok(seed), Ok(key)) => match open_with(&key, sealed, opts, used) {
+            Err(e) => format!(
+                "{} does not open with what was offered ({e}), so it cannot be compared: keep \
+                 {} until it does",
+                sealed.display(),
+                raw.display()
             ),
-        }
+            Ok(opened) if *opened.seed == *seed => format!(
+                "both hold the same key, {}: remove {} (unlinking it does not erase it)",
+                did_of(&seed),
+                raw.display()
+            ),
+            Ok(opened) => format!(
+                "they hold different keys: {} is {}, {} is {}. Remove neither until you know \
+                 which DID this {} has published",
+                raw.display(),
+                did_of(&seed),
+                sealed.display(),
+                did_of(&opened.seed),
+                opts.role
+            ),
+        },
+    };
+    ServerKeyError::BothPresent {
+        raw: raw.to_path_buf(),
+        sealed: sealed.to_path_buf(),
+        verdict,
     }
-    Ok(())
 }
 
 /// The message for a key that only one slot opens, if it is one: losing that
@@ -263,14 +363,10 @@ pub fn single_slot_warning(role: &str, slots: &[SlotKind]) -> Option<String> {
 
 /// Load the key `path` names, or make and seal one if there is none.
 pub fn load_or_create(path: &Path, opts: &ServerKeyOptions) -> Result<SigningKey> {
-    check_boot_credentials(opts)?;
     let sealed = sealed_path(path);
     let raw = (sealed != path).then_some(path);
     match (sealed.exists(), raw.filter(|r| r.exists())) {
-        (true, Some(raw)) => Err(ServerKeyError::BothPresent {
-            raw: raw.to_path_buf(),
-            sealed,
-        }),
+        (true, Some(raw)) => Err(both_present(raw, &sealed, opts, Use::Boot)),
         (true, None) => open_sealed(&sealed, opts),
         (false, Some(raw)) if opts.plaintext => {
             warn_plaintext(raw, opts);
@@ -297,12 +393,20 @@ pub fn load_or_create(path: &Path, opts: &ServerKeyOptions) -> Result<SigningKey
     }
 }
 
-/// Seal the raw key at `raw` with one slot per entry of `specs`, write it
-/// beside `raw` as `.jigkey`, check that it opens to the same key, then remove
-/// `raw`. Returns the sealed path and the key's DID.
+/// Seal the raw key at `raw` with one slot per entry of `specs` into the
+/// `.jigkey` beside it, keeping its DID and its owner, then remove `raw`.
+/// Returns the sealed path and the DID.
 ///
+/// The sealed copy is written to a temporary file, synced, read back and
+/// opened with every slot named, and only then linked into place, never over
+/// an existing file. So a crash or a failed check leaves no `.jigkey` behind,
+/// and the raw key stays the one good copy until a verified one exists.
 /// Removing `raw` unlinks it; it does not erase the blocks it used.
-pub fn seal_raw(raw: &Path, specs: &[String], kdf: KdfParams) -> Result<(PathBuf, String)> {
+pub fn seal_raw(
+    raw: &Path,
+    specs: &[String],
+    opts: &ServerKeyOptions,
+) -> Result<(PathBuf, String)> {
     let sealed = sealed_path(raw);
     if sealed == raw {
         return Err(ServerKeyError::BadUnlock(format!(
@@ -310,7 +414,11 @@ pub fn seal_raw(raw: &Path, specs: &[String], kdf: KdfParams) -> Result<(PathBuf
         )));
     }
     if sealed.exists() {
-        return Err(ServerKeyError::Exists(sealed));
+        return Err(if raw.exists() {
+            both_present(raw, &sealed, opts, Use::Operator)
+        } else {
+            ServerKeyError::Exists(sealed)
+        });
     }
     if specs.is_empty() {
         return Err(ServerKeyError::BadUnlock(
@@ -321,39 +429,93 @@ pub fn seal_raw(raw: &Path, specs: &[String], kdf: KdfParams) -> Result<(PathBuf
     let did = did_of(&seed);
     let parsed = specs
         .iter()
-        .map(|s| Spec::parse(s))
+        .map(|s| Spec::parse(s, "--slot", Use::Operator))
         .collect::<Result<Vec<_>>>()?;
     let slots = parsed
         .iter()
-        .map(|s| s.clone().slot(kdf))
+        .map(|s| s.clone().slot(opts.kdf))
         .collect::<Result<Vec<_>>>()?;
     let (key, _) =
         JigKey::seal(&did, &seed, &slots).map_err(|source| ServerKeyError::Keystore {
             path: sealed.clone(),
             source,
         })?;
-    write_new(&sealed, &key.to_bytes())?;
-    // Read back what is on disk, and open it with every slot just named,
-    // before the only other copy goes.
-    let reopened = read_jigkey(&sealed)?;
-    for spec in parsed {
-        let opened = reopened.open(&[spec.offer()]);
-        if !opened.is_ok_and(|o| *o.seed == *seed) {
-            return Err(ServerKeyError::NotVerified {
-                path: sealed,
-                kept: format!("the raw key {raw:?} was kept"),
-            });
+    let tmp = temporary(&sealed);
+    let staged = (|| {
+        write_new(&tmp, &key.to_bytes())?;
+        same_owner(&tmp, raw)?;
+        // Read back what is on disk, and open it with every slot just named,
+        // before the only other copy goes.
+        let reopened = read_jigkey(&tmp)?;
+        for spec in parsed {
+            if !reopened
+                .open(&[spec.offer()])
+                .is_ok_and(|o| *o.seed == *seed)
+            {
+                return Err(ServerKeyError::NotVerified {
+                    path: sealed.clone(),
+                    kept: format!("nothing was written and the raw key {raw:?} was kept"),
+                });
+            }
+        }
+        // A link, unlike a rename, fails rather than replace a file that
+        // appeared meanwhile.
+        std::fs::hard_link(&tmp, &sealed).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                ServerKeyError::Exists(sealed.clone())
+            } else {
+                ServerKeyError::Io {
+                    path: sealed.clone(),
+                    source: e,
+                }
+            }
+        })
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    staged?;
+    let io = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| ServerKeyError::Io { path, source }
+    };
+    sync_parent_dir(&sealed).map_err(io(&sealed))?;
+    std::fs::remove_file(raw).map_err(io(raw))?;
+    sync_parent_dir(raw).map_err(io(raw))?;
+    Ok((sealed, did))
+}
+
+/// A name beside `path` for a file being staged, unique to this call.
+fn temporary(path: &Path) -> PathBuf {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(
+        ".tmp.{}",
+        hex::encode(jig_core::crypto::ed25519::random_array::<8>())
+    ));
+    PathBuf::from(tmp)
+}
+
+/// Give `path` the owner and group of `like`: a key sealed or rewritten by
+/// root must stay readable by the server user that owned it. A no-op unless
+/// they differ, which only root can change.
+fn same_owner(path: &Path, like: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let io = |source| ServerKeyError::Io {
+            path: path.to_path_buf(),
+            source,
+        };
+        let want = std::fs::metadata(like).map_err(|source| ServerKeyError::Io {
+            path: like.to_path_buf(),
+            source,
+        })?;
+        let have = std::fs::metadata(path).map_err(io)?;
+        if (have.uid(), have.gid()) != (want.uid(), want.gid()) {
+            std::os::unix::fs::chown(path, Some(want.uid()), Some(want.gid())).map_err(io)?;
         }
     }
-    std::fs::remove_file(raw).map_err(|source| ServerKeyError::Io {
-        path: raw.to_path_buf(),
-        source,
-    })?;
-    sync_parent_dir(raw).map_err(|source| ServerKeyError::Io {
-        path: raw.to_path_buf(),
-        source,
-    })?;
-    Ok((sealed, did))
+    #[cfg(not(unix))]
+    let _ = (path, like);
+    Ok(())
 }
 
 /// Make a new key and seal it at `path` (a `.jigkey`) with one slot per entry
@@ -368,7 +530,7 @@ pub fn generate_sealed(path: &Path, specs: &[String], kdf: KdfParams) -> Result<
     let path = sealed_path(path);
     let slots = specs
         .iter()
-        .map(|s| Spec::parse(s)?.slot(kdf))
+        .map(|s| Spec::parse(s, "--slot", Use::Operator)?.slot(kdf))
         .collect::<Result<Vec<_>>>()?;
     let seed = Zeroizing::new(jig_core::crypto::ed25519::generate_signing_key().to_bytes());
     let did = did_of(&seed);
@@ -389,25 +551,21 @@ pub fn generate_sealed(path: &Path, specs: &[String], kdf: KdfParams) -> Result<
 
 /// Add a slot made from `new_spec` to the sealed key at `path`, opening it
 /// with what `opts` offers. For moving a ceremony key onto its server: seal
-/// it offline with a passphrase, then add the server's credential there.
-/// The file is replaced atomically, and the new slot is checked to open it.
+/// it offline with a passphrase, then add the server's credential there. A
+/// configured secret that cannot be read (a unit's credential, with the unit
+/// stopped) is skipped, so `JIG_KEY_PASSPHRASE` still opens it.
+///
+/// The new slot is checked to open the key, the file is replaced atomically,
+/// and it keeps its owner.
 pub fn add_slot(path: &Path, opts: &ServerKeyOptions, new_spec: &str) -> Result<String> {
     let path = sealed_path(path);
     let key = read_jigkey(&path)?;
-    let offers: Vec<Unlock> = configured(opts)?.into_iter().map(Spec::offer).collect();
     let keystore = |source| ServerKeyError::Keystore {
         path: path.clone(),
         source,
     };
-    let opened = key.open(&offers).map_err(|e| match e {
-        KeystoreError::NoSlotOpened => ServerKeyError::Locked {
-            role: opts.role,
-            path: path.clone(),
-            slots: describe_slots(&key.slots()),
-        },
-        source => keystore(source),
-    })?;
-    let new = Spec::parse(new_spec)?;
+    let opened = open_with(&key, &path, opts, Use::Operator)?;
+    let new = Spec::parse(new_spec, "--slot", Use::Operator)?;
     let updated = key
         .with_slot(&opened, &new.clone().slot(opts.kdf)?)
         .map_err(keystore)?;
@@ -421,10 +579,19 @@ pub fn add_slot(path: &Path, opts: &ServerKeyOptions, new_spec: &str) -> Result<
             kept: "the file was left as it was".to_string(),
         });
     }
-    write_private_atomic(&path, &updated.to_bytes()).map_err(|source| ServerKeyError::Io {
+    let owner = temporary(&path);
+    std::fs::hard_link(&path, &owner).map_err(|source| ServerKeyError::Io {
         path: path.clone(),
         source,
     })?;
+    let written = write_private_atomic(&path, &updated.to_bytes())
+        .map_err(|source| ServerKeyError::Io {
+            path: path.clone(),
+            source,
+        })
+        .and_then(|()| same_owner(&path, &owner));
+    let _ = std::fs::remove_file(&owner);
+    written?;
     Ok(describe_slots(&updated.slots()))
 }
 
@@ -446,7 +613,7 @@ pub enum KeysAction {
 pub fn run(action: KeysAction, opts: &ServerKeyOptions) -> Result<String> {
     match action {
         KeysAction::Seal { keyfile, slots } => {
-            let (sealed, did) = seal_raw(&keyfile, &slots, opts.kdf)?;
+            let (sealed, did) = seal_raw(&keyfile, &slots, opts)?;
             let mut out = format!(
                 "sealed {did} into {}\nremoved {}: that unlinks the file but does not erase it \
                  from the disk, nor from backups made before now",
@@ -480,18 +647,7 @@ pub fn describe(path: &Path) -> Result<(String, String)> {
 
 fn open_sealed(path: &Path, opts: &ServerKeyOptions) -> Result<SigningKey> {
     let key = read_jigkey(path)?;
-    let offers: Vec<Unlock> = configured(opts)?.into_iter().map(Spec::offer).collect();
-    let opened = key.open(&offers).map_err(|e| match e {
-        KeystoreError::NoSlotOpened => ServerKeyError::Locked {
-            role: opts.role,
-            path: path.to_path_buf(),
-            slots: describe_slots(&key.slots()),
-        },
-        source => ServerKeyError::Keystore {
-            path: path.to_path_buf(),
-            source,
-        },
-    })?;
+    let opened = open_with(&key, path, opts, Use::Boot)?;
     let found = did_of(&opened.seed);
     if found != key.did() {
         return Err(ServerKeyError::WrongDid {
@@ -507,7 +663,8 @@ fn open_sealed(path: &Path, opts: &ServerKeyOptions) -> Result<SigningKey> {
 }
 
 fn create_sealed(path: &Path, opts: &ServerKeyOptions) -> Result<SigningKey> {
-    let spec = configured(opts)?
+    let spec = configured(opts, Use::Boot)?
+        .0
         .into_iter()
         .next()
         .ok_or_else(|| ServerKeyError::NoWayToSeal {
@@ -631,12 +788,12 @@ fn describe_slots(slots: &[SlotKind]) -> String {
 /// written on first use and reused after, so a test server seals its key the
 /// way a deployed one does, with no environment variable to race on, and
 /// opens it again when it restarts over the same directory.
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn credential_for_tests(dir: &Path) -> String {
     let path = dir.join("server-key.credential");
     if !path.exists() {
         let secret = hex::encode(jig_core::crypto::ed25519::random_array::<32>());
-        std::fs::write(&path, secret).expect("writing a test credential");
+        write_new(&path, secret.as_bytes()).expect("writing a test credential");
     }
     format!("credential:{}", path.display())
 }
@@ -679,12 +836,7 @@ mod tests {
         let unlock = credential_for_tests(dir.path());
         let raw = dir.path().join("server.key");
         write_raw(&raw, [5u8; 32]);
-        let (sealed, did) = seal_raw(
-            &raw,
-            std::slice::from_ref(&unlock),
-            KdfParams::insecure_for_tests(),
-        )
-        .unwrap();
+        let (sealed, did) = seal_raw(&raw, std::slice::from_ref(&unlock), &opts(None)).unwrap();
         assert_eq!(did, did_of(&[5u8; 32]));
         assert!(
             !raw.exists(),
@@ -705,17 +857,80 @@ mod tests {
         let unlock = credential_for_tests(dir.path());
         let raw = dir.path().join("server.key");
         write_raw(&raw, [5u8; 32]);
-        seal_raw(
-            &raw,
-            std::slice::from_ref(&unlock),
-            KdfParams::insecure_for_tests(),
-        )
-        .unwrap();
+        seal_raw(&raw, std::slice::from_ref(&unlock), &opts(None)).unwrap();
+        // The same key twice: removing the raw copy is safe, and it says so.
         write_raw(&raw, [5u8; 32]);
-        assert!(matches!(
-            load_or_create(&raw, &opts(Some(unlock))),
-            Err(ServerKeyError::BothPresent { .. })
+        let err = load_or_create(&raw, &opts(Some(unlock.clone()))).unwrap_err();
+        assert!(matches!(err, ServerKeyError::BothPresent { .. }), "{err}");
+        assert!(err.to_string().contains("same key"), "{err}");
+        // Another key beside it: neither is to be removed.
+        write_raw(&raw, [8u8; 32]);
+        let err = load_or_create(&raw, &opts(Some(unlock.clone()))).unwrap_err();
+        assert!(err.to_string().contains("different keys"), "{err}");
+        assert!(err.to_string().contains("Remove neither"), "{err}");
+        // A damaged sealed copy, as an interrupted write would leave: keep the raw one.
+        std::fs::write(sealed_path(&raw), b"{not a key").unwrap();
+        let err = load_or_create(&raw, &opts(Some(unlock.clone()))).unwrap_err();
+        assert!(err.to_string().contains("damaged"), "{err}");
+        // And `keys seal` gives the same diagnosis, never "already exists".
+        let err = seal_raw(&raw, &[unlock], &opts(None)).unwrap_err();
+        assert!(err.to_string().contains("damaged"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_seal_that_fails_its_check_leaves_no_sealed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("server.key");
+        write_raw(&raw, [4u8; 32]);
+        // A slot that cannot be read fails before anything is written.
+        let err = seal_raw(&raw, &["env:JIG_TEST_NOT_SET_ANYWHERE".into()], &opts(None));
+        assert!(err.is_err());
+        assert!(
+            !sealed_path(&raw).exists(),
+            "no sealed file after a failed seal"
+        );
+        assert!(raw.exists(), "the raw key is kept");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "no temporary file is left behind");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_credential_readable_by_others_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cred = dir.path().join("loose");
+        std::fs::write(&cred, "a credential secret of at least 32 bytes, loose").unwrap();
+        std::fs::set_permissions(&cred, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let spec = format!("credential:{}", cred.display());
+        for used in [Use::Boot, Use::Operator] {
+            let err = Spec::parse(&spec, "[keys] unlock", used).err().unwrap();
+            assert!(err.to_string().contains("readable by others"), "{err}");
+            assert!(err.to_string().starts_with("[keys] unlock"), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_operator_command_skips_a_credential_it_cannot_read() {
+        // A unit's credential, with the unit stopped: at boot that is an
+        // error; for add-slot it is skipped, and the refusal says so.
+        let dir = tempfile::tempdir().unwrap();
+        let boot = credential_for_tests(dir.path());
+        let path = dir.path().join("server.key");
+        load_or_create(&path, &opts(Some(boot.clone()))).unwrap();
+        let gone = opts(Some(
+            "credential:/run/credentials/jig-server.service/gone".into(),
         ));
+        let err = load_or_create(&path, &gone).unwrap_err();
+        assert!(err.to_string().contains("LoadCredentialEncrypted"), "{err}");
+        let err = add_slot(&path, &gone, &boot).unwrap_err();
+        assert!(matches!(err, ServerKeyError::Locked { .. }), "{err}");
+        assert!(err.to_string().contains("skipped"), "{err}");
     }
 
     #[test]
@@ -774,6 +989,7 @@ mod tests {
         write_raw(&raw, [6u8; 32]);
         let fifo = dir.path().join("cred.fifo");
         let status = std::process::Command::new("mkfifo")
+            .args(["-m", "600"])
             .arg(&fifo)
             .status()
             .unwrap();
@@ -785,7 +1001,7 @@ mod tests {
             })
         };
         let spec = format!("credential:{}", fifo.display());
-        seal_raw(&raw, &[spec], KdfParams::insecure_for_tests()).unwrap();
+        seal_raw(&raw, &[spec], &opts(None)).unwrap();
         writer.join().unwrap();
         assert!(!raw.exists());
     }
@@ -804,7 +1020,9 @@ mod tests {
 
     #[test]
     fn a_slot_spec_that_is_not_one_is_refused_without_echoing_it() {
-        let err = Spec::parse("hunter2-the-secret-itself").err().unwrap();
+        let err = Spec::parse("hunter2-the-secret-itself", "[keys] unlock", Use::Boot)
+            .err()
+            .unwrap();
         assert!(!err.to_string().contains("hunter2"), "{err}");
     }
 }

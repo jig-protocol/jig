@@ -106,41 +106,60 @@ snapshot_db "$JIG_STATE_DIR/nameserver_v002.db"
 #
 # copy_key PATH LABEL: copy the key PATH names. PATH may name the raw file
 # (server.key) or the sealed one (server.jigkey); the sealed one is what a
-# server reads, so it is preferred. Returns 1 if neither exists.
+# server reads, so it is preferred. The extension is taken from the file name
+# alone, as the server does: /srv/jig.d/server names /srv/jig.d/server.jigkey.
+#
+# Returns 1 if neither file exists and 2 if one does but could not be copied.
+# It runs with `set -e` off (it is called in a test), so every step that can
+# fail says so itself: a key that was not copied is never counted.
 key_notes=""
 copy_key() {
-    local path="$1" label="$2" sealed raw
-    case "$path" in
+    local path="$1" label="$2" dir base sealed raw src dest
+    dir="$(dirname -- "$path")"
+    base="$(basename -- "$path")"
+    case "$base" in
         *.jigkey) sealed="$path"; raw="" ;;
-        *.*)      sealed="${path%.*}.jigkey"; raw="$path" ;;
-        *)        sealed="$path.jigkey"; raw="$path" ;;
+        *.*)      sealed="$dir/${base%.*}.jigkey"; raw="$path" ;;
+        *)        sealed="$dir/$base.jigkey"; raw="$path" ;;
     esac
     if [ -f "$sealed" ]; then
-        cp -p "$sealed" "$DEST/$(basename "$sealed")"
-        chmod 600 "$DEST/$(basename "$sealed")"
-        log "key:  $sealed -> $DEST/$(basename "$sealed") (sealed)"
+        src="$sealed"
+    elif [ -n "$raw" ] && [ -f "$raw" ]; then
+        src="$raw"
+    else
+        return 1
+    fi
+    dest="$DEST/$(basename -- "$src")"
+    cp -p -- "$src" "$dest" || { log "ERROR: could not copy $src (is it readable by $(id -un)?)"; return 2; }
+    chmod 600 -- "$dest" || { log "ERROR: could not chmod $dest"; return 2; }
+    [ -s "$dest" ] || { log "ERROR: $dest is empty after copying $src"; return 2; }
+    if [ "$src" = "$sealed" ]; then
+        log "key:  $sealed -> $dest (sealed)"
         if [ -n "$raw" ] && [ -f "$raw" ]; then
             log "WARN: $raw is a raw copy of the $label key in clear beside its sealed copy;"
             log "      it is not backed up, and $label refuses to start until it is removed"
         fi
         key_notes="$key_notes $label=sealed"
-    elif [ -n "$raw" ] && [ -f "$raw" ]; then
-        cp -p "$raw" "$DEST/$(basename "$raw")"
-        chmod 600 "$DEST/$(basename "$raw")"
-        log "key:  $raw -> $DEST/$(basename "$raw")"
+    else
+        log "key:  $raw -> $dest"
         log "WARN: the $label key is stored in clear, so this snapshot holds it in clear."
         log "      Seal it: $label keys seal --keyfile $raw --slot ..."
         key_notes="$key_notes $label=raw-in-clear"
-    else
-        return 1
     fi
     backed_up=$((backed_up + 1))
 }
 
 KEYFILE="${JIG_SERVER_KEYFILE:-$JIG_STATE_DIR/server.key}"
-copy_key "$KEYFILE" jig-server || die "server key $KEYFILE (or its .jigkey) not
-    found — refusing to record a backup that omits the server identity. Set
-    JIG_SERVER_KEYFILE to [server] server_did_keyfile if it lives elsewhere."
+rc=0
+copy_key "$KEYFILE" jig-server || rc=$?
+case "$rc" in
+    0) ;;
+    1) die "server key $KEYFILE (or its .jigkey) not found — refusing to record a
+    backup that omits the server identity. Set JIG_SERVER_KEYFILE to [server]
+    server_did_keyfile if it lives elsewhere." ;;
+    *) die "the server key could not be copied — refusing to record a backup
+    without it" ;;
+esac
 
 # The nameserver's signing key. The nameserver is optional on a box, so a
 # missing key is fatal only when its alias store exists: bindings without the
@@ -148,7 +167,12 @@ copy_key "$KEYFILE" jig-server || die "server key $KEYFILE (or its .jigkey) not
 # nameserver reads the path from [v0_0_2.server] server_did_keyfile when that
 # is set; set JIG_NAMESERVER_KEYFILE to the same path in that case.
 NS_KEYFILE="${JIG_NAMESERVER_KEYFILE:-$JIG_STATE_DIR/nameserver_v002.key}"
-if ! copy_key "$NS_KEYFILE" jig-nameserver; then
+rc=0
+copy_key "$NS_KEYFILE" jig-nameserver || rc=$?
+if [ "$rc" -eq 2 ]; then
+    die "the nameserver key could not be copied — refusing to record a backup
+    without it"
+elif [ "$rc" -eq 1 ]; then
     if [ -f "$JIG_STATE_DIR/nameserver_v002.db" ]; then
         die "nameserver key $NS_KEYFILE (or its .jigkey) not found, but
     $JIG_STATE_DIR/nameserver_v002.db exists — refusing to record a backup of

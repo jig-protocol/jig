@@ -133,6 +133,7 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 
 [dev-dependencies]
 tempfile = "3.8"
+jig-client = { path = "../jig-client", features = ["test-support"] }
 # The suite conformance vectors (tests/suite_vectors.rs): `test-aead`
 # registered, and MLS leaves minted to outlive the checked-in files.
 jig-core = { path = "../jig-core", features = ["test-suite"] }

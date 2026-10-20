@@ -331,9 +331,14 @@ fn under_a_unit_with_credentials_a_plain_secret_file_is_refused() {
         assert!(out.contains("CREDENTIALS_DIRECTORY"), "{out}");
     }
 
-    // One that systemd handed over is accepted.
+    // One that systemd handed over is accepted (systemd makes them 0400).
     let inside = creds.join("jig-server-key");
     std::fs::write(&inside, TEST_SECRET).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&inside, std::fs::Permissions::from_mode(0o400)).unwrap();
+    }
     let mut child = server(dir.path())
         .env("JIG_KEY_UNLOCK", format!("credential:{}", inside.display()))
         .env("CREDENTIALS_DIRECTORY", &creds)
@@ -350,6 +355,58 @@ fn under_a_unit_with_credentials_a_plain_secret_file_is_refused() {
     assert_still_running(&mut child, "a credential from $CREDENTIALS_DIRECTORY boots");
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Restoring on another machine: the config names the unit's credential,
+/// which does not exist while the unit is stopped. Boot refuses and says why;
+/// `keys add-slot` skips it and opens the key with what the environment
+/// offers (here the env slot, as a passphrase would be).
+#[cfg(unix)]
+#[test]
+fn add_slot_opens_the_key_when_the_units_credential_is_not_there() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(&cfg, valid_config(dir.path())).unwrap();
+    let mut child = spawn(dir.path(), &["--config", cfg.to_str().unwrap()]);
+    assert_still_running(&mut child, "first boot seals with the env slot");
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let missing = "/run/credentials/jig-server.service/not-here";
+    std::fs::write(
+        &cfg,
+        format!(
+            "{}\n[keys]\nunlock = \"credential:{missing}\"\n",
+            valid_config(dir.path())
+        ),
+    )
+    .unwrap();
+    let (ok, out) = run_to_exit(spawn(dir.path(), &["--config", cfg.to_str().unwrap()]));
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("LoadCredentialEncrypted"),
+        "boot says what is missing: {out}"
+    );
+
+    let new_cred = dir.path().join("this-machines-credential");
+    std::fs::write(&new_cred, "this machine's credential, at least 32 bytes").unwrap();
+    std::fs::set_permissions(&new_cred, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let (ok, out) = run_to_exit(
+        server(dir.path())
+            .args([
+                "--config",
+                cfg.to_str().unwrap(),
+                "keys",
+                "add-slot",
+                "--slot",
+            ])
+            .arg(format!("credential:{}", new_cred.display()))
+            .spawn()
+            .unwrap(),
+    );
+    assert!(ok, "add-slot opens the key with the env slot: {out}");
+    assert!(out.contains("an env slot, a credential slot"), "{out}");
 }
 
 #[test]
