@@ -277,12 +277,12 @@ impl WelcomeStatement {
                 push(&mut out, &m.seq.to_le_bytes());
             }
         }
-        match &self.key_link {
-            None => push(&mut out, &[0]),
-            Some(link) => {
-                push(&mut out, &[1]);
-                push(&mut out, link.as_bytes());
-            }
+        // The last field, and only when present: a welcome without a link
+        // signs the same bytes as before links existed, so welcomes kept
+        // verbatim (pins, evidence bundles) still verify.
+        if let Some(link) = &self.key_link {
+            push(&mut out, &[1]);
+            push(&mut out, link.as_bytes());
         }
         out
     }
@@ -1124,6 +1124,15 @@ mod tests {
         changed_nonce.nonce = "nonce-2".to_string();
         let mut changed_v = base.clone();
         changed_v.v = 9;
+        let mut changed_link = base.clone();
+        changed_link.key_link = Some("bGluaw".to_string());
+        let mut other_link = base.clone();
+        other_link.key_link = Some("b3RoZXI".to_string());
+        assert_ne!(
+            changed_link.canonical_bytes(),
+            other_link.canonical_bytes(),
+            "the link's bytes must be covered by the signature"
+        );
 
         for (label, bytes) in [
             ("did", changed_did.canonical_bytes()),
@@ -1134,6 +1143,7 @@ mod tests {
             ("reputation", changed_rep.canonical_bytes()),
             ("nonce", changed_nonce.canonical_bytes()),
             ("v", changed_v.canonical_bytes()),
+            ("key_link", changed_link.canonical_bytes()),
         ] {
             assert_ne!(
                 base_bytes, bytes,

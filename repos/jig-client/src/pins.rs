@@ -367,6 +367,10 @@ impl Pins {
             }
             pin.server_did = to.to_string();
             pin.links.push(key_link.to_string());
+            // The old key signed these, so they show nothing about the new
+            // one: the next welcome is checked against its manifest afresh.
+            pin.welcome = None;
+            pin.manifest = None;
             Ok(((), true))
         })
     }
@@ -1110,6 +1114,9 @@ mod tests {
         };
         let mut pins = Pins::load(&path).unwrap();
         pins.check_server_did(server, &did(&old)).unwrap();
+        let mut signed_by_old = welcome(&did(&old), &["none"]);
+        signed_by_old.evidence = "the old key's welcome".into();
+        pins.check_welcome(server, &signed_by_old).unwrap();
 
         // From a key nobody pinned, or claiming to leave one it does not.
         for (from, link) in [
@@ -1128,6 +1135,12 @@ mod tests {
         let pins = Pins::load(&path).unwrap();
         assert_eq!(pins.server(server).unwrap().server_did, did(&new));
         assert_eq!(pins.server(server).unwrap().links, [link(&old, &new)]);
+        assert_eq!(
+            pins.server(server).unwrap().welcome,
+            None,
+            "a welcome the old key signed is not kept as the new key's"
+        );
+        assert_eq!(pins.server(server).unwrap().manifest, None);
     }
 
     #[test]

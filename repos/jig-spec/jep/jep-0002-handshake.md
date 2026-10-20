@@ -90,7 +90,7 @@ Draft. Field names are provisional. The design behind this revision is
 
    | Class | Failure | Closes | Code |
    | --- | --- | --- | --- |
-   | Handshake failure | The `welcome` is missing, malformed or late (`WELCOME_WAIT`), its signature does not verify, `nonce` does not match, `server_did` is not the pinned DID, it contradicts itself or the offer, it no longer advertises a pinned suite, its skew bound is outside the protocol's range, or `tls_exporter` is empty on a TLS connection; a required `peer_proof` is missing or does not verify | The side that detects it | 4001 |
+   | Handshake failure | The `welcome` is missing, malformed or late (`WELCOME_WAIT`), its signature does not verify, `nonce` does not match, `server_did` is not the pinned DID and no `key_link` moves the pin to it (rule 14), it contradicts itself or the offer, it no longer advertises a pinned suite, its skew bound is outside the protocol's range, or `tls_exporter` is empty on a TLS connection; a required `peer_proof` is missing or does not verify | The side that detects it | 4001 |
    | Incompatible | No version or suite in common | The server, after its signed `refusal` | 4002 |
    | Contradiction | Behaviour that contradicts the signed `welcome` (rule 8), or a broken `ingest` chain (rule 9) | The client | 4003 |
    | Protocol violation | A frame before `hello`; a second `hello`; a client frame outside the version or suite it offered | The server, after an error frame | 4004 |
@@ -172,7 +172,7 @@ Draft. Field names are provisional. The design behind this revision is
     close on a `welcome` from another `server_did` (rule 7), unless the `welcome`
     carries a `key_link` with audience `public` from exactly the pinned DID to exactly
     that `server_did`, which it MUST verify under both keys; it then moves its pin.
-    The server serves the same link at `/.well-known/jig`. It MUST treat a `welcome`
+    The server MUST serve the same link at `/.well-known/jig`. It MUST treat a `welcome`
     that no longer advertises a pinned suite as a downgrade and refuse it. A server
     adding a suite is not a downgrade.
 15. A pinned name moves to a new DID automatically only with a rotation signed by the

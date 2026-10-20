@@ -49,6 +49,9 @@ pub fn check_cited(
     if manifest.kind != Some(BlockKind::ServerManifest) {
         return Err(unproven("the cited block is not a server-manifest"));
     }
+    if manifest.metadata.get("channel").and_then(|v| v.as_str()) != Some(LOG_SLUG) {
+        return Err(unproven("the cited block is not in the manifest log"));
+    }
     let author = manifest.authors.first().map(|a| a.did.to_did_jig_string());
     if !author
         .as_deref()
@@ -213,12 +216,22 @@ mod tests {
             doc: &ServerManifest,
             seq: u64,
         ) -> (ManifestRef, String, String, IngestRecord) {
+            self.publish_in(LOG_SLUG, doc, seq)
+        }
+
+        /// [`Self::publish`], with the block naming `channel`.
+        fn publish_in(
+            &self,
+            channel: &str,
+            doc: &ServerManifest,
+            seq: u64,
+        ) -> (ManifestRef, String, String, IngestRecord) {
             let block = crate::blocks::build_with_metadata(
                 &self.identity,
                 BlockKind::ServerManifest,
                 jig_core::HlcTimestamp::now_wall(self.identity.did().clone()),
                 serde_json::json!({
-                    "channel": LOG_SLUG,
+                    "channel": channel,
                     METADATA_KEY: STANDARD.encode(doc.encode().unwrap()),
                 }),
             );
@@ -343,6 +356,11 @@ mod tests {
         ));
         // A signature that is not the author's.
         unproven(check_cited(&welcome, &cited, &bundle, &other_sig, &record));
+        // A server-manifest the server wrote into another channel.
+        let (o_cited, o_bundle, o_sig, o_record) = server.publish_in("#ops", &doc(), 1);
+        unproven(check_cited(
+            &welcome, &o_cited, &o_bundle, &o_sig, &o_record,
+        ));
     }
 
     /// A welcome `server` signs that cites `cited`, and what it advertises.

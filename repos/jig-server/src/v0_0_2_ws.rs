@@ -2379,6 +2379,36 @@ mod tests {
         assert!(dialing.peers.sender_for(&dialed.server_did).is_none());
     }
 
+    /// A peer that moved its key, along a link both keys signed, is not
+    /// federated with until its operator lists the new DID: one connection
+    /// does not carry two peer identities.
+    #[tokio::test]
+    async fn a_dialer_refuses_a_peer_that_moved_until_it_is_listed_anew() {
+        let mut moved = federating(vec![]);
+        let old = jig_core::crypto::ed25519::generate_signing_key();
+        moved.key_link = Some(
+            jig_core::key_link::SignedKeyLink::sign(
+                &old,
+                &moved.ingest_ctx.server_key,
+                jig_core::key_link::Audience::Public,
+                1,
+            )
+            .unwrap()
+            .envelope()
+            .to_vec(),
+        );
+        let (moved, url) = start_test_server_with(moved).await;
+        let dialing = Arc::new(federating(vec![]));
+        let old_did =
+            jig_core::Did::from_ed25519_pubkey(old.verifying_key().as_bytes()).to_did_jig_string();
+        let err = crate::v0_0_2_federation::connect_and_relay(&dialing, &peer_at(&url, old_did))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("set its expected_did"), "{err}");
+        assert!(dialing.peers.sender_for(&moved.server_did).is_none());
+    }
+
     /// A peer the dialer has not proven reaches no handler: one that sends a
     /// peer frame in place of a welcome, and one whose welcome is another
     /// DID's than the expected one.
