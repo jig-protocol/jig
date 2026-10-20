@@ -22,7 +22,9 @@
 //! not this path.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::{Arc, OnceLock};
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use cid::Cid;
