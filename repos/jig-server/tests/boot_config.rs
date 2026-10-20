@@ -302,6 +302,35 @@ fn under_a_unit_with_credentials_a_plain_secret_file_is_refused() {
     assert!(!ok, "{out}");
     assert!(out.contains("CREDENTIALS_DIRECTORY"), "{out}");
 
+    // Nor may a path that only looks inside: one that climbs out, or a
+    // symlink in the directory that points out.
+    let climbing = creds.join("..").join("beside-the-key");
+    let link = creds.join("link-out");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let mut sneaky = vec![climbing];
+    if cfg!(unix) {
+        sneaky.push(link);
+    }
+    for path in sneaky {
+        let child = server(dir.path())
+            .env("JIG_KEY_UNLOCK", format!("credential:{}", path.display()))
+            .env("CREDENTIALS_DIRECTORY", &creds)
+            .args([
+                "--config",
+                cfg.to_str().unwrap(),
+                "--bind",
+                "127.0.0.1",
+                "--port",
+                "0",
+            ])
+            .spawn()
+            .unwrap();
+        let (ok, out) = run_to_exit(child);
+        assert!(!ok, "{} must count as outside: {out}", path.display());
+        assert!(out.contains("CREDENTIALS_DIRECTORY"), "{out}");
+    }
+
     // One that systemd handed over is accepted.
     let inside = creds.join("jig-server-key");
     std::fs::write(&inside, TEST_SECRET).unwrap();

@@ -225,7 +225,14 @@ fn check_boot_credentials(opts: &ServerKeyOptions) -> Result<()> {
             continue;
         };
         match std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from) {
-            Some(dir) if !path.starts_with(&dir) => {
+            // Judged on the resolved paths: `$CREDENTIALS_DIRECTORY/../x`, or
+            // a symlink in it that points out, is a file outside it. A path
+            // that does not resolve is outside too.
+            Some(dir)
+                if !path.canonicalize().is_ok_and(|real| {
+                    dir.canonicalize().is_ok_and(|dir| real.starts_with(dir))
+                }) =>
+            {
                 return Err(ServerKeyError::NotACredential { path, dir });
             }
             Some(_) => {}
