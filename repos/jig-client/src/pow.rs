@@ -5,12 +5,15 @@
 //! when the suffix asks for work, a [`PowOffer`] the nameserver signed: the
 //! effort it will check the proof against. [`verify_offer`] accepts an offer
 //! only if the nameserver the client is talking to signed it, for exactly
-//! this challenge, action, name and DID, and it has not expired. An unsigned
-//! or wrongly signed effort is never solved.
+//! this challenge, action, name and DID. An unsigned or wrongly signed effort
+//! is never solved. Whether the offer has expired is the nameserver's call:
+//! this machine's clock may be off.
 //!
 //! [`Cap`] is how much work this client will do: what its measured rate
-//! solves in `max_solve_secs`, never above [`pow::MAX_EFFORT`]. An offer above
-//! it is refused before any work, with both numbers in the message.
+//! solves in `max_solve_secs`, never above [`pow::MAX_EFFORT`], and
+//! ([`Cap::within`]) no more than fits in what is left of the challenge's
+//! life, timed by the nameserver's own clock. An offer above it is refused
+//! before any work, with both numbers in the message.
 //!
 //! [`solve`] splits the nonce space across the machine's cores on blocking
 //! threads and reports progress, so a long solve is visible and the async
@@ -31,6 +34,9 @@ pub const DEFAULT_MAX_SOLVE_SECS: u64 = 60;
 /// Solves expected to take longer than this get progress reports.
 pub const PROGRESS_AFTER: Duration = Duration::from_secs(2);
 
+/// What a solve leaves of the challenge's life for sending the proof.
+pub const SEND_MARGIN: Duration = Duration::from_secs(5);
+
 #[derive(Debug, thiserror::Error)]
 pub enum PowClientError {
     #[error("the nameserver's proof-of-work offer is not unpadded base64url")]
@@ -48,23 +54,27 @@ pub enum PowClientError {
         got: String,
         want: String,
     },
-    #[error("the proof-of-work offer expired at {0}")]
-    Expired(i64),
     #[error("the proof-of-work offer names algorithm {0}; this client solves only BLAKE3 (1)")]
     UnknownAlg(u32),
     #[error(
         "the nameserver asks for proof-of-work at effort {asked}, more than this client will \
-         do ({cap}: about {secs} s at this machine's measured rate). Try again later, or allow \
-         this client more time"
+         do ({cap}: about {secs} s at this machine's measured rate{why})",
+        why = if *.by_challenge { ", all the challenge has left" } else { "" }
     )]
-    AboveCap { asked: u64, cap: u64, secs: u64 },
+    AboveCap {
+        asked: u64,
+        cap: u64,
+        secs: u64,
+        by_challenge: bool,
+    },
 }
 
 /// Verify `offer_b64u`, the `pow_offer` a nameserver returned for
 /// `challenge`, and return the effort it promises. The offer must be signed
 /// by `ns_did`, the nameserver the client is talking to, and name exactly
 /// this challenge, `action`, `name` (the full lowercased `alias@suffix`) and
-/// `did` (the subject; for rotate, the old DID), unexpired at `now`.
+/// `did` (the subject; for rotate, the old DID). Expiry is not checked here
+/// (see [`deadline`]).
 pub fn verify_offer(
     offer_b64u: &str,
     ns_did: &str,
@@ -72,7 +82,6 @@ pub fn verify_offer(
     action: Action,
     name: &str,
     did: &str,
-    now: i64,
 ) -> Result<PowOffer, PowClientError> {
     let envelope = URL_SAFE_NO_PAD
         .decode(offer_b64u.as_bytes())
@@ -112,10 +121,17 @@ pub fn verify_offer(
             &pow::EMPTY_SALT_ID.to_string(),
         ));
     }
-    if now >= offer.expires_at {
-        return Err(PowClientError::Expired(offer.expires_at));
-    }
     Ok(offer)
+}
+
+/// When an offer expiring at `expires_at` runs out, on this machine's
+/// monotonic clock: `server_now` is the nameserver's clock (its `Date`
+/// header) at `received`. Comparing the server's two times keeps this
+/// machine's wall clock, which may be off by minutes, out of it. `None`
+/// without a server time.
+pub fn deadline(expires_at: i64, server_now: Option<i64>, received: Instant) -> Option<Instant> {
+    let left = u64::try_from(expires_at.saturating_sub(server_now?)).unwrap_or(0);
+    Some(received + Duration::from_secs(left))
 }
 
 /// The most work this client will do for one request.
@@ -126,6 +142,9 @@ pub struct Cap {
     pub max_solve_secs: u64,
     /// `rate × max_solve_secs`, at least 1, at most [`pow::MAX_EFFORT`].
     pub effort: u64,
+    /// Whether the challenge's remaining life, not `max_solve_secs` as
+    /// configured, set this cap.
+    pub by_challenge: bool,
 }
 
 impl Cap {
@@ -141,6 +160,27 @@ impl Cap {
             rate,
             max_solve_secs,
             effort,
+            by_challenge: false,
+        }
+    }
+
+    /// This cap, lowered to what fits before `deadline` with
+    /// [`SEND_MARGIN`] to spare. A solve that outlives its challenge is
+    /// wasted: the nameserver refuses the proof.
+    pub fn within(self, deadline: Option<Instant>) -> Self {
+        let Some(deadline) = deadline else {
+            return self;
+        };
+        let left = deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(SEND_MARGIN)
+            .as_secs();
+        if left >= self.max_solve_secs {
+            return self;
+        }
+        Self {
+            by_challenge: true,
+            ..Self::from_rate(self.rate, left)
         }
     }
 
@@ -151,6 +191,7 @@ impl Cap {
                 asked,
                 cap: self.effort,
                 secs: self.max_solve_secs,
+                by_challenge: self.by_challenge,
             });
         }
         Ok(())
@@ -169,7 +210,8 @@ pub fn retry_bid(new_offer: u64, previous_bid: u64, cap: u64) -> u64 {
 }
 
 /// Digests per second across every core: a short run of a puzzle no nonce
-/// solves, timed.
+/// solves on all of them at once, timed. Running them together counts what
+/// shared cores (SMT) and a lower all-core clock really deliver.
 pub fn measure_rate() -> f64 {
     let impossible = NonZeroU64::new(u64::MAX).expect("non-zero");
     let puzzle = Puzzle::new(
@@ -178,18 +220,24 @@ pub fn measure_rate() -> f64 {
         Action::NsRegister,
         [0; 32],
     );
-    let per_core = {
-        let p = puzzle.borrow().expect("ns-register is a challenge action");
-        let mut done = 0u64;
-        let start = Instant::now();
-        // About 100 ms on a fast core, a few hundred on a slow one.
-        while start.elapsed() < Duration::from_millis(100) {
-            let _ = p.try_solve(impossible, done, 4096);
-            done += 4096;
+    let done = AtomicU64::new(0);
+    let start = Instant::now();
+    std::thread::scope(|s| {
+        for _ in 0..cores() {
+            let (puzzle, done) = (&puzzle, &done);
+            s.spawn(move || {
+                let p = puzzle.borrow().expect("ns-register is a challenge action");
+                let mut nonce = 0u64;
+                // About 100 ms, a little more on a slow core.
+                while start.elapsed() < Duration::from_millis(100) {
+                    let _ = p.try_solve(impossible, nonce, 4096);
+                    nonce += 4096;
+                }
+                done.fetch_add(nonce, Ordering::Relaxed);
+            });
         }
-        done as f64 / start.elapsed().as_secs_f64()
-    };
-    per_core * cores() as f64
+    });
+    done.into_inner() as f64 / start.elapsed().as_secs_f64()
 }
 
 fn cores() -> u64 {
@@ -324,7 +372,6 @@ mod tests {
             Action::NsRegister,
             "dj@dj.jig",
             &me(),
-            NOW,
         )
     }
 
@@ -342,23 +389,21 @@ mod tests {
     }
 
     #[test]
-    fn an_offer_for_another_request_or_expired_is_refused() {
+    fn an_offer_for_another_request_is_refused() {
         let b64 = offer(&ns(), 1);
         let ns_did = did_of(&ns());
         let (me, you) = (me(), you());
-        let other = |challenge, action, name, did: &str, now| {
-            verify_offer(&b64, &ns_did, challenge, action, name, did, now).unwrap_err()
+        let other = |challenge, action, name, did: &str| {
+            verify_offer(&b64, &ns_did, challenge, action, name, did).unwrap_err()
         };
         for err in [
-            other("beef", Action::NsRegister, "dj@dj.jig", &me, NOW),
-            other("c0ffee", Action::NsRenew, "dj@dj.jig", &me, NOW),
-            other("c0ffee", Action::NsRegister, "dk@dj.jig", &me, NOW),
-            other("c0ffee", Action::NsRegister, "dj@dj.jig", &you, NOW),
+            other("beef", Action::NsRegister, "dj@dj.jig", &me),
+            other("c0ffee", Action::NsRenew, "dj@dj.jig", &me),
+            other("c0ffee", Action::NsRegister, "dk@dj.jig", &me),
+            other("c0ffee", Action::NsRegister, "dj@dj.jig", &you),
         ] {
             assert!(matches!(err, PowClientError::Mismatch { .. }), "{err}");
         }
-        let err = other("c0ffee", Action::NsRegister, "dj@dj.jig", &me, NOW + 60);
-        assert!(matches!(err, PowClientError::Expired(_)), "{err}");
         assert!(matches!(
             check("not base64!", &ns_did),
             Err(PowClientError::BadEncoding)
@@ -378,6 +423,36 @@ mod tests {
             "never above rule 19's ceiling"
         );
         assert!(Cap::measure(1).effort >= 1);
+    }
+
+    #[test]
+    fn the_deadline_comes_from_the_nameservers_clock_not_this_machines() {
+        let received = Instant::now();
+        // The offer's 60 s are counted from the server's Date, however far
+        // this machine's own clock is off.
+        assert_eq!(
+            deadline(NOW + 60, Some(NOW), received),
+            Some(received + Duration::from_secs(60))
+        );
+        assert_eq!(deadline(NOW, Some(NOW + 5), received), Some(received));
+        assert_eq!(deadline(NOW + 60, None, received), None);
+    }
+
+    #[test]
+    fn the_cap_fits_in_what_is_left_of_the_challenge() {
+        let cap = Cap::from_rate(1000.0, 60);
+        assert_eq!(cap.within(None), cap, "no server time, no change");
+        let far = Instant::now() + Duration::from_secs(3600);
+        assert_eq!(cap.within(Some(far)), cap, "the configured cap is lower");
+        // 30 s left, less the margin to send: at most about 25 s of work.
+        let soon = cap.within(Some(Instant::now() + Duration::from_secs(30)));
+        assert!(soon.by_challenge);
+        assert!((24..=25).contains(&soon.max_solve_secs), "{soon:?}");
+        assert_eq!(soon.effort, soon.max_solve_secs * 1000);
+        let err = soon.allow(30_000).unwrap_err().to_string();
+        assert!(err.contains("all the challenge has left"), "{err}");
+        // Already over: only the least work is left to try.
+        assert_eq!(cap.within(Some(Instant::now())).effort, 1);
     }
 
     #[test]

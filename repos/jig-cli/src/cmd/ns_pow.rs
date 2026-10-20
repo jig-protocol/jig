@@ -16,7 +16,7 @@ use jig_client::pow::{Cap, PROGRESS_AFTER, Puzzle, retry_bid};
 use jig_core::naming::Name;
 use jig_core::pow::{Action, Proof};
 
-use crate::cmd::ns::{Nameserver, Refusal};
+use crate::cmd::ns::{Challenge, Nameserver, Refusal};
 
 /// What one request proves work for.
 pub(crate) struct Work<'a> {
@@ -40,17 +40,23 @@ pub(crate) async fn with_pow<T>(
     let mut cap = || *cap.get_or_insert_with(|| Cap::measure(max_solve_secs()));
     let mut bid = 0;
     for attempt in 0..2 {
-        let (challenge, offer) = ns
+        let Challenge {
+            challenge,
+            offer,
+            deadline,
+        } = ns
             .challenge_for(work.action, work.subject, work.name)
             .await?;
         let asked = offer.as_ref().map_or(0, |o| u64::from(o.effort));
         let proof = if asked == 0 && attempt == 0 {
             None
         } else {
-            let cap = cap();
-            cap.allow(asked).context(
-                "set JIG_POW_MAX_SOLVE_SECS to allow this machine more time, if you mean to",
-            )?;
+            let cap = cap().within(deadline);
+            cap.allow(asked).context(if cap.by_challenge {
+                "the challenge would expire before this machine finishes; try again later"
+            } else {
+                "set JIG_POW_MAX_SOLVE_SECS to allow this machine more time, if you mean to"
+            })?;
             bid = if attempt == 0 {
                 asked
             } else {
@@ -175,6 +181,16 @@ mod tests {
     /// Every request the stub saw: method, path and body.
     type Seen = Arc<Mutex<Vec<(String, String, String)>>>;
 
+    /// The stub's clock: how far it is ahead of this machine's (`skew`, s),
+    /// and how long its offers live (`ttl`, s). It sends its time as `Date`.
+    #[derive(Clone, Copy)]
+    struct Clock {
+        skew: i64,
+        ttl: i64,
+    }
+
+    const TRUE_CLOCK: Clock = Clock { skew: 0, ttl: 60 };
+
     /// A nameserver for `dj.jig` signing as `ns`. Each challenge is fresh and
     /// carries an offer at `effort` signed by `offer_signer`, for the action,
     /// DID and name the query names. `post` answers each POST from its path
@@ -183,6 +199,7 @@ mod tests {
         ns: SigningKey,
         offer_signer: SigningKey,
         effort: u32,
+        clock: Clock,
         post: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 'static,
     ) -> (String, Seen) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -263,7 +280,9 @@ mod tests {
                                     alg: 1,
                                     effort,
                                     salt_id: 0,
-                                    expires_at: chrono::Utc::now().timestamp() + 60,
+                                    expires_at: chrono::Utc::now().timestamp()
+                                        + clock.skew
+                                        + clock.ttl,
                                     envelope: Vec::new(),
                                 },
                             )
@@ -277,9 +296,11 @@ mod tests {
                         ("POST", p) => post(p, &body),
                         _ => (404, "{}".into()),
                     };
+                    let date = (chrono::Utc::now() + chrono::Duration::seconds(clock.skew))
+                        .format("%a, %d %b %Y %H:%M:%S GMT");
                     let resp = format!(
                         "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
-                         content-length: {}\r\nconnection: close\r\n\r\n{out}",
+                         date: {date}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{out}",
                         out.len()
                     );
                     let _ = sock.write_all(resp.as_bytes()).await;
@@ -352,7 +373,14 @@ mod tests {
     #[tokio::test]
     async fn register_renew_and_rotate_send_work_that_verifies_for_their_binding() {
         let ns = key(1);
-        let (base, seen) = stub(ns.clone(), ns.clone(), 1 << 8, checking(ns, "dj@dj.jig")).await;
+        let (base, seen) = stub(
+            ns.clone(),
+            ns.clone(),
+            1 << 8,
+            TRUE_CLOCK,
+            checking(ns, "dj@dj.jig"),
+        )
+        .await;
         let dir = tempfile::tempdir().unwrap();
         let (me, next) = (
             jig_client::Identity::generate_for_tests(dir.path()),
@@ -385,7 +413,14 @@ mod tests {
     #[tokio::test]
     async fn an_offer_signed_by_another_key_is_refused_before_any_work() {
         let ns = key(1);
-        let (base, seen) = stub(ns.clone(), key(9), 1 << 8, checking(ns, "dj@dj.jig")).await;
+        let (base, seen) = stub(
+            ns.clone(),
+            key(9),
+            1 << 8,
+            TRUE_CLOCK,
+            checking(ns, "dj@dj.jig"),
+        )
+        .await;
         let dir = tempfile::tempdir().unwrap();
         let me = jig_client::Identity::generate_for_tests(dir.path());
         let err = crate::cmd::init::register_with_nameserver(&me, "dj", &base)
@@ -403,7 +438,14 @@ mod tests {
         let ns = key(1);
         // Above rule 19's ceiling, so above any cap.
         let asked = u32::try_from(jig_core::pow::MAX_EFFORT + 1).unwrap();
-        let (base, seen) = stub(ns.clone(), ns.clone(), asked, checking(ns, "dj@dj.jig")).await;
+        let (base, seen) = stub(
+            ns.clone(),
+            ns.clone(),
+            asked,
+            TRUE_CLOCK,
+            checking(ns, "dj@dj.jig"),
+        )
+        .await;
         let dir = tempfile::tempdir().unwrap();
         let me = jig_client::Identity::generate_for_tests(dir.path());
         let err = crate::cmd::init::register_with_nameserver(&me, "dj", &base)
@@ -426,7 +468,7 @@ mod tests {
                 r#"{"code":"POW_REQUIRED","message":"more"}"#.to_string(),
             )
         };
-        let (base, seen) = stub(ns.clone(), ns, 1 << 6, required).await;
+        let (base, seen) = stub(ns.clone(), ns, 1 << 6, TRUE_CLOCK, required).await;
         let dir = tempfile::tempdir().unwrap();
         let me = jig_client::Identity::generate_for_tests(dir.path());
         let err = crate::cmd::init::register_with_nameserver(&me, "dj", &base)
@@ -438,5 +480,57 @@ mod tests {
             .map(|b| b["pow"]["effort"].as_u64().unwrap())
             .collect();
         assert_eq!(bids, [1 << 6, 1 << 7], "the same offer, bid twice as high");
+    }
+
+    #[tokio::test]
+    async fn an_offer_is_timed_by_the_nameservers_clock_not_this_machines() {
+        // The nameserver's clock is an hour behind: by this machine's clock
+        // every offer has long expired, by the nameserver's it has 60 s.
+        let ns = key(1);
+        let behind = Clock {
+            skew: -3600,
+            ttl: 60,
+        };
+        let (base, seen) = stub(
+            ns.clone(),
+            ns.clone(),
+            1 << 8,
+            behind,
+            checking(ns, "dj@dj.jig"),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let me = jig_client::Identity::generate_for_tests(dir.path());
+        crate::cmd::init::register_with_nameserver(&me, "dj", &base)
+            .await
+            .expect("registers: the offer is live where it is checked");
+        assert_eq!(posts(&seen).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn work_that_would_outlive_its_challenge_is_refused_before_solving() {
+        // Two seconds left, less than the margin to send: no solve can land.
+        let ns = key(1);
+        let short = Clock { skew: 0, ttl: 2 };
+        let (base, seen) = stub(
+            ns.clone(),
+            ns.clone(),
+            1 << 8,
+            short,
+            checking(ns, "dj@dj.jig"),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let me = jig_client::Identity::generate_for_tests(dir.path());
+        let err = crate::cmd::init::register_with_nameserver(&me, "dj", &base)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("would expire before this machine finishes")
+                && msg.contains("all the challenge has left"),
+            "{msg}"
+        );
+        assert!(posts(&seen).is_empty(), "nothing was solved or sent");
     }
 }

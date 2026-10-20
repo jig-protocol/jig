@@ -105,6 +105,14 @@ fn http_client() -> Result<reqwest::Client> {
         .context("building HTTP client for the nameserver")
 }
 
+/// A challenge for one action, with the work the nameserver asks for it.
+pub(crate) struct Challenge {
+    pub challenge: String,
+    pub offer: Option<jig_core::naming::PowOffer>,
+    /// When the offer runs out, by the nameserver's clock (its `Date`).
+    pub deadline: Option<std::time::Instant>,
+}
+
 /// Body of GET `/v1/challenge`. `pow_offer` is there when the suffix asks
 /// for proof-of-work; the unsigned `pow` beside it is never read.
 #[derive(Debug, Deserialize)]
@@ -222,7 +230,7 @@ impl Nameserver {
         action: jig_core::pow::Action,
         did: &str,
         name: &Name,
-    ) -> Result<(String, Option<jig_core::naming::PowOffer>)> {
+    ) -> Result<Challenge> {
         let label = match action {
             jig_core::pow::Action::NsRegister => "register",
             jig_core::pow::Action::NsRenew => "renew",
@@ -256,11 +264,17 @@ impl Nameserver {
                 resp.text().await.unwrap_or_default()
             );
         }
+        let received = std::time::Instant::now();
+        let server_now = resp
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| chrono::DateTime::parse_from_rfc2822(v).ok())
+            .map(|t| t.timestamp());
         let body: ChallengeResponse = resp
             .json()
             .await
             .with_context(|| format!("decoding the response to GET {url}"))?;
-        let now = chrono::Utc::now().timestamp();
         let offer = body
             .pow_offer
             .map(|offer| {
@@ -271,11 +285,17 @@ impl Nameserver {
                     action,
                     &alias,
                     did,
-                    now,
                 )
             })
             .transpose()?;
-        Ok((body.challenge, offer))
+        let deadline = offer
+            .as_ref()
+            .and_then(|o| jig_client::pow::deadline(o.expires_at, server_now, received));
+        Ok(Challenge {
+            challenge: body.challenge,
+            offer,
+            deadline,
+        })
     }
 
     /// POST `body` to `path` and return the attestation from a 2xx reply.

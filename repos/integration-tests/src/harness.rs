@@ -665,7 +665,6 @@ impl TestNameserver {
                     jig_core::pow::Action::NsRegister,
                     &alias,
                     &did,
-                    chrono::Utc::now().timestamp(),
                 )?;
                 match std::num::NonZeroU64::new(u64::from(offer.effort)) {
                     None => None,
