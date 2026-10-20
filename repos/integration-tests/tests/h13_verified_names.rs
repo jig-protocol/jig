@@ -172,6 +172,10 @@ fn delegation(authorities: &[&TestNameserver], nameservers: &[String]) -> Delega
             },
         )]
         .into(),
+        // The test nameservers serve plaintext http on loopback. Without
+        // this the resolver refuses them before any lookup, and the lying
+        // server's case would fail for the wrong reason.
+        dangerously_allow_plaintext_nameservers: true,
     }
 }
 

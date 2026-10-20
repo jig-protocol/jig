@@ -554,6 +554,17 @@ impl TestNameserver {
         Self::start_inner(alias_suffix, None, true).await
     }
 
+    /// [`Self::start_with_key`] over its default TLS.
+    pub async fn start_tls_with_key(alias_suffix: &str, seed: [u8; 32]) -> Result<Self> {
+        Self::start_inner(alias_suffix, Some(seed), true).await
+    }
+
+    /// An HTTP client that reaches this nameserver: under TLS, it trusts the
+    /// certificate the nameserver's DID vouches for and no other.
+    pub fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
     async fn start_inner(alias_suffix: &str, seed: Option<[u8; 32]>, tls: bool) -> Result<Self> {
         let tempdir = tempfile::tempdir().context("tempdir")?;
         if let Some(seed) = seed {
