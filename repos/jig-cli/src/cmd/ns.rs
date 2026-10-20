@@ -105,10 +105,40 @@ fn http_client() -> Result<reqwest::Client> {
         .context("building HTTP client for the nameserver")
 }
 
-/// Body of GET `/v1/challenge` (only the `challenge` field is read).
+/// A challenge for one action, with the work the nameserver asks for it.
+pub(crate) struct Challenge {
+    pub challenge: String,
+    pub offer: Option<jig_core::naming::PowOffer>,
+    /// When the offer runs out, by the nameserver's clock (its `Date`).
+    pub deadline: Option<std::time::Instant>,
+}
+
+/// Body of GET `/v1/challenge`. `pow_offer` is there when the suffix asks
+/// for proof-of-work; the unsigned `pow` beside it is never read.
 #[derive(Debug, Deserialize)]
 struct ChallengeResponse {
     challenge: String,
+    #[serde(default)]
+    pow_offer: Option<String>,
+}
+
+/// A 4xx a nameserver answered a register, renew or rotate with: it did not
+/// act. Carried in the `anyhow` error so a caller can tell which refusal it
+/// was.
+#[derive(Debug, thiserror::Error)]
+#[error("POST {url} returned {status}: {body}")]
+pub(crate) struct Refusal {
+    pub url: String,
+    pub status: reqwest::StatusCode,
+    pub body: String,
+}
+
+impl Refusal {
+    /// The `code` of the nameserver's error body, if it has one.
+    pub(crate) fn code(&self) -> Option<String> {
+        let body: serde_json::Value = serde_json::from_str(&self.body).ok()?;
+        Some(body.get("code")?.as_str()?.to_string())
+    }
 }
 
 /// Body of GET `/.well-known/jig-ns-delegation`.
@@ -190,11 +220,82 @@ impl Nameserver {
         &self.delegation.suffix
     }
 
-    /// GET `/v1/challenge`.
-    pub(crate) async fn challenge(&self) -> Result<String> {
-        let url = format!("{}/v1/challenge", self.base);
-        let body: ChallengeResponse = get_json(&self.http, &url).await?;
-        Ok(body.challenge)
+    /// GET `/v1/challenge` for `action` by `did` on `name`, with the
+    /// proof-of-work it asks for: an offer this nameserver signed for exactly
+    /// this request (JEP-0008 rule 16), or `None` when it asks for none. A
+    /// nameserver from before proof-of-work ignores the query and sends no
+    /// offer.
+    pub(crate) async fn challenge_for(
+        &self,
+        action: jig_core::pow::Action,
+        did: &str,
+        name: &Name,
+    ) -> Result<Challenge> {
+        let label = match action {
+            jig_core::pow::Action::NsRegister => "register",
+            jig_core::pow::Action::NsRenew => "renew",
+            jig_core::pow::Action::NsRotate => "rotate",
+            other => anyhow::bail!("{other:?} is not a nameserver action"),
+        };
+        // A DID and `Name::parse`'s output are legal in a query as they are.
+        let alias = name.as_alias();
+        let url = format!(
+            "{}/v1/challenge?action={label}&did={did}&name={alias}",
+            self.base
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        {
+            anyhow::bail!(
+                "GET {url} returned {status}: the nameserver is not issuing challenges right \
+                 now (rate-limited or busy); try again in a minute"
+            );
+        }
+        if !status.is_success() {
+            anyhow::bail!(
+                "GET {url} returned {status}: {}",
+                resp.text().await.unwrap_or_default()
+            );
+        }
+        let received = std::time::Instant::now();
+        let server_now = resp
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| chrono::DateTime::parse_from_rfc2822(v).ok())
+            .map(|t| t.timestamp());
+        let body: ChallengeResponse = resp
+            .json()
+            .await
+            .with_context(|| format!("decoding the response to GET {url}"))?;
+        let offer = body
+            .pow_offer
+            .map(|offer| {
+                jig_client::pow::verify_offer(
+                    &offer,
+                    self.ns_did(),
+                    &body.challenge,
+                    action,
+                    &alias,
+                    did,
+                )
+            })
+            .transpose()?;
+        let deadline = offer
+            .as_ref()
+            .and_then(|o| jig_client::pow::deadline(o.expires_at, server_now, received));
+        Ok(Challenge {
+            challenge: body.challenge,
+            offer,
+            deadline,
+        })
     }
 
     /// POST `body` to `path` and return the attestation from a 2xx reply.
@@ -226,8 +327,8 @@ impl Nameserver {
         };
         let status = resp.status();
         if status.is_client_error() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("POST {url} returned {status}: {text}");
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Refusal { url, status, body }.into());
         }
         let text = match resp.text().await {
             Ok(text) => text,
@@ -686,7 +787,7 @@ mod tests {
                         .push((method.into(), path.into(), body.clone()));
                     let answer = match (method, path) {
                         ("GET", "/.well-known/jig-ns-delegation") => Answer::Full(200, deleg),
-                        ("GET", "/v1/challenge") => {
+                        ("GET", p) if p.starts_with("/v1/challenge") => {
                             Answer::Full(200, r#"{"challenge":"c0ffee"}"#.into())
                         }
                         ("POST", p) => post(p, &body),

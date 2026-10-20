@@ -542,8 +542,8 @@ impl PoolPolicy {
 /// (JEP-0008 rules 16–31). Each challenge promises an effort, signed, and the
 /// proof is checked against that promise.
 ///
-/// Off by default until the client solves (R1 slice 2), which makes
-/// [`PowPolicy::recommended`] the default.
+/// The default is [`PowPolicy::recommended`]: the CLI solves (R1 slice 2).
+/// `min_effort = 0` turns it off.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PowPolicy {
@@ -570,13 +570,8 @@ pub struct PowPolicy {
 }
 
 impl Default for PowPolicy {
-    /// No work is asked, with [`PowPolicy::recommended`]'s other values.
     fn default() -> Self {
-        Self {
-            min_effort: 0,
-            renew_effort: 0,
-            ..Self::recommended()
-        }
+        Self::recommended()
     }
 }
 
@@ -593,6 +588,16 @@ impl PowPolicy {
             short_name_factor: 4,
             renew_effort: 1,
             penalty_decay_secs: 600,
+        }
+    }
+
+    /// No work is asked on this suffix, with [`PowPolicy::recommended`]'s
+    /// other values.
+    pub fn off() -> Self {
+        Self {
+            min_effort: 0,
+            renew_effort: 0,
+            ..Self::recommended()
         }
     }
 }

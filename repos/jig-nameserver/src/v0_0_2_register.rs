@@ -604,8 +604,9 @@ fn busy() -> ApiError {
 /// `?action=&did=&name=` bind it to one request, and on a suffix that asks
 /// for proof-of-work the reply carries the effort asked, signed
 /// (JEP-0008 rule 16): `{challenge, pow: {alg, effort, salt_id, expires_at},
-/// pow_offer}`. For a registration the policy's cheap refusals run first, so
-/// nobody solves work for a name they cannot have; register repeats them.
+/// pow_offer}`. For a registration the policy's cheap refusals (closed, too
+/// short, reserved, taken) run first, so nobody solves work for a name they
+/// cannot have; register repeats them.
 /// Without `action` the challenge is bound to `did` and `name` if given, and
 /// on such a suffix it can only lead to `428 POW_REQUIRED`.
 pub async fn get_challenge(
@@ -660,8 +661,10 @@ pub async fn get_challenge(
             let admission = policy
                 .admit(&did, &name.alias)
                 .map_err(|r| refused(r, policy))?;
+            // Not `refuse_second_name`: it names the alias the DID holds,
+            // and this is before any proof, so anyone could map a DID to its
+            // name. Register refuses a second name once the DID has signed.
             refuse_taken(&state, &did, &alias).await?;
-            refuse_second_name(&state, &did, &name).await?;
             policy.register_effort(
                 admission,
                 &name.alias,

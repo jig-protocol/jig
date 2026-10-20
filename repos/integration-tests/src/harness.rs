@@ -502,6 +502,9 @@ impl TestJigServer {
 // TestNameserver
 // ---------------------------------------------------------------------------
 
+/// How much proof-of-work a [`TestNameserver`] asks for.
+pub use jig_config::v0_0_2_server::PowPolicy;
+
 /// A `jig-nameserver` running on `127.0.0.1:<random>` for tests.
 pub struct TestNameserver {
     pub bound_addr: std::net::SocketAddr,
@@ -532,6 +535,27 @@ impl TestNameserver {
     }
 
     pub async fn start_with_suffix(alias_suffix: &str) -> Result<Self> {
+        Self::start_with_pow(alias_suffix, Self::test_pow()).await
+    }
+
+    /// The proof-of-work a test nameserver asks for unless told otherwise:
+    /// on, at the recommended floor of 2^20 to register, but without the
+    /// length multiplier, so a 3-letter test alias costs a tenth of a second
+    /// in a debug build rather than seconds. Pass
+    /// [`PowPolicy::off`] only to a test that is about something else.
+    pub fn test_pow() -> PowPolicy {
+        PowPolicy {
+            short_name_factor: 1,
+            ..PowPolicy::recommended()
+        }
+    }
+
+    /// A nameserver for `alias_suffix` that asks for proof-of-work as `pow`
+    /// says (JEP-0008).
+    pub async fn start_with_pow(
+        alias_suffix: &str,
+        pow: jig_config::v0_0_2_server::PowPolicy,
+    ) -> Result<Self> {
         let tempdir = tempfile::tempdir().context("tempdir")?;
 
         let mut config = base_config()?;
@@ -541,8 +565,9 @@ impl TestNameserver {
             .to_string_lossy()
             .into_owned();
         config.server.listen = "127.0.0.1:0".to_string();
-        config.nameserver.alias_suffixes =
-            vec![jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix)];
+        let mut suffix = jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix);
+        suffix.pow = pow;
+        config.nameserver.alias_suffixes = vec![suffix];
         // Tests enumerate registered aliases; production leaves this off.
         config.debug.list_handles = true;
 
@@ -598,35 +623,77 @@ impl TestNameserver {
         key: &ed25519_dalek::SigningKey,
     ) -> Result<serde_json::Value> {
         let client = reqwest::Client::new();
-        // 1. Get challenge
-        let ch_resp = client
-            .get(format!("{}/v1/challenge", self.http_url()))
+        let did =
+            jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
+        let alias = format!("{alias_local}@{}", self.alias_suffix).to_ascii_lowercase();
+        let ns_did = self.state.ns_did_string();
+
+        // 1. A challenge for this registration, with the work it asks
+        let ch: serde_json::Value = client
+            .get(format!(
+                "{}/v1/challenge?action=register&did={did}&name={alias}",
+                self.http_url()
+            ))
             .send()
             .await
-            .context("GET /v1/challenge")?;
-        let ch: serde_json::Value = ch_resp.json().await?;
+            .context("GET /v1/challenge")?
+            .json()
+            .await?;
         let challenge = ch["challenge"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("challenge missing"))?
+            .ok_or_else(|| anyhow::anyhow!("challenge missing: {ch}"))?
             .to_string();
 
         // 2. Prove control for this action, alias and nameserver
-        let alias = format!("{alias_local}@{}", self.alias_suffix).to_ascii_lowercase();
         let proof = jig_core::naming::sign_proof(
             key,
             jig_core::naming::Action::Register,
-            &self.state.ns_did_string(),
+            &ns_did,
             &alias,
             &challenge,
         );
 
-        // 3. Register
+        // 3. The proof-of-work the nameserver's signed offer asks for (JEP-0008),
+        //    as `jig init --request-alias` solves it
+        let pow = match ch["pow_offer"].as_str() {
+            None => None,
+            Some(offer) => {
+                let offer = jig_client::pow::verify_offer(
+                    offer,
+                    &ns_did,
+                    &challenge,
+                    jig_core::pow::Action::NsRegister,
+                    &alias,
+                    &did,
+                )?;
+                match std::num::NonZeroU64::new(u64::from(offer.effort)) {
+                    None => None,
+                    Some(effort) => {
+                        let binding = jig_core::naming::proof_hash(
+                            jig_core::naming::Action::Register,
+                            &ns_did,
+                            &alias,
+                            &challenge,
+                        );
+                        let puzzle = jig_client::pow::Puzzle::new(
+                            &ns_did,
+                            &did,
+                            jig_core::pow::Action::NsRegister,
+                            binding,
+                        );
+                        Some(jig_client::pow::solve(puzzle, effort, |_| {}).await?)
+                    }
+                }
+            }
+        };
+
+        // 4. Register
         let body = serde_json::json!({
-            "did": jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes())
-                .to_did_jig_string(),
+            "did": did,
             "requested_alias": alias_local,
             "proof_of_control": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(proof),
             "challenge": challenge,
+            "pow": pow,
         });
         let resp = client
             .post(format!("{}/v1/register", self.http_url()))
