@@ -536,7 +536,19 @@ impl TestNameserver {
     }
 
     pub async fn start_with_suffix(alias_suffix: &str) -> Result<Self> {
-        Self::start_with_pow(alias_suffix, Self::test_pow()).await
+        Self::start_inner(alias_suffix, None, Self::test_pow(), PoolPolicy::off()).await
+    }
+
+    /// Start a nameserver for `alias_suffix` whose DID key has the given
+    /// seed, so a test can name it as an authority before it boots.
+    pub async fn start_with_key(alias_suffix: &str, seed: [u8; 32]) -> Result<Self> {
+        Self::start_inner(
+            alias_suffix,
+            Some(seed),
+            Self::test_pow(),
+            PoolPolicy::off(),
+        )
+        .await
     }
 
     /// The proof-of-work a test nameserver asks for unless told otherwise:
@@ -568,7 +580,19 @@ impl TestNameserver {
         pow: PowPolicy,
         pool: PoolPolicy,
     ) -> Result<Self> {
+        Self::start_inner(alias_suffix, None, pow, pool).await
+    }
+
+    async fn start_inner(
+        alias_suffix: &str,
+        seed: Option<[u8; 32]>,
+        pow: PowPolicy,
+        pool: PoolPolicy,
+    ) -> Result<Self> {
         let tempdir = tempfile::tempdir().context("tempdir")?;
+        if let Some(seed) = seed {
+            std::fs::write(tempdir.path().join("nameserver.key"), seed).context("keyfile")?;
+        }
 
         let mut config = base_config()?;
         config.server.server_did_keyfile = tempdir
@@ -580,6 +604,9 @@ impl TestNameserver {
         let mut suffix = jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix);
         suffix.pow = pow;
         suffix.pool = pool;
+        // A single-label suffix is trusted only through clients' own config;
+        // a test that serves one means it.
+        suffix.single_label_authority = !alias_suffix.contains('.');
         config.nameserver.alias_suffixes = vec![suffix];
         // Tests enumerate registered aliases; production leaves this off.
         config.debug.list_handles = true;
@@ -694,7 +721,7 @@ impl TestNameserver {
                             jig_core::pow::Action::NsRegister,
                             binding,
                         );
-                        Some(jig_client::pow::solve(puzzle, effort, |_| {}).await?)
+                        Some(jig_client::pow::solve(puzzle, effort, None, |_| {}).await?)
                     }
                 }
             }

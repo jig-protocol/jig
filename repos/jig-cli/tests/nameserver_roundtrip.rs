@@ -160,6 +160,94 @@ async fn renewing_an_alias_held_by_another_key_is_refused() {
     );
 }
 
+/// The default user's path: no `[naming]` in cli.toml, a nameserver serving
+/// the single-label `jig` (no DNS delegation), and the built-in `@jig`
+/// authority. Test builds accept the placeholder authority, so the
+/// nameserver here runs under its public test seed.
+#[tokio::test(flavor = "multi_thread")]
+async fn register_renew_and_rotate_an_at_jig_name_under_the_built_in_authority() {
+    let ns = TestNameserver::start_with_key("jig", [0x4a; 32])
+        .await
+        .unwrap();
+    assert_eq!(
+        ns.state.ns_did_string(),
+        jig_core::naming::PLACEHOLDER_JIG_AUTHORITY
+    );
+    let url = ns.http_url();
+    let home = tempfile::tempdir().unwrap();
+
+    let (ok, out) = jig(
+        home.path(),
+        &[
+            "init",
+            "dj",
+            "--request-alias",
+            "DeJi@jig",
+            "--nameserver",
+            &url,
+        ],
+    )
+    .await;
+    assert!(ok, "jig init --request-alias DeJi@jig: {out}");
+    assert!(
+        out.contains("alias attestation verified: deji@jig"),
+        "{out}"
+    );
+    let first = configured_did(home.path());
+    assert_eq!(resolved(&ns, "deji@jig").await.did, first);
+
+    let (ok, out) = jig(
+        home.path(),
+        &["keys", "renew", "deji@jig", "--nameserver", &url],
+    )
+    .await;
+    assert!(ok, "jig keys renew: {out}");
+    assert_eq!(resolved(&ns, "deji@jig").await.did, first);
+
+    let (ok, out) = jig(
+        home.path(),
+        &["keys", "rotate", "deji@jig", "--nameserver", &url],
+    )
+    .await;
+    assert!(ok, "jig keys rotate: {out}");
+    let second = configured_did(home.path());
+    assert_ne!(second, first);
+    assert_eq!(resolved(&ns, "deji@jig").await.did, second);
+}
+
+/// A nameserver for `jig` that is not the `@jig` authority gets nothing
+/// signed, and the name stays unregistered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_jig_nameserver_that_is_not_the_authority_is_refused_before_signing() {
+    let ns = TestNameserver::start_with_suffix("jig").await.unwrap();
+    let url = ns.http_url();
+    let home = tempfile::tempdir().unwrap();
+
+    let (ok, out) = jig(
+        home.path(),
+        &[
+            "init",
+            "dj",
+            "--request-alias",
+            "deji@jig",
+            "--nameserver",
+            &url,
+        ],
+    )
+    .await;
+    assert!(!ok, "{out}");
+    assert!(out.contains("nothing was signed"), "{out}");
+    let status = reqwest::get(format!("{url}/v1/resolve/deji@jig"))
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "deji@jig was never registered"
+    );
+}
+
 /// The same CLI against a nameserver that asks for proof-of-work (JEP-0008):
 /// each command fetches a challenge for its action, solves the effort the
 /// nameserver signed, and the nameserver checks the work before anything

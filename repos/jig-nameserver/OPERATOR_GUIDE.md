@@ -28,7 +28,7 @@ A future feature that needs a symmetric server secret will add a purpose-named, 
 
 ## Configuration
 
-Settings come from the config file (`JIG_NS_CONFIG`, or the default path), then environment variables override them. Settings are read at start-up; restart the service after changing them.
+Settings come from the config file named by `--config <path>` or else `JIG_NS_CONFIG`, then environment variables override them. There is no default path: with neither set, the nameserver refuses to start and says so. It no longer reads `JIG_CONFIG`, `~/.jig/config.toml` or `./config/jig-nameserver/jig-config.toml`. Settings are read at start-up; restart the service after changing them.
 
 - `[[v0_0_2.nameserver.alias_suffixes]]` (required, no default): each suffix this nameserver serves, with its registration policy. The nameserver refuses to start without one. See `deploy/README.md` for the per-suffix options.
 - `[v0_0_2.server] server_did_keyfile`: the nameserver's signing key. Created on first start if missing. Back it up; a new key is a new nameserver identity.

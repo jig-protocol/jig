@@ -17,7 +17,10 @@
 //!
 //! [`solve`] splits the nonce space across the machine's cores on blocking
 //! threads and reports progress, so a long solve is visible and the async
-//! runtime keeps running.
+//! runtime keeps running. The work is a lottery: an unlucky solve can take
+//! several times its expected time, so it stops, with
+//! [`PowClientError::Expired`], once a proof could no longer land before the
+//! challenge expires.
 
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -37,6 +40,10 @@ pub const PROGRESS_AFTER: Duration = Duration::from_secs(2);
 /// What a solve leaves of the challenge's life for sending the proof.
 pub const SEND_MARGIN: Duration = Duration::from_secs(5);
 
+/// A solve still running this close to its deadline stops: a proof found
+/// later would not reach the nameserver in time.
+pub const LAND_MARGIN: Duration = Duration::from_secs(1);
+
 #[derive(Debug, thiserror::Error)]
 pub enum PowClientError {
     #[error("the nameserver's proof-of-work offer is not unpadded base64url")]
@@ -54,6 +61,10 @@ pub enum PowClientError {
         got: String,
         want: String,
     },
+    #[error("the challenge expired before this machine finished its proof-of-work")]
+    Expired,
+    #[error("building the proof-of-work puzzle: {0}")]
+    Puzzle(#[from] pow::PowError),
     #[error("the proof-of-work offer names algorithm {0}; this client solves only BLAKE3 (1)")]
     UnknownAlg(u32),
     #[error(
@@ -269,25 +280,32 @@ impl Puzzle {
 }
 
 /// Solve `puzzle` at `effort` on every core. `progress` is called about once
-/// a second with the digests computed so far.
+/// a second with the digests computed so far. With a `deadline` (the
+/// challenge's, see [`deadline`]) the solve stops [`LAND_MARGIN`] before it
+/// with [`PowClientError::Expired`].
 pub async fn solve(
     puzzle: Puzzle,
     effort: NonZeroU64,
+    deadline: Option<Instant>,
     progress: impl Fn(u64) + Send + 'static,
-) -> Result<Proof, pow::PowError> {
+) -> Result<Proof, PowClientError> {
     puzzle.borrow()?;
-    tokio::task::spawn_blocking(move || solve_blocking(&puzzle, effort, progress))
+    let give_up = deadline.map(|d| d.checked_sub(LAND_MARGIN).unwrap_or(d));
+    tokio::task::spawn_blocking(move || solve_blocking(&puzzle, effort, give_up, progress))
         .await
         .expect("the solver does not panic")
+        .ok_or(PowClientError::Expired)
 }
 
 fn solve_blocking(
     puzzle: &Puzzle,
     effort: NonZeroU64,
+    give_up: Option<Instant>,
     progress: impl Fn(u64),
-) -> Result<Proof, pow::PowError> {
+) -> Option<Proof> {
     const CHUNK: u64 = 1 << 14;
     let next = AtomicU64::new(0);
+    // Set when a proof is found or the deadline passes: either way, stop.
     let found = AtomicBool::new(false);
     let done = AtomicU64::new(0);
     let answer = std::sync::Mutex::new(None);
@@ -309,16 +327,15 @@ fn solve_blocking(
         let mut last = Instant::now();
         while !found.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(50));
-            if last.elapsed() >= Duration::from_secs(1) {
+            if give_up.is_some_and(|t| Instant::now() >= t) {
+                found.store(true, Ordering::Relaxed);
+            } else if last.elapsed() >= Duration::from_secs(1) {
                 progress(done.load(Ordering::Relaxed));
                 last = Instant::now();
             }
         }
     });
-    Ok(answer
-        .into_inner()
-        .expect("solver lock")
-        .expect("a worker found a proof"))
+    answer.into_inner().expect("solver lock")
 }
 
 #[cfg(test)]
@@ -466,10 +483,29 @@ mod tests {
     async fn a_solved_proof_checks_against_its_puzzle() {
         let puzzle = Puzzle::new("did:jig:zNs", "did:jig:zMe", Action::NsRenew, [7; 32]);
         let effort = NonZeroU64::new(1 << 10).unwrap();
-        let proof = solve(puzzle.clone(), effort, |_| {}).await.unwrap();
+        let soon = Some(Instant::now() + Duration::from_secs(60));
+        let proof = solve(puzzle.clone(), effort, soon, |_| {}).await.unwrap();
         puzzle.borrow().unwrap().check(&proof, effort).unwrap();
         // The same work does not count for another subject.
         let other = Puzzle::new("did:jig:zNs", "did:jig:zYou", Action::NsRenew, [7; 32]);
         assert!(other.borrow().unwrap().check(&proof, effort).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_solve_that_cannot_finish_stops_before_its_deadline() {
+        let puzzle = Puzzle::new("did:jig:zNs", "did:jig:zMe", Action::NsRenew, [7; 32]);
+        // Above any real offer, so no machine finds it in time.
+        let effort = NonZeroU64::new(u64::MAX).unwrap();
+        let start = Instant::now();
+        let deadline = start + LAND_MARGIN + Duration::from_millis(300);
+        let err = solve(puzzle, effort, Some(deadline), |_| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PowClientError::Expired), "{err}");
+        assert!(
+            Instant::now() < deadline,
+            "stopped {LAND_MARGIN:?} early, so a found proof could still land"
+        );
+        assert!(start.elapsed() >= Duration::from_millis(300), "it did try");
     }
 }
