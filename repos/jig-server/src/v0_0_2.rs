@@ -57,6 +57,9 @@ pub struct AppState {
     /// once the listener has its certificate ([`Self::bind_tls_certificate`])
     /// and published at `/.well-known/jig`. Shared by every clone.
     pub tls_binding: Arc<std::sync::OnceLock<jig_core::tls_binding::TlsBinding>>,
+    /// The `server-manifest` every welcome cites, once
+    /// [`crate::v0_0_2_manifest_log::publish`] has run. Shared by every clone.
+    pub manifest: Arc<std::sync::RwLock<Option<jig_pipeline::handshake::ManifestRef>>>,
     /// What handles frames between proven peers
     /// ([`crate::v0_0_2_peer::PeerFrames`]), set once at boot by
     /// [`Self::set_peer_frames`]. Shared by every clone.
@@ -285,6 +288,7 @@ impl AppState {
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
             tls_binding: Default::default(),
+            manifest: Default::default(),
             peer_frames: Default::default(),
             peers: Default::default(),
         })
@@ -340,6 +344,7 @@ impl AppState {
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
             tls_binding: Default::default(),
+            manifest: Default::default(),
             peer_frames: Default::default(),
             peers: Default::default(),
         })
@@ -392,6 +397,7 @@ impl AppState {
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
             tls_binding: Default::default(),
+            manifest: Default::default(),
             peer_frames: Default::default(),
             peers: Default::default(),
         })

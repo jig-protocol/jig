@@ -5,7 +5,12 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
-use jig_config::v0_0_2_server::{NameserverSection, Registration, SuffixConfig};
+use jig_config::v0_0_2_server::{NameserverSection, PowPolicy, Registration, SuffixConfig};
+
+/// Digests a second the slowest client a suffix means to serve is assumed to
+/// manage: the one server core `jig-core`'s `benches/pow.rs` measured. Boot
+/// refuses a `max_effort` that would not fit `max_solve_secs` at this rate.
+const REFERENCE_DIGESTS_PER_SEC: u64 = 5_500_000;
 
 /// Every suffix this nameserver serves, in config order.
 #[derive(Debug, Clone)]
@@ -24,6 +29,7 @@ pub struct SuffixPolicy {
     reserved_affixes: Vec<String>,
     /// Lowercased alias → the one DID that may register it past the policy.
     allow: HashMap<String, String>,
+    pow: PowPolicy,
 }
 
 /// Why a registration was refused by policy, before any proof is checked
@@ -125,7 +131,45 @@ impl SuffixPolicy {
             reserved_contains: cfg.reserved_contains.iter().map(|w| fold(w)).collect(),
             reserved_affixes: cfg.reserved_affixes.iter().map(|w| fold(w)).collect(),
             allow,
+            pow: checked_pow(&cfg.suffix, &cfg.pow)?,
         })
+    }
+
+    /// Whether register, renew and rotate on this suffix carry proof-of-work.
+    pub fn requires_pow(&self) -> bool {
+        self.pow.min_effort > 0
+    }
+
+    /// The effort a registration of the lowercased local part `alias` is
+    /// asked for. An allowlisted one pays `min_effort` and nothing for length
+    /// (R1 decision 3); an ordinary one pays `min_effort` ×
+    /// `short_name_factor`^(`short_name_len` − length), up to `max_effort`.
+    pub fn register_effort(&self, admission: Admission, alias: &str) -> u64 {
+        let p = &self.pow;
+        if p.min_effort == 0 || admission == Admission::Allowlisted {
+            return p.min_effort;
+        }
+        let short_by = p.short_name_len.saturating_sub(alias.chars().count());
+        let factor = p
+            .short_name_factor
+            .checked_pow(u32::try_from(short_by).unwrap_or(u32::MAX))
+            .unwrap_or(u64::MAX);
+        p.min_effort.saturating_mul(factor).min(p.max_effort)
+    }
+
+    /// What renew and rotate by the holder pay (JEP-0008 rule 31). `0` when
+    /// the suffix asks no work.
+    pub fn renew_effort(&self) -> u64 {
+        if self.requires_pow() {
+            self.pow.renew_effort
+        } else {
+            0
+        }
+    }
+
+    /// The puzzle algorithm this suffix asks for.
+    pub fn pow_alg(&self) -> u8 {
+        self.pow.alg
     }
 
     /// May `did` register the lowercased local part `alias` here?
@@ -175,6 +219,56 @@ impl SuffixPolicy {
             });
         found.cloned()
     }
+}
+
+/// Check a suffix's `pow` table: a registered algorithm, efforts in order and
+/// under JEP-0008's ceiling, and a `max_effort` that fits `max_solve_secs`.
+fn checked_pow(suffix: &str, pow: &PowPolicy) -> Result<PowPolicy> {
+    if jig_core::pow::Alg::from_id(pow.alg).is_none() {
+        bail!(
+            "suffix `{suffix}`: pow.alg {} is not a registered algorithm",
+            pow.alg
+        );
+    }
+    if pow.min_effort == 0 {
+        return Ok(pow.clone());
+    }
+    if pow.min_effort > pow.max_effort || pow.renew_effort > pow.max_effort {
+        bail!(
+            "suffix `{suffix}`: pow.min_effort {} and pow.renew_effort {} must be at most \
+             pow.max_effort {}",
+            pow.min_effort,
+            pow.renew_effort,
+            pow.max_effort
+        );
+    }
+    if pow.max_effort > jig_core::pow::MAX_EFFORT {
+        bail!(
+            "suffix `{suffix}`: pow.max_effort {} is above JEP-0008's ceiling of {} (rule 19)",
+            pow.max_effort,
+            jig_core::pow::MAX_EFFORT
+        );
+    }
+    let ttl = crate::v0_0_2::DEFAULT_CHALLENGE_TTL.as_secs();
+    if pow.max_solve_secs.saturating_mul(2) > ttl {
+        bail!(
+            "suffix `{suffix}`: pow.max_solve_secs {} must be at most half the challenge \
+             lifetime of {ttl} s, or slow solves outlive their challenge",
+            pow.max_solve_secs
+        );
+    }
+    if pow.max_effort > pow.max_solve_secs.saturating_mul(REFERENCE_DIGESTS_PER_SEC) {
+        bail!(
+            "suffix `{suffix}`: pow.max_effort {} cannot be solved in pow.max_solve_secs {} at \
+             {REFERENCE_DIGESTS_PER_SEC} digests a second",
+            pow.max_effort,
+            pow.max_solve_secs
+        );
+    }
+    if pow.short_name_factor == 0 {
+        bail!("suffix `{suffix}`: pow.short_name_factor must be at least 1");
+    }
+    Ok(pow.clone())
 }
 
 /// Drop separators and fold digit lookalikes: `0→o`, `3→e`, `4→a`, `5→s`,
@@ -308,6 +402,59 @@ mod tests {
         let mut cfg = SuffixConfig::new("names.example.org");
         cfg.min_alias_len = 1;
         assert_eq!(policy(cfg).admit(&did(1), "x"), Ok(Admission::Ordinary));
+    }
+
+    /// A `pow` table that cannot work stops the boot.
+    #[test]
+    fn a_pow_table_that_cannot_work_is_refused_at_boot() {
+        let with = |edit: fn(&mut PowPolicy)| {
+            let mut cfg = SuffixConfig::new("names.example.org");
+            cfg.pow = PowPolicy::recommended();
+            edit(&mut cfg.pow);
+            SuffixPolicy::from_config(&cfg)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        assert!(with(|_| {}).is_ok(), "the recommended values boot");
+        assert!(with(|p| p.alg = 2).unwrap_err().contains("pow.alg"));
+        assert!(
+            with(|p| p.min_effort = p.max_effort + 1)
+                .unwrap_err()
+                .contains("at most")
+        );
+        assert!(
+            with(|p| p.renew_effort = p.max_effort + 1)
+                .unwrap_err()
+                .contains("at most")
+        );
+        assert!(
+            with(|p| p.max_effort = jig_core::pow::MAX_EFFORT * 2)
+                .unwrap_err()
+                .contains("ceiling")
+        );
+        assert!(
+            with(|p| p.max_solve_secs = 1)
+                .unwrap_err()
+                .contains("max_solve_secs")
+        );
+        assert!(
+            with(|p| p.max_solve_secs = 31)
+                .unwrap_err()
+                .contains("half the challenge")
+        );
+        assert!(
+            with(|p| p.short_name_factor = 0)
+                .unwrap_err()
+                .contains("short_name_factor")
+        );
+        // Off is off, whatever else the table says.
+        assert!(
+            with(|p| {
+                p.min_effort = 0;
+                p.max_effort = 0;
+            })
+            .is_ok()
+        );
     }
 
     #[test]

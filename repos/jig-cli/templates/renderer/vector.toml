@@ -1,0 +1,5 @@
+# A vector: an invocation and its expected outcome. `jig block test` runs every file here, and
+# `jig block test --bless` records the outcome of any vector that has none. Fields left out take
+# fixed defaults (sender "did:jig:local", channel "local", seq 0, media type "text/plain").
+[invocation]
+input = "hello"

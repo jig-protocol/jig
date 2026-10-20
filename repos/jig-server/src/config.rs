@@ -338,7 +338,12 @@ server_did_keyfile = "{keyfile}"
 # channel-create and member-add are not optional extras — `jig channel create`
 # and `jig channel join` submit exactly these kinds. member-remove and
 # channel-promote back `jig channel kick/leave/promote`.
-allowed_block_kinds = [{kinds}]
+#
+# Leave allowed_block_kinds unset to track the built-in default as new kinds
+# ship. Today the default is:
+#   allowed_block_kinds = [{kinds}]
+# To restrict it, uncomment that line and remove kinds. A list here is fixed:
+# kinds added in later releases stay refused until you add them.
 
 [identity]
 # tofu = trust the first key seen for a DID and pin it. No nameserver needed.
@@ -573,12 +578,11 @@ mod config_file_tests {
             format!("{}:{}", server.bind_address, server.port),
             "template's decorative `listen` must agree with the real bind address"
         );
-        for kind in ["text-render", "channel-create", "member-add"] {
-            assert!(
-                v002.server.allowed_block_kinds.contains(&kind.to_string()),
-                "template must allow {kind}"
-            );
-        }
+        assert_eq!(
+            v002.server.allowed_block_kinds,
+            jig_config::v0_0_2_server::ServerSection::default().allowed_block_kinds,
+            "the template leaves allowed_block_kinds to the built-in default"
+        );
     }
 
     /// Extract the literal heredoc `install.sh` writes to `~/.jig/config.toml`
@@ -649,15 +653,52 @@ mod config_file_tests {
             format!("{}:{}", server.bind_address, server.port),
             "install.sh must keep the decorative `listen` in sync with the real bind address"
         );
+        assert_eq!(
+            v002.server.allowed_block_kinds,
+            jig_config::v0_0_2_server::ServerSection::default().allowed_block_kinds,
+            "install.sh leaves allowed_block_kinds to the built-in default, so new kinds reach new installs"
+        );
     }
 
     /// The example operators copy must stay loadable as the config surface
     /// tightens.
+    /// The commented-out default that `install.sh` and the deploy example
+    /// show operators, as the built-in default renders it.
+    fn commented_default_kinds() -> String {
+        let kinds = jig_config::v0_0_2_server::ServerSection::default()
+            .allowed_block_kinds
+            .iter()
+            .map(|k| format!("\"{k}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("#   allowed_block_kinds = [{kinds}]")
+    }
+
+    /// Both files leave the list unset but show today's default, so an
+    /// operator restricting it starts from the real list.
+    #[test]
+    fn install_sh_and_the_example_show_the_current_default_kinds() {
+        let line = commented_default_kinds();
+        for file in ["../../install.sh", "../../deploy/config.example.toml"] {
+            let text =
+                fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file)).unwrap();
+            assert!(
+                text.contains(&line),
+                "{file} must show the built-in default as `{line}`"
+            );
+        }
+    }
+
     #[test]
     fn deploy_example_config_loads() {
         let example =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/config.example.toml");
-        ServerConfig::load(&example).expect("deploy/config.example.toml must load");
+        let example = ServerConfig::load(&example).expect("deploy/config.example.toml must load");
+        assert_eq!(
+            example.v0_0_2().server.allowed_block_kinds,
+            jig_config::v0_0_2_server::ServerSection::default().allowed_block_kinds,
+            "the example leaves allowed_block_kinds to the built-in default"
+        );
     }
 
     #[test]

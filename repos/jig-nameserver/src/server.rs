@@ -193,11 +193,13 @@ pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
 
     let mut v0_0_2_cfg = cfg.v0_0_2.clone();
     v0_0_2_cfg.server.server_did_keyfile = resolve_v0_0_2_keyfile(cfg);
-    let v0_0_2_state = Arc::new(crate::v0_0_2::AppState::new(
+    let mut v0_0_2_state = crate::v0_0_2::AppState::new(
         v0_0_2_cfg,
         db_sibling(&cfg.storage.database_path, "_v002.db"),
         crate::v0_0_2_policy::Suffixes::from_config(&cfg.v0_0_2.nameserver)?,
-    )?);
+    )?;
+    v0_0_2_state.max_pending_challenges = cfg.alias_rate_limits.max_pending_challenges;
+    let v0_0_2_state = Arc::new(v0_0_2_state);
 
     let tls_binding = Arc::new(OnceLock::new());
     let state = AppState {
@@ -417,8 +419,10 @@ mod tests {
     fn scratch_config(dir: &ScratchDir, alias_suffix: &str) -> NameServerConfig {
         let mut cfg = NameServerConfig::default();
         cfg.storage.database_path = dir.0.join("nameserver.db");
-        cfg.v0_0_2.nameserver.alias_suffixes =
-            vec![jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix)];
+        let mut suffix = jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix);
+        // These tests are about routes and rate limits, not proof-of-work.
+        suffix.pow = jig_config::v0_0_2_server::PowPolicy::off();
+        cfg.v0_0_2.nameserver.alias_suffixes = vec![suffix];
         cfg.v0_0_2.server.server_did_keyfile = dir.0.join("ns.key").to_string_lossy().into_owned();
         // Off by default in production; on here so the route-presence assertions
         // exercise the mounted handler.
@@ -677,6 +681,22 @@ mod tests {
         let (status, body) = get(router, "/v1/challenge").await;
         assert_eq!(status, StatusCode::OK);
         body["challenge"].as_str().unwrap().to_string()
+    }
+
+    /// `GET /v1/challenge` has a per-IP bucket of its own (JEP-0008 rule 31).
+    #[tokio::test]
+    async fn challenges_are_rate_limited_per_ip() {
+        let dir = ScratchDir::new("challenge-rate-limit");
+        let mut cfg = scratch_config(&dir, "dj.jig");
+        cfg.alias_rate_limits.challenge_per_ip_per_min = 2;
+        let router = build_app(&cfg).expect("build_app");
+        fresh_challenge(&router).await;
+        fresh_challenge(&router).await;
+        let (status, body) = get(&router, "/v1/challenge").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert_eq!(body["code"], "RATE_LIMITED");
+        // Other GETs are not counted.
+        assert_eq!(get(&router, "/v1/health").await.0, StatusCode::OK);
     }
 
     /// The limiter sits in front of the mounted register/rotate/renew
