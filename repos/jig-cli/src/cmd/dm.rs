@@ -39,7 +39,7 @@ fn check_roster<'a>(roster: &'a [String], me: &str, peer: &str) -> Result<(), Op
 }
 
 pub async fn run(ctx: &CliContext, who: String, message: String) -> Result<()> {
-    let peer = resolve_who(ctx, &who)?;
+    let peer = resolve_who(ctx, &who).await?;
     let me = ctx.identity()?.did_string();
     if peer == me {
         anyhow::bail!("that is you");

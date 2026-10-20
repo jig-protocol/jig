@@ -181,6 +181,7 @@ fn delivered(block: &BuiltBlock) -> jig_client::DeliveredBlock {
         sig_b64: Some(b64.encode(&block.sender_sig)),
         receipts: vec![],
         delivery_cid: block.cid(),
+        ingest: None,
     }
 }
 

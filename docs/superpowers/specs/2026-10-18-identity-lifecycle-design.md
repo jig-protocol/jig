@@ -283,6 +283,13 @@ Any verifier that holds both keeps them as evidence and accepts neither automati
   `verify_rotation_chain` checks alias moves without knowing the encoding.
 - This is the same stack as the v0.3 receipts.
 
+#### The link, byte for byte
+
+Specified in [JEP-0012](../../../repos/jig-spec/jep/jep-0012-key-links.md) and
+implemented in `jig_core::key_link`. The payload is `{domain: "jig-key-link-v1", old, new,
+audience: {kind, …}, issued_at}`, signed as a COSE_Sign by `old` and then `new`. The test
+vectors are in `repos/jig-spec/jep/vectors/0012/`.
+
 ## Q3. Revocation
 
 **Decided (DJ, 2026-10-18): self-revocation.**
@@ -414,9 +421,9 @@ These are applied in implementation PRs, not in this one.
 
   PV-03 gains a sentence: a link is the one message that ties two DIDs, and only the
   holder makes one.
-- **New JEP-0006, "Key links and revocation":** the objects, their encoding, the
-  `key-link`, `key-revoke`, `server-rekey` and `sequencer-rekey` records, and who acts
-  on each.
+- **JEP-0012, "Key links":** the link object, its encoding and the fork rule. Revocation
+  and the `key-link`, `key-revoke`, `server-rekey` and `sequencer-rekey` records, with who
+  acts on each, follow in later JEPs or amendments.
 - **JEP-0001 Q4:** a leaf per device, under leaf certificates. A rotation is a new DID
   and a channel-scoped link.
 - **JEP-0002:** `sequencer-rekey`; the welcome carries the link during an overlap.

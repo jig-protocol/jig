@@ -18,6 +18,13 @@ use std::process::Command;
 fn server_set_writes_base_url_to_cli_toml() {
     let tmp = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["server", "set", "http://example.com:9090"])
         .env("HOME", tmp.path())
         .output()
@@ -48,6 +55,13 @@ fn server_set_accepts_wss_scheme() {
     // at info-fetch time, so we should store it verbatim here.
     let tmp = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["server", "set", "wss://deji.jig.onl"])
         .env("HOME", tmp.path())
         .output()
@@ -69,6 +83,13 @@ fn server_set_accepts_wss_scheme() {
 fn server_set_rejects_empty_url() {
     let tmp = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["server", "set", ""])
         .env("HOME", tmp.path())
         .output()
@@ -91,6 +112,13 @@ fn server_set_rejects_garbage_url() {
     // `url` crate should reject it. Same for `://` and similar nonsense.
     let tmp = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["server", "set", "not a url at all"])
         .env("HOME", tmp.path())
         .output()
@@ -105,6 +133,13 @@ fn server_set_rejects_garbage_url() {
 #[test]
 fn binary_exposes_server_subcommands() {
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["server", "--help"])
         .output()
         .unwrap();
@@ -129,6 +164,13 @@ fn server_info_help_mentions_url_override_flag() {
     // The `--url` override is the diagnostic escape hatch — check that
     // it shows up so operators don't have to grep for it.
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         .args(["server", "info", "--help"])
         .output()
         .unwrap();
@@ -147,6 +189,13 @@ fn server_info_fails_loudly_when_target_unreachable() {
     // panic or silent success).
     let tmp = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
         // Port 1 is privileged and almost certainly closed; the connect
         // attempt should fail fast.
         .args(["server", "info", "--url", "http://127.0.0.1:1"])
