@@ -37,6 +37,7 @@ pub mod api;
 pub mod component;
 pub mod config;
 pub mod error;
+pub mod grant_linker;
 pub mod payload;
 
 // Internal implementation modules

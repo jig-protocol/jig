@@ -22,13 +22,11 @@ Group=jig
 Restart=on-failure
 RestartSec=5s
 
-# JIG_NS_SECRET is MANDATORY — the nameserver panics at startup without it
-# ("JIG_NS_SECRET env var is required"). It is a secret, so it lives in a
-# chmod 600 root:jig file, never inline in this unit (unit files are readable
-# by anyone who can run `systemctl cat`). NOTE: no leading '-' — if the file is
-# missing we want the unit to fail immediately and loudly, not to boot a
-# nameserver with a default PoW secret.
-EnvironmentFile=/etc/jig/jig-nameserver.env
+# Optional (leading '-'): the nameserver needs no secret. Put any JIG_NS_*
+# setting you want kept out of this unit in a chmod 600 root:jig file here
+# (unit files are readable by anyone who can run `systemctl cat`). A
+# JIG_NS_SECRET left in it from an older install is ignored.
+EnvironmentFile=-/etc/jig/jig-nameserver.env
 
 # `jig-nameserver serve --bind/--port` are honoured as of the v0.0.2 alias-API
 # work — main.rs passes them into run_http_server and they override the loaded
