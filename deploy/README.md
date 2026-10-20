@@ -11,6 +11,7 @@ Tailscale**.
 | `config.example.toml` | The `/etc/jig/config.toml` template |
 | `jig-backup.sh` | `VACUUM INTO` snapshots + the sealed `server.jigkey` |
 | `jig-backup.service` / `.timer` | Daily 03:17 UTC backup |
+| `setup-server-key.sh` | Seals the server's or nameserver's key to a systemd credential plus an offline passphrase ([Sealing the server key](#sealing-the-server-key)) |
 
 Each unit file carries its own rationale in comments. This document covers the
 sequence and the things that are not visible from inside a single file.
@@ -521,6 +522,9 @@ sudo systemctl start jig-server jig-nameserver
 curl -k https://100.x.y.z:7117/.well-known/jig  # server_did MUST match the old one
 ```
 
+That last check is the whole point: if `server_did` changed, you restored the
+databases without the key.
+
 On the same machine the keys open with the credential they were sealed with. On
 **another machine** a TPM-bound credential does not decrypt: make this host's
 credential ([Sealing the server key](#sealing-the-server-key), step 1), then add
@@ -536,12 +540,37 @@ unset JIG_KEY_PASSPHRASE
 ```
 
 The old machine's credential slot stays in the file and opens nothing here.
+`sudo deploy/setup-server-key.sh` does the same: it makes the credential, and
+adds it after checking that the passphrase opens the key.
 
 ### Sealing the server key
 
 A server boots unattended, so its key opens with a secret the server is handed
 at start, never typed. `[keys] unlock` names it. The recommended one is a
-systemd credential, encrypted to this machine's TPM where it has one:
+systemd credential, encrypted to this machine's TPM where it has one, plus a
+passphrase kept offline for restoring on other hardware.
+
+`deploy/setup-server-key.sh` does all of it, and changes nothing when run again:
+
+```bash
+sudo deploy/setup-server-key.sh               # jig-server; asks for the passphrase
+sudo deploy/setup-server-key.sh --nameserver  # jig-nameserver
+sudo systemctl restart jig-server
+```
+
+It makes the credential, then makes the key sealed (`keys generate`), seals a
+raw one in place (`keys seal`, same DID), or adds whichever of the credential
+and the passphrase does not open an existing sealed key yet (`keys verify`,
+`keys add-slot`). Then it writes a drop-in with `LoadCredentialEncrypted=` and
+sets `unlock`. It never prints a secret, refuses to replace a credential, a key
+or a different `unlock` it finds, and moves them aside (a NEW DID) only with
+`--force`. `--import SEED` seals a raw 32-byte seed from elsewhere as the key.
+Without `systemd-creds` (systemd before 250), `--passphrase-only` seals the
+key with the passphrase alone, and the server then needs `JIG_KEY_PASSPHRASE`
+at every boot. Once it is done, store the passphrase offline: it is the only
+thing that opens the key on another machine.
+
+By hand, the same steps:
 
 1. Make the secret, encrypted at rest. `--with-key=auto` uses the TPM2 when there
    is one, and otherwise a host key in `/var/lib/systemd/credential.secret`:
@@ -570,6 +599,16 @@ systemd credential, encrypted to this machine's TPM where it has one:
    Removing the raw file does not erase it from the disk or from earlier backups.
    Then add the offline passphrase slot (top of this file).
 
+To check, at any time, that a secret still opens the key without trying anything
+else (the offline passphrase, say, before you rely on it):
+
+```bash
+sudo -i
+read -rs -p 'passphrase: ' JIG_KEY_PASSPHRASE; echo; export JIG_KEY_PASSPHRASE
+/opt/jig/bin/jig-server --config /etc/jig/config.toml keys verify --slot passphrase
+unset JIG_KEY_PASSPHRASE
+```
+
 What each choice protects against:
 
 | `[keys] unlock` | Protects the key against | Not against |
@@ -582,9 +621,6 @@ What each choice protects against:
 
 At-rest encryption does not protect a key from code running as the server's
 user while it runs, and does not protect the key in memory.
-
-That last check is the whole point: if `server_did` changed, you restored the
-databases without the key.
 
 ---
 
@@ -665,6 +701,20 @@ it with the ceremony passphrase in `JIG_KEY_PASSPHRASE` (the same
 root-shell pattern as for jig-server). A key made elsewhere as a raw 32-byte
 seed is imported with `keys seal`, which keeps its DID. Nameserver keys open as
 `[v0_0_2.keys]` says, the same section as jig-server's `[keys]`.
+
+On the server, `sudo deploy/setup-server-key.sh --nameserver` finishes the
+ceremony: with the `.jigkey` where the config names it, it asks for the
+ceremony passphrase, checks that it opens the key, and adds the machine's
+credential. For a raw seed from elsewhere, `--import SEED` seals it instead,
+and then the seed file is the key in clear: destroy it, or keep it offline as
+carefully as the passphrase.
+
+**TLS in front of a nameserver.** Clients reach a nameserver over TLS only
+when the certificate it presents is the one its DID binds in
+`/.well-known/jig-ns`, and CA roots are not consulted. A TLS-terminating proxy
+presents its own certificate and is refused, so put the nameserver on the
+public address itself, or behind a proxy that passes TLS through (TCP or SNI
+passthrough) without terminating it.
 
 ---
 
