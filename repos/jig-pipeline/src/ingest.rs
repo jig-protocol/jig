@@ -658,7 +658,9 @@ pub async fn ingest(
         _ => None,
     };
     if render_input.is_some() && matches!(mls_plan, crate::mls_gate::MlsPlan::Advance { .. }) {
-        return Err(anyhow::anyhow!("an MLS commit is not a text-render block").into());
+        return Err(IngestError::MlsRejected {
+            detail: "an MLS commit cannot be a text-render block".to_string(),
+        });
     }
     if let Some(input) = &render_input {
         check_text_render(ctx, input, &block_cid).await?;
@@ -822,9 +824,11 @@ pub async fn ingest(
                 _ => return Err(refused_at_landing(guard_refusal, kind_str)),
             };
             if let Some(input) = render_input.take() {
-                stored_receipt = render_after_landing(ctx, input, &block_cid, record).await?;
+                stored_receipt = receipt_after_landing(ctx, input, &block_cid, record).await;
             }
-            ctx.store.insert_receipt_once(&stored_receipt)?;
+            if !stored_receipt.receipt_bytes.is_empty() {
+                ctx.store.insert_receipt_once(&stored_receipt)?;
+            }
         }
         plan => {
             if let crate::mls_gate::MlsPlan::Genesis(mut group) = plan {
@@ -853,9 +857,11 @@ pub async fn ingest(
             // The receipt is written before fanout below, so no subscriber or peer sees the
             // block without it.
             if let Some(input) = render_input.take() {
-                stored_receipt = render_after_landing(ctx, input, &block_cid, record).await?;
+                stored_receipt = receipt_after_landing(ctx, input, &block_cid, record).await;
             }
-            ctx.store.insert_receipt_once(&stored_receipt)?;
+            if !stored_receipt.receipt_bytes.is_empty() {
+                ctx.store.insert_receipt_once(&stored_receipt)?;
+            }
         }
     }
 
@@ -1475,6 +1481,58 @@ async fn render_after_landing(
     Ok(stored_receipt(ctx, block_cid, bytes, render_hash))
 }
 
+/// The receipt of a landed `text-render` block, whatever happens while rendering it.
+///
+/// Once the block and its record have landed, ingest must not report it as refused: it is in the
+/// channel's chain and history serves it. So a failure here (the render task dying, a store
+/// error reading the record, a signing error) is logged and the block gets an `accepted` receipt
+/// instead of an `exec` one. If even that cannot be signed, the receipt is left unwritten: readers
+/// see the block as pending, and the boot backfill tries again.
+async fn receipt_after_landing(
+    ctx: &IngestContext,
+    input: text_block::Input,
+    block_cid: &str,
+    record: Option<crate::ingest_record::IngestRecord>,
+) -> StoredReceipt {
+    #[cfg(test)]
+    let rendered = if FAIL_AFTER_LANDING.with(|f| f.replace(false)) {
+        Err(IngestError::RenderFailed {
+            kind: "text-render".into(),
+            detail: "injected by a test".into(),
+        })
+    } else {
+        render_after_landing(ctx, input, block_cid, record).await
+    };
+    #[cfg(not(test))]
+    let rendered = render_after_landing(ctx, input, block_cid, record).await;
+    match rendered {
+        Ok(receipt) => receipt,
+        Err(e) => {
+            tracing::warn!(block_cid, error = %e, "rendering a landed block failed; writing an accepted receipt");
+            fallback_receipt(ctx, block_cid)
+        }
+    }
+}
+
+/// An `accepted` receipt for a landed block that could not be rendered. Empty bytes if it cannot
+/// be signed; [`SqliteStore::insert_receipt_once`] callers skip those.
+fn fallback_receipt(ctx: &IngestContext, block_cid: &str) -> StoredReceipt {
+    match crate::receipts::accepted(block_cid, &ctx.server_key) {
+        Ok(bytes) => stored_receipt(ctx, block_cid, bytes, None),
+        Err(e) => {
+            tracing::error!(block_cid, error = %e, "signing an accepted receipt failed; the block stays pending");
+            stored_receipt(ctx, block_cid, Vec::new(), None)
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes the next render after landing fail, so a test can check ingest still reports the
+    /// landed block as accepted.
+    static FAIL_AFTER_LANDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Run text-render once, off the async worker.
 ///
 /// `render` parks on a condvar for a concurrency slot and then runs the guest on the same thread.
@@ -1562,21 +1620,51 @@ fn stored_receipt(
 pub async fn backfill_render_receipts(ctx: &IngestContext) -> Result<usize, IngestError> {
     let kind = BlockKind::TextRender.as_str();
     let mut written = 0;
+    let mut fell_back = 0;
     for block in ctx
         .store
         .blocks_missing_receipt(kind, &ctx.server_did.to_string())?
     {
-        let (manifest_bytes, _code): (Vec<u8>, Vec<u8>) =
-            serde_json::from_slice(&block.bundle_bytes)
-                .map_err(|e| IngestError::BundleMalformed(format!("stored bundle: {e}")))?;
-        let manifest = parse_manifest(&manifest_bytes)?;
-        let input = text_render_input(ctx, &manifest, kind)?;
-        let receipt = render_after_landing(ctx, input, &block.cid, None).await?;
-        if ctx.store.insert_receipt_once(&receipt)? {
+        // One block that cannot be rendered (a damaged bundle, a missing body) gets an
+        // `accepted` receipt and is logged, so it neither stops the blocks after it nor comes
+        // back on every boot.
+        let receipt = match backfill_input(ctx, &block, kind) {
+            Ok(input) => match render_after_landing(ctx, input, &block.cid, None).await {
+                Ok(receipt) => receipt,
+                Err(e) => {
+                    tracing::warn!(block_cid = %block.cid, error = %e, "backfill render failed");
+                    fell_back += 1;
+                    fallback_receipt(ctx, &block.cid)
+                }
+            },
+            Err(e) => {
+                tracing::warn!(block_cid = %block.cid, error = %e, "stored block cannot be rendered");
+                fell_back += 1;
+                fallback_receipt(ctx, &block.cid)
+            }
+        };
+        if !receipt.receipt_bytes.is_empty() && ctx.store.insert_receipt_once(&receipt)? {
             written += 1;
         }
     }
+    if fell_back > 0 {
+        tracing::warn!(
+            fell_back,
+            "backfill wrote accepted receipts for blocks it could not render"
+        );
+    }
     Ok(written)
+}
+
+fn backfill_input(
+    ctx: &IngestContext,
+    block: &StoredBlock,
+    kind: &str,
+) -> Result<text_block::Input, IngestError> {
+    let (manifest_bytes, _code): (Vec<u8>, Vec<u8>) =
+        serde_json::from_slice(&block.bundle_bytes)
+            .map_err(|e| IngestError::BundleMalformed(format!("stored bundle: {e}")))?;
+    text_render_input(ctx, &parse_manifest(&manifest_bytes)?, kind)
 }
 
 // ---- Tests ----------------------------------------------------------------
@@ -1902,6 +1990,54 @@ mod tests {
                 .is_empty(),
             "the refused block must not have landed"
         );
+    }
+
+    /// A render that fails after the block has landed does not make ingest report the block as
+    /// refused: it is in the chain. It gets an `accepted` receipt and is delivered.
+    #[tokio::test]
+    async fn a_render_failure_after_landing_still_accepts_and_delivers_the_block() {
+        let ctx = test_ctx();
+        let channel_id = seed_channel(&ctx, "#hello");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.fanout
+            .subscribe_local(
+                crate::fanout::SubscriptionScope::Channel(channel_id),
+                crate::fanout::SubscriberIdentity::Unchecked,
+                tx,
+            )
+            .await;
+        super::FAIL_AFTER_LANDING.with(|f| f.set(true));
+        let cid = ingest_text(&ctx, "lands, then the render fails").await;
+
+        assert!(ctx.store.get_ingest_record(&cid).unwrap().is_some());
+        assert_eq!(
+            exec_receipt(&ctx, &cid).receipt.body,
+            jig_core::block_receipt::Body::Accepted
+        );
+        assert!(rx.try_recv().is_ok(), "the landed block must be delivered");
+    }
+
+    /// One stored block the backfill cannot render gets an `accepted` receipt; it does not stop
+    /// the blocks after it.
+    #[tokio::test]
+    async fn the_backfill_skips_past_a_block_it_cannot_render() {
+        let ctx = test_ctx();
+        seed_channel(&ctx, "#hello");
+        let bad = ingest_text(&ctx, "first").await;
+        let good = ingest_text(&ctx, "second").await;
+        ctx.store.delete_receipts_for_block(&bad).unwrap();
+        ctx.store.delete_receipts_for_block(&good).unwrap();
+        ctx.store.corrupt_bundle_for_test(&bad).unwrap();
+
+        assert_eq!(backfill_render_receipts(&ctx).await.unwrap(), 2);
+        assert_eq!(
+            exec_receipt(&ctx, &bad).receipt.body,
+            jig_core::block_receipt::Body::Accepted
+        );
+        assert!(matches!(
+            exec_receipt(&ctx, &good).receipt.body,
+            jig_core::block_receipt::Body::Exec(_)
+        ));
     }
 
     /// The server stops after landing a block and before writing its receipt. At the next boot

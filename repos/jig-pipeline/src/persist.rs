@@ -1428,6 +1428,16 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Replace a block's stored bundle with bytes that do not parse. Tests only.
+    #[cfg(test)]
+    pub(crate) fn corrupt_bundle_for_test(&self, block_cid: &str) -> Result<()> {
+        self.conn.lock().expect("poisoned").execute(
+            "UPDATE blocks SET bundle_bytes = x'00' WHERE cid = ?",
+            [block_cid],
+        )?;
+        Ok(())
+    }
+
     /// Blocks of `kind` that landed without a receipt from `server_id`: ones whose receipt was
     /// still to be written after landing when the server stopped.
     pub fn blocks_missing_receipt(&self, kind: &str, server_id: &str) -> Result<Vec<StoredBlock>> {
