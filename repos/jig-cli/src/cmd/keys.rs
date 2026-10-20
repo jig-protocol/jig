@@ -123,7 +123,12 @@ pub async fn renew_with_nameserver(
             subject: &did,
             name: &name,
             binding: &|challenge| {
-                jig_core::naming::proof_hash(Action::Renew, ns.ns_did(), &full, challenge)
+                Ok(jig_core::naming::proof_hash(
+                    Action::Renew,
+                    ns.ns_did(),
+                    &full,
+                    challenge,
+                ))
             },
         },
         async |challenge, pow| {
@@ -264,6 +269,7 @@ pub async fn rotate_with_nameserver(
                     &new_did,
                     challenge,
                 )
+                .context("binding the rotation's proof-of-work")
             },
         },
         async |challenge, pow| {

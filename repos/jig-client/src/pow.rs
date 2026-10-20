@@ -51,7 +51,7 @@ pub enum PowClientError {
     #[error("the proof-of-work offer expired at {0}")]
     Expired(i64),
     #[error("the proof-of-work offer names algorithm {0}; this client solves only BLAKE3 (1)")]
-    UnknownAlg(u64),
+    UnknownAlg(u32),
     #[error(
         "the nameserver asks for proof-of-work at effort {asked}, more than this client will \
          do ({cap}: about {secs} s at this machine's measured rate). Try again later, or allow \
@@ -93,8 +93,8 @@ pub fn verify_offer(
     if offer.challenge != challenge {
         return Err(mismatch("challenge", &offer.challenge, challenge));
     }
-    if offer.action != action.label() {
-        return Err(mismatch("action", &offer.action, action.label()));
+    if offer.action != action {
+        return Err(mismatch("action", offer.action.label(), action.label()));
     }
     if offer.name != name {
         return Err(mismatch("name", &offer.name, name));
@@ -102,10 +102,10 @@ pub fn verify_offer(
     if offer.did != did {
         return Err(mismatch("did", &offer.did, did));
     }
-    if offer.alg != u64::from(Alg::Blake3.id()) {
+    if offer.alg != u32::from(Alg::Blake3.id()) {
         return Err(PowClientError::UnknownAlg(offer.alg));
     }
-    if offer.salt_id != pow::EMPTY_SALT_ID {
+    if u64::from(offer.salt_id) != pow::EMPTY_SALT_ID {
         return Err(mismatch(
             "salt_id",
             &offer.salt_id.to_string(),
@@ -288,14 +288,22 @@ mod tests {
         jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
     }
 
-    fn offer(signer: &SigningKey, effort: u64) -> String {
+    fn me() -> String {
+        did_of(&SigningKey::from_bytes(&[3; 32]))
+    }
+
+    fn you() -> String {
+        did_of(&SigningKey::from_bytes(&[4; 32]))
+    }
+
+    fn offer(signer: &SigningKey, effort: u32) -> String {
         let signed = PowOffer::sign(
             signer,
             PowOffer {
                 challenge: "c0ffee".into(),
-                action: Action::NsRegister.label().into(),
+                action: Action::NsRegister,
                 name: "dj@dj.jig".into(),
-                did: "did:jig:zMe".into(),
+                did: me(),
                 ns_did: String::new(),
                 alg: 1,
                 effort,
@@ -303,7 +311,8 @@ mod tests {
                 expires_at: NOW + 60,
                 envelope: Vec::new(),
             },
-        );
+        )
+        .unwrap();
         URL_SAFE_NO_PAD.encode(&signed.envelope)
     }
 
@@ -314,7 +323,7 @@ mod tests {
             "c0ffee",
             Action::NsRegister,
             "dj@dj.jig",
-            "did:jig:zMe",
+            &me(),
             NOW,
         )
     }
@@ -336,36 +345,19 @@ mod tests {
     fn an_offer_for_another_request_or_expired_is_refused() {
         let b64 = offer(&ns(), 1);
         let ns_did = did_of(&ns());
-        let other = |challenge, action, name, did, now| {
+        let (me, you) = (me(), you());
+        let other = |challenge, action, name, did: &str, now| {
             verify_offer(&b64, &ns_did, challenge, action, name, did, now).unwrap_err()
         };
         for err in [
-            other("beef", Action::NsRegister, "dj@dj.jig", "did:jig:zMe", NOW),
-            other("c0ffee", Action::NsRenew, "dj@dj.jig", "did:jig:zMe", NOW),
-            other(
-                "c0ffee",
-                Action::NsRegister,
-                "dk@dj.jig",
-                "did:jig:zMe",
-                NOW,
-            ),
-            other(
-                "c0ffee",
-                Action::NsRegister,
-                "dj@dj.jig",
-                "did:jig:zYou",
-                NOW,
-            ),
+            other("beef", Action::NsRegister, "dj@dj.jig", &me, NOW),
+            other("c0ffee", Action::NsRenew, "dj@dj.jig", &me, NOW),
+            other("c0ffee", Action::NsRegister, "dk@dj.jig", &me, NOW),
+            other("c0ffee", Action::NsRegister, "dj@dj.jig", &you, NOW),
         ] {
             assert!(matches!(err, PowClientError::Mismatch { .. }), "{err}");
         }
-        let err = other(
-            "c0ffee",
-            Action::NsRegister,
-            "dj@dj.jig",
-            "did:jig:zMe",
-            NOW + 60,
-        );
+        let err = other("c0ffee", Action::NsRegister, "dj@dj.jig", &me, NOW + 60);
         assert!(matches!(err, PowClientError::Expired(_)), "{err}");
         assert!(matches!(
             check("not base64!", &ns_did),

@@ -25,7 +25,7 @@ pub(crate) struct Work<'a> {
     pub subject: &'a str,
     pub name: &'a Name,
     /// The puzzle's binding for a challenge.
-    pub binding: &'a dyn Fn(&str) -> [u8; 32],
+    pub binding: &'a dyn Fn(&str) -> Result<[u8; 32]>,
 }
 
 /// Fetch a challenge for `work`, solve what its offer asks, and `send` the
@@ -43,7 +43,7 @@ pub(crate) async fn with_pow<T>(
         let (challenge, offer) = ns
             .challenge_for(work.action, work.subject, work.name)
             .await?;
-        let asked = offer.as_ref().map_or(0, |o| o.effort);
+        let asked = offer.as_ref().map_or(0, |o| u64::from(o.effort));
         let proof = if asked == 0 && attempt == 0 {
             None
         } else {
@@ -64,7 +64,7 @@ pub(crate) async fn with_pow<T>(
                     ns.ns_did(),
                     work.subject,
                     work.action,
-                    (work.binding)(&challenge),
+                    (work.binding)(&challenge)?,
                 );
                 Some(solve(puzzle, bid, &cap).await?)
             }
@@ -182,7 +182,7 @@ mod tests {
     async fn stub(
         ns: SigningKey,
         offer_signer: SigningKey,
-        effort: u64,
+        effort: u32,
         post: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 'static,
     ) -> (String, Seen) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -251,7 +251,12 @@ mod tests {
                                 &signer,
                                 PowOffer {
                                     challenge: challenge.clone(),
-                                    action: format!("ns-{}", query["action"]),
+                                    action: match query["action"].as_str() {
+                                        "register" => Action::NsRegister,
+                                        "renew" => Action::NsRenew,
+                                        "rotate" => Action::NsRotate,
+                                        other => panic!("action {other}"),
+                                    },
                                     name: query["name"].clone(),
                                     did: query["did"].clone(),
                                     ns_did: String::new(),
@@ -261,7 +266,8 @@ mod tests {
                                     expires_at: chrono::Utc::now().timestamp() + 60,
                                     envelope: Vec::new(),
                                 },
-                            );
+                            )
+                            .unwrap();
                             let out = serde_json::json!({
                                 "challenge": challenge,
                                 "pow_offer": b64(&offer.envelope),
@@ -311,7 +317,8 @@ mod tests {
                         req["old_did"].as_str().unwrap(),
                         req["new_did"].as_str().unwrap(),
                         challenge,
-                    ),
+                    )
+                    .unwrap(),
                 ),
                 other => panic!("unexpected POST {other}"),
             };
@@ -395,7 +402,7 @@ mod tests {
     async fn an_offer_above_the_cap_is_refused_with_the_cap_in_the_message() {
         let ns = key(1);
         // Above rule 19's ceiling, so above any cap.
-        let asked = jig_core::pow::MAX_EFFORT + 1;
+        let asked = u32::try_from(jig_core::pow::MAX_EFFORT + 1).unwrap();
         let (base, seen) = stub(ns.clone(), ns.clone(), asked, checking(ns, "dj@dj.jig")).await;
         let dir = tempfile::tempdir().unwrap();
         let me = jig_client::Identity::generate_for_tests(dir.path());

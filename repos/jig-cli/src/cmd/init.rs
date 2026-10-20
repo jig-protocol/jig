@@ -186,7 +186,12 @@ pub async fn register_with_nameserver(
             subject: &did,
             name: &name,
             binding: &|challenge| {
-                jig_core::naming::proof_hash(Action::Register, ns.ns_did(), &alias, challenge)
+                Ok(jig_core::naming::proof_hash(
+                    Action::Register,
+                    ns.ns_did(),
+                    &alias,
+                    challenge,
+                ))
             },
         },
         async |challenge, pow| {

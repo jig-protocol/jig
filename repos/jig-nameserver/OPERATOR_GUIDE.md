@@ -41,7 +41,7 @@ Every config section denies unknown keys: a typo, or a key in the wrong section,
 
 ## Proof-of-work
 
-Each suffix sets the JEP-0008 work its register, renew and rotate requests carry. It is **off by default** (`min_effort = 0`) until `jig` solves it; these are the recommended values:
+Each suffix sets the JEP-0008 work its register, renew and rotate requests carry. It is **on by default**, at these recommended values, and `jig` solves it:
 
 ```toml
 [v0_0_2.nameserver.alias_suffixes.pow]
@@ -57,7 +57,7 @@ renew_effort = 1         # renew and rotate by the holder
 - **Refused before any work.** For `register`, the challenge request already refuses a closed suffix, a short or reserved alias and a taken alias. `register` checks them again, and refuses a second name for the DID once the DID has signed (not before, since the refusal names the alias it holds).
 - **Order of checks.** The work is checked (one hash) before any signature. Bad work is `400 POW_INVALID`, too little is `400 POW_INSUFFICIENT`, missing work is `428 POW_REQUIRED` with the offer restated. None of them consumes the challenge.
 - **Allowlisted names** (`registration_allow`) pay `min_effort`, with no length multiplier.
-- **Off** (the default): `min_effort = 0`. A challenge requested without `action` still works on such a suffix; on one that asks for work it can only lead to `428`.
+- **Off:** `min_effort = 0`. A challenge requested without `action` still works on such a suffix; on one that asks for work it can only lead to `428`.
 
 ## Rate limits
 
