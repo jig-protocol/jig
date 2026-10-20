@@ -11,6 +11,7 @@
 //! | `channel-create` of a `#dm/` slug | also `dm_peer`, and the slug must be the sender's and that peer's |
 //! | `member-add` | `mls_commit` adding `member_did` (+ `mls_welcome`), or the sender's external commit |
 //! | `member-remove` | `mls_commit` removing `member_did`; none when the sender leaves |
+//! | `role-assign`, `role-unassign` | nothing: plaintext control plane, no commit |
 //! | content | `mls_message`, an application `PrivateMessage` for this group; no `body` |
 //!
 //! A restricted channel is always `mls` (ROADMAP D25): a `channel-create` that
@@ -173,6 +174,14 @@ pub fn plan(
             })?;
 
     match kind {
+        // Role blocks (JEP-0005 rule 7b) are control plane the server reads to
+        // judge later blocks, so they are plaintext on every suite. They carry
+        // no commit: a role changes who may sign, not who is in the group.
+        // Who may sign one is the write gate's call, from the chain.
+        BlockKind::RoleAssign | BlockKind::RoleUnassign => {
+            require_plaintext_block(manifest, block_suite)?;
+            Ok(MlsPlan::Nothing)
+        }
         BlockKind::MemberAdd
         | BlockKind::MemberRemove
         | BlockKind::ChannelPromote
@@ -398,6 +407,8 @@ mod tests {
             created_at: 0,
             owner_did: owner.to_string(),
             suite: suite.to_string(),
+            sequencer_did: String::new(),
+            co_owners: Vec::new(),
         }
     }
 

@@ -192,13 +192,49 @@ where
         + Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
         + Unpin,
 {
+    handshake_as(ws, pinned_server_did, &[], None).await
+}
+
+/// [`complete_client_handshake`] as a server dialing a peer (JEP-0002 rule
+/// 12): the hello names this server's DID, the welcome must be bound to
+/// `tls_exporter` (this connection's, empty over plaintext), and the
+/// handshake ends with this server's `peer_proof` over the transcript.
+pub async fn complete_peer_handshake<S>(
+    ws: &mut S,
+    pinned_server_did: &str,
+    tls_exporter: &[u8],
+    key: &ed25519_dalek::SigningKey,
+) -> anyhow::Result<jig_pipeline::handshake::VerifiedWelcome>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    handshake_as(ws, Some(pinned_server_did), tls_exporter, Some(key)).await
+}
+
+async fn handshake_as<S>(
+    ws: &mut S,
+    pinned_server_did: Option<&str>,
+    tls_exporter: &[u8],
+    key: Option<&ed25519_dalek::SigningKey>,
+) -> anyhow::Result<jig_pipeline::handshake::VerifiedWelcome>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
     let offer = jig_pipeline::handshake::ClientOffer {
         pinned_server_did: pinned_server_did.map(str::to_string),
+        peer_did: key.map(|k| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        }),
         ..Default::default()
     };
     let (hello, pending) = jig_pipeline::handshake::begin(&offer);
-    ws.send(Message::Text(serde_json::to_string(&hello)?.into()))
-        .await?;
+    // The transcript covers the hello exactly as sent.
+    let hello_text = serde_json::to_string(&hello)?;
+    ws.send(Message::Text(hello_text.clone().into())).await?;
     // Same absolute deadline as the client. Control frames must not restart it,
     // or the peer loop never reaches its reconnect delay.
     let deadline = tokio::time::Instant::now() + jig_pipeline::handshake::WELCOME_WAIT;
@@ -221,8 +257,16 @@ where
             reason: "handshake failed".into(),
         }))
     };
-    match pending.interpret(&text) {
-        HandshakeResult::Established(welcome) => Ok(welcome),
+    match pending.interpret_on(&text, tls_exporter) {
+        HandshakeResult::Established(welcome) => {
+            if let Some(key) = key {
+                let proof =
+                    jig_pipeline::handshake::peer_proof(key, &hello_text, &text, tls_exporter);
+                ws.send(Message::Text(serde_json::to_string(&proof)?.into()))
+                    .await?;
+            }
+            Ok(welcome)
+        }
         HandshakeResult::Incompatible(refusal) => anyhow::bail!(
             "peer speaks none of this offer ({}): {}; it speaks versions {:?}, suites {:?}",
             refusal.code,
@@ -238,6 +282,27 @@ where
             let _ = ws.send(close_with(close::CONTRADICTION)).await;
             anyhow::bail!("peer contradicted what it signed: {reason}")
         }
+    }
+}
+
+/// The TLS exporter value of a dialed connection (JEP-0002 rule 12), or
+/// nothing over plaintext. A TLS session that cannot export one has nothing
+/// to bind the welcome to, so the welcome check then refuses it.
+pub(crate) fn tls_exporter_of(
+    stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+) -> Vec<u8> {
+    match stream {
+        tokio_tungstenite::MaybeTlsStream::Rustls(tls) => tls
+            .get_ref()
+            .1
+            .export_keying_material(
+                [0u8; jig_pipeline::handshake::TLS_EXPORTER_LEN],
+                jig_pipeline::handshake::TLS_EXPORTER_LABEL,
+                None,
+            )
+            .map(|v| v.to_vec())
+            .unwrap_or_default(),
+        _ => Vec::new(),
     }
 }
 
@@ -264,7 +329,14 @@ async fn connect_and_relay(
     };
     // Same hello/welcome a CLI client speaks. The fed-hello bundle below is a
     // block, not this handshake, and the server now refuses it until welcome.
-    complete_client_handshake(&mut ws, Some(&peer.expected_did)).await?;
+    let tls_exporter = tls_exporter_of(ws.get_ref());
+    complete_peer_handshake(
+        &mut ws,
+        &peer.expected_did,
+        &tls_exporter,
+        &state.ingest_ctx.server_key,
+    )
+    .await?;
     let (mut sink, mut stream) = ws.split();
     info!(peer_url = %peer.url, "federation peer connected");
 
@@ -807,6 +879,8 @@ mod tests {
                 created_at: 0,
                 owner_did: managed_did.clone(),
                 suite: "none".to_string(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })
             .unwrap();
         state
@@ -907,6 +981,8 @@ mod tests {
                     created_at: 0,
                     owner_did: "did:jig:zOwner".into(),
                     suite: suite.into(),
+                    sequencer_did: String::new(),
+                    co_owners: Vec::new(),
                 })
                 .unwrap();
             let secret: [u8; 32] = rand::random();
@@ -1174,6 +1250,8 @@ mod tests {
                 created_at: 0,
                 owner_did: "did:jig:zOwner".into(),
                 suite: "none".into(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })
             .unwrap();
         let stranger = ed25519_dalek::SigningKey::from_bytes(&rand::random());
@@ -1221,6 +1299,8 @@ mod tests {
                 created_at: 0,
                 owner_did: "did:jig:zOwner".into(),
                 suite: "none".into(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })
             .unwrap();
 
