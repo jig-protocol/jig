@@ -512,6 +512,12 @@ pub struct AliasRateLimitConfig {
     pub per_ip_per_min: u32,
     /// Requests naming a given DID per minute (`did`, `old_did` or `new_did`).
     pub per_did_per_min: u32,
+    /// `GET /v1/challenge` requests per client IP per minute (JEP-0008 rule
+    /// 31): each one can make the nameserver sign an effort offer.
+    pub challenge_per_ip_per_min: u32,
+    /// Challenges issued and not yet used or expired. At the cap a new one is
+    /// refused with `503 BUSY`; live ones are never evicted.
+    pub max_pending_challenges: usize,
 }
 
 impl Default for AliasRateLimitConfig {
@@ -520,6 +526,8 @@ impl Default for AliasRateLimitConfig {
             enabled: true,
             per_ip_per_min: 30,
             per_did_per_min: 10,
+            challenge_per_ip_per_min: 60,
+            max_pending_challenges: 100_000,
         }
     }
 }
@@ -1238,6 +1246,10 @@ database_path = "~/.jig/nameserver.db"
 enabled = true
 per_ip_per_min = 30
 per_did_per_min = 10
+# GET /v1/challenge per client IP per minute, and the most challenges pending
+# at once (past it, new ones get 503 BUSY).
+challenge_per_ip_per_min = 60
+max_pending_challenges = 100000
 
 [penalties]
 decay_secs = 300
@@ -1340,6 +1352,19 @@ default_time_range = "last_day"  # Options: last_hour, last_day, last_week, last
 # [[v0_0_2.nameserver.alias_suffixes.registration_allow]]
 # did = "did:jig:z..."
 # aliases = ["alice"]
+#
+# # Proof-of-work on register, renew and rotate (JEP-0008). Off by default
+# # (min_effort = 0) until jig clients solve it; the recommended values are
+# # shown. An allowlisted registration pays min_effort; an ordinary one pays
+# # min_effort x short_name_factor^(short_name_len - length), up to max_effort.
+# [v0_0_2.nameserver.alias_suffixes.pow]
+# alg = 1
+# min_effort = 1048576       # 2^20
+# max_effort = 16777216      # 2^24, about 3 s on one server core
+# max_solve_secs = 10
+# short_name_len = 5
+# short_name_factor = 4
+# renew_effort = 1
 
 [v0_0_2.server]
 # Ed25519 key that signs alias attestations. Left at the jig-server default

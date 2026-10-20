@@ -551,6 +551,18 @@ as `jig` also needs `single_label_authority = true`: clients trust it only
 through their own config, so its names verify only for clients whose config
 names this nameserver's DID.
 
+**Proof-of-work.** Register, renew and rotate can carry JEP-0008
+proof-of-work, set per suffix in `[v0_0_2.nameserver.alias_suffixes.pow]`. It
+is off by default (`min_effort = 0`) until `jig` solves it; the recommended
+values are 2^20 to register, 4× more per letter under 5, at most 2^24, and 1
+to renew or rotate. A client asks
+`GET /v1/challenge?action=register|renew|rotate&did=&name=`, and the reply
+states the effort, signed by the nameserver (`pow_offer`). The policy's
+refusals (closed, too short, reserved, taken, one name per DID) come back
+there, before any work. `[alias_rate_limits]` caps `GET /v1/challenge` per IP
+(`challenge_per_ip_per_min`, default 60) and the challenges pending at once
+(`max_pending_challenges`, default 100 000; past it, `503 BUSY`).
+
 For a DNS-rooted suffix, `/.well-known/jig-ns-delegation` serves this
 nameserver's signed delegation; a resolver treats it as authoritative only when
 fetched from `https://<suffix>/`. `GET /v1/suffixes` lists the suffixes served
