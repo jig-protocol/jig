@@ -180,8 +180,8 @@ pub const ROTATE_POW_DOMAIN: &str = "jig-alias-rotate-pow-v1";
 /// What a rotation's proof-of-work binds to until lane I's I3 gives
 /// [`Action`] a `Rotate` (R1 decision 4): BLAKE3 of the deterministic CBOR
 /// map `{domain, ns_did, alias, old_did, new_did, challenge}`, built like
-/// [`proof_hash`], so I3 changes only its domain. Both DIDs must be
-/// canonical `did:jig`.
+/// [`proof_hash`], so I3 changes only its domain. Every DID must be
+/// canonical `did:jig`, and `alias` the normalized `alias@suffix`.
 pub fn rotate_pow_binding(
     ns_did: &str,
     alias: &str,
@@ -189,8 +189,12 @@ pub fn rotate_pow_binding(
     new_did: &str,
     challenge: &str,
 ) -> Result<[u8; 32], NamingError> {
+    canonical_did(ns_did)?;
     canonical_did(old_did)?;
     canonical_did(new_did)?;
+    if Name::parse(alias)?.as_alias() != alias {
+        return Err(NamingError::BadName(alias.to_string()));
+    }
     let payload = encode(Value::text_map([
         ("domain", Value::Text(ROTATE_POW_DOMAIN.into())),
         ("ns_did", Value::Text(ns_did.into())),
@@ -934,24 +938,21 @@ mod tests {
 
     #[test]
     fn the_rotate_binding_is_over_canonical_dids_only() {
-        let (old, new) = (did_of(&key(1)), did_of(&key(2)));
-        let b = rotate_pow_binding("did:jig:zns", "alice@example.org", &old, &new, "c0ffee");
+        let (ns, old, new) = (did_of(&key(3)), did_of(&key(1)), did_of(&key(2)));
+        let b = rotate_pow_binding(&ns, "alice@example.org", &old, &new, "c0ffee");
         assert!(b.is_ok());
-        // Each input changes it.
+        // The order of the DIDs matters.
         assert_ne!(
             b,
-            rotate_pow_binding("did:jig:zns", "alice@example.org", &new, &old, "c0ffee")
+            rotate_pow_binding(&ns, "alice@example.org", &new, &old, "c0ffee")
         );
-        assert!(
-            rotate_pow_binding(
-                "did:jig:zns",
-                "alice@example.org",
-                &old.to_uppercase(),
-                &new,
-                "c0ffee"
-            )
-            .is_err()
-        );
+        for (ns, alias, old) in [
+            (ns.as_str(), "alice@example.org", old.to_uppercase()),
+            ("did:jig:zns", "alice@example.org", old.clone()),
+            (ns.as_str(), "Alice@example.org", old.clone()),
+        ] {
+            assert!(rotate_pow_binding(ns, alias, &old, &new, "c0ffee").is_err());
+        }
     }
 
     #[test]
