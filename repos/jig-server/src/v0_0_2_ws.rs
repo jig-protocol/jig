@@ -2292,6 +2292,8 @@ mod tests {
             url: url.trim_end_matches("/api/v1/ws").to_string(),
             expected_did,
             alias: None,
+            publish: false,
+            quota: None,
         }
     }
 

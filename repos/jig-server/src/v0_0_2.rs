@@ -73,12 +73,14 @@ pub struct AppState {
 ///
 /// Every `AppState` constructor goes through here, so this is also where a
 /// peer that must not be dialed — a `ws://` URL without
-/// `dangerously_allow_plaintext_federation` — becomes a boot error.
+/// `dangerously_allow_plaintext_federation` — becomes a boot error, as does a
+/// peer policy the server manifest must not publish.
 fn build_auth(
     config: &JigServerConfig,
     store: Arc<SqliteStore>,
 ) -> anyhow::Result<Arc<crate::auth::AuthState>> {
     crate::v0_0_2_federation::check_federation_transport(&config.federation)?;
+    config.federation.validate().map_err(anyhow::Error::msg)?;
     let auth = crate::auth::AuthState::from_config(&config.auth)?.with_proofs(store);
     for (i, peer) in config.federation.peers.iter().enumerate() {
         auth.trust_federation_peer(&peer.expected_did)

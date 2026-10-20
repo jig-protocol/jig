@@ -118,6 +118,78 @@ struct ServerInfoResponse {
     /// client can trust a certificate no CA issued. Absent over plaintext.
     #[serde(skip_serializing_if = "Option::is_none")]
     tls_binding: Option<jig_core::tls_binding::TlsBinding>,
+    /// The peer policy the signed server manifest publishes (JEP-0005 rule
+    /// 16), unsigned. Absent when the v0.0.2 module is not active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_policy: Option<PeerPolicyInfo>,
+}
+
+/// [`jig_pipeline::server_manifest::PeerPolicy`] as JSON.
+#[derive(Serialize, Debug, PartialEq)]
+struct PeerPolicyInfo {
+    relayed_kinds: Vec<String>,
+    default_peer_quota: QuotaInfo,
+    peer_quotas: Vec<PeerQuotaInfo>,
+    peers: Vec<String>,
+    attested_suffixes: Vec<AttestedSuffixInfo>,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+struct QuotaInfo {
+    blocks_per_min: u64,
+    bytes_per_min: u64,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+struct PeerQuotaInfo {
+    peer: String,
+    blocks_per_min: u64,
+    bytes_per_min: u64,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+struct AttestedSuffixInfo {
+    suffix: String,
+    root: &'static str,
+    domain: String,
+}
+
+impl PeerPolicyInfo {
+    /// Built from the manifest's own policy, so the two cannot disagree.
+    fn of(state: &crate::v0_0_2::AppState) -> Self {
+        use jig_pipeline::server_manifest::AttestedSuffix;
+        let policy = crate::v0_0_2_manifest_log::current(state).peer_policy;
+        Self {
+            relayed_kinds: policy.relayed_kinds,
+            default_peer_quota: QuotaInfo {
+                blocks_per_min: policy.default_peer_quota.blocks_per_min,
+                bytes_per_min: policy.default_peer_quota.bytes_per_min,
+            },
+            peer_quotas: policy
+                .peer_quotas
+                .into_iter()
+                .map(|q| PeerQuotaInfo {
+                    peer: q.peer,
+                    blocks_per_min: q.quota.blocks_per_min,
+                    bytes_per_min: q.quota.bytes_per_min,
+                })
+                .collect(),
+            peers: policy.peers,
+            attested_suffixes: policy
+                .attested_suffixes
+                .into_iter()
+                .filter_map(|s| match s {
+                    AttestedSuffix::Dns { suffix, domain } => Some(AttestedSuffixInfo {
+                        suffix,
+                        root: "dns",
+                        domain,
+                    }),
+                    // The server publishes no contract root before v0.3.
+                    AttestedSuffix::Contract { .. } => None,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -223,6 +295,7 @@ async fn server_info(State(state): State<AppState>) -> Json<ServerInfoResponse> 
             .v0_0_2
             .as_ref()
             .and_then(|v| v.tls_binding.get().cloned()),
+        peer_policy: state.v0_0_2.as_deref().map(PeerPolicyInfo::of),
     })
 }
 
@@ -461,6 +534,45 @@ mod tests {
         assert!(body.peers.is_empty());
         // default config has no bridges configured (deny-by-default)
         assert!(body.bridges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn server_info_mirrors_the_manifests_peer_policy() {
+        let config = crate::v0_0_2_manifest_log::tests::policy_config();
+        let v002 = Arc::new(crate::v0_0_2::AppState::for_test_with_config(config).unwrap());
+        let manifest = crate::v0_0_2_manifest_log::current(&v002).peer_policy;
+        let state = AppState {
+            config: ServerConfig::default(),
+            v0_0_2: Some(v002),
+        };
+        let body = serde_json::to_value(server_info(State(state)).await.0).unwrap();
+        let quota = |q: jig_pipeline::server_manifest::Quota| serde_json::json!({ "blocks_per_min": q.blocks_per_min, "bytes_per_min": q.bytes_per_min });
+        let expected = serde_json::json!({
+            "relayed_kinds": manifest.relayed_kinds,
+            "default_peer_quota": quota(manifest.default_peer_quota),
+            "peer_quotas": manifest.peer_quotas.iter().map(|q| serde_json::json!({
+                "peer": q.peer,
+                "blocks_per_min": q.quota.blocks_per_min,
+                "bytes_per_min": q.quota.bytes_per_min,
+            })).collect::<Vec<_>>(),
+            "peers": manifest.peers,
+            "attested_suffixes": manifest.attested_suffixes.iter().map(|s| match s {
+                jig_pipeline::server_manifest::AttestedSuffix::Dns { suffix, domain } =>
+                    serde_json::json!({ "suffix": suffix, "root": "dns", "domain": domain }),
+                other => panic!("no contract root yet: {other:?}"),
+            }).collect::<Vec<_>>(),
+        });
+        assert_eq!(body["peer_policy"], expected);
+        // Not vacuous: the fixture publishes something in every field.
+        assert_eq!(body["peer_policy"]["peers"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            body["peer_policy"]["peer_quotas"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            body["peer_policy"]["attested_suffixes"][0]["domain"],
+            "names.example.org"
+        );
     }
 
     #[tokio::test]

@@ -159,6 +159,25 @@ list_handles = false
 # [[federation.peers]]
 # url = "wss://peer.example.ts.net:7117"
 # expected_did = "did:jig:..."
+# Name this peer in the signed server manifest's peer policy (JEP-0005 rule
+# 16). Off by default: who you federate with is yours to disclose.
+# publish = true
+# This peer's own quota, in place of default_peer_quota. Published only with
+# publish = true. Published, not yet enforced.
+# quota = { blocks_per_min = 1200, bytes_per_min = 16777216 }
+#
+# The quota published for every peer without its own. These are the defaults
+# (600 blocks and 8 MiB a minute); neither may be 0.
+# [federation.default_peer_quota]
+# blocks_per_min = 600
+# bytes_per_min = 8388608
+#
+# Name suffixes this server attests, published in its manifest. Only
+# root = "dns" with a multi-label suffix; a config-rooted suffix is never
+# published, and contract roots come in v0.3.
+# [[federation.attested_suffixes]]
+# suffix = "names.example.org"
+# root = "dns"
 
 # [bridges]
 # Deny-by-default: with no allow_list and no per_bridge entry, no bridge loads.

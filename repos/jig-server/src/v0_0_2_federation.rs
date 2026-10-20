@@ -721,6 +721,8 @@ mod tests {
             url: "ws://127.0.0.1:1".to_string(),
             expected_did: jig_core::Did::from_ed25519_pubkey(&[9u8; 32]).to_did_jig_string(),
             alias: None,
+            publish: false,
+            quota: None,
         }
     }
 
@@ -865,6 +867,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         };
 
         // Build a fake block bundle in the same (manifest_bytes, code_bytes) shape
@@ -942,6 +946,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         };
 
         // A managed (bridge-owned) DID is a member of open channel "#dm/x". Channels
@@ -1047,6 +1053,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         };
         for (slug, visibility, suite) in [
             ("#private", "restricted", "none"),
@@ -1117,6 +1125,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         };
 
         // Alice signs; manifest claims bob as author. Sig verifies against
@@ -1176,6 +1186,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         };
 
         let secret: [u8; 32] = rand::random();
@@ -1222,6 +1234,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         };
         let secret: [u8; 32] = rand::random();
         let key = SigningKey::from_bytes(&secret);
@@ -1310,6 +1324,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         }
     }
 

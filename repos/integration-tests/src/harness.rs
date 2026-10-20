@@ -227,6 +227,8 @@ impl TestJigServer {
             url: other.ws_url(),
             expected_did: other.server_did_string.clone(),
             alias: None,
+            publish: false,
+            quota: None,
         };
 
         // Listing a peer is what trusts it: `other` may now subscribe to our

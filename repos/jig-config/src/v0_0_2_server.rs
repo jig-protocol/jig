@@ -5,7 +5,7 @@
 //! ## Sections
 //! - `[server]`     — bind address, server DID keyfile, allowed block kinds
 //! - `[identity]`   — TOFU vs nameserver mode + trusted nameservers
-//! - `[federation]` — peers + TLS toggle
+//! - `[federation]` — peers, TLS toggle, the published peer policy
 //! - `[debug]`      — antipattern-flag-gated REST endpoints + nameserver enumeration
 //! - `[nameserver]` — alias suffixes this node serves (nameserver mode)
 //!
@@ -317,7 +317,7 @@ pub struct ReputationRecord {
     pub score: i64,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FederationSection {
     pub peers: Vec<FederationPeer>,
@@ -327,6 +327,36 @@ pub struct FederationSection {
     /// still checked by the signed welcome, but nothing after the welcome is
     /// protected on a plaintext link. Surfaces in `unsafe_options_active`.
     pub dangerously_allow_plaintext_federation: bool,
+    /// The quota for every peer without its own `quota`, published in the
+    /// server manifest (JEP-0005 rule 16). Defaults to
+    /// [`DEFAULT_PEER_BLOCKS_PER_MIN`] blocks and [`DEFAULT_PEER_BYTES_PER_MIN`]
+    /// bytes a minute.
+    pub default_peer_quota: PeerQuotaConfig,
+    /// The name suffixes this server attests, published in the server
+    /// manifest.
+    pub attested_suffixes: Vec<AttestedSuffixConfig>,
+}
+
+/// Blocks a peer may relay to this server per minute, unless it has its own
+/// `quota`.
+pub const DEFAULT_PEER_BLOCKS_PER_MIN: u64 = 600;
+/// Bytes a peer may relay to this server per minute, unless it has its own
+/// `quota`: 8 MiB.
+pub const DEFAULT_PEER_BYTES_PER_MIN: u64 = 8 * 1024 * 1024;
+
+impl Default for FederationSection {
+    fn default() -> Self {
+        Self {
+            peers: Vec::new(),
+            dangerously_disable_federation_tls: false,
+            dangerously_allow_plaintext_federation: false,
+            default_peer_quota: PeerQuotaConfig {
+                blocks_per_min: DEFAULT_PEER_BLOCKS_PER_MIN,
+                bytes_per_min: DEFAULT_PEER_BYTES_PER_MIN,
+            },
+            attested_suffixes: Vec::new(),
+        }
+    }
 }
 
 /// A server this one federates with. Listing it is what makes it trusted:
@@ -340,6 +370,99 @@ pub struct FederationPeer {
     pub expected_did: String,
     #[serde(default)]
     pub alias: Option<String>,
+    /// List `expected_did` in the server manifest's `peers`. Off by default:
+    /// who a server federates with is the operator's to disclose.
+    #[serde(default)]
+    pub publish: bool,
+    /// This peer's own quota, in place of `default_peer_quota`. Published
+    /// only when `publish` is set: a quota names its peer.
+    #[serde(default)]
+    pub quota: Option<PeerQuotaConfig>,
+}
+
+/// How much one peer may relay to this server.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerQuotaConfig {
+    pub blocks_per_min: u64,
+    pub bytes_per_min: u64,
+}
+
+/// A name suffix this server attests (JEP-0004).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttestedSuffixConfig {
+    pub suffix: String,
+    /// What the attestation rests on. Only `"dns"` for now.
+    pub root: String,
+}
+
+impl FederationSection {
+    /// Refuse a peer policy the server manifest could not publish, or should
+    /// not.
+    pub fn validate(&self) -> Result<(), String> {
+        let check_quota = |q: &PeerQuotaConfig, at: &str| {
+            // Zero would publish "send nothing", which no peer can honour
+            // while federating.
+            if q.blocks_per_min == 0 || q.bytes_per_min == 0 {
+                return Err(format!(
+                    "[federation] {at}: blocks_per_min and bytes_per_min must both be at least 1"
+                ));
+            }
+            Ok(())
+        };
+        check_quota(&self.default_peer_quota, "default_peer_quota")?;
+        let mut quotas: BTreeMap<&str, Option<PeerQuotaConfig>> = BTreeMap::new();
+        for (i, peer) in self.peers.iter().enumerate() {
+            if let Some(q) = &peer.quota {
+                check_quota(q, &format!("peers[{i}].quota"))?;
+            }
+            if let Some(earlier) = quotas.insert(&peer.expected_did, peer.quota)
+                && earlier != peer.quota
+            {
+                return Err(format!(
+                    "[federation] peers[{i}]: {} is listed more than once with different quotas",
+                    peer.expected_did
+                ));
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, entry) in self.attested_suffixes.iter().enumerate() {
+            let at = format!("[federation] attested_suffixes[{i}]");
+            match entry.root.as_str() {
+                "dns" => {}
+                "contract" => {
+                    return Err(format!(
+                        "{at}: contract-rooted suffixes are v0.3; only root = \"dns\" is \
+                         supported"
+                    ));
+                }
+                "config" => {
+                    return Err(format!(
+                        "{at}: a config-rooted suffix is never published (JEP-0004 rule 7); \
+                         only root = \"dns\" belongs here"
+                    ));
+                }
+                other => {
+                    return Err(format!(
+                        "{at}: unknown root `{other}`; only \"dns\" is supported"
+                    ));
+                }
+            }
+            let suffix = entry.suffix.to_lowercase();
+            // JEP-0004 rule 4: a single label has no DNS name to root it.
+            if suffix.split('.').count() < 2 || suffix.split('.').any(str::is_empty) {
+                return Err(format!(
+                    "{at}: `{}` is not a multi-label DNS suffix (e.g. `names.example.org`)",
+                    entry.suffix
+                ));
+            }
+            if !seen.insert(suffix) {
+                return Err(format!("{at}: `{}` is listed more than once", entry.suffix));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
@@ -992,6 +1115,128 @@ mod tests {
         assert_eq!(cfg.federation.peers.len(), 1);
         assert_eq!(cfg.federation.peers[0].alias.as_deref(), Some("deji.jig"));
         assert!(!cfg.debug.list_handles);
+    }
+
+    // --- [federation] peer policy ----------------------------------------
+
+    fn federation(doc: &str) -> Result<FederationSection, String> {
+        let cfg: JigServerConfig = toml::from_str(doc).map_err(|e| e.to_string())?;
+        cfg.federation.validate()?;
+        Ok(cfg.federation)
+    }
+
+    #[test]
+    fn the_peer_policy_defaults_publish_nothing_but_the_default_quota() {
+        let f = federation(
+            r#"
+            [[federation.peers]]
+            url = "wss://peer.example.org"
+            expected_did = "did:jig:zPeer"
+            "#,
+        )
+        .unwrap();
+        assert!(!f.peers[0].publish);
+        assert_eq!(f.peers[0].quota, None);
+        assert_eq!(
+            f.default_peer_quota,
+            PeerQuotaConfig {
+                blocks_per_min: 600,
+                bytes_per_min: 8 * 1024 * 1024,
+            }
+        );
+        assert!(f.attested_suffixes.is_empty());
+        JigServerConfig::default().federation.validate().unwrap();
+    }
+
+    #[test]
+    fn a_full_peer_policy_parses() {
+        let f = federation(
+            r#"
+            [federation.default_peer_quota]
+            blocks_per_min = 100
+            bytes_per_min = 1000
+
+            [[federation.peers]]
+            url = "wss://peer.example.org"
+            expected_did = "did:jig:zPeer"
+            publish = true
+            quota = { blocks_per_min = 5, bytes_per_min = 50 }
+
+            [[federation.attested_suffixes]]
+            suffix = "Names.Example.org"
+            root = "dns"
+            "#,
+        )
+        .unwrap();
+        assert!(f.peers[0].publish);
+        assert_eq!(
+            f.peers[0].quota,
+            Some(PeerQuotaConfig {
+                blocks_per_min: 5,
+                bytes_per_min: 50,
+            })
+        );
+        assert_eq!(f.default_peer_quota.blocks_per_min, 100);
+        assert_eq!(f.attested_suffixes[0].suffix, "Names.Example.org");
+    }
+
+    #[test]
+    fn a_bad_peer_policy_is_refused() {
+        let peer = |did: &str, quota: &str| {
+            format!(
+                "[[federation.peers]]\nurl = \"wss://peer.example.org\"\n\
+                 expected_did = \"{did}\"\n{quota}\n"
+            )
+        };
+        let suffix = |s: &str, root: &str| {
+            format!("[[federation.attested_suffixes]]\nsuffix = \"{s}\"\nroot = \"{root}\"\n")
+        };
+        for (doc, why) in [
+            (suffix("names.example.org", "contract"), "v0.3"),
+            (suffix("names.example.org", "config"), "never published"),
+            (suffix("names.example.org", "ens"), "unknown root"),
+            (suffix("jig", "dns"), "multi-label"),
+            (suffix("example.", "dns"), "multi-label"),
+            (
+                suffix("names.example.org", "dns") + &suffix("NAMES.example.org", "dns"),
+                "more than once",
+            ),
+            (
+                "[federation.default_peer_quota]\nblocks_per_min = 0\nbytes_per_min = 1\n"
+                    .to_string(),
+                "at least 1",
+            ),
+            (
+                peer(
+                    "did:jig:zPeer",
+                    "quota = { blocks_per_min = 1, bytes_per_min = 0 }",
+                ),
+                "at least 1",
+            ),
+            (
+                peer(
+                    "did:jig:zPeer",
+                    "quota = { blocks_per_min = 1, bytes_per_min = 1 }",
+                ) + &peer(
+                    "did:jig:zPeer",
+                    "quota = { blocks_per_min = 2, bytes_per_min = 1 }",
+                ),
+                "different quotas",
+            ),
+            (
+                peer(
+                    "did:jig:zPeer",
+                    "quota = { blocks_per_min = 1, bytes_per_min = 1 }",
+                ) + &peer("did:jig:zPeer", ""),
+                "different quotas",
+            ),
+        ] {
+            let err = federation(&doc).expect_err(&doc);
+            assert!(err.contains(why), "{doc}: {err}");
+        }
+        // The same DID twice with the same quota is one peer.
+        let same = "quota = { blocks_per_min = 1, bytes_per_min = 1 }";
+        federation(&(peer("did:jig:zPeer", same) + &peer("did:jig:zPeer", same))).unwrap();
     }
 
     #[test]
