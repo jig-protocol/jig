@@ -99,7 +99,8 @@ fn load_key_link(path: &std::path::Path, server_did: &Did) -> Result<Option<Vec<
         path.display()
     );
     anyhow::ensure!(
-        jig_pipeline::handshake::same_did(&link.new, &server_did.to_did_jig_string()),
+        // Exactly, as clients compare it (`handshake::link_moves`).
+        link.new == server_did.to_did_jig_string(),
         "{}: the key link moves to {}, not to this server's DID",
         path.display(),
         link.new
