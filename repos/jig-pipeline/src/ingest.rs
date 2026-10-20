@@ -660,6 +660,9 @@ pub async fn ingest(
     if render_input.is_some() && matches!(mls_plan, crate::mls_gate::MlsPlan::Advance { .. }) {
         return Err(anyhow::anyhow!("an MLS commit is not a text-render block").into());
     }
+    if let Some(input) = &render_input {
+        check_text_render(ctx, input, &block_cid).await?;
+    }
     let (receipt_bytes, render_hash, is_synthetic) = match (&mls_plan, kind) {
         // Ciphertext cannot be executed, and the server does not pretend to.
         (crate::mls_gate::MlsPlan::Sealed, _) => (
@@ -1458,22 +1461,7 @@ async fn render_after_landing(
         logical: record.ingest_logical,
     };
 
-    // Off the async worker: `render` parks on a condvar for a concurrency slot and then runs the
-    // guest on the same thread. Execution is bounded by the epoch deadline; the slot wait is not,
-    // so running it inline could park enough workers to stall the tasks that would free slots.
-    let executor = Arc::clone(executor);
-    let kind = BlockKind::TextRender.as_str().to_string();
-    let run = tokio::task::spawn_blocking(move || executor.render(&invocation))
-        .await
-        // A join error points at the host (a panic, a pool shut down), not the block.
-        .map_err(|e| IngestError::RenderFailed {
-            kind: kind.clone(),
-            detail: format!("render task did not complete: {e}"),
-        })?
-        .map_err(|e| IngestError::RenderFailed {
-            kind,
-            detail: e.to_string(),
-        })?;
+    let run = run_text_render(executor, invocation).await?;
 
     let render_hash = run.text_output().ok().map(|o| o.render_hash);
     let receipt = run.receipt(
@@ -1485,6 +1473,68 @@ async fn render_after_landing(
     let bytes = crate::receipts::sign(receipt, &ctx.server_key)
         .map_err(|e| anyhow::anyhow!("signing the exec receipt: {e}"))?;
     Ok(stored_receipt(ctx, block_cid, bytes, render_hash))
+}
+
+/// Run text-render once, off the async worker.
+///
+/// `render` parks on a condvar for a concurrency slot and then runs the guest on the same thread.
+/// Execution is bounded by the epoch deadline; the slot wait is not, so running it inline could
+/// park enough workers to stall the tasks that would free slots.
+async fn run_text_render(
+    executor: &Arc<crate::executor::BlockExecutor>,
+    invocation: jig_runtime::component::Invocation,
+) -> Result<crate::executor::ExecRun, IngestError> {
+    let executor = Arc::clone(executor);
+    let kind = BlockKind::TextRender.as_str().to_string();
+    tokio::task::spawn_blocking(move || executor.render(&invocation))
+        .await
+        // A join error points at the host (a panic, a pool shut down), not the block.
+        .map_err(|e| IngestError::RenderFailed {
+            kind: kind.clone(),
+            detail: format!("render task did not complete: {e}"),
+        })?
+        .map_err(|e| IngestError::RenderFailed {
+            kind,
+            detail: e.to_string(),
+        })
+}
+
+/// Refuse, before it lands, a `text-render` block whose render runs out of fuel, stack or time,
+/// or faults the host.
+///
+/// An `incomplete` run asserts nothing about the block (JEP-0006), and nothing requires storing
+/// it. Storing it would let one post that exhausts the limits be fanned out and, in step 7,
+/// re-executed by every recipient. The receipt's run needs the block's ingest record, which
+/// exists only after landing, and a landed block cannot be unlanded (its record is in the
+/// channel's hash chain). So this check runs first, on the invocation without the record
+/// (sequence 0, the block's own clock); the receipt's run follows after landing.
+///
+/// Fuel and stack use do not depend on the record's values for a renderer that does not branch on
+/// them, which includes text-block. A deadline can still pass on the second run under load; that
+/// block lands with an `incomplete` receipt, which is never compared.
+async fn check_text_render(
+    ctx: &IngestContext,
+    input: &text_block::Input,
+    block_cid: &str,
+) -> Result<(), IngestError> {
+    let executor = ctx
+        .executor
+        .as_ref()
+        .ok_or_else(|| IngestError::NoExecutor {
+            kind: BlockKind::TextRender.as_str().to_string(),
+        })?;
+    let run = run_text_render(
+        executor,
+        crate::executor::text_invocation(input, block_cid.to_string(), 0),
+    )
+    .await?;
+    if let jig_runtime::component::RunOutcome::Incomplete(reason) = &run.outcome {
+        return Err(IngestError::RenderFailed {
+            kind: BlockKind::TextRender.as_str().to_string(),
+            detail: format!("the render is incomplete: {}", reason.as_str()),
+        });
+    }
+    Ok(())
 }
 
 fn stored_receipt(
@@ -1819,6 +1869,38 @@ mod tests {
         assert_eq!(
             exec_receipt(&ctx, &cid).receipt.body,
             jig_core::block_receipt::Body::Accepted
+        );
+    }
+
+    /// A render that runs out of fuel is refused before the block lands: nothing is stored,
+    /// sequenced or fanned out.
+    #[tokio::test]
+    async fn a_text_render_that_exhausts_its_fuel_is_refused_before_landing() {
+        let mut ctx = test_ctx();
+        let mut config = jig_runtime::RuntimeConfig::default();
+        config.limits.fuel_max = 100; // far below what a render costs
+        ctx.executor = Some(Arc::new(
+            crate::executor::BlockExecutor::for_tests(config).unwrap(),
+        ));
+        seed_channel(&ctx, "#hello");
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &random_signing_key(),
+            BlockKind::TextRender,
+            &[("channel", "#hello"), ("body", "too expensive")],
+        );
+        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, IngestError::RenderFailed { detail, .. } if detail.contains("fuel-exhausted")),
+            "{err:?}"
+        );
+        assert!(
+            ctx.store
+                .list_blocks_by_channel("#hello", 10, None)
+                .unwrap()
+                .is_empty(),
+            "the refused block must not have landed"
         );
     }
 
