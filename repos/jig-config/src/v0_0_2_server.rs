@@ -498,6 +498,64 @@ pub struct SuffixConfig {
     pub reserved_affixes: Vec<String>,
     #[serde(default)]
     pub registration_allow: Vec<AllowEntry>,
+    /// The proof-of-work register, renew and rotate carry (JEP-0008).
+    #[serde(default)]
+    pub pow: PowPolicy,
+}
+
+/// `[v0_0_2.nameserver.alias_suffixes.pow]`: how much work a suffix asks for
+/// (JEP-0008 rules 16–31). Each challenge promises an effort, signed, and the
+/// proof is checked against that promise.
+///
+/// Off by default until the client solves (R1 slice 2), which makes
+/// [`PowPolicy::recommended`] the default.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PowPolicy {
+    /// The puzzle algorithm (rule 8). Only `1`, BLAKE3, is registered.
+    pub alg: u8,
+    /// The effort an ordinary registration pays before the length multiplier;
+    /// the floor for strangers (rule 19). `0` asks no work of anyone on this
+    /// suffix.
+    pub min_effort: u64,
+    /// The most a registration is asked for. It must fit `max_solve_secs` on
+    /// the slowest client this suffix means to serve.
+    pub max_effort: u64,
+    /// What `max_effort` must be solvable in.
+    pub max_solve_secs: u64,
+    /// Aliases shorter than this pay the length multiplier.
+    pub short_name_len: usize,
+    /// Effort × `short_name_factor`^(`short_name_len` − length).
+    pub short_name_factor: u64,
+    /// What renew and rotate by the holder pay (rule 31). `0` asks none.
+    pub renew_effort: u64,
+}
+
+impl Default for PowPolicy {
+    /// No work is asked, with [`PowPolicy::recommended`]'s other values.
+    fn default() -> Self {
+        Self {
+            min_effort: 0,
+            renew_effort: 0,
+            ..Self::recommended()
+        }
+    }
+}
+
+impl PowPolicy {
+    /// The R1 plan's values: 2^20 to register, ×4 per letter under 5, at most
+    /// 2^24 (about 3 s on one server core); 1 to renew or rotate.
+    pub fn recommended() -> Self {
+        Self {
+            alg: 1,
+            min_effort: 1 << 20,
+            max_effort: 1 << 24,
+            max_solve_secs: 10,
+            short_name_len: 5,
+            short_name_factor: 4,
+            renew_effort: 1,
+        }
+    }
 }
 
 fn default_min_alias_len() -> usize {
@@ -549,6 +607,7 @@ impl SuffixConfig {
             reserved_contains: default_reserved_contains(),
             reserved_affixes: default_reserved_affixes(),
             registration_allow: Vec::new(),
+            pow: PowPolicy::default(),
         }
     }
 

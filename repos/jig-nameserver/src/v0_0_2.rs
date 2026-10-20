@@ -28,21 +28,56 @@ use crate::v0_0_2_policy::Suffixes;
 /// Default time-to-live for an issued challenge nonce. Picked to comfortably
 /// exceed normal HTTP round-trip + signing time while staying small enough
 /// that the in-memory map can't grow without bound under DoS.
-const DEFAULT_CHALLENGE_TTL: Duration = Duration::from_secs(60);
+pub(crate) const DEFAULT_CHALLENGE_TTL: Duration = Duration::from_secs(60);
 
 /// The suffix of [`AppState::for_test`].
 #[cfg(test)]
 pub const TEST_SUFFIX: &str = "dj.jig";
 
+/// The most challenges pending at once unless `[alias_rate_limits]
+/// max_pending_challenges` says otherwise.
+pub const DEFAULT_MAX_PENDING_CHALLENGES: usize = 100_000;
+
 /// An issued challenge. `did` and `name` are set when the client named them
 /// at issue time; a challenge so bound is consumed only by a request for that
-/// DID and that `alias@suffix`. Proof-of-work (lane R's R1) sets its effort
-/// from them when the challenge is issued.
+/// DID and that `alias@suffix`. A challenge issued for an `action` carries the
+/// effort promised for it (JEP-0008 rule 16), and its signed offer.
 #[derive(Debug, Clone)]
 pub struct PendingChallenge {
     pub issued_at: Instant,
     pub did: Option<String>,
     pub name: Option<String>,
+    pub action: Option<jig_core::pow::Action>,
+    /// `0` when no work was asked.
+    pub effort: u64,
+    /// The `PowOffer` envelope, restated when a request comes without work.
+    pub offer: Option<Vec<u8>>,
+}
+
+impl PendingChallenge {
+    /// A challenge bound to nothing, as `GET /v1/challenge` issued before R1.
+    pub fn unbound() -> Self {
+        Self::bound(None, None)
+    }
+
+    /// Bound to `did` on `name`, for no particular action.
+    pub fn bound(did: Option<String>, name: Option<String>) -> Self {
+        Self {
+            issued_at: Instant::now(),
+            did,
+            name,
+            action: None,
+            effort: 0,
+            offer: None,
+        }
+    }
+
+    /// Can a request for `action` by `did` on `name` use it?
+    fn fits(&self, did: &str, name: &str, action: jig_core::pow::Action) -> bool {
+        self.did.as_deref().is_none_or(|d| d == did)
+            && self.name.as_deref().is_none_or(|n| n == name)
+            && self.action.is_none_or(|a| a == action)
+    }
 }
 
 /// Nameserver-scoped v0.0.2 boot state. Identity resolution in a
@@ -65,6 +100,8 @@ pub struct AppState {
     /// How long a challenge nonce remains valid before being swept. Configurable
     /// so tests can use a tight TTL instead of waiting 60s.
     pub challenge_ttl: Duration,
+    /// At this many pending challenges, new ones are refused.
+    pub max_pending_challenges: usize,
 }
 
 impl AppState {
@@ -141,6 +178,7 @@ impl AppState {
             suffixes: Arc::new(suffixes),
             pending_challenges,
             challenge_ttl: DEFAULT_CHALLENGE_TTL,
+            max_pending_challenges: DEFAULT_MAX_PENDING_CHALLENGES,
         })
     }
 
@@ -234,6 +272,7 @@ impl AppState {
             suffixes: Arc::new(suffixes),
             pending_challenges,
             challenge_ttl: DEFAULT_CHALLENGE_TTL,
+            max_pending_challenges: DEFAULT_MAX_PENDING_CHALLENGES,
         })
     }
 
@@ -248,18 +287,40 @@ impl AppState {
     }
 
     /// Record a challenge nonce so a later register, renew or rotate can verify
-    /// it was issued, bound to `did` and `name` when the client named them.
-    /// The nonce is tagged with the current `Instant` so the background sweeper
-    /// can drop it once it's older than `challenge_ttl`.
-    pub async fn remember_challenge(&self, nonce: &str, did: Option<String>, name: Option<String>) {
-        self.pending_challenges.write().await.insert(
-            nonce.to_string(),
-            PendingChallenge {
-                issued_at: Instant::now(),
-                did,
-                name,
-            },
-        );
+    /// it was issued, and for what. The background sweeper drops it once it is
+    /// older than `challenge_ttl`. Returns false, recording nothing, when the
+    /// map is full: live challenges are never evicted to make room. A tenth of
+    /// `max_pending_challenges` is kept for renew and rotate, so a flood of
+    /// registrations cannot stop holders keeping their names.
+    pub async fn remember_challenge(&self, nonce: &str, pending: PendingChallenge) -> bool {
+        use jig_core::pow::Action;
+        let cap = match pending.action {
+            Some(Action::NsRenew | Action::NsRotate) => self.max_pending_challenges,
+            _ => self.max_pending_challenges - self.max_pending_challenges / 10,
+        };
+        let mut guard = self.pending_challenges.write().await;
+        if guard.len() >= cap {
+            return false;
+        }
+        guard.insert(nonce.to_string(), pending);
+        true
+    }
+
+    /// The pending challenge `nonce`, if a request for `action` by `did` on
+    /// `name` can use it now. Leaves it in place.
+    pub async fn peek_challenge(
+        &self,
+        nonce: &str,
+        did: &str,
+        name: &str,
+        action: jig_core::pow::Action,
+    ) -> Option<PendingChallenge> {
+        let guard = self.pending_challenges.read().await;
+        guard
+            .get(nonce)
+            .filter(|p| p.issued_at.elapsed() <= self.challenge_ttl)
+            .filter(|p| p.fits(did, name, action))
+            .cloned()
     }
 
     /// Consume a challenge nonce for a request by `did` on `name`. Returns true
@@ -268,14 +329,19 @@ impl AppState {
     /// return false without distinguishing, so callers surface the same
     /// "challenge not recognized" error and leak nothing about the nonce. A
     /// mismatched request leaves the challenge in place for its rightful use.
-    pub async fn take_challenge(&self, nonce: &str, did: &str, name: &str) -> bool {
+    pub async fn take_challenge(
+        &self,
+        nonce: &str,
+        did: &str,
+        name: &str,
+        action: jig_core::pow::Action,
+    ) -> bool {
         let mut guard = self.pending_challenges.write().await;
         let Some(pending) = guard.get(nonce) else {
             return false;
         };
         let fresh = pending.issued_at.elapsed() <= self.challenge_ttl;
-        let bound_ok = pending.did.as_deref().is_none_or(|d| d == did)
-            && pending.name.as_deref().is_none_or(|n| n == name);
+        let bound_ok = pending.fits(did, name, action);
         if !fresh {
             guard.remove(nonce);
             return false;
@@ -464,10 +530,20 @@ mod tests {
     async fn challenge_round_trip() {
         let state = AppState::for_test().unwrap();
         let n1 = fresh_nonce();
-        state.remember_challenge(&n1, None, None).await;
-        assert!(state.take_challenge(&n1, "did:a", "a@dj.jig").await);
+        state
+            .remember_challenge(&n1, PendingChallenge::unbound())
+            .await;
+        assert!(
+            state
+                .take_challenge(&n1, "did:a", "a@dj.jig", jig_core::pow::Action::NsRegister)
+                .await
+        );
         // Already taken — consumed
-        assert!(!state.take_challenge(&n1, "did:a", "a@dj.jig").await);
+        assert!(
+            !state
+                .take_challenge(&n1, "did:a", "a@dj.jig", jig_core::pow::Action::NsRegister)
+                .await
+        );
     }
 
     #[tokio::test]
@@ -475,22 +551,33 @@ mod tests {
         let state = AppState::for_test().unwrap();
         let n = fresh_nonce();
         state
-            .remember_challenge(&n, Some("did:a".into()), Some("a@dj.jig".into()))
+            .remember_challenge(
+                &n,
+                PendingChallenge::bound(Some("did:a".into()), Some("a@dj.jig".into())),
+            )
             .await;
         assert!(
-            !state.take_challenge(&n, "did:b", "a@dj.jig").await,
+            !state
+                .take_challenge(&n, "did:b", "a@dj.jig", jig_core::pow::Action::NsRegister)
+                .await,
             "other DID"
         );
         assert!(
-            !state.take_challenge(&n, "did:a", "b@dj.jig").await,
+            !state
+                .take_challenge(&n, "did:a", "b@dj.jig", jig_core::pow::Action::NsRegister)
+                .await,
             "other name"
         );
         assert!(
-            state.take_challenge(&n, "did:a", "a@dj.jig").await,
+            state
+                .take_challenge(&n, "did:a", "a@dj.jig", jig_core::pow::Action::NsRegister)
+                .await,
             "still usable"
         );
         assert!(
-            !state.take_challenge(&n, "did:a", "a@dj.jig").await,
+            !state
+                .take_challenge(&n, "did:a", "a@dj.jig", jig_core::pow::Action::NsRegister)
+                .await,
             "consumed"
         );
     }
@@ -503,19 +590,27 @@ mod tests {
                 .unwrap();
 
         let (na, nb) = (fresh_nonce(), fresh_nonce());
-        state.remember_challenge(&na, None, None).await;
+        state
+            .remember_challenge(&na, PendingChallenge::unbound())
+            .await;
         // Fresh: consume succeeds.
         assert!(
-            state.take_challenge(&na, "did:a", "a@dj.jig").await,
+            state
+                .take_challenge(&na, "did:a", "a@dj.jig", jig_core::pow::Action::NsRegister)
+                .await,
             "fresh challenge must be accepted"
         );
 
-        state.remember_challenge(&nb, None, None).await;
+        state
+            .remember_challenge(&nb, PendingChallenge::unbound())
+            .await;
         // Wait past the TTL and the sweep interval (sweep = ttl/2 = 25ms,
         // so 200ms guarantees at least one sweep has fired and dropped it).
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(
-            !state.take_challenge(&nb, "did:a", "a@dj.jig").await,
+            !state
+                .take_challenge(&nb, "did:a", "a@dj.jig", jig_core::pow::Action::NsRegister)
+                .await,
             "expired challenge must be rejected"
         );
     }

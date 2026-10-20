@@ -10,6 +10,8 @@ pub mod types;
 pub mod v0_0_2;
 pub mod v0_0_2_handles;
 pub mod v0_0_2_policy;
+#[cfg(test)]
+mod v0_0_2_pow_tests;
 pub mod v0_0_2_rate_limit;
 pub mod v0_0_2_register;
 pub mod v0_0_2_resolve;

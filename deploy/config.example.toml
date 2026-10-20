@@ -76,8 +76,14 @@ server_did_keyfile = "/var/lib/jig/server.key"
 # owner-gated against channels.owner_did, so listing it does not let anyone
 # else retire your channels. member-remove (`jig channel kick` / `leave`) and
 # channel-promote (`jig channel promote`) are the v0.2 channel dynamics, gated
-# the same way.
-allowed_block_kinds = ["text-render", "channel-create", "member-add", "member-remove", "channel-promote", "channel-archive"]
+# the same way. role-assign and role-unassign (JEP-0005 rule 7b) are
+# owner-only.
+#
+# Leave allowed_block_kinds unset to track the built-in default as new kinds
+# ship. Today the default is:
+#   allowed_block_kinds = ["text-render", "channel-create", "member-add", "member-remove", "channel-promote", "channel-archive", "role-assign", "role-unassign"]
+# To restrict it, uncomment that line and remove kinds. A list here is fixed:
+# kinds added in later releases stay refused until you add them.
 
 [identity]
 # tofu = trust the first key seen for a DID and pin it. No nameserver required.

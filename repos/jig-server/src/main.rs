@@ -255,6 +255,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "v0.0.2 module active: server_did = {}",
                     state.server_did.to_did_jig_string()
                 );
+                // Before serving: write the receipt of every text-render block
+                // that landed without one because the server stopped between
+                // landing it and rendering it.
+                match jig_pipeline::ingest::backfill_render_receipts(&state.ingest_ctx).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("wrote {n} receipt(s) owed from before the restart"),
+                    Err(e) => tracing::warn!("receipt backfill failed: {e}"),
+                }
                 for opt in state.config.unsafe_options_active() {
                     tracing::warn!("v0.0.2 unsafe option active: {}", opt);
                 }
