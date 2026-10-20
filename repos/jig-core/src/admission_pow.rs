@@ -13,6 +13,10 @@
 //! form below is kept for one release (JEP-0008, Backwards Compatibility) so
 //! clients from before it keep working; its `bits` is effort `2^bits`.
 //!
+//! TODO(R1, release after v0.2.0-alpha.2): remove the legacy form ([`DOMAIN`],
+//! [`digest`], [`meets`], [`solve`], [`signed_message`]) and its acceptance in
+//! `jig-server`'s `/api/v1/admission`. Deprecated in alpha.2.
+//!
 //! Legacy: the digest is [`hash_labeled_parts`] over (`domain`, [`DOMAIN`]),
 //! (`server`, the server's DID), (`did`, the new DID) and (`nonce`, the
 //! client's nonce). The work is done when the digest has at least `bits`
