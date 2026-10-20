@@ -227,21 +227,28 @@ impl BlockExecutor {
     /// than the pool reintroduces the hard instantiation failure the gate exists
     /// to prevent.
     ///
-    /// The same config sets every run's fuel, deadline and memory cap, so the ingest render path
-    /// runs under the limits the operator configured, and its receipts state them.
+    /// Every run is bounded by the effective limits: the smaller of the program manifest's
+    /// `limits` and the operator's config, for fuel and memory; the deadline is the operator's
+    /// alone, since a manifest states none. Receipts state the effective limits.
     pub fn with_config(
         config: jig_runtime::RuntimeConfig,
         server_key: &SigningKey,
         program: SignedProgram,
     ) -> Result<Self, ExecutorError> {
         let concurrency = config.limits.max_concurrent_instances.max(1) as usize;
-        let memory_max_pages = config.limits.memory_max_mb.saturating_mul(16);
+        let declared = program.manifest.limits;
+        let memory_max_pages = config
+            .limits
+            .memory_max_mb
+            .saturating_mul(16)
+            .min(declared.memory_max_pages);
+        let fuel = config.limits.fuel_max.min(declared.fuel_max);
         let render_limits = RenderLimits {
-            fuel: config.limits.fuel_max,
+            fuel,
             timeout: Duration::from_millis(config.limits.execution_timeout_ms),
         };
         let receipt_limits = block_receipt::Limits {
-            fuel: config.limits.fuel_max,
+            fuel,
             max_wasm_stack: jig_runtime::MAX_WASM_STACK as u64,
             memory_max_pages,
             timeout_ms: config.limits.execution_timeout_ms,
@@ -623,6 +630,40 @@ mod tests {
         assert_eq!(
             block_receipt::compare(&rx.exec, &ry.exec),
             block_receipt::Comparison::Agree
+        );
+    }
+
+    /// The effective limits are the smaller of the manifest's and the operator's, and the
+    /// receipt states them.
+    #[test]
+    fn a_run_is_bounded_by_the_smaller_of_manifest_and_operator_limits() {
+        let key = test_server_key();
+        let operator = jig_runtime::RuntimeConfig::default();
+        let mut tight = operator.clone();
+        tight.limits.fuel_max = operator.limits.fuel_max / 2;
+        tight.limits.memory_max_mb = operator.limits.memory_max_mb / 2;
+        // The manifest declares less than the operator allows: the manifest wins.
+        let program = text_block_program(&key, &tight).unwrap();
+        let ex = BlockExecutor::with_config(operator.clone(), &key, program).unwrap();
+        let run = ex
+            .render(&text_invocation(&input("x"), "bafyblock".into(), 1))
+            .unwrap();
+        assert_eq!(run.exec.limits.fuel, tight.limits.fuel_max);
+        assert_eq!(
+            run.exec.limits.memory_max_pages,
+            tight.limits.memory_max_mb * 16
+        );
+
+        // The operator allows less than the manifest declares: the operator wins.
+        let program = text_block_program(&key, &operator).unwrap();
+        let ex = BlockExecutor::with_config(tight.clone(), &key, program).unwrap();
+        let run = ex
+            .render(&text_invocation(&input("x"), "bafyblock".into(), 1))
+            .unwrap();
+        assert_eq!(run.exec.limits.fuel, tight.limits.fuel_max);
+        assert_eq!(
+            run.exec.limits.timeout_ms,
+            tight.limits.execution_timeout_ms
         );
     }
 
