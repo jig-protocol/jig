@@ -361,8 +361,10 @@ impl Pins {
                 return Err(replaced());
             }
             pin.server_did = to.to_string();
-            // The old key signed it, so it shows nothing about the new one.
+            // The old key signed these, so they show nothing about the new
+            // one: the next welcome is checked against its manifest afresh.
             pin.welcome = None;
+            pin.manifest = None;
             Ok(((), true))
         })
     }
@@ -1089,6 +1091,7 @@ mod tests {
             None,
             "a welcome the old key signed is not kept as the new key's"
         );
+        assert_eq!(pins.server(server).unwrap().manifest, None);
     }
 
     #[test]
