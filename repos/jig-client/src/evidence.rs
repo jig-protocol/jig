@@ -426,10 +426,9 @@ mod tests {
                 suites: jig_pipeline::handshake::implemented_suite_names(),
                 capabilities: Default::default(),
                 nonce: jig_pipeline::handshake::fresh_nonce(),
+                peer_did: None,
             },
-            &ServerOffer {
-                capabilities: Default::default(),
-            },
+            &ServerOffer::default(),
         )
         .unwrap();
         statement.suites.extend(extra.iter().map(|s| s.to_string()));

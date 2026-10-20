@@ -29,8 +29,8 @@ RestartSec=5s
 # When bridges are enabled the file must exist and be chmod 600 root:jig.
 EnvironmentFile=-/etc/jig/jig-server.env
 
-# The hybrid config: root-level keys feed ServerConfig (what actually binds),
-# [server]/[identity]/[debug]/[bridges] feed JigServerConfig. See config.example.toml.
+# One config file, parsed strictly: an unknown or removed key stops the boot
+# with an error naming it. See config.example.toml.
 ExecStart=/opt/jig/bin/jig-server --config /etc/jig/config.toml
 
 WorkingDirectory=/var/lib/jig

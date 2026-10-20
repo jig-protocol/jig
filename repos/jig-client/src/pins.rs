@@ -657,7 +657,7 @@ mod tests {
     use serde_json::json;
 
     fn identity() -> Identity {
-        Identity::generate_and_save(&tempfile::tempdir().unwrap().keep()).unwrap()
+        Identity::generate_for_tests(&tempfile::tempdir().unwrap().keep())
     }
 
     fn welcome(did: &str, suites: &[&str]) -> VerifiedWelcome {
@@ -668,6 +668,8 @@ mod tests {
             capabilities: Default::default(),
             reputation: jig_pipeline::handshake::Reputation::none(),
             nonce: String::new(),
+            server_nonce: String::new(),
+            tls_exporter: Vec::new(),
             evidence: String::new(),
         }
     }

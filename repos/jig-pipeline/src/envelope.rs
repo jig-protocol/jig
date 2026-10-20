@@ -161,6 +161,11 @@ pub enum Frame {
         suites: Vec<String>,
         capabilities: crate::handshake::Capabilities,
         nonce: String,
+        /// Set when the dialer is a server: the DID it proves with
+        /// [`Frame::PeerProof`] once the welcome arrives. Absent for a client,
+        /// which stays anonymous until it signs a subscription (PV-03).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_did: Option<String>,
     },
     /// Server's signed answer to [`Frame::Hello`]. The envelope's `v` is the
     /// chosen version; `suite` is the suite this frame is carried under.
@@ -171,9 +176,20 @@ pub enum Frame {
         capabilities: crate::handshake::Capabilities,
         reputation: crate::handshake::Reputation,
         nonce: String,
+        /// The server's own fresh nonce, so the transcript a dialer signs is
+        /// fresh on both sides.
+        server_nonce: String,
+        /// base64 of the TLS exporter value of the connection the server
+        /// answered on ([`crate::handshake::TLS_EXPORTER_LABEL`]); empty over
+        /// plaintext. Signed, so the welcome holds only on that TLS session.
+        tls_exporter: String,
         /// base64 ed25519 over [`crate::handshake::WelcomeStatement::canonical_bytes`].
         sig: String,
     },
+    /// The dialing server's proof that it holds `peer_did`'s key: base64
+    /// ed25519 over [`crate::handshake::transcript_hash`]. Sent once, right
+    /// after the welcome, and only by a dialer that named a `peer_did`.
+    PeerProof { sig: String },
     /// Server's signed answer to a [`Frame::Hello`] it shares no version or
     /// suite with (JEP-0002 rule 3). The server closes after sending it.
     /// Signed so that a server refusing a suite it once advertised has

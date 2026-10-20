@@ -85,8 +85,8 @@ async fn server_state_survives_restart() {
     assert_eq!(block_after.sender_did, block_before.sender_did);
     assert_eq!(
         block_after.channel_id.as_deref(),
-        Some(SLUG),
-        "channel_id column must survive the restart intact"
+        Some(channel_before.id.as_str()),
+        "channel_id column (the channel's CID) must survive the restart intact"
     );
     assert_eq!(
         server.receipts_for(&msg_cid).expect("receipts after"),

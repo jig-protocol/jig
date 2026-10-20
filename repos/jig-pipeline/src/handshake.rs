@@ -49,7 +49,10 @@ pub const TLS_EXPORTER_LABEL: &[u8] = b"EXPORTER-jig-handshake";
 /// Length of the exported value.
 pub const TLS_EXPORTER_LEN: usize = 32;
 
-const DOMAIN: &[u8] = b"jig-handshake-welcome-v1";
+const DOMAIN: &[u8] = b"jig-handshake-welcome-v2";
+/// The domain tag of the transcript a dialing server signs
+/// ([`transcript_hash`]).
+pub const PEER_DOMAIN: &[u8] = b"jig-handshake-peer-v1";
 /// The format a refusal is signed in, named on the frame and as the signed
 /// payload's `domain`: a COSE_Sign1 over deterministic CBOR. A refusal in any
 /// other format is refused by name.
@@ -182,6 +185,9 @@ pub struct ClientOffer {
     /// Suites this client pinned for the server. A signed refusal that no
     /// longer lists one is a downgrade, not an incompatibility.
     pub pinned_suites: Vec<String>,
+    /// Set when this end is a server dialing a peer: the DID it then proves
+    /// with [`peer_proof`].
+    pub peer_did: Option<String>,
 }
 
 impl Default for ClientOffer {
@@ -192,14 +198,18 @@ impl Default for ClientOffer {
             capabilities: Capabilities::default(),
             pinned_server_did: None,
             pinned_suites: Vec::new(),
+            peer_did: None,
         }
     }
 }
 
 /// Facts the server puts in the welcome, aside from the key it signs with.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServerOffer {
     pub capabilities: Capabilities,
+    /// The TLS exporter value of the connection being answered; empty over
+    /// plaintext.
+    pub tls_exporter: Vec<u8>,
 }
 
 /// The client's hello, after it has parsed.
@@ -209,6 +219,7 @@ pub struct HelloView {
     pub suites: Vec<String>,
     pub capabilities: Capabilities,
     pub nonce: String,
+    pub peer_did: Option<String>,
 }
 
 /// The bytes the server signs. `v` and `frame_suite` are the envelope fields
@@ -222,6 +233,9 @@ pub struct WelcomeStatement {
     pub capabilities: Capabilities,
     pub reputation: Reputation,
     pub nonce: String,
+    pub server_nonce: String,
+    /// base64, as on the wire; empty over plaintext.
+    pub tls_exporter: String,
 }
 
 impl WelcomeStatement {
@@ -237,6 +251,8 @@ impl WelcomeStatement {
         push(&mut out, &self.capabilities.canonical_bytes());
         push(&mut out, self.reputation.canonical_json().as_bytes());
         push(&mut out, self.nonce.as_bytes());
+        push(&mut out, self.server_nonce.as_bytes());
+        push(&mut out, self.tls_exporter.as_bytes());
         out
     }
 
@@ -345,6 +361,9 @@ pub struct VerifiedWelcome {
     pub capabilities: Capabilities,
     pub reputation: Reputation,
     pub nonce: String,
+    pub server_nonce: String,
+    /// The TLS exporter value the welcome is bound to; empty over plaintext.
+    pub tls_exporter: Vec<u8>,
     /// The frame text, kept so a later contradiction has something to show.
     pub evidence: String,
 }
@@ -380,7 +399,15 @@ pub struct PendingHello {
 }
 
 impl PendingHello {
+    /// [`Self::interpret_on`] for a connection without TLS.
     pub fn interpret(&self, text: &str) -> HandshakeResult {
+        self.interpret_on(text, &[])
+    }
+
+    /// Check the server's first frame, received on a connection whose TLS
+    /// exporter value is `tls_exporter` (empty over plaintext): a welcome
+    /// must be bound to exactly that value.
+    pub fn interpret_on(&self, text: &str, tls_exporter: &[u8]) -> HandshakeResult {
         let env = match Envelope::parse(text) {
             Ok(env) => env,
             // A first frame at a version or suite this client does not speak
@@ -398,7 +425,7 @@ impl PendingHello {
                 };
             }
         };
-        interpret_envelope(&env, text, &self.nonce, &self.offer)
+        interpret_envelope(&env, text, &self.nonce, &self.offer, Some(tls_exporter))
     }
 }
 
@@ -429,6 +456,7 @@ pub fn begin(offer: &ClientOffer) -> (Envelope, PendingHello) {
         suites: offer.suites.clone(),
         capabilities: offer.capabilities.clone(),
         nonce: nonce.clone(),
+        peer_did: offer.peer_did.clone(),
     });
     (
         env,
@@ -476,6 +504,8 @@ pub fn negotiate(
         capabilities: server.capabilities.clone(),
         reputation: Reputation::none(),
         nonce: hello.nonce.clone(),
+        server_nonce: fresh_nonce(),
+        tls_exporter: STANDARD.encode(&server.tls_exporter),
     })
 }
 
@@ -493,8 +523,47 @@ pub fn seal(key: &SigningKey, mut statement: WelcomeStatement) -> Envelope {
         capabilities: statement.capabilities,
         reputation: statement.reputation,
         nonce: statement.nonce,
+        server_nonce: statement.server_nonce,
+        tls_exporter: statement.tls_exporter,
         sig,
     })
+}
+
+/// The transcript a dialing server signs: BLAKE3 over [`PEER_DOMAIN`], the
+/// `hello` and `welcome` frames exactly as sent, and the TLS exporter value,
+/// each length-prefixed. Both nonces are inside the frames, so it is fresh
+/// for both sides; the exporter ties it to one TLS session.
+pub fn transcript_hash(hello: &str, welcome: &str, tls_exporter: &[u8]) -> [u8; 32] {
+    let mut out = Vec::new();
+    push(&mut out, PEER_DOMAIN);
+    push(&mut out, hello.as_bytes());
+    push(&mut out, welcome.as_bytes());
+    push(&mut out, tls_exporter);
+    *blake3::hash(&out).as_bytes()
+}
+
+/// The dialer's [`Frame::PeerProof`] for the handshake it just completed.
+pub fn peer_proof(key: &SigningKey, hello: &str, welcome: &str, tls_exporter: &[u8]) -> Envelope {
+    let sig = key.sign(&transcript_hash(hello, welcome, tls_exporter));
+    Envelope::new(Frame::PeerProof {
+        sig: STANDARD.encode(sig.to_bytes()),
+    })
+}
+
+/// Check a dialer's proof: `sig_b64` must be `peer_did`'s signature over the
+/// transcript of this connection.
+pub fn verify_peer_proof(
+    peer_did: &str,
+    sig_b64: &str,
+    hello: &str,
+    welcome: &str,
+    tls_exporter: &[u8],
+) -> Result<(), String> {
+    verify_key_signature(
+        peer_did,
+        &transcript_hash(hello, welcome, tls_exporter),
+        sig_b64,
+    )
 }
 
 /// Sign a refusal of `hello` for `refusal`, which must be a version or suite
@@ -568,7 +637,8 @@ pub fn verify_offline(text: &str, server_did: &str) -> HandshakeResult {
     if let Frame::Welcome { suites, .. } = &env.frame {
         offer.suites.extend(suites.iter().cloned());
     }
-    interpret_envelope(&env, text, &nonce, &offer)
+    // The session it was bound to is long gone: only the signature counts.
+    interpret_envelope(&env, text, &nonce, &offer, None)
 }
 
 fn interpret_refusal(
@@ -650,6 +720,7 @@ fn interpret_envelope(
     text: &str,
     nonce: &str,
     offer: &ClientOffer,
+    tls_exporter: Option<&[u8]>,
 ) -> HandshakeResult {
     let Frame::Welcome {
         server_did,
@@ -657,6 +728,8 @@ fn interpret_envelope(
         capabilities,
         reputation,
         nonce: echoed,
+        server_nonce,
+        tls_exporter: bound_to,
         sig,
     } = &env.frame
     else {
@@ -678,6 +751,8 @@ fn interpret_envelope(
         capabilities: capabilities.clone(),
         reputation: reputation.clone(),
         nonce: echoed.clone(),
+        server_nonce: server_nonce.clone(),
+        tls_exporter: bound_to.clone(),
     };
 
     if echoed != nonce {
@@ -720,6 +795,27 @@ fn interpret_envelope(
             evidence: Some(text.to_string()),
         };
     }
+    let Ok(bound) = STANDARD.decode(bound_to) else {
+        return HandshakeResult::FailClosed {
+            reason: "welcome tls_exporter is not base64".to_string(),
+            evidence: Some(text.to_string()),
+        };
+    };
+    // The welcome must be bound to this TLS session: one signed for another
+    // session was relayed by whatever terminated TLS in between.
+    if let Some(tls_exporter) = tls_exporter
+        && bound != tls_exporter
+    {
+        let reason = match (bound.is_empty(), tls_exporter.is_empty()) {
+            (true, false) => "the welcome is not bound to a TLS session, but this one is TLS",
+            (false, true) => "the welcome is bound to a TLS session this connection is not",
+            _ => "the welcome is bound to another TLS session: something relayed it",
+        };
+        return HandshakeResult::FailClosed {
+            reason: reason.to_string(),
+            evidence: Some(text.to_string()),
+        };
+    }
 
     HandshakeResult::Established(VerifiedWelcome {
         server_did: server_did.clone(),
@@ -728,6 +824,8 @@ fn interpret_envelope(
         capabilities: capabilities.clone(),
         reputation: reputation.clone(),
         nonce: echoed.clone(),
+        server_nonce: server_nonce.clone(),
+        tls_exporter: bound,
         evidence: text.to_string(),
     })
 }
@@ -808,6 +906,7 @@ fn frame_name(frame: &Frame) -> &'static str {
         Frame::Ack { .. } => "ack",
         Frame::Block { .. } => "block",
         Frame::Error { .. } => "error",
+        Frame::PeerProof { .. } => "peer_proof",
     }
 }
 
@@ -840,6 +939,7 @@ mod tests {
                 federation: false,
                 ..Capabilities::default()
             },
+            ..ServerOffer::default()
         }
     }
 
@@ -849,6 +949,7 @@ mod tests {
             suites: implemented_suite_names(),
             capabilities: Capabilities::default(),
             nonce: nonce.to_string(),
+            peer_did: None,
         }
     }
 
@@ -1165,6 +1266,103 @@ mod tests {
         assert!(matches!(
             verify_offline("{}", &did),
             HandshakeResult::FailClosed { .. }
+        ));
+    }
+
+    #[test]
+    fn a_welcome_holds_only_on_the_tls_session_it_was_signed_for() {
+        let key = generate_signing_key();
+        let session = [1u8; TLS_EXPORTER_LEN];
+        let welcome_on = |exporter: &[u8]| {
+            let (hello, pending) = begin(&ClientOffer::default());
+            let Frame::Hello { nonce, .. } = hello.frame else {
+                panic!("hello");
+            };
+            let offer = ServerOffer {
+                tls_exporter: exporter.to_vec(),
+                ..offer_server()
+            };
+            let text =
+                serde_json::to_string(&seal(&key, negotiate(&hello_view(&nonce), &offer).unwrap()))
+                    .unwrap();
+            (pending, text)
+        };
+
+        let (pending, text) = welcome_on(&session);
+        match pending.interpret_on(&text, &session) {
+            HandshakeResult::Established(w) => assert_eq!(w.tls_exporter, session),
+            other => panic!("expected a welcome, got {other:?}"),
+        }
+        // Relayed into another session, onto plaintext, or plaintext onto TLS.
+        for (signed, ours, why) in [
+            (
+                &session[..],
+                &[2u8; TLS_EXPORTER_LEN][..],
+                "another TLS session",
+            ),
+            (&session[..], &[][..], "this connection is not"),
+            (&[][..], &session[..], "not bound to a TLS session"),
+        ] {
+            let (pending, text) = welcome_on(signed);
+            assert!(
+                matches!(
+                    pending.interpret_on(&text, ours),
+                    HandshakeResult::FailClosed { ref reason, .. } if reason.contains(why)
+                ),
+                "{why}"
+            );
+        }
+        // The binding is signed: rewriting it breaks the signature.
+        let (pending, text) = welcome_on(&session);
+        let mut env: Envelope = serde_json::from_str(&text).unwrap();
+        if let Frame::Welcome { tls_exporter, .. } = &mut env.frame {
+            *tls_exporter = STANDARD.encode([2u8; TLS_EXPORTER_LEN]);
+        }
+        assert!(matches!(
+            pending.interpret_on(&serde_json::to_string(&env).unwrap(), &[2u8; TLS_EXPORTER_LEN]),
+            HandshakeResult::FailClosed { reason, .. } if reason.contains("signature")
+        ));
+    }
+
+    #[test]
+    fn a_peer_proof_covers_the_whole_transcript() {
+        let key = generate_signing_key();
+        let did = Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
+        let exporter = [3u8; TLS_EXPORTER_LEN];
+        let Frame::PeerProof { sig } = peer_proof(&key, "hello", "welcome", &exporter).frame else {
+            panic!("peer_proof");
+        };
+        assert!(verify_peer_proof(&did, &sig, "hello", "welcome", &exporter).is_ok());
+        for (hello, welcome, exporter) in [
+            ("hellO", "welcome", &exporter[..]),
+            ("hello", "welcomE", &exporter[..]),
+            ("hello", "welcome", &[4u8; TLS_EXPORTER_LEN][..]),
+            ("hello", "welcome", &[][..]),
+        ] {
+            assert!(verify_peer_proof(&did, &sig, hello, welcome, exporter).is_err());
+        }
+        let other = Did::from_ed25519_pubkey(generate_signing_key().verifying_key().as_bytes())
+            .to_did_jig_string();
+        assert!(verify_peer_proof(&other, &sig, "hello", "welcome", &exporter).is_err());
+        // Length-prefixed: moving bytes between fields is another transcript.
+        assert_ne!(
+            transcript_hash("ab", "c", &[]),
+            transcript_hash("a", "bc", &[])
+        );
+    }
+
+    #[test]
+    fn a_dialer_names_its_did_in_the_hello_and_a_client_does_not() {
+        let (hello, _) = begin(&ClientOffer::default());
+        let text = serde_json::to_string(&hello).unwrap();
+        assert!(!text.contains("peer_did"), "{text}");
+        let (hello, _) = begin(&ClientOffer {
+            peer_did: Some("did:jig:zPeer".into()),
+            ..ClientOffer::default()
+        });
+        assert!(matches!(
+            hello.frame,
+            Frame::Hello { peer_did: Some(ref d), .. } if d == "did:jig:zPeer"
         ));
     }
 
