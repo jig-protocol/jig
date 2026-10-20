@@ -53,8 +53,16 @@ pub async fn server_tls(server: &str) -> Result<Config> {
         let probed = probe(server, expected.as_deref())
             .await
             .map_err(|e| refusal(server, e))?;
-        if let Some(did) = &probed.server_did {
-            pins.check_server_did(server, did)?;
+        match (&probed.server_did, &probed.moved_from, &probed.key_link) {
+            (Some(did), Some(from), Some(link)) => {
+                pins.move_server(server, from, did, link)?;
+                eprintln!(
+                    "note: {server} moved its key from {from} to {did}, and both keys signed the \
+                     move (JEP-0012); this device's pin follows it."
+                );
+            }
+            (Some(did), _, _) => pins.check_server_did(server, did)?,
+            _ => {}
         }
         probed.config
     };
@@ -452,6 +460,199 @@ pub fn live_contradiction(client: &jig_client::Client, server: &str) -> Option<a
             c.reason
         )
     })
+}
+
+/// Hold `welcome` to the `server-manifest` it cites (JEP-0002 rule 12): fetch
+/// the block and its record, check that they are the server's and say what
+/// the welcome says ([`jig_client::manifest::check_cited`]), and hold the
+/// manifest log's chain to this device's pin of it. A manifest already
+/// checked is not fetched again. A welcome that cites none is let through
+/// with a warning: a server from before manifest logs has none.
+pub async fn check_manifest(
+    who: &jig_client::Identity,
+    server: &str,
+    welcome: &jig_client::manifest::VerifiedWelcome,
+) -> Result<()> {
+    check_manifest_in(&Pins::default_path(), who, server, welcome).await
+}
+
+async fn check_manifest_in(
+    pins_path: &std::path::Path,
+    who: &jig_client::Identity,
+    server: &str,
+    welcome: &jig_client::manifest::VerifiedWelcome,
+) -> Result<()> {
+    use jig_client::manifest::{LOG_SLUG, check_cited};
+    let Some(cited) = &welcome.manifest else {
+        eprintln!(
+            "warning: {server}'s welcome cites no manifest log entry, so its claims are not \
+             checked against one."
+        );
+        return Ok(());
+    };
+    let mut pins = Pins::load(pins_path)?;
+    if pins.server(server).and_then(|p| p.manifest.as_ref()) == Some(cited) {
+        return Ok(());
+    }
+    #[derive(serde::Deserialize)]
+    struct Served {
+        bundle_b64: String,
+        sig_b64: Option<String>,
+    }
+    let base = crate::cmd::channel::base_http_url(server);
+    let url = format!("{base}/api/v1/blocks/{}", cited.cid);
+    let proof = jig_client::read_auth::ReadProof::sign(
+        who,
+        "GET",
+        jig_client::read_auth::signable_path(&url),
+    );
+    let mut req = http(server, std::time::Duration::from_secs(10))
+        .await?
+        .get(&url);
+    for (name, value) in proof.headers() {
+        req = req.header(name, value);
+    }
+    let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "{server} did not serve the manifest its welcome cites: GET {url} returned {}",
+        resp.status()
+    );
+    let served: Served = resp
+        .json()
+        .await
+        .with_context(|| format!("decoding {url}"))?;
+    let record = fetch_records(who, server, LOG_SLUG, cited.seq, cited.seq + 1)
+        .await?
+        .into_iter()
+        .next()
+        .with_context(|| {
+            format!(
+                "{server} did not serve record {} of its manifest log",
+                cited.seq
+            )
+        })?;
+    check_cited(
+        welcome,
+        cited,
+        &served.bundle_b64,
+        served.sig_b64.as_deref().unwrap_or_default(),
+        &record,
+    )
+    .map_err(|e| anyhow::anyhow!("{server}: {e}. Refusing to go on"))?;
+
+    // The log is a channel like any other: pinned at first sight, and held
+    // to its chain from then on.
+    pins.check_channel(
+        server,
+        LOG_SLUG,
+        jig_client::pins::ChannelPin {
+            create_cid: record.channel_id.clone(),
+            suite: "none".into(),
+            owner_did: welcome.server_did.clone(),
+            chain_head: None,
+        },
+    )?;
+    if let ChainCheck::Unfilled { from, to } =
+        check_chain_in(pins_path, who, server, LOG_SLUG, &[record]).await?
+    {
+        eprintln!(
+            "warning: {server} did not serve records {from}..{to} of its manifest log; the \
+             entries in between are not checked."
+        );
+    }
+    Pins::load(pins_path)?.set_manifest(server, cited)?;
+    Ok(())
+}
+
+/// `jig trust show <server>`: what this device pinned for `server`, and its
+/// manifest log, oldest entry first, each checked as the server's and the
+/// chain held to the pin.
+pub async fn show(who: &jig_client::Identity, server: &str) -> Result<()> {
+    use jig_client::manifest::{LOG_SLUG, read_entry};
+    let pins = Pins::load(&Pins::default_path())?;
+    let Some(pin) = pins.server(server).cloned() else {
+        println!("{server}: nothing pinned yet. Connect once to pin it.");
+        return Ok(());
+    };
+    println!("server:    {server}");
+    println!("DID:       {}", pin.server_did);
+    println!(
+        "suites:    {}",
+        pin.suites.iter().cloned().collect::<Vec<_>>().join(", ")
+    );
+    if let Some(m) = &pin.manifest {
+        println!(
+            "manifest:  {} (entry {} of its log, last checked)",
+            m.cid, m.seq
+        );
+    }
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        bundle_b64: String,
+        sig_b64: Option<String>,
+        ingest: Option<jig_client::chain::IngestRecord>,
+    }
+    let base = crate::cmd::channel::base_http_url(server);
+    let url = format!(
+        "{base}/api/v1/channels/{}/blocks?limit=200",
+        crate::cmd::channel::escape_slug_for_url(LOG_SLUG)
+    );
+    let proof = jig_client::read_auth::ReadProof::sign(
+        who,
+        "GET",
+        jig_client::read_auth::signable_path(&url),
+    );
+    let mut req = http(server, std::time::Duration::from_secs(10))
+        .await?
+        .get(&url);
+    for (name, value) in proof.headers() {
+        req = req.header(name, value);
+    }
+    let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "GET {url} returned {}",
+        resp.status()
+    );
+    let entries: Vec<Entry> = resp
+        .json()
+        .await
+        .with_context(|| format!("decoding {url}"))?;
+    let records: Vec<_> = entries.iter().filter_map(|e| e.ingest.clone()).collect();
+    if !records.is_empty() {
+        check_channel_chain(who, server, LOG_SLUG, &records).await?;
+    }
+    println!("manifest log ({LOG_SLUG}):");
+    for entry in &entries {
+        let seq = entry
+            .ingest
+            .as_ref()
+            .map_or("-".to_string(), |r| r.seq.to_string());
+        match read_entry(
+            &pin.server_did,
+            &entry.bundle_b64,
+            entry.sig_b64.as_deref().unwrap_or_default(),
+        ) {
+            Ok(Some((cid, doc))) => {
+                let caps = &doc.capabilities;
+                println!(
+                    "  {seq:>4}  {cid}\n        versions {:?}, suites {}, kinds {}, execution {}, \
+                     federation {}, skew bound {} ms, {} published peer(s)",
+                    doc.versions,
+                    doc.suites.join(", "),
+                    caps.block_kinds.join(", "),
+                    caps.execution,
+                    caps.federation,
+                    caps.max_future_skew_ms,
+                    doc.peer_policy.peers.len()
+                );
+            }
+            Ok(None) => println!("  {seq:>4}  (the log's creation)"),
+            Err(e) => println!("  {seq:>4}  NOT THE SERVER'S: {e}"),
+        }
+    }
+    Ok(())
 }
 
 /// Records `from..to` of `slug`, signed as `who`.
