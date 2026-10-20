@@ -1604,6 +1604,7 @@ mod tests {
             nonce: "n".to_string(),
             server_nonce: "s".to_string(),
             tls_exporter: String::new(),
+            manifest: None,
             sig: String::new(),
         }))
         .unwrap();
