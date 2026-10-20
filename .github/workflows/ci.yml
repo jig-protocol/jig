@@ -156,6 +156,12 @@ jobs:
             -p jig-bridge-core \
             --all-targets \
             -- -D warnings
+      - name: No normal build enables jig-pipeline's test-support
+        # test-support compiles BlockExecutor::shared, which signs operator
+        # policies with a public test key; only [dev-dependencies] may enable it.
+        run: |
+          ! cargo tree --locked -e normal,features -i jig-pipeline --workspace \
+            | grep 'feature "test-support"'
       - name: Clippy (jig-bridge-core web feature)
         # The webhook-mount path (RouterMount + cfg'd BridgeContext field) is
         # gated behind the `web` feature; lint it explicitly so it's covered.

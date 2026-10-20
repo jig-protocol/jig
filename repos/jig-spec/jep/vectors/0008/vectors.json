@@ -1,0 +1,146 @@
+{
+  "boundaries": [
+    {
+      "effort": 1048576,
+      "fails_digest_hex": "0000100000000000ffffffffffffffffffffffffffffffffffffffffffffffff",
+      "max_prefix_hex": "00000fffffffffff",
+      "passes_digest_hex": "00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    },
+    {
+      "effort": 1000003,
+      "fails_digest_hex": "000010c6f45449ccffffffffffffffffffffffffffffffffffffffffffffffff",
+      "max_prefix_hex": "000010c6f45449cb",
+      "passes_digest_hex": "000010c6f45449cbffffffffffffffffffffffffffffffffffffffffffffffff"
+    }
+  ],
+  "cases": [
+    {
+      "action": "admit",
+      "alg": 1,
+      "binding_hex": "",
+      "digest_hex": "0008857ffab94c568931b142c8b378d8df0cb6daeecf40d35858059cd52f0869",
+      "effort": 4096,
+      "nonce_hex": "0000000000000679",
+      "proof": {
+        "alg": 1,
+        "effort": 4096,
+        "nonce": "AAAAAAAABnk",
+        "salt_id": 0
+      },
+      "salt_hex": "",
+      "salt_id": 0,
+      "subject": "did:jig:zsubject",
+      "verifier": "did:jig:zverifier"
+    },
+    {
+      "action": "post",
+      "alg": 1,
+      "binding_hex": "6261666b726569676832616b69736361696c646371616273796733646672366368753366677072656769796d73636b376537617161347335327a79",
+      "digest_hex": "000866b81010ae265edce0b5fbd91eeba98455c2a585080e77897f881c5a21a2",
+      "effort": 4096,
+      "nonce_hex": "00000000000013ad",
+      "proof": {
+        "alg": 1,
+        "effort": 4096,
+        "nonce": "AAAAAAAAE60",
+        "salt_id": 7
+      },
+      "salt_hex": "d3cbdbf36de71e1f7aa7128a0f0850e2988e6a4c985bab6a8916c5b7ea45457c",
+      "salt_id": 7,
+      "subject": "did:jig:zsubject",
+      "verifier": "did:jig:zverifier"
+    },
+    {
+      "action": "kp-request",
+      "alg": 1,
+      "binding_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "digest_hex": "00086c5e73d515a81b787e829e4c177ed7834ee810d0231d6dfa07e46d169ab3",
+      "effort": 4096,
+      "nonce_hex": "0000000000001dcf",
+      "proof": {
+        "alg": 1,
+        "effort": 4096,
+        "nonce": "AAAAAAAAHc8",
+        "salt_id": 7
+      },
+      "salt_hex": "d3cbdbf36de71e1f7aa7128a0f0850e2988e6a4c985bab6a8916c5b7ea45457c",
+      "salt_id": 7,
+      "subject": "did:jig:zsubject",
+      "verifier": "did:jig:zverifier"
+    },
+    {
+      "action": "dial",
+      "alg": 1,
+      "binding_hex": "6469643a6a69673a7a6469616c6572",
+      "digest_hex": "00076ea3fce1b24770031e0affcf91268038f0d16c39c41e55b2f2cf464bb7b2",
+      "effort": 4096,
+      "nonce_hex": "0000000000004be0",
+      "proof": {
+        "alg": 1,
+        "effort": 4096,
+        "nonce": "AAAAAAAAS-A",
+        "salt_id": 7
+      },
+      "salt_hex": "d3cbdbf36de71e1f7aa7128a0f0850e2988e6a4c985bab6a8916c5b7ea45457c",
+      "salt_id": 7,
+      "subject": "did:jig:zsubject",
+      "verifier": "did:jig:zverifier"
+    },
+    {
+      "action": "ns-register",
+      "alg": 1,
+      "binding_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "digest_hex": "00077de91c769a1856c683d7d4556417302c48ffc4f0fd845ee512f69cf8d78d",
+      "effort": 4096,
+      "nonce_hex": "0000000000002bf1",
+      "proof": {
+        "alg": 1,
+        "effort": 4096,
+        "nonce": "AAAAAAAAK_E",
+        "salt_id": 0
+      },
+      "salt_hex": "",
+      "salt_id": 0,
+      "subject": "did:jig:zsubject",
+      "verifier": "did:jig:zverifier"
+    },
+    {
+      "action": "ns-renew",
+      "alg": 1,
+      "binding_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "digest_hex": "00081edb08bead8c4d23b114f1fd3dc7bb80ca7b25ab6ccab58c2e3fbf9f6375",
+      "effort": 4096,
+      "nonce_hex": "00000000000007d8",
+      "proof": {
+        "alg": 1,
+        "effort": 4096,
+        "nonce": "AAAAAAAAB9g",
+        "salt_id": 0
+      },
+      "salt_hex": "",
+      "salt_id": 0,
+      "subject": "did:jig:zsubject",
+      "verifier": "did:jig:zverifier"
+    },
+    {
+      "action": "ns-rotate",
+      "alg": 1,
+      "binding_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "digest_hex": "00034847561318bf4af960c4b81207c4d78bc3a1691bfc20e5bf261ae56b2740",
+      "effort": 4096,
+      "nonce_hex": "0000000000000bf0",
+      "proof": {
+        "alg": 1,
+        "effort": 4096,
+        "nonce": "AAAAAAAAC_A",
+        "salt_id": 0
+      },
+      "salt_hex": "",
+      "salt_id": 0,
+      "subject": "did:jig:zsubject",
+      "verifier": "did:jig:zverifier"
+    }
+  ],
+  "domain": "jig-pow-v1",
+  "rule_7": "valid when u64_be(digest[0..8]) <= floor((2^64 - 1) / effort)"
+}
