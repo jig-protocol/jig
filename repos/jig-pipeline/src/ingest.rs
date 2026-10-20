@@ -217,6 +217,38 @@ pub enum IngestError {
     /// The owner tried to leave its own channel; it archives it instead.
     #[error("the owner cannot leave '{slug}'; archive the channel instead")]
     OwnerCannotLeave { slug: String },
+    /// A `channel-create` named a sequencer other than this server. This
+    /// server creates only channels it sequences (JEP-0005 rule 5); a
+    /// channel sequenced elsewhere reaches it by contract.
+    #[error(
+        "channel-create names sequencer `{sequencer}`, but this server is `{server}`; \
+         create the channel on its sequencer, or omit `sequencer`"
+    )]
+    NotSequencer { sequencer: String, server: String },
+    /// A channel term (`sequencer`, `co_owners`) is malformed.
+    #[error("channel-create term `{field}` is invalid: {detail}")]
+    InvalidTerms { field: String, detail: String },
+    /// The signer lacks the right the block needs as of its position in the
+    /// channel's ingest chain (JEP-0005 rule 7b).
+    #[error("`{kind}` on `{slug}` refused: `{sender}` does not hold the `{right}` right")]
+    MissingRight {
+        kind: String,
+        slug: String,
+        sender: String,
+        right: String,
+    },
+    /// A role block named a root owner of the channel (its creator or a
+    /// co-owner listed at creation), whose role is fixed.
+    #[error("`{member}` is a root owner of '{slug}'; its role cannot be assigned or removed")]
+    RootOwnerRole { slug: String, member: String },
+    /// A role block named a role this version does not define.
+    #[error("unknown role `{role}`: the only role that can be assigned is `admin`")]
+    UnknownRole { role: String },
+    /// A `channel-create` whose slug is outside the slug grammar, or in a
+    /// reserved namespace its author may not create in
+    /// ([`jig_core::slug::check_create`]).
+    #[error("channel slug {slug:?} is refused: {reason}")]
+    InvalidSlug { slug: String, reason: String },
     /// A `channel-create` named a suite that is not in the registry.
     #[error("unknown encryption suite `{suite}`")]
     UnknownSuite { suite: String },
@@ -374,41 +406,53 @@ pub async fn ingest(
         });
     }
 
+    // The store's local channels are the ones this server sequences; make
+    // sure it knows which server that is before any slug is resolved (a
+    // no-op once boot or an earlier block has said so).
+    let server_did = ctx.server_did.to_did_jig_string();
+    ctx.store.adopt_local_sequencer(&server_did)?;
+
+    // The block's CID, needed this early because a channel-create's channel
+    // IS that block: its `channel_id` is its own CID (JEP-0005 rule 1).
+    let block_cid = bundle
+        .block_cid()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|_| "bafy_invalid".to_string());
+
     // Step 3b: channel-existence guard for channel-scoped kinds.
     //
     // Resolved once here and reused for the bridge-sink member lookup after
-    // persist, so the guard costs no extra query. `channel_slug_of` is the ONE
-    // rule for which metadata key names a block's channel; the persisted
-    // `channel_id` below uses the same call, so the channel that is gated is
-    // the channel the block lands in.
-    let channel_slug = channel_slug_of(kind, &manifest);
-    let mut resolved_channel = match channel_slug {
-        Some(slug) => ctx.store.get_channel_by_slug(slug)?,
+    // persist, so the guard costs no extra query. `channel_id_of` is the ONE
+    // rule for which channel a block names; the persisted `channel_id` below
+    // is its answer, so the channel that is gated is the channel the block
+    // lands in.
+    let block_channel = channel_id_of(&ctx.store, kind, &manifest, &block_cid)?;
+    let channel_id = block_channel.as_ref().and_then(|c| c.id.as_deref());
+    let channel_named = block_channel.as_ref().map(|c| c.named.as_str());
+    let mut resolved_channel = match channel_id {
+        Some(id) => ctx.store.get_channel_by_id(id)?,
         None => None,
     };
-    // A live row is what writes need. No live row but an archived one means
-    // the channel was retired: nothing goes into it, from any source, of any
-    // kind — otherwise a kind the write gate does not know would resolve to
-    // "no channel", pass the gate, and land in the archived timeline the read
-    // gate still guards.
-    if let Some(slug) = channel_slug
+    // A live row is what writes need. An id with no live row means the
+    // channel was retired (`channel_id_of` resolves archived rows too):
+    // nothing goes into it, from any source, of any kind — otherwise a kind
+    // the write gate does not know would resolve to "no channel", pass the
+    // gate, and land in the archived timeline the read gate still guards.
+    if let Some(named) = channel_named
+        && channel_id.is_some()
         && resolved_channel.is_none()
         && kind != BlockKind::ChannelCreate
-        && ctx
-            .store
-            .get_channel_by_slug_including_archived(slug)?
-            .is_some()
     {
         return Err(IngestError::ChannelArchived {
-            slug: slug.to_string(),
+            slug: named.to_string(),
         });
     }
-    if let Some(slug) = channel_slug
-        && resolved_channel.is_none()
+    if let Some(named) = channel_named
+        && channel_id.is_none()
         && requires_existing_channel(kind, &source)
     {
         return Err(IngestError::UnknownChannel {
-            slug: slug.to_string(),
+            slug: named.to_string(),
         });
     }
 
@@ -421,13 +465,13 @@ pub async fn ingest(
     // this server's signature. The membership query runs only when the
     // decision can turn on it (content into a restricted channel).
     let membership = if crate::authorize_write::needs_membership(kind, resolved_channel.as_ref()) {
-        match channel_slug {
-            Some(slug) => crate::authorize_write::Membership {
-                sender: ctx.store.is_member(slug, sender.as_str())?,
+        match channel_id {
+            Some(id) => crate::authorize_write::Membership {
+                sender: ctx.store.is_member_by_id(id, sender.as_str())?,
                 target: match manifest.metadata.get("member_did").and_then(|v| v.as_str()) {
                     Some(target) if kind == BlockKind::MemberRemove => ctx
                         .store
-                        .is_member(slug, &crate::effect::canonical_did_string(target))?,
+                        .is_member_by_id(id, &crate::effect::canonical_did_string(target))?,
                     _ => false,
                 },
             },
@@ -436,12 +480,27 @@ pub async fn ingest(
     } else {
         Default::default()
     };
-    if let Err(refusal) = crate::authorize_write::authorize_block(
+    // The sender's rights as of this block's position in the channel's
+    // chain (JEP-0005 rule 7b): it has no record yet, so every role block
+    // already sequenced comes before it. Read only when a decision can
+    // turn on them.
+    let rights = match resolved_channel.as_ref() {
+        Some(chan)
+            if kind != BlockKind::ChannelCreate
+                && (crate::authorize_write::changes_the_channel(kind)
+                    || crate::authorize_write::needs_membership(kind, Some(chan))) =>
+        {
+            crate::roles::rights_at_channel(&ctx.store, chan, sender.as_str(), crate::roles::NEXT)?
+        }
+        _ => crate::roles::Rights::default(),
+    };
+    if let Err(refusal) = crate::authorize_write::authorize_block_with(
         kind,
         sender.as_str(),
         &manifest,
         resolved_channel.as_ref(),
         membership,
+        rights,
     ) {
         use crate::authorize_write::WriteRefusal;
         // The audit record of what actually happened, independent of what any
@@ -456,7 +515,69 @@ pub async fn ingest(
                 IngestError::NotChannelMember { kind, slug, sender }
             }
             WriteRefusal::OwnerCannotLeave { slug } => IngestError::OwnerCannotLeave { slug },
+            WriteRefusal::MissingRight {
+                slug,
+                sender,
+                right,
+            } => IngestError::MissingRight {
+                kind,
+                slug,
+                sender,
+                right: right.to_string(),
+            },
+            WriteRefusal::RootOwnerRole { slug, member } => {
+                IngestError::RootOwnerRole { slug, member }
+            }
+            WriteRefusal::UnknownRole { role } => IngestError::UnknownRole { role },
+            WriteRefusal::MissingRoleMember => IngestError::MissingMetadata {
+                kind,
+                field: crate::roles::MEMBER_KEY.to_string(),
+            },
         });
+    }
+
+    // Whether that decision rested on a role rather than on the channel's
+    // terms alone. If so, the role must still hold at the seq the block is
+    // given: the landing below re-checks it inside the transaction that
+    // assigns that seq, which is the authoritative check (JEP-0005 rule 7b).
+    // Only `membership` is granted by a role and can be taken away; the
+    // owner role is fixed by the terms.
+    let guard_refusal = match resolved_channel.as_ref() {
+        Some(chan)
+            if matches!(kind, BlockKind::MemberAdd | BlockKind::MemberRemove)
+                && crate::authorize_write::authorize_block_with(
+                    kind,
+                    sender.as_str(),
+                    &manifest,
+                    Some(chan),
+                    membership,
+                    crate::roles::Rights::of_root(chan, sender.as_str()),
+                )
+                .is_err() =>
+        {
+            Some(IngestError::NotChannelOwner {
+                kind: kind_str.to_string(),
+                slug: chan.slug.clone(),
+                sender: sender.as_str().to_string(),
+            })
+        }
+        _ => None,
+    };
+
+    // Step 3c': a channel-create's terms (JEP-0005 rules 5 and 6). This
+    // server creates only channels it sequences; the co-owners are fixed
+    // here for the channel's life.
+    if kind == BlockKind::ChannelCreate {
+        // The slug's canonical grammar applies to new channels only; rows
+        // from before it keep their slugs (lookups stay exact-match). Then
+        // who may create each class.
+        check_create_slug(
+            channel_slug_of(kind, &manifest).unwrap_or_default(),
+            &sender.to_did_jig_string(),
+            &server_did,
+            &source,
+        )?;
+        channel_terms(&manifest, &server_did)?;
     }
 
     // Step 3: HLC update on receive, within the advertised skew bound. A
@@ -492,10 +613,6 @@ pub async fn ingest(
     // blocks (channel-create, member-add, …) whose effect is applied by
     // `apply_effect`; they have no rendered output to hash. Promoting them is a
     // separate piece of work, not an oversight.
-    let block_cid = bundle
-        .block_cid()
-        .map(|c| c.to_string())
-        .unwrap_or_else(|_| "bafy_invalid".to_string());
 
     // Step 3d: a block is ingested once. The `blocks.cid` primary key would
     // refuse the second insert anyway, but `apply_effect` runs BEFORE that
@@ -509,7 +626,7 @@ pub async fn ingest(
     // After the signature, admission and write gates, so an unauthenticated
     // caller cannot use it to probe which slugs exist.
     if kind == BlockKind::ChannelCreate
-        && let Some(slug) = channel_slug
+        && let Some(slug) = channel_slug_of(kind, &manifest)
         && ctx
             .store
             .get_channel_by_slug_including_archived(slug)?
@@ -523,12 +640,19 @@ pub async fn ingest(
     // payload. After every authorization gate, so validating a commit is work
     // done only for a sender who may make the change; before the receipt, so
     // a refused block never carries this server's signature.
-    let mls_group = match (&resolved_channel, channel_slug) {
-        (Some(chan), Some(slug)) if chan.suite == jig_core::EncryptionSuite::Mls.as_str() => {
-            ctx.store.get_mls_group(slug)?
+    let mls_group = match &resolved_channel {
+        Some(chan) if chan.suite == jig_core::EncryptionSuite::Mls.as_str() => {
+            ctx.store.get_mls_group_by_id(&chan.id)?
         }
         _ => None,
     };
+    // How errors name the channel: its slug when this server holds it,
+    // otherwise whatever the block's metadata said.
+    let channel_label = resolved_channel
+        .as_ref()
+        .map(|c| c.slug.clone())
+        .or_else(|| channel_named.map(str::to_string))
+        .unwrap_or_default();
     let mls_plan = crate::mls_gate::plan(
         kind,
         &sender.to_did_jig_string(),
@@ -536,7 +660,7 @@ pub async fn ingest(
         resolved_channel.as_ref(),
         mls_group.as_ref(),
     )
-    .map_err(|refusal| suite_refusal(refusal, channel_slug.unwrap_or_default()))?;
+    .map_err(|refusal| suite_refusal(refusal, &channel_label))?;
 
     let (receipt_bytes, render_hash, is_synthetic) = match (&mls_plan, kind) {
         // Ciphertext cannot be executed, and the server does not pretend to.
@@ -556,11 +680,11 @@ pub async fn ingest(
     let hlc = manifest.hlc_ts.as_ref();
     let stored_block = StoredBlock {
         cid: block_cid.clone(),
-        // Lift the channel slug from manifest metadata into the first-class
-        // column so channel-scoped fanout + the bridge sink can find it. Same
-        // rule as step 3b, by construction: a block is stored under exactly
-        // the channel the write gate examined.
-        channel_id: channel_slug.map(|s| s.to_string()),
+        // The channel's id (its creation-block CID), so channel-scoped
+        // fanout, history and the bridge sink find it. Step 3b's answer, by
+        // construction: a block is stored under exactly the channel the write
+        // gate examined.
+        channel_id: channel_id.map(str::to_string),
         block_kind: kind_str.to_string(),
         sender_did: sender_did_str,
         sender_sig: sig,
@@ -608,6 +732,18 @@ pub async fn ingest(
         ingest_logical: ingest_hlc.logical,
     });
     let signer = signer.filter(|_| stored_block.channel_id.is_some());
+    let sender_did = sender.to_did_jig_string();
+    let guard = match (&guard_refusal, resolved_channel.as_ref()) {
+        (Some(_), Some(chan)) => Some(crate::persist::RightGuard {
+            channel: chan,
+            did: &sender_did,
+            right: crate::roles::Right::Membership,
+        }),
+        _ => None,
+    };
+
+    #[cfg(test)]
+    run_before_landing_hook();
 
     match mls_plan {
         // Step 5/6 for a commit on an encrypted channel: the group's advance,
@@ -623,24 +759,27 @@ pub async fn ingest(
         } => {
             let membership =
                 membership_change(kind, &manifest, resolved_channel.as_ref(), &block_cid);
-            if ctx
-                .store
-                .land_mls_commit(
-                    &slug,
-                    from_epoch,
-                    &state,
-                    to_epoch,
-                    group_info.as_deref(),
-                    &membership,
-                    &stored_block,
-                    &stored_receipt,
-                    signer.as_ref(),
-                )?
-                .is_none()
-            {
+            // An advance needs the channel's row, so `channel_id` is set.
+            let group_key = channel_id.unwrap_or_default();
+            let landing = ctx.store.land_mls_commit_guarded(
+                group_key,
+                from_epoch,
+                &state,
+                to_epoch,
+                group_info.as_deref(),
+                &membership,
+                &stored_block,
+                &stored_receipt,
+                signer.as_ref(),
+                guard.as_ref(),
+            )?;
+            if landing == crate::persist::Landing::Unauthorized {
+                return Err(refused_at_landing(guard_refusal, kind_str));
+            }
+            if landing == crate::persist::Landing::LostRace {
                 let current = ctx
                     .store
-                    .get_mls_group(&slug)?
+                    .get_mls_group_by_id(group_key)?
                     .map(|g| g.epoch)
                     .unwrap_or_default();
                 return Err(IngestError::StaleEpoch {
@@ -650,10 +789,38 @@ pub async fn ingest(
                 });
             }
         }
+        // A membership block whose authority rests on a role: its effect,
+        // block and record land in one transaction, and only if the role
+        // still holds at the seq it is given.
+        _ if guard.is_some() => {
+            let Some(signer) = signer.as_ref() else {
+                return Err(refused_at_landing(guard_refusal, kind_str));
+            };
+            if !manifest.metadata.contains_key("member_did") {
+                return Err(IngestError::MissingMetadata {
+                    kind: kind_str.to_string(),
+                    field: "member_did".to_string(),
+                });
+            }
+            let membership =
+                membership_change(kind, &manifest, resolved_channel.as_ref(), &block_cid);
+            match ctx.store.insert_block_sequenced_guarded(
+                &stored_block,
+                signer,
+                &membership,
+                guard.as_ref(),
+            )? {
+                crate::persist::Landing::Landed(_) => {}
+                _ => return Err(refused_at_landing(guard_refusal, kind_str)),
+            }
+            ctx.store.insert_receipt(&stored_receipt)?;
+        }
         plan => {
-            if let crate::mls_gate::MlsPlan::Genesis(group) = plan {
+            if let crate::mls_gate::MlsPlan::Genesis(mut group) = plan {
+                // The group is keyed by the channel's id: this block's CID.
                 // A channel-create that fails after this leaves a row its
                 // retry overwrites (`put_mls_group` replaces).
+                group.channel_id = block_cid.clone();
                 ctx.store.put_mls_group(&group)?;
             }
             // Step 5: apply effect
@@ -675,10 +842,8 @@ pub async fn ingest(
         }
     }
 
-    // Channel membership for bridge-sink dispatch. `channel_id` here is the
-    // channel SLUG (lifted from manifest metadata), but memberships are keyed
-    // by the channel's CID (its channel-create block CID). Step 3b resolved
-    // the row BEFORE `apply_effect`; a control-plane block has just changed
+    // Channel membership for bridge-sink dispatch. Step 3b resolved the row
+    // BEFORE `apply_effect`; a control-plane block has just changed
     // that row (channel-create wrote it, channel-promote flipped its
     // visibility), so it is resolved again for those kinds. Content kinds
     // change nothing and keep the row already in hand.
@@ -694,16 +859,16 @@ pub async fn ingest(
         BlockKind::TextRender | BlockKind::EmailRender | BlockKind::EmailEncrypted
     );
     if (resolved_channel.is_none() || effect_may_have_changed_the_row)
-        && let Some(slug) = stored_block.channel_id.as_deref()
+        && let Some(id) = stored_block.channel_id.as_deref()
     {
         // Archived rows included: a channel-archive has just set
         // `archived_at`, and its own block must still be delivered under the
         // channel's policy rather than to everyone because the live lookup
         // stopped finding it.
-        match ctx.store.get_channel_by_slug_including_archived(slug) {
+        match ctx.store.get_channel_by_id_including_archived(id) {
             Ok(row) => resolved_channel = row,
             Err(e) => {
-                tracing::warn!(slug, error = %e, "channel lookup failed at fanout; denying");
+                tracing::warn!(channel_id = id, error = %e, "channel lookup failed at fanout; denying");
                 lookup_failed = true;
             }
         }
@@ -736,6 +901,15 @@ pub async fn ingest(
             .push(crate::effect::canonical_did_string(target));
     }
 
+    // A subscription made by slug before this channel existed waits under
+    // that slug; from now on it follows the channel's id, starting with this
+    // very block.
+    if kind == BlockKind::ChannelCreate
+        && let Some(slug) = channel_slug_of(kind, &manifest)
+    {
+        ctx.fanout.bind_pending_channel(slug, &block_cid).await;
+    }
+
     // Step 7: fanout — broadcast policy depends on source
     match source {
         IngestSource::FederatedPeer { .. } => {
@@ -761,9 +935,115 @@ pub async fn ingest(
     Ok(block_cid)
 }
 
-/// The channel a block belongs to, from its manifest metadata — the one rule
-/// shared by the write gate, the persisted `channel_id` column, fanout and
-/// the metrics label.
+/// The refusal a block gets when its role no longer held at the seq it was
+/// to be given: the one the write gate would have returned.
+fn refused_at_landing(refusal: Option<IngestError>, kind: &str) -> IngestError {
+    tracing::info!(
+        kind,
+        "write refused at landing: the signer's role was taken away first"
+    );
+    refusal.unwrap_or_else(|| IngestError::Other(anyhow::anyhow!("refused at landing")))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once, between the write gate and the landing transaction, so a
+    /// test can sequence another block in exactly that window.
+    static BEFORE_LANDING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_before_landing_hook() {
+    if let Some(hook) = BEFORE_LANDING.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+}
+
+/// The metadata key under which a block names its channel by id: the CID of
+/// the channel's channel-create block, in canonical text.
+pub const CHANNEL_ID_KEY: &str = "channel_id";
+
+/// A block's channel: the name its metadata gave, and the id that name
+/// resolves to. What [`channel_id_of`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockChannel {
+    /// The channel's id — the CID of its channel-create block (JEP-0005
+    /// rule 1). For a channel-create, the block's own CID; otherwise the id
+    /// of the channel row the metadata names, archived or not. `None` when
+    /// the name resolves to no channel this server holds.
+    pub id: Option<String>,
+    /// The name as the block carried it — the slug, or the `channel_id` text
+    /// — for errors and logs.
+    pub named: String,
+}
+
+/// The channel a block belongs to — the ONE rule shared by the write gate,
+/// the persisted `blocks.channel_id` column, fanout and the effect layer.
+/// `None` when the block names no channel at all.
+///
+/// - A `channel-create` is its channel: the id is `block_cid`, its own CID.
+/// - Any other kind names the channel it acts on by metadata `channel_id`
+///   (the canonical CID text) when present, else by metadata `channel` (the
+///   slug), which is looked up among this server's channels.
+/// - A block carrying both must have them agree: a `channel` slug naming
+///   any other channel (or none) leaves the id unresolved, so the block is
+///   refused as naming an unknown channel. Otherwise a reader going by the
+///   slug would file the block under a channel it was never gated against.
+///
+/// Archived channels resolve too, so the caller can tell "retired" from "no
+/// such channel".
+pub fn channel_id_of(
+    store: &SqliteStore,
+    kind: BlockKind,
+    manifest: &jig_core::BlockManifest,
+    block_cid: &str,
+) -> crate::persist::Result<Option<BlockChannel>> {
+    if kind == BlockKind::ChannelCreate {
+        return Ok(Some(BlockChannel {
+            id: Some(block_cid.to_string()),
+            named: channel_slug_of(kind, manifest)
+                .unwrap_or(block_cid)
+                .to_string(),
+        }));
+    }
+    if let Some(id) = manifest
+        .metadata
+        .get(CHANNEL_ID_KEY)
+        .and_then(|v| v.as_str())
+    {
+        let mut resolved = store
+            .get_channel_by_id_including_archived(id)?
+            .map(|c| c.id);
+        if let Some(slug) = channel_slug_of(kind, manifest)
+            && resolved.is_some()
+            && store
+                .get_channel_by_slug_including_archived(slug)?
+                .map(|c| c.id)
+                != resolved
+        {
+            resolved = None;
+        }
+        return Ok(Some(BlockChannel {
+            id: resolved,
+            named: id.to_string(),
+        }));
+    }
+    if let Some(slug) = channel_slug_of(kind, manifest) {
+        return Ok(Some(BlockChannel {
+            id: store
+                .get_channel_by_slug_including_archived(slug)?
+                .map(|c| c.id),
+            named: slug.to_string(),
+        }));
+    }
+    Ok(None)
+}
+
+/// The slug a block's manifest metadata names, if any. Ingest keys channels
+/// by [`channel_id_of`]; this is for callers that only have the manifest (a
+/// client deciding how to decrypt, a metrics label) and for the
+/// slug-uniqueness check on channel-create.
 ///
 /// `channel-create` names the channel it creates under `slug`; every other
 /// kind names the channel it acts on under `channel`. The key is chosen by
@@ -797,12 +1077,19 @@ fn manifest_log_write(
     if !reserved && kind != BlockKind::ServerManifest {
         return Ok(false);
     }
+    let own = sender.to_did_jig_string() == ctx.server_did.to_did_jig_string();
+    // Who may create a channel under `#jig/` is the slug grammar's rule
+    // (`check_new_slug`); here only the log's own create skips the kind
+    // whitelist.
+    if kind == BlockKind::ChannelCreate {
+        return Ok(own && slug == Some(LOG_SLUG));
+    }
     let refuse = |reason: &str| {
         Err(IngestError::ManifestLog {
             reason: reason.to_string(),
         })
     };
-    if sender.to_did_jig_string() != ctx.server_did.to_did_jig_string() {
+    if !own {
         return refuse("only this server writes its manifest log and its reserved channels");
     }
     if slug != Some(LOG_SLUG) {
@@ -811,7 +1098,6 @@ fn manifest_log_write(
         );
     }
     match kind {
-        BlockKind::ChannelCreate => Ok(true),
         BlockKind::ServerManifest => {
             use base64::Engine as _;
             let decoded = manifest
@@ -870,7 +1156,127 @@ fn requires_existing_channel(kind: BlockKind, _source: &IngestSource) -> bool {
             | BlockKind::MemberRemove
             | BlockKind::ChannelPromote
             | BlockKind::ChannelArchive
+            | BlockKind::RoleAssign
+            | BlockKind::RoleUnassign
     )
+}
+
+/// Check a new channel's slug ([`jig_core::slug::classify_slug`]) and that
+/// its creator may create that class:
+/// - `User`: anyone;
+/// - `Dm`: anyone here; the DM rule in [`crate::mls_gate`] then limits it to
+///   one of the pair that derives the slug;
+/// - `Email`: only the email bridge (`IngestSource::Bridge`), so nobody can
+///   take a DID pair's mail-thread slug before the bridge does. A relayed
+///   create (`IngestSource::FederatedPeer`) is refused on purpose: bridge
+///   threads are local-only. The bridge creates them restricted
+///   (`bridges/email/src/channel.rs`, `ensure_thread_channel`), and v0.2
+///   federates only open, unencrypted channels (`DeliveryPolicy::federates`),
+///   so no peer legitimately relays one. A future peer-policy field naming a
+///   peer's bridge DIDs could relax this;
+/// - `Server`: only this server's own DID.
+pub fn check_create_slug(
+    slug: &str,
+    creator: &str,
+    server_did: &str,
+    source: &IngestSource,
+) -> Result<jig_core::slug::SlugClass, IngestError> {
+    use jig_core::slug::SlugClass;
+    let refuse = |reason: String| IngestError::InvalidSlug {
+        slug: slug.to_string(),
+        reason,
+    };
+    let class = jig_core::slug::classify_slug(slug).map_err(|e| refuse(e.to_string()))?;
+    match class {
+        SlugClass::Email if !matches!(source, IngestSource::Bridge) => Err(refuse(format!(
+            "`{}` is reserved for the email bridge's mail threads",
+            jig_core::slug::EMAIL_PREFIX
+        ))),
+        SlugClass::Server if creator != server_did => Err(refuse(format!(
+            "`{}` is reserved for this server's own channels",
+            jig_core::slug::JIG_PREFIX
+        ))),
+        class => Ok(class),
+    }
+}
+
+/// The metadata key a `channel-create` names its sequencer under.
+pub const SEQUENCER_KEY: &str = "sequencer";
+/// The metadata key a `channel-create` lists its co-owners under.
+pub const CO_OWNERS_KEY: &str = "co_owners";
+
+/// A `channel-create`'s terms beyond slug, visibility and suite, checked:
+/// the sequencer (this server's DID when absent) and the co-owners, both in
+/// canonical text. The co-owners are deduplicated and never include the
+/// creator, who is the root owner already.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelTerms {
+    pub sequencer: String,
+    pub co_owners: Vec<String>,
+}
+
+/// Read and check a `channel-create`'s terms (JEP-0005 rules 5 and 6).
+///
+/// - `sequencer`, when present, is a `did:jig` DID and MUST be this server:
+///   a server creates only channels it sequences. Absent, the channel is
+///   local and this server sequences it, which keeps clients from before
+///   terms working.
+/// - `co_owners`, when present, is an array of `did:jig` DIDs.
+pub fn channel_terms(
+    manifest: &jig_core::BlockManifest,
+    server_did: &str,
+) -> Result<ChannelTerms, IngestError> {
+    let invalid = |field: &str, detail: String| IngestError::InvalidTerms {
+        field: field.to_string(),
+        detail,
+    };
+    let did = |field: &str, raw: &serde_json::Value| -> Result<String, IngestError> {
+        let text = raw
+            .as_str()
+            .ok_or_else(|| invalid(field, format!("`{raw}` is not a DID string")))?;
+        let parsed = Did::from_did_jig_string(text)
+            .map_err(|e| invalid(field, format!("`{text}` is not a did:jig DID: {e}")))?;
+        Ok(crate::effect::canonical_did_string(
+            &parsed.to_did_jig_string(),
+        ))
+    };
+    let sequencer = match manifest.metadata.get(SEQUENCER_KEY) {
+        None => server_did.to_string(),
+        Some(raw) => did(SEQUENCER_KEY, raw)?,
+    };
+    if sequencer != server_did {
+        return Err(IngestError::NotSequencer {
+            sequencer,
+            server: server_did.to_string(),
+        });
+    }
+    let creator = manifest
+        .authors
+        .first()
+        .map(|a| crate::effect::canonical_did_string(&a.did.to_string()))
+        .unwrap_or_default();
+    let mut co_owners: Vec<String> = Vec::new();
+    match manifest.metadata.get(CO_OWNERS_KEY) {
+        None => {}
+        Some(serde_json::Value::Array(list)) => {
+            for raw in list {
+                let co_owner = did(CO_OWNERS_KEY, raw)?;
+                if co_owner != creator && !co_owners.contains(&co_owner) {
+                    co_owners.push(co_owner);
+                }
+            }
+        }
+        Some(other) => {
+            return Err(invalid(
+                CO_OWNERS_KEY,
+                format!("`{other}` is not an array of DIDs"),
+            ));
+        }
+    }
+    Ok(ChannelTerms {
+        sequencer,
+        co_owners,
+    })
 }
 
 /// The membership change a commit-carrying block makes — what
@@ -1257,6 +1663,8 @@ mod tests {
                 created_at: 0,
                 owner_did: owner_did.into(),
                 suite: "none".to_string(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })
             .unwrap();
         id
@@ -2027,6 +2435,191 @@ mod tests {
         assert!(ctx.store.get_channel_by_slug("#first").unwrap().is_some());
     }
 
+    /// A channel-create is its own channel: its `channel_id` is its own CID,
+    /// the id the channel row carries (JEP-0005 rule 1).
+    #[tokio::test]
+    async fn a_channel_create_is_stored_under_its_own_cid() {
+        let ctx = test_ctx_allowing(&["channel-create"]);
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &random_signing_key(),
+            BlockKind::ChannelCreate,
+            &[("slug", "#first"), ("visibility", "open")],
+        );
+        let cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap();
+        let stored = ctx.store.get_block(&cid).unwrap().unwrap();
+        assert_eq!(stored.channel_id.as_deref(), Some(cid.as_str()));
+        assert_eq!(
+            ctx.store.get_channel_by_slug("#first").unwrap().unwrap().id,
+            cid
+        );
+    }
+
+    /// A subscription made by slug before the channel exists follows the
+    /// channel once it is created: it receives the creation block and what
+    /// is posted after it, both keyed by the channel's CID.
+    #[tokio::test]
+    async fn a_subscription_waiting_on_a_slug_follows_the_channel_once_created() {
+        let ctx = test_ctx_allowing(&["channel-create", "text-render"]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.fanout
+            .subscribe_local(
+                crate::fanout::SubscriptionScope::Channel("#later".to_string()),
+                crate::fanout::SubscriberIdentity::Unchecked,
+                tx,
+            )
+            .await;
+        let owner = random_signing_key();
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &owner,
+            BlockKind::ChannelCreate,
+            &[("slug", "#later"), ("visibility", "open")],
+        );
+        let channel_cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap();
+        let (mb, cb, sig) =
+            build_bundle_parts_with_channel(&owner, BlockKind::TextRender, "#later");
+        do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap();
+        for kind in ["channel-create", "text-render"] {
+            let got = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .expect("the waiting subscription should receive")
+                .expect("a delivery");
+            assert_eq!(got.0.block_kind, kind);
+            assert_eq!(got.0.channel_id.as_deref(), Some(channel_cid.as_str()));
+        }
+    }
+
+    /// A block may name its channel by `channel_id`, the CID of the
+    /// channel-create, and lands under that CID.
+    #[tokio::test]
+    async fn a_block_naming_channel_id_lands_under_that_cid() {
+        let ctx = test_ctx();
+        let channel_id = seed_channel(&ctx, "#hello");
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &random_signing_key(),
+            BlockKind::TextRender,
+            &[("channel_id", channel_id.as_str()), ("body", TEST_BODY)],
+        );
+        let cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap();
+        let stored = ctx.store.get_block(&cid).unwrap().unwrap();
+        assert_eq!(stored.channel_id.as_deref(), Some(channel_id.as_str()));
+        assert_eq!(
+            ctx.store
+                .list_blocks_by_channel("#hello", 10, None)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// A `channel_id` that names no channel here is refused exactly as an
+    /// unknown slug is, and leaves nothing behind.
+    #[tokio::test]
+    async fn a_block_naming_an_unknown_channel_id_is_refused_like_an_unknown_slug() {
+        let ctx = test_ctx_allowing(&["text-render", "member-add"]);
+        // The slug of a real channel is not its id.
+        seed_channel(&ctx, "#hello");
+        for (kind, named) in [
+            (BlockKind::TextRender, "bafyNoSuchChannel"),
+            (BlockKind::TextRender, "#hello"),
+            (BlockKind::MemberAdd, "bafyNoSuchChannel"),
+        ] {
+            let (mb, cb, sig) = build_bundle_parts_with_meta(
+                &random_signing_key(),
+                kind,
+                &[
+                    ("channel_id", named),
+                    ("body", TEST_BODY),
+                    ("member_did", "did:jig:zX"),
+                ],
+            );
+            let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, IngestError::UnknownChannel { slug } if slug == named),
+                "{kind:?} naming {named}: expected UnknownChannel, got {err:?}"
+            );
+        }
+        assert!(
+            ctx.store
+                .list_blocks_by_channel("#hello", 10, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// `channel_id` and `channel` must name the same channel; a pair that
+    /// disagrees is refused as naming an unknown channel. A pair that agrees
+    /// lands under the id.
+    #[tokio::test]
+    async fn a_channel_id_and_slug_that_disagree_are_refused() {
+        let ctx = test_ctx();
+        let hello = seed_channel(&ctx, "#hello");
+        seed_channel(&ctx, "#other");
+        for slug in ["#other", "#nowhere"] {
+            let (mb, cb, sig) = build_bundle_parts_with_meta(
+                &random_signing_key(),
+                BlockKind::TextRender,
+                &[
+                    ("channel_id", hello.as_str()),
+                    ("channel", slug),
+                    ("body", TEST_BODY),
+                ],
+            );
+            let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, IngestError::UnknownChannel { slug } if *slug == hello),
+                "channel {slug}: expected UnknownChannel, got {err:?}"
+            );
+        }
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &random_signing_key(),
+            BlockKind::TextRender,
+            &[
+                ("channel_id", hello.as_str()),
+                ("channel", "#hello"),
+                ("body", TEST_BODY),
+            ],
+        );
+        let cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.store.get_block(&cid).unwrap().unwrap().channel_id,
+            Some(hello)
+        );
+    }
+
+    /// An archived channel named by its id refuses like one named by slug.
+    #[tokio::test]
+    async fn an_archived_channel_named_by_id_refuses() {
+        let ctx = test_ctx();
+        let channel_id = seed_channel(&ctx, "#retired");
+        assert!(ctx.store.archive_channel_by_id(&channel_id, 1).unwrap());
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &random_signing_key(),
+            BlockKind::TextRender,
+            &[("channel_id", channel_id.as_str()), ("body", TEST_BODY)],
+        );
+        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, IngestError::ChannelArchived { .. }),
+            "expected ChannelArchived, got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn member_add_by_the_owner_against_existing_channel_still_ingests() {
         let ctx = test_ctx_allowing(&["member-add"]);
@@ -2358,8 +2951,10 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_lifts_channel_id_from_metadata() {
+        // A block naming its channel only by slug is stored under the
+        // channel's CID, never the slug (JEP-0005 rule 1).
         let ctx = test_ctx(); // allows "text-render"
-        seed_channel(&ctx, "#hello");
+        let channel_id = seed_channel(&ctx, "#hello");
         let sender_key = random_signing_key();
         let (mb, cb, sig) =
             build_bundle_parts_with_channel(&sender_key, BlockKind::TextRender, "#hello");
@@ -2367,7 +2962,7 @@ mod tests {
             .await
             .unwrap();
         let stored = ctx.store.get_block(&cid).unwrap().unwrap();
-        assert_eq!(stored.channel_id.as_deref(), Some("#hello"));
+        assert_eq!(stored.channel_id.as_deref(), Some(channel_id.as_str()));
     }
 
     #[tokio::test]
@@ -2393,6 +2988,8 @@ mod tests {
                 created_at: 0,
                 owner_did: bob_did.clone(),
                 suite: "none".to_string(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })
             .unwrap();
         for did in [bob_did.clone(), shadow.clone()] {
@@ -2418,7 +3015,7 @@ mod tests {
             .await
             .expect("bridge sink should receive within timeout")
             .expect("a delivery");
-        assert_eq!(got.0.channel_id.as_deref(), Some("#dm/x"));
+        assert_eq!(got.0.channel_id.as_deref(), Some(channel_cid.as_str()));
         assert_eq!(got.0.sender_did, bob_did);
     }
 
@@ -2451,6 +3048,8 @@ mod tests {
                 created_at: 0,
                 owner_did: bob_did.clone(),
                 suite: "none".to_string(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })
             .unwrap();
         // Memberships are keyed by the CID, not the slug.
@@ -2477,7 +3076,7 @@ mod tests {
             .await
             .expect("bridge sink should receive within timeout — slug->CID resolution must fire")
             .expect("a delivery");
-        assert_eq!(got.0.channel_id.as_deref(), Some("#dm/z"));
+        assert_eq!(got.0.channel_id.as_deref(), Some(channel_cid.as_str()));
         assert_eq!(got.0.sender_did, bob_did);
     }
 
@@ -2486,11 +3085,11 @@ mod tests {
         // A block ingested with IngestSource::Bridge should reach a local
         // channel subscriber (full broadcast), same as LocalClient.
         let ctx = test_ctx();
-        seed_channel(&ctx, "#dm/y");
+        let channel_id = seed_channel(&ctx, "#dm/y");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         ctx.fanout
             .subscribe_local(
-                crate::fanout::SubscriptionScope::Channel("#dm/y".to_string()),
+                crate::fanout::SubscriptionScope::Channel(channel_id.clone()),
                 crate::fanout::SubscriberIdentity::Unchecked,
                 tx,
             )
@@ -2504,6 +3103,746 @@ mod tests {
             .await
             .expect("local sub should receive")
             .expect("a delivery");
-        assert_eq!(got.0.channel_id.as_deref(), Some("#dm/y"));
+        assert_eq!(got.0.channel_id.as_deref(), Some(channel_id.as_str()));
+    }
+
+    // ---- Channel terms and roles (JEP-0005 rules 5-7b) -------------------
+
+    fn roles_ctx() -> IngestContext {
+        test_ctx_allowing(&[
+            "text-render",
+            "channel-create",
+            "member-add",
+            "member-remove",
+            "channel-archive",
+            "role-assign",
+            "role-unassign",
+        ])
+    }
+
+    async fn plain(
+        ctx: &IngestContext,
+        who: &Person,
+        kind: BlockKind,
+        meta: serde_json::Value,
+    ) -> Result<String, IngestError> {
+        submit(ctx, who, kind, jig_core::EncryptionSuite::Unencrypted, meta).await
+    }
+
+    fn seq_of(ctx: &IngestContext, cid: &str) -> u64 {
+        ctx.store.get_ingest_record(cid).unwrap().unwrap().seq
+    }
+
+    /// Rule 5: this server creates only the channels it sequences. A create
+    /// naming another sequencer is refused and leaves nothing behind; one
+    /// naming none is local, stored with this server's DID.
+    #[tokio::test]
+    async fn a_channel_create_naming_another_sequencer_is_refused() {
+        let ctx = roles_ctx();
+        let owner = person();
+        let elsewhere = did_of(&random_signing_key());
+        let refused = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#theirs", "sequencer": elsewhere}),
+        )
+        .await;
+        match refused {
+            Err(IngestError::NotSequencer { sequencer, server }) => {
+                assert_eq!(sequencer, elsewhere);
+                assert_eq!(server, ctx.server_did.to_did_jig_string());
+            }
+            other => panic!("expected NotSequencer, got {other:?}"),
+        }
+        assert!(ctx.store.get_channel_by_slug("#theirs").unwrap().is_none());
+
+        let not_a_did = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#bad", "sequencer": "server.example"}),
+        )
+        .await;
+        assert!(
+            matches!(not_a_did, Err(IngestError::InvalidTerms { ref field, .. }) if field == "sequencer"),
+            "got {not_a_did:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_channel_create_without_a_sequencer_is_this_servers() {
+        let ctx = roles_ctx();
+        let owner = person();
+        let cid = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#mine"}),
+        )
+        .await
+        .unwrap();
+        let row = ctx.store.get_channel_by_id(&cid).unwrap().unwrap();
+        assert_eq!(row.sequencer_did, ctx.server_did.to_did_jig_string());
+        assert!(row.co_owners.is_empty());
+
+        // Naming this server explicitly is the same channel shape, and the
+        // co-owners are kept, canonical and without the creator.
+        let co = person();
+        let cid = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#ours",
+                "sequencer": ctx.server_did.to_did_jig_string(),
+                "co_owners": [co.did.to_uppercase().replacen("DID:JIG:Z", "did:jig:z", 1),
+                              co.did, owner.did]}),
+        )
+        .await
+        .unwrap();
+        let row = ctx.store.get_channel_by_id(&cid).unwrap().unwrap();
+        assert_eq!(row.sequencer_did, ctx.server_did.to_did_jig_string());
+        assert_eq!(row.co_owners, vec![co.did.clone()]);
+
+        let bad = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#worse", "co_owners": "did:jig:zNotAList"}),
+        )
+        .await;
+        assert!(
+            matches!(bad, Err(IngestError::InvalidTerms { ref field, .. }) if field == "co_owners"),
+            "got {bad:?}"
+        );
+    }
+
+    /// A carried channel with the same slug (inserted directly: carried
+    /// channels arrive by contract in a later slice) does not take the slug
+    /// from this server, and slug-named blocks land in the local one.
+    #[tokio::test]
+    async fn a_carried_channel_does_not_shadow_a_local_slug() {
+        let ctx = roles_ctx();
+        ctx.store
+            .adopt_local_sequencer(&ctx.server_did.to_did_jig_string())
+            .unwrap();
+        ctx.store
+            .upsert_channel(&crate::persist::StoredChannel {
+                id: "bafy_carried".to_string(),
+                slug: "#shared".to_string(),
+                visibility: "open".to_string(),
+                created_at: 0,
+                owner_did: "did:jig:zFarOwner".to_string(),
+                suite: "none".to_string(),
+                sequencer_did: did_of(&random_signing_key()),
+                co_owners: Vec::new(),
+            })
+            .unwrap();
+        let owner = person();
+        let local = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#shared"}),
+        )
+        .await
+        .expect("the slug is free among this server's channels");
+        let post = plain(
+            &ctx,
+            &owner,
+            BlockKind::TextRender,
+            serde_json::json!({"channel": "#shared", "body": "hi"}),
+        )
+        .await
+        .unwrap();
+        let stored = ctx.store.get_block(&post).unwrap().unwrap();
+        assert_eq!(stored.channel_id.as_deref(), Some(local.as_str()));
+    }
+
+    /// Rule 7b: an admin holds `membership` but not the owner role. Its
+    /// member-add passes; its role-assign is refused; the owner's passes.
+    #[tokio::test]
+    async fn an_admin_adds_members_but_only_an_owner_assigns_roles() {
+        let ctx = roles_ctx();
+        let owner = person();
+        let admin = person();
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#team"}),
+        )
+        .await
+        .unwrap();
+
+        let before = plain(
+            &ctx,
+            &admin,
+            BlockKind::MemberAdd,
+            serde_json::json!({"channel_id": chan, "member_did": "did:jig:zFriend"}),
+        )
+        .await;
+        assert!(
+            matches!(before, Err(IngestError::NotChannelOwner { .. })),
+            "not an admin yet: {before:?}"
+        );
+
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::RoleAssign,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
+        )
+        .await
+        .expect("an owner assigns roles");
+
+        plain(
+            &ctx,
+            &admin,
+            BlockKind::MemberAdd,
+            serde_json::json!({"channel_id": chan, "member_did": "did:jig:zFriend"}),
+        )
+        .await
+        .expect("an admin holds the membership right");
+        assert!(ctx.store.is_member_by_id(&chan, "did:jig:zFriend").unwrap());
+
+        let promote = plain(
+            &ctx,
+            &admin,
+            BlockKind::RoleAssign,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": "did:jig:zFriend"}),
+        )
+        .await;
+        match promote {
+            Err(IngestError::MissingRight { right, sender, .. }) => {
+                assert_eq!(right, "owner");
+                assert_eq!(sender, admin.did);
+            }
+            other => panic!("an admin cannot make an admin; got {other:?}"),
+        }
+        let archive = plain(
+            &ctx,
+            &admin,
+            BlockKind::ChannelArchive,
+            serde_json::json!({"channel_id": chan}),
+        )
+        .await;
+        assert!(
+            matches!(archive, Err(IngestError::NotChannelOwner { .. })),
+            "archive stays owner-only: {archive:?}"
+        );
+    }
+
+    /// Rights are read as of the block's position in the chain, by record
+    /// `seq`: a block the admin signed while it was one stays valid after
+    /// the role is taken away, and its next membership block is refused.
+    #[tokio::test]
+    async fn rights_are_read_at_the_blocks_position_in_the_chain() {
+        let ctx = roles_ctx();
+        let owner = person();
+        let admin = person();
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#team"}),
+        )
+        .await
+        .unwrap();
+        let assign = plain(
+            &ctx,
+            &owner,
+            BlockKind::RoleAssign,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
+        )
+        .await
+        .unwrap();
+        let added = plain(
+            &ctx,
+            &admin,
+            BlockKind::MemberAdd,
+            serde_json::json!({"channel_id": chan, "member_did": "did:jig:zEarly"}),
+        )
+        .await
+        .unwrap();
+        let unassign = plain(
+            &ctx,
+            &owner,
+            BlockKind::RoleUnassign,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
+        )
+        .await
+        .unwrap();
+        let (s_assign, s_added, s_unassign) = (
+            seq_of(&ctx, &assign),
+            seq_of(&ctx, &added),
+            seq_of(&ctx, &unassign),
+        );
+        assert!(s_assign < s_added && s_added < s_unassign);
+
+        use crate::roles::{Rights, rights_at};
+        let at = |seq| rights_at(&ctx.store, &chan, &admin.did, seq).unwrap();
+        assert_eq!(at(s_assign), Rights::NONE, "a block does not see itself");
+        assert_eq!(
+            at(s_added),
+            Rights::ADMIN,
+            "the admin's add was signed in role"
+        );
+        assert_eq!(at(s_unassign), Rights::ADMIN);
+        assert_eq!(at(s_unassign + 1), Rights::NONE);
+        assert_eq!(
+            rights_at(&ctx.store, &chan, &owner.did, 0).unwrap(),
+            Rights::OWNER,
+            "the creator is owner from the start"
+        );
+        assert!(
+            ctx.store.is_member_by_id(&chan, "did:jig:zEarly").unwrap(),
+            "the earlier add stands"
+        );
+
+        let late = plain(
+            &ctx,
+            &admin,
+            BlockKind::MemberAdd,
+            serde_json::json!({"channel_id": chan, "member_did": "did:jig:zLate"}),
+        )
+        .await;
+        assert!(
+            matches!(late, Err(IngestError::NotChannelOwner { .. })),
+            "after the unassign, the same DID's next membership block is refused: {late:?}"
+        );
+        assert!(!ctx.store.is_member_by_id(&chan, "did:jig:zLate").unwrap());
+    }
+
+    /// The creator and a co-owner the channel-create listed are root owners:
+    /// no role block can name them, and the co-owner holds every right.
+    #[tokio::test]
+    async fn the_creator_and_a_co_owner_cannot_be_unassigned() {
+        let ctx = roles_ctx();
+        let owner = person();
+        let co = person();
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#team", "co_owners": [co.did]}),
+        )
+        .await
+        .unwrap();
+        for (signer, target) in [(&owner, &co), (&co, &owner), (&owner, &owner)] {
+            let r = plain(
+                &ctx,
+                signer,
+                BlockKind::RoleUnassign,
+                serde_json::json!({"channel_id": chan, "role": "admin", "member": target.did}),
+            )
+            .await;
+            match r {
+                Err(IngestError::RootOwnerRole { member, .. }) => assert_eq!(member, target.did),
+                other => panic!("a root owner's role is fixed; got {other:?}"),
+            }
+        }
+        // The co-owner holds the owner role from the terms alone.
+        let admin = person();
+        plain(
+            &ctx,
+            &co,
+            BlockKind::RoleAssign,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
+        )
+        .await
+        .expect("a co-owner assigns roles");
+        let leave = plain(
+            &ctx,
+            &co,
+            BlockKind::MemberRemove,
+            serde_json::json!({"channel_id": chan, "member_did": co.did}),
+        )
+        .await;
+        assert!(
+            matches!(leave, Err(IngestError::OwnerCannotLeave { .. })),
+            "got {leave:?}"
+        );
+        let unknown = plain(
+            &ctx,
+            &owner,
+            BlockKind::RoleAssign,
+            serde_json::json!({"channel_id": chan, "role": "owner", "member": admin.did}),
+        )
+        .await;
+        assert!(
+            matches!(unknown, Err(IngestError::UnknownRole { .. })),
+            "got {unknown:?}"
+        );
+    }
+
+    /// A role block on an encrypted channel is plaintext control plane and
+    /// needs no MLS payload.
+    #[tokio::test]
+    async fn a_role_block_on_an_encrypted_channel_needs_no_commit() {
+        let ctx = roles_ctx();
+        let owner = person();
+        create_sealed(&ctx, &owner).await;
+        let admin = person();
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::RoleAssign,
+            serde_json::json!({"channel": "#sealed", "role": "admin", "member": admin.did}),
+        )
+        .await
+        .expect("role-assign on an mls channel");
+    }
+
+    /// The rights check is atomic with sequencing (JEP-0005 rule 7b): an
+    /// admin's member-add passes the write gate, then a role-unassign for
+    /// that admin is sequenced before the add lands. The landing transaction
+    /// folds the chain up to the seq the add would get, finds the role gone,
+    /// and refuses it with the gate's own error. Nothing of it is written.
+    #[tokio::test]
+    async fn a_role_taken_away_before_landing_refuses_the_block() {
+        let ctx = roles_ctx();
+        let owner = person();
+        let admin = person();
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#team"}),
+        )
+        .await
+        .unwrap();
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::RoleAssign,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
+        )
+        .await
+        .unwrap();
+
+        // The interleaving: between the gate and the landing, the owner's
+        // role-unassign is sequenced.
+        let (mb, cb, sig) = signed_parts(
+            &owner.key,
+            BlockKind::RoleUnassign,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
+        );
+        let unassign = StoredBlock {
+            cid: crate::ingest_record::label_cid("unassign in the window"),
+            channel_id: Some(chan.clone()),
+            block_kind: "role-unassign".to_string(),
+            sender_did: owner.did.clone(),
+            sender_sig: sig,
+            bundle_bytes: serde_json::to_vec(&(&mb, &cb)).unwrap(),
+            is_synthetic: true,
+            hlc_wall_ms: 0,
+            hlc_logical: 0,
+            hlc_origin: String::new(),
+            posted_at: 0,
+            origin_server: String::new(),
+            federated_from: None,
+        };
+        let store = ctx.store.clone();
+        let key = ctx.server_key.clone();
+        let channel_id = chan.clone();
+        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+        let ran_in_hook = ran.clone();
+        super::BEFORE_LANDING.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                ran_in_hook.set(true);
+                store
+                    .insert_block_sequenced(
+                        &unassign,
+                        &crate::ingest_record::RecordSigner {
+                            channel_id,
+                            key: &key,
+                            ingest_wall_ms: 0,
+                            ingest_logical: 0,
+                        },
+                    )
+                    .unwrap();
+            }));
+        });
+
+        let add = plain(
+            &ctx,
+            &admin,
+            BlockKind::MemberAdd,
+            serde_json::json!({"channel_id": chan, "member_did": "did:jig:zRacer"}),
+        )
+        .await;
+        assert!(ran.get(), "the add passed the write gate's early check");
+        match add {
+            Err(IngestError::NotChannelOwner { kind, sender, .. }) => {
+                assert_eq!(kind, "member-add");
+                assert_eq!(sender, admin.did);
+            }
+            other => panic!("the add must be refused at landing; got {other:?}"),
+        }
+        assert!(!ctx.store.is_member_by_id(&chan, "did:jig:zRacer").unwrap());
+        let chain = ctx.store.list_ingest_records_by_id(&chan, 0, 50).unwrap();
+        assert_eq!(
+            chain.last().map(|r| r.block_cid.as_str()),
+            Some(crate::ingest_record::label_cid("unassign in the window").as_str()),
+            "the refused add got no record and the chain has no gap"
+        );
+        assert_eq!(chain.len(), 3);
+
+        // An owner's add needs no role and is not guarded.
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::MemberAdd,
+            serde_json::json!({"channel_id": chan, "member_did": "did:jig:zRacer"}),
+        )
+        .await
+        .unwrap();
+        assert!(ctx.store.is_member_by_id(&chan, "did:jig:zRacer").unwrap());
+    }
+
+    /// A role that still holds at landing lets the guarded block through,
+    /// with its effect applied in the same transaction.
+    #[tokio::test]
+    async fn a_guarded_member_remove_by_an_admin_lands_with_its_effect() {
+        let ctx = roles_ctx();
+        let owner = person();
+        let admin = person();
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#team"}),
+        )
+        .await
+        .unwrap();
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::MemberAdd,
+            serde_json::json!({"channel_id": chan, "member_did": "did:jig:zGone"}),
+        )
+        .await
+        .unwrap();
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::RoleAssign,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
+        )
+        .await
+        .unwrap();
+        let rm = plain(
+            &ctx,
+            &admin,
+            BlockKind::MemberRemove,
+            serde_json::json!({"channel_id": chan, "member_did": "did:jig:zGone"}),
+        )
+        .await
+        .unwrap();
+        assert!(!ctx.store.is_member_by_id(&chan, "did:jig:zGone").unwrap());
+        assert!(ctx.store.get_ingest_record(&rm).unwrap().is_some());
+        assert!(!ctx.store.get_receipts_for_block(&rm).unwrap().is_empty());
+    }
+
+    /// Co-owners are members, with role `owner`, like the creator.
+    #[tokio::test]
+    async fn a_co_owner_is_a_member_from_the_creation_block() {
+        let ctx = roles_ctx();
+        let owner = person();
+        let co = person();
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#team", "co_owners": [co.did]}),
+        )
+        .await
+        .unwrap();
+        let members = ctx.store.list_members(&chan).unwrap();
+        for did in [&owner.did, &co.did] {
+            let m = members
+                .iter()
+                .find(|m| &m.member_did == did)
+                .unwrap_or_else(|| panic!("{did} must be a member"));
+            assert_eq!(m.role, "owner");
+        }
+    }
+
+    // ---- Slug grammar (jig_core::slug) ------------------------------------
+
+    async fn create_from(
+        ctx: &IngestContext,
+        key: &SigningKey,
+        slug: &str,
+        source: IngestSource,
+    ) -> Result<String, IngestError> {
+        let (mb, cb, sig) = signed_parts(
+            key,
+            BlockKind::ChannelCreate,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"slug": slug, "visibility": "open"}),
+        );
+        do_ingest(ctx, mb, cb, sig, source).await
+    }
+
+    fn local() -> IngestSource {
+        IngestSource::LocalClient { conn_id: 1 }
+    }
+
+    fn invalid_slug(r: &Result<String, IngestError>) -> bool {
+        matches!(r, Err(IngestError::InvalidSlug { .. }))
+    }
+
+    #[tokio::test]
+    async fn a_create_outside_the_slug_grammar_is_refused_never_lowercased() {
+        let ctx = roles_ctx();
+        let who = random_signing_key();
+        let max = format!("#{}", "a".repeat(64));
+        for slug in ["#general", "#dev-ops", "#a", max.as_str()] {
+            create_from(&ctx, &who, slug, local())
+                .await
+                .unwrap_or_else(|e| panic!("{slug}: {e}"));
+        }
+        let too_long = format!("#{}", "a".repeat(65));
+        for slug in [
+            "#General",
+            "#café",
+            "＃x",
+            "#a\u{200d}b",
+            "#a b",
+            too_long.as_str(),
+            "#",
+            "#-lead",
+            "#team/ops",
+        ] {
+            let r = create_from(&ctx, &who, slug, local()).await;
+            assert!(invalid_slug(&r), "{slug:?}: {r:?}");
+        }
+        assert!(
+            ctx.store.get_channel_by_slug("#general").unwrap().is_some()
+                && ctx.store.get_channel_by_slug("#General").unwrap().is_none(),
+            "a refused slug is not created under a lowercased spelling"
+        );
+    }
+
+    /// `#email/` threads are the email bridge's: only a bridge-sourced create
+    /// is taken. Not from a client, which could otherwise squat a DID pair's
+    /// thread before the bridge; not from a peer either, since bridge threads
+    /// are local-only (restricted, so they never federate).
+    #[tokio::test]
+    async fn an_email_thread_is_created_only_through_the_bridge() {
+        let ctx = roles_ctx();
+        let who = random_signing_key();
+        let thread = "#email/0011223344556677";
+        let r = create_from(&ctx, &who, thread, local()).await;
+        assert!(invalid_slug(&r), "client: {r:?}");
+        let r = create_from(&ctx, &who, thread, IngestSource::AdminEndpoint).await;
+        assert!(invalid_slug(&r), "admin endpoint: {r:?}");
+        let peer = IngestSource::FederatedPeer {
+            peer_did: Did::from_ed25519_pubkey(random_signing_key().verifying_key().as_bytes()),
+            peer_url: "wss://peer.invalid".to_string(),
+        };
+        let r = create_from(&ctx, &who, thread, peer).await;
+        assert!(invalid_slug(&r), "peer: {r:?}");
+        assert!(ctx.store.get_channel_by_slug(thread).unwrap().is_none());
+
+        create_from(&ctx, &who, thread, IngestSource::Bridge)
+            .await
+            .expect("the bridge creates its thread");
+        for bad in ["#EMAIL/0011223344556677", "#email/xyz"] {
+            let r = create_from(&ctx, &who, bad, IngestSource::Bridge).await;
+            assert!(invalid_slug(&r), "{bad}: {r:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_jig_slug_is_the_servers_alone() {
+        let ctx = roles_ctx();
+        let user = random_signing_key();
+        for slug in ["#jig/manifest", "#JIG/manifest", "#Jig/manifest"] {
+            let r = create_from(&ctx, &user, slug, local()).await;
+            assert!(invalid_slug(&r), "{slug}: {r:?}");
+        }
+        let server_key = ctx.server_key.clone();
+        let r = create_from(&ctx, &server_key, "#JIG/manifest", local()).await;
+        assert!(
+            invalid_slug(&r),
+            "not canonical, even for the server: {r:?}"
+        );
+        create_from(&ctx, &server_key, "#jig/manifest", local())
+            .await
+            .expect("the server creates its own #jig/ channel");
+    }
+
+    #[tokio::test]
+    async fn a_dm_slug_is_created_only_through_the_dm_rule() {
+        let ctx = roles_ctx();
+        let alice = person();
+        let bob = person();
+        let r = create_from(&ctx, &alice.key, "#dm/xyz", local()).await;
+        assert!(invalid_slug(&r), "{r:?}");
+        let r = create_from(&ctx, &alice.key, "#Dm/0011223344556677", local()).await;
+        assert!(invalid_slug(&r), "{r:?}");
+
+        // A well-formed DM slug still answers to the DM rule: an open,
+        // plaintext create of it is refused there.
+        let slug = jig_core::dm::dm_slug(&alice.did, &bob.did);
+        let r = create_from(&ctx, &alice.key, &slug, local()).await;
+        assert!(
+            matches!(
+                r,
+                Err(IngestError::MissingMetadata { .. }) | Err(IngestError::MlsRejected { .. })
+            ),
+            "{r:?}"
+        );
+
+        let created = alice.mls.create_group().unwrap();
+        submit(
+            &ctx,
+            &alice,
+            BlockKind::ChannelCreate,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"slug": slug, "visibility": "restricted", "suite": "mls",
+                "dm_peer": bob.did,
+                "mls_group_info": b64(&created.group_info),
+                "mls_ratchet_tree": b64(&created.ratchet_tree)}),
+        )
+        .await
+        .expect("one of the pair creates their DM");
+    }
+
+    /// The grammar is for new channels. A row from before it keeps its slug
+    /// and stays reachable by exact match.
+    #[tokio::test]
+    async fn a_grandfathered_slug_stays_readable_and_writable() {
+        let ctx = roles_ctx();
+        let id = seed_channel(&ctx, "#Old");
+        assert_eq!(
+            ctx.store.get_channel_by_slug("#Old").unwrap().map(|c| c.id),
+            Some(id.clone())
+        );
+        assert!(ctx.store.get_channel_by_slug("#old").unwrap().is_none());
+        let who = person();
+        let post = plain(
+            &ctx,
+            &who,
+            BlockKind::TextRender,
+            serde_json::json!({"channel": "#Old", "body": "still here"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ctx.store.get_block(&post).unwrap().unwrap().channel_id,
+            Some(id.clone())
+        );
+        assert_eq!(
+            ctx.store
+                .list_blocks_by_channel_id(&id, 10, None)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

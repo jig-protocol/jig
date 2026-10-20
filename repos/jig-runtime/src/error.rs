@@ -46,12 +46,6 @@ pub enum RuntimeError {
     #[error("Capability denied: {capability}")]
     CapabilityDenied { capability: String },
 
-    #[error("Capability not found: {capability}")]
-    CapabilityNotFound { capability: String },
-
-    #[error("Capability quota exceeded: {capability}")]
-    CapabilityQuotaExceeded { capability: String },
-
     // I/O and system errors
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
@@ -80,9 +74,7 @@ impl RuntimeError {
             | RuntimeError::MemoryExhausted { .. }
             | RuntimeError::TimeoutExceeded { .. } => "limits_exceeded",
 
-            RuntimeError::CapabilityDenied { .. }
-            | RuntimeError::CapabilityNotFound { .. }
-            | RuntimeError::CapabilityQuotaExceeded { .. } => "capability_error",
+            RuntimeError::CapabilityDenied { .. } => "capability_error",
 
             RuntimeError::ExecutionError(_)
             | RuntimeError::Trap(_)
@@ -108,8 +100,6 @@ impl RuntimeError {
             RuntimeError::MemoryExhausted { .. } => "ERR_MEMORY_EXHAUSTED",
             RuntimeError::TimeoutExceeded { .. } => "ERR_TIMEOUT",
             RuntimeError::CapabilityDenied { .. } => "ERR_CAPABILITY_DENIED",
-            RuntimeError::CapabilityNotFound { .. } => "ERR_CAPABILITY_NOT_FOUND",
-            RuntimeError::CapabilityQuotaExceeded { .. } => "ERR_QUOTA_EXCEEDED",
             RuntimeError::IoError(_) => "ERR_IO",
             RuntimeError::SerializationError(_) => "ERR_SERIALIZATION",
             RuntimeError::InternalError(_) => "ERR_INTERNAL",

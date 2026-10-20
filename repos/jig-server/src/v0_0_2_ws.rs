@@ -767,7 +767,27 @@ async fn handle_client_frame(
             }
 
             let sub_scope = match scope {
-                Scope::Channel { slug } => SubscriptionScope::Channel(slug),
+                // Clients name a channel by slug; fanout keys channels by
+                // their id (the channel-create CID). A slug with no row yet
+                // stays as it is until that channel is created (see
+                // `Fanout::bind_pending_channel`).
+                Scope::Channel { slug } => {
+                    match state
+                        .ingest_ctx
+                        .store
+                        .get_channel_by_slug_including_archived(&slug)
+                    {
+                        Ok(channel) => {
+                            SubscriptionScope::Channel(channel.map(|c| c.id).unwrap_or(slug))
+                        }
+                        Err(e) => {
+                            let detail = e.to_string();
+                            let _ =
+                                send_error(socket, Some(500), "PERSIST_ERROR", None, &detail).await;
+                            return Ok(());
+                        }
+                    }
+                }
                 Scope::Federation { block_kinds } => SubscriptionScope::Federation { block_kinds },
             };
             // A connection holds ONE subscription. A re-Subscribe replaces it,
@@ -1187,7 +1207,7 @@ mod tests {
     fn test_identity() -> jig_client::Identity {
         let dir = tempdir().unwrap();
         let path = dir.keep();
-        jig_client::Identity::generate_and_save(&path).unwrap()
+        jig_client::Identity::generate_for_tests(&path)
     }
 
     fn test_hlc(id: &jig_client::Identity) -> HlcTimestamp {
@@ -1212,6 +1232,8 @@ mod tests {
                 created_at: 0,
                 owner_did: "did:jig:zSeedOwner".to_string(),
                 suite: "none".to_string(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })
             .unwrap();
     }
@@ -1710,6 +1732,8 @@ mod tests {
                     created_at: 0,
                     owner_did: "did:jig:zSeedOwner".to_string(),
                     suite: "none".to_string(),
+                    sequencer_did: String::new(),
+                    co_owners: Vec::new(),
                 })
                 .unwrap();
         }
@@ -1752,6 +1776,8 @@ mod tests {
                 created_at: 0,
                 owner_did: "did:jig:zSeedOwner".to_string(),
                 suite: "none".to_string(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })
             .unwrap();
         let manifest = serde_json::to_vec(&serde_json::json!({
