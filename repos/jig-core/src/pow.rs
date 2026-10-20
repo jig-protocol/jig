@@ -50,10 +50,12 @@ pub enum Alg {
 }
 
 impl Alg {
+    /// The registered id, as it appears in a proof.
     pub fn id(self) -> u8 {
         self as u8
     }
 
+    /// The algorithm registered under `id`, if any.
     pub fn from_id(id: u8) -> Option<Self> {
         (id == 1).then_some(Alg::Blake3)
     }
@@ -104,6 +106,7 @@ pub enum Action {
 }
 
 impl Action {
+    /// Every registered action, in the order of rule 11.
     pub const ALL: [Action; 7] = [
         Action::Admit,
         Action::Post,
@@ -114,6 +117,7 @@ impl Action {
         Action::NsRotate,
     ];
 
+    /// The label the digest and the wire use (rule 11).
     pub fn label(self) -> &'static str {
         match self {
             Action::Admit => "admit",
@@ -126,10 +130,12 @@ impl Action {
         }
     }
 
+    /// The action registered under `label`, if any.
     pub fn from_label(label: &str) -> Option<Self> {
         Action::ALL.into_iter().find(|a| a.label() == label)
     }
 
+    /// How this action's work is kept fresh (rule 13).
     pub fn mode(self) -> Mode {
         match self {
             Action::Admit => Mode::Admission,
@@ -166,6 +172,12 @@ mod nonce_b64u {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(nonce: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        // Refuse to write what the other side must refuse to read.
+        if nonce.len() > MAX_NONCE_LEN {
+            return Err(serde::ser::Error::custom(format!(
+                "nonce is longer than {MAX_NONCE_LEN} bytes"
+            )));
+        }
         s.serialize_str(&BASE64URL_NOPAD.encode(nonce))
     }
 
@@ -587,6 +599,13 @@ mod tests {
             "long nonce"
         );
         assert!(bad(serde_json::json!({ "extra": 1 })), "unknown field");
+
+        // And an over-long nonce is not written in the first place.
+        let long = Proof {
+            nonce: overlong_nonce(),
+            ..proof
+        };
+        assert!(serde_json::to_value(&long).is_err());
     }
 
     /// The digest as rule 6 specifies it, rebuilt from raw BLAKE3, so an
