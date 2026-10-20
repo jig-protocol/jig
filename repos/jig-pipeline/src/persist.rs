@@ -1397,6 +1397,55 @@ impl SqliteStore {
         insert_receipt_on(&self.conn.lock().expect("poisoned"), r)
     }
 
+    /// Store `r` unless this server already holds a receipt for its block, and say whether it
+    /// was stored. Keyed by `(block_cid, server_id)`, so ingest and the boot backfill can both
+    /// write a block's receipt without ever producing two.
+    pub fn insert_receipt_once(&self, r: &StoredReceipt) -> Result<bool> {
+        let changed = self.conn.lock().expect("poisoned").execute(
+            "INSERT OR IGNORE INTO receipts
+                 (cid, block_cid, server_id, receipt_bytes, render_hash, produced_at)
+             VALUES (?,?,?,?,?,?)",
+            params![
+                r.cid,
+                r.block_cid,
+                r.server_id,
+                r.receipt_bytes,
+                r.render_hash,
+                r.produced_at
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Delete a block's receipts. Tests only: it simulates a server that stopped between landing
+    /// a block and writing its receipt.
+    #[cfg(test)]
+    pub(crate) fn delete_receipts_for_block(&self, block_cid: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .expect("poisoned")
+            .execute("DELETE FROM receipts WHERE block_cid = ?", [block_cid])?;
+        Ok(())
+    }
+
+    /// Blocks of `kind` that landed without a receipt from `server_id`: ones whose receipt was
+    /// still to be written after landing when the server stopped.
+    pub fn blocks_missing_receipt(&self, kind: &str, server_id: &str) -> Result<Vec<StoredBlock>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {BLOCK_COLUMNS} FROM blocks b
+             WHERE b.block_kind = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM receipts r WHERE r.block_cid = b.cid AND r.server_id = ?2
+               )
+             ORDER BY b.posted_at, b.cid"
+        ))?;
+        let rows = stmt
+            .query_map(params![kind, server_id], row_to_stored_block)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn get_receipts_for_block(&self, block_cid: &str) -> Result<Vec<StoredReceipt>> {
         let conn = self.conn.lock().expect("poisoned");
         let mut stmt = conn.prepare(

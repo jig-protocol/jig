@@ -2,8 +2,9 @@
 //!
 //! It used to sign `jig_runtime::RUNTIME_VERSION`, which was jig-runtime's own
 //! crate version: "0.1.0" from 2024 onward, across wasmtime 24 to 49. Fuel is
-//! only comparable between receipts from the same engine, configuration and
-//! schedule, so the signed identity has to say which ones produced it.
+//! only comparable between receipts from the same engine and configuration, so
+//! the signed v0.3 `exec` receipt names the exact wasmtime patch and the
+//! engine's configuration fingerprint.
 
 use integration_tests::harness::*;
 
@@ -24,31 +25,27 @@ async fn the_signed_render_receipt_carries_the_engine_identity() {
 
     let receipts = app.receipts_for(&cid).expect("receipts");
     assert_eq!(receipts.len(), 1);
-    let wrapped: serde_json::Value =
-        serde_json::from_slice(&receipts[0].receipt_bytes).expect("receipt wrapper is JSON");
-    let canonical = hex::decode(wrapped["canonical_hex"].as_str().expect("canonical_hex"))
-        .expect("canonical_hex is hex");
-    let signed: serde_json::Value =
-        serde_json::from_slice(&canonical).expect("signed payload is JSON");
+    let signed = match jig_pipeline::receipts::read(&receipts[0].receipt_bytes)
+        .expect("the receipt verifies")
+    {
+        jig_pipeline::receipts::ReadReceipt::V03(r) => r,
+        other => panic!("a new receipt is v0.3, got {other:?}"),
+    };
+    let jig_core::block_receipt::Body::Exec(exec) = &signed.receipt.body else {
+        panic!(
+            "a rendered block gets an exec receipt: {:?}",
+            signed.receipt.body
+        );
+    };
 
-    let identity = &signed["engine"]["identity"];
-    assert_eq!(
-        identity["wasmtime"],
-        jig_runtime::WASMTIME_VERSION,
-        "signed payload: {signed}"
-    );
-    assert_eq!(
-        identity["fuel_schedule"],
-        jig_runtime::FUEL_SCHEDULE_VERSION
-    );
+    // The exact wasmtime patch and the configuration fingerprint together fix how fuel is
+    // metered, so the separate fuel-schedule label of the JSON receipts is not carried.
+    assert_eq!(exec.engine.version, jig_runtime::WASMTIME_VERSION);
+    assert_eq!(exec.engine.name, "wasmtime");
+    assert_eq!(exec.engine.profile, "jig-det-1");
     assert!(
-        identity["config_fingerprint"]
-            .as_str()
-            .is_some_and(|f| f.starts_with("blake3:")),
-        "signed payload: {signed}"
-    );
-    assert!(
-        signed["engine"].get("runtime_version").is_none(),
-        "the crate-version label must be gone: {signed}"
+        exec.engine.config_fingerprint.starts_with("blake3:"),
+        "{:?}",
+        exec.engine
     );
 }
