@@ -139,8 +139,8 @@ What to watch when scoping it:
   allowed actions exclude third-party path filters), and later jobs skip with a job-level `if:`.
   A skipped job reports success.
 - Count `repos/Cargo.lock`, `rust-toolchain.toml`, `deny.toml` and `.github/workflows/**` as code.
-  `fuel-portability.yml` already filters on `repos/jig-runtime/**` alone, so a lockfile-only
-  wasmtime bump, the change most likely to move fuel, skips it today.
+  `fuel-portability.yml` now also runs on `repos/Cargo.lock`, so a lockfile-only wasmtime bump,
+  the change most likely to move fuel, gets the aarch64 matrix.
 - Keep `dependency-policy` unconditional. It is quick, and the advisory database changes whatever
   the diff touches.
 
