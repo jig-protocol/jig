@@ -23,8 +23,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use jig_core::did::Did;
+use jig_pipeline::handshake::close;
 use jig_pipeline::{Envelope, Frame};
 use tokio::sync::mpsc;
+
+/// Frames a connection holds for its peer before [`PeerSender::send`] says
+/// [`PeerSendError::Full`]: a peer that reads slowly holds back its sender,
+/// not this server's memory.
+pub const PEER_QUEUE: usize = 256;
 
 /// What handles peer frames: lane F's federation contract.
 pub trait PeerFrames: Send + Sync {
@@ -40,29 +46,41 @@ pub trait PeerFrames: Send + Sync {
 }
 
 /// Why a handler ends a connection: a WebSocket close code (4000–4999) and a
-/// short reason.
+/// short reason. A code outside that range is sent as
+/// [`close::PROTOCOL_VIOLATION`].
+///
+/// For a connection that is bad, not for ending one contract: one connection
+/// carries every contract between two servers. When this server dialed, it
+/// redials after a delay that doubles with each such close in a row
+/// ([`crate::v0_0_2_federation`]), so a peer that keeps sending the same bad
+/// frame is not met with a reconnect loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloseReason {
     pub code: u16,
     pub reason: String,
 }
 
-/// The connection is gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("the peer connection is closed")]
-pub struct PeerGone;
+pub enum PeerSendError {
+    /// The connection is gone.
+    #[error("the peer connection is closed")]
+    Gone,
+    /// [`PEER_QUEUE`] frames are waiting for the peer to read them.
+    #[error("the peer is not reading: {PEER_QUEUE} frames are waiting")]
+    Full,
+}
 
 /// Sends frames on one live connection to a proven peer.
 #[derive(Debug, Clone)]
 pub struct PeerSender {
     peer: Did,
-    tx: mpsc::UnboundedSender<Envelope>,
+    tx: mpsc::Sender<Envelope>,
 }
 
 impl PeerSender {
     /// A sender for `peer`, and the receiving end its connection loop drains.
-    pub fn new(peer: Did) -> (Self, mpsc::UnboundedReceiver<Envelope>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub fn new(peer: Did) -> (Self, mpsc::Receiver<Envelope>) {
+        let (tx, rx) = mpsc::channel(PEER_QUEUE);
         (Self { peer, tx }, rx)
     }
 
@@ -71,14 +89,17 @@ impl PeerSender {
         &self.peer
     }
 
-    /// Send a peer frame of `kind`.
-    pub fn send(&self, kind: &str, body: Vec<u8>) -> Result<(), PeerGone> {
+    /// Queue a peer frame of `kind`, without waiting.
+    pub fn send(&self, kind: &str, body: Vec<u8>) -> Result<(), PeerSendError> {
         self.tx
-            .send(Envelope::new(Frame::Peer {
+            .try_send(Envelope::new(Frame::Peer {
                 kind: kind.to_string(),
                 body,
             }))
-            .map_err(|_| PeerGone)
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => PeerSendError::Full,
+                mpsc::error::TrySendError::Closed(_) => PeerSendError::Gone,
+            })
     }
 
     pub fn is_closed(&self) -> bool {
@@ -135,7 +156,14 @@ pub fn dispatch(
     body: &[u8],
 ) -> Result<(), CloseReason> {
     match handler {
-        Some(handler) => handler.on_peer_frame(sender.peer(), kind, body, sender),
+        Some(handler) => handler
+            .on_peer_frame(sender.peer(), kind, body, sender)
+            .map_err(|mut reason| {
+                if !(4000..=4999).contains(&reason.code) {
+                    reason.code = close::PROTOCOL_VIOLATION;
+                }
+                reason
+            }),
         None => {
             tracing::debug!(peer = %sender.peer().to_did_jig_string(), kind, "no peer-frame handler");
             Ok(())
@@ -181,6 +209,44 @@ mod tests {
             registry.sender_for(&did(1)).is_none(),
             "a connection whose loop is gone is not live"
         );
+    }
+
+    #[test]
+    fn a_slow_peer_fills_its_queue_and_a_bad_close_code_is_not_sent() {
+        let (sender, mut rx) = PeerSender::new(did(1));
+        for _ in 0..PEER_QUEUE {
+            sender.send("record", vec![]).unwrap();
+        }
+        assert_eq!(sender.send("record", vec![]), Err(PeerSendError::Full));
+        rx.try_recv().unwrap();
+        sender.send("record", vec![]).unwrap();
+        drop(rx);
+        assert_eq!(sender.send("record", vec![]), Err(PeerSendError::Gone));
+
+        struct Closes(u16);
+        impl PeerFrames for Closes {
+            fn on_peer_frame(
+                &self,
+                _: &Did,
+                _: &str,
+                _: &[u8],
+                _: &PeerSender,
+            ) -> Result<(), CloseReason> {
+                Err(CloseReason {
+                    code: self.0,
+                    reason: "no".into(),
+                })
+            }
+        }
+        for (asked, sent) in [
+            (4010, 4010),
+            (1000, close::PROTOCOL_VIOLATION),
+            (1006, close::PROTOCOL_VIOLATION),
+            (5000, close::PROTOCOL_VIOLATION),
+        ] {
+            let got = dispatch(Some(&Closes(asked)), &sender, "x", b"").unwrap_err();
+            assert_eq!(got.code, sent, "{asked}");
+        }
     }
 
     #[test]

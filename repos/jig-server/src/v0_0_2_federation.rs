@@ -42,6 +42,27 @@ use crate::v0_0_2::AppState;
 /// Constant in v0.0.2; exponential backoff is a v0.0.3+ refinement.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
+/// The delay before redialing a peer whose federation contract closed the
+/// connection ([`crate::v0_0_2_peer::CloseReason`]), doubling with each such
+/// close in a row up to [`MAX_CONTRACT_CLOSE_DELAY`].
+const CONTRACT_CLOSE_DELAY: Duration = Duration::from_secs(30);
+const MAX_CONTRACT_CLOSE_DELAY: Duration = Duration::from_secs(15 * 60);
+
+/// A connection the federation contract closed.
+#[derive(Debug, thiserror::Error)]
+#[error("closed by the federation contract ({}): {}", .0.code, .0.reason)]
+struct ContractClosed(crate::v0_0_2_peer::CloseReason);
+
+/// How long to wait before redialing, after `closes` contract closes in a row.
+fn redial_delay(closes: u32) -> Duration {
+    if closes == 0 {
+        return RECONNECT_DELAY;
+    }
+    CONTRACT_CLOSE_DELAY
+        .saturating_mul(1 << (closes - 1).min(16))
+        .min(MAX_CONTRACT_CLOSE_DELAY)
+}
+
 /// Whether `url` names a plaintext WebSocket. Scheme comparison is
 /// case-insensitive, as URL schemes are.
 fn is_plaintext_url(url: &str) -> bool {
@@ -155,22 +176,29 @@ pub fn spawn_federation_peers(state: Arc<AppState>) {
 
 async fn run_peer_loop(state: Arc<AppState>, peer: jig_config::v0_0_2_server::FederationPeer) {
     info!(peer_url = %peer.url, "federation peer task started");
+    let mut contract_closes = 0;
     loop {
-        match connect_and_relay(&state, &peer).await {
+        let outcome = connect_and_relay(&state, &peer).await;
+        contract_closes = match &outcome {
+            Err(e) if e.is::<ContractClosed>() => contract_closes + 1,
+            _ => 0,
+        };
+        let delay = redial_delay(contract_closes);
+        match outcome {
             Ok(()) => {
                 warn!(
                     peer_url = %peer.url,
-                    "peer connection ended cleanly; reconnecting in {RECONNECT_DELAY:?}"
+                    "peer connection ended cleanly; reconnecting in {delay:?}"
                 );
             }
             Err(e) => {
                 warn!(
                     peer_url = %peer.url,
-                    "peer connection failed: {e}; reconnecting in {RECONNECT_DELAY:?}"
+                    "peer connection failed: {e}; reconnecting in {delay:?}"
                 );
             }
         }
-        tokio::time::sleep(RECONNECT_DELAY).await;
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -306,7 +334,7 @@ pub(crate) fn tls_exporter_of(
     }
 }
 
-async fn connect_and_relay(
+pub(crate) async fn connect_and_relay(
     state: &Arc<AppState>,
     peer: &jig_config::v0_0_2_server::FederationPeer,
 ) -> anyhow::Result<()> {
@@ -411,10 +439,7 @@ async fn connect_and_relay(
                                         },
                                     )))
                                     .await;
-                                break Err(anyhow::anyhow!(
-                                    "closed by the federation contract: {}",
-                                    reason.reason
-                                ));
+                                break Err(ContractClosed(reason).into());
                             }
                             Ok(None) => {}
                             Err(e) => warn!(peer_url = %peer.url, "inbound frame error: {e}"),
@@ -697,6 +722,15 @@ mod tests {
             expected_did: jig_core::Did::from_ed25519_pubkey(&[9u8; 32]).to_did_jig_string(),
             alias: None,
         }
+    }
+
+    #[test]
+    fn a_peer_that_keeps_closing_is_redialed_ever_more_slowly() {
+        assert_eq!(redial_delay(0), RECONNECT_DELAY);
+        assert_eq!(redial_delay(1), CONTRACT_CLOSE_DELAY);
+        assert_eq!(redial_delay(2), CONTRACT_CLOSE_DELAY * 2);
+        assert_eq!(redial_delay(6), MAX_CONTRACT_CLOSE_DELAY);
+        assert_eq!(redial_delay(u32::MAX), MAX_CONTRACT_CLOSE_DELAY);
     }
 
     #[test]
