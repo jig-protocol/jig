@@ -1363,7 +1363,7 @@ mod tests {
             &keychain_only(keychain.clone()),
             Protect::Add(SlotToAdd::Keychain),
         );
-        assert!(matches!(again, Err(IdentityError::Protect(_))), "{again:?}");
+        assert!(matches!(again, Err(IdentityError::Protect(_))));
 
         // Remove the keychain's slot: its secret goes too, and the passphrase
         // still opens the key.
@@ -1396,10 +1396,10 @@ mod tests {
             &passphrase_only("a passphrase kept offline"),
             Protect::Remove(0),
         );
-        assert!(
-            matches!(last, Err(IdentityError::Keystore(KeystoreError::LastSlot))),
-            "{last:?}"
-        );
+        assert!(matches!(
+            last,
+            Err(IdentityError::Keystore(KeystoreError::LastSlot))
+        ));
         // A short new passphrase is refused.
         clear_cache();
         let short = protect(
@@ -1408,10 +1408,7 @@ mod tests {
             &passphrase_only("a passphrase kept offline"),
             Protect::Add(SlotToAdd::Passphrase(Some(Zeroizing::new("short".into())))),
         );
-        assert!(
-            matches!(short, Err(IdentityError::ShortPassphrase)),
-            "{short:?}"
-        );
+        assert!(matches!(short, Err(IdentityError::ShortPassphrase)));
     }
 
     #[test]
