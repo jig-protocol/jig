@@ -123,12 +123,35 @@ fn build_auth(
 ) -> anyhow::Result<Arc<crate::auth::AuthState>> {
     crate::v0_0_2_federation::check_federation_transport(&config.federation)?;
     config.federation.validate().map_err(anyhow::Error::msg)?;
+    check_published_peer_dids(&config.federation)?;
     let auth = crate::auth::AuthState::from_config(&config.auth)?.with_proofs(store);
     for (i, peer) in config.federation.peers.iter().enumerate() {
         auth.trust_federation_peer(&peer.expected_did)
             .with_context(|| format!("[federation] peers[{i}].expected_did"))?;
     }
     Ok(Arc::new(auth))
+}
+
+/// A published peer's DID goes into the signed manifest as written, so it
+/// must be the canonical spelling: two spellings of one key would list the
+/// peer twice and match neither consistently.
+fn check_published_peer_dids(
+    federation: &jig_config::v0_0_2_server::FederationSection,
+) -> anyhow::Result<()> {
+    for (i, peer) in federation
+        .peers
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.publish)
+    {
+        let canonical = jig_pipeline::effect::canonical_did_string(&peer.expected_did);
+        if canonical != peer.expected_did {
+            anyhow::bail!(
+                "[federation] peers[{i}].expected_did: a published peer's DID must be canonical: `{canonical}`"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Translate the operator's server-level execution settings into the runtime's
@@ -545,6 +568,21 @@ fn with_default_delegation(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_published_peer_needs_a_canonical_did() {
+        let mut config = crate::v0_0_2_manifest_log::tests::policy_config();
+        assert!(super::check_published_peer_dids(&config.federation).is_ok());
+        let canonical = config.federation.peers[0].expected_did.clone();
+        let body = canonical.strip_prefix("did:jig:z").unwrap();
+        // Still parses (the body decodes case-insensitively), but isn't canonical.
+        config.federation.peers[0].expected_did = format!("did:jig:z{}", body.to_uppercase());
+        let err = super::check_published_peer_dids(&config.federation).unwrap_err();
+        assert!(err.to_string().contains(&canonical), "{err}");
+        // An unpublished peer's spelling isn't published, so it's left alone.
+        config.federation.peers[0].publish = false;
+        assert!(super::check_published_peer_dids(&config.federation).is_ok());
+    }
 
     #[test]
     fn a_key_link_beside_the_key_is_served_only_if_it_moves_to_this_server() {

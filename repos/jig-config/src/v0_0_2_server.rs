@@ -478,10 +478,14 @@ impl FederationSection {
                 }
             }
             let suffix = entry.suffix.to_lowercase();
-            // JEP-0004 rules 1 and 4: a dotted name of `[a-z0-9-]` labels, and
+            // JEP-0004 rules 1 and 4: a dotted name of `[a-z0-9-]` labels that
+            // neither start nor end with a hyphen, and
             // more than one, since a single label has no DNS name to root it.
             let labels_ok = suffix.split('.').all(|label| {
-                !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                !label.is_empty()
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
             });
             if suffix.split('.').count() < 2 || !labels_ok {
                 return Err(format!(
@@ -1258,6 +1262,8 @@ mod tests {
             (suffix("example.", "dns"), "multi-label"),
             (suffix("ex ample.org", "dns"), "multi-label"),
             (suffix("ex_ample.org", "dns"), "multi-label"),
+            (suffix("-ex.org", "dns"), "multi-label"),
+            (suffix("ex-.org", "dns"), "multi-label"),
             (
                 suffix("names.example.org", "dns") + &suffix("NAMES.example.org", "dns"),
                 "more than once",
