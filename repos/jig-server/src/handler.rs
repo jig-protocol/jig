@@ -118,6 +118,11 @@ struct ServerInfoResponse {
     /// client can trust a certificate no CA issued. Absent over plaintext.
     #[serde(skip_serializing_if = "Option::is_none")]
     tls_binding: Option<jig_core::tls_binding::TlsBinding>,
+    /// During a key change: the public link from the server's old DID to
+    /// `server_did` (JEP-0012), base64 COSE_Sign. Clients that pinned the old
+    /// DID follow it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_link: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -223,6 +228,12 @@ async fn server_info(State(state): State<AppState>) -> Json<ServerInfoResponse> 
             .v0_0_2
             .as_ref()
             .and_then(|v| v.tls_binding.get().cloned()),
+        key_link: state.v0_0_2.as_ref().and_then(|v| {
+            use base64::Engine as _;
+            v.key_link
+                .as_ref()
+                .map(|l| base64::engine::general_purpose::STANDARD.encode(l))
+        }),
     })
 }
 
