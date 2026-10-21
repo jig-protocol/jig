@@ -355,6 +355,7 @@ pub fn protect(ctx: &CliContext, add: Option<&str>, remove: Option<usize>) -> Re
         (None, Some(0)) => anyhow::bail!("slots are numbered from 1, as the list shows them"),
         (None, Some(n)) => Some(Protect::Remove(n - 1)),
     };
+    let removing = matches!(change, Some(Protect::Remove(_)));
     let slots = match change {
         None => jig_client::identity::slots(&keys_dir, &did)?,
         Some(change) => {
@@ -369,6 +370,15 @@ pub fn protect(ctx: &CliContext, add: Option<&str>, remove: Option<usize>) -> Re
                 "updated {}",
                 jig_client::identity::key_path(&keys_dir, &did).display()
             );
+            if removing {
+                // The data key is unchanged, so older copies of the file still
+                // open with the slot just removed.
+                eprintln!(
+                    "note: only this file changed. A backup or synced copy made before still \
+                     opens with the removed slot; if its secret may have leaked, move to a new \
+                     key with `jig keys rotate`"
+                );
+            }
             slots
         }
     };

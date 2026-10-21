@@ -77,7 +77,9 @@ label that names no key.
   where there is one and a passphrase otherwise, and converts an older raw key file on
   first load (#177). An identity's MLS state and read history are sealed under keys derived
   from the same data key, one per file. `jig keys protect` lists the slots and adds or
-  removes one; removing the last is refused.
+  removes one; removing the last is refused. Removing a slot changes only this file: the
+  data key stays, so a backup or synced copy made before still opens with the removed
+  slot. For a secret that may have leaked, move to a new key (`jig keys rotate`).
 - **jig-server and jig-nameserver** seal their own signing keys the same way (#254). A
   server never prompts: `[keys] unlock` names a `credential:`, `env:` or `passphrase`
   slot, and a server with nothing to open its key refuses to start rather than write one

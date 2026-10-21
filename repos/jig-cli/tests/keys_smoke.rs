@@ -241,6 +241,7 @@ fn keys_protect_adds_and_removes_slots_but_never_the_last() {
         ok && out.contains("1. a passphrase") && !out.contains("2."),
         "{out}"
     );
+    assert!(out.contains("only this file changed"), "{out}");
 
     let (ok, out) = jig(&["keys", "protect", "--remove", "1"], &pass);
     assert!(
