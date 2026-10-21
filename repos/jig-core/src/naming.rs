@@ -517,7 +517,7 @@ impl SuffixDelegation {
     /// `root_id` must be the contract CID's one canonical text form (JEP-0004
     /// rule 3), so one root has one encoding.
     pub fn verify(&self) -> Result<(), NamingError> {
-        if self.root == Root::Contract && !is_canonical_cidv1(&self.root_id) {
+        if self.root == Root::Contract && !crate::canonical_cid::is_canonical_text(&self.root_id) {
             return Err(NamingError::BadContractRootId(self.root_id.clone()));
         }
         let payload = self.payload();
@@ -690,14 +690,6 @@ pub fn verify_rotation_chain<L: AliasLink>(
     } else {
         Err(NamingError::BrokenChain(pinned.into(), new.into()))
     }
-}
-
-/// `s` is the canonical text form (base32 lowercase, `b` prefix, exactly as
-/// it round-trips) of a CID that JEP-0004 rule 0 admits
-/// ([`crate::canonical_cid::check`]).
-fn is_canonical_cidv1(s: &str) -> bool {
-    cid::Cid::try_from(s)
-        .is_ok_and(|c| crate::canonical_cid::check(&c).is_ok() && c.to_string() == s)
 }
 
 fn did_of(key: &SigningKey) -> String {

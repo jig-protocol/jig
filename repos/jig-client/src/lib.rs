@@ -17,8 +17,10 @@ pub mod manifest;
 pub mod naming;
 pub mod open;
 pub mod pins;
+pub mod pow;
 pub mod read_auth;
 pub mod secure;
+pub mod server_key;
 pub mod tls;
 
 pub use connection::envelope;

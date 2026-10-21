@@ -14,6 +14,7 @@
 use crate::runtime::ExecutionConfig;
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
+use jig_client::server_key::ServerKeyOptions;
 use jig_config::v0_0_2_server::{IdentityMode, JigServerConfig, NameDelegation};
 use jig_core::Did;
 use jig_pipeline::{
@@ -207,8 +208,8 @@ impl AppState {
         execution: ExecutionConfig,
     ) -> Result<Self> {
         let store = Arc::new(SqliteStore::open(&db_path).context("opening SqliteStore")?);
-        let signing_key = load_or_generate_server_key(&config.server.server_did_keyfile)
-            .context("loading server signing key")?;
+        let signing_key =
+            load_or_generate_server_key(&config).context("loading server signing key")?;
         // Before anything logs a DID: tags are keyed by this server's seed.
         if !jig_core::did::set_log_tag_key(&signing_key.to_bytes()) {
             tracing::warn!(
@@ -451,47 +452,23 @@ impl AppState {
     }
 }
 
-/// Load the server's ed25519 signing key from `path`, or generate + write
-/// it if the file doesn't exist. A generated file is created owner-only (0600
-/// on Unix) and its key comes from the protocol's one keygen path. The path supports `~` expansion (e.g. `~/.jig/server/server.key`).
-fn load_or_generate_server_key(path: &str) -> Result<SigningKey> {
-    let expanded = shellexpand::tilde(path).into_owned();
-    let path = Path::new(&expanded);
-    if path.exists() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(path)
-                .with_context(|| format!("stating keyfile at {}", path.display()))?
-                .permissions()
-                .mode()
-                & 0o777;
-            if mode & 0o077 != 0 {
-                anyhow::bail!(
-                    "server keyfile at {} has insecure permissions {:#o} (must be 0o600 — group/other access is forbidden)",
-                    path.display(),
-                    mode,
-                );
-            }
-        }
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("reading server keyfile at {}", path.display()))?;
-        if bytes.len() != 32 {
-            anyhow::bail!(
-                "server keyfile at {} is malformed: expected 32 bytes, got {}",
-                path.display(),
-                bytes.len()
-            );
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        Ok(SigningKey::from_bytes(&arr))
-    } else {
-        let signing = jig_core::crypto::ed25519::generate_signing_key();
-        jig_core::crypto::ed25519::write_new_key_file(path, &signing)
-            .with_context(|| format!("writing server keyfile to {}", path.display()))?;
-        Ok(signing)
-    }
+/// Load the server's signing key from `[server] server_did_keyfile`, or make
+/// and seal one if there is none, opening it as `[keys]` says
+/// ([`jig_client::server_key`]). The path supports `~` expansion.
+fn load_or_generate_server_key(config: &JigServerConfig) -> Result<SigningKey> {
+    let path = shellexpand::tilde(&config.server.server_did_keyfile).into_owned();
+    Ok(jig_client::server_key::load_or_create(
+        Path::new(&path),
+        &key_options(&config.keys),
+    )?)
+}
+
+/// How `jig-server` opens its key, from `[keys]`.
+pub fn key_options(keys: &jig_config::v0_0_2_server::KeysSection) -> ServerKeyOptions {
+    let mut opts = ServerKeyOptions::new("server", "jig-server");
+    opts.unlock = keys.unlock.clone();
+    opts.plaintext = keys.storage == jig_config::v0_0_2_server::KeyStorage::Plaintext;
+    opts
 }
 
 /// `[identity.delegations]` as the pipeline's resolver takes it.
@@ -746,21 +723,35 @@ mod tests {
         assert!(Arc::ptr_eq(&state.ingest_ctx, &cloned.ingest_ctx));
     }
 
+    fn keyed_config(dir: &Path, keyfile: &str) -> JigServerConfig {
+        let mut config = JigServerConfig::default();
+        config.server.server_did_keyfile = dir.join(keyfile).to_string_lossy().into_owned();
+        config.keys.unlock = Some(jig_client::server_key::credential_for_tests(dir));
+        config
+    }
+
     #[test]
-    fn load_or_generate_creates_keyfile_and_returns_signing_key() {
+    fn a_new_key_is_sealed_and_reloads_to_the_same_did() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("subdir/server.key");
-        assert!(!path.exists());
-        let key = load_or_generate_server_key(path.to_str().unwrap()).unwrap();
-        assert!(path.exists());
-        // Reloading returns the same signing key
-        let reloaded = load_or_generate_server_key(path.to_str().unwrap()).unwrap();
+        let config = keyed_config(dir.path(), "subdir/server.key");
+        let key = load_or_generate_server_key(&config).unwrap();
+        let sealed = dir.path().join("subdir/server.jigkey");
+        assert!(
+            sealed.exists(),
+            "the configured server.key names server.jigkey"
+        );
+        assert!(
+            !dir.path().join("subdir/server.key").exists(),
+            "nothing in clear"
+        );
+        assert!(jig_core::keystore::JigKey::from_bytes(&std::fs::read(&sealed).unwrap()).is_ok());
+        let reloaded = load_or_generate_server_key(&config).unwrap();
         assert_eq!(key.to_bytes(), reloaded.to_bytes());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "generated keyfile must be 0600 on Unix");
+            let mode = std::fs::metadata(&sealed).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "a sealed keyfile is 0600 too");
         }
     }
 
@@ -775,36 +766,67 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
     }
 
-    #[test]
-    fn load_or_generate_errors_on_malformed_keyfile() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("bad.key");
-        std::fs::write(&path, b"too short").unwrap();
-        // Set 0600 so the permission check passes and we hit the length check.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        let err = load_or_generate_server_key(path.to_str().unwrap()).unwrap_err();
-        assert!(err.to_string().contains("malformed"));
+    #[cfg(unix)]
+    fn write_raw(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, [7u8; 32]).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
-    fn load_or_generate_rejects_world_readable_keyfile() {
-        use std::os::unix::fs::PermissionsExt;
+    fn a_raw_keyfile_is_refused_and_the_error_names_the_seal_command() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("server.key");
-        // Write a valid 32-byte keyfile but with permissive (0644) mode.
-        std::fs::write(&path, [0u8; 32]).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let config = keyed_config(dir.path(), "server.key");
+        write_raw(&dir.path().join("server.key"), 0o600);
+        let msg = load_or_generate_server_key(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("jig-server keys seal"), "{msg}");
+        assert!(msg.contains("storage = \"plaintext\""), "{msg}");
+    }
 
-        let err = load_or_generate_server_key(path.to_str().unwrap()).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("permissions") || msg.contains("0644") || msg.contains("0o644"),
-            "expected permission error, got: {msg}"
-        );
+    #[cfg(unix)]
+    #[test]
+    fn plaintext_storage_still_loads_a_raw_key_but_checks_it() {
+        let dir = tempdir().unwrap();
+        let mut config = keyed_config(dir.path(), "server.key");
+        config.keys.storage = jig_config::v0_0_2_server::KeyStorage::Plaintext;
+        let path = dir.path().join("server.key");
+        write_raw(&path, 0o600);
+        let key = load_or_generate_server_key(&config).unwrap();
+        assert_eq!(key.to_bytes(), [7u8; 32]);
+
+        write_raw(&path, 0o644);
+        let msg = load_or_generate_server_key(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("permissions"), "{msg}");
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&path, b"too short").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let msg = load_or_generate_server_key(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("malformed"), "{msg}");
+    }
+
+    #[test]
+    fn with_nothing_to_seal_with_a_new_key_is_refused() {
+        let dir = tempdir().unwrap();
+        let mut config = keyed_config(dir.path(), "server.key");
+        config.keys.unlock = None;
+        // The process may carry these; this test is about the config alone.
+        if std::env::var_os("JIG_KEY_UNLOCK").is_some()
+            || std::env::var_os("JIG_KEY_PASSPHRASE").is_some()
+        {
+            return;
+        }
+        let msg = load_or_generate_server_key(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("[keys] unlock"), "{msg}");
+        assert!(!dir.path().join("server.jigkey").exists());
     }
 }
