@@ -554,8 +554,9 @@ passphrase kept offline for restoring on other hardware.
 
 ```bash
 sudo deploy/setup-server-key.sh               # jig-server; asks for the passphrase
-sudo deploy/setup-server-key.sh --nameserver  # jig-nameserver
 sudo systemctl restart jig-server
+sudo deploy/setup-server-key.sh --nameserver  # jig-nameserver
+sudo systemctl restart jig-nameserver
 ```
 
 It makes the credential, then makes the key sealed (`keys generate`), seals a

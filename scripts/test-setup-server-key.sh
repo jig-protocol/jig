@@ -39,7 +39,7 @@ cat >"$t/fakebin/systemctl" <<'STUB'
 #!/usr/bin/env bash
 case "$1" in
   show) [ "$3" = User ] && echo "$STUB_USER"
-        [ "$3" = Environment ] && echo "JIG_NS_DB_PATH=$STUB_DIR/ns/nameserver.db" ;;
+        [ "$3" = Environment ] && echo "JIG_NS_DB_PATH=${STUB_NS_DB:-$STUB_DIR/ns/nameserver.db}" ;;
   cat) cat "$JIG_UNIT_DIR/$2.d/"*.conf 2>/dev/null ;;
   daemon-reload) echo reload >>"$STUB_DIR/reloads" ;;
 esac
@@ -86,6 +86,7 @@ cat "$h/out" >>"$t/all-out"
 if P='not the passphrase at all' run "$h"; then fail "a wrong passphrase was accepted"; fi
 grep -q "does not open" "$h/out" || { cat "$h/out"; fail "wrong passphrase message"; }
 [ "$(sums "$h")" = "$before" ] || fail "a refused run changed something"
+cat "$h/out" >>"$t/all-out"
 
 # A different unlock is refused.
 h2="$t/b"; host "$h2"
@@ -93,6 +94,7 @@ sed -i 's|^# *unlock = .*|unlock = "env:SOMETHING"|' "$h2/etc/config.toml"
 grep -q '^unlock = "env:SOMETHING"' "$h2/etc/config.toml" || fail "test setup: no unlock line to replace"
 if run "$h2"; then fail "a different unlock was replaced"; fi
 [ ! -e "$h2/var/server.jigkey" ] && [ ! -e "$h2/credstore" ] || fail "a refused run wrote something"
+cat "$h2/out" >>"$t/all-out"
 
 # --force over a different unlock replaces it: one unlock, ours.
 run "$h2" --force || { cat "$h2/out"; fail "--force over a different unlock"; }
@@ -135,9 +137,24 @@ JIG_CREDSTORE_DIR="$h6/credstore" JIG_UNIT_DIR="$h6/units" JIG_KEY_PASSPHRASE="$
   "$script" --nameserver --config "$h6/etc/config.toml" </dev/null >"$h6/out" 2>&1 ||
   { cat "$h6/out"; fail "nameserver"; }
 [ -s "$t/ns/nameserver_v002.jigkey" ] || fail "no nameserver key"
+[ -s "$h6/credstore/jig-nameserver-key" ] || fail "no nameserver credential"
+grep -qx "LoadCredentialEncrypted=jig-nameserver-key:$h6/credstore/jig-nameserver-key" \
+  "$h6/units/jig-nameserver.service.d/"*.conf || fail "nameserver drop-in"
 awk '/^\[v0_0_2.keys\]/{s=1;next} /^\[/{s=0} s' "$h6/etc/config.toml" |
   grep -qx 'unlock = "credential:/run/credentials/jig-nameserver.service/jig-nameserver-key"' || fail "nameserver unlock"
 cat "$h6/out" >>"$t/all-out"
+
+# The nameserver's own resolution: jig-server's default keyfile reads as
+# unset, and the key is named after the database's stem, whatever its
+# extension.
+h7="$t/g"; mkdir -p "$h7/etc" "$h7/units" "$t/ns2"
+cp "$root/deploy/jig-nameserver.example.toml" "$h7/etc/config.toml"
+printf '\n[v0_0_2.server]\nserver_did_keyfile = "~/.jig/server/server.key"\n' >>"$h7/etc/config.toml"
+STUB_NS_DB="$t/ns2/nameserver.sqlite" JIG_CREDSTORE_DIR="$h7/credstore" JIG_UNIT_DIR="$h7/units" \
+  JIG_KEY_PASSPHRASE="$PASS" "$script" --nameserver --config "$h7/etc/config.toml" \
+  </dev/null >"$h7/out" 2>&1 || { cat "$h7/out"; fail "nameserver with the default keyfile"; }
+[ -s "$t/ns2/nameserver_v002.jigkey" ] || { ls "$t/ns2"; fail "nameserver key beside a .sqlite database"; }
+cat "$h7/out" >>"$t/all-out"
 
 # No secret in any output.
 grep -qF "$PASS" "$t/all-out" && fail "the passphrase was printed"

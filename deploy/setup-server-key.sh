@@ -156,13 +156,26 @@ toml_get() { # file section key
 # --- Where the key is -------------------------------------------------------
 if [ -z "$KEYFILE" ]; then
   KEYFILE="$(toml_get "$CONFIG" "$KEYFILE_SECTION" server_did_keyfile)"
+  # jig-nameserver reads jig-server's default keyfile as "not set".
+  # shellcheck disable=SC2088 # the literal default, not a path to expand
+  if [ "$ROLE" = nameserver ] && [ "$KEYFILE" = "~/.jig/server/server.key" ]; then
+    KEYFILE=""
+  fi
   if [ -z "$KEYFILE" ] && [ "$ROLE" = nameserver ]; then
-    # As jig-nameserver resolves it: beside the database, from the unit's
-    # JIG_NS_DB_PATH.
+    # As jig-nameserver resolves it: beside the database (the unit's
+    # JIG_NS_DB_PATH, else [storage] database_path), named after its stem.
     db="$(systemctl show -p Environment --value "$UNIT" 2>/dev/null |
       tr ' ' '\n' | sed -n 's/^JIG_NS_DB_PATH=//p')" || true
     db="${db%%$'\n'*}"
-    [ -n "$db" ] && KEYFILE="${db%.db}_v002.key"
+    [ -n "$db" ] || db="$(toml_get "$CONFIG" storage database_path)"
+    if [ -n "$db" ]; then
+      db_base="${db##*/}"
+      case "$db_base" in
+        ?*.*) db_stem="${db_base%.*}" ;;
+        *) db_stem="$db_base" ;;
+      esac
+      KEYFILE="${db%/*}/${db_stem}_v002.key"
+    fi
   fi
   [ -n "$KEYFILE" ] || die "no server_did_keyfile in [$KEYFILE_SECTION] of $CONFIG: pass --keyfile"
 fi
@@ -292,7 +305,11 @@ with_slots() { # action
 
 if [ -n "$IMPORT" ]; then
   install -m 0600 -o "$SERVICE_USER" -- "$IMPORT" "$RAW"
-  with_slots seal
+  if ! with_slots seal; then
+    # Not left behind as a second copy of the seed in clear.
+    rm -f -- "$RAW" || die "sealing the imported seed failed; remove the copy at $RAW by hand"
+    die "sealing the imported seed failed; the copy at $RAW was removed"
+  fi
   say "imported the seed from $IMPORT. That file still holds the key in clear: destroy it, or keep it offline as carefully as the passphrase"
 elif [ -e "$SEALED" ]; then
   [ -e "$RAW" ] && die "both $RAW and $SEALED exist; \`$BIN keys show\` or a boot says which to keep"
