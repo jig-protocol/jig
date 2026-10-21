@@ -19,6 +19,7 @@ pub mod pins;
 pub mod pow;
 pub mod read_auth;
 pub mod secure;
+pub mod server_key;
 pub mod tls;
 
 pub use connection::envelope;

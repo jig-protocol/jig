@@ -141,6 +141,7 @@ async fn setup_with_toml(
         .join("server.key")
         .to_string_lossy()
         .into_owned();
+    config.keys.unlock = Some(jig_client::server_key::credential_for_tests(tempdir.path()));
     config.server.listen = "127.0.0.1:0".into();
     // Ensure all three block kinds the email bridge submits are allowed.
     // (JigServerConfig::default() already includes them; the TOML above

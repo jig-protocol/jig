@@ -12,7 +12,7 @@ path = "src/lib.rs"
 jig-runtime = { workspace = true }
 jig-server = { path = "../jig-server" }
 jig-nameserver = { path = "../jig-nameserver" }
-jig-client = { path = "../jig-client" }
+jig-client = { path = "../jig-client", features = ["test-support"] }
 jig-mls = { workspace = true }
 jig-pipeline = { path = "../jig-pipeline" }
 jig-core = { workspace = true }

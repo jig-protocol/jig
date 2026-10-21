@@ -40,6 +40,34 @@ pub struct JigServerConfig {
     pub nameserver: NameserverSection,
     #[serde(default)]
     pub auth: AuthSection,
+    #[serde(default)]
+    pub keys: KeysSection,
+}
+
+/// `[keys]`: how this server opens its own signing key, a `.jigkey`.
+///
+/// A server boots unattended: it never prompts and never uses an OS keychain.
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeysSection {
+    /// The slot to open the key with, and to seal a new key with:
+    /// `credential:PATH` (a systemd credential, `LoadCredentialEncrypted=`),
+    /// `env:NAME`, or `passphrase` (read from `JIG_KEY_PASSPHRASE`).
+    /// `JIG_KEY_UNLOCK` and `JIG_KEY_PASSPHRASE` are tried too.
+    pub unlock: Option<String>,
+    /// `sealed` (the default) or `plaintext`, an antipattern: a raw 32-byte
+    /// key in clear, warned about on every boot. Deliberately not listed in
+    /// `unsafe_options_active`, which `/.well-known/jig` publishes: it would
+    /// mark this server as a soft target, and no client can verify it.
+    pub storage: KeyStorage,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyStorage {
+    #[default]
+    Sealed,
+    Plaintext,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -947,6 +975,24 @@ mod tests {
     }
 
     #[test]
+    fn keys_default_to_sealed_and_parse_when_set() {
+        let omitted: JigServerConfig = toml::from_str("").unwrap();
+        assert_eq!(omitted.keys, KeysSection::default());
+        assert_eq!(omitted.keys.storage, KeyStorage::Sealed);
+        let set: JigServerConfig = toml::from_str(
+            "[keys]\nunlock = \"credential:/run/credentials/jig-server.service/key\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            set.keys.unlock.as_deref(),
+            Some("credential:/run/credentials/jig-server.service/key")
+        );
+        let plain: JigServerConfig = toml::from_str("[keys]\nstorage = \"plaintext\"\n").unwrap();
+        assert_eq!(plain.keys.storage, KeyStorage::Plaintext);
+        assert!(toml::from_str::<JigServerConfig>("[keys]\nunlok = \"env:X\"\n").is_err());
+    }
+
+    #[test]
     fn the_skew_bound_defaults_when_omitted_and_parses_when_set() {
         let omitted: JigServerConfig =
             toml::from_str("[server]\nlisten = \"0.0.0.0:443\"\n").unwrap();
@@ -968,7 +1014,11 @@ mod tests {
         cfg.identity.dangerously_allow_plaintext_nameservers = true;
         cfg.debug.list_handles = true;
         cfg.auth.require_authenticated_reads = false;
+        cfg.keys.storage = KeyStorage::Plaintext;
         let active = cfg.unsafe_options_active();
+        // Not published: it would point attackers at soft targets, and clients
+        // cannot verify an operator's word about it anyway. It warns at boot.
+        assert!(!active.iter().any(|o| o.starts_with("keys.")));
         assert!(active.contains(&"auth.require_authenticated_reads=false".to_string()));
         assert!(active.contains(&"federation.dangerously_disable_federation_tls".to_string()));
         assert!(active.contains(&"federation.dangerously_allow_plaintext_federation".to_string()));
