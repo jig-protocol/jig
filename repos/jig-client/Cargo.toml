@@ -63,6 +63,10 @@ zeroize = "1"
 keyring-core = "1"
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 
+[features]
+# Test helpers for crates that stand up servers (`server_key::credential_for_tests`).
+test-support = []
+
 [dev-dependencies]
 tempfile = "3"
 # `naming` tests stand up real TLS servers: one under a test CA, one
