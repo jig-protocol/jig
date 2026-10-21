@@ -526,6 +526,90 @@ impl TestServer {
     }
 
     /// This server's DID, as `/.well-known/jig` advertises it.
+    /// The store, for rows no endpoint here writes.
+    pub fn store(&self) -> &jig_pipeline::persist::SqliteStore {
+        &self.state.ingest_ctx.store
+    }
+
+    /// The id of the local channel `slug`.
+    pub fn channel_id(&self, slug: &str) -> String {
+        self.store()
+            .get_channel_by_slug_including_archived(slug)
+            .expect("store answers")
+            .unwrap_or_else(|| panic!("no local channel {slug}"))
+            .id
+    }
+
+    /// Store a carried channel: an open channel named `slug` that another
+    /// server sequences, so no endpoint here creates it. It holds `member`,
+    /// one block and an MLS group with a group info, each told apart from a
+    /// local channel's by its contents. Returns its id and its block.
+    pub fn carry_channel(
+        &self,
+        slug: &str,
+        member: &Identity,
+    ) -> (String, jig_pipeline::persist::StoredBlock) {
+        use jig_pipeline::persist::{StoredBlock, StoredChannel, StoredMembership, StoredMlsGroup};
+        let id = jig_core::canonical_cid::of(format!("carried {slug}").as_bytes()).to_string();
+        let store = self.store();
+        let channel = StoredChannel {
+            id: id.clone(),
+            slug: slug.to_string(),
+            visibility: "open".to_string(),
+            created_at: 0,
+            owner_did: member.did().to_did_jig_string(),
+            suite: "none".to_string(),
+            sequencer_did: Identity::new(250).did().to_did_jig_string(),
+            co_owners: Vec::new(),
+        };
+        store.upsert_channel(&channel).expect("carried channel");
+        store
+            .upsert_membership(&StoredMembership {
+                channel_id: id.clone(),
+                member_did: member.did().to_did_jig_string(),
+                role: "owner".to_string(),
+                joined_at: 0,
+                source_block_cid: id.clone(),
+            })
+            .expect("carried membership");
+        let block = StoredBlock {
+            cid: jig_core::canonical_cid::of(format!("carried block {slug}").as_bytes())
+                .to_string(),
+            channel_id: Some(id.clone()),
+            block_kind: "text-render".to_string(),
+            sender_did: member.did().to_did_jig_string(),
+            sender_sig: Vec::new(),
+            bundle_bytes: b"carried".to_vec(),
+            is_synthetic: false,
+            hlc_wall_ms: 1,
+            hlc_logical: 0,
+            hlc_origin: member.did().to_did_jig_string(),
+            posted_at: 1,
+            origin_server: "elsewhere".to_string(),
+            federated_from: Some("elsewhere".to_string()),
+        };
+        store.insert_block(&block).expect("carried block");
+        store
+            .put_mls_group(&StoredMlsGroup {
+                channel_id: id.clone(),
+                group_id: b"carried".to_vec(),
+                state: Vec::new(),
+                epoch: 7,
+                group_info: Some(b"carried group info".to_vec()),
+            })
+            .expect("carried group");
+        (id, block)
+    }
+
+    /// POST a signed channel-op block to `path` on the channel-op routes.
+    pub async fn post_channel_op(
+        &self,
+        path: &str,
+        block: &BuiltBlock,
+    ) -> (StatusCode, serde_json::Value) {
+        self.post_admin(path, block).await
+    }
+
     pub fn server_did(&self) -> String {
         self.state.server_did.to_did_jig_string()
     }

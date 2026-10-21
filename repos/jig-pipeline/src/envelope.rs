@@ -313,13 +313,23 @@ pub struct SubscribeAuth {
     pub sig_b64: String,
 }
 
-/// Subscription scope: a single channel by slug or a federation-wide subscription
-/// filtered to specified block kinds.
+/// Subscription scope: a single channel, by id or by slug, or a
+/// federation-wide subscription filtered to specified block kinds.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Scope {
-    Channel { slug: String },
-    Federation { block_kinds: Vec<String> },
+    /// A channel by slug, which names only a channel the server sequences.
+    Channel {
+        slug: String,
+    },
+    /// A channel by its id: the canonical CID text of its channel-create
+    /// block, which names one channel on any server.
+    ChannelId {
+        channel_id: String,
+    },
+    Federation {
+        block_kinds: Vec<String>,
+    },
 }
 
 impl Scope {
@@ -337,6 +347,7 @@ impl Scope {
     pub fn canonical_string(&self) -> String {
         match self {
             Scope::Channel { slug } => format!("channel:{slug}"),
+            Scope::ChannelId { channel_id } => format!("channel_id:{channel_id}"),
             Scope::Federation { block_kinds } => {
                 let mut kinds = block_kinds.clone();
                 kinds.sort();
@@ -532,6 +543,22 @@ mod tests {
     }
 
     #[test]
+    fn subscribe_by_channel_id_round_trips() {
+        let env = Envelope::new(Frame::Subscribe {
+            scope: Scope::ChannelId {
+                channel_id: "bafkexample".into(),
+            },
+            auth: None,
+        });
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(
+            json.contains(r#""scope":{"kind":"channel_id","channel_id":"bafkexample"}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Envelope>(&json).unwrap(), env);
+    }
+
+    #[test]
     fn unknown_op_returns_error() {
         let json = r##"{"v":1,"op":"teleport","scope":{"kind":"channel","slug":"#x"}}"##;
         let result: Result<Envelope, _> = serde_json::from_str(json);
@@ -559,6 +586,14 @@ mod tests {
             fed.canonical_string(),
             "a channel named like a federation filter must not collide"
         );
+
+        // The same text as a slug and as an id is two scopes, signed apart.
+        let by_slug = Scope::Channel { slug: "x".into() };
+        let by_id = Scope::ChannelId {
+            channel_id: "x".into(),
+        };
+        assert_eq!(by_id.canonical_string(), "channel_id:x");
+        assert_ne!(by_slug.canonical_string(), by_id.canonical_string());
     }
 
     /// Block-kind order is incidental on the wire, so it must not change the

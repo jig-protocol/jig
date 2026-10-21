@@ -494,22 +494,36 @@ enum SubscribeRefusal {
     Store(String),
 }
 
-/// Gate 3 for a channel subscription: the same `authorize_read` decision the
-/// REST timeline runs, over the same store facts.
-///
-/// `Ok` for a slug with no row at all — see the call site for why. An
-/// archived channel still has a row and is still gated by it; the
+/// The channel row a channel scope names, archived or not: by id for
+/// [`Scope::ChannelId`], and for [`Scope::Channel`] by slug among the
+/// channels this server sequences only, so a slug never reaches a carried
+/// channel. An archived channel still has a row and is still gated by it; the
 /// live-channel lookup would read it as absent and let anyone in.
-fn authorize_subscribe(state: &AppState, slug: &str, did: &str) -> Result<(), SubscribeRefusal> {
+fn subscribed_channel(
+    state: &AppState,
+    scope: &Scope,
+) -> Result<Option<jig_pipeline::persist::StoredChannel>, String> {
     let store = &state.ingest_ctx.store;
-    let channel = store
-        .get_channel_by_slug_including_archived(slug)
-        .map_err(|e| SubscribeRefusal::Store(e.to_string()))?;
-    let Some(channel) = channel else {
-        return Ok(());
-    };
-    let is_member = store
-        .is_member(slug, did)
+    match scope {
+        Scope::Channel { slug } => store.get_channel_by_slug_including_archived(slug),
+        Scope::ChannelId { channel_id } => store.get_channel_by_id_including_archived(channel_id),
+        Scope::Federation { .. } => Ok(None),
+    }
+    .map_err(|e| e.to_string())
+}
+
+/// Gate 3 for a channel subscription: the same `authorize_read` decision the
+/// REST timeline runs, over the same store facts, looked up by the channel's
+/// id. A channel with no row at all is not gated here — see the call site.
+fn authorize_subscribe(
+    state: &AppState,
+    channel: &jig_pipeline::persist::StoredChannel,
+    did: &str,
+) -> Result<(), SubscribeRefusal> {
+    let is_member = state
+        .ingest_ctx
+        .store
+        .is_member_by_id(&channel.id, did)
         .map_err(|e| SubscribeRefusal::Store(e.to_string()))?;
     let is_owner = channel.owner_did == did;
     crate::auth::authorize_read(
@@ -674,6 +688,22 @@ async fn handle_client_frame(
         Frame::Hello { .. } => Ok(()),
         // ------------------------------------------------------------------ Subscribe
         Frame::Subscribe { scope, auth } => {
+            // An id has one spelling; any other is no channel id, refused as
+            // a malformed scope before anything is looked up or verified.
+            if let Scope::ChannelId { channel_id } = &scope
+                && !jig_core::canonical_cid::is_canonical_text(channel_id)
+            {
+                let _ = send_error(
+                    socket,
+                    Some(400),
+                    "BAD_SCOPE",
+                    None,
+                    &format!("`{channel_id}` is not a channel id in its canonical CID form"),
+                )
+                .await;
+                return Ok(());
+            }
+
             // Gate 1 on the WSS path. The scope's canonical string is what was
             // signed, so a proof for one channel cannot subscribe to another.
             // The federation stream is for configured peers only, so it is
@@ -776,10 +806,18 @@ async fn handle_client_frame(
             // carry anything. A channel with no local row is NOT refused here
             // — federated channels routinely have none — and is guarded at
             // delivery once a row exists.
+            let channel = match subscribed_channel(state, &scope) {
+                Ok(channel) => channel,
+                Err(detail) => {
+                    // Same word the REST path uses for a failing store.
+                    let _ = send_error(socket, Some(500), "PERSIST_ERROR", None, &detail).await;
+                    return Ok(());
+                }
+            };
             if let SubscriberIdentity::Did(did) = &who
-                && let Scope::Channel { slug } = &scope
+                && let Some(channel) = &channel
             {
-                match authorize_subscribe(state, slug, did) {
+                match authorize_subscribe(state, channel, did) {
                     Ok(()) => {}
                     Err(SubscribeRefusal::Gate(outcome)) => {
                         tracing::info!(
@@ -800,27 +838,13 @@ async fn handle_client_frame(
             }
 
             let sub_scope = match scope {
-                // Clients name a channel by slug; fanout keys channels by
-                // their id (the channel-create CID). A slug with no row yet
-                // stays as it is until that channel is created (see
-                // `Fanout::bind_pending_channel`).
+                // Fanout keys channels by their id (the channel-create CID).
+                // A slug with no local row yet stays as it is until that
+                // channel is created (see `Fanout::bind_pending_channel`).
                 Scope::Channel { slug } => {
-                    match state
-                        .ingest_ctx
-                        .store
-                        .get_channel_by_slug_including_archived(&slug)
-                    {
-                        Ok(channel) => {
-                            SubscriptionScope::Channel(channel.map(|c| c.id).unwrap_or(slug))
-                        }
-                        Err(e) => {
-                            let detail = e.to_string();
-                            let _ =
-                                send_error(socket, Some(500), "PERSIST_ERROR", None, &detail).await;
-                            return Ok(());
-                        }
-                    }
+                    SubscriptionScope::Channel(channel.map(|c| c.id).unwrap_or(slug))
                 }
+                Scope::ChannelId { channel_id } => SubscriptionScope::Channel(channel_id),
                 Scope::Federation { block_kinds } => SubscriptionScope::Federation { block_kinds },
             };
             // A connection holds ONE subscription. A re-Subscribe replaces it,
