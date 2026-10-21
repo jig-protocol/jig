@@ -52,8 +52,13 @@ impl BinarySurface {
             .join("nameserver.key")
             .to_string_lossy()
             .into_owned();
-        cfg.v0_0_2.nameserver.alias_suffixes =
-            vec![jig_config::v0_0_2_server::SuffixConfig::new(ALIAS_SUFFIX)];
+        cfg.v0_0_2.keys.unlock = Some(jig_client::server_key::credential_for_tests(tempdir.path()));
+        let mut suffix = jig_config::v0_0_2_server::SuffixConfig::new(ALIAS_SUFFIX);
+        // This test is about which routes the binary mounts; the
+        // proof-of-work they ask for is covered by jig-nameserver's pow tests
+        // and the CLI's nameserver_roundtrip.
+        suffix.pow = jig_config::v0_0_2_server::PowPolicy::off();
+        cfg.v0_0_2.nameserver.alias_suffixes = vec![suffix];
         cfg.v0_0_2.debug.list_handles = list_handles;
         cfg.validate().context("config must be valid")?;
 

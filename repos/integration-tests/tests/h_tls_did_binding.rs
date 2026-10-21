@@ -230,3 +230,43 @@ async fn a_federation_peer_is_held_to_its_expected_did() {
         .expect("a peer naming another DID is refused");
     assert!(err.to_string().contains("not the server"), "{err}");
 }
+
+/// A server that changed its key is followed only along a public link its old
+/// key signed to the new one (JEP-0012): the probe says where it moved from,
+/// and refuses a new DID with no link, or one signed by someone else.
+#[tokio::test]
+async fn a_pinned_server_is_followed_to_a_new_key_only_along_its_link() {
+    use base64::Engine as _;
+    use jig_core::key_link::{Audience, SignedKeyLink};
+    let (old, new, stranger) = (
+        SigningKey::from_bytes(&[3; 32]),
+        SigningKey::from_bytes(&[4; 32]),
+        SigningKey::from_bytes(&[5; 32]),
+    );
+    let real = cert();
+    let with_link = |link: Option<&SignedKeyLink>| {
+        let mut doc = well_known(&did(&new), &TlsBinding::sign(&new, real.der.as_ref()));
+        if let Some(link) = link {
+            doc["key_link"] = serde_json::json!(
+                base64::engine::general_purpose::STANDARD.encode(link.envelope())
+            );
+        }
+        doc
+    };
+
+    let link = SignedKeyLink::sign(&old, &new, Audience::Public, 1).unwrap();
+    let base = serve(&real, with_link(Some(&link))).await;
+    let probed = probe(&base, Some(&did(&old))).await.expect("followed");
+    assert_eq!(probed.moved_from.as_deref(), Some(did(&old).as_str()));
+    assert_eq!(probed.server_did.as_deref(), Some(did(&new).as_str()));
+    assert!(reaches(&base, &probed.config.unwrap()).await);
+
+    let forged = SignedKeyLink::sign(&stranger, &new, Audience::Public, 1).unwrap();
+    for doc in [with_link(None), with_link(Some(&forged))] {
+        let base = serve(&real, doc).await;
+        assert!(matches!(
+            probe(&base, Some(&did(&old))).await,
+            Err(TlsError::OtherServer { .. })
+        ));
+    }
+}

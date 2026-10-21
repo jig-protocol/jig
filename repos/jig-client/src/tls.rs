@@ -65,6 +65,12 @@ pub struct Probed {
     /// For every later connection: accepts the certificate the DID vouched
     /// for, or one a CA vouches for. `None` for a plaintext server.
     pub config: Option<Arc<ClientConfig>>,
+    /// Set when the server names another DID than the one expected and
+    /// serves a public key link from that one to it (JEP-0012): the expected
+    /// DID it moved from. The caller moves its pin ([`crate::pins::Pins::move_server`]).
+    pub moved_from: Option<String>,
+    /// That link, base64, as served.
+    pub key_link: Option<String>,
 }
 
 /// Fetch `server`'s `/.well-known/jig` and work out which certificate to
@@ -105,24 +111,38 @@ pub async fn probe(server: &str, expected_did: Option<&str>) -> Result<Probed, T
     struct Advertised {
         server_did: Option<String>,
         tls_binding: Option<TlsBinding>,
+        key_link: Option<String>,
     }
     let advertised: Advertised =
         serde_json::from_value(well_known.clone()).map_err(|e| fetch(e.to_string()))?;
+    // Another DID than the expected one only through a public link the
+    // expected key signed to it.
+    let mut moved_from = None;
     if let (Some(expected), Some(presented)) = (expected_did, advertised.server_did.as_deref())
-        && expected != presented
+        && !jig_pipeline::handshake::same_did(expected, presented)
     {
-        return Err(TlsError::OtherServer {
-            server: server.to_string(),
-            expected: expected.to_string(),
-            presented: presented.to_string(),
-        });
+        let moves = advertised
+            .key_link
+            .as_deref()
+            .map(|link| jig_pipeline::handshake::link_moves(link, expected, presented));
+        if !matches!(moves, Some(Ok(()))) {
+            return Err(TlsError::OtherServer {
+                server: server.to_string(),
+                expected: expected.to_string(),
+                presented: presented.to_string(),
+            });
+        }
+        moved_from = Some(expected.to_string());
     }
+    let key_link = advertised.key_link.clone();
     let server_did = advertised.server_did.or(expected_did.map(str::to_string));
     if !tls {
         return Ok(Probed {
             server_did,
             well_known,
             config: None,
+            moved_from,
+            key_link,
         });
     }
 
@@ -156,6 +176,8 @@ pub async fn probe(server: &str, expected_did: Option<&str>) -> Result<Probed, T
         config: Some(Arc::new(client_config(Arc::new(DidBoundVerifier::new(
             accepted, false,
         ))))),
+        moved_from,
+        key_link,
     })
 }
 

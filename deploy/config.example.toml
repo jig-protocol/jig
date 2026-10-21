@@ -62,10 +62,11 @@ port = 7117
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 listen = "100.x.y.z:7117"
 
-# The ed25519 seed the server DID is derived from. BACK THIS UP OFFSITE.
-# Losing it changes the server DID and breaks TOFU pinning for every client.
-# The server generates it 0600 on first boot and REFUSES TO START if the file
-# is later group- or other-readable.
+# The ed25519 seed the server DID is derived from, sealed: this path names
+# /var/lib/jig/server.jigkey beside it. BACK IT UP OFFSITE, with a way to open
+# it (deploy/README.md). Losing it changes the server DID and breaks TOFU
+# pinning for every client. A raw server.key from an older release is refused
+# until `jig-server keys seal` converts it.
 server_did_keyfile = "/var/lib/jig/server.key"
 
 # channel-create, member-add and channel-archive are not optional extras:
@@ -141,6 +142,19 @@ per_did_per_second = 50
 per_ip_burst = 600
 per_ip_per_second = 100
 replay_per_did = 2000
+
+[keys]
+# What opens the sealed server key at boot. The server never prompts. The
+# systemd credential in jig-server.service (LoadCredentialEncrypted=), bound to
+# the TPM where there is one, is the recommended slot: see deploy/README.md,
+# "Sealing the server key", for what each choice protects against. With none
+# set, a new key is refused rather than written in clear.
+#
+# DO THESE TOGETHER: make the credential (systemd-creds encrypt), uncomment
+# LoadCredentialEncrypted= in jig-server.service, and uncomment this line.
+# Either one alone fails the boot.
+# unlock = "credential:/run/credentials/jig-server.service/jig-server-key"
+storage = "sealed"
 
 [debug]
 # Handle enumeration stays off — it dumps the registry to any caller.

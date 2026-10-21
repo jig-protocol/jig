@@ -122,6 +122,11 @@ struct ServerInfoResponse {
     /// 16), unsigned. Absent when the v0.0.2 module is not active.
     #[serde(skip_serializing_if = "Option::is_none")]
     peer_policy: Option<PeerPolicyInfo>,
+    /// During a key change: the public link from the server's old DID to
+    /// `server_did` (JEP-0012), base64 COSE_Sign. Clients that pinned the old
+    /// DID follow it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_link: Option<String>,
 }
 
 /// [`jig_pipeline::server_manifest::PeerPolicy`] as JSON.
@@ -296,6 +301,12 @@ async fn server_info(State(state): State<AppState>) -> Json<ServerInfoResponse> 
             .as_ref()
             .and_then(|v| v.tls_binding.get().cloned()),
         peer_policy: state.v0_0_2.as_deref().map(PeerPolicyInfo::of),
+        key_link: state.v0_0_2.as_ref().and_then(|v| {
+            use base64::Engine as _;
+            v.key_link
+                .as_ref()
+                .map(|l| base64::engine::general_purpose::STANDARD.encode(l))
+        }),
     })
 }
 

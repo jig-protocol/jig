@@ -59,6 +59,9 @@ pub(crate) struct RegisterRequest {
     pub suffix: String,
     pub proof_of_control: String,
     pub challenge: String,
+    /// JEP-0008 proof-of-work, when the suffix asks for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pow: Option<jig_core::pow::Proof>,
 }
 
 pub async fn run(args: InitArgs) -> Result<()> {
@@ -181,10 +184,31 @@ pub async fn register_with_nameserver(
     delegations: &jig_client::naming::Delegations,
 ) -> Result<Attestation> {
     let ns = Nameserver::connect(ns_url, who, delegations, Purpose::Register).await?;
-    let challenge = ns.challenge().await?;
-    let body = build_register_request(id, ns.name(), ns.ns_did(), &challenge);
-    ns.post_binding("/v1/register", &body, &id.did_string())
-        .await?
+    let name = ns.name().clone();
+    let did = id.did_string();
+    let alias = name.as_alias();
+    crate::cmd::ns_pow::with_pow(
+        &ns,
+        crate::cmd::ns_pow::Work {
+            action: jig_core::pow::Action::NsRegister,
+            subject: &did,
+            name: &name,
+            binding: &|challenge| {
+                Ok(jig_core::naming::proof_hash(
+                    Action::Register,
+                    ns.ns_did(),
+                    &alias,
+                    challenge,
+                ))
+            },
+        },
+        async |challenge, pow| {
+            let mut body = build_register_request(id, &name, ns.ns_did(), &challenge);
+            body.pow = pow;
+            ns.post_binding("/v1/register", &body, &did).await
+        },
+    )
+    .await?
 }
 
 /// Build the POST /v1/register body: the proof of control is bound to the
@@ -204,6 +228,7 @@ pub(crate) fn build_register_request(
         suffix: name.suffix.clone(),
         proof_of_control: b64u(&proof),
         challenge: challenge.to_string(),
+        pow: None,
     }
 }
 
