@@ -187,6 +187,10 @@ pub enum Frame {
         /// only before the server has published one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         manifest: Option<crate::handshake::ManifestRef>,
+        /// During a key change, the public key link from the server's old DID
+        /// to `server_did` (JEP-0012), base64 COSE_Sign.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_link: Option<String>,
         /// base64 ed25519 over [`crate::handshake::WelcomeStatement::canonical_bytes`].
         sig: String,
     },
