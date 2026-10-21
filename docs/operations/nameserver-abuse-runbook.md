@@ -11,14 +11,14 @@
 >   proxy).
 > - Section 3, "Compromised nameserver": steps 1 to 3 and 5 to 7. Step 4's attestation-key
 >   rotation also still applies.
-> - Section 4: steps 5 and 6.
+> - Section 4 describes what applies now.
 >
 > A new runbook follows lane R's redesign: the [framing doc](../superpowers/specs/2026-10-18-reputation-pow-tribunals-framing.md) and the draft
 > [JEP-0008](../../repos/jig-spec/jep/jep-0008-proof-of-work.md), [JEP-0009](../../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) and [JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md).
 
 What a `jig-nameserver` operator does about harassment reports, registration and relay
-abuse, a compromised nameserver, and a rogue federated instance. Parameters and endpoints
-are the reference implementation's. Settings and defaults are listed in the
+abuse, a compromised nameserver, and a rogue or contradicting nameserver. Parameters and
+endpoints are the reference implementation's. Settings and defaults are listed in the
 [operator guide](../../repos/jig-nameserver/OPERATOR_GUIDE.md); the reasoning behind them is
 in [nameserver abuse economics](../security/nameserver-abuse-economics.md).
 
@@ -45,8 +45,9 @@ spreads further than the group.
 - **Know your files.** With the shipped unit: legacy store `/var/lib/jig/nameserver.db`
   (penalties, rate windows, federation cache, reputation, tribunal records, the
   `ns_identity` key), alias store `/var/lib/jig/nameserver_v002.db`, attestation signing key
-  `/var/lib/jig/nameserver_v002.key` (or `[v0_0_2.server] server_did_keyfile`), and
-  `JIG_NS_SECRET` in `/etc/jig/jig-nameserver.env`.
+  `/var/lib/jig/nameserver_v002.jigkey`, sealed (or the `.jigkey` beside `[v0_0_2.server] server_did_keyfile`), and any
+  `JIG_NS_*` settings in the optional `/etc/jig/jig-nameserver.env`. The nameserver has no
+  `JIG_NS_SECRET` any more (#192).
 - **Know that settings are read at start-up.** Every `JIG_NS_*` change below needs
   `sudo systemctl restart jig-nameserver`. A restart does not reset the legacy penalties or
   rate windows, which live in the database. It does reset the `[alias_rate_limits]`
@@ -176,19 +177,20 @@ issue attestations, and read or change everything in its databases.
 1. **Contain.** Stop the service (`sudo systemctl stop jig-nameserver`) or firewall it. Keep
    copies of both databases, the key file and the logs before changing anything.
 2. **Cut dependent servers loose.** Operators of servers with `[identity] mode =
-   "nameserver"` remove your URL from `trusted_nameservers`, or switch to another nameserver
-   or to `tofu`, and restart. Their cached resolutions expire within `cache_ttl_seconds`
-   (default 300). Servers do not verify attestation signatures yet, so changing the key
-   does not protect them; removing the URL does.
+   "nameserver"` remove your nameserver's `ns_did` from the `authorities` of each suffix
+   under `[identity.delegations]` (and your URL from its `nameservers`), or switch to
+   `tofu`, and restart. Servers accept only attestations an authority signed (#200), so an
+   attestation under the removed key is refused from then on. `trusted_nameservers` is no
+   longer used. Clients that list your suffix under `[naming.delegations]` need the same
+   change.
 3. **Find what changed.** Compare alias bindings in `nameserver_v002.db` and identities in
    `nameserver.db` against your latest backup. List every alias whose DID changed.
 4. **Rotate everything:**
-   - `JIG_NS_SECRET`: new value from `openssl rand -hex 32`. Outstanding challenges become
-     invalid; there is no overlap window.
    - `JIG_NS_ADMIN_TOKEN`: new value.
-   - Attestation key: move `nameserver_v002.key` aside and let the service mint a new one,
+   - Attestation key: move `nameserver_v002.jigkey` aside and let the service seal a new one,
      which gives the nameserver a new `ns_did`. Every attestation signed by the old key
-     must be treated as untrusted.
+     must be treated as untrusted. Dependent servers and clients accept the new key only
+     once its `ns_did` is in their delegation's `authorities`, so tell them the new DID.
    - `ns_identity` key: delete its row from `nameserver.db` so a new one is generated. This
      changes the `ns_id` in `/.well-known/jig-ns`.
 5. **Restore bindings.** Revert changed aliases from backup. Ask users to renew
@@ -203,26 +205,35 @@ issue attestations, and read or change everything in its databases.
    group's tribunal so the other members can quarantine cross-registered records from the
    window of compromise, and check your transparency log against their copies.
 
-## 4. Rogue federated instance
+## 4. Rogue or contradicting nameserver
 
-**Signs:** a peer domain's handles resolving to conflicting DIDs, policy hashes from a peer
-changing often, junk gossip, or reports that names from one domain are unreliable.
+**Signs:** two valid attestations for one alias that name different DIDs over overlapping
+windows (equivocation, JEP-0004 rule 15), resolution evidence a client kept under
+`~/.jig/evidence/names/` (#227), or attestations that fail against the authority the
+suffix's delegation names.
 
-1. **Gather evidence.** Record the remote answers you saw (`GET /v1/resolve?name=<handle>`),
-   gossip and policy hashes (`GET /v1/federation/policy`), and timestamps.
-2. **Cut it off.** Add the domain to `JIG_NS_DENY_DOMAINS` (comma-separated, lowercase), or
-   remove it from `JIG_NS_ALLOW_DOMAINS` if you run an allow list, and restart. Deny wins
-   over allow.
-3. **Purge the cache.** Cached answers are served before the deny check, so bad records
-   from that domain live until `JIG_NS_CACHE_TTL` (default 300 s) expires. To drop them at
-   once, delete that domain's rows from the `cache_identities` table in `nameserver.db`.
-4. **Record it.** Open a case and record an observation with `"subject":"nameserver"` (or
-   `"server"`) and the domain or DID as `subject_id`.
-5. **Tell your peers** what you saw and what you did. They decide for themselves. No
-   nameserver, an anchor included, can defederate an instance on anyone else's behalf.
-6. **Reinstate deliberately.** Remove the domain from the deny list once the other operator
-   explains and fixes the problem, and watch its answers for a while.
-7. **(not yet implemented)** If the instance is in your ruleset group, take the evidence to
-   the group's tribunal. Members apply its outcome under the group's ruleset; an anchor
-   coordinates, it does not decide. A rogue instance outside your group is yours alone to
-   cut off.
+1. **Keep the evidence.** Save the attestations and evidence files exactly as served, with
+   timestamps. The nameserver signed each attestation, so anyone can check them without
+   trusting you.
+2. **Cut it off where lookups happen.** Remove or replace that suffix's delegation in
+   `[identity.delegations]` (jig-server) or `[naming.delegations]` (`cli.toml`).
+   - jig-server refuses a suffix with no entry. The exception is `jig`: without an entry the
+     server falls back to its built-in `@jig` delegation, once a build ships the project's
+     authority. This build ships none, so `@jig` names fail closed.
+   - The CLI falls back when `cli.toml` has no entry: to the suffix's DNS-rooted delegation
+     for a multi-label suffix, and to the built-in `@jig` delegation for `jig`. If that
+     fallback names the same nameserver, replace the entry rather than delete it.
+
+   No nameserver can defederate another: each server and client decides whose attestations
+   it accepts.
+3. **Tell your peers** what you saw and what you changed. They decide for themselves.
+4. **(not yet implemented)** Shared lists and tribunal outcomes: the draft
+   [JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md).
+
+The deny and allow domain lists and the gossip this section used to describe were removed
+in #237. They never exchanged data with peers, and the routes they served were removed in
+#154.
+Where nameserver federation is headed (witnessed logs and rulesets within a ruleset group) is
+in the [roadmap](../ROADMAP.md) under "Nameserver federation (target)", and in the draft
+[JEP-0009](../../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) and
+[JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md).

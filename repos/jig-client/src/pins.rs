@@ -100,6 +100,10 @@ pub struct ChannelPin {
     pub create_cid: String,
     pub suite: String,
     pub owner_did: String,
+    /// The last record of the channel's `ingest` chain this device verified
+    /// ([`crate::chain`]); the server is held to it on every later read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_head: Option<crate::chain::ChainHead>,
 }
 
 impl ChannelPin {
@@ -117,12 +121,32 @@ pub struct ServerPin {
     pub suites: BTreeSet<String>,
     #[serde(default)]
     pub channels: BTreeMap<String, ChannelPin>,
+    /// A welcome from this server that advertised [`Self::suites`],
+    /// verbatim, so a later signed refusal that drops one can be shown with
+    /// both halves ([`crate::evidence::Proof::Downgrade`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welcome: Option<String>,
+}
+
+/// A server this device refuses until its user accepts it again, after it
+/// signed a contradiction (JEP-0002 rule 16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StickyRefusal {
+    /// The bundle that shows it ([`crate::evidence::EvidenceStore`] id).
+    pub bundle: String,
+    pub reason: String,
+    pub at_ms: u64,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PinFile {
     #[serde(default)]
     servers: BTreeMap<String, ServerPin>,
+    /// Servers refused after a signed contradiction, by server key. Kept
+    /// apart from `servers` so that forgetting a server's pin does not lift
+    /// its refusal: only [`Pins::accept_server`] does.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    refused: BTreeMap<String, StickyRefusal>,
     /// Name pins (JEP-0004 rule 17), one per [`NameKey`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     names: Vec<NamePinEntry>,
@@ -311,10 +335,14 @@ impl Pins {
                     suite: dropped.clone(),
                 });
             }
-            let changed = first || pin.suites != advertised || pin.server_did != welcome.server_did;
+            let changed = first
+                || pin.suites != advertised
+                || pin.server_did != welcome.server_did
+                || pin.welcome.is_none();
             if changed {
                 pin.suites = advertised;
                 pin.server_did.clone_from(&welcome.server_did);
+                pin.welcome = Some(welcome.evidence.clone());
             }
             Ok(((), changed))
         })
@@ -338,6 +366,37 @@ impl Pins {
                 });
             }
             Ok(((), false))
+        })
+    }
+
+    /// Move `server`'s pin from `from` to `to` along `key_link` (base64, as
+    /// served), which must be a public link the pinned key signed to `to`
+    /// (JEP-0012). Checked here, whoever calls: a pin moves only along a link
+    /// that verifies from it. Its channel pins stay; they name channels, not
+    /// keys.
+    pub fn move_server(
+        &mut self,
+        server: &str,
+        from: &str,
+        to: &str,
+        key_link: &str,
+    ) -> Result<(), PinError> {
+        self.update(|file| {
+            let pin = file.servers.entry(server_key(server)).or_default();
+            let replaced = || PinError::ServerReplaced {
+                server: server.to_string(),
+                pinned: pin.server_did.clone(),
+                presented: to.to_string(),
+            };
+            if !jig_pipeline::handshake::same_did(&pin.server_did, from)
+                || jig_pipeline::handshake::link_moves(key_link, &pin.server_did, to).is_err()
+            {
+                return Err(replaced());
+            }
+            pin.server_did = to.to_string();
+            // The old key signed it, so it shows nothing about the new one.
+            pin.welcome = None;
+            Ok(((), true))
         })
     }
 
@@ -374,7 +433,68 @@ impl Pins {
         })
     }
 
+    /// Move the pinned chain head of `slug` on `server` to `head`, which the
+    /// caller verified follows the pinned one ([`crate::chain::ChannelChain`]).
+    /// A head behind the pinned one is ignored: pins never move backwards.
+    /// Returns whether the channel is pinned at all.
+    pub fn advance_chain(
+        &mut self,
+        server: &str,
+        slug: &str,
+        head: &crate::chain::ChainHead,
+    ) -> Result<bool, PinError> {
+        self.update(|file| {
+            let Some(pin) = file
+                .servers
+                .get_mut(&server_key(server))
+                .and_then(|p| p.channels.get_mut(slug))
+            else {
+                return Ok((false, false));
+            };
+            // A head in another record format is replaced, never compared:
+            // see `ChainHead::is_current`.
+            let ahead = pin
+                .chain_head
+                .as_ref()
+                .is_none_or(|h| head.seq > h.seq || h.format != head.format);
+            if ahead {
+                pin.chain_head = Some(head.clone());
+            }
+            Ok((true, ahead))
+        })
+    }
+
     /// Drop everything pinned for `server`. Returns whether there was any.
+    /// Why `server` is refused, if it is: a contradiction it signed, kept as
+    /// a bundle. Every connection to it, WebSocket or REST, stops here until
+    /// [`Self::accept_server`].
+    pub fn refusal(&self, server: &str) -> Option<&StickyRefusal> {
+        self.file.refused.get(&server_key(server))
+    }
+
+    /// Refuse `server` from now on. A second contradiction keeps the first
+    /// refusal, which is what its user has to answer.
+    pub fn refuse(&mut self, server: &str, refusal: StickyRefusal) -> Result<(), PinError> {
+        self.update(|file| {
+            let key = server_key(server);
+            if file.refused.contains_key(&key) {
+                return Ok(((), false));
+            }
+            file.refused.insert(key, refusal);
+            Ok(((), true))
+        })
+    }
+
+    /// Lift `server`'s refusal (`jig trust accept`), returning it. Its pins
+    /// stay: the server is held to them again from the next connection.
+    pub fn accept_server(&mut self, server: &str) -> Result<Option<StickyRefusal>, PinError> {
+        self.update(|file| {
+            let lifted = file.refused.remove(&server_key(server));
+            let changed = lifted.is_some();
+            Ok((lifted, changed))
+        })
+    }
+
     pub fn forget(&mut self, server: &str) -> Result<bool, PinError> {
         self.update(|file| {
             let had = file.servers.remove(&server_key(server)).is_some();
@@ -581,6 +701,7 @@ pub fn prove_channel(
         create_cid: cid.to_string(),
         suite: suite.as_str().to_string(),
         owner_did: Did::from_ed25519_pubkey(&key_bytes).to_did_jig_string(),
+        chain_head: None,
     })
 }
 
@@ -604,7 +725,7 @@ mod tests {
     use serde_json::json;
 
     fn identity() -> Identity {
-        Identity::generate_and_save(&tempfile::tempdir().unwrap().keep()).unwrap()
+        Identity::generate_for_tests(&tempfile::tempdir().unwrap().keep())
     }
 
     fn welcome(did: &str, suites: &[&str]) -> VerifiedWelcome {
@@ -615,6 +736,10 @@ mod tests {
             capabilities: Default::default(),
             reputation: jig_pipeline::handshake::Reputation::none(),
             nonce: String::new(),
+            server_nonce: String::new(),
+            tls_exporter: Vec::new(),
+            manifest: None,
+            moved_from: None,
             evidence: String::new(),
         }
     }
@@ -666,6 +791,7 @@ mod tests {
             create_cid: "bafy".into(),
             suite: suite.into(),
             owner_did: "did:jig:zA".into(),
+            chain_head: None,
         };
         assert!(!pin("none").encrypted());
         assert!(pin("mls").encrypted());
@@ -786,6 +912,7 @@ mod tests {
             create_cid: "bafyFirst".into(),
             suite: "mls".into(),
             owner_did: "did:jig:zOwner".into(),
+            chain_head: None,
         };
         assert_eq!(
             pins.check_channel(server, "#ops", first.clone()).unwrap(),
@@ -868,6 +995,7 @@ mod tests {
             create_cid: cid.into(),
             suite: "mls".into(),
             owner_did: "did:jig:zOwner".into(),
+            chain_head: None,
         };
         chat.check_channel(server, "#a", pin("bafyA")).unwrap();
         send.check_channel(server, "#b", pin("bafyB")).unwrap();
@@ -879,6 +1007,149 @@ mod tests {
             chat.check_channel(server, "#b", pin("bafyOther")),
             Err(PinError::ChannelReplaced { .. })
         ));
+    }
+
+    #[test]
+    fn a_chain_head_only_moves_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let server = "https://host:7117";
+        let mut pins = Pins::load(&path).unwrap();
+        let head = |seq: u64| crate::chain::ChainHead {
+            format: crate::chain::RECORD_FORMAT.to_string(),
+            seq,
+            hash: format!("{seq:064x}"),
+            ingest_wall_ms: seq,
+            ingest_logical: 0,
+            record: None,
+        };
+        assert!(
+            !pins.advance_chain(server, "#ops", &head(1)).unwrap(),
+            "not pinned"
+        );
+        pins.check_channel(
+            server,
+            "#ops",
+            ChannelPin {
+                create_cid: "bafyC".into(),
+                suite: "mls".into(),
+                owner_did: "did:jig:zOwner".into(),
+                chain_head: None,
+            },
+        )
+        .unwrap();
+        assert!(pins.advance_chain(server, "#ops", &head(5)).unwrap());
+        pins.advance_chain(server, "#ops", &head(3)).unwrap();
+        let reloaded = Pins::load(&path).unwrap();
+        assert_eq!(
+            reloaded.channel(server, "#ops").unwrap().chain_head,
+            Some(head(5)),
+            "a head behind the pinned one is ignored"
+        );
+        // A head pinned in an older format is replaced even from behind:
+        // it cannot be compared with records in this one.
+        let mut old = head(9);
+        old.format = String::new();
+        pins.advance_chain(server, "#ops", &old).unwrap();
+        pins.advance_chain(server, "#ops", &head(2)).unwrap();
+        assert_eq!(
+            Pins::load(&path)
+                .unwrap()
+                .channel(server, "#ops")
+                .unwrap()
+                .chain_head,
+            Some(head(2))
+        );
+    }
+
+    #[test]
+    fn a_server_pin_moves_only_along_a_link_from_the_pinned_key() {
+        use base64::Engine as _;
+        use jig_core::key_link::{Audience, SignedKeyLink};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let server = "https://host:7117";
+        let key = jig_core::crypto::ed25519::generate_signing_key;
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let (old, new, stranger) = (key(), key(), key());
+        let link = |a, b| {
+            base64::engine::general_purpose::STANDARD.encode(
+                SignedKeyLink::sign(a, b, Audience::Public, 1)
+                    .unwrap()
+                    .envelope(),
+            )
+        };
+        let mut pins = Pins::load(&path).unwrap();
+        pins.check_server_did(server, &did(&old)).unwrap();
+        let mut signed_by_old = welcome(&did(&old), &["none"]);
+        signed_by_old.evidence = "the old key's welcome".into();
+        pins.check_welcome(server, &signed_by_old).unwrap();
+
+        // From a key nobody pinned, or claiming to leave one it does not.
+        for (from, link) in [
+            (did(&stranger), link(&stranger, &new)),
+            (did(&old), link(&stranger, &new)),
+        ] {
+            assert!(matches!(
+                pins.move_server(server, &from, &did(&new), &link),
+                Err(PinError::ServerReplaced { .. })
+            ));
+        }
+        assert_eq!(pins.server(server).unwrap().server_did, did(&old));
+
+        pins.move_server(server, &did(&old), &did(&new), &link(&old, &new))
+            .unwrap();
+        let pins = Pins::load(&path).unwrap();
+        assert_eq!(pins.server(server).unwrap().server_did, did(&new));
+        assert_eq!(
+            pins.server(server).unwrap().welcome,
+            None,
+            "a welcome the old key signed is not kept as the new key's"
+        );
+    }
+
+    #[test]
+    fn a_refused_server_stays_refused_until_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let server = "https://host:7117";
+        let mut pins = Pins::load(&path).unwrap();
+        let mut w = welcome("did:jig:zS", &["none", "mls"]);
+        w.evidence = "first".into();
+        pins.check_welcome(server, &w).unwrap();
+        w.evidence = "second".into();
+        pins.check_welcome(server, &w).unwrap();
+        assert_eq!(
+            pins.server(server).unwrap().welcome.as_deref(),
+            Some("first"),
+            "a welcome that changes nothing is not written again"
+        );
+
+        let refusal = |bundle: &str| StickyRefusal {
+            bundle: bundle.into(),
+            reason: "forked".into(),
+            at_ms: 1,
+        };
+        pins.refuse("wss://HOST:7117/", refusal("a")).unwrap();
+        pins.refuse(server, refusal("b")).unwrap();
+        let pins = Pins::load(&path).unwrap();
+        assert_eq!(
+            pins.refusal(server).unwrap().bundle,
+            "a",
+            "the first stands"
+        );
+
+        let mut pins = pins;
+        assert!(pins.forget(server).unwrap());
+        assert!(
+            pins.refusal(server).is_some(),
+            "forgetting the pin does not lift the refusal"
+        );
+        assert_eq!(pins.accept_server(server).unwrap().unwrap().bundle, "a");
+        assert!(Pins::load(&path).unwrap().refusal(server).is_none());
+        assert_eq!(pins.accept_server(server).unwrap(), None);
     }
 
     #[test]

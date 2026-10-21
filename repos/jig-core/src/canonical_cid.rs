@@ -50,6 +50,12 @@ pub fn check(cid: &Cid) -> Result<(), CidError> {
     Ok(())
 }
 
+/// `s` is the canonical text form of a canonical CID: base32 lowercase with the `b` prefix,
+/// exactly as it round-trips, so one CID has one spelling (JEP-0004 rule 3).
+pub fn is_canonical_text(s: &str) -> bool {
+    Cid::try_from(s).is_ok_and(|c| check(&c).is_ok() && c.to_string() == s)
+}
+
 /// Parse a binary CID from a payload, refusing every form but the canonical one.
 pub fn from_bytes(bytes: &[u8]) -> Result<Cid, CidError> {
     let cid = Cid::try_from(bytes).map_err(|_| CidError::Malformed)?;
@@ -87,6 +93,21 @@ mod tests {
     fn another_multihash_is_refused() {
         let sha2 = Cid::new_v1(RAW_CODEC, Multihash::<64>::wrap(0x12, &[0; 32]).unwrap());
         assert_eq!(from_bytes(&sha2.to_bytes()), Err(CidError::NotBlake3));
+    }
+
+    #[test]
+    fn only_the_one_text_spelling_is_canonical() {
+        let text = of(b"x").to_string();
+        assert!(is_canonical_text(&text));
+        assert!(!is_canonical_text(&text.to_uppercase()));
+        let base58 = of(b"x")
+            .to_string_of_base(cid::multibase::Base::Base58Btc)
+            .unwrap();
+        assert!(!is_canonical_text(&base58));
+        assert!(!is_canonical_text("#general"));
+        assert!(!is_canonical_text(""));
+        let dag_cbor = Cid::new_v1(0x71, Code::Blake3_256.digest(b"x"));
+        assert!(!is_canonical_text(&dag_cbor.to_string()));
     }
 
     #[test]

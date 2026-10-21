@@ -34,7 +34,6 @@ async-trait = { workspace = true }
 hex = { workspace = true }
 
 reqwest = { workspace = true }
-hickory-resolver = { version = "0.26", default-features = false, features = ["dnssec-ring", "tokio"] }
 urlencoding = "2"
 toml = "1.1"
 
@@ -54,6 +53,7 @@ shellexpand = "3"
 base64 = "0.23"
 
 [dev-dependencies]
+jig-client = { path = "../jig-client", features = ["test-support"] }
 serde_json = { workspace = true }
 http-body-util = { workspace = true }
 semver = { version = "1.0", features = ["serde"] }

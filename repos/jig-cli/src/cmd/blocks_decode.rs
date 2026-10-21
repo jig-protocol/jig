@@ -165,7 +165,7 @@ mod tests {
     fn test_identity() -> Identity {
         let dir = tempdir().unwrap();
         let path = dir.keep();
-        Identity::generate_and_save(&path).unwrap()
+        Identity::generate_for_tests(&path)
     }
 
     fn delivered_for(bundle_b64: String, receipts: Vec<ReceiptRef>) -> DeliveredBlock {
@@ -174,6 +174,7 @@ mod tests {
             bundle_b64,
             receipts,
             delivery_cid: "bafy_test_delivery".into(),
+            ingest: None,
         }
     }
 
@@ -184,6 +185,7 @@ mod tests {
             sig_b64: Some(base64::engine::general_purpose::STANDARD.encode(&block.sender_sig)),
             receipts,
             delivery_cid: "bafy_test_delivery".into(),
+            ingest: None,
         }
     }
 

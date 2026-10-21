@@ -1,0 +1,21 @@
+# jig-nameserver config. Install as /etc/jig/jig-nameserver.toml; the unit
+# points JIG_NS_CONFIG at it. Bind address, port and database path stay in
+# the unit's environment, which wins over anything here.
+#
+# Required: the suffixes this nameserver serves. There is no default, and the
+# nameserver refuses to start without one. Replace the example name with a
+# suffix you control. See `jig-nameserver`'s generated template for every
+# per-suffix option (registration open/closed, minimum length, reserved
+# names, allowlist).
+
+[[v0_0_2.nameserver.alias_suffixes]]
+suffix = "names.example.org"
+
+# What opens the nameserver's sealed signing key at boot, as jig-server's
+# [keys] (deploy/README.md, "Sealing the server key").
+#
+# DO THESE TOGETHER: make the credential (systemd-creds encrypt), uncomment
+# LoadCredentialEncrypted= in jig-nameserver.service, and uncomment this line.
+# Either one alone fails the boot.
+[v0_0_2.keys]
+# unlock = "credential:/run/credentials/jig-nameserver.service/jig-nameserver-key"

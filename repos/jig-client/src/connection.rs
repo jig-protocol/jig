@@ -85,18 +85,83 @@ pub struct Client {
     /// Set once the server contradicts its welcome. The connection is then
     /// closed, and every later call returns it.
     contradiction: Arc<StdMutex<Option<Contradiction>>>,
+    on_contradiction: Option<ContradictionHook>,
+    /// Ranges of channel chains this session skipped over, for the caller to
+    /// fill from the records endpoint.
+    gaps: Arc<StdMutex<Vec<ChainGap>>>,
+}
+
+/// Entries of a channel's chain a live stream did not deliver: `from..to`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainGap {
+    pub channel_id: String,
+    pub from: u64,
+    pub to: u64,
+}
+
+/// Each channel's chain as this session has verified it, by channel id.
+type ChainMap = Arc<StdMutex<HashMap<String, crate::chain::ChannelChain>>>;
+
+fn lock_chains(
+    map: &StdMutex<HashMap<String, crate::chain::ChannelChain>>,
+) -> MutexGuard<'_, HashMap<String, crate::chain::ChannelChain>> {
+    map.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_gaps(gaps: &StdMutex<Vec<ChainGap>>) -> MutexGuard<'_, Vec<ChainGap>> {
+    gaps.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The CID of a delivered bundle, or `None` when it does not decode; opening
+/// the block refuses it then, so the record check has nothing to compare.
+fn block_cid_of(bundle_b64: &str) -> Option<String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(bundle_b64)
+        .ok()?;
+    let (manifest_bytes, code_bytes): (Vec<u8>, Vec<u8>) = serde_json::from_slice(&bytes).ok()?;
+    jig_core::BlockBundle {
+        manifest_bytes: &manifest_bytes,
+        code_bytes: &code_bytes,
+        resources: vec![],
+    }
+    .block_cid()
+    .ok()
+    .map(|cid| cid.to_string())
 }
 
 /// The server contradicted something it signed (JEP-0002 rule 8).
 ///
-/// `evidence` holds the frames as received: the signed welcome or refusal
-/// first, then what contradicts it. Every item that proves the contradiction
-/// is signed by the server, so it can be checked without trusting this
-/// client.
+/// Every frame involved is kept as received. Only [`Self::proof`] is checked
+/// later without trusting this client: frames themselves are not signed, so
+/// a contradiction without one is evidence of what this client saw, not of
+/// what the server did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contradiction {
+    /// A stable name for what was contradicted, as evidence bundles file it.
+    pub code: &'static str,
     pub reason: String,
+    /// The signed welcome of the connection, verbatim; `None` when the
+    /// handshake itself was the contradiction.
+    pub welcome: Option<String>,
+    /// The frames that contradict it, as received.
     pub evidence: Vec<String>,
+    /// Server-signed items that show the contradiction on their own, when
+    /// there are any ([`crate::evidence::verify`]).
+    pub proof: Option<Box<crate::evidence::Proof>>,
+}
+
+/// Called once, from the connection's reader, when the server contradicts
+/// itself: the place to keep the evidence before anything else can fail.
+pub type ContradictionHook = Arc<dyn Fn(&Contradiction) + Send + Sync>;
+
+/// How [`Client::connect_with_options`] connects.
+#[derive(Default, Clone)]
+pub struct ConnectOptions {
+    pub offer: jig_pipeline::handshake::ClientOffer,
+    /// `None` uses the system's CA roots alone ([`Client::connect_with_tls`]).
+    pub tls: Option<std::sync::Arc<rustls::ClientConfig>>,
+    pub on_contradiction: Option<ContradictionHook>,
 }
 
 /// Per-channel delivery senders, keyed by channel slug.
@@ -153,6 +218,10 @@ pub struct DeliveredBlock {
     pub sig_b64: Option<String>,
     pub receipts: Vec<ReceiptRef>,
     pub delivery_cid: String,
+    /// The block's record in its channel's chain, when the server sequences
+    /// the channel (JEP-0002 rule 9). [`crate::chain`] checks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest: Option<jig_pipeline::ingest_record::IngestRecord>,
 }
 
 /// Stream of [`DeliveredBlock`] items for a subscribed channel. Returned
@@ -214,6 +283,30 @@ impl Client {
         offer: jig_pipeline::handshake::ClientOffer,
         tls: Option<std::sync::Arc<rustls::ClientConfig>>,
     ) -> Result<Self, ClientError> {
+        Self::connect_with_options(
+            server_url,
+            identity,
+            ConnectOptions {
+                offer,
+                tls,
+                on_contradiction: None,
+            },
+        )
+        .await
+    }
+
+    /// [`Client::connect_with_tls`], calling `options.on_contradiction` with
+    /// any contradiction the server signs, in the handshake or after it.
+    pub async fn connect_with_options(
+        server_url: &str,
+        identity: Identity,
+        options: ConnectOptions,
+    ) -> Result<Self, ClientError> {
+        let ConnectOptions {
+            offer,
+            tls,
+            on_contradiction,
+        } = options;
         let url = Url::parse(server_url).map_err(|e| ClientError::BadUrl(e.to_string()))?;
         // Map http(s) → ws(s) if user gave HTTP scheme; otherwise leave alone.
         let scheme = match url.scheme() {
@@ -240,9 +333,11 @@ impl Client {
             None => connect_async(&ws_url).await,
         }
         .map_err(|e| ClientError::Connect(e.to_string()))?;
+        // What the welcome must be bound to (JEP-0002 rule 12).
+        let tls_exporter = tls_exporter_of(ws.get_ref());
         let (mut sink, mut stream) = ws.split();
 
-        let welcome = match drive_handshake(&mut sink, &mut stream, &offer).await {
+        let welcome = match drive_handshake(&mut sink, &mut stream, &offer, &tls_exporter).await {
             Ok(welcome) => welcome,
             Err(err) => {
                 use jig_pipeline::handshake::close;
@@ -254,6 +349,9 @@ impl Client {
                 };
                 if let Some(code) = code {
                     let _ = sink.send(close_frame(code, "handshake failed")).await;
+                }
+                if let (ClientError::Contradiction(c), Some(hook)) = (&err, &on_contradiction) {
+                    hook(c);
                 }
                 let _ = sink.close().await;
                 return Err(err);
@@ -288,19 +386,37 @@ impl Client {
         let cursors_for_reader = last_cursors.clone();
         let closed_for_reader = closed.clone();
         let contradiction_for_reader = contradiction.clone();
+        let chains: ChainMap = Arc::new(StdMutex::new(HashMap::new()));
+        let gaps: Arc<StdMutex<Vec<ChainGap>>> = Arc::new(StdMutex::new(Vec::new()));
+        let chains_for_reader = chains.clone();
+        let gaps_for_reader = gaps.clone();
         let write_tx_for_reader = write_tx.clone();
+        let hook_for_reader = on_contradiction.clone();
         tokio::spawn(async move {
             let _cleanup = ReaderCleanup {
                 pending_subscriptions: pending_subs_for_reader.clone(),
                 closed: closed_for_reader,
             };
-            let contradict = |reason: String, frame: &str| {
-                contradicted(
-                    &contradiction_for_reader,
-                    &write_tx_for_reader,
-                    reason,
-                    vec![welcome_text.clone(), frame.to_string()],
-                );
+            let contradict_with =
+                |code: &'static str,
+                 reason: String,
+                 frame: &str,
+                 proof: Option<Box<crate::evidence::Proof>>| {
+                    contradicted(
+                        &contradiction_for_reader,
+                        &write_tx_for_reader,
+                        hook_for_reader.as_ref(),
+                        Contradiction {
+                            code,
+                            reason,
+                            welcome: Some(welcome_text.clone()),
+                            evidence: vec![frame.to_string()],
+                            proof,
+                        },
+                    );
+                };
+            let contradict = |code: &'static str, reason: String, frame: &str| {
+                contradict_with(code, reason, frame, None);
             };
             while let Some(Ok(msg)) = stream.next().await {
                 if let Message::Text(text) = msg {
@@ -312,6 +428,7 @@ impl Client {
                         Ok(env) => env,
                         Err(EnvelopeParseError::Gate(gate)) => {
                             contradict(
+                                "frame-outside-welcome",
                                 format!("a frame outside the signed welcome: {gate}"),
                                 &text,
                             );
@@ -325,6 +442,7 @@ impl Client {
                     match env.frame {
                         Frame::Welcome { .. } | Frame::Refusal { .. } => {
                             contradict(
+                                "second-handshake-answer",
                                 "a second handshake answer on one connection".to_string(),
                                 &text,
                             );
@@ -335,7 +453,7 @@ impl Client {
                             sig_b64,
                             receipts,
                             delivery_cid,
-                            ..
+                            ingest,
                         } => {
                             // This server's receipts name the key that signed
                             // its welcome; a relayed block arrives with the
@@ -344,6 +462,7 @@ impl Client {
                                 !jig_pipeline::handshake::same_did(&r.server_did, &welcome_did)
                             }) {
                                 contradict(
+                                    "receipt-other-server",
                                     format!(
                                         "a receipt names {}, not the server that signed the welcome",
                                         other.server_did
@@ -351,6 +470,45 @@ impl Client {
                                     &text,
                                 );
                                 break;
+                            }
+                            // The block's record must continue its channel's
+                            // chain as this session has seen it, signed by the
+                            // server that signed the welcome. A break is a
+                            // contradiction; a gap is the caller's to fill.
+                            if let Some(record) = &ingest {
+                                let cid = block_cid_of(&bundle_b64);
+                                let mut chains = lock_chains(&chains_for_reader);
+                                let chain =
+                                    chains.entry(record.channel_id.clone()).or_insert_with(|| {
+                                        crate::chain::ChannelChain::new(
+                                            &record.channel_id,
+                                            &welcome_did,
+                                            None,
+                                        )
+                                    });
+                                match chain.accept_live(record, cid.as_deref()) {
+                                    Ok(crate::chain::Step::Gap { from, to }) => {
+                                        lock_gaps(&gaps_for_reader).push(ChainGap {
+                                            channel_id: record.channel_id.clone(),
+                                            from,
+                                            to,
+                                        });
+                                    }
+                                    Ok(_) => {}
+                                    Err(chain_break) => {
+                                        let proof = chain.proof(record, &chain_break).map(|p| {
+                                            Box::new(crate::evidence::Proof::Chain(Box::new(p)))
+                                        });
+                                        drop(chains);
+                                        contradict_with(
+                                            chain_break.code(),
+                                            format!("the channel's history broke: {chain_break}"),
+                                            &text,
+                                            proof,
+                                        );
+                                        break;
+                                    }
+                                }
                             }
                             // Track HLC cursor from receipts (best-effort —
                             // receipts may carry render_hash but not HLC; the
@@ -363,6 +521,7 @@ impl Client {
                                 sig_b64,
                                 receipts,
                                 delivery_cid: delivery_cid.clone(),
+                                ingest,
                             };
                             // Dispatch to ALL pending channel subs (server-side
                             // filtering means we only get blocks for our subs;
@@ -407,12 +566,20 @@ impl Client {
             submit_ack_timeout_seconds: 5,
             welcome: Some(welcome),
             contradiction,
+            on_contradiction,
+            gaps,
         })
     }
 
     /// The signed welcome, once the handshake has succeeded.
     pub fn welcome(&self) -> Option<&jig_pipeline::handshake::VerifiedWelcome> {
         self.welcome.as_ref()
+    }
+
+    /// Take the chain gaps this session has seen so far: ranges the server
+    /// skipped, to fill from the records endpoint before trusting what follows.
+    pub fn take_chain_gaps(&self) -> Vec<ChainGap> {
+        std::mem::take(&mut *lock_gaps(&self.gaps))
     }
 
     /// Set once the server has contradicted its signed welcome. The
@@ -565,16 +732,16 @@ impl Client {
                         contradicted(
                             &self.contradiction,
                             &self.write_tx,
-                            format!(
-                                "the server refused `{kind}`, a block kind its welcome advertises"
-                            ),
-                            vec![
-                                self.welcome
-                                    .as_ref()
-                                    .map(|w| w.evidence.clone())
-                                    .unwrap_or_default(),
-                                serde_json::to_string(&error)?,
-                            ],
+                            self.on_contradiction.as_ref(),
+                            Contradiction {
+                                code: "kind-refused",
+                                reason: format!(
+                                    "the server refused `{kind}`, a block kind its welcome advertises"
+                                ),
+                                welcome: self.welcome.as_ref().map(|w| w.evidence.clone()),
+                                evidence: vec![serde_json::to_string(&error)?],
+                                proof: None,
+                            },
                         );
                         return Err(ClientError::Contradiction(
                             self.contradiction().expect("just recorded"),
@@ -628,15 +795,23 @@ fn lock_contradiction(
 fn contradicted(
     slot: &StdMutex<Option<Contradiction>>,
     write_tx: &mpsc::UnboundedSender<Message>,
-    reason: String,
-    evidence: Vec<String>,
+    hook: Option<&ContradictionHook>,
+    contradiction: Contradiction,
 ) {
     let mut guard = lock_contradiction(slot);
     if guard.is_some() {
         return;
     }
-    tracing::warn!("closing: the server contradicted what it signed: {reason}");
-    *guard = Some(Contradiction { reason, evidence });
+    tracing::warn!(
+        "closing: the server contradicted what it signed: {}",
+        contradiction.reason
+    );
+    *guard = Some(contradiction.clone());
+    drop(guard);
+    // Outside the lock: the hook may ask the client what happened.
+    if let Some(hook) = hook {
+        hook(&contradiction);
+    }
     let _ = write_tx.send(close_frame(
         jig_pipeline::handshake::close::CONTRADICTION,
         "contradiction",
@@ -653,6 +828,25 @@ fn close_frame(code: u16, reason: &str) -> Message {
 
 /// Send hello and read the first frame. `Err` means the handshake did not
 /// establish: the caller closes with the code the error's class names.
+/// The TLS exporter value of a connection (RFC 9266), or nothing over
+/// plaintext. A TLS session that cannot export one leaves nothing to bind
+/// the welcome to, and the welcome check refuses it.
+fn tls_exporter_of(stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>) -> Vec<u8> {
+    match stream {
+        tokio_tungstenite::MaybeTlsStream::Rustls(tls) => tls
+            .get_ref()
+            .1
+            .export_keying_material(
+                [0u8; jig_pipeline::handshake::TLS_EXPORTER_LEN],
+                jig_pipeline::handshake::TLS_EXPORTER_LABEL,
+                None,
+            )
+            .map(|v| v.to_vec())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 async fn drive_handshake(
     sink: &mut (impl futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
     stream: &mut (
@@ -660,6 +854,7 @@ async fn drive_handshake(
              + Unpin
          ),
     offer: &jig_pipeline::handshake::ClientOffer,
+    tls_exporter: &[u8],
 ) -> Result<jig_pipeline::handshake::VerifiedWelcome, ClientError> {
     use futures_util::SinkExt;
 
@@ -695,7 +890,7 @@ async fn drive_handshake(
         match message {
             Message::Text(text) => {
                 use jig_pipeline::handshake::HandshakeResult;
-                return match pending.interpret(&text) {
+                return match pending.interpret_on(&text, tls_exporter) {
                     HandshakeResult::Established(welcome) => Ok(welcome),
                     HandshakeResult::Incompatible(refusal) => {
                         Err(ClientError::Incompatible(Box::new(refusal)))
@@ -705,8 +900,11 @@ async fn drive_handshake(
                     }
                     HandshakeResult::Contradiction { reason, evidence } => {
                         Err(ClientError::Contradiction(Contradiction {
+                            code: "refusal-downgrade",
                             reason,
+                            welcome: None,
                             evidence: vec![evidence],
+                            proof: None,
                         }))
                     }
                 };
@@ -754,6 +952,7 @@ mod tests {
             suites,
             capabilities,
             nonce,
+            peer_did,
         } = env.frame
         else {
             return None;
@@ -764,6 +963,7 @@ mod tests {
                 suites,
                 capabilities,
                 nonce,
+                peer_did,
             },
             &jig_pipeline::handshake::ServerOffer {
                 capabilities: jig_pipeline::handshake::Capabilities {
@@ -772,6 +972,7 @@ mod tests {
                     federation: false,
                     ..Default::default()
                 },
+                ..Default::default()
             },
         ) {
             Ok(statement) => jig_pipeline::handshake::seal(key, statement),
@@ -793,6 +994,14 @@ mod tests {
     async fn start_scripted_server(
         after_welcome: Vec<String>,
     ) -> (String, Arc<StdMutex<Option<u16>>>) {
+        start_scripted_server_with_key(test_signing_key(), after_welcome).await
+    }
+
+    /// [`start_scripted_server`], signing its welcome with `key`.
+    async fn start_scripted_server_with_key(
+        key: ed25519_dalek::SigningKey,
+        after_welcome: Vec<String>,
+    ) -> (String, Arc<StdMutex<Option<u16>>>) {
         use tokio::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
@@ -805,7 +1014,6 @@ mod tests {
             let Ok(mut ws) = accept_async(stream).await else {
                 return;
             };
-            let key = test_signing_key();
             while let Some(Ok(msg)) = ws.next().await {
                 if let Message::Text(text) = msg
                     && let Some(reply) = welcome_reply(&text, &key)
@@ -841,7 +1049,7 @@ mod tests {
     fn test_identity() -> Identity {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.keep();
-        Identity::generate_and_save(&path).unwrap()
+        Identity::generate_for_tests(&path)
     }
 
     /// Spin up a tiny WS server on an ephemeral port. The handler closure
@@ -1179,6 +1387,7 @@ mod tests {
                 receipt_bytes_b64: "cmVjZWlwdA==".to_string(),
             }],
             delivery_cid: "bafy_delivery_1".to_string(),
+            ingest: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let decoded: DeliveredBlock = serde_json::from_str(&json).unwrap();
@@ -1201,12 +1410,14 @@ mod tests {
                 bundle_b64: "YQ==".to_string(),
                 receipts: vec![],
                 delivery_cid: "bafy_a".to_string(),
+                ingest: None,
             },
             DeliveredBlock {
                 sig_b64: None,
                 bundle_b64: "Yg==".to_string(),
                 receipts: vec![],
                 delivery_cid: "bafy_b".to_string(),
+                ingest: None,
             },
         ];
         let json = serde_json::to_string(&blocks).unwrap();
@@ -1287,10 +1498,9 @@ mod tests {
                     suites: vec!["none".to_string()],
                     capabilities: jig_pipeline::handshake::Capabilities::default(),
                     nonce,
+                    peer_did: None,
                 },
-                &jig_pipeline::handshake::ServerOffer {
-                    capabilities: jig_pipeline::handshake::Capabilities::default(),
-                },
+                &jig_pipeline::handshake::ServerOffer::default(),
             )
             .unwrap();
             // Signed, but the frame is carried as `none` while the advertisement
@@ -1362,11 +1572,16 @@ mod tests {
         let client = Client::connect(&url, test_identity()).await.unwrap();
         let contradiction = await_contradiction(&client).await;
         assert!(contradiction.reason.contains("outside the signed welcome"));
-        assert_eq!(contradiction.evidence[1], v2);
+        assert_eq!(contradiction.code, "frame-outside-welcome");
+        assert_eq!(contradiction.evidence, [v2]);
         assert_eq!(
-            contradiction.evidence[0],
-            client.welcome().unwrap().evidence,
-            "the evidence starts with the signed welcome"
+            contradiction.welcome.as_deref(),
+            Some(client.welcome().unwrap().evidence.as_str()),
+            "the signed welcome is kept with it"
+        );
+        assert_eq!(
+            contradiction.proof, None,
+            "an unsigned frame proves nothing"
         );
         assert!(matches!(
             client.subscribe_channel("#hello").await,
@@ -1387,6 +1602,10 @@ mod tests {
             capabilities: Default::default(),
             reputation: jig_pipeline::handshake::Reputation::none(),
             nonce: "n".to_string(),
+            server_nonce: "s".to_string(),
+            tls_exporter: String::new(),
+            manifest: None,
+            key_link: None,
             sig: String::new(),
         }))
         .unwrap();
@@ -1424,6 +1643,179 @@ mod tests {
                 .await
                 .reason
                 .contains(&stranger)
+        );
+    }
+
+    /// A block frame carrying `record`, for a real text-render bundle whose
+    /// CID is `record`'s block.
+    fn block_frame(record: &jig_pipeline::ingest_record::IngestRecord, bundle_b64: &str) -> String {
+        serde_json::to_string(&Envelope::new(Frame::Block {
+            bundle_b64: bundle_b64.to_string(),
+            sig_b64: None,
+            receipts: vec![],
+            delivery_cid: format!("delivery:{}", record.block_cid),
+            ingest: Some(record.clone()),
+        }))
+        .unwrap()
+    }
+
+    /// Bundles and their CIDs, `n` of them.
+    fn bundles(n: usize) -> Vec<(String, String)> {
+        use base64::Engine as _;
+        let id = test_identity();
+        (0..n)
+            .map(|i| {
+                let hlc = jig_core::HlcTimestamp::now_wall(id.did().clone());
+                let b = crate::blocks::build_text_render(&id, "#hello", &format!("m{i}"), hlc);
+                (
+                    base64::engine::general_purpose::STANDARD.encode(b.canonical_bytes()),
+                    b.cid(),
+                )
+            })
+            .collect()
+    }
+
+    fn records_for(
+        key: &ed25519_dalek::SigningKey,
+        cids: &[&str],
+    ) -> Vec<jig_pipeline::ingest_record::IngestRecord> {
+        let mut out: Vec<jig_pipeline::ingest_record::IngestRecord> = Vec::new();
+        for (seq, cid) in cids.iter().enumerate() {
+            let prev = out
+                .last()
+                .map_or(jig_pipeline::ingest_record::GENESIS_PREV, |r| r.hash());
+            out.push(
+                jig_pipeline::ingest_record::RecordSigner {
+                    channel_id: crate::chain::label_cid("bafyCreate"),
+                    key,
+                    ingest_wall_ms: seq as u64,
+                    ingest_logical: 0,
+                }
+                .sign(seq as u64, cid, prev)
+                .unwrap(),
+            );
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_chain_that_continues_is_delivered_and_a_gap_is_reported() {
+        let key = test_signing_key();
+        let blocks = bundles(4);
+        let cids: Vec<&str> = blocks.iter().map(|(_, c)| c.as_str()).collect();
+        let records = records_for(&key, &cids);
+        // Seq 0, 1, then 3: entry 2 is never sent.
+        let frames = [0, 1, 3]
+            .iter()
+            .map(|&i| block_frame(&records[i], &blocks[i].0))
+            .collect();
+        let (url, close_code) = start_scripted_server_with_key(key, frames).await;
+        let client = Client::connect(&url, test_identity()).await.unwrap();
+        let mut stream = client.subscribe_channel("#hello").await.unwrap();
+        for expected in [0u64, 1, 3] {
+            let got = stream.next().await.expect("delivered");
+            assert_eq!(got.ingest.unwrap().seq, expected);
+        }
+        assert!(client.contradiction().is_none());
+        assert_eq!(
+            client.take_chain_gaps(),
+            vec![ChainGap {
+                channel_id: crate::chain::label_cid("bafyCreate"),
+                from: 2,
+                to: 3
+            }]
+        );
+        assert_eq!(*close_code.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_forked_chain_is_a_contradiction() {
+        let key = test_signing_key();
+        let blocks = bundles(3);
+        let records = records_for(&key, &[&blocks[0].1, &blocks[1].1]);
+        // The same key signs another entry 1, then an entry 2 after it.
+        let fork = records_for(&key, &[&blocks[0].1, &blocks[2].1]);
+        let frames = vec![
+            block_frame(&records[0], &blocks[0].0),
+            block_frame(&records[1], &blocks[1].0),
+            block_frame(&fork[1], &blocks[2].0),
+        ];
+        let (url, close_code) = start_scripted_server_with_key(key, frames).await;
+        let seen: Arc<StdMutex<Vec<Contradiction>>> = Arc::default();
+        let seen_by_hook = seen.clone();
+        let client = Client::connect_with_options(
+            &url,
+            test_identity(),
+            ConnectOptions {
+                on_contradiction: Some(Arc::new(move |c: &Contradiction| {
+                    seen_by_hook.lock().unwrap().push(c.clone());
+                })),
+                ..ConnectOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let contradiction = await_contradiction(&client).await;
+        assert!(
+            contradiction.reason.contains("history broke"),
+            "{}",
+            contradiction.reason
+        );
+        assert_eq!(contradiction.code, "chain-rewritten");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            std::slice::from_ref(&contradiction),
+            "the hook ran once"
+        );
+
+        // What the hook was handed holds offline, against the welcome's key.
+        let server_did = client.welcome().unwrap().server_did.clone();
+        let bundle = crate::evidence::Bundle {
+            format: crate::evidence::BUNDLE_FORMAT.to_string(),
+            class: 3,
+            code: contradiction.code.to_string(),
+            reason: contradiction.reason.clone(),
+            server: url.clone(),
+            server_did,
+            observed_at_ms: 0,
+            welcome: contradiction.welcome.clone(),
+            items: contradiction.evidence.clone(),
+            proof: contradiction.proof.clone().map(|p| *p),
+        };
+        let checked = crate::evidence::verify(&bundle).unwrap();
+        assert!(
+            checked
+                .proven
+                .as_deref()
+                .is_some_and(|p| p.contains("record 1")),
+            "{checked:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            *close_code.lock().unwrap(),
+            Some(jig_pipeline::handshake::close::CONTRADICTION)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_for_another_block_or_from_another_key_is_a_contradiction() {
+        let key = test_signing_key();
+        let blocks = bundles(2);
+        let records = records_for(&key, &[&blocks[0].1]);
+        // Record 0 delivered with block 1's bundle.
+        let (url, _) =
+            start_scripted_server_with_key(key, vec![block_frame(&records[0], &blocks[1].0)]).await;
+        let client = Client::connect(&url, test_identity()).await.unwrap();
+        assert!(await_contradiction(&client).await.reason.contains("block"));
+
+        let stranger = records_for(&test_signing_key(), &[&blocks[0].1]);
+        let (url, _) = start_scripted_server(vec![block_frame(&stranger[0], &blocks[0].0)]).await;
+        let client = Client::connect(&url, test_identity()).await.unwrap();
+        assert!(
+            await_contradiction(&client)
+                .await
+                .reason
+                .contains("sequencer")
         );
     }
 

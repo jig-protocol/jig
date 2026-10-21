@@ -6,7 +6,6 @@ pub mod error;
 pub mod handler;
 pub mod runtime;
 pub mod server;
-pub mod storage;
 pub mod v0_0_2;
 pub mod v0_0_2_admin;
 pub mod v0_0_2_admission;
@@ -16,14 +15,12 @@ pub mod v0_0_2_bridges;
 pub mod v0_0_2_federation;
 pub mod v0_0_2_federation_tls;
 pub mod v0_0_2_ingest_error;
+pub mod v0_0_2_manifest_log;
 pub mod v0_0_2_mls;
+pub mod v0_0_2_peer;
 pub mod v0_0_2_ws;
 
 pub use config::ServerConfig;
 pub use error::{Result, ServerError};
 pub use runtime::ExecutionConfig;
 pub use server::JigServer;
-pub use storage::{
-    SqliteBlockStore, StoredBlock, StoredBlockSummary, StoredReceipt, StoredResource,
-    encode_resource_data,
-};

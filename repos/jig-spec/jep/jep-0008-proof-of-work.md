@@ -69,7 +69,9 @@ Non-goals:
 
 ## The puzzle
 
-6. The **digest** is the labelled BLAKE3 hash (JEP-0004 rule 8) of these parts, in order:
+6. The **digest** is the labelled BLAKE3 hash of these parts, in order. Each part is fed to one
+   BLAKE3 hasher as its label's bytes, the value's length as an 8-byte little-endian integer,
+   then the value's bytes:
    1. (`domain`, `jig-pow-v1`);
    2. (`alg`, the algorithm id as decimal ASCII);
    3. (`verifier`, the verifier's DID);
@@ -91,6 +93,9 @@ Non-goals:
 10. **The proof** is `{alg, effort, nonce, salt_id}` where `salt_id` names the salt (rule 13). A
     verifier checks it with one evaluation of the algorithm. It MUST check the work before any
     signature verification, database read or other costly step for the same request.
+    - `effort` is the solver's bid, at least the effort asked (rule 20). The verifier checks the
+      work against the bid.
+    - In JSON, `alg`, `effort` and `salt_id` are integers and `nonce` is unpadded base64url.
 
 ## Actions and bindings
 
@@ -104,7 +109,7 @@ Non-goals:
     | `dial` | server | stamp | the dialing server's DID |
     | `ns-register` | nameserver | challenge | `proof_hash("register", ns_did, alias, challenge)` (JEP-0004 rule 10) |
     | `ns-renew` | nameserver | challenge | `proof_hash("renew", ns_did, alias, challenge)` |
-    | `ns-rotate` | nameserver | challenge | `proof_hash("rotate", ns_did, alias, challenge)` |
+    | `ns-rotate` | nameserver | challenge | interim, until JEP-0004 gains a rotate proof: BLAKE3 of the deterministic CBOR map `{domain: "jig-alias-rotate-pow-v1", ns_did, alias, old_did, new_did, challenge}`, every DID canonical `did:jig` |
 
     For `ns-rotate`, the subject is the old DID, the key that holds the name.
 12. A new action MUST be registered here with its mode and binding before any verifier asks for
@@ -115,10 +120,12 @@ Non-goals:
 13. Salts:
     - **Admission:** the salt is empty. One proof admits one subject at one verifier, once.
     - **Stamp:** the salt is the verifier's current **epoch salt**, 32 random bytes that the
-      verifier rotates every `epoch_secs` on its own clock (TM-01). `salt_id` is the epoch number.
+      verifier rotates every `epoch_secs` on its own clock (TM-01). `salt_id` is the epoch number;
+      epochs start at 1.
       The verifier MUST accept the current and the previous epoch, and no other.
     - **Challenge:** the salt is empty. The nameserver's challenge is inside the binding's proof
       hash, and JEP-0004 rule 10 makes it fresh and single-use.
+    - The empty salt's `salt_id` is 0.
 14. **Replay.**
     - Admission: the verifier records the subject as proven (as today). A second proof for a
       proven subject is redundant, not an error.
@@ -161,6 +168,9 @@ Non-goals:
       within `max_solve_secs`.
     - A verifier MUST NOT ask for more than `2^28` for `admit`, or `2^28` for any challenge action.
     - A client SHOULD refuse an effort above those caps.
+    - A verifier cannot measure its clients, so a client SHOULD also derive its own cap from its
+      measured solve rate × `max_solve_secs`, by a short calibration run on the cores it will
+      solve with, and refuse an effort above that cap as it would one above `2^28`.
     - A ruleset MAY set `min_effort ≥ 1` (a floor). The reference ruleset sets none.
 20. **Client behaviour.** A client:
     - bids at least the signed `effort`;
@@ -279,16 +289,18 @@ a nonce. No message links two DIDs.
 
 # Reference Implementation
 
-None yet. Milestone R1. The existing `jig-core::admission_pow` is the starting point for the
-digest.
+`jig_core::pow` (milestone R1): the digest, the effort test, the solver and the proof. The
+verifiers that ask for work are built on it in R1's later tasks.
 
 # Test Vectors
 
-To be added with R1, under a fixed test key:
+`vectors/0008/vectors.json`:
 
 - one proof per action in rule 11, with its inputs, digest and effort;
-- the boundary of rule 7 for `E = 2^20` and for an effort that is not a power of two;
-- a signed `PROOF_OF_WORK_REQUIRED` refusal.
+- the boundary of rule 7 for `E = 2^20` and for an effort that is not a power of two.
+
+`vectors/0008/ns-pow.json`: a nameserver's signed offer (`jig-ns-pow-offer-v1`), which it
+returns with a challenge and restates in its `428` refusal, and the interim `ns-rotate` binding.
 
 # Rejected Alternatives
 

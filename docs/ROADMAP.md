@@ -66,6 +66,18 @@ network is the machine: Alan Kay's "objects all the way down".
   handling) so nobody has to bootstrap one from scratch. Joining is opt-in. Anyone can run their own
   zones at any security level, with their own anchors, or just connect to servers without hosting
   anything.
+- **Nameserver federation (target).** Nameservers federate through signed, witnessed
+  transparency logs and shared rulesets within a ruleset group: RFC 6962-style logs in C2SP
+  formats, cosigned by the group's witnesses
+  ([JEP-0009](../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) rules 29–33, draft).
+  How checkpoints travel beyond a group, gossip included, is open.
+  Aligned nameservers and servers form a high-security ruleset group, so its clients get one set
+  of behaviours and expectations. Cross-nameserver lookup takes two forms: inside a group, a
+  standard answer to "where do I ask for `@suffix`" (ruleset-group delegation, deferred in
+  [JEP-0004](../repos/jig-spec/jep/jep-0004-verified-naming.md)); elsewhere, the client's own order
+  of local config, then a `contract`-rooted delegation, then DNS-rooted discovery. The v0.1
+  gossip prototype was removed in #237: it exchanged nothing with peers, and its routes went in
+  #154. Its replacement is this work, not a revival.
 - **Keep the spec small.** `jig-spec` holds final decisions, normative and terse. Modelling,
   alternatives and justifications go in `docs/` and link to the spec.
 
@@ -107,7 +119,7 @@ reserve the hooks for encryption so that turning it on in v0.2 changes a value, 
 | 13 | `CONTRIBUTING.md` (with the dependency rule below), `CODE_OF_CONDUCT.md`, templates, `CODEOWNERS` | Done |
 | 14 | CLI papercuts: `jig read`, `jig --version`, client reconnect with backoff, `block` stubs | `read` and `--version` done; reconnect and `block` stubs open |
 | 15 | `publish = false` on crates not meant for crates.io | Open |
-| 16 | CI: macOS job, clippy on every crate, federation and bridge counters in `/metrics`, scope jobs by changed paths (note below) | Partial (macOS covered by the install smoke test only). Scoping done: pull requests skip the build jobs when only docs change or while a draft, and the merge queue runs everything |
+| 16 | CI: macOS job, clippy on every crate, federation and bridge counters in `/metrics`, scope jobs by changed paths (note below) | Partial (macOS covered by the install smoke test only). Clippy runs on every crate, and `/metrics` counts federation and bridge ingest (`jig_blocks_ingested_total`, #121). Scoping done: pull requests skip the build jobs when only docs change or while a draft, and the merge queue runs everything |
 | 17 | Collapse the hybrid server config into one struct with `deny_unknown_fields` | Done (#199): one `ServerConfig`, every table denies unknown fields, removed keys fail with a message naming them |
 | 18 | Run federated blocks through the write gate; "trusted peer" becomes explicit config | Done: relayed blocks go through `ingest`, peers are pinned and listed. Encrypted and restricted channels still do not federate (D12) |
 | 19 | Discovery JEP stub | Done ([JEP-0003](../repos/jig-spec/jep/jep-0003-server-discovery.md)) |
@@ -127,8 +139,8 @@ What to watch when scoping it:
   allowed actions exclude third-party path filters), and later jobs skip with a job-level `if:`.
   A skipped job reports success.
 - Count `repos/Cargo.lock`, `rust-toolchain.toml`, `deny.toml` and `.github/workflows/**` as code.
-  `fuel-portability.yml` already filters on `repos/jig-runtime/**` alone, so a lockfile-only
-  wasmtime bump, the change most likely to move fuel, skips it today.
+  `fuel-portability.yml` now also runs on `repos/Cargo.lock`, so a lockfile-only wasmtime bump,
+  the change most likely to move fuel, gets the aarch64 matrix.
 - Keep `dependency-policy` unconditional. It is quick, and the advisory database changes whatever
   the diff touches.
 
@@ -175,7 +187,8 @@ Still to do in this phase:
 ### Phase 2: executable blocks (`v0.3`)
 
 - The **Wasm Component Model + WIT** as the block ABI.
-- Host functions granted strictly through manifest capabilities (the existing `capability_dsl`):
+- Host functions granted strictly through manifest capabilities (the capability names, scopes and
+  attenuation order are defined in `jig-core/src/grant.rs`, #205, but nothing checks them yet):
   storage, fetch-block-by-CID, post-message, timer.
 - Per-block persistent state, CID-addressed.
 - The client runs the same runtime (`jig-client` embeds `jig-runtime`).

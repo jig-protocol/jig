@@ -34,9 +34,6 @@ tokio = { workspace = true }
 tokio-util = "0.7"
 futures = "0.3"
 
-# Database
-rusqlite = { workspace = true }
-
 # Web framework
 axum = { version = "0.8", features = ["ws"] }
 # tower 0.5 to match the dev-deps entry below; having both 0.4 and 0.5 in the
@@ -136,10 +133,13 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 
 [dev-dependencies]
 tempfile = "3.8"
+jig-client = { path = "../jig-client", features = ["test-support"] }
 # The suite conformance vectors (tests/suite_vectors.rs): `test-aead`
 # registered, and MLS leaves minted to outlive the checked-in files.
 jig-core = { path = "../jig-core", features = ["test-suite"] }
 jig-mls = { workspace = true, features = ["conformance"] }
+# `BlockExecutor::shared` for the test `AppState`s (see jig-pipeline's `test-support`).
+jig-pipeline = { path = "../jig-pipeline", features = ["test-support"] }
 
 [features]
 default = ["sqlite"]

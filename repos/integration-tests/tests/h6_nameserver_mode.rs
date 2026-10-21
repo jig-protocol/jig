@@ -116,7 +116,7 @@ async fn nameserver_expires_attestation_after_explicit_expiry() {
     ns.state
         .ingest_ctx
         .store
-        .expire_alias_attestation(&alice.did_string(), &ns_did, now)
+        .expire_alias_attestation(&alice.did_string(), &ns_did, &alias_full, now)
         .expect("expire");
 
     // Wait for cache TTL to elapse so the resolver re-queries the NS.

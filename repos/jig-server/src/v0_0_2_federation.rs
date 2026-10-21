@@ -42,6 +42,27 @@ use crate::v0_0_2::AppState;
 /// Constant in v0.0.2; exponential backoff is a v0.0.3+ refinement.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
+/// The delay before redialing a peer whose federation contract closed the
+/// connection ([`crate::v0_0_2_peer::CloseReason`]), doubling with each such
+/// close in a row up to [`MAX_CONTRACT_CLOSE_DELAY`].
+const CONTRACT_CLOSE_DELAY: Duration = Duration::from_secs(30);
+const MAX_CONTRACT_CLOSE_DELAY: Duration = Duration::from_secs(15 * 60);
+
+/// A connection the federation contract closed.
+#[derive(Debug, thiserror::Error)]
+#[error("closed by the federation contract ({}): {}", .0.code, .0.reason)]
+struct ContractClosed(crate::v0_0_2_peer::CloseReason);
+
+/// How long to wait before redialing, after `closes` contract closes in a row.
+fn redial_delay(closes: u32) -> Duration {
+    if closes == 0 {
+        return RECONNECT_DELAY;
+    }
+    CONTRACT_CLOSE_DELAY
+        .saturating_mul(1 << (closes - 1).min(16))
+        .min(MAX_CONTRACT_CLOSE_DELAY)
+}
+
 /// Whether `url` names a plaintext WebSocket. Scheme comparison is
 /// case-insensitive, as URL schemes are.
 fn is_plaintext_url(url: &str) -> bool {
@@ -160,22 +181,29 @@ pub fn spawn_federation_peers(state: Arc<AppState>) {
 
 async fn run_peer_loop(state: Arc<AppState>, peer: jig_config::v0_0_2_server::FederationPeer) {
     info!(peer_url = %peer.url, "federation peer task started");
+    let mut contract_closes = 0;
     loop {
-        match connect_and_relay(&state, &peer).await {
+        let outcome = connect_and_relay(&state, &peer).await;
+        contract_closes = match &outcome {
+            Err(e) if e.is::<ContractClosed>() => contract_closes + 1,
+            _ => 0,
+        };
+        let delay = redial_delay(contract_closes);
+        match outcome {
             Ok(()) => {
                 warn!(
                     peer_url = %peer.url,
-                    "peer connection ended cleanly; reconnecting in {RECONNECT_DELAY:?}"
+                    "peer connection ended cleanly; reconnecting in {delay:?}"
                 );
             }
             Err(e) => {
                 warn!(
                     peer_url = %peer.url,
-                    "peer connection failed: {e}; reconnecting in {RECONNECT_DELAY:?}"
+                    "peer connection failed: {e}; reconnecting in {delay:?}"
                 );
             }
         }
-        tokio::time::sleep(RECONNECT_DELAY).await;
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -197,13 +225,49 @@ where
         + Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
         + Unpin,
 {
+    handshake_as(ws, pinned_server_did, &[], None).await
+}
+
+/// [`complete_client_handshake`] as a server dialing a peer (JEP-0002 rule
+/// 12): the hello names this server's DID, the welcome must be bound to
+/// `tls_exporter` (this connection's, empty over plaintext), and the
+/// handshake ends with this server's `peer_proof` over the transcript.
+pub async fn complete_peer_handshake<S>(
+    ws: &mut S,
+    pinned_server_did: &str,
+    tls_exporter: &[u8],
+    key: &ed25519_dalek::SigningKey,
+) -> anyhow::Result<jig_pipeline::handshake::VerifiedWelcome>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    handshake_as(ws, Some(pinned_server_did), tls_exporter, Some(key)).await
+}
+
+async fn handshake_as<S>(
+    ws: &mut S,
+    pinned_server_did: Option<&str>,
+    tls_exporter: &[u8],
+    key: Option<&ed25519_dalek::SigningKey>,
+) -> anyhow::Result<jig_pipeline::handshake::VerifiedWelcome>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
     let offer = jig_pipeline::handshake::ClientOffer {
         pinned_server_did: pinned_server_did.map(str::to_string),
+        peer_did: key.map(|k| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        }),
         ..Default::default()
     };
     let (hello, pending) = jig_pipeline::handshake::begin(&offer);
-    ws.send(Message::Text(serde_json::to_string(&hello)?.into()))
-        .await?;
+    // The transcript covers the hello exactly as sent.
+    let hello_text = serde_json::to_string(&hello)?;
+    ws.send(Message::Text(hello_text.clone().into())).await?;
     // Same absolute deadline as the client. Control frames must not restart it,
     // or the peer loop never reaches its reconnect delay.
     let deadline = tokio::time::Instant::now() + jig_pipeline::handshake::WELCOME_WAIT;
@@ -226,8 +290,27 @@ where
             reason: "handshake failed".into(),
         }))
     };
-    match pending.interpret(&text) {
-        HandshakeResult::Established(welcome) => Ok(welcome),
+    match pending.interpret_on(&text, tls_exporter) {
+        HandshakeResult::Established(welcome) => {
+            // A peer is listed by DID, and that DID is what lets it
+            // subscribe here and what its blocks are attributed to, so a
+            // moved peer is not federated with under two DIDs: its
+            // operator lists the new one.
+            if let Some(from) = &welcome.moved_from {
+                anyhow::bail!(
+                    "the peer moved its key from {from} to {} along a public link both keys \
+                     signed; set its expected_did to the new DID to federate with it",
+                    welcome.server_did
+                );
+            }
+            if let Some(key) = key {
+                let proof =
+                    jig_pipeline::handshake::peer_proof(key, &hello_text, &text, tls_exporter);
+                ws.send(Message::Text(serde_json::to_string(&proof)?.into()))
+                    .await?;
+            }
+            Ok(welcome)
+        }
         HandshakeResult::Incompatible(refusal) => anyhow::bail!(
             "peer speaks none of this offer ({}): {}; it speaks versions {:?}, suites {:?}",
             refusal.code,
@@ -246,7 +329,28 @@ where
     }
 }
 
-async fn connect_and_relay(
+/// The TLS exporter value of a dialed connection (JEP-0002 rule 12), or
+/// nothing over plaintext. A TLS session that cannot export one has nothing
+/// to bind the welcome to, so the welcome check then refuses it.
+pub(crate) fn tls_exporter_of(
+    stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+) -> Vec<u8> {
+    match stream {
+        tokio_tungstenite::MaybeTlsStream::Rustls(tls) => tls
+            .get_ref()
+            .1
+            .export_keying_material(
+                [0u8; jig_pipeline::handshake::TLS_EXPORTER_LEN],
+                jig_pipeline::handshake::TLS_EXPORTER_LABEL,
+                None,
+            )
+            .map(|v| v.to_vec())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+pub(crate) async fn connect_and_relay(
     state: &Arc<AppState>,
     peer: &jig_config::v0_0_2_server::FederationPeer,
 ) -> anyhow::Result<()> {
@@ -269,8 +373,22 @@ async fn connect_and_relay(
     };
     // Same hello/welcome a CLI client speaks. The fed-hello bundle below is a
     // block, not this handshake, and the server now refuses it until welcome.
-    complete_client_handshake(&mut ws, Some(&peer.expected_did)).await?;
+    let tls_exporter = tls_exporter_of(ws.get_ref());
+    let welcome = complete_peer_handshake(
+        &mut ws,
+        &peer.expected_did,
+        &tls_exporter,
+        &state.ingest_ctx.server_key,
+    )
+    .await?;
     let (mut sink, mut stream) = ws.split();
+    // The handshake proved the peer's DID; peer frames on this connection
+    // are from it and go to it ([`crate::v0_0_2_peer`]).
+    let (peer_sender, mut peer_out) = crate::v0_0_2_peer::PeerSender::new(
+        jig_core::did::Did::from_did_jig_string(&welcome.server_did)
+            .map_err(|e| anyhow::anyhow!("the peer's welcome DID: {e}"))?,
+    );
+    let registration = state.peers.register(peer_sender.clone());
     info!(peer_url = %peer.url, "federation peer connected");
 
     // 1. Send fed-hello synthetic bundle as the handshake.
@@ -327,13 +445,33 @@ async fn connect_and_relay(
                         if let Some(refusal) = subscription_refusal(&text) {
                             break Err(anyhow::anyhow!("peer refused our federation subscription: {refusal}"));
                         }
-                        if let Err(e) = handle_inbound_frame(state, peer, &text).await {
-                            warn!(peer_url = %peer.url, "inbound frame error: {e}");
+                        match handle_inbound_frame(state, peer, &peer_sender, &text).await {
+                            Ok(Some(reason)) => {
+                                let _ = sink
+                                    .send(Message::Close(Some(
+                                        tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                                            code: reason.code.into(),
+                                            reason: reason.reason.clone().into(),
+                                        },
+                                    )))
+                                    .await;
+                                break Err(ContractClosed(reason).into());
+                            }
+                            Ok(None) => {}
+                            Err(e) => warn!(peer_url = %peer.url, "inbound frame error: {e}"),
                         }
                     }
                     Message::Close(_) => break Ok(()),
                     // Ignore Ping/Pong/Binary.
                     _ => {}
+                }
+            }
+
+            // Peer frames this server sends unprompted
+            Some(env) = peer_out.recv() => {
+                let json = serde_json::to_string(&env)?;
+                if let Err(e) = sink.send(Message::Text(json.into())).await {
+                    break Err(anyhow::anyhow!("peer frame send error: {e}"));
                 }
             }
 
@@ -354,16 +492,33 @@ async fn connect_and_relay(
     // 5. On loop exit (peer disconnect, error, or task cancellation), unregister
     //    the peer from Fanout so we don't accumulate dead senders.
     state.ingest_ctx.fanout.unregister_peer(&peer.url).await;
+    state.peers.unregister(registration);
 
     result
 }
 
+/// Handle one frame from a peer this server dialed. `Ok(Some(_))` means the
+/// federation contract closed the connection.
 async fn handle_inbound_frame(
     state: &Arc<AppState>,
     peer: &jig_config::v0_0_2_server::FederationPeer,
+    sender: &crate::v0_0_2_peer::PeerSender,
     text: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<crate::v0_0_2_peer::CloseReason>> {
     let env: Envelope = serde_json::from_str(text)?;
+    if let Frame::Peer { kind, body } = &env.frame {
+        return Ok(
+            crate::v0_0_2_peer::dispatch(state.peer_frame_handler(), sender, kind, body).err(),
+        );
+    }
+    handle_relayed_frame(state, peer, env).await.map(|()| None)
+}
+
+async fn handle_relayed_frame(
+    state: &Arc<AppState>,
+    peer: &jig_config::v0_0_2_server::FederationPeer,
+    env: Envelope,
+) -> anyhow::Result<()> {
     match env.frame {
         Frame::Block {
             bundle_b64,
@@ -432,27 +587,38 @@ pub async fn ingest_peer_block(
         warn!(peer_url = %peer.url, %delivery_cid, "rejecting peer block: encrypted content does not federate");
         return Ok(());
     }
-    if let Some(slug) = manifest
-        .kind
-        .and_then(|kind| jig_pipeline::ingest::channel_slug_of(kind, &manifest))
+    let bundle = jig_core::BlockBundle {
+        manifest_bytes: &manifest_bytes,
+        code_bytes: &code_bytes,
+        resources: vec![],
+    };
+    // The same resolver ingest gates with, so a block naming its channel by
+    // `channel_id` is held to the same rule as one naming it by slug.
+    let block_cid = bundle
+        .block_cid()
+        .map(|c| c.to_string())
+        .unwrap_or_default();
+    if let Some(kind) = manifest.kind
+        && let Some(named) = jig_pipeline::ingest::channel_id_of(
+            &state.ingest_ctx.store,
+            kind,
+            &manifest,
+            &block_cid,
+        )?
+        && let Some(id) = named.id.as_deref()
         && let Some(chan) = state
             .ingest_ctx
             .store
-            .get_channel_by_slug_including_archived(slug)?
+            .get_channel_by_id_including_archived(id)?
         && !DeliveryPolicy::for_channel(&chan, vec![]).federates
     {
-        warn!(peer_url = %peer.url, %delivery_cid, slug, "rejecting peer block: the local channel does not federate");
+        warn!(peer_url = %peer.url, %delivery_cid, slug = %chan.slug, "rejecting peer block: the local channel does not federate");
         return Ok(());
     }
 
     let sig = sig_b64
         .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
         .unwrap_or_default();
-    let bundle = jig_core::BlockBundle {
-        manifest_bytes: &manifest_bytes,
-        code_bytes: &code_bytes,
-        resources: vec![],
-    };
     let source = jig_pipeline::ingest::IngestSource::FederatedPeer {
         peer_did: jig_core::Did::from_str_unchecked(jig_pipeline::effect::canonical_did_string(
             &peer.expected_did,
@@ -572,6 +738,15 @@ mod tests {
             expected_did: jig_core::Did::from_ed25519_pubkey(&[9u8; 32]).to_did_jig_string(),
             alias: None,
         }
+    }
+
+    #[test]
+    fn a_peer_that_keeps_closing_is_redialed_ever_more_slowly() {
+        assert_eq!(redial_delay(0), RECONNECT_DELAY);
+        assert_eq!(redial_delay(1), CONTRACT_CLOSE_DELAY);
+        assert_eq!(redial_delay(2), CONTRACT_CLOSE_DELAY * 2);
+        assert_eq!(redial_delay(6), MAX_CONTRACT_CLOSE_DELAY);
+        assert_eq!(redial_delay(u32::MAX), MAX_CONTRACT_CLOSE_DELAY);
     }
 
     #[test]
@@ -801,6 +976,8 @@ mod tests {
                 created_at: 0,
                 owner_did: managed_did.clone(),
                 suite: "none".to_string(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })
             .unwrap();
         state
@@ -864,7 +1041,10 @@ mod tests {
             .await
             .expect("bridge sink should receive the federated block")
             .expect("delivery present");
-        assert_eq!(got.0.channel_id.as_deref(), Some("#dm/x"));
+        assert_eq!(
+            got.0.channel_id.as_deref(),
+            Some(jig_pipeline::ingest_record::label_cid("chan x").as_str())
+        );
         assert_eq!(got.0.sender_did, sender_did.to_did_jig_string());
     }
 
@@ -898,6 +1078,8 @@ mod tests {
                     created_at: 0,
                     owner_did: "did:jig:zOwner".into(),
                     suite: suite.into(),
+                    sequencer_did: String::new(),
+                    co_owners: Vec::new(),
                 })
                 .unwrap();
             let secret: [u8; 32] = rand::random();
@@ -1165,6 +1347,8 @@ mod tests {
                 created_at: 0,
                 owner_did: "did:jig:zOwner".into(),
                 suite: "none".into(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })
             .unwrap();
         let stranger = ed25519_dalek::SigningKey::from_bytes(&rand::random());
@@ -1212,6 +1396,8 @@ mod tests {
                 created_at: 0,
                 owner_did: "did:jig:zOwner".into(),
                 suite: "none".into(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })
             .unwrap();
 

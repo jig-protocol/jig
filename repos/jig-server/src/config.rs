@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use jig_config::v0_0_2_server::{
     AuthSection, BridgesSection, DebugSection, FederationSection, IdentitySection, JigServerConfig,
-    NameserverSection, ServerSection,
+    KeysSection, NameserverSection, ServerSection,
 };
 
 use crate::runtime::ExecutionConfig;
@@ -60,6 +60,8 @@ pub struct ServerConfig {
     pub nameserver: NameserverSection,
     #[serde(default)]
     pub auth: AuthSection,
+    #[serde(default)]
+    pub keys: KeysSection,
 }
 
 /// Keys jig-server once accepted and no longer does, as a dotted path and the
@@ -73,9 +75,9 @@ pub const REMOVED_KEYS: &[(&str, &str)] = &[
     (
         "debug.admin_endpoints",
         "channel operations are always served at /api/v1/channels; the /_admin_v0_0_2 \
-         aliases it enabled were removed. v0.1.0-alpha.1's install.sh and \
-         deploy/config.example.toml wrote `admin_endpoints = false` under [debug]; deleting \
-         that one line is all an upgrade needs",
+         aliases it enabled were removed. install.sh (v0.1.0-alpha.1) and \
+         deploy/config.example.toml (through v0.2.0-alpha.1) wrote `admin_endpoints = false` \
+         under [debug]; deleting that one line is all an upgrade needs",
     ),
     (
         "execution.pricing_enabled",
@@ -100,9 +102,11 @@ pub const REMOVED_KEYS: &[(&str, &str)] = &[
 /// certificate a CA issued (`tailscale cert`, certbot); jig clients accept
 /// either.
 ///
-/// `enabled = false` serves plaintext HTTP. It is an unsafe option: use it only
-/// on loopback or behind a proxy that terminates TLS, never on a listener peers
-/// or clients reach directly. The server advertises it as `tls.enabled=false`
+/// `enabled = false` serves plaintext HTTP. It is an unsafe option, for
+/// loopback or local testing only. A remote client over TLS refuses a server
+/// whose welcome is not bound to its TLS session (JEP-0002 rule 4), so
+/// anything in front of jig-server must pass TLS through (TCP or SNI
+/// passthrough), never terminate it. The server advertises it as `tls.enabled=false`
 /// in `unsafe_options_active` and warns at startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -210,6 +214,7 @@ impl Default for ServerConfig {
             bridges: BridgesSection::default(),
             nameserver: NameserverSection::default(),
             auth: AuthSection::default(),
+            keys: KeysSection::default(),
         }
     }
 }
@@ -259,6 +264,7 @@ impl ServerConfig {
             bridges: self.bridges.clone(),
             nameserver: self.nameserver.clone(),
             auth: self.auth.clone(),
+            keys: self.keys.clone(),
         }
     }
 
@@ -409,14 +415,20 @@ fn v0_0_2_template_sections(server: &ServerConfig) -> String {
 # when the two disagree.
 listen = "{listen}"
 
-# The ed25519 seed the server DID is derived from. BACK IT UP: losing it
-# changes the server DID and breaks TOFU pinning for every client.
+# The ed25519 seed the server DID is derived from, sealed: `server.key` here
+# names `server.jigkey` beside it. BACK IT UP, with what opens it: losing
+# either changes the server DID and breaks TOFU pinning for every client.
 server_did_keyfile = "{keyfile}"
 
 # channel-create and member-add are not optional extras — `jig channel create`
 # and `jig channel join` submit exactly these kinds. member-remove and
 # channel-promote back `jig channel kick/leave/promote`.
-allowed_block_kinds = [{kinds}]
+#
+# Leave allowed_block_kinds unset to track the built-in default as new kinds
+# ship. Today the default is:
+#   allowed_block_kinds = [{kinds}]
+# To restrict it, uncomment that line and remove kinds. A list here is fixed:
+# kinds added in later releases stay refused until you add them.
 
 [identity]
 # tofu = trust the first key seen for a DID and pin it. No nameserver needed.
@@ -451,11 +463,11 @@ unknown_dids = "admit"
 # pow_bits = 20
 banned_dids = []
 # [[auth.admission.floors]]
-# ruleset_key = "gigue.highsec.v1"
+# ruleset_key = "jig.highsec.v1"
 # minimum = 0
 # [[auth.admission.records]]
 # did = "did:jig:z..."
-# ruleset_key = "gigue.highsec.v1"
+# ruleset_key = "jig.highsec.v1"
 # score = 5
 
 # Token buckets in front of the gates: per verified DID (reads, subscriptions,
@@ -470,6 +482,21 @@ per_ip_burst = {per_ip_burst}
 per_ip_per_second = {per_ip_per_second}
 replay_per_did = {replay_per_did}
 max_tracked = {max_tracked}
+
+[keys]
+# How this server opens its key. A server never prompts, so name a slot it can
+# open unattended:
+#   credential:PATH  a systemd credential (LoadCredentialEncrypted=, bound to
+#                    the TPM where there is one): see docs/operations
+#   env:NAME         a secret of at least 32 bytes in an environment variable
+#   passphrase       read from JIG_KEY_PASSPHRASE
+# Unset, JIG_KEY_UNLOCK or JIG_KEY_PASSPHRASE is used; with neither, a new key
+# is refused rather than written in clear. A raw key from before keys were
+# sealed is refused too: `jig-server keys seal` converts it.
+# unlock = "credential:/run/credentials/jig-server.service/server-key"
+# `plaintext` keeps a raw key in clear: an antipattern, warned about on every
+# boot and advertised in unsafe_options_active.
+storage = "sealed"
 
 [debug]
 # Handle enumeration stays off — it dumps the registry to any caller.
@@ -651,12 +678,11 @@ mod config_file_tests {
             format!("{}:{}", server.bind_address, server.port),
             "template's decorative `listen` must agree with the real bind address"
         );
-        for kind in ["text-render", "channel-create", "member-add"] {
-            assert!(
-                v002.server.allowed_block_kinds.contains(&kind.to_string()),
-                "template must allow {kind}"
-            );
-        }
+        assert_eq!(
+            v002.server.allowed_block_kinds,
+            jig_config::v0_0_2_server::ServerSection::default().allowed_block_kinds,
+            "the template leaves allowed_block_kinds to the built-in default"
+        );
     }
 
     /// Extract the literal heredoc `install.sh` writes to `~/.jig/config.toml`
@@ -685,6 +711,7 @@ mod config_file_tests {
             .replace("${JIG_SERVER_LISTEN%%:*}", host)
             .replace("${JIG_SERVER_LISTEN##*:}", port)
             .replace("$JIG_SERVER_LISTEN", listen)
+            .replace("$cred", &format!("{jig_home}/server/server-key.credential"))
             .replace("$JIG_HOME", jig_home)
     }
 
@@ -727,15 +754,61 @@ mod config_file_tests {
             format!("{}:{}", server.bind_address, server.port),
             "install.sh must keep the decorative `listen` in sync with the real bind address"
         );
+        // A fresh install boots with no hand editing, and its key is sealed.
+        assert_eq!(
+            v002.keys.unlock.as_deref(),
+            Some("credential:/opt/jig-home/server/server-key.credential")
+        );
+        assert_eq!(
+            v002.keys.storage,
+            jig_config::v0_0_2_server::KeyStorage::Sealed
+        );
+        assert_eq!(
+            v002.server.allowed_block_kinds,
+            jig_config::v0_0_2_server::ServerSection::default().allowed_block_kinds,
+            "install.sh leaves allowed_block_kinds to the built-in default, so new kinds reach new installs"
+        );
     }
 
     /// The example operators copy must stay loadable as the config surface
     /// tightens.
+    /// The commented-out default that `install.sh` and the deploy example
+    /// show operators, as the built-in default renders it.
+    fn commented_default_kinds() -> String {
+        let kinds = jig_config::v0_0_2_server::ServerSection::default()
+            .allowed_block_kinds
+            .iter()
+            .map(|k| format!("\"{k}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("#   allowed_block_kinds = [{kinds}]")
+    }
+
+    /// Both files leave the list unset but show today's default, so an
+    /// operator restricting it starts from the real list.
+    #[test]
+    fn install_sh_and_the_example_show_the_current_default_kinds() {
+        let line = commented_default_kinds();
+        for file in ["../../install.sh", "../../deploy/config.example.toml"] {
+            let text =
+                fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file)).unwrap();
+            assert!(
+                text.contains(&line),
+                "{file} must show the built-in default as `{line}`"
+            );
+        }
+    }
+
     #[test]
     fn deploy_example_config_loads() {
         let example =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/config.example.toml");
-        ServerConfig::load(&example).expect("deploy/config.example.toml must load");
+        let example = ServerConfig::load(&example).expect("deploy/config.example.toml must load");
+        assert_eq!(
+            example.v0_0_2().server.allowed_block_kinds,
+            jig_config::v0_0_2_server::ServerSection::default().allowed_block_kinds,
+            "the example leaves allowed_block_kinds to the built-in default"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 +++
 jep = 0004
 title = "Verified Naming: Suffix Authority, Attestations and Client Pins"
-status = "Draft"
+status = "Review"
 type = "Standards Track"
 category = "Security"
 authors = ["DJ <dev@jig.onl>"]
@@ -265,8 +265,26 @@ Non-goals:
 
 # Reference Implementation
 
-In progress (milestone F1): `jig_core::naming` (pull request #147), on the shared
-`jig_core::dcbor` and `jig_core::cose` (pull request #175).
+Milestone F1, in the reference implementation:
+
+- `jig_core::naming` (#147), on the shared `jig_core::dcbor` and `jig_core::cose` (#175):
+  every object, its signed bytes and its verification.
+- The nameserver issues COSE attestations and takes action-bound register and renew proofs
+  (#210), for several suffixes with their own policies (#224).
+- Servers resolve through `[identity.delegations]` (#200); clients through
+  `[naming.delegations]` or `dns` discovery (#201).
+- Client name pins (#213), used by `jig dm`, `jig channel add` and `jig channel kick`
+  (#215).
+- The default `@jig` delegation, in the CLI (#214) and the server (#218).
+- `integration-tests/tests/h13_verified_names.rs` runs rules 5, 13, 15, 17 and 18 end to
+  end, against real nameservers and a lying one.
+
+Not yet implemented:
+
+- rotation by link (rule 9), which waits on lane I's I3;
+- TLS on the nameserver (rule 12);
+- proof-of-work on registration (rule 11);
+- the `contract` root (v0.3).
 
 # Test Vectors
 

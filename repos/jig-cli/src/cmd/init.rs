@@ -19,7 +19,7 @@ use jig_client::Identity;
 use jig_core::naming::{Action, Attestation, Name};
 use serde::Serialize;
 
-use crate::cmd::ns::{Nameserver, b64u};
+use crate::cmd::ns::{Nameserver, Purpose, b64u};
 use crate::config::{self, Config};
 
 /// Parsed flags for `jig init`. Construct directly from `clap`-parsed args
@@ -54,8 +54,14 @@ pub struct InitArgs {
 pub(crate) struct RegisterRequest {
     pub did: String,
     pub requested_alias: String,
+    /// Which of the nameserver's suffixes to register under. Always sent;
+    /// a nameserver that predates multi-suffix serving ignores it.
+    pub suffix: String,
     pub proof_of_control: String,
     pub challenge: String,
+    /// JEP-0008 proof-of-work, when the suffix asks for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pow: Option<jig_core::pow::Proof>,
 }
 
 pub async fn run(args: InitArgs) -> Result<()> {
@@ -73,13 +79,14 @@ pub async fn run(args: InitArgs) -> Result<()> {
 
     // 2. Generate fresh ed25519 keypair under ~/.jig/keys/.
     let keys_dir = jig_client::identity::default_keys_dir();
-    let id = Identity::generate_and_save(&keys_dir)
+    let id = Identity::create(&keys_dir, super::passphrase::key_access()?)
         .with_context(|| format!("generating identity under {}", keys_dir.display()))?;
+    super::passphrase::warn_if_unsealed(&id);
     let did_string = id.did_string();
     println!("generated DID: {did_string}");
     println!(
         "keyfile: {}",
-        keys_dir.join(format!("{did_string}.key")).display()
+        jig_client::identity::key_path(&keys_dir, &did_string).display()
     );
 
     // 3. Persist nickname + DID binding to ~/.jig/cli.toml.
@@ -107,7 +114,10 @@ pub async fn run(args: InitArgs) -> Result<()> {
         let ns_url = args
             .nameserver
             .ok_or_else(|| anyhow!("--nameserver <url> is required with --request-alias"))?;
-        let attestation = register_with_nameserver(&id, &alias_local, &ns_url).await?;
+        let cfg = config::load_config(Some(&cfg_path))?;
+        let attestation =
+            register_with_nameserver(&id, &alias_local, &ns_url, &config::delegations(&cfg))
+                .await?;
         let ttl_days = (attestation.valid_until - attestation.valid_from) / 86_400;
         println!(
             "alias attestation verified: {} (valid {ttl_days}d, ns={})",
@@ -160,23 +170,45 @@ fn build_initial_config(id: &Identity, nickname: &str, server_url: Option<&str>)
     cfg
 }
 
-/// Register `alias_local` under the nameserver's suffix for `id`.
+/// Register `who` for `id`: a full `alias@suffix`, or a bare local part when
+/// the nameserver serves exactly one suffix.
 ///
-/// Returns the attestation once it verifies: signed by the nameserver's
-/// delegated authority, for the lowercased `alias_local@suffix`, valid now,
-/// and naming `id`'s DID.
+/// Returns the attestation once it verifies: signed by an authority for the
+/// suffix (`delegations`' for a `config` root, the published delegation's
+/// for a `dns` one), for the lowercased full name, valid now, and naming
+/// `id`'s DID.
 pub async fn register_with_nameserver(
     id: &Identity,
-    alias_local: &str,
+    who: &str,
     ns_url: &str,
+    delegations: &jig_client::naming::Delegations,
 ) -> Result<Attestation> {
-    let ns = Nameserver::connect(ns_url).await?;
-    let name = Name::parse(&format!("{alias_local}@{}", ns.suffix()))
-        .with_context(|| format!("`{alias_local}` is not a valid alias"))?;
-    let challenge = ns.challenge().await?;
-    let body = build_register_request(id, &name, ns.ns_did(), &challenge);
-    ns.post_binding("/v1/register", &body, &name, &id.did_string())
-        .await?
+    let ns = Nameserver::connect(ns_url, who, delegations, Purpose::Register).await?;
+    let name = ns.name().clone();
+    let did = id.did_string();
+    let alias = name.as_alias();
+    crate::cmd::ns_pow::with_pow(
+        &ns,
+        crate::cmd::ns_pow::Work {
+            action: jig_core::pow::Action::NsRegister,
+            subject: &did,
+            name: &name,
+            binding: &|challenge| {
+                Ok(jig_core::naming::proof_hash(
+                    Action::Register,
+                    ns.ns_did(),
+                    &alias,
+                    challenge,
+                ))
+            },
+        },
+        async |challenge, pow| {
+            let mut body = build_register_request(id, &name, ns.ns_did(), &challenge);
+            body.pow = pow;
+            ns.post_binding("/v1/register", &body, &did).await
+        },
+    )
+    .await?
 }
 
 /// Build the POST /v1/register body: the proof of control is bound to the
@@ -193,8 +225,10 @@ pub(crate) fn build_register_request(
     RegisterRequest {
         did: id.did_string(),
         requested_alias: name.alias.clone(),
+        suffix: name.suffix.clone(),
         proof_of_control: b64u(&proof),
         challenge: challenge.to_string(),
+        pow: None,
     }
 }
 
@@ -209,7 +243,7 @@ mod tests {
     fn build_register_request_signs_an_action_bound_proof() {
         // Generate a fresh identity in a tempdir (separate from ~/.jig/keys/).
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(dir.path()).unwrap();
+        let id = Identity::generate_for_tests(dir.path());
         let name = Name::parse("DJ@Dj.Jig").unwrap();
         let ns_did = "did:jig:zNameserver";
 
@@ -240,7 +274,7 @@ mod tests {
         // Seeding the address book with your own DID is what stops `jig chat`
         // rendering a 61-char DID for every line you write yourself.
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(dir.path()).unwrap();
+        let id = Identity::generate_for_tests(dir.path());
 
         let cfg = build_initial_config(&id, "dj", None);
 
@@ -258,7 +292,7 @@ mod tests {
         // Tests build jig-core with `test-default-authority`; a real build
         // writes no entry while the authority is the placeholder.
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(dir.path()).unwrap();
+        let id = Identity::generate_for_tests(dir.path());
         let cfg = build_initial_config(&id, "dj", None);
         assert_eq!(
             cfg.naming.delegations.get(config::DEFAULT_SUFFIX),
@@ -269,7 +303,7 @@ mod tests {
     #[test]
     fn initial_config_keeps_the_default_server_unless_overridden() {
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(dir.path()).unwrap();
+        let id = Identity::generate_for_tests(dir.path());
         assert_eq!(
             build_initial_config(&id, "dj", None).server.base_url,
             Config::default().server.base_url
@@ -287,7 +321,7 @@ mod tests {
         // The nameserver composes `<local>@<its suffix>`; the request names
         // only the local part, but the proof is over the full name.
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(dir.path()).unwrap();
+        let id = Identity::generate_for_tests(dir.path());
         let name = Name::parse("Alice_42@dj.jig").unwrap();
         let req = build_register_request(&id, &name, "did:jig:zNs", "abc");
         assert_eq!(req.requested_alias, "alice_42");

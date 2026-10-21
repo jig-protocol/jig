@@ -109,4 +109,22 @@ mod tests {
         assert!(slug.starts_with(THREAD_PREFIX));
         assert!(!slug.starts_with(jig_core::dm::DM_PREFIX));
     }
+
+    /// The server's slug grammar admits exactly what this function makes:
+    /// an `#email/` thread, which it lets only the bridge create.
+    #[test]
+    fn a_thread_slug_is_in_the_servers_email_class() {
+        for (a, b) in [
+            ("did:jig:zA", "did:jig:zB"),
+            ("did:jig:zbob", "did:jig:zalice"),
+        ] {
+            let slug = thread_slug(a, b);
+            assert_eq!(
+                jig_core::slug::classify_slug(&slug),
+                Ok(jig_core::slug::SlugClass::Email),
+                "{slug}"
+            );
+        }
+        assert_eq!(THREAD_PREFIX, jig_core::slug::EMAIL_PREFIX);
+    }
 }

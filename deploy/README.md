@@ -9,7 +9,7 @@ Tailscale**.
 | `jig-server.service` | Block server, port **7117** |
 | `jig-nameserver.service` | DID/alias registry, port **7070** |
 | `config.example.toml` | The `/etc/jig/config.toml` template |
-| `jig-backup.sh` | `VACUUM INTO` snapshots + `server.key` |
+| `jig-backup.sh` | `VACUUM INTO` snapshots + the sealed `server.jigkey` |
 | `jig-backup.service` / `.timer` | Daily 03:17 UTC backup |
 
 Each unit file carries its own rationale in comments. This document covers the
@@ -17,40 +17,54 @@ sequence and the things that are not visible from inside a single file.
 
 ---
 
-## 🔴 BACK UP `/var/lib/jig/server.key` OFFSITE. TODAY.
+## 🔴 BACK UP `/var/lib/jig/server.jigkey`, AND A WAY TO OPEN IT, OFFSITE. TODAY.
 
-**LOSING `/var/lib/jig/server.key` CHANGES THE SERVER DID.**
+**LOSING THE SERVER KEY CHANGES THE SERVER DID.**
 
-The server DID is derived from that 32-byte ed25519 seed. If the key is gone, the
-server comes back up with a **different identity**:
+The server DID is derived from a 32-byte ed25519 seed. `server_did_keyfile =
+"/var/lib/jig/server.key"` names `/var/lib/jig/server.jigkey` beside it, which
+holds the seed sealed (XChaCha20-Poly1305 under a key that one of its slots
+unwraps). If the key is gone, the server comes back up with a **different
+identity**:
 
 - every receipt it signs from then on is under a new key, unlinkable to its
   earlier receipts;
 - federation peers that list this server by `expected_did` now hold a stale value;
-- once clients pin the server DID on first contact (the mandatory handshake,
-  JEP-0002), every client will see what is indistinguishable from a
-  man-in-the-middle. Clients do not pin it yet, so today this is the next
-  release's problem, not an excuse to skip the backup.
+- every client that pinned the server DID on first contact (JEP-0002) sees what
+  is indistinguishable from a man-in-the-middle.
 
 Restoring a database without the key restores nothing useful.
 
 User nickname pins (the server-side TOFU lock that binds a nickname to a user's
 DID) live in the database, not in the key, and survive a key loss.
 
+**A backup of `server.jigkey` restores only with a secret for one of its slots.**
+The server boots with a systemd credential ([Sealing the server
+key](#sealing-the-server-key)). Give the key a second slot, a passphrase kept
+offline, so it can be opened on another machine:
+
 ```bash
-sudo base64 /var/lib/jig/server.key   # paste into 1Password, then forget it exists
+# With jig-server running: root can read the credential [keys] unlock names.
+sudo -i     # a root shell: nothing below lands in a unit, the journal or ps
+read -rs -p 'new passphrase: ' JIG_KEY_PASSPHRASE; echo; export JIG_KEY_PASSPHRASE
+/opt/jig/bin/jig-server --config /etc/jig/config.toml keys add-slot --slot passphrase
+chown jig:jig /var/lib/jig/server.jigkey
+unset JIG_KEY_PASSPHRASE
+/opt/jig/bin/jig-server --config /etc/jig/config.toml keys show
 ```
+
+The passphrase goes into the password manager; the sealed file goes into the
+backups.
 
 Two related traps:
 
-- The server **generates** the key `0600` on first boot and **refuses to start**
-  later if the file is group- or other-readable (it hard-fails on `mode & 0o077`).
-  If you restore it from backup, `chmod 600` and `chown jig:jig` it.
+- The server writes its key `0600` on first boot. A raw `server.key` must not be
+  left beside `server.jigkey`: the server refuses to start until it is removed.
 - Restoring the key onto a *different* host is what you want. Restoring the
   databases without it is not.
 
 Teammates have the same problem one level down: see
-[Teammate onboarding](#teammate-onboarding) — `~/.jig/keys/*.key` is the only
+[Teammate onboarding](#teammate-onboarding) — `~/.jig/keys/*.jigkey` is the only
 copy of a person's identity.
 
 ---
@@ -168,16 +182,15 @@ sudo install -m 0644 deploy/config.example.toml /etc/jig/config.toml
 tailscale ip -4                     # <- put this address in the config
 sudoedit /etc/jig/config.toml
 
-# 4. nameserver secret (MANDATORY — it exits non-zero at startup without one)
-printf 'JIG_NS_SECRET=%s\n' "$(openssl rand -hex 32)" \
-  | sudo tee /etc/jig/jig-nameserver.env >/dev/null
-sudo chown root:jig /etc/jig/jig-nameserver.env
-sudo chmod 600 /etc/jig/jig-nameserver.env      # <- 600. it is a secret.
+# 3b. nameserver config — EDIT IT, it must name the suffixes you serve
+sudo install -m 0644 deploy/jig-nameserver.example.toml /etc/jig/jig-nameserver.toml
+sudoedit /etc/jig/jig-nameserver.toml
 
-# 5. optional server secrets (bridge tokens etc.), same treatment
+# 4. optional env files (bridge tokens etc.): chmod 600 root:jig
 #    sudo chmod 600 /etc/jig/jig-server.env
+#    /etc/jig/jig-nameserver.env is optional too; the nameserver needs no secret
 
-# 6. units
+# 5. units
 sudo install -m 0644 deploy/jig-server.service deploy/jig-nameserver.service \
                      deploy/jig-backup.service deploy/jig-backup.timer \
                      /etc/systemd/system/
@@ -215,8 +228,17 @@ the root keys and every section in one file.
 >
 > **Upgrading a server that ran without `[tls]`:** it comes back on TLS. Every
 > client re-runs `jig server set https://…`; their pins and encrypted-channel
-> state carry over, because neither is keyed by the scheme. To keep plaintext
-> (behind a proxy that terminates TLS, say), set `[tls] enabled = false`.
+> state carry over, because neither is keyed by the scheme.
+>
+> **jig-server terminates TLS itself; do not put a TLS-terminating proxy in
+> front of it.** The signed welcome carries the connection's TLS exporter (#234),
+> so a server behind a proxy that terminates TLS signs an empty exporter, and
+> every remote client refuses it. If something must sit in front of jig-server,
+> it passes TLS through (TCP or SNI passthrough). `[tls] enabled = false` serves
+> plaintext for loopback or local testing only: the server lists
+> `tls.enabled=false` in `/.well-known/jig`'s `unsafe_options_active` and logs a
+> startup warning, and a `jig` CLI refuses a plaintext `http://` server that is
+> not on its own machine (#142).
 >
 > The nameserver on `:7070` is **not** covered by `[tls]` — that section belongs
 > to `jig-server` only — so its rows stay `http://` unless you terminate TLS in
@@ -440,16 +462,29 @@ so a rebooted box catches up). It snapshots:
 
 | What | Why |
 | --- | --- |
-| `/var/lib/jig/jig.db` | v0.0.1 store |
 | `/var/lib/jig/jig_v002.db` | **the v0.0.2 block store — where the actual messages are** |
-| `/var/lib/jig/nameserver.db` | alias registry |
-| `/var/lib/jig/server.key` | server identity |
+| `/var/lib/jig/nameserver.db` | the nameserver's legacy registry |
+| `/var/lib/jig/nameserver_v002.db` | **the nameserver's alias bindings** |
+| `/var/lib/jig/server.jigkey` | server identity, sealed |
+| `/var/lib/jig/nameserver_v002.jigkey` | **the nameserver's signing key**, sealed (set `JIG_NAMESERVER_KEYFILE` if `[v0_0_2.server] server_did_keyfile` puts it elsewhere) |
 
-**The `_v002` suffix is not a typo.** `jig-server` derives the v0.0.2 store path
-from `database_path` by appending `_v002` to the file stem, so a configured
-`/var/lib/jig/jig.db` means blocks live in `/var/lib/jig/jig_v002.db`. **Both
-files exist and both matter** — a backup of only `jig.db` backs up essentially
-nothing anyone typed.
+A key still in clear (`[keys] storage = "plaintext"`) is copied too, with a
+warning, and the snapshot then holds it in clear. A snapshot holds no secret
+that opens a sealed key; `MANIFEST.txt` records which keys were sealed.
+
+The nameserver files are skipped on a box that doesn't run the nameserver, but
+a snapshot is refused if `nameserver_v002.db` exists without its key. **A
+restore without `nameserver_v002.jigkey` loses the nameserver's DID**: the
+nameserver mints a new key, and every attestation the old one signed stops
+verifying for servers and clients whose delegation names the old DID.
+
+**The `_v002` suffix is not a typo.** `jig-server` derives its store path from
+`database_path` by appending `_v002` to the file stem, so a configured
+`/var/lib/jig/jig.db` means blocks live in `/var/lib/jig/jig_v002.db`.
+`jig.db` itself is no longer opened: the v0.0.1 store it held was removed
+(#196). On a box upgraded from an older release the file is still there and
+unused; delete it yourself once no backup you keep needs it. Nothing deletes
+it for you.
 
 Databases are copied with `sqlite3 … 'VACUUM INTO …'`, which takes a read lock
 and writes one consistent file, so snapshots are safe while the server is
@@ -469,20 +504,84 @@ journalctl -u jig-backup.service -n 50
 
 `/var/backups/jig` is **on the same disk as the thing it is backing up**. Ship
 it elsewhere — `tailscale file cp`, `rsync` to another tailnet node, or restic
-to object storage. At minimum, get `server.key` off the box (top of this file).
+to object storage. At minimum, get `server.jigkey` and `nameserver_v002.jigkey` off the box, and
+their passphrases into a password manager (top of this file).
 
 ### Restore
 
 ```bash
 sudo systemctl stop jig-server jig-nameserver
-sudo cp /path/to/snapshot/{jig.db,jig_v002.db,nameserver.db} /var/lib/jig/
-sudo cp /path/to/snapshot/server.key /var/lib/jig/server.key
+sudo cp /path/to/snapshot/{jig_v002.db,nameserver.db,nameserver_v002.db} /var/lib/jig/
+sudo cp /path/to/snapshot/server.jigkey /var/lib/jig/server.jigkey
+sudo cp /path/to/snapshot/nameserver_v002.jigkey /var/lib/jig/nameserver_v002.jigkey
 sudo chown -R jig:jig /var/lib/jig          # -R, not /var/lib/jig/* — see the
                                             # glob note in the TLS section above
-sudo chmod 600 /var/lib/jig/server.key      # or the server refuses to start
+sudo chmod 600 /var/lib/jig/*.jigkey
 sudo systemctl start jig-server jig-nameserver
 curl -k https://100.x.y.z:7117/.well-known/jig  # server_did MUST match the old one
 ```
+
+On the same machine the keys open with the credential they were sealed with. On
+**another machine** a TPM-bound credential does not decrypt: make this host's
+credential ([Sealing the server key](#sealing-the-server-key), step 1), then add
+it as a slot, opening the key with its offline passphrase:
+
+```bash
+sudo -i
+read -rs -p 'passphrase: ' JIG_KEY_PASSPHRASE; echo; export JIG_KEY_PASSPHRASE
+/opt/jig/bin/jig-server --config /etc/jig/config.toml keys add-slot --slot \
+  credential:<(systemd-creds decrypt --name=jig-server-key /etc/credstore.encrypted/jig-server-key -)
+chown jig:jig /var/lib/jig/server.jigkey
+unset JIG_KEY_PASSPHRASE
+```
+
+The old machine's credential slot stays in the file and opens nothing here.
+
+### Sealing the server key
+
+A server boots unattended, so its key opens with a secret the server is handed
+at start, never typed. `[keys] unlock` names it. The recommended one is a
+systemd credential, encrypted to this machine's TPM where it has one:
+
+1. Make the secret, encrypted at rest. `--with-key=auto` uses the TPM2 when there
+   is one, and otherwise a host key in `/var/lib/systemd/credential.secret`:
+   ```bash
+   sudo install -d -m 0700 /etc/credstore.encrypted
+   head -c 48 /dev/urandom | base64 | sudo systemd-creds encrypt --with-key=auto \
+     --name=jig-server-key - /etc/credstore.encrypted/jig-server-key
+   ```
+2. Hand it to the unit (`jig-server.service` carries the line, commented):
+   `LoadCredentialEncrypted=jig-server-key:/etc/credstore.encrypted/jig-server-key`.
+3. Name it in `/etc/jig/config.toml`:
+   ```toml
+   [keys]
+   unlock = "credential:/run/credentials/jig-server.service/jig-server-key"
+   ```
+4. A new server seals its first key with it. A server upgraded from a release
+   that wrote a raw `server.key` refuses to start and names this command, which
+   seals the key in place, keeps its DID and removes the raw file:
+   ```bash
+   sudo systemctl stop jig-server
+   sudo bash -c '/opt/jig/bin/jig-server --config /etc/jig/config.toml keys seal --slot \
+     credential:<(systemd-creds decrypt --name=jig-server-key /etc/credstore.encrypted/jig-server-key -)'
+   sudo chown jig:jig /var/lib/jig/server.jigkey
+   sudo systemctl start jig-server
+   ```
+   Removing the raw file does not erase it from the disk or from earlier backups.
+   Then add the offline passphrase slot (top of this file).
+
+What each choice protects against:
+
+| `[keys] unlock` | Protects the key against | Not against |
+| --- | --- | --- |
+| `credential:`, TPM-bound | a copied disk, image or backup: the secret decrypts only on this machine's TPM | root on the running machine |
+| `credential:`, host key | a backup of `/var/lib/jig` alone | a copy of the whole disk, which holds the host key too |
+| `env:NAME` from a secret manager | whatever the manager protects; nothing on this disk | anyone who can read the process environment |
+| a secret in a file beside the key | almost nothing: whoever reads one reads both | |
+| `storage = "plaintext"` | nothing; warned about on every boot | |
+
+At-rest encryption does not protect a key from code running as the server's
+user while it runs, and does not protect the key in memory.
 
 That last check is the whole point: if `server_did` changed, you restored the
 databases without the key.
@@ -501,7 +600,9 @@ reputation, tribunal, transparency and federation) were removed:
 | `/v1/health` | GET | liveness |
 | `/v1/challenge` | GET | issues a 64-hex nonce |
 | `/v1/register` | POST | consumes a GET-issued challenge, returns an attestation |
-| `/v1/resolve/:alias` | GET | alias → DID |
+| `/v1/resolve/:alias` | GET | the signed alias attestation, plus transitional unsigned hints (`did`, `alias`, `valid_until`) |
+| `/v1/suffixes` | GET | suffixes served, their registration mode, and this nameserver's DID |
+| `/.well-known/jig-ns-delegation` | GET | signed delegation for a DNS-rooted suffix (`?suffix=`, else the `Host`) |
 | `/v1/rotate`, `/v1/renew` | POST | key rotation / renewal |
 | `/v1/handles` | GET | **debug-gated** behind `[debug] list_handles` |
 
@@ -519,12 +620,51 @@ reputation, tribunal, transparency and federation) were removed:
 > the proxy's address and its limit. Limits are in memory and reset when the
 > nameserver restarts.
 
-None of the nameserver's routes asks for proof-of-work.
+Register, renew and rotate ask for proof-of-work only on a suffix whose
+`pow.min_effort` is above 0 (see **Proof-of-work** below).
 
 `/v1/handles` enumerates every registered alias, so it stays off unless you
-explicitly set `list_handles = true`. Alias resolution never touches DNS, so the
-default `alias_suffix` (`gigue.jig`) works on a tailnet and cannot leak
-publicly — `.jig` is not an IANA TLD.
+explicitly set `list_handles = true`.
+
+**Suffixes.** `[[v0_0_2.nameserver.alias_suffixes]]` is required and has no
+default: the nameserver refuses to start until you name at least one suffix
+(see `deploy/jig-nameserver.example.toml`). One DID holds at most one name per
+suffix. Each suffix sets its own policy: `registration = "open" | "closed"`
+(a closed suffix still resolves, renews and rotates), `min_alias_len`
+(default 3), reserved names, and `registration_allow`, a list of DIDs with the
+exact aliases each may register past that policy. A single-label suffix such
+as `jig` also needs `single_label_authority = true`: clients trust it only
+through their own config, so its names verify only for clients whose config
+names this nameserver's DID.
+
+**Proof-of-work.** Register, renew and rotate can carry JEP-0008
+proof-of-work, set per suffix in `[v0_0_2.nameserver.alias_suffixes.pow]`. It
+is on by default, at the recommended values: 2^20 to register, 4× more per
+letter under 5, at most 2^24, and 1 to renew or rotate. `jig` solves it;
+`min_effort = 0` turns it off. A client asks
+`GET /v1/challenge?action=register|renew|rotate&did=&name=`, and the reply
+states the effort, signed by the nameserver (`pow_offer`). The policy's
+refusals (closed, too short, reserved, taken) come back
+there, before any work. `[alias_rate_limits]` caps `GET /v1/challenge` per IP
+(`challenge_per_ip_per_min`, default 60) and the challenges pending at once
+(`max_pending_challenges`, default 100 000; past it, `503 BUSY`, with a tenth
+kept for renew and rotate).
+
+For a DNS-rooted suffix, `/.well-known/jig-ns-delegation` serves this
+nameserver's signed delegation; a resolver treats it as authoritative only when
+fetched from `https://<suffix>/`. `GET /v1/suffixes` lists the suffixes served
+and this nameserver's DID.
+
+**Key ceremony.** `jig-nameserver keygen --out <path> --slot passphrase` writes
+a new signing key, sealed (0600, never overwriting an existing file), and prints
+only the DID, so the DID can be recorded on an offline machine before any
+server exists. The key is never written in clear. Move the `.jigkey` to the
+server, point `[v0_0_2.server] server_did_keyfile` at it, and add the server's
+credential with `jig-nameserver keys add-slot --slot credential:...`, opening
+it with the ceremony passphrase in `JIG_KEY_PASSPHRASE` (the same
+root-shell pattern as for jig-server). A key made elsewhere as a raw 32-byte
+seed is imported with `keys seal`, which keeps its DID. Nameserver keys open as
+`[v0_0_2.keys]` says, the same section as jig-server's `[keys]`.
 
 ---
 
@@ -535,17 +675,25 @@ publicly — `.jig` is not an IANA TLD.
   vars instead, which is still correct and still applied after any TOML load.
   *(The comment inside `jig-nameserver.service` still says the flags are parsed
   and ignored; that comment is stale.)*
-- **`JIG_NS_SECRET` is mandatory** — the nameserver refuses to start without it,
-  logging through tracing *and* stderr before exiting non-zero. It is in a
-  required (no leading `-`) `EnvironmentFile` so a missing secret fails loudly
-  instead of booting with a default PoW secret.
+- **The nameserver needs no secret, and its config is strict (#247).**
+  `JIG_NS_SECRET` and `[pow]` went with the legacy proof-of-work routes (#192),
+  `[rate_limits]` with the legacy rate limits (#197), and `[federation]` with
+  nameserver federation (#237). A config that still has any of these sections,
+  or `[transparency]`, `[runtime]`, `[anomaly_detection]`, `[hot]` or a
+  `storage`/`analytics` `backend` key, **stops the nameserver from starting**,
+  with a message naming the key: delete it. An env file that still sets
+  `JIG_NS_SECRET`, `JIG_NS_POW_*`, `JIG_NS_RATE_*`, a federation variable or
+  another removed `JIG_NS_*` variable starts, with a warning naming each one;
+  remove them at your own pace. The unit's
+  `EnvironmentFile=` is optional (leading `-`) and only carries any `JIG_NS_*`
+  settings you choose to put there.
 - **Secrets never go inline in a unit file.** `systemctl cat` is readable by any
   local user. `EnvironmentFile`, `chmod 600 root:jig`, always.
 - **`MemoryDenyWriteExecute` is deliberately absent** from every unit. Blocks
   execute through wasmtime's cranelift JIT, which maps pages W then X; enabling
   W^X denial turns every block execution into a segfault.
-- **`UMask=0077` is deliberate.** The server writes `server.key` on first boot
-  and refuses to start later if the mode is loose.
+- **`UMask=0077` is deliberate.** The server writes `server.jigkey` owner-only
+  on first boot, and refuses a raw key whose mode is loose.
 - **`StateDirectory=jig`** makes systemd create and chown `/var/lib/jig`;
   `ReadWritePaths=/var/lib/jig` is still needed because `ProtectSystem=strict`
   makes everything else read-only, and SQLite must write `-wal`/`-shm` siblings

@@ -10,22 +10,23 @@
 //! `jig_nameserver::v0_0_2_rotate_renew`. Keep field names in lockstep.
 //!
 //! Rotate semantics:
-//!   1. Load the current identity from `~/.jig/keys/<old_did>.key`.
-//!   2. Mint a fresh identity (writes the new keyfile via
-//!      `Identity::generate_and_save`).
+//!   1. Load the current identity from `~/.jig/keys/<old_did>.jigkey`.
+//!   2. Mint a fresh identity (seals the new keyfile via
+//!      `Identity::create`).
 //!   3. Sign the same challenge with BOTH keys.
-//!   4. POST /v1/rotate. If the request fails, the new keyfile is
-//!      removed before bailing so we never end up with two valid keys
-//!      and a stale config. If the nameserver accepts the rotation but its
-//!      reply does not verify, both keyfiles and the config stay as they
-//!      are: the alias may already point at the new DID, so its key must
-//!      not be thrown away.
-//!   5. On a verified reply: rename the OLD keyfile to `<old_did>.key.rotated`
+//!   4. POST /v1/rotate. If the nameserver certainly did not act (the
+//!      request never reached it, or it answered 4xx), the new keyfile is
+//!      removed before bailing. In every other failure (a timeout or
+//!      dropped connection after sending, a 5xx, an unreadable or
+//!      unverifiable reply), both keyfiles and the config stay as they are:
+//!      the alias may already point at the new DID, so its key must not be
+//!      thrown away.
+//!   5. On a verified reply: rename the OLD keyfile to `<old_did>.jigkey.rotated`
 //!      (kept for offline recovery) and rewrite the active config file
 //!      (`--config <path>`, else `~/.jig/cli.toml`) so `[user] did`
 //!      points at the new DID.
 //!
-//! The `.key.rotated` rename is a design call — `v0_0_2_rotate_renew.rs`
+//! The `.jigkey.rotated` rename is a design call — `v0_0_2_rotate_renew.rs`
 //! handles the server-side expiry but is silent on client-side cleanup;
 //! keeping the file (under a non-loadable name) preserves the operator's
 //! ability to verify or recover offline.
@@ -37,7 +38,7 @@ use jig_core::naming::{Action, Attestation, Name};
 use serde::{Deserialize, Serialize};
 
 use crate::cmd::common::CliContext;
-use crate::cmd::ns::{Nameserver, b64u};
+use crate::cmd::ns::{Nameserver, Purpose, b64u};
 
 /// Parsed flags for `jig keys renew`.
 #[derive(Debug, Clone)]
@@ -65,6 +66,9 @@ pub(crate) struct RenewRequestBody {
     pub did: String,
     pub challenge: String,
     pub proof_of_control: String,
+    /// JEP-0008 proof-of-work, when the suffix asks for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pow: Option<jig_core::pow::Proof>,
 }
 
 /// Body of POST `/v1/rotate`. Mirrors
@@ -77,6 +81,9 @@ pub(crate) struct RotateRequestBody {
     pub challenge: String,
     pub sig_by_old: String,
     pub sig_by_new: String,
+    /// JEP-0008 proof-of-work by the old DID, when the suffix asks for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pow: Option<jig_core::pow::Proof>,
 }
 
 // ============================================================================
@@ -88,7 +95,9 @@ pub async fn renew(ctx: &CliContext, args: KeysRenewArgs) -> Result<()> {
     let id = ctx.identity()?;
 
     // 2. Run the renew handshake.
-    let attestation = renew_with_nameserver(&id, &args.alias, &args.nameserver).await?;
+    let delegations = crate::config::delegations(ctx.effective());
+    let attestation =
+        renew_with_nameserver(&id, &args.alias, &args.nameserver, &delegations).await?;
 
     let ttl_days = (attestation.valid_until - attestation.valid_from) / 86_400;
     println!(
@@ -104,13 +113,35 @@ pub async fn renew_with_nameserver(
     id: &Identity,
     alias: &str,
     ns_url: &str,
+    delegations: &jig_client::naming::Delegations,
 ) -> Result<Attestation> {
-    let name = parse_full_name(alias)?;
-    let ns = Nameserver::connect(ns_url).await?;
-    let challenge = ns.challenge().await?;
-    let body = build_renew_request(id, &name, ns.ns_did(), &challenge);
-    ns.post_binding("/v1/renew", &body, &name, &id.did_string())
-        .await?
+    parse_full_name(alias)?;
+    let ns = Nameserver::connect(ns_url, alias, delegations, Purpose::Keep).await?;
+    let name = ns.name().clone();
+    let did = id.did_string();
+    let full = name.as_alias();
+    crate::cmd::ns_pow::with_pow(
+        &ns,
+        crate::cmd::ns_pow::Work {
+            action: jig_core::pow::Action::NsRenew,
+            subject: &did,
+            name: &name,
+            binding: &|challenge| {
+                Ok(jig_core::naming::proof_hash(
+                    Action::Renew,
+                    ns.ns_did(),
+                    &full,
+                    challenge,
+                ))
+            },
+        },
+        async |challenge, pow| {
+            let mut body = build_renew_request(id, &name, ns.ns_did(), &challenge);
+            body.pow = pow;
+            ns.post_binding("/v1/renew", &body, &did).await
+        },
+    )
+    .await?
 }
 
 /// Build the POST /v1/renew body: the proof of control is bound to the renew
@@ -129,6 +160,7 @@ pub(crate) fn build_renew_request(
         did: id.did_string(),
         challenge: challenge.to_string(),
         proof_of_control: b64u(&proof),
+        pow: None,
     }
 }
 
@@ -141,18 +173,35 @@ pub async fn rotate(ctx: &CliContext, args: KeysRotateArgs) -> Result<()> {
     let old_id = ctx.identity()?;
     let old_did_str = old_id.did_string();
     let keys_dir = jig_client::identity::default_keys_dir();
+    // Checked before anything changes: once the nameserver has moved the
+    // alias, failing to move the old key aside would leave cli.toml on it.
+    let rotated = keys_dir.join(format!("{old_did_str}.jigkey.rotated"));
+    if rotated.exists() {
+        anyhow::bail!(
+            "{} exists already; move it somewhere safe before rotating again",
+            rotated.display()
+        );
+    }
 
     // 2. Mint a fresh keypair. This writes the new keyfile to disk.
-    let new_id = Identity::generate_and_save(&keys_dir)
+    let new_id = Identity::create(&keys_dir, super::passphrase::key_access()?)
         .with_context(|| format!("generating new identity under {}", keys_dir.display()))?;
     let new_did_str = new_id.did_string();
-    let new_keyfile = keys_dir.join(format!("{new_did_str}.key"));
+    let new_keyfile = jig_client::identity::key_path(&keys_dir, &new_did_str);
 
-    // 3. Drive the rotate handshake. If the nameserver never accepted it,
-    //    undo the new keyfile so we don't leak an orphaned key. If it
-    //    accepted but the reply doesn't verify, keep everything: the alias
-    //    may already be bound to the new key.
-    let reply = match rotate_with_nameserver(&old_id, &new_id, &args.alias, &args.nameserver).await
+    // 3. Drive the rotate handshake. If the nameserver certainly did not
+    //    act, undo the new keyfile so we don't leak an orphaned key.
+    //    Otherwise keep everything: the alias may already be bound to the
+    //    new key.
+    let delegations = crate::config::delegations(ctx.effective());
+    let reply = match rotate_with_nameserver(
+        &old_id,
+        &new_id,
+        &args.alias,
+        &args.nameserver,
+        &delegations,
+    )
+    .await
     {
         Ok(reply) => reply,
         Err(e) => {
@@ -163,27 +212,26 @@ pub async fn rotate(ctx: &CliContext, args: KeysRotateArgs) -> Result<()> {
     };
     let attestation = reply.with_context(|| {
         format!(
-            "the nameserver accepted the rotation, so {} may now point at {new_did_str}. \
-             Both keyfiles are kept and [user] did still names {old_did_str}; check with \
-             `jig ns resolve {}` before switching keys by hand (new keyfile: {})",
+            "the nameserver may have applied the rotation, so {} may now point at \
+             {new_did_str}. Both keyfiles are kept and [user] did still names \
+             {old_did_str}; check with `jig ns resolve {}` before switching keys by hand (new keyfile: {})",
             args.alias,
             args.alias,
             new_keyfile.display()
         )
     })?;
 
-    // 4. Rename the OLD keyfile to <old_did>.key.rotated. Operator may
-    //    want it for offline recovery. The rename keeps it on disk but
-    //    out of the DID-load lookup path.
-    let old_keyfile = keys_dir.join(format!("{old_did_str}.key"));
-    let rotated_keyfile = keys_dir.join(format!("{old_did_str}.key.rotated"));
-    std::fs::rename(&old_keyfile, &rotated_keyfile).with_context(|| {
-        format!(
-            "renaming {} -> {} after successful rotation",
-            old_keyfile.display(),
-            rotated_keyfile.display()
-        )
-    })?;
+    // 4. Rename the OLD keyfile to <old_did>.jigkey.rotated. Operator may
+    //    want it for offline recovery. The rename keeps it on disk, still
+    //    sealed, but out of the DID-load lookup path.
+    let old_keyfile = jig_client::identity::key_path(&keys_dir, &old_did_str);
+    let rotated_keyfile =
+        jig_client::identity::retire_key(&keys_dir, &old_did_str).with_context(|| {
+            format!(
+                "moving {} aside after successful rotation",
+                old_keyfile.display()
+            )
+        })?;
 
     // 5. Point the config file at the new DID. Start from the on-disk
     //    config so a one-shot `--server`/`--display-name` override isn't
@@ -207,20 +255,47 @@ pub async fn rotate(ctx: &CliContext, args: KeysRotateArgs) -> Result<()> {
 }
 
 /// Drive the challenge → dual-sign → rotate handshake. `Err` means the
-/// nameserver did not accept the rotation; `Ok(Err(_))` means it accepted it
-/// but its reply does not verify as an attestation for `new_id`.
+/// nameserver did not apply the rotation; `Ok(Err(_))` means it may have,
+/// but no verified attestation for `new_id` came back.
 pub async fn rotate_with_nameserver(
     old_id: &Identity,
     new_id: &Identity,
     alias: &str,
     ns_url: &str,
+    delegations: &jig_client::naming::Delegations,
 ) -> Result<Result<Attestation>> {
-    let name = parse_full_name(alias)?;
-    let ns = Nameserver::connect(ns_url).await?;
-    let challenge = ns.challenge().await?;
-    let body = build_rotate_request(old_id, new_id, &name.as_alias(), &challenge);
-    ns.post_binding("/v1/rotate", &body, &name, &new_id.did_string())
-        .await
+    parse_full_name(alias)?;
+    let ns = Nameserver::connect(ns_url, alias, delegations, Purpose::Keep).await?;
+    let name = ns.name().clone();
+    let (old_did, new_did) = (old_id.did_string(), new_id.did_string());
+    let full = name.as_alias();
+    // `post_binding`'s outer `Err` is a refusal, the only case `with_pow`
+    // retries; an unknown outcome (a timeout, a 5xx) is its inner `Err`,
+    // returned as is so the caller keeps the new key.
+    crate::cmd::ns_pow::with_pow(
+        &ns,
+        crate::cmd::ns_pow::Work {
+            action: jig_core::pow::Action::NsRotate,
+            subject: &old_did,
+            name: &name,
+            binding: &|challenge| {
+                jig_core::naming::rotate_pow_binding(
+                    ns.ns_did(),
+                    &full,
+                    &old_did,
+                    &new_did,
+                    challenge,
+                )
+                .context("binding the rotation's proof-of-work")
+            },
+        },
+        async |challenge, pow| {
+            let mut body = build_rotate_request(old_id, new_id, &full, &challenge);
+            body.pow = pow;
+            ns.post_binding("/v1/rotate", &body, &new_did).await
+        },
+    )
+    .await
 }
 
 /// Build the POST /v1/rotate body. Factored out for unit testing.
@@ -240,6 +315,7 @@ pub(crate) fn build_rotate_request(
         challenge: challenge.to_string(),
         sig_by_old: encode(sig_old.to_bytes()),
         sig_by_new: encode(sig_new.to_bytes()),
+        pow: None,
     }
 }
 
@@ -262,7 +338,7 @@ mod tests {
     #[test]
     fn build_renew_request_signs_an_action_bound_proof() {
         let dir = tempdir().unwrap();
-        let id = Identity::generate_and_save(dir.path()).unwrap();
+        let id = Identity::generate_for_tests(dir.path());
         let name = Name::parse("Alice_42@Dj.Jig").unwrap();
         let ns_did = "did:jig:zNameserver";
 
@@ -297,10 +373,10 @@ mod tests {
     #[test]
     fn build_rotate_request_signs_with_both_keys_and_pins_both_dids() {
         let dir = tempdir().unwrap();
-        let old = Identity::generate_and_save(dir.path()).unwrap();
+        let old = Identity::generate_for_tests(dir.path());
         // Sleep is unnecessary — two separate generate calls produce
         // distinct keys with overwhelming probability.
-        let new = Identity::generate_and_save(dir.path()).unwrap();
+        let new = Identity::generate_for_tests(dir.path());
         assert_ne!(old.did_string(), new.did_string(), "DIDs must differ");
 
         let challenge = "c0ffee".to_string();
@@ -339,8 +415,8 @@ mod tests {
         // Defence-in-depth: confirm that swapping sigs across pubkeys
         // doesn't accidentally pass (would indicate identical signing input).
         let dir = tempdir().unwrap();
-        let old = Identity::generate_and_save(dir.path()).unwrap();
-        let new = Identity::generate_and_save(dir.path()).unwrap();
+        let old = Identity::generate_for_tests(dir.path());
+        let new = Identity::generate_for_tests(dir.path());
         let req = build_rotate_request(&old, &new, "dj@dj.jig", "zz");
 
         let old_sig = ed25519_dalek::Signature::from_slice(

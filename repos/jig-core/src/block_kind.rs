@@ -32,6 +32,13 @@ pub enum BlockKind {
     /// marking it archived — a soft delete. Never destroys blocks; see
     /// `jig_pipeline::effect::apply_channel_archive` for the rationale.
     ChannelArchive,
+    /// Gives a DID a role in a channel (JEP-0005 rule 7b). v0.2 defines one
+    /// assignable role, `admin`. Only an owner may sign it.
+    RoleAssign,
+    /// Takes a role away again (JEP-0005 rule 7b). The channel's root owners
+    /// (its creator and the co-owners its `channel-create` lists) have no
+    /// role to take: they cannot be unassigned.
+    RoleUnassign,
     /// Synthetic in v0.0.2; real Wasm in v0.0.3+. Federation handshake.
     FedHello,
     /// Synthetic in v0.0.2; real Wasm in v0.0.3+. Nameserver registration.
@@ -50,6 +57,10 @@ pub enum BlockKind {
     EmailEncrypted,
     /// Reserved for v0.0.3+ receipt-as-block consolidation.
     Receipt,
+    /// What a server advertises (JEP-0002 rule 12), written only by that
+    /// server, only into its manifest log. Synthetic: the document is in its
+    /// metadata (`jig_pipeline::server_manifest`).
+    ServerManifest,
 }
 
 impl BlockKind {
@@ -62,6 +73,8 @@ impl BlockKind {
             Self::MemberRemove => "member-remove",
             Self::ChannelPromote => "channel-promote",
             Self::ChannelArchive => "channel-archive",
+            Self::RoleAssign => "role-assign",
+            Self::RoleUnassign => "role-unassign",
             Self::FedHello => "fed-hello",
             Self::NsRegister => "ns-register",
             Self::NsRotate => "ns-rotate",
@@ -71,6 +84,7 @@ impl BlockKind {
             Self::EmailRender => "email-render",
             Self::EmailEncrypted => "email-encrypted",
             Self::Receipt => "receipt",
+            Self::ServerManifest => "server-manifest",
         }
     }
 
@@ -92,6 +106,8 @@ impl std::str::FromStr for BlockKind {
             "member-remove" => Ok(Self::MemberRemove),
             "channel-promote" => Ok(Self::ChannelPromote),
             "channel-archive" => Ok(Self::ChannelArchive),
+            "role-assign" => Ok(Self::RoleAssign),
+            "role-unassign" => Ok(Self::RoleUnassign),
             "fed-hello" => Ok(Self::FedHello),
             "ns-register" => Ok(Self::NsRegister),
             "ns-rotate" => Ok(Self::NsRotate),
@@ -101,6 +117,7 @@ impl std::str::FromStr for BlockKind {
             "email-render" => Ok(Self::EmailRender),
             "email-encrypted" => Ok(Self::EmailEncrypted),
             "receipt" => Ok(Self::Receipt),
+            "server-manifest" => Ok(Self::ServerManifest),
             _ => Err(BlockKindError::Unknown(s.to_string())),
         }
     }
@@ -126,6 +143,8 @@ mod tests {
             ("member-remove", BlockKind::MemberRemove),
             ("channel-promote", BlockKind::ChannelPromote),
             ("channel-archive", BlockKind::ChannelArchive),
+            ("role-assign", BlockKind::RoleAssign),
+            ("role-unassign", BlockKind::RoleUnassign),
             ("fed-hello", BlockKind::FedHello),
             ("ns-register", BlockKind::NsRegister),
             ("ns-rotate", BlockKind::NsRotate),
@@ -135,6 +154,7 @@ mod tests {
             ("email-render", BlockKind::EmailRender),
             ("email-encrypted", BlockKind::EmailEncrypted),
             ("receipt", BlockKind::Receipt),
+            ("server-manifest", BlockKind::ServerManifest),
         ];
         for (s, k) in kinds {
             assert_eq!(k.as_str(), s);
@@ -150,6 +170,8 @@ mod tests {
         assert!(!BlockKind::MemberRemove.is_wasm_executable());
         assert!(!BlockKind::ChannelPromote.is_wasm_executable());
         assert!(!BlockKind::ChannelArchive.is_wasm_executable());
+        assert!(!BlockKind::RoleAssign.is_wasm_executable());
+        assert!(!BlockKind::RoleUnassign.is_wasm_executable());
         assert!(!BlockKind::FedHello.is_wasm_executable());
         assert!(!BlockKind::NsRegister.is_wasm_executable());
         assert!(!BlockKind::NsRotate.is_wasm_executable());

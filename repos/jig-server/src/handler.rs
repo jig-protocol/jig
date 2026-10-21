@@ -109,10 +109,36 @@ struct ServerInfoResponse {
     /// (`POST /api/v1/admission`). Absent when it asks for none.
     #[serde(skip_serializing_if = "Option::is_none")]
     admission_pow_bits: Option<u8>,
+    /// The same, as JEP-0008 asks for it: the `admit` action's algorithm,
+    /// effort and salt. An unsigned hint until the signed welcome carries it
+    /// (rule 15). Absent when the server asks for no work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admission_pow: Option<AdmissionPowHint>,
     /// The server DID's signature over the TLS certificate it serves, so a
     /// client can trust a certificate no CA issued. Absent over plaintext.
     #[serde(skip_serializing_if = "Option::is_none")]
     tls_binding: Option<jig_core::tls_binding::TlsBinding>,
+    /// During a key change: the public link from the server's old DID to
+    /// `server_did` (JEP-0012), base64 COSE_Sign. Clients that pinned the old
+    /// DID follow it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_link: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct AdmissionPowHint {
+    pub alg: jig_core::pow::Alg,
+    pub effort: u64,
+    pub salt_id: u64,
+}
+
+/// The `admit` work a `pow_bits` setting asks for, as JEP-0008 states it.
+fn admission_pow_hint(bits: Option<u8>) -> Option<AdmissionPowHint> {
+    bits.map(|bits| AdmissionPowHint {
+        alg: jig_core::pow::Alg::Blake3,
+        effort: jig_core::admission_pow::effort_for_bits(bits).get(),
+        salt_id: jig_core::pow::EMPTY_SALT_ID,
+    })
 }
 
 #[derive(Serialize, Clone)]
@@ -197,10 +223,17 @@ async fn server_info(State(state): State<AppState>) -> Json<ServerInfoResponse> 
         peers,
         bridges,
         admission_pow_bits: state.v0_0_2.as_ref().and_then(|v| v.auth.pow_bits()),
+        admission_pow: admission_pow_hint(state.v0_0_2.as_ref().and_then(|v| v.auth.pow_bits())),
         tls_binding: state
             .v0_0_2
             .as_ref()
             .and_then(|v| v.tls_binding.get().cloned()),
+        key_link: state.v0_0_2.as_ref().and_then(|v| {
+            use base64::Engine as _;
+            v.key_link
+                .as_ref()
+                .map(|l| base64::engine::general_purpose::STANDARD.encode(l))
+        }),
     })
 }
 
@@ -216,6 +249,16 @@ mod tests {
     /// one — so the advertised origin is pinned by tests.
     fn advertised_http(cfg: ServerConfig) -> String {
         advertised_origin(&cfg)
+    }
+
+    #[test]
+    fn the_admission_hint_states_the_effort_jep_0008_asks_for() {
+        assert!(admission_pow_hint(None).is_none());
+        let hint = serde_json::to_value(admission_pow_hint(Some(20))).unwrap();
+        assert_eq!(
+            hint,
+            serde_json::json!({ "alg": 1, "effort": 1u64 << 20, "salt_id": 0 })
+        );
     }
 
     #[test]

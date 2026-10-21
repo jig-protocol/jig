@@ -1,10 +1,14 @@
 //! `/api/v1/admission` — where a new DID does this server's proof of work.
 //!
 //! Under `[auth.admission] unknown_dids = "proof-of-work"`, a DID this server
-//! has no record of is refused (`PROOF_OF_WORK_REQUIRED`) until it posts a
-//! nonce worth `pow_bits` for this server and itself
-//! ([`jig_core::admission_pow`]), signed with its key. The proof is recorded
-//! and the DID is known from then on.
+//! has no record of is refused (`PROOF_OF_WORK_REQUIRED`) until it posts work
+//! for this server and itself, signed with its key. The proof is recorded and
+//! the DID is known from then on.
+//!
+//! The work is JEP-0008's `admit` puzzle (`{did, pow, sig_b64}`), at effort
+//! `2^pow_bits`. The legacy `jig-admission-pow-v1` form (`{did, nonce,
+//! sig_b64}`) is accepted for one release ([`jig_core::admission_pow`]).
+//! Either way the work is checked before the signature (JEP-0008 rule 10).
 
 use std::sync::Arc;
 
@@ -31,6 +35,14 @@ pub struct AdmissionStatus {
     pub proven: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pow_bits: Option<u8>,
+    /// The same work as a JEP-0008 effort, `2^pow_bits`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<u64>,
+}
+
+/// The effort a `pow_bits` setting asks for.
+pub fn effort(bits: Option<u8>) -> Option<u64> {
+    bits.map(|b| admission_pow::effort_for_bits(b).get())
 }
 
 /// `GET /api/v1/admission`, signed: the caller's own standing. Gate 1, then
@@ -74,18 +86,44 @@ async fn status(
         Err(crate::auth::GateOutcome::AdmissionProofRequired { .. }) => false,
         Err(outcome) => return Err(disclose(&outcome)),
     };
+    let bits = state.auth.pow_bits();
     Ok(Json(AdmissionStatus {
         proven,
-        pow_bits: state.auth.pow_bits(),
+        pow_bits: bits,
+        effort: effort(bits),
         did,
     }))
 }
 
+/// The body of `POST /api/v1/admission`: the JEP-0008 form, or the legacy
+/// one for one release.
 #[derive(Debug, Deserialize)]
-pub struct Proof {
-    pub did: String,
-    pub nonce: String,
-    pub sig_b64: String,
+#[serde(untagged)]
+pub enum Proof {
+    Pow {
+        did: String,
+        pow: jig_core::pow::Proof,
+        sig_b64: String,
+    },
+    Legacy {
+        did: String,
+        nonce: String,
+        sig_b64: String,
+    },
+}
+
+impl Proof {
+    fn did(&self) -> &str {
+        match self {
+            Proof::Pow { did, .. } | Proof::Legacy { did, .. } => did,
+        }
+    }
+
+    fn sig_b64(&self) -> &str {
+        match self {
+            Proof::Pow { sig_b64, .. } | Proof::Legacy { sig_b64, .. } => sig_b64,
+        }
+    }
 }
 
 type Refusal = (StatusCode, Json<ErrorBody>);
@@ -108,7 +146,9 @@ async fn prove(
     State(state): State<Arc<AppState>>,
     Json(proof): Json<Proof>,
 ) -> Result<Json<AdmissionStatus>, Refusal> {
-    if proof.nonce.len() > MAX_NONCE_LEN {
+    if let Proof::Legacy { nonce, .. } = &proof
+        && nonce.len() > MAX_NONCE_LEN
+    {
         return Err(refuse(
             StatusCode::BAD_REQUEST,
             "BAD_NONCE",
@@ -117,7 +157,7 @@ async fn prove(
     }
     // Only the canonical DID and the bits are kept, never the proof itself,
     // so a re-cased spelling is read as its key.
-    let did = jig_core::Did::canonicalize(&proof.did)
+    let did = jig_core::Did::canonicalize(proof.did().trim())
         .map_err(|_| refuse(StatusCode::BAD_REQUEST, "BAD_DID", "not a did:jig DID"))?;
     let key_bytes = did
         .as_bytes()
@@ -125,12 +165,50 @@ async fn prove(
     let did = jig_core::Did::from_ed25519_pubkey(&key_bytes).to_did_jig_string();
     let server = state.server_did.to_did_jig_string();
 
-    // The key holder, for this server: work done for someone else's key, or
-    // replayed from another server, proves nothing here.
+    let bits = state.auth.pow_bits();
+
+    // The work first: one digest, before the signature or any store read
+    // (JEP-0008 rule 10). Work done for another server or another key fails
+    // here, whoever signed it.
+    if let Some(bits) = bits {
+        match &proof {
+            Proof::Pow { pow, .. } => admission_pow::puzzle(&server, &did)
+                .check(pow, admission_pow::effort_for_bits(bits))
+                .map_err(|e| {
+                    refuse(
+                        StatusCode::BAD_REQUEST,
+                        "PROOF_OF_WORK_INSUFFICIENT",
+                        format!("not an admission proof for this server and DID: {e}"),
+                    )
+                })?,
+            Proof::Legacy { nonce, .. } => {
+                if !admission_pow::meets(&server, &did, nonce, bits) {
+                    return Err(refuse(
+                        StatusCode::BAD_REQUEST,
+                        "PROOF_OF_WORK_INSUFFICIENT",
+                        format!("the nonce is not {bits} bits of work for this server and DID"),
+                    ));
+                }
+            }
+        }
+    }
+    let (proof_bits, message) = match &proof {
+        Proof::Pow { pow, .. } => (
+            admission_pow::bits_for_effort(pow.effort),
+            admission_pow::proof_message(&server, &did, pow),
+        ),
+        Proof::Legacy { nonce, .. } => (
+            bits.unwrap_or(0),
+            admission_pow::signed_message(&server, &did, nonce),
+        ),
+    };
+
+    // Then the key holder: work done for someone else's key proves nothing
+    // here.
     let key = VerifyingKey::from_bytes(&key_bytes)
         .map_err(|_| refuse(StatusCode::BAD_REQUEST, "BAD_DID", "not an ed25519 key"))?;
     let sig = base64::engine::general_purpose::STANDARD
-        .decode(&proof.sig_b64)
+        .decode(proof.sig_b64())
         .ok()
         .and_then(|b| Signature::from_slice(&b).ok())
         .ok_or_else(|| {
@@ -140,11 +218,7 @@ async fn prove(
                 "malformed signature",
             )
         })?;
-    key.verify(
-        &admission_pow::signed_message(&server, &did, &proof.nonce),
-        &sig,
-    )
-    .map_err(|_| {
+    key.verify(&message, &sig).map_err(|_| {
         refuse(
             StatusCode::UNAUTHORIZED,
             "BAD_SIGNATURE",
@@ -161,21 +235,16 @@ async fn prove(
     }
 
     // A server that asks for no work records none and needs none.
-    let Some(bits) = state.auth.pow_bits() else {
+    let Some(bits) = bits else {
         return Ok(Json(AdmissionStatus {
             proven: state.auth.proven(&did),
             pow_bits: None,
+            effort: None,
             did,
         }));
     };
-    if !admission_pow::meets(&server, &did, &proof.nonce, bits) {
-        return Err(refuse(
-            StatusCode::BAD_REQUEST,
-            "PROOF_OF_WORK_INSUFFICIENT",
-            format!("the nonce is not {bits} bits of work for this server and DID"),
-        ));
-    }
-    state.auth.record_proof(&did, bits).map_err(|e| {
+
+    state.auth.record_proof(&did, proof_bits).map_err(|e| {
         tracing::error!(
             error = %e,
             did = %jig_core::did::log_tag(&did),
@@ -191,5 +260,6 @@ async fn prove(
         did,
         proven: true,
         pow_bits: Some(bits),
+        effort: effort(Some(bits)),
     }))
 }

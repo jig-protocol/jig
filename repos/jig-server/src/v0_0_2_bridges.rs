@@ -264,6 +264,9 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         IngestError::DisallowedBlockKind { kind } => SubmitDenied::PolicyBlocked {
             reason: format!("disallowed block kind: {kind}"),
         },
+        IngestError::ManifestLog { reason } => SubmitDenied::PolicyBlocked {
+            reason: reason.clone(),
+        },
         IngestError::KindRequired => SubmitDenied::PolicyBlocked {
             reason: "block kind required".into(),
         },
@@ -304,6 +307,16 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
             reason: e.to_string(),
         },
         ref e @ IngestError::NotChannelMember { .. } => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
+        // Channel terms and roles: the same signed block is refused again on
+        // retry, so the bridge bounces it.
+        ref e @ (IngestError::NotSequencer { .. }
+        | IngestError::InvalidTerms { .. }
+        | IngestError::MissingRight { .. }
+        | IngestError::RootOwnerRole { .. }
+        | IngestError::UnknownRole { .. }
+        | IngestError::InvalidSlug { .. }) => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },
         // Retrying sends the same bytes, which is what was refused.
@@ -636,6 +649,8 @@ mod tests {
                 created_at: 0,
                 owner_did: shadow_did.clone(),
                 suite: "none".to_string(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
             })
             .unwrap();
         store
@@ -652,7 +667,7 @@ mod tests {
         // is the channel's other member, exactly as the bridge would have
         // enrolled him; delivery to the shadow DID follows membership.
         let dir = tempdir().unwrap();
-        let bob = Identity::generate_and_save(&dir.keep()).unwrap();
+        let bob = Identity::generate_for_tests(&dir.keep());
         store
             .upsert_membership(&StoredMembership {
                 channel_id: jig_pipeline::ingest_record::label_cid("dm x"),

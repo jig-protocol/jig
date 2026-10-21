@@ -53,6 +53,39 @@ fn err(
     )
 }
 
+/// Whether the route's `:channel` and the block's `channel` metadata name the
+/// same channel. Equal text needs no lookup, so a slug route answers exactly
+/// as before; otherwise both sides are resolved (an id anywhere, a slug only
+/// among this server's channels) and compared by id. Any failure reads as a
+/// mismatch, never "no such channel": these routes answer nothing about the
+/// store before `ingest` has verified the signature.
+fn same_channel(
+    state: &AppState,
+    channel_ref: &str,
+    bundle_channel: &str,
+) -> Result<bool, (StatusCode, Json<AdminError>)> {
+    if channel_ref == bundle_channel {
+        return Ok(true);
+    }
+    let store = &state.ingest_ctx.store;
+    let resolve = |r: &str| {
+        store
+            .get_channel_by_ref_including_archived(r)
+            .map(|c| c.map(|c| c.id))
+            .map_err(|e| {
+                err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "PERSIST_ERROR",
+                    e.to_string(),
+                )
+            })
+    };
+    Ok(match resolve(channel_ref)? {
+        Some(id) => resolve(bundle_channel)?.as_ref() == Some(&id),
+        None => false,
+    })
+}
+
 /// Decode a BundleSubmission into (manifest_bytes, code_bytes, sig).
 #[allow(clippy::type_complexity)]
 fn decode_submission(
@@ -144,15 +177,16 @@ pub async fn create_channel(
     Ok(Json(AdminResult { block_cid: cid }))
 }
 
-/// POST /api/v1/channels/:slug/members
+/// POST /api/v1/channels/:channel/members
 ///
-/// Body: signed `member-add` block. The `slug` path parameter is asserted
-/// to match the `channel` metadata in the bundle (defense in depth).
+/// Body: signed `member-add` block. The `channel` path parameter, the
+/// channel's id or a local slug, is asserted to name the channel in the
+/// bundle's `channel` metadata (defense in depth).
 ///
 /// Returns `{ "block_cid": "bafy..." }` on success.
 pub async fn add_member(
     State(state): State<Arc<AppState>>,
-    Path(slug): Path<String>,
+    Path(channel_ref): Path<String>,
     Json(body): Json<BundleSubmission>,
 ) -> Result<Json<AdminResult>, (StatusCode, Json<AdminError>)> {
     let (manifest_bytes, code_bytes, sig) = decode_submission(&body)?;
@@ -180,11 +214,11 @@ pub async fn add_member(
                 "member-add bundle metadata missing `channel`",
             )
         })?;
-    if bundle_slug != slug {
+    if !same_channel(&state, &channel_ref, bundle_slug)? {
         return Err(err(
             StatusCode::BAD_REQUEST,
             "SLUG_MISMATCH",
-            format!("URL slug `{slug}` doesn't match bundle channel `{bundle_slug}`"),
+            format!("URL slug `{channel_ref}` doesn't match bundle channel `{bundle_slug}`"),
         ));
     }
 
@@ -201,7 +235,7 @@ pub async fn add_member(
     Ok(Json(AdminResult { block_cid: cid }))
 }
 
-/// POST /api/v1/channels/:slug/archive
+/// POST /api/v1/channels/:channel/archive
 ///
 /// The v0.0.2 channel delete. Body: signed `channel-archive` block. Archiving
 /// is a **soft delete** — the channel stops being listed and stops resolving as
@@ -222,7 +256,7 @@ pub async fn add_member(
 /// Returns `{ "block_cid": "bafy..." }` on success.
 pub async fn archive_channel(
     State(state): State<Arc<AppState>>,
-    Path(slug): Path<String>,
+    Path(channel_ref): Path<String>,
     Json(body): Json<BundleSubmission>,
 ) -> Result<Json<AdminResult>, (StatusCode, Json<AdminError>)> {
     let (manifest_bytes, code_bytes, sig) = decode_submission(&body)?;
@@ -249,11 +283,11 @@ pub async fn archive_channel(
                 "channel-archive bundle metadata missing `channel`",
             )
         })?;
-    if bundle_slug != slug {
+    if !same_channel(&state, &channel_ref, bundle_slug)? {
         return Err(err(
             StatusCode::BAD_REQUEST,
             "SLUG_MISMATCH",
-            format!("URL slug `{slug}` doesn't match bundle channel `{bundle_slug}`"),
+            format!("URL slug `{channel_ref}` doesn't match bundle channel `{bundle_slug}`"),
         ));
     }
 
@@ -283,8 +317,8 @@ pub async fn archive_channel(
 pub fn build_channel_ops_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/v1/channels", post(create_channel))
-        .route("/api/v1/channels/{slug}/members", post(add_member))
-        .route("/api/v1/channels/{slug}/archive", post(archive_channel))
+        .route("/api/v1/channels/{channel}/members", post(add_member))
+        .route("/api/v1/channels/{channel}/archive", post(archive_channel))
         .with_state(state)
 }
 
@@ -313,7 +347,7 @@ mod tests {
     fn test_identity() -> Identity {
         let dir = tempdir().unwrap();
         let path = dir.keep();
-        Identity::generate_and_save(&path).unwrap()
+        Identity::generate_for_tests(&path)
     }
 
     fn test_hlc(id: &Identity) -> HlcTimestamp {
@@ -374,6 +408,10 @@ mod tests {
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
             tls_binding: Default::default(),
+            manifest: Default::default(),
+            key_link: None,
+            peer_frames: Default::default(),
+            peers: Default::default(),
         })
     }
 
@@ -662,10 +700,18 @@ mod tests {
 
         // Seed one message directly through the store (the admin router has no
         // text-render endpoint; the history-retention claim is about storage).
+        // Blocks are keyed by the channel's id, its creation-block CID.
+        let channel_id = state
+            .ingest_ctx
+            .store
+            .get_channel_by_slug("#scratch")
+            .unwrap()
+            .expect("the channel exists")
+            .id;
         let msg_cid = jig_pipeline::ingest_record::label_cid("msg 1");
         let msg = jig_pipeline::persist::StoredBlock {
             cid: msg_cid.clone(),
-            channel_id: Some("#scratch".into()),
+            channel_id: Some(channel_id.clone()),
             block_kind: "text-render".into(),
             sender_did: owner.did_string(),
             sender_sig: vec![0u8; 64],
@@ -680,13 +726,6 @@ mod tests {
         };
         // Sequenced as ingest would: every block of a channel this server holds
         // has its record, and history is read through the chain.
-        let channel_id = state
-            .ingest_ctx
-            .store
-            .get_channel_by_slug("#scratch")
-            .unwrap()
-            .expect("the channel exists")
-            .id;
         state
             .ingest_ctx
             .store

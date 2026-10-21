@@ -190,7 +190,7 @@ gcloud compute instances set-machine-type jig-vps --zone=us-west1-a \
 gcloud compute instances start jig-vps --zone=us-west1-a
 ```
 
-What survives the stop/start: the boot disk, `/var/lib/jig`, `server.key`, the
+What survives the stop/start: the boot disk, `/var/lib/jig`, `server.jigkey`, the
 Tailscale node identity and its `100.x` address, and the MagicDNS name (Tailscale
 state lives in `/var/lib/tailscale`). What changes: the ephemeral **external** IP
 — which you do not care about, because nothing ever connects to it.
@@ -569,13 +569,7 @@ sudoedit /etc/jig/config.toml
 #   set root-level  bind_address = "<the 100.x address>"   <- this is what binds
 #   set [server]    listen = "<the 100.x address>:7117"    <- decorative, but keep in sync
 
-# 4. nameserver secret — MANDATORY, it panics at startup without one
-printf 'JIG_NS_SECRET=%s\n' "$(openssl rand -hex 32)" \
-  | sudo tee /etc/jig/jig-nameserver.env >/dev/null
-sudo chown root:jig /etc/jig/jig-nameserver.env
-sudo chmod 600 /etc/jig/jig-nameserver.env
-
-# 5. units — EDIT jig-nameserver.service's Environment=JIG_NS_BIND first
+# 4. units (the nameserver needs no secret or env file) — EDIT jig-nameserver.service's Environment=JIG_NS_BIND first
 sudoedit deploy/jig-nameserver.service        # JIG_NS_BIND=<the 100.x address>
 sudo install -m 0644 deploy/jig-server.service deploy/jig-nameserver.service \
                      deploy/jig-backup.service deploy/jig-backup.timer \
@@ -608,14 +602,24 @@ curl http://<100.x.y.z>:7117/.well-known/jig
 A reboot that silently fails to rebind is the failure mode where the whole team
 discovers it at once the next morning.
 
-### 4h. Get `server.key` off the box. Now. Before the first message.
+### 4h. Make the server key restorable. Now. Before the first message.
+
+The server's key is sealed in `/var/lib/jig/server.jigkey`, opened at boot with
+a systemd credential bound to this VM ([deploy/README.md, "Sealing the server
+key"](../../deploy/README.md#sealing-the-server-key)). That credential does not
+move to another VM, so give the key a passphrase slot too, put the passphrase in
+1Password, and copy `server.jigkey` off the box (the backups below do):
 
 ```bash
-sudo base64 /var/lib/jig/server.key
+sudo -i
+read -rs -p 'new passphrase: ' JIG_KEY_PASSPHRASE; echo; export JIG_KEY_PASSPHRASE
+/opt/jig/bin/jig-server --config /etc/jig/config.toml keys add-slot --slot passphrase
+chown jig:jig /var/lib/jig/server.jigkey; unset JIG_KEY_PASSPHRASE
 ```
 
-Paste it into 1Password. It is 32 bytes. **Losing it changes the server DID and
-breaks TOFU pinning for every client** — every user sees what is
+Never paste the raw key anywhere: there is none on disk, and there should not be
+one in 1Password. **Losing the key, or every way to open it, changes the server
+DID and breaks TOFU pinning for every client** — every user sees what is
 indistinguishable from a MITM and there is no recovery short of everyone wiping
 their pin. Restoring databases without the key restores nothing useful. Do this
 before you put a single message through the server, not after.
@@ -798,7 +802,7 @@ gcloud compute instances stop jig-vps --zone=us-west1-a
 
 A **stopped** instance bills **no vCPU and no RAM** — you keep paying only for
 the boot disk (~$5/mo for 50 GB balanced) and, if you promoted it to static, the
-IP. The Tailscale node, `/var/lib/jig`, and `server.key` all persist. Start it
+IP. The Tailscale node, `/var/lib/jig`, and `server.jigkey` all persist. Start it
 again with:
 
 ```bash
@@ -830,7 +834,7 @@ gcloud compute networks delete jig-net
 > while travelling rather than tearing it down, delete the NAT gateway and
 > router too and recreate them on return — they are two commands each way.
 
-**Before you ever run that:** confirm `server.key` is in 1Password and the
+**Before you ever run that:** confirm `server.jigkey` is backed up, its passphrase is in 1Password, and the
 databases are in GCS. `--keep-disks=boot` preserves the disk if you want an
 escape hatch, at ~$5/month to keep it around.
 
@@ -863,10 +867,12 @@ actually shrink it".
 `deploy/jig-backup.sh` already does the local half correctly — `VACUUM INTO`
 snapshots (safe on a live WAL database, unlike `cp`), a `MANIFEST.txt` of sha256
 sums, `umask 077`, partial-snapshot cleanup, and retention pruning that only
-ever touches timestamp-shaped directories. It backs up four things:
-`jig.db`, **`jig_v002.db`** (the v0.0.2 block store — where the messages actually
-are; the `_v002` suffix is derived from `database_path`, not a typo),
-`nameserver.db`, and `server.key`.
+ever touches timestamp-shaped directories. It backs up **`jig_v002.db`** (the
+block store — where the messages actually are; the `_v002` suffix is derived
+from `database_path`, not a typo) and the sealed `server.jigkey`, plus, when the box runs the
+nameserver, `nameserver.db`, `nameserver_v002.db` (the alias bindings) and
+`nameserver_v002.jigkey` (the nameserver's signing key, sealed). The older `jig.db` is no longer used (#196) and is not backed
+up.
 
 Its stated gap is the one this section closes: *"`/var/backups/jig` is on the
 same disk as the thing it is backing up."*
@@ -895,7 +901,7 @@ gcloud storage buckets update gs://<PROJECT_ID>-jig-backups \
 `--uniform-bucket-level-access` kills per-object ACLs (the classic way a bucket
 accidentally goes public) and `--public-access-prevention` makes it impossible to
 grant `allUsers` even deliberately. Both matter here: **these snapshots contain
-`server.key`.**
+the server's sealed key**, which opens with its passphrase.
 
 ### 8b. A write-only service account
 
@@ -975,12 +981,10 @@ gcloud storage ls -r gs://<PROJECT_ID>-jig-backups/   # from your Mac
 
 ### 8d. Two honest caveats
 
-- **`server.key` is inside these snapshots.** GCS encrypts at rest with
-  Google-managed keys, and the bucket is private and public-access-prevented —
-  but anyone with project-level `storage.objectViewer` can read it. If that
-  bothers you, `age`- or `gpg`-encrypt the snapshot before upload. **Regardless:
-  the 1Password copy from Section 4h is the backup that actually matters.** GCS
-  is for the message history; 1Password is for the identity.
+- **The sealed `server.jigkey` is inside these snapshots.** It opens only with a
+  secret for one of its slots, and the snapshot holds none. Anyone who also has
+  the passphrase from Section 4h has the key, so keep the two apart: the
+  passphrase in 1Password, the file in GCS.
 - **A backup you have not restored is a hypothesis.** The restore drill is in
   `deploy/README.md`. The one assertion that matters afterwards is that
   `curl http://<100.x>:7117/.well-known/jig` returns **the same `server_did` as

@@ -11,45 +11,17 @@ The Jig nameserver anchors decentralized identity, reputation, and tribunal gove
 
 ## Configuration
 
-Nameserver configuration is driven by the shared `jig-config` profile system:
+The nameserver reads one config file, named by `--config <path>` or else `JIG_NS_CONFIG`. There is no default path: with neither set it refuses to start. It no longer reads `JIG_CONFIG`, `~/.jig/config.toml` or `./config/jig-nameserver/jig-config.toml`. Environment variables (`JIG_NS_BIND`, `JIG_NS_PORT`, `JIG_NS_DB_PATH`, …) override the file. The file must name the suffixes it serves; see `deploy/jig-nameserver.example.toml` and `OPERATOR_GUIDE.md`.
 
-1. We read `JIG_NS_CONFIG` first (explicit path).
-2. Otherwise we look for `nameserver` sections in the global `jig-config.toml` (honoring profiles + overrides).
-3. Environment variables always win last (`JIG_NS_DB_PATH`, `JIG_NS_POW_DIFFICULTY`, etc.).
-
-Key sections in `jig-config.toml`:
+A minimal file:
 
 ```toml
-[nameserver]
-profile = "high-sec"
+[network]
+bind = "127.0.0.1"
+port = 7070
 
-[nameserver.network]
-bind = "0.0.0.0"
-port = 8070
-
-[nameserver.reputation]
-default_ruleset = "high-sec"
-
-[[nameserver.reputation.local_rulesets]]
-key = "high-sec"
-description = "Baseline high security contract"
-authority = "did:jig:central"
-weight = 1.0
-
-[nameserver.reputation.local_rulesets.pow_policy]
-min_bits = 14
-max_bits = 28
-multiplier = 1.0
-
-[nameserver.reputation.translation_contracts]
-# Translate partner QA scores into our high-sec range
-from = "partner-qa"
-to = "high-sec"
-weight = 0.6
-[nameserver.reputation.translation_contracts.transform]
-type = "linear"
-slope = 0.5
-intercept = 0.0
+[[v0_0_2.nameserver.alias_suffixes]]
+suffix = "names.example.org"
 ```
 
 For more examples, see [`examples/config`](examples/config/).
@@ -75,9 +47,6 @@ For more examples, see [`examples/config`](examples/config/).
 | `GET /v1/transparency/entries` | List transparency log entries (filter by time/kind).
 | `GET /v1/transparency/hashes` | List hourly hash checkpoints.
 | `GET /v1/transparency/verify` | Verify chain integrity.
-| `GET /v1/federation/peers` | List federation peers (active, unreachable, suspended).
-| `POST /v1/federation/gossip` | Receive gossip message from peer.
-| `GET /v1/federation/policy` | List policy hashes exchanged with peers.
 
 Responses are JSON and mirror the `types` module (see `src/types.rs`).
 
@@ -337,150 +306,10 @@ federation: disabled
 
 This lightweight, TOML-first approach keeps dependencies minimal while enabling robust federation without JSON/YAML overhead.
 
-## Federation Gossip Protocol
-
-The nameserver implements a decentralized gossip protocol for coordinating policy, reputation, and tribunal decisions across a federation of nameservers.
-
-### Configuration
-
-```toml
-[nameserver.federation]
-enabled = true
-seed_peers = [
-  "https://ns-alpha.example.com",
-  "https://ns-beta.example.org"
-]
-max_peers = 50
-allow_domains = []  # Empty = allow all
-deny_domains = []   # Block specific domains
-cache_ttl_secs = 3600
-gossip_interval_secs = 300  # 5 minutes
-handshake_timeout_secs = 30
-gossip_batch_size = 100
-```
-
-Environment variables:
-- `JIG_NS_FEDERATION_ENABLED` – Enable/disable federation (true/false)
-- `JIG_NS_SEED_PEERS` – Comma-separated list of seed peer URLs
-- `JIG_NS_MAX_PEERS` – Maximum number of federation peers
-- `JIG_NS_GOSSIP_INTERVAL` – Gossip interval in seconds
-- `JIG_NS_HANDSHAKE_TIMEOUT` – Handshake timeout in seconds
-
-### Gossip Protocol
-
-The federation coordinator runs a background task that periodically:
-1. **Discovers peers** from seed URLs
-2. **Handshakes** with new peers to exchange capabilities
-3. **Gossips** with active peers to propagate:
-   - **Policy hashes** – Protocol versions and ruleset configurations
-   - **Reputation summaries** – Aggregate scores per ruleset (no PII)
-   - **Tribunal decisions** – Case outcomes and penalties
-
-### Peer Discovery
-
-```bash
-# Peers are discovered from seed URLs via capabilities endpoint
-curl https://ns.example.com/.well-known/jig-ns/capabilities
-```
-
-The coordinator:
-- Fetches capabilities from seed peers
-- Computes BLAKE3 hash for version verification
-- Stores peer metadata (domain, endpoint, status, capabilities_hash)
-- Tracks peer status (Active, Unreachable, Suspended)
-
-### Gossip Messages
-
-Four message types are exchanged:
-- `policy_hash` – Protocol version + ruleset configuration hashes
-- `reputation_summary` – Aggregate reputation scores per ruleset
-- `tribunal_decision` – Tribunal case outcomes (with privacy-preserving subject hashes)
-- `handshake` – Initial peer capability exchange
-
-### Federation Endpoints
-
-#### List Federation Peers
-
-```bash
-curl "http://localhost:8070/v1/federation/peers?limit=50"
-```
-
-Returns:
-```json
-{
-  "peers": [
-    {
-      "id": "...",
-      "domain": "ns.example.com",
-      "endpoint": "https://ns.example.com",
-      "status": "active",
-      "capabilities_hash": "blake3_hash...",
-      "discovered_at": "2025-10-29T00:00:00Z",
-      "last_seen_at": "2025-10-29T12:34:56Z"
-    }
-  ],
-  "count": 1
-}
-```
-
-#### Receive Gossip Message
-
-```bash
-curl -X POST http://localhost:8070/v1/federation/gossip \
-  -H "Content-Type: application/json" \
-  -d '{
-    "message": {
-      "id": "...",
-      "kind": "policy_hash",
-      "from_peer": "ns.example.com",
-      "payload": { ... },
-      "timestamp": "2025-10-29T12:34:56Z"
-    }
-  }'
-```
-
-#### List Policy Hashes
-
-```bash
-curl "http://localhost:8070/v1/federation/policy?limit=50"
-```
-
-Returns policy hashes exchanged with peers:
-```json
-{
-  "policies": [
-    {
-      "domain": "ns.example.com",
-      "policy_version": "v1",
-      "policy_hash": "blake3_hash...",
-      "rulesets": ["high-sec", "partner-qa"],
-      "capabilities_url": "https://ns.example.com/.well-known/jig-ns/capabilities",
-      "timestamp": "2025-10-29T12:34:56Z"
-    }
-  ],
-  "count": 1
-}
-```
-
-### Privacy & Security
-
-- **No PII in gossip** – Reputation summaries aggregate scores without identifiable information
-- **Subject hashing** – Tribunal decisions use BLAKE3 hashes of subject IDs
-- **Capability verification** – Peers verify protocol compatibility via capabilities hashes
-- **Status tracking** – Unreachable peers are marked and excluded from gossip rounds
-
-### Integration with Transparency Log
-
-Federation gossip messages are stored in the transparency log, providing an auditable record of all inter-nameserver coordination.
-
 ## Running Locally
 
 ```bash
-# With default in-memory storage
-cargo run -p jig-nameserver
-
-# Using a specific config profile
-JIG_CONFIG=./examples/config/profile_potato.toml cargo run -p jig-nameserver
+cargo run -p jig-nameserver -- --config ./my-nameserver.toml serve
 ```
 
 ## Tests

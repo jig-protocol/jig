@@ -303,37 +303,43 @@ are where key substitution happens (OP-08).
   `identity.naively_allow_unknown_handles_fallback` turns it off. TOFU suits small and
   private servers.
 - **Built: nameserver attestation.** In `mode = "nameserver"`, the server resolves an alias
-  such as `alice@example.jig` against one or more configured nameservers and refuses a block
-  whose DID differs from the answer
+  such as `alice@example.jig` against the nameservers its `[identity.delegations]` entry
+  lists for the suffix, and refuses a block whose DID differs from the answer
   ([`NameserverResolver`](../../repos/jig-pipeline/src/identity.rs),
   [`h6_nameserver_mode.rs`](../../repos/integration-tests/tests/h6_nameserver_mode.rs)). To
-  register, a client fetches a single-use challenge, signs it with the DID's key, and posts
-  the signature with the requested alias. The nameserver checks the proof of control,
-  refuses an alias already held by another DID, and returns an attestation it signs: DID,
-  alias, nameserver DID and a validity window of 90 days. Renewal needs the same proof;
-  rotation needs proofs from both keys.
+  register, a client fetches a single-use challenge and signs a proof of control that names
+  the action, the nameserver's DID, the alias and the challenge (#210). The nameserver checks
+  it, refuses an alias already held by another DID, and returns an attestation it signs as
+  COSE: DID, alias, nameserver DID and a validity window of 90 days. Renewal needs the same
+  kind of proof for the renew action; rotation needs signatures over the challenge from both
+  keys.
 - **Partial: the check is on the server.** TOFU stores its lock in the server's database,
   and the resolver caches answers in the server's memory. Either way the client trusts the
   server's check, which protects users from each other but not from the operator (OP-08).
   The CLI pins each server's DID on its first signed welcome (or first TLS probe) and
-  refuses another, but it does not yet pin a name's DID
+  refuses another. `jig trust verify-name` pins a verified name's DID the same way and
+  refuses a changed one until `jig trust accept-name` moves the pin (#213); `jig ns resolve`
+  verifies but does not pin
   ([`jig-client/src/pins.rs`](../../repos/jig-client/src/pins.rs)).
-- **Partial: attestations are signed but not yet verified.** The server's resolver does not
-  yet verify attestation signatures or suffix authority (NS-01).
-- **Partial: "one or more nameservers" means failover, not agreement.** A second configured
-  nameserver adds availability, not cross-checking.
-- **None.** No resolver keeps the attestations it acts on, so equivocation leaves no
-  evidence. Nameservers do not cross-register.
+- **Built: verified resolution.** Servers (#200) and clients (#201) accept an attestation
+  only from an authority of the suffix's delegation, check its signature, validity window and
+  alias, and cache it no longer than its `valid_until`. Every nameserver the delegation lists
+  is asked, and two valid answers naming different DIDs refuse the name (NS-01).
+- **Partial: evidence is kept, not published.** Servers keep every attestation their
+  resolver acts on, and `jig trust verify-name` keeps them under `~/.jig/evidence/names/`,
+  so an equivocation leaves evidence with whoever saw it. Nothing publishes it, and
+  nameservers do not cross-register.
 
 ### 4.3 To be designed
 
-- **Open.** How a resolver learns which nameserver is authoritative for a suffix: local
-  configuration, the ruleset, or a signed delegation.
-- **Proposed.** Verification of attestations, and expiry of cached answers, in the resolver
-  and in clients.
-- **Proposed.** A client pin store for names (the CLI's store for server DIDs and suites is
-  built), and how a change is shown to the holder.
-- **Proposed.** Resolvers keep the attestations they act on, and a ruleset group's
+- **Partial.** How a resolver learns which nameserver is authoritative for a suffix. Built:
+  local configuration (`[identity.delegations]` on servers, `[naming.delegations]` on
+  clients) and, for clients, a signed delegation at
+  `https://<suffix>/.well-known/jig-ns-delegation` over a CA-issued certificate, never for a
+  single-label suffix (#200, #201). Open: delegation through the ruleset.
+- **Partial.** A client pin store for names: built for `jig trust verify-name` (#213). Open:
+  pinning on every path that resolves a name, and how a change is shown to the holder.
+- **Proposed.** A ruleset group's
   transparency log ([section 8](#8-nameservers-in-a-ruleset-group-and-anchors)) makes
   equivocation public evidence.
 - **Open.** Cross-registration mechanics in a high-sec ruleset group, in section 8.
@@ -923,7 +929,9 @@ every member. It can withhold, delay and reorder blocks (OP-06).
   key distribution, conformance vectors), and whether post-quantum protection arrives as its
   own suite, as a hybrid MLS cipher suite, or both.
 - **Open.** Making encryption the default for channels, not only for DMs.
-- **Open.** Multi-device membership and key rotation (JEP-0001, open question 4).
+- **Open.** Multi-device membership and key rotation (JEP-0001, open question 4). The
+  [JEP-0012](../../repos/jig-spec/jep/jep-0012-key-links.md) draft specifies the key link a
+  rotation hands over with; which records carry it is still to be specified.
 - **Open.** Binding the handshake transcript into MLS group joins (JEP-0002, open
   question 4).
 - **Open.** Client-side execution of decrypted content (JEP-0001, open question 7).
@@ -1123,10 +1131,12 @@ gap.
   resell, and once challenges carry proof-of-work a solved one is worth stealing.
   *Obligation:* challenges are single-use and short-lived, and a proof covers the action, the
   alias and every DID involved. *Today:* the nameserver consumes each challenge on first use
-  and expires it after 60 seconds, but proofs are not bound to an action or a DID; read
+  and expires it after 60 seconds. Register and renew proofs are bound to the action, the
+  nameserver's DID and the alias, and signed by the DID (#210); rotate still signs the bare
+  challenge; read
   proofs carry a timestamp window and a nonce record that never evicts a live nonce
   ([`jig-server/src/auth/replay.rs`](../../repos/jig-server/src/auth/replay.rs)). *To
-  design:* the binding, for every challenge-consuming action.
+  design:* the same binding for rotation.
 - **AB-02, botnet proof-of-work.** A botnet solves puzzles at a fraction of a legitimate
   user's marginal cost, and difficulty high enough to stop it locks out phones and potatoes.
   *Obligation:* servers enforce proof-of-work on the clients they serve, at the cost their
@@ -1216,15 +1226,16 @@ gap.
 
 - **NS-01, false or poisoned resolution.** *Obligation:* accept an attestation only from a
   nameserver authoritative for the alias's suffix, verify its signature, never cache past its
-  validity; clients pin (OP-08). *Today:* attestations are signed and expire, but the
-  server's resolver does not verify them, does not bind suffixes to nameservers, and takes
-  the first answer. *To design:* section 4.3.
+  validity; clients pin (OP-08). *Today:* servers and clients accept only attestations an
+  authority of the suffix's delegation signed, inside their validity, and ask every listed
+  nameserver (#200, #201); only `jig trust verify-name` pins names. *To design:* section 4.3.
 - **NS-02, equivocation.** A nameserver that tells one asker that `alice` is DID 1 and another
   that she is DID 2 is not caught by signature checks, because both answers are validly
   signed. *Obligation:* two such attestations with overlapping validity are proof of
   misbehaviour; resolvers keep the attestations they act on, and a ruleset group's
-  nameserver transparency log records every registration (D23). *Today:* nothing keeps
-  attestations, and nothing writes to a log. *To design:* transparency logs (section 8.3).
+  nameserver transparency log records every registration (D23). *Today:* servers keep the
+  attestations their resolver acts on, `jig trust verify-name` keeps them on the client, and
+  nothing writes to a log. *To design:* transparency logs (section 8.3).
 - **NS-03, collusion on clock or state.** Facts shared across a ruleset group, such as when a
   DID registered or what penalty it carries, are only as good as the agreement behind them.
   *Obligation:* no single nameserver, anchor included, decides a group-wide claim.
@@ -1266,8 +1277,9 @@ gap.
   observed by the group.
 - **TM-02, self-asserted timestamps.** *Obligation:* a signer's own timestamp is a claim, so
   ordering and age come from others. *Today:* a block's `hlc_ts` is set by its author, inside
-  the signed manifest, and the server orders history by it; the only server-signed time is
-  the receipt's `produced_at`. *To design:* countersigned time; in a ruleset group, NS-03's
+  the signed manifest, but the server orders a channel's history by its own signed `ingest`
+  record (`seq`, with the sequencer's clock reading; #161). No party other than the sequencer
+  countersigns time. *To design:* countersigned time; in a ruleset group, NS-03's
   agreement applies to time as to any shared fact.
 
 ---
@@ -1279,8 +1291,8 @@ gap.
 | A DID is a self-certifying ed25519 key; the sender is the DID that signed | Built: `did:jig`, minted locally; ingest uses the canonical DID | None for the core; multi-device and recovery open |
 | Every state change is a signed block | Partial: channel and membership changes are blocks; alias attestations are records | Attestations as blocks |
 | Many DIDs per holder, nothing linking them; one DID per session | Partial: no message links DIDs; a socket can change read identity | Session binding; client key-store separation (PV-03) |
-| Names are signed claims, verified and pinned by clients | Partial: attestations signed; resolver ignores the signature; the CLI pins server DIDs but not names' DIDs | Suffix authority, verification, client pins (NS-01, OP-08) |
-| Equivocation is detectable | None | Attestation retention, transparency log (NS-02) |
+| Names are signed claims, verified and pinned by clients | Partial: servers and clients verify attestations against per-suffix delegations; `jig trust verify-name` pins names' DIDs | Pinning on every resolving path; delegation through the ruleset (NS-01, OP-08) |
+| Equivocation is detectable | Partial: resolvers refuse conflicting answers and keep the attestations they act on | Transparency log (NS-02) |
 | `--anon` is a fresh, unregistered session key with no protocol link to any DID (D20) | None: no `--anon` mode; unknown DIDs admitted by default (admission proof-of-work is optional) | Client mode with nothing on disk |
 | What a server does with `--anon` is server policy | Partial: only the unknown-DID setting (admit, refuse, or proof-of-work) | Ruleset vocabulary for unknown keys, declared in the welcome |
 | Reputation is one number per ruleset; a ruleset group's members are rated by the same rules and maths; never pooled across a security level (D21) | Partial: `ruleset key → score`, seeded by the operator; nothing shared | Inputs, decay, sharing within a group, acknowledgement; interop between groups later |
@@ -1294,7 +1306,7 @@ gap.
 | A peer is a transport; relayed blocks pass every gate | Built: relayed blocks run through `ingest` and the write gate (authors not asked for admission proof-of-work); peers listed and pinned in configuration | Peer DID in the contract; per-peer limits |
 | Pluggable suites, MLS default and first (D1, D13) | Built: MLS per channel; validating delivery service | Non-MLS plug-in shape (D13); per-suite conformance |
 | End-to-end encryption by default | Partial: DMs and restricted channels always encrypted; open channels plaintext unless created `mls` | Encryption on by default |
-| Mandatory signed handshake; clients fail closed and pin | Partial: signed welcome with nonce; CLI pins server DIDs, suites and channel suites; later frames checked against the welcome; refusals close with 4002 | Mutual server-to-server handshake; pins; real reputation (D11) |
+| Mandatory signed handshake; clients fail closed and pin | Partial: signed welcome with nonce; CLI pins server DIDs, suites and channel suites; later frames checked against the welcome; refusals close with 4002; the welcome is bound to the TLS session and federation peers prove their DID (#234) | Pins between servers; real reputation (D11) |
 | No backdoors, no scanning, no default escrow | Holds: no backdoor, scanning or escrow exists | Keep it so as reporting is designed |
 | Provable abuse reports from encrypted channels, by participants only (D22) | None: signature exists; no tooling | Delegation or proof mechanism (AB-06) |
 | Tribunals per ruleset group, held by its nameservers; penalties only under an acknowledged ruleset | None | Tribunal process, eligibility (GV-01 to GV-03) |

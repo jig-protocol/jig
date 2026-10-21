@@ -57,8 +57,12 @@ every server. **Alternative rejected:** an optional handshake, because the attac
 chooses to omit it.
 
 **Status evidence.** `jig-server` answers `hello` with a signed `welcome` and
-refuses any earlier frame. `jig-client` closes when that welcome is missing or
-malformed. Version and suite refusals leave the socket open.
+closes on a frame before `hello`, a second `hello` or a malformed one (4004). A version
+or suite refusal is signed and then closes (4002). `jig-client` closes when the welcome
+is missing, malformed, unsigned or mismatched (4001; #140). Between servers the handshake
+is mutual: a dialing server names its DID in `hello` and ends with a signed `peer_proof`
+over the transcript and the TLS exporter, and the dialed server closes without one
+(`jig-pipeline/src/handshake.rs`, #234).
 
 ### OP-02: false handshake answers
 
@@ -70,10 +74,14 @@ The server signs its answer, and the client treats contradicting behaviour as a 
 A signed false claim is evidence a user or a reputation system can act on. **Alternative
 rejected:** unsigned answers, which leave nothing to show anyone.
 
-**Status evidence.** The welcome is signed over version, suites, capabilities,
-reputation (`null`), and the client's nonce. The client keeps the frame when
-the signature fails or the welcome contradicts itself. Checking a later frame
-against that signature is still open.
+**Status evidence.** The welcome (`jig-handshake-welcome-v2`) is signed over version,
+suites, capabilities, reputation (`null`), the client's nonce, a server nonce and the
+connection's TLS exporter. The client refuses a welcome whose exporter differs from its
+own, so a welcome cannot be replayed into another TLS session, and a TLS-terminating proxy
+in front of the server makes every remote client refuse it (#234). The client keeps the
+frame when the signature fails or the welcome contradicts itself, and checks every later
+frame against the welcome (#140): a contradiction closes the connection (4003). That
+evidence is not yet stored or shown to anyone else.
 
 ### OP-03: suite downgrade
 
@@ -119,7 +127,9 @@ block under the same slug is refused (`ChannelReplaced`). The welcome's advertis
 are pinned per server too, and a welcome that drops one is refused (`SuiteDropped`). What
 remains: a device's very first look at a channel can be answered with a channel the server
 made up and signed under its own key; the pin turns that into one lie that is then caught,
-not one that is silently repeated.
+not one that is silently repeated. The made-up channel cannot be a restricted one under a
+suite the operator can read: `prove_channel` refuses a restricted creation block whose suite
+is not operator-confidential (#142, #204).
 
 ### OP-04: metadata harvesting
 
@@ -151,17 +161,24 @@ channels created without a suite remain plaintext, and encrypted channels do not
 replays old blocks.
 
 **Decision rationale.** Replay is cheap to stop and is stopped. Omission and reordering
-are not detectable by a single client talking to a single server. Detecting them needs
-either signed per-channel sequence or hash chains from authors, or comparison across
-servers and members. Both are design work, so the register says Open for those parts.
+are not detectable by a single client talking to a single server unless something binds
+each block to the ones before it. A signed per-channel sequence does that for one server;
+comparison across servers and members covers a server that signs two different chains. The
+sequence is built: the server signs it and clients check it (#169); comparison is design work.
 
 **Status evidence.** `IngestError::DuplicateBlock` refuses a CID seen before, which also
 stops replay of control-plane blocks. Read proofs go through a
 `ReplayGuard` (`jig-server/src/auth/`). The manifest's `hlc_ts` is set by the block's
-author (TM-02), not the server, but it still does not help a client detect reordering or
-omission: nothing binds one author's block to the blocks before it, so the server can
-reorder or withhold blocks whatever their timestamps say, and the server's clock adopts
-block timestamps with no skew bound (TM-01).
+author (TM-02), not the server. Since #161 the server signs an `ingest` record for every
+block of a channel it holds: `seq`, `prev` (the hash of the record before) and its own clock
+reading, as COSE (`jig-pipeline/src/ingest_record.rs`). History is ordered by `seq`, and
+the record is served with each block on history and WebSocket frames and at
+`GET /api/v1/channels/{slug}/records`. Since #169 clients check it: history, `jig read`,
+`jig tail` and `jig chat` verify each record's signature, `seq`, `prev` and clock against the
+chain the device pinned (`jig-client/src/chain.rs`), refuse a fork or a rewritten record, and
+fetch a gap in history from the records route, warning when the server does not serve it. A
+gap seen live is not filled until the next history read, and a server that shows two members
+two different chains is caught only if they compare them.
 
 ### OP-07: forged or withheld receipts; lying about fuel or execution
 
@@ -195,8 +212,11 @@ drops a server's pins. Over TLS, the default since TLS on by default landed, eve
 and WebSocket connection is tied to the pinned DID as well: once per process the CLI
 fetches `/.well-known/jig`, requires the DID it names to be the pinned one, and then
 accepts only the certificate that DID vouches for there (`tls_binding`), or one a CA
-issued (`jig_client::tls`). Over plaintext a REST response is still not tied to the
-pinned server. Name→DID mappings are not yet pinned client-side.
+issued (`jig_client::tls`). The CLI refuses plaintext REST and WebSocket connections to
+anything but this machine, since nothing would tie their answers to the pinned server
+(#142). `jig trust verify-name` pins a verified name's DID on first sight and refuses a
+changed one until `jig trust accept-name` moves the pin (#213); `jig ns resolve` verifies
+names but does not pin them.
 
 ### OP-09: federation abuse
 

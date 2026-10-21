@@ -74,11 +74,19 @@ impl WsClient {
     /// emits no frame, so this waits briefly for a refusal and returns it;
     /// `None` means the subscription was registered.
     pub async fn subscribe(&mut self, who: &Identity, slug: &str) -> Option<Frame> {
-        let scope = Scope::Channel {
-            slug: slug.to_string(),
-        };
+        self.subscribe_scope(
+            who,
+            Scope::Channel {
+                slug: slug.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// [`subscribe`](Self::subscribe) for any scope.
+    pub async fn subscribe_scope(&mut self, who: &Identity, scope: Scope) -> Option<Frame> {
         let hlc_wall_ms = now_ms();
-        let nonce = format!("ws-{hlc_wall_ms}-{}", slug.len());
+        let nonce = format!("ws-{hlc_wall_ms}-{}", scope.canonical_string().len());
         let hash = jig_core::request_auth::canonical_request_hash(
             "SUBSCRIBE",
             &scope.canonical_string(),
