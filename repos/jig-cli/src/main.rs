@@ -516,6 +516,19 @@ enum KeysAction {
         nameserver: String,
     },
 
+    /// List what opens this identity's key, or add or remove one way.
+    /// Adding opens the key first, as any command does. Removing the last
+    /// way is refused.
+    Protect {
+        /// Add a slot: `passphrase` (asked twice, or JIG_KEY_NEW_PASSPHRASE),
+        /// `keychain`, `env:NAME` or `credential:PATH`.
+        #[arg(long, conflicts_with = "remove")]
+        add: Option<String>,
+        /// Remove the slot with this number, as the list shows it.
+        #[arg(long)]
+        remove: Option<usize>,
+    },
+
     /// Mint a fresh keypair and rotate the alias binding from the
     /// current DID to the new one. The old keyfile is preserved, still
     /// sealed, as `<old_did>.jigkey.rotated` for offline recovery.
@@ -715,6 +728,9 @@ async fn run() -> Result<()> {
             }
             KeysAction::Rotate { alias, nameserver } => {
                 cmd::keys::rotate(&ctx, cmd::keys::KeysRotateArgs { alias, nameserver }).await?;
+            }
+            KeysAction::Protect { add, remove } => {
+                cmd::keys::protect(&ctx, add.as_deref(), remove)?;
             }
         }
         return Ok(());

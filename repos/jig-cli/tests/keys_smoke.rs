@@ -186,3 +186,71 @@ fn keys_rotate_refuses_before_changing_anything_when_a_rotated_key_exists() {
         "a key was minted: {keys_after:?}"
     );
 }
+
+/// `jig keys protect`: list, add a passphrase, remove the first slot, and
+/// never the last.
+#[test]
+fn keys_protect_adds_and_removes_slots_but_never_the_last() {
+    let tmp = tempfile::tempdir().unwrap();
+    let jig = |args: &[&str], env: &[(&str, &str)]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_jig"));
+        cmd.env("HOME", tmp.path())
+            .env("JIG_KEYCHAIN", "none")
+            .env("JIG_NONINTERACTIVE", "1")
+            .env_remove("JIG_KEY_UNLOCK")
+            .env_remove("JIG_KEY_PASSPHRASE")
+            .env(
+                "JIG_TEST_KEY_SECRET",
+                "jig cli tests: a fixed, public secret",
+            )
+            .args(args);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    let secret = [("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")];
+    let (ok, out) = jig(&["init", "dj"], &secret);
+    assert!(ok, "{out}");
+
+    let (ok, out) = jig(&["keys", "protect"], &[]);
+    assert!(ok && out.contains("1. an environment secret"), "{out}");
+    assert!(out.contains("one way to open this key"), "{out}");
+
+    let (ok, out) = jig(
+        &["keys", "protect", "--add", "passphrase"],
+        &[
+            secret[0],
+            ("JIG_KEY_NEW_PASSPHRASE", "a passphrase kept offline"),
+        ],
+    );
+    assert!(ok && out.contains("2. a passphrase"), "{out}");
+
+    // Opened with the passphrase alone, the environment's slot goes.
+    let pass = [("JIG_KEY_PASSPHRASE", "a passphrase kept offline")];
+    let (ok, out) = jig(&["keys", "protect", "--remove", "1"], &pass);
+    assert!(
+        ok && out.contains("1. a passphrase") && !out.contains("2."),
+        "{out}"
+    );
+
+    let (ok, out) = jig(&["keys", "protect", "--remove", "1"], &pass);
+    assert!(
+        !ok && out.contains("last"),
+        "removing the last slot is refused: {out}"
+    );
+
+    let (ok, out) = jig(&["keys", "protect", "--add", "hunter2-not-a-spec"], &pass);
+    assert!(
+        !ok && !out.contains("hunter2"),
+        "a bad --add is not echoed: {out}"
+    );
+}

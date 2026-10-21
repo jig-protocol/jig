@@ -324,6 +324,67 @@ pub(crate) fn build_rotate_request(
 // ============================================================================
 
 /// Parse the full `alias@suffix` renew and rotate take.
+/// `jig keys protect`: list the slots of the active identity's key, or add
+/// or remove one ([`jig_client::identity::protect`]).
+pub fn protect(ctx: &CliContext, add: Option<&str>, remove: Option<usize>) -> Result<()> {
+    use jig_client::identity::{Protect, SlotToAdd};
+    let did = ctx.effective().user.did.clone();
+    if !did.starts_with("did:jig:") {
+        anyhow::bail!("no identity is configured: run `jig init` first");
+    }
+    let keys_dir = jig_client::identity::default_keys_dir();
+    let change = match (add, remove) {
+        (None, None) => None,
+        (Some(spec), _) => Some(Protect::Add(match spec {
+            "passphrase" => SlotToAdd::Passphrase(
+                std::env::var("JIG_KEY_NEW_PASSPHRASE")
+                    .ok()
+                    .filter(|p| !p.is_empty())
+                    .map(zeroize::Zeroizing::new),
+            ),
+            "keychain" => SlotToAdd::Keychain,
+            other if other.starts_with("env:") || other.starts_with("credential:") => {
+                SlotToAdd::Secret(other.to_string())
+            }
+            // Not echoed: it may be a secret pasted in by mistake.
+            _ => anyhow::bail!(
+                "--add takes passphrase, keychain, env:NAME or credential:PATH (the value is not \
+                 shown, in case it is a secret)"
+            ),
+        })),
+        (None, Some(0)) => anyhow::bail!("slots are numbered from 1, as the list shows them"),
+        (None, Some(n)) => Some(Protect::Remove(n - 1)),
+    };
+    let slots = match change {
+        None => jig_client::identity::slots(&keys_dir, &did)?,
+        Some(change) => {
+            let slots = jig_client::identity::protect(
+                &keys_dir,
+                &did,
+                super::passphrase::key_access()?,
+                change,
+            )
+            .with_context(|| format!("changing the slots of {did}"))?;
+            eprintln!(
+                "updated {}",
+                jig_client::identity::key_path(&keys_dir, &did).display()
+            );
+            slots
+        }
+    };
+    println!("{did} opens with:");
+    for (i, slot) in slots.iter().enumerate() {
+        println!("  {}. {}", i + 1, jig_client::identity::slot_name(slot));
+    }
+    if slots.len() == 1 {
+        eprintln!(
+            "warning: one way to open this key. Losing it (a forgotten passphrase, a wiped \
+             keychain) loses the identity: add another with `jig keys protect --add passphrase`"
+        );
+    }
+    Ok(())
+}
+
 fn parse_full_name(alias: &str) -> Result<Name> {
     Name::parse(alias).with_context(|| format!("`{alias}` is not a full alias@suffix"))
 }
