@@ -140,8 +140,8 @@ impl AppState {
                 "lowercased aliases stored before case folding"
             );
         }
-        let signing_key = load_or_generate_server_key(&config.server.server_did_keyfile)
-            .context("loading nameserver signing key")?;
+        let signing_key =
+            load_or_generate_server_key(&config).context("loading nameserver signing key")?;
         // Before anything logs a DID: tags are keyed by this nameserver's seed.
         if !jig_core::did::set_log_tag_key(&signing_key.to_bytes()) {
             tracing::warn!(
@@ -439,46 +439,47 @@ fn spawn_challenge_sweeper(pending: Arc<RwLock<HashMap<String, PendingChallenge>
     });
 }
 
-/// Write a new nameserver signing key to `path` and return the DID the
+/// Write a new nameserver signing key, sealed with one slot per entry of
+/// `slots`, to the `.jigkey` that `path` names, and return the DID the
 /// nameserver will sign as when it loads that file. For a key ceremony on an
-/// offline machine: the DID can be recorded before any server exists.
+/// offline machine: the DID can be recorded before any server exists, and no
+/// copy of the key is ever in clear. Seal it with a passphrase there, then
+/// add the server's credential on the server (`keys add-slot`).
 ///
 /// The file is created owner-only (0600) at open, never chmod'ed after, and
 /// synced to disk. An existing file is never overwritten. Errors name the
 /// path only, never key material.
-pub fn keygen(path: &std::path::Path) -> Result<String> {
-    let signing = jig_core::crypto::ed25519::generate_signing_key();
-    jig_core::crypto::ed25519::write_new_key_file(path, &signing).with_context(|| {
-        format!(
-            "writing a new nameserver keyfile to {} (an existing file is never overwritten)",
-            path.display()
-        )
-    })?;
-    Ok(Did::from_ed25519_pubkey(signing.verifying_key().as_bytes()).to_did_jig_string())
+pub fn keygen(path: &std::path::Path, slots: &[String]) -> Result<String> {
+    jig_client::server_key::generate_sealed(path, slots, jig_core::keystore::KdfParams::default())
+        .with_context(|| {
+            format!(
+                "writing a new nameserver keyfile to {} (an existing file is never overwritten)",
+                jig_client::server_key::sealed_path(path).display()
+            )
+        })
 }
 
-fn load_or_generate_server_key(path: &str) -> Result<SigningKey> {
-    let expanded = shellexpand::tilde(path).into_owned();
-    let path = std::path::Path::new(&expanded);
-    if path.exists() {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("reading nameserver keyfile at {}", path.display()))?;
-        if bytes.len() != 32 {
-            anyhow::bail!(
-                "nameserver keyfile at {} is malformed: expected 32 bytes, got {}",
-                path.display(),
-                bytes.len()
-            );
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        Ok(SigningKey::from_bytes(&arr))
-    } else {
-        let signing = jig_core::crypto::ed25519::generate_signing_key();
-        jig_core::crypto::ed25519::write_new_key_file(path, &signing)
-            .with_context(|| format!("writing nameserver keyfile to {}", path.display()))?;
-        Ok(signing)
-    }
+/// Load the nameserver's signing key from `[v0_0_2.server] server_did_keyfile`,
+/// or make and seal one if there is none, opening it as `[v0_0_2.keys]` says
+/// ([`jig_client::server_key`]).
+fn load_or_generate_server_key(
+    config: &jig_config::v0_0_2_server::JigServerConfig,
+) -> Result<SigningKey> {
+    let path = shellexpand::tilde(&config.server.server_did_keyfile).into_owned();
+    Ok(jig_client::server_key::load_or_create(
+        std::path::Path::new(&path),
+        &key_options(&config.keys),
+    )?)
+}
+
+/// How `jig-nameserver` opens its key, from `[v0_0_2.keys]`.
+pub fn key_options(
+    keys: &jig_config::v0_0_2_server::KeysSection,
+) -> jig_client::server_key::ServerKeyOptions {
+    let mut opts = jig_client::server_key::ServerKeyOptions::new("nameserver", "jig-nameserver");
+    opts.unlock = keys.unlock.clone();
+    opts.plaintext = keys.storage == jig_config::v0_0_2_server::KeyStorage::Plaintext;
+    opts
 }
 
 #[cfg(test)]
@@ -662,11 +663,19 @@ mod tests {
     async fn keygen_prints_the_did_the_nameserver_signs_as() {
         let dir = std::env::temp_dir().join(format!("jig-ns-keygen-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let unlock = jig_client::server_key::credential_for_tests(&dir);
         let key = dir.join("ns.key");
-        let did = keygen(&key).unwrap();
+        let did = keygen(&key, std::slice::from_ref(&unlock)).unwrap();
+        let sealed = dir.join("ns.jigkey");
+        assert!(
+            sealed.exists() && !key.exists(),
+            "only the sealed file is written"
+        );
 
         let mut config = JigServerConfig::default();
         config.server.server_did_keyfile = key.to_string_lossy().into_owned();
+        config.keys.unlock = Some(unlock.clone());
         let suffixes = Suffixes::from_config(&jig_config::v0_0_2_server::NameserverSection {
             alias_suffix: None,
             alias_suffixes: vec![jig_config::v0_0_2_server::SuffixConfig::new("dj.jig")],
@@ -675,11 +684,11 @@ mod tests {
         let state = AppState::new(config, dir.join("ns.db"), suffixes).unwrap();
         assert_eq!(state.ns_did_string(), did);
 
-        let before = std::fs::read(&key).unwrap();
-        let err = keygen(&key).unwrap_err();
+        let before = std::fs::read(&sealed).unwrap();
+        let err = keygen(&key, &[unlock]).unwrap_err();
         assert!(format!("{err:#}").contains("never overwritten"), "{err:#}");
         assert_eq!(
-            std::fs::read(&key).unwrap(),
+            std::fs::read(&sealed).unwrap(),
             before,
             "the existing key is untouched"
         );

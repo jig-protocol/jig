@@ -53,8 +53,16 @@ pub async fn server_tls(server: &str) -> Result<Config> {
         let probed = probe(server, expected.as_deref())
             .await
             .map_err(|e| refusal(server, e))?;
-        if let Some(did) = &probed.server_did {
-            pins.check_server_did(server, did)?;
+        match (&probed.server_did, &probed.moved_from, &probed.key_link) {
+            (Some(did), Some(from), Some(link)) => {
+                pins.move_server(server, from, did, link)?;
+                eprintln!(
+                    "note: {server} moved its key from {from} to {did}, and both keys signed the \
+                     move (JEP-0012); this device's pin follows it."
+                );
+            }
+            (Some(did), _, _) => pins.check_server_did(server, did)?,
+            _ => {}
         }
         probed.config
     };

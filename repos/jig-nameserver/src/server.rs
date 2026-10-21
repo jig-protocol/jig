@@ -103,7 +103,7 @@ pub struct NameServerApp {
 /// attest under the chat server's DID, so treat the untouched default (and an
 /// empty string) as "operator did not choose" and derive a sibling of the
 /// nameserver database instead.
-fn resolve_v0_0_2_keyfile(cfg: &NameServerConfig) -> String {
+pub fn resolve_v0_0_2_keyfile(cfg: &NameServerConfig) -> String {
     let configured = cfg.v0_0_2.server.server_did_keyfile.trim();
     let jig_server_default = jig_config::v0_0_2_server::ServerSection::default().server_did_keyfile;
     if !configured.is_empty() && configured != jig_server_default {
@@ -288,6 +288,7 @@ mod tests {
         suffix.pow = jig_config::v0_0_2_server::PowPolicy::off();
         cfg.v0_0_2.nameserver.alias_suffixes = vec![suffix];
         cfg.v0_0_2.server.server_did_keyfile = dir.0.join("ns.key").to_string_lossy().into_owned();
+        cfg.v0_0_2.keys.unlock = Some(jig_client::server_key::credential_for_tests(&dir.0));
         // Off by default in production; on here so the route-presence assertions
         // exercise the mounted handler.
         cfg.v0_0_2.debug.list_handles = true;

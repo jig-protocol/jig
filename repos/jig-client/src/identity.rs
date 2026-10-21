@@ -334,17 +334,49 @@ impl KeyAccess {
     }
 }
 
-fn read_unlock_spec(spec: &str) -> Result<(SecretSource, Zeroizing<Vec<u8>>), IdentityError> {
-    let bad = |reason: String| IdentityError::BadEnv {
-        var: "JIG_KEY_UNLOCK",
-        reason,
-    };
+pub(crate) fn read_unlock_spec(
+    spec: &str,
+) -> Result<(SecretSource, Zeroizing<Vec<u8>>), IdentityError> {
+    read_unlock_spec_from(spec, "JIG_KEY_UNLOCK")
+}
+
+/// [`read_unlock_spec`], with `var` naming where the spec came from in errors.
+///
+/// A `credential:` file is key material: whoever reads it can open the key. So
+/// it must be readable by its owner only, as a raw key once had to be. The mode
+/// is checked on the file that is then read, not on its name, so a swap
+/// between the two reads nothing.
+pub(crate) fn read_unlock_spec_from(
+    spec: &str,
+    var: &'static str,
+) -> Result<(SecretSource, Zeroizing<Vec<u8>>), IdentityError> {
+    let bad = |reason: String| IdentityError::BadEnv { var, reason };
     let (source, secret) = if let Some(name) = spec.strip_prefix("env:") {
         let value = std::env::var(name).map_err(|_| bad(format!("{name} is not set")))?;
         (SecretSource::Env, Zeroizing::new(value.into_bytes()))
     } else if let Some(path) = spec.strip_prefix("credential:") {
-        let bytes = std::fs::read(path).map_err(|e| bad(format!("reading {path}: {e}")))?;
-        (SecretSource::Credential, Zeroizing::new(bytes))
+        let mut file =
+            std::fs::File::open(path).map_err(|e| bad(format!("reading {path}: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = file
+                .metadata()
+                .map_err(|e| bad(format!("reading {path}: {e}")))?
+                .permissions()
+                .mode()
+                & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(bad(format!(
+                    "{path} is readable by others (mode {mode:o}); a credential opens the key, \
+                     so it must be 0600 or 0400"
+                )));
+            }
+        }
+        let mut bytes = Zeroizing::new(Vec::new());
+        std::io::Read::read_to_end(&mut file, &mut bytes)
+            .map_err(|e| bad(format!("reading {path}: {e}")))?;
+        (SecretSource::Credential, bytes)
     } else {
         // Not the value itself: it may be the secret, pasted in by mistake.
         return Err(bad(
@@ -1672,6 +1704,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let cred = dir.path().join("cred");
         std::fs::write(&cred, [9u8; 40]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Readable by others: key material in the open, refused.
+            std::fs::set_permissions(&cred, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let err = read_unlock_spec(&format!("credential:{}", cred.display())).unwrap_err();
+            assert!(err.to_string().contains("readable by others"), "{err}");
+            std::fs::set_permissions(&cred, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let (source, secret) = read_unlock_spec(&format!("credential:{}", cred.display())).unwrap();
         assert_eq!(source, SecretSource::Credential);
         assert_eq!(secret.len(), 40);

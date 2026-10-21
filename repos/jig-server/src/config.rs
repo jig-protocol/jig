@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use jig_config::v0_0_2_server::{
     AuthSection, BridgesSection, DebugSection, FederationSection, IdentitySection, JigServerConfig,
-    NameserverSection, ServerSection,
+    KeysSection, NameserverSection, ServerSection,
 };
 
 use crate::runtime::ExecutionConfig;
@@ -60,6 +60,8 @@ pub struct ServerConfig {
     pub nameserver: NameserverSection,
     #[serde(default)]
     pub auth: AuthSection,
+    #[serde(default)]
+    pub keys: KeysSection,
 }
 
 /// Keys jig-server once accepted and no longer does, as a dotted path and the
@@ -212,6 +214,7 @@ impl Default for ServerConfig {
             bridges: BridgesSection::default(),
             nameserver: NameserverSection::default(),
             auth: AuthSection::default(),
+            keys: KeysSection::default(),
         }
     }
 }
@@ -261,6 +264,7 @@ impl ServerConfig {
             bridges: self.bridges.clone(),
             nameserver: self.nameserver.clone(),
             auth: self.auth.clone(),
+            keys: self.keys.clone(),
         }
     }
 
@@ -411,8 +415,9 @@ fn v0_0_2_template_sections(server: &ServerConfig) -> String {
 # when the two disagree.
 listen = "{listen}"
 
-# The ed25519 seed the server DID is derived from. BACK IT UP: losing it
-# changes the server DID and breaks TOFU pinning for every client.
+# The ed25519 seed the server DID is derived from, sealed: `server.key` here
+# names `server.jigkey` beside it. BACK IT UP, with what opens it: losing
+# either changes the server DID and breaks TOFU pinning for every client.
 server_did_keyfile = "{keyfile}"
 
 # channel-create and member-add are not optional extras — `jig channel create`
@@ -477,6 +482,21 @@ per_ip_burst = {per_ip_burst}
 per_ip_per_second = {per_ip_per_second}
 replay_per_did = {replay_per_did}
 max_tracked = {max_tracked}
+
+[keys]
+# How this server opens its key. A server never prompts, so name a slot it can
+# open unattended:
+#   credential:PATH  a systemd credential (LoadCredentialEncrypted=, bound to
+#                    the TPM where there is one): see docs/operations
+#   env:NAME         a secret of at least 32 bytes in an environment variable
+#   passphrase       read from JIG_KEY_PASSPHRASE
+# Unset, JIG_KEY_UNLOCK or JIG_KEY_PASSPHRASE is used; with neither, a new key
+# is refused rather than written in clear. A raw key from before keys were
+# sealed is refused too: `jig-server keys seal` converts it.
+# unlock = "credential:/run/credentials/jig-server.service/server-key"
+# `plaintext` keeps a raw key in clear: an antipattern, warned about on every
+# boot and advertised in unsafe_options_active.
+storage = "sealed"
 
 [debug]
 # Handle enumeration stays off — it dumps the registry to any caller.
@@ -691,6 +711,7 @@ mod config_file_tests {
             .replace("${JIG_SERVER_LISTEN%%:*}", host)
             .replace("${JIG_SERVER_LISTEN##*:}", port)
             .replace("$JIG_SERVER_LISTEN", listen)
+            .replace("$cred", &format!("{jig_home}/server/server-key.credential"))
             .replace("$JIG_HOME", jig_home)
     }
 
@@ -732,6 +753,15 @@ mod config_file_tests {
             v002.server.listen,
             format!("{}:{}", server.bind_address, server.port),
             "install.sh must keep the decorative `listen` in sync with the real bind address"
+        );
+        // A fresh install boots with no hand editing, and its key is sealed.
+        assert_eq!(
+            v002.keys.unlock.as_deref(),
+            Some("credential:/opt/jig-home/server/server-key.credential")
+        );
+        assert_eq!(
+            v002.keys.storage,
+            jig_config::v0_0_2_server::KeyStorage::Sealed
         );
         assert_eq!(
             v002.server.allowed_block_kinds,

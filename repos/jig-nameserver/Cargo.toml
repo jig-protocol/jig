@@ -55,6 +55,7 @@ base64 = "0.23"
 [dev-dependencies]
 # Paused time for the registration pool's queue tests.
 tokio = { workspace = true, features = ["test-util"] }
+jig-client = { path = "../jig-client", features = ["test-support"] }
 serde_json = { workspace = true }
 http-body-util = { workspace = true }
 semver = { version = "1.0", features = ["serde"] }
