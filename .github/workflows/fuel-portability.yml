@@ -31,7 +31,7 @@ name: fuel-portability
 # spend down — macOS minutes bill at a premium.
 #
 # Not part of the normal CI gate: manual dispatch, plus PRs that touch
-# jig-runtime, since that is where the answer would change.
+# jig-runtime or the lockfile, since that is where the answer would change.
 
 on:
   workflow_dispatch:
@@ -39,6 +39,8 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'repos/jig-runtime/**'
+      # A lockfile-only wasmtime/cranelift bump is the change most likely to move fuel.
+      - 'repos/Cargo.lock'
       - '.github/workflows/fuel-portability.yml'
 
 env:
