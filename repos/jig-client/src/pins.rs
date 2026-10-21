@@ -226,8 +226,9 @@ fn warn_respelled(file: &PinFile) {
             std::iter::once(&pin.server_did).chain(pin.channels.values().map(|c| &c.owner_did));
         for did in dids.filter(|d| respelled(d)) {
             tracing::warn!(
-                "the pin for {server} holds {did}, a did:jig not in its canonical lowercase \
-                 spelling; it will be refused (`jig server forget {server}` clears it)"
+                "the pin for {server} holds a did:jig ({}) not in its canonical lowercase \
+                 spelling; it will be refused (`jig server forget {server}` clears it)",
+                jig_core::did::log_tag(did)
             );
         }
     }
@@ -237,9 +238,9 @@ fn warn_respelled(file: &PinFile) {
             .filter(|d| respelled(d))
         {
             tracing::warn!(
-                "the name pin for {} holds {did}, a did:jig not in its canonical lowercase \
-                 spelling; the name will be refused",
-                entry.name()
+                "a name pin holds a did:jig ({}) not in its canonical lowercase spelling; \
+                 the name will be refused",
+                jig_core::did::log_tag(did)
             );
         }
     }

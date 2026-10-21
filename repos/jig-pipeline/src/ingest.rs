@@ -1417,8 +1417,9 @@ fn bundle_canonical_bytes(manifest_bytes: &[u8], code_bytes: &[u8]) -> Result<Ve
 }
 
 /// The manifest's DID fields that this pipeline reads, by the name an error
-/// reports them under.
-const MANIFEST_DID_FIELDS: &[&str] = &["member_did", "ns_did"];
+/// reports them under: `member_did` (member-add), `member` (role-assign and
+/// role-unassign) and `ns_did`.
+const MANIFEST_DID_FIELDS: &[&str] = &["member_did", crate::roles::MEMBER_KEY, "ns_did"];
 
 /// Refuse a manifest carrying a key-derived DID in any spelling but the key's
 /// own. Legacy, non-key-derived DIDs (`did:jig:alice`) are opaque labels and
@@ -1443,6 +1444,14 @@ fn check_manifest_dids(manifest: &jig_core::BlockManifest) -> Result<(), IngestE
                 field: (*field).to_string(),
             });
         }
+    }
+    // Signed too, and stored as the tie-break between equal clocks.
+    if let Some(hlc) = &manifest.hlc_ts
+        && respelled(hlc.server_did.as_str())
+    {
+        return Err(IngestError::NonCanonicalDid {
+            field: "hlc_ts.server_did".to_string(),
+        });
     }
     Ok(())
 }
@@ -1788,6 +1797,61 @@ mod tests {
 
     fn test_ctx() -> IngestContext {
         test_ctx_allowing(&["text-render"])
+    }
+
+    /// Every key-derived DID a manifest carries, signed, is in its one
+    /// spelling: a role-assign's `member` and the clock's `server_did` too.
+    #[test]
+    fn a_recased_member_or_clock_server_did_is_refused() {
+        let key = random_signing_key();
+        let did = Did::from_ed25519_pubkey(key.verifying_key().as_bytes());
+        let recased = did
+            .to_did_jig_string()
+            .to_uppercase()
+            .replacen("DID:JIG:Z", "did:jig:z", 1);
+        let manifest = || {
+            BlockManifest::builder()
+                .version(Version::new(0, 1, 0))
+                .author(Author {
+                    did: did.clone(),
+                    public_key: None,
+                    roles: vec![],
+                })
+                .build()
+                .unwrap()
+                .with_kind(BlockKind::RoleAssign)
+        };
+        let mut role = manifest();
+        role.metadata
+            .insert(crate::roles::MEMBER_KEY.into(), serde_json::json!(recased));
+        assert!(matches!(
+            check_manifest_dids(&role),
+            Err(IngestError::NonCanonicalDid { ref field }) if field == "member"
+        ));
+
+        let mut clock = manifest();
+        clock.hlc_ts = Some(jig_core::HlcTimestamp {
+            wall_ms: 1,
+            logical: 0,
+            server_did: Did::from_str_unchecked(recased.clone()),
+        });
+        assert!(matches!(
+            check_manifest_dids(&clock),
+            Err(IngestError::NonCanonicalDid { ref field }) if field == "hlc_ts.server_did"
+        ));
+
+        // Canonical, and legacy labels, pass.
+        let mut fine = manifest();
+        fine.metadata.insert(
+            crate::roles::MEMBER_KEY.into(),
+            serde_json::json!(did.to_did_jig_string()),
+        );
+        fine.hlc_ts = Some(jig_core::HlcTimestamp {
+            wall_ms: 1,
+            logical: 0,
+            server_did: Did::from_str_unchecked("did:jig:server-test"),
+        });
+        assert!(check_manifest_dids(&fine).is_ok());
     }
 
     fn test_ctx_allowing(kinds: &[&str]) -> IngestContext {
