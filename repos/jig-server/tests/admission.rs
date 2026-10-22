@@ -265,11 +265,11 @@ async fn a_banned_did_cannot_use_the_admin_routes_even_as_an_owner() {
     assert_eq!(body["code"], "NOT_ADMITTED");
 }
 
-/// Admission is decided on the DID the signature ESTABLISHED, not on the
-/// spelling in the manifest: a banned key cannot slip past its ban by
-/// re-casing its DID.
+/// A banned key cannot slip past its ban by re-casing its DID: a block that
+/// spells a DID any way but its key's own is refused before admission, since
+/// it is signed and this server cannot re-spell it.
 #[tokio::test]
-async fn a_recased_author_did_is_still_the_banned_key() {
+async fn a_recased_author_did_is_refused() {
     use jig_core::{Author, BlockKind, BlockManifest};
     let owner = Identity::new(1);
     let banned = Identity::new(2);
@@ -302,8 +302,8 @@ async fn a_recased_author_did_is_still_the_banned_key() {
     };
 
     let (status, body) = server.try_submit(&block).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
-    assert_eq!(body["code"], "NOT_ADMITTED");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    assert_eq!(body["code"], "NON_CANONICAL_DID");
 }
 
 /// Found in review: the admin archive route looked the channel up — and named

@@ -332,3 +332,31 @@ async fn the_work_is_checked_before_the_signature() {
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
     assert_eq!(body["code"], "BAD_SIGNATURE");
 }
+
+/// The signed welcome states the effort a new DID owes (JEP-0008 rule 15),
+/// and work at that effort admits.
+#[tokio::test]
+async fn the_welcome_states_the_effort_that_admits() {
+    let server = pow_server(&[]);
+    let alice = Identity::new(1);
+    let url = server.serve_ws().await;
+    let client = jig_client::Client::connect(&url, alice.as_client())
+        .await
+        .unwrap();
+    let welcome = client.welcome().expect("welcome");
+    assert_eq!(welcome.server_did, server.server_did());
+    let admit = welcome.admit.expect("the welcome asks admission work");
+    assert_eq!(admit.alg(), Some(jig_core::pow::Alg::Blake3));
+    assert_eq!(admit.effort(), Some(effort()));
+
+    let proof = PowAdmissionProof::solve(
+        &alice.as_client(),
+        &welcome.server_did,
+        admit.effort().unwrap(),
+    );
+    let (status, body) = server
+        .post_json("/api/v1/admission", &proof_json(&proof))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["proven"], true);
+}

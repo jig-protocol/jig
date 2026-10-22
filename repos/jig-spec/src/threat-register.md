@@ -5,8 +5,8 @@ protocol decision assumes an operator may run modified software, read and alter 
 storage, and lie on the wire. An operator cannot forge a user's signature.
 
 Operators are not the only adversary. The families after OP cover abuse and Sybil attacks
-(AB), the supply chain (SC), privacy (PV), malicious nameservers (NS), governance (GV) and
-time (TM). The same rule holds for each: a party the protocol cannot vet is assumed hostile.
+(AB), the supply chain (SC), privacy (PV), malicious nameservers (NS), governance (GV),
+time (TM) and identity keys (ID). The same rule holds for each: a party the protocol cannot vet is assumed hostile.
 
 Each entry records the decision that binds implementations and its status in v0.2. The
 decision is the obligation, whether or not anything implements it yet; the status says what
@@ -69,6 +69,7 @@ property the decisions choose deliberately, with its cost stated.
 | PV-02 | Receipt linkage: receipts revealing who executed what, where and when | A receipt carries only the block's CID, the server's identity, time and execution facts. A receipt for encrypted content MUST NOT carry a render hash or any content-derived value. | Partial: `sealed` receipts carry no `render_hash`; receipts still link a CID to every server that handled it |
 | PV-03 | Identity cross-linking by the protocol or the client | No protocol message links two DIDs, and none links an `--anon` session key to any DID (D20). A session SHOULD be bound to one DID. Clients SHOULD keep identities used in different ruleset groups in separate key stores and never use two of them from one session. | Partial: no message links DIDs; there is no `--anon` mode; a socket rebinds its read identity per subscription; the CLI keeps every identity under `~/.jig/` |
 | PV-04 | Non-deniability: signed content is attributable to its author by anyone it is disclosed to | Every block is signed by its author's DID, and on an encrypted channel the MLS content signature uses the same key. This is deliberate: it makes abuse provable (AB-06, D22). jig makes no deniability claim for content signed by a DID. | By design |
+| PV-05 | Share disclosure: the operator learns which servers a channel is shared with | The share blocks and contract records of [JEP-0005] are control blocks in clear on every suite, a restricted MLS channel's included, so the owning server can act on a share and members can check its record. The owning server, and every server carrying the channel, learn each share's target server, grant, requester and time. They MUST learn nothing of the channel's content, and a share the server cannot read is refused rather than carried. | Partial: share and record blocks are refused unless in clear, and on an MLS channel a share discloses only `{to, grant}` while application messages stay ciphertext (`a_share_on_an_encrypted_channel_discloses_its_target_and_grant_only`). Servers do not yet exchange shares, so no follower learns them (F2 slice 4b) |
 
 ## Malicious nameservers (NS)
 
@@ -93,10 +94,18 @@ property the decisions choose deliberately, with its cost stated.
 | TM-01 | Clock-skewed farms against time-based limits (account age, windows, decay) | Time-based limits MUST use the verifier's clock, never the claimant's. Age SHOULD be measured from the first signed observation by a party other than the subject. | Partial: replay windows use the server's clock; no time-based reputation limits exist; ingest refuses a block whose `hlc_ts` runs more than `[server] max_future_skew_ms` ahead of the server's clock (`CLOCK_SKEW`; default 300 000, allowed 30 000–900 000, signed in the welcome; #149). The bound is on the future only, and a block's timestamp is still its author's claim (TM-02) |
 | TM-02 | Self-asserted timestamps used to fake history or ordering | A signer's own timestamp is a claim. Ordering and age SHOULD come from receipts or countersignatures by other parties. | Partial: a channel's history is ordered by its sequencer's signed `ingest` record (`seq`, with the sequencer's `ingest_wall_ms` and `ingest_logical`), not by authors' `hlc_ts` (#161). No party other than the sequencer countersigns time |
 
+## Identity keys (ID)
+
+| ID | Threat | Decision | v0.2 |
+| --- | --- | --- | --- |
+| ID-04 | Key or cache theft at rest: a stolen or discarded disk, a backup, cloud sync of the home directory, a dotfiles repo, another local user | Identity keys, server and nameserver keys, and an identity's MLS state and read history are sealed at rest under a per-key data key that any one slot unwraps: the OS keychain, an Argon2id passphrase, a credential file or an environment secret ([Crypto Primitives]). Nothing is written in clear by default. At-rest encryption does not protect against code running as the user or the server, nor a key in memory. | Partial: the CLI seals its identity keys and MLS state (#177); jig-server and jig-nameserver seal their own keys, booting unattended from a systemd credential, TPM2-bound where the machine has one, with `deploy/setup-server-key.sh` to set it up (#254). `jig keys protect` adds and removes slots, refusing the last; `jig keys export` writes a recovery kit, a key file opened only by a passphrase of 12+ characters at the full Argon2id parameters. `JIG_KEYS_STORAGE=plaintext` and `[keys] storage = "plaintext"` still store keys in clear, with a warning on every load. Open: bot keys (C3) |
+
+[Crypto Primitives]: crypto.md
 [Encryption]: encryption.md
 [JEP-0001]: https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0001-encryption-suites.md
 [JEP-0002]: https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0002-handshake.md
 [JEP-0003]: https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0003-server-discovery.md
+[JEP-0005]: https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0005-channel-federation-contract.md
 [JEP-0008]: https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0008-proof-of-work.md
 [JEP-0009]: https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md
 [JEP-0010]: https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md

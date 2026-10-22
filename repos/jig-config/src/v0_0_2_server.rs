@@ -152,6 +152,13 @@ pub struct IdentitySection {
     /// here is refused when it is looked up; there is no discovery on the
     /// server side.
     pub delegations: BTreeMap<String, NameDelegation>,
+    /// Ask `http://` nameservers under `[identity.delegations]`. Off, a
+    /// nameserver is reached only over TLS one of its suffix's authorities
+    /// vouches for (its DID's binding for the certificate). For loopback or
+    /// local testing only: over plaintext anyone on the path sees which
+    /// aliases are looked up and can hide answers, though not forge them.
+    /// Listed in `unsafe_options_active`.
+    pub dangerously_allow_plaintext_nameservers: bool,
 }
 
 /// One suffix's entry in `[identity.delegations]`.
@@ -174,6 +181,7 @@ impl Default for IdentitySection {
             cache_ttl_seconds: 300,
             naively_allow_unknown_handles_fallback: false,
             delegations: BTreeMap::new(),
+            dangerously_allow_plaintext_nameservers: false,
         }
     }
 }
@@ -656,6 +664,75 @@ pub struct SuffixConfig {
     /// The proof-of-work register, renew and rotate carry (JEP-0008).
     #[serde(default)]
     pub pow: PowPolicy,
+    /// The cap on stranger registrations (JEP-0008 rules 17 and 21–24).
+    #[serde(default)]
+    pub pool: PoolPolicy,
+}
+
+/// `[v0_0_2.nameserver.alias_suffixes.pool]`: how many registrations by DIDs
+/// the allowlist does not name are admitted, however much work they bring
+/// (R1 decision 2), and how effort follows the demand.
+///
+/// On by default at [`PoolPolicy::recommended`], the opening value for `@jig`:
+/// `jig` waits out `503 REGISTRATION_BUSY` and retries (R1 slice 2).
+/// [`PoolPolicy::off`] admits every stranger.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PoolPolicy {
+    pub enabled: bool,
+    /// Stranger registrations admitted per hour.
+    pub strangers_per_hour: u32,
+    /// How many may be admitted at once after a quiet spell.
+    pub burst: u32,
+    /// How the suggested effort follows the queue. Only `doubling`.
+    pub controller: Controller,
+    /// One controller window.
+    pub controller_window_secs: u64,
+    /// Requests held for a token, highest effort first.
+    pub queue_len: usize,
+    /// The longest a held request waits before `503 REGISTRATION_BUSY`.
+    pub queue_wait_secs: u64,
+}
+
+/// How the suggested effort adapts (JEP-0008 rule 17).
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum Controller {
+    /// Double after a window with the queue full; halve after a window with
+    /// it empty throughout.
+    #[default]
+    Doubling,
+}
+
+impl Default for PoolPolicy {
+    fn default() -> Self {
+        Self::recommended()
+    }
+}
+
+impl PoolPolicy {
+    /// R1 decision 2: 60 an hour with a burst of 10 for `@jig`'s first week.
+    pub fn recommended() -> Self {
+        Self {
+            enabled: true,
+            strangers_per_hour: 60,
+            burst: 10,
+            controller: Controller::Doubling,
+            controller_window_secs: 300,
+            queue_len: 20,
+            queue_wait_secs: 10,
+        }
+    }
+
+    /// No pool: every stranger with valid work is admitted, with
+    /// [`PoolPolicy::recommended`]'s other values.
+    pub fn off() -> Self {
+        Self {
+            enabled: false,
+            ..Self::recommended()
+        }
+    }
 }
 
 /// `[v0_0_2.nameserver.alias_suffixes.pow]`: how much work a suffix asks for
@@ -684,6 +761,9 @@ pub struct PowPolicy {
     pub short_name_factor: u64,
     /// What renew and rotate by the holder pay (rule 31). `0` asks none.
     pub renew_effort: u64,
+    /// How long a penalty point lasts; each repeat offence before it lapses
+    /// doubles it (rule 27).
+    pub penalty_decay_secs: u64,
 }
 
 impl Default for PowPolicy {
@@ -704,6 +784,7 @@ impl PowPolicy {
             short_name_len: 5,
             short_name_factor: 4,
             renew_effort: 1,
+            penalty_decay_secs: 600,
         }
     }
 
@@ -768,6 +849,7 @@ impl SuffixConfig {
             reserved_affixes: default_reserved_affixes(),
             registration_allow: Vec::new(),
             pow: PowPolicy::default(),
+            pool: PoolPolicy::default(),
         }
     }
 
@@ -877,6 +959,9 @@ impl JigServerConfig {
         }
         if self.identity.naively_allow_unknown_handles_fallback {
             active.push("identity.naively_allow_unknown_handles_fallback".to_string());
+        }
+        if self.identity.dangerously_allow_plaintext_nameservers {
+            active.push("identity.dangerously_allow_plaintext_nameservers".to_string());
         }
         if self.debug.list_handles {
             active.push("debug.list_handles".to_string());
@@ -1160,6 +1245,7 @@ mod tests {
         cfg.federation.dangerously_disable_federation_tls = true;
         cfg.federation.dangerously_allow_plaintext_federation = true;
         cfg.identity.naively_allow_unknown_handles_fallback = true;
+        cfg.identity.dangerously_allow_plaintext_nameservers = true;
         cfg.debug.list_handles = true;
         cfg.auth.require_authenticated_reads = false;
         cfg.keys.storage = KeyStorage::Plaintext;
@@ -1171,6 +1257,7 @@ mod tests {
         assert!(active.contains(&"federation.dangerously_disable_federation_tls".to_string()));
         assert!(active.contains(&"federation.dangerously_allow_plaintext_federation".to_string()));
         assert!(active.contains(&"identity.naively_allow_unknown_handles_fallback".to_string()));
+        assert!(active.contains(&"identity.dangerously_allow_plaintext_nameservers".to_string()));
         assert!(active.contains(&"debug.list_handles".to_string()));
         assert!(!active.contains(&"naively_unbounded_clock_skew".to_string()));
     }

@@ -268,14 +268,13 @@ impl jig_pipeline::ingest::Admission for AuthState {
     }
 }
 
-/// The canonical form of a configured DID: parsed as a real `did:jig:z…`
-/// (so the key material is there) and re-spelled from it (so the case matches
+/// The canonical form of a configured DID: an operator typed it, so it may
+/// be in any letter case, and is re-spelled from its key (so the case matches
 /// what the gates compare against).
 fn canonical_did(raw: &str) -> anyhow::Result<String> {
-    let did = jig_core::did::Did::from_did_jig_string(raw.trim())
-        .map_err(|e| anyhow::anyhow!("`{raw}` is not a canonical did:jig:z… DID ({e})"))?;
-    let bytes = did.as_bytes()?;
-    Ok(jig_core::did::Did::from_ed25519_pubkey(&bytes).to_did_jig_string())
+    let did = jig_core::did::Did::canonicalize(raw)
+        .map_err(|e| anyhow::anyhow!("`{raw}` is not a did:jig:z… DID ({e})"))?;
+    Ok(did.to_did_jig_string())
 }
 
 fn admission_policy(section: &AdmissionSection, banned_dids: BTreeSet<String>) -> AdmissionPolicy {

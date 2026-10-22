@@ -129,6 +129,28 @@ enum KeysCommand {
         #[arg(long)]
         keyfile: Option<PathBuf>,
     },
+    /// Check that one secret opens the key, trying nothing configured: for
+    /// an offline passphrase or a new machine's credential, before relying
+    /// on it.
+    Verify {
+        /// The keyfile. Defaults to `[server] server_did_keyfile`.
+        #[arg(long)]
+        keyfile: Option<PathBuf>,
+        /// The slot to try: credential:PATH, env:NAME or passphrase.
+        #[arg(long)]
+        slot: String,
+    },
+    /// Make a new key, sealed with every slot named, where there is none. It
+    /// is never written in clear and never overwrites a key. Prints the DID.
+    Generate {
+        /// The keyfile. Defaults to `[server] server_did_keyfile`.
+        #[arg(long)]
+        keyfile: Option<PathBuf>,
+        /// A slot to seal it with: credential:PATH, env:NAME, or passphrase
+        /// (read from JIG_KEY_PASSPHRASE). Repeatable.
+        #[arg(long = "slot", required = true)]
+        slots: Vec<String>,
+    },
 }
 
 /// `jig-server keys ...`: works on the key file only, never starts the server.
@@ -150,6 +172,14 @@ fn run_keys(keys: KeysCommand, config: &ServerConfig) -> Result<String, String> 
         },
         KeysCommand::Show { keyfile } => KeysAction::Show {
             keyfile: or_configured(keyfile),
+        },
+        KeysCommand::Verify { keyfile, slot } => KeysAction::Verify {
+            keyfile: or_configured(keyfile),
+            slot,
+        },
+        KeysCommand::Generate { keyfile, slots } => KeysAction::Generate {
+            keyfile: or_configured(keyfile),
+            slots,
         },
     };
     jig_client::server_key::run(action, &jig_server::v0_0_2::key_options(&config.keys))
