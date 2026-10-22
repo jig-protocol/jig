@@ -69,6 +69,7 @@ property the decisions choose deliberately, with its cost stated.
 | PV-02 | Receipt linkage: receipts revealing who executed what, where and when | A receipt carries only the block's CID, the server's identity, time and execution facts. A receipt for encrypted content MUST NOT carry a render hash or any content-derived value. | Partial: `sealed` receipts carry no `render_hash`; receipts still link a CID to every server that handled it |
 | PV-03 | Identity cross-linking by the protocol or the client | No protocol message links two DIDs, and none links an `--anon` session key to any DID (D20). A session SHOULD be bound to one DID. Clients SHOULD keep identities used in different ruleset groups in separate key stores and never use two of them from one session. | Partial: no message links DIDs; there is no `--anon` mode; a socket rebinds its read identity per subscription; the CLI keeps every identity under `~/.jig/` |
 | PV-04 | Non-deniability: signed content is attributable to its author by anyone it is disclosed to | Every block is signed by its author's DID, and on an encrypted channel the MLS content signature uses the same key. This is deliberate: it makes abuse provable (AB-06, D22). jig makes no deniability claim for content signed by a DID. | By design |
+| PV-05 | Share disclosure: the operator learns which servers a channel is shared with | The share blocks and contract records of [JEP-0005] are control blocks in clear on every suite, a restricted MLS channel's included, so the owning server can act on a share and members can check its record. The owning server, and every server carrying the channel, learn each share's target server, grant, requester and time. They MUST learn nothing of the channel's content, and a share the server cannot read is refused rather than carried. | Partial: share and record blocks are refused unless in clear, and on an MLS channel a share discloses only `{to, grant}` while application messages stay ciphertext (`a_share_on_an_encrypted_channel_discloses_its_target_and_grant_only`). Servers do not yet exchange shares, so no follower learns them (F2 slice 4b) |
 
 ## Malicious nameservers (NS)
 
@@ -104,6 +105,7 @@ property the decisions choose deliberately, with its cost stated.
 [JEP-0001]: https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0001-encryption-suites.md
 [JEP-0002]: https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0002-handshake.md
 [JEP-0003]: https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0003-server-discovery.md
+[JEP-0005]: https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0005-channel-federation-contract.md
 [JEP-0008]: https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0008-proof-of-work.md
 [JEP-0009]: https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md
 [JEP-0010]: https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md

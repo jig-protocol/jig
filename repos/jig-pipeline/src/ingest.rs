@@ -3949,11 +3949,6 @@ mod tests {
         .expect("role-assign on an mls channel");
     }
 
-    /// The rights check is atomic with sequencing (JEP-0005 rule 7b): an
-    /// admin's member-add passes the write gate, then a role-unassign for
-    /// that admin is sequenced before the add lands. The landing transaction
-    /// folds the chain up to the seq the add would get, finds the role gone,
-    /// and refuses it with the gate's own error. Nothing of it is written.
     /// Sequence the owner's `role-unassign` of `admin` between the next
     /// block's write gate and its landing. Says whether it ran.
     fn unassign_before_landing(
@@ -4007,6 +4002,11 @@ mod tests {
         ran
     }
 
+    /// The rights check is atomic with sequencing (JEP-0005 rule 7b): an
+    /// admin's member-add passes the write gate, then a role-unassign for
+    /// that admin is sequenced before the add lands. The landing transaction
+    /// folds the chain up to the seq the add would get, finds the role gone,
+    /// and refuses it with the gate's own error. Nothing of it is written.
     #[tokio::test]
     async fn a_role_taken_away_before_landing_refuses_the_block() {
         let ctx = roles_ctx();
@@ -4462,5 +4462,80 @@ mod tests {
         );
         let chain = ctx.store.list_ingest_records_by_id(&chan, 0, 50).unwrap();
         assert_eq!(chain.len(), 3, "create, assign, and the unassign: no share");
+    }
+
+    /// What a share discloses (JEP-0005 Security Considerations, PV-05). On a
+    /// restricted MLS channel the server reads a share's `{to, grant}`, which
+    /// it needs to make the offer, and nothing of the content around it: an
+    /// application message on the same channel stays ciphertext to it. A
+    /// share cannot be sent encrypted instead, since the server must read it.
+    #[tokio::test]
+    async fn a_share_on_an_encrypted_channel_discloses_its_target_and_grant_only() {
+        let ctx = test_ctx_allowing(&[
+            "channel-create",
+            "member-add",
+            "text-render",
+            "channel-share",
+        ]);
+        let owner = person();
+        let bob = person();
+        let gid = create_sealed(&ctx, &owner).await;
+        add_to_sealed(&ctx, &owner, &bob, &gid).await;
+        let to = did_of(&random_signing_key());
+
+        let share = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelShare,
+            serde_json::json!({"channel": "#sealed", "to": to, "grant": "write"}),
+        )
+        .await
+        .expect("a share is a plaintext control block on an mls channel");
+        let stored = ctx.store.get_block(&share).unwrap().unwrap();
+        let (manifest_bytes, _): (Vec<u8>, Vec<u8>) =
+            serde_json::from_slice(&stored.bundle_bytes).unwrap();
+        let manifest: BlockManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(
+            crate::contracts::share_request(BlockKind::ChannelShare, &manifest).unwrap(),
+            crate::contracts::ShareRequest {
+                to: to.clone(),
+                grant: Some(jig_core::contract::Grant::Write),
+            },
+            "the server reads the target and the grant"
+        );
+        let mut keys: Vec<_> = manifest.metadata.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, ["channel", "grant", "to"], "and nothing else");
+
+        let (msg, _) = owner.mls.encrypt(&gid, b"the plan").unwrap();
+        let post = submit(
+            &ctx,
+            &owner,
+            BlockKind::TextRender,
+            jig_core::EncryptionSuite::Mls,
+            serde_json::json!({"channel": "#sealed", "mls_message": b64(&msg)}),
+        )
+        .await
+        .unwrap();
+        let stored = ctx.store.get_block(&post).unwrap().unwrap();
+        assert!(
+            !String::from_utf8_lossy(&stored.bundle_bytes).contains("the plan"),
+            "the content around it stays ciphertext"
+        );
+
+        let (sealed_share, _) = owner.mls.encrypt(&gid, b"{}").unwrap();
+        let hidden = submit(
+            &ctx,
+            &owner,
+            BlockKind::ChannelShare,
+            jig_core::EncryptionSuite::Mls,
+            serde_json::json!({"channel": "#sealed", "to": to, "grant": "read",
+                "mls_message": b64(&sealed_share)}),
+        )
+        .await;
+        assert!(
+            matches!(hidden, Err(IngestError::SuiteMismatch { .. })),
+            "a share the server cannot read is refused: {hidden:?}"
+        );
     }
 }
