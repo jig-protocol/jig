@@ -74,7 +74,6 @@ jig-server --config server.toml
 
 - **Runtime Architecture**: [jig-runtime/README.md](jig-runtime/README.md)
 - **Protocol Spec**: [jig-core/README.md](jig-core/README.md)
-- **CLI Integration**: [jig-cli/RUNTIME_INTEGRATION.md](jig-cli/RUNTIME_INTEGRATION.md)
 - **Server Integration**: [jig-server/src/runtime/mod.rs](jig-server/src/runtime/mod.rs)
 
 ---

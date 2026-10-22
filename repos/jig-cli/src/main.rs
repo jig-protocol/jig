@@ -3,7 +3,6 @@
 mod channel_arg;
 mod cmd;
 mod config;
-mod receipt;
 
 #[cfg(feature = "local-runtime")]
 mod runtime;
@@ -570,14 +569,16 @@ enum KeysAction {
 
 #[derive(Subcommand, Debug)]
 enum ReceiptAction {
-    /// View a receipt from a file
+    /// Show a v0.3 block receipt from a file, once its signature verifies. The file holds the
+    /// receipt's bytes, raw or base64 (as the server delivers them in `receipt_bytes_b64`).
     View {
-        /// Path to the receipt JSON
+        /// Path to the receipt
         #[arg(long)]
         file: String,
     },
 
-    /// Compare two receipt files (for parity testing)
+    /// Compare two exec receipts on component, world, invocation and outcome; a divergence
+    /// exits non-zero
     Compare {
         /// First receipt file
         first: String,

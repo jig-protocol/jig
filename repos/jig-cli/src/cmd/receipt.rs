@@ -1,173 +1,312 @@
-//! Receipt viewing and inspection commands
+//! `jig receipt view` and `jig receipt compare`: verify v0.3 block receipts from files.
+//!
+//! A receipt is the `COSE_Sign1` envelope a server or member signs over a deterministic-CBOR
+//! payload (`jig_core::block_receipt`). A file may hold the raw envelope, or its base64, as the
+//! server delivers it in `receipt_bytes_b64`. Either way the receipt is opened with its
+//! signature checked against the executor it names, before anything is shown.
 
-use crate::receipt::v0_2::{BlockReceipt, ReceiptExt};
-use anyhow::Result;
+use anyhow::{Context, Result};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use jig_core::block_receipt::{Body, Comparison, Exec, Outcome, Role, SignedReceipt, compare};
 
-/// View a receipt from a file
+/// Show a receipt, once its signature verifies.
 pub fn view_receipt(path: &str, json_output: bool) -> Result<()> {
-    let receipt = load_receipt_from_file(path)?;
-
-    // Validate receipt
-    if let Err(e) = receipt.validate_cli() {
-        eprintln!("Warning: Receipt validation failed: {}", e);
-    }
-
-    // Output
+    let signed = load(path)?;
     if json_output {
-        let json = serde_json::to_string_pretty(&receipt)?;
-        println!("{}", json);
+        println!("{}", serde_json::to_string_pretty(&to_json(&signed))?);
     } else {
-        print!("{}", receipt.pretty());
+        print!("{}", pretty(&signed));
     }
-
     Ok(())
 }
 
-/// Compare two receipts (for parity testing)
+/// Compare two `exec` receipts on what executors must agree on: component, world, invocation
+/// and outcome. A divergence is an error, so a script can tell.
 pub fn compare_receipts(path_a: &str, path_b: &str) -> Result<()> {
-    let a = load_receipt_from_file(path_a)?;
-    let b = load_receipt_from_file(path_b)?;
-
-    println!("Comparing receipts...\n");
-
-    // Block IDs should match
-    if a.block_id != b.block_id {
-        println!("❌ Block IDs differ:");
-        println!("  A: {}", a.block_id);
-        println!("  B: {}", b.block_id);
-    } else {
-        println!("✓ Block IDs match: {}", a.block_id);
+    let (a, b) = (load(path_a)?, load(path_b)?);
+    let exec = |s: &SignedReceipt, path: &str| match &s.receipt.body {
+        Body::Exec(exec) => Ok((**exec).clone()),
+        _ => anyhow::bail!(
+            "{path} is a {} receipt; only exec receipts carry an outcome to compare",
+            kind(&s.receipt.body)
+        ),
+    };
+    let (ea, eb) = (exec(&a, path_a)?, exec(&b, path_b)?);
+    if a.receipt.block_cid != b.receipt.block_cid {
+        println!(
+            "note: the receipts are for different blocks ({} and {})",
+            a.receipt.block_cid, b.receipt.block_cid
+        );
     }
-
-    // Render hashes should match for determinism
-    if a.render_hash != b.render_hash {
-        println!("❌ Render hashes differ:");
-        println!("  A: {}", a.render_hash);
-        println!("  B: {}", b.render_hash);
-    } else {
-        println!("✓ Render hashes match");
-    }
-
-    // Fuel usage (may differ slightly due to host overhead)
-    if a.fuel_used != b.fuel_used {
-        let diff = (a.fuel_used as i64 - b.fuel_used as i64).abs();
-        let pct = (diff as f64 / a.fuel_used as f64) * 100.0;
-        if pct > 5.0 {
-            println!("⚠️  Fuel usage differs significantly:");
-            println!("  A: {}", a.fuel_used);
-            println!("  B: {}", b.fuel_used);
-            println!("  Diff: {} ({:.2}%)", diff, pct);
-        } else {
-            println!("✓ Fuel usage similar (within 5%)");
+    match compare(&ea, &eb) {
+        Comparison::Agree => {
+            println!("agree: {}", outcome(&ea.outcome));
+            Ok(())
         }
-    } else {
-        println!("✓ Fuel usage identical: {}", a.fuel_used);
-    }
-
-    // Host and engine are expected to differ
-    if a.host != b.host {
-        println!("ℹ️  Hosts differ (expected):");
-        println!("  A: {}", a.host);
-        println!("  B: {}", b.host);
-    }
-
-    // Capabilities used should match
-    if a.capabilities_used != b.capabilities_used {
-        println!("❌ Capabilities used differ:");
-        println!("  A: {:?}", a.capabilities_used);
-        println!("  B: {:?}", b.capabilities_used);
-    } else if !a.capabilities_used.is_empty() {
-        println!("✓ Capabilities used match: {:?}", a.capabilities_used);
-    }
-
-    // v0.2 counters comparison
-    if let (Some(counters_a), Some(counters_b)) = (&a.counters, &b.counters) {
-        println!("\nCounters comparison:");
-
-        if counters_a.fuel_total != counters_b.fuel_total {
+        Comparison::NotComparable => {
             println!(
-                "  ⚠️  Fuel total differs: {} vs {}",
-                counters_a.fuel_total, counters_b.fuel_total
+                "not comparable: an incomplete run asserts nothing ({} / {})",
+                outcome(&ea.outcome),
+                outcome(&eb.outcome)
             );
-        } else {
-            println!("  ✓ Fuel total matches: {}", counters_a.fuel_total);
+            Ok(())
         }
-
-        if counters_a.bytes_tx != counters_b.bytes_tx {
+        Comparison::DifferentRuns => {
             println!(
-                "  ⚠️  Bytes TX differs: {} vs {}",
-                counters_a.bytes_tx, counters_b.bytes_tx
+                "different runs: the component, world or invocation differs, so the outcomes \
+                 are not evidence about the same run"
             );
+            Ok(())
         }
-
-        if counters_a.bytes_rx != counters_b.bytes_rx {
-            println!(
-                "  ⚠️  Bytes RX differs: {} vs {}",
-                counters_a.bytes_rx, counters_b.bytes_rx
-            );
-        }
+        Comparison::Diverge => anyhow::bail!(
+            "diverge: {} ({}) and {} ({}) reached different outcomes for the same run",
+            a.receipt.executor,
+            outcome(&ea.outcome),
+            b.receipt.executor,
+            outcome(&eb.outcome)
+        ),
     }
-
-    // Outcome comparison
-    if let (Some(outcome_a), Some(outcome_b)) = (&a.outcome, &b.outcome) {
-        println!("\nOutcome comparison:");
-
-        if outcome_a.status != outcome_b.status {
-            println!(
-                "  ❌ Status differs: {:?} vs {:?}",
-                outcome_a.status, outcome_b.status
-            );
-        } else {
-            println!("  ✓ Status matches: {:?}", outcome_a.status);
-        }
-
-        if outcome_a.affordances != outcome_b.affordances {
-            println!("  ⚠️  Affordances differ");
-        } else if !outcome_a.affordances.is_empty() {
-            println!("  ✓ Affordances match: {:?}", outcome_a.affordances);
-        }
-    }
-
-    println!("\nComparison complete.");
-    Ok(())
 }
 
-fn load_receipt_from_file(path: &str) -> Result<BlockReceipt> {
-    let content = std::fs::read_to_string(path)?;
-    let receipt: BlockReceipt = serde_json::from_str(&content)?;
-    Ok(receipt)
+/// Read `path` and open the receipt in it: the raw envelope, or its base64.
+fn load(path: &str) -> Result<SignedReceipt> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+    let envelope = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| STANDARD.decode(text.trim()).ok())
+        .unwrap_or(bytes);
+    SignedReceipt::open(&envelope)
+        .with_context(|| format!("{path} is not a v0.3 receipt that verifies"))
+}
+
+fn kind(body: &Body) -> &'static str {
+    match body {
+        Body::Exec(_) => "exec",
+        Body::Sealed => "sealed",
+        Body::Accepted => "accepted",
+    }
+}
+
+fn role(role: Role) -> &'static str {
+    match role {
+        Role::Server => "server",
+        Role::Member => "member",
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn outcome(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Ok { hash } => format!("ok {}", hex(hash)),
+        Outcome::Error { trap: None, hash } => format!("error {}", hex(hash)),
+        Outcome::Error {
+            trap: Some(trap),
+            hash,
+        } => format!("trap {trap} {}", hex(hash)),
+        Outcome::Incomplete { reason } => format!("incomplete ({reason})"),
+    }
+}
+
+fn pretty(signed: &SignedReceipt) -> String {
+    let r = &signed.receipt;
+    let mut out = format!(
+        "Receipt {}  (signature verifies)\n  kind:      {}\n  block:     {}\n  executor:  {} ({})\n  \
+         produced:  {}\n",
+        signed.cid(),
+        kind(&r.body),
+        r.block_cid,
+        r.executor,
+        role(r.role),
+        r.produced_at,
+    );
+    if let Body::Exec(exec) = &r.body {
+        out.push_str(&pretty_exec(exec));
+    }
+    out
+}
+
+fn pretty_exec(e: &Exec) -> String {
+    let mut out = format!(
+        "  outcome:   {}\n  component: {}\n  program:   {}\n  world:     {}\n  \
+         invocation: {}\n  limits:    fuel {}, memory {} pages, stack {}, timeout {} ms\n  \
+         engine:    {} {} ({}), fuel used {}\n",
+        outcome(&e.outcome),
+        hex(&e.component),
+        e.program,
+        e.world,
+        hex(&e.invocation_hash),
+        e.limits.fuel,
+        e.limits.memory_max_pages,
+        e.limits.max_wasm_stack,
+        e.limits.timeout_ms,
+        e.engine.name,
+        e.engine.version,
+        e.engine.profile,
+        e.engine.fuel_used,
+    );
+    if let Some(policy) = &e.operator_policy_cid {
+        out.push_str(&format!("  policy:    {policy}\n"));
+    }
+    out
+}
+
+fn to_json(signed: &SignedReceipt) -> serde_json::Value {
+    let r = &signed.receipt;
+    let mut v = serde_json::json!({
+        "cid": signed.cid().to_string(),
+        "kind": kind(&r.body),
+        "block_cid": r.block_cid.to_string(),
+        "executor": r.executor,
+        "role": role(r.role),
+        "produced_at": r.produced_at,
+    });
+    if let Body::Exec(e) = &r.body {
+        v["exec"] = serde_json::json!({
+            "outcome": outcome(&e.outcome),
+            "component": hex(&e.component),
+            "program": e.program.to_string(),
+            "world": e.world,
+            "invocation_hash": hex(&e.invocation_hash),
+            "operator_policy_cid": e.operator_policy_cid.map(|c| c.to_string()),
+            "limits": {
+                "fuel": e.limits.fuel,
+                "max_wasm_stack": e.limits.max_wasm_stack,
+                "memory_max_pages": e.limits.memory_max_pages,
+                "timeout_ms": e.limits.timeout_ms,
+            },
+            "engine": {
+                "name": e.engine.name,
+                "version": e.engine.version,
+                "profile": e.engine.profile,
+                "config_fingerprint": e.engine.config_fingerprint,
+                "fuel_used": e.engine.fuel_used,
+            },
+        });
+    }
+    v
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cid::Cid;
-    use std::str::FromStr;
+    use ed25519_dalek::SigningKey;
+    use jig_core::block_receipt::{Engine, Limits, Receipt};
+    use jig_core::canonical_cid;
+    use std::io::Write;
+
+    fn did_of(key: &SigningKey) -> String {
+        jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string()
+    }
+
+    fn exec(outcome: Outcome) -> Body {
+        Body::Exec(Box::new(Exec {
+            component: [1; 32],
+            program: canonical_cid::of(b"program"),
+            world: "jig:block/renderer@0.1.0".into(),
+            invocation_hash: [2; 32],
+            operator_policy_cid: Some(canonical_cid::of(b"policy")),
+            outcome,
+            limits: Limits {
+                fuel: 1_000_000,
+                max_wasm_stack: 1 << 20,
+                memory_max_pages: 16,
+                timeout_ms: 250,
+            },
+            engine: Engine {
+                name: "wasmtime".into(),
+                version: "49".into(),
+                profile: "jig-det-1".into(),
+                config_fingerprint: "f".into(),
+                fuel_used: 1234,
+            },
+        }))
+    }
+
+    fn signed(key: &SigningKey, body: Body) -> SignedReceipt {
+        SignedReceipt::sign(
+            Receipt {
+                block_cid: canonical_cid::of(b"block"),
+                executor: did_of(key),
+                role: Role::Server,
+                produced_at: 1_800_000_000,
+                body,
+            },
+            key,
+        )
+        .unwrap()
+    }
+
+    fn file(bytes: &[u8]) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(bytes).unwrap();
+        f
+    }
+
+    fn path(f: &tempfile::NamedTempFile) -> &str {
+        f.path().to_str().unwrap()
+    }
 
     #[test]
-    fn test_load_receipt_from_json() {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
+    fn a_receipt_loads_from_raw_bytes_or_base64_and_shows_what_it_states() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let receipt = signed(&key, exec(Outcome::Ok { hash: [3; 32] }));
+        for f in [
+            file(&receipt.envelope),
+            file(format!("{}\n", STANDARD.encode(&receipt.envelope)).as_bytes()),
+        ] {
+            let loaded = load(path(&f)).unwrap();
+            assert_eq!(loaded, receipt);
+            let text = pretty(&loaded);
+            assert!(text.contains("kind:      exec"), "{text}");
+            assert!(text.contains(&did_of(&key)), "{text}");
+            assert!(text.contains(&format!("ok {}", hex(&[3; 32]))), "{text}");
+            assert_eq!(to_json(&loaded)["exec"]["engine"]["fuel_used"], 1234);
+        }
+    }
 
-        let block_id =
-            Cid::from_str("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi").unwrap();
+    #[test]
+    fn a_receipt_whose_signature_does_not_verify_is_refused() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let mut envelope = signed(&key, Body::Accepted).envelope;
+        let last = envelope.len() - 1;
+        envelope[last] ^= 1;
+        let err = load(path(&file(&envelope))).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not a v0.3 receipt that verifies"),
+            "{err:#}"
+        );
+        assert!(load(path(&file(b"{\"not\": \"a receipt\"}"))).is_err());
+    }
 
-        let receipt = BlockReceipt::builder(block_id)
-            .host("did:jig:test-host")
-            .render_hash("sha256:abc123")
-            .fuel_used(100_000)
-            .build()
-            .unwrap();
+    #[test]
+    fn compare_agrees_refuses_a_divergence_and_skips_what_cannot_be_compared() {
+        let (a, b) = (
+            SigningKey::from_bytes(&[7; 32]),
+            SigningKey::from_bytes(&[8; 32]),
+        );
+        let ok = |k| file(&signed(k, exec(Outcome::Ok { hash: [3; 32] })).envelope);
+        let other = file(&signed(&b, exec(Outcome::Ok { hash: [4; 32] })).envelope);
+        let incomplete = file(
+            &signed(
+                &b,
+                exec(Outcome::Incomplete {
+                    reason: "fuel-exhausted".into(),
+                }),
+            )
+            .envelope,
+        );
+        let accepted = file(&signed(&b, Body::Accepted).envelope);
+        let (fa, fb) = (ok(&a), ok(&b));
 
-        // Write to temp file
-        let mut file = NamedTempFile::new().unwrap();
-        let json = serde_json::to_string_pretty(&receipt).unwrap();
-        file.write_all(json.as_bytes()).unwrap();
-        file.flush().unwrap();
-
-        // Load it back
-        let loaded = load_receipt_from_file(file.path().to_str().unwrap()).unwrap();
-        assert_eq!(loaded.block_id, receipt.block_id);
-        assert_eq!(loaded.fuel_used, receipt.fuel_used);
+        compare_receipts(path(&fa), path(&fb)).expect("the same outcome agrees");
+        let err = compare_receipts(path(&fa), path(&other)).unwrap_err();
+        assert!(err.to_string().starts_with("diverge:"), "{err}");
+        compare_receipts(path(&fa), path(&incomplete)).expect("incomplete is not evidence");
+        let err = compare_receipts(path(&fa), path(&accepted)).unwrap_err();
+        assert!(err.to_string().contains("only exec receipts"), "{err}");
     }
 }
