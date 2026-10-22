@@ -944,13 +944,33 @@ pub fn rotate(
     // Keep what is replaced under names nothing else uses, then rename the
     // new files over the old ones: each rename is atomic, and a link,
     // unlike a rename, never replaces a file that is already there.
+    // Every name is chosen before the first file is made, so a failure here
+    // leaves nothing behind.
+    let names = (|| {
+        let archive_to = match chain.links.last() {
+            Some(_) => Some(next_archive(&link_path)?),
+            None => None,
+        };
+        let prune_to = match &prune {
+            Some(_) => Some(next_pruned(&link_path)?),
+            None => None,
+        };
+        Ok::<_, ServerKeyError>((archive_to, prune_to))
+    })();
+    let (archive_to, prune_to) = match names {
+        Ok(names) => names,
+        Err(e) => {
+            unstage();
+            return Err(e);
+        }
+    };
     let retired = retired_path(&sealed, &old_did);
     if let Err(e) = link_new(&sealed, &retired) {
         unstage();
         return Err(e);
     }
-    let archived = match chain.links.last() {
-        Some(current) => match link_new(&link_path, &next_archive(&link_path)?) {
+    let archived = match chain.links.last().zip(archive_to) {
+        Some((current, to)) => match link_new(&link_path, &to) {
             Ok(archived) => Some((archived, current.old.clone())),
             Err(e) => {
                 unstage();
@@ -961,9 +981,8 @@ pub fn rotate(
         None => None,
     };
     // Kept, under a name the chain is not read from.
-    let pruned = match prune {
-        Some(oldest) => {
-            let to = next_pruned(&link_path)?;
+    let pruned = match prune.zip(prune_to) {
+        Some((oldest, to)) => {
             let moved = link_new(&oldest.path, &to).and_then(|to| {
                 std::fs::remove_file(&oldest.path)
                     .map(|()| to)

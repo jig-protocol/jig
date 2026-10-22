@@ -53,7 +53,7 @@ Draft. Field names are provisional. The design behind this revision is
    | `manifest` | CID and `seq` of the server's current `server-manifest` block | OP-02, OP-03 |
    | `key_link` | During a key change: the public key link (JEP-0012) from the server's old DID to `server_did`, signed by both keys; absent otherwise | OP-08 |
    | `admit` | The work asked of a DID the server has not admitted, `{alg, effort, salt_id, expires_at}` (JEP-0008 rule 15); absent when admission asks none | AB-02 |
-   | `prior_key_links` | The server's earlier key links, oldest first, each leaving the DID the one after it moves to, so that with `key_link` last they form one chain to `server_did` (JEP-0012, "Following a chain"); absent when there are none | OP-08 |
+   | `prior_key_links` | The server's earlier key links, oldest first, each leaving the DID the one before it moves to, so that with `key_link` last they form one chain to `server_did` (JEP-0012, "Following a chain"); absent when there are none | OP-08 |
    | `nonce` | Echo of the client's nonce | replayed `welcome` |
    | `server_nonce` | A fresh random value from the server | replayed `peer_proof` |
    | `tls_exporter` | 32 bytes exported from the TLS session (RFC 9266, label `EXPORTER-jig-handshake`); empty over plaintext | relayed handshake |

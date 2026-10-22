@@ -60,6 +60,13 @@ pub async fn server_tls(server: &str) -> Result<Config> {
         };
         match (&probed.server_did, &probed.moved_from) {
             (Some(did), Some(from)) => {
+                // Every link it serves, not only the hops this pin follows: a
+                // link before the pin can still fork one the pin followed.
+                if let Some(refused) =
+                    links_fork_in(&Pins::default_path(), server, &probed.key_links)?
+                {
+                    return Err(refused);
+                }
                 pins.move_server(server, from, did, &probed.followed)?;
                 // The DIDs are left out: `jig trust show` prints the pin.
                 eprintln!(
@@ -298,6 +305,17 @@ fn link_fork_in(
     let TlsError::OtherServer { key_links, .. } = e else {
         return Ok(None);
     };
+    links_fork_in(pins_path, server, key_links)
+}
+
+/// [`link_fork_in`] for the links `server` serves, whether the probe moved
+/// the pin or was refused: any one of them that forks a link this pin
+/// followed is kept as evidence and refuses `server`.
+fn links_fork_in(
+    pins_path: &std::path::Path,
+    server: &str,
+    key_links: &[String],
+) -> Result<Option<anyhow::Error>> {
     let kept = Pins::load(pins_path)?
         .server(server)
         .map(|p| p.links.clone())
@@ -984,6 +1002,49 @@ mod tests {
                 .unwrap()
                 .proven
                 .is_some()
+        );
+    }
+
+    /// A chain the pin would follow, whose earlier part forks a link the pin
+    /// already followed: refused before the pin moves.
+    #[test]
+    fn a_followable_chain_with_an_earlier_fork_is_refused() {
+        use base64::Engine as _;
+        use jig_core::key_link::{Audience, SignedKeyLink};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let server = "https://jig.example";
+        let new_key = jig_core::crypto::ed25519::generate_signing_key;
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let link = |a, b| {
+            base64::engine::general_purpose::STANDARD.encode(
+                SignedKeyLink::sign(a, b, Audience::Public, 1)
+                    .unwrap()
+                    .envelope(),
+            )
+        };
+        // The pin followed X -> P.
+        let (x, p, w, q) = (new_key(), new_key(), new_key(), new_key());
+        let mut pins = Pins::load(&path).unwrap();
+        pins.check_server_did(server, &did(&x)).unwrap();
+        pins.move_server(server, &did(&x), &did(&p), &[link(&x, &p)])
+            .unwrap();
+        // It now serves X -> W -> P -> Q: one chain, which a client pinned on
+        // P would follow to Q, but X -> W forks X -> P.
+        let served = vec![link(&x, &w), link(&w, &p), link(&p, &q)];
+        let refused = links_fork_in(&path, server, &served).unwrap().unwrap();
+        assert!(refused.to_string().contains("refusing"), "{refused}");
+        assert!(Pins::load(&path).unwrap().refusal(server).is_some());
+        assert_eq!(
+            Pins::load(&path)
+                .unwrap()
+                .server(server)
+                .unwrap()
+                .server_did,
+            did(&p),
+            "the pin did not move"
         );
     }
 
