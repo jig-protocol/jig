@@ -1041,6 +1041,24 @@ mod tests {
         );
     }
 
+    /// A share goes to the server it names and to no one else: another peer
+    /// connected to the owner receives nothing of it.
+    #[tokio::test]
+    async fn a_share_reaches_only_the_server_it_names() {
+        let p = pair(OfferPolicy::Accept).await;
+        let bystander = Did::from_ed25519_pubkey(&[11; 32]);
+        let (to_bystander, mut bystander_rx) = PeerSender::new(bystander);
+        p.owner.peers.register(to_bystander);
+        let channel = p.channel().await;
+        p.share(&channel, "write").await;
+        p.both(&channel, OfferState::Accepted).await;
+        record_of(&p.owner, &channel, BlockKind::ContractAccept).await;
+        assert!(
+            bystander_rx.try_recv().is_err(),
+            "the other peer was sent nothing"
+        );
+    }
+
     /// Design 5.7: a share naming a server that is not a configured peer
     /// fails visibly in the channel's log, and nothing is sent.
     #[tokio::test]
