@@ -756,9 +756,13 @@ passthrough) without terminating it.
   settings you choose to put there.
 - **Secrets never go inline in a unit file.** `systemctl cat` is readable by any
   local user. `EnvironmentFile`, `chmod 600 root:jig`, always.
-- **`MemoryDenyWriteExecute` is deliberately absent** from every unit. Blocks
-  execute through wasmtime's cranelift JIT, which maps pages W then X; enabling
-  W^X denial turns every block execution into a segfault.
+- **`MemoryDenyWriteExecute` is set on `jig-nameserver.service` only.** jig-server
+  executes blocks through wasmtime's cranelift JIT, which maps pages W then X;
+  W^X denial makes it fail to start. The nameserver runs no blocks and, built on
+  its own, links no Wasm engine. Build it in its own cargo invocation
+  (`cargo build --release -p jig-nameserver`): built together with jig-server,
+  cargo unifies features and links the executor into it too. It still never
+  creates an executable mapping, but the binary carries wasmtime for nothing.
 - **`UMask=0077` is deliberate.** The server writes `server.jigkey` owner-only
   on first boot, and refuses a raw key whose mode is loose.
 - **`StateDirectory=jig`** makes systemd create and chown `/var/lib/jig`;

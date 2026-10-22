@@ -3108,6 +3108,7 @@ dependencies = [
  "jig-config",
  "jig-core",
  "jig-pipeline",
+ "libc",
  "pprof",
  "rand 0.10.3",
  "reqwest",
