@@ -65,9 +65,14 @@ pub fn authenticate(
     // Every malformed-input path collapses to one refusal: a caller who cannot
     // authenticate has not earned a breakdown of which part was wrong. The DID
     // string is attacker-controlled, so this must refuse rather than panic.
-    let pubkey_bytes = proof
-        .did
-        .as_bytes()
+    //
+    // The proof is transient: it lives in this request's headers, and
+    // nothing below stores or forwards it, only the canonical DID rebuilt
+    // from its key. So a re-cased spelling is read as its key here, unlike a
+    // DID inside signed data that is kept or relayed, which must already be
+    // canonical.
+    let pubkey_bytes = Did::canonicalize(proof.did.as_str())
+        .and_then(|did| did.as_bytes())
         .map_err(|_| GateOutcome::AuthSignatureInvalid)?;
     let pubkey =
         VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| GateOutcome::AuthSignatureInvalid)?;
@@ -132,7 +137,8 @@ pub fn authenticate_subscribe(
     let signature = base64::engine::general_purpose::STANDARD
         .decode(&auth.sig_b64)
         .map_err(|_| GateOutcome::AuthSignatureInvalid)?;
-    let did = Did::from_did_jig_string(&auth.did).map_err(|_| GateOutcome::AuthSignatureInvalid)?;
+    // Transient, like a request proof: see `authenticate`.
+    let did = Did::canonicalize(&auth.did).map_err(|_| GateOutcome::AuthSignatureInvalid)?;
 
     let proof = AuthProof {
         did,
@@ -167,7 +173,9 @@ pub fn proof_from_headers(headers: &axum::http::HeaderMap) -> Option<AuthProof> 
     let get = |name: &str| headers.get(name)?.to_str().ok();
 
     Some(AuthProof {
-        did: Did::from_did_jig_string(get(headers::DID)?).ok()?,
+        // The DID is not in the signed hash, and the proof is never kept, so
+        // a re-cased spelling is read as its key (see `authenticate`).
+        did: Did::canonicalize(get(headers::DID)?).ok()?,
         hlc_wall_ms: get(headers::HLC_WALL_MS)?.parse().ok()?,
         hlc_logical: get(headers::HLC_LOGICAL)?.parse().ok()?,
         nonce: get(headers::NONCE)?.to_string(),

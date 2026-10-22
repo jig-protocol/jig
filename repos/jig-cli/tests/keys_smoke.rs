@@ -255,3 +255,85 @@ fn keys_protect_adds_and_removes_slots_but_never_the_last() {
         "a bad --add is not echoed: {out}"
     );
 }
+
+/// A recovery kit made on one machine restores the same identity on another,
+/// opened by its own passphrase; a wrong passphrase opens nothing.
+#[test]
+fn a_recovery_kit_exports_and_imports_to_the_same_did() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let jig = |home: &std::path::Path, args: &[&str], env: &[(&str, &str)]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_jig"));
+        cmd.env("HOME", home)
+            .env("JIG_KEYCHAIN", "none")
+            .env("JIG_NONINTERACTIVE", "1")
+            .env_remove("JIG_KEY_UNLOCK")
+            .env_remove("JIG_KEY_PASSPHRASE")
+            .env_remove("JIG_KEY_KIT_PASSPHRASE")
+            .env(
+                "JIG_TEST_KEY_SECRET",
+                "jig cli tests: a fixed, public secret",
+            )
+            .args(args);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let secret = ("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET");
+    let kit_pass = ("JIG_KEY_KIT_PASSPHRASE", "a kit passphrase kept offline");
+    let wrong = ("JIG_KEY_KIT_PASSPHRASE", "not the kit passphrase at all");
+    let (ok, _, err) = jig(first.path(), &["init", "dj"], &[secret]);
+    assert!(ok, "{err}");
+    let kit = first.path().join("dj.kit.jigkey");
+    let kit_arg = kit.to_str().unwrap();
+
+    let (ok, _, err) = jig(
+        first.path(),
+        &["keys", "export", "--out", kit_arg],
+        &[secret, ("JIG_KEY_KIT_PASSPHRASE", "too short")],
+    );
+    assert!(
+        !ok && err.contains("12"),
+        "a short kit passphrase is refused: {err}"
+    );
+    let (ok, did, err) = jig(
+        first.path(),
+        &["keys", "export", "--out", kit_arg],
+        &[secret, kit_pass],
+    );
+    assert!(ok && did.trim().starts_with("did:jig:z"), "{err}");
+    let did = did.trim().to_string();
+    let (ok, _, _) = jig(
+        first.path(),
+        &["keys", "export", "--out", kit_arg],
+        &[secret, kit_pass],
+    );
+    assert!(!ok, "an existing kit is never overwritten");
+
+    let (ok, out, err) = jig(first.path(), &["keys", "verify", kit_arg], &[kit_pass]);
+    assert!(ok && out.trim() == did, "{err}");
+    let (ok, _, _) = jig(first.path(), &["keys", "verify", kit_arg], &[wrong]);
+    assert!(!ok, "a wrong passphrase does not open the kit");
+
+    // The other machine: a wrong passphrase imports nothing; the right one
+    // restores the same DID and makes it the configured identity.
+    let (ok, _, _) = jig(second.path(), &["keys", "import", kit_arg], &[wrong]);
+    assert!(!ok);
+    let (ok, out, err) = jig(second.path(), &["keys", "import", kit_arg], &[kit_pass]);
+    assert!(ok && out.trim() == did, "{err}");
+    let (ok, out, err) = jig(
+        second.path(),
+        &["keys", "protect"],
+        &[("JIG_KEY_PASSPHRASE", "a kit passphrase kept offline")],
+    );
+    assert!(
+        ok && out.contains(&did) && out.contains("1. a passphrase"),
+        "{out}{err}"
+    );
+}

@@ -135,6 +135,10 @@ Non-goals:
 15. The epoch salt and its epoch number are published in the verifier's signed welcome and
     `server-manifest` (JEP-0002, JEP-0005 rule 16) and in every refusal (rule 16).
     `/.well-known/jig` MAY repeat them as a hint, never as the authority.
+    - The welcome's `admit` states admission's ask as `{alg, effort, salt_id, expires_at}`:
+      `salt_id` is 0, and `expires_at` (Unix seconds) is when the verifier stops promising to
+      accept a proof at that `effort`. The field is absent when admission asks no work. A
+      `salt_id` other than 0 contradicts the welcome.
 
 ## Effort: the controller and the refusal
 

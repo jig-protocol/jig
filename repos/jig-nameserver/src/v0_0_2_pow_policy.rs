@@ -564,7 +564,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_pool_that_is_off_admits_everyone() {
-        let m = Market::new(pow(), PoolPolicy::default());
+        let m = Market::new(pow(), PoolPolicy::off());
         for _ in 0..100 {
             assert_eq!(m.admit(1).await, Ok(()));
         }

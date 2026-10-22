@@ -508,8 +508,9 @@ impl TestJigServer {
 // TestNameserver
 // ---------------------------------------------------------------------------
 
-/// How much proof-of-work a [`TestNameserver`] asks for.
-pub use jig_config::v0_0_2_server::PowPolicy;
+/// How much proof-of-work a [`TestNameserver`] asks for, and how many
+/// strangers it admits.
+pub use jig_config::v0_0_2_server::{PoolPolicy, PowPolicy};
 
 /// A `jig-nameserver` running on `127.0.0.1:<random>` for tests.
 pub struct TestNameserver {
@@ -546,24 +547,52 @@ impl TestNameserver {
     }
 
     pub async fn start_with_suffix(alias_suffix: &str) -> Result<Self> {
-        Self::start_inner(alias_suffix, None, Self::test_pow(), false).await
+        Self::start_inner(
+            alias_suffix,
+            None,
+            Self::test_pow(),
+            PoolPolicy::off(),
+            false,
+        )
+        .await
     }
 
     /// Start a nameserver for `alias_suffix` whose DID key has the given
     /// seed, so a test can name it as an authority before it boots.
     pub async fn start_with_key(alias_suffix: &str, seed: [u8; 32]) -> Result<Self> {
-        Self::start_inner(alias_suffix, Some(seed), Self::test_pow(), false).await
+        Self::start_inner(
+            alias_suffix,
+            Some(seed),
+            Self::test_pow(),
+            PoolPolicy::off(),
+            false,
+        )
+        .await
     }
 
     /// A nameserver for `alias_suffix` as `jig-nameserver serve` runs it by
     /// default: over TLS, with a self-signed certificate its DID vouches for.
     pub async fn start_tls_with_suffix(alias_suffix: &str) -> Result<Self> {
-        Self::start_inner(alias_suffix, None, Self::test_pow(), true).await
+        Self::start_inner(
+            alias_suffix,
+            None,
+            Self::test_pow(),
+            PoolPolicy::off(),
+            true,
+        )
+        .await
     }
 
     /// [`Self::start_with_key`] over its default TLS.
     pub async fn start_tls_with_key(alias_suffix: &str, seed: [u8; 32]) -> Result<Self> {
-        Self::start_inner(alias_suffix, Some(seed), Self::test_pow(), true).await
+        Self::start_inner(
+            alias_suffix,
+            Some(seed),
+            Self::test_pow(),
+            PoolPolicy::off(),
+            true,
+        )
+        .await
     }
 
     /// An HTTP client that reaches this nameserver: under TLS, it trusts the
@@ -585,12 +614,14 @@ impl TestNameserver {
     }
 
     /// A plaintext nameserver for `alias_suffix` that asks for proof-of-work
-    /// as `pow` says (JEP-0008).
+    /// as `pow` says (JEP-0008). Its registration pool is off: tests register
+    /// many names within a second, which the recommended 60 an hour would
+    /// refuse.
     pub async fn start_with_pow(
         alias_suffix: &str,
         pow: jig_config::v0_0_2_server::PowPolicy,
     ) -> Result<Self> {
-        Self::start_inner(alias_suffix, None, pow, false).await
+        Self::start_with_policies(alias_suffix, pow, PoolPolicy::off()).await
     }
 
     /// [`Self::start_with_pow`] over its default TLS.
@@ -598,17 +629,38 @@ impl TestNameserver {
         alias_suffix: &str,
         pow: jig_config::v0_0_2_server::PowPolicy,
     ) -> Result<Self> {
-        Self::start_inner(alias_suffix, None, pow, true).await
+        Self::start_inner(alias_suffix, None, pow, PoolPolicy::off(), true).await
+    }
+
+    /// A plaintext nameserver for `alias_suffix` with these proof-of-work and
+    /// pool policies.
+    pub async fn start_with_policies(
+        alias_suffix: &str,
+        pow: PowPolicy,
+        pool: PoolPolicy,
+    ) -> Result<Self> {
+        Self::start_inner(alias_suffix, None, pow, pool, false).await
+    }
+
+    /// [`Self::start_with_policies`] over its default TLS.
+    pub async fn start_tls_with_policies(
+        alias_suffix: &str,
+        pow: PowPolicy,
+        pool: PoolPolicy,
+    ) -> Result<Self> {
+        Self::start_inner(alias_suffix, None, pow, pool, true).await
     }
 
     async fn start_inner(
         alias_suffix: &str,
         seed: Option<[u8; 32]>,
-        pow: jig_config::v0_0_2_server::PowPolicy,
+        pow: PowPolicy,
+        pool: PoolPolicy,
         tls: bool,
     ) -> Result<Self> {
         let mut suffix = jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix);
         suffix.pow = pow;
+        suffix.pool = pool;
         // A single-label suffix is trusted only through clients' own config;
         // a test that serves one means it.
         suffix.single_label_authority = !alias_suffix.contains('.');
