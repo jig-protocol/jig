@@ -1,23 +1,22 @@
 //! Executes the `text-block` renderer component (JEP-0006, first-slice step 5).
 //!
-//! The component is the same block as the byte-payload module in `text_block_payload.rs`,
-//! rebuilt for the `jig:block/renderer@0.1.0` world. This suite pins three things:
+//! The component is the `text-render` block for the `jig:block/renderer@0.1.0` world. This
+//! suite pins three things:
 //!
 //! - the committed artifact passes jig-core's component validator (`jig-det-1`);
 //! - its output matches text-block's native `execute_pure`, the shared oracle;
-//! - its `render_hash` equals the byte-payload module's, so servers on mixed versions keep
-//!   agreeing while the server moves from one to the other.
+//! - its `render_hash` for a fixed corpus is what the byte-payload module (ABI 1) produced
+//!   before it was deleted, so servers on mixed versions keep agreeing.
 //!
 //! It runs through jig-runtime's component path (`jig_runtime::component`), the same one the
 //! server and client use.
 //!
-//! As with the module, CI runs the suite twice: once against the committed artifact, and once
+//! CI runs the suite twice: once against the committed artifact, and once
 //! with `JIG_TEXT_BLOCK_COMPONENT` pointing at a fresh build. Wasm output is not reproducible
 //! across hosts, so the two are held together by behaviour, not bytes.
 
 use jig_core::component_validation::{BlockWorld, ComponentProfile, validate_component};
 use jig_core::grant::Grant;
-use jig_runtime::Runtime;
 use jig_runtime::component::{
     BlockError, CompiledRenderer, ComponentRuntime, ErrorOutcome, Hlc, Invocation, Payload,
     RenderLimits, RunOutcome,
@@ -33,7 +32,7 @@ const LIMITS: RenderLimits = RenderLimits {
 const MAX_MEMORY_PAGES: u32 = 256;
 
 /// The committed component, or the file `JIG_TEXT_BLOCK_COMPONENT` names. A relative path is
-/// resolved against the workspace root, as in `text_block_payload.rs`.
+/// resolved against the workspace root (`repos/`), which is where CI runs from.
 fn component_bytes() -> std::borrow::Cow<'static, [u8]> {
     let Some(raw) = std::env::var_os("JIG_TEXT_BLOCK_COMPONENT") else {
         return std::borrow::Cow::Borrowed(canonical::CANONICAL_COMPONENT);
@@ -140,19 +139,26 @@ fn component_and_native_agree() {
     }
 }
 
+/// `render_hash` for each body in [`CORPUS`], as the byte-payload module (ABI 1) produced it
+/// before it was deleted. A server or client on any version must keep producing these, or
+/// servers on mixed versions stop agreeing.
+const RENDER_HASHES: &[&str] = &[
+    "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+    "ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f",
+    "e2e526e9f22bd44ee96c841e6d16837198f116c70bb3a68f449251f508a61d75",
+    "fc9abd2ab1d9b73e164db57ed088c28c5e9f4ea598a13de45eded347e7ef03d2",
+    "e0429a89d7d07b06101b6ec461847bdcba8c5ccff91b3f3d9b541ae19c0313b3",
+    "0b2f21fbcf847c67fbc32b5d027a4a0eec7fceeda9ee57bb38a8a2a853eb52db",
+];
+
 #[test]
-fn render_hash_matches_the_byte_payload_module() {
+fn render_hash_has_not_moved() {
     let (runtime, renderer) = compiled();
-    let module_runtime = Runtime::new().expect("runtime construction");
-    for body in CORPUS {
-        let input = postcard::to_allocvec(&native_input(body)).expect("input encodes");
-        let module = module_runtime
-            .execute_payload(canonical::CANONICAL_WASM, canonical::ENTRY_POINT, &input)
-            .expect("byte-payload module executes");
-        let from_module: Output = postcard::from_bytes(&module.bytes).expect("output decodes");
-        let from_component = render_output(&runtime, &renderer, body);
+    assert_eq!(CORPUS.len(), RENDER_HASHES.len());
+    for (body, expected) in CORPUS.iter().zip(RENDER_HASHES) {
         assert_eq!(
-            from_component.render_hash, from_module.render_hash,
+            render_output(&runtime, &renderer, body).render_hash,
+            *expected,
             "body {body:?}"
         );
     }

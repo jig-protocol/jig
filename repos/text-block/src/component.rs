@@ -1,11 +1,10 @@
 //! The `jig:block/renderer@0.1.0` export (JEP-0006).
 //!
-//! Built only with `--features component`, which also drops the byte-payload exports, so the
-//! component's core module exposes nothing but what `wit-bindgen` generates.
+//! Built only with `--features component`, so host builds of this crate don't compile
+//! `wit-bindgen`. The component's core module exposes nothing but what `wit-bindgen` generates.
 //!
 //! The body of the invocation's input is the raw message text. The returned payload is the
-//! postcard-encoded [`crate::Output`], the same bytes the byte-payload ABI returns, under
-//! [`COMPONENT_OUTPUT_MEDIA_TYPE`]. `render_hash` inside it is unchanged: it is still
+//! postcard-encoded [`crate::Output`], under [`COMPONENT_OUTPUT_MEDIA_TYPE`]. `render_hash` inside it is unchanged: it is still
 //! `blake3(canonical_text)`, computed by [`execute_pure`].
 
 use crate::canonical::COMPONENT_OUTPUT_MEDIA_TYPE;
