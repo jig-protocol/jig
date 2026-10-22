@@ -67,7 +67,9 @@ fn serves_with_write_execute_memory_denied() {
     std::fs::write(
         &config,
         format!(
-            "[v0_0_2.keys]\nunlock = \"{unlock}\"\n\n\
+            // Plaintext, so the probe below can speak raw HTTP.
+            "[tls]\nenabled = false\n\n\
+             [v0_0_2.keys]\nunlock = \"{unlock}\"\n\n\
              [[v0_0_2.nameserver.alias_suffixes]]\nsuffix = \"mdwe.jig\"\n"
         ),
     )
