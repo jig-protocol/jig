@@ -639,15 +639,12 @@ pub fn seal_refusal(key: &SigningKey, refusal: &HelloRefusal, nonce: &str) -> En
     })
 }
 
-/// Whether two DID strings name the same key. Unparseable strings name
-/// nothing, so they match nothing.
+/// Whether two DID strings name the same key. A key has one spelling
+/// ([`Did::from_did_jig_string`] refuses any other), so this is string
+/// equality, and a string that is not a canonical DID matches nothing. A DID
+/// a person typed is canonicalized where it is read ([`Did::canonicalize`]).
 pub fn same_did(a: &str, b: &str) -> bool {
-    let key = |s: &str| {
-        Did::from_did_jig_string(s)
-            .and_then(|did| did.as_bytes())
-            .ok()
-    };
-    matches!((key(a), key(b)), (Some(a), Some(b)) if a == b)
+    a == b && Did::from_did_jig_string(a).is_ok()
 }
 
 /// Check a kept welcome or refusal frame, long after its connection, as
@@ -975,8 +972,8 @@ fn outside_offer(statement: &WelcomeStatement, offer: &ClientOffer) -> Option<&'
 /// verifies under both keys, it is for everyone, it leaves the pinned DID's
 /// key, and it moves to exactly the presented DID. `presented` comes from
 /// something the server signed, and a link's DIDs are canonical (JEP-0012),
-/// so it is compared as written: another spelling of the same key is
-/// refused. `pinned` may be a local spelling, so it is compared by key.
+/// so both are compared as written: another spelling of the same key is
+/// refused.
 pub fn link_moves(link_b64: &str, pinned: &str, presented: &str) -> Result<(), String> {
     use jig_core::key_link::{Audience, SignedKeyLink};
     let bytes = STANDARD
@@ -1590,7 +1587,11 @@ mod tests {
         // Another spelling of the new key is not the DID the link names.
         let canonical = did(&new);
         let recased = format!("did:jig:z{}", canonical["did:jig:z".len()..].to_uppercase());
-        assert!(same_did(&recased, &canonical), "the same key");
+        assert!(
+            !same_did(&recased, &canonical),
+            "one key, one spelling: another is not it"
+        );
+        assert!(same_did(&canonical, &canonical));
         let b64 = STANDARD.encode(link(&old, &new, Audience::Public));
         assert!(link_moves(&b64, &did(&old), &canonical).is_ok());
         assert!(link_moves(&b64, &did(&old), &recased).is_err());
