@@ -11,14 +11,17 @@ The Jig nameserver anchors decentralized identity, reputation, and tribunal gove
 
 ## Configuration
 
-The nameserver reads one config file, named by `--config <path>` or else `JIG_NS_CONFIG`. There is no default path: with neither set it refuses to start. It no longer reads `JIG_CONFIG`, `~/.jig/config.toml` or `./config/jig-nameserver/jig-config.toml`. Environment variables (`JIG_NS_BIND`, `JIG_NS_PORT`, `JIG_NS_DB_PATH`, …) override the file. The file must name the suffixes it serves; see `deploy/jig-nameserver.example.toml` and `OPERATOR_GUIDE.md`.
+The nameserver reads one config file, named by `--config <path>` or else `JIG_NS_CONFIG`. There is no default path: with neither set it refuses to start. It no longer reads `JIG_CONFIG`, `~/.jig/config.toml` or `./config/jig-nameserver/jig-config.toml`. Environment variables (`JIG_NS_BIND`, `JIG_NS_PORT`, `JIG_NS_DB_PATH`, …) override the file. The file must name the suffixes it serves; see `deploy/jig-nameserver.example.toml` and `OPERATOR_GUIDE.md`. It serves TLS by default, with a self-signed certificate its DID vouches for; see [TLS](OPERATOR_GUIDE.md#tls).
 
-A minimal file:
+A minimal file (here with plaintext, for local testing only):
 
 ```toml
 [network]
 bind = "127.0.0.1"
 port = 7070
+
+[tls]
+enabled = false
 
 [[v0_0_2.nameserver.alias_suffixes]]
 suffix = "names.example.org"

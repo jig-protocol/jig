@@ -35,9 +35,25 @@ Settings come from the config file named by `--config <path>` or else `JIG_NS_CO
 - `[v0_0_2.debug] list_handles` (default `false`): mounts `/v1/handles`.
 - `[storage] database_path` / `JIG_NS_DB_PATH`: the alias database.
 - `[network] bind` / `JIG_NS_BIND` and `[network] port` / `JIG_NS_PORT`: listen address.
+- `[tls]`: see [TLS](#tls).
 - `[network] trust_proxy` / `JIG_NS_TRUST_PROXY` and `[network] proxy_ip_header` / `JIG_NS_PROXY_IP_HEADER`: see [Behind a reverse proxy](#behind-a-reverse-proxy).
 
 Every config section denies unknown keys: a typo, or a key in the wrong section, stops the nameserver at start-up with an error naming the key. A section or key that was removed (`[pow]`, `[rate_limits]`, `[transparency]`, `[runtime]`, `[anomaly_detection]`, `[hot]`, `[federation]`, `storage.backend*`, `analytics.backend*`) fails with a message saying so; delete it. Removed environment variables, such as `JIG_NS_SECRET`, `JIG_NS_POW_*` and the federation `JIG_NS_*` variables, don't stop start-up: the nameserver logs a warning naming each one and ignores it.
+
+## TLS
+
+The nameserver serves TLS by default (JEP-0004 rule 12), TLS 1.3 only, with the same `[tls]` section jig-server takes:
+
+```toml
+[tls]
+enabled = true                              # the default
+# cert_path = "/etc/jig/nameserver.crt"     # both, or neither
+# key_path = "/etc/jig/nameserver.key"
+```
+
+- **Neither path set:** on first start the nameserver makes a self-signed certificate in `nameserver/tls/`, next to its database, apart from jig-server's `tls/`. Its DID (the one that signs attestations) vouches for that certificate in `/.well-known/jig-ns`, as `server_did` and `tls_binding`, the same fields jig-server publishes at `/.well-known/jig`. Clients check the certificate against the DIDs the suffix's delegation lists.
+- **Both paths set:** it serves that certificate, for example one a CA issued (`tailscale cert`, certbot), and its DID vouches for it the same way. For a `config` or `contract` suffix, clients accept a certificate only on the DID's word, never a CA's alone. A DNS-rooted suffix is the other way round: its nameserver is reached at `https://<suffix>/` and must hold a CA-valid certificate for that name.
+- **`enabled = false`:** serves plaintext. This is an unsafe option. The nameserver logs a warning and lists `tls.enabled=false` under `unsafe_options_active` in `/.well-known/jig-ns`. Use it only on loopback. Clients refuse an `http://` nameserver unless they opt in, for loopback or local testing only: jig-server with `[identity] dangerously_allow_plaintext_nameservers = true`, which it lists in its own `unsafe_options_active`, and the CLI with `[naming] dangerously_allow_plaintext_nameservers = true` in `cli.toml`.
 
 ## Proof-of-work
 
@@ -115,6 +131,8 @@ proxy_ip_header = "x-forwarded-for"   # the default
 ```
 
 The nameserver uses the **last** address in that header, the one your proxy appended. Earlier entries are whatever the client sent and are ignored. With one proxy in front this is the client's address; behind several, the limit applies to the nearest proxy. Only set `trust_proxy` when the nameserver is reachable through the proxy alone, since anyone who can connect directly can otherwise choose the address they are counted under.
+
+A proxy in front of a nameserver for a `config` or `contract` suffix must pass TLS through (TCP or SNI passthrough), as for jig-server: clients accept only the certificate the nameserver's DID vouches for, and a proxy that terminates TLS presents its own. A passthrough proxy cannot add `X-Forwarded-For`, so leave `trust_proxy` off there. Only a DNS-rooted suffix's nameserver may sit behind a proxy that terminates TLS with a CA certificate.
 
 ## Security notes
 

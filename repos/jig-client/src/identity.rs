@@ -69,6 +69,8 @@ pub enum IdentityError {
     ShortPassphrase,
     #[error("sealed {path:?}, but it does not open again: {reason}")]
     NotVerified { path: PathBuf, reason: String },
+    #[error("{0}")]
+    Protect(String),
     #[error(transparent)]
     Keystore(#[from] KeystoreError),
     #[error(transparent)]
@@ -84,6 +86,9 @@ pub enum PromptPurpose {
     Unlock,
     /// Choose a passphrase for a key being sealed. The prompt should ask twice.
     New,
+    /// Choose a passphrase for a slot added to an existing key
+    /// (`jig keys protect --add passphrase`). The prompt should ask twice.
+    Add,
 }
 
 /// Asks the person at the terminal for a passphrase. `None` means they
@@ -397,15 +402,7 @@ pub(crate) fn read_unlock_spec_from(
 }
 
 fn describe_slots(slots: &[SlotKind]) -> String {
-    let names: Vec<&str> = slots
-        .iter()
-        .map(|s| match s {
-            SlotKind::Passphrase(_) => "a passphrase",
-            SlotKind::Secret(SecretSource::Keychain) => "the OS keychain",
-            SlotKind::Secret(SecretSource::Credential) => "a credential file",
-            SlotKind::Secret(SecretSource::Env) => "an environment secret",
-        })
-        .collect();
+    let names: Vec<&str> = slots.iter().map(slot_name).collect();
     format!(
         "its key opens with {}, and none was available",
         names.join(" or ")
@@ -843,6 +840,182 @@ pub fn seal_rotated_keys(
     Ok(sealed)
 }
 
+/// A slot for [`protect`] to add.
+pub enum SlotToAdd {
+    /// A passphrase. `None` asks the prompt ([`PromptPurpose::Add`]).
+    Passphrase(Option<Zeroizing<String>>),
+    /// A new random secret, kept in the OS keychain.
+    Keychain,
+    /// A secret read from `env:NAME` or `credential:PATH`, as for
+    /// `JIG_KEY_UNLOCK`. Opening the key later needs `JIG_KEY_UNLOCK` set to it.
+    Secret(String),
+}
+
+/// What [`protect`] does to a key's slots.
+pub enum Protect {
+    Add(SlotToAdd),
+    /// Remove the slot at this index in [`JigKey::slots`]'s order.
+    Remove(usize),
+}
+
+/// The slots of `did_str`'s sealed key, without opening it.
+pub fn slots(keys_dir: &Path, did_str: &str) -> Result<Vec<SlotKind>, IdentityError> {
+    let path = key_path(keys_dir, did_str);
+    if !path.exists() {
+        return Err(IdentityError::KeyfileNotFound {
+            did: did_str.to_string(),
+            dir: keys_dir.to_path_buf(),
+        });
+    }
+    Ok(JigKey::from_bytes(&std::fs::read(&path)?)?.slots())
+}
+
+/// Add or remove one slot of `did_str`'s sealed key, opening it with
+/// `access`. Returns the slots it has after. The data key, and so every file
+/// sealed under it, is unchanged.
+///
+/// - The new file replaces the old one atomically, and an added slot is
+///   checked to open it from disk; if it does not, the old file is put back.
+/// - Removing the last slot is refused. Removing the keychain slot also
+///   deletes its secret from the keychain, after the file no longer needs it.
+/// - Adding a keychain slot to a key that has one is refused: the keychain
+///   keeps one secret per DID, so the new one would orphan the old slot.
+pub fn protect(
+    keys_dir: &Path,
+    did_str: &str,
+    access: &KeyAccess,
+    change: Protect,
+) -> Result<Vec<SlotKind>, IdentityError> {
+    let path = key_path(keys_dir, did_str);
+    let _lock = lock_did(keys_dir, did_str)?;
+    let before = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(IdentityError::KeyfileNotFound {
+                did: did_str.to_string(),
+                dir: keys_dir.to_path_buf(),
+            });
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let key = JigKey::from_bytes(&before)?;
+    let opened = access.open(&key)?;
+    check_did(&path, did_str, &opened.seed)?;
+    let has_keychain = key
+        .slots()
+        .contains(&SlotKind::Secret(SecretSource::Keychain));
+    let updated = match change {
+        Protect::Remove(index) => {
+            let removed = key.slots().get(index).cloned();
+            let updated = key.without_slot(&opened, index)?;
+            write_private_atomic(&path, &updated.to_bytes())?;
+            if removed == Some(SlotKind::Secret(SecretSource::Keychain))
+                && let Some(keychain) = &access.keychain
+                && let Err(e) = keychain.delete(did_str)
+            {
+                access.notice(&format!(
+                    "removed the keychain slot, but its secret is still in {}: {e}",
+                    keychain.name()
+                ));
+            }
+            updated
+        }
+        Protect::Add(add) => {
+            let (slot, check) = match add {
+                SlotToAdd::Passphrase(given) => {
+                    let passphrase = match given {
+                        Some(p) => Some(p),
+                        None => match &access.prompt {
+                            Some(prompt) => prompt.passphrase(did_str, PromptPurpose::Add)?,
+                            None => None,
+                        },
+                    }
+                    .filter(|p| !p.is_empty())
+                    .ok_or_else(|| {
+                        IdentityError::Protect(
+                            "no new passphrase: run from a terminal, or set \
+                             JIG_KEY_NEW_PASSPHRASE"
+                                .to_string(),
+                        )
+                    })?;
+                    if passphrase.chars().count() < MIN_PASSPHRASE_CHARS {
+                        return Err(IdentityError::ShortPassphrase);
+                    }
+                    let check = Unlock::Passphrase(passphrase.clone());
+                    (
+                        NewSlot::Passphrase {
+                            passphrase,
+                            params: access.kdf,
+                        },
+                        check,
+                    )
+                }
+                SlotToAdd::Keychain => {
+                    if has_keychain {
+                        return Err(IdentityError::Protect(format!(
+                            "{did_str} already has a keychain slot"
+                        )));
+                    }
+                    let keychain = access.keychain.as_ref().ok_or_else(|| {
+                        IdentityError::Protect("no OS keychain is available".to_string())
+                    })?;
+                    let mut secret = Zeroizing::new(vec![0u8; 32]);
+                    jig_core::crypto::ed25519::fill_random(&mut secret);
+                    keychain.set(did_str, &secret)?;
+                    // Read back, as the next open will.
+                    let stored = keychain.get(did_str)?.ok_or_else(|| {
+                        IdentityError::Protect(format!("{} kept no secret", keychain.name()))
+                    })?;
+                    (
+                        NewSlot::Secret {
+                            source: SecretSource::Keychain,
+                            secret,
+                        },
+                        Unlock::Secret(stored),
+                    )
+                }
+                SlotToAdd::Secret(spec) => {
+                    let (source, secret) = read_unlock_spec_from(&spec, "--add")?;
+                    let check = Unlock::Secret(secret.clone());
+                    (NewSlot::Secret { source, secret }, check)
+                }
+            };
+            let updated = key.with_slot(&opened, &slot)?;
+            write_private_atomic(&path, &updated.to_bytes())?;
+            let reopened = std::fs::read(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|b| JigKey::from_bytes(&b).map_err(|e| e.to_string()))
+                .and_then(|k| k.open(&[check]).map_err(|e| e.to_string()));
+            match reopened {
+                Ok(o) if *o.seed == *opened.seed => {}
+                other => {
+                    let reason = match other {
+                        Err(e) => e,
+                        Ok(_) => "it opens to another key".to_string(),
+                    };
+                    write_private_atomic(&path, &before)?;
+                    return Err(IdentityError::NotVerified { path, reason });
+                }
+            }
+            updated
+        }
+    };
+    // This process's cached key is still right (the data key is unchanged),
+    // but drop it so the next open reads the file as it now is.
+    OPENED.lock().expect("key cache poisoned").remove(&path);
+    Ok(updated.slots())
+}
+
+/// How one slot is named to a person, as `jig keys protect` lists them.
+pub fn slot_name(slot: &SlotKind) -> &'static str {
+    match slot {
+        SlotKind::Passphrase(_) => "a passphrase",
+        SlotKind::Secret(SecretSource::Keychain) => "the OS keychain",
+        SlotKind::Secret(SecretSource::Credential) => "a credential file",
+        SlotKind::Secret(SecretSource::Env) => "an environment secret",
+    }
+}
+
 fn open_cached(
     path: &Path,
     did_str: &str,
@@ -1149,6 +1322,149 @@ mod tests {
 
     fn clear_cache() {
         OPENED.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn protect_adds_and_removes_slots_and_never_the_last() {
+        let dir = tempdir().unwrap();
+        let keychain = Arc::new(MemoryKeychain::default());
+        let id = Identity::create(dir.path(), &keychain_only(keychain.clone())).unwrap();
+        let did = id.did_string();
+        clear_cache();
+
+        // A passphrase slot beside the keychain's.
+        let slots = protect(
+            dir.path(),
+            &did,
+            &keychain_only(keychain.clone()),
+            Protect::Add(SlotToAdd::Passphrase(Some(Zeroizing::new(
+                "a passphrase kept offline".into(),
+            )))),
+        )
+        .unwrap();
+        assert_eq!(slots.len(), 2);
+        clear_cache();
+        let alone = Identity::open(
+            dir.path(),
+            &did,
+            &passphrase_only("a passphrase kept offline"),
+        );
+        assert_eq!(
+            alone.unwrap().did_string(),
+            did,
+            "the new slot opens it alone"
+        );
+
+        // A second keychain slot would orphan the first.
+        clear_cache();
+        let again = protect(
+            dir.path(),
+            &did,
+            &keychain_only(keychain.clone()),
+            Protect::Add(SlotToAdd::Keychain),
+        );
+        assert!(matches!(again, Err(IdentityError::Protect(_))));
+
+        // Remove the keychain's slot: its secret goes too, and the passphrase
+        // still opens the key.
+        clear_cache();
+        let slots = protect(
+            dir.path(),
+            &did,
+            &passphrase_only("a passphrase kept offline"),
+            Protect::Remove(0),
+        )
+        .unwrap();
+        assert!(matches!(slots.as_slice(), [SlotKind::Passphrase(_)]));
+        // The keychain was not in that access, so the secret stays.
+        assert!(keychain.get(&did).unwrap().is_some());
+        clear_cache();
+        assert!(
+            Identity::open(
+                dir.path(),
+                &did,
+                &passphrase_only("a passphrase kept offline")
+            )
+            .is_ok()
+        );
+
+        // Never the last.
+        clear_cache();
+        let last = protect(
+            dir.path(),
+            &did,
+            &passphrase_only("a passphrase kept offline"),
+            Protect::Remove(0),
+        );
+        assert!(matches!(
+            last,
+            Err(IdentityError::Keystore(KeystoreError::LastSlot))
+        ));
+        // A short new passphrase is refused.
+        clear_cache();
+        let short = protect(
+            dir.path(),
+            &did,
+            &passphrase_only("a passphrase kept offline"),
+            Protect::Add(SlotToAdd::Passphrase(Some(Zeroizing::new("short".into())))),
+        );
+        assert!(matches!(short, Err(IdentityError::ShortPassphrase)));
+    }
+
+    #[test]
+    fn removing_the_keychain_slot_deletes_its_secret() {
+        let dir = tempdir().unwrap();
+        let keychain = Arc::new(MemoryKeychain::default());
+        let did = Identity::create(dir.path(), &keychain_only(keychain.clone()))
+            .unwrap()
+            .did_string();
+        clear_cache();
+        let mut both = keychain_only(keychain.clone());
+        both.passphrase = Some(Zeroizing::new("a passphrase kept offline".into()));
+        protect(
+            dir.path(),
+            &did,
+            &both,
+            Protect::Add(SlotToAdd::Passphrase(Some(Zeroizing::new(
+                "a passphrase kept offline".into(),
+            )))),
+        )
+        .unwrap();
+        clear_cache();
+        protect(dir.path(), &did, &both, Protect::Remove(0)).unwrap();
+        assert!(keychain.get(&did).unwrap().is_none());
+        assert_eq!(slots(dir.path(), &did).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn protect_adds_a_credential_slot() {
+        let dir = tempdir().unwrap();
+        let did = Identity::create(dir.path(), &passphrase_only("a passphrase kept offline"))
+            .unwrap()
+            .did_string();
+        clear_cache();
+        let cred = dir.path().join("credential");
+        std::fs::write(&cred, "a secret of at least thirty-two bytes, for a slot").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cred, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let slots = protect(
+            dir.path(),
+            &did,
+            &passphrase_only("a passphrase kept offline"),
+            Protect::Add(SlotToAdd::Secret(format!("credential:{}", cred.display()))),
+        )
+        .unwrap();
+        assert_eq!(slots[1], SlotKind::Secret(SecretSource::Credential));
+        clear_cache();
+        let mut by_secret = no_keychain();
+        by_secret.secret = Some((
+            SecretSource::Credential,
+            Zeroizing::new(b"a secret of at least thirty-two bytes, for a slot".to_vec()),
+        ));
+        assert!(Identity::open(dir.path(), &did, &by_secret).is_ok());
     }
 
     #[test]

@@ -46,11 +46,18 @@ pub struct NamingSection {
     /// to [`default_jig_delegation`].
     #[serde(default)]
     pub delegations: BTreeMap<String, DelegationEntry>,
+    /// Ask `http://` nameservers under `[naming.delegations]`. For loopback
+    /// or local testing only: over plaintext anyone on the path sees which
+    /// names you look up, and can hide answers (not forge them). Off, a
+    /// nameserver is reached only over TLS one of its suffix's authorities
+    /// vouches for.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dangerously_allow_plaintext_nameservers: bool,
 }
 
 impl NamingSection {
     fn is_empty(&self) -> bool {
-        self.delegations.is_empty()
+        self.delegations.is_empty() && !self.dangerously_allow_plaintext_nameservers
     }
 }
 
@@ -135,6 +142,7 @@ fn delegations_with_authority(
                 )
             })
             .collect(),
+        dangerously_allow_plaintext_nameservers: cfg.naming.dangerously_allow_plaintext_nameservers,
     }
 }
 

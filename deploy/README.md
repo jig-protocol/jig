@@ -214,8 +214,9 @@ the root keys and every section in one file.
 | Server identity | `curl -k https://100.x.y.z:7117/.well-known/jig` | `server_did`, `tls_binding` and `unsafe_options_active` |
 | Server counters | `curl -k https://100.x.y.z:7117/metrics` | Prometheus text |
 | Channel list | `curl -k https://100.x.y.z:7117/api/v1/channels` | `401` `AUTH_REQUIRED` — reads are signed; use `jig channel list` instead |
-| Nameserver liveness | `curl http://100.x.y.z:7070/v1/health` | `{"status":"ok"}` |
-| Nameserver alias API | `curl http://100.x.y.z:7070/v1/challenge` | `{"challenge":"<64 hex>"}` |
+| Nameserver liveness | `curl -k https://100.x.y.z:7070/v1/health` | `{"status":"ok"}` |
+| Nameserver identity | `curl -k https://100.x.y.z:7070/.well-known/jig-ns` | `server_did`, `tls_binding` and `unsafe_options_active` |
+| Nameserver alias API | `curl -k https://100.x.y.z:7070/v1/challenge` | `{"challenge":"<64 hex>"}` |
 | Units | `systemctl status jig-server jig-nameserver` | both `active (running)` |
 
 > ⚠️ **`jig-server` serves TLS by default**, on every route of its one port:
@@ -241,9 +242,22 @@ the root keys and every section in one file.
 > startup warning, and a `jig` CLI refuses a plaintext `http://` server that is
 > not on its own machine (#142).
 >
-> The nameserver on `:7070` is **not** covered by `[tls]` — that section belongs
-> to `jig-server` only — so its rows stay `http://` unless you terminate TLS in
-> front of it yourself.
+> **The nameserver on `:7070` serves TLS by default too**, from its own `[tls]`
+> section in `/etc/jig/jig-nameserver.toml` (same keys). Its self-signed
+> certificate lives in `/var/lib/jig/nameserver/tls/`, apart from jig-server's,
+> and the nameserver's DID vouches for it at `/.well-known/jig-ns`.
+>
+> **Upgrading a nameserver that served plaintext:** it comes back on TLS, and
+> `http://…:7070` stops answering. Point every client and server at
+> `https://…:7070` instead (`jig --nameserver`, `[server] nameserver_url`, and
+> the nameserver URLs in delegations). Clients accept the certificate on the
+> word of the DID the suffix's delegation lists, not on a CA's alone, so a
+> reverse proxy in front of the nameserver must pass TLS through, not
+> terminate it.
+> An `http://` nameserver is refused unless the client opts in, for loopback
+> or local testing only: `[identity] dangerously_allow_plaintext_nameservers`
+> on jig-server (listed in `unsafe_options_active`), `[naming]
+> dangerously_allow_plaintext_nameservers` in the CLI's `cli.toml`.
 
 `/healthz` and `/metrics` are always mounted and need no signed read,
 so they answer on a default, locked-down deployment. Use `/healthz` — not
