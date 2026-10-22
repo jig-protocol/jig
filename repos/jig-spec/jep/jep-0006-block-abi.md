@@ -211,15 +211,17 @@ lands. A landed block cannot be refused afterwards. Therefore:
 - Before landing, a server MAY run the block to decide whether to accept it. It MUST refuse a
   block whose run is `incomplete`, since its receipt could not carry a comparable outcome.
 - After landing, a failure to execute or sign MUST NOT undo the block. The server issues an
-  `accepted` receipt in place of `exec`.
+  `accepted` receipt in place of `exec`. If it cannot sign that either, the block stays without
+  a receipt, and the server issues one later, at the latest when it restarts.
 - A server keeps at most one receipt per block. A server that restarts before issuing it issues
   it then. Until a receipt exists, readers SHOULD show the block as pending, not as unverified.
 
 **Checking a receipt (client).** A client that holds a block in plaintext MAY re-execute it and
 compare. A client that does:
 
-1. MUST check the `exec` receipt's signature, and that its `executor` is the server that
-   delivered it.
+1. MUST check the `exec` receipt's signature, that its `executor` is the server that
+   delivered it, and that its `block_cid` is the block being checked. A receipt for another
+   block is not evidence about this one.
 2. MUST NOT execute or compare when the receipt's outcome is `incomplete`.
 3. MUST check that the block's `ingest` record names the block and is signed by the same server
    as the receipt, before using it to build the invocation. A forged record would otherwise turn
