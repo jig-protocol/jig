@@ -1,7 +1,7 @@
 //! Executes `jig:block` components (JEP-0006, first-slice step 4).
 //!
 //! This is the one execution path the design commits server, client and CLI to (decision A4).
-//! It sits beside the byte-payload ABI (`payload.rs`) until that is deleted.
+//! The byte-payload ABI it replaced (`payload.rs`, ABI 1) has been deleted.
 //!
 //! What it does, per decisions A2 and A3:
 //!
@@ -350,7 +350,7 @@ impl ComponentRuntime {
     }
 
     /// A runtime under operator-supplied limits: `runtime_config`'s pooling ceilings and stack
-    /// size apply to this engine exactly as they do to [`crate::WasmEngine`]. Per-run fuel and
+    /// size apply to this engine. Per-run fuel and
     /// deadline come from [`RenderLimits`], not from here.
     pub fn with_config(runtime_config: &RuntimeConfig, backend: Backend) -> Result<Self> {
         let mut config = deterministic_config(runtime_config)?;

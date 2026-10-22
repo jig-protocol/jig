@@ -102,8 +102,9 @@ pub struct ResourceLimits {
     /// Wall-clock execution timeout in milliseconds
     pub execution_timeout_ms: u64,
 
-    /// Maximum instances a SINGLE execution may create. One, always, for the
-    /// byte-payload convention: a block gets one instance per invocation.
+    /// Maximum instances a SINGLE execution may create. One, always: a block
+    /// gets one instance per invocation, which the component path guarantees by
+    /// instantiating once per run, so this is not otherwise enforced.
     ///
     /// Not to be confused with [`ResourceLimits::max_concurrent_instances`],
     /// which bounds how many executions can be in flight at once. Conflating the
@@ -194,9 +195,6 @@ pub struct EngineConfig {
     /// Canonicalize NaN values
     pub canonicalize_nans: bool,
 
-    /// Enable WASI preview2
-    pub wasi_preview2: bool,
-
     /// Enable component model
     pub component_model: bool,
 
@@ -212,7 +210,6 @@ impl Default for EngineConfig {
         Self {
             deterministic: true,
             canonicalize_nans: true,
-            wasi_preview2: true,
             component_model: false, // Opt-in for now
             enable_cache: false,    // Disabled by default for safety
             cache_dir: None,
