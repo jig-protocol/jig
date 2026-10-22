@@ -1,5 +1,9 @@
 # Is `fuel_used` a protocol quantity? — investigation for #33
 
+> **History.** The WASI execution path, its fixtures and `fuel-portability.yml` were removed
+> with ABI 2 (block ABI step 9b). Cross-architecture agreement is now checked on outcomes by
+> the `jig:block` conformance vectors (`block-abi-vectors.yml`).
+
 **Status:** settled. The cross-platform matrix has run; results in Finding 2.
 My leading hypothesis (a wall-clock deadline) was **wrong** and is retracted there.
 **Blocks:** receipt work (PR-B of the Wasm execution series) — **now unblocked**, on

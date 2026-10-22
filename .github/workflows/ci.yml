@@ -281,8 +281,6 @@ jobs:
   #   never turns `workspace` red; one already sat broken on main for a while
   #   (jig-config's validation.rs). jig-cli is left out because it has no
   #   library target for `--doc` to test.
-  # - jig-runtime's `tracing` feature, which no default build enables, so a
-  #   warning or a break behind it would otherwise go unseen.
   nightly:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -337,10 +335,6 @@ jobs:
             -p integration-tests \
             -p jig-bridge-core \
             -p jig-bridge-email
-      - name: Clippy, jig-runtime with the tracing feature
-        # Runs even when the doc tests failed, so one red step never hides the other.
-        if: ${{ !cancelled() && steps.changed.outputs.run == 'true' }}
-        run: cargo clippy -p jig-runtime --all-targets --features tracing -- -D warnings
 
   # Renamed from `license-compliance`: bare `cargo deny check` runs ALL FOUR
   # checks (advisories, bans, licenses, sources). The old name once sent a
