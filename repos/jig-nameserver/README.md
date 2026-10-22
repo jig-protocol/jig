@@ -26,7 +26,7 @@ For more examples, see [`examples/config`](examples/config/).
 
 | Route | Method | Purpose |
 | --- | --- | --- |
-| `/v1/challenge` | GET | one-time nonce that register and renew sign |
+| `/v1/challenge` | GET | one-time nonce that register, renew and rotate sign, with the signed proof-of-work offer |
 | `/v1/register` | POST | bind an alias to a DID |
 | `/v1/resolve/{alias}` | GET | the signed attestation, links and reachability for an alias |
 | `/v1/rotate` | POST | move an alias to a new key (signed by both keys) |
@@ -38,12 +38,13 @@ For more examples, see [`examples/config`](examples/config/).
 | `/v1/health` | GET | liveness |
 | `/v1/handles` | GET | every registered alias; mounted only with `[v0_0_2.debug] list_handles = true` |
 
-[`OPERATOR_GUIDE.md`](OPERATOR_GUIDE.md) covers the rate limits on the write routes and running behind a reverse proxy. [`deploy/README.md`](../../deploy/README.md) covers suffix and registration policy.
+[`OPERATOR_GUIDE.md`](OPERATOR_GUIDE.md) covers the rate limits on the write routes and running behind a reverse proxy. A nameserver for a `config` or `contract` suffix serves its own certificate, which clients accept on its DID's word: put it on the internet directly or behind a TLS passthrough (TCP or SNI) proxy, never one that terminates TLS. [`deploy/README.md`](../../deploy/README.md) covers suffix and registration policy.
 
 ## Commands
 
 - `jig-nameserver serve` (the default): run the HTTP server. `--bind` and `--port` override the config.
-- `jig-nameserver keygen --out <path>`: write a new signing key and print its DID, for a key ceremony before a server exists. It never overwrites a file.
+- `jig-nameserver keygen --out <path> --slot <slot>`: write a new signing key, sealed with each `--slot` (`passphrase`, `credential:PATH` or `env:NAME`), and print its DID, for a key ceremony before a server exists. It never overwrites a file.
+- `jig-nameserver keys seal|add-slot|show|verify|generate`: manage the sealed signing key the config names (`--keyfile` for another).
 - `dns-txt [CONFIG]`: print DNS TXT records advertising the `[capabilities]` section.
 
 ## Running Locally
