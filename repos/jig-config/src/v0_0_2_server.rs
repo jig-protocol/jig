@@ -414,6 +414,22 @@ pub struct FederationPeer {
     /// only when `publish` is set: a quota names its peer.
     #[serde(default)]
     pub quota: Option<PeerQuotaConfig>,
+    /// What this server does with a channel this peer offers it (JEP-0005
+    /// rule 8): hold the offer for the operator (the default), or accept it.
+    /// An offer this server cannot honour is refused either way.
+    #[serde(default)]
+    pub offers: OfferPolicy,
+}
+
+/// What a server does with a contract offer from one peer.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OfferPolicy {
+    /// Keep the offer until the operator accepts or refuses it.
+    #[default]
+    Hold,
+    /// Accept every offer this server can honour.
+    Accept,
 }
 
 /// How much one peer may relay to this server.

@@ -111,6 +111,8 @@ pub struct Fanout {
     local: RwLock<HashMap<u64, LocalSubscription>>,
     peers: RwLock<HashMap<String, DeliverySender>>,
     bridge_dids: StdRwLock<HashMap<String, DeliverySender>>,
+    /// The server's own watchers, by block kind ([`Fanout::watch_kinds`]).
+    server_watchers: StdRwLock<Vec<(Vec<String>, DeliverySender)>>,
 }
 
 impl Fanout {
@@ -189,6 +191,18 @@ impl Fanout {
             .write()
             .expect("bridge_dids poisoned")
             .remove(managed_did);
+    }
+
+    /// Deliver every block of one of `kinds` to `tx`, in any channel and
+    /// whatever its policy. For the server's own reactions to a block it has
+    /// accepted (a `channel-share` it must act on), never for a subscriber:
+    /// nothing here checks who may read the block.
+    pub fn watch_kinds(&self, kinds: &[jig_core::BlockKind], tx: DeliverySender) {
+        let kinds = kinds.iter().map(|k| k.as_str().to_string()).collect();
+        self.server_watchers
+            .write()
+            .expect("server_watchers poisoned")
+            .push((kinds, tx));
     }
 
     /// Like `broadcast`, but also dispatches to bridge sinks for any managed
@@ -289,6 +303,16 @@ impl Fanout {
         receipt: &StoredReceipt,
         policy: Option<&DeliveryPolicy>,
     ) {
+        for (kinds, tx) in self
+            .server_watchers
+            .read()
+            .expect("server_watchers poisoned")
+            .iter()
+        {
+            if kinds.iter().any(|k| k == &block.block_kind) {
+                let _ = tx.send((block.clone(), receipt.clone()));
+            }
+        }
         let subs = self.local.read().await;
         for sub in subs.values() {
             let matches = match &sub.scope {
@@ -944,5 +968,32 @@ mod tests {
         let res = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
         let no_delivery = res.is_err() || matches!(res, Ok(None));
         assert!(no_delivery, "unregistered bridge DID should not receive");
+    }
+
+    /// The server's own watcher sees every block of its kinds, a restricted
+    /// channel's included, on every path; and nothing else.
+    #[tokio::test]
+    async fn a_server_watcher_sees_its_kinds_wherever_they_land() {
+        let f = Fanout::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        f.watch_kinds(&[jig_core::BlockKind::ChannelShare], tx);
+        let share = sample_block(Some("bafy_room"), "channel-share");
+        let sealed = restricted("did:jig:zOwner", &[]);
+        f.broadcast_with_members(&share, &sample_receipt(), Some(&sealed))
+            .await
+            .unwrap();
+        assert!(received(&mut rx).await, "a restricted channel's share");
+        f.broadcast_local_only(&share, &sample_receipt(), None)
+            .await
+            .unwrap();
+        assert!(received(&mut rx).await, "a relayed share");
+        f.broadcast(
+            &sample_block(Some("bafy_room"), "text-render"),
+            &sample_receipt(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!received(&mut rx).await, "another kind");
     }
 }

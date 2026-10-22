@@ -231,6 +231,7 @@ impl TestJigServer {
             alias: None,
             publish: false,
             quota: None,
+            offers: Default::default(),
         };
 
         // Listing a peer is what trusts it: `other` may now subscribe to our

@@ -181,6 +181,11 @@ list_handles = false
 # This peer's own quota, in place of default_peer_quota. Published only with
 # publish = true. Published, not yet enforced.
 # quota = { blocks_per_min = 1200, bytes_per_min = 16777216 }
+# What to do when this peer offers a channel (JEP-0005 rule 8). "hold" (the
+# default) keeps the offer for you to accept or refuse; "accept" accepts every
+# offer this server can honour. An offer it cannot honour (a suite it does not
+# carry, a name suffix you both claim) is refused either way.
+# offers = "hold"
 #
 # The quota published for every peer without its own. These are the defaults
 # (600 blocks and 8 MiB a minute); neither may be 0.
