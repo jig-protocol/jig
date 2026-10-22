@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jig_core::naming::{self, Attestation, Name, NamingError};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -45,6 +45,8 @@ pub enum IdentityError {
     MalformedResponse(String),
     #[error("no delegation configured for suffix `{suffix}`")]
     NoDelegation { suffix: String },
+    #[error("aliases under `{0}` are refused by this server")]
+    SuffixRefused(String),
     #[error("alias attestation refused: {0}")]
     Naming(#[from] NamingError),
     #[error("nameservers for `{alias}` attest different DIDs: {dids:?}")]
@@ -153,7 +155,8 @@ impl IdentityResolver for TofuResolver {
 /// lists for its suffix, and accepts only an attestation signed by one of that
 /// suffix's authorities, inside its validity window, for exactly this alias
 /// (JEP-0004 rules 3 and 13). A suffix with no entry is refused: the server
-/// does no discovery.
+/// does no discovery. A refused suffix is refused before its delegation is
+/// even looked at.
 ///
 /// Every listed nameserver is asked. Two valid attestations naming different
 /// DIDs are an equivocation: the alias is refused and both are kept as
@@ -161,6 +164,8 @@ impl IdentityResolver for TofuResolver {
 /// the attestation's `valid_until`.
 pub struct NameserverResolver {
     delegations: BTreeMap<String, SuffixAuthority>,
+    /// `[identity] refused_suffixes`, lowercased.
+    refused: BTreeSet<String>,
     store: Arc<SqliteStore>,
     cache: RwLock<HashMap<String, CachedDid>>,
     cache_ttl: Duration,
@@ -261,6 +266,7 @@ enum Answer {
 impl NameserverResolver {
     pub fn new(
         delegations: BTreeMap<String, SuffixAuthority>,
+        refused: BTreeSet<String>,
         cache_ttl_seconds: u64,
         store: Arc<SqliteStore>,
         transport: Arc<dyn NameserverTransport>,
@@ -271,6 +277,7 @@ impl NameserverResolver {
                 .into_iter()
                 .map(|(suffix, d)| (suffix.to_ascii_lowercase(), d))
                 .collect(),
+            refused: refused.iter().map(|s| s.to_ascii_lowercase()).collect(),
             store,
             cache: RwLock::new(HashMap::new()),
             cache_ttl: Duration::from_secs(cache_ttl_seconds),
@@ -284,6 +291,9 @@ impl NameserverResolver {
     pub async fn resolve(&self, alias: &str) -> Result<String, IdentityError> {
         // Before any request: a malformed alias never reaches a URL.
         let name = Name::parse(alias)?;
+        if self.refused.contains(&name.suffix) {
+            return Err(IdentityError::SuffixRefused(name.suffix));
+        }
         let key = name.as_alias();
         let now = (self.now)();
         {
@@ -670,6 +680,7 @@ mod tests {
         let clock = Arc::new(AtomicI64::new(NOW));
         let mut r = NameserverResolver::new(
             delegations("dj.jig", authorities, nameservers),
+            Default::default(),
             300,
             store.clone(),
             Arc::new(LocalPlaintextNameservers),
@@ -693,6 +704,29 @@ mod tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].root_id, "dj.jig");
         assert_eq!(kept[0].first_seen, NOW);
+    }
+
+    #[tokio::test]
+    async fn a_refused_suffix_is_refused_without_asking_its_nameservers() {
+        let (ns, alice) = (key(1), did_of(&key(9)));
+        let mock = MockNameserver::start().await;
+        mock.serve("dj@dj.jig", &attest(&ns, &alice, "dj@dj.jig", NOW + 100))
+            .await;
+        // A delegation that would resolve, as the built-in `jig` one would.
+        let r = NameserverResolver::new(
+            delegations("dj.jig", &[&ns], &[&mock]),
+            BTreeSet::from(["DJ.jig".to_string()]),
+            300,
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            Arc::new(LocalPlaintextNameservers),
+        );
+
+        let err = r.verify("dj@dj.jig", &alice).await.unwrap_err();
+        assert!(
+            matches!(err, IdentityError::SuffixRefused(ref s) if s == "dj.jig"),
+            "{err:?}"
+        );
+        assert_eq!(mock.hits(), 0, "nothing was asked");
     }
 
     #[tokio::test]
@@ -875,6 +909,7 @@ mod tests {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let mut r = NameserverResolver::new(
             delegations("DJ.jig", &[&ns], &[&mock]),
+            Default::default(),
             300,
             store,
             Arc::new(LocalPlaintextNameservers),
@@ -961,6 +996,7 @@ mod tests {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let mut r = NameserverResolver::new(
             delegations("dj.jig", &[&ns], &[&mock]),
+            Default::default(),
             300,
             store,
             Arc::new(Refusing),
@@ -994,8 +1030,13 @@ mod tests {
                 nameservers: vec!["http://127.0.0.1:1".to_string()],
             },
         )]);
-        let r =
-            NameserverResolver::new(delegations, 300, store, Arc::new(LocalPlaintextNameservers));
+        let r = NameserverResolver::new(
+            delegations,
+            Default::default(),
+            300,
+            store,
+            Arc::new(LocalPlaintextNameservers),
+        );
         let err = r.resolve("anyone@dj.jig").await.unwrap_err();
         assert!(
             matches!(err, IdentityError::AllNameserversUnreachable),

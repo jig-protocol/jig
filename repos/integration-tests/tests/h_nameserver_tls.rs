@@ -42,6 +42,7 @@ fn client_delegations(ns: &TestNameserver, authorities: Vec<String>) -> Delegati
                 nameservers: vec![ns.http_url()],
             },
         )]),
+        refused: Default::default(),
         dangerously_allow_plaintext_nameservers: false,
     }
 }
@@ -58,6 +59,7 @@ fn server_resolver(
     }
     NameserverResolver::new(
         suffix_authorities(&delegations),
+        Default::default(),
         1,
         Arc::new(SqliteStore::open_in_memory().unwrap()),
         Arc::new(BoundNameservers { allow_plaintext }),
