@@ -324,6 +324,147 @@ pub(crate) fn build_rotate_request(
 // ============================================================================
 
 /// Parse the full `alias@suffix` renew and rotate take.
+/// `jig keys protect`: list the slots of the active identity's key, or add
+/// or remove one ([`jig_client::identity::protect`]).
+pub fn protect(ctx: &CliContext, add: Option<&str>, remove: Option<usize>) -> Result<()> {
+    use jig_client::identity::{Protect, SlotToAdd};
+    let did = ctx.effective().user.did.clone();
+    if !did.starts_with("did:jig:") {
+        anyhow::bail!("no identity is configured: run `jig init` first");
+    }
+    let keys_dir = jig_client::identity::default_keys_dir();
+    let change = match (add, remove) {
+        (None, None) => None,
+        (Some(spec), _) => Some(Protect::Add(match spec {
+            "passphrase" => SlotToAdd::Passphrase(
+                std::env::var("JIG_KEY_NEW_PASSPHRASE")
+                    .ok()
+                    .filter(|p| !p.is_empty())
+                    .map(zeroize::Zeroizing::new),
+            ),
+            "keychain" => SlotToAdd::Keychain,
+            other if other.starts_with("env:") || other.starts_with("credential:") => {
+                SlotToAdd::Secret(other.to_string())
+            }
+            // Not echoed: it may be a secret pasted in by mistake.
+            _ => anyhow::bail!(
+                "--add takes passphrase, keychain, env:NAME or credential:PATH (the value is not \
+                 shown, in case it is a secret)"
+            ),
+        })),
+        (None, Some(0)) => anyhow::bail!("slots are numbered from 1, as the list shows them"),
+        (None, Some(n)) => Some(Protect::Remove(n - 1)),
+    };
+    let removing = matches!(change, Some(Protect::Remove(_)));
+    let slots = match change {
+        None => jig_client::identity::slots(&keys_dir, &did)?,
+        Some(change) => {
+            let slots = jig_client::identity::protect(
+                &keys_dir,
+                &did,
+                super::passphrase::key_access()?,
+                change,
+            )
+            .with_context(|| format!("changing the slots of {did}"))?;
+            eprintln!(
+                "updated {}",
+                jig_client::identity::key_path(&keys_dir, &did).display()
+            );
+            if removing {
+                // The data key is unchanged, so older copies of the file still
+                // open with the slot just removed.
+                eprintln!(
+                    "note: only this file changed. A backup or synced copy made before still \
+                     opens with the removed slot; if its secret may have leaked, move to a new \
+                     key with `jig keys rotate`"
+                );
+            }
+            slots
+        }
+    };
+    println!("{did} opens with:");
+    for (i, slot) in slots.iter().enumerate() {
+        println!("  {}. {}", i + 1, jig_client::identity::slot_name(slot));
+    }
+    if slots.len() == 1 {
+        eprintln!(
+            "warning: one way to open this key. Losing it (a forgotten passphrase, a wiped \
+             keychain) loses the identity: add another with `jig keys protect --add passphrase`"
+        );
+    }
+    Ok(())
+}
+
+/// `jig keys export --out PATH`: write a recovery kit for the active
+/// identity ([`jig_client::identity::export_kit`]).
+pub fn export(ctx: &CliContext, out: &std::path::Path) -> Result<()> {
+    let did = ctx.effective().user.did.clone();
+    if !did.starts_with("did:jig:") {
+        anyhow::bail!("no identity is configured: run `jig init` first");
+    }
+    let pass = super::passphrase::kit_passphrase(true)?;
+    jig_client::identity::export_kit(
+        &jig_client::identity::default_keys_dir(),
+        &did,
+        super::passphrase::key_access()?,
+        &pass,
+        out,
+    )
+    .with_context(|| format!("writing a recovery kit for {did}"))?;
+    println!("{did}");
+    eprintln!(
+        "wrote {}. With its passphrase it opens this identity anywhere: keep it offline, \
+         apart from the passphrase. `jig keys verify` checks it; `jig keys import` restores it",
+        out.display()
+    );
+    Ok(())
+}
+
+/// `jig keys import KIT`: restore an identity from a recovery kit
+/// ([`jig_client::identity::import_kit`]), and make it the configured one
+/// when none is.
+pub fn import(ctx: &CliContext, kit: &std::path::Path) -> Result<()> {
+    let pass = super::passphrase::kit_passphrase(false)?;
+    let keys_dir = jig_client::identity::default_keys_dir();
+    let did =
+        jig_client::identity::import_kit(&keys_dir, kit, &pass, super::passphrase::key_access()?)
+            .with_context(|| format!("importing the recovery kit {}", kit.display()))?;
+    println!("{did}");
+    let current = ctx.file_config().user.did.clone();
+    // An identity is configured when its key is here: a fresh config names a
+    // placeholder DID with no key.
+    let has_key = |d: &str| {
+        jig_client::identity::key_path(&keys_dir, d).exists()
+            || keys_dir.join(format!("{d}.key")).exists()
+    };
+    if current != did && has_key(&current) {
+        eprintln!(
+            "imported into {}. Your config still names {current}; set [user] did to use the \
+             imported identity",
+            keys_dir.display()
+        );
+    } else if current != did {
+        let mut cfg = ctx.file_config().clone();
+        cfg.user.did = did.clone();
+        ctx.save_file_config(&cfg)?;
+        eprintln!(
+            "imported into {}, and set as [user] did",
+            keys_dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// `jig keys verify KIT`: check a recovery kit opens with its passphrase.
+pub fn verify(kit: &std::path::Path) -> Result<()> {
+    let pass = super::passphrase::kit_passphrase(false)?;
+    let did = jig_client::identity::verify_kit(kit, &pass)
+        .with_context(|| format!("opening the recovery kit {}", kit.display()))?;
+    println!("{did}");
+    eprintln!("the kit opens with that passphrase");
+    Ok(())
+}
+
 fn parse_full_name(alias: &str) -> Result<Name> {
     Name::parse(alias).with_context(|| format!("`{alias}` is not a full alias@suffix"))
 }

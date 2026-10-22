@@ -9,7 +9,9 @@
 //! resolve route, verifying the signed attestation independently of the CLI.
 //!
 //! Every invocation points `HOME` at a tempdir, so keys and `cli.toml` are
-//! this test's own.
+//! this test's own. The nameservers run as `jig-nameserver serve` does by
+//! default, over TLS with a self-signed certificate their DID vouches for,
+//! which `jig` takes on that DID's word and no CA's.
 
 use std::path::Path;
 use std::process::Command;
@@ -63,7 +65,10 @@ fn configured_did(home: &Path) -> String {
 /// What the nameserver now attests for `name`, verified here: the envelope
 /// must be the nameserver's own signature over exactly this name.
 async fn resolved(ns: &TestNameserver, name: &str) -> Attestation {
-    let body: serde_json::Value = reqwest::get(format!("{}/v1/resolve/{name}", ns.http_url()))
+    let body: serde_json::Value = ns
+        .client()
+        .get(format!("{}/v1/resolve/{name}", ns.http_url()))
+        .send()
         .await
         .unwrap()
         .json()
@@ -86,7 +91,9 @@ async fn resolved(ns: &TestNameserver, name: &str) -> Attestation {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn register_renew_and_rotate_against_the_real_nameserver() {
-    let ns = TestNameserver::start().await.unwrap();
+    let ns = TestNameserver::start_tls_with_suffix("dj.jig")
+        .await
+        .unwrap();
     let url = ns.http_url();
     let name = format!("deji@{}", ns.alias_suffix);
     let home = tempfile::tempdir().unwrap();
@@ -143,7 +150,9 @@ async fn register_renew_and_rotate_against_the_real_nameserver() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn renewing_an_alias_held_by_another_key_is_refused() {
-    let ns = TestNameserver::start().await.unwrap();
+    let ns = TestNameserver::start_tls_with_suffix("dj.jig")
+        .await
+        .unwrap();
     let url = ns.http_url();
     let holder = ns.register("deji").await.unwrap();
     let name = format!("deji@{}", ns.alias_suffix);
@@ -166,7 +175,7 @@ async fn renewing_an_alias_held_by_another_key_is_refused() {
 /// nameserver here runs under its public test seed.
 #[tokio::test(flavor = "multi_thread")]
 async fn register_renew_and_rotate_an_at_jig_name_under_the_built_in_authority() {
-    let ns = TestNameserver::start_with_key("jig", [0x4a; 32])
+    let ns = TestNameserver::start_tls_with_key("jig", [0x4a; 32])
         .await
         .unwrap();
     assert_eq!(
@@ -219,7 +228,7 @@ async fn register_renew_and_rotate_an_at_jig_name_under_the_built_in_authority()
 /// signed, and the name stays unregistered.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_jig_nameserver_that_is_not_the_authority_is_refused_before_signing() {
-    let ns = TestNameserver::start_with_suffix("jig").await.unwrap();
+    let ns = TestNameserver::start_tls_with_suffix("jig").await.unwrap();
     let url = ns.http_url();
     let home = tempfile::tempdir().unwrap();
 
@@ -237,7 +246,10 @@ async fn a_jig_nameserver_that_is_not_the_authority_is_refused_before_signing() 
     .await;
     assert!(!ok, "{out}");
     assert!(out.contains("nothing was signed"), "{out}");
-    let status = reqwest::get(format!("{url}/v1/resolve/deji@jig"))
+    let status = ns
+        .client()
+        .get(format!("{url}/v1/resolve/deji@jig"))
+        .send()
         .await
         .unwrap()
         .status();
@@ -246,6 +258,37 @@ async fn a_jig_nameserver_that_is_not_the_authority_is_refused_before_signing() 
         reqwest::StatusCode::NOT_FOUND,
         "deji@jig was never registered"
     );
+}
+
+/// A plaintext nameserver is not asked at all unless cli.toml opts in.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plaintext_nameserver_is_refused_without_the_opt_in() {
+    let ns = TestNameserver::start().await.unwrap();
+    let url = ns.http_url();
+    let home = tempfile::tempdir().unwrap();
+
+    let (ok, out) = jig(
+        home.path(),
+        &[
+            "init",
+            "dj",
+            "--request-alias",
+            "deji",
+            "--nameserver",
+            &url,
+        ],
+    )
+    .await;
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("dangerously_allow_plaintext_nameservers"),
+        "{out}"
+    );
+    let status = reqwest::get(format!("{url}/v1/resolve/deji@dj.jig"))
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "nothing registered");
 }
 
 /// The same CLI against a nameserver that asks for proof-of-work (JEP-0008):
@@ -260,7 +303,9 @@ async fn register_renew_and_rotate_solve_the_nameservers_proof_of_work() {
         renew_effort: 1 << 8,
         ..integration_tests::harness::PowPolicy::default()
     };
-    let ns = TestNameserver::start_with_pow("dj.jig", pow).await.unwrap();
+    let ns = TestNameserver::start_tls_with_pow("dj.jig", pow)
+        .await
+        .unwrap();
     let url = ns.http_url();
     let name = "deji@dj.jig";
     let home = tempfile::tempdir().unwrap();
@@ -289,4 +334,89 @@ async fn register_renew_and_rotate_solve_the_nameservers_proof_of_work() {
     let second = configured_did(home.path());
     assert_ne!(second, first);
     assert_eq!(resolved(&ns, name).await.did, second);
+}
+
+/// A nameserver whose registration pool is full answers `503
+/// REGISTRATION_BUSY` with `Retry-After` (JEP-0008 rules 22–24). `jig` waits
+/// that long, says so, and registers on a fresh challenge.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_pool_is_waited_out_and_the_registration_retried() {
+    use integration_tests::harness::PoolPolicy;
+    // One stranger a second, and one token: the harness's own registration
+    // takes it, so the CLI's finds the pool empty for about a second.
+    let pool = PoolPolicy {
+        strangers_per_hour: 3600,
+        burst: 1,
+        queue_wait_secs: 0,
+        ..PoolPolicy::recommended()
+    };
+    let ns = TestNameserver::start_tls_with_policies("dj.jig", TestNameserver::test_pow(), pool)
+        .await
+        .unwrap();
+    ns.register("first").await.expect("takes the one token");
+    let url = ns.http_url();
+    let home = tempfile::tempdir().unwrap();
+
+    let (ok, out) = jig(
+        home.path(),
+        &[
+            "init",
+            "dj",
+            "--request-alias",
+            "deji",
+            "--nameserver",
+            &url,
+        ],
+    )
+    .await;
+    assert!(ok, "jig init after a busy pool: {out}");
+    assert!(
+        out.contains("taking no more new names for now; waiting"),
+        "{out}"
+    );
+    assert_eq!(
+        resolved(&ns, "deji@dj.jig").await.did,
+        configured_did(home.path())
+    );
+}
+
+/// When the pool's next token is further off than the client will wait, it
+/// says when to try again instead of waiting.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pool_full_for_long_is_reported_not_waited_for() {
+    use integration_tests::harness::PoolPolicy;
+    let pool = PoolPolicy {
+        strangers_per_hour: 1,
+        burst: 1,
+        queue_wait_secs: 0,
+        ..PoolPolicy::recommended()
+    };
+    let ns = TestNameserver::start_tls_with_policies("dj.jig", TestNameserver::test_pow(), pool)
+        .await
+        .unwrap();
+    ns.register("first").await.expect("takes the one token");
+    let home = tempfile::tempdir().unwrap();
+
+    let started = std::time::Instant::now();
+    let (ok, out) = jig(
+        home.path(),
+        &[
+            "init",
+            "dj",
+            "--request-alias",
+            "deji",
+            "--nameserver",
+            &ns.http_url(),
+        ],
+    )
+    .await;
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("taking no more new names for now; try again in about"),
+        "{out}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "did not wait an hour"
+    );
 }

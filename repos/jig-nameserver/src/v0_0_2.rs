@@ -52,6 +52,10 @@ pub struct PendingChallenge {
     pub effort: u64,
     /// The `PowOffer` envelope, restated when a request comes without work.
     pub offer: Option<Vec<u8>>,
+    /// Held by one request on its way to admission. Another request with the
+    /// same challenge, a replay of the same proof, is refused rather than let
+    /// take a second pool token.
+    pub claimed: bool,
 }
 
 impl PendingChallenge {
@@ -69,6 +73,7 @@ impl PendingChallenge {
             action: None,
             effort: 0,
             offer: None,
+            claimed: false,
         }
     }
 
@@ -102,6 +107,9 @@ pub struct AppState {
     pub challenge_ttl: Duration,
     /// At this many pending challenges, new ones are refused.
     pub max_pending_challenges: usize,
+    /// How a client's address is read (`[network] trust_proxy`), for the
+    /// penalties registration pricing keys on.
+    pub network: crate::config::NetworkConfig,
 }
 
 impl AppState {
@@ -179,6 +187,7 @@ impl AppState {
             pending_challenges,
             challenge_ttl: DEFAULT_CHALLENGE_TTL,
             max_pending_challenges: DEFAULT_MAX_PENDING_CHALLENGES,
+            network: crate::config::NetworkConfig::default(),
         })
     }
 
@@ -275,6 +284,7 @@ impl AppState {
             pending_challenges,
             challenge_ttl: DEFAULT_CHALLENGE_TTL,
             max_pending_challenges: DEFAULT_MAX_PENDING_CHALLENGES,
+            network: crate::config::NetworkConfig::default(),
         })
     }
 
@@ -353,6 +363,38 @@ impl AppState {
         }
         guard.remove(nonce);
         true
+    }
+
+    /// Claim challenge `nonce` for one request by `did` on `name` for
+    /// `action`: true for the first to ask while it is pending and fits,
+    /// false for every other, until [`AppState::release_challenge`].
+    pub async fn claim_challenge(
+        &self,
+        nonce: &str,
+        did: &str,
+        name: &str,
+        action: jig_core::pow::Action,
+    ) -> bool {
+        let mut guard = self.pending_challenges.write().await;
+        match guard.get_mut(nonce) {
+            Some(p)
+                if !p.claimed
+                    && p.issued_at.elapsed() <= self.challenge_ttl
+                    && p.fits(did, name, action) =>
+            {
+                p.claimed = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Give a claim up, leaving the challenge usable. Nothing happens once
+    /// the challenge is consumed.
+    pub async fn release_challenge(&self, nonce: &str) {
+        if let Some(p) = self.pending_challenges.write().await.get_mut(nonce) {
+            p.claimed = false;
+        }
     }
 
     /// Check if a `<local>@<suffix>` alias is already attested. Returns the

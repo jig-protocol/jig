@@ -317,8 +317,17 @@ Non-goals for v0.2:
   wedge others (19).
 - **Metadata.** The owner and every follower see routing metadata for the channel. There
   is no metadata-privacy claim (OP-04, PV-01).
+- **Shares are visible to the servers.** `channel-share`, `channel-unshare` and the
+  `contract-accept`, `contract-refuse` and `contract-end` records are control blocks in
+  clear on every suite, a restricted MLS channel's included: the owning server must read a
+  share to make its offer, and members check the records. The owning server's operator, and
+  every server that carries the channel, therefore learn which servers the channel is
+  shared with, under which grant, who asked, and when. They learn nothing of the channel's
+  content, which stays MLS ciphertext. A share sent encrypted is refused, not carried
+  unread (PV-05).
 
-**Threat register rows:** OP-06, OP-09, AB-03 and PV-01 are updated in implementation PRs.
+**Threat register rows:** OP-06, OP-09, AB-03, PV-01 and PV-05 are updated in implementation
+PRs.
 
 # Backwards Compatibility
 

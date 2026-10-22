@@ -45,13 +45,14 @@ Draft. Field names are provisional. The design behind this revision is
 
    | Field | Content | Threats |
    | --- | --- | --- |
-   | `server_did` | The signing key | OP-08 |
+   | `server_did` | The signing key, as a `did:jig` in its canonical lowercase spelling; a client MUST refuse any other spelling of it | OP-08 |
    | `v` | Chosen envelope version | OP-02 |
    | `suites` | Suites the server implements | OP-02, OP-03 |
    | `capabilities` | Allowed block kinds, limits (including `max_future_skew_ms`), features (execution, federation) | OP-02, TM-01 |
    | `reputation` | Placeholder object; `null` until JEP-0003 | OP-10 |
    | `manifest` | CID and `seq` of the server's current `server-manifest` block | OP-02, OP-03 |
    | `key_link` | During a key change: the public key link (JEP-0012) from the server's old DID to `server_did`, signed by both keys; absent otherwise | OP-08 |
+   | `admit` | The work asked of a DID the server has not admitted, `{alg, effort, salt_id, expires_at}` (JEP-0008 rule 15); absent when admission asks none | AB-02 |
    | `nonce` | Echo of the client's nonce | replayed `welcome` |
    | `server_nonce` | A fresh random value from the server | replayed `peer_proof` |
    | `tls_exporter` | 32 bytes exported from the TLS session (RFC 9266, label `EXPORTER-jig-handshake`); empty over plaintext | relayed handshake |

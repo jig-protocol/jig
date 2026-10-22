@@ -22,6 +22,8 @@ pub mod read_auth;
 pub mod secure;
 pub mod server_key;
 pub mod tls;
+#[cfg(feature = "verify")]
+pub mod verify;
 
 pub use connection::envelope;
 pub use connection::{BlockStream, Client, ClientError, DeliveredBlock};

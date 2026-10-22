@@ -68,6 +68,12 @@ pub enum ServerKeyError {
         /// For an operator command: what was configured but could not be read.
         skipped: String,
     },
+    #[error("that --slot does not open the {role} key at {path:?}, which has {slots}")]
+    DoesNotOpen {
+        role: &'static str,
+        path: PathBuf,
+        slots: String,
+    },
     #[error("{path:?} names {claimed} but holds the key for {found}")]
     WrongDid {
         path: PathBuf,
@@ -527,7 +533,12 @@ pub fn generate_sealed(path: &Path, specs: &[String], kdf: KdfParams) -> Result<
             "name at least one --slot: credential:PATH, env:NAME or passphrase".to_string(),
         ));
     }
-    let path = sealed_path(path);
+    let sealed = sealed_path(path);
+    if sealed != path && path.exists() {
+        // A raw key beside the new sealed one would make boot refuse both.
+        return Err(ServerKeyError::Exists(path.to_path_buf()));
+    }
+    let path = sealed;
     let slots = specs
         .iter()
         .map(|s| Spec::parse(s, "--slot", Use::Operator)?.slot(kdf))
@@ -607,6 +618,13 @@ pub enum KeysAction {
     AddSlot { keyfile: PathBuf, slot: String },
     /// The DID and the slots ([`describe`]).
     Show { keyfile: PathBuf },
+    /// Make a new key, sealed, where there is none ([`generate_sealed`]).
+    Generate {
+        keyfile: PathBuf,
+        slots: Vec<String>,
+    },
+    /// Check that one secret opens the key ([`verify`]).
+    Verify { keyfile: PathBuf, slot: String },
 }
 
 /// Run `action`, returning what to print.
@@ -636,6 +654,19 @@ pub fn run(action: KeysAction, opts: &ServerKeyOptions) -> Result<String> {
             let (did, slots) = describe(&keyfile)?;
             Ok(format!("{did}\nopened by: {slots}"))
         }
+        KeysAction::Verify { keyfile, slot } => {
+            let did = verify(&keyfile, &slot, opts)?;
+            Ok(format!("{did}\nopened by that --slot"))
+        }
+        KeysAction::Generate { keyfile, slots } => {
+            let did = generate_sealed(&keyfile, &slots, opts.kdf)?;
+            let sealed = sealed_path(&keyfile);
+            let mut out = format!("{did}\nsealed into {}", sealed.display());
+            if let Some(warning) = single_slot_warning(opts.role, &read_jigkey(&sealed)?.slots()) {
+                out.push_str(&format!("\nwarning: {warning}"));
+            }
+            Ok(out)
+        }
     }
 }
 
@@ -643,6 +674,35 @@ pub fn run(action: KeysAction, opts: &ServerKeyOptions) -> Result<String> {
 pub fn describe(path: &Path) -> Result<(String, String)> {
     let key = read_jigkey(&sealed_path(path))?;
     Ok((key.did().to_string(), describe_slots(&key.slots())))
+}
+
+/// Open the sealed key at `path` with `spec` alone, and nothing configured,
+/// so an operator can check a secret (an offline passphrase, a new machine's
+/// credential) before relying on it. Returns the DID.
+pub fn verify(path: &Path, spec: &str, opts: &ServerKeyOptions) -> Result<String> {
+    let path = sealed_path(path);
+    let key = read_jigkey(&path)?;
+    let offer = Spec::parse(spec, "--slot", Use::Operator)?.offer();
+    let opened = key.open(&[offer]).map_err(|e| match e {
+        KeystoreError::NoSlotOpened => ServerKeyError::DoesNotOpen {
+            role: opts.role,
+            path: path.clone(),
+            slots: describe_slots(&key.slots()),
+        },
+        source => ServerKeyError::Keystore {
+            path: path.clone(),
+            source,
+        },
+    })?;
+    let found = did_of(&opened.seed);
+    if found != key.did() {
+        return Err(ServerKeyError::WrongDid {
+            path,
+            claimed: key.did().to_string(),
+            found,
+        });
+    }
+    Ok(found)
 }
 
 fn open_sealed(path: &Path, opts: &ServerKeyOptions) -> Result<SigningKey> {
@@ -944,6 +1004,47 @@ mod tests {
         let err = load_or_create(&path, &opts(Some(wrong))).unwrap_err();
         assert!(matches!(err, ServerKeyError::Locked { .. }), "{err}");
         assert!(err.to_string().contains("a credential slot"), "{err}");
+    }
+
+    #[test]
+    fn verify_opens_with_that_slot_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.key");
+        let good = credential_for_tests(dir.path());
+        let did = generate_sealed(
+            &path,
+            std::slice::from_ref(&good),
+            KdfParams::insecure_for_tests(),
+        )
+        .unwrap();
+        // What is configured plays no part: only the --slot is tried.
+        assert_eq!(verify(&path, &good, &opts(None)).unwrap(), did);
+        let other = tempfile::tempdir().unwrap();
+        let wrong = credential_for_tests(other.path());
+        let err = verify(&path, &wrong, &opts(Some(good))).unwrap_err();
+        assert!(matches!(err, ServerKeyError::DoesNotOpen { .. }), "{err}");
+        assert!(err.to_string().contains("a credential slot"), "{err}");
+    }
+
+    #[test]
+    fn generate_refuses_beside_a_raw_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.key");
+        std::fs::write(&path, [7u8; 32]).unwrap();
+        let unlock = credential_for_tests(dir.path());
+        let err = run(
+            KeysAction::Generate {
+                keyfile: path.clone(),
+                slots: vec![unlock],
+            },
+            &opts(None),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ServerKeyError::Exists(ref p) if *p == path),
+            "{err}"
+        );
+        assert!(!sealed_path(&path).exists());
     }
 
     #[test]
