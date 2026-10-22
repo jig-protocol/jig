@@ -52,6 +52,7 @@ Draft. Field names are provisional. The design behind this revision is
    | `reputation` | Placeholder object; `null` until JEP-0003 | OP-10 |
    | `manifest` | CID and `seq` of the server's current `server-manifest` block | OP-02, OP-03 |
    | `key_link` | During a key change: the public key link (JEP-0012) from the server's old DID to `server_did`, signed by both keys; absent otherwise | OP-08 |
+   | `prior_key_links` | The server's earlier key links, oldest first, each leaving the DID the one after it moves to, so that with `key_link` last they form one chain to `server_did` (JEP-0012, "Following a chain"); absent when there are none. Signed after `key_link`, and only when present | OP-08 |
    | `nonce` | Echo of the client's nonce | replayed `welcome` |
    | `server_nonce` | A fresh random value from the server | replayed `peer_proof` |
    | `tls_exporter` | 32 bytes exported from the TLS session (RFC 9266, label `EXPORTER-jig-handshake`); empty over plaintext | relayed handshake |
@@ -169,10 +170,15 @@ Draft. Field names are provisional. The design behind this revision is
 
 14. A client SHOULD pin, on its first verified `welcome` from a server, the
     `server_did`, the suites it advertised and its manifest-log chain. It MUST then
-    close on a `welcome` from another `server_did` (rule 7), unless the `welcome`
-    carries a `key_link` with audience `public` from exactly the pinned DID to exactly
-    that `server_did`, which it MUST verify under both keys; it then moves its pin.
-    The server MUST serve the same link at `/.well-known/jig`. It MUST treat a `welcome`
+    close on a `welcome` from another `server_did` (rule 7), unless the chain of
+    `prior_key_links` and then `key_link` moves the pinned DID to exactly that
+    `server_did`, as JEP-0012 "Following a chain" says: every link public and verified
+    under both its keys, from the link that leaves the pinned DID to the last. It then
+    moves its pin, and keeps the links it followed. A chain that does not reach back to
+    the pinned DID MUST be refused, with a reason that says the server changed its key
+    more than once or is not that server, and that pinning it anew is trust on first use
+    again; the client MUST NOT pin it without its user. The server MUST serve the same
+    links at `/.well-known/jig`, under the same names. It MUST treat a `welcome`
     that no longer advertises a pinned suite as a downgrade and refuse it. A server
     adding a suite is not a downgrade.
 15. A pinned name moves to a new DID automatically only with a rotation signed by the

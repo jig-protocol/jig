@@ -341,17 +341,18 @@ impl Pins {
         })
     }
 
-    /// Move `server`'s pin from `from` to `to` along `key_link` (base64, as
-    /// served), which must be a public link the pinned key signed to `to`
-    /// (JEP-0012). Checked here, whoever calls: a pin moves only along a link
-    /// that verifies from it. Its channel pins stay; they name channels, not
-    /// keys.
+    /// Move `server`'s pin from `from` to `to` along `key_links` (base64, as
+    /// served, oldest first), which must be a chain of public links from the
+    /// pinned key to `to` (JEP-0012). Checked here, whoever calls: a pin moves
+    /// only along links that verify from it, hop by hop. The hops followed
+    /// are kept, for fork detection later. Its channel pins stay; they name
+    /// channels, not keys.
     pub fn move_server(
         &mut self,
         server: &str,
         from: &str,
         to: &str,
-        key_link: &str,
+        key_links: &[String],
     ) -> Result<(), PinError> {
         self.update(|file| {
             let pin = file.servers.entry(server_key(server)).or_default();
@@ -360,13 +361,19 @@ impl Pins {
                 pinned: pin.server_did.clone(),
                 presented: to.to_string(),
             };
-            if !jig_pipeline::handshake::same_did(&pin.server_did, from)
-                || jig_pipeline::handshake::link_moves(key_link, &pin.server_did, to).is_err()
-            {
+            if !jig_pipeline::handshake::same_did(&pin.server_did, from) {
                 return Err(replaced());
             }
+            let Ok(followed) = jig_pipeline::handshake::chain_moves(key_links, &pin.server_did, to)
+            else {
+                return Err(replaced());
+            };
             pin.server_did = to.to_string();
-            pin.links.push(key_link.to_string());
+            for link in followed {
+                if !pin.links.contains(&link) {
+                    pin.links.push(link);
+                }
+            }
             // The old key signed these, so they show nothing about the new
             // one: the next welcome is checked against its manifest afresh.
             pin.welcome = None;
@@ -1124,13 +1131,13 @@ mod tests {
             (did(&old), link(&stranger, &new)),
         ] {
             assert!(matches!(
-                pins.move_server(server, &from, &did(&new), &link),
+                pins.move_server(server, &from, &did(&new), std::slice::from_ref(&link)),
                 Err(PinError::ServerReplaced { .. })
             ));
         }
         assert_eq!(pins.server(server).unwrap().server_did, did(&old));
 
-        pins.move_server(server, &did(&old), &did(&new), &link(&old, &new))
+        pins.move_server(server, &did(&old), &did(&new), &[link(&old, &new)])
             .unwrap();
         let pins = Pins::load(&path).unwrap();
         assert_eq!(pins.server(server).unwrap().server_did, did(&new));

@@ -11,7 +11,7 @@
 #   - a different unlock, or --import over a key, is refused;
 #   - --force moves the old key aside and makes a new DID;
 #   - --rotate makes a new DID linked from the old one, keeps the old key and
-#     credential, and a second --rotate needs --replace-link;
+#     credential, and a second --rotate keeps the first link beside the new;
 #   - the nameserver's [v0_0_2.keys];
 #   - no output ever holds the passphrase or the credential's plaintext.
 set -euo pipefail
@@ -153,15 +153,14 @@ fi
 "$bin/jig-server" --config "$h/etc/config.toml" keys verify --slot credential:/dev/fd/3 \
   --keyfile "$h/var/server.key" 3< <(cred_slot "$h") >/dev/null || fail "the credential does not open the new key"
 cat "$h/out" >>"$t/all-out"
-# Again: refused without --replace-link, and nothing changes.
-before="$(sums "$h")"
-if JIG_KEY_NEW_PASSPHRASE="$NEW" run "$h" --rotate; then fail "a second --rotate went through"; fi
-grep -q -- "--replace-link" "$h/out" || { cat "$h/out"; fail "the second --rotate does not name --replace-link"; }
-[ "$(sums "$h")" = "$before" ] || fail "a refused --rotate changed something"
-cat "$h/out" >>"$t/all-out"
-# With it: the first link is kept beside the new one.
-JIG_KEY_NEW_PASSPHRASE="$NEW" run "$h" --rotate --replace-link || { cat "$h/out"; fail "--replace-link"; }
+# Again: the first link is kept beside the new one, and both are served.
+JIG_KEY_NEW_PASSPHRASE="$NEW" run "$h" --rotate || { cat "$h/out"; fail "a second --rotate"; }
 [ -s "$h/var/server.key.link.1" ] || fail "the first link was not kept"
+cat "$h/out" >>"$t/all-out"
+# --replace-link is accepted, and says it does nothing.
+JIG_KEY_NEW_PASSPHRASE="$NEW" run "$h" --rotate --replace-link || { cat "$h/out"; fail "--replace-link"; }
+grep -q "does nothing" "$h/out" || { cat "$h/out"; fail "--replace-link did not warn"; }
+[ -s "$h/var/server.key.link.2" ] || fail "the second link was not kept"
 cat "$h/out" >>"$t/all-out"
 if run "$h" --nameserver --rotate; then fail "--rotate on a nameserver"; fi
 

@@ -191,6 +191,11 @@ pub enum Frame {
         /// to `server_did` (JEP-0012), base64 COSE_Sign.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key_link: Option<String>,
+        /// The links before `key_link`, oldest first, each base64 COSE_Sign:
+        /// with `key_link` last, one chain from an earlier DID to
+        /// `server_did`, each link leaving the DID the one before moved to.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        prior_key_links: Vec<String>,
         /// base64 ed25519 over [`crate::handshake::WelcomeStatement::canonical_bytes`].
         sig: String,
     },

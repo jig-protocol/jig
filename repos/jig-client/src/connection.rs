@@ -1611,6 +1611,7 @@ mod tests {
             tls_exporter: String::new(),
             manifest: None,
             key_link: None,
+            prior_key_links: Vec::new(),
             sig: String::new(),
         }))
         .unwrap();

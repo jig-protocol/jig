@@ -1046,6 +1046,7 @@ async fn complete_hello(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone(),
         key_link: state.key_link.clone(),
+        prior_key_links: state.prior_key_links.clone(),
     };
     match jig_pipeline::handshake::negotiate(&hello, &offer) {
         Ok(statement) => {
