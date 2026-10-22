@@ -319,6 +319,11 @@ enum TrustAction {
     /// Connect to `server` again after it signed a contradiction. Its pins
     /// stay, and it is held to them.
     Accept { server: String },
+    /// What this device pinned for a server, and the server's manifest log.
+    Show {
+        /// The server; the configured one when omitted.
+        server: Option<String>,
+    },
     /// Resolve `name` (alias@suffix), verify it, and pin it on first sight; a
     /// name that now resolves to another DID than the pinned one is refused.
     VerifyName {
@@ -766,6 +771,13 @@ async fn run() -> Result<()> {
                 EvidenceAction::Import { file } => cmd::trust::evidence_import(&file)?,
             },
             TrustAction::Accept { server } => cmd::trust::accept_server(&server)?,
+            TrustAction::Show { server } => {
+                let server = match server {
+                    Some(s) => s,
+                    None => ctx.server_url()?,
+                };
+                cmd::trust::show(&ctx.identity()?, &server).await?;
+            }
             TrustAction::VerifyName {
                 name,
                 nameserver,
