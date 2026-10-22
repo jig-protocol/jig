@@ -481,7 +481,8 @@ so a rebooted box catches up). It snapshots:
 | `/var/lib/jig/nameserver.db` | the nameserver's legacy registry |
 | `/var/lib/jig/nameserver_v002.db` | **the nameserver's alias bindings** |
 | `/var/lib/jig/server.jigkey` | server identity, sealed |
-| `/var/lib/jig/server.key.link` | the server's key link, when it serves one: the configured key path with `.link` appended. Without it, clients that pinned an earlier DID refuse the restored server |
+| `/var/lib/jig/server.key.link*` | the server's key links, when it serves one: the configured key path with `.link` appended, and earlier links kept as `.link.1`, `.link.2`, ... Without them, clients that pinned an earlier DID refuse the restored server |
+| `/var/lib/jig/server.retired-*.jigkey` | keys a rotation retired, still sealed |
 | `/var/lib/jig/nameserver_v002.jigkey` | **the nameserver's signing key**, sealed (set `JIG_NAMESERVER_KEYFILE` if `[v0_0_2.server] server_did_keyfile` puts it elsewhere) |
 
 A key still in clear (`[keys] storage = "plaintext"`) is copied too, with a
