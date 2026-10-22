@@ -93,7 +93,9 @@ Non-goals for v0.2:
 
 ## Offer, accept, refuse, end
 
-7. A share starts with a `channel-share` block naming the target server and a grant. The
+7. A share starts with a `channel-share` block naming the target server and a grant: its
+   metadata is `{to, grant}`, where `to` is the target's DID in canonical form and `grant`
+   is `read`, `write` or `member` (7a). The
    block MUST be signed by the channel's owner or by a DID holding the `share` right at
    that point in the `ingest` chain (7b). The owning server MUST then check that the
    target is on its configured peer list, and sends the target a `contract-offer`, signed
@@ -154,8 +156,20 @@ Non-goals for v0.2:
    another suite or relay plaintext.
 10. The owner MUST append each accept to the channel's log as a block, so members can see
     which servers carry the channel.
+    - A `contract-accept` block carries `{to, offer, accept}`: the follower's DID, and the
+      signed offer and accept, each base64. A member checks that the sequencer signed the
+      offer to `to`, and that `to` signed an accept of it.
+    - The owner records a refusal the same way, as a `contract-refuse` block carrying
+      `{to, code, offer, refuse}`. When the owner refuses a share itself, because the
+      target is not a configured peer (17), no offer was sent, and the block carries only
+      `{to, code}`.
+    - Only the channel's sequencer writes `contract-accept`, `contract-refuse` and
+      `contract-end` blocks. A server MUST refuse one signed by anyone else.
 11. Either side ends a share with a signed `contract-end {server, channel_id, offer_id}`,
-    naming the accepted offer it ends. Members then commit removals
+    naming the accepted offer it ends. On the owner's side, a `channel-unshare {to}` block,
+    signed as a `channel-share` must be (7), asks the owner to end its share with `to`. The
+    owner records each end, its own or the follower's, as a `contract-end` block carrying
+    `{to, end}`: the follower's DID and the signed `contract-end`, base64. Members then commit removals
     for any leaves reachable only through that follower. A grant changes by a new offer
     and accept.
 
@@ -303,8 +317,17 @@ Non-goals for v0.2:
   wedge others (19).
 - **Metadata.** The owner and every follower see routing metadata for the channel. There
   is no metadata-privacy claim (OP-04, PV-01).
+- **Shares are visible to the servers.** `channel-share`, `channel-unshare` and the
+  `contract-accept`, `contract-refuse` and `contract-end` records are control blocks in
+  clear on every suite, a restricted MLS channel's included: the owning server must read a
+  share to make its offer, and members check the records. The owning server's operator, and
+  every server that carries the channel, therefore learn which servers the channel is
+  shared with, under which grant, who asked, and when. They learn nothing of the channel's
+  content, which stays MLS ciphertext. A share sent encrypted is refused, not carried
+  unread (PV-05).
 
-**Threat register rows:** OP-06, OP-09, AB-03 and PV-01 are updated in implementation PRs.
+**Threat register rows:** OP-06, OP-09, AB-03, PV-01 and PV-05 are updated in implementation
+PRs.
 
 # Backwards Compatibility
 

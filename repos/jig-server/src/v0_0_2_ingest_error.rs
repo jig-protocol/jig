@@ -136,6 +136,14 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
             (StatusCode::CONFLICT, "ROOT_OWNER_ROLE", e.to_string())
         }
         IngestError::UnknownRole { .. } => (StatusCode::BAD_REQUEST, "UNKNOWN_ROLE", e.to_string()),
+        // 403: only the channel's sequencer records what came of a share
+        // (JEP-0005 rule 10).
+        IngestError::SequencerOnly { .. } => {
+            (StatusCode::FORBIDDEN, "SEQUENCER_ONLY", e.to_string())
+        }
+        IngestError::BadContractBlock { .. } => {
+            (StatusCode::BAD_REQUEST, "BAD_CONTRACT_BLOCK", e.to_string())
+        }
         // 400: the slug is outside the canonical grammar or in a reserved
         // namespace (`#dm/`, `#jig/`, `#email/`) the author may not use.
         IngestError::InvalidSlug { .. } => (StatusCode::BAD_REQUEST, "INVALID_SLUG", e.to_string()),
@@ -295,6 +303,15 @@ mod tests {
             },
             IngestError::UnknownRole {
                 role: "owner".to_string(),
+            },
+            IngestError::SequencerOnly {
+                kind: "contract-accept".to_string(),
+                slug: "#room".to_string(),
+                sender: "did:jig:zMember".to_string(),
+            },
+            IngestError::BadContractBlock {
+                kind: "channel-share".to_string(),
+                detail: "`to` is missing".to_string(),
             },
             IngestError::InvalidSlug {
                 slug: "#General".to_string(),
