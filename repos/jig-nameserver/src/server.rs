@@ -158,7 +158,6 @@ pub fn build_app(cfg: &NameServerConfig) -> Result<Router> {
 
 /// [`build_app`] plus the v0.0.2 state — see [`NameServerApp`].
 pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
-
     let mut v0_0_2_cfg = cfg.v0_0_2.clone();
     v0_0_2_cfg.server.server_did_keyfile = resolve_v0_0_2_keyfile(cfg);
     let mut v0_0_2_state = crate::v0_0_2::AppState::new(

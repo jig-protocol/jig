@@ -1,6 +1,7 @@
 //! Jig Nameserver binary
 
 use clap::{Parser, Subcommand};
+use jig_nameserver::config::NameServerConfig;
 use jig_nameserver::server::run_http_server;
 
 #[derive(Parser, Debug)]
@@ -143,7 +144,6 @@ fn run_keys(keys: KeysCommand, config: Option<&std::path::Path>) -> Result<Strin
         &jig_nameserver::v0_0_2::key_options(&config.v0_0_2.keys),
     )
     .map_err(|e| e.to_string())
-}
 }
 
 #[tokio::main]
