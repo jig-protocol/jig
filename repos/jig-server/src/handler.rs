@@ -127,6 +127,10 @@ struct ServerInfoResponse {
     /// DID follow it.
     #[serde(skip_serializing_if = "Option::is_none")]
     key_link: Option<String>,
+    /// The links before `key_link`, oldest first, base64 COSE_Sign: with it,
+    /// one chain from an earlier DID to `server_did` (JEP-0012).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    prior_key_links: Vec<String>,
 }
 
 /// [`jig_pipeline::server_manifest::PeerPolicy`] as JSON.
@@ -307,6 +311,17 @@ async fn server_info(State(state): State<AppState>) -> Json<ServerInfoResponse> 
                 .as_ref()
                 .map(|l| base64::engine::general_purpose::STANDARD.encode(l))
         }),
+        prior_key_links: state
+            .v0_0_2
+            .as_ref()
+            .map(|v| {
+                use base64::Engine as _;
+                v.prior_key_links
+                    .iter()
+                    .map(|l| base64::engine::general_purpose::STANDARD.encode(l))
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 

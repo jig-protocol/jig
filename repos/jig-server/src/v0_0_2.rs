@@ -66,6 +66,10 @@ pub struct AppState {
     /// `/.well-known/jig`, so clients and peers that pinned the old DID
     /// follow it. Read from [`key_link_path`] at boot.
     pub key_link: Option<Vec<u8>>,
+    /// The links before `key_link`, oldest first: with it, the chain clients
+    /// pinned on any earlier DID follow, hop by hop. Read from the
+    /// `<link>.N` files beside it ([`jig_client::server_key::key_chain`]).
+    pub prior_key_links: Vec<Vec<u8>>,
     /// What handles frames between proven peers
     /// ([`crate::v0_0_2_peer::PeerFrames`]), set once at boot by
     /// [`Self::set_peer_frames`]. Shared by every clone.
@@ -81,32 +85,32 @@ pub fn key_link_path(keyfile: &std::path::Path) -> PathBuf {
     jig_client::server_key::key_link_path(keyfile)
 }
 
-/// The key link at `path`, if there is one. A link that does not verify, is
-/// not public, or does not move to `server_did` is a boot error: serving it
-/// would make every client that pinned the old DID refuse this server.
-fn load_key_link(path: &std::path::Path, server_did: &Did) -> Result<Option<Vec<u8>>> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(anyhow::anyhow!("reading {}: {e}", path.display())),
-    };
-    let signed = jig_core::key_link::SignedKeyLink::from_envelope(&bytes)
-        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-    let link = signed.link();
-    anyhow::ensure!(
-        link.audience == jig_core::key_link::Audience::Public,
-        "{}: the key link is not a public one",
-        path.display()
-    );
-    anyhow::ensure!(
-        // Exactly, as clients compare it (`handshake::link_moves`).
-        link.new == server_did.to_did_jig_string(),
-        "{}: the key link moves to {}, not to this server's DID",
-        path.display(),
-        link.new
-    );
-    tracing::info!(from = %link.old, "serving the key link from this server's old DID");
-    Ok(Some(bytes))
+/// The chain of key links this server serves, as the newest and the ones
+/// before it ([`jig_client::server_key::key_chain`]). A newest link that does
+/// not verify, is not public, or does not move to `server_did` is a boot
+/// error: serving it would make every client that pinned the old DID refuse
+/// this server. A bad earlier link only shortens the chain, and is logged.
+/// The newest key link, and the ones before it, oldest first.
+type ServedChain = (Option<Vec<u8>>, Vec<Vec<u8>>);
+
+fn load_key_chain(keyfile: &std::path::Path, server_did: &Did) -> Result<ServedChain> {
+    let chain = jig_client::server_key::key_chain(keyfile, &server_did.to_did_jig_string())?;
+    for problem in &chain.problems {
+        tracing::error!(
+            "{problem}. Clients pinned on a DID before it are refused and must re-pin; restore \
+             the file from a backup to serve them"
+        );
+    }
+    let mut bytes: Vec<Vec<u8>> = chain.links.iter().map(|l| l.bytes.clone()).collect();
+    let newest = bytes.pop();
+    if let Some(first) = chain.links.first() {
+        tracing::info!(
+            from = %first.old,
+            hops = chain.links.len(),
+            "serving the key links from this server's earlier DIDs"
+        );
+    }
+    Ok((newest, bytes))
 }
 
 /// Gates 1 and 2 from `[auth]`, plus the federation peers from `[federation]`:
@@ -246,10 +250,8 @@ impl AppState {
             );
         }
         let server_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
-        let key_link = load_key_link(
-            &key_link_path(Path::new(
-                shellexpand::tilde(&config.server.server_did_keyfile).as_ref(),
-            )),
+        let (key_link, prior_key_links) = load_key_chain(
+            Path::new(shellexpand::tilde(&config.server.server_did_keyfile).as_ref()),
             &server_did,
         )?;
         // A store written before `ingest` records existed is sequenced once,
@@ -367,6 +369,7 @@ impl AppState {
             tls_binding: Default::default(),
             manifest: Default::default(),
             key_link,
+            prior_key_links,
             peer_frames: Default::default(),
             peers: Default::default(),
         })
@@ -424,6 +427,7 @@ impl AppState {
             tls_binding: Default::default(),
             manifest: Default::default(),
             key_link: None,
+            prior_key_links: Vec::new(),
             peer_frames: Default::default(),
             peers: Default::default(),
         })
@@ -478,6 +482,7 @@ impl AppState {
             tls_binding: Default::default(),
             manifest: Default::default(),
             key_link: None,
+            prior_key_links: Vec::new(),
             peer_frames: Default::default(),
             peers: Default::default(),
         })
@@ -595,6 +600,7 @@ mod tests {
     fn a_key_link_beside_the_key_is_served_only_if_it_moves_to_this_server() {
         use jig_core::key_link::{Audience, SignedKeyLink};
         let dir = tempfile::tempdir().unwrap();
+        let keyfile = dir.path().join("server.key");
         let path = dir.path().join("server.key.link");
         let (old, new) = (
             jig_core::crypto::ed25519::generate_signing_key(),
@@ -602,8 +608,8 @@ mod tests {
         );
         let server_did = Did::from_ed25519_pubkey(new.verifying_key().as_bytes());
         assert_eq!(
-            load_key_link(&path, &server_did).unwrap(),
-            None,
+            load_key_chain(&keyfile, &server_did).unwrap(),
+            (None, Vec::new()),
             "no file, no link"
         );
         assert_eq!(
@@ -614,17 +620,35 @@ mod tests {
         let good = SignedKeyLink::sign(&old, &new, Audience::Public, 1).unwrap();
         std::fs::write(&path, good.envelope()).unwrap();
         assert_eq!(
-            load_key_link(&path, &server_did).unwrap().as_deref(),
-            Some(good.envelope())
+            load_key_chain(&keyfile, &server_did).unwrap(),
+            (Some(good.envelope().to_vec()), Vec::new())
         );
+        // An earlier link that moves to the DID the newest leaves.
+        let older = jig_core::crypto::ed25519::generate_signing_key();
+        let before = SignedKeyLink::sign(&older, &old, Audience::Public, 1).unwrap();
+        std::fs::write(dir.path().join("server.key.link.1"), before.envelope()).unwrap();
+        assert_eq!(
+            load_key_chain(&keyfile, &server_did).unwrap(),
+            (
+                Some(good.envelope().to_vec()),
+                vec![before.envelope().to_vec()]
+            )
+        );
+        // A broken earlier link is left out; the server still boots.
+        std::fs::write(dir.path().join("server.key.link.1"), b"not a link").unwrap();
+        assert_eq!(
+            load_key_chain(&keyfile, &server_did).unwrap(),
+            (Some(good.envelope().to_vec()), Vec::new())
+        );
+
         let elsewhere = SignedKeyLink::sign(&new, &old, Audience::Public, 1).unwrap();
         std::fs::write(&path, elsewhere.envelope()).unwrap();
         assert!(
-            load_key_link(&path, &server_did).is_err(),
+            load_key_chain(&keyfile, &server_did).is_err(),
             "moves to another DID"
         );
         std::fs::write(&path, b"not a link").unwrap();
-        assert!(load_key_link(&path, &server_did).is_err());
+        assert!(load_key_chain(&keyfile, &server_did).is_err());
     }
 
     #[test]
@@ -803,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn after_keys_rotate_the_server_boots_with_the_new_did_and_serves_the_link() {
+    fn after_two_rotations_the_server_boots_with_the_new_did_and_serves_the_chain() {
         let dir = tempdir().unwrap();
         let mut config = keyed_config(dir.path(), "server.key");
         let old = load_or_generate_server_key(&config).unwrap();
@@ -823,6 +847,24 @@ mod tests {
             Did::from_ed25519_pubkey(old.verifying_key().as_bytes()).to_did_jig_string()
         );
 
+        // Again: the first link is kept and served before the new one.
+        let third_dir = dir.path().join("third");
+        std::fs::create_dir_all(&third_dir).unwrap();
+        let third = jig_client::server_key::credential_for_tests(&third_dir);
+        config.keys.unlock = Some(next.clone());
+        let again = jig_client::server_key::rotate(
+            &dir.path().join("server.key"),
+            std::slice::from_ref(&third),
+            false,
+            &key_options(&config.keys),
+            2,
+        )
+        .unwrap();
+        assert_eq!(again.old_did, done.new_did);
+        let first_link = std::fs::read(again.archived.as_ref().unwrap().0.clone()).unwrap();
+        let done = again;
+        let next = third;
+
         config.keys.unlock = Some(next);
         let state = AppState::new(
             config,
@@ -835,6 +877,7 @@ mod tests {
             state.key_link.as_deref(),
             Some(std::fs::read(&done.link).unwrap().as_slice())
         );
+        assert_eq!(state.prior_key_links, vec![first_link]);
     }
 
     #[test]
