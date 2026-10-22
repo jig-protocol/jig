@@ -92,12 +92,16 @@ impl Prompt for TerminalPrompt {
         }
         match purpose {
             PromptPurpose::Unlock => read_hidden(&format!("passphrase for {did}: ")).map(Some),
-            PromptPurpose::New => {
+            PromptPurpose::New | PromptPurpose::Add => {
                 let mut out = terminal_writer();
-                writeln!(
-                    out,
-                    "No OS keychain is available, so {did} will be sealed with a passphrase."
-                )?;
+                if purpose == PromptPurpose::New {
+                    writeln!(
+                        out,
+                        "No OS keychain is available, so {did} will be sealed with a passphrase."
+                    )?;
+                } else {
+                    writeln!(out, "A new passphrase slot for {did}.")?;
+                }
                 for _ in 0..3 {
                     let first = read_hidden("new passphrase: ")?;
                     if first.chars().count() < MIN_PASSPHRASE_CHARS {

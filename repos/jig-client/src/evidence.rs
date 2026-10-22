@@ -24,10 +24,13 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use jig_core::key_link::{self, SignedKeyLink};
 use jig_pipeline::handshake::{HandshakeResult, same_did, verify_offline};
 use serde::{Deserialize, Serialize};
 
 use crate::chain::ChainProof;
+use crate::manifest::{ManifestCheck, check_cited};
+use jig_pipeline::ingest_record::IngestRecord;
 
 /// The format of a bundle against a server.
 pub const BUNDLE_FORMAT: &str = "jig-evidence-v1";
@@ -74,6 +77,20 @@ pub enum Proof {
         pinned_welcome: String,
         refusal: String,
         suite: String,
+    },
+    /// Two key links (JEP-0012) from the pinned DID to two different DIDs,
+    /// base64 of each COSE_Sign envelope as served. The pinned key signed
+    /// both, so someone other than its holder has it, whichever audience
+    /// each names ([`jig_core::key_link::fork`]).
+    KeyLinkFork { first: String, second: String },
+    /// A welcome, verbatim, and the `server-manifest` block and `ingest`
+    /// record it cites, as served (base64 bundle and signature), that say
+    /// different things (JEP-0002 rule 12; [`crate::manifest::check_cited`]).
+    ManifestContradiction {
+        welcome: String,
+        block: String,
+        sig: String,
+        record: IngestRecord,
     },
 }
 
@@ -154,6 +171,63 @@ pub fn verify(bundle: &Bundle) -> Result<Checked, BundleError> {
                 bundle.server_did
             ))
         }
+        Some(Proof::KeyLinkFork { first, second }) => {
+            let (a, b) = (link_of(first)?, link_of(second)?);
+            if !same_did(&a.link().old, &bundle.server_did) {
+                return Err(BundleError::Proof(format!(
+                    "the links are from {}, not {}",
+                    a.link().old,
+                    bundle.server_did
+                )));
+            }
+            if !key_link::fork(&a, &b) {
+                return Err(BundleError::Proof(
+                    "the links are not from one DID to two others".into(),
+                ));
+            }
+            Some(format!(
+                "{} signed key links to both {} and {}",
+                bundle.server_did,
+                a.link().new,
+                b.link().new
+            ))
+        }
+        Some(Proof::ManifestContradiction {
+            welcome,
+            block,
+            sig,
+            record,
+        }) => {
+            let w = match verify_offline(welcome, &bundle.server_did) {
+                HandshakeResult::Established(w) => w,
+                other => {
+                    return Err(BundleError::Proof(format!(
+                        "the welcome does not verify: {}",
+                        reason_of(&other)
+                    )));
+                }
+            };
+            let cited = w
+                .manifest
+                .clone()
+                .ok_or_else(|| BundleError::Proof("the welcome cites no manifest".into()))?;
+            match check_cited(&w, &cited, block, sig, record) {
+                Err(ManifestCheck::Contradicts(reason)) => Some(format!(
+                    "{} signed a welcome that contradicts entry {} of its manifest log: {reason}",
+                    bundle.server_did, cited.seq
+                )),
+                Err(ManifestCheck::Unproven(reason)) => {
+                    return Err(BundleError::Proof(format!(
+                        "the manifest is not shown to be the server's: {reason}"
+                    )));
+                }
+                Ok(_) => {
+                    return Err(BundleError::Proof(
+                        "the welcome says what the manifest it cites says".into(),
+                    ));
+                }
+            }
+        }
     };
     Ok(Checked { proven })
 }
@@ -179,6 +253,33 @@ pub fn downgrade_proof(
         refusal: refusal.to_string(),
         suite: suite.clone(),
     })
+}
+
+/// A [`Proof::KeyLinkFork`] from `presented` and the first of `kept` it
+/// forks, all base64 as served, with the DID that signed both; `None` when
+/// `presented` does not verify or forks none of them.
+pub fn key_link_fork(kept: &[String], presented: &str) -> Option<(String, Proof)> {
+    let b = link_of(presented).ok()?;
+    kept.iter().find_map(|first| {
+        let a = link_of(first).ok()?;
+        key_link::fork(&a, &b).then(|| {
+            (
+                a.link().old.clone(),
+                Proof::KeyLinkFork {
+                    first: first.clone(),
+                    second: presented.to_string(),
+                },
+            )
+        })
+    })
+}
+
+fn link_of(b64: &str) -> Result<SignedKeyLink, BundleError> {
+    let bytes = STANDARD
+        .decode(b64)
+        .map_err(|e| BundleError::Proof(format!("a link is not base64: {e}")))?;
+    SignedKeyLink::from_envelope(&bytes)
+        .map_err(|e| BundleError::Proof(format!("a link does not verify: {e}")))
 }
 
 /// The suites a kept welcome advertises, once it verifies as `server_did`'s.
@@ -531,6 +632,72 @@ mod tests {
         // Another server's refusal.
         let other = jig_core::crypto::ed25519::generate_signing_key();
         assert_eq!(downgrade_proof(&w, &pinned, &refusal(&other), &did), None);
+    }
+
+    #[test]
+    fn a_key_link_fork_holds_only_from_one_did_to_two_others() {
+        use jig_core::key_link::{Audience, SignedKeyLink};
+        let new_key = jig_core::crypto::ed25519::generate_signing_key;
+        let (key, one, two) = (new_key(), new_key(), new_key());
+        let link = |old, new, audience| {
+            STANDARD.encode(
+                SignedKeyLink::sign(old, new, audience, 1_700_000_000)
+                    .unwrap()
+                    .envelope(),
+            )
+        };
+        let to_one = link(&key, &one, Audience::Public);
+        let to_two = link(&key, &two, Audience::Public);
+        let onward = link(&one, &two, Audience::Public);
+
+        // Found against any link kept, the one it forks named first.
+        let kept = [onward.clone(), to_one.clone()];
+        let (signer, proof) = key_link_fork(&kept, &to_two).unwrap();
+        assert_eq!(signer, did_of(&key));
+        assert!(matches!(&proof, Proof::KeyLinkFork { first, .. } if *first == to_one));
+        let proven = verify(&bundle(&key, Some(proof))).unwrap().proven.unwrap();
+        assert!(proven.contains(&did_of(&two)), "{proven}");
+        // Any audience: one key never links to two DIDs.
+        let contact = link(
+            &key,
+            &two,
+            Audience::Contact {
+                did: did_of(&new_key()),
+            },
+        );
+        assert!(key_link_fork(&kept, &contact).is_some());
+
+        // The same link again, a chain onward, a link that does not verify.
+        let mut tampered = STANDARD.decode(&to_two).unwrap();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        let tampered = STANDARD.encode(tampered);
+        for presented in [&to_one, &onward, &tampered, &"not base64!".to_string()] {
+            assert_eq!(
+                key_link_fork(std::slice::from_ref(&to_one), presented),
+                None
+            );
+        }
+
+        // A forged proof fails `verify`, whatever its claim; so does a true
+        // fork kept against another DID than the one that signed it.
+        for (first, second) in [
+            (to_one.clone(), to_one.clone()),
+            (to_one.clone(), onward.clone()),
+            (to_one.clone(), tampered.clone()),
+            (to_one.clone(), "not base64!".into()),
+        ] {
+            let b = bundle(&key, Some(Proof::KeyLinkFork { first, second }));
+            assert!(matches!(verify(&b), Err(BundleError::Proof(_))));
+        }
+        let elsewhere = bundle(
+            &one,
+            Some(Proof::KeyLinkFork {
+                first: to_one,
+                second: to_two,
+            }),
+        );
+        assert!(matches!(verify(&elsewhere), Err(BundleError::Proof(_))));
     }
 
     #[test]

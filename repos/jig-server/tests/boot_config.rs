@@ -18,10 +18,10 @@ fn server_bin() -> &'static str {
     env!("CARGO_BIN_EXE_jig-server")
 }
 
-/// Spawn jig-server with an isolated HOME/cwd and an ephemeral port.
 /// A fixed, public secret: test servers seal their keys with an env slot.
 const TEST_SECRET: &str = "jig-server boot tests: a fixed, public secret";
 
+/// jig-server with an isolated HOME/cwd, unlocking with [`TEST_SECRET`].
 fn server(home: &Path) -> Command {
     let mut cmd = Command::new(server_bin());
     cmd.current_dir(home)
@@ -35,6 +35,7 @@ fn server(home: &Path) -> Command {
     cmd
 }
 
+/// Spawn jig-server on an ephemeral port.
 fn spawn(home: &Path, args: &[&str]) -> Child {
     server(home)
         .args(args)
@@ -267,6 +268,49 @@ fn a_raw_key_is_refused_until_sealed_and_keeps_its_did_after() {
 
     let mut child = spawn(dir.path(), &["--config", cfg.to_str().unwrap()]);
     assert_still_running(&mut child, "the sealed key boots");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// `keys generate` makes the key sealed, before the server first runs, and
+/// never replaces one.
+#[test]
+fn keys_generate_seals_a_new_key_that_boots_and_is_never_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(&cfg, valid_config(dir.path())).unwrap();
+    let generate = || {
+        run_to_exit(
+            server(dir.path())
+                .args(["--config", cfg.to_str().unwrap(), "keys", "generate"])
+                .args(["--slot", "env:JIG_TEST_SERVER_SECRET"])
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let (ok, out) = generate();
+    assert!(ok, "{out}");
+    let did = out
+        .split_whitespace()
+        .find(|w| w.starts_with("did:jig:"))
+        .expect("prints the DID")
+        .to_string();
+    assert!(dir.path().join("server.jigkey").exists());
+    assert!(!dir.path().join("server.key").exists(), "nothing in clear");
+
+    let (ok, out) = generate();
+    assert!(!ok && out.contains("never overwritten"), "{out}");
+
+    let (ok, out) = run_to_exit(
+        server(dir.path())
+            .args(["--config", cfg.to_str().unwrap(), "keys", "show"])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(ok && out.contains(&did), "the key was not replaced: {out}");
+
+    let mut child = spawn(dir.path(), &["--config", cfg.to_str().unwrap()]);
+    assert_still_running(&mut child, "the generated key boots");
     let _ = child.kill();
     let _ = child.wait();
 }

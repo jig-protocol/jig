@@ -210,6 +210,8 @@ async fn a_federation_peer_is_held_to_its_expected_did() {
         url: base.replacen("https://", "wss://", 1),
         expected_did,
         alias: None,
+        publish: false,
+        quota: None,
     };
     let federation = FederationSection::default();
 

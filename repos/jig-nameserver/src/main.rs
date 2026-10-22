@@ -111,6 +111,28 @@ enum KeysCommand {
         #[arg(long)]
         keyfile: Option<std::path::PathBuf>,
     },
+    /// Check that one secret opens the key, trying nothing configured: for
+    /// an offline passphrase or a new machine's credential, before relying
+    /// on it.
+    Verify {
+        /// The keyfile. Defaults to the configured one.
+        #[arg(long)]
+        keyfile: Option<std::path::PathBuf>,
+        /// The slot to try: credential:PATH, env:NAME or passphrase.
+        #[arg(long)]
+        slot: String,
+    },
+    /// Make a new key, sealed with every slot named, at the configured path
+    /// (`keygen` takes any path). Never written in clear; never overwrites.
+    Generate {
+        /// The keyfile. Defaults to the configured one.
+        #[arg(long)]
+        keyfile: Option<std::path::PathBuf>,
+        /// A slot to seal it with: credential:PATH, env:NAME, or passphrase
+        /// (read from JIG_KEY_PASSPHRASE). Repeatable.
+        #[arg(long = "slot", required = true)]
+        slots: Vec<String>,
+    },
 }
 
 /// `jig-nameserver keys ...`: works on the key file only. The keyfile and
@@ -124,7 +146,9 @@ fn run_keys(keys: KeysCommand, config: Option<&std::path::Path>) -> Result<Strin
     let keyfile = match &keys {
         KeysCommand::Seal { keyfile, .. }
         | KeysCommand::AddSlot { keyfile, .. }
-        | KeysCommand::Show { keyfile } => keyfile.clone(),
+        | KeysCommand::Show { keyfile }
+        | KeysCommand::Verify { keyfile, .. }
+        | KeysCommand::Generate { keyfile, .. } => keyfile.clone(),
     };
     let named = config.is_some() || std::env::var_os("JIG_NS_CONFIG").is_some();
     let config = if keyfile.is_some() && !named {
@@ -142,6 +166,8 @@ fn run_keys(keys: KeysCommand, config: Option<&std::path::Path>) -> Result<Strin
         KeysCommand::Seal { slots, .. } => KeysAction::Seal { keyfile, slots },
         KeysCommand::AddSlot { slot, .. } => KeysAction::AddSlot { keyfile, slot },
         KeysCommand::Show { .. } => KeysAction::Show { keyfile },
+        KeysCommand::Verify { slot, .. } => KeysAction::Verify { keyfile, slot },
+        KeysCommand::Generate { slots, .. } => KeysAction::Generate { keyfile, slots },
     };
     jig_client::server_key::run(
         action,

@@ -761,6 +761,11 @@ impl Client {
         &self.server_url
     }
 
+    /// The identity this client signs with.
+    pub fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
     /// Returns the DID of the identity this client is signing with.
     pub fn identity_did(&self) -> String {
         self.identity.did_string()

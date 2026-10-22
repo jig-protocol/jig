@@ -11,6 +11,7 @@ Tailscale**.
 | `config.example.toml` | The `/etc/jig/config.toml` template |
 | `jig-backup.sh` | `VACUUM INTO` snapshots + the sealed `server.jigkey` |
 | `jig-backup.service` / `.timer` | Daily 03:17 UTC backup |
+| `setup-server-key.sh` | Seals the server's or nameserver's key to a systemd credential plus an offline passphrase ([Sealing the server key](#sealing-the-server-key)) |
 
 Each unit file carries its own rationale in comments. This document covers the
 sequence and the things that are not visible from inside a single file.
@@ -213,8 +214,9 @@ the root keys and every section in one file.
 | Server identity | `curl -k https://100.x.y.z:7117/.well-known/jig` | `server_did`, `tls_binding` and `unsafe_options_active` |
 | Server counters | `curl -k https://100.x.y.z:7117/metrics` | Prometheus text |
 | Channel list | `curl -k https://100.x.y.z:7117/api/v1/channels` | `401` `AUTH_REQUIRED` — reads are signed; use `jig channel list` instead |
-| Nameserver liveness | `curl http://100.x.y.z:7070/v1/health` | `{"status":"ok"}` |
-| Nameserver alias API | `curl http://100.x.y.z:7070/v1/challenge` | `{"challenge":"<64 hex>"}` |
+| Nameserver liveness | `curl -k https://100.x.y.z:7070/v1/health` | `{"status":"ok"}` |
+| Nameserver identity | `curl -k https://100.x.y.z:7070/.well-known/jig-ns` | `server_did`, `tls_binding` and `unsafe_options_active` |
+| Nameserver alias API | `curl -k https://100.x.y.z:7070/v1/challenge` | `{"challenge":"<64 hex>"}` |
 | Units | `systemctl status jig-server jig-nameserver` | both `active (running)` |
 
 > ⚠️ **`jig-server` serves TLS by default**, on every route of its one port:
@@ -240,9 +242,22 @@ the root keys and every section in one file.
 > startup warning, and a `jig` CLI refuses a plaintext `http://` server that is
 > not on its own machine (#142).
 >
-> The nameserver on `:7070` is **not** covered by `[tls]` — that section belongs
-> to `jig-server` only — so its rows stay `http://` unless you terminate TLS in
-> front of it yourself.
+> **The nameserver on `:7070` serves TLS by default too**, from its own `[tls]`
+> section in `/etc/jig/jig-nameserver.toml` (same keys). Its self-signed
+> certificate lives in `/var/lib/jig/nameserver/tls/`, apart from jig-server's,
+> and the nameserver's DID vouches for it at `/.well-known/jig-ns`.
+>
+> **Upgrading a nameserver that served plaintext:** it comes back on TLS, and
+> `http://…:7070` stops answering. Point every client and server at
+> `https://…:7070` instead (`jig --nameserver`, `[server] nameserver_url`, and
+> the nameserver URLs in delegations). Clients accept the certificate on the
+> word of the DID the suffix's delegation lists, not on a CA's alone, so a
+> reverse proxy in front of the nameserver must pass TLS through, not
+> terminate it.
+> An `http://` nameserver is refused unless the client opts in, for loopback
+> or local testing only: `[identity] dangerously_allow_plaintext_nameservers`
+> on jig-server (listed in `unsafe_options_active`), `[naming]
+> dangerously_allow_plaintext_nameservers` in the CLI's `cli.toml`.
 
 `/healthz` and `/metrics` are always mounted and need no signed read,
 so they answer on a default, locked-down deployment. Use `/healthz` — not
@@ -521,6 +536,9 @@ sudo systemctl start jig-server jig-nameserver
 curl -k https://100.x.y.z:7117/.well-known/jig  # server_did MUST match the old one
 ```
 
+That last check is the whole point: if `server_did` changed, you restored the
+databases without the key.
+
 On the same machine the keys open with the credential they were sealed with. On
 **another machine** a TPM-bound credential does not decrypt: make this host's
 credential ([Sealing the server key](#sealing-the-server-key), step 1), then add
@@ -536,12 +554,38 @@ unset JIG_KEY_PASSPHRASE
 ```
 
 The old machine's credential slot stays in the file and opens nothing here.
+`sudo deploy/setup-server-key.sh` does the same: it makes the credential, and
+adds it after checking that the passphrase opens the key.
 
 ### Sealing the server key
 
 A server boots unattended, so its key opens with a secret the server is handed
 at start, never typed. `[keys] unlock` names it. The recommended one is a
-systemd credential, encrypted to this machine's TPM where it has one:
+systemd credential, encrypted to this machine's TPM where it has one, plus a
+passphrase kept offline for restoring on other hardware.
+
+`deploy/setup-server-key.sh` does all of it, and changes nothing when run again:
+
+```bash
+sudo deploy/setup-server-key.sh               # jig-server; asks for the passphrase
+sudo systemctl restart jig-server
+sudo deploy/setup-server-key.sh --nameserver  # jig-nameserver
+sudo systemctl restart jig-nameserver
+```
+
+It makes the credential, then makes the key sealed (`keys generate`), seals a
+raw one in place (`keys seal`, same DID), or adds whichever of the credential
+and the passphrase does not open an existing sealed key yet (`keys verify`,
+`keys add-slot`). Then it writes a drop-in with `LoadCredentialEncrypted=` and
+sets `unlock`. It never prints a secret, refuses to replace a credential, a key
+or a different `unlock` it finds, and moves them aside (a NEW DID) only with
+`--force`. `--import SEED` seals a raw 32-byte seed from elsewhere as the key.
+Without `systemd-creds` (systemd before 250), `--passphrase-only` seals the
+key with the passphrase alone, and the server then needs `JIG_KEY_PASSPHRASE`
+at every boot. Once it is done, store the passphrase offline: it is the only
+thing that opens the key on another machine.
+
+By hand, the same steps:
 
 1. Make the secret, encrypted at rest. `--with-key=auto` uses the TPM2 when there
    is one, and otherwise a host key in `/var/lib/systemd/credential.secret`:
@@ -570,6 +614,16 @@ systemd credential, encrypted to this machine's TPM where it has one:
    Removing the raw file does not erase it from the disk or from earlier backups.
    Then add the offline passphrase slot (top of this file).
 
+To check, at any time, that a secret still opens the key without trying anything
+else (the offline passphrase, say, before you rely on it):
+
+```bash
+sudo -i
+read -rs -p 'passphrase: ' JIG_KEY_PASSPHRASE; echo; export JIG_KEY_PASSPHRASE
+/opt/jig/bin/jig-server --config /etc/jig/config.toml keys verify --slot passphrase
+unset JIG_KEY_PASSPHRASE
+```
+
 What each choice protects against:
 
 | `[keys] unlock` | Protects the key against | Not against |
@@ -582,9 +636,6 @@ What each choice protects against:
 
 At-rest encryption does not protect a key from code running as the server's
 user while it runs, and does not protect the key in memory.
-
-That last check is the whole point: if `server_did` changed, you restored the
-databases without the key.
 
 ---
 
@@ -645,7 +696,9 @@ letter under 5, at most 2^24, and 1 to renew or rotate. `jig` solves it;
 `GET /v1/challenge?action=register|renew|rotate&did=&name=`, and the reply
 states the effort, signed by the nameserver (`pow_offer`). The policy's
 refusals (closed, too short, reserved, taken) come back
-there, before any work. `[alias_rate_limits]` caps `GET /v1/challenge` per IP
+there, before any work. A per-suffix `[v0_0_2.nameserver.alias_suffixes.pool]` (also off by default)
+caps stranger registrations per hour and raises the effort under load; see the
+nameserver's OPERATOR_GUIDE. `[alias_rate_limits]` caps `GET /v1/challenge` per IP
 (`challenge_per_ip_per_min`, default 60) and the challenges pending at once
 (`max_pending_challenges`, default 100 000; past it, `503 BUSY`, with a tenth
 kept for renew and rotate).
@@ -665,6 +718,20 @@ it with the ceremony passphrase in `JIG_KEY_PASSPHRASE` (the same
 root-shell pattern as for jig-server). A key made elsewhere as a raw 32-byte
 seed is imported with `keys seal`, which keeps its DID. Nameserver keys open as
 `[v0_0_2.keys]` says, the same section as jig-server's `[keys]`.
+
+On the server, `sudo deploy/setup-server-key.sh --nameserver` finishes the
+ceremony: with the `.jigkey` where the config names it, it asks for the
+ceremony passphrase, checks that it opens the key, and adds the machine's
+credential. For a raw seed from elsewhere, `--import SEED` seals it instead,
+and then the seed file is the key in clear: destroy it, or keep it offline as
+carefully as the passphrase.
+
+**TLS in front of a nameserver.** Clients reach a nameserver over TLS only
+when the certificate it presents is the one its DID binds in
+`/.well-known/jig-ns`, and CA roots are not consulted. A TLS-terminating proxy
+presents its own certificate and is refused, so put the nameserver on the
+public address itself, or behind a proxy that passes TLS through (TCP or SNI
+passthrough) without terminating it.
 
 ---
 
