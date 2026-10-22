@@ -289,6 +289,9 @@ impl AppState {
                     suffix_authorities(&delegations),
                     config.identity.cache_ttl_seconds,
                     store.clone(),
+                    Arc::new(crate::v0_0_2_nameserver_tls::BoundNameservers {
+                        allow_plaintext: config.identity.dangerously_allow_plaintext_nameservers,
+                    }),
                 ))
             }
         };

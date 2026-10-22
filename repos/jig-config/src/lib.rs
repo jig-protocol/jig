@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+pub mod tls;
+
 // v0.0.2 hello-world server config (jig-server boot path)
 pub mod v0_0_2_server;
 pub use v0_0_2_server::{
