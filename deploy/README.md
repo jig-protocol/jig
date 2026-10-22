@@ -481,6 +481,7 @@ so a rebooted box catches up). It snapshots:
 | `/var/lib/jig/nameserver.db` | the nameserver's legacy registry |
 | `/var/lib/jig/nameserver_v002.db` | **the nameserver's alias bindings** |
 | `/var/lib/jig/server.jigkey` | server identity, sealed |
+| `/var/lib/jig/server.key.link` | the server's key link, when it serves one: the configured key path with `.link` appended. Without it, clients that pinned an earlier DID refuse the restored server |
 | `/var/lib/jig/nameserver_v002.jigkey` | **the nameserver's signing key**, sealed (set `JIG_NAMESERVER_KEYFILE` if `[v0_0_2.server] server_did_keyfile` puts it elsewhere) |
 
 A key still in clear (`[keys] storage = "plaintext"`) is copied too, with a
@@ -613,6 +614,11 @@ By hand, the same steps:
    ```
    Removing the raw file does not erase it from the disk or from earlier backups.
    Then add the offline passphrase slot (top of this file).
+
+   An upgraded nameserver with a raw `nameserver_v002.key` refuses to start the
+   same way. Seal it with `sudo deploy/setup-server-key.sh --nameserver`, or by
+   hand with `jig-nameserver --config /etc/jig/jig-nameserver.toml keys seal
+   --slot ...` and the same slot as `[v0_0_2.keys] unlock`.
 
 To check, at any time, that a secret still opens the key without trying anything
 else (the offline passphrase, say, before you rely on it):

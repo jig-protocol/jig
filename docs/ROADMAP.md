@@ -176,9 +176,11 @@ Still to do in this phase:
   between jig servers (encrypted channels across servers, the suite fixed in the contract), with
   how names map to DIDs and who resolves them. Nameserver-led shared contracts for trusted subnets
   and ruleset groups follow. Federating with a differently built server comes after the MVP.
-- Multi-device and key rotation; a server-key rotation ceremony.
-- ACME certificates, and TLS on the nameserver (it still serves plaintext).
-- Signed peer policy (federation already runs through the write gate).
+- Multi-device and key rotation; a server-key rotation ceremony (clients follow a server's key link
+  since #241; no tool makes one yet).
+- ACME certificates. TLS on the nameserver, bound to its DID, landed in #262.
+- Signed peer policy (federation already runs through the write gate). The policy is published in
+  the signed server manifest since #275; its quotas are not enforced yet.
 - **One implementation of each thing:** remove the v0.0.1 paths that sit beside v0.0.2 ones, the
   capability scaffolding that enforces nothing, and prototypes nothing calls.
 - An external security audit (D27), designed now and run once v0.2 is code-complete. It does not

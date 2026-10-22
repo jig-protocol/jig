@@ -12,6 +12,10 @@
 #                     server.key names server.jigkey beside it). Losing it
 #                     changes the server's identity and breaks TOFU pinning for
 #                     every client that ever connected. See deploy/README.md.
+#      server.key.link — the server's key link (JEP-0012, #241), when it has
+#                     one: the configured key path with ".link" appended. It
+#                     is what lets clients that pinned an older DID follow the
+#                     server to this one; restored without it, they refuse it.
 #   3. nameserver.db, nameserver_v002.db and nameserver_v002.jigkey, when this
 #                     box runs jig-nameserver. nameserver_v002.db holds the
 #                     alias bindings; the key is the nameserver's signing key.
@@ -160,6 +164,17 @@ case "$rc" in
     *) die "the server key could not be copied — refusing to record a backup
     without it" ;;
 esac
+
+# The server's key link, if it serves one: jig-server reads it from the
+# configured key path with ".link" appended. It is public (it holds no secret),
+# but without it clients that pinned the server's previous DID refuse it.
+LINKFILE="$KEYFILE.link"
+if [ -f "$LINKFILE" ]; then
+    cp -p -- "$LINKFILE" "$DEST/$(basename -- "$LINKFILE")" \
+        || die "could not copy the server key link $LINKFILE"
+    log "link: $LINKFILE -> $DEST/$(basename -- "$LINKFILE")"
+    key_notes="$key_notes jig-server-link=present"
+fi
 
 # The nameserver's signing key. The nameserver is optional on a box, so a
 # missing key is fatal only when its alias store exists: bindings without the
