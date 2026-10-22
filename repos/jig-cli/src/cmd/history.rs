@@ -199,8 +199,9 @@ mod tests {
         ];
         let decoded = decode_history(&blocks);
         assert_eq!(decoded.len(), 2, "one bad block must not drop the backlog");
-        assert_eq!(decoded[0].body, "first");
-        assert_eq!(decoded[1].body, "third");
+        // No server receipts in these fixtures, so nothing is verified.
+        assert_eq!(decoded[0].body, "first  [unverified]");
+        assert_eq!(decoded[1].body, "third  [unverified]");
     }
 
     #[test]
@@ -226,7 +227,7 @@ mod tests {
 
         let decoded = decode_history(&blocks);
         assert_eq!(decoded.len(), 1, "only the message block should replay");
-        assert_eq!(decoded[0].body, "hello team");
+        assert_eq!(decoded[0].body, "hello team  [unverified]");
     }
 
     #[tokio::test]

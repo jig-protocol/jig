@@ -1506,33 +1506,9 @@ fn text_render_input(
             kind: kind_str.to_string(),
         });
     }
-    // Rendering the empty string in the body's absence would hash a message nobody sent.
-    let body = manifest
-        .metadata
-        .get("body")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| IngestError::MissingMetadata {
-            kind: kind_str.to_string(),
-            field: "body".to_string(),
-        })?;
-    let channel = manifest
-        .metadata
-        .get("channel")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    let hlc = manifest.hlc_ts.as_ref();
-    Ok(text_block::Input {
-        sender_did: manifest
-            .authors
-            .first()
-            .map(|a| a.did.to_string())
-            .unwrap_or_default(),
-        channel_id: channel.to_string(),
-        body_raw: body.to_string(),
-        hlc_wall_ms: hlc.map(|h| h.wall_ms).unwrap_or(0),
-        hlc_logical: hlc.map(|h| h.logical).unwrap_or(0),
-        hlc_origin: hlc.map(|h| h.server_did.to_string()).unwrap_or_default(),
-        client_version: manifest.version.to_string(),
+    crate::executor::text_input(manifest).ok_or_else(|| IngestError::MissingMetadata {
+        kind: kind_str.to_string(),
+        field: "body".to_string(),
     })
 }
 
@@ -1570,13 +1546,7 @@ async fn render_after_landing(
             kind: BlockKind::TextRender.as_str().to_string(),
         })?;
 
-    let mut invocation =
-        crate::executor::text_invocation(&input, block_cid.to_string(), record.seq);
-    invocation.channel_cid = record.channel_id.clone();
-    invocation.ingest_hlc = jig_runtime::component::Hlc {
-        wall_ms: record.ingest_wall_ms,
-        logical: record.ingest_logical,
-    };
+    let invocation = crate::executor::text_render_invocation(&input, block_cid, &record);
 
     let run = run_text_render(executor, invocation).await?;
 
@@ -2093,12 +2063,7 @@ mod tests {
             "text-render",
         )
         .unwrap();
-        let mut invocation = crate::executor::text_invocation(&input, cid.clone(), record.seq);
-        invocation.channel_cid = record.channel_id.clone();
-        invocation.ingest_hlc = jig_runtime::component::Hlc {
-            wall_ms: record.ingest_wall_ms,
-            logical: record.ingest_logical,
-        };
+        let invocation = crate::executor::text_render_invocation(&input, &cid, &record);
         assert_eq!(
             exec.invocation_hash,
             jig_runtime::component::hash_bytes(&jig_runtime::component::invocation_hash(

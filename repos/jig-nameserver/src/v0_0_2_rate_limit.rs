@@ -109,23 +109,42 @@ impl AliasRateLimiter {
         }
     }
 
-    /// The connection's peer address, or with `trust_proxy` the **last**
-    /// entry of `proxy_ip_header`: the one the nearest proxy appended. Earlier
-    /// entries were written by the client and can be anything.
     fn client_ip(&self, req: &Request) -> Option<IpAddr> {
-        if self.network.trust_proxy
-            && let Some(ip) = req
-                .headers()
-                .get(&self.network.proxy_ip_header)
-                .and_then(|v| v.to_str().ok())
-                .and_then(last_forwarded)
-        {
-            return Some(ip);
-        }
-        req.extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|ConnectInfo(addr)| addr.ip())
+        client_ip(
+            &self.network,
+            req.headers(),
+            req.extensions().get::<ConnectInfo<SocketAddr>>(),
+        )
     }
+}
+
+/// The connection's peer address, or with `trust_proxy` the **last** entry of
+/// `proxy_ip_header`: the one the nearest proxy appended. Earlier entries were
+/// written by the client and can be anything.
+pub(crate) fn client_ip(
+    network: &NetworkConfig,
+    headers: &axum::http::HeaderMap,
+    peer: Option<&ConnectInfo<SocketAddr>>,
+) -> Option<IpAddr> {
+    if network.trust_proxy
+        && let Some(ip) = headers
+            .get(&network.proxy_ip_header)
+            .and_then(|v| v.to_str().ok())
+            .and_then(last_forwarded)
+    {
+        return Some(ip);
+    }
+    peer.map(|ConnectInfo(addr)| addr.ip())
+}
+
+/// The key penalties and buckets count a client under: its address as
+/// [`ip_key`] folds it, or `ip:unknown`.
+pub(crate) fn client_key(
+    network: &NetworkConfig,
+    headers: &axum::http::HeaderMap,
+    peer: Option<&ConnectInfo<SocketAddr>>,
+) -> String {
+    client_ip(network, headers, peer).map_or_else(|| "ip:unknown".to_string(), ip_key)
 }
 
 fn last_forwarded(header: &str) -> Option<IpAddr> {
@@ -169,6 +188,7 @@ fn refuse(status: StatusCode, code: &str, message: String, retry_after: Option<u
             code: code.to_string(),
             message,
             pow_offer: None,
+            retry_after: None,
         }),
     )
         .into_response();

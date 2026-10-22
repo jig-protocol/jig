@@ -183,8 +183,11 @@ Draft. Field names are provisional. The design behind this revision is
     decrypted content, and is not signed by the user's key by default. It stays with the
     user. A client MUST refuse later connections to that server until the user accepts
     it again. Only items the server signed, and that show the contradiction on their own,
-    may cause that refusal: two `ingest` records that cannot both hold, or a signed
-    `refusal` that drops a suite a signed `welcome` advertised. Frames are not signed, so
+    may cause that refusal: two `ingest` records that cannot both hold; a signed
+    `refusal` that drops a suite a signed `welcome` advertised; a signed `welcome` and the
+    `server-manifest` block and record it cites (rule 12) that disagree; or two key links
+    (JEP-0012) out of one DID the pin held, to two different DIDs, which show that
+    someone other than the server holds that key. Frames are not signed, so
     a frame the welcome did not allow is kept as evidence but does not cause it. Timeouts,
     closed connections and malformed frames never do, and neither does evidence imported
     from others.

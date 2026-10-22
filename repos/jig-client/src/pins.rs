@@ -126,6 +126,15 @@ pub struct ServerPin {
     /// both halves ([`crate::evidence::Proof::Downgrade`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub welcome: Option<String>,
+    /// The `server-manifest` this device last checked a welcome against
+    /// ([`crate::manifest`]); a welcome citing it needs no second check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<jig_pipeline::handshake::ManifestRef>,
+    /// The public key links this pin moved along, base64 as served, oldest
+    /// first: a later link out of one of their DIDs to another is a fork
+    /// ([`crate::evidence::key_link_fork`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<String>,
 }
 
 /// A server this device refuses until its user accepts it again, after it
@@ -395,9 +404,26 @@ impl Pins {
                 return Err(replaced());
             }
             pin.server_did = to.to_string();
-            // The old key signed it, so it shows nothing about the new one.
+            pin.links.push(key_link.to_string());
+            // The old key signed these, so they show nothing about the new
+            // one: the next welcome is checked against its manifest afresh.
             pin.welcome = None;
+            pin.manifest = None;
             Ok(((), true))
+        })
+    }
+
+    /// Record that `server`'s welcome was checked against `manifest`.
+    pub fn set_manifest(
+        &mut self,
+        server: &str,
+        manifest: &jig_pipeline::handshake::ManifestRef,
+    ) -> Result<(), PinError> {
+        self.update(|file| {
+            let pin = file.servers.entry(server_key(server)).or_default();
+            let changed = pin.manifest.as_ref() != Some(manifest);
+            pin.manifest = Some(manifest.clone());
+            Ok(((), changed))
         })
     }
 
@@ -1064,6 +1090,48 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_server_stays_refused_until_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let server = "https://host:7117";
+        let mut pins = Pins::load(&path).unwrap();
+        let mut w = welcome("did:jig:zS", &["none", "mls"]);
+        w.evidence = "first".into();
+        pins.check_welcome(server, &w).unwrap();
+        w.evidence = "second".into();
+        pins.check_welcome(server, &w).unwrap();
+        assert_eq!(
+            pins.server(server).unwrap().welcome.as_deref(),
+            Some("first"),
+            "a welcome that changes nothing is not written again"
+        );
+
+        let refusal = |bundle: &str| StickyRefusal {
+            bundle: bundle.into(),
+            reason: "forked".into(),
+            at_ms: 1,
+        };
+        pins.refuse("wss://HOST:7117/", refusal("a")).unwrap();
+        pins.refuse(server, refusal("b")).unwrap();
+        let pins = Pins::load(&path).unwrap();
+        assert_eq!(
+            pins.refusal(server).unwrap().bundle,
+            "a",
+            "the first stands"
+        );
+
+        let mut pins = pins;
+        assert!(pins.forget(server).unwrap());
+        assert!(
+            pins.refusal(server).is_some(),
+            "forgetting the pin does not lift the refusal"
+        );
+        assert_eq!(pins.accept_server(server).unwrap().unwrap().bundle, "a");
+        assert!(Pins::load(&path).unwrap().refusal(server).is_none());
+        assert_eq!(pins.accept_server(server).unwrap(), None);
+    }
+
+    #[test]
     fn a_server_pin_moves_only_along_a_link_from_the_pinned_key() {
         use base64::Engine as _;
         use jig_core::key_link::{Audience, SignedKeyLink};
@@ -1104,53 +1172,13 @@ mod tests {
             .unwrap();
         let pins = Pins::load(&path).unwrap();
         assert_eq!(pins.server(server).unwrap().server_did, did(&new));
+        assert_eq!(pins.server(server).unwrap().links, [link(&old, &new)]);
         assert_eq!(
             pins.server(server).unwrap().welcome,
             None,
             "a welcome the old key signed is not kept as the new key's"
         );
-    }
-
-    #[test]
-    fn a_refused_server_stays_refused_until_accepted() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pins.json");
-        let server = "https://host:7117";
-        let mut pins = Pins::load(&path).unwrap();
-        let mut w = welcome("did:jig:zS", &["none", "mls"]);
-        w.evidence = "first".into();
-        pins.check_welcome(server, &w).unwrap();
-        w.evidence = "second".into();
-        pins.check_welcome(server, &w).unwrap();
-        assert_eq!(
-            pins.server(server).unwrap().welcome.as_deref(),
-            Some("first"),
-            "a welcome that changes nothing is not written again"
-        );
-
-        let refusal = |bundle: &str| StickyRefusal {
-            bundle: bundle.into(),
-            reason: "forked".into(),
-            at_ms: 1,
-        };
-        pins.refuse("wss://HOST:7117/", refusal("a")).unwrap();
-        pins.refuse(server, refusal("b")).unwrap();
-        let pins = Pins::load(&path).unwrap();
-        assert_eq!(
-            pins.refusal(server).unwrap().bundle,
-            "a",
-            "the first stands"
-        );
-
-        let mut pins = pins;
-        assert!(pins.forget(server).unwrap());
-        assert!(
-            pins.refusal(server).is_some(),
-            "forgetting the pin does not lift the refusal"
-        );
-        assert_eq!(pins.accept_server(server).unwrap().unwrap().bundle, "a");
-        assert!(Pins::load(&path).unwrap().refusal(server).is_none());
-        assert_eq!(pins.accept_server(server).unwrap(), None);
+        assert_eq!(pins.server(server).unwrap().manifest, None);
     }
 
     #[test]
