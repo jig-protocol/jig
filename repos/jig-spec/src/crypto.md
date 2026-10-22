@@ -96,8 +96,16 @@ label that names no key.
   backup, in a synced home directory, or from another local user.
 - Backups SHOULD use more than one mechanism. A sealed key file is safe to back up as it
   is; keep a passphrase slot, written down offline, so the key opens on another machine.
-  A keychain or TPM-bound slot does not move with the file. *(An exported recovery kit,
-  `jig keys export`, is not yet implemented.)*
+  A keychain or TPM-bound slot does not move with the file.
+- **A recovery kit** (`jig keys export --out FILE`) is the key file with one slot of its
+  own: a passphrase of at least 12 characters, at the full Argon2id parameters whatever
+  the local slots use, because a kit is meant to leave the machine and can be attacked
+  offline. It is a `.jigkey` like any other, so `jig keys verify` (or `jig-server keys
+  verify --slot passphrase`) checks it and `jig keys import` restores it: the restored
+  file keeps the kit's passphrase slot and gains the slot the machine seals new keys
+  with. The kit holds the same data key as the file it came from. Kits encrypted to an
+  age recipient (a hardware token, a team key) may be added later as another export
+  format, beside this one.
 
 **Rotation:**
 - Clients and servers MUST support key rotation (publishing new key signed by old key)
