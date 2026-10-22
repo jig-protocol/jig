@@ -123,6 +123,41 @@ impl Prompt for TerminalPrompt {
     }
 }
 
+/// A recovery kit's passphrase: `JIG_KEY_KIT_PASSPHRASE`, else asked at the
+/// terminal, twice when `new` (a kit being made). Never the identity's own
+/// passphrase variable: a kit's passphrase should be one of its own.
+pub fn kit_passphrase(new: bool) -> anyhow::Result<Zeroizing<String>> {
+    if let Some(p) = std::env::var("JIG_KEY_KIT_PASSPHRASE")
+        .ok()
+        .filter(|p| !p.is_empty())
+    {
+        return Ok(Zeroizing::new(p));
+    }
+    if !terminal_available() {
+        anyhow::bail!("no terminal to ask for the kit's passphrase: set JIG_KEY_KIT_PASSPHRASE");
+    }
+    if !new {
+        return Ok(read_hidden("recovery kit passphrase: ")?);
+    }
+    let min = jig_client::identity::MIN_KIT_PASSPHRASE_CHARS;
+    for _ in 0..3 {
+        let first = read_hidden(&format!("new kit passphrase ({min}+ characters): "))?;
+        if first.chars().count() < min {
+            writeln!(
+                terminal_writer(),
+                "the passphrase needs at least {min} characters"
+            )?;
+            continue;
+        }
+        let second = read_hidden("repeat it: ")?;
+        if *first == *second {
+            return Ok(first);
+        }
+        writeln!(terminal_writer(), "the two did not match")?;
+    }
+    anyhow::bail!("no kit passphrase chosen")
+}
+
 /// Read one line from the terminal with echo off. The label goes to the
 /// terminal too, so it shows even when stderr is redirected.
 fn read_hidden(label: &str) -> std::io::Result<Zeroizing<String>> {
