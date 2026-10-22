@@ -820,6 +820,14 @@ fn refuse_remote_plaintext(server: &str) -> Result<()> {
 
 fn refusal(server: &str, e: TlsError) -> anyhow::Error {
     match e {
+        TlsError::OtherServer {
+            rotated_past: Some(_),
+            ref presented,
+            ..
+        } => anyhow::anyhow!(
+            "{e}. Only once its operator has confirmed {presented} does `jig server forget \
+             {server}` drop the pin."
+        ),
         TlsError::OtherServer { .. } => anyhow::anyhow!(
             "{e}. If its key really changed, `jig server forget {server}` drops the pin."
         ),
@@ -945,6 +953,7 @@ mod tests {
             expected: did(&new),
             presented: did(&thief),
             key_link,
+            rotated_past: None,
         };
 
         // No link, or one that forks nothing followed: an ordinary refusal.

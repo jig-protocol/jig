@@ -988,6 +988,9 @@ pub fn link_moves(link_b64: &str, pinned: &str, presented: &str) -> Result<(), S
         return Err("the key link is not a public one".to_string());
     }
     if !same_did(&link.old, pinned) {
+        if link.new == presented {
+            return Err(rotated_past(pinned, &link.old));
+        }
         return Err(format!(
             "the key link leaves {}, not the pinned DID",
             link.old
@@ -1000,6 +1003,30 @@ pub fn link_moves(link_b64: &str, pinned: &str, presented: &str) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+/// The DID a served key link leaves, when the link verifies, is public,
+/// moves to `presented`, but leaves another DID than `pinned`: what a
+/// server that changed its key more than once since it was pinned serves,
+/// and what an impostor holding two keys can serve too. Either way it is
+/// refused; this only names it.
+pub fn link_from_elsewhere(link_b64: &str, pinned: &str, presented: &str) -> Option<String> {
+    use jig_core::key_link::{Audience, SignedKeyLink};
+    let bytes = STANDARD.decode(link_b64).ok()?;
+    let signed = SignedKeyLink::from_envelope(&bytes).ok()?;
+    let link = signed.link();
+    (link.audience == Audience::Public && link.new == presented && !same_did(&link.old, pinned))
+        .then(|| link.old.clone())
+}
+
+/// Why a link from `left`, not from `pinned`, is not followed.
+pub fn rotated_past(pinned: &str, left: &str) -> String {
+    format!(
+        "its key link leaves {left}, a DID this device never pinned. Either the server changed \
+         its key more than once since it was pinned as {pinned}, or it is not that server. \
+         Either way it is refused: re-pinning would trust the new DID on first use again, so \
+         check it with the server's operator first"
+    )
 }
 
 fn pin_mismatch(server_did: &str, pinned: Option<&str>) -> Option<String> {
@@ -1518,6 +1545,38 @@ mod tests {
     }
 
     #[test]
+    fn a_link_from_a_key_after_the_pin_is_refused_by_name() {
+        use jig_core::key_link::{Audience, SignedKeyLink};
+        let (a, b, c) = (
+            generate_signing_key(),
+            generate_signing_key(),
+            generate_signing_key(),
+        );
+        let did = |k: &SigningKey| {
+            Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let b_to_c = STANDARD.encode(
+            SignedKeyLink::sign(&b, &c, Audience::Public, 2)
+                .unwrap()
+                .envelope(),
+        );
+        assert!(link_moves(&b_to_c, &did(&b), &did(&c)).is_ok());
+        assert_eq!(link_from_elsewhere(&b_to_c, &did(&b), &did(&c)), None);
+
+        let why = link_moves(&b_to_c, &did(&a), &did(&c)).unwrap_err();
+        assert!(
+            why.contains("more than once") && why.contains(&did(&a)),
+            "{why}"
+        );
+        assert_eq!(
+            link_from_elsewhere(&b_to_c, &did(&a), &did(&c)),
+            Some(did(&b))
+        );
+        // A link to another DID than the one presented is not this case.
+        assert_eq!(link_from_elsewhere(&b_to_c, &did(&a), &did(&a)), None);
+    }
+
+    #[test]
     fn a_new_key_is_followed_only_along_a_link_the_pinned_key_signed() {
         use jig_core::key_link::{Audience, SignedKeyLink};
         let old = generate_signing_key();
@@ -1564,9 +1623,11 @@ mod tests {
         };
         refused(welcome_with(None), "does not match the pinned DID");
         let stranger = generate_signing_key();
+        // A link to the presented DID from a key this device never pinned:
+        // a later rotation, or an impostor. Refused, and said so.
         refused(
             welcome_with(Some(link(&stranger, &new, Audience::Public))),
-            "not the pinned DID",
+            "never pinned",
         );
         refused(
             welcome_with(Some(link(&old, &stranger, Audience::Public))),

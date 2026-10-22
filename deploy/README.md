@@ -637,6 +637,59 @@ What each choice protects against:
 At-rest encryption does not protect a key from code running as the server's
 user while it runs, and does not protect the key in memory.
 
+### Rotating the server key
+
+A server's DID is its key, so a new key is a new DID. `keys rotate` makes the
+new key and a **key link** from the old DID to the new one, signed by both
+keys (JEP-0012). The server serves the link in every welcome and at
+`/.well-known/jig`, and clients and federation peers that pinned the old DID
+follow it to the new one.
+
+```bash
+sudo deploy/setup-server-key.sh --rotate
+sudo systemctl restart jig-server
+```
+
+It asks for a **new** offline passphrase (or reads `JIG_KEY_NEW_PASSPHRASE`)
+and makes a new credential secret, so nothing that opened the old key opens
+the new one. In place, so the config and the drop-in do not change:
+
+| File | After `--rotate` |
+| --- | --- |
+| `/var/lib/jig/server.jigkey` | the new key, opened by the new credential and the new passphrase |
+| `/var/lib/jig/server.key.link` | the link from the old DID to the new one: back it up with the key |
+| `/var/lib/jig/server.retired-<DID tail>.jigkey` | the old key, still sealed |
+| `/etc/credstore.encrypted/jig-server-key.retired-<time>` | the old credential |
+
+**Keep the retired key, never delete it:** move it and the old credential
+offline. Nothing needs them to serve the link; they keep the old DID's key
+usable if anything ever has to be signed by it again, such as a revocation
+once there is one.
+
+By hand, the same is
+`jig-server keys rotate --slot credential:PATH --slot passphrase`, with the old
+key opened by `[keys] unlock`, `JIG_KEY_UNLOCK` or `JIG_KEY_PASSPHRASE`, and the
+new passphrase in `JIG_KEY_NEW_PASSPHRASE`. For a key made offline with
+`keys generate`, `jig-server keys link --old-keyfile OLD --keyfile NEW` writes
+only the link, beside `NEW`.
+
+**Rotate once per pin generation.** The server serves one link, and a client
+follows one: after a second rotation, a client still pinned on the first DID is
+refused, with an error saying the server changed its key more than once. It
+must re-pin, which trusts the server on first use again. So `--rotate` refuses
+a second rotation unless you pass `--replace-link`, and keeps the earlier link
+as `server.key.link.1`. Serving the whole chain is planned.
+
+A DID is linked to one new key only, ever: two links from one DID are what a
+stolen key looks like (JEP-0012), and clients that see both follow neither.
+`keys rotate` and `keys link` refuse to link a DID that a link beside the key
+already leaves.
+
+Not covered yet: federation peers follow the link, but their operators should
+still update `expected_did`; JEP-0012's `server-rekey` block is not
+implemented; and the nameserver has no key link, so a new nameserver key is a
+new identity.
+
 ---
 
 ## The nameserver

@@ -83,6 +83,24 @@ pub enum ServerKeyError {
     #[error("{0}")]
     BadUnlock(String),
     #[error(
+        "{path:?} already moves {previous} to this key, since {since}. Rotating again replaces \
+         that link, and a client still pinned on {previous} can then follow neither: it is \
+         refused, and re-pinning trusts the server on first use again. Pass --replace-link to \
+         rotate anyway; the old link is kept beside it as {path:?}.N"
+    )]
+    Linked {
+        path: PathBuf,
+        previous: String,
+        since: String,
+    },
+    #[error(
+        "{old} already has a key link, {path:?}: one DID never links to two keys (JEP-0012), \
+         because two links from one key are what a stolen key looks like"
+    )]
+    AlreadyLinked { old: String, path: PathBuf },
+    #[error("{path:?}: {reason}")]
+    BadLink { path: PathBuf, reason: String },
+    #[error(
         "{path:?} is outside $CREDENTIALS_DIRECTORY ({dir:?}): under a unit with credentials, \
          [keys] unlock names one of them, not a file beside the key"
     )]
@@ -167,10 +185,21 @@ impl Spec {
     /// `credential:PATH`, `env:NAME` or `passphrase`, from `source` (named in
     /// errors: `[keys] unlock`, `JIG_KEY_UNLOCK`, `--slot`).
     fn parse(spec: &str, source: &'static str, used: Use) -> Result<Self> {
+        Self::parse_reading(spec, source, used, "JIG_KEY_PASSPHRASE")
+    }
+
+    /// [`Spec::parse`], with `passphrase` read from `passphrase_var`: a new
+    /// key's passphrase is not the old one's.
+    fn parse_reading(
+        spec: &str,
+        source: &'static str,
+        used: Use,
+        passphrase_var: &'static str,
+    ) -> Result<Self> {
         if spec == "passphrase" {
-            let passphrase = std::env::var("JIG_KEY_PASSPHRASE").map_err(|_| {
+            let passphrase = std::env::var(passphrase_var).map_err(|_| {
                 ServerKeyError::BadUnlock(format!(
-                    "{source}: the passphrase slot reads JIG_KEY_PASSPHRASE, which is not set; \
+                    "{source}: the passphrase slot reads {passphrase_var}, which is not set; \
                      a server never prompts"
                 ))
             })?;
@@ -606,6 +635,385 @@ pub fn add_slot(path: &Path, opts: &ServerKeyOptions, new_spec: &str) -> Result<
     Ok(describe_slots(&updated.slots()))
 }
 
+/// Where a server's key link is read from: beside its configured keyfile,
+/// with `.link` appended (`server.key.link` for `server.key`). The file holds
+/// the link's COSE_Sign bytes (JEP-0012).
+pub fn key_link_path(keyfile: &Path) -> PathBuf {
+    let mut name = keyfile.as_os_str().to_owned();
+    name.push(".link");
+    PathBuf::from(name)
+}
+
+/// What [`rotate`] did.
+#[derive(Debug)]
+pub struct Rotated {
+    pub old_did: String,
+    pub new_did: String,
+    /// The old key, still sealed with its own slots.
+    pub retired: PathBuf,
+    /// The new link, from `old_did` to `new_did`.
+    pub link: PathBuf,
+    /// Where the link it replaced was kept, and the DID that link left.
+    pub archived: Option<(PathBuf, String)>,
+}
+
+/// Replace the server's key at `keyfile` with a new one sealed with one slot
+/// per entry of `specs`, and link the old DID to the new one with a public
+/// key link signed by both (JEP-0012), so clients and peers that pinned the
+/// old DID follow it. The configured keyfile path, and the config that
+/// names it, stay as they are.
+///
+/// The old key is opened as `opts` says, like [`add_slot`]. A `passphrase`
+/// slot for the new key reads `JIG_KEY_NEW_PASSPHRASE`, not the old one's.
+///
+/// A link already beside the key is replaced only with `replace_link`: a
+/// client still pinned two keys back follows neither link and is refused.
+/// It is kept as `<link>.N`. A DID that any of those links already leaves is
+/// never linked again.
+///
+/// The new key and the link are staged, read back and checked first: every
+/// slot opens the new key, and the link verifies from the old DID to the new.
+/// Only then is the old key kept as `<stem>.retired-<did tail>.jigkey` and
+/// the new key and link renamed into place. The old key is never deleted.
+pub fn rotate(
+    keyfile: &Path,
+    specs: &[String],
+    replace_link: bool,
+    opts: &ServerKeyOptions,
+    now: i64,
+) -> Result<Rotated> {
+    use jig_core::key_link::{Audience, SignedKeyLink};
+    let sealed = sealed_path(keyfile);
+    if sealed != keyfile && keyfile.exists() {
+        return Err(both_present(keyfile, &sealed, opts, Use::Operator));
+    }
+    let key = read_jigkey(&sealed)?;
+    let opened = open_with(&key, &sealed, opts, Use::Operator)?;
+    let old_did = did_of(&opened.seed);
+    if old_did != key.did() {
+        return Err(ServerKeyError::WrongDid {
+            path: sealed,
+            claimed: key.did().to_string(),
+            found: old_did,
+        });
+    }
+    let link_path = key_link_path(keyfile);
+    let links = links_beside(&link_path)?;
+    refuse_relink(&links, &old_did)?;
+    let current = links.iter().find(|(p, _)| *p == link_path);
+    if let Some((_, current)) = current {
+        let previous = &current.link().old;
+        if current.link().new != old_did {
+            return Err(ServerKeyError::BadLink {
+                path: link_path,
+                reason: format!(
+                    "it moves {previous} to {}, not to this key ({old_did}), so the server would \
+                     refuse to boot with it. Find out why before rotating",
+                    current.link().new
+                ),
+            });
+        }
+        if !replace_link {
+            return Err(ServerKeyError::Linked {
+                path: link_path,
+                previous: previous.clone(),
+                since: utc(current.link().issued_at),
+            });
+        }
+    }
+    if specs.is_empty() {
+        return Err(ServerKeyError::BadUnlock(
+            "name at least one --slot for the new key: credential:PATH, env:NAME or passphrase"
+                .to_string(),
+        ));
+    }
+    let parsed = specs
+        .iter()
+        .map(|s| Spec::parse_reading(s, "--slot", Use::Operator, "JIG_KEY_NEW_PASSPHRASE"))
+        .collect::<Result<Vec<_>>>()?;
+    let slots = parsed
+        .iter()
+        .map(|s| s.clone().slot(opts.kdf))
+        .collect::<Result<Vec<_>>>()?;
+    let new_signing = jig_core::crypto::ed25519::generate_signing_key();
+    let new_seed = Zeroizing::new(new_signing.to_bytes());
+    let new_did = did_of(&new_seed);
+    let (new_key, _) =
+        JigKey::seal(&new_did, &new_seed, &slots).map_err(|source| ServerKeyError::Keystore {
+            path: sealed.clone(),
+            source,
+        })?;
+    let link = SignedKeyLink::sign(
+        &SigningKey::from_bytes(&opened.seed),
+        &new_signing,
+        Audience::Public,
+        now,
+    )
+    .map_err(|e| ServerKeyError::BadLink {
+        path: link_path.clone(),
+        reason: e.to_string(),
+    })?;
+
+    let tmp_key = temporary(&sealed);
+    let tmp_link = temporary(&link_path);
+    let staged = (|| {
+        write_new(&tmp_key, &new_key.to_bytes())?;
+        same_owner(&tmp_key, &sealed)?;
+        let reopened = read_jigkey(&tmp_key)?;
+        for spec in parsed {
+            if !reopened
+                .open(&[spec.offer()])
+                .is_ok_and(|o| *o.seed == *new_seed)
+            {
+                return Err(ServerKeyError::NotVerified {
+                    path: sealed.clone(),
+                    kept: "nothing was changed".to_string(),
+                });
+            }
+        }
+        write_new(&tmp_link, link.envelope())?;
+        same_owner(&tmp_link, &sealed)?;
+        check_link_file(&tmp_link, &old_did, &new_did)
+    })();
+    let unstage = || {
+        let _ = std::fs::remove_file(&tmp_key);
+        let _ = std::fs::remove_file(&tmp_link);
+    };
+    if let Err(e) = staged {
+        unstage();
+        return Err(e);
+    }
+
+    // Keep what is replaced under names nothing else uses, then rename the
+    // new files over the old ones: each rename is atomic, and a link,
+    // unlike a rename, never replaces a file that is already there.
+    let retired = retired_path(&sealed, &old_did);
+    if let Err(e) = link_new(&sealed, &retired) {
+        unstage();
+        return Err(e);
+    }
+    let archived = match current {
+        Some((_, current)) => match link_new(&link_path, &next_archive(&link_path)) {
+            Ok(archived) => Some((archived, current.link().old.clone())),
+            Err(e) => {
+                unstage();
+                let _ = std::fs::remove_file(&retired);
+                return Err(e);
+            }
+        },
+        None => None,
+    };
+    let io = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| ServerKeyError::Io { path, source }
+    };
+    std::fs::rename(&tmp_key, &sealed).map_err(io(&sealed))?;
+    std::fs::rename(&tmp_link, &link_path).map_err(io(&link_path))?;
+    sync_parent_dir(&sealed).map_err(io(&sealed))?;
+    sync_parent_dir(&link_path).map_err(io(&link_path))?;
+    Ok(Rotated {
+        old_did,
+        new_did,
+        retired,
+        link: link_path,
+        archived,
+    })
+}
+
+/// Link the DID of the sealed key at `old_keyfile` to the DID of the one at
+/// `keyfile`, writing the link beside `keyfile` ([`key_link_path`]), where a
+/// server configured with `keyfile` serves it. For a key made offline with
+/// `keys generate`; [`rotate`] does this and the swap in one step.
+///
+/// The old key opens as `opts` says. The new key opens with `slot` alone if
+/// given (a `passphrase` reads `JIG_KEY_NEW_PASSPHRASE`), else as `opts`
+/// says. An existing link is never overwritten, and a DID that a link beside
+/// `keyfile` already leaves is never linked again. Returns the two DIDs and
+/// the link's path.
+pub fn link(
+    old_keyfile: &Path,
+    keyfile: &Path,
+    slot: Option<&str>,
+    opts: &ServerKeyOptions,
+    now: i64,
+) -> Result<(String, String, PathBuf)> {
+    use jig_core::key_link::{Audience, SignedKeyLink};
+    let open = |path: &Path, spec: Option<Spec>| -> Result<Zeroizing<[u8; 32]>> {
+        let path = sealed_path(path);
+        let key = read_jigkey(&path)?;
+        let opened = match spec {
+            Some(spec) => key.open(&[spec.offer()]).map_err(|e| match e {
+                KeystoreError::NoSlotOpened => ServerKeyError::DoesNotOpen {
+                    role: opts.role,
+                    path: path.clone(),
+                    slots: describe_slots(&key.slots()),
+                },
+                source => ServerKeyError::Keystore {
+                    path: path.clone(),
+                    source,
+                },
+            })?,
+            None => open_with(&key, &path, opts, Use::Operator)?,
+        };
+        let found = did_of(&opened.seed);
+        if found != key.did() {
+            return Err(ServerKeyError::WrongDid {
+                path,
+                claimed: key.did().to_string(),
+                found,
+            });
+        }
+        Ok(Zeroizing::new(*opened.seed))
+    };
+    let new_spec = slot
+        .map(|s| Spec::parse_reading(s, "--slot", Use::Operator, "JIG_KEY_NEW_PASSPHRASE"))
+        .transpose()?;
+    let old_seed = open(old_keyfile, None)?;
+    let new_seed = open(keyfile, new_spec)?;
+    let (old_did, new_did) = (did_of(&old_seed), did_of(&new_seed));
+    let link_path = key_link_path(keyfile);
+    if link_path.exists() {
+        return Err(ServerKeyError::Exists(link_path));
+    }
+    refuse_relink(&links_beside(&link_path)?, &old_did)?;
+    let link = SignedKeyLink::sign(
+        &SigningKey::from_bytes(&old_seed),
+        &SigningKey::from_bytes(&new_seed),
+        Audience::Public,
+        now,
+    )
+    .map_err(|e| ServerKeyError::BadLink {
+        path: link_path.clone(),
+        reason: e.to_string(),
+    })?;
+    let tmp = temporary(&link_path);
+    let staged = (|| {
+        write_new(&tmp, link.envelope())?;
+        same_owner(&tmp, &sealed_path(keyfile))?;
+        check_link_file(&tmp, &old_did, &new_did)?;
+        link_new(&tmp, &link_path).map(|_| ())
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    staged?;
+    sync_parent_dir(&link_path).map_err(|source| ServerKeyError::Io {
+        path: link_path.clone(),
+        source,
+    })?;
+    Ok((old_did, new_did, link_path))
+}
+
+/// The key links at `link_path` and at `<link_path>.N` beside it, each
+/// verified: a file there that does not verify is an error, not skipped.
+fn links_beside(link_path: &Path) -> Result<Vec<(PathBuf, jig_core::key_link::SignedKeyLink)>> {
+    let mut found = Vec::new();
+    let mut paths = vec![link_path.to_path_buf()];
+    paths.extend(
+        (1..)
+            .map(|n| archive_path(link_path, n))
+            .take_while(|p| p.exists()),
+    );
+    for path in paths {
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(ServerKeyError::Io { path, source }),
+        };
+        let link = jig_core::key_link::SignedKeyLink::from_envelope(&bytes).map_err(|e| {
+            ServerKeyError::BadLink {
+                path: path.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+        found.push((path, link));
+    }
+    Ok(found)
+}
+
+/// Refuse to link `old` again if one of `links` already leaves it.
+fn refuse_relink(links: &[(PathBuf, jig_core::key_link::SignedKeyLink)], old: &str) -> Result<()> {
+    match links.iter().find(|(_, l)| l.link().old == old) {
+        Some((path, _)) => Err(ServerKeyError::AlreadyLinked {
+            old: old.to_string(),
+            path: path.clone(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Read the link at `path` back and check it is public and moves `old` to
+/// `new`, as a booting server will.
+fn check_link_file(path: &Path, old: &str, new: &str) -> Result<()> {
+    let bytes = std::fs::read(path).map_err(|source| ServerKeyError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let bad = |reason: String| ServerKeyError::BadLink {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let link =
+        jig_core::key_link::SignedKeyLink::from_envelope(&bytes).map_err(|e| bad(e.to_string()))?;
+    let link = link.link();
+    if link.audience != jig_core::key_link::Audience::Public || link.old != old || link.new != new {
+        return Err(bad(
+            "it did not read back as the link just signed".to_string()
+        ));
+    }
+    Ok(())
+}
+
+/// `<stem>.retired-<last 8 of the DID>.jigkey` beside `sealed`.
+fn retired_path(sealed: &Path, did: &str) -> PathBuf {
+    let tail = &did[did.len().saturating_sub(8)..];
+    let stem = sealed
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    sealed.with_file_name(format!("{stem}.retired-{tail}.jigkey"))
+}
+
+fn archive_path(link_path: &Path, n: u32) -> PathBuf {
+    let mut name = link_path.as_os_str().to_owned();
+    name.push(format!(".{n}"));
+    PathBuf::from(name)
+}
+
+/// The first `<link_path>.N` that does not exist.
+fn next_archive(link_path: &Path) -> PathBuf {
+    (1..)
+        .map(|n| archive_path(link_path, n))
+        .find(|p| !p.exists())
+        .expect("some N is free")
+}
+
+/// Hard-link `from` to `to`, refusing an existing `to`. Returns `to`.
+fn link_new(from: &Path, to: &Path) -> Result<PathBuf> {
+    std::fs::hard_link(from, to).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            ServerKeyError::Exists(to.to_path_buf())
+        } else {
+            ServerKeyError::Io {
+                path: to.to_path_buf(),
+                source: e,
+            }
+        }
+    })?;
+    Ok(to.to_path_buf())
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn utc(secs: i64) -> String {
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| format!("{secs} (Unix seconds)"))
+}
+
 /// A `keys` subcommand of `jig-server` or `jig-nameserver`, apart from its
 /// argument parsing.
 pub enum KeysAction {
@@ -625,6 +1033,18 @@ pub enum KeysAction {
     },
     /// Check that one secret opens the key ([`verify`]).
     Verify { keyfile: PathBuf, slot: String },
+    /// Replace the key with a new one and link the old DID to it ([`rotate`]).
+    Rotate {
+        keyfile: PathBuf,
+        slots: Vec<String>,
+        replace_link: bool,
+    },
+    /// Link one sealed key's DID to another's ([`link`]).
+    Link {
+        old_keyfile: PathBuf,
+        keyfile: PathBuf,
+        slot: Option<String>,
+    },
 }
 
 /// Run `action`, returning what to print.
@@ -657,6 +1077,50 @@ pub fn run(action: KeysAction, opts: &ServerKeyOptions) -> Result<String> {
         KeysAction::Verify { keyfile, slot } => {
             let did = verify(&keyfile, &slot, opts)?;
             Ok(format!("{did}\nopened by that --slot"))
+        }
+        KeysAction::Rotate {
+            keyfile,
+            slots,
+            replace_link,
+        } => {
+            let done = rotate(&keyfile, &slots, replace_link, opts, unix_now())?;
+            let mut out = format!(
+                "rotated {} to {}\nsealed the new key into {}\nwrote the key link to {}\nkept \
+                 the old key, still sealed, as {}: move it offline, and keep it",
+                done.old_did,
+                done.new_did,
+                sealed_path(&keyfile).display(),
+                done.link.display(),
+                done.retired.display()
+            );
+            if let Some((archived, previous)) = &done.archived {
+                out.push_str(&format!(
+                    "\nkept the previous link as {}: clients still pinned on {previous} are \
+                     refused and must re-pin",
+                    archived.display()
+                ));
+            }
+            out.push_str(&format!(
+                "\nrestart the {} to sign as {}; until then it signs as {}",
+                opts.role, done.new_did, done.old_did
+            ));
+            if let Some(warning) =
+                single_slot_warning(opts.role, &read_jigkey(&sealed_path(&keyfile))?.slots())
+            {
+                out.push_str(&format!("\nwarning: {warning}"));
+            }
+            Ok(out)
+        }
+        KeysAction::Link {
+            old_keyfile,
+            keyfile,
+            slot,
+        } => {
+            let (old, new, path) = link(&old_keyfile, &keyfile, slot.as_deref(), opts, unix_now())?;
+            Ok(format!(
+                "linked {old} to {new}\nwrote the key link to {}",
+                path.display()
+            ))
         }
         KeysAction::Generate { keyfile, slots } => {
             let did = generate_sealed(&keyfile, &slots, opts.kdf)?;
@@ -1125,5 +1589,242 @@ mod tests {
             .err()
             .unwrap();
         assert!(!err.to_string().contains("hunter2"), "{err}");
+    }
+
+    /// A fresh credential secret in its own directory under `dir`.
+    fn credential_in(dir: &Path, name: &str) -> String {
+        let sub = dir.join(name);
+        std::fs::create_dir_all(&sub).unwrap();
+        credential_for_tests(&sub)
+    }
+
+    fn did_of_key(key: &SigningKey) -> String {
+        Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string()
+    }
+
+    #[test]
+    fn rotating_replaces_the_key_in_place_and_links_the_old_did_to_the_new() {
+        use jig_core::key_link::{Audience, SignedKeyLink};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.key");
+        let boot = credential_in(dir.path(), "boot");
+        let old = load_or_create(&path, &opts(Some(boot.clone()))).unwrap();
+        let next = credential_in(dir.path(), "next");
+
+        let done = rotate(
+            &path,
+            std::slice::from_ref(&next),
+            false,
+            &opts(Some(boot.clone())),
+            7,
+        )
+        .unwrap();
+        assert_eq!(done.old_did, did_of_key(&old));
+        assert!(done.archived.is_none());
+        assert_eq!(done.link, dir.path().join("server.key.link"));
+
+        // The configured path now opens to the new key, with the new slot.
+        let new = load_or_create(&path, &opts(Some(next.clone()))).unwrap();
+        assert_eq!(did_of_key(&new), done.new_did);
+        assert_ne!(done.new_did, done.old_did);
+        // The link verifies from the old DID to the new, for everyone.
+        let link = SignedKeyLink::from_envelope(&std::fs::read(&done.link).unwrap()).unwrap();
+        assert_eq!(
+            (link.link().old.as_str(), link.link().new.as_str()),
+            (done.old_did.as_str(), done.new_did.as_str())
+        );
+        assert_eq!(link.link().audience, Audience::Public);
+        assert_eq!(link.link().issued_at, 7);
+        // The old key is kept, sealed, and still opens with its own slot.
+        let retired = load_or_create(&done.retired, &opts(Some(boot))).unwrap();
+        assert_eq!(did_of_key(&retired), done.old_did);
+    }
+
+    #[test]
+    fn a_second_rotation_needs_replace_link_and_keeps_the_first_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.key");
+        let a = credential_in(dir.path(), "a");
+        load_or_create(&path, &opts(Some(a.clone()))).unwrap();
+        let b = credential_in(dir.path(), "b");
+        let first = rotate(&path, std::slice::from_ref(&b), false, &opts(Some(a)), 1).unwrap();
+
+        let c = credential_in(dir.path(), "c");
+        let refused = rotate(
+            &path,
+            std::slice::from_ref(&c),
+            false,
+            &opts(Some(b.clone())),
+            2,
+        )
+        .unwrap_err();
+        let ServerKeyError::Linked {
+            previous, since, ..
+        } = &refused
+        else {
+            panic!("{refused}");
+        };
+        assert_eq!(previous, &first.old_did);
+        assert!(since.starts_with("1970-01-01"), "{since}");
+        assert!(refused.to_string().contains("--replace-link"));
+        // Nothing moved.
+        assert_eq!(
+            did_of_key(&load_or_create(&path, &opts(Some(b.clone()))).unwrap()),
+            first.new_did
+        );
+
+        let first_link = std::fs::read(&first.link).unwrap();
+        let second = rotate(&path, std::slice::from_ref(&c), true, &opts(Some(b)), 2).unwrap();
+        assert_eq!(second.old_did, first.new_did);
+        let (archived, left) = second.archived.clone().unwrap();
+        assert_eq!(archived, dir.path().join("server.key.link.1"));
+        assert_eq!(left, first.old_did);
+        assert_eq!(std::fs::read(&archived).unwrap(), first_link);
+        assert_ne!(first.retired, second.retired);
+        assert!(first.retired.exists() && second.retired.exists());
+    }
+
+    #[test]
+    fn a_did_that_a_link_already_leaves_is_never_linked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.key");
+        let a = credential_in(dir.path(), "a");
+        load_or_create(&path, &opts(Some(a.clone()))).unwrap();
+        let b = credential_in(dir.path(), "b");
+        let first = rotate(
+            &path,
+            std::slice::from_ref(&b),
+            false,
+            &opts(Some(a.clone())),
+            1,
+        )
+        .unwrap();
+
+        // Link the retired key a second time, to another key made offline.
+        let other = dir.path().join("other.key");
+        generate_sealed(
+            &other,
+            std::slice::from_ref(&a),
+            KdfParams::insecure_for_tests(),
+        )
+        .unwrap();
+        // The link that left it, kept beside the other key as an earlier one.
+        std::fs::copy(&first.link, archive_path(&key_link_path(&other), 1)).unwrap();
+        let refused = link(&first.retired, &other, None, &opts(Some(a)), 2).unwrap_err();
+        assert!(
+            matches!(&refused, ServerKeyError::AlreadyLinked { old, .. } if *old == first.old_did),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn link_writes_beside_the_new_key_and_never_over_a_link() {
+        use jig_core::key_link::SignedKeyLink;
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old.key");
+        let old_cred = credential_in(dir.path(), "old");
+        let old_did = generate_sealed(
+            &old,
+            std::slice::from_ref(&old_cred),
+            KdfParams::insecure_for_tests(),
+        )
+        .unwrap();
+        let new = dir.path().join("new.key");
+        let new_cred = credential_in(dir.path(), "new");
+        let new_did = generate_sealed(
+            &new,
+            std::slice::from_ref(&new_cred),
+            KdfParams::insecure_for_tests(),
+        )
+        .unwrap();
+
+        // The new key opens only with its own slot.
+        assert!(matches!(
+            link(
+                &old,
+                &new,
+                Some(&old_cred),
+                &opts(Some(old_cred.clone())),
+                3
+            ),
+            Err(ServerKeyError::DoesNotOpen { .. })
+        ));
+        let (from, to, path) = link(
+            &old,
+            &new,
+            Some(&new_cred),
+            &opts(Some(old_cred.clone())),
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            (from.as_str(), to.as_str()),
+            (old_did.as_str(), new_did.as_str())
+        );
+        assert_eq!(path, dir.path().join("new.key.link"));
+        let link_read = SignedKeyLink::from_envelope(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(link_read.link().new, new_did);
+
+        assert!(matches!(
+            link(
+                &old,
+                &new,
+                Some(&new_cred),
+                &opts(Some(old_cred.clone())),
+                4
+            ),
+            Err(ServerKeyError::Exists(_))
+        ));
+        // A key never links to itself.
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            link(&old, &old, None, &opts(Some(old_cred)), 5),
+            Err(ServerKeyError::BadLink { .. })
+        ));
+    }
+
+    #[test]
+    fn a_rotation_that_cannot_keep_the_old_key_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.key");
+        let a = credential_in(dir.path(), "a");
+        let old = load_or_create(&path, &opts(Some(a.clone()))).unwrap();
+        let before = std::fs::read(sealed_path(&path)).unwrap();
+        // Something already holds the name the old key would be kept under.
+        let retired = retired_path(&sealed_path(&path), &did_of_key(&old));
+        std::fs::write(&retired, b"in the way").unwrap();
+
+        let b = credential_in(dir.path(), "b");
+        assert!(matches!(
+            rotate(&path, &[b], false, &opts(Some(a)), 1),
+            Err(ServerKeyError::Exists(p)) if p == retired
+        ));
+        assert_eq!(std::fs::read(sealed_path(&path)).unwrap(), before);
+        assert!(!key_link_path(&path).exists());
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn a_rotation_whose_new_key_does_not_open_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.key");
+        let a = credential_in(dir.path(), "a");
+        load_or_create(&path, &opts(Some(a.clone()))).unwrap();
+        let before = std::fs::read(sealed_path(&path)).unwrap();
+        // A passphrase for the new key reads JIG_KEY_NEW_PASSPHRASE, unset here.
+        let refused =
+            rotate(&path, &["passphrase".to_string()], false, &opts(Some(a)), 1).unwrap_err();
+        assert!(
+            refused.to_string().contains("JIG_KEY_NEW_PASSPHRASE"),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read(sealed_path(&path)).unwrap(), before);
+        assert!(!key_link_path(&path).exists());
     }
 }
