@@ -674,8 +674,8 @@ reputation, tribunal, transparency and federation) were removed:
 > suffix must not sit behind one: clients accept only the certificate its DID
 > vouches for, so serve it directly or behind TCP/SNI passthrough. A
 > passthrough proxy cannot add `x-forwarded-for`, so leave `trust_proxy` off
-> there; the limits then count the proxy's address, unless the proxy speaks
-> PROXY protocol, which the nameserver does not read. Limits are in memory and
+> there. Every client then shares the proxy's address and its limit: the
+> nameserver does not read PROXY protocol either. Limits are in memory and
 > reset when the nameserver restarts.
 
 Register, renew and rotate ask for proof-of-work only on a suffix whose
