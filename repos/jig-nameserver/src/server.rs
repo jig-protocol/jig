@@ -169,6 +169,7 @@ pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
         crate::v0_0_2_policy::Suffixes::from_config(&cfg.v0_0_2.nameserver)?,
     )?;
     v0_0_2_state.max_pending_challenges = cfg.alias_rate_limits.max_pending_challenges;
+    v0_0_2_state.network = cfg.network.clone();
     let v0_0_2_state = Arc::new(v0_0_2_state);
 
     // `merge` is safe here even though both halves register `/v1/challenge`:
