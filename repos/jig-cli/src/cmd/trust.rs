@@ -50,11 +50,25 @@ pub async fn server_tls(server: &str) -> Result<Config> {
     } else {
         let mut pins = Pins::load(&Pins::default_path())?;
         let expected = pins.offer(server).pinned_server_did;
-        let probed = probe(server, expected.as_deref())
-            .await
-            .map_err(|e| refusal(server, e))?;
-        if let Some(did) = &probed.server_did {
-            pins.check_server_did(server, did)?;
+        let probed = match probe(server, expected.as_deref()).await {
+            Ok(probed) => probed,
+            Err(e) => {
+                return Err(
+                    link_fork_in(&Pins::default_path(), server, &e)?.unwrap_or(refusal(server, e))
+                );
+            }
+        };
+        match (&probed.server_did, &probed.moved_from, &probed.key_link) {
+            (Some(did), Some(from), Some(link)) => {
+                pins.move_server(server, from, did, link)?;
+                // The DIDs are left out: `jig trust show` prints the pin.
+                eprintln!(
+                    "note: {server} moved to a new key, and both keys signed the move \
+                     (JEP-0012); this device's pin follows it. `jig trust show` shows it."
+                );
+            }
+            (Some(did), _, _) => pins.check_server_did(server, did)?,
+            _ => {}
         }
         probed.config
     };
@@ -212,6 +226,21 @@ fn keep_evidence_in(
     server: &str,
     c: &jig_client::connection::Contradiction,
 ) -> Result<Kept> {
+    let server_did = Pins::load(pins_path)?
+        .server(server)
+        .map(|p| p.server_did.clone())
+        .unwrap_or_default();
+    keep_bundle_in(pins_path, server, &server_did, c)
+}
+
+/// [`keep_evidence_in`], against `server_did`: the DID that signed the
+/// evidence, which a key-link fork shows is one the pin has left.
+fn keep_bundle_in(
+    pins_path: &std::path::Path,
+    server: &str,
+    server_did: &str,
+    c: &jig_client::connection::Contradiction,
+) -> Result<Kept> {
     use jig_client::evidence::{BUNDLE_FORMAT, Bundle, EvidenceStore, verify};
     let mut pins = Pins::load(pins_path)?;
     let pin = pins.server(server).cloned().unwrap_or_default();
@@ -233,7 +262,7 @@ fn keep_evidence_in(
         code: c.code.to_string(),
         reason: c.reason.clone(),
         server: server.to_string(),
-        server_did: pin.server_did.clone(),
+        server_did: server_did.to_string(),
         observed_at_ms: now_ms(),
         welcome: c.welcome.clone(),
         items: c.evidence.clone(),
@@ -254,6 +283,52 @@ fn keep_evidence_in(
         )?;
     }
     Ok(Kept { id, sticky })
+}
+
+/// A probe refused because `server` named another DID, when the key link it
+/// served forks one this pin moved along: the key that signed both is held by
+/// someone else, and neither link is to be trusted (JEP-0012). Kept as a
+/// bundle, and `server` is refused until its user accepts it again. `None`
+/// for any other refusal.
+fn link_fork_in(
+    pins_path: &std::path::Path,
+    server: &str,
+    e: &TlsError,
+) -> Result<Option<anyhow::Error>> {
+    let TlsError::OtherServer {
+        key_link: Some(presented),
+        ..
+    } = e
+    else {
+        return Ok(None);
+    };
+    let kept = Pins::load(pins_path)?
+        .server(server)
+        .map(|p| p.links.clone())
+        .unwrap_or_default();
+    let Some((signer, proof)) = jig_client::evidence::key_link_fork(&kept, presented) else {
+        return Ok(None);
+    };
+    let reason = format!(
+        "{signer}, a key {server} moved away from, signed a second key link to another DID; \
+         someone other than the server holds that key"
+    );
+    let c = jig_client::connection::Contradiction {
+        code: "key-link-fork",
+        reason: reason.clone(),
+        welcome: None,
+        evidence: vec![presented.clone()],
+        proof: Some(Box::new(proof)),
+    };
+    let kept = keep_bundle_in(pins_path, server, &signer, &c)?;
+    if !kept.sticky {
+        return Ok(None);
+    }
+    Ok(Some(anyhow::anyhow!(
+        "refusing {server}: {reason}. The evidence is `jig trust evidence show {}`. Every \
+         connection to it is refused until you run `jig trust accept {server}`",
+        kept.id
+    )))
 }
 
 /// The evidence store beside the pin store `pins_path`: `~/.jig/evidence`
@@ -454,6 +529,229 @@ pub fn live_contradiction(client: &jig_client::Client, server: &str) -> Option<a
     })
 }
 
+/// Hold `welcome` to the `server-manifest` it cites (JEP-0002 rule 12): fetch
+/// the block and its record, check that they are the server's and say what
+/// the welcome says ([`jig_client::manifest::check_cited`]), and hold the
+/// manifest log's chain to this device's pin of it. A manifest already
+/// checked is not fetched again. A welcome that cites none is let through
+/// with a warning: a server from before manifest logs has none.
+pub async fn check_manifest(
+    who: &jig_client::Identity,
+    server: &str,
+    welcome: &jig_client::manifest::VerifiedWelcome,
+) -> Result<()> {
+    check_manifest_in(&Pins::default_path(), who, server, welcome).await
+}
+
+async fn check_manifest_in(
+    pins_path: &std::path::Path,
+    who: &jig_client::Identity,
+    server: &str,
+    welcome: &jig_client::manifest::VerifiedWelcome,
+) -> Result<()> {
+    use jig_client::manifest::{LOG_SLUG, check_cited};
+    let Some(cited) = &welcome.manifest else {
+        eprintln!(
+            "warning: {server}'s welcome cites no manifest log entry, so its claims are not \
+             checked against one."
+        );
+        return Ok(());
+    };
+    let mut pins = Pins::load(pins_path)?;
+    if pins.server(server).and_then(|p| p.manifest.as_ref()) == Some(cited) {
+        return Ok(());
+    }
+    #[derive(serde::Deserialize)]
+    struct Served {
+        bundle_b64: String,
+        sig_b64: Option<String>,
+    }
+    let base = crate::cmd::channel::base_http_url(server);
+    let url = format!("{base}/api/v1/blocks/{}", cited.cid);
+    let proof = jig_client::read_auth::ReadProof::sign(
+        who,
+        "GET",
+        jig_client::read_auth::signable_path(&url),
+    );
+    let mut req = http(server, std::time::Duration::from_secs(10))
+        .await?
+        .get(&url);
+    for (name, value) in proof.headers() {
+        req = req.header(name, value);
+    }
+    let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "{server} did not serve the manifest its welcome cites: GET {url} returned {}",
+        resp.status()
+    );
+    let served: Served = resp
+        .json()
+        .await
+        .with_context(|| format!("decoding {url}"))?;
+    let record = fetch_records(who, server, LOG_SLUG, cited.seq, cited.seq + 1)
+        .await?
+        .into_iter()
+        .next()
+        .with_context(|| {
+            format!(
+                "{server} did not serve record {} of its manifest log",
+                cited.seq
+            )
+        })?;
+    let sig_b64 = served.sig_b64.unwrap_or_default();
+    match check_cited(welcome, cited, &served.bundle_b64, &sig_b64, &record) {
+        Ok(_) => {}
+        Err(e @ jig_client::manifest::ManifestCheck::Unproven(_)) => {
+            anyhow::bail!("{server}: {e}. Refusing to go on")
+        }
+        // Two things the server signed disagree: kept, and the server
+        // refused from now on.
+        Err(e @ jig_client::manifest::ManifestCheck::Contradicts(_)) => {
+            let c = jig_client::connection::Contradiction {
+                code: "manifest-contradiction",
+                reason: e.to_string(),
+                welcome: Some(welcome.evidence.clone()),
+                evidence: vec![],
+                proof: Some(Box::new(
+                    jig_client::evidence::Proof::ManifestContradiction {
+                        welcome: welcome.evidence.clone(),
+                        block: served.bundle_b64,
+                        sig: sig_b64,
+                        record,
+                    },
+                )),
+            };
+            let kept = keep_bundle_in(pins_path, server, &welcome.server_did, &c)?;
+            anyhow::bail!(
+                "{server}: {e}. Refusing to go on. The evidence is `jig trust evidence show {}`{}",
+                kept.id,
+                if kept.sticky {
+                    format!(
+                        "; every connection to it is refused until you run `jig trust accept \
+                         {server}`"
+                    )
+                } else {
+                    String::new()
+                }
+            )
+        }
+    }
+
+    // The log is a channel like any other: pinned at first sight, and held
+    // to its chain from then on.
+    pins.check_channel(
+        server,
+        LOG_SLUG,
+        jig_client::pins::ChannelPin {
+            create_cid: record.channel_id.clone(),
+            suite: "none".into(),
+            owner_did: welcome.server_did.clone(),
+            chain_head: None,
+        },
+    )?;
+    if let ChainCheck::Unfilled { from, to } =
+        check_chain_in(pins_path, who, server, LOG_SLUG, &[record]).await?
+    {
+        eprintln!(
+            "warning: {server} did not serve records {from}..{to} of its manifest log; the \
+             entries in between are not checked."
+        );
+    }
+    Pins::load(pins_path)?.set_manifest(server, cited)?;
+    Ok(())
+}
+
+/// `jig trust show <server>`: what this device pinned for `server`, and its
+/// manifest log, oldest entry first, each checked as the server's and the
+/// chain held to the pin.
+pub async fn show(who: &jig_client::Identity, server: &str) -> Result<()> {
+    use jig_client::manifest::{LOG_SLUG, read_entry};
+    let pins = Pins::load(&Pins::default_path())?;
+    let Some(pin) = pins.server(server).cloned() else {
+        println!("{server}: nothing pinned yet. Connect once to pin it.");
+        return Ok(());
+    };
+    println!("server:    {server}");
+    println!("DID:       {}", pin.server_did);
+    println!(
+        "suites:    {}",
+        pin.suites.iter().cloned().collect::<Vec<_>>().join(", ")
+    );
+    if let Some(m) = &pin.manifest {
+        println!(
+            "manifest:  {} (entry {} of its log, last checked)",
+            m.cid, m.seq
+        );
+    }
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        bundle_b64: String,
+        sig_b64: Option<String>,
+        ingest: Option<jig_client::chain::IngestRecord>,
+    }
+    let base = crate::cmd::channel::base_http_url(server);
+    let url = format!(
+        "{base}/api/v1/channels/{}/blocks?limit=200",
+        crate::cmd::channel::escape_slug_for_url(LOG_SLUG)
+    );
+    let proof = jig_client::read_auth::ReadProof::sign(
+        who,
+        "GET",
+        jig_client::read_auth::signable_path(&url),
+    );
+    let mut req = http(server, std::time::Duration::from_secs(10))
+        .await?
+        .get(&url);
+    for (name, value) in proof.headers() {
+        req = req.header(name, value);
+    }
+    let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "GET {url} returned {}",
+        resp.status()
+    );
+    let entries: Vec<Entry> = resp
+        .json()
+        .await
+        .with_context(|| format!("decoding {url}"))?;
+    let records: Vec<_> = entries.iter().filter_map(|e| e.ingest.clone()).collect();
+    if !records.is_empty() {
+        check_channel_chain(who, server, LOG_SLUG, &records).await?;
+    }
+    println!("manifest log ({LOG_SLUG}):");
+    for entry in &entries {
+        let seq = entry
+            .ingest
+            .as_ref()
+            .map_or("-".to_string(), |r| r.seq.to_string());
+        match read_entry(
+            &pin.server_did,
+            &entry.bundle_b64,
+            entry.sig_b64.as_deref().unwrap_or_default(),
+        ) {
+            Ok(Some((cid, doc))) => {
+                let caps = &doc.capabilities;
+                println!(
+                    "  {seq:>4}  {cid}\n        versions {:?}, suites {}, kinds {}, execution {}, \
+                     federation {}, skew bound {} ms, {} published peer(s)",
+                    doc.versions,
+                    doc.suites.join(", "),
+                    caps.block_kinds.join(", "),
+                    caps.execution,
+                    caps.federation,
+                    caps.max_future_skew_ms,
+                    doc.peer_policy.peers.len()
+                );
+            }
+            Ok(None) => println!("  {seq:>4}  (the log's creation)"),
+            Err(e) => println!("  {seq:>4}  NOT THE SERVER'S: {e}"),
+        }
+    }
+    Ok(())
+}
+
 /// Records `from..to` of `slug`, signed as `who`.
 async fn fetch_records(
     who: &jig_client::Identity,
@@ -617,6 +915,63 @@ mod tests {
             .channel(SERVER, "#ops")
             .and_then(|c| c.chain_head.as_ref())
             .map(|h| h.seq)
+    }
+
+    #[test]
+    fn a_link_forking_one_the_pin_followed_refuses_the_server() {
+        use base64::Engine as _;
+        use jig_core::key_link::{Audience, SignedKeyLink};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let server = "https://host:7117";
+        let new_key = jig_core::crypto::ed25519::generate_signing_key;
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let link = |a, b| {
+            base64::engine::general_purpose::STANDARD.encode(
+                SignedKeyLink::sign(a, b, Audience::Public, 1)
+                    .unwrap()
+                    .envelope(),
+            )
+        };
+        let (old, new, thief) = (new_key(), new_key(), new_key());
+        let mut pins = Pins::load(&path).unwrap();
+        pins.check_server_did(server, &did(&old)).unwrap();
+        pins.move_server(server, &did(&old), &did(&new), &link(&old, &new))
+            .unwrap();
+        let other = |key_link: Option<String>| TlsError::OtherServer {
+            server: server.into(),
+            expected: did(&new),
+            presented: did(&thief),
+            key_link,
+        };
+
+        // No link, or one that forks nothing followed: an ordinary refusal.
+        for e in [other(None), other(Some(link(&thief, &new)))] {
+            assert!(link_fork_in(&path, server, &e).unwrap().is_none());
+        }
+        assert!(Pins::load(&path).unwrap().refusal(server).is_none());
+
+        // The key the pin left, linked again to another DID.
+        let refused = link_fork_in(&path, server, &other(Some(link(&old, &thief))))
+            .unwrap()
+            .unwrap();
+        let sticky = Pins::load(&path).unwrap().refusal(server).cloned().unwrap();
+        assert!(refused.to_string().contains(&sticky.bundle), "{refused}");
+        let bundle = jig_client::evidence::EvidenceStore::new(&evidence_dir(&path))
+            .get(&sticky.bundle)
+            .unwrap();
+        assert_eq!(
+            (bundle.code.as_str(), bundle.server_did.clone()),
+            ("key-link-fork", did(&old))
+        );
+        assert!(
+            jig_client::evidence::verify(&bundle)
+                .unwrap()
+                .proven
+                .is_some()
+        );
     }
 
     #[tokio::test]

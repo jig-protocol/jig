@@ -33,17 +33,26 @@ impl Drop for Scratch {
     }
 }
 
+/// A new nameserver key at `key`, sealed to the test credential beside it,
+/// and the DID it signs as.
+fn new_did(key: &Path) -> String {
+    let unlock = jig_client::server_key::credential_for_tests(key.parent().unwrap());
+    jig_nameserver::v0_0_2::keygen(key, &[unlock]).unwrap()
+}
+
 /// Start a nameserver in `dir` with `extra` appended to its config, and
 /// return its DID and address.
 async fn start(dir: &Path, extra: &str) -> (String, std::net::SocketAddr) {
     let key = dir.join("ns.key");
-    let did = jig_nameserver::v0_0_2::keygen(&key).unwrap();
+    let did = new_did(&key);
+    let unlock = jig_client::server_key::credential_for_tests(dir);
     let path = dir.join("ns.toml");
     std::fs::write(
         &path,
         format!(
             "[storage]\ndatabase_path = {db:?}\n\n\
              [v0_0_2.server]\nserver_did_keyfile = {key:?}\n\n\
+             [v0_0_2.keys]\nunlock = {unlock:?}\n\n\
              [[v0_0_2.nameserver.alias_suffixes]]\nsuffix = \"names.example.org\"\n\n{extra}",
             db = dir.join("ns.db"),
         ),
@@ -105,7 +114,7 @@ async fn a_client_that_pins_the_nameservers_did_connects() {
 async fn a_client_that_pins_another_did_is_refused() {
     let dir = Scratch::new("other");
     let (_, addr) = start(&dir.0, "").await;
-    let other = jig_nameserver::v0_0_2::keygen(&dir.0.join("other.key")).unwrap();
+    let other = new_did(&dir.0.join("other.key"));
 
     let refused = probe_at(&format!("https://{addr}"), WELL_KNOWN, Some(&other)).await;
     assert!(
@@ -150,7 +159,7 @@ async fn a_nameserver_bound_to_any_listed_authority_is_accepted() {
     let dir = Scratch::new("bound");
     let (did, addr) = start(&dir.0, "").await;
     let base = format!("https://{addr}");
-    let other = jig_nameserver::v0_0_2::keygen(&dir.0.join("other.key")).unwrap();
+    let other = new_did(&dir.0.join("other.key"));
 
     // The lists are not paired with nameservers: any listed DID will do.
     let probed = probe_bound(&base, WELL_KNOWN, &[other, did.clone()])
@@ -174,7 +183,7 @@ async fn a_nameserver_bound_to_any_listed_authority_is_accepted() {
 async fn a_nameserver_bound_to_an_unlisted_did_is_refused() {
     let dir = Scratch::new("unlisted");
     let (_, addr) = start(&dir.0, "").await;
-    let listed = jig_nameserver::v0_0_2::keygen(&dir.0.join("listed.key")).unwrap();
+    let listed = new_did(&dir.0.join("listed.key"));
 
     let refused = probe_bound(&format!("https://{addr}"), WELL_KNOWN, &[listed]).await;
     assert!(

@@ -6,9 +6,9 @@
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
-    extract::{Query, State},
-    http::StatusCode,
+    Extension, Json, Router,
+    extract::{ConnectInfo, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header::RETRY_AFTER},
     routing::{get, post},
 };
 use base64::Engine as _;
@@ -55,9 +55,25 @@ pub struct ErrorBody {
     /// `GET /v1/challenge` returned it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pow_offer: Option<String>,
+    /// On `503 REGISTRATION_BUSY`: seconds until the pool's next token, also
+    /// sent as `Retry-After`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<u64>,
 }
 
 pub(crate) type ApiError = (StatusCode, Json<ErrorBody>);
+
+/// The connection's address, as `[network] trust_proxy` says to read it.
+pub(crate) type Peer = Option<Extension<ConnectInfo<std::net::SocketAddr>>>;
+
+/// The key penalties count the client of a request under.
+pub(crate) fn client_key(state: &AppState, headers: &HeaderMap, peer: &Peer) -> String {
+    crate::v0_0_2_rate_limit::client_key(
+        &state.network,
+        headers,
+        peer.as_ref().map(|Extension(c)| c),
+    )
+}
 
 pub(crate) fn err(status: StatusCode, code: &'static str, msg: impl Into<String>) -> ApiError {
     (
@@ -66,6 +82,7 @@ pub(crate) fn err(status: StatusCode, code: &'static str, msg: impl Into<String>
             code: code.to_string(),
             message: msg.into(),
             pow_offer: None,
+            retry_after: None,
         }),
     )
 }
@@ -594,6 +611,8 @@ fn busy() -> ApiError {
 /// on such a suffix it can only lead to `428 POW_REQUIRED`.
 pub async fn get_challenge(
     State(state): State<Arc<AppState>>,
+    peer: Peer,
+    headers: HeaderMap,
     Query(query): Query<ChallengeQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let action = query.action.as_deref().map(challenge_action).transpose()?;
@@ -646,7 +665,12 @@ pub async fn get_challenge(
             // and this is before any proof, so anyone could map a DID to its
             // name. Register refuses a second name once the DID has signed.
             refuse_taken(&state, &did, &alias).await?;
-            policy.register_effort(admission, &name.alias)
+            policy.register_effort(
+                admission,
+                &name.alias,
+                &did,
+                &client_key(&state, &headers, &peer),
+            )
         }
         _ => policy.renew_effort(),
     };
@@ -709,9 +733,92 @@ async fn refuse_taken(state: &AppState, did: &str, alias: &str) -> Result<(), Ap
     }
 }
 
-/// POST /v1/register
+/// A registration's hold on its challenge between the checks and the consume.
+/// Dropped, it gives the challenge back; after the consume that is a no-op.
+struct ChallengeClaim {
+    state: Arc<AppState>,
+    nonce: String,
+}
+
+impl ChallengeClaim {
+    async fn take(
+        state: &Arc<AppState>,
+        nonce: &str,
+        did: &str,
+        alias: &str,
+    ) -> Result<Self, ApiError> {
+        if state
+            .claim_challenge(nonce, did, alias, PowAction::NsRegister)
+            .await
+        {
+            Ok(Self {
+                state: state.clone(),
+                nonce: nonce.to_string(),
+            })
+        } else {
+            Err(challenge_unknown())
+        }
+    }
+
+    /// Give the claim up now, so the reply that follows finds the challenge
+    /// free again.
+    async fn release(mut self) {
+        let nonce = std::mem::take(&mut self.nonce);
+        self.state.release_challenge(&nonce).await;
+    }
+}
+
+impl Drop for ChallengeClaim {
+    fn drop(&mut self) {
+        if self.nonce.is_empty() {
+            return;
+        }
+        let (state, nonce) = (self.state.clone(), std::mem::take(&mut self.nonce));
+        tokio::spawn(async move { state.release_challenge(&nonce).await });
+    }
+}
+
+/// `503 REGISTRATION_BUSY`, with `Retry-After` until the pool's next token.
+fn registration_busy(busy: crate::v0_0_2_pow_policy::Busy) -> ApiError {
+    let (status, mut body) = err(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "REGISTRATION_BUSY",
+        format!(
+            "registrations on this suffix are at capacity; retry with a fresh challenge in {}s",
+            busy.retry_after
+        ),
+    );
+    body.retry_after = Some(busy.retry_after);
+    (status, body)
+}
+
+/// POST /v1/register. A refusal that names a `retry_after` carries it as
+/// `Retry-After` too.
 pub async fn register(
+    state: State<Arc<AppState>>,
+    peer: Peer,
+    headers: HeaderMap,
+    req: Json<RegisterReq>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    match register_request(state, peer, headers, req).await {
+        Ok(body) => body.into_response(),
+        Err((status, body)) => {
+            let retry_after = body.retry_after;
+            let mut resp = (status, body).into_response();
+            if let Some(secs) = retry_after {
+                resp.headers_mut()
+                    .insert(RETRY_AFTER, HeaderValue::from(secs));
+            }
+            resp
+        }
+    }
+}
+
+async fn register_request(
     State(state): State<Arc<AppState>>,
+    peer: Peer,
+    headers: HeaderMap,
     Json(req): Json<RegisterReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     validate_local_part(&req.requested_alias)?;
@@ -721,6 +828,7 @@ pub async fn register(
     let admission = policy
         .admit(&req.did, &name.alias)
         .map_err(|r| refused(r, policy))?;
+    let ip = client_key(&state, &headers, &peer);
     check_pow(
         &state,
         policy,
@@ -738,7 +846,13 @@ pub async fn register(
             proof: req.pow.as_ref(),
         },
     )
-    .await?;
+    .await
+    .inspect_err(|(status, _)| {
+        // Bad or short work costs the source address, never the DID it names.
+        if *status == StatusCode::BAD_REQUEST {
+            policy.market().penalize_ip(&ip);
+        }
+    })?;
 
     verify_action_proof(
         &state,
@@ -749,6 +863,31 @@ pub async fn register(
         &req.proof_of_control,
     )?;
     let reachability = parse_reachability(&req.did, req.reachability.as_deref())?;
+    // The DID signed for this name: a name held by another DID is now its
+    // attempt, charged to the (alias, DID) pair (JEP-0008 rule 26). Checked
+    // again after the consume below, since the store can change meanwhile.
+    refuse_taken(&state, &req.did, &alias)
+        .await
+        .inspect_err(|_| policy.market().penalize_pair(&name.alias, &req.did))?;
+    // Claim the challenge before a pool token is taken: replays of this
+    // proof, sent at once, find it claimed and take no token. The claim is
+    // given up if this request is refused or dropped before the consume.
+    let claim = ChallengeClaim::take(&state, &req.challenge, &req.did, &alias).await?;
+    // A stranger takes a pool token, or waits for one, before anything is
+    // consumed, so a busy refusal leaves the challenge usable.
+    if admission == Admission::Ordinary {
+        // The bid orders the queue, so it is only work that `check_pow`
+        // verified: a suffix that asks for none never looked at `req.pow`.
+        let bid = if policy.requires_pow() {
+            req.pow.as_ref().map_or(0, |p| p.effort.get())
+        } else {
+            0
+        };
+        if let Err(busy) = policy.market().admit(bid).await {
+            claim.release().await;
+            return Err(registration_busy(busy));
+        }
+    }
     consume_challenge(
         &state,
         &req.challenge,
@@ -1112,7 +1251,7 @@ mod tests {
         let alias = format!("dj@{}", state.suffix());
         let record = ReachabilityRecord::sign(
             &key,
-            vec![("did:jig:zserver".into(), "wss://example.org".into())],
+            vec![(fresh_did_and_key().0, "wss://example.org".into())],
             1,
         );
 

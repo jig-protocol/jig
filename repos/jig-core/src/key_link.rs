@@ -299,15 +299,11 @@ fn did_of(key: &SigningKey) -> String {
 }
 
 fn check_did(did: &str) -> Result<(), KeyLinkError> {
-    // `Did` parsing accepts any letter case, so compare against the spelling
-    // the key itself gives: one key, one string, for forks and audience matches.
-    let bytes = Did::from_did_jig_string(did)
-        .and_then(|d| d.as_bytes())
-        .map_err(|_| KeyLinkError::BadDid(did.into()))?;
-    if Did::from_ed25519_pubkey(&bytes).to_did_jig_string() != did {
-        return Err(KeyLinkError::BadDid(did.into()));
-    }
-    Ok(())
+    // Strict parsing refuses any spelling but the key's own: one key, one
+    // string, for forks and audience matches.
+    Did::from_did_jig_string(did)
+        .map(|_| ())
+        .map_err(|_| KeyLinkError::BadDid(did.into()))
 }
 
 fn text(map: &Value, key: &str) -> Result<String, KeyLinkError> {

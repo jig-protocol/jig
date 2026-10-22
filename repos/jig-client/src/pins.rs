@@ -126,6 +126,15 @@ pub struct ServerPin {
     /// both halves ([`crate::evidence::Proof::Downgrade`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub welcome: Option<String>,
+    /// The `server-manifest` this device last checked a welcome against
+    /// ([`crate::manifest`]); a welcome citing it needs no second check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<jig_pipeline::handshake::ManifestRef>,
+    /// The public key links this pin moved along, base64 as served, oldest
+    /// first: a later link out of one of their DIDs to another is a fork
+    /// ([`crate::evidence::key_link_fork`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<String>,
 }
 
 /// A server this device refuses until its user accepts it again, after it
@@ -209,6 +218,43 @@ fn read(path: &Path) -> Result<PinFile, PinError> {
     }
 }
 
+/// A store written before DIDs had to be canonical may hold a key-derived DID
+/// in another spelling. Such a pin is kept, not dropped or re-spelled: it
+/// now matches no DID, so whatever it guards is refused, as for a replaced
+/// key, and `jig server forget` clears it. Dropping it would turn the next
+/// use into a first use; this only says why the refusals are coming.
+fn warn_respelled(file: &PinFile) {
+    let respelled = |did: &str| {
+        matches!(
+            jig_core::Did::from_str_unchecked(did).as_bytes(),
+            Err(jig_core::DidError::NotLowercase)
+        )
+    };
+    for (server, pin) in &file.servers {
+        let dids =
+            std::iter::once(&pin.server_did).chain(pin.channels.values().map(|c| &c.owner_did));
+        for did in dids.filter(|d| respelled(d)) {
+            tracing::warn!(
+                "the pin for {server} holds a did:jig ({}) not in its canonical lowercase \
+                 spelling; it will be refused (`jig server forget {server}` clears it)",
+                jig_core::did::log_tag(did)
+            );
+        }
+    }
+    for entry in &file.names {
+        for did in [&entry.did, &entry.ns_did]
+            .into_iter()
+            .filter(|d| respelled(d))
+        {
+            tracing::warn!(
+                "a name pin holds a did:jig ({}) not in its canonical lowercase spelling; \
+                 the name will be refused",
+                jig_core::did::log_tag(did)
+            );
+        }
+    }
+}
+
 /// File servers pinned while the URL scheme was part of the key under the
 /// key [`server_key`] gives them now. Returns whether any moved.
 fn rekey(file: &mut PinFile) -> bool {
@@ -247,6 +293,7 @@ impl Pins {
             path: path.to_path_buf(),
             file: read(path)?,
         };
+        warn_respelled(&pins.file);
         // Stores written while the scheme was part of the key are saved
         // rekeyed, under the lock like any other change.
         if rekey(&mut pins.file) {
@@ -329,6 +376,54 @@ impl Pins {
                 });
             }
             Ok(((), false))
+        })
+    }
+
+    /// Move `server`'s pin from `from` to `to` along `key_link` (base64, as
+    /// served), which must be a public link the pinned key signed to `to`
+    /// (JEP-0012). Checked here, whoever calls: a pin moves only along a link
+    /// that verifies from it. Its channel pins stay; they name channels, not
+    /// keys.
+    pub fn move_server(
+        &mut self,
+        server: &str,
+        from: &str,
+        to: &str,
+        key_link: &str,
+    ) -> Result<(), PinError> {
+        self.update(|file| {
+            let pin = file.servers.entry(server_key(server)).or_default();
+            let replaced = || PinError::ServerReplaced {
+                server: server.to_string(),
+                pinned: pin.server_did.clone(),
+                presented: to.to_string(),
+            };
+            if !jig_pipeline::handshake::same_did(&pin.server_did, from)
+                || jig_pipeline::handshake::link_moves(key_link, &pin.server_did, to).is_err()
+            {
+                return Err(replaced());
+            }
+            pin.server_did = to.to_string();
+            pin.links.push(key_link.to_string());
+            // The old key signed these, so they show nothing about the new
+            // one: the next welcome is checked against its manifest afresh.
+            pin.welcome = None;
+            pin.manifest = None;
+            Ok(((), true))
+        })
+    }
+
+    /// Record that `server`'s welcome was checked against `manifest`.
+    pub fn set_manifest(
+        &mut self,
+        server: &str,
+        manifest: &jig_pipeline::handshake::ManifestRef,
+    ) -> Result<(), PinError> {
+        self.update(|file| {
+            let pin = file.servers.entry(server_key(server)).or_default();
+            let changed = pin.manifest.as_ref() != Some(manifest);
+            pin.manifest = Some(manifest.clone());
+            Ok(((), changed))
         })
     }
 
@@ -671,6 +766,8 @@ mod tests {
             server_nonce: String::new(),
             tls_exporter: Vec::new(),
             manifest: None,
+            admit: None,
+            moved_from: None,
             evidence: String::new(),
         }
     }
@@ -1033,6 +1130,56 @@ mod tests {
         assert_eq!(pins.accept_server(server).unwrap().unwrap().bundle, "a");
         assert!(Pins::load(&path).unwrap().refusal(server).is_none());
         assert_eq!(pins.accept_server(server).unwrap(), None);
+    }
+
+    #[test]
+    fn a_server_pin_moves_only_along_a_link_from_the_pinned_key() {
+        use base64::Engine as _;
+        use jig_core::key_link::{Audience, SignedKeyLink};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let server = "https://host:7117";
+        let key = jig_core::crypto::ed25519::generate_signing_key;
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let (old, new, stranger) = (key(), key(), key());
+        let link = |a, b| {
+            base64::engine::general_purpose::STANDARD.encode(
+                SignedKeyLink::sign(a, b, Audience::Public, 1)
+                    .unwrap()
+                    .envelope(),
+            )
+        };
+        let mut pins = Pins::load(&path).unwrap();
+        pins.check_server_did(server, &did(&old)).unwrap();
+        let mut signed_by_old = welcome(&did(&old), &["none"]);
+        signed_by_old.evidence = "the old key's welcome".into();
+        pins.check_welcome(server, &signed_by_old).unwrap();
+
+        // From a key nobody pinned, or claiming to leave one it does not.
+        for (from, link) in [
+            (did(&stranger), link(&stranger, &new)),
+            (did(&old), link(&stranger, &new)),
+        ] {
+            assert!(matches!(
+                pins.move_server(server, &from, &did(&new), &link),
+                Err(PinError::ServerReplaced { .. })
+            ));
+        }
+        assert_eq!(pins.server(server).unwrap().server_did, did(&old));
+
+        pins.move_server(server, &did(&old), &did(&new), &link(&old, &new))
+            .unwrap();
+        let pins = Pins::load(&path).unwrap();
+        assert_eq!(pins.server(server).unwrap().server_did, did(&new));
+        assert_eq!(pins.server(server).unwrap().links, [link(&old, &new)]);
+        assert_eq!(
+            pins.server(server).unwrap().welcome,
+            None,
+            "a welcome the old key signed is not kept as the new key's"
+        );
+        assert_eq!(pins.server(server).unwrap().manifest, None);
     }
 
     #[test]

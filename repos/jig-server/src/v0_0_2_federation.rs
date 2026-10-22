@@ -157,7 +157,12 @@ static FED_SUBSCRIBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// reconnect loop and persists across the server's lifetime.
 pub fn spawn_federation_peers(state: Arc<AppState>) {
     let peers = state.config.federation.peers.clone();
-    for peer in peers {
+    for mut peer in peers {
+        // An operator typed `expected_did`, so it may be in any letter case;
+        // the welcome, the TLS binding and ingest compare the one spelling.
+        if let Ok(did) = jig_core::Did::canonicalize(&peer.expected_did) {
+            peer.expected_did = did.to_did_jig_string();
+        }
         // `AppState` refuses this at boot; repeated so no caller can spawn
         // a plaintext dialer the operator did not opt into.
         if let Err(reason) = check_peer_transport(&peer, &state.config.federation) {
@@ -287,6 +292,17 @@ where
     };
     match pending.interpret_on(&text, tls_exporter) {
         HandshakeResult::Established(welcome) => {
+            // A peer is listed by DID, and that DID is what lets it
+            // subscribe here and what its blocks are attributed to, so a
+            // moved peer is not federated with under two DIDs: its
+            // operator lists the new one.
+            if let Some(from) = &welcome.moved_from {
+                anyhow::bail!(
+                    "the peer moved its key from {from} to {} along a public link both keys \
+                     signed; set its expected_did to the new DID to federate with it",
+                    welcome.server_did
+                );
+            }
             if let Some(key) = key {
                 let proof =
                     jig_pipeline::handshake::peer_proof(key, &hello_text, &text, tls_exporter);
@@ -721,6 +737,8 @@ mod tests {
             url: "ws://127.0.0.1:1".to_string(),
             expected_did: jig_core::Did::from_ed25519_pubkey(&[9u8; 32]).to_did_jig_string(),
             alias: None,
+            publish: false,
+            quota: None,
         }
     }
 
@@ -865,6 +883,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         };
 
         // Build a fake block bundle in the same (manifest_bytes, code_bytes) shape
@@ -942,6 +962,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         };
 
         // A managed (bridge-owned) DID is a member of open channel "#dm/x". Channels
@@ -1047,6 +1069,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         };
         for (slug, visibility, suite) in [
             ("#private", "restricted", "none"),
@@ -1117,6 +1141,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         };
 
         // Alice signs; manifest claims bob as author. Sig verifies against
@@ -1176,6 +1202,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         };
 
         let secret: [u8; 32] = rand::random();
@@ -1222,6 +1250,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         };
         let secret: [u8; 32] = rand::random();
         let key = SigningKey::from_bytes(&secret);
@@ -1310,6 +1340,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         }
     }
 

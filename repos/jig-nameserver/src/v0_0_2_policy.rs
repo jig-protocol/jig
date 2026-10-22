@@ -5,7 +5,13 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
-use jig_config::v0_0_2_server::{NameserverSection, PowPolicy, Registration, SuffixConfig};
+use std::sync::Arc;
+
+use jig_config::v0_0_2_server::{
+    NameserverSection, PoolPolicy, PowPolicy, Registration, SuffixConfig,
+};
+
+use crate::v0_0_2_pow_policy::Market;
 
 /// Digests a second the slowest client a suffix means to serve is assumed to
 /// manage: the one server core `jig-core`'s `benches/pow.rs` measured. Boot
@@ -30,6 +36,8 @@ pub struct SuffixPolicy {
     /// Lowercased alias → the one DID that may register it past the policy.
     allow: HashMap<String, String>,
     pow: PowPolicy,
+    /// The stranger pool, the effort controller and penalties.
+    market: Arc<Market>,
 }
 
 /// Why a registration was refused by policy, before any proof is checked
@@ -132,7 +140,16 @@ impl SuffixPolicy {
             reserved_affixes: cfg.reserved_affixes.iter().map(|w| fold(w)).collect(),
             allow,
             pow: checked_pow(&cfg.suffix, &cfg.pow)?,
+            market: Arc::new(Market::new(
+                cfg.pow.clone(),
+                checked_pool(&cfg.suffix, &cfg.pool, &cfg.pow)?,
+            )),
         })
+    }
+
+    /// This suffix's pool, controller and penalties.
+    pub fn market(&self) -> &Market {
+        &self.market
     }
 
     /// Whether register, renew and rotate on this suffix carry proof-of-work.
@@ -140,21 +157,15 @@ impl SuffixPolicy {
         self.pow.min_effort > 0
     }
 
-    /// The effort a registration of the lowercased local part `alias` is
-    /// asked for. An allowlisted one pays `min_effort` and nothing for length
-    /// (R1 decision 3); an ordinary one pays `min_effort` ×
-    /// `short_name_factor`^(`short_name_len` − length), up to `max_effort`.
-    pub fn register_effort(&self, admission: Admission, alias: &str) -> u64 {
-        let p = &self.pow;
-        if p.min_effort == 0 || admission == Admission::Allowlisted {
-            return p.min_effort;
+    /// The effort a registration of the lowercased local part `alias` by
+    /// `did` from `ip` is asked for. An allowlisted one pays `min_effort`
+    /// (R1 decision 3); an ordinary one what the [`Market`] prices: the
+    /// controller's suggestion, the length multiplier and penalties.
+    pub fn register_effort(&self, admission: Admission, alias: &str, did: &str, ip: &str) -> u64 {
+        if admission == Admission::Allowlisted {
+            return self.pow.min_effort;
         }
-        let short_by = p.short_name_len.saturating_sub(alias.chars().count());
-        let factor = p
-            .short_name_factor
-            .checked_pow(u32::try_from(short_by).unwrap_or(u32::MAX))
-            .unwrap_or(u64::MAX);
-        p.min_effort.saturating_mul(factor).min(p.max_effort)
+        self.market.register_effort(alias, did, ip)
     }
 
     /// What renew and rotate by the holder pay (JEP-0008 rule 31). `0` when
@@ -269,6 +280,42 @@ fn checked_pow(suffix: &str, pow: &PowPolicy) -> Result<PowPolicy> {
         bail!("suffix `{suffix}`: pow.short_name_factor must be at least 1");
     }
     Ok(pow.clone())
+}
+
+/// Check a suffix's `pool` table when it is on.
+///
+/// A queued registration still has to consume its challenge, so the longest
+/// solve plus the longest wait must fit the challenge's lifetime. Bounding
+/// the wait here also keeps `Market::admit`'s deadline arithmetic in range.
+fn checked_pool(suffix: &str, pool: &PoolPolicy, pow: &PowPolicy) -> Result<PoolPolicy> {
+    if pool.enabled {
+        let ttl = crate::v0_0_2::DEFAULT_CHALLENGE_TTL.as_secs();
+        let solve = if pow.min_effort == 0 {
+            0
+        } else {
+            pow.max_solve_secs
+        };
+        if solve.saturating_add(pool.queue_wait_secs) > ttl {
+            bail!(
+                "suffix `{suffix}`: pow.max_solve_secs {solve} plus pool.queue_wait_secs {} \
+                 must be at most the challenge lifetime of {ttl} s, or a queued registration \
+                 outlives its challenge",
+                pool.queue_wait_secs
+            );
+        }
+    }
+    if pool.enabled
+        && (pool.strangers_per_hour == 0
+            || pool.burst == 0
+            || pool.queue_len == 0
+            || pool.controller_window_secs == 0)
+    {
+        bail!(
+            "suffix `{suffix}`: pool.strangers_per_hour, burst, queue_len and \
+             controller_window_secs must each be at least 1"
+        );
+    }
+    Ok(pool.clone())
 }
 
 /// Drop separators and fold digit lookalikes: `0→o`, `3→e`, `4→a`, `5→s`,
@@ -405,6 +452,38 @@ mod tests {
     }
 
     /// A `pow` table that cannot work stops the boot.
+    #[test]
+    fn a_queue_wait_that_outlives_the_challenge_is_refused_at_boot() {
+        let with = |min_effort: u64, queue_wait_secs: u64| {
+            let mut cfg = SuffixConfig::new("names.example.org");
+            cfg.pow = PowPolicy {
+                min_effort,
+                ..PowPolicy::recommended()
+            };
+            cfg.pool = PoolPolicy {
+                queue_wait_secs,
+                ..PoolPolicy::recommended()
+            };
+            SuffixPolicy::from_config(&cfg)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        assert!(with(1 << 20, 10).is_ok(), "the recommended values boot");
+        // 10 s to solve plus 51 s queued is past the 60 s challenge.
+        assert!(with(1 << 20, 51).unwrap_err().contains("queue_wait_secs"));
+        assert!(with(1 << 20, 50).is_ok());
+        // With no work asked, the whole lifetime is the queue's.
+        assert!(with(0, 60).is_ok());
+        assert!(with(0, 61).unwrap_err().contains("queue_wait_secs"));
+        // A wait that would overflow the admit deadline never boots.
+        assert!(with(0, u64::MAX).unwrap_err().contains("queue_wait_secs"));
+        // A pool that is off is not checked.
+        let mut cfg = SuffixConfig::new("names.example.org");
+        cfg.pool.enabled = false;
+        cfg.pool.queue_wait_secs = u64::MAX;
+        assert!(SuffixPolicy::from_config(&cfg).is_ok());
+    }
+
     #[test]
     fn a_pow_table_that_cannot_work_is_refused_at_boot() {
         let with = |edit: fn(&mut PowPolicy)| {
