@@ -1,7 +1,6 @@
 use clap::Parser;
 use hdrhistogram::Histogram;
-use jig_nameserver::storage::NamesStorage;
-use jig_nameserver::{NameServerConfig, server::app_router, storage::MemoryStorage};
+use jig_nameserver::{NameServerConfig, server::app_router};
 use pprof::ProfilerGuardBuilder;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -187,12 +186,8 @@ async fn main() -> anyhow::Result<()> {
 
 async fn start_inproc_server() -> anyhow::Result<(String, JoinHandle<()>)> {
     let cfg = NameServerConfig::default();
-    let storage: Arc<dyn NamesStorage> = Arc::new(MemoryStorage::default());
     let app = app_router(jig_nameserver::server::AppState {
         cfg: cfg.clone(),
-        storage,
-        ns_id: "perf".into(),
-        ns_pubkey_hex: String::new(),
         server_did: None,
         tls_binding: Default::default(),
     });

@@ -2,8 +2,6 @@
 
 use crate::config::NameServerConfig;
 use crate::error::{NameServerError, Result};
-use crate::identity::{get_or_create as ns_get_or_create, ns_id_from_pubkey};
-use crate::storage::{MemoryStorage, NamesStorage, SqliteStorage};
 use axum::{Json, Router, extract::State, routing::get};
 use hyper_util::rt::TokioIo;
 use jig_core::tls_binding::TlsBinding;
@@ -14,30 +12,15 @@ use tokio::net::TcpListener;
 use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
 use tower::ServiceExt as _; // oneshot
 
+#[derive(Clone)]
 pub struct AppState {
     pub cfg: NameServerConfig,
-    pub storage: Arc<dyn NamesStorage>,
-    pub ns_id: String,
-    pub ns_pubkey_hex: String,
     /// The v0.0.2 DID: it signs every attestation and vouches for the TLS
     /// certificate.
     pub server_did: Option<String>,
     /// The DID's word for the listener's certificate, set when TLS starts.
     /// Empty over plaintext.
     pub tls_binding: Arc<OnceLock<TlsBinding>>,
-}
-
-impl Clone for AppState {
-    fn clone(&self) -> Self {
-        Self {
-            cfg: self.cfg.clone(),
-            storage: Arc::clone(&self.storage),
-            ns_id: self.ns_id.clone(),
-            ns_pubkey_hex: self.ns_pubkey_hex.clone(),
-            server_did: self.server_did.clone(),
-            tls_binding: Arc::clone(&self.tls_binding),
-        }
-    }
 }
 
 pub fn app_router(state: AppState) -> Router {
@@ -51,7 +34,6 @@ pub fn app_router(state: AppState) -> Router {
 #[derive(Serialize)]
 struct WellKnownNsInfo {
     version: String,
-    ns_id: String,
     endpoints: serde_json::Value,
     policy: serde_json::Value,
     /// With `tls_binding`, what `jig_client::tls::probe_at` checks a
@@ -65,7 +47,6 @@ struct WellKnownNsInfo {
 }
 
 async fn well_known(State(state): State<AppState>) -> Result<Json<WellKnownNsInfo>> {
-    let ns_id = state.ns_id.clone();
     let endpoints = serde_json::json!({
         "health": "/v1/health",
     });
@@ -85,11 +66,9 @@ async fn well_known(State(state): State<AppState>) -> Result<Json<WellKnownNsInf
             "human_review_window_secs": state.cfg.automation.human_review_window_secs,
         },
         "reputation": state.cfg.reputation.clone(),
-        "public_key": state.ns_pubkey_hex,
     });
     Ok(Json(WellKnownNsInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        ns_id,
         endpoints,
         policy,
         server_did: state.server_did.clone(),
@@ -151,10 +130,12 @@ pub fn resolve_v0_0_2_keyfile(cfg: &NameServerConfig) -> String {
         .into_owned()
 }
 
-/// Alias attestations live in `jig_pipeline::persist::SqliteStore`, a different
-/// database from the legacy `SqliteStorage`. Derive it as a sibling of the
-/// configured DB so a one-line deploy needs no extra path (mirrors the
-/// `_v002.db` convention in jig-server's `main.rs`).
+/// The alias store (`jig_pipeline::persist::SqliteStore`) and the signing key
+/// are derived as siblings of `[storage] database_path`, so a one-line deploy
+/// needs no extra path (mirrors the `_v002.db` convention in jig-server's
+/// `main.rs`). Nothing opens `database_path` itself any more: it only anchors
+/// these names.
+// TODO(v0.3): replace the anchor with a `data_dir`.
 fn db_sibling(database_path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     let stem = database_path
         .file_stem()
@@ -177,20 +158,6 @@ pub fn build_app(cfg: &NameServerConfig) -> Result<Router> {
 
 /// [`build_app`] plus the v0.0.2 state — see [`NameServerApp`].
 pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
-    // Prefer persistent SQLite storage using configured DB path
-    let storage: Arc<dyn NamesStorage> = match SqliteStorage::new(cfg.storage.database_path.clone())
-    {
-        Ok(sqlite) => Arc::new(sqlite),
-        Err(e) => {
-            tracing::warn!("sqlite init failed ({}), falling back to memory storage", e);
-            Arc::new(MemoryStorage::default())
-        }
-    };
-    // Initialize nameserver identity (ed25519)
-    let ns_identity = ns_get_or_create(&cfg.storage.database_path)?;
-    let ns_pubkey_hex = hex::encode(ns_identity.public_key.as_bytes());
-    let ns_id = ns_id_from_pubkey(&ns_identity.public_key);
-
     let mut v0_0_2_cfg = cfg.v0_0_2.clone();
     v0_0_2_cfg.server.server_did_keyfile = resolve_v0_0_2_keyfile(cfg);
     let mut v0_0_2_state = crate::v0_0_2::AppState::new(
@@ -205,9 +172,6 @@ pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
     let tls_binding = Arc::new(OnceLock::new());
     let state = AppState {
         cfg: cfg.clone(),
-        storage,
-        ns_id,
-        ns_pubkey_hex,
         server_did: Some(v0_0_2_state.ns_did_string()),
         tls_binding: Arc::clone(&tls_binding),
     };
@@ -459,9 +423,6 @@ mod tests {
         let cfg = NameServerConfig::default();
         let router = app_router(AppState {
             cfg,
-            storage: Arc::new(MemoryStorage::default()),
-            ns_id: "test".into(),
-            ns_pubkey_hex: String::new(),
             server_did: None,
             tls_binding: Default::default(),
         });
@@ -649,19 +610,28 @@ mod tests {
         let policy = body["policy"].as_object().expect("policy object");
         let mut keys: Vec<&str> = policy.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(
-            keys,
-            [
-                "alias_rate_limits",
-                "automation",
-                "public_key",
-                "reputation",
-            ]
-        );
+        assert_eq!(keys, ["alias_rate_limits", "automation", "reputation"]);
         assert_eq!(
             policy["alias_rate_limits"],
             serde_json::json!({ "enabled": true, "per_ip_per_min": 7, "per_did_per_min": 3 })
         );
+        // The legacy identity is gone: the nameserver is known by its DID only.
+        assert!(body.get("ns_id").is_none(), "{body}");
+    }
+
+    /// `[storage] database_path` only anchors the v0.0.2 file names. Nothing
+    /// creates the legacy registry, whose `ns_identity` row held a raw key.
+    #[tokio::test]
+    async fn build_app_creates_no_legacy_database() {
+        let dir = ScratchDir::new("no-legacy-db");
+        let cfg = scratch_config(&dir, "dj.jig");
+        let _router = build_app(&cfg).expect("build_app");
+        assert!(
+            !cfg.storage.database_path.exists(),
+            "{} was created",
+            cfg.storage.database_path.display()
+        );
+        assert!(db_sibling(&cfg.storage.database_path, "_v002.db").exists());
     }
 
     async fn post_json(router: &Router, uri: &str, body: serde_json::Value) -> Response<Body> {

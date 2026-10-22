@@ -633,14 +633,17 @@ removed, including the host-penalty ledger (`GET /v1/hosts/{did}/penalties`). Kn
 
 A nameserver publishes its policy at three paths:
 
-- **`GET /.well-known/jig-ns`** (JSON): `version`, `ns_id` (BLAKE3 of the nameserver's
-  public key, hex), `endpoints`, and `policy` with `pow` (`base`, `min`, `max`,
+- **`GET /.well-known/jig-ns`** (JSON): `version`, `endpoints`, and `policy` with `pow` (`base`, `min`, `max`,
   `anonymous_min`) *(not served: removed in #192)*, `rate_limit` (`per_key_per_min`,
   `per_ip_per_min`, `global_per_min`) *(not served: replaced by `alias_rate_limits` in #197)*,
   `alias_rate_limits` (`enabled`, `per_ip_per_min`, `per_did_per_min`; the limits the alias
-  routes enforce), `automation` (legacy; nothing enforces it), `reputation` and
-  `public_key`. `allow_domains`, `deny_domains` and `cache_ttl_secs` are no longer served
-  (removed with nameserver federation, #237).
+  routes enforce), `automation` (legacy; nothing enforces it) and `reputation`.
+  `allow_domains`, `deny_domains` and `cache_ttl_secs` are no longer served (removed with
+  nameserver federation, #237). `ns_id` and `policy.public_key`, which named a second,
+  legacy nameserver key, are no longer served (#259): a nameserver has one identity, its
+  `ns_did`. Where the document carries `server_did`, that is the same DID, the one its TLS
+  certificate is bound to. The document is unsigned, so `server_did` is a hint only: clients
+  authenticate a nameserver by its TLS binding and the suffix's delegation.
 - **`GET /.well-known/jig-ns/capabilities`** (plain text): `version`, optional `domain`,
   one `work:` line per useful-work type, `tribunal:`, `transparency:` and `federation:`
   (`enabled` or `disabled`), and optional `affordance:` lines.

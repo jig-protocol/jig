@@ -142,6 +142,10 @@ const REMOVED_KEYS: &[(&str, &str)] = &[
     ("anomaly_detection", "the anomaly detector was removed"),
     ("hot", "the hot-state backends were removed"),
     ("federation", "nameserver federation was removed"),
+    (
+        "capabilities.federation_enabled",
+        "nameserver federation was removed",
+    ),
     ("storage.backend", "only SQLite storage remains"),
     ("storage.backend_config", "only SQLite storage remains"),
     ("analytics.backend", "only SQLite analytics remain"),
@@ -963,7 +967,6 @@ pub struct CapabilitiesConfig {
     pub useful_work_types: Vec<String>,
     pub tribunal_enabled: bool,
     pub transparency_enabled: bool,
-    pub federation_enabled: bool,
     #[serde(default)]
     pub affordances: Vec<String>, // Phase C: e.g. ["email.delivered", "bridge.forwarded"]
 }
@@ -980,7 +983,6 @@ impl Default for CapabilitiesConfig {
             ],
             tribunal_enabled: true,
             transparency_enabled: true,
-            federation_enabled: false,
             affordances: Vec::new(),
         }
     }
@@ -1025,10 +1027,6 @@ impl CapabilitiesConfig {
             records.push("jig-ns=transparency:enabled".into());
         }
 
-        if self.federation_enabled {
-            records.push("jig-ns=federation:enabled".into());
-        }
-
         // Phase C: Add affordances if present
         if !self.affordances.is_empty() {
             records.push(format!("jig-ns=affordances:{}", self.affordances.join(",")));
@@ -1067,14 +1065,6 @@ impl CapabilitiesConfig {
         lines.push(format!(
             "transparency: {}",
             if self.transparency_enabled {
-                "enabled"
-            } else {
-                "disabled"
-            }
-        ));
-        lines.push(format!(
-            "federation: {}",
-            if self.federation_enabled {
                 "enabled"
             } else {
                 "disabled"
@@ -1187,6 +1177,8 @@ trust_proxy = false
 proxy_ip_header = "x-forwarded-for"
 
 [storage]
+# Names where the nameserver keeps <stem>_v002.db (aliases) and <stem>_v002.key
+# (its signing key). The file itself is never created.
 database_path = "~/.jig/nameserver.db"
 
 # TLS, on by default. With neither path set, the nameserver makes a self-signed
@@ -1274,7 +1266,6 @@ version = "v1"
 useful_work_types = ["validate_block", "verify_observation", "audit_ruleset"]
 tribunal_enabled = true
 transparency_enabled = true
-federation_enabled = false
 
 # Phase F: Analytics configuration
 [analytics]
@@ -1475,7 +1466,6 @@ domain = "test.example.com"
 useful_work_types = ["custom"]
 tribunal_enabled = false
 transparency_enabled = true
-federation_enabled = true
 "#;
         let cfg: CapabilitiesConfig = toml::from_str(doc).unwrap();
 
@@ -1484,7 +1474,6 @@ federation_enabled = true
         assert_eq!(cfg.useful_work_types, vec!["custom"]);
         assert!(!cfg.tribunal_enabled);
         assert!(cfg.transparency_enabled);
-        assert!(cfg.federation_enabled);
     }
 
     #[test]
@@ -1493,7 +1482,6 @@ federation_enabled = true
         assert_eq!(cfg.capabilities.version, "v1");
         assert!(cfg.capabilities.tribunal_enabled);
         assert!(cfg.capabilities.transparency_enabled);
-        assert!(!cfg.capabilities.federation_enabled);
     }
 
     // --- [v0_0_2] alias-API section ----------------------------------------
