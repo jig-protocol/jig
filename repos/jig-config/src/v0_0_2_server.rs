@@ -649,8 +649,9 @@ pub struct SuffixConfig {
 /// the allowlist does not name are admitted, however much work they bring
 /// (R1 decision 2), and how effort follows the demand.
 ///
-/// Off by default until the client handles `503 REGISTRATION_BUSY` (R1 slice
-/// 2); [`PoolPolicy::recommended`] is the opening value for `@jig`.
+/// On by default at [`PoolPolicy::recommended`], the opening value for `@jig`:
+/// `jig` waits out `503 REGISTRATION_BUSY` and retries (R1 slice 2).
+/// [`PoolPolicy::off`] admits every stranger.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PoolPolicy {
@@ -681,17 +682,8 @@ pub enum Controller {
 }
 
 impl Default for PoolPolicy {
-    /// Off, with [`PoolPolicy::recommended`]'s other values.
     fn default() -> Self {
-        Self {
-            enabled: false,
-            strangers_per_hour: 60,
-            burst: 10,
-            controller: Controller::Doubling,
-            controller_window_secs: 300,
-            queue_len: 20,
-            queue_wait_secs: 10,
-        }
+        Self::recommended()
     }
 }
 
@@ -700,7 +692,21 @@ impl PoolPolicy {
     pub fn recommended() -> Self {
         Self {
             enabled: true,
-            ..Self::default()
+            strangers_per_hour: 60,
+            burst: 10,
+            controller: Controller::Doubling,
+            controller_window_secs: 300,
+            queue_len: 20,
+            queue_wait_secs: 10,
+        }
+    }
+
+    /// No pool: every stranger with valid work is admitted, with
+    /// [`PoolPolicy::recommended`]'s other values.
+    pub fn off() -> Self {
+        Self {
+            enabled: false,
+            ..Self::recommended()
         }
     }
 }
