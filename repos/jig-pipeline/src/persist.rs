@@ -1005,6 +1005,7 @@ impl SqliteStore {
         rekey_channels_by_id(conn)?;
         rebuild_channels_slug_per_sequencer(conn)?;
         rebuild_alias_attestations_with_suffix(conn)?;
+        crate::contracts::migrate(conn)?;
         Ok(())
     }
 

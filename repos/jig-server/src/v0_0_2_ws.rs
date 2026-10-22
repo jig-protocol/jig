@@ -2345,6 +2345,7 @@ mod tests {
             alias: None,
             publish: false,
             quota: None,
+            offers: Default::default(),
         }
     }
 

@@ -739,6 +739,7 @@ mod tests {
             alias: None,
             publish: false,
             quota: None,
+            offers: Default::default(),
         }
     }
 
@@ -885,6 +886,7 @@ mod tests {
             alias: None,
             publish: false,
             quota: None,
+            offers: Default::default(),
         };
 
         // Build a fake block bundle in the same (manifest_bytes, code_bytes) shape
@@ -964,6 +966,7 @@ mod tests {
             alias: None,
             publish: false,
             quota: None,
+            offers: Default::default(),
         };
 
         // A managed (bridge-owned) DID is a member of open channel "#dm/x". Channels
@@ -1071,6 +1074,7 @@ mod tests {
             alias: None,
             publish: false,
             quota: None,
+            offers: Default::default(),
         };
         for (slug, visibility, suite) in [
             ("#private", "restricted", "none"),
@@ -1143,6 +1147,7 @@ mod tests {
             alias: None,
             publish: false,
             quota: None,
+            offers: Default::default(),
         };
 
         // Alice signs; manifest claims bob as author. Sig verifies against
@@ -1204,6 +1209,7 @@ mod tests {
             alias: None,
             publish: false,
             quota: None,
+            offers: Default::default(),
         };
 
         let secret: [u8; 32] = rand::random();
@@ -1252,6 +1258,7 @@ mod tests {
             alias: None,
             publish: false,
             quota: None,
+            offers: Default::default(),
         };
         let secret: [u8; 32] = rand::random();
         let key = SigningKey::from_bytes(&secret);
@@ -1342,6 +1349,7 @@ mod tests {
             alias: None,
             publish: false,
             quota: None,
+            offers: Default::default(),
         }
     }
 

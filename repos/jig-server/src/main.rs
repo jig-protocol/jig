@@ -323,6 +323,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("[jig-server] FATAL: {msg}");
             std::process::exit(1);
         }
+        // The contract's frames are handled from the first connection on.
+        jig_server::v0_0_2_contract::start(state);
         jig_server::v0_0_2_federation::spawn_federation_peers(state.clone());
         // Start config-permitted bridges before the router is built (they mount
         // their HTTP routes into bridge_router_mount, which build_v0_0_2_router
