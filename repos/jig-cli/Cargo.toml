@@ -15,7 +15,9 @@ path = "src/main.rs"
 
 [features]
 default = ["local-runtime"]
-local-runtime = ["jig-runtime"]
+# The block runtime: `jig block run`, and checking each message against its
+# server's exec receipt (jig-client's `verify`).
+local-runtime = ["jig-runtime", "jig-client/verify"]
 
 [dependencies]
 # Core protocol

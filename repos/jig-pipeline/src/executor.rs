@@ -472,6 +472,52 @@ pub fn text_block_program(
     })
 }
 
+/// The text-render input a block's manifest gives: its body, author, channel name, clock and
+/// version. `None` when the manifest has no `body`, since rendering the empty string would hash a
+/// message nobody sent.
+///
+/// The server and every re-executing client build the input with this one function, so they
+/// cannot disagree on what was rendered.
+pub fn text_input(manifest: &jig_core::BlockManifest) -> Option<text_block::Input> {
+    let body = manifest.metadata.get("body")?.as_str()?;
+    let channel = manifest
+        .metadata
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let hlc = manifest.hlc_ts.as_ref();
+    Some(text_block::Input {
+        sender_did: manifest
+            .authors
+            .first()
+            .map(|a| a.did.to_string())
+            .unwrap_or_default(),
+        channel_id: channel.to_string(),
+        body_raw: body.to_string(),
+        hlc_wall_ms: hlc.map(|h| h.wall_ms).unwrap_or(0),
+        hlc_logical: hlc.map(|h| h.logical).unwrap_or(0),
+        hlc_origin: hlc.map(|h| h.server_did.to_string()).unwrap_or_default(),
+        client_version: manifest.version.to_string(),
+    })
+}
+
+/// The invocation an `exec` receipt names for a landed chat message: the message text, and the
+/// block's ingest record's sequence, clock and channel CID (JEP-0006). A client rebuilds it from
+/// the same record to check the receipt.
+pub fn text_render_invocation(
+    input: &text_block::Input,
+    block_cid: &str,
+    record: &crate::ingest_record::IngestRecord,
+) -> Invocation {
+    let mut invocation = text_invocation(input, block_cid.to_string(), record.seq);
+    invocation.channel_cid = record.channel_id.clone();
+    invocation.ingest_hlc = Hlc {
+        wall_ms: record.ingest_wall_ms,
+        logical: record.ingest_logical,
+    };
+    invocation
+}
+
 /// The `jig:block` invocation for a chat message: the message text as the input, and the ingest
 /// record's block CID, sequence and clock.
 pub fn text_invocation(
