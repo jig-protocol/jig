@@ -62,9 +62,14 @@ fn serves_with_write_execute_memory_denied() {
     let dir = std::env::temp_dir().join(format!("jig-ns-mdwe-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let config = dir.join("ns.toml");
+    // The signing key is sealed at rest; a test credential opens it.
+    let unlock = jig_client::server_key::credential_for_tests(&dir);
     std::fs::write(
         &config,
-        "[[v0_0_2.nameserver.alias_suffixes]]\nsuffix = \"mdwe.jig\"\n",
+        format!(
+            "[v0_0_2.keys]\nunlock = \"{unlock}\"\n\n\
+             [[v0_0_2.nameserver.alias_suffixes]]\nsuffix = \"mdwe.jig\"\n"
+        ),
     )
     .unwrap();
     let port = std::net::TcpListener::bind("127.0.0.1:0")
