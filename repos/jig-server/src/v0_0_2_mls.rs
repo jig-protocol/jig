@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::v0_0_2::AppState;
 use crate::v0_0_2_blocks::{
-    ErrorBody, admit_caller, authorize_channel_read, err, persist_err, refuse,
+    ErrorBody, admit_caller, authorize_channel_ref_read, err, persist_err, refuse,
 };
 
 /// Most packages one request may publish.
@@ -196,25 +196,30 @@ pub async fn key_package_stock(
     }))
 }
 
-/// GET /api/v1/channels/:slug/mls/group-info — the newest group info a
+/// GET /api/v1/channels/:channel/mls/group-info — the newest group info a
 /// committer published, for joining by external commit. Same read gates as
 /// the timeline: a restricted channel's group info goes to its members only.
+/// `:channel` is the channel's id or a slug this server sequences.
 pub async fn group_info(
     State(state): State<Arc<AppState>>,
-    Path(slug): Path<String>,
+    Path(channel_ref): Path<String>,
     uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<GroupInfoBody>, (StatusCode, Json<ErrorBody>)> {
     let started = std::time::Instant::now();
     let caller = admit_caller(&state, &headers, "GET", uri.path(), started)?;
-    if let Some(caller) = caller.as_ref() {
-        authorize_channel_read(&state, &slug, caller, started)?;
-    }
-    let group = state
-        .ingest_ctx
-        .store
-        .get_mls_group(&slug)
-        .map_err(persist_err)?;
+    let store = &state.ingest_ctx.store;
+    let channel = match caller.as_ref() {
+        Some(caller) => authorize_channel_ref_read(&state, &channel_ref, caller, started)?,
+        None => store
+            .get_channel_by_ref_including_archived(&channel_ref)
+            .map_err(persist_err)?,
+    };
+    let group = match channel.as_ref() {
+        Some(c) => store.get_mls_group_by_id(&c.id).map_err(persist_err)?,
+        None => None,
+    };
+    let slug = channel.map_or(channel_ref, |c| c.slug);
     match group {
         Some(g) => match g.group_info {
             Some(info) => Ok(Json(GroupInfoBody {
@@ -244,7 +249,7 @@ pub fn build_mls_router(state: Arc<AppState>) -> Router {
             "/api/v1/mls/key-packages/{did}/stock",
             get(key_package_stock),
         )
-        .route("/api/v1/channels/{slug}/mls/group-info", get(group_info))
+        .route("/api/v1/channels/{channel}/mls/group-info", get(group_info))
         .with_state(state)
 }
 

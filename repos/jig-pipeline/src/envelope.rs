@@ -183,6 +183,14 @@ pub enum Frame {
         /// answered on ([`crate::handshake::TLS_EXPORTER_LABEL`]); empty over
         /// plaintext. Signed, so the welcome holds only on that TLS session.
         tls_exporter: String,
+        /// The server's current `server-manifest` (JEP-0002 rule 12). Absent
+        /// only before the server has published one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manifest: Option<crate::handshake::ManifestRef>,
+        /// During a key change, the public key link from the server's old DID
+        /// to `server_did` (JEP-0012), base64 COSE_Sign.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_link: Option<String>,
         /// base64 ed25519 over [`crate::handshake::WelcomeStatement::canonical_bytes`].
         sig: String,
     },
@@ -190,6 +198,15 @@ pub enum Frame {
     /// ed25519 over [`crate::handshake::transcript_hash`]. Sent once, right
     /// after the welcome, and only by a dialer that named a `peer_did`.
     PeerProof { sig: String },
+    /// A frame between two servers that proved their DIDs to each other
+    /// (JEP-0002 rule 5), for the federation contract (JEP-0005) to define.
+    /// `kind` names it; `body` is its own encoding, base64 on the wire. A
+    /// server refuses one on a connection whose peer is not proven.
+    Peer {
+        kind: String,
+        #[serde(with = "body_b64")]
+        body: Vec<u8>,
+    },
     /// Server's signed answer to a [`Frame::Hello`] it shares no version or
     /// suite with (JEP-0002 rule 3). The server closes after sending it.
     /// Signed so that a server refusing a suite it once advertised has
@@ -296,13 +313,23 @@ pub struct SubscribeAuth {
     pub sig_b64: String,
 }
 
-/// Subscription scope: a single channel by slug or a federation-wide subscription
-/// filtered to specified block kinds.
+/// Subscription scope: a single channel, by id or by slug, or a
+/// federation-wide subscription filtered to specified block kinds.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Scope {
-    Channel { slug: String },
-    Federation { block_kinds: Vec<String> },
+    /// A channel by slug, which names only a channel the server sequences.
+    Channel {
+        slug: String,
+    },
+    /// A channel by its id: the canonical CID text of its channel-create
+    /// block, which names one channel on any server.
+    ChannelId {
+        channel_id: String,
+    },
+    Federation {
+        block_kinds: Vec<String>,
+    },
 }
 
 impl Scope {
@@ -320,6 +347,7 @@ impl Scope {
     pub fn canonical_string(&self) -> String {
         match self {
             Scope::Channel { slug } => format!("channel:{slug}"),
+            Scope::ChannelId { channel_id } => format!("channel_id:{channel_id}"),
             Scope::Federation { block_kinds } => {
                 let mut kinds = block_kinds.clone();
                 kinds.sort();
@@ -346,6 +374,22 @@ pub struct HlcCursor {
     pub wall_ms: u64,
     pub logical: u32,
     pub origin: String,
+}
+
+/// `Frame::Peer`'s body as base64 on the wire.
+mod body_b64 {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(body: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(body))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(d)?;
+        STANDARD.decode(text).map_err(serde::de::Error::custom)
+    }
 }
 
 #[cfg(test)]
@@ -499,6 +543,22 @@ mod tests {
     }
 
     #[test]
+    fn subscribe_by_channel_id_round_trips() {
+        let env = Envelope::new(Frame::Subscribe {
+            scope: Scope::ChannelId {
+                channel_id: "bafkexample".into(),
+            },
+            auth: None,
+        });
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(
+            json.contains(r#""scope":{"kind":"channel_id","channel_id":"bafkexample"}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Envelope>(&json).unwrap(), env);
+    }
+
+    #[test]
     fn unknown_op_returns_error() {
         let json = r##"{"v":1,"op":"teleport","scope":{"kind":"channel","slug":"#x"}}"##;
         let result: Result<Envelope, _> = serde_json::from_str(json);
@@ -526,6 +586,14 @@ mod tests {
             fed.canonical_string(),
             "a channel named like a federation filter must not collide"
         );
+
+        // The same text as a slug and as an id is two scopes, signed apart.
+        let by_slug = Scope::Channel { slug: "x".into() };
+        let by_id = Scope::ChannelId {
+            channel_id: "x".into(),
+        };
+        assert_eq!(by_id.canonical_string(), "channel_id:x");
+        assert_ne!(by_slug.canonical_string(), by_id.canonical_string());
     }
 
     /// Block-kind order is incidental on the wire, so it must not change the

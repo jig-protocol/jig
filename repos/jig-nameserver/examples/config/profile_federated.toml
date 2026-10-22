@@ -1,53 +1,52 @@
 # Example nameserver config with multiple rulesets and translation contracts
-[nameserver]
 profile = "federated"
 
-[nameserver.network]
+[network]
 bind = "0.0.0.0"
 port = 8070
 
-[nameserver.storage]
+[storage]
 database_path = "/var/lib/jig/ns.db"
 
-[nameserver.reputation]
+[reputation]
 default_ruleset = "high-sec"
 
-[[nameserver.reputation.local_rulesets]]
+[[reputation.local_rulesets]]
 key = "high-sec"
 description = "Shared high-sec contract"
 authority = "did:jig:central"
 weight = 1.0
 
-[nameserver.reputation.local_rulesets.pow_policy]
+[reputation.local_rulesets.pow_policy]
 min_bits = 14
 max_bits = 28
 multiplier = 1.0
 
-[[nameserver.reputation.local_rulesets]]
+[[reputation.local_rulesets]]
 key = "partner-qa"
 description = "Partner quality assurance sandbox"
 authority = "did:partner:qa"
 weight = 0.4
 
-[nameserver.reputation.local_rulesets.pow_policy]
+[reputation.local_rulesets.pow_policy]
 min_bits = 10
 max_bits = 24
 multiplier = 0.8
 
-[[nameserver.reputation.translation_contracts]]
+[[reputation.translation_contracts]]
 from = "partner-qa"
 to = "high-sec"
 weight = 0.6
-[nameserver.reputation.translation_contracts.transform]
+[reputation.translation_contracts.transform]
 type = "linear"
 slope = 0.5
 intercept = 0.0
 
-[[nameserver.reputation.translation_contracts]]
+[[reputation.translation_contracts]]
 from = "legacy-null"
 to = "high-sec"
 weight = 0.2
-[nameserver.reputation.translation_contracts.transform]
+[reputation.translation_contracts.transform]
 type = "table"
 entries = [
   { min = -1.0, max = -0.2, mapped = -0.6 },

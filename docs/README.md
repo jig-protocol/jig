@@ -20,12 +20,12 @@ should not be read as a status page.
 
 | Doc | Status | What it is |
 | --- | --- | --- |
-| [`deploy/README.md`](../deploy/README.md) | CURRENT | Operator runbook: systemd units, the strict `/etc/jig/config.toml`, backups, and the `server.key` warning. The unit files carry their own rationale in comments; this doc covers sequence. |
+| [`deploy/README.md`](../deploy/README.md) | CURRENT | Operator runbook: systemd units, the strict `/etc/jig/config.toml`, backups, sealing the server key, and the server-key warning. The unit files carry their own rationale in comments; this doc covers sequence. |
 | [`deployment/gcp-vps-runbook.md`](deployment/gcp-vps-runbook.md) | CURRENT | GCP-specific box setup — machine sizing, the build-big-then-shrink recommendation, Tailscale-only reachability. Prices and build times in it are the author's estimates, unverified against the console. |
 | [`deployment/internal-dogfood-3day.md`](deployment/internal-dogfood-3day.md) | HISTORICAL | The internal-MVP plan. Its STATUS section is a snapshot of what had shipped by that batch, not maintained; the plan body predates the implementation and is kept for its reasoning. |
 | [`deployment/internal-dogfood-24h.md`](deployment/internal-dogfood-24h.md) | HISTORICAL | Superseded by the 3-day plan. Retained for its verified state-of-the-union table, which was proven by running binaries rather than reading code. |
 | [`deployment/install-benchmark.md`](deployment/install-benchmark.md) | CURRENT | The 60-second `curl \| bash` install gate: the manual procedure on a $5-class VM, still the only measure on target hardware, and the CI runs (`scripts/install-smoke.sh` in `release.yml` and `install-smoke.yml`) with their first measurements. |
-| [`operations/nameserver-abuse-runbook.md`](operations/nameserver-abuse-runbook.md) | HISTORICAL | Nameserver incident runbooks: harassment reports, registration and relay abuse, a compromised nameserver, a rogue federated instance. Mostly out of date since #154 removed the legacy routes it calls; a banner lists the steps that still apply; tribunal steps are marked future. |
+| [`operations/nameserver-abuse-runbook.md`](operations/nameserver-abuse-runbook.md) | HISTORICAL | Nameserver incident runbooks: harassment reports, registration and relay abuse, a compromised nameserver, a rogue or contradicting nameserver. Mostly out of date since #154 removed the legacy routes it calls; a banner lists the steps that still apply; tribunal steps are marked future. |
 
 ## Design and implementation records
 

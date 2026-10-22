@@ -154,6 +154,8 @@ impl TestJigServer {
             .join("server.key")
             .to_string_lossy()
             .into_owned();
+        // Sealed, the way a deployed server keeps it: a credential slot.
+        config.keys.unlock = Some(jig_client::server_key::credential_for_tests(tempdir.path()));
         // listen field is informational only (we bind our own listener);
         // overwrite to make federation-peer URLs sensible.
         config.server.listen = "127.0.0.1:0".to_string();
@@ -227,6 +229,8 @@ impl TestJigServer {
             url: other.ws_url(),
             expected_did: other.server_did_string.clone(),
             alias: None,
+            publish: false,
+            quota: None,
         };
 
         // Listing a peer is what trusts it: `other` may now subscribe to our
@@ -535,7 +539,13 @@ impl TestNameserver {
     }
 
     pub async fn start_with_suffix(alias_suffix: &str) -> Result<Self> {
-        Self::start_with_pow(alias_suffix, Self::test_pow()).await
+        Self::start_inner(alias_suffix, None, Self::test_pow()).await
+    }
+
+    /// Start a nameserver for `alias_suffix` whose DID key has the given
+    /// seed, so a test can name it as an authority before it boots.
+    pub async fn start_with_key(alias_suffix: &str, seed: [u8; 32]) -> Result<Self> {
+        Self::start_inner(alias_suffix, Some(seed), Self::test_pow()).await
     }
 
     /// The proof-of-work a test nameserver asks for unless told otherwise:
@@ -556,9 +566,20 @@ impl TestNameserver {
         alias_suffix: &str,
         pow: jig_config::v0_0_2_server::PowPolicy,
     ) -> Result<Self> {
+        Self::start_inner(alias_suffix, None, pow).await
+    }
+
+    async fn start_inner(
+        alias_suffix: &str,
+        seed: Option<[u8; 32]>,
+        pow: jig_config::v0_0_2_server::PowPolicy,
+    ) -> Result<Self> {
         let mut suffix = jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix);
         suffix.pow = pow;
-        Self::start_with_suffix_config(suffix).await
+        // A single-label suffix is trusted only through clients' own config;
+        // a test that serves one means it.
+        suffix.single_label_authority = !alias_suffix.contains('.');
+        Self::start_with_parts(suffix, seed).await
     }
 
     /// A nameserver serving one suffix with every policy `suffix` sets:
@@ -566,15 +587,37 @@ impl TestNameserver {
     pub async fn start_with_suffix_config(
         suffix: jig_config::v0_0_2_server::SuffixConfig,
     ) -> Result<Self> {
+        Self::start_with_parts(suffix, None).await
+    }
+
+    async fn start_with_parts(
+        suffix: jig_config::v0_0_2_server::SuffixConfig,
+        seed: Option<[u8; 32]>,
+    ) -> Result<Self> {
         let alias_suffix = suffix.suffix.clone();
         let tempdir = tempfile::tempdir().context("tempdir")?;
+        let keyfile = tempdir.path().join("nameserver.key");
+        let unlock = jig_client::server_key::credential_for_tests(tempdir.path());
+        if let Some(seed) = seed {
+            // A known key, sealed as an operator would import one: raw at
+            // 0600, then `keys seal`, which keeps its DID.
+            let mut raw = std::fs::OpenOptions::new();
+            raw.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut raw, 0o600);
+            std::io::Write::write_all(&mut raw.open(&keyfile).context("keyfile")?, &seed)
+                .context("keyfile")?;
+            jig_client::server_key::seal_raw(
+                &keyfile,
+                std::slice::from_ref(&unlock),
+                &jig_client::server_key::ServerKeyOptions::new("nameserver", "jig-nameserver"),
+            )
+            .context("sealing the test nameserver key")?;
+        }
 
         let mut config = base_config()?;
-        config.server.server_did_keyfile = tempdir
-            .path()
-            .join("nameserver.key")
-            .to_string_lossy()
-            .into_owned();
+        config.server.server_did_keyfile = keyfile.to_string_lossy().into_owned();
+        config.keys.unlock = Some(unlock);
         config.server.listen = "127.0.0.1:0".to_string();
         config.nameserver.alias_suffixes = vec![suffix];
         // Tests enumerate registered aliases; production leaves this off.
@@ -707,7 +750,7 @@ impl TestNameserver {
                             jig_core::pow::Action::NsRegister,
                             binding,
                         );
-                        Some(jig_client::pow::solve(puzzle, effort, |_| {}).await?)
+                        Some(jig_client::pow::solve(puzzle, effort, None, |_| {}).await?)
                     }
                 }
             }

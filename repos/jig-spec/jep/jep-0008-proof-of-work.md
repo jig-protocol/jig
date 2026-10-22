@@ -168,6 +168,9 @@ Non-goals:
       within `max_solve_secs`.
     - A verifier MUST NOT ask for more than `2^28` for `admit`, or `2^28` for any challenge action.
     - A client SHOULD refuse an effort above those caps.
+    - A verifier cannot measure its clients, so a client SHOULD also derive its own cap from its
+      measured solve rate × `max_solve_secs`, by a short calibration run on the cores it will
+      solve with, and refuse an effort above that cap as it would one above `2^28`.
     - A ruleset MAY set `min_effort ≥ 1` (a floor). The reference ruleset sets none.
 20. **Client behaviour.** A client:
     - bids at least the signed `effort`;

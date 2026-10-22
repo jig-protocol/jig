@@ -42,6 +42,27 @@ use crate::v0_0_2::AppState;
 /// Constant in v0.0.2; exponential backoff is a v0.0.3+ refinement.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
+/// The delay before redialing a peer whose federation contract closed the
+/// connection ([`crate::v0_0_2_peer::CloseReason`]), doubling with each such
+/// close in a row up to [`MAX_CONTRACT_CLOSE_DELAY`].
+const CONTRACT_CLOSE_DELAY: Duration = Duration::from_secs(30);
+const MAX_CONTRACT_CLOSE_DELAY: Duration = Duration::from_secs(15 * 60);
+
+/// A connection the federation contract closed.
+#[derive(Debug, thiserror::Error)]
+#[error("closed by the federation contract ({}): {}", .0.code, .0.reason)]
+struct ContractClosed(crate::v0_0_2_peer::CloseReason);
+
+/// How long to wait before redialing, after `closes` contract closes in a row.
+fn redial_delay(closes: u32) -> Duration {
+    if closes == 0 {
+        return RECONNECT_DELAY;
+    }
+    CONTRACT_CLOSE_DELAY
+        .saturating_mul(1 << (closes - 1).min(16))
+        .min(MAX_CONTRACT_CLOSE_DELAY)
+}
+
 /// Whether `url` names a plaintext WebSocket. Scheme comparison is
 /// case-insensitive, as URL schemes are.
 fn is_plaintext_url(url: &str) -> bool {
@@ -155,22 +176,29 @@ pub fn spawn_federation_peers(state: Arc<AppState>) {
 
 async fn run_peer_loop(state: Arc<AppState>, peer: jig_config::v0_0_2_server::FederationPeer) {
     info!(peer_url = %peer.url, "federation peer task started");
+    let mut contract_closes = 0;
     loop {
-        match connect_and_relay(&state, &peer).await {
+        let outcome = connect_and_relay(&state, &peer).await;
+        contract_closes = match &outcome {
+            Err(e) if e.is::<ContractClosed>() => contract_closes + 1,
+            _ => 0,
+        };
+        let delay = redial_delay(contract_closes);
+        match outcome {
             Ok(()) => {
                 warn!(
                     peer_url = %peer.url,
-                    "peer connection ended cleanly; reconnecting in {RECONNECT_DELAY:?}"
+                    "peer connection ended cleanly; reconnecting in {delay:?}"
                 );
             }
             Err(e) => {
                 warn!(
                     peer_url = %peer.url,
-                    "peer connection failed: {e}; reconnecting in {RECONNECT_DELAY:?}"
+                    "peer connection failed: {e}; reconnecting in {delay:?}"
                 );
             }
         }
-        tokio::time::sleep(RECONNECT_DELAY).await;
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -259,6 +287,17 @@ where
     };
     match pending.interpret_on(&text, tls_exporter) {
         HandshakeResult::Established(welcome) => {
+            // A peer is listed by DID, and that DID is what lets it
+            // subscribe here and what its blocks are attributed to, so a
+            // moved peer is not federated with under two DIDs: its
+            // operator lists the new one.
+            if let Some(from) = &welcome.moved_from {
+                anyhow::bail!(
+                    "the peer moved its key from {from} to {} along a public link both keys \
+                     signed; set its expected_did to the new DID to federate with it",
+                    welcome.server_did
+                );
+            }
             if let Some(key) = key {
                 let proof =
                     jig_pipeline::handshake::peer_proof(key, &hello_text, &text, tls_exporter);
@@ -306,7 +345,7 @@ pub(crate) fn tls_exporter_of(
     }
 }
 
-async fn connect_and_relay(
+pub(crate) async fn connect_and_relay(
     state: &Arc<AppState>,
     peer: &jig_config::v0_0_2_server::FederationPeer,
 ) -> anyhow::Result<()> {
@@ -330,7 +369,7 @@ async fn connect_and_relay(
     // Same hello/welcome a CLI client speaks. The fed-hello bundle below is a
     // block, not this handshake, and the server now refuses it until welcome.
     let tls_exporter = tls_exporter_of(ws.get_ref());
-    complete_peer_handshake(
+    let welcome = complete_peer_handshake(
         &mut ws,
         &peer.expected_did,
         &tls_exporter,
@@ -338,6 +377,13 @@ async fn connect_and_relay(
     )
     .await?;
     let (mut sink, mut stream) = ws.split();
+    // The handshake proved the peer's DID; peer frames on this connection
+    // are from it and go to it ([`crate::v0_0_2_peer`]).
+    let (peer_sender, mut peer_out) = crate::v0_0_2_peer::PeerSender::new(
+        jig_core::did::Did::from_did_jig_string(&welcome.server_did)
+            .map_err(|e| anyhow::anyhow!("the peer's welcome DID: {e}"))?,
+    );
+    let registration = state.peers.register(peer_sender.clone());
     info!(peer_url = %peer.url, "federation peer connected");
 
     // 1. Send fed-hello synthetic bundle as the handshake.
@@ -394,13 +440,33 @@ async fn connect_and_relay(
                         if let Some(refusal) = subscription_refusal(&text) {
                             break Err(anyhow::anyhow!("peer refused our federation subscription: {refusal}"));
                         }
-                        if let Err(e) = handle_inbound_frame(state, peer, &text).await {
-                            warn!(peer_url = %peer.url, "inbound frame error: {e}");
+                        match handle_inbound_frame(state, peer, &peer_sender, &text).await {
+                            Ok(Some(reason)) => {
+                                let _ = sink
+                                    .send(Message::Close(Some(
+                                        tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                                            code: reason.code.into(),
+                                            reason: reason.reason.clone().into(),
+                                        },
+                                    )))
+                                    .await;
+                                break Err(ContractClosed(reason).into());
+                            }
+                            Ok(None) => {}
+                            Err(e) => warn!(peer_url = %peer.url, "inbound frame error: {e}"),
                         }
                     }
                     Message::Close(_) => break Ok(()),
                     // Ignore Ping/Pong/Binary.
                     _ => {}
+                }
+            }
+
+            // Peer frames this server sends unprompted
+            Some(env) = peer_out.recv() => {
+                let json = serde_json::to_string(&env)?;
+                if let Err(e) = sink.send(Message::Text(json.into())).await {
+                    break Err(anyhow::anyhow!("peer frame send error: {e}"));
                 }
             }
 
@@ -421,16 +487,33 @@ async fn connect_and_relay(
     // 5. On loop exit (peer disconnect, error, or task cancellation), unregister
     //    the peer from Fanout so we don't accumulate dead senders.
     state.ingest_ctx.fanout.unregister_peer(&peer.url).await;
+    state.peers.unregister(registration);
 
     result
 }
 
+/// Handle one frame from a peer this server dialed. `Ok(Some(_))` means the
+/// federation contract closed the connection.
 async fn handle_inbound_frame(
     state: &Arc<AppState>,
     peer: &jig_config::v0_0_2_server::FederationPeer,
+    sender: &crate::v0_0_2_peer::PeerSender,
     text: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<crate::v0_0_2_peer::CloseReason>> {
     let env: Envelope = serde_json::from_str(text)?;
+    if let Frame::Peer { kind, body } = &env.frame {
+        return Ok(
+            crate::v0_0_2_peer::dispatch(state.peer_frame_handler(), sender, kind, body).err(),
+        );
+    }
+    handle_relayed_frame(state, peer, env).await.map(|()| None)
+}
+
+async fn handle_relayed_frame(
+    state: &Arc<AppState>,
+    peer: &jig_config::v0_0_2_server::FederationPeer,
+    env: Envelope,
+) -> anyhow::Result<()> {
     match env.frame {
         Frame::Block {
             bundle_b64,
@@ -649,7 +732,18 @@ mod tests {
             url: "ws://127.0.0.1:1".to_string(),
             expected_did: jig_core::Did::from_ed25519_pubkey(&[9u8; 32]).to_did_jig_string(),
             alias: None,
+            publish: false,
+            quota: None,
         }
+    }
+
+    #[test]
+    fn a_peer_that_keeps_closing_is_redialed_ever_more_slowly() {
+        assert_eq!(redial_delay(0), RECONNECT_DELAY);
+        assert_eq!(redial_delay(1), CONTRACT_CLOSE_DELAY);
+        assert_eq!(redial_delay(2), CONTRACT_CLOSE_DELAY * 2);
+        assert_eq!(redial_delay(6), MAX_CONTRACT_CLOSE_DELAY);
+        assert_eq!(redial_delay(u32::MAX), MAX_CONTRACT_CLOSE_DELAY);
     }
 
     #[test]
@@ -784,6 +878,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         };
 
         // Build a fake block bundle in the same (manifest_bytes, code_bytes) shape
@@ -861,6 +957,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         };
 
         // A managed (bridge-owned) DID is a member of open channel "#dm/x". Channels
@@ -966,6 +1064,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         };
         for (slug, visibility, suite) in [
             ("#private", "restricted", "none"),
@@ -1036,6 +1136,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         };
 
         // Alice signs; manifest claims bob as author. Sig verifies against
@@ -1095,6 +1197,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         };
 
         let secret: [u8; 32] = rand::random();
@@ -1141,6 +1245,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         };
         let secret: [u8; 32] = rand::random();
         let key = SigningKey::from_bytes(&secret);
@@ -1229,6 +1335,8 @@ mod tests {
             url: "wss://test-peer".to_string(),
             expected_did: "did:jig:zPeer".to_string(),
             alias: None,
+            publish: false,
+            quota: None,
         }
     }
 

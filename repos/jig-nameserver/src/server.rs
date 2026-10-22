@@ -103,7 +103,7 @@ pub struct NameServerApp {
 /// attest under the chat server's DID, so treat the untouched default (and an
 /// empty string) as "operator did not choose" and derive a sibling of the
 /// nameserver database instead.
-fn resolve_v0_0_2_keyfile(cfg: &NameServerConfig) -> String {
+pub fn resolve_v0_0_2_keyfile(cfg: &NameServerConfig) -> String {
     let configured = cfg.v0_0_2.server.server_did_keyfile.trim();
     let jig_server_default = jig_config::v0_0_2_server::ServerSection::default().server_did_keyfile;
     if !configured.is_empty() && configured != jig_server_default {
@@ -213,15 +213,17 @@ pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
     })
 }
 
-/// Load config, apply the CLI overrides, and serve. `bind_override` /
+/// Load config, apply the CLI overrides, and serve. `config` is
+/// `jig-nameserver --config`, else `JIG_NS_CONFIG` is read. `bind_override` /
 /// `port_override` come from `jig-nameserver serve --bind/--port` and win over
 /// both the config file and `JIG_NS_BIND`/`JIG_NS_PORT`, which `load` has
 /// already applied.
 pub async fn run_http_server(
+    config: Option<&std::path::Path>,
     bind_override: Option<String>,
     port_override: Option<u16>,
 ) -> Result<()> {
-    let mut cfg = NameServerConfig::load()?;
+    let mut cfg = NameServerConfig::load(config)?;
     if let Some(bind) = bind_override {
         cfg.network.bind = bind;
     }
@@ -286,6 +288,7 @@ mod tests {
         suffix.pow = jig_config::v0_0_2_server::PowPolicy::off();
         cfg.v0_0_2.nameserver.alias_suffixes = vec![suffix];
         cfg.v0_0_2.server.server_did_keyfile = dir.0.join("ns.key").to_string_lossy().into_owned();
+        cfg.v0_0_2.keys.unlock = Some(jig_client::server_key::credential_for_tests(&dir.0));
         // Off by default in production; on here so the route-presence assertions
         // exercise the mounted handler.
         cfg.v0_0_2.debug.list_handles = true;

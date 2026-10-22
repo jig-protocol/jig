@@ -161,8 +161,7 @@ enum Commands {
         action: NsAction,
     },
 
-    /// Execute WASM blocks locally
-    #[cfg(feature = "local-runtime")]
+    /// Write, build, check and run blocks
     Block {
         #[command(subcommand)]
         action: BlockAction,
@@ -295,7 +294,36 @@ enum NsAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum EvidenceAction {
+    /// Every bundle kept, oldest first.
+    List,
+    /// One bundle, checked from what it holds.
+    Show { id: String },
+    /// One bundle as JSON, to a file or stdout, for someone else to check.
+    Export {
+        id: String,
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Check a bundle someone else made, and show it. Never refuses a server.
+    Import { file: std::path::PathBuf },
+}
+
+#[derive(Subcommand, Debug)]
 enum TrustAction {
+    /// Evidence kept against servers that contradicted what they signed.
+    Evidence {
+        #[command(subcommand)]
+        action: EvidenceAction,
+    },
+    /// Connect to `server` again after it signed a contradiction. Its pins
+    /// stay, and it is held to them.
+    Accept { server: String },
+    /// What this device pinned for a server, and the server's manifest log.
+    Show {
+        /// The server; the configured one when omitted.
+        server: Option<String>,
+    },
     /// Resolve `name` (alias@suffix), verify it, and pin it on first sight; a
     /// name that now resolves to another DID than the pinned one is refused.
     VerifyName {
@@ -356,13 +384,74 @@ enum ServerAction {
     },
 }
 
+// Parsed once per process; boxing `Run`'s fields would buy nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
-#[cfg(feature = "local-runtime")]
 enum BlockAction {
-    /// Run a WASM block locally and generate a receipt
+    /// Create a block project from a template
+    New {
+        /// The block's name: lowercase letters, digits and `-`
+        name: String,
+
+        /// The template to start from
+        #[arg(long, value_enum, default_value = "renderer")]
+        template: cmd::block_new::Template,
+
+        /// Write the project here instead of ./<name>
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
+
+    /// Build the block project in the current directory into a component, then lint it
+    Build {
+        /// The project directory
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+    },
+
+    /// Check a component against the determinism profile jig-det-1
+    Lint {
+        /// A block project directory (lints its built component), or a .wasm file
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+
+        /// The memory limit in 64 KiB pages, when linting a .wasm file directly
+        #[arg(long, default_value_t = cmd::block_project::DEFAULT_MEMORY_PAGES)]
+        max_memory_pages: u32,
+    },
+
+    /// Run a block once, locally. A component (a block project, or a .wasm component) runs
+    /// through the same component path as the server and client; a core module runs on the
+    /// legacy ABI and gets a v0.2 receipt.
+    #[cfg(feature = "local-runtime")]
     Run {
-        /// Path to WASM file
+        /// A block project directory, or a .wasm file
+        #[arg(default_value = ".")]
         wasm: String,
+
+        /// Component input: the message text
+        #[arg(long, conflicts_with = "input_file")]
+        input: Option<String>,
+
+        /// Component input: read the message body from this file
+        #[arg(long)]
+        input_file: Option<std::path::PathBuf>,
+
+        /// Component input: the body's media type
+        #[arg(long, default_value = "text/plain")]
+        media_type: String,
+
+        /// Component input: the sender's DID
+        #[arg(long)]
+        sender: Option<String>,
+
+        /// Component input: the channel CID
+        #[arg(long)]
+        channel: Option<String>,
+
+        /// Component input: the ingest sequence number
+        #[arg(long)]
+        seq: Option<u64>,
 
         /// Deterministic seed for RNG (for reproducible execution)
         #[arg(long)]
@@ -395,6 +484,26 @@ enum BlockAction {
         /// Enable pricing in receipt
         #[arg(long)]
         pricing: bool,
+    },
+
+    /// Run a block project's vectors (tests/vectors/*.toml) and compare their outcomes
+    #[cfg(feature = "local-runtime")]
+    Test {
+        /// The project directory
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+
+        /// Record the outcome of every vector that has none, or whose outcome changed
+        #[arg(long)]
+        bless: bool,
+
+        /// Maximum fuel per run
+        #[arg(long)]
+        fuel: Option<u64>,
+
+        /// Wall-clock limit per run, in milliseconds
+        #[arg(long)]
+        timeout: Option<u64>,
     },
 }
 
@@ -445,6 +554,87 @@ enum ReceiptAction {
     },
 }
 
+/// `jig block new`, `build` and `lint`, or `None` for the block actions that need a config.
+// `global_json` is read only by `run`, which needs the `local-runtime` feature.
+#[cfg_attr(not(feature = "local-runtime"), allow(unused_variables))]
+fn run_local_block_action(action: &BlockAction, global_json: bool) -> Option<Result<()>> {
+    Some(match action {
+        BlockAction::New {
+            name,
+            template,
+            dir,
+        } => std::env::current_dir()
+            .map_err(anyhow::Error::from)
+            .and_then(|cwd| cmd::block_new::new_block(name, *template, &cwd, dir.as_deref()))
+            .map(|root| print!("{}", cmd::block_new::next_steps(&root))),
+        BlockAction::Build { path } => cmd::block_build::build(path).and_then(|built| {
+            println!("built {}", built.component.display());
+            println!("component {}", built.component_hash);
+            print!("{}", built.lint.render());
+            if built.lint.passes() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("the component does not pass jig-det-1"))
+            }
+        }),
+        BlockAction::Lint {
+            path,
+            max_memory_pages,
+        } => cmd::block_lint::lint_path(path, *max_memory_pages).and_then(|l| {
+            print!("{}", l.render());
+            if l.passes() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("the component does not pass jig-det-1"))
+            }
+        }),
+        #[cfg(feature = "local-runtime")]
+        BlockAction::Run {
+            wasm,
+            input,
+            input_file,
+            media_type,
+            sender,
+            channel,
+            seq,
+            fuel,
+            timeout,
+            json,
+            ..
+        } => {
+            let target = match cmd::block_exec::load_target(std::path::Path::new(wasm)) {
+                Ok(t) => t,
+                Err(e) => return Some(Err(e)),
+            };
+            // A core module takes the legacy path, after the config is loaded.
+            if !cmd::block_exec::is_component(&target.bytes) {
+                return None;
+            }
+            cmd::block_run::run_component(
+                &target,
+                cmd::block_run::ComponentRunArgs {
+                    input: input.as_deref(),
+                    input_file: input_file.as_deref(),
+                    media_type,
+                    sender: sender.as_deref(),
+                    channel: channel.as_deref(),
+                    seq: *seq,
+                    fuel: *fuel,
+                    timeout_ms: *timeout,
+                    json: *json || global_json,
+                },
+            )
+        }
+        #[cfg(feature = "local-runtime")]
+        BlockAction::Test {
+            path,
+            bless,
+            fuel,
+            timeout,
+        } => cmd::block_run::run_vectors(path, *bless, *fuel, *timeout),
+    })
+}
+
 /// Exit status when no key slot can seal a new identity key: no OS keychain,
 /// no terminal, and no `JIG_KEY_PASSPHRASE` or `JIG_KEY_UNLOCK`. `install.sh`
 /// matches it, not the message, to fall back to plaintext keys. 78 is
@@ -475,6 +665,14 @@ async fn main() -> std::process::ExitCode {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+
+    // Writing, building and linting a block touch only local files: they need no config,
+    // identity or server, so they run before any of those is loaded.
+    if let Some(Commands::Block { action }) = &cli.command
+        && let Some(result) = run_local_block_action(action, cli.json)
+    {
+        return result;
+    }
 
     // Lift the global flags out of `cli` FIRST. Everything below reads
     // config through the resolved context, so `--server` / `--config` /
@@ -564,6 +762,22 @@ async fn run() -> Result<()> {
 
     if let Some(Commands::Trust { action }) = cli.command {
         match action {
+            TrustAction::Evidence { action } => match action {
+                EvidenceAction::List => cmd::trust::evidence_list()?,
+                EvidenceAction::Show { id } => cmd::trust::evidence_show(&id)?,
+                EvidenceAction::Export { id, out } => {
+                    cmd::trust::evidence_export(&id, out.as_deref())?;
+                }
+                EvidenceAction::Import { file } => cmd::trust::evidence_import(&file)?,
+            },
+            TrustAction::Accept { server } => cmd::trust::accept_server(&server)?,
+            TrustAction::Show { server } => {
+                let server = match server {
+                    Some(s) => s,
+                    None => ctx.server_url()?,
+                };
+                cmd::trust::show(&ctx.identity()?, &server).await?;
+            }
             TrustAction::VerifyName {
                 name,
                 nameserver,
@@ -658,12 +872,10 @@ async fn run() -> Result<()> {
     let direct_message = cli.message;
 
     // Every command below but the local ones talks to the server.
-    let local = match &cli.command {
-        Some(Commands::Receipt { .. }) => true,
-        #[cfg(feature = "local-runtime")]
-        Some(Commands::Block { .. }) => true,
-        _ => false,
-    };
+    let local = matches!(
+        &cli.command,
+        Some(Commands::Receipt { .. } | Commands::Block { .. })
+    );
     if !local {
         cmd::admission::ensure(&ctx).await?;
     }
@@ -716,8 +928,13 @@ async fn run() -> Result<()> {
                 cmd::receipt::compare_receipts(&first, &second)?
             }
         },
-        #[cfg(feature = "local-runtime")]
         Some(Commands::Block { action }) => match action {
+            BlockAction::New { .. } | BlockAction::Build { .. } | BlockAction::Lint { .. } => {
+                unreachable!("handled before the config is loaded")
+            }
+            #[cfg(feature = "local-runtime")]
+            BlockAction::Test { .. } => unreachable!("handled before the config is loaded"),
+            #[cfg(feature = "local-runtime")]
             BlockAction::Run {
                 wasm,
                 seed,
@@ -728,8 +945,25 @@ async fn run() -> Result<()> {
                 receipt,
                 json,
                 pricing,
+                input,
+                input_file,
+                sender,
+                channel,
+                seq,
+                ..
             } => {
                 use cmd::block_run::{RunBlockArgs, run_block};
+                if input.is_some()
+                    || input_file.is_some()
+                    || sender.is_some()
+                    || channel.is_some()
+                    || seq.is_some()
+                {
+                    anyhow::bail!(
+                        "{wasm} is a core module; --input, --input-file, --sender, --channel and \
+                         --seq apply only to components (`jig block build` makes one)"
+                    );
+                }
                 run_block(RunBlockArgs {
                     wasm_path: &wasm,
                     seed,

@@ -1,0 +1,29 @@
+//! A `jig:block/renderer` block: an invocation comes in, a rendered payload goes out.
+//!
+//! A renderer is a pure function. It has no clock, no randomness and no network: everything it
+//! may depend on is in the invocation. Avoid floating-point arithmetic, and crates that use it
+//! (serde_json, float formatting): blocks must not contain float instructions.
+
+wit_bindgen::generate!({ world: "renderer", path: "wit" });
+
+use exports::jig::block::render::Guest;
+use jig::block::types::{BlockError, Invocation, Payload};
+
+struct Block;
+
+impl Guest for Block {
+    fn render(inv: Invocation) -> Result<Payload, BlockError> {
+        let text = String::from_utf8(inv.input.body)
+            .map_err(|_| BlockError::InvalidInput("the message is not UTF-8".into()))?;
+
+        // Edit here: turn the message into what the channel shows.
+        let rendered = format!("{} says: {}", inv.sender_did, text);
+
+        Ok(Payload {
+            media_type: "text/plain".into(),
+            body: rendered.into_bytes(),
+        })
+    }
+}
+
+export!(Block);
