@@ -973,7 +973,7 @@ pub fn rotate(
                     })
             });
             match moved {
-                Ok(to) => Some((to, oldest.old)),
+                Ok(to) => Some((to, oldest.old, oldest.path)),
                 Err(e) => {
                     unstage();
                     let _ = std::fs::remove_file(&retired);
@@ -990,8 +990,15 @@ pub fn rotate(
         let path = path.to_path_buf();
         move |source| ServerKeyError::Io { path, source }
     };
+    // A pruned link goes back where it was served from.
+    let unprune = || {
+        if let Some((to, _, from)) = &pruned {
+            let _ = std::fs::rename(to, from);
+        }
+    };
     if let Err(e) = std::fs::rename(&tmp_key, &sealed) {
         unstage();
+        unprune();
         let _ = std::fs::remove_file(&retired);
         if let Some((archived, _)) = &archived {
             let _ = std::fs::remove_file(archived);
@@ -1003,6 +1010,7 @@ pub fn rotate(
         // so the server keeps booting as the DID its clients pinned.
         let restored = std::fs::rename(&retired, &sealed);
         let _ = std::fs::remove_file(&tmp_link);
+        unprune();
         if let Some((archived, _)) = &archived {
             let _ = std::fs::remove_file(archived);
         }
@@ -1028,7 +1036,7 @@ pub fn rotate(
         retired,
         link: link_path,
         archived,
-        pruned,
+        pruned: pruned.map(|(to, left, _)| (to, left)),
     })
 }
 
