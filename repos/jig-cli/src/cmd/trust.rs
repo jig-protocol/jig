@@ -825,8 +825,8 @@ fn refusal(server: &str, e: TlsError) -> anyhow::Error {
             ref presented,
             ..
         } => anyhow::anyhow!(
-            "{e}. Only once its operator has confirmed {presented} does `jig server forget \
-             {server}` drop the pin."
+            "{e}. Confirm {presented} with its operator first; only then run `jig server \
+             forget {server}` to drop the pin."
         ),
         TlsError::OtherServer { .. } => anyhow::anyhow!(
             "{e}. If its key really changed, `jig server forget {server}` drops the pin."
