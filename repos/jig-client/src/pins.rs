@@ -728,6 +728,7 @@ mod tests {
             server_nonce: String::new(),
             tls_exporter: Vec::new(),
             manifest: None,
+            admit: None,
             moved_from: None,
             evidence: String::new(),
         }
