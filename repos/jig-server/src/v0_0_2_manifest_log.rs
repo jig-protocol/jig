@@ -15,15 +15,18 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use base64::Engine as _;
+use jig_config::v0_0_2_server::{JigServerConfig, PeerQuotaConfig};
 use jig_core::{Author, BlockBundle, BlockKind, BlockManifest};
 use jig_pipeline::handshake::{ManifestRef, implemented_suite_names};
 use jig_pipeline::ingest::{IngestSource, ingest};
-use jig_pipeline::server_manifest::{LOG_SLUG, METADATA_KEY, PeerPolicy, ServerManifest};
+use jig_pipeline::server_manifest::{
+    AttestedSuffix, LOG_SLUG, METADATA_KEY, PeerPolicy, PeerQuota, Quota, ServerManifest,
+};
 
 use crate::v0_0_2::AppState;
 
-/// What this server advertises now: the facts every welcome signs. Peer
-/// policy is published empty until lane F fills it (F2 task 3).
+/// What this server advertises now: the facts every welcome signs, and its
+/// peer policy (JEP-0005 rule 16) from `[federation]`.
 pub fn current(state: &AppState) -> ServerManifest {
     let mut capabilities = crate::v0_0_2_ws::handshake_capabilities(state);
     // A kind listed twice in config is one kind; the document holds each once.
@@ -34,7 +37,51 @@ pub fn current(state: &AppState) -> ServerManifest {
         versions: vec![u64::from(jig_pipeline::envelope::ENVELOPE_VERSION)],
         suites,
         capabilities,
-        peer_policy: PeerPolicy::default(),
+        peer_policy: peer_policy(&state.config),
+    }
+}
+
+/// The peer policy `config` publishes. Only peers with `publish = true` are
+/// named, in `peers` and `peer_quotas` alike; config validation has refused
+/// one DID with two quotas, so deduplicating by DID loses nothing.
+fn peer_policy(config: &JigServerConfig) -> PeerPolicy {
+    let federation = &config.federation;
+    // Every kind this server accepts, it relays.
+    let mut relayed_kinds = config.server.allowed_block_kinds.clone();
+    dedup(&mut relayed_kinds);
+    let published = federation.peers.iter().filter(|p| p.publish);
+    let mut peers: Vec<String> = published.clone().map(|p| p.expected_did.clone()).collect();
+    dedup(&mut peers);
+    let quota = |q: PeerQuotaConfig| Quota {
+        blocks_per_min: q.blocks_per_min,
+        bytes_per_min: q.bytes_per_min,
+    };
+    // Published, not yet enforced: enforcement is F2 slice 10.
+    let mut seen = std::collections::BTreeSet::new();
+    let peer_quotas = published
+        .filter_map(|p| {
+            let q = p.quota?;
+            seen.insert(p.expected_did.clone()).then(|| PeerQuota {
+                peer: p.expected_did.clone(),
+                quota: quota(q),
+            })
+        })
+        .collect();
+    // Validation has refused every root but `dns`, and repeats.
+    let attested_suffixes = federation
+        .attested_suffixes
+        .iter()
+        .map(|s| AttestedSuffix::Dns {
+            suffix: s.suffix.to_lowercase(),
+            domain: s.suffix.to_lowercase(),
+        })
+        .collect();
+    PeerPolicy {
+        relayed_kinds,
+        default_peer_quota: quota(federation.default_peer_quota),
+        peer_quotas,
+        peers,
+        attested_suffixes,
     }
 }
 
@@ -179,7 +226,7 @@ fn document_of(bundle_bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[tokio::test]
@@ -221,6 +268,99 @@ mod tests {
         let second = publish(&changed).await.unwrap();
         assert_ne!(second.cid, first.cid);
         assert_eq!(second.seq, 2);
+    }
+
+    /// Three peers (published with a quota, published without, unpublished
+    /// with one), a default quota and a dns suffix.
+    pub(crate) fn policy_config() -> JigServerConfig {
+        let mut config: JigServerConfig = toml::from_str(
+            r#"
+            [federation.default_peer_quota]
+            blocks_per_min = 100
+            bytes_per_min = 2000
+
+            [[federation.peers]]
+            url = "wss://a.example.org"
+            expected_did = "did:jig:zA"
+            publish = true
+            quota = { blocks_per_min = 5, bytes_per_min = 50 }
+
+            [[federation.peers]]
+            url = "wss://b.example.org"
+            expected_did = "did:jig:zB"
+            publish = true
+
+            [[federation.peers]]
+            url = "wss://c.example.org"
+            expected_did = "did:jig:zC"
+            quota = { blocks_per_min = 7, bytes_per_min = 70 }
+
+            [[federation.attested_suffixes]]
+            suffix = "Names.Example.org"
+            root = "dns"
+            "#,
+        )
+        .unwrap();
+        // Real DIDs, since boot trusts each peer's.
+        for (i, peer) in config.federation.peers.iter_mut().enumerate() {
+            peer.expected_did =
+                jig_core::Did::from_ed25519_pubkey(&[i as u8 + 1; 32]).to_did_jig_string();
+        }
+        config.server.allowed_block_kinds = vec!["text-render".into(), "text-render".into()];
+        config
+    }
+
+    #[tokio::test]
+    async fn the_peer_policy_publishes_only_the_published_peers() {
+        let config = policy_config();
+        let did = |i: usize| config.federation.peers[i].expected_did.clone();
+        let (a, b) = (did(0), did(1));
+        let state = Arc::new(AppState::for_test_with_config(config.clone()).unwrap());
+        let first = publish(&state).await.unwrap();
+        let store = &state.ingest_ctx.store;
+        let block = store.get_block(&first.cid).unwrap().unwrap();
+        let doc = ServerManifest::decode(&document_of(&block.bundle_bytes).unwrap()).unwrap();
+        let mut peers = vec![a.clone(), b];
+        peers.sort_by_key(|p| jig_core::dcbor::encode(&jig_core::dcbor::Value::text(p)).unwrap());
+        assert_eq!(
+            doc.peer_policy,
+            PeerPolicy {
+                relayed_kinds: vec!["text-render".into()],
+                default_peer_quota: Quota {
+                    blocks_per_min: 100,
+                    bytes_per_min: 2000,
+                },
+                peer_quotas: vec![PeerQuota {
+                    peer: a,
+                    quota: Quota {
+                        blocks_per_min: 5,
+                        bytes_per_min: 50,
+                    },
+                }],
+                peers,
+                attested_suffixes: vec![AttestedSuffix::Dns {
+                    suffix: "names.example.org".into(),
+                    domain: "names.example.org".into(),
+                }],
+            }
+        );
+
+        // Nothing changed: nothing written.
+        assert_eq!(publish(&state).await.unwrap(), first);
+
+        // Publishing the third peer is a new manifest.
+        let mut config = config;
+        config.federation.peers[2].publish = true;
+        let mut changed = AppState::for_test_with_config(config).unwrap();
+        changed.ingest_ctx = state.ingest_ctx.clone();
+        changed.server_did = state.server_did.clone();
+        let second = publish(&Arc::new(changed)).await.unwrap();
+        assert_ne!(second.cid, first.cid);
+        assert_eq!(second.seq, first.seq + 1);
+        let block = store.get_block(&second.cid).unwrap().unwrap();
+        let doc = ServerManifest::decode(&document_of(&block.bundle_bytes).unwrap()).unwrap();
+        assert_eq!(doc.peer_policy.peers.len(), 3);
+        assert_eq!(doc.peer_policy.peer_quotas.len(), 2);
     }
 
     #[tokio::test]

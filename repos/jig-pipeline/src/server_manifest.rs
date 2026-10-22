@@ -17,9 +17,8 @@
 //! [`ServerManifest::decode`] refuses anything else, and any key it does not
 //! know: a new field is a new [`FORMAT`].
 //!
-//! The peer-policy keys are lane F's to fill (F2 task 3). This module
-//! reserves them with the agreed shape; a server publishes them empty until
-//! then.
+//! jig-server fills the peer-policy keys from its `[federation]` config
+//! (`v0_0_2_manifest_log`).
 
 use jig_core::dcbor::{self, Value};
 
