@@ -8,17 +8,26 @@
 #                     configured /var/lib/jig/jig.db means the blocks people
 #                     actually sent live in /var/lib/jig/jig_v002.db. jig.db
 #                     itself is no longer used (#196) and is not backed up.
-#   2. server.key   — the ed25519 seed the server DID is derived from. Losing it
+#   2. server.jigkey — the server's signing key, sealed (a configured
+#                     server.key names server.jigkey beside it). Losing it
 #                     changes the server's identity and breaks TOFU pinning for
 #                     every client that ever connected. See deploy/README.md.
-#   3. nameserver_v002.db and nameserver_v002.key, when this box runs
+#   3. nameserver_v002.db and nameserver_v002.jigkey, when this box runs
 #                     jig-nameserver. nameserver_v002.db holds the alias
-#                     bindings; nameserver_v002.key is the nameserver's signing
-#                     key. Without the key a restore gets a new nameserver DID,
-#                     and every attestation the old one signed stops verifying
-#                     for anyone whose delegation names the old DID.
-#                     nameserver.db, the legacy registry, is no longer used and
-#                     is not backed up: it holds a raw key (`ns_identity`).
+#                     bindings; the key is the nameserver's signing key.
+#                     Without it a restore gets a new nameserver DID, and every
+#                     attestation the old one signed stops verifying for anyone
+#                     whose delegation names the old DID. nameserver.db, the
+#                     legacy registry, is no longer used and is not backed up:
+#                     it holds a raw key (`ns_identity`).
+#
+# A sealed key restores only with a secret for one of its slots, and this
+# backup does not hold one: that is the point of sealing it. Keep a slot that
+# can open it on another machine (a passphrase kept offline) beside the one the
+# server boots with: a TPM-bound systemd credential does not move with the disk.
+# `jig-server keys show` lists the slots. A raw key (`[keys] storage =
+# "plaintext"`) is still copied, with a warning: the snapshot then holds the
+# key in clear.
 #
 # SQLite is copied with `VACUUM INTO`, not `cp`: it takes a read lock and emits
 # a single consistent file, so a snapshot taken while the server is serving is
@@ -92,19 +101,66 @@ snapshot_db "$JIG_STATE_DIR/jig_v002.db"
 # lost alias store means every handle has to be re-registered.
 snapshot_db "$JIG_STATE_DIR/nameserver_v002.db"
 
-# --- the irreplaceable one --------------------------------------------------
-# The databases can be rebuilt from what people re-send. The key cannot be
+# --- the irreplaceable ones -------------------------------------------------
+# The databases can be rebuilt from what people re-send. A key cannot be
 # rebuilt from anything. If it is missing we do NOT quietly continue.
-KEYFILE="${JIG_SERVER_KEYFILE:-$JIG_STATE_DIR/server.key}"
-if [ -f "$KEYFILE" ]; then
-    cp -p "$KEYFILE" "$DEST/server.key"
-    chmod 600 "$DEST/server.key"
-    log "key:  $KEYFILE -> $DEST/server.key"
+#
+# copy_key PATH LABEL: copy the key PATH names. PATH may name the raw file
+# (server.key) or the sealed one (server.jigkey); the sealed one is what a
+# server reads, so it is preferred. The extension is taken from the file name
+# alone, as the server does: /srv/jig.d/server names /srv/jig.d/server.jigkey.
+#
+# Returns 1 if neither file exists and 2 if one does but could not be copied.
+# It runs with `set -e` off (it is called in a test), so every step that can
+# fail says so itself: a key that was not copied is never counted.
+key_notes=""
+copy_key() {
+    local path="$1" label="$2" dir base sealed raw src dest
+    dir="$(dirname -- "$path")"
+    base="$(basename -- "$path")"
+    case "$base" in
+        *.jigkey) sealed="$path"; raw="" ;;
+        *.*)      sealed="$dir/${base%.*}.jigkey"; raw="$path" ;;
+        *)        sealed="$dir/$base.jigkey"; raw="$path" ;;
+    esac
+    if [ -f "$sealed" ]; then
+        src="$sealed"
+    elif [ -n "$raw" ] && [ -f "$raw" ]; then
+        src="$raw"
+    else
+        return 1
+    fi
+    dest="$DEST/$(basename -- "$src")"
+    cp -p -- "$src" "$dest" || { log "ERROR: could not copy $src (is it readable by $(id -un)?)"; return 2; }
+    chmod 600 -- "$dest" || { log "ERROR: could not chmod $dest"; return 2; }
+    [ -s "$dest" ] || { log "ERROR: $dest is empty after copying $src"; return 2; }
+    if [ "$src" = "$sealed" ]; then
+        log "key:  $sealed -> $dest (sealed)"
+        if [ -n "$raw" ] && [ -f "$raw" ]; then
+            log "WARN: $raw is a raw copy of the $label key in clear beside its sealed copy;"
+            log "      it is not backed up, and $label refuses to start until it is removed"
+        fi
+        key_notes="$key_notes $label=sealed"
+    else
+        log "key:  $raw -> $dest"
+        log "WARN: the $label key is stored in clear, so this snapshot holds it in clear."
+        log "      Seal it: $label keys seal --keyfile $raw --slot ..."
+        key_notes="$key_notes $label=raw-in-clear"
+    fi
     backed_up=$((backed_up + 1))
-else
-    die "server keyfile $KEYFILE not found — refusing to record a backup that
-    omits the server identity. Set JIG_SERVER_KEYFILE if it lives elsewhere."
-fi
+}
+
+KEYFILE="${JIG_SERVER_KEYFILE:-$JIG_STATE_DIR/server.key}"
+rc=0
+copy_key "$KEYFILE" jig-server || rc=$?
+case "$rc" in
+    0) ;;
+    1) die "server key $KEYFILE (or its .jigkey) not found — refusing to record a
+    backup that omits the server identity. Set JIG_SERVER_KEYFILE to [server]
+    server_did_keyfile if it lives elsewhere." ;;
+    *) die "the server key could not be copied — refusing to record a backup
+    without it" ;;
+esac
 
 # The nameserver's signing key. The nameserver is optional on a box, so a
 # missing key is fatal only when its alias store exists: bindings without the
@@ -112,16 +168,18 @@ fi
 # nameserver reads the path from [v0_0_2.server] server_did_keyfile when that
 # is set; set JIG_NAMESERVER_KEYFILE to the same path in that case.
 NS_KEYFILE="${JIG_NAMESERVER_KEYFILE:-$JIG_STATE_DIR/nameserver_v002.key}"
-if [ -f "$NS_KEYFILE" ]; then
-    cp -p "$NS_KEYFILE" "$DEST/nameserver_v002.key"
-    chmod 600 "$DEST/nameserver_v002.key"
-    log "key:  $NS_KEYFILE -> $DEST/nameserver_v002.key"
-    backed_up=$((backed_up + 1))
-elif [ -f "$JIG_STATE_DIR/nameserver_v002.db" ]; then
-    die "nameserver keyfile $NS_KEYFILE not found, but $JIG_STATE_DIR/nameserver_v002.db
-    exists — refusing to record a backup of alias bindings without the key that
-    signed them. Set JIG_NAMESERVER_KEYFILE if it lives elsewhere."
-else
+rc=0
+copy_key "$NS_KEYFILE" jig-nameserver || rc=$?
+if [ "$rc" -eq 2 ]; then
+    die "the nameserver key could not be copied — refusing to record a backup
+    without it"
+elif [ "$rc" -eq 1 ]; then
+    if [ -f "$JIG_STATE_DIR/nameserver_v002.db" ]; then
+        die "nameserver key $NS_KEYFILE (or its .jigkey) not found, but
+    $JIG_STATE_DIR/nameserver_v002.db exists — refusing to record a backup of
+    alias bindings without the key that signed them. Set JIG_NAMESERVER_KEYFILE
+    if it lives elsewhere."
+    fi
     log "skip: $NS_KEYFILE not present"
 fi
 
@@ -147,6 +205,9 @@ manifest_hashes="$(cd "$DEST" && hash_files)"
     printf 'host=%s\n' "$(hostname)"
     printf 'state_dir=%s\n' "$JIG_STATE_DIR"
     printf 'files=%s\n' "$manifest_files"
+    printf 'keys=%s\n' "${key_notes# }"
+    printf 'restore: a sealed key opens only with a secret for one of its slots (not in this snapshot);\n'
+    printf '         `jig-server keys show --keyfile <file>` lists them\n'
     printf 'sha256:\n'
     printf '%s\n' "$manifest_hashes"
 } > "$DEST/MANIFEST.txt"

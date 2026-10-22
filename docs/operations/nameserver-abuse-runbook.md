@@ -43,7 +43,7 @@ spreads further than the group.
   shipped unit binds to the tailnet only ([`deploy/README.md`](../../deploy/README.md)). Keep it that way until these are
   authenticated.
 - **Know your files.** With the shipped unit: alias store `/var/lib/jig/nameserver_v002.db`,
-  attestation signing key `/var/lib/jig/nameserver_v002.key` (or `[v0_0_2.server] server_did_keyfile`), and any
+  attestation signing key `/var/lib/jig/nameserver_v002.jigkey`, sealed (or the `.jigkey` beside `[v0_0_2.server] server_did_keyfile`), and any
   `JIG_NS_*` settings in the optional `/etc/jig/jig-nameserver.env`. The nameserver has no
   `JIG_NS_SECRET` any more (#192).
 - **Know that settings are read at start-up.** Every `JIG_NS_*` change below needs
@@ -185,7 +185,7 @@ issue attestations, and read or change everything in its databases.
    backup. List every alias whose DID changed.
 4. **Rotate everything:**
    - `JIG_NS_ADMIN_TOKEN`: new value.
-   - Attestation key: move `nameserver_v002.key` aside and let the service mint a new one,
+   - Attestation key: move `nameserver_v002.jigkey` aside and let the service seal a new one,
      which gives the nameserver a new `ns_did`. Every attestation signed by the old key
      must be treated as untrusted. Dependent servers and clients accept the new key only
      once its `ns_did` is in their delegation's `authorities`, so tell them the new DID.

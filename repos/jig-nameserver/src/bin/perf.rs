@@ -186,7 +186,11 @@ async fn main() -> anyhow::Result<()> {
 
 async fn start_inproc_server() -> anyhow::Result<(String, JoinHandle<()>)> {
     let cfg = NameServerConfig::default();
-    let app = app_router(jig_nameserver::server::AppState { cfg: cfg.clone() });
+    let app = app_router(jig_nameserver::server::AppState {
+        cfg: cfg.clone(),
+        server_did: None,
+        tls_binding: Default::default(),
+    });
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let url = format!("http://{}:{}", addr.ip(), addr.port());

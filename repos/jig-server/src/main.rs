@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use jig_server::{JigServer, ServerConfig};
 
 #[derive(Parser, Debug)]
@@ -27,6 +27,106 @@ struct Args {
     /// Override port.
     #[arg(long)]
     port: Option<u16>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// The server's own signing key.
+    Keys {
+        #[command(subcommand)]
+        keys: KeysCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum KeysCommand {
+    /// Seal a raw 32-byte keyfile, written by an older jig-server, into a
+    /// .jigkey beside it, then remove the raw file. The DID does not change.
+    Seal {
+        /// The raw keyfile. Defaults to `[server] server_did_keyfile`.
+        #[arg(long)]
+        keyfile: Option<PathBuf>,
+        /// A slot to seal it with: credential:PATH, env:NAME, or passphrase
+        /// (read from JIG_KEY_PASSPHRASE). Repeat for more than one, for
+        /// example a credential to boot with and a passphrase kept offline to
+        /// restore with on another machine.
+        #[arg(long = "slot", required = true)]
+        slots: Vec<String>,
+    },
+    /// Add a slot to the sealed key, opening it with `[keys] unlock`,
+    /// JIG_KEY_UNLOCK or JIG_KEY_PASSPHRASE.
+    AddSlot {
+        /// The keyfile. Defaults to `[server] server_did_keyfile`.
+        #[arg(long)]
+        keyfile: Option<PathBuf>,
+        /// The slot to add: credential:PATH, env:NAME or passphrase.
+        #[arg(long)]
+        slot: String,
+    },
+    /// Print the DID of the sealed key and which slots open it.
+    Show {
+        /// The keyfile. Defaults to `[server] server_did_keyfile`.
+        #[arg(long)]
+        keyfile: Option<PathBuf>,
+    },
+    /// Check that one secret opens the key, trying nothing configured: for
+    /// an offline passphrase or a new machine's credential, before relying
+    /// on it.
+    Verify {
+        /// The keyfile. Defaults to `[server] server_did_keyfile`.
+        #[arg(long)]
+        keyfile: Option<PathBuf>,
+        /// The slot to try: credential:PATH, env:NAME or passphrase.
+        #[arg(long)]
+        slot: String,
+    },
+    /// Make a new key, sealed with every slot named, where there is none. It
+    /// is never written in clear and never overwrites a key. Prints the DID.
+    Generate {
+        /// The keyfile. Defaults to `[server] server_did_keyfile`.
+        #[arg(long)]
+        keyfile: Option<PathBuf>,
+        /// A slot to seal it with: credential:PATH, env:NAME, or passphrase
+        /// (read from JIG_KEY_PASSPHRASE). Repeatable.
+        #[arg(long = "slot", required = true)]
+        slots: Vec<String>,
+    },
+}
+
+/// `jig-server keys ...`: works on the key file only, never starts the server.
+fn run_keys(keys: KeysCommand, config: &ServerConfig) -> Result<String, String> {
+    use jig_client::server_key::KeysAction;
+    let or_configured = |keyfile: Option<PathBuf>| {
+        keyfile.unwrap_or_else(|| {
+            PathBuf::from(shellexpand::tilde(&config.server.server_did_keyfile).into_owned())
+        })
+    };
+    let action = match keys {
+        KeysCommand::Seal { keyfile, slots } => KeysAction::Seal {
+            keyfile: or_configured(keyfile),
+            slots,
+        },
+        KeysCommand::AddSlot { keyfile, slot } => KeysAction::AddSlot {
+            keyfile: or_configured(keyfile),
+            slot,
+        },
+        KeysCommand::Show { keyfile } => KeysAction::Show {
+            keyfile: or_configured(keyfile),
+        },
+        KeysCommand::Verify { keyfile, slot } => KeysAction::Verify {
+            keyfile: or_configured(keyfile),
+            slot,
+        },
+        KeysCommand::Generate { keyfile, slots } => KeysAction::Generate {
+            keyfile: or_configured(keyfile),
+            slots,
+        },
+    };
+    jig_client::server_key::run(action, &jig_server::v0_0_2::key_options(&config.keys))
+        .map_err(|e| e.to_string())
 }
 
 /// Load the `--config` file.
@@ -122,6 +222,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    if let Some(Command::Keys { keys }) = args.command {
+        match run_keys(keys, &config) {
+            Ok(out) => println!("{out}"),
+            Err(msg) => {
+                eprintln!("[jig-server] {msg}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
     let env_db = std::env::var("JIG_DB_PATH").ok().map(PathBuf::from);
     config.apply_overrides_explicit(args.db_path, env_db, args.bind, args.port);
 
@@ -191,7 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Fatal: without the v0.0.2 module the server would serve only
                 // /.well-known/jig, /healthz and /metrics, which reads as "up"
                 // to every health check while accepting and serving nothing.
-                let msg = format!("v0.0.2 module failed to initialize: {e}");
+                let msg = format!("v0.0.2 module failed to initialize: {e:#}");
                 tracing::error!("{msg}");
                 eprintln!("[jig-server] FATAL: {msg}");
                 std::process::exit(1);

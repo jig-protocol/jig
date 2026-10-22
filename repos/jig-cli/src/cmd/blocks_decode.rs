@@ -75,9 +75,57 @@ pub const SYSTEM: &str = "*";
 ///   * Body lives at `manifest.metadata["body"]` (a JSON string).
 ///   * Sender DID is `manifest.authors[0].did`.
 ///   * Wall-clock timestamp comes from `manifest.hlc_ts.wall_ms` if set.
+///
+/// A text-render message is also checked against its server's `exec` receipt
+/// ([`render_check`]) and marked when it could not be verified or the server's
+/// render differs from this client's.
 pub fn decode(d: &DeliveredBlock) -> Result<DecodedBlock> {
     let opened = open(d).context("opening delivered block")?;
-    Ok(plain(&opened, &d.receipts))
+    let mut decoded = plain(&opened, &d.receipts);
+    if decoded.kind == Some(BlockKind::TextRender) {
+        decoded.body.push_str(render_check(d, &opened).marker());
+    }
+    Ok(decoded)
+}
+
+/// What this client could say about a text-render message's server render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "local-runtime"), allow(dead_code))]
+pub enum RenderCheck {
+    /// This client ran the same component on the same invocation and agreed.
+    Agreed,
+    /// The server's receipt disagrees with this client on a comparable outcome. Shown, not
+    /// resolved: it can also mean this client runs a different text-block build.
+    Differs,
+    /// Not checked: no `exec` receipt, an incomplete run, or a build without the runtime.
+    Unverified,
+}
+
+impl RenderCheck {
+    /// The fixed text appended to the message. Never server-supplied text.
+    pub fn marker(self) -> &'static str {
+        match self {
+            RenderCheck::Agreed => "",
+            RenderCheck::Differs => "  [server render differs]",
+            RenderCheck::Unverified => "  [unverified]",
+        }
+    }
+}
+
+#[cfg(feature = "local-runtime")]
+pub fn render_check(d: &DeliveredBlock, opened: &OpenedBlock) -> RenderCheck {
+    use jig_client::verify::{Verification, verify};
+    match verify(d, opened) {
+        Verification::Agree => RenderCheck::Agreed,
+        Verification::Diverge(_) => RenderCheck::Differs,
+        Verification::NotComparable(_) | Verification::Unverified(_) => RenderCheck::Unverified,
+    }
+}
+
+/// A build without the block runtime cannot re-execute anything.
+#[cfg(not(feature = "local-runtime"))]
+pub fn render_check(_d: &DeliveredBlock, _opened: &OpenedBlock) -> RenderCheck {
+    RenderCheck::Unverified
 }
 
 /// Present a block given what an encrypted-channel session made of it.
@@ -211,7 +259,8 @@ mod tests {
 
         assert_eq!(decoded.ts, 1_747_680_000_000);
         assert_eq!(decoded.sender, did.to_did_jig_string());
-        assert_eq!(decoded.body, "hi there");
+        // No server receipt to check against.
+        assert_eq!(decoded.body, "hi there  [unverified]");
         assert!(!decoded.parity_warning);
         assert_eq!(decoded.parity_hash_count, 0);
     }
@@ -264,7 +313,7 @@ mod tests {
         );
         let mut d = signed(&block, vec![]);
         d.sig_b64 = None;
-        assert_eq!(decode(&d).unwrap().body, "hi  [unsigned]");
+        assert_eq!(decode(&d).unwrap().body, "hi  [unsigned]  [unverified]");
     }
 
     #[test]

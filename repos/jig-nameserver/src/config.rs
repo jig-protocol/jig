@@ -52,6 +52,9 @@ pub struct NameServerConfig {
     /// Per-IP and per-DID limits on the v0.0.2 `register`, `rotate` and
     /// `renew` routes (`[alias_rate_limits]`).
     pub alias_rate_limits: AliasRateLimitConfig,
+    /// TLS for the listener (`[tls]`), on by default with a self-signed
+    /// certificate the nameserver's DID vouches for at `/.well-known/jig-ns`.
+    pub tls: jig_config::tls::TlsConfig,
 }
 
 /// `JIG_NS_*` variables a removed feature read, with what removed it. Setting
@@ -319,7 +322,18 @@ impl NameServerConfig {
             analytics: AnalyticsConfig::from_env(),
             v0_0_2: jig_config::v0_0_2_server::JigServerConfig::default(),
             alias_rate_limits: AliasRateLimitConfig::default(),
+            tls: jig_config::tls::TlsConfig::default(),
         }
+    }
+
+    /// Unsafe options this config sets, as `/.well-known/jig-ns` lists them
+    /// (JEP-0004 rule 12), named the way jig-server names its own.
+    pub fn unsafe_options_active(&self) -> Vec<String> {
+        let mut active = Vec::new();
+        if !self.tls.enabled {
+            active.push("tls.enabled=false".to_string());
+        }
+        active
     }
 
     fn apply_env_overrides(&mut self) {
@@ -1167,6 +1181,16 @@ proxy_ip_header = "x-forwarded-for"
 # (its signing key). The file itself is never created.
 database_path = "~/.jig/nameserver.db"
 
+# TLS, on by default. With neither path set, the nameserver makes a self-signed
+# certificate on first start (in nameserver/tls/ next to the database), and its
+# DID vouches for it at /.well-known/jig-ns. Set both paths to serve a
+# certificate a CA issued. `enabled = false` serves plaintext: an unsafe
+# option, listed in /.well-known/jig-ns under unsafe_options_active.
+[tls]
+enabled = true
+# cert_path = "/etc/jig/nameserver.crt"
+# key_path = "/etc/jig/nameserver.key"
+
 
 # v0.0.2 register / rotate / renew. Refused requests get HTTP 429 with code
 # RATE_LIMITED and a Retry-After header.
@@ -1280,9 +1304,9 @@ default_time_range = "last_day"  # Options: last_hour, last_day, last_week, last
 # did = "did:jig:z..."
 # aliases = ["alice"]
 #
-# # Proof-of-work on register, renew and rotate (JEP-0008). Off by default
-# # (min_effort = 0) until jig clients solve it; the recommended values are
-# # shown. An allowlisted registration pays min_effort; an ordinary one pays
+# # Proof-of-work on register, renew and rotate (JEP-0008). On by default
+# # at the values shown, which jig clients solve; min_effort = 0 turns it
+# # off. An allowlisted registration pays min_effort; an ordinary one pays
 # # min_effort x short_name_factor^(short_name_len - length), up to max_effort.
 # [v0_0_2.nameserver.alias_suffixes.pow]
 # alg = 1
@@ -1292,6 +1316,19 @@ default_time_range = "last_day"  # Options: last_hour, last_day, last_week, last
 # short_name_len = 5
 # short_name_factor = 4
 # renew_effort = 1
+# penalty_decay_secs = 600   # a penalty point's life; a repeat doubles it
+#
+# # The cap on registrations by DIDs registration_allow does not name. Off by
+# # default until jig clients handle 503 REGISTRATION_BUSY; recommended values
+# # shown.
+# [v0_0_2.nameserver.alias_suffixes.pool]
+# enabled = true
+# strangers_per_hour = 60
+# burst = 10
+# controller = "doubling"    # double the effort after a window with the queue
+# controller_window_secs = 300  # full, halve it after a window with none queued
+# queue_len = 20             # held for a token, highest effort first
+# queue_wait_secs = 10       # then 503 REGISTRATION_BUSY with Retry-After
 
 [v0_0_2.server]
 # Ed25519 key that signs alias attestations. Left at the jig-server default

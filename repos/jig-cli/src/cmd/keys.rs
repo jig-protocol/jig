@@ -66,6 +66,9 @@ pub(crate) struct RenewRequestBody {
     pub did: String,
     pub challenge: String,
     pub proof_of_control: String,
+    /// JEP-0008 proof-of-work, when the suffix asks for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pow: Option<jig_core::pow::Proof>,
 }
 
 /// Body of POST `/v1/rotate`. Mirrors
@@ -78,6 +81,9 @@ pub(crate) struct RotateRequestBody {
     pub challenge: String,
     pub sig_by_old: String,
     pub sig_by_new: String,
+    /// JEP-0008 proof-of-work by the old DID, when the suffix asks for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pow: Option<jig_core::pow::Proof>,
 }
 
 // ============================================================================
@@ -111,10 +117,31 @@ pub async fn renew_with_nameserver(
 ) -> Result<Attestation> {
     parse_full_name(alias)?;
     let ns = Nameserver::connect(ns_url, alias, delegations, Purpose::Keep).await?;
-    let challenge = ns.challenge().await?;
-    let body = build_renew_request(id, ns.name(), ns.ns_did(), &challenge);
-    ns.post_binding("/v1/renew", &body, &id.did_string())
-        .await?
+    let name = ns.name().clone();
+    let did = id.did_string();
+    let full = name.as_alias();
+    crate::cmd::ns_pow::with_pow(
+        &ns,
+        crate::cmd::ns_pow::Work {
+            action: jig_core::pow::Action::NsRenew,
+            subject: &did,
+            name: &name,
+            binding: &|challenge| {
+                Ok(jig_core::naming::proof_hash(
+                    Action::Renew,
+                    ns.ns_did(),
+                    &full,
+                    challenge,
+                ))
+            },
+        },
+        async |challenge, pow| {
+            let mut body = build_renew_request(id, &name, ns.ns_did(), &challenge);
+            body.pow = pow;
+            ns.post_binding("/v1/renew", &body, &did).await
+        },
+    )
+    .await?
 }
 
 /// Build the POST /v1/renew body: the proof of control is bound to the renew
@@ -133,6 +160,7 @@ pub(crate) fn build_renew_request(
         did: id.did_string(),
         challenge: challenge.to_string(),
         proof_of_control: b64u(&proof),
+        pow: None,
     }
 }
 
@@ -238,10 +266,36 @@ pub async fn rotate_with_nameserver(
 ) -> Result<Result<Attestation>> {
     parse_full_name(alias)?;
     let ns = Nameserver::connect(ns_url, alias, delegations, Purpose::Keep).await?;
-    let challenge = ns.challenge().await?;
-    let body = build_rotate_request(old_id, new_id, &ns.name().as_alias(), &challenge);
-    ns.post_binding("/v1/rotate", &body, &new_id.did_string())
-        .await
+    let name = ns.name().clone();
+    let (old_did, new_did) = (old_id.did_string(), new_id.did_string());
+    let full = name.as_alias();
+    // `post_binding`'s outer `Err` is a refusal, the only case `with_pow`
+    // retries; an unknown outcome (a timeout, a 5xx) is its inner `Err`,
+    // returned as is so the caller keeps the new key.
+    crate::cmd::ns_pow::with_pow(
+        &ns,
+        crate::cmd::ns_pow::Work {
+            action: jig_core::pow::Action::NsRotate,
+            subject: &old_did,
+            name: &name,
+            binding: &|challenge| {
+                jig_core::naming::rotate_pow_binding(
+                    ns.ns_did(),
+                    &full,
+                    &old_did,
+                    &new_did,
+                    challenge,
+                )
+                .context("binding the rotation's proof-of-work")
+            },
+        },
+        async |challenge, pow| {
+            let mut body = build_rotate_request(old_id, new_id, &full, &challenge);
+            body.pow = pow;
+            ns.post_binding("/v1/rotate", &body, &new_did).await
+        },
+    )
+    .await
 }
 
 /// Build the POST /v1/rotate body. Factored out for unit testing.
@@ -261,6 +315,7 @@ pub(crate) fn build_rotate_request(
         challenge: challenge.to_string(),
         sig_by_old: encode(sig_old.to_bytes()),
         sig_by_new: encode(sig_new.to_bytes()),
+        pow: None,
     }
 }
 
@@ -269,6 +324,77 @@ pub(crate) fn build_rotate_request(
 // ============================================================================
 
 /// Parse the full `alias@suffix` renew and rotate take.
+/// `jig keys protect`: list the slots of the active identity's key, or add
+/// or remove one ([`jig_client::identity::protect`]).
+pub fn protect(ctx: &CliContext, add: Option<&str>, remove: Option<usize>) -> Result<()> {
+    use jig_client::identity::{Protect, SlotToAdd};
+    let did = ctx.effective().user.did.clone();
+    if !did.starts_with("did:jig:") {
+        anyhow::bail!("no identity is configured: run `jig init` first");
+    }
+    let keys_dir = jig_client::identity::default_keys_dir();
+    let change = match (add, remove) {
+        (None, None) => None,
+        (Some(spec), _) => Some(Protect::Add(match spec {
+            "passphrase" => SlotToAdd::Passphrase(
+                std::env::var("JIG_KEY_NEW_PASSPHRASE")
+                    .ok()
+                    .filter(|p| !p.is_empty())
+                    .map(zeroize::Zeroizing::new),
+            ),
+            "keychain" => SlotToAdd::Keychain,
+            other if other.starts_with("env:") || other.starts_with("credential:") => {
+                SlotToAdd::Secret(other.to_string())
+            }
+            // Not echoed: it may be a secret pasted in by mistake.
+            _ => anyhow::bail!(
+                "--add takes passphrase, keychain, env:NAME or credential:PATH (the value is not \
+                 shown, in case it is a secret)"
+            ),
+        })),
+        (None, Some(0)) => anyhow::bail!("slots are numbered from 1, as the list shows them"),
+        (None, Some(n)) => Some(Protect::Remove(n - 1)),
+    };
+    let removing = matches!(change, Some(Protect::Remove(_)));
+    let slots = match change {
+        None => jig_client::identity::slots(&keys_dir, &did)?,
+        Some(change) => {
+            let slots = jig_client::identity::protect(
+                &keys_dir,
+                &did,
+                super::passphrase::key_access()?,
+                change,
+            )
+            .with_context(|| format!("changing the slots of {did}"))?;
+            eprintln!(
+                "updated {}",
+                jig_client::identity::key_path(&keys_dir, &did).display()
+            );
+            if removing {
+                // The data key is unchanged, so older copies of the file still
+                // open with the slot just removed.
+                eprintln!(
+                    "note: only this file changed. A backup or synced copy made before still \
+                     opens with the removed slot; if its secret may have leaked, move to a new \
+                     key with `jig keys rotate`"
+                );
+            }
+            slots
+        }
+    };
+    println!("{did} opens with:");
+    for (i, slot) in slots.iter().enumerate() {
+        println!("  {}. {}", i + 1, jig_client::identity::slot_name(slot));
+    }
+    if slots.len() == 1 {
+        eprintln!(
+            "warning: one way to open this key. Losing it (a forgotten passphrase, a wiped \
+             keychain) loses the identity: add another with `jig keys protect --add passphrase`"
+        );
+    }
+    Ok(())
+}
+
 fn parse_full_name(alias: &str) -> Result<Name> {
     Name::parse(alias).with_context(|| format!("`{alias}` is not a full alias@suffix"))
 }

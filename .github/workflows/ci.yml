@@ -159,9 +159,18 @@ jobs:
       - name: No normal build enables jig-pipeline's test-support
         # test-support compiles BlockExecutor::shared, which signs operator
         # policies with a public test key; only [dev-dependencies] may enable it.
+        # The grep names the crate: jig-client has a test-support feature too.
         run: |
           ! cargo tree --locked -e normal,features -i jig-pipeline --workspace \
-            | grep 'feature "test-support"'
+            | grep 'jig-pipeline feature "test-support"'
+      - name: No release binary enables jig-client's test-support
+        # test-support compiles server_key::credential_for_tests. integration-
+        # tests enables it as a normal dependency (its harness is in src/), so
+        # this is scoped to the binaries release.yml ships, not --workspace.
+        run: |
+          ! cargo tree --locked -e normal,features -i jig-client \
+            -p jig-server -p jig-cli -p jig-nameserver \
+            | grep 'jig-client feature "test-support"'
       - name: Clippy (jig-bridge-core web feature)
         # The webhook-mount path (RouterMount + cfg'd BridgeContext field) is
         # gated behind the `web` feature; lint it explicitly so it's covered.
@@ -196,6 +205,12 @@ jobs:
             -p jig-bridge-email
       - name: Nextest (jig-bridge-core web feature)
         run: cargo nextest run -p jig-bridge-core --features web
+      - name: deploy/setup-server-key.sh against the binaries just tested
+        # Stub systemctl and systemd-creds; the real jig-server and
+        # jig-nameserver, which the nextest run above built. Root, because the
+        # script chowns the key to the unit's user.
+        working-directory: .
+        run: sudo env "PATH=$PATH" scripts/test-setup-server-key.sh repos/target/debug
 
   wasm-build:
     name: wasm-build (text-block, wasm32-unknown-unknown)

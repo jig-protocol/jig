@@ -6,6 +6,7 @@ pub mod server;
 pub mod v0_0_2;
 pub mod v0_0_2_handles;
 pub mod v0_0_2_policy;
+pub mod v0_0_2_pow_policy;
 #[cfg(test)]
 mod v0_0_2_pow_tests;
 pub mod v0_0_2_rate_limit;
