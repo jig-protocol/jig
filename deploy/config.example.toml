@@ -182,8 +182,10 @@ list_handles = false
 # publish = true. Published, not yet enforced.
 # quota = { blocks_per_min = 1200, bytes_per_min = 16777216 }
 # What to do when this peer offers a channel (JEP-0005 rule 8). "hold" (the
-# default) keeps the offer for you to accept or refuse; "accept" accepts every
-# offer this server can honour. An offer it cannot honour (a suite it does not
+# default) keeps the offer for you to accept or refuse with
+# `jig-server contracts list` and `jig-server contracts accept <id>` (or
+# `refuse`, or `end` for a live share); "accept" accepts every offer this
+# server can honour. An offer it cannot honour (a suite it does not
 # carry, a name suffix you both claim) is refused either way.
 # offers = "hold"
 #
