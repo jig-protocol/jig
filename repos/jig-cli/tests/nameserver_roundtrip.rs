@@ -335,3 +335,96 @@ async fn register_renew_and_rotate_solve_the_nameservers_proof_of_work() {
     assert_ne!(second, first);
     assert_eq!(resolved(&ns, name).await.did, second);
 }
+
+/// A nameserver whose registration pool is full answers `503
+/// REGISTRATION_BUSY` with `Retry-After` (JEP-0008 rules 22–24). `jig` waits
+/// that long, says so, and registers on a fresh challenge.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_pool_is_waited_out_and_the_registration_retried() {
+    use integration_tests::harness::{PoolPolicy, PowPolicy};
+    // One stranger every 10 s, and one token: the harness's own registration
+    // takes it, so the CLI's finds the pool empty. The window is wide enough
+    // for a debug `jig` on a loaded CI runner to start, probe TLS and reach
+    // /v1/register inside it; without proof-of-work there is nothing to
+    // solve first.
+    let pool = PoolPolicy {
+        strangers_per_hour: 360,
+        burst: 1,
+        queue_wait_secs: 0,
+        ..PoolPolicy::recommended()
+    };
+    let ns = TestNameserver::start_tls_with_policies("dj.jig", PowPolicy::off(), pool)
+        .await
+        .unwrap();
+    ns.register("first").await.expect("takes the one token");
+    let url = ns.http_url();
+    let home = tempfile::tempdir().unwrap();
+
+    let (ok, out) = jig(
+        home.path(),
+        &[
+            "init",
+            "dj",
+            "--request-alias",
+            "deji",
+            "--nameserver",
+            &url,
+        ],
+    )
+    .await;
+    assert!(ok, "jig init after a busy pool: {out}");
+    // The CLI saw REGISTRATION_BUSY and waited what its Retry-After said: at
+    // most the 10 s refill, never more.
+    let waited: u64 = out
+        .split("taking no more new names for now; waiting ")
+        .nth(1)
+        .and_then(|rest| rest.split('s').next())
+        .and_then(|secs| secs.parse().ok())
+        .unwrap_or_else(|| panic!("no busy refusal was waited out: {out}"));
+    assert!((1..=10).contains(&waited), "waited {waited}s: {out}");
+    assert_eq!(
+        resolved(&ns, "deji@dj.jig").await.did,
+        configured_did(home.path())
+    );
+}
+
+/// When the pool's next token is further off than the client will wait, it
+/// says when to try again instead of waiting.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pool_full_for_long_is_reported_not_waited_for() {
+    use integration_tests::harness::PoolPolicy;
+    let pool = PoolPolicy {
+        strangers_per_hour: 1,
+        burst: 1,
+        queue_wait_secs: 0,
+        ..PoolPolicy::recommended()
+    };
+    let ns = TestNameserver::start_tls_with_policies("dj.jig", TestNameserver::test_pow(), pool)
+        .await
+        .unwrap();
+    ns.register("first").await.expect("takes the one token");
+    let home = tempfile::tempdir().unwrap();
+
+    let started = std::time::Instant::now();
+    let (ok, out) = jig(
+        home.path(),
+        &[
+            "init",
+            "dj",
+            "--request-alias",
+            "deji",
+            "--nameserver",
+            &ns.http_url(),
+        ],
+    )
+    .await;
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("taking no more new names for now; try again in about"),
+        "{out}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "did not wait an hour"
+    );
+}

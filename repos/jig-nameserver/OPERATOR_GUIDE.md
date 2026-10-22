@@ -31,7 +31,8 @@ A future feature that needs a symmetric server secret will add a purpose-named, 
 Settings come from the config file named by `--config <path>` or else `JIG_NS_CONFIG`, then environment variables override them. There is no default path: with neither set, the nameserver refuses to start and says so. It no longer reads `JIG_CONFIG`, `~/.jig/config.toml` or `./config/jig-nameserver/jig-config.toml`. Settings are read at start-up; restart the service after changing them.
 
 - `[[v0_0_2.nameserver.alias_suffixes]]` (required, no default): each suffix this nameserver serves, with its registration policy. The nameserver refuses to start without one. See `deploy/README.md` for the per-suffix options.
-- `[v0_0_2.server] server_did_keyfile`: the nameserver's signing key. Created on first start if missing. Back it up; a new key is a new nameserver identity.
+- `[v0_0_2.server] server_did_keyfile`: the nameserver's signing key, sealed at rest in the `.jigkey` beside that path. Created on first start if missing, sealed with the slot `[v0_0_2.keys] unlock` names (else `JIG_KEY_UNLOCK` or `JIG_KEY_PASSPHRASE`); with no slot to seal it with, the nameserver refuses to start rather than write the key in clear. See [Signing key](#signing-key).
+- `[v0_0_2.keys]`: how the key is opened. See [Signing key](#signing-key).
 - `[v0_0_2.debug] list_handles` (default `false`): mounts `/v1/handles`.
 - `[storage] database_path` / `JIG_NS_DB_PATH`: the alias database.
 - `[network] bind` / `JIG_NS_BIND` and `[network] port` / `JIG_NS_PORT`: listen address.
@@ -82,7 +83,7 @@ The pool caps registrations by DIDs that `registration_allow` does not name, how
 
 ```toml
 [v0_0_2.nameserver.alias_suffixes.pool]
-enabled = true                 # off by default until jig handles 503 REGISTRATION_BUSY
+enabled = true                 # the default; jig waits out 503 REGISTRATION_BUSY
 strangers_per_hour = 60
 burst = 10
 controller = "doubling"
@@ -134,9 +135,28 @@ The nameserver uses the **last** address in that header, the one your proxy appe
 
 A proxy in front of a nameserver for a `config` or `contract` suffix must pass TLS through (TCP or SNI passthrough), as for jig-server: clients accept only the certificate the nameserver's DID vouches for, and a proxy that terminates TLS presents its own. A passthrough proxy cannot add `X-Forwarded-For`, so leave `trust_proxy` off there. Only a DNS-rooted suffix's nameserver may sit behind a proxy that terminates TLS with a CA certificate.
 
+## Signing key
+
+The nameserver signs every attestation with one key, and its DID is that key. A new key is a new nameserver identity: servers and clients whose delegation names the old DID stop accepting what the new one signs.
+
+The key is stored sealed, in the `.jigkey` file beside `server_did_keyfile` (`nameserver_v002.key` is kept as `nameserver_v002.jigkey`). A sealed file opens only with one of its slots: a systemd credential, an environment secret or a passphrase. The nameserver never prompts, so name a slot it can open unattended:
+
+```toml
+[v0_0_2.keys]
+unlock = "credential:/run/credentials/jig-nameserver.service/jig-nameserver-key"
+```
+
+`deploy/setup-server-key.sh` sets this up: it seals the key to a systemd credential, bound to the TPM where the machine has one, and adds an offline passphrase slot for recovery. `jig-nameserver keys show`, `add-slot`, `verify`, `seal` and `generate` inspect the file, add a slot, check one, seal a raw key from an older release, and make a new key offline; see `deploy/README.md`, "Sealing the server key".
+
+**Backups.** Back up the `.jigkey` file. It is safe to copy as it is: nothing in it opens without a slot's secret. Keep the recovery passphrase offline and apart from the backup. A slot bound to a TPM opens only on that machine, so a restore elsewhere needs the passphrase slot. `jig-backup.sh` copies the key into each snapshot.
+
+**Plaintext.** `[v0_0_2.keys] storage = "plaintext"` keeps a raw key in clear. It is an antipattern, warned about on every boot. It is not listed in `unsafe_options_active`, so it does not advertise this nameserver as a soft target.
+
+**Changing the key.** The nameserver serves no key link: unlike jig-server, it has no `.link` file that moves its old DID to a new one. Changing its key means updating every delegation that names the old DID.
+
 ## Security notes
 
-- Back up `server_did_keyfile` and keep it readable by the service user only.
+- Back up the sealed key (see [Signing key](#signing-key)). Keep it, and any credential that opens it, readable by the service user only.
 - Keep `[v0_0_2.debug] list_handles` off on any nameserver reachable by people you do not trust.
 - `[federation] enabled` (off by default) still starts an outbound gossip loop, but no peer can reach this nameserver's federation routes because they were removed. Leave it off.
 - Keep instance logs minimal; avoid storing sensitive metadata.

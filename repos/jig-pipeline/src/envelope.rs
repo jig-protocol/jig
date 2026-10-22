@@ -191,6 +191,10 @@ pub enum Frame {
         /// to `server_did` (JEP-0012), base64 COSE_Sign.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key_link: Option<String>,
+        /// The admission work asked of a DID the server has not admitted
+        /// (JEP-0008 rule 15). Absent when it asks none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        admit: Option<crate::handshake::PowOffer>,
         /// The links before `key_link`, oldest first, each base64 COSE_Sign:
         /// with `key_link` last, one chain from an earlier DID to
         /// `server_did`, each link leaving the DID the one before moved to.

@@ -291,7 +291,8 @@ impl Market {
 
     fn busy(&self, st: &State, _now: Instant) -> Busy {
         Busy {
-            retry_after: self.until_token(st).as_secs().max(1),
+            // Rounded up: a client that waits exactly this long must find the token there.
+            retry_after: (self.until_token(st).as_secs_f64().ceil() as u64).max(1),
         }
     }
 
@@ -564,7 +565,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_pool_that_is_off_admits_everyone() {
-        let m = Market::new(pow(), PoolPolicy::default());
+        let m = Market::new(pow(), PoolPolicy::off());
         for _ in 0..100 {
             assert_eq!(m.admit(1).await, Ok(()));
         }

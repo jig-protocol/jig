@@ -1251,7 +1251,7 @@ mod tests {
         let alias = format!("dj@{}", state.suffix());
         let record = ReachabilityRecord::sign(
             &key,
-            vec![("did:jig:zserver".into(), "wss://example.org".into())],
+            vec![(fresh_did_and_key().0, "wss://example.org".into())],
             1,
         );
 
