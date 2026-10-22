@@ -40,6 +40,8 @@ use jig_runtime::component::{
 };
 use text_block::canonical;
 
+pub use crate::text_input::text_input;
+
 /// The world text-block's program manifest declares.
 pub const RENDERER_WORLD: &str = "jig:block/renderer@0.1.0";
 
@@ -470,6 +472,23 @@ pub fn text_block_program(
             source_msg: e.to_string(),
         }
     })
+}
+
+/// The invocation an `exec` receipt names for a landed chat message: the message text, and the
+/// block's ingest record's sequence, clock and channel CID (JEP-0006). A client rebuilds it from
+/// the same record to check the receipt.
+pub fn text_render_invocation(
+    input: &text_block::Input,
+    block_cid: &str,
+    record: &crate::ingest_record::IngestRecord,
+) -> Invocation {
+    let mut invocation = text_invocation(input, block_cid.to_string(), record.seq);
+    invocation.channel_cid = record.channel_id.clone();
+    invocation.ingest_hlc = Hlc {
+        wall_ms: record.ingest_wall_ms,
+        logical: record.ingest_logical,
+    };
+    invocation
 }
 
 /// The `jig:block` invocation for a chat message: the message text as the input, and the ingest

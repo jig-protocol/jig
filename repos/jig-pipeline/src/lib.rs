@@ -19,6 +19,8 @@ pub mod executor;
 /// must execute is refused with [`IngestError::NoExecutor`].
 #[cfg(not(feature = "executor"))]
 pub mod executor {
+    pub use crate::text_input::text_input;
+
     /// No value of this type exists without the `executor` feature.
     #[derive(Debug)]
     pub enum BlockExecutor {}
@@ -35,9 +37,16 @@ pub mod persist;
 pub mod receipts;
 pub mod roles;
 pub mod server_manifest;
+pub mod text_input;
 pub mod visibility;
 
 pub use effect::apply_effect;
 pub use envelope::{Envelope, Frame, HlcCursor, ReceiptRef, Scope};
 pub use fanout::{Fanout, SubscriptionScope};
 pub use ingest::{IngestContext, IngestError, IngestSource, ingest};
+
+/// The block runtime and the text-block component, as this crate links them: a client that
+/// re-executes blocks (`jig-client`'s `verify`) runs exactly the versions the server runs.
+#[cfg(feature = "executor")]
+pub use jig_runtime;
+pub use text_block;
