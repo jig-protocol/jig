@@ -2,6 +2,8 @@
 
 pub mod admission;
 pub mod block_build;
+#[cfg(feature = "local-runtime")]
+pub mod block_exec;
 pub mod block_lint;
 pub mod block_new;
 pub mod block_project;

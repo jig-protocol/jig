@@ -759,10 +759,20 @@ impl ChallengeClaim {
             Err(challenge_unknown())
         }
     }
+
+    /// Give the claim up now, so the reply that follows finds the challenge
+    /// free again.
+    async fn release(mut self) {
+        let nonce = std::mem::take(&mut self.nonce);
+        self.state.release_challenge(&nonce).await;
+    }
 }
 
 impl Drop for ChallengeClaim {
     fn drop(&mut self) {
+        if self.nonce.is_empty() {
+            return;
+        }
         let (state, nonce) = (self.state.clone(), std::mem::take(&mut self.nonce));
         tokio::spawn(async move { state.release_challenge(&nonce).await });
     }
@@ -862,16 +872,21 @@ async fn register_request(
     // Claim the challenge before a pool token is taken: replays of this
     // proof, sent at once, find it claimed and take no token. The claim is
     // given up if this request is refused or dropped before the consume.
-    let _claim = ChallengeClaim::take(&state, &req.challenge, &req.did, &alias).await?;
+    let claim = ChallengeClaim::take(&state, &req.challenge, &req.did, &alias).await?;
     // A stranger takes a pool token, or waits for one, before anything is
     // consumed, so a busy refusal leaves the challenge usable.
     if admission == Admission::Ordinary {
-        let bid = req.pow.as_ref().map_or(0, |p| p.effort.get());
-        policy
-            .market()
-            .admit(bid)
-            .await
-            .map_err(registration_busy)?;
+        // The bid orders the queue, so it is only work that `check_pow`
+        // verified: a suffix that asks for none never looked at `req.pow`.
+        let bid = if policy.requires_pow() {
+            req.pow.as_ref().map_or(0, |p| p.effort.get())
+        } else {
+            0
+        };
+        if let Err(busy) = policy.market().admit(bid).await {
+            claim.release().await;
+            return Err(registration_busy(busy));
+        }
     }
     consume_challenge(
         &state,

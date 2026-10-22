@@ -51,7 +51,8 @@ use crate::operator_policy::{ComponentHash, ProgramFacts};
 /// The payload's `domain`.
 pub const DOMAIN: &str = "jig-program-manifest-v1";
 
-/// The program's limits, as the author tested it.
+/// The program's ceilings. An executor runs it under the smaller of these and its own
+/// configured limits, and records the result in the `exec` receipt (JEP-0011 §3.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub memory_max_pages: u32,

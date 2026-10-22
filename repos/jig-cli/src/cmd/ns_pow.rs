@@ -290,6 +290,15 @@ mod tests {
         assert!(!pow_refusal(&anyhow::anyhow!("connection refused")));
     }
 
+    /// No delegations of our own, and the stub's `http://` allowed: it
+    /// serves plaintext on loopback.
+    fn plaintext() -> Delegations {
+        Delegations {
+            dangerously_allow_plaintext_nameservers: true,
+            ..Delegations::default()
+        }
+    }
+
     /// Every request the stub saw: method, path and body.
     type Seen = Arc<Mutex<Vec<(String, String, String)>>>;
 
@@ -510,22 +519,16 @@ mod tests {
             jig_client::Identity::generate_for_tests(dir.path()),
         );
 
-        crate::cmd::init::register_with_nameserver(&me, "DJ", &base, &Delegations::default())
+        crate::cmd::init::register_with_nameserver(&me, "DJ", &base, &plaintext())
             .await
             .expect("registers with work");
-        crate::cmd::keys::renew_with_nameserver(&me, "dj@dj.jig", &base, &Delegations::default())
+        crate::cmd::keys::renew_with_nameserver(&me, "dj@dj.jig", &base, &plaintext())
             .await
             .expect("renews with work");
-        crate::cmd::keys::rotate_with_nameserver(
-            &me,
-            &next,
-            "dj@dj.jig",
-            &base,
-            &Delegations::default(),
-        )
-        .await
-        .expect("accepted")
-        .expect("verifies");
+        crate::cmd::keys::rotate_with_nameserver(&me, &next, "dj@dj.jig", &base, &plaintext())
+            .await
+            .expect("accepted")
+            .expect("verifies");
         let sent = posts(&seen);
         assert_eq!(sent.len(), 3);
         for body in &sent {
@@ -552,10 +555,9 @@ mod tests {
         .await;
         let dir = tempfile::tempdir().unwrap();
         let me = jig_client::Identity::generate_for_tests(dir.path());
-        let err =
-            crate::cmd::init::register_with_nameserver(&me, "dj", &base, &Delegations::default())
-                .await
-                .unwrap_err();
+        let err = crate::cmd::init::register_with_nameserver(&me, "dj", &base, &plaintext())
+            .await
+            .unwrap_err();
         assert!(
             format!("{err:#}").contains("not by this nameserver"),
             "{err:#}"
@@ -578,10 +580,9 @@ mod tests {
         .await;
         let dir = tempfile::tempdir().unwrap();
         let me = jig_client::Identity::generate_for_tests(dir.path());
-        let err =
-            crate::cmd::init::register_with_nameserver(&me, "dj", &base, &Delegations::default())
-                .await
-                .unwrap_err();
+        let err = crate::cmd::init::register_with_nameserver(&me, "dj", &base, &plaintext())
+            .await
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains(&asked.to_string()) && msg.contains("more than this client will do"),
@@ -602,10 +603,9 @@ mod tests {
         let (base, seen) = stub(ns.clone(), ns, 1 << 6, TRUE_CLOCK, required).await;
         let dir = tempfile::tempdir().unwrap();
         let me = jig_client::Identity::generate_for_tests(dir.path());
-        let err =
-            crate::cmd::init::register_with_nameserver(&me, "dj", &base, &Delegations::default())
-                .await
-                .unwrap_err();
+        let err = crate::cmd::init::register_with_nameserver(&me, "dj", &base, &plaintext())
+            .await
+            .unwrap_err();
         assert!(format!("{err:#}").contains("under load"), "{err:#}");
         let bids: Vec<_> = posts(&seen)
             .iter()
@@ -633,7 +633,7 @@ mod tests {
         .await;
         let dir = tempfile::tempdir().unwrap();
         let me = jig_client::Identity::generate_for_tests(dir.path());
-        crate::cmd::init::register_with_nameserver(&me, "dj", &base, &Delegations::default())
+        crate::cmd::init::register_with_nameserver(&me, "dj", &base, &plaintext())
             .await
             .expect("registers: the offer is live where it is checked");
         assert_eq!(posts(&seen).len(), 1);
@@ -654,10 +654,9 @@ mod tests {
         .await;
         let dir = tempfile::tempdir().unwrap();
         let me = jig_client::Identity::generate_for_tests(dir.path());
-        let err =
-            crate::cmd::init::register_with_nameserver(&me, "dj", &base, &Delegations::default())
-                .await
-                .unwrap_err();
+        let err = crate::cmd::init::register_with_nameserver(&me, "dj", &base, &plaintext())
+            .await
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("would expire before this machine finishes")
@@ -727,7 +726,7 @@ mod tests {
             stub_with(ns.clone(), ns, vec![(1, 5), (1 << 6, 60)], TRUE_CLOCK, post).await;
         let dir = tempfile::tempdir().unwrap();
         let me = jig_client::Identity::generate_for_tests(dir.path());
-        crate::cmd::init::register_with_nameserver(&me, "dj", &base, &Delegations::default())
+        crate::cmd::init::register_with_nameserver(&me, "dj", &base, &plaintext())
             .await
             .expect("registers on the second challenge");
         let bids: Vec<_> = posts(&seen)
@@ -749,10 +748,9 @@ mod tests {
         let (base, seen) = stub_with(ns.clone(), ns, vec![(1, 5)], TRUE_CLOCK, unknown).await;
         let dir = tempfile::tempdir().unwrap();
         let me = jig_client::Identity::generate_for_tests(dir.path());
-        let err =
-            crate::cmd::init::register_with_nameserver(&me, "dj", &base, &Delegations::default())
-                .await
-                .unwrap_err();
+        let err = crate::cmd::init::register_with_nameserver(&me, "dj", &base, &plaintext())
+            .await
+            .unwrap_err();
         assert!(
             format!("{err:#}")
                 .contains("couldn't finish the proof-of-work within the challenge's life"),

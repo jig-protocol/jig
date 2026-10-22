@@ -142,7 +142,7 @@ impl SuffixPolicy {
             pow: checked_pow(&cfg.suffix, &cfg.pow)?,
             market: Arc::new(Market::new(
                 cfg.pow.clone(),
-                checked_pool(&cfg.suffix, &cfg.pool)?,
+                checked_pool(&cfg.suffix, &cfg.pool, &cfg.pow)?,
             )),
         })
     }
@@ -283,7 +283,27 @@ fn checked_pow(suffix: &str, pow: &PowPolicy) -> Result<PowPolicy> {
 }
 
 /// Check a suffix's `pool` table when it is on.
-fn checked_pool(suffix: &str, pool: &PoolPolicy) -> Result<PoolPolicy> {
+///
+/// A queued registration still has to consume its challenge, so the longest
+/// solve plus the longest wait must fit the challenge's lifetime. Bounding
+/// the wait here also keeps `Market::admit`'s deadline arithmetic in range.
+fn checked_pool(suffix: &str, pool: &PoolPolicy, pow: &PowPolicy) -> Result<PoolPolicy> {
+    if pool.enabled {
+        let ttl = crate::v0_0_2::DEFAULT_CHALLENGE_TTL.as_secs();
+        let solve = if pow.min_effort == 0 {
+            0
+        } else {
+            pow.max_solve_secs
+        };
+        if solve.saturating_add(pool.queue_wait_secs) > ttl {
+            bail!(
+                "suffix `{suffix}`: pow.max_solve_secs {solve} plus pool.queue_wait_secs {} \
+                 must be at most the challenge lifetime of {ttl} s, or a queued registration \
+                 outlives its challenge",
+                pool.queue_wait_secs
+            );
+        }
+    }
     if pool.enabled
         && (pool.strangers_per_hour == 0
             || pool.burst == 0
@@ -432,6 +452,38 @@ mod tests {
     }
 
     /// A `pow` table that cannot work stops the boot.
+    #[test]
+    fn a_queue_wait_that_outlives_the_challenge_is_refused_at_boot() {
+        let with = |min_effort: u64, queue_wait_secs: u64| {
+            let mut cfg = SuffixConfig::new("names.example.org");
+            cfg.pow = PowPolicy {
+                min_effort,
+                ..PowPolicy::recommended()
+            };
+            cfg.pool = PoolPolicy {
+                queue_wait_secs,
+                ..PoolPolicy::recommended()
+            };
+            SuffixPolicy::from_config(&cfg)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        assert!(with(1 << 20, 10).is_ok(), "the recommended values boot");
+        // 10 s to solve plus 51 s queued is past the 60 s challenge.
+        assert!(with(1 << 20, 51).unwrap_err().contains("queue_wait_secs"));
+        assert!(with(1 << 20, 50).is_ok());
+        // With no work asked, the whole lifetime is the queue's.
+        assert!(with(0, 60).is_ok());
+        assert!(with(0, 61).unwrap_err().contains("queue_wait_secs"));
+        // A wait that would overflow the admit deadline never boots.
+        assert!(with(0, u64::MAX).unwrap_err().contains("queue_wait_secs"));
+        // A pool that is off is not checked.
+        let mut cfg = SuffixConfig::new("names.example.org");
+        cfg.pool.enabled = false;
+        cfg.pool.queue_wait_secs = u64::MAX;
+        assert!(SuffixPolicy::from_config(&cfg).is_ok());
+    }
+
     #[test]
     fn a_pow_table_that_cannot_work_is_refused_at_boot() {
         let with = |edit: fn(&mut PowPolicy)| {
