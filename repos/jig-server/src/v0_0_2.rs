@@ -75,11 +75,10 @@ pub struct AppState {
 }
 
 /// Where the server's key link is read from: beside its key file, with
-/// `.link` appended. The file holds the link's COSE_Sign bytes.
+/// `.link` appended, where `jig-server keys rotate` and `keys link` write it
+/// ([`jig_client::server_key::key_link_path`]).
 pub fn key_link_path(keyfile: &std::path::Path) -> PathBuf {
-    let mut name = keyfile.as_os_str().to_owned();
-    name.push(".link");
-    PathBuf::from(name)
+    jig_client::server_key::key_link_path(keyfile)
 }
 
 /// The key link at `path`, if there is one. A link that does not verify, is
@@ -801,6 +800,41 @@ mod tests {
             let mode = std::fs::metadata(&sealed).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "a sealed keyfile is 0600 too");
         }
+    }
+
+    #[test]
+    fn after_keys_rotate_the_server_boots_with_the_new_did_and_serves_the_link() {
+        let dir = tempdir().unwrap();
+        let mut config = keyed_config(dir.path(), "server.key");
+        let old = load_or_generate_server_key(&config).unwrap();
+        let next_dir = dir.path().join("next");
+        std::fs::create_dir_all(&next_dir).unwrap();
+        let next = jig_client::server_key::credential_for_tests(&next_dir);
+        let done = jig_client::server_key::rotate(
+            &dir.path().join("server.key"),
+            std::slice::from_ref(&next),
+            false,
+            &key_options(&config.keys),
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            done.old_did,
+            Did::from_ed25519_pubkey(old.verifying_key().as_bytes()).to_did_jig_string()
+        );
+
+        config.keys.unlock = Some(next);
+        let state = AppState::new(
+            config,
+            dir.path().join("jig.db"),
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(state.server_did.to_did_jig_string(), done.new_did);
+        assert_eq!(
+            state.key_link.as_deref(),
+            Some(std::fs::read(&done.link).unwrap().as_slice())
+        );
     }
 
     #[test]
