@@ -481,13 +481,15 @@ so a rebooted box catches up). It snapshots:
 | `/var/lib/jig/nameserver.db` | the nameserver's legacy registry |
 | `/var/lib/jig/nameserver_v002.db` | **the nameserver's alias bindings** |
 | `/var/lib/jig/server.jigkey` | server identity, sealed |
-| `/var/lib/jig/server.key.link*` | the server's key links, when it serves one: the configured key path with `.link` appended, and earlier links kept as `.link.1`, `.link.2`, ... Without them, clients that pinned an earlier DID refuse the restored server |
+| `/var/lib/jig/server.key.link*` | the server's key links, when it serves one: the configured key path with `.link` appended, and earlier links kept as `.link.1`, `.link.2`, ... and `.link.pruned-N`. Without them, clients that pinned an earlier DID refuse the restored server |
 | `/var/lib/jig/server.retired-*.jigkey` | keys a rotation retired, still sealed |
 | `/var/lib/jig/nameserver_v002.jigkey` | **the nameserver's signing key**, sealed (set `JIG_NAMESERVER_KEYFILE` if `[v0_0_2.server] server_did_keyfile` puts it elsewhere) |
 
 A key still in clear (`[keys] storage = "plaintext"`) is copied too, with a
 warning, and the snapshot then holds it in clear. A snapshot holds no secret
-that opens a sealed key; `MANIFEST.txt` records which keys were sealed.
+that opens a sealed key; `MANIFEST.txt` records which keys were sealed. A
+rotation's retired credential (`/etc/credstore.encrypted/*.retired-*`) is not in
+the snapshot either: it is the operator's to move offline.
 
 The nameserver files are skipped on a box that doesn't run the nameserver, but
 a snapshot is refused if `nameserver_v002.db` exists without its key. **A

@@ -15,7 +15,7 @@
 #      server.key.link* — the server's key link (JEP-0012, #241), when it
 #                     has one: the configured key path with ".link" appended,
 #                     plus earlier links kept beside it as .link.1, .link.2,
-#                     ... It is what lets clients that pinned an older DID
+#                     ... and .link.pruned-N. It is what lets clients that pinned an older DID
 #                     follow the server to this one; restored without it, they
 #                     refuse it. The earlier links stop one DID being linked
 #                     twice, and later form the chain clients follow.
@@ -171,7 +171,8 @@ esac
 
 # The server's key links, if it serves one: jig-server reads the current link
 # from the configured key path with ".link" appended, and a rotation keeps the
-# earlier ones beside it as .link.1, .link.2, ... They are public (they hold no
+# earlier ones beside it as .link.1, .link.2, ... (and .link.pruned-N, which are
+# not served but still count against linking one DID twice). They are public (they hold no
 # secret), but without them clients that pinned an earlier DID refuse the
 # server. Keys a rotation retired are kept sealed beside the key; copy them too.
 key_dir="$(dirname -- "$KEYFILE")"
@@ -179,7 +180,8 @@ key_stem="$(basename -- "$KEYFILE")"
 key_stem="${key_stem%.*}"
 links=0
 retired=0
-for extra in "$KEYFILE".link "$KEYFILE".link.[0-9]* "$key_dir/$key_stem".retired-*.jigkey; do
+for extra in "$KEYFILE".link "$KEYFILE".link.[0-9]* "$KEYFILE".link.pruned-[0-9]* \
+             "$key_dir/$key_stem".retired-*.jigkey; do
     [ -f "$extra" ] || continue
     cp -p -- "$extra" "$DEST/$(basename -- "$extra")" || die "could not copy $extra"
     case "$extra" in
