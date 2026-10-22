@@ -177,7 +177,10 @@ Still to do in this phase:
   how names map to DIDs and who resolves them. Nameserver-led shared contracts for trusted subnets
   and ruleset groups follow. Federating with a differently built server comes after the MVP.
 - Multi-device and key rotation; a server-key rotation ceremony.
-- ACME certificates, and TLS on the nameserver (it still serves plaintext).
+- ACME certificates for DNS-rooted suffixes (the nameserver has served TLS by default since #262).
+- PROXY protocol v2 on the nameserver listener, so its per-client rate limits still apply behind a
+  TCP/SNI passthrough proxy. A `config` or `contract` suffix needs passthrough, and today every
+  client behind one shares the proxy's limit.
 - Signed peer policy (federation already runs through the write gate).
 - **One implementation of each thing:** remove the v0.0.1 paths that sit beside v0.0.2 ones, the
   capability scaffolding that enforces nothing, and prototypes nothing calls.
