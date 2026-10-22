@@ -291,7 +291,8 @@ impl Market {
 
     fn busy(&self, st: &State, _now: Instant) -> Busy {
         Busy {
-            retry_after: self.until_token(st).as_secs().max(1),
+            // Rounded up: a client that waits exactly this long must find the token there.
+            retry_after: (self.until_token(st).as_secs_f64().ceil() as u64).max(1),
         }
     }
 

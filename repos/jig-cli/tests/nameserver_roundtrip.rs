@@ -341,16 +341,19 @@ async fn register_renew_and_rotate_solve_the_nameservers_proof_of_work() {
 /// that long, says so, and registers on a fresh challenge.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_full_pool_is_waited_out_and_the_registration_retried() {
-    use integration_tests::harness::PoolPolicy;
-    // One stranger a second, and one token: the harness's own registration
-    // takes it, so the CLI's finds the pool empty for about a second.
+    use integration_tests::harness::{PoolPolicy, PowPolicy};
+    // One stranger every 10 s, and one token: the harness's own registration
+    // takes it, so the CLI's finds the pool empty. The window is wide enough
+    // for a debug `jig` on a loaded CI runner to start, probe TLS and reach
+    // /v1/register inside it; without proof-of-work there is nothing to
+    // solve first.
     let pool = PoolPolicy {
-        strangers_per_hour: 3600,
+        strangers_per_hour: 360,
         burst: 1,
         queue_wait_secs: 0,
         ..PoolPolicy::recommended()
     };
-    let ns = TestNameserver::start_tls_with_policies("dj.jig", TestNameserver::test_pow(), pool)
+    let ns = TestNameserver::start_tls_with_policies("dj.jig", PowPolicy::off(), pool)
         .await
         .unwrap();
     ns.register("first").await.expect("takes the one token");
@@ -370,10 +373,15 @@ async fn a_full_pool_is_waited_out_and_the_registration_retried() {
     )
     .await;
     assert!(ok, "jig init after a busy pool: {out}");
-    assert!(
-        out.contains("taking no more new names for now; waiting"),
-        "{out}"
-    );
+    // The CLI saw REGISTRATION_BUSY and waited what its Retry-After said: at
+    // most the 10 s refill, never more.
+    let waited: u64 = out
+        .split("taking no more new names for now; waiting ")
+        .nth(1)
+        .and_then(|rest| rest.split('s').next())
+        .and_then(|secs| secs.parse().ok())
+        .unwrap_or_else(|| panic!("no busy refusal was waited out: {out}"));
+    assert!((1..=10).contains(&waited), "waited {waited}s: {out}");
     assert_eq!(
         resolved(&ns, "deji@dj.jig").await.did,
         configured_did(home.path())
