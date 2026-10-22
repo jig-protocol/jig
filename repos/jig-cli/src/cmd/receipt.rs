@@ -224,6 +224,7 @@ fn to_json(signed: &SignedReceipt, pins: &Pins) -> serde_json::Value {
         "cid": signed.cid().to_string(),
         "signature_valid": true,
         "signer": r.executor,
+        "executor_pinned": !pins.servers_pinned_to(&r.executor).is_empty(),
         "signer_pinned_servers": pins.servers_pinned_to(&r.executor),
         "kind": kind(&r.body),
         "block_cid": r.block_cid.to_string(),
@@ -354,6 +355,7 @@ mod tests {
             );
             let json = to_json(&loaded, &pins);
             assert_eq!(json["signer_pinned_servers"][0], "jig.example");
+            assert_eq!(json["executor_pinned"], true);
             assert_eq!(json["exec"]["engine"]["fuel_used"], 1234);
         }
     }
@@ -374,6 +376,7 @@ mod tests {
             )),
             "{text}"
         );
+        assert_eq!(to_json(&loaded, &pins)["executor_pinned"], false);
         assert!(
             to_json(&loaded, &pins)["signer_pinned_servers"]
                 .as_array()
