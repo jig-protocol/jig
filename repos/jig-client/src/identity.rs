@@ -1006,6 +1006,171 @@ pub fn protect(
     Ok(updated.slots())
 }
 
+/// The fewest characters a recovery kit's passphrase may have. A kit leaves
+/// the machine and can be attacked offline, so it asks for more than
+/// [`MIN_PASSPHRASE_CHARS`].
+pub const MIN_KIT_PASSPHRASE_CHARS: usize = 12;
+
+/// Write a recovery kit for `did_str` to `out`: a copy of its key file with
+/// one slot, `passphrase`, and no other. The slot always uses the full
+/// Argon2id parameters ([`KdfParams::default`]), whatever `access` uses: a kit
+/// is meant to be copied off the machine, where it can be attacked offline.
+///
+/// The key is opened with `access`. `out` is never overwritten, and the kit
+/// is read back from disk and opened with `passphrase` before this returns;
+/// a kit that does not open is removed.
+pub fn export_kit(
+    keys_dir: &Path,
+    did_str: &str,
+    access: &KeyAccess,
+    passphrase: &Zeroizing<String>,
+    out: &Path,
+) -> Result<(), IdentityError> {
+    if passphrase.chars().count() < MIN_KIT_PASSPHRASE_CHARS {
+        return Err(IdentityError::Protect(format!(
+            "a recovery kit's passphrase needs at least {MIN_KIT_PASSPHRASE_CHARS} characters"
+        )));
+    }
+    let path = key_path(keys_dir, did_str);
+    let key = match std::fs::read(&path) {
+        Ok(bytes) => JigKey::from_bytes(&bytes)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(IdentityError::KeyfileNotFound {
+                did: did_str.to_string(),
+                dir: keys_dir.to_path_buf(),
+            });
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let opened = access.open(&key)?;
+    check_did(&path, did_str, &opened.seed)?;
+    // The kit's slot is added after the file's own, which are then removed:
+    // the kit holds the same data key, opened only by its passphrase.
+    let others = key.slots().len();
+    let mut kit = key.with_slot(
+        &opened,
+        &NewSlot::Passphrase {
+            passphrase: passphrase.clone(),
+            params: KdfParams::default(),
+        },
+    )?;
+    for _ in 0..others {
+        kit = kit.without_slot(&opened, 0)?;
+    }
+    write_new_private(out, &kit.to_bytes())?;
+    if let Err(reason) = verify_kit(out, passphrase).map_err(|e| e.to_string()) {
+        let _ = std::fs::remove_file(out);
+        return Err(IdentityError::NotVerified {
+            path: out.to_path_buf(),
+            reason,
+        });
+    }
+    Ok(())
+}
+
+/// Open the recovery kit at `kit` with `passphrase` and check it holds the
+/// key of the DID it names. Returns the DID.
+pub fn verify_kit(kit: &Path, passphrase: &Zeroizing<String>) -> Result<String, IdentityError> {
+    let key = JigKey::from_bytes(&std::fs::read(kit)?)?;
+    let opened = key.open(&[Unlock::Passphrase(passphrase.clone())])?;
+    check_did(kit, key.did(), &opened.seed)?;
+    Ok(key.did().to_string())
+}
+
+/// Restore `did`'s key from the recovery kit at `kit` into `keys_dir`, opened
+/// with `passphrase`. Returns the DID.
+///
+/// The key file keeps the kit's passphrase slot, as a recovery slot, and
+/// gains the slot this machine seals new keys with (`access`: the OS
+/// keychain where there is one) when there is one to add. A key already in
+/// `keys_dir` for that DID is never replaced.
+pub fn import_kit(
+    keys_dir: &Path,
+    kit: &Path,
+    passphrase: &Zeroizing<String>,
+    access: &KeyAccess,
+) -> Result<String, IdentityError> {
+    let did = verify_kit(kit, passphrase)?;
+    create_private_dir(keys_dir)?;
+    let _lock = lock_did(keys_dir, &did)?;
+    let path = key_path(keys_dir, &did);
+    if path.exists() || raw_key_path(keys_dir, &did).exists() {
+        return Err(IdentityError::Protect(format!(
+            "{} already holds a key for {did}; it is never replaced",
+            keys_dir.display()
+        )));
+    }
+    let key = JigKey::from_bytes(&std::fs::read(kit)?)?;
+    let opened = key.open(&[Unlock::Passphrase(passphrase.clone())])?;
+    let key = match access.new_slot(&did) {
+        Ok(slot) => key.with_slot(&opened, &slot)?,
+        // Nothing to add: the kit's passphrase alone opens the key.
+        Err(IdentityError::NoWayToSeal { .. }) => key,
+        Err(e) => return Err(e),
+    };
+    write_new_private(&path, &key.to_bytes())?;
+    if let Err(reason) = verify_kit(&path, passphrase).map_err(|e| e.to_string()) {
+        let _ = std::fs::remove_file(&path);
+        return Err(IdentityError::NotVerified { path, reason });
+    }
+    OPENED.lock().expect("key cache poisoned").remove(&path);
+    Ok(did)
+}
+
+/// Write `bytes` to `path`, which must not exist, owner-only: through a
+/// temporary file linked into place, so `path` is never overwritten nor seen
+/// half-written.
+fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), IdentityError> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(
+        ".tmp.{}",
+        hex::encode(jig_core::crypto::ed25519::random_array::<8>())
+    ));
+    let tmp = PathBuf::from(tmp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    let linked = written.and_then(|()| match std::fs::hard_link(&tmp, path) {
+        // FAT and exFAT, where a kit on a USB stick lands, have no hard
+        // links: write the file in place instead, still never over one.
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+            write_in_place(&options, path, bytes)
+        }
+        other => other,
+    });
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(sync_parent_dir(path)?),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(IdentityError::Protect(
+            format!("{} already exists; it is never overwritten", path.display()),
+        )),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Create `path` (`options` has `create_new`) and write `bytes` to it,
+/// removing it again if the write does not complete.
+fn write_in_place(
+    options: &std::fs::OpenOptions,
+    path: &Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let mut file = options.open(path)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    if written.is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+    written
+}
+
 /// How one slot is named to a person, as `jig keys protect` lists them.
 pub fn slot_name(slot: &SlotKind) -> &'static str {
     match slot {
@@ -1322,6 +1487,92 @@ mod tests {
 
     fn clear_cache() {
         OPENED.lock().unwrap().clear();
+    }
+
+    /// A recovery kit is the key file with one full-strength passphrase slot:
+    /// it opens on another machine with that passphrase alone, to the same
+    /// DID, and nothing else opens it.
+    #[test]
+    fn a_recovery_kit_round_trips_to_the_same_did() {
+        let home = tempdir().unwrap();
+        let keychain = Arc::new(MemoryKeychain::default());
+        let did = Identity::create(home.path(), &keychain_only(keychain.clone()))
+            .unwrap()
+            .did_string();
+        clear_cache();
+        let kit = home.path().join("kit.jigkey");
+        let pass = Zeroizing::new("a kit passphrase kept offline".to_string());
+        export_kit(home.path(), &did, &keychain_only(keychain), &pass, &kit).unwrap();
+
+        // One slot, the passphrase, at the full parameters whatever `access` used.
+        let key = JigKey::from_bytes(&std::fs::read(&kit).unwrap()).unwrap();
+        assert_eq!(
+            key.slots(),
+            vec![SlotKind::Passphrase(KdfParams::default())]
+        );
+        assert_eq!(verify_kit(&kit, &pass).unwrap(), did);
+        assert!(verify_kit(&kit, &Zeroizing::new("not the kit passphrase".into())).is_err());
+
+        // Another machine, no keychain: the kit's passphrase is its slot.
+        let other = tempdir().unwrap();
+        clear_cache();
+        let wrong = import_kit(
+            other.path(),
+            &kit,
+            &Zeroizing::new("not the kit passphrase".into()),
+            &no_keychain(),
+        );
+        assert!(wrong.is_err() && !key_path(other.path(), &did).exists());
+        let imported = import_kit(other.path(), &kit, &pass, &passphrase_only("")).unwrap();
+        assert_eq!(imported, did);
+        clear_cache();
+        let id = Identity::open(
+            other.path(),
+            &did,
+            &passphrase_only("a kit passphrase kept offline"),
+        )
+        .unwrap();
+        assert_eq!(id.did_string(), did);
+
+        // Never replaced, never overwritten.
+        clear_cache();
+        assert!(import_kit(other.path(), &kit, &pass, &no_keychain()).is_err());
+        let again = export_kit(
+            other.path(),
+            &did,
+            &passphrase_only("a kit passphrase kept offline"),
+            &pass,
+            &kit,
+        );
+        assert!(matches!(again, Err(IdentityError::Protect(_))));
+    }
+
+    #[test]
+    fn writing_in_place_never_overwrites() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("kit.jigkey");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        write_in_place(&options, &path, b"first").unwrap();
+        let again = write_in_place(&options, &path, b"second").unwrap_err();
+        assert_eq!(again.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+    }
+
+    #[test]
+    fn a_recovery_kit_needs_twelve_characters() {
+        let home = tempdir().unwrap();
+        let did = Identity::generate_for_tests(home.path()).did_string();
+        let kit = home.path().join("kit.jigkey");
+        let short = export_kit(
+            home.path(),
+            &did,
+            &no_keychain(),
+            &Zeroizing::new("elevenchars".into()),
+            &kit,
+        );
+        assert!(matches!(short, Err(IdentityError::Protect(_))));
+        assert!(!kit.exists());
     }
 
     #[test]

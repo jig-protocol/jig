@@ -395,6 +395,76 @@ pub fn protect(ctx: &CliContext, add: Option<&str>, remove: Option<usize>) -> Re
     Ok(())
 }
 
+/// `jig keys export --out PATH`: write a recovery kit for the active
+/// identity ([`jig_client::identity::export_kit`]).
+pub fn export(ctx: &CliContext, out: &std::path::Path) -> Result<()> {
+    let did = ctx.effective().user.did.clone();
+    if !did.starts_with("did:jig:") {
+        anyhow::bail!("no identity is configured: run `jig init` first");
+    }
+    let pass = super::passphrase::kit_passphrase(true)?;
+    jig_client::identity::export_kit(
+        &jig_client::identity::default_keys_dir(),
+        &did,
+        super::passphrase::key_access()?,
+        &pass,
+        out,
+    )
+    .with_context(|| format!("writing a recovery kit for {did}"))?;
+    println!("{did}");
+    eprintln!(
+        "wrote {}. With its passphrase it opens this identity anywhere: keep it offline, \
+         apart from the passphrase. `jig keys verify` checks it; `jig keys import` restores it",
+        out.display()
+    );
+    Ok(())
+}
+
+/// `jig keys import KIT`: restore an identity from a recovery kit
+/// ([`jig_client::identity::import_kit`]), and make it the configured one
+/// when none is.
+pub fn import(ctx: &CliContext, kit: &std::path::Path) -> Result<()> {
+    let pass = super::passphrase::kit_passphrase(false)?;
+    let keys_dir = jig_client::identity::default_keys_dir();
+    let did =
+        jig_client::identity::import_kit(&keys_dir, kit, &pass, super::passphrase::key_access()?)
+            .with_context(|| format!("importing the recovery kit {}", kit.display()))?;
+    println!("{did}");
+    let current = ctx.file_config().user.did.clone();
+    // An identity is configured when its key is here: a fresh config names a
+    // placeholder DID with no key.
+    let has_key = |d: &str| {
+        jig_client::identity::key_path(&keys_dir, d).exists()
+            || keys_dir.join(format!("{d}.key")).exists()
+    };
+    if current != did && has_key(&current) {
+        eprintln!(
+            "imported into {}. Your config still names {current}; set [user] did to use the \
+             imported identity",
+            keys_dir.display()
+        );
+    } else if current != did {
+        let mut cfg = ctx.file_config().clone();
+        cfg.user.did = did.clone();
+        ctx.save_file_config(&cfg)?;
+        eprintln!(
+            "imported into {}, and set as [user] did",
+            keys_dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// `jig keys verify KIT`: check a recovery kit opens with its passphrase.
+pub fn verify(kit: &std::path::Path) -> Result<()> {
+    let pass = super::passphrase::kit_passphrase(false)?;
+    let did = jig_client::identity::verify_kit(kit, &pass)
+        .with_context(|| format!("opening the recovery kit {}", kit.display()))?;
+    println!("{did}");
+    eprintln!("the kit opens with that passphrase");
+    Ok(())
+}
+
 fn parse_full_name(alias: &str) -> Result<Name> {
     Name::parse(alias).with_context(|| format!("`{alias}` is not a full alias@suffix"))
 }
