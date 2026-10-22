@@ -1,709 +1,177 @@
 # Receipts
 
-**Audience:** This chapter is for **protocol implementers** running hosts that emit receipts, **developers** building blocks that need to understand billing, and **server operators** setting pricing policies. **End users** might want to skim the outcome-based pricing section to understand how billing works.
+**Audience:** This chapter is for **protocol implementers** running hosts that sign receipts or
+clients that check them. **Server operators** might care about what a receipt reveals.
+**End users** only need to know that a receipt is a server's signed claim about a block, and that
+their client can check it by running the block itself.
 
 ---
 
-**Version:** 0.2
-**Status:** Draft. *(partial: `jig-runtime` builds receipts in this schema, but no server path signs or serves them since the legacy v0.0.1 REST routes were removed (D28).)*
-
-> **Not the receipt the server signs.** The reference server signs a different, smaller
-> object for each rendered block, tagged `"v": "0.3-render"`: `block_cid`, `server_did`,
-> `synthetic`, `render` (`hash`, `module`, `length_bytes`), `engine` (`name`,
-> `runtime_version`, `fuel_used`) and `produced_at`, hex-encoded and signed with the
-> server key. Blocks it does not execute get a signed synthetic receipt, and encrypted
-> blocks a `sealed` one with no `render_hash`. That format is not yet specified here.
-> Outcome-based pricing, affordances, per-capability counters and receipt exchange between
-> servers are not implemented.
-
-Receipts are like itemized bills for block execution. When a host runs your block, it emits a signed receipt proving:
-
-- **What ran**: Block CID, host DID, timestamp
-- **What happened**: Success, soft fail, or hard fail
-- **What it cost**: Fuel consumed, broken down by capability
-- **What it achieved**: Affordances (e.g., "email delivered", "HTTP 2xx")
-
-Receipts enable three critical features:
-
-1. **Outcome-based pricing**: Charge different rates for success vs. failure. If a block fails due to network timeout (not your fault), you get a partial refund.
-2. **Fraud detection**: Anyone can replay a block and verify the receipt matches. If a server says your block used 5M fuel but your replay only uses 500k, they're overcharging.
-3. **Federation trust**: Receipts travel with blocks across servers as cryptographic proof of work done.
-
-## Receipt Schema (v0.2)
-
-Here's a complete receipt with all fields explained:
-
-```json
-{
-  "version": "0.2.0",
-  "block_id": "cid:bafyBlock123...",
-  "host": "did:jig:server:prod",
-  "executed_at": "2025-11-09T12:34:56.789Z",
-
-  "outcome": {
-    "status": "ok",
-    "affordances": ["email.delivered"],
-    "reason": null
-  },
-
-  "counters": {
-    "fuel_total": 421337,
-    "fuel_by_capability": {
-      "net.fetch": 310000,
-      "crypto.sign": 60000,
-      "core.compute": 51337
-    },
-    "status_by_capability": {
-      "net.fetch": { "OK": 1 }
-    },
-    "bytes_tx": 20480,
-    "bytes_rx": 32768,
-    "syscalls": 0
-  },
-
-  "timings": {
-    "queue_wait_ms": 2,
-    "init_ms": 3,
-    "exec_ms": 187,
-    "total_ms": 190
-  },
+**Version:** 0.3
+**Status:** Draft. The format is [JEP-0006](../jep/jep-0006-block-abi.md#receipts), which is
+normative; this chapter explains it. The reference server and client implement it.
+
+A receipt is a signed statement by the host that handled a block. It says which block, who
+signed, in what role, when, and, if the host executed the block, exactly what ran and what came
+out:
+
+- **What ran:** the component (by hash), the program that named it, the world, and the hash of
+  the invocation it was given.
+- **What came out:** the outcome class and its hash.
+- **Under what limits:** fuel, stack, memory and deadline.
+
+A receipt is a claim, not proof (threat OP-07). It is checked by **re-executing** the block, not
+by trusting the signer: a client that holds the same component and the same invocation runs it
+and compares outcomes. Fuel is never compared, because fuel is not portable across engines or
+versions.
+
+## Encoding and signature
+
+A receipt is a CBOR map with text keys, encoded under the core deterministic rules of RFC 8949
+§4.2.1. The executor signs it as a COSE_Sign1 object (RFC 9052):
+
+- the payload is attached;
+- the protected header names algorithm EdDSA (`-8`, Ed25519);
+- `kid` is the executor's DID.
+
+A verifier MUST refuse a receipt whose signature does not verify against the key of the DID in
+its `executor` field, or whose payload is not in deterministic form.
+
+## Kinds
+
+| `kind` | Issued for | Carries |
+| --- | --- | --- |
+| `exec` | a block the executor ran | the run and its outcome (below) |
+| `sealed` | encrypted content the server stored but cannot read | nothing derived from the content |
+| `accepted` | a block stored without executing | nothing beyond the common fields |
+
+A server never executes encrypted content, so it never issues `exec` for it; a verifier MUST
+refuse a server `exec` receipt for a block in an encrypted channel. Members of an encrypted
+group execute its blocks on their own devices. A member's receipt travels only inside the
+group's encrypted messages.
+
+## Fields
+
+Every receipt:
+
+| Key | Value |
+| --- | --- |
+| `domain` | `"jig-block-receipt-v1"` |
+| `kind` | `exec`, `sealed` or `accepted` |
+| `block_cid` | the block's CID, binary |
+| `executor` | the signer's DID |
+| `role` | `server` or `member` |
+| `produced_at` | milliseconds since the Unix epoch |
+
+An `exec` receipt adds:
+
+| Key | Value |
+| --- | --- |
+| `component` | BLAKE3 over the component's bytes |
+| `program` | the CID of the program manifest that named it (JEP-0011 §2) |
+| `world` | the world with its version, e.g. `jig:block/renderer@0.1.0` |
+| `invocation_hash` | BLAKE3 over the canonical encoding of the invocation |
+| `operator_policy_cid` | the operator policy the run was allowed under (JEP-0011 §5.1). Present exactly when `role` is `server`. |
+| `outcome` | `class` (`ok`, `error` or `incomplete`); `hash` for `ok` and `error`; `trap` for an error from a trap; `reason` for `incomplete` |
+| `limits` | `fuel`, `max_wasm_stack`, `memory_max_pages`, `timeout_ms` |
+| `engine` | `name`, `version`, `profile`, `config_fingerprint`, `fuel_used` |
+
+`engine` is telemetry: it helps diagnose a divergence, and verifiers MUST NOT compare it.
+`cost` is reserved for pricing, which is deferred; v0.3 executors MUST NOT emit it and
+verifiers MUST ignore it.
+
+[JEP-0006](../jep/jep-0006-block-abi.md#runs-and-outcomes) defines the outcome classes, the trap
+codes and how each hash is computed. In short:
+
+- **`ok`** and **`error`** are comparable. Two conforming executors that reach either for the
+  same run MUST reach the same class and hash on any architecture, engine or engine version.
+- **`incomplete`** (fuel, stack, deadline, host fault, or refusal by policy) asserts nothing
+  about the block. It is never compared and is never evidence against an executor.
+
+## When a server issues one
+
+A server builds a block's invocation from the block's signed `ingest` record (its sequence
+number, clock and channel), so it executes the block only after the block has landed. A landed
+block cannot be refused, so:
+
+1. Before landing, the server MAY run the block to decide whether to accept it, and MUST refuse
+   a block whose run is `incomplete`.
+2. After landing, it executes and signs `exec`. If that fails, it signs `accepted` instead; the
+   block stays. If it cannot sign either, the block has no receipt yet.
+3. It keeps one receipt per block. A server that restarts before signing one signs it then.
+   Until then, readers show the block as pending.
+
+## Checking a receipt
+
+A client that holds a block in plaintext and has the component the receipt names can check an
+`exec` receipt by running the block itself. The steps are
+[JEP-0006's](../jep/jep-0006-block-abi.md#receipts); the reference client
+(`jig-client`, `verify` feature) follows them:
+
+1. Check the signature, that the `executor` is the server that delivered the receipt, and that
+   the receipt's `block_cid` is this block. A receipt for another block says nothing about it.
+2. If the outcome is `incomplete`, stop: there is nothing to compare.
+3. Check that the block's `ingest` record names this block and is signed by the same server.
+   Otherwise a forged record would make an honest receipt look divergent.
+4. If the client does not have the named component, the block is **unverified**, not divergent.
+5. Rebuild the invocation. A different `invocation_hash` is a divergence.
+6. Run it with fuel at most the receipt's `limits.fuel`. A local `incomplete` is not comparable.
+7. Compare class and hash. Equal is **agreement**; anything else is a **divergence**.
 
-  "limits": {
-    "max_fuel": 5000000,
-    "max_memory_bytes": 33554432,
-    "max_execution_time_ms": 250
-  },
+The comparison keys on component, world, invocation and outcome, never on the program CID: two
+servers wrap the same component in different program manifests (JEP-0011 §5.1). A client MUST
+show a divergence to its user. What follows from one is not yet specified.
 
-  "render": {
-    "output_hash": "blake3:d3abc...",
-    "output_size_bytes": 512,
-    "matches_expected": true
-  },
+The reference CLI marks a text message `[server render differs]` on a divergence and
+`[unverified]` when it could not check, and adds nothing on agreement.
 
-  "capabilities_used": [
-    "net.fetch",
-    "crypto.sign"
-  ],
+## Older formats
 
-  "signature": {
-    "key": "ed25519:v1:hostKey...",
-    "signature": "ed25519:v1:sigBytes..."
-  },
+Stores and peers from before v0.3 hold JSON receipts. A host MUST keep reading them and MUST
+NOT write them. Each is `{"canonical_hex": …, "sig_hex": …}`: the hex of a JSON payload, and an
+Ed25519 signature over those bytes by the key of the payload's `server_did`. The payload's `v`
+names its shape:
 
-  "metadata": {
-    "timing.clock_source": "monotonic",
-    "host.region": "us-west-2"
-  }
-}
-```
+| `v` | Was issued for | Also carries |
+| --- | --- | --- |
+| `0.3-render` | a rendered `text-render` block | `render.hash`, `render.module`, `render.length_bytes` |
+| `0.3-sealed` | encrypted content | no content-derived value |
+| `0.2-synthetic` | a block stored without executing | nothing beyond the common fields |
 
-Let's break down each section:
+Every payload carries `block_cid` and `server_did`. A reader MUST check the signature before
+using any of it.
 
-## Core Fields
+`jig-runtime` also still builds the v0.2 runtime receipt for its WASI preview 1 path. No server
+path signs or serves it, and it is removed with that path.
 
-**`version`**: Receipt schema version (currently `0.2.0`). Future breaking changes will bump to `0.3.0`.
+## What a receipt reveals
 
-**`block_id`**: Content identifier (CID) of the block that was executed. This ties the receipt to a specific, immutable block.
+A receipt names the block, the signer, the time and the facts of a run. It reveals that this
+server handled this block, and when (threat PV-02). A `sealed` receipt MUST NOT carry anything
+derived from the content: no hash of it, no length.
 
-**`host`**: DID of the server/host that executed the block. This is who's attesting to the execution.
+## Normative requirements
 
-**`executed_at`**: Timestamp in RFC 3339 format (UTC). Useful for chronological ordering and replay audits.
-
-**For implementers:** All receipts MUST be signed by the host's keypair. Invalid signatures → reject the receipt.
-
-## Outcome
-
-The `outcome` object tells you whether execution succeeded and what was achieved:
-
-```json
-"outcome": {
-  "status": "ok",
-  "affordances": ["email.delivered"],
-  "reason": null
-}
-```
-
-### Status
-
-**`ok`**: Execution completed successfully. Block did what it promised.
-
-**`soft_fail`**: Recoverable failure. Examples:
-- Network timeout (upstream API down)
-- Upstream 5xx error (their problem, not yours)
-- Render mismatch (output hash doesn't match expected)
-
-**`hard_fail`**: Fatal error. Examples:
-- Fuel exhausted (block ran out of CPU budget)
-- Memory limit exceeded
-- Capability denied (block requested something not granted)
-- Manifest invalid (signature failed)
-
-**Why three statuses?**
-
-- **`ok`**: You pay full price (100% fuel cost).
-- **`soft_fail`**: You pay partial or nothing (network retry isn't your fault).
-- **`hard_fail`**: You pay nothing (server's fault for accepting invalid manifest, or your fault for exceeding limits—policy determines refund).
-
-**For server operators:** Configure refund policies:
-
-- **Soft fail**: 50% refund (user attempted, server couldn't deliver)
-- **Hard fail**: 100% refund if manifest was invalid (server's fault), 0% refund if fuel exhausted (user's fault)
-
-### Affordances
-
-Affordances are success signals that prove what the block achieved. They enable outcome-based pricing without leaking payload content.
-
-**Canonical affordances:**
-
-- **`email.delivered`**: Email delivered to recipient's mail server (SMTP 250 OK).
-- **`bridge.forwarded`**: Message forwarded to external protocol (Slack, Discord, IRC).
-- **`net.http_2xx`**: HTTP request returned 2xx status (success).
-- **`queue.enqueued`**: Message persisted to durable queue (Kafka, SQS, RabbitMQ).
-- **`storage.persisted`**: Data written to durable storage (S3, IPFS, database).
-
-**Why affordances matter:**
-
-**Privacy-preserving**: Reveals THAT an action succeeded, not WHAT data was involved. "Email delivered" doesn't tell you the recipient or content—just that delivery succeeded.
-
-**Outcome-based pricing**: Hosts can charge a premium for successful delivery:
-
-```
-Base cost: 421,337 fuel × $0.000001/fuel = $0.42
-Affordance bonus: "email.delivered" × 1.5× = $0.21
-Total: $0.63
-```
-
-**Federation trust**: Receipts with `email.delivered` can be relayed to federated servers as proof that email was sent (without exposing the email content).
-
-**Custom affordances:**
-
-If you need application-specific affordances, use this format:
-
-```
-custom:<namespace>:<action>
-```
-
-Examples:
-
-- `custom:stripe.com:payment_captured`
-- `custom:example.com:invoice_generated`
-
-**For developers:** Namespace SHOULD be a domain you control (DNS-style). Use past-tense verbs (snake_case) for actions. Don't expose PII in affordance names.
-
-### Reason Codes
-
-When execution fails (`soft_fail` or `hard_fail`), the `reason` field contains a machine-readable code:
-
-| Code | Description | Typical Status |
-|------|-------------|----------------|
-| `FUEL_EXHAUSTED` | Ran out of CPU budget | `hard_fail` |
-| `MEMORY_LIMIT_EXCEEDED` | Memory limit exceeded | `hard_fail` |
-| `RUNTIME_TIMEOUT` | Execution timeout | `hard_fail` |
-| `RUNTIME_TRAP` | WebAssembly panic/trap | `hard_fail` |
-| `CAPABILITY_DENIED` | Capability not granted | `hard_fail` |
-| `MANIFEST_INVALID` | Manifest validation failed | `hard_fail` |
-| `NONDETERMINISM_DETECTED` | Replay gave different result | `hard_fail` |
-| `RENDER_MISMATCH` | Output hash ≠ expected | `soft_fail` |
-| `NET_TIMEOUT` | Network operation timeout | `soft_fail` |
-| `UPSTREAM_5XX` | Upstream service error | `soft_fail` |
-| `HOST_PANIC` | Host runtime panic | `hard_fail` |
-| `UNKNOWN` | Unclassified error | `hard_fail` |
-
-**Normative requirements:**
-
-- Failures (`soft_fail`, `hard_fail`) MUST include `reason`.
-- Failures MUST NOT include `affordances` (if it failed, it didn't afford anything).
-- Success (`ok`) SHOULD include `affordances` when applicable.
-
-**For implementers:** Use SCREAMING_SNAKE_CASE for reason codes to match established conventions.
-
-## Counters
-
-The `counters` object breaks down resource usage:
-
-```json
-"counters": {
-  "fuel_total": 421337,
-  "fuel_by_capability": {
-    "net.fetch": 310000,
-    "crypto.sign": 60000,
-    "core.compute": 51337
-  },
-  "status_by_capability": {
-    "net.fetch": { "OK": 1 }
-  },
-  "bytes_tx": 20480,
-  "bytes_rx": 32768,
-  "syscalls": 0
-}
-```
-
-**`fuel_total`**: Total CPU instructions consumed. MUST equal the sum of `fuel_by_capability` values.
-
-**`fuel_by_capability`**: Fuel consumed per capability. This enables granular pricing:
-
-```
-net.fetch:     310,000 fuel × $0.000001/fuel = $0.31
-crypto.sign:    60,000 fuel × $0.000002/fuel = $0.12  (crypto costs more)
-core.compute:   51,337 fuel × $0.000001/fuel = $0.05
-Total: $0.48
-```
-
-**Why per-capability billing:** Because different operations have different real costs. Network calls are expensive (latency, bandwidth). Crypto operations need specialized hardware. Pure CPU is cheap.
-
-**`status_by_capability`**: Bins status codes by capability. Example:
-
-```json
-"status_by_capability": {
-  "net.fetch": {
-    "OK": 3,      // 3 successful requests
-    "TIMEOUT": 1  // 1 timeout
-  }
-}
-```
-
-Status labels MUST be UPPERCASE (e.g., `OK`, `FAIL`, `TIMEOUT`).
-
-**`bytes_tx` / `bytes_rx`**: Network bytes transmitted/received. Useful for metered bandwidth pricing.
-
-**`syscalls`**: System calls made (0 unless WASI syscalls are explicitly enabled—rare in deterministic mode).
-
-**Validation rules:**
-
-- `fuel_total` MUST equal sum of `fuel_by_capability` values.
-- Keys in `status_by_capability` MUST exist in `capabilities_used`.
-
-**For implementers:** Track fuel at the capability level (not just total). This prevents billing fraud—hosts can't claim "500k fuel for compute" when it was actually "400k compute + 100k network."
-
-## Timings
-
-Execution time breakdown (milliseconds):
-
-```json
-"timings": {
-  "queue_wait_ms": 2,
-  "init_ms": 3,
-  "exec_ms": 187,
-  "total_ms": 190
-}
-```
-
-**`queue_wait_ms`**: Time waiting in the execution queue (not counted in `total_ms`). High queue wait suggests the host is overloaded.
-
-**`init_ms`**: WebAssembly module initialization time (loading, linking, compiling).
-
-**`exec_ms`**: Actual execution time (running the block's code).
-
-**`total_ms`**: `init_ms + exec_ms` (MUST equal sum). This is the billable time.
-
-**Why separate init and exec:** Because init time is amortized—if the host caches compiled modules, init drops to near-zero on subsequent runs. Exec time is per-invocation.
-
-**Validation rule:** `total_ms == init_ms + exec_ms`.
-
-**For implementers:** Use **monotonic clocks** (not wall-clock time) to prevent time drift or NTP adjustments from affecting measurements.
-
-## Limits
-
-Execution constraints snapshot:
-
-```json
-"limits": {
-  "max_fuel": 5000000,
-  "max_memory_bytes": 33554432,
-  "max_execution_time_ms": 250
-}
-```
-
-**Why include limits in the receipt?**
-
-For **replay verification**. When you replay a block to verify the receipt, you use the exact same limits:
-
-```
-replay_receipt = execute(block, limits=receipt.limits)
-assert replay_receipt.fuel_used == receipt.fuel_used
-assert replay_receipt.render.output_hash == receipt.render.output_hash
-```
-
-If the replayed receipt differs, the original receipt was forged or the host misbehaved.
-
-**For developers:** When debugging billing disputes, replay locally with the same limits. If your replay uses 100k fuel but the server's receipt claims 1M fuel, you have evidence of fraud.
-
-## Render Output
-
-The `render` object describes the block's output:
-
-```json
-"render": {
-  "output_hash": "blake3:d3abc...",
-  "output_size_bytes": 512,
-  "matches_expected": true
-}
-```
-
-**`output_hash`**: Hash of the render output (stdout, return value). Uses BLAKE3 for speed.
-
-**`output_size_bytes`**: Size of the output in bytes. Useful for storage accounting.
-
-**`matches_expected`**: Boolean indicating whether `output_hash` matches the `manifest.render.expected_hash`. If `false`, this might be a `soft_fail` with `RENDER_MISMATCH` reason (output was produced, but it's not what the manifest promised).
-
-**For implementers:** Always hash the output, even if the manifest doesn't provide an expected hash. This enables post-hoc verification.
-
-## Capabilities Used
-
-```json
-"capabilities_used": [
-  "net.fetch",
-  "crypto.sign"
-]
-```
-
-List of capabilities actually used during execution (subset of what was requested in the manifest).
-
-**Why track this:** A block might declare 10 capabilities but only use 2. The receipt shows which were actually invoked, enabling accurate billing.
-
-**For developers:** If your block requests `net.fetch` but the receipt shows `capabilities_used: []`, you forgot to call `fetch()` or it was optimized out.
-
-## Signature
-
-```json
-"signature": {
-  "key": "ed25519:v1:hostKey...",
-  "signature": "ed25519:v1:sigBytes..."
-}
-```
-
-**What gets signed:** Canonical JSON of the entire receipt (minus the `signature` field itself).
-
-**Why sign receipts:** So you can verify the receipt came from the host it claims. If a malicious actor tries to forge a receipt (claiming you owe $100 when you actually owe $1), they can't fake the host's signature.
-
-**For implementers:** Use constant-time signature verification (see [Crypto Primitives § Constant-Time Operations](crypto.md#constant-time-operations)) to prevent timing attacks.
-
-## Metadata
-
-```json
-"metadata": {
-  "timing.clock_source": "monotonic",
-  "host.region": "us-west-2"
-}
-```
-
-Optional map for host-specific metadata. Common uses:
-
-- **Clock source**: `monotonic` (preferred) vs `realtime` (discouraged)
-- **Host region**: Geographic location (e.g., `us-west-2`, `eu-central-1`)
-- **Runtime version**: `wasmtime:v15.0.0`
-
-**For server operators:** Don't put PII in metadata. This field may be logged or published to transparency logs.
-
-## Backwards Compatibility
-
-### Version History
-
-**v0.1** (deprecated): Core fields only (`block_id`, `host`, `executed_at`, `render_hash`, `fuel_used`).
-
-**v0.2** (current): Added `outcome`, `counters`, `timings`, `limits`, `version` field.
-
-### Migration Path
-
-All v0.2 fields are backward-compatible with v0.1:
-
-- Parsers MUST accept v0.1 receipts (missing v0.2 fields default to `null`).
-- Hosts MAY emit v0.2 fields incrementally (don't have to add all at once).
-- No explicit version detection required—presence of v0.2 fields indicates v0.2.
-
-**For implementers:** When parsing receipts, check if `outcome` exists. If yes, it's v0.2. If no, it's v0.1.
-
-### Future Versions
-
-Breaking changes (e.g., renaming fields, changing semantics) will trigger **v0.3** with an explicit `receipt_version` field.
-
-## Use Cases
-
-### Outcome-Based Pricing
-
-Charge different rates based on execution outcome:
-
-```python
-def calculate_cost(receipt):
-    base_cost = receipt['counters']['fuel_total'] * FUEL_RATE
-
-    if receipt['outcome']['status'] == 'ok':
-        return base_cost  # Full price
-    elif receipt['outcome']['status'] == 'soft_fail':
-        return base_cost * 0.5  # 50% refund (network retry)
-    elif receipt['outcome']['status'] == 'hard_fail':
-        if receipt['outcome']['reason'] == 'MANIFEST_INVALID':
-            return 0  # Our fault, full refund
-        else:
-            return base_cost * 0.25  # User's fault (fuel exhausted), partial refund
-```
-
-**Why this matters:** Aligns incentives. If the server's network is flaky and requests timeout, users shouldn't pay full price. If the user submits a block that runs out of fuel, they pay for wasted CPU.
-
-### Per-Capability Billing
-
-Price different capabilities at different rates:
-
-```python
-PRICING = {
-    'net.fetch': 0.000002,   # $2/M fuel (network is expensive)
-    'crypto.sign': 0.000003, # $3/M fuel (crypto is specialized)
-    'core.compute': 0.000001 # $1/M fuel (CPU is cheap)
-}
-
-def calculate_cost(receipt):
-    total = 0
-    for capability, fuel in receipt['counters']['fuel_by_capability'].items():
-        capability_type = capability.split(':')[0]  # Extract "net", "crypto", etc.
-        rate = PRICING.get(capability_type, PRICING['core.compute'])
-        total += fuel * rate
-    return total
-```
-
-**Real-world pricing example:**
-
-```
-Block uses:
-  - net.fetch: 310,000 fuel × $0.000002 = $0.62
-  - crypto.sign: 60,000 fuel × $0.000003 = $0.18
-  - core.compute: 51,337 fuel × $0.000001 = $0.05
-Total: $0.85
-```
-
-**For server operators:** Set rates based on your actual costs. If you're running on AWS, network costs real money. If you're on bare metal with 10Gbps, network is nearly free.
-
-### Deterministic Replay
-
-Verify receipts by re-executing the block:
-
-```python
-def verify_receipt(block, receipt):
-    # Replay with same limits
-    replay = execute_block(block, limits=receipt['limits'])
-
-    # Check fuel consumption
-    if replay['counters']['fuel_total'] != receipt['counters']['fuel_total']:
-        raise FraudDetected(f"Fuel mismatch: {replay} vs {receipt}")
-
-    # Check output hash
-    if replay['render']['output_hash'] != receipt['render']['output_hash']:
-        raise FraudDetected(f"Render mismatch: {replay} vs {receipt}")
-
-    # Receipt verified!
-    return True
-```
-
-**Why this matters:** Prevents billing fraud. If a malicious server claims your block used 10M fuel, you can replay it locally and prove it only used 500k.
-
-**For end users:** If you suspect overcharging, run `jig replay <receipt_id>` (CLI tool) to verify locally.
-
-### Affordance-Based Pricing
-
-Charge premiums for successful delivery:
-
-```python
-def calculate_cost(receipt):
-    base_cost = receipt['counters']['fuel_total'] * FUEL_RATE
-
-    if 'email.delivered' in receipt['outcome'].get('affordances', []):
-        base_cost *= 1.5  # 50% premium for email delivery
-
-    if 'storage.persisted' in receipt['outcome'].get('affordances', []):
-        base_cost *= 1.2  # 20% premium for durable storage
-
-    return base_cost
-```
-
-**Why premiums:** Because delivery has real costs beyond CPU. Email delivery requires SMTP server resources, reputation management, bounce handling. Durable storage requires disk, backups, replication.
-
-## Privacy & Security
-
-### E2EE Compatibility
-
-> **v0.2:** a server executes nothing on an encrypted channel; its receipt for such a
-> block is marked `"content": "sealed"` and carries no `render_hash`. See
-> [Encryption](encryption.md#server-obligations).
-
-Receipts are designed to work with end-to-end encryption:
-
-**What receipts reveal:**
-
-- Fuel consumed (how much CPU was used)
-- Capabilities used (e.g., `net.fetch` called)
-- Affordances achieved (e.g., `email.delivered`)
-
-**What receipts DON'T reveal:**
-
-- Email recipient (just "email was delivered")
-- HTTP request payload (just "HTTP 2xx returned")
-- Message content (encrypted, not metered)
-
-**For developers:** Fuel consumption is deterministic—same code + same inputs = same fuel, regardless of encrypted data. This prevents content leakage through metering.
-
-### Fraud Prevention
-
-**Validation checks:**
-
-- `counters.fuel_total == sum(fuel_by_capability)` prevents fuel inflation.
-- `timings.total_ms == init_ms + exec_ms` prevents timing manipulation.
-- `signature` verification ensures receipt came from claimed host.
-
-**Replay audits:**
-
-Anyone can re-execute a block with `limits` from the receipt and verify fuel/output match.
-
-**Transparency logs:**
-
-Receipts SHOULD be published to transparency logs (e.g., Rekor) so anyone can audit billing over time.
-
-**For server operators:** If you detect fraud (user replayed and got vastly different results), investigate immediately. Either your metering is broken or the receipt was forged.
-
-### PII Protection
-
-**Don't include in receipts:**
-
-- Email addresses
-- User names (beyond DIDs)
-- Message content
-- IP addresses (unless required for abuse prevention, then hash them)
-
-**For server operators:** Receipts may be published to transparency logs or shared with federated servers. Treat them as public.
-
-## Example Receipts
-
-### Success Receipt (Email Delivery)
-
-```json
-{
-  "version": "0.2.0",
-  "block_id": "cid:bafyEmailBlock...",
-  "host": "did:jig:server:prod",
-  "executed_at": "2025-11-09T12:34:56.789Z",
-
-  "outcome": {
-    "status": "ok",
-    "affordances": ["email.delivered"],
-    "reason": null
-  },
-
-  "counters": {
-    "fuel_total": 421337,
-    "fuel_by_capability": {
-      "net.fetch": 310000,
-      "crypto.sign": 60000,
-      "core.compute": 51337
-    },
-    "bytes_tx": 20480,
-    "bytes_rx": 32768
-  },
-
-  "timings": {
-    "queue_wait_ms": 2,
-    "init_ms": 3,
-    "exec_ms": 187,
-    "total_ms": 190
-  },
-
-  "limits": {
-    "max_fuel": 5000000,
-    "max_memory_bytes": 33554432,
-    "max_execution_time_ms": 250
-  },
-
-  "render": {
-    "output_hash": "blake3:d3abc...",
-    "output_size_bytes": 512,
-    "matches_expected": true
-  },
-
-  "capabilities_used": ["net.fetch", "crypto.sign"],
-
-  "signature": {
-    "key": "ed25519:v1:hostKey...",
-    "signature": "ed25519:v1:sigBytes..."
-  }
-}
-```
-
-### Failure Receipt (Fuel Exhausted)
-
-```json
-{
-  "version": "0.2.0",
-  "block_id": "cid:bafyInfiniteLoop...",
-  "host": "did:jig:server:prod",
-  "executed_at": "2025-11-09T12:35:00.123Z",
-
-  "outcome": {
-    "status": "hard_fail",
-    "affordances": [],
-    "reason": "FUEL_EXHAUSTED"
-  },
-
-  "counters": {
-    "fuel_total": 1000000,
-    "fuel_by_capability": {
-      "core.compute": 1000000
-    }
-  },
-
-  "timings": {
-    "queue_wait_ms": 1,
-    "init_ms": 2,
-    "exec_ms": 45,
-    "total_ms": 47
-  },
-
-  "limits": {
-    "max_fuel": 1000000,
-    "max_memory_bytes": 16777216,
-    "max_execution_time_ms": 100
-  },
-
-  "render": {
-    "output_hash": "",
-    "output_size_bytes": 0,
-    "matches_expected": false
-  },
-
-  "capabilities_used": [],
-
-  "signature": {
-    "key": "ed25519:v1:hostKey...",
-    "signature": "ed25519:v1:sigBytes..."
-  }
-}
-```
-
-**What happened:** Block ran out of fuel after consuming exactly 1M fuel (the limit). No output was produced. User pays 0% or partial cost (policy-dependent).
-
-## Normative Requirements Summary
+The requirements are JEP-0006's. Collected here:
 
 **MUST:**
 
-- Include `version`, `block_id`, `host`, `executed_at`, `outcome`, `signature` in every receipt.
-- Sign receipts with the host's Ed25519 keypair.
-- Ensure `counters.fuel_total == sum(fuel_by_capability)`.
-- Ensure `timings.total_ms == init_ms + exec_ms`.
-- Include `reason` for all failures (`soft_fail`, `hard_fail`).
-- Exclude `affordances` from failure receipts.
-- Use SCREAMING_SNAKE_CASE for reason codes.
-- Use UPPERCASE labels for `status_by_capability` bins.
-
-**SHOULD:**
-
-- Use monotonic clocks for timings (not wall-clock).
-- Publish receipts to transparency logs (e.g., Rekor).
-- Track fuel at the capability level (not just total).
-- Verify receipts via replay when fraud is suspected.
+- Encode a receipt as deterministic CBOR and sign it as COSE_Sign1 with EdDSA, `kid` the
+  executor's DID.
+- Refuse a receipt whose signature does not verify or whose payload is not deterministic CBOR.
+- Never issue a server `exec` receipt for encrypted content, and refuse one.
+- Never put a content-derived value in a `sealed` receipt.
+- Never compare `incomplete` outcomes, or `fuel_used`.
+- Refuse an `incomplete` run before landing a block; after landing, never undo the block.
+- Check the `ingest` record against the receipt's signer before re-executing.
+- Show a divergence on a comparable outcome to the user.
 
 **MAY:**
 
-- Include optional `metadata` for host-specific details.
-- Implement reputation-based affordance trust (trust `verified` users more than `null_sec`).
-- Cache compiled WebAssembly modules to reduce `init_ms` on repeated executions.
-- Add custom affordances using `custom:<namespace>:<action>` format.
+- Re-execute a block to check a receipt, when the client has its component.
 
 ---
 
-**Next:** Now that you understand receipts, check out [Transports](transports.md) to see how blocks and receipts are transmitted over IRC, WebSocket, and SSH, or jump to [Federation](federation.md) to see how receipts enable trustless inter-server collaboration.
+**Related chapters:** [Block Execution](block-execution.md) for how a block runs,
+[Blocks](blocks.md) for what a block is, and the [threat register](threat-register.md) for
+OP-07 (receipts are claims) and PV-02 (receipt linkage).
