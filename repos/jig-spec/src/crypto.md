@@ -100,10 +100,9 @@ label that names no key.
 - **A recovery kit** (`jig keys export --out FILE`) is the key file with one slot of its
   own: a passphrase of at least 12 characters, at the full Argon2id parameters whatever
   the local slots use, because a kit is meant to leave the machine and can be attacked
-  offline. It is a `.jigkey` like any other, so `jig keys verify` (or `jig-server keys
-  verify --slot passphrase`) checks it and `jig keys import` restores it: the restored
-  file keeps the kit's passphrase slot and gains the slot the machine seals new keys
-  with. The kit holds the same data key as the file it came from. Kits encrypted to an
+  offline. It is a `.jigkey` like any other, so `jig keys verify FILE` checks it and
+  `jig keys import FILE` restores it: the restored file keeps the kit's passphrase slot
+  and gains the slot the machine seals new keys with. The kit holds the same data key as the file it came from. Kits encrypted to an
   age recipient (a hardware token, a team key) may be added later as another export
   format, beside this one.
 

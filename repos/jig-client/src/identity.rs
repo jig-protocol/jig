@@ -1137,7 +1137,14 @@ fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), IdentityError> {
     let mut file = options.open(&tmp)?;
     let written = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
-    let linked = written.and_then(|()| std::fs::hard_link(&tmp, path));
+    let linked = written.and_then(|()| match std::fs::hard_link(&tmp, path) {
+        // FAT and exFAT, where a kit on a USB stick lands, have no hard
+        // links: write the file in place instead, still never over one.
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+            write_in_place(&options, path, bytes)
+        }
+        other => other,
+    });
     let _ = std::fs::remove_file(&tmp);
     match linked {
         Ok(()) => Ok(sync_parent_dir(path)?),
@@ -1146,6 +1153,22 @@ fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), IdentityError> {
         )),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Create `path` (`options` has `create_new`) and write `bytes` to it,
+/// removing it again if the write does not complete.
+fn write_in_place(
+    options: &std::fs::OpenOptions,
+    path: &Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let mut file = options.open(path)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    if written.is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+    written
 }
 
 /// How one slot is named to a person, as `jig keys protect` lists them.
@@ -1522,6 +1545,18 @@ mod tests {
             &kit,
         );
         assert!(matches!(again, Err(IdentityError::Protect(_))));
+    }
+
+    #[test]
+    fn writing_in_place_never_overwrites() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("kit.jigkey");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        write_in_place(&options, &path, b"first").unwrap();
+        let again = write_in_place(&options, &path, b"second").unwrap_err();
+        assert_eq!(again.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
     }
 
     #[test]
