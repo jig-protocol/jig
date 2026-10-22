@@ -990,8 +990,36 @@ pub fn rotate(
         let path = path.to_path_buf();
         move |source| ServerKeyError::Io { path, source }
     };
-    std::fs::rename(&tmp_key, &sealed).map_err(io(&sealed))?;
-    std::fs::rename(&tmp_link, &link_path).map_err(io(&link_path))?;
+    if let Err(e) = std::fs::rename(&tmp_key, &sealed) {
+        unstage();
+        let _ = std::fs::remove_file(&retired);
+        if let Some((archived, _)) = &archived {
+            let _ = std::fs::remove_file(archived);
+        }
+        return Err(io(&sealed)(e));
+    }
+    if let Err(e) = std::fs::rename(&tmp_link, &link_path) {
+        // The new key is in place without its link: put the old one back,
+        // so the server keeps booting as the DID its clients pinned.
+        let restored = std::fs::rename(&retired, &sealed);
+        let _ = std::fs::remove_file(&tmp_link);
+        if let Some((archived, _)) = &archived {
+            let _ = std::fs::remove_file(archived);
+        }
+        return Err(match restored {
+            Ok(()) => ServerKeyError::NotVerified {
+                path: link_path,
+                kept: format!("the old key was put back ({e})"),
+            },
+            Err(undo) => ServerKeyError::BadLink {
+                path: link_path,
+                reason: format!(
+                    "{e}, and putting the old key back failed too ({undo}). {sealed:?} now holds \
+                     the new key with no link: copy {retired:?} over it before restarting"
+                ),
+            },
+        });
+    }
     sync_parent_dir(&sealed).map_err(io(&sealed))?;
     sync_parent_dir(&link_path).map_err(io(&link_path))?;
     Ok(Rotated {

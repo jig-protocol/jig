@@ -317,6 +317,13 @@ if [ "$ROTATE" = 1 ]; then
   head -c 48 /dev/urandom | base64 -w0 |
     systemd-creds encrypt --with-key=auto --name="$CRED_NAME" - "$TMP/cred"
   mv -- "$TMP/cred" "$CRED.new"
+  # The old credential is kept under its retired name before anything moves:
+  # after the rotation one rename, which replaces atomically, puts the new
+  # one in place.
+  ln -- "$CRED" "$CRED.retired-$stamp" || {
+    rm -f -- "$CRED.new"
+    die "could not keep $CRED as $CRED.retired-$stamp; nothing was changed"
+  }
   rotate_args=(--slot "credential:/dev/fd/3")
   if [ "$NO_PASSPHRASE" = 0 ]; then rotate_args+=(--slot passphrase); fi
   if [ "$PRUNE_OLDEST" = 1 ]; then rotate_args+=(--prune-oldest); fi
@@ -326,11 +333,12 @@ if [ "$ROTATE" = 1 ]; then
     JIG_KEY_NEW_PASSPHRASE="$PASS" \
     "$BIN" --config "$CONFIG" keys rotate --keyfile "$KEYFILE" "${rotate_args[@]}" \
     3< <(systemd-creds decrypt --name="$CRED_NAME" "$CRED.new" -) 4< <(decrypt); then
-    rm -f -- "$CRED.new"
+    rm -f -- "$CRED.new" "$CRED.retired-$stamp"
     die "the key was not rotated; nothing was changed"
   fi
-  mv -- "$CRED" "$CRED.retired-$stamp"
-  mv -- "$CRED.new" "$CRED"
+  mv -f -- "$CRED.new" "$CRED" ||
+    die "the key was rotated, but $CRED.new could not be moved to $CRED. The new key opens \
+with $CRED.new (and the new passphrase): run \`mv -f $CRED.new $CRED\` before restarting"
   say "the old credential is kept as $CRED.retired-$stamp: with it, or the old passphrase, the retired key still opens. Move both offline; delete neither"
   echo
   jig_keys show
