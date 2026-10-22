@@ -521,6 +521,39 @@ enum KeysAction {
         nameserver: String,
     },
 
+    /// List what opens this identity's key, or add or remove one way.
+    /// Adding opens the key first, as any command does. Removing the last
+    /// way is refused.
+    Protect {
+        /// Add a slot: `passphrase` (asked twice, or JIG_KEY_NEW_PASSPHRASE),
+        /// `keychain`, `env:NAME` or `credential:PATH`.
+        #[arg(long, conflicts_with = "remove")]
+        add: Option<String>,
+        /// Remove the slot with this number, as the list shows it.
+        #[arg(long)]
+        remove: Option<usize>,
+    },
+
+    /// Write a recovery kit: a copy of this identity's key file opened by one
+    /// passphrase of its own (12+ characters, full-strength Argon2id). Keep
+    /// it offline; with its passphrase it is the identity.
+    Export {
+        /// Where to write the kit. Never overwritten.
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Restore an identity from a recovery kit into ~/.jig/keys, opened with
+    /// the kit's passphrase (JIG_KEY_KIT_PASSPHRASE, else asked).
+    Import {
+        /// The kit file.
+        kit: std::path::PathBuf,
+    },
+    /// Check that a recovery kit opens with its passphrase, and print its DID.
+    Verify {
+        /// The kit file.
+        kit: std::path::PathBuf,
+    },
+
     /// Mint a fresh keypair and rotate the alias binding from the
     /// current DID to the new one. The old keyfile is preserved, still
     /// sealed, as `<old_did>.jigkey.rotated` for offline recovery.
@@ -721,6 +754,12 @@ async fn run() -> Result<()> {
             KeysAction::Rotate { alias, nameserver } => {
                 cmd::keys::rotate(&ctx, cmd::keys::KeysRotateArgs { alias, nameserver }).await?;
             }
+            KeysAction::Protect { add, remove } => {
+                cmd::keys::protect(&ctx, add.as_deref(), remove)?;
+            }
+            KeysAction::Export { out } => cmd::keys::export(&ctx, &out)?,
+            KeysAction::Import { kit } => cmd::keys::import(&ctx, &kit)?,
+            KeysAction::Verify { kit } => cmd::keys::verify(&kit)?,
         }
         return Ok(());
     }

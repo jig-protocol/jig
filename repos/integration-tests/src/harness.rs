@@ -116,6 +116,8 @@ impl TestJigServer {
             cache_ttl_seconds: 1, // short for tests so cache misses re-resolve
             naively_allow_unknown_handles_fallback: false,
             delegations: ns.delegations(),
+            // TestNameserver serves plaintext on loopback.
+            dangerously_allow_plaintext_nameservers: true,
         };
         Self::start_with_config(config).await
     }
@@ -506,14 +508,20 @@ impl TestJigServer {
 // TestNameserver
 // ---------------------------------------------------------------------------
 
-/// How much proof-of-work a [`TestNameserver`] asks for.
-pub use jig_config::v0_0_2_server::PowPolicy;
+/// How much proof-of-work a [`TestNameserver`] asks for, and how many
+/// strangers it admits.
+pub use jig_config::v0_0_2_server::{PoolPolicy, PowPolicy};
 
 /// A `jig-nameserver` running on `127.0.0.1:<random>` for tests.
 pub struct TestNameserver {
     pub bound_addr: std::net::SocketAddr,
     pub state: Arc<jig_nameserver::v0_0_2::AppState>,
     pub alias_suffix: String,
+    /// Serving its default TLS: a self-signed certificate its DID vouches
+    /// for in `/.well-known/jig-ns`. Otherwise plaintext.
+    pub tls: bool,
+    /// Reaches this nameserver: trusts its DID-bound certificate under TLS.
+    client: reqwest::Client,
     _tempdir: TempDir,
     _handle: JoinHandle<()>,
 }
@@ -539,13 +547,58 @@ impl TestNameserver {
     }
 
     pub async fn start_with_suffix(alias_suffix: &str) -> Result<Self> {
-        Self::start_inner(alias_suffix, None, Self::test_pow()).await
+        Self::start_inner(
+            alias_suffix,
+            None,
+            Self::test_pow(),
+            PoolPolicy::off(),
+            false,
+        )
+        .await
     }
 
     /// Start a nameserver for `alias_suffix` whose DID key has the given
     /// seed, so a test can name it as an authority before it boots.
     pub async fn start_with_key(alias_suffix: &str, seed: [u8; 32]) -> Result<Self> {
-        Self::start_inner(alias_suffix, Some(seed), Self::test_pow()).await
+        Self::start_inner(
+            alias_suffix,
+            Some(seed),
+            Self::test_pow(),
+            PoolPolicy::off(),
+            false,
+        )
+        .await
+    }
+
+    /// A nameserver for `alias_suffix` as `jig-nameserver serve` runs it by
+    /// default: over TLS, with a self-signed certificate its DID vouches for.
+    pub async fn start_tls_with_suffix(alias_suffix: &str) -> Result<Self> {
+        Self::start_inner(
+            alias_suffix,
+            None,
+            Self::test_pow(),
+            PoolPolicy::off(),
+            true,
+        )
+        .await
+    }
+
+    /// [`Self::start_with_key`] over its default TLS.
+    pub async fn start_tls_with_key(alias_suffix: &str, seed: [u8; 32]) -> Result<Self> {
+        Self::start_inner(
+            alias_suffix,
+            Some(seed),
+            Self::test_pow(),
+            PoolPolicy::off(),
+            true,
+        )
+        .await
+    }
+
+    /// An HTTP client that reaches this nameserver: under TLS, it trusts the
+    /// certificate the nameserver's DID vouches for and no other.
+    pub fn client(&self) -> &reqwest::Client {
+        &self.client
     }
 
     /// The proof-of-work a test nameserver asks for unless told otherwise:
@@ -560,19 +613,50 @@ impl TestNameserver {
         }
     }
 
-    /// A nameserver for `alias_suffix` that asks for proof-of-work as `pow`
-    /// says (JEP-0008).
+    /// A plaintext nameserver for `alias_suffix` that asks for proof-of-work
+    /// as `pow` says (JEP-0008). Its registration pool is off: tests register
+    /// many names within a second, which the recommended 60 an hour would
+    /// refuse.
     pub async fn start_with_pow(
         alias_suffix: &str,
         pow: jig_config::v0_0_2_server::PowPolicy,
     ) -> Result<Self> {
-        Self::start_inner(alias_suffix, None, pow).await
+        Self::start_with_policies(alias_suffix, pow, PoolPolicy::off()).await
+    }
+
+    /// [`Self::start_with_pow`] over its default TLS.
+    pub async fn start_tls_with_pow(
+        alias_suffix: &str,
+        pow: jig_config::v0_0_2_server::PowPolicy,
+    ) -> Result<Self> {
+        Self::start_inner(alias_suffix, None, pow, PoolPolicy::off(), true).await
+    }
+
+    /// A plaintext nameserver for `alias_suffix` with these proof-of-work and
+    /// pool policies.
+    pub async fn start_with_policies(
+        alias_suffix: &str,
+        pow: PowPolicy,
+        pool: PoolPolicy,
+    ) -> Result<Self> {
+        Self::start_inner(alias_suffix, None, pow, pool, false).await
+    }
+
+    /// [`Self::start_with_policies`] over its default TLS.
+    pub async fn start_tls_with_policies(
+        alias_suffix: &str,
+        pow: PowPolicy,
+        pool: PoolPolicy,
+    ) -> Result<Self> {
+        Self::start_inner(alias_suffix, None, pow, pool, true).await
     }
 
     async fn start_inner(
         alias_suffix: &str,
         seed: Option<[u8; 32]>,
-        pow: jig_config::v0_0_2_server::PowPolicy,
+        pow: PowPolicy,
+        pool: PoolPolicy,
+        tls: bool,
     ) -> Result<Self> {
         let tempdir = tempfile::tempdir().context("tempdir")?;
         let keyfile = tempdir.path().join("nameserver.key");
@@ -600,6 +684,7 @@ impl TestNameserver {
         config.server.listen = "127.0.0.1:0".to_string();
         let mut suffix = jig_config::v0_0_2_server::SuffixConfig::new(alias_suffix);
         suffix.pow = pow;
+        suffix.pool = pool;
         // A single-label suffix is trusted only through clients' own config;
         // a test that serves one means it.
         suffix.single_label_authority = !alias_suffix.contains('.');
@@ -614,33 +699,50 @@ impl TestNameserver {
         ns_config.storage.database_path = tempdir.path().join("nameserver.db");
         ns_config.v0_0_2 = config;
 
+        ns_config.tls.enabled = tls;
         let app = jig_nameserver::server::build_app_parts(&ns_config).context("build_app_parts")?;
         let state = app.v0_0_2_state.clone();
-        let router = app.router;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.context("bind")?;
         let bound_addr = listener.local_addr().context("local_addr")?;
 
         let handle = tokio::spawn(async move {
-            let _ = axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .await;
+            let _ = jig_nameserver::server::serve_app(&ns_config, app, listener).await;
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let scheme = if tls { "https" } else { "http" };
+        let client = if tls {
+            let probed = jig_client::tls::probe_bound(
+                &format!("{scheme}://{bound_addr}"),
+                "/.well-known/jig-ns",
+                &[state.ns_did_string()],
+            )
+            .await
+            .context("probing the test nameserver's TLS")?;
+            let config = probed.config.context("a TLS config")?;
+            reqwest::Client::builder()
+                .use_preconfigured_tls(config.as_ref().clone())
+                .build()?
+        } else {
+            reqwest::Client::new()
+        };
 
         Ok(Self {
             bound_addr,
             state,
             alias_suffix: alias_suffix.to_string(),
+            tls,
+            client,
             _tempdir: tempdir,
             _handle: handle,
         })
     }
 
+    /// The nameserver's base URL: `https://` under TLS, else `http://`.
     pub fn http_url(&self) -> String {
-        format!("http://{}", self.bound_addr)
+        let scheme = if self.tls { "https" } else { "http" };
+        format!("{scheme}://{}", self.bound_addr)
     }
 
     /// Register `alias_local@<suffix>` with a fresh identity. Returns the
@@ -658,7 +760,7 @@ impl TestNameserver {
         alias_local: &str,
         key: &ed25519_dalek::SigningKey,
     ) -> Result<serde_json::Value> {
-        let client = reqwest::Client::new();
+        let client = &self.client;
         let did =
             jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
         let alias = format!("{alias_local}@{}", self.alias_suffix).to_ascii_lowercase();

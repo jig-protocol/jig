@@ -5,14 +5,26 @@ use crate::error::{NameServerError, Result};
 use crate::identity::{get_or_create as ns_get_or_create, ns_id_from_pubkey};
 use crate::storage::{MemoryStorage, NamesStorage, SqliteStorage};
 use axum::{Json, Router, extract::State, routing::get};
+use hyper_util::rt::TokioIo;
+use jig_core::tls_binding::TlsBinding;
 use serde::Serialize;
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
+use tokio::net::TcpListener;
+use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
+use tower::ServiceExt as _; // oneshot
 
 pub struct AppState {
     pub cfg: NameServerConfig,
     pub storage: Arc<dyn NamesStorage>,
     pub ns_id: String,
     pub ns_pubkey_hex: String,
+    /// The v0.0.2 DID: it signs every attestation and vouches for the TLS
+    /// certificate.
+    pub server_did: Option<String>,
+    /// The DID's word for the listener's certificate, set when TLS starts.
+    /// Empty over plaintext.
+    pub tls_binding: Arc<OnceLock<TlsBinding>>,
 }
 
 impl Clone for AppState {
@@ -22,6 +34,8 @@ impl Clone for AppState {
             storage: Arc::clone(&self.storage),
             ns_id: self.ns_id.clone(),
             ns_pubkey_hex: self.ns_pubkey_hex.clone(),
+            server_did: self.server_did.clone(),
+            tls_binding: Arc::clone(&self.tls_binding),
         }
     }
 }
@@ -40,6 +54,14 @@ struct WellKnownNsInfo {
     ns_id: String,
     endpoints: serde_json::Value,
     policy: serde_json::Value,
+    /// With `tls_binding`, what `jig_client::tls::probe_at` checks a
+    /// self-signed certificate against; the same fields as `/.well-known/jig`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_did: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tls_binding: Option<TlsBinding>,
+    /// JEP-0004 rule 12: plaintext only behind an advertised flag.
+    unsafe_options_active: Vec<String>,
 }
 
 async fn well_known(State(state): State<AppState>) -> Result<Json<WellKnownNsInfo>> {
@@ -70,6 +92,9 @@ async fn well_known(State(state): State<AppState>) -> Result<Json<WellKnownNsInf
         ns_id,
         endpoints,
         policy,
+        server_did: state.server_did.clone(),
+        tls_binding: state.tls_binding.get().cloned(),
+        unsafe_options_active: state.cfg.unsafe_options_active(),
     }))
 }
 
@@ -96,6 +121,18 @@ async fn health() -> Result<Json<HealthResponse>> {
 pub struct NameServerApp {
     pub router: Router,
     pub v0_0_2_state: Arc<crate::v0_0_2::AppState>,
+    /// What `/.well-known/jig-ns` publishes as `tls_binding`.
+    pub tls_binding: Arc<OnceLock<TlsBinding>>,
+}
+
+impl NameServerApp {
+    /// Have the nameserver's DID vouch for `cert_der`, the leaf certificate
+    /// the listener serves. Only the first call counts.
+    pub fn bind_tls_certificate(&self, cert_der: &[u8]) {
+        let _ = self
+            .tls_binding
+            .get_or_init(|| TlsBinding::sign(&self.v0_0_2_state.ingest_ctx.server_key, cert_der));
+    }
 }
 
 /// jig-server's keyfile default (`~/.jig/server/server.key`) belongs to the
@@ -154,13 +191,6 @@ pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
     let ns_pubkey_hex = hex::encode(ns_identity.public_key.as_bytes());
     let ns_id = ns_id_from_pubkey(&ns_identity.public_key);
 
-    let state = AppState {
-        cfg: cfg.clone(),
-        storage,
-        ns_id,
-        ns_pubkey_hex,
-    };
-
     let mut v0_0_2_cfg = cfg.v0_0_2.clone();
     v0_0_2_cfg.server.server_did_keyfile = resolve_v0_0_2_keyfile(cfg);
     let mut v0_0_2_state = crate::v0_0_2::AppState::new(
@@ -169,7 +199,18 @@ pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
         crate::v0_0_2_policy::Suffixes::from_config(&cfg.v0_0_2.nameserver)?,
     )?;
     v0_0_2_state.max_pending_challenges = cfg.alias_rate_limits.max_pending_challenges;
+    v0_0_2_state.network = cfg.network.clone();
     let v0_0_2_state = Arc::new(v0_0_2_state);
+
+    let tls_binding = Arc::new(OnceLock::new());
+    let state = AppState {
+        cfg: cfg.clone(),
+        storage,
+        ns_id,
+        ns_pubkey_hex,
+        server_did: Some(v0_0_2_state.ns_did_string()),
+        tls_binding: Arc::clone(&tls_binding),
+    };
 
     // `merge` is safe here even though both halves register `/v1/challenge`:
     // the legacy handler is POST and the v0.0.2 handler is GET, and axum
@@ -209,6 +250,7 @@ pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
     Ok(NameServerApp {
         router,
         v0_0_2_state,
+        tls_binding,
     })
 }
 
@@ -230,17 +272,113 @@ pub async fn run_http_server(
         cfg.network.port = port;
     }
 
-    let app = build_app(&cfg)?;
-
     let addr = format!("{}:{}", cfg.network.bind, cfg.network.port);
-    let listener = tokio::net::TcpListener::bind(&addr)
+    let listener = TcpListener::bind(&addr)
         .await
+        .map_err(|e| NameServerError::Other(anyhow::anyhow!("binding {addr}: {e}")))?;
+    serve(&cfg, listener).await
+}
+
+/// Serve `cfg`'s nameserver on `listener`: over TLS (JEP-0004 rule 12) unless
+/// `[tls] enabled = false`.
+pub async fn serve(cfg: &NameServerConfig, listener: TcpListener) -> Result<()> {
+    serve_app(cfg, build_app_parts(cfg)?, listener).await
+}
+
+/// [`serve`] an app already built from `cfg`, for a caller that keeps a
+/// handle on its state (tests register names through it).
+pub async fn serve_app(
+    cfg: &NameServerConfig,
+    app: NameServerApp,
+    listener: TcpListener,
+) -> Result<()> {
+    let other = |e: String| NameServerError::Other(anyhow::anyhow!(e));
+    let addr = listener
+        .local_addr()
         .map_err(|e| NameServerError::Other(e.into()))?;
-    tracing::info!("nameserver listening on {}", addr);
-    let make_svc = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
-    axum::serve(listener, make_svc)
-        .await
-        .map_err(|e| NameServerError::Other(e.into()))
+    if !cfg.tls.enabled {
+        tracing::warn!(
+            "[tls] enabled = false: serving plaintext on http://{addr}. This is an unsafe \
+             option, listed in /.well-known/jig-ns; use it only on loopback or behind a proxy \
+             that terminates TLS"
+        );
+        let make_svc = app
+            .router
+            .into_make_service_with_connect_info::<SocketAddr>();
+        return axum::serve(listener, make_svc)
+            .await
+            .map_err(|e| NameServerError::Other(e.into()));
+    }
+    // Not jig-server's `tls/`: the two often share a data directory, and each
+    // DID vouches for its own certificate.
+    let dir = cfg
+        .storage
+        .database_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."))
+        .join("nameserver");
+    let (cert, key) = cfg
+        .tls
+        .material(&dir, &tls_names(&cfg.network.bind))
+        .map_err(other)?;
+    let (rustls_config, leaf) = jig_config::tls::load_rustls_config(&cert, &key).map_err(other)?;
+    app.bind_tls_certificate(leaf.as_ref());
+    tracing::info!("nameserver listening on https://{addr}");
+    serve_tls(listener, app.router, rustls_config).await
+}
+
+/// Names a self-signed certificate is made for: `localhost`, and the bind
+/// address unless it is a wildcard. Clients trust it through the DID, not
+/// these names.
+fn tls_names(bind: &str) -> Vec<String> {
+    let mut names = vec!["localhost".to_string()];
+    if !matches!(bind, "0.0.0.0" | "::" | "[::]") && bind != "localhost" {
+        names.push(bind.to_string());
+    }
+    names
+}
+
+/// Serve `router` over rustls. Each connection's handshake runs in its own
+/// task, so a slow one can't block accept.
+async fn serve_tls(
+    listener: TcpListener,
+    router: Router,
+    rustls_config: RustlsServerConfig,
+) -> Result<()> {
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(rustls_config));
+    loop {
+        let (tcp, peer) = listener
+            .accept()
+            .await
+            .map_err(|e| NameServerError::Other(anyhow::anyhow!("accept error: {e}")))?;
+        let (acceptor, router) = (acceptor.clone(), router.clone());
+        tokio::spawn(async move {
+            let tls = match acceptor.accept(tcp).await {
+                Ok(tls) => tls,
+                Err(e) => {
+                    tracing::debug!("TLS handshake failed: {e}");
+                    return;
+                }
+            };
+            let service = hyper::service::service_fn(
+                move |mut req: hyper::Request<hyper::body::Incoming>| {
+                    // What `into_make_service_with_connect_info` gives the
+                    // plaintext listener: the rate limiter keys on it.
+                    req.extensions_mut()
+                        .insert(axum::extract::ConnectInfo(peer));
+                    router.clone().oneshot(req)
+                },
+            );
+            // ALPN offers only http/1.1.
+            if let Err(e) = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(tls), service)
+                .await
+            {
+                tracing::debug!("connection error: {e}");
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -324,6 +462,8 @@ mod tests {
             storage: Arc::new(MemoryStorage::default()),
             ns_id: "test".into(),
             ns_pubkey_hex: String::new(),
+            server_did: None,
+            tls_binding: Default::default(),
         });
 
         let (status, _) = get(&router, "/v1/health").await;

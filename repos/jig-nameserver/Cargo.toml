@@ -28,7 +28,13 @@ blake3 = { workspace = true }
 axum = { workspace = true, features = ["macros"] }
 tower = { workspace = true, features = ["make", "util"] }
 tower-http = { workspace = true, features = ["cors", "trace"] }
-hyper = { workspace = true }
+hyper = { workspace = true, features = ["server", "http1"] }
+# [tls]: the listener.
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "logging",
+    "ring",
+    "tls12",
+] }
 hyper-util = { version = "0.1", features = ["server", "http1", "http2", "tokio"] }
 async-trait = { workspace = true }
 hex = { workspace = true }
@@ -53,6 +59,8 @@ shellexpand = "3"
 base64 = "0.23"
 
 [dev-dependencies]
+# Paused time for the registration pool's queue tests.
+tokio = { workspace = true, features = ["test-util"] }
 jig-client = { path = "../jig-client", features = ["test-support"] }
 serde_json = { workspace = true }
 http-body-util = { workspace = true }

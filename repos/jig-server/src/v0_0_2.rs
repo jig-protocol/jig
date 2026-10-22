@@ -144,7 +144,12 @@ fn check_published_peer_dids(
         .enumerate()
         .filter(|(_, p)| p.publish)
     {
-        let canonical = jig_pipeline::effect::canonical_did_string(&peer.expected_did);
+        // A re-cased spelling no longer parses strictly, so name the key's
+        // canonical DID from the lenient reading of what the operator wrote.
+        let Ok(canonical) = Did::canonicalize(&peer.expected_did).map(|d| d.to_did_jig_string())
+        else {
+            continue;
+        };
         if canonical != peer.expected_did {
             anyhow::bail!(
                 "[federation] peers[{i}].expected_did: a published peer's DID must be canonical: `{canonical}`"
@@ -289,6 +294,9 @@ impl AppState {
                     suffix_authorities(&delegations),
                     config.identity.cache_ttl_seconds,
                     store.clone(),
+                    Arc::new(crate::v0_0_2_nameserver_tls::BoundNameservers {
+                        allow_plaintext: config.identity.dangerously_allow_plaintext_nameservers,
+                    }),
                 ))
             }
         };

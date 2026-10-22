@@ -9,7 +9,11 @@
 //! 2. Ask every nameserver the delegation names for `/v1/resolve/{alias}`,
 //!    and verify each attestation: signer authoritative for the suffix,
 //!    signature, validity window, alias. Two valid attestations naming
-//!    different DIDs refuse the name.
+//!    different DIDs refuse the name. A `config` delegation's nameservers are
+//!    reached only over TLS bound to one of its authorities' DIDs
+//!    ([`crate::tls::probe_bound`]), never over a CA's word or plaintext,
+//!    unless plaintext is allowed for local testing
+//!    ([`Delegations::dangerously_allow_plaintext_nameservers`]).
 //! 3. Compare with the pin for `(alias, suffix, root, root_id)` (rule 6).
 //! 4. Hand what it acted on to the evidence writer (rule 20).
 //!
@@ -48,6 +52,12 @@ pub struct ConfigDelegation {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Delegations {
     pub config: BTreeMap<String, ConfigDelegation>,
+    /// Also ask `http://` nameservers in `config`. For loopback or local
+    /// testing only: over plaintext anyone on the path sees which names are
+    /// looked up, and can hide or delay answers. (It cannot forge one; every
+    /// attestation is still verified.) Off, a `config` nameserver is reached
+    /// only over TLS one of its authorities' DIDs vouches for.
+    pub dangerously_allow_plaintext_nameservers: bool,
 }
 
 /// What a name means (rule 6), and what a name pin is keyed by.
@@ -155,6 +165,8 @@ pub enum ResolveError {
     Unreachable(String),
     #[error("malformed answer: {0}")]
     Malformed(String),
+    #[error("no nameserver for `{name}` could be trusted: {reason}")]
+    Untrusted { name: String, reason: String },
     #[error("nameservers for `{name}` attest different DIDs: {dids:?}")]
     Equivocation { name: String, dids: Vec<String> },
     #[error(
@@ -199,6 +211,8 @@ enum Asked {
     NotFound,
     Refused(NamingError),
     Malformed(String),
+    /// The nameserver's transport is not vouched for by an authority.
+    Untrusted(String),
     Unreachable,
 }
 
@@ -282,24 +296,40 @@ impl NameResolver {
             // `Name::parse` admits only `[a-z0-9_-]`, `.` and one `@`, all
             // legal in a path segment.
             let url = format!("{}/v1/resolve/{wanted}", ns.trim_end_matches('/'));
-            let http = self.http.clone();
-            let (name, authorities, delegation) = (
+            let (http, plaintext) = (
+                self.http.clone(),
+                delegations.dangerously_allow_plaintext_nameservers,
+            );
+            let (ns, name, authorities, delegation) = (
+                ns.clone(),
                 name.clone(),
                 authority.authorities.clone(),
                 authority.delegation.clone(),
             );
             asks.spawn(async move {
+                // Under `dns` the nameserver is the suffix's own host, which a
+                // CA vouches for; a `config` nameserver must be an authority.
+                let http = if delegation.is_some() {
+                    http
+                } else {
+                    match bound_client(&ns, &authorities, plaintext, &http).await {
+                        Ok(bound) => bound,
+                        Err(reason) => return Asked::Untrusted(reason),
+                    }
+                };
                 ask(&http, &url, &name, &authorities, delegation.as_ref(), now).await
             });
         }
         let mut valid: Vec<Answer> = Vec::new();
         let (mut refused, mut malformed, mut not_found) = (None, None, false);
+        let mut untrusted = None;
         while let Some(asked) = asks.join_next().await {
             match asked.map_err(|e| ResolveError::Malformed(e.to_string()))? {
                 Asked::Valid(a) => valid.push(a),
                 Asked::NotFound => not_found = true,
                 Asked::Refused(e) => refused = refused.or(Some(e)),
                 Asked::Malformed(e) => malformed = malformed.or(Some(e)),
+                Asked::Untrusted(e) => untrusted = untrusted.or(Some(e)),
                 Asked::Unreachable => {}
             }
         }
@@ -308,6 +338,11 @@ impl NameResolver {
                 ResolveError::Refused(e)
             } else if not_found {
                 ResolveError::NotFound(wanted)
+            } else if let Some(reason) = untrusted {
+                ResolveError::Untrusted {
+                    name: wanted,
+                    reason,
+                }
             } else if let Some(e) = malformed {
                 ResolveError::Malformed(e)
             } else {
@@ -456,6 +491,41 @@ impl Default for NameResolver {
         Self::new()
     }
 }
+
+/// A client for `ns`, a nameserver a `config` delegation lists: TLS that one
+/// of `authorities` vouches for. An `http://` nameserver gets `plain` when
+/// `plaintext` allows it, and is refused otherwise.
+async fn bound_client(
+    ns: &str,
+    authorities: &[String],
+    plaintext: bool,
+    plain: &reqwest::Client,
+) -> Result<reqwest::Client, String> {
+    let base = crate::tls::http_base(ns).map_err(|e| e.to_string())?;
+    if base.starts_with("http://") {
+        return if plaintext {
+            Ok(plain.clone())
+        } else {
+            Err(format!(
+                "{ns} is plaintext; a nameserver is reached only over TLS an authority's \
+                 DID vouches for"
+            ))
+        };
+    }
+    let probed = crate::tls::probe_bound(&base, NS_WELL_KNOWN, authorities)
+        .await
+        .map_err(|e| e.to_string())?;
+    let config = probed.config.expect("a bound probe over TLS has a config");
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .use_preconfigured_tls(config.as_ref().clone())
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// Where a nameserver publishes its DID and the binding for its certificate.
+const NS_WELL_KNOWN: &str = "/.well-known/jig-ns";
 
 /// GET `url`, at most [`MAX_RESPONSE`] bytes. `Ok(None)` is a 404.
 async fn fetch(http: &reqwest::Client, url: &str) -> Result<Option<Vec<u8>>, String> {
@@ -727,6 +797,8 @@ mod tests {
                     nameservers: stubs.iter().map(|s| s.url()).collect(),
                 },
             )]),
+            // The stubs are plaintext.
+            dangerously_allow_plaintext_nameservers: true,
         }
     }
 
@@ -1014,7 +1086,7 @@ mod tests {
         let alice = did_of(&alice_key);
         let own = ReachabilityRecord::sign(
             &alice_key,
-            vec![("did:jig:zS".into(), "https://s.example".into())],
+            vec![(did_of(&key(13)), "https://s.example".into())],
             1,
         );
         let foreign = ReachabilityRecord::sign(&key(66), vec![], 1);
@@ -1144,6 +1216,36 @@ mod tests {
         );
     }
 
+    /// Without the opt-in, a `config` nameserver on `http://` is never asked.
+    #[tokio::test]
+    async fn a_plaintext_config_nameserver_is_refused_without_the_opt_in() {
+        let (ns, alice) = (key(1), did_of(&key(9)));
+        let plain = Stub::start(None).await;
+        plain.route(
+            "/v1/resolve/dj@dj.jig",
+            resolve_body(&attest(&ns, &alice, "dj@dj.jig"), &[], None),
+        );
+        let mut r = NameResolver::with_roots(RootCertStore::empty(), |b| b.no_proxy());
+        r.now = Arc::new(|| NOW);
+        let err = r
+            .resolve(
+                "dj@dj.jig",
+                &Delegations {
+                    dangerously_allow_plaintext_nameservers: false,
+                    ..config(&[&ns], &[&plain])
+                },
+                &MemPins::default(),
+                &MemEvidence::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ResolveError::Untrusted { ref reason, .. } if reason.contains("plaintext")),
+            "{err:?}"
+        );
+        assert_eq!(plain.hits(), 0, "nothing was sent in the clear");
+    }
+
     #[tokio::test]
     async fn a_config_delegation_takes_precedence_over_dns() {
         let (roots, cert, cert_key) = ca_issued();
@@ -1164,6 +1266,7 @@ mod tests {
                     nameservers: vec![plain.url()],
                 },
             )]),
+            dangerously_allow_plaintext_nameservers: true,
         };
 
         let got = dns_resolver(roots, &tls)
@@ -1220,6 +1323,7 @@ mod tests {
                     nameservers: vec![plain.url()],
                 },
             )]),
+            dangerously_allow_plaintext_nameservers: true,
         };
         let got = r
             .resolve(

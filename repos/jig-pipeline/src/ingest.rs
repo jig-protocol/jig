@@ -143,6 +143,11 @@ pub enum IngestError {
     BundleMalformed(String),
     #[error("manifest missing kind field — v0.0.2 blocks must declare kind")]
     KindRequired,
+    /// A DID in the manifest decodes to a key but is not spelled the way that
+    /// key encodes (an upper-cased body, say). The block is signed, so this
+    /// server cannot re-spell it, and a peer would refuse it anyway.
+    #[error("`{field}` is not a did:jig in its canonical lowercase spelling")]
+    NonCanonicalDid { field: String },
     /// The manifest's schema or encryption suite is one this server does not
     /// speak. Checked before the signature: what the signature covers is
     /// defined by the schema.
@@ -347,7 +352,9 @@ pub async fn ingest(
     // Parse the manifest from canonical bytes on the bundle.
     let manifest = parse_manifest(bundle.manifest_bytes)?;
 
-    // Step 1: signature verification
+    // Step 1: signature verification, after the DIDs it and every later step
+    // compare are known to be in their one spelling.
+    check_manifest_dids(&manifest)?;
     let sender = verify_sig(bundle.manifest_bytes, bundle.code_bytes, &manifest, &sig)?;
 
     // Step 1b: admission, on the DID the signature just established. Before
@@ -1447,16 +1454,54 @@ fn bundle_canonical_bytes(manifest_bytes: &[u8], code_bytes: &[u8]) -> Result<Ve
     serde_json::to_vec(&payload).map_err(|e| e.to_string())
 }
 
+/// The manifest's DID fields that this pipeline reads, by the name an error
+/// reports them under: `member_did` (member-add), `member` (role-assign and
+/// role-unassign) and `ns_did`.
+const MANIFEST_DID_FIELDS: &[&str] = &["member_did", crate::roles::MEMBER_KEY, "ns_did"];
+
+/// Refuse a manifest carrying a key-derived DID in any spelling but the key's
+/// own. Legacy, non-key-derived DIDs (`did:jig:alice`) are opaque labels and
+/// are left to the steps that read them.
+fn check_manifest_dids(manifest: &jig_core::BlockManifest) -> Result<(), IngestError> {
+    let respelled = |did: &str| {
+        matches!(
+            Did::from_str_unchecked(did).as_bytes(),
+            Err(jig_core::did::DidError::NotLowercase)
+        )
+    };
+    if let Some(author) = manifest.authors.iter().find(|a| respelled(&a.did)) {
+        return Err(IngestError::NonCanonicalDid {
+            field: format!("authors[].did `{}`", author.did),
+        });
+    }
+    for field in MANIFEST_DID_FIELDS {
+        if let Some(did) = manifest.metadata.get(*field).and_then(|v| v.as_str())
+            && respelled(did)
+        {
+            return Err(IngestError::NonCanonicalDid {
+                field: (*field).to_string(),
+            });
+        }
+    }
+    // Signed too, and stored as the tie-break between equal clocks.
+    if let Some(hlc) = &manifest.hlc_ts
+        && respelled(hlc.server_did.as_str())
+    {
+        return Err(IngestError::NonCanonicalDid {
+            field: "hlc_ts.server_did".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Verify the sender's ed25519 signature over the bundle's canonical bytes.
 ///
 /// The signer is the first author in the manifest. If the DID is not in
 /// canonical `did:jig:z<base32>` form (e.g. a legacy test DID), decoding
 /// fails and we return `InvalidSignature` — no opaque-label fallback,
 /// because the ingest pipeline must never accept an unverifiable signature.
-/// Verify the author's signature and return the author's DID in canonical
-/// form — rebuilt from the key the signature verified against, not the
-/// spelling the manifest carried, so every downstream comparison sees one
-/// form.
+/// Verify the author's signature and return the author's DID. Its spelling
+/// is canonical: [`check_manifest_dids`] refused any other.
 fn verify_sig(
     manifest_bytes: &[u8],
     code_bytes: &[u8],
@@ -1499,33 +1544,9 @@ fn text_render_input(
             kind: kind_str.to_string(),
         });
     }
-    // Rendering the empty string in the body's absence would hash a message nobody sent.
-    let body = manifest
-        .metadata
-        .get("body")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| IngestError::MissingMetadata {
-            kind: kind_str.to_string(),
-            field: "body".to_string(),
-        })?;
-    let channel = manifest
-        .metadata
-        .get("channel")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    let hlc = manifest.hlc_ts.as_ref();
-    Ok(text_block::Input {
-        sender_did: manifest
-            .authors
-            .first()
-            .map(|a| a.did.to_string())
-            .unwrap_or_default(),
-        channel_id: channel.to_string(),
-        body_raw: body.to_string(),
-        hlc_wall_ms: hlc.map(|h| h.wall_ms).unwrap_or(0),
-        hlc_logical: hlc.map(|h| h.logical).unwrap_or(0),
-        hlc_origin: hlc.map(|h| h.server_did.to_string()).unwrap_or_default(),
-        client_version: manifest.version.to_string(),
+    crate::executor::text_input(manifest).ok_or_else(|| IngestError::MissingMetadata {
+        kind: kind_str.to_string(),
+        field: "body".to_string(),
     })
 }
 
@@ -1563,13 +1584,7 @@ async fn render_after_landing(
             kind: BlockKind::TextRender.as_str().to_string(),
         })?;
 
-    let mut invocation =
-        crate::executor::text_invocation(&input, block_cid.to_string(), record.seq);
-    invocation.channel_cid = record.channel_id.clone();
-    invocation.ingest_hlc = jig_runtime::component::Hlc {
-        wall_ms: record.ingest_wall_ms,
-        logical: record.ingest_logical,
-    };
+    let invocation = crate::executor::text_render_invocation(&input, block_cid, &record);
 
     let run = run_text_render(executor, invocation).await?;
 
@@ -1790,6 +1805,61 @@ mod tests {
 
     fn test_ctx() -> IngestContext {
         test_ctx_allowing(&["text-render"])
+    }
+
+    /// Every key-derived DID a manifest carries, signed, is in its one
+    /// spelling: a role-assign's `member` and the clock's `server_did` too.
+    #[test]
+    fn a_recased_member_or_clock_server_did_is_refused() {
+        let key = random_signing_key();
+        let did = Did::from_ed25519_pubkey(key.verifying_key().as_bytes());
+        let recased = did
+            .to_did_jig_string()
+            .to_uppercase()
+            .replacen("DID:JIG:Z", "did:jig:z", 1);
+        let manifest = || {
+            BlockManifest::builder()
+                .version(Version::new(0, 1, 0))
+                .author(Author {
+                    did: did.clone(),
+                    public_key: None,
+                    roles: vec![],
+                })
+                .build()
+                .unwrap()
+                .with_kind(BlockKind::RoleAssign)
+        };
+        let mut role = manifest();
+        role.metadata
+            .insert(crate::roles::MEMBER_KEY.into(), serde_json::json!(recased));
+        assert!(matches!(
+            check_manifest_dids(&role),
+            Err(IngestError::NonCanonicalDid { ref field }) if field == "member"
+        ));
+
+        let mut clock = manifest();
+        clock.hlc_ts = Some(jig_core::HlcTimestamp {
+            wall_ms: 1,
+            logical: 0,
+            server_did: Did::from_str_unchecked(recased.clone()),
+        });
+        assert!(matches!(
+            check_manifest_dids(&clock),
+            Err(IngestError::NonCanonicalDid { ref field }) if field == "hlc_ts.server_did"
+        ));
+
+        // Canonical, and legacy labels, pass.
+        let mut fine = manifest();
+        fine.metadata.insert(
+            crate::roles::MEMBER_KEY.into(),
+            serde_json::json!(did.to_did_jig_string()),
+        );
+        fine.hlc_ts = Some(jig_core::HlcTimestamp {
+            wall_ms: 1,
+            logical: 0,
+            server_did: Did::from_str_unchecked("did:jig:server-test"),
+        });
+        assert!(check_manifest_dids(&fine).is_ok());
     }
 
     fn test_ctx_allowing(kinds: &[&str]) -> IngestContext {
@@ -2031,12 +2101,7 @@ mod tests {
             "text-render",
         )
         .unwrap();
-        let mut invocation = crate::executor::text_invocation(&input, cid.clone(), record.seq);
-        invocation.channel_cid = record.channel_id.clone();
-        invocation.ingest_hlc = jig_runtime::component::Hlc {
-            wall_ms: record.ingest_wall_ms,
-            logical: record.ingest_logical,
-        };
+        let invocation = crate::executor::text_render_invocation(&input, &cid, &record);
         assert_eq!(
             exec.invocation_hash,
             jig_runtime::component::hash_bytes(&jig_runtime::component::invocation_hash(
@@ -3564,7 +3629,7 @@ mod tests {
         assert!(row.co_owners.is_empty());
 
         // Naming this server explicitly is the same channel shape, and the
-        // co-owners are kept, canonical and without the creator.
+        // co-owners are kept once each and without the creator.
         let co = person();
         let cid = plain(
             &ctx,
@@ -3572,11 +3637,24 @@ mod tests {
             BlockKind::ChannelCreate,
             serde_json::json!({"slug": "#ours",
                 "sequencer": ctx.server_did.to_did_jig_string(),
-                "co_owners": [co.did.to_uppercase().replacen("DID:JIG:Z", "did:jig:z", 1),
-                              co.did, owner.did]}),
+                "co_owners": [co.did, co.did, owner.did]}),
         )
         .await
         .unwrap();
+        // A DID in signed terms is in its one canonical spelling: another
+        // spelling of the same key is refused, not read as it.
+        let recased = co.did.to_uppercase().replacen("DID:JIG:Z", "did:jig:z", 1);
+        let bad = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#recased", "co_owners": [recased]}),
+        )
+        .await;
+        assert!(
+            matches!(bad, Err(IngestError::InvalidTerms { ref field, .. }) if field == "co_owners"),
+            "{bad:?}"
+        );
         let row = ctx.store.get_channel_by_id(&cid).unwrap().unwrap();
         assert_eq!(row.sequencer_did, ctx.server_did.to_did_jig_string());
         assert_eq!(row.co_owners, vec![co.did.clone()]);

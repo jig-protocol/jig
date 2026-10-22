@@ -403,9 +403,11 @@ impl Attestation {
         Ok(att)
     }
 
-    /// The envelope carries exactly these fields and is `ns_did`'s. Says
-    /// nothing about authority or time.
+    /// The envelope carries exactly these fields and is `ns_did`'s, and
+    /// `did` is a key in its one spelling. Says nothing about authority or
+    /// time.
     pub fn verify(&self) -> Result<(), NamingError> {
+        check_did(&self.did)?;
         verify_envelope(&self.envelope, &self.payload(), &self.ns_did)
     }
 }
@@ -604,6 +606,9 @@ impl ReachabilityRecord {
     }
 
     pub fn verify(&self) -> Result<(), NamingError> {
+        for (server_did, _) in &self.servers {
+            check_did(server_did)?;
+        }
         verify_envelope(&self.envelope, &self.payload(), &self.did)
     }
 }
@@ -690,6 +695,15 @@ pub fn verify_rotation_chain<L: AliasLink>(
     } else {
         Err(NamingError::BrokenChain(pinned.into(), new.into()))
     }
+}
+
+/// A DID this module reads but does not verify a signature under must still
+/// be a key in its canonical spelling, as every signer's is ([`cose`]): two
+/// spellings of one key would compare unequal.
+fn check_did(did: &str) -> Result<(), NamingError> {
+    Did::from_did_jig_string(did)
+        .map(|_| ())
+        .map_err(|_| NamingError::BadDid(did.into()))
 }
 
 fn did_of(key: &SigningKey) -> String {
@@ -1227,14 +1241,8 @@ mod tests {
     fn reachability_records_sign_their_server_order() {
         let k = key(9);
         let servers = vec![
-            (
-                "did:jig:zserverone".to_string(),
-                "https://one.example".to_string(),
-            ),
-            (
-                "did:jig:zservertwo".to_string(),
-                "https://two.example".to_string(),
-            ),
+            (did_of(&key(11)), "https://one.example".to_string()),
+            (did_of(&key(12)), "https://two.example".to_string()),
         ];
         let rec = ReachabilityRecord::sign(&k, servers, 3);
         assert_eq!(rec.verify(), Ok(()));
@@ -1304,6 +1312,47 @@ mod tests {
         println!("{}", serde_json::to_string_pretty(&vectors()).unwrap());
     }
 
+    /// The same key with its body upper-cased.
+    fn shouted(did: &str) -> String {
+        let body = did.strip_prefix("did:jig:z").unwrap();
+        format!("did:jig:z{}", body.to_uppercase())
+    }
+
+    /// A DID in another spelling names the same key but compares unequal, so
+    /// two attestations for one alias by one nameserver could be spelled apart
+    /// and slip past an equivocation check. Every DID must be canonical.
+    #[test]
+    fn a_did_in_another_spelling_is_refused() {
+        let (ns, alice) = (key(7), key(9));
+        let subject = att(&ns, &shouted(&did_of(&alice)));
+        assert!(matches!(
+            Attestation::from_envelope(&subject.envelope),
+            Err(NamingError::BadDid(_))
+        ));
+        // The nameserver's own DID, re-spelled and re-signed by its key.
+        let mut respelled = att(&ns, &did_of(&alice));
+        respelled.ns_did = shouted(&respelled.ns_did);
+        respelled.envelope = cose::sign1(&ns, &respelled.payload());
+        assert!(matches!(
+            Attestation::from_envelope(&respelled.envelope),
+            Err(NamingError::BadDid(_))
+        ));
+        let rec = ReachabilityRecord::sign(
+            &alice,
+            vec![(shouted(&did_of(&key(13))), "https://s".into())],
+            1,
+        );
+        assert!(matches!(
+            ReachabilityRecord::from_envelope(&rec.envelope),
+            Err(NamingError::BadDid(_))
+        ));
+        let d = deleg(&[&ns]);
+        let mut shouty = d.clone();
+        shouty.authorities = vec![shouted(&did_of(&ns))];
+        shouty.envelopes = vec![cose::sign1(&ns, &shouty.payload())];
+        assert!(SuffixDelegation::from_envelopes(&shouty.envelopes).is_err());
+    }
+
     #[test]
     fn envelopes_round_trip_and_refuse_other_objects() {
         let (ns, alice) = (key(7), key(9));
@@ -1314,8 +1363,7 @@ mod tests {
             SuffixDelegation::from_envelopes(&d.envelopes),
             Ok(d.clone())
         );
-        let rec =
-            ReachabilityRecord::sign(&alice, vec![("did:jig:zs".into(), "https://s".into())], 1);
+        let rec = ReachabilityRecord::sign(&alice, vec![(did_of(&key(13)), "https://s".into())], 1);
         assert_eq!(
             ReachabilityRecord::from_envelope(&rec.envelope),
             Ok(rec.clone())

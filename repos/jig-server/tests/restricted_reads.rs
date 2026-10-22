@@ -708,13 +708,12 @@ async fn an_archived_channel_accepts_no_new_blocks() {
     assert_eq!(body["code"], "CHANNEL_ARCHIVED");
 }
 
-/// A DID's base32 body decodes case-insensitively, so the spelling a block
-/// carries is the author's choice. Rows are written in canonical form, so an
-/// owner who spelled their DID in upper case is still the owner the read
-/// gate recognises — and the spelling a stranger sees in a listing is the one
-/// an operator can copy into a ban.
+/// A block is signed, so this server cannot re-spell a DID in it. One that
+/// spells its author's DID any way but the key's own (here, upper case) is
+/// refused, rather than written under a spelling that would compare unequal
+/// to the owner's own.
 #[tokio::test]
-async fn an_owner_who_recased_their_did_still_owns_their_channel() {
+async fn a_channel_created_with_a_recased_did_is_refused() {
     use jig_core::{Author, BlockKind, BlockManifest};
     let server = TestServer::authenticated();
     let owner = Identity::new(1);
@@ -751,33 +750,23 @@ async fn an_owner_who_recased_their_did_still_owns_their_channel() {
         sender_sig: me.sign(&payload).to_bytes().to_vec(),
     };
     let (status, body) = server.try_submit(&create).await;
-    assert_eq!(status, StatusCode::OK, "create: {body}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "create: {body}");
+    assert_eq!(body["code"], "NON_CANONICAL_DID");
 
-    // The owner reads with a normally-signed (canonical) proof.
-    let (status, body) = server
-        .send(&server.sign_get(&owner, &history_path("#mine")))
-        .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "owner locked out of their own channel: {body}"
-    );
-
-    // And the listing shows the canonical spelling, not the recased one.
+    // Nothing was created under the re-spelled DID.
     let (_, listing) = server
         .send(&server.sign_get(&owner, "/api/v1/channels"))
         .await;
     assert!(
-        listing.to_string().contains(&did_string),
-        "listing must show the canonical DID: {listing}"
+        !listing.to_string().contains("#mine"),
+        "no channel was created: {listing}"
     );
 }
 
-/// The write gate must see the same canonical sender the rows were written
-/// with: an owner who spells their DID in upper case in a control-plane
-/// block is still the owner who may change the channel.
+/// A control-plane block from the owner, with the owner's DID upper-cased,
+/// is refused like any other re-spelled block, and the channel stays live.
 #[tokio::test]
-async fn an_owner_who_recased_their_did_can_still_archive_their_channel() {
+async fn an_archive_with_a_recased_owner_did_is_refused() {
     use jig_core::{Author, BlockKind, BlockManifest};
     let server = TestServer::authenticated();
     let owner = Identity::new(1);
@@ -808,9 +797,10 @@ async fn an_owner_who_recased_their_did_can_still_archive_their_channel() {
     };
 
     let (status, body) = server.try_submit(&archive).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "the owner, however spelled, may archive: {body}"
-    );
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    assert_eq!(body["code"], "NON_CANONICAL_DID");
+    let (status, body) = server
+        .send(&server.sign_get(&owner, &history_path("#mine")))
+        .await;
+    assert_eq!(status, StatusCode::OK, "the channel is still live: {body}");
 }
