@@ -97,7 +97,7 @@ block cannot be refused, so:
 1. Before landing, the server MAY run the block to decide whether to accept it, and MUST refuse
    a block whose run is `incomplete`.
 2. After landing, it executes and signs `exec`. If that fails, it signs `accepted` instead; the
-   block stays.
+   block stays. If it cannot sign either, the block has no receipt yet.
 3. It keeps one receipt per block. A server that restarts before signing one signs it then.
    Until then, readers show the block as pending.
 
@@ -108,7 +108,8 @@ A client that holds a block in plaintext and has the component the receipt names
 [JEP-0006's](../jep/jep-0006-block-abi.md#receipts); the reference client
 (`jig-client`, `verify` feature) follows them:
 
-1. Check the signature, and that the `executor` is the server that delivered the receipt.
+1. Check the signature, that the `executor` is the server that delivered the receipt, and that
+   the receipt's `block_cid` is this block. A receipt for another block says nothing about it.
 2. If the outcome is `incomplete`, stop: there is nothing to compare.
 3. Check that the block's `ingest` record names this block and is signed by the same server.
    Otherwise a forged record would make an honest receipt look divergent.
