@@ -35,13 +35,29 @@ Settings come from the config file named by `--config <path>` or else `JIG_NS_CO
 - `[v0_0_2.debug] list_handles` (default `false`): mounts `/v1/handles`.
 - `[storage] database_path` / `JIG_NS_DB_PATH`: the alias database.
 - `[network] bind` / `JIG_NS_BIND` and `[network] port` / `JIG_NS_PORT`: listen address.
+- `[tls]`: see [TLS](#tls).
 - `[network] trust_proxy` / `JIG_NS_TRUST_PROXY` and `[network] proxy_ip_header` / `JIG_NS_PROXY_IP_HEADER`: see [Behind a reverse proxy](#behind-a-reverse-proxy).
 
 Every config section denies unknown keys: a typo, or a key in the wrong section, stops the nameserver at start-up with an error naming the key. A section or key that was removed (`[pow]`, `[rate_limits]`, `[transparency]`, `[runtime]`, `[anomaly_detection]`, `[hot]`, `[federation]`, `storage.backend*`, `analytics.backend*`) fails with a message saying so; delete it. Removed environment variables, such as `JIG_NS_SECRET`, `JIG_NS_POW_*` and the federation `JIG_NS_*` variables, don't stop start-up: the nameserver logs a warning naming each one and ignores it.
 
+## TLS
+
+The nameserver serves TLS by default (JEP-0004 rule 12), TLS 1.3 only, with the same `[tls]` section jig-server takes:
+
+```toml
+[tls]
+enabled = true                              # the default
+# cert_path = "/etc/jig/nameserver.crt"     # both, or neither
+# key_path = "/etc/jig/nameserver.key"
+```
+
+- **Neither path set:** on first start the nameserver makes a self-signed certificate in `nameserver/tls/`, next to its database, apart from jig-server's `tls/`. Its DID (the one that signs attestations) vouches for that certificate in `/.well-known/jig-ns`, as `server_did` and `tls_binding`, the same fields jig-server publishes at `/.well-known/jig`. Clients check the certificate against the DIDs the suffix's delegation lists.
+- **Both paths set:** it serves that certificate, for example one a CA issued (`tailscale cert`, certbot), and its DID vouches for it the same way. For a `config` or `contract` suffix, clients accept a certificate only on the DID's word, never a CA's alone. A DNS-rooted suffix is the other way round: its nameserver is reached at `https://<suffix>/` and must hold a CA-valid certificate for that name.
+- **`enabled = false`:** serves plaintext. This is an unsafe option. The nameserver logs a warning and lists `tls.enabled=false` under `unsafe_options_active` in `/.well-known/jig-ns`. Use it only on loopback. Clients refuse an `http://` nameserver unless they opt in, for loopback or local testing only: jig-server with `[identity] dangerously_allow_plaintext_nameservers = true`, which it lists in its own `unsafe_options_active`, and the CLI with `[naming] dangerously_allow_plaintext_nameservers = true` in `cli.toml`.
+
 ## Proof-of-work
 
-Each suffix sets the JEP-0008 work its register, renew and rotate requests carry. It is **off by default** (`min_effort = 0`) until `jig` solves it; these are the recommended values:
+Each suffix sets the JEP-0008 work its register, renew and rotate requests carry. It is **on by default**, at these recommended values, and `jig` solves it:
 
 ```toml
 [v0_0_2.nameserver.alias_suffixes.pow]
@@ -57,7 +73,30 @@ renew_effort = 1         # renew and rotate by the holder
 - **Refused before any work.** For `register`, the challenge request already refuses a closed suffix, a short or reserved alias and a taken alias. `register` checks them again, and refuses a second name for the DID once the DID has signed (not before, since the refusal names the alias it holds).
 - **Order of checks.** The work is checked (one hash) before any signature. Bad work is `400 POW_INVALID`, too little is `400 POW_INSUFFICIENT`, missing work is `428 POW_REQUIRED` with the offer restated. None of them consumes the challenge.
 - **Allowlisted names** (`registration_allow`) pay `min_effort`, with no length multiplier.
-- **Off** (the default): `min_effort = 0`. A challenge requested without `action` still works on such a suffix; on one that asks for work it can only lead to `428`.
+- **Penalties.** Work that does not verify adds a point to the client's address (never to the DID it names, which is unproven at that stage). A signed attempt on a name another DID holds adds a point to that (alias, DID) pair only. Each point doubles the effort asked; it lasts `penalty_decay_secs` (600), and a repeat before it lapses adds a point and doubles its life.
+- **Off:** `min_effort = 0`. A challenge requested without `action` still works on such a suffix; on one that asks for work it can only lead to `428`.
+
+## Registration pool
+
+The pool caps registrations by DIDs that `registration_allow` does not name, however much work they bring:
+
+```toml
+[v0_0_2.nameserver.alias_suffixes.pool]
+enabled = true                 # off by default until jig handles 503 REGISTRATION_BUSY
+strangers_per_hour = 60
+burst = 10
+controller = "doubling"
+controller_window_secs = 300
+queue_len = 20
+queue_wait_secs = 10
+```
+
+- A stranger registration whose work and signature verified takes a token. With none left it waits, up to `queue_len` of them, the highest effort bid first; a full queue takes a newcomer only if it bids more than the lowest waiting, which is refused. After `queue_wait_secs` without a token the answer is `503 REGISTRATION_BUSY` with `Retry-After`. The challenge is not consumed, but the retry must fetch a fresh one (as `jig` does): the old one may not outlive the wait.
+- `max_solve_secs + queue_wait_secs` must fit the 60 s challenge lifetime (`queue_wait_secs` alone when `min_effort = 0`), or the nameserver refuses to start.
+- On a suffix that asks for no work (`min_effort = 0`), every stranger bids 0, so the queue is first come, first served: a `pow` field the nameserver did not check never orders it.
+- **The controller.** After a window in which the queue filled, the effort asked doubles (up to `max_effort`); after a window in which nothing queued, it halves (never below `min_effort`). New challenges state the current effort.
+- Allowlisted registrations skip the pool and pay `min_effort`.
+- The pool, controller and penalties are in memory and per process.
 
 ## Rate limits
 
@@ -92,6 +131,8 @@ proxy_ip_header = "x-forwarded-for"   # the default
 ```
 
 The nameserver uses the **last** address in that header, the one your proxy appended. Earlier entries are whatever the client sent and are ignored. With one proxy in front this is the client's address; behind several, the limit applies to the nearest proxy. Only set `trust_proxy` when the nameserver is reachable through the proxy alone, since anyone who can connect directly can otherwise choose the address they are counted under.
+
+A proxy in front of a nameserver for a `config` or `contract` suffix must pass TLS through (TCP or SNI passthrough), as for jig-server: clients accept only the certificate the nameserver's DID vouches for, and a proxy that terminates TLS presents its own. A passthrough proxy cannot add `X-Forwarded-For`, so leave `trust_proxy` off there. Only a DNS-rooted suffix's nameserver may sit behind a proxy that terminates TLS with a CA certificate.
 
 ## Security notes
 

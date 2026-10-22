@@ -126,13 +126,13 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "ring",
     "tls12",
 ] }
-# The self-signed certificate a server makes on first start ([tls] defaults).
-rcgen = "0.14"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 
 [dev-dependencies]
+rcgen = "0.14"
 tempfile = "3.8"
+jig-client = { path = "../jig-client", features = ["test-support"] }
 # The suite conformance vectors (tests/suite_vectors.rs): `test-aead`
 # registered, and MLS leaves minted to outlive the checked-in files.
 jig-core = { path = "../jig-core", features = ["test-suite"] }

@@ -761,6 +761,11 @@ impl Client {
         &self.server_url
     }
 
+    /// The identity this client signs with.
+    pub fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
     /// Returns the DID of the identity this client is signing with.
     pub fn identity_did(&self) -> String {
         self.identity.did_string()
@@ -1605,6 +1610,7 @@ mod tests {
             server_nonce: "s".to_string(),
             tls_exporter: String::new(),
             manifest: None,
+            key_link: None,
             sig: String::new(),
         }))
         .unwrap();

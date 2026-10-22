@@ -96,19 +96,89 @@ pub fn format_handles(entries: &[HandleEntry]) -> String {
         .join("\n")
 }
 
-/// Shared HTTP client for the two lookups. Short timeout: these are
-/// interactive diagnostics, not background jobs.
-fn http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+/// HTTP client for a nameserver at `base`, and the DID its TLS is bound to.
+///
+/// Over TLS it accepts only the certificate the nameserver's own DID vouches
+/// for at `/.well-known/jig-ns`, never a CA's; the caller checks that DID
+/// against what it trusts (the suffix's authorities, or nothing, for `jig ns
+/// list`). Plaintext, with no DID to check, needs `[naming]
+/// dangerously_allow_plaintext_nameservers`.
+async fn bound_client(
+    base: &str,
+    allow_plaintext: bool,
+    timeout: std::time::Duration,
+) -> Result<(reqwest::Client, Option<String>)> {
+    let builder = reqwest::Client::builder().timeout(timeout);
+    let (builder, did) = if base.starts_with("http://") {
+        if !allow_plaintext {
+            anyhow::bail!(
+                "{base} is plaintext; a nameserver is reached only over TLS its DID vouches for \
+                 (set [naming] dangerously_allow_plaintext_nameservers in cli.toml only for \
+                 loopback or local testing)"
+            );
+        }
+        (builder, None)
+    } else {
+        let probed = jig_client::tls::probe_self_bound(base, "/.well-known/jig-ns")
+            .await
+            .with_context(|| format!("{base}: the nameserver's TLS"))?;
+        let config = probed.config.expect("a bound probe over TLS has a config");
+        (
+            builder.use_preconfigured_tls(config.as_ref().clone()),
+            probed.server_did,
+        )
+    };
+    let http = builder
         .build()
-        .context("building HTTP client for the nameserver")
+        .context("building HTTP client for the nameserver")?;
+    Ok((http, did))
 }
 
-/// Body of GET `/v1/challenge` (only the `challenge` field is read).
+/// The DID the replies at `base` speak for, `claimed` by the nameserver
+/// (unsigned), checked against the DID its TLS is bound to when there is one.
+fn speaking_for(base: &str, claimed: String, bound: Option<&str>) -> Result<String> {
+    match bound {
+        Some(bound) if bound != claimed => anyhow::bail!(
+            "{base} claims to be {claimed}, but its TLS is bound to {bound}; nothing was signed"
+        ),
+        _ => Ok(claimed),
+    }
+}
+
+/// A challenge for one action, with the work the nameserver asks for it.
+pub(crate) struct Challenge {
+    pub challenge: String,
+    pub offer: Option<jig_core::naming::PowOffer>,
+    /// When the offer runs out, by the nameserver's clock (its `Date`).
+    pub deadline: Option<std::time::Instant>,
+}
+
+/// Body of GET `/v1/challenge`. `pow_offer` is there when the suffix asks
+/// for proof-of-work; the unsigned `pow` beside it is never read.
 #[derive(Debug, Deserialize)]
 struct ChallengeResponse {
     challenge: String,
+    #[serde(default)]
+    pow_offer: Option<String>,
+}
+
+/// A 4xx a nameserver answered a register, renew or rotate with: it did not
+/// act. Carried in the `anyhow` error so a caller can tell which refusal it
+/// was.
+#[derive(Debug, thiserror::Error)]
+#[error("POST {url}: {}", explain_nameserver_error(status.as_u16(), body))]
+pub(crate) struct Refusal {
+    pub url: String,
+    pub status: reqwest::StatusCode,
+    pub body: String,
+}
+
+impl Refusal {
+    /// The `code` of the nameserver's error body, if it has one.
+    pub(crate) fn code(&self) -> Option<String> {
+        let body: serde_json::Value = serde_json::from_str(&self.body).ok()?;
+        Some(body.get("code")?.as_str()?.to_string())
+    }
 }
 
 /// Body of GET `/.well-known/jig-ns-delegation`.
@@ -195,10 +265,12 @@ impl Nameserver {
         purpose: Purpose,
     ) -> Result<Self> {
         let base = ns_url.trim().trim_end_matches('/').to_string();
-        let http = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .context("building HTTP client for nameserver")?;
+        let (http, bound) = bound_client(
+            &base,
+            delegations.dangerously_allow_plaintext_nameservers,
+            REQUEST_TIMEOUT,
+        )
+        .await?;
         let url = format!("{base}/v1/suffixes");
         let resp = http
             .get(&url)
@@ -208,9 +280,13 @@ impl Nameserver {
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             // A nameserver from before multi-suffix serving: one suffix, named
             // by its own delegation.
-            return Self::connect_single_suffix(base, http, who).await;
+            return Self::connect_single_suffix(base, http, bound, who).await;
         }
-        let served: SuffixesResponse = json_or_explain(resp, &url).await?;
+        let mut served: SuffixesResponse = json_or_explain(resp, &url).await?;
+        // Every check below is on this DID: under TLS it is the one the
+        // certificate is bound to, so an authority's DID cannot be claimed by
+        // a server that does not hold its key.
+        served.ns_did = speaking_for(&base, served.ns_did, bound.as_deref())?;
 
         let name = match who.split_once('@') {
             Some(_) => Name::parse(who).with_context(|| format!("`{who}` is not alias@suffix"))?,
@@ -296,7 +372,12 @@ impl Nameserver {
 
     /// The path for a nameserver without `/v1/suffixes`: its one suffix and
     /// its DID come from the delegation it publishes.
-    async fn connect_single_suffix(base: String, http: reqwest::Client, who: &str) -> Result<Self> {
+    async fn connect_single_suffix(
+        base: String,
+        http: reqwest::Client,
+        bound: Option<String>,
+        who: &str,
+    ) -> Result<Self> {
         let url = format!("{base}/.well-known/jig-ns-delegation");
         let delegation = fetch_delegation(&http, &url).await?;
         if delegation.authorities.len() != 1 {
@@ -311,10 +392,11 @@ impl Nameserver {
             None => Name::parse(&format!("{who}@{}", delegation.suffix))
                 .with_context(|| format!("`{who}` is not a valid alias"))?,
         };
+        let ns_did = speaking_for(&base, delegation.authorities[0].clone(), bound.as_deref())?;
         Ok(Self {
             base,
             http,
-            ns_did: delegation.authorities[0].clone(),
+            ns_did,
             name,
             authority: Authority::Dns(delegation),
         })
@@ -330,17 +412,82 @@ impl Nameserver {
         &self.name
     }
 
-    /// GET `/v1/challenge`.
-    pub(crate) async fn challenge(&self) -> Result<String> {
-        let url = format!("{}/v1/challenge", self.base);
+    /// GET `/v1/challenge` for `action` by `did` on `name`, with the
+    /// proof-of-work it asks for: an offer this nameserver signed for exactly
+    /// this request (JEP-0008 rule 16), or `None` when it asks for none. A
+    /// nameserver from before proof-of-work ignores the query and sends no
+    /// offer.
+    pub(crate) async fn challenge_for(
+        &self,
+        action: jig_core::pow::Action,
+        did: &str,
+        name: &Name,
+    ) -> Result<Challenge> {
+        let label = match action {
+            jig_core::pow::Action::NsRegister => "register",
+            jig_core::pow::Action::NsRenew => "renew",
+            jig_core::pow::Action::NsRotate => "rotate",
+            other => anyhow::bail!("{other:?} is not a nameserver action"),
+        };
+        // A DID and `Name::parse`'s output are legal in a query as they are.
+        let alias = name.as_alias();
+        let url = format!(
+            "{}/v1/challenge?action={label}&did={did}&name={alias}",
+            self.base
+        );
         let resp = self
             .http
             .get(&url)
             .send()
             .await
             .with_context(|| format!("GET {url}"))?;
-        let body: ChallengeResponse = json_or_explain(resp, &url).await?;
-        Ok(body.challenge)
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        {
+            anyhow::bail!(
+                "GET {url} returned {status}: the nameserver is not issuing challenges right \
+                 now (rate-limited or busy); try again in a minute"
+            );
+        }
+        if !status.is_success() {
+            anyhow::bail!(
+                "GET {url} returned {status}: {}",
+                resp.text().await.unwrap_or_default()
+            );
+        }
+        let received = std::time::Instant::now();
+        let server_now = resp
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| chrono::DateTime::parse_from_rfc2822(v).ok())
+            .map(|t| t.timestamp());
+        let body: ChallengeResponse = resp
+            .json()
+            .await
+            .with_context(|| format!("decoding the response to GET {url}"))?;
+        let offer = body
+            .pow_offer
+            .map(|offer| {
+                jig_client::pow::verify_offer(
+                    &offer,
+                    self.ns_did(),
+                    &body.challenge,
+                    action,
+                    &alias,
+                    did,
+                )
+            })
+            .transpose()?;
+        let deadline = offer
+            .as_ref()
+            .and_then(|o| jig_client::pow::deadline(o.expires_at, server_now, received));
+        Ok(Challenge {
+            challenge: body.challenge,
+            offer,
+            deadline,
+        })
     }
 
     /// POST `body` to `path` and return the attestation from a 2xx reply.
@@ -371,11 +518,8 @@ impl Nameserver {
         };
         let status = resp.status();
         if status.is_client_error() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "POST {url}: {}",
-                explain_nameserver_error(status.as_u16(), &text)
-            );
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Refusal { url, status, body }.into());
         }
         let text = match resp.text().await {
             Ok(text) => text,
@@ -655,7 +799,12 @@ pub async fn list(ctx: &CliContext, nameserver: Option<String>) -> Result<()> {
     let base = nameserver_base(ctx, nameserver.as_deref())?;
     let url = format!("{base}/v1/handles");
 
-    let resp = http_client()?
+    let plaintext = ctx
+        .effective()
+        .naming
+        .dangerously_allow_plaintext_nameservers;
+    let (http, _) = bound_client(&base, plaintext, std::time::Duration::from_secs(10)).await?;
+    let resp = http
         .get(&url)
         .send()
         .await
@@ -947,7 +1096,7 @@ mod tests {
                             Some(body) => Answer::Full(200, body),
                             None => Answer::Full(404, "{}".into()),
                         },
-                        ("GET", "/v1/challenge") => {
+                        ("GET", p) if p.starts_with("/v1/challenge") => {
                             Answer::Full(200, r#"{"challenge":"c0ffee"}"#.into())
                         }
                         ("POST", p) => post(p, &body),
@@ -1016,10 +1165,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let me = jig_client::Identity::generate_for_tests(dir.path());
 
-        let att =
-            crate::cmd::init::register_with_nameserver(&me, "DJ", &base, &Delegations::default())
-                .await
-                .expect("registers");
+        let att = crate::cmd::init::register_with_nameserver(&me, "DJ", &base, &plaintext())
+            .await
+            .expect("registers");
         assert_eq!(att.did, me.did_string());
         assert_eq!(att.alias, "dj@dj.jig");
 
@@ -1037,13 +1185,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_plaintext_nameserver_is_not_asked_without_the_opt_in() {
+        let ns = key(1);
+        let (base, seen) = stub_nameserver(ns.clone(), attest_as(ns, "dj@dj.jig")).await;
+        let dir = tempdir().unwrap();
+        let me = jig_client::Identity::generate_for_tests(dir.path());
+        let err = crate::cmd::keys::renew_with_nameserver(
+            &me,
+            "dj@dj.jig",
+            &base,
+            &Delegations::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("dangerously_allow_plaintext_nameservers"),
+            "{err:#}"
+        );
+        assert!(paths(&seen).is_empty(), "nothing was asked");
+    }
+
+    #[test]
+    fn a_nameserver_speaks_only_for_the_did_its_tls_is_bound_to() {
+        let (a, b) = (did_of(&key(1)), did_of(&key(2)));
+        assert_eq!(speaking_for("https://ns", a.clone(), Some(&a)).unwrap(), a);
+        assert_eq!(
+            speaking_for("http://ns", a.clone(), None).unwrap(),
+            a,
+            "plaintext, opted into, has no DID to check"
+        );
+        let err = speaking_for("https://ns", a, Some(&b))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bound to") && err.contains(&b), "{err}");
+    }
+
+    #[tokio::test]
     async fn renew_signs_a_renew_proof() {
         let ns = key(1);
         let (base, seen) = stub_nameserver(ns.clone(), attest_as(ns.clone(), "dj@dj.jig")).await;
         let dir = tempdir().unwrap();
         let me = jig_client::Identity::generate_for_tests(dir.path());
 
-        crate::cmd::keys::renew_with_nameserver(&me, "dj@DJ.jig", &base, &Delegations::default())
+        crate::cmd::keys::renew_with_nameserver(&me, "dj@DJ.jig", &base, &plaintext())
             .await
             .expect("renews");
         let (did, proof) = sent_proof(&seen, "/v1/renew");
@@ -1071,10 +1255,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let me = jig_client::Identity::generate_for_tests(dir.path());
 
-        let err =
-            crate::cmd::init::register_with_nameserver(&me, "dj", &base, &Delegations::default())
-                .await
-                .expect_err("a binding to someone else is not a registration");
+        let err = crate::cmd::init::register_with_nameserver(&me, "dj", &base, &plaintext())
+            .await
+            .expect_err("a binding to someone else is not a registration");
         assert!(format!("{err:#}").contains("does not verify"), "{err:#}");
     }
 
@@ -1090,14 +1273,9 @@ mod tests {
             (401, r#"{"code":"PROOF_FAILED"}"#.into())
         })
         .await;
-        let refused = crate::cmd::keys::rotate_with_nameserver(
-            &old,
-            &new,
-            "dj@dj.jig",
-            &base,
-            &Delegations::default(),
-        )
-        .await;
+        let refused =
+            crate::cmd::keys::rotate_with_nameserver(&old, &new, "dj@dj.jig", &base, &plaintext())
+                .await;
         assert!(refused.is_err(), "a 401 is a refused rotation");
 
         // Accepted, but the attestation still names the old DID: the inner
@@ -1109,15 +1287,10 @@ mod tests {
             (200, reply(&att))
         };
         let (base, _) = stub_nameserver(ns.clone(), stale).await;
-        let accepted = crate::cmd::keys::rotate_with_nameserver(
-            &old,
-            &new,
-            "dj@dj.jig",
-            &base,
-            &Delegations::default(),
-        )
-        .await
-        .expect("the nameserver accepted");
+        let accepted =
+            crate::cmd::keys::rotate_with_nameserver(&old, &new, "dj@dj.jig", &base, &plaintext())
+                .await
+                .expect("the nameserver accepted");
         assert!(
             accepted.is_err(),
             "the reply binds the old DID, not the new one"
@@ -1125,16 +1298,11 @@ mod tests {
 
         // Accepted and verified.
         let (base, _) = stub_nameserver(ns.clone(), attest_as(ns, "dj@dj.jig")).await;
-        let att = crate::cmd::keys::rotate_with_nameserver(
-            &old,
-            &new,
-            "dj@dj.jig",
-            &base,
-            &Delegations::default(),
-        )
-        .await
-        .expect("accepted")
-        .expect("verifies");
+        let att =
+            crate::cmd::keys::rotate_with_nameserver(&old, &new, "dj@dj.jig", &base, &plaintext())
+                .await
+                .expect("accepted")
+                .expect("verifies");
         assert_eq!(att.did, new.did_string());
     }
 
@@ -1150,14 +1318,8 @@ mod tests {
         let rotate = |base: String| {
             let (old, new) = (&old, &new);
             async move {
-                crate::cmd::keys::rotate_with_nameserver(
-                    old,
-                    new,
-                    "dj@dj.jig",
-                    &base,
-                    &Delegations::default(),
-                )
-                .await
+                crate::cmd::keys::rotate_with_nameserver(old, new, "dj@dj.jig", &base, &plaintext())
+                    .await
             }
         };
         let now = chrono::Utc::now().timestamp();
@@ -1200,10 +1362,9 @@ mod tests {
         let addr = closed.local_addr().unwrap();
         drop(closed);
         let (base, _) = stub_nameserver(ns, attest_as(key(1), "dj@dj.jig")).await;
-        let ns_conn =
-            Nameserver::connect(&base, "dj@dj.jig", &Delegations::default(), Purpose::Keep)
-                .await
-                .unwrap();
+        let ns_conn = Nameserver::connect(&base, "dj@dj.jig", &plaintext(), Purpose::Keep)
+            .await
+            .unwrap();
         let moved = Nameserver {
             base: format!("http://{addr}"),
             ..ns_conn
@@ -1240,7 +1401,7 @@ mod tests {
                 let _ = sock.write_all(resp.as_bytes()).await;
             }
         });
-        let err = Nameserver::connect(&base, "dj", &Delegations::default(), Purpose::Register)
+        let err = Nameserver::connect(&base, "dj", &plaintext(), Purpose::Register)
             .await
             .err()
             .expect("refused");
@@ -1263,8 +1424,17 @@ mod tests {
         ])
     }
 
+    /// No delegations of our own, and the stubs' `http://` allowed: they
+    /// serve plaintext on loopback.
+    fn plaintext() -> Delegations {
+        Delegations {
+            dangerously_allow_plaintext_nameservers: true,
+            ..Delegations::default()
+        }
+    }
+
     fn jig_authority(did: &str) -> Delegations {
-        let mut d = Delegations::default();
+        let mut d = plaintext();
         d.config.insert(
             "jig".into(),
             jig_client::naming::ConfigDelegation {
@@ -1454,6 +1624,8 @@ mod tests {
                 nameservers: vec![nameserver.into()],
             },
         );
+        // The stubs are plaintext.
+        cfg.naming.dangerously_allow_plaintext_nameservers = true;
         cfg
     }
 
