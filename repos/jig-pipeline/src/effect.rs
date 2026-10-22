@@ -54,6 +54,13 @@ pub async fn apply_effect(
         // A role lives in the channel's ingest chain, which is its record;
         // `roles::rights_at` reads it from there, so there is no row to keep.
         BlockKind::RoleAssign | BlockKind::RoleUnassign => Ok(()),
+        // A share's state is its blocks: the requests, and the sequencer's
+        // records of what came of them (`crate::contracts`).
+        BlockKind::ChannelShare
+        | BlockKind::ChannelUnshare
+        | BlockKind::ContractAccept
+        | BlockKind::ContractRefuse
+        | BlockKind::ContractEnd => Ok(()),
         BlockKind::FedHello => apply_fed_hello(store, &manifest, block_cid),
 
         BlockKind::NsRegister | BlockKind::NsAttestation => apply_ns_attestation(store, &manifest),

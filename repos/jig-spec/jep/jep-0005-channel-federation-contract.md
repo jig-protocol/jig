@@ -93,7 +93,9 @@ Non-goals for v0.2:
 
 ## Offer, accept, refuse, end
 
-7. A share starts with a `channel-share` block naming the target server and a grant. The
+7. A share starts with a `channel-share` block naming the target server and a grant: its
+   metadata is `{to, grant}`, where `to` is the target's DID in canonical form and `grant`
+   is `read`, `write` or `member` (7a). The
    block MUST be signed by the channel's owner or by a DID holding the `share` right at
    that point in the `ingest` chain (7b). The owning server MUST then check that the
    target is on its configured peer list, and sends the target a `contract-offer`, signed
@@ -154,8 +156,20 @@ Non-goals for v0.2:
    another suite or relay plaintext.
 10. The owner MUST append each accept to the channel's log as a block, so members can see
     which servers carry the channel.
+    - A `contract-accept` block carries `{to, offer, accept}`: the follower's DID, and the
+      signed offer and accept, each base64. A member checks that the sequencer signed the
+      offer to `to`, and that `to` signed an accept of it.
+    - The owner records a refusal the same way, as a `contract-refuse` block carrying
+      `{to, code, offer, refuse}`. When the owner refuses a share itself, because the
+      target is not a configured peer (17), no offer was sent, and the block carries only
+      `{to, code}`.
+    - Only the channel's sequencer writes `contract-accept`, `contract-refuse` and
+      `contract-end` blocks. A server MUST refuse one signed by anyone else.
 11. Either side ends a share with a signed `contract-end {server, channel_id, offer_id}`,
-    naming the accepted offer it ends. Members then commit removals
+    naming the accepted offer it ends. On the owner's side, a `channel-unshare {to}` block,
+    signed as a `channel-share` must be (7), asks the owner to end its share with `to`. The
+    owner records each end, its own or the follower's, as a `contract-end` block carrying
+    `{to, end}`: the follower's DID and the signed `contract-end`, base64. Members then commit removals
     for any leaves reachable only through that follower. A grant changes by a new offer
     and accept.
 
