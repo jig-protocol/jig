@@ -413,9 +413,10 @@ max_tracked = {max_tracked}
 # Unset, JIG_KEY_UNLOCK or JIG_KEY_PASSPHRASE is used; with neither, a new key
 # is refused rather than written in clear. A raw key from before keys were
 # sealed is refused too: `jig-server keys seal` converts it.
-# unlock = "credential:/run/credentials/jig-server.service/server-key"
+# unlock = "credential:/run/credentials/jig-server.service/jig-server-key"
 # `plaintext` keeps a raw key in clear: an antipattern, warned about on every
-# boot and advertised in unsafe_options_active.
+# boot. It is not listed in unsafe_options_active: that would mark this server
+# as a soft target, and no client can verify it.
 storage = "sealed"
 
 [debug]

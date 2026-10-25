@@ -1021,6 +1021,31 @@ pub(crate) fn handshake_capabilities(state: &AppState) -> jig_pipeline::handshak
     }
 }
 
+/// How long a welcome's admission ask holds. A client reads it just before
+/// it solves; this covers the default `max_solve_secs` (10 s) many times over.
+pub(crate) const ADMIT_OFFER_SECS: i64 = 120;
+
+/// The admission work the welcome asks of a DID this server has not admitted
+/// (JEP-0008 rule 15), from the configured bit count. `None` when admission
+/// asks no work.
+pub(crate) fn admit_offer(
+    pow_bits: Option<u8>,
+    now: i64,
+) -> Option<jig_pipeline::handshake::PowOffer> {
+    pow_bits.map(|bits| jig_pipeline::handshake::PowOffer {
+        alg: jig_core::pow::Alg::Blake3.id(),
+        effort: jig_core::admission_pow::effort_for_bits(bits).get(),
+        salt_id: jig_core::pow::EMPTY_SALT_ID,
+        expires_at: now.saturating_add(ADMIT_OFFER_SECS),
+    })
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
 /// Sign a welcome, or refuse the hello and close.
 async fn complete_hello(
     state: &AppState,
@@ -1046,6 +1071,7 @@ async fn complete_hello(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone(),
         key_link: state.key_link.clone(),
+        admit: admit_offer(state.auth.pow_bits(), unix_now()),
     };
     match jig_pipeline::handshake::negotiate(&hello, &offer) {
         Ok(statement) => {
@@ -1962,26 +1988,32 @@ mod tests {
         let url = format!("ws://{}/api/v1/ws", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        // The hello is the first of three.
+        // The hello is the first of three. 1/s is the slowest refill there
+        // is, so a slow runner may see one between frames: count frames up to
+        // the first refusal rather than assume exactly two more get in.
+        let start = std::time::Instant::now();
         let mut ws = established(&url).await;
-        for _ in 0..2 {
+        let mut processed = 0u32;
+        loop {
             ws.send(TMessage::Text("not valid json".into()))
                 .await
                 .unwrap();
             match next_frame(&mut ws).await.frame {
-                Frame::Error { code, .. } => assert_ne!(code, "RATE_LIMITED"),
+                Frame::Error { status, code, .. } if code == "RATE_LIMITED" => {
+                    assert_eq!(status, Some(429));
+                    break;
+                }
+                Frame::Error { .. } => processed += 1,
                 other => panic!("expected an error frame, got {other:?}"),
             }
+            assert!(processed <= 64, "the address was never limited");
         }
-        ws.send(TMessage::Text("not valid json".into()))
-            .await
-            .unwrap();
-        match next_frame(&mut ws).await.frame {
-            Frame::Error { status, code, .. } => {
-                assert_eq!((status, code.as_str()), (Some(429), "RATE_LIMITED"));
-            }
-            other => panic!("expected RATE_LIMITED, got {other:?}"),
-        }
+        let refilled = start.elapsed().as_secs() as u32 + 1;
+        assert!(
+            (2..=2 + refilled).contains(&processed),
+            "{processed} frames after the hello got in over {:?}",
+            start.elapsed()
+        );
     }
 
     /// A well-formed frame at a version or suite this server does not speak,
@@ -2557,6 +2589,29 @@ mod tests {
         );
         assert!(welcome.capabilities.execution);
         assert!(welcome.capabilities.federation);
+        // The default server admits anyone, so it asks no work.
+        assert_eq!(welcome.admit, None);
+    }
+
+    #[tokio::test]
+    async fn the_welcome_signs_the_admission_work_a_new_did_owes() {
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.auth.admission.unknown_dids =
+            jig_config::v0_0_2_server::UnknownDidsPolicy::ProofOfWork;
+        config.auth.admission.pow_bits = 8;
+        let (_state, url) =
+            start_test_server_with(AppState::for_test_with_config(config).unwrap()).await;
+        let before = unix_now();
+        let client = jig_client::Client::connect(&url, test_identity())
+            .await
+            .unwrap();
+        let admit = client.welcome().expect("welcome").admit.expect("admit");
+        assert_eq!(admit.alg(), Some(jig_core::pow::Alg::Blake3));
+        assert_eq!(admit.effort().map(|e| e.get()), Some(256));
+        assert_eq!(admit.salt_id, jig_core::pow::EMPTY_SALT_ID);
+        assert!(
+            (before + ADMIT_OFFER_SECS..=unix_now() + ADMIT_OFFER_SECS).contains(&admit.expires_at)
+        );
     }
 
     #[tokio::test]
