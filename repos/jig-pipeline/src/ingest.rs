@@ -230,6 +230,17 @@ pub enum IngestError {
          create the channel on its sequencer, or omit `sequencer`"
     )]
     NotSequencer { sequencer: String, server: String },
+    /// A block for a channel another server sequences: this server carries
+    /// it, and takes its blocks only from its sequencer (JEP-0005 rule 12).
+    #[error(
+        "`{kind}` refused: channel {channel_id} is sequenced by `{sequencer}`; \
+         post it there, or through a share that relays writes"
+    )]
+    CarriedChannel {
+        kind: String,
+        channel_id: String,
+        sequencer: String,
+    },
     /// A channel term (`sequencer`, `co_owners`) is malformed.
     #[error("channel-create term `{field}` is invalid: {detail}")]
     InvalidTerms { field: String, detail: String },
@@ -473,6 +484,19 @@ pub async fn ingest(
     {
         return Err(IngestError::UnknownChannel {
             slug: named.to_string(),
+        });
+    }
+    // A channel another server sequences takes its blocks only from that
+    // server, with that server's records (`crate::follow`): this server never
+    // signs a record for it (JEP-0005 rule 12), so nothing lands here.
+    if let Some(chan) = resolved_channel.as_ref()
+        && !chan.sequencer_did.is_empty()
+        && crate::effect::canonical_did_string(&chan.sequencer_did) != server_did
+    {
+        return Err(IngestError::CarriedChannel {
+            kind: kind_str.to_string(),
+            channel_id: chan.id.clone(),
+            sequencer: chan.sequencer_did.clone(),
         });
     }
 
@@ -1437,7 +1461,9 @@ pub fn suite_refusal(refusal: crate::mls_gate::SuiteRefusal, slug: &str) -> Inge
 
 /// Parse the manifest from raw bytes. The manifest_bytes field of BlockBundle
 /// is the canonical JSON serialisation of BlockManifest.
-fn parse_manifest(manifest_bytes: &[u8]) -> Result<jig_core::BlockManifest, IngestError> {
+pub(crate) fn parse_manifest(
+    manifest_bytes: &[u8],
+) -> Result<jig_core::BlockManifest, IngestError> {
     let manifest: jig_core::BlockManifest = serde_json::from_slice(manifest_bytes)
         .map_err(|e| IngestError::BundleMalformed(format!("manifest parse: {e}")))?;
     manifest.check_gates()?;
@@ -1449,7 +1475,10 @@ fn parse_manifest(manifest_bytes: &[u8]) -> Result<jig_core::BlockManifest, Inge
 /// Serialise (manifest_bytes, code_bytes) as a JSON tuple — the same
 /// representation used by the test bundle builder so signatures produced
 /// in tests match what ingest verifies.
-fn bundle_canonical_bytes(manifest_bytes: &[u8], code_bytes: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn bundle_canonical_bytes(
+    manifest_bytes: &[u8],
+    code_bytes: &[u8],
+) -> Result<Vec<u8>, String> {
     let payload = (manifest_bytes, code_bytes);
     serde_json::to_vec(&payload).map_err(|e| e.to_string())
 }
@@ -1462,7 +1491,7 @@ const MANIFEST_DID_FIELDS: &[&str] = &["member_did", crate::roles::MEMBER_KEY, "
 /// Refuse a manifest carrying a key-derived DID in any spelling but the key's
 /// own. Legacy, non-key-derived DIDs (`did:jig:alice`) are opaque labels and
 /// are left to the steps that read them.
-fn check_manifest_dids(manifest: &jig_core::BlockManifest) -> Result<(), IngestError> {
+pub(crate) fn check_manifest_dids(manifest: &jig_core::BlockManifest) -> Result<(), IngestError> {
     let respelled = |did: &str| {
         matches!(
             Did::from_str_unchecked(did).as_bytes(),
@@ -1502,7 +1531,7 @@ fn check_manifest_dids(manifest: &jig_core::BlockManifest) -> Result<(), IngestE
 /// because the ingest pipeline must never accept an unverifiable signature.
 /// Verify the author's signature and return the author's DID. Its spelling
 /// is canonical: [`check_manifest_dids`] refused any other.
-fn verify_sig(
+pub(crate) fn verify_sig(
     manifest_bytes: &[u8],
     code_bytes: &[u8],
     manifest: &jig_core::BlockManifest,

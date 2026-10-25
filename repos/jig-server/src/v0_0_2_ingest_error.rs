@@ -124,6 +124,10 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         // rule 5). Policy, not a malformed request: the same block is fine
         // on the server it names.
         IngestError::NotSequencer { .. } => (StatusCode::FORBIDDEN, "NOT_SEQUENCER", e.to_string()),
+        // 403: the channel is carried here for the server that sequences it.
+        IngestError::CarriedChannel { .. } => {
+            (StatusCode::FORBIDDEN, "CARRIED_CHANNEL", e.to_string())
+        }
         IngestError::InvalidTerms { .. } => {
             (StatusCode::BAD_REQUEST, "INVALID_TERMS", e.to_string())
         }
@@ -286,6 +290,11 @@ mod tests {
             IngestError::NotSequencer {
                 sequencer: "did:jig:zElsewhere".to_string(),
                 server: "did:jig:zHere".to_string(),
+            },
+            IngestError::CarriedChannel {
+                kind: "text-render".to_string(),
+                channel_id: "bafy-carried".to_string(),
+                sequencer: "did:jig:zElsewhere".to_string(),
             },
             IngestError::InvalidTerms {
                 field: "co_owners".to_string(),

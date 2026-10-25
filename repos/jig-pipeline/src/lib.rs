@@ -27,6 +27,7 @@ pub mod executor {
     pub enum BlockExecutor {}
 }
 pub mod fanout;
+pub mod follow;
 pub mod handshake;
 pub mod hlc;
 pub mod identity;

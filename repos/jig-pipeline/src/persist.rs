@@ -688,7 +688,7 @@ fn apply_membership_on(conn: &Connection, membership: &MembershipChange) -> Resu
     Ok(())
 }
 
-fn insert_block_on(conn: &Connection, b: &StoredBlock) -> Result<()> {
+pub(crate) fn insert_block_on(conn: &Connection, b: &StoredBlock) -> Result<()> {
     conn.execute(
         "INSERT INTO blocks
          (cid, channel_id, block_kind, sender_did, sender_sig, bundle_bytes,
@@ -1006,6 +1006,7 @@ impl SqliteStore {
         rebuild_channels_slug_per_sequencer(conn)?;
         rebuild_alias_attestations_with_suffix(conn)?;
         crate::contracts::migrate(conn)?;
+        crate::follow::migrate(conn)?;
         Ok(())
     }
 
