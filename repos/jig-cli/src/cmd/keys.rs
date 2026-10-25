@@ -38,7 +38,7 @@ use jig_core::naming::{Action, Attestation, Name};
 use serde::{Deserialize, Serialize};
 
 use crate::cmd::common::CliContext;
-use crate::cmd::ns::{Nameserver, Purpose, b64u};
+use crate::cmd::ns::{Nameserver, b64u};
 
 /// Parsed flags for `jig keys renew`.
 #[derive(Debug, Clone)]
@@ -116,7 +116,7 @@ pub async fn renew_with_nameserver(
     delegations: &jig_client::naming::Delegations,
 ) -> Result<Attestation> {
     parse_full_name(alias)?;
-    let ns = Nameserver::connect(ns_url, alias, delegations, Purpose::Keep).await?;
+    let ns = Nameserver::connect(ns_url, alias, delegations).await?;
     let name = ns.name().clone();
     let did = id.did_string();
     let full = name.as_alias();
@@ -265,7 +265,7 @@ pub async fn rotate_with_nameserver(
     delegations: &jig_client::naming::Delegations,
 ) -> Result<Result<Attestation>> {
     parse_full_name(alias)?;
-    let ns = Nameserver::connect(ns_url, alias, delegations, Purpose::Keep).await?;
+    let ns = Nameserver::connect(ns_url, alias, delegations).await?;
     let name = ns.name().clone();
     let (old_did, new_did) = (old_id.did_string(), new_id.did_string());
     let full = name.as_alias();
