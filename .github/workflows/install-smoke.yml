@@ -109,7 +109,9 @@ jobs:
       - name: Build
         working-directory: repos
         run: |
-          cargo build --release --locked -p jig-server -p jig-cli -p jig-nameserver
+          # jig-nameserver alone, so it links no wasmtime (see release.yml).
+          cargo build --release --locked -p jig-server -p jig-cli
+          cargo build --release --locked -p jig-nameserver
       - name: Package, checksum, sign with a throwaway key, serve
         id: mirror
         shell: bash

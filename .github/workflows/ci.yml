@@ -178,6 +178,18 @@ jobs:
           ! cargo tree --locked -e normal,features -i jig-nameserver \
             -p jig-server -p jig-cli -p jig-nameserver \
             | grep 'jig-nameserver feature "test-support"'
+      - name: jig-nameserver links no Wasm engine
+        # Its unit sets MemoryDenyWriteExecute, which a JIT cannot run under. It
+        # takes jig-pipeline and jig-client without the `executor` feature;
+        # anything that pulls wasmtime back into its graph fails here.
+        run: |
+          if cargo tree --locked -p jig-nameserver -e normal | grep -E ' (wasmtime|cranelift-codegen|jig-runtime) '; then
+            echo "::error::jig-nameserver's normal graph links a Wasm engine"
+            exit 1
+          fi
+          # Every other step builds it alongside jig-server, which turns the
+          # executor back on; this is the only build of the code without it.
+          cargo clippy --locked -p jig-nameserver --all-targets -- -D warnings
       - name: Clippy (jig-bridge-core web feature)
         # The webhook-mount path (RouterMount + cfg'd BridgeContext field) is
         # gated behind the `web` feature; lint it explicitly so it's covered.

@@ -31,6 +31,7 @@ use jig_server::v0_0_2_nameserver_tls::BoundNameservers;
 fn resolver_for(ns: &TestNameserver) -> NameserverResolver {
     NameserverResolver::new(
         suffix_authorities(&ns.delegations()),
+        Default::default(),
         1,
         Arc::new(SqliteStore::open_in_memory().unwrap()),
         // TestNameserver serves plaintext on loopback.
@@ -166,6 +167,7 @@ async fn jig_server_in_nameserver_mode_resolves_through_authority() {
     // construction.
     let resolver = NameserverResolver::new(
         suffix_authorities(&server.state.config.identity.delegations),
+        Default::default(),
         server.state.config.identity.cache_ttl_seconds,
         Arc::new(SqliteStore::open_in_memory().unwrap()),
         Arc::new(BoundNameservers {

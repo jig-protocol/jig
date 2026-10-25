@@ -97,6 +97,10 @@ server_did_keyfile = "/var/lib/jig/server.key"
 # suffix (alice@jig): the server ships the jig delegation built in, once the
 # project authority DID is published, and an [identity.delegations.jig] entry
 # here overrides it. trusted_nameservers is not used to resolve aliases.
+# To refuse every alias under a suffix, whatever would otherwise delegate it
+# (the built-in jig delegation included), list it in refused_suffixes. A
+# suffix may not be both delegated and refused. Logged at boot, not advertised.
+#   refused_suffixes = ["example.org"]
 mode = "tofu"
 trusted_nameservers = []
 cache_ttl_seconds = 300
