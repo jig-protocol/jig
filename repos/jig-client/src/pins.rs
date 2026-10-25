@@ -218,6 +218,43 @@ fn read(path: &Path) -> Result<PinFile, PinError> {
     }
 }
 
+/// A store written before DIDs had to be canonical may hold a key-derived DID
+/// in another spelling. Such a pin is kept, not dropped or re-spelled: it
+/// now matches no DID, so whatever it guards is refused, as for a replaced
+/// key, and `jig server forget` clears it. Dropping it would turn the next
+/// use into a first use; this only says why the refusals are coming.
+fn warn_respelled(file: &PinFile) {
+    let respelled = |did: &str| {
+        matches!(
+            jig_core::Did::from_str_unchecked(did).as_bytes(),
+            Err(jig_core::DidError::NotLowercase)
+        )
+    };
+    for (server, pin) in &file.servers {
+        let dids =
+            std::iter::once(&pin.server_did).chain(pin.channels.values().map(|c| &c.owner_did));
+        for did in dids.filter(|d| respelled(d)) {
+            tracing::warn!(
+                "the pin for {server} holds a did:jig ({}) not in its canonical lowercase \
+                 spelling; it will be refused (`jig server forget {server}` clears it)",
+                jig_core::did::log_tag(did)
+            );
+        }
+    }
+    for entry in &file.names {
+        for did in [&entry.did, &entry.ns_did]
+            .into_iter()
+            .filter(|d| respelled(d))
+        {
+            tracing::warn!(
+                "a name pin holds a did:jig ({}) not in its canonical lowercase spelling; \
+                 the name will be refused",
+                jig_core::did::log_tag(did)
+            );
+        }
+    }
+}
+
 /// File servers pinned while the URL scheme was part of the key under the
 /// key [`server_key`] gives them now. Returns whether any moved.
 fn rekey(file: &mut PinFile) -> bool {
@@ -256,6 +293,7 @@ impl Pins {
             path: path.to_path_buf(),
             file: read(path)?,
         };
+        warn_respelled(&pins.file);
         // Stores written while the scheme was part of the key are saved
         // rekeyed, under the lock like any other change.
         if rekey(&mut pins.file) {
@@ -266,6 +304,18 @@ impl Pins {
 
     pub fn server(&self, server: &str) -> Option<&ServerPin> {
         self.file.servers.get(&server_key(server))
+    }
+
+    /// The servers pinned to `did`, as their pin keys: who this device knows
+    /// a signature by `did` to come from. Empty for a DID no server is pinned
+    /// to, whatever it signed.
+    pub fn servers_pinned_to(&self, did: &str) -> Vec<&str> {
+        self.file
+            .servers
+            .iter()
+            .filter(|(_, pin)| !pin.server_did.is_empty() && pin.server_did == did)
+            .map(|(server, _)| server.as_str())
+            .collect()
     }
 
     /// The handshake offer for `server`: the default offer, with the pinned
@@ -728,6 +778,7 @@ mod tests {
             server_nonce: String::new(),
             tls_exporter: Vec::new(),
             manifest: None,
+            admit: None,
             moved_from: None,
             evidence: String::new(),
         }

@@ -146,14 +146,20 @@ jobs:
           key: release-${{ matrix.target }}
 
       # No separate text-block build: jig-server embeds the committed,
-      # CI-verified artifact (repos/text-block/artifacts/text_block.wasm) and
-      # executes only that.
+      # CI-verified component (repos/text-block/artifacts/) and executes only
+      # that.
       - name: Build jig-server, jig, jig-nameserver
         working-directory: repos
         shell: bash
+        # jig-nameserver gets a build of its own. Built in one invocation with
+        # jig-server, cargo would unify features and link jig-pipeline's
+        # executor (wasmtime) into it: a JIT in a binary whose unit sets
+        # MemoryDenyWriteExecute.
         run: |
           cargo ${{ matrix.zigbuild && 'zigbuild' || 'build' }} --release --locked \
-            --target ${{ matrix.target }} -p jig-server -p jig-cli -p jig-nameserver
+            --target ${{ matrix.target }} -p jig-server -p jig-cli
+          cargo ${{ matrix.zigbuild && 'zigbuild' || 'build' }} --release --locked \
+            --target ${{ matrix.target }} -p jig-nameserver
 
       - name: Check binaries
         shell: bash

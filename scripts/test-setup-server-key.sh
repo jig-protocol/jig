@@ -10,6 +10,8 @@
 #   - a ceremony key sealed with a passphrase alone gains the credential;
 #   - a different unlock, or --import over a key, is refused;
 #   - --force moves the old key aside and makes a new DID;
+#   - --rotate makes a new DID linked from the old one, keeps the old key and
+#     credential, and a second --rotate needs --replace-link;
 #   - the nameserver's [v0_0_2.keys];
 #   - no output ever holds the passphrase or the credential's plaintext.
 set -euo pipefail
@@ -130,6 +132,39 @@ compgen -G "$h/var/server.jigkey.replaced-*" >/dev/null || fail "the old key was
 compgen -G "$h/credstore/jig-server-key.replaced-*" >/dev/null || fail "the old credential was not kept"
 cat "$h/out" >>"$t/all-out"
 
+# --rotate: a new DID, a key link from the old one, the old key and credential
+# kept, the new key opened by the new credential and the new passphrase.
+NEW='a different offline passphrase'
+cred_slot() { systemd-creds decrypt --name=jig-server-key "$1/credstore/jig-server-key" -; }
+did="$(did_of "$h")"
+JIG_KEY_NEW_PASSPHRASE="$NEW" run "$h" --rotate || { cat "$h/out"; fail "--rotate"; }
+[ "$(did_of "$h")" != "$did" ] || fail "--rotate kept the DID"
+[ -s "$h/var/server.key.link" ] || fail "no key link"
+compgen -G "$h/var/server.retired-*.jigkey" >/dev/null || fail "the old key was not kept"
+compgen -G "$h/credstore/jig-server-key.retired-*" >/dev/null || fail "the old credential was not kept"
+[ ! -e "$h/credstore/jig-server-key.new" ] || fail "the new credential was left as .new"
+show "$h" | grep -q "a credential slot, a passphrase slot" || { show "$h"; fail "rotated slots"; }
+JIG_KEY_PASSPHRASE="$NEW" "$bin/jig-server" --config "$h/etc/config.toml" keys verify --slot passphrase \
+  --keyfile "$h/var/server.key" >/dev/null || fail "the new passphrase does not open the new key"
+if JIG_KEY_PASSPHRASE="$PASS" "$bin/jig-server" --config "$h/etc/config.toml" keys verify \
+  --slot passphrase --keyfile "$h/var/server.key" >/dev/null 2>&1; then
+  fail "the old passphrase opens the new key"
+fi
+"$bin/jig-server" --config "$h/etc/config.toml" keys verify --slot credential:/dev/fd/3 \
+  --keyfile "$h/var/server.key" 3< <(cred_slot "$h") >/dev/null || fail "the credential does not open the new key"
+cat "$h/out" >>"$t/all-out"
+# Again: refused without --replace-link, and nothing changes.
+before="$(sums "$h")"
+if JIG_KEY_NEW_PASSPHRASE="$NEW" run "$h" --rotate; then fail "a second --rotate went through"; fi
+grep -q -- "--replace-link" "$h/out" || { cat "$h/out"; fail "the second --rotate does not name --replace-link"; }
+[ "$(sums "$h")" = "$before" ] || fail "a refused --rotate changed something"
+cat "$h/out" >>"$t/all-out"
+# With it: the first link is kept beside the new one.
+JIG_KEY_NEW_PASSPHRASE="$NEW" run "$h" --rotate --replace-link || { cat "$h/out"; fail "--replace-link"; }
+[ -s "$h/var/server.key.link.1" ] || fail "the first link was not kept"
+cat "$h/out" >>"$t/all-out"
+if run "$h" --nameserver --rotate; then fail "--rotate on a nameserver"; fi
+
 # The nameserver, keyfile beside its database as the unit sets it.
 h6="$t/f"; mkdir -p "$h6/etc" "$h6/units" "$t/ns"
 cp "$root/deploy/jig-nameserver.example.toml" "$h6/etc/config.toml"
@@ -158,6 +193,7 @@ cat "$h7/out" >>"$t/all-out"
 
 # No secret in any output.
 grep -qF "$PASS" "$t/all-out" && fail "the passphrase was printed"
+grep -qF "$NEW" "$t/all-out" && fail "the new passphrase was printed"
 while IFS= read -r -n 64 secret; do
   [ -n "$secret" ] && grep -qF "$secret" "$t/all-out" && fail "a credential was printed"
 done <"$t/secrets"

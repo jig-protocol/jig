@@ -54,6 +54,13 @@ pub async fn apply_effect(
         // A role lives in the channel's ingest chain, which is its record;
         // `roles::rights_at` reads it from there, so there is no row to keep.
         BlockKind::RoleAssign | BlockKind::RoleUnassign => Ok(()),
+        // A share's state is its blocks: the requests, and the sequencer's
+        // records of what came of them (`crate::contracts`).
+        BlockKind::ChannelShare
+        | BlockKind::ChannelUnshare
+        | BlockKind::ContractAccept
+        | BlockKind::ContractRefuse
+        | BlockKind::ContractEnd => Ok(()),
         BlockKind::FedHello => apply_fed_hello(store, &manifest, block_cid),
 
         BlockKind::NsRegister | BlockKind::NsAttestation => apply_ns_attestation(store, &manifest),
@@ -72,12 +79,10 @@ fn meta_i64(m: &BlockManifest, key: &str) -> Option<i64> {
 
 /// The block's author, in canonical spelling.
 ///
-/// A DID's base32 body decodes case-insensitively, so the spelling a manifest
-/// carries is the author's choice; rows written from it are what the gates
-/// later compare a caller's canonical DID against. Storing the author's
-/// spelling would let an owner who wrote `zABC…` be locked out of their own
-/// channel, and let an operator copy a spelling from a listing into a ban
-/// that never matches. Legacy, non-key-derived DIDs (`did:jig:alice`) have no
+/// Rows written from it are what the gates later compare a caller's canonical
+/// DID against. Ingest refuses a manifest whose DIDs are spelled any other
+/// way ([`crate::ingest::IngestError::NonCanonicalDid`]), so this only
+/// re-checks. Legacy, non-key-derived DIDs (`did:jig:alice`) have no
 /// canonical form and pass through unchanged.
 fn sender_did_string(m: &BlockManifest) -> String {
     canonical_did_string(
@@ -90,12 +95,12 @@ fn sender_did_string(m: &BlockManifest) -> String {
 
 /// See [`sender_did_string`]. Public so ingest persists `blocks.sender_did`
 /// in the same form the effect layer writes `owner_did` and `member_did`.
+/// A key-derived DID in another spelling is not canonical and is returned as
+/// it came, so it matches no row.
 pub fn canonical_did_string(raw: &str) -> String {
     jig_core::Did::from_did_jig_string(raw)
-        .ok()
-        .and_then(|d| d.as_bytes().ok())
-        .map(|bytes| jig_core::Did::from_ed25519_pubkey(&bytes).to_did_jig_string())
-        .unwrap_or_else(|| raw.to_string())
+        .map(|d| d.to_did_jig_string())
+        .unwrap_or_else(|_| raw.to_string())
 }
 
 /// The channel a block of `kind` acts on, resolved by the same rule ingest

@@ -94,6 +94,43 @@ enum KeysCommand {
         #[arg(long = "slot", required = true)]
         slots: Vec<String>,
     },
+    /// Replace the key with a new one, in place, and write a key link from
+    /// the old DID to the new one beside it (`<keyfile>.link`), signed by
+    /// both, so clients and peers that pinned the old DID follow it. The old
+    /// key opens with `[keys] unlock`, JIG_KEY_UNLOCK or JIG_KEY_PASSPHRASE,
+    /// and is kept, still sealed, as `<stem>.retired-<DID tail>.jigkey`.
+    /// Restart the server afterwards.
+    Rotate {
+        /// The keyfile. Defaults to `[server] server_did_keyfile`.
+        #[arg(long)]
+        keyfile: Option<PathBuf>,
+        /// A slot to seal the new key with: credential:PATH, env:NAME, or
+        /// passphrase (read from JIG_KEY_NEW_PASSPHRASE). Repeatable.
+        #[arg(long = "slot", required = true)]
+        slots: Vec<String>,
+        /// Replace a key link left by an earlier rotation. A client still
+        /// pinned on the DID that link leaves is then refused and must re-pin.
+        #[arg(long)]
+        replace_link: bool,
+    },
+    /// Write a key link from the DID of the sealed key at --old-keyfile to
+    /// that of the key at --keyfile, beside the latter, for a key made with
+    /// `keys generate`. `keys rotate` does this and the swap in one step.
+    Link {
+        /// The key being left. It opens with `[keys] unlock`, JIG_KEY_UNLOCK
+        /// or JIG_KEY_PASSPHRASE.
+        #[arg(long)]
+        old_keyfile: PathBuf,
+        /// The key taking over: the path the server will be configured with.
+        /// Defaults to `[server] server_did_keyfile`.
+        #[arg(long)]
+        keyfile: Option<PathBuf>,
+        /// What opens the new key: credential:PATH, env:NAME, or passphrase
+        /// (read from JIG_KEY_NEW_PASSPHRASE). Unset, what opens the old key
+        /// is tried.
+        #[arg(long)]
+        slot: Option<String>,
+    },
 }
 
 /// `jig-server keys ...`: works on the key file only, never starts the server.
@@ -123,6 +160,24 @@ fn run_keys(keys: KeysCommand, config: &ServerConfig) -> Result<String, String> 
         KeysCommand::Generate { keyfile, slots } => KeysAction::Generate {
             keyfile: or_configured(keyfile),
             slots,
+        },
+        KeysCommand::Rotate {
+            keyfile,
+            slots,
+            replace_link,
+        } => KeysAction::Rotate {
+            keyfile: or_configured(keyfile),
+            slots,
+            replace_link,
+        },
+        KeysCommand::Link {
+            old_keyfile,
+            keyfile,
+            slot,
+        } => KeysAction::Link {
+            old_keyfile,
+            keyfile: or_configured(keyfile),
+            slot,
         },
     };
     jig_client::server_key::run(action, &jig_server::v0_0_2::key_options(&config.keys))

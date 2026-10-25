@@ -820,6 +820,14 @@ fn refuse_remote_plaintext(server: &str) -> Result<()> {
 
 fn refusal(server: &str, e: TlsError) -> anyhow::Error {
     match e {
+        TlsError::OtherServer {
+            rotated_past: Some(_),
+            ref presented,
+            ..
+        } => anyhow::anyhow!(
+            "{e}. Confirm {presented} with its operator first; only then run `jig server \
+             forget {server}` to drop the pin."
+        ),
         TlsError::OtherServer { .. } => anyhow::anyhow!(
             "{e}. If its key really changed, `jig server forget {server}` drops the pin."
         ),
@@ -945,6 +953,7 @@ mod tests {
             expected: did(&new),
             presented: did(&thief),
             key_link,
+            rotated_past: None,
         };
 
         // No link, or one that forks nothing followed: an ordinary refusal.
@@ -1234,6 +1243,9 @@ pub async fn verify_name(
                     "if its holder confirms the change, `jig trust accept-name {name} --did {new}` \
                      moves the pin"
                 )),
+                ResolveError::SuffixRefused { suffix } => {
+                    Some(crate::cmd::ns::refused_message(suffix))
+                }
                 _ => None,
             };
             let e = anyhow::Error::new(e);
@@ -1282,8 +1294,14 @@ pub async fn accept_name(
     );
     let binding = match NameResolver::new()
         .resolve(name, delegations, &Unpinned, &evidence)
-        .await?
-    {
+        .await
+        .map_err(|e| match &e {
+            jig_client::naming::ResolveError::SuffixRefused { suffix } => {
+                let hint = crate::cmd::ns::refused_message(suffix);
+                anyhow::Error::new(e).context(hint)
+            }
+            _ => anyhow::Error::new(e),
+        })? {
         Verified::New(b) | Verified::Pinned(b) | Verified::Rotated { binding: b, .. } => b,
     };
     let mut pins = Pins::load(&Pins::default_path())?;

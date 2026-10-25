@@ -170,7 +170,9 @@ impl ServerConfig {
                 "`{key}` is no longer a jig-server config key: {why}. Delete it."
             ));
         }
-        toml::from_str(contents).map_err(|e| e.to_string())
+        let cfg: Self = toml::from_str(contents).map_err(|e| e.to_string())?;
+        cfg.identity.validate()?;
+        Ok(cfg)
     }
 
     /// The pipeline's sections, as the [`JigServerConfig`] its `AppState`
@@ -413,9 +415,10 @@ max_tracked = {max_tracked}
 # Unset, JIG_KEY_UNLOCK or JIG_KEY_PASSPHRASE is used; with neither, a new key
 # is refused rather than written in clear. A raw key from before keys were
 # sealed is refused too: `jig-server keys seal` converts it.
-# unlock = "credential:/run/credentials/jig-server.service/server-key"
+# unlock = "credential:/run/credentials/jig-server.service/jig-server-key"
 # `plaintext` keeps a raw key in clear: an antipattern, warned about on every
-# boot and advertised in unsafe_options_active.
+# boot. It is not listed in unsafe_options_active: that would mark this server
+# as a soft target, and no client can verify it.
 storage = "sealed"
 
 [debug]
@@ -778,6 +781,28 @@ bridge_secret = "literal-secret"
             .expect_err(&format!("`{key}` must be rejected"));
             assert!(err.contains(key), "the error must name `{key}`, got: {err}");
         }
+    }
+
+    #[test]
+    fn a_suffix_both_delegated_and_refused_fails_to_load() {
+        let err = ServerConfig::from_toml_str(
+            r#"
+database_path = "/tmp/x.db"
+bind_address = "127.0.0.1"
+port = 7117
+
+[identity]
+mode = "nameserver"
+refused_suffixes = ["Example.ORG"]
+
+[identity.delegations."example.org"]
+authorities = ["did:jig:zA"]
+nameservers = ["https://ns.example"]
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("`example.org`"), "{err}");
+        assert!(err.contains("refused_suffixes"), "{err}");
     }
 
     #[test]

@@ -77,11 +77,13 @@ server_did_keyfile = "/var/lib/jig/server.key"
 # else retire your channels. member-remove (`jig channel kick` / `leave`) and
 # channel-promote (`jig channel promote`) are the v0.2 channel dynamics, gated
 # the same way. role-assign and role-unassign (JEP-0005 rule 7b) are
-# owner-only.
+# owner-only. channel-share and channel-unshare need the `share` right, and
+# only the channel's sequencer writes the contract-accept, contract-refuse and
+# contract-end records of what came of a share (JEP-0005 rules 7-11).
 #
 # Leave allowed_block_kinds unset to track the built-in default as new kinds
 # ship. Today the default is:
-#   allowed_block_kinds = ["text-render", "channel-create", "member-add", "member-remove", "channel-promote", "channel-archive", "role-assign", "role-unassign"]
+#   allowed_block_kinds = ["text-render", "channel-create", "member-add", "member-remove", "channel-promote", "channel-archive", "role-assign", "role-unassign", "channel-share", "channel-unshare", "contract-accept", "contract-refuse", "contract-end"]
 # To restrict it, uncomment that line and remove kinds. A list here is fixed:
 # kinds added in later releases stay refused until you add them.
 
@@ -97,6 +99,10 @@ server_did_keyfile = "/var/lib/jig/server.key"
 # suffix (alice@jig): the server ships the jig delegation built in, once the
 # project authority DID is published, and an [identity.delegations.jig] entry
 # here overrides it. trusted_nameservers is not used to resolve aliases.
+# To refuse every alias under a suffix, whatever would otherwise delegate it
+# (the built-in jig delegation included), list it in refused_suffixes. A
+# suffix may not be both delegated and refused. Logged at boot, not advertised.
+#   refused_suffixes = ["example.org"]
 mode = "tofu"
 trusted_nameservers = []
 cache_ttl_seconds = 300

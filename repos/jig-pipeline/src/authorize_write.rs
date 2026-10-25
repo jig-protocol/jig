@@ -48,6 +48,13 @@ pub enum WriteRefusal {
     UnknownRole { role: String },
     /// A role block named no `member` DID.
     MissingRoleMember,
+    /// A contract record (`contract-accept`, `contract-refuse`,
+    /// `contract-end`) from anyone but the channel's sequencer: the server
+    /// that took part in the contract is the only one that can record it.
+    SequencerOnly { slug: String, sender: String },
+    /// A share block or contract record whose metadata does not say what its
+    /// kind needs, or whose envelopes do not check out.
+    BadContractBlock { detail: String },
 }
 
 /// The membership facts a decision can turn on, resolved by the caller.
@@ -86,6 +93,11 @@ pub fn changes_the_channel(kind: BlockKind) -> bool {
             | BlockKind::ChannelArchive
             | BlockKind::RoleAssign
             | BlockKind::RoleUnassign
+            | BlockKind::ChannelShare
+            | BlockKind::ChannelUnshare
+            | BlockKind::ContractAccept
+            | BlockKind::ContractRefuse
+            | BlockKind::ContractEnd
     )
 }
 
@@ -260,6 +272,41 @@ pub fn authorize_block_with(
                 });
             }
             Ok(())
+        }
+        BlockKind::ChannelShare | BlockKind::ChannelUnshare => {
+            if !rights.share {
+                return Err(WriteRefusal::MissingRight {
+                    slug: channel.slug.clone(),
+                    sender,
+                    right: Right::Share,
+                });
+            }
+            crate::contracts::share_request(kind, manifest)
+                .map(|_| ())
+                .map_err(|e| WriteRefusal::BadContractBlock {
+                    detail: e.to_string(),
+                })
+        }
+        BlockKind::ContractAccept | BlockKind::ContractRefuse | BlockKind::ContractEnd => {
+            let sequencer = crate::effect::canonical_did_string(&channel.sequencer_did);
+            if sender != sequencer {
+                return Err(WriteRefusal::SequencerOnly {
+                    slug: channel.slug.clone(),
+                    sender,
+                });
+            }
+            let channel_id =
+                channel
+                    .id
+                    .parse::<cid::Cid>()
+                    .map_err(|e| WriteRefusal::BadContractBlock {
+                        detail: format!("the channel's id is not a CID: {e}"),
+                    })?;
+            crate::contracts::check_record(kind, manifest, &channel_id, &sequencer).map_err(|e| {
+                WriteRefusal::BadContractBlock {
+                    detail: e.to_string(),
+                }
+            })
         }
         BlockKind::ChannelCreate => Ok(()),
         _ => {
@@ -921,6 +968,112 @@ mod tests {
         assert!(needs_membership(
             BlockKind::TextRender,
             Some(&channel("Open"))
+        ));
+    }
+
+    #[test]
+    fn sharing_needs_the_share_right() {
+        use crate::roles::Rights;
+        let to = crate::contracts::tests::did(&crate::contracts::tests::parties().follower);
+        let share = manifest_with(
+            BlockKind::ChannelShare,
+            STRANGER,
+            json!({"channel": "#room", "to": to, "grant": "write"}),
+        );
+        let unshare = manifest_with(
+            BlockKind::ChannelUnshare,
+            STRANGER,
+            json!({"channel": "#room", "to": to}),
+        );
+        assert!(changes_the_channel(BlockKind::ChannelShare));
+        for m in [&share, &unshare] {
+            let kind = m.kind.unwrap();
+            let gate = |rights| {
+                authorize_block_with(kind, STRANGER, m, Some(&channel("open")), true, rights)
+            };
+            assert_eq!(
+                gate(Rights::NONE),
+                Err(WriteRefusal::MissingRight {
+                    slug: "#room".into(),
+                    sender: STRANGER.into(),
+                    right: Right::Share,
+                }),
+                "a member without the right, even on an open channel: {kind:?}"
+            );
+            assert_eq!(gate(Rights::ADMIN), Ok(()), "{kind:?}");
+            assert_eq!(gate(Rights::OWNER), Ok(()), "{kind:?}");
+        }
+        // The right is checked before the metadata, so a stranger learns
+        // nothing from a malformed share.
+        let no_grant = manifest_with(
+            BlockKind::ChannelShare,
+            OWNER,
+            json!({"channel": "#room", "to": to}),
+        );
+        assert!(matches!(
+            authorize_block_with(
+                BlockKind::ChannelShare,
+                OWNER,
+                &no_grant,
+                Some(&channel("open")),
+                true,
+                Rights::OWNER
+            ),
+            Err(WriteRefusal::BadContractBlock { .. })
+        ));
+    }
+
+    #[test]
+    fn only_the_sequencer_records_a_contract() {
+        use crate::contracts::tests::{accept_record, did, parties};
+        use crate::roles::Rights;
+        let p = parties();
+        let sequencer = did(&p.owner);
+        let mut ch = channel("restricted");
+        ch.id = p.channel_id.to_string();
+        ch.sequencer_did = sequencer.clone();
+        let record = accept_record(&p);
+        // The sequencer, signing the records it took part in.
+        assert_eq!(
+            authorize_block_with(
+                BlockKind::ContractAccept,
+                &sequencer,
+                &record,
+                Some(&ch),
+                false,
+                Rights::NONE
+            ),
+            Ok(())
+        );
+        // Anyone else, the channel's owner included, whatever its rights.
+        for sender in [OWNER, STRANGER] {
+            assert_eq!(
+                authorize_block_with(
+                    BlockKind::ContractAccept,
+                    sender,
+                    &record,
+                    Some(&ch),
+                    true,
+                    Rights::OWNER
+                ),
+                Err(WriteRefusal::SequencerOnly {
+                    slug: "#room".into(),
+                    sender: sender.into(),
+                })
+            );
+        }
+        // Signed messages for another channel.
+        ch.id = jig_core::canonical_cid::of(b"elsewhere").to_string();
+        assert!(matches!(
+            authorize_block_with(
+                BlockKind::ContractAccept,
+                &sequencer,
+                &record,
+                Some(&ch),
+                false,
+                Rights::NONE
+            ),
+            Err(WriteRefusal::BadContractBlock { .. })
         ));
     }
 }

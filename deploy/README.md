@@ -481,11 +481,15 @@ so a rebooted box catches up). It snapshots:
 | `/var/lib/jig/nameserver.db` | the nameserver's legacy registry |
 | `/var/lib/jig/nameserver_v002.db` | **the nameserver's alias bindings** |
 | `/var/lib/jig/server.jigkey` | server identity, sealed |
+| `/var/lib/jig/server.key.link*` | the server's key links, when it serves one: the configured key path with `.link` appended, and earlier links kept as `.link.1`, `.link.2`, ... and `.link.pruned-N`. Without them, clients that pinned an earlier DID refuse the restored server |
+| `/var/lib/jig/server.retired-*.jigkey` | keys a rotation retired, still sealed |
 | `/var/lib/jig/nameserver_v002.jigkey` | **the nameserver's signing key**, sealed (set `JIG_NAMESERVER_KEYFILE` if `[v0_0_2.server] server_did_keyfile` puts it elsewhere) |
 
 A key still in clear (`[keys] storage = "plaintext"`) is copied too, with a
 warning, and the snapshot then holds it in clear. A snapshot holds no secret
-that opens a sealed key; `MANIFEST.txt` records which keys were sealed.
+that opens a sealed key; `MANIFEST.txt` records which keys were sealed. A
+rotation's retired credential (`/etc/credstore.encrypted/*.retired-*`) is not in
+the snapshot either: it is the operator's to move offline.
 
 The nameserver files are skipped on a box that doesn't run the nameserver, but
 a snapshot is refused if `nameserver_v002.db` exists without its key. **A
@@ -614,6 +618,11 @@ By hand, the same steps:
    Removing the raw file does not erase it from the disk or from earlier backups.
    Then add the offline passphrase slot (top of this file).
 
+   An upgraded nameserver with a raw `nameserver_v002.key` refuses to start the
+   same way. Seal it with `sudo deploy/setup-server-key.sh --nameserver`, or by
+   hand with `jig-nameserver --config /etc/jig/jig-nameserver.toml keys seal
+   --slot ...` and the same slot as `[v0_0_2.keys] unlock`.
+
 To check, at any time, that a secret still opens the key without trying anything
 else (the offline passphrase, say, before you rely on it):
 
@@ -636,6 +645,59 @@ What each choice protects against:
 
 At-rest encryption does not protect a key from code running as the server's
 user while it runs, and does not protect the key in memory.
+
+### Rotating the server key
+
+A server's DID is its key, so a new key is a new DID. `keys rotate` makes the
+new key and a **key link** from the old DID to the new one, signed by both
+keys (JEP-0012). The server serves the link in every welcome and at
+`/.well-known/jig`, and clients and federation peers that pinned the old DID
+follow it to the new one.
+
+```bash
+sudo deploy/setup-server-key.sh --rotate
+sudo systemctl restart jig-server
+```
+
+It asks for a **new** offline passphrase (or reads `JIG_KEY_NEW_PASSPHRASE`)
+and makes a new credential secret, so nothing that opened the old key opens
+the new one. In place, so the config and the drop-in do not change:
+
+| File | After `--rotate` |
+| --- | --- |
+| `/var/lib/jig/server.jigkey` | the new key, opened by the new credential and the new passphrase |
+| `/var/lib/jig/server.key.link` | the link from the old DID to the new one: back it up with the key |
+| `/var/lib/jig/server.retired-<DID tail>.jigkey` | the old key, still sealed |
+| `/etc/credstore.encrypted/jig-server-key.retired-<time>` | the old credential |
+
+**Keep the retired key, never delete it:** move it and the old credential
+offline. Nothing needs them to serve the link; they keep the old DID's key
+usable if anything ever has to be signed by it again, such as a revocation
+once there is one.
+
+By hand, the same is
+`jig-server keys rotate --slot credential:PATH --slot passphrase`, with the old
+key opened by `[keys] unlock`, `JIG_KEY_UNLOCK` or `JIG_KEY_PASSPHRASE`, and the
+new passphrase in `JIG_KEY_NEW_PASSPHRASE`. For a key made offline with
+`keys generate`, `jig-server keys link --old-keyfile OLD --keyfile NEW` writes
+only the link, beside `NEW`.
+
+**Rotate once per pin generation.** The server serves one link, and a client
+follows one: after a second rotation, a client still pinned on the first DID is
+refused, with an error saying the server changed its key more than once. It
+must re-pin, which trusts the server on first use again. So `--rotate` refuses
+a second rotation unless you pass `--replace-link`, and keeps the earlier link
+as `server.key.link.1`. Serving the whole chain is planned.
+
+A DID is linked to one new key only, ever: two links from one DID are what a
+stolen key looks like (JEP-0012), and clients that see both follow neither.
+`keys rotate` and `keys link` refuse to link a DID that a link beside the key
+already leaves.
+
+Not covered yet: federation peers follow the link, but their operators should
+still update `expected_did`; JEP-0012's `server-rekey` block is not
+implemented; and the nameserver has no key link, so a new nameserver key is a
+new identity.
 
 ---
 
@@ -696,8 +758,8 @@ letter under 5, at most 2^24, and 1 to renew or rotate. `jig` solves it;
 `GET /v1/challenge?action=register|renew|rotate&did=&name=`, and the reply
 states the effort, signed by the nameserver (`pow_offer`). The policy's
 refusals (closed, too short, reserved, taken) come back
-there, before any work. A per-suffix `[v0_0_2.nameserver.alias_suffixes.pool]` (also off by default)
-caps stranger registrations per hour and raises the effort under load; see the
+there, before any work. A per-suffix `[v0_0_2.nameserver.alias_suffixes.pool]` (on by default: 60 an
+hour, burst 10) caps stranger registrations per hour and raises the effort under load; see the
 nameserver's OPERATOR_GUIDE. `[alias_rate_limits]` caps `GET /v1/challenge` per IP
 (`challenge_per_ip_per_min`, default 60) and the challenges pending at once
 (`max_pending_challenges`, default 100 000; past it, `503 BUSY`, with a tenth
@@ -756,9 +818,13 @@ passthrough) without terminating it.
   settings you choose to put there.
 - **Secrets never go inline in a unit file.** `systemctl cat` is readable by any
   local user. `EnvironmentFile`, `chmod 600 root:jig`, always.
-- **`MemoryDenyWriteExecute` is deliberately absent** from every unit. Blocks
-  execute through wasmtime's cranelift JIT, which maps pages W then X; enabling
-  W^X denial turns every block execution into a segfault.
+- **`MemoryDenyWriteExecute` is set on `jig-nameserver.service` only.** jig-server
+  executes blocks through wasmtime's cranelift JIT, which maps pages W then X;
+  W^X denial makes it fail to start. The nameserver runs no blocks and, built on
+  its own, links no Wasm engine. Build it in its own cargo invocation
+  (`cargo build --release -p jig-nameserver`): built together with jig-server,
+  cargo unifies features and links the executor into it too. It still never
+  creates an executable mapping, but the binary carries wasmtime for nothing.
 - **`UMask=0077` is deliberate.** The server writes `server.jigkey` owner-only
   on first boot, and refuses a raw key whose mode is loose.
 - **`StateDirectory=jig`** makes systemd create and chown `/var/lib/jig`;
