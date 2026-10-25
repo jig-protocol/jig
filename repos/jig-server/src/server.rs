@@ -50,6 +50,7 @@ fn boot_checks(config: &ServerConfig) -> Result<()> {
         jig_runtime::component::Backend::Native,
     )
     .map_err(|e| ServerError::Runtime(format!("failed to create jig-runtime: {e}")))?;
+    crate::v0_0_2_limits::Limits::validate(&config.limits).map_err(ServerError::Config)?;
     Ok(())
 }
 
@@ -92,6 +93,11 @@ impl JigServer {
         } else {
             main_router
         };
+        // `[limits] max_request_body_bytes` on every route, the v0.0.1 ones
+        // included, rather than axum's implicit default.
+        let router = router.layer(axum::extract::DefaultBodyLimit::max(
+            crate::v0_0_2_limits::Limits::resolve(&self.config.limits).request_body,
+        ));
 
         let addr: SocketAddr = format!("{}:{}", self.config.bind_address, self.config.port)
             .parse()

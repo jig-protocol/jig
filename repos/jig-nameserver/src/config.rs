@@ -205,6 +205,12 @@ impl NameServerConfig {
     /// (and callers who want to patch a field before booting) can build an
     /// unvalidated config, and so failures are errors rather than panics.
     pub fn validate(&self) -> Result<()> {
+        if self.network.max_body_bytes == 0 {
+            return Err(NameServerError::Other(anyhow::anyhow!(
+                "[network] max_body_bytes = 0 would refuse every request body; leave it unset \
+                 for {DEFAULT_MAX_BODY_BYTES}"
+            )));
+        }
         self.v0_0_2
             .nameserver
             .validate()
@@ -370,7 +376,14 @@ pub struct NetworkConfig {
     pub port: u16,
     pub trust_proxy: bool,
     pub proxy_ip_header: String,
+    /// Largest request body, in bytes, on every route. A body over it is
+    /// refused with `413` before it is parsed. The nameserver's requests are a
+    /// few kilobytes at most.
+    pub max_body_bytes: usize,
 }
+
+/// The default `[network] max_body_bytes`.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
 
 impl Default for NetworkConfig {
     fn default() -> Self {
@@ -379,6 +392,7 @@ impl Default for NetworkConfig {
             port: default_port(),
             trust_proxy: false,
             proxy_ip_header: default_proxy_header(),
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         }
     }
 }
@@ -1175,6 +1189,8 @@ bind = "0.0.0.0"
 port = 7070
 trust_proxy = false
 proxy_ip_header = "x-forwarded-for"
+# Largest request body on every route; a bigger one gets 413.
+max_body_bytes = 65536
 
 [storage]
 # Names where the nameserver keeps <stem>_v002.db (aliases) and <stem>_v002.key

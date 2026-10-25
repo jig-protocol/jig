@@ -37,10 +37,6 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
-/// Largest body the layer buffers to read the DIDs. The handlers' requests
-/// are a few hundred bytes; anything bigger is refused before it is parsed.
-const MAX_BODY_BYTES: usize = 64 * 1024;
-
 /// Above this many tracked keys, buckets from earlier windows are dropped.
 const PRUNE_THRESHOLD: usize = 10_000;
 
@@ -246,11 +242,14 @@ pub async fn limit(
         return next.run(req).await;
     }
     let (parts, body) = req.into_parts();
-    let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
+    // Buffered to read the DIDs, so it is held to `[network] max_body_bytes`
+    // here as well as by the router's `DefaultBodyLimit`.
+    let max = limiter.network.max_body_bytes;
+    let Ok(bytes) = to_bytes(body, max).await else {
         return refuse(
             StatusCode::PAYLOAD_TOO_LARGE,
             "BODY_TOO_LARGE",
-            format!("request body over {MAX_BODY_BYTES} bytes"),
+            format!("request body over {max} bytes"),
             None,
         );
     };
