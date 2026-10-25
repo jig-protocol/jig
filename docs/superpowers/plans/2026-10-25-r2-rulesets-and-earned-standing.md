@@ -1,7 +1,7 @@
 # R2: Rulesets and earned standing — Design plan
 
-> **Design only. No code lands from this document.** It proposes slices and lists the decisions
-> DJ has to make. Each slice becomes its own implementation plan once DJ has answered.
+> **Design only. No code lands from this document.** It proposes slices; DJ decided every
+> question on 2026-10-25 (see Decisions). Each slice becomes its own implementation plan.
 
 **Goal:** a server's admission and pool membership rest on standing the subject **earned**, under
 rules the subject was shown and agreed to. Today they rest on what the operator typed into
@@ -211,41 +211,44 @@ Tests:
 
 ---
 
-## Decisions for DJ
+## Decisions (DJ, 2026-10-25)
+
+DJ accepted every recommendation below as written, including R2.4 and the project's DID signing
+the reference ruleset.
 
 1. **What is R2?**
    - (a) The framing's R2 only (declare and ack). Earned standing waits for R3 and a group.
-   - (b) **Recommended:** the framing's R2 plus R2.4, local earned standing as a stepping stone to
+   - (b) **Decided:** the framing's R2 plus R2.4, local earned standing as a stepping stone to
      R3.
    - (c) Skip to R3 and stand up a two-nameserver group for `@jig` first.
-2. **Does an `ack` gate admission?** Recommended: no. A subject without an `ack` is a stranger,
+2. **Does an `ack` gate admission?** Decided: no. A subject without an `ack` is a stranger,
    never refused for it. Refusing would make the ruleset a click-through wall and would lock out
    every client that predates R2.3.
 3. **The reference ruleset's numbers:** `established`, `min_age_secs`, `accrual_per_period`,
-   `period_secs`, `lambda_pos` and `lambda_neg`. Proposed starting values: a day per period; 30
+   `period_secs`, `lambda_pos` and `lambda_neg`. Decided starting values: a day per period; 30
    periods to established; a 90-day half-life for `r` (framing 7.2) and 30 days for minor
    negatives. They are to be tuned against R1's pool metrics.
 4. **Local clock for age (R2.4).** TM-01 says the server's own clock is not group time. R2.4
    uses it anyway, because the standing is the server's own and is used only by the server.
-   Recommended: accept, and state it in the doc comment and the threat register.
-5. **Standing feeds pools and effort only, not floors.** Recommended: yes, as rule 20 says for
+   Decided: accept, and state it in the doc comment and the threat register.
+5. **Standing feeds pools and effort only, not floors.** Decided: yes, as rule 20 says for
    R3. A floor on R2.4's local standing would refuse subjects on unverified local evidence.
 6. **One source for parameters.** When a server declares a ruleset, `[auth.pools]` shares and
    the admission effort bounds come from the document, and config that also sets them refuses
-   to boot. Recommended: yes. Otherwise the server enforces something other than what it
+   to boot. Decided: yes. Otherwise the server enforces something other than what it
    declared (rule 4).
-7. **Operator records stay members.** Recommended: yes, and logged as operator assertions, so an
+7. **Operator records stay members.** Decided: yes, and logged as operator assertions, so an
    R4 log can show them. Removing them would break every server that uses them today.
 8. **A per-address cap on promotions** to the member pool (R2.4): at most `k` new members per /24
    (IPv4) or /48 (IPv6) per period. It bounds a farm behind one network, and costs a
-   shared-address population (a campus, a carrier NAT). Recommended: yes, off by default, with
+   shared-address population (a campus, a carrier NAT). Decided: yes, off by default, with
    the knob in the ruleset's `parameters`.
 9. **Who signs the reference ruleset?** The project's DID (as for the `@jig` delegation), or each
-   operator re-signing their own copy. Recommended: the project's DID signs `jig-reference`, and
+   operator re-signing their own copy. Decided: the project's DID signs `jig-reference`, and
    an operator who changes anything publishes their own `id`.
 
 10. **How the welcome grows.** A welcome `v: 2` that carries the ruleset (and 5b's stamp offer),
-    or separately signed objects beside a `v: 1` welcome. Recommended: a `v: 2` for the ruleset,
+    or separately signed objects beside a `v: 1` welcome. Decided: a `v: 2` for the ruleset,
     which changes rarely and belongs in what the server signs at the handshake; a separate
     object for the stamp offer, which rotates every epoch.
 
