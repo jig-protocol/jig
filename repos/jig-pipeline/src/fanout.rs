@@ -111,8 +111,9 @@ pub struct Fanout {
     local: RwLock<HashMap<u64, LocalSubscription>>,
     peers: RwLock<HashMap<String, DeliverySender>>,
     bridge_dids: StdRwLock<HashMap<String, DeliverySender>>,
-    /// The server's own watchers, by block kind ([`Fanout::watch_kinds`]).
-    server_watchers: StdRwLock<Vec<(Vec<String>, DeliverySender)>>,
+    /// The server's own watchers, by block kind ([`Fanout::watch_kinds`]), or
+    /// of every block (`None`, [`Fanout::watch_all`]).
+    server_watchers: StdRwLock<Vec<(Option<Vec<String>>, DeliverySender)>>,
 }
 
 impl Fanout {
@@ -202,7 +203,17 @@ impl Fanout {
         self.server_watchers
             .write()
             .expect("server_watchers poisoned")
-            .push((kinds, tx));
+            .push((Some(kinds), tx));
+    }
+
+    /// [`Self::watch_kinds`] for every block this server delivers: the
+    /// owner's stream to the servers that follow its channels. Server-only,
+    /// like it.
+    pub fn watch_all(&self, tx: DeliverySender) {
+        self.server_watchers
+            .write()
+            .expect("server_watchers poisoned")
+            .push((None, tx));
     }
 
     /// Like `broadcast`, but also dispatches to bridge sinks for any managed
@@ -309,7 +320,11 @@ impl Fanout {
             .expect("server_watchers poisoned")
             .iter()
         {
-            if kinds.iter().any(|k| k == &block.block_kind) {
+            let watched = match kinds {
+                Some(kinds) => kinds.iter().any(|k| k == &block.block_kind),
+                None => true,
+            };
+            if watched {
                 let _ = tx.send((block.clone(), receipt.clone()));
             }
         }

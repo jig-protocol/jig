@@ -34,8 +34,9 @@
 //! connection's proven peer, closes the connection: that peer is not speaking
 //! the contract.
 //!
-//! What a live share carries (the owner's stream to the follower, and the
-//! follower's relayed writes) is JEP-0005 rules 12-15, in later slices.
+//! A live share carries the owner's stream to the follower
+//! ([`crate::v0_0_2_stream`], rules 12-14), on the same connection. The
+//! follower's relayed writes (rule 15) come in a later slice.
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -57,6 +58,7 @@ use jig_pipeline::persist::{SqliteStore, StoredBlock, StoredChannel};
 
 use crate::v0_0_2::AppState;
 use crate::v0_0_2_peer::{CloseReason, PeerFrames, PeerRegistry, PeerSender};
+use crate::v0_0_2_stream::Stream;
 
 /// The owner's offer: one signed `contract-offer`.
 pub const OFFER_FRAME: &str = "contract-offer";
@@ -84,13 +86,16 @@ pub struct Contracts {
     federation: Arc<FederationSection>,
     manifest: Arc<RwLock<Option<jig_pipeline::handshake::ManifestRef>>>,
     peers: Arc<PeerRegistry>,
+    stream: Stream,
 }
 
 /// Run the contract on `state`'s server:
 /// - register its peer-frame handler;
 /// - watch for share blocks;
 /// - resend unanswered offers every [`RESEND_EVERY`];
-/// - act on the operator's decisions every [`DECIDE_EVERY`].
+/// - act on the operator's decisions every [`DECIDE_EVERY`];
+/// - ask each followed channel's owner for its new records every
+///   [`crate::v0_0_2_stream::PULL_EVERY`].
 ///
 /// Call once, at boot.
 pub fn start(state: &AppState) -> Contracts {
@@ -111,11 +116,20 @@ pub fn start(state: &AppState) -> Contracts {
             decider.act_on_decisions().await;
         }
     });
+    let puller = contracts.stream.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(crate::v0_0_2_stream::PULL_EVERY);
+        loop {
+            tick.tick().await;
+            puller.pull_all();
+        }
+    });
     contracts
 }
 
-/// Register the peer-frame handler and watch for share blocks, with no
-/// timers: what [`start`] runs, less the resending and the decisions.
+/// Register the peer-frame handler, watch for share blocks and stream the
+/// blocks of shared channels, with no timers: what [`start`] runs, less the
+/// resending, the decisions and the pulls.
 fn handle(state: &AppState) -> Contracts {
     let contracts = Contracts::new(state);
     if !state.set_peer_frames(Arc::new(contracts.clone())) {
@@ -134,16 +148,29 @@ fn handle(state: &AppState) -> Contracts {
             }
         }
     });
+    contracts.stream.run();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    state.ingest_ctx.fanout.watch_all(tx);
+    let streamer = contracts.stream.clone();
+    tokio::spawn(async move {
+        while let Some((block, _receipt)) = rx.recv().await {
+            if let Err(e) = streamer.on_block(&block) {
+                tracing::warn!(block = %block.cid, "block not streamed: {e:#}");
+            }
+        }
+    });
     contracts
 }
 
 impl Contracts {
     pub fn new(state: &AppState) -> Self {
+        let federation = Arc::new(state.config.federation.clone());
         Self {
             ctx: state.ingest_ctx.clone(),
-            federation: Arc::new(state.config.federation.clone()),
+            federation: federation.clone(),
             manifest: state.manifest.clone(),
             peers: state.peers.clone(),
+            stream: Stream::new(state.ingest_ctx.clone(), federation, state.peers.clone()),
         }
     }
 
@@ -715,6 +742,9 @@ impl PeerFrames for Contracts {
         body: &[u8],
         out: &PeerSender,
     ) -> Result<(), CloseReason> {
+        if let Some(handled) = self.stream.on_peer_frame(peer, kind, body, out) {
+            return handled;
+        }
         let peer = peer.to_did_jig_string();
         match kind {
             OFFER_FRAME => {
@@ -1020,13 +1050,24 @@ mod tests {
     }
 
     async fn pair(offers: OfferPolicy) -> Pair {
+        pair_with(offers, None).await
+    }
+
+    /// [`pair`], with the follower holding the owner to `quota`.
+    async fn pair_with(
+        offers: OfferPolicy,
+        quota: Option<jig_config::v0_0_2_server::PeerQuotaConfig>,
+    ) -> Pair {
         let mut owner = state_with(vec![], &[]);
         let follower = state_with(
-            vec![peer(
-                "ws://127.0.0.1:1",
-                owner.server_did.to_did_jig_string(),
-                offers,
-            )],
+            vec![FederationPeer {
+                quota,
+                ..peer(
+                    "ws://127.0.0.1:1",
+                    owner.server_did.to_did_jig_string(),
+                    offers,
+                )
+            }],
             &[],
         );
         let (follower, url) = serve(follower).await;
@@ -1827,6 +1868,190 @@ mod tests {
                 .unwrap()
                 .state,
             OfferState::Accepting
+        );
+    }
+
+    // ---- The owner's stream (JEP-0005 rules 12-14, 22a) --------------------
+
+    impl Pair {
+        async fn text(&self, channel: &str, body: &str) -> String {
+            post(
+                &self.owner,
+                &self.user,
+                BlockKind::TextRender,
+                serde_json::json!({"channel_id": channel, "body": body}),
+            )
+            .await
+            .unwrap()
+        }
+
+        /// A shared channel, accepted on both sides, with `texts` posts
+        /// before the share.
+        async fn shared(&self, texts: usize) -> String {
+            let channel = self.channel().await;
+            for i in 0..texts {
+                self.text(&channel, &format!("before {i}")).await;
+            }
+            self.share(&channel, "read").await;
+            self.both(&channel, OfferState::Accepted).await;
+            channel
+        }
+
+        /// The head of `channel`'s chain on `state`.
+        fn head(state: &AppState, channel: &str) -> Option<u64> {
+            state
+                .ingest_ctx
+                .store
+                .latest_ingest_record(channel)
+                .unwrap()
+                .map(|r| r.seq)
+        }
+
+        /// Wait for the follower's chain to reach the owner's head.
+        async fn caught_up(&self, channel: &str) -> u64 {
+            let want = Self::head(&self.owner, channel).unwrap();
+            eventually("the follower at the owner's head", || {
+                (Self::head(&self.follower, channel) == Some(want)).then_some(want)
+            })
+            .await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_follower_carries_the_owners_chain_as_signed() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.shared(3).await;
+        // Catch-up from nothing, then each new block as it lands.
+        p.follows.stream.pull_all();
+        let head = p.caught_up(&channel).await;
+        p.text(&channel, "live").await;
+        assert_eq!(p.caught_up(&channel).await, head + 1, "pushed, not pulled");
+
+        let follower = &p.follower.ingest_ctx.store;
+        let owner = &p.owner.ingest_ctx.store;
+        let row = follower.get_channel_by_id(&channel).unwrap().unwrap();
+        assert_eq!(row.sequencer_did, p.owner.server_did.to_did_jig_string());
+        for seq in 0..=head + 1 {
+            assert_eq!(
+                follower.ingest_record_bytes(&channel, seq).unwrap(),
+                owner.ingest_record_bytes(&channel, seq).unwrap(),
+                "seq {seq}, byte for byte"
+            );
+        }
+        // The follower signed nothing of its own into it.
+        let records = follower
+            .list_ingest_records_by_id(&channel, 0, 100)
+            .unwrap();
+        assert!(
+            records
+                .iter()
+                .all(|r| r.sequencer == p.owner.server_did.to_did_jig_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_follower_catches_up_across_frames() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.shared(crate::v0_0_2_stream::MAX_ENTRIES + 6).await;
+        // One pull: the rest follows on the owner's `more`.
+        p.follows.stream.pull_all();
+        let head = p.caught_up(&channel).await;
+        assert!(head as usize > crate::v0_0_2_stream::MAX_ENTRIES);
+    }
+
+    #[tokio::test]
+    async fn only_the_connections_peer_sequences_what_it_streams() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.shared(1).await;
+        let records = Contracts::new(&p.owner)
+            .stream
+            .records_from(&channel, 0)
+            .unwrap()
+            .unwrap();
+        // The owner's own blocks and records, landed as if another server
+        // sent them: the sequencer is the connection's peer, and this one
+        // holds no share and sequences nothing.
+        let stranger = Did::from_ed25519_pubkey(
+            SigningKey::from_bytes(&rand::random())
+                .verifying_key()
+                .as_bytes(),
+        );
+        p.follows.stream.land(&stranger, records.clone()).await;
+        let follower = &p.follower.ingest_ctx.store;
+        assert!(
+            follower
+                .get_channel_by_id_including_archived(&channel)
+                .unwrap()
+                .is_none(),
+            "no row for a stream from a server that does not own the channel"
+        );
+        // From the owner, the same frame lands.
+        p.follows.stream.land(&p.owner.server_did, records).await;
+        assert!(follower.get_channel_by_id(&channel).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_channel_pushed_without_an_accepted_share_makes_no_row() {
+        let p = pair(OfferPolicy::Hold).await;
+        let channel = p.channel().await;
+        p.share(&channel, "read").await;
+        eventually("the offer held", || {
+            (p.offers(Side::Follower, &channel, OfferState::Held).len() == 1).then_some(())
+        })
+        .await;
+        let ours = p
+            .offers(Side::Owner, &channel, OfferState::Offered)
+            .remove(0);
+        // The owner takes the offer as accepted, though the follower holds it
+        // still, and streams the channel.
+        let owner = &p.owner.ingest_ctx.store;
+        assert!(
+            owner
+                .move_contract_offer(
+                    &ours.offer_id,
+                    OfferState::Offered,
+                    OfferState::Accepted,
+                    None
+                )
+                .unwrap()
+        );
+        p.text(&channel, "pushed").await;
+        p.follows.stream.pull_all();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            p.follower
+                .ingest_ctx
+                .store
+                .get_channel_by_id_including_archived(&channel)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn what_a_peer_streams_counts_against_its_quota() {
+        let quota = jig_config::v0_0_2_server::PeerQuotaConfig {
+            blocks_per_min: 3,
+            bytes_per_min: 8 * 1024 * 1024,
+        };
+        let p = pair_with(OfferPolicy::Accept, Some(quota)).await;
+        let channel = p.shared(5).await;
+        // Three entries a minute, whichever frames carry them: the owner's
+        // push of its accept counts too, so two or three land.
+        p.follows.stream.pull_all();
+        let head = eventually("the blocks the quota allows", || {
+            Pair::head(&p.follower, &channel).filter(|h| *h >= 1)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        p.follows.stream.pull_all();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let now = Pair::head(&p.follower, &channel).unwrap();
+        assert!(now <= 2, "at most three blocks: seq {now}");
+        assert!(now >= head);
+        assert!(
+            now < Pair::head(&p.owner, &channel).unwrap(),
+            "nothing past the quota this minute"
         );
     }
 }
