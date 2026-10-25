@@ -110,7 +110,7 @@ Non-goals for v0.2:
      one is never published, and appears only in contract messages (JEP-0004 rule 7).
 
    Its payload is `{domain, owner, to, channel_id, grant, creation_block, ingest_head,
-   manifest: {cid, seq}, private_suffixes, offer_id}`. `owner` is the signing server and
+   manifest: {cid, seq}, attested_suffixes, offer_id}`. `owner` is the signing server and
    `to` the offered one, so an offer cannot be replayed to a third server. `channel_id` and
    `manifest.cid` are CIDs as rule 0 states. `creation_block` and `ingest_head` are byte
    strings carrying the block and the record as they travel, and the receiver checks that
@@ -139,7 +139,7 @@ Non-goals for v0.2:
       is ordered in the `ingest` chain. From its `seq`, the owning server reads the old
       DID's roles and membership as the new DID's. The creator rule carries across the
       link. A link scoped to another channel, alias or contact moves nothing here.
-7c. `private_suffixes` lists every name suffix the signing server attests, each once, as one
+7c. `attested_suffixes` lists every name suffix the signing server attests, each once, as one
     of:
     - `{suffix, root: "config", authorities}`: `authorities` is the delegation's DIDs, in
       canonical form, sorted ascending and distinct, and never empty;
@@ -151,13 +151,13 @@ Non-goals for v0.2:
     side compares the other's list with its own, so it decides a conflict from the contract
     messages alone, without fetching the other's manifest.
 8. The offered server MUST answer, signed by its DID, with exactly one of:
-   - `contract-accept {server, channel_id, offer_id, sequencer, manifest, private_suffixes,
+   - `contract-accept {server, channel_id, offer_id, sequencer, manifest, attested_suffixes,
      bot_dids}`, where `server` is the signing server and `bot_dids` is empty except on a
      sequencer move (11a).
      - `offer_id` names the exact offer accepted, under the follower's signature. An
        accept binds only the grant in that offer.
      - `manifest` names its current `server-manifest`.
-     - `private_suffixes` lists the suffixes it attests, each with its authority (7c).
+     - `attested_suffixes` lists the suffixes it attests, each with its authority (7c).
      - The accept states that the server implements the suite and will enforce the
        membership rule.
    - `contract-refuse {server, channel_id, offer_id, code}`, where `code` is one of `UNSUPPORTED_SUITE`,
