@@ -102,6 +102,22 @@ ignore = [
     # Drop when hax-lib moves off it or openmls_rust_crypto off hpke-rs 0.7.
     "RUSTSEC-2026-0173",
 
+    # RUSTSEC-2026-0387: crypto-bigint 0.5.5 has secret-dependent branches in
+    # operations meant to be constant-time; fixed only in 0.7.6. Reached via
+    # jig-mls -> openmls_rust_crypto 0.6 (and openmls_basic_credential 0.6,
+    # hpke-rs-rust-crypto 0.7) -> p256/p384 (and k256) 0.13 -> elliptic-curve
+    # 0.13 -> crypto-bigint 0.5. 0.6.0 is the newest openmls_rust_crypto and
+    # pins hpke-rs-rust-crypto 0.7, so no compatible bump exists
+    # (hpke-rs-rust-crypto 0.8 is a breaking release nothing here can take
+    # yet). The elliptic-curve code is linked but never run: jig signs with
+    # Ed25519 only, and speaks only MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519
+    # (jig-mls/src/lib.rs CIPHERSUITE), and every group info, key package and
+    # welcome jig is handed is refused in any other ciphersuite before its
+    # signature or anything else in it is checked (jig-mls/src/delivery.rs
+    # require_ciphersuite; jig-mls/tests/ciphersuite.rs proves each path).
+    # Drop when openmls_rust_crypto moves off elliptic-curve 0.13.
+    "RUSTSEC-2026-0387",
+
     # RUSTSEC-2024-0436 (paste, unmaintained) left with ratatui 0.27. ratatui
     # 0.30 uses pastey instead, so the advisory no longer matches a crate.
 
