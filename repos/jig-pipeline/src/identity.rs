@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jig_core::naming::{self, Attestation, Name, NamingError};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -37,12 +37,16 @@ pub enum IdentityError {
     NotFound { alias: String },
     #[error("all configured nameservers unreachable")]
     AllNameserversUnreachable,
+    #[error("no nameserver could be trusted: {0}")]
+    UntrustedNameserver(String),
     #[error("invalid nickname: must match ^[a-zA-Z0-9_-]{{1,24}}$ (no `@`, `:`, or homoglyphs)")]
     InvalidNickname,
     #[error("nameserver returned malformed response: {0}")]
     MalformedResponse(String),
     #[error("no delegation configured for suffix `{suffix}`")]
     NoDelegation { suffix: String },
+    #[error("aliases under `{0}` are refused by this server")]
+    SuffixRefused(String),
     #[error("alias attestation refused: {0}")]
     Naming(#[from] NamingError),
     #[error("nameservers for `{alias}` attest different DIDs: {dids:?}")]
@@ -151,7 +155,8 @@ impl IdentityResolver for TofuResolver {
 /// lists for its suffix, and accepts only an attestation signed by one of that
 /// suffix's authorities, inside its validity window, for exactly this alias
 /// (JEP-0004 rules 3 and 13). A suffix with no entry is refused: the server
-/// does no discovery.
+/// does no discovery. A refused suffix is refused before its delegation is
+/// even looked at.
 ///
 /// Every listed nameserver is asked. Two valid attestations naming different
 /// DIDs are an equivocation: the alias is refused and both are kept as
@@ -159,11 +164,62 @@ impl IdentityResolver for TofuResolver {
 /// the attestation's `valid_until`.
 pub struct NameserverResolver {
     delegations: BTreeMap<String, SuffixAuthority>,
+    /// `[identity] refused_suffixes`, lowercased.
+    refused: BTreeSet<String>,
     store: Arc<SqliteStore>,
     cache: RwLock<HashMap<String, CachedDid>>,
     cache_ttl: Duration,
-    client: reqwest::Client,
+    transport: Arc<dyn NameserverTransport>,
     now: Arc<dyn Fn() -> i64 + Send + Sync>,
+}
+
+/// How the resolver reaches a nameserver: a client for `ns_url` that only a
+/// nameserver one of `authorities` vouches for can answer on, or why there is
+/// none. jig-server's implementation accepts TLS bound to an authority's DID
+/// and nothing else; this crate does not depend on the client crate that
+/// checks the binding, so the server passes it in.
+#[async_trait]
+pub trait NameserverTransport: Send + Sync {
+    async fn client(&self, ns_url: &str, authorities: &[String])
+    -> Result<reqwest::Client, String>;
+}
+
+/// A [`NameserverTransport`] for `http://` nameservers only, unverified. For
+/// loopback or local testing: over plaintext anyone on the path sees which
+/// aliases are looked up and can hide answers (not forge them; every
+/// attestation is still checked). `https://` is refused, since nothing here
+/// can check whose certificate it is.
+pub struct LocalPlaintextNameservers;
+
+#[async_trait]
+impl NameserverTransport for LocalPlaintextNameservers {
+    async fn client(
+        &self,
+        ns_url: &str,
+        _authorities: &[String],
+    ) -> Result<reqwest::Client, String> {
+        if !ns_url.trim().to_ascii_lowercase().starts_with("http://") {
+            return Err(format!(
+                "{ns_url}: this resolver reaches plaintext nameservers only"
+            ));
+        }
+        Ok(plaintext_client())
+    }
+}
+
+/// The client every nameserver request uses, before any TLS policy.
+pub fn plaintext_client() -> reqwest::Client {
+    nameserver_client_builder()
+        .build()
+        .expect("reqwest client construction")
+}
+
+/// Timeout and redirect policy for nameserver requests; a transport adds
+/// its TLS config.
+pub fn nameserver_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
 }
 
 #[derive(Debug, Clone)]
@@ -202,14 +258,18 @@ enum Answer {
     NotFound,
     Refused(NamingError),
     Malformed(String),
+    /// The transport refused the nameserver before anything was asked.
+    Untrusted(String),
     Unreachable,
 }
 
 impl NameserverResolver {
     pub fn new(
         delegations: BTreeMap<String, SuffixAuthority>,
+        refused: BTreeSet<String>,
         cache_ttl_seconds: u64,
         store: Arc<SqliteStore>,
+        transport: Arc<dyn NameserverTransport>,
     ) -> Self {
         Self {
             // Suffixes compare in the lowercase form `Name::parse` produces.
@@ -217,13 +277,11 @@ impl NameserverResolver {
                 .into_iter()
                 .map(|(suffix, d)| (suffix.to_ascii_lowercase(), d))
                 .collect(),
+            refused: refused.iter().map(|s| s.to_ascii_lowercase()).collect(),
             store,
             cache: RwLock::new(HashMap::new()),
             cache_ttl: Duration::from_secs(cache_ttl_seconds),
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .expect("reqwest client construction"),
+            transport,
             now: Arc::new(|| chrono::Utc::now().timestamp()),
         }
     }
@@ -233,6 +291,9 @@ impl NameserverResolver {
     pub async fn resolve(&self, alias: &str) -> Result<String, IdentityError> {
         // Before any request: a malformed alias never reaches a URL.
         let name = Name::parse(alias)?;
+        if self.refused.contains(&name.suffix) {
+            return Err(IdentityError::SuffixRefused(name.suffix));
+        }
         let key = name.as_alias();
         let now = (self.now)();
         {
@@ -257,21 +318,29 @@ impl NameserverResolver {
             // `Name::parse` admits only `[a-z0-9_-]`, `.` and one `@`, all
             // legal in a path segment, so the alias needs no escaping.
             let url = format!("{}/v1/resolve/{}", ns_url.trim_end_matches('/'), key);
-            let client = self.client.clone();
-            let name = name.clone();
+            let transport = self.transport.clone();
+            let (ns_url, name) = (ns_url.clone(), name.clone());
             let authorities = deleg.authorities.clone();
-            asks.spawn(async move { ask(&client, &url, &name, &authorities, now).await });
+            asks.spawn(async move {
+                let client = match transport.client(&ns_url, &authorities).await {
+                    Ok(client) => client,
+                    Err(reason) => return Answer::Untrusted(reason),
+                };
+                ask(&client, &url, &name, &authorities, now).await
+            });
         }
         let mut valid: Vec<Attestation> = Vec::new();
         let mut refused = None;
         let mut malformed = None;
         let mut not_found = false;
+        let mut untrusted = None;
         while let Some(answer) = asks.join_next().await {
             match answer.map_err(|e| IdentityError::Other(e.into()))? {
                 Answer::Valid(att) => valid.push(att),
                 Answer::NotFound => not_found = true,
                 Answer::Refused(e) => refused = refused.or(Some(e)),
                 Answer::Malformed(e) => malformed = malformed.or(Some(e)),
+                Answer::Untrusted(e) => untrusted = untrusted.or(Some(e)),
                 Answer::Unreachable => {}
             }
         }
@@ -281,6 +350,9 @@ impl NameserverResolver {
                 IdentityError::Naming(e)
             } else if not_found {
                 IdentityError::NotFound { alias: key }
+            } else if let Some(e) = untrusted {
+                tracing::warn!(alias = %key, "no nameserver could be trusted: {e}");
+                IdentityError::UntrustedNameserver(e)
             } else if let Some(e) = malformed {
                 IdentityError::MalformedResponse(e)
             } else {
@@ -608,8 +680,10 @@ mod tests {
         let clock = Arc::new(AtomicI64::new(NOW));
         let mut r = NameserverResolver::new(
             delegations("dj.jig", authorities, nameservers),
+            Default::default(),
             300,
             store.clone(),
+            Arc::new(LocalPlaintextNameservers),
         );
         let c = clock.clone();
         r.now = Arc::new(move || c.load(Ordering::SeqCst));
@@ -630,6 +704,29 @@ mod tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].root_id, "dj.jig");
         assert_eq!(kept[0].first_seen, NOW);
+    }
+
+    #[tokio::test]
+    async fn a_refused_suffix_is_refused_without_asking_its_nameservers() {
+        let (ns, alice) = (key(1), did_of(&key(9)));
+        let mock = MockNameserver::start().await;
+        mock.serve("dj@dj.jig", &attest(&ns, &alice, "dj@dj.jig", NOW + 100))
+            .await;
+        // A delegation that would resolve, as the built-in `jig` one would.
+        let r = NameserverResolver::new(
+            delegations("dj.jig", &[&ns], &[&mock]),
+            BTreeSet::from(["DJ.jig".to_string()]),
+            300,
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            Arc::new(LocalPlaintextNameservers),
+        );
+
+        let err = r.verify("dj@dj.jig", &alice).await.unwrap_err();
+        assert!(
+            matches!(err, IdentityError::SuffixRefused(ref s) if s == "dj.jig"),
+            "{err:?}"
+        );
+        assert_eq!(mock.hits(), 0, "nothing was asked");
     }
 
     #[tokio::test]
@@ -810,7 +907,13 @@ mod tests {
         mock.serve("dj@dj.jig", &attest(&ns, &alice, "dj@dj.jig", NOW + 100))
             .await;
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let mut r = NameserverResolver::new(delegations("DJ.jig", &[&ns], &[&mock]), 300, store);
+        let mut r = NameserverResolver::new(
+            delegations("DJ.jig", &[&ns], &[&mock]),
+            Default::default(),
+            300,
+            store,
+            Arc::new(LocalPlaintextNameservers),
+        );
         r.now = Arc::new(|| NOW);
         assert_eq!(r.resolve("dj@dj.jig").await.unwrap(), alice);
     }
@@ -883,6 +986,39 @@ mod tests {
         assert!(matches!(err, IdentityError::NotFound { .. }), "{err:?}");
     }
 
+    /// A nameserver the transport will not vouch for is never asked.
+    #[tokio::test]
+    async fn a_nameserver_the_transport_refuses_is_not_asked() {
+        let (ns, alice) = (key(1), did_of(&key(9)));
+        let mock = MockNameserver::start().await;
+        mock.serve("dj@dj.jig", &attest(&ns, &alice, "dj@dj.jig", NOW + 100))
+            .await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mut r = NameserverResolver::new(
+            delegations("dj.jig", &[&ns], &[&mock]),
+            Default::default(),
+            300,
+            store,
+            Arc::new(Refusing),
+        );
+        r.now = Arc::new(|| NOW);
+        let err = r.resolve("dj@dj.jig").await.unwrap_err();
+        assert!(
+            matches!(err, IdentityError::UntrustedNameserver(ref e) if e == "not vouched for"),
+            "{err:?}"
+        );
+        assert_eq!(mock.hits(), 0);
+    }
+
+    struct Refusing;
+
+    #[async_trait]
+    impl NameserverTransport for Refusing {
+        async fn client(&self, _: &str, _: &[String]) -> Result<reqwest::Client, String> {
+            Err("not vouched for".into())
+        }
+    }
+
     #[tokio::test]
     async fn nameserver_resolver_unreachable_when_no_nameservers_respond() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
@@ -894,7 +1030,13 @@ mod tests {
                 nameservers: vec!["http://127.0.0.1:1".to_string()],
             },
         )]);
-        let r = NameserverResolver::new(delegations, 300, store);
+        let r = NameserverResolver::new(
+            delegations,
+            Default::default(),
+            300,
+            store,
+            Arc::new(LocalPlaintextNameservers),
+        );
         let err = r.resolve("anyone@dj.jig").await.unwrap_err();
         assert!(
             matches!(err, IdentityError::AllNameserversUnreachable),

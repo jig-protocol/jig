@@ -45,16 +45,19 @@ Draft. Field names are provisional. The design behind this revision is
 
    | Field | Content | Threats |
    | --- | --- | --- |
-   | `server_did` | The signing key | OP-08 |
+   | `server_did` | The signing key, as a `did:jig` in its canonical lowercase spelling; a client MUST refuse any other spelling of it | OP-08 |
    | `v` | Chosen envelope version | OP-02 |
    | `suites` | Suites the server implements | OP-02, OP-03 |
    | `capabilities` | Allowed block kinds, limits (including `max_future_skew_ms`), features (execution, federation) | OP-02, TM-01 |
    | `reputation` | Placeholder object; `null` until JEP-0003 | OP-10 |
    | `manifest` | CID and `seq` of the server's current `server-manifest` block | OP-02, OP-03 |
+   | `key_link` | During a key change: the public key link (JEP-0012) from the server's old DID to `server_did`, signed by both keys; absent otherwise | OP-08 |
+   | `admit` | The work asked of a DID the server has not admitted, `{alg, effort, salt_id, expires_at}` (JEP-0008 rule 15); absent when admission asks none | AB-02 |
+   | `prior_key_links` | The server's earlier key links, oldest first, each leaving the DID the one before it moves to, so that with `key_link` last they form one chain to `server_did` (JEP-0012, "Following a chain"); absent when there are none | OP-08 |
    | `nonce` | Echo of the client's nonce | replayed `welcome` |
    | `server_nonce` | A fresh random value from the server | replayed `peer_proof` |
    | `tls_exporter` | 32 bytes exported from the TLS session (RFC 9266, label `EXPORTER-jig-handshake`); empty over plaintext | relayed handshake |
-   | `sig` | ed25519 over the above | OP-02 |
+   | `sig` | ed25519 over the above. The optional `key_link`, `admit` and `prior_key_links` come last, in that order, each only when present and each under its own tag (1, 2 and 3), so no two can be read as one another and a welcome without them signs what it did before they existed | OP-02 |
 
 3. If the server shares no version or suite with the `hello`, it sends a `refusal`
    instead of a `welcome`: a COSE_Sign1 (EdDSA) by `server_did` over a deterministic
@@ -89,7 +92,7 @@ Draft. Field names are provisional. The design behind this revision is
 
    | Class | Failure | Closes | Code |
    | --- | --- | --- | --- |
-   | Handshake failure | The `welcome` is missing, malformed or late (`WELCOME_WAIT`), its signature does not verify, `nonce` does not match, `server_did` is not the pinned DID, it contradicts itself or the offer, it no longer advertises a pinned suite, its skew bound is outside the protocol's range, or `tls_exporter` is empty on a TLS connection; a required `peer_proof` is missing or does not verify | The side that detects it | 4001 |
+   | Handshake failure | The `welcome` is missing, malformed or late (`WELCOME_WAIT`), its signature does not verify, `nonce` does not match, `server_did` is not the pinned DID and no `key_link` moves the pin to it (rule 14), it contradicts itself or the offer, it no longer advertises a pinned suite, its skew bound is outside the protocol's range, or `tls_exporter` is empty on a TLS connection; a required `peer_proof` is missing or does not verify | The side that detects it | 4001 |
    | Incompatible | No version or suite in common | The server, after its signed `refusal` | 4002 |
    | Contradiction | Behaviour that contradicts the signed `welcome` (rule 8), or a broken `ingest` chain (rule 9) | The client | 4003 |
    | Protocol violation | A frame before `hello`; a second `hello`; a client frame outside the version or suite it offered | The server, after an error frame | 4004 |
@@ -168,7 +171,15 @@ Draft. Field names are provisional. The design behind this revision is
 
 14. A client SHOULD pin, on its first verified `welcome` from a server, the
     `server_did`, the suites it advertised and its manifest-log chain. It MUST then
-    close on a `welcome` from another `server_did` (rule 7), and MUST treat a `welcome`
+    close on a `welcome` from another `server_did` (rule 7), unless the chain of
+    `prior_key_links` and then `key_link` moves the pinned DID to exactly that
+    `server_did`, as JEP-0012 "Following a chain" says: every link public and verified
+    under both its keys, from the link that leaves the pinned DID to the last. It then
+    moves its pin, and keeps the links it followed. A chain that does not reach back to
+    the pinned DID MUST be refused, with a reason that says the server changed its key
+    more than once or is not that server, and that pinning it anew is trust on first use
+    again; the client MUST NOT pin it without its user. The server MUST serve the same
+    links at `/.well-known/jig`, under the same names. It MUST treat a `welcome`
     that no longer advertises a pinned suite as a downgrade and refuse it. A server
     adding a suite is not a downgrade.
 15. A pinned name moves to a new DID automatically only with a rotation signed by the
@@ -178,9 +189,15 @@ Draft. Field names are provisional. The design behind this revision is
     records on both sides of any gap, and the class and code. The bundle holds no
     decrypted content, and is not signed by the user's key by default. It stays with the
     user. A client MUST refuse later connections to that server until the user accepts
-    it again. Only items the server signed may cause that refusal: timeouts, closed
-    connections and malformed frames never do, and neither does evidence imported from
-    others.
+    it again. Only items the server signed, and that show the contradiction on their own,
+    may cause that refusal: two `ingest` records that cannot both hold; a signed
+    `refusal` that drops a suite a signed `welcome` advertised; a signed `welcome` and the
+    `server-manifest` block and record it cites (rule 12) that disagree; or two key links
+    (JEP-0012) out of one DID the pin held, to two different DIDs, which show that
+    someone other than the server holds that key. Frames are not signed, so
+    a frame the welcome did not allow is kept as evidence but does not cause it. Timeouts,
+    closed connections and malformed frames never do, and neither does evidence imported
+    from others.
 17. A nameserver's list of abandoned or compromised servers is advisory. It MUST NOT
     override the sequencer an owner names in `sequencer-set`.
 

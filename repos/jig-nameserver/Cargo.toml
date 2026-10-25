@@ -16,7 +16,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 clap = { workspace = true, features = ["derive", "env"] }
 chrono = { workspace = true, features = ["serde"] }
-uuid = { workspace = true, features = ["v7", "serde"] }
 rusqlite = { workspace = true }
 ed25519-dalek = { workspace = true }
 # For challenge nonces and PoW salts only. Identity keygen goes through
@@ -24,13 +23,17 @@ ed25519-dalek = { workspace = true }
 # from this dependency. (`jig-client` has no `rand` at all for that reason; the
 # nameserver still needs it for the non-key randomness above.)
 rand = { workspace = true }
-blake3 = { workspace = true }
 axum = { workspace = true, features = ["macros"] }
 tower = { workspace = true, features = ["make", "util"] }
 tower-http = { workspace = true, features = ["cors", "trace"] }
-hyper = { workspace = true }
+hyper = { workspace = true, features = ["server", "http1"] }
+# [tls]: the listener.
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "logging",
+    "ring",
+    "tls12",
+] }
 hyper-util = { version = "0.1", features = ["server", "http1", "http2", "tokio"] }
-async-trait = { workspace = true }
 hex = { workspace = true }
 
 reqwest = { workspace = true }
@@ -42,23 +45,32 @@ hdrhistogram = { version = "7", optional = true }
 pprof = { version = "0.15", features = ["flamegraph"], optional = true }
 dirs = "7"
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
-cid.workspace = true
 jig-config = { workspace = true }
 jig-core = { workspace = true }
 
 # v0.0.2 hello-world milestone
-jig-pipeline = { path = "../jig-pipeline" }
+jig-pipeline = { path = "../jig-pipeline", default-features = false }
 jig-client = { path = "../jig-client" }
 shellexpand = "3"
 base64 = "0.23"
 
 [dev-dependencies]
+# Paused time for the registration pool's queue tests.
+tokio = { workspace = true, features = ["test-util"] }
+jig-client = { path = "../jig-client", features = ["test-support"] }
 serde_json = { workspace = true }
 http-body-util = { workspace = true }
 semver = { version = "1.0", features = ["serde"] }
 
+# tests/mdwe.rs: start the binary under prctl(PR_SET_MDWE).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
 [features]
 default = []
+# Test hooks (`SuffixPolicy::hold_pool`). Only integration-tests
+# enables it; ci.yml checks no release binary does.
+test-support = []
 # Profiling tools for performance analysis (not needed for core nameserver)
 profiling = ["dep:hdrhistogram", "dep:pprof"]
 

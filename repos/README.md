@@ -74,7 +74,6 @@ jig-server --config server.toml
 
 - **Runtime Architecture**: [jig-runtime/README.md](jig-runtime/README.md)
 - **Protocol Spec**: [jig-core/README.md](jig-core/README.md)
-- **CLI Integration**: [jig-cli/RUNTIME_INTEGRATION.md](jig-cli/RUNTIME_INTEGRATION.md)
 - **Server Integration**: [jig-server/src/runtime/mod.rs](jig-server/src/runtime/mod.rs)
 
 ---
@@ -84,7 +83,7 @@ jig-server --config server.toml
 ### Prerequisites
 
 - Rust 1.75+ (edition 2024)
-- WASM target: `rustup target add wasm32-wasi`
+- Wasm target for blocks: `rustup target add wasm32-unknown-unknown` (`jig block new` sets it in each block project)
 
 ### Workspace Structure
 

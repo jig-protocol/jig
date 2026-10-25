@@ -21,7 +21,12 @@ use crate::v0_0_2_rotate_renew::build_rotate_renew_router;
 const A: &str = "a.example.org";
 const B: &str = "b.example.org";
 
-fn state_with(suffixes: Vec<SuffixConfig>) -> Arc<AppState> {
+/// These tests are about suffix policy, not proof-of-work, so every suffix
+/// here asks for none; `v0_0_2_pow_tests` covers the work.
+fn state_with(mut suffixes: Vec<SuffixConfig>) -> Arc<AppState> {
+    for s in &mut suffixes {
+        s.pow = jig_config::v0_0_2_server::PowPolicy::off();
+    }
     Arc::new(AppState::for_test_with_suffixes(suffixes).unwrap())
 }
 
@@ -187,7 +192,12 @@ async fn policy_refusals_leave_the_challenge_usable() {
         );
         assert!(
             state
-                .take_challenge(&ch, &naming_did(&key), &format!("{local}@{suffix}"))
+                .take_challenge(
+                    &ch,
+                    &naming_did(&key),
+                    &format!("{local}@{suffix}"),
+                    jig_core::pow::Action::NsRegister
+                )
                 .await,
             "{local}: the challenge was not consumed"
         );

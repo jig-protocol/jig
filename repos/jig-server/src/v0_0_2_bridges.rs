@@ -264,8 +264,14 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         IngestError::DisallowedBlockKind { kind } => SubmitDenied::PolicyBlocked {
             reason: format!("disallowed block kind: {kind}"),
         },
+        IngestError::ManifestLog { reason } => SubmitDenied::PolicyBlocked {
+            reason: reason.clone(),
+        },
         IngestError::KindRequired => SubmitDenied::PolicyBlocked {
             reason: "block kind required".into(),
+        },
+        ref e @ IngestError::NonCanonicalDid { .. } => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
         },
         IngestError::InvalidSignature => SubmitDenied::PolicyBlocked {
             reason: "invalid signature".into(),
@@ -310,6 +316,8 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         | IngestError::MissingRight { .. }
         | IngestError::RootOwnerRole { .. }
         | IngestError::UnknownRole { .. }
+        | IngestError::SequencerOnly { .. }
+        | IngestError::BadContractBlock { .. }
         | IngestError::InvalidSlug { .. }) => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },

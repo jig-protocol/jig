@@ -1,7 +1,7 @@
 //! Executes `jig:block` components (JEP-0006, first-slice step 4).
 //!
 //! This is the one execution path the design commits server, client and CLI to (decision A4).
-//! It sits beside the byte-payload ABI (`payload.rs`) until that is deleted.
+//! The byte-payload ABI it replaced (`payload.rs`, ABI 1) has been deleted.
 //!
 //! What it does, per decisions A2 and A3:
 //!
@@ -32,6 +32,7 @@
 //!   of the validator's check of declared maxima.
 
 use jig_core::block_abi::{self, WitValue};
+use jig_core::block_receipt as receipt_outcome;
 use jig_core::component_validation::{BlockWorld, ComponentProfile, validate_component};
 use jig_core::grant::Grant;
 use std::time::Duration;
@@ -64,6 +65,18 @@ pub enum IncompleteReason {
     DeadlineExceeded,
     /// The host failed outside the guest's control.
     HostFault(String),
+}
+
+impl IncompleteReason {
+    /// The reason's name in a receipt (JEP-0006).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IncompleteReason::FuelExhausted => "fuel-exhausted",
+            IncompleteReason::StackExhausted => "stack-exhausted",
+            IncompleteReason::DeadlineExceeded => "deadline-exceeded",
+            IncompleteReason::HostFault(_) => "host-fault",
+        }
+    }
 }
 
 /// A trap every conforming engine raises at the same point of the same run (JEP-0006).
@@ -177,6 +190,40 @@ impl RunOutcome {
         };
         Some(block_abi::outcome_hash(&value).expect("block-ABI values always encode"))
     }
+}
+
+impl RunOutcome {
+    /// The outcome as an `exec` receipt states it: the class, the trap code if any, and the
+    /// outcome hash as raw bytes. A host fault's detail stays local; only its reason is signed.
+    pub fn to_receipt(&self) -> receipt_outcome::Outcome {
+        let hash = || hash_bytes(&self.hash().expect("a comparable outcome has a hash"));
+        match self {
+            RunOutcome::Ok(_) => receipt_outcome::Outcome::Ok { hash: hash() },
+            RunOutcome::Error(ErrorOutcome::Guest(_)) => receipt_outcome::Outcome::Error {
+                trap: None,
+                hash: hash(),
+            },
+            RunOutcome::Error(ErrorOutcome::Trap(code)) => receipt_outcome::Outcome::Error {
+                trap: Some(code.as_str().to_string()),
+                hash: hash(),
+            },
+            RunOutcome::Incomplete(reason) => receipt_outcome::Outcome::Incomplete {
+                reason: reason.as_str().to_string(),
+            },
+        }
+    }
+}
+
+/// `blake3:<hex>`, as `jig_core::block_abi` writes a hash, to the 32 bytes a receipt carries.
+pub fn hash_bytes(hash: &str) -> [u8; 32] {
+    let hex = hash
+        .strip_prefix("blake3:")
+        .expect("block_abi hashes are blake3:<hex>");
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).expect("block_abi hashes are hex");
+    }
+    out
 }
 
 /// The hash that identifies a run's input (JEP-0006): the `invocation` record, encoded
@@ -299,7 +346,14 @@ impl ComponentRuntime {
     /// A runtime on the given backend. Outcomes must not depend on the choice; the conformance
     /// vectors run on both.
     pub fn with_backend(backend: Backend) -> Result<Self> {
-        let mut config = deterministic_config(&RuntimeConfig::default())?;
+        Self::with_config(&RuntimeConfig::default(), backend)
+    }
+
+    /// A runtime under operator-supplied limits: `runtime_config`'s pooling ceilings and stack
+    /// size apply to this engine. Per-run fuel and
+    /// deadline come from [`RenderLimits`], not from here.
+    pub fn with_config(runtime_config: &RuntimeConfig, backend: Backend) -> Result<Self> {
+        let mut config = deterministic_config(runtime_config)?;
         if backend == Backend::Pulley {
             config
                 .target("pulley64")

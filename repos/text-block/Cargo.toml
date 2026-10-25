@@ -22,7 +22,9 @@ blake3 = { workspace = true }
 wit-bindgen = { version = "0.51", optional = true }
 
 [features]
-# Build the `jig:block/renderer@0.1.0` component (JEP-0006) instead of the byte-payload module.
+# The `jig:block/renderer@0.1.0` exports (JEP-0006). build-artifact.sh builds the core module
+# with this, then wraps it as a component; host builds leave it off, so they don't compile
+# wit-bindgen.
 component = ["dep:wit-bindgen"]
 
 [dev-dependencies]

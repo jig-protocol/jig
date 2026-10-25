@@ -3,8 +3,8 @@
 > **Encryption is per channel since v0.2.** This chapter's signature, hashing and key
 > management sections describe the protocol. Confidentiality is specified in
 > [Encryption](encryption.md): channels created under `mls` are end-to-end encrypted;
-> others are signed, not encrypted. Key storage at rest, rotation and revocation are not
-> yet implemented; those sections are marked.
+> others are signed, not encrypted. Keys are sealed at rest (see Storage below), and
+> rotation and revocation are not yet implemented; those sections are marked.
 
 **Audience:** This chapter is primarily for **protocol implementers** and **developers building on Jig**. If you're an **end user** or **server operator**, you don't need to understand the cryptographic details—just know that Jig uses modern, audited crypto that's the same stuff Signal, SSH, and WireGuard use.
 
@@ -54,18 +54,63 @@ This section is for **implementers** building Jig clients, servers, or libraries
 
 Your DID is derived from a long-term Ed25519 keypair:
 ```
-did:jig:<base58(public_key)>
+did:jig:z<base32(public_key)>
 ```
+The body is the 32-byte public key in RFC 4648 base32, lowercase and without padding: 52
+characters after the `z`. The `z` marks a key-derived DID; a DID without it is a legacy
+label that names no key.
 
 **Storage:**
-- Private keys MUST be stored encrypted at rest (OS keychain, hardware token, or encrypted file) *(not yet implemented: the CLI and server store raw Ed25519 keys in files, unencrypted, with 0600 permissions on Unix)*
-- Backups SHOULD use multiple mechanisms (paper backup + cloud + hardware key)
+- Private keys MUST be stored encrypted at rest. A key file (`.jigkey`) holds the 32-byte
+  seed sealed with XChaCha20-Poly1305 under a random per-key data key, and one or more
+  **slots**, each wrapping that data key under its own key-encryption key. Any one slot
+  opens the file. The header (version, DID, slots) is the associated data, so a slot cannot
+  be swapped or removed without the file failing to open. The slots:
+  - `keychain`: a random secret in the OS keychain (service `jig`, account the DID);
+  - `passphrase`: Argon2id (64 MiB, t=3, p=4 by default) over a passphrase of at least 8
+    characters, salted per slot;
+  - `credential`: at least 32 bytes read from a file that only its owner can read, such
+    as a systemd credential (`LoadCredentialEncrypted=`, TPM2-bound where the machine has
+    one);
+  - `env`: at least 32 bytes from an environment variable, for a secret manager.
+- **The CLI** seals each identity key in `~/.jig/keys/<did>.jigkey`, with the OS keychain
+  where there is one and a passphrase otherwise, and converts an older raw key file on
+  first load (#177). An identity's MLS state and read history are sealed under keys derived
+  from the same data key, one per file. `jig keys protect` lists the slots and adds or
+  removes one; removing the last is refused. Removing a slot changes only this file: the
+  data key stays, so a backup or synced copy made before still opens with the removed
+  slot. For a secret that may have leaked, move to a new key (`jig keys rotate`).
+- **jig-server and jig-nameserver** seal their own signing keys the same way (#254). A
+  server never prompts: `[keys] unlock` names a `credential:`, `env:` or `passphrase`
+  slot, and a server with nothing to open its key refuses to start rather than write one
+  in clear. `jig-server keys` (and `jig-nameserver keys`) seals a raw key, adds a slot,
+  verifies one, or makes a new key; `deploy/setup-server-key.sh` sets up a systemd
+  credential and an offline passphrase.
+- Keys in clear remain possible only by asking for them (`JIG_KEYS_STORAGE=plaintext`,
+  `[keys] storage = "plaintext"`), with a warning on every load. Key files are created
+  0600, and one that group or others can read is warned about (sealed) or refused (raw).
+- **What this does not protect against:** code running as the user, or as the server,
+  while a key is in use. Such code can ask the keychain, read a passphrase as it is typed,
+  read a credential, or read the key from memory, where it is while a process signs.
+  At-rest encryption protects a key that is not in use: on a stolen or discarded disk, in a
+  backup, in a synced home directory, or from another local user.
+- Backups SHOULD use more than one mechanism. A sealed key file is safe to back up as it
+  is; keep a passphrase slot, written down offline, so the key opens on another machine.
+  A keychain or TPM-bound slot does not move with the file.
+- **A recovery kit** (`jig keys export --out FILE`) is the key file with one slot of its
+  own: a passphrase of at least 12 characters, at the full Argon2id parameters whatever
+  the local slots use, because a kit is meant to leave the machine and can be attacked
+  offline. It is a `.jigkey` like any other, so `jig keys verify FILE` checks it and
+  `jig keys import FILE` restores it: the restored file keeps the kit's passphrase slot
+  and gains the slot the machine seals new keys with. The kit holds the same data key as the file it came from. Kits encrypted to an
+  age recipient (a hardware token, a team key) may be added later as another export
+  format, beside this one.
 
 **Rotation:**
 - Clients and servers MUST support key rotation (publishing new key signed by old key)
 - Rotation certificates MUST be published to nameserver and propagated via transparency log
 
-*(not yet implemented: a DID is its key, and nothing rotates it. The nameserver's `/v1/rotate` moves an alias to a new DID, with proofs from both keys; it is not a rotation certificate and no transparency log receives it.)*
+*(partial: a DID is its key, and no rotation certificate exists. A server whose key changes can serve a key link (JEP-0012) from its old DID to its new one, which clients follow to move their pin (#241); no tool makes the link yet. The nameserver's `/v1/rotate` moves an alias to a new DID, with proofs from both keys; it is not a rotation certificate and no transparency log receives it.)*
 
 **For end users:** Your keys = your identity. If you lose them, you lose your account. Back them up. If they're stolen, rotate immediately.
 
@@ -153,8 +198,11 @@ ed25519:v1:PkQx7TfHJ_3eLZ8YxH4YGJLXVJsJcZjYh7x_VJLXVJs
 Keys need to be rotated periodically (annual schedule) or immediately (after compromise).
 
 > **Not implemented.** No rotation certificate, `/v1/identity/rotate` endpoint, grace period
-> or revocation certificate exists. A server whose key changes has a new DID, and clients
-> that pinned the old one refuse it.
+> or revocation certificate exists. A server whose key changes has a new DID. What exists is
+> the key link (JEP-0012): `jig-server keys rotate` signs one from the old DID to the new
+> and keeps the earlier ones, the server serves them as a chain, and clients and peers
+> pinned on any DID in it follow every hop. A chain holds at most 16 links; a client pinned
+> on a DID the chain no longer reaches is refused.
 
 ### Rotation Certificate Format
 
@@ -287,7 +335,7 @@ chosen when it was created (`mls`). DMs are channels with locked membership, not
 - Constant-time operations (use vetted libraries)
 - Explicit algorithm negotiation (no silent downgrade)
 - Zeroize ephemeral secrets (explicit_bzero)
-- Support key rotation (dual-signature certificates) *(not yet implemented)*
+- Support key rotation (dual-signature certificates) *(partial: server key links, JEP-0012, #241)*
 
 **Test vectors:** See [Appendix § Test Vectors](appendix.md#test-vectors) for canonical examples.
 

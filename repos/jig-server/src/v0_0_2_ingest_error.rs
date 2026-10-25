@@ -31,11 +31,17 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
             "DISALLOWED_BLOCK_KIND",
             format!("kind not in allow list: {kind}"),
         ),
+        IngestError::ManifestLog { reason } => {
+            (StatusCode::FORBIDDEN, "MANIFEST_LOG", reason.clone())
+        }
         IngestError::KindRequired => (
             StatusCode::BAD_REQUEST,
             "KIND_REQUIRED",
             "manifest must declare block kind".to_string(),
         ),
+        IngestError::NonCanonicalDid { .. } => {
+            (StatusCode::BAD_REQUEST, "NON_CANONICAL_DID", e.to_string())
+        }
         IngestError::BundleMalformed(m) => (StatusCode::BAD_REQUEST, "BUNDLE_MALFORMED", m.clone()),
         IngestError::ManifestGate(gate) => (
             StatusCode::BAD_REQUEST,
@@ -130,6 +136,14 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
             (StatusCode::CONFLICT, "ROOT_OWNER_ROLE", e.to_string())
         }
         IngestError::UnknownRole { .. } => (StatusCode::BAD_REQUEST, "UNKNOWN_ROLE", e.to_string()),
+        // 403: only the channel's sequencer records what came of a share
+        // (JEP-0005 rule 10).
+        IngestError::SequencerOnly { .. } => {
+            (StatusCode::FORBIDDEN, "SEQUENCER_ONLY", e.to_string())
+        }
+        IngestError::BadContractBlock { .. } => {
+            (StatusCode::BAD_REQUEST, "BAD_CONTRACT_BLOCK", e.to_string())
+        }
         // 400: the slug is outside the canonical grammar or in a reserved
         // namespace (`#dm/`, `#jig/`, `#email/`) the author may not use.
         IngestError::InvalidSlug { .. } => (StatusCode::BAD_REQUEST, "INVALID_SLUG", e.to_string()),
@@ -188,7 +202,13 @@ mod tests {
             IngestError::DisallowedBlockKind {
                 kind: "widget".to_string(),
             },
+            IngestError::ManifestLog {
+                reason: "not the server".to_string(),
+            },
             IngestError::KindRequired,
+            IngestError::NonCanonicalDid {
+                field: "member_did".to_string(),
+            },
             IngestError::BundleMalformed("bad tuple".to_string()),
             IngestError::ManifestGate(jig_core::ManifestGateError::UnsupportedSchema(
                 "https://example.com/v9".to_string(),
@@ -283,6 +303,15 @@ mod tests {
             },
             IngestError::UnknownRole {
                 role: "owner".to_string(),
+            },
+            IngestError::SequencerOnly {
+                kind: "contract-accept".to_string(),
+                slug: "#room".to_string(),
+                sender: "did:jig:zMember".to_string(),
+            },
+            IngestError::BadContractBlock {
+                kind: "channel-share".to_string(),
+                detail: "`to` is missing".to_string(),
             },
             IngestError::InvalidSlug {
                 slug: "#General".to_string(),

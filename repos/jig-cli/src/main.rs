@@ -3,10 +3,6 @@
 mod channel_arg;
 mod cmd;
 mod config;
-mod receipt;
-
-#[cfg(feature = "local-runtime")]
-mod runtime;
 
 use anyhow::Result;
 use channel_arg::ChannelArg;
@@ -161,8 +157,7 @@ enum Commands {
         action: NsAction,
     },
 
-    /// Execute WASM blocks locally
-    #[cfg(feature = "local-runtime")]
+    /// Write, build, check and run blocks
     Block {
         #[command(subcommand)]
         action: BlockAction,
@@ -295,7 +290,36 @@ enum NsAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum EvidenceAction {
+    /// Every bundle kept, oldest first.
+    List,
+    /// One bundle, checked from what it holds.
+    Show { id: String },
+    /// One bundle as JSON, to a file or stdout, for someone else to check.
+    Export {
+        id: String,
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Check a bundle someone else made, and show it. Never refuses a server.
+    Import { file: std::path::PathBuf },
+}
+
+#[derive(Subcommand, Debug)]
 enum TrustAction {
+    /// Evidence kept against servers that contradicted what they signed.
+    Evidence {
+        #[command(subcommand)]
+        action: EvidenceAction,
+    },
+    /// Connect to `server` again after it signed a contradiction. Its pins
+    /// stay, and it is held to them.
+    Accept { server: String },
+    /// What this device pinned for a server, and the server's manifest log.
+    Show {
+        /// The server; the configured one when omitted.
+        server: Option<String>,
+    },
     /// Resolve `name` (alias@suffix), verify it, and pin it on first sight; a
     /// name that now resolves to another DID than the pinned one is refused.
     VerifyName {
@@ -356,45 +380,106 @@ enum ServerAction {
     },
 }
 
+// Parsed once per process; boxing `Run`'s fields would buy nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
-#[cfg(feature = "local-runtime")]
 enum BlockAction {
-    /// Run a WASM block locally and generate a receipt
+    /// Create a block project from a template
+    New {
+        /// The block's name: lowercase letters, digits and `-`
+        name: String,
+
+        /// The template to start from
+        #[arg(long, value_enum, default_value = "renderer")]
+        template: cmd::block_new::Template,
+
+        /// Write the project here instead of ./<name>
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
+
+    /// Build the block project in the current directory into a component, then lint it
+    Build {
+        /// The project directory
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+    },
+
+    /// Check a component against the determinism profile jig-det-1
+    Lint {
+        /// A block project directory (lints its built component), or a .wasm file
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+
+        /// The memory limit in 64 KiB pages, when linting a .wasm file directly
+        #[arg(long, default_value_t = cmd::block_project::DEFAULT_MEMORY_PAGES)]
+        max_memory_pages: u32,
+    },
+
+    /// Run a block once, locally: a block project, or a .wasm component, through the same
+    /// component path as the server and client. A core module is refused; `jig block build`
+    /// makes a component.
+    #[cfg(feature = "local-runtime")]
     Run {
-        /// Path to WASM file
+        /// A block project directory, or a .wasm file
+        #[arg(default_value = ".")]
         wasm: String,
 
-        /// Deterministic seed for RNG (for reproducible execution)
+        /// Component input: the message text
+        #[arg(long, conflicts_with = "input_file")]
+        input: Option<String>,
+
+        /// Component input: read the message body from this file
         #[arg(long)]
-        seed: Option<u64>,
+        input_file: Option<std::path::PathBuf>,
+
+        /// Component input: the body's media type
+        #[arg(long, default_value = "text/plain")]
+        media_type: String,
+
+        /// Component input: the sender's DID
+        #[arg(long)]
+        sender: Option<String>,
+
+        /// Component input: the channel CID
+        #[arg(long)]
+        channel: Option<String>,
+
+        /// Component input: the ingest sequence number
+        #[arg(long)]
+        seq: Option<u64>,
 
         /// Maximum fuel budget
         #[arg(long)]
         fuel: Option<u64>,
 
-        /// Maximum memory in MB
-        #[arg(long)]
-        memory: Option<u32>,
-
         /// Execution timeout in milliseconds
         #[arg(long)]
         timeout: Option<u64>,
 
-        /// Enable capability (can be specified multiple times)
-        #[arg(long = "cap")]
-        capabilities: Vec<String>,
-
-        /// Write receipt JSON to file
-        #[arg(long)]
-        receipt: Option<String>,
-
         /// Output as JSON instead of pretty format
         #[arg(long)]
         json: bool,
+    },
 
-        /// Enable pricing in receipt
+    /// Run a block project's vectors (tests/vectors/*.toml) and compare their outcomes
+    #[cfg(feature = "local-runtime")]
+    Test {
+        /// The project directory
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+
+        /// Record the outcome of every vector that has none, or whose outcome changed
         #[arg(long)]
-        pricing: bool,
+        bless: bool,
+
+        /// Maximum fuel per run
+        #[arg(long)]
+        fuel: Option<u64>,
+
+        /// Wall-clock limit per run, in milliseconds
+        #[arg(long)]
+        timeout: Option<u64>,
     },
 }
 
@@ -410,6 +495,39 @@ enum KeysAction {
         /// Nameserver base URL (e.g. http://127.0.0.1:7070).
         #[arg(long)]
         nameserver: String,
+    },
+
+    /// List what opens this identity's key, or add or remove one way.
+    /// Adding opens the key first, as any command does. Removing the last
+    /// way is refused.
+    Protect {
+        /// Add a slot: `passphrase` (asked twice, or JIG_KEY_NEW_PASSPHRASE),
+        /// `keychain`, `env:NAME` or `credential:PATH`.
+        #[arg(long, conflicts_with = "remove")]
+        add: Option<String>,
+        /// Remove the slot with this number, as the list shows it.
+        #[arg(long)]
+        remove: Option<usize>,
+    },
+
+    /// Write a recovery kit: a copy of this identity's key file opened by one
+    /// passphrase of its own (12+ characters, full-strength Argon2id). Keep
+    /// it offline; with its passphrase it is the identity.
+    Export {
+        /// Where to write the kit. Never overwritten.
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Restore an identity from a recovery kit into ~/.jig/keys, opened with
+    /// the kit's passphrase (JIG_KEY_KIT_PASSPHRASE, else asked).
+    Import {
+        /// The kit file.
+        kit: std::path::PathBuf,
+    },
+    /// Check that a recovery kit opens with its passphrase, and print its DID.
+    Verify {
+        /// The kit file.
+        kit: std::path::PathBuf,
     },
 
     /// Mint a fresh keypair and rotate the alias binding from the
@@ -428,14 +546,17 @@ enum KeysAction {
 
 #[derive(Subcommand, Debug)]
 enum ReceiptAction {
-    /// View a receipt from a file
+    /// Show a v0.3 block receipt from a file, once its signature verifies, with its signer and
+    /// whether that DID is a server this device pinned. The file holds the receipt's bytes, raw
+    /// or base64 (as the server delivers them in `receipt_bytes_b64`).
     View {
-        /// Path to the receipt JSON
+        /// Path to the receipt
         #[arg(long)]
         file: String,
     },
 
-    /// Compare two receipt files (for parity testing)
+    /// Compare two exec receipts on component, world, invocation and outcome, with each
+    /// signer's pin; a divergence exits non-zero
     Compare {
         /// First receipt file
         first: String,
@@ -443,6 +564,87 @@ enum ReceiptAction {
         /// Second receipt file
         second: String,
     },
+}
+
+/// `jig block new`, `build` and `lint`, or `None` for the block actions that need a config.
+// `global_json` is read only by `run`, which needs the `local-runtime` feature.
+#[cfg_attr(not(feature = "local-runtime"), allow(unused_variables))]
+fn run_local_block_action(action: &BlockAction, global_json: bool) -> Option<Result<()>> {
+    Some(match action {
+        BlockAction::New {
+            name,
+            template,
+            dir,
+        } => std::env::current_dir()
+            .map_err(anyhow::Error::from)
+            .and_then(|cwd| cmd::block_new::new_block(name, *template, &cwd, dir.as_deref()))
+            .map(|root| print!("{}", cmd::block_new::next_steps(&root))),
+        BlockAction::Build { path } => cmd::block_build::build(path).and_then(|built| {
+            println!("built {}", built.component.display());
+            println!("component {}", built.component_hash);
+            print!("{}", built.lint.render());
+            if built.lint.passes() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("the component does not pass jig-det-1"))
+            }
+        }),
+        BlockAction::Lint {
+            path,
+            max_memory_pages,
+        } => cmd::block_lint::lint_path(path, *max_memory_pages).and_then(|l| {
+            print!("{}", l.render());
+            if l.passes() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("the component does not pass jig-det-1"))
+            }
+        }),
+        #[cfg(feature = "local-runtime")]
+        BlockAction::Run {
+            wasm,
+            input,
+            input_file,
+            media_type,
+            sender,
+            channel,
+            seq,
+            fuel,
+            timeout,
+            json,
+        } => {
+            let target = match cmd::block_exec::load_target(std::path::Path::new(wasm)) {
+                Ok(t) => t,
+                Err(e) => return Some(Err(e)),
+            };
+            if !cmd::block_exec::is_component(&target.bytes) {
+                return Some(Err(anyhow::anyhow!(
+                    "{wasm} is a core module; `jig block build` makes a component"
+                )));
+            }
+            cmd::block_run::run_component(
+                &target,
+                cmd::block_run::ComponentRunArgs {
+                    input: input.as_deref(),
+                    input_file: input_file.as_deref(),
+                    media_type,
+                    sender: sender.as_deref(),
+                    channel: channel.as_deref(),
+                    seq: *seq,
+                    fuel: *fuel,
+                    timeout_ms: *timeout,
+                    json: *json || global_json,
+                },
+            )
+        }
+        #[cfg(feature = "local-runtime")]
+        BlockAction::Test {
+            path,
+            bless,
+            fuel,
+            timeout,
+        } => cmd::block_run::run_vectors(path, *bless, *fuel, *timeout),
+    })
 }
 
 /// Exit status when no key slot can seal a new identity key: no OS keychain,
@@ -475,6 +677,14 @@ async fn main() -> std::process::ExitCode {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+
+    // Writing, building and linting a block touch only local files: they need no config,
+    // identity or server, so they run before any of those is loaded.
+    if let Some(Commands::Block { action }) = &cli.command
+        && let Some(result) = run_local_block_action(action, cli.json)
+    {
+        return result;
+    }
 
     // Lift the global flags out of `cli` FIRST. Everything below reads
     // config through the resolved context, so `--server` / `--config` /
@@ -523,6 +733,12 @@ async fn run() -> Result<()> {
             KeysAction::Rotate { alias, nameserver } => {
                 cmd::keys::rotate(&ctx, cmd::keys::KeysRotateArgs { alias, nameserver }).await?;
             }
+            KeysAction::Protect { add, remove } => {
+                cmd::keys::protect(&ctx, add.as_deref(), remove)?;
+            }
+            KeysAction::Export { out } => cmd::keys::export(&ctx, &out)?,
+            KeysAction::Import { kit } => cmd::keys::import(&ctx, &kit)?,
+            KeysAction::Verify { kit } => cmd::keys::verify(&kit)?,
         }
         return Ok(());
     }
@@ -564,6 +780,22 @@ async fn run() -> Result<()> {
 
     if let Some(Commands::Trust { action }) = cli.command {
         match action {
+            TrustAction::Evidence { action } => match action {
+                EvidenceAction::List => cmd::trust::evidence_list()?,
+                EvidenceAction::Show { id } => cmd::trust::evidence_show(&id)?,
+                EvidenceAction::Export { id, out } => {
+                    cmd::trust::evidence_export(&id, out.as_deref())?;
+                }
+                EvidenceAction::Import { file } => cmd::trust::evidence_import(&file)?,
+            },
+            TrustAction::Accept { server } => cmd::trust::accept_server(&server)?,
+            TrustAction::Show { server } => {
+                let server = match server {
+                    Some(s) => s,
+                    None => ctx.server_url()?,
+                };
+                cmd::trust::show(&ctx.identity()?, &server).await?;
+            }
             TrustAction::VerifyName {
                 name,
                 nameserver,
@@ -658,12 +890,10 @@ async fn run() -> Result<()> {
     let direct_message = cli.message;
 
     // Every command below but the local ones talks to the server.
-    let local = match &cli.command {
-        Some(Commands::Receipt { .. }) => true,
-        #[cfg(feature = "local-runtime")]
-        Some(Commands::Block { .. }) => true,
-        _ => false,
-    };
+    let local = matches!(
+        &cli.command,
+        Some(Commands::Receipt { .. } | Commands::Block { .. })
+    );
     if !local {
         cmd::admission::ensure(&ctx).await?;
     }
@@ -711,37 +941,25 @@ async fn run() -> Result<()> {
             cmd::chat::run(&ctx, cmd::chat::ChatArgs { channel }).await?;
         }
         Some(Commands::Receipt { action }) => match action {
-            ReceiptAction::View { file } => cmd::receipt::view_receipt(&file, cli.json)?,
-            ReceiptAction::Compare { first, second } => {
-                cmd::receipt::compare_receipts(&first, &second)?
-            }
+            ReceiptAction::View { file } => cmd::receipt::view_receipt(
+                &file,
+                cli.json,
+                &jig_client::pins::Pins::default_path(),
+            )?,
+            ReceiptAction::Compare { first, second } => cmd::receipt::compare_receipts(
+                &first,
+                &second,
+                &jig_client::pins::Pins::default_path(),
+            )?,
         },
-        #[cfg(feature = "local-runtime")]
         Some(Commands::Block { action }) => match action {
-            BlockAction::Run {
-                wasm,
-                seed,
-                fuel,
-                memory,
-                timeout,
-                capabilities,
-                receipt,
-                json,
-                pricing,
-            } => {
-                use cmd::block_run::{RunBlockArgs, run_block};
-                run_block(RunBlockArgs {
-                    wasm_path: &wasm,
-                    seed,
-                    fuel,
-                    memory_mb: memory,
-                    timeout_ms: timeout,
-                    capabilities,
-                    receipt_out: receipt.as_deref(),
-                    json_output: json || cli.json,
-                    enable_pricing: pricing,
-                })?;
+            BlockAction::New { .. } | BlockAction::Build { .. } | BlockAction::Lint { .. } => {
+                unreachable!("handled before the config is loaded")
             }
+            #[cfg(feature = "local-runtime")]
+            BlockAction::Test { .. } => unreachable!("handled before the config is loaded"),
+            #[cfg(feature = "local-runtime")]
+            BlockAction::Run { .. } => unreachable!("handled before the config is loaded"),
         },
         Some(Commands::Init { .. }) => unreachable!("init handled earlier"),
         Some(Commands::Keys { .. }) => unreachable!("keys handled earlier"),

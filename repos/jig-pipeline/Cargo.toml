@@ -8,7 +8,9 @@ description = "Shared block ingest/effect/persist pipeline for jig-server and ji
 
 [dependencies]
 jig-core = { workspace = true }
-jig-runtime = { workspace = true }
+# The Wasm engine (wasmtime), behind `executor`. A build without it, such as jig-nameserver's,
+# links no JIT, so it can run under systemd's MemoryDenyWriteExecute.
+jig-runtime = { workspace = true, optional = true }
 # Validates the MLS payload of blocks on encrypted channels (`mls_gate`).
 jig-mls = { workspace = true }
 # The canonical text-render block: its embedded Wasm artifact, its module
@@ -34,6 +36,16 @@ hex = { workspace = true }
 cid = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
+
+[features]
+# Runs blocks: `executor::BlockExecutor` and the renders ingest does. On by default; jig-nameserver
+# turns it off, and CI checks that it links no wasmtime.
+default = ["executor"]
+executor = ["dep:jig-runtime"]
+# `BlockExecutor::shared` and `for_tests`, which sign operator policies with a fixed, public test
+# key. For other crates' tests only: enable it from `[dev-dependencies]`, never from
+# `[dependencies]`, so no server build can sign with that key.
+test-support = ["executor"]
 
 [dev-dependencies]
 # Registers the `test-aead` conformance suite for this crate's tests only.

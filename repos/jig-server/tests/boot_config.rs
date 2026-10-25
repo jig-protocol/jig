@@ -18,18 +18,48 @@ fn server_bin() -> &'static str {
     env!("CARGO_BIN_EXE_jig-server")
 }
 
-/// Spawn jig-server with an isolated HOME/cwd and an ephemeral port.
-fn spawn(home: &Path, args: &[&str]) -> Child {
-    Command::new(server_bin())
-        .args(args)
-        .args(["--bind", "127.0.0.1", "--port", "0"])
-        .current_dir(home)
+/// A fixed, public secret: test servers seal their keys with an env slot.
+const TEST_SECRET: &str = "jig-server boot tests: a fixed, public secret";
+
+/// jig-server with an isolated HOME/cwd, unlocking with [`TEST_SECRET`].
+fn server(home: &Path) -> Command {
+    let mut cmd = Command::new(server_bin());
+    cmd.current_dir(home)
         .env("HOME", home)
         .env("RUST_LOG", "info")
+        .env_remove("JIG_KEY_PASSPHRASE")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_SERVER_SECRET")
+        .env("JIG_TEST_SERVER_SECRET", TEST_SECRET)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+/// Spawn jig-server on an ephemeral port.
+fn spawn(home: &Path, args: &[&str]) -> Child {
+    server(home)
+        .args(args)
+        .args(["--bind", "127.0.0.1", "--port", "0"])
         .spawn()
         .expect("spawn jig-server")
+}
+
+/// Run to exit, failing if it outlives a bound; returns (success, stdout+stderr).
+fn run_to_exit(mut child: Child) -> (bool, String) {
+    let Some(status) = wait_bounded(&mut child, Duration::from_secs(15)) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "expected jig-server to exit\nstderr:\n{}",
+            drain_stderr(&mut child)
+        );
+    };
+    let mut out = String::new();
+    if let Some(mut o) = child.stdout.take() {
+        let _ = o.read_to_string(&mut out);
+    }
+    out.push_str(&drain_stderr(&mut child));
+    (status.success(), out)
 }
 
 fn drain_stderr(child: &mut Child) -> String {
@@ -149,6 +179,278 @@ fn a_v0_0_2_module_that_cannot_start_is_fatal() {
         stderr.contains("v0.0.2 module failed to initialize"),
         "the failure must say what failed; stderr was:\n{stderr}"
     );
+}
+
+#[test]
+fn a_first_boot_seals_its_key_and_writes_nothing_in_clear() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(&cfg, valid_config(dir.path())).unwrap();
+    let mut child = spawn(dir.path(), &["--config", cfg.to_str().unwrap()]);
+    assert_still_running(&mut child, "a valid --config must boot");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(dir.path().join("server.jigkey").exists());
+    assert!(
+        !dir.path().join("server.key").exists(),
+        "no raw key on disk"
+    );
+}
+
+#[test]
+fn a_new_key_with_nothing_to_seal_it_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(&cfg, valid_config(dir.path())).unwrap();
+    let child = server(dir.path())
+        .env_remove("JIG_KEY_UNLOCK")
+        .args([
+            "--config",
+            cfg.to_str().unwrap(),
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            "0",
+        ])
+        .spawn()
+        .unwrap();
+    let (ok, out) = run_to_exit(child);
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("[keys] unlock"),
+        "the refusal says what to set: {out}"
+    );
+    assert!(!dir.path().join("server.key").exists() && !dir.path().join("server.jigkey").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_raw_key_is_refused_until_sealed_and_keeps_its_did_after() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(&cfg, valid_config(dir.path())).unwrap();
+    let raw = dir.path().join("server.key");
+    std::fs::write(&raw, [9u8; 32]).unwrap();
+    std::fs::set_permissions(&raw, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let (ok, out) = run_to_exit(spawn(dir.path(), &["--config", cfg.to_str().unwrap()]));
+    assert!(!ok, "a raw key must not boot: {out}");
+    assert!(out.contains("jig-server keys seal"), "{out}");
+
+    let (ok, out) = run_to_exit(
+        server(dir.path())
+            .args(["--config", cfg.to_str().unwrap(), "keys", "seal"])
+            .args(["--slot", "env:JIG_TEST_SERVER_SECRET"])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(ok, "{out}");
+    let did = jig_core::Did::from_ed25519_pubkey(
+        ed25519_dalek::SigningKey::from_bytes(&[9u8; 32])
+            .verifying_key()
+            .as_bytes(),
+    )
+    .to_did_jig_string();
+    assert!(out.contains(&did), "seal keeps the DID: {out}");
+    assert!(!raw.exists(), "the raw key is removed");
+
+    let (ok, out) = run_to_exit(
+        server(dir.path())
+            .args(["--config", cfg.to_str().unwrap(), "keys", "show"])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(
+        ok && out.contains(&did) && out.contains("an env slot"),
+        "{out}"
+    );
+
+    let mut child = spawn(dir.path(), &["--config", cfg.to_str().unwrap()]);
+    assert_still_running(&mut child, "the sealed key boots");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// `keys generate` makes the key sealed, before the server first runs, and
+/// never replaces one.
+#[test]
+fn keys_generate_seals_a_new_key_that_boots_and_is_never_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(&cfg, valid_config(dir.path())).unwrap();
+    let generate = || {
+        run_to_exit(
+            server(dir.path())
+                .args(["--config", cfg.to_str().unwrap(), "keys", "generate"])
+                .args(["--slot", "env:JIG_TEST_SERVER_SECRET"])
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let (ok, out) = generate();
+    assert!(ok, "{out}");
+    let did = out
+        .split_whitespace()
+        .find(|w| w.starts_with("did:jig:"))
+        .expect("prints the DID")
+        .to_string();
+    assert!(dir.path().join("server.jigkey").exists());
+    assert!(!dir.path().join("server.key").exists(), "nothing in clear");
+
+    let (ok, out) = generate();
+    assert!(!ok && out.contains("never overwritten"), "{out}");
+
+    let (ok, out) = run_to_exit(
+        server(dir.path())
+            .args(["--config", cfg.to_str().unwrap(), "keys", "show"])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(ok && out.contains(&did), "the key was not replaced: {out}");
+
+    let mut child = spawn(dir.path(), &["--config", cfg.to_str().unwrap()]);
+    assert_still_running(&mut child, "the generated key boots");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Under a unit with credentials, `[keys] unlock` must name one of them: a
+/// `credential:` file elsewhere is a secret on disk, likely beside the key.
+#[test]
+fn under_a_unit_with_credentials_a_plain_secret_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(&cfg, valid_config(dir.path())).unwrap();
+    let creds = dir.path().join("credentials");
+    std::fs::create_dir(&creds).unwrap();
+    let outside = dir.path().join("beside-the-key");
+    std::fs::write(&outside, TEST_SECRET).unwrap();
+    let child = server(dir.path())
+        .env(
+            "JIG_KEY_UNLOCK",
+            format!("credential:{}", outside.display()),
+        )
+        .env("CREDENTIALS_DIRECTORY", &creds)
+        .args([
+            "--config",
+            cfg.to_str().unwrap(),
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            "0",
+        ])
+        .spawn()
+        .unwrap();
+    let (ok, out) = run_to_exit(child);
+    assert!(!ok, "{out}");
+    assert!(out.contains("CREDENTIALS_DIRECTORY"), "{out}");
+
+    // Nor may a path that only looks inside: one that climbs out, or a
+    // symlink in the directory that points out.
+    let climbing = creds.join("..").join("beside-the-key");
+    let link = creds.join("link-out");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let mut sneaky = vec![climbing];
+    if cfg!(unix) {
+        sneaky.push(link);
+    }
+    for path in sneaky {
+        let child = server(dir.path())
+            .env("JIG_KEY_UNLOCK", format!("credential:{}", path.display()))
+            .env("CREDENTIALS_DIRECTORY", &creds)
+            .args([
+                "--config",
+                cfg.to_str().unwrap(),
+                "--bind",
+                "127.0.0.1",
+                "--port",
+                "0",
+            ])
+            .spawn()
+            .unwrap();
+        let (ok, out) = run_to_exit(child);
+        assert!(!ok, "{} must count as outside: {out}", path.display());
+        assert!(out.contains("CREDENTIALS_DIRECTORY"), "{out}");
+    }
+
+    // One that systemd handed over is accepted (systemd makes them 0400).
+    let inside = creds.join("jig-server-key");
+    std::fs::write(&inside, TEST_SECRET).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&inside, std::fs::Permissions::from_mode(0o400)).unwrap();
+    }
+    let mut child = server(dir.path())
+        .env("JIG_KEY_UNLOCK", format!("credential:{}", inside.display()))
+        .env("CREDENTIALS_DIRECTORY", &creds)
+        .args([
+            "--config",
+            cfg.to_str().unwrap(),
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            "0",
+        ])
+        .spawn()
+        .unwrap();
+    assert_still_running(&mut child, "a credential from $CREDENTIALS_DIRECTORY boots");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Restoring on another machine: the config names the unit's credential,
+/// which does not exist while the unit is stopped. Boot refuses and says why;
+/// `keys add-slot` skips it and opens the key with what the environment
+/// offers (here the env slot, as a passphrase would be).
+#[cfg(unix)]
+#[test]
+fn add_slot_opens_the_key_when_the_units_credential_is_not_there() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(&cfg, valid_config(dir.path())).unwrap();
+    let mut child = spawn(dir.path(), &["--config", cfg.to_str().unwrap()]);
+    assert_still_running(&mut child, "first boot seals with the env slot");
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let missing = "/run/credentials/jig-server.service/not-here";
+    std::fs::write(
+        &cfg,
+        format!(
+            "{}\n[keys]\nunlock = \"credential:{missing}\"\n",
+            valid_config(dir.path())
+        ),
+    )
+    .unwrap();
+    let (ok, out) = run_to_exit(spawn(dir.path(), &["--config", cfg.to_str().unwrap()]));
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("LoadCredentialEncrypted"),
+        "boot says what is missing: {out}"
+    );
+
+    let new_cred = dir.path().join("this-machines-credential");
+    std::fs::write(&new_cred, "this machine's credential, at least 32 bytes").unwrap();
+    std::fs::set_permissions(&new_cred, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let (ok, out) = run_to_exit(
+        server(dir.path())
+            .args([
+                "--config",
+                cfg.to_str().unwrap(),
+                "keys",
+                "add-slot",
+                "--slot",
+            ])
+            .arg(format!("credential:{}", new_cred.display()))
+            .spawn()
+            .unwrap(),
+    );
+    assert!(ok, "add-slot opens the key with the env slot: {out}");
+    assert!(out.contains("an env slot, a credential slot"), "{out}");
 }
 
 #[test]

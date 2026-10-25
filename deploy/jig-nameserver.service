@@ -44,10 +44,17 @@ EnvironmentFile=-/etc/jig/jig-nameserver.env
 # `100.x.y.z` looked plausibly like an address and cost 600 restarts to spot.
 Environment=JIG_NS_BIND=REPLACE_WITH_TAILNET_IPV4
 Environment=JIG_NS_PORT=7070
+# Anchors the file names only: the nameserver keeps nameserver_v002.db and
+# nameserver_v002.key next to this path and never creates nameserver.db itself.
 Environment=JIG_NS_DB_PATH=/var/lib/jig/nameserver.db
 Environment=JIG_NS_CONFIG=/etc/jig/jig-nameserver.toml
 # Pin HOME so config discovery cannot wander into another account's ~/.jig.
 Environment=HOME=/var/lib/jig
+
+# The secret that opens the nameserver's sealed key (nameserver_v002.jigkey),
+# as for jig-server. Uncomment this AND [v0_0_2.keys] unlock in
+# jig-nameserver.toml together: either one alone fails the boot.
+#LoadCredentialEncrypted=jig-nameserver-key:/etc/credstore.encrypted/jig-nameserver-key
 
 ExecStart=/opt/jig/bin/jig-nameserver serve
 
@@ -71,7 +78,11 @@ LockPersonality=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 ReadWritePaths=/var/lib/jig
 
-# DELIBERATELY NOT SET: MemoryDenyWriteExecute — see jig-server.service.
+# W^X: no page may be writable and executable. jig-server cannot take this (its
+# Wasm JIT maps pages W then X); the nameserver runs no blocks and, built on its
+# own (`cargo build -p jig-nameserver`), links no Wasm engine. CI checks both
+# (jig-nameserver/tests/mdwe.rs and the "links no Wasm engine" step).
+MemoryDenyWriteExecute=yes
 CapabilityBoundingSet=
 
 [Install]

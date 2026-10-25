@@ -109,10 +109,112 @@ struct ServerInfoResponse {
     /// (`POST /api/v1/admission`). Absent when it asks for none.
     #[serde(skip_serializing_if = "Option::is_none")]
     admission_pow_bits: Option<u8>,
+    /// The same, as JEP-0008 asks for it: the `admit` action's algorithm,
+    /// effort and salt. An unsigned hint until the signed welcome carries it
+    /// (rule 15). Absent when the server asks for no work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admission_pow: Option<AdmissionPowHint>,
     /// The server DID's signature over the TLS certificate it serves, so a
     /// client can trust a certificate no CA issued. Absent over plaintext.
     #[serde(skip_serializing_if = "Option::is_none")]
     tls_binding: Option<jig_core::tls_binding::TlsBinding>,
+    /// The peer policy the signed server manifest publishes (JEP-0005 rule
+    /// 16), unsigned. Absent when the v0.0.2 module is not active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_policy: Option<PeerPolicyInfo>,
+    /// During a key change: the public link from the server's old DID to
+    /// `server_did` (JEP-0012), base64 COSE_Sign. Clients that pinned the old
+    /// DID follow it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_link: Option<String>,
+    /// The links before `key_link`, oldest first, base64 COSE_Sign: with it,
+    /// one chain from an earlier DID to `server_did` (JEP-0012).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    prior_key_links: Vec<String>,
+}
+
+/// [`jig_pipeline::server_manifest::PeerPolicy`] as JSON.
+#[derive(Serialize, Debug, PartialEq)]
+struct PeerPolicyInfo {
+    relayed_kinds: Vec<String>,
+    default_peer_quota: QuotaInfo,
+    peer_quotas: Vec<PeerQuotaInfo>,
+    peers: Vec<String>,
+    attested_suffixes: Vec<AttestedSuffixInfo>,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+struct QuotaInfo {
+    blocks_per_min: u64,
+    bytes_per_min: u64,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+struct PeerQuotaInfo {
+    peer: String,
+    blocks_per_min: u64,
+    bytes_per_min: u64,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+struct AttestedSuffixInfo {
+    suffix: String,
+    root: &'static str,
+    domain: String,
+}
+
+impl PeerPolicyInfo {
+    /// Built from the manifest's own policy, so the two cannot disagree.
+    fn of(state: &crate::v0_0_2::AppState) -> Self {
+        use jig_pipeline::server_manifest::AttestedSuffix;
+        let policy = crate::v0_0_2_manifest_log::current(state).peer_policy;
+        Self {
+            relayed_kinds: policy.relayed_kinds,
+            default_peer_quota: QuotaInfo {
+                blocks_per_min: policy.default_peer_quota.blocks_per_min,
+                bytes_per_min: policy.default_peer_quota.bytes_per_min,
+            },
+            peer_quotas: policy
+                .peer_quotas
+                .into_iter()
+                .map(|q| PeerQuotaInfo {
+                    peer: q.peer,
+                    blocks_per_min: q.quota.blocks_per_min,
+                    bytes_per_min: q.quota.bytes_per_min,
+                })
+                .collect(),
+            peers: policy.peers,
+            attested_suffixes: policy
+                .attested_suffixes
+                .into_iter()
+                .filter_map(|s| match s {
+                    AttestedSuffix::Dns { suffix, domain } => Some(AttestedSuffixInfo {
+                        suffix,
+                        root: "dns",
+                        domain,
+                    }),
+                    // The server publishes no contract root before v0.3.
+                    AttestedSuffix::Contract { .. } => None,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize, Clone)]
+pub struct AdmissionPowHint {
+    pub alg: jig_core::pow::Alg,
+    pub effort: u64,
+    pub salt_id: u64,
+}
+
+/// The `admit` work a `pow_bits` setting asks for, as JEP-0008 states it.
+fn admission_pow_hint(bits: Option<u8>) -> Option<AdmissionPowHint> {
+    bits.map(|bits| AdmissionPowHint {
+        alg: jig_core::pow::Alg::Blake3,
+        effort: jig_core::admission_pow::effort_for_bits(bits).get(),
+        salt_id: jig_core::pow::EMPTY_SALT_ID,
+    })
 }
 
 #[derive(Serialize, Clone)]
@@ -197,10 +299,29 @@ async fn server_info(State(state): State<AppState>) -> Json<ServerInfoResponse> 
         peers,
         bridges,
         admission_pow_bits: state.v0_0_2.as_ref().and_then(|v| v.auth.pow_bits()),
+        admission_pow: admission_pow_hint(state.v0_0_2.as_ref().and_then(|v| v.auth.pow_bits())),
         tls_binding: state
             .v0_0_2
             .as_ref()
             .and_then(|v| v.tls_binding.get().cloned()),
+        peer_policy: state.v0_0_2.as_deref().map(PeerPolicyInfo::of),
+        key_link: state.v0_0_2.as_ref().and_then(|v| {
+            use base64::Engine as _;
+            v.key_link
+                .as_ref()
+                .map(|l| base64::engine::general_purpose::STANDARD.encode(l))
+        }),
+        prior_key_links: state
+            .v0_0_2
+            .as_ref()
+            .map(|v| {
+                use base64::Engine as _;
+                v.prior_key_links
+                    .iter()
+                    .map(|l| base64::engine::general_purpose::STANDARD.encode(l))
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -216,6 +337,16 @@ mod tests {
     /// one — so the advertised origin is pinned by tests.
     fn advertised_http(cfg: ServerConfig) -> String {
         advertised_origin(&cfg)
+    }
+
+    #[test]
+    fn the_admission_hint_states_the_effort_jep_0008_asks_for() {
+        assert!(admission_pow_hint(None).is_none());
+        let hint = serde_json::to_value(admission_pow_hint(Some(20))).unwrap();
+        assert_eq!(
+            hint,
+            serde_json::json!({ "alg": 1, "effort": 1u64 << 20, "salt_id": 0 })
+        );
     }
 
     #[test]
@@ -429,6 +560,45 @@ mod tests {
         assert!(body.peers.is_empty());
         // default config has no bridges configured (deny-by-default)
         assert!(body.bridges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn server_info_mirrors_the_manifests_peer_policy() {
+        let config = crate::v0_0_2_manifest_log::tests::policy_config();
+        let v002 = Arc::new(crate::v0_0_2::AppState::for_test_with_config(config).unwrap());
+        let manifest = crate::v0_0_2_manifest_log::current(&v002).peer_policy;
+        let state = AppState {
+            config: ServerConfig::default(),
+            v0_0_2: Some(v002),
+        };
+        let body = serde_json::to_value(server_info(State(state)).await.0).unwrap();
+        let quota = |q: jig_pipeline::server_manifest::Quota| serde_json::json!({ "blocks_per_min": q.blocks_per_min, "bytes_per_min": q.bytes_per_min });
+        let expected = serde_json::json!({
+            "relayed_kinds": manifest.relayed_kinds,
+            "default_peer_quota": quota(manifest.default_peer_quota),
+            "peer_quotas": manifest.peer_quotas.iter().map(|q| serde_json::json!({
+                "peer": q.peer,
+                "blocks_per_min": q.quota.blocks_per_min,
+                "bytes_per_min": q.quota.bytes_per_min,
+            })).collect::<Vec<_>>(),
+            "peers": manifest.peers,
+            "attested_suffixes": manifest.attested_suffixes.iter().map(|s| match s {
+                jig_pipeline::server_manifest::AttestedSuffix::Dns { suffix, domain } =>
+                    serde_json::json!({ "suffix": suffix, "root": "dns", "domain": domain }),
+                other => panic!("no contract root yet: {other:?}"),
+            }).collect::<Vec<_>>(),
+        });
+        assert_eq!(body["peer_policy"], expected);
+        // Not vacuous: the fixture publishes something in every field.
+        assert_eq!(body["peer_policy"]["peers"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            body["peer_policy"]["peer_quotas"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            body["peer_policy"]["attested_suffixes"][0]["domain"],
+            "names.example.org"
+        );
     }
 
     #[tokio::test]

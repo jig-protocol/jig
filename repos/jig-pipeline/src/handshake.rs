@@ -204,12 +204,70 @@ impl Default for ClientOffer {
 }
 
 /// Facts the server puts in the welcome, aside from the key it signs with.
+/// The `server-manifest` block a welcome cites (JEP-0002 rule 12): its CID
+/// and its `seq` in the server's manifest log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestRef {
+    pub cid: String,
+    pub seq: u64,
+}
+
+/// Work a verifier asks for one action (JEP-0008 rules 15, 16): what a
+/// proof must bid, under which algorithm and salt, until when.
+///
+/// The fields stay plain numbers on the wire, so a welcome naming an
+/// algorithm this build lacks still parses; [`PowOffer::alg`] and
+/// [`PowOffer::effort`] say what this build can do with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PowOffer {
+    /// The registered algorithm id (JEP-0008 rule 8).
+    pub alg: u8,
+    /// The effort a proof must bid. Zero asks no work (rule 17).
+    pub effort: u64,
+    /// The salt a proof must be made under: 0 for the empty salt.
+    pub salt_id: u64,
+    /// Unix seconds until which the verifier accepts a proof at `effort`.
+    pub expires_at: i64,
+}
+
+impl PowOffer {
+    /// The algorithm, when this build implements it.
+    pub fn alg(&self) -> Option<jig_core::pow::Alg> {
+        jig_core::pow::Alg::from_id(self.alg)
+    }
+
+    /// The effort to bid, or `None` when no work is asked.
+    pub fn effort(&self) -> Option<std::num::NonZeroU64> {
+        std::num::NonZeroU64::new(self.effort)
+    }
+
+    fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        push(&mut out, &[self.alg]);
+        push(&mut out, &self.effort.to_le_bytes());
+        push(&mut out, &self.salt_id.to_le_bytes());
+        push(&mut out, &self.expires_at.to_le_bytes());
+        out
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServerOffer {
     pub capabilities: Capabilities,
+    /// The current manifest; `None` until the server has published one.
+    pub manifest: Option<ManifestRef>,
+    /// During a key change: the dual-signed public link from the server's
+    /// old DID to this one (JEP-0012), as COSE_Sign bytes.
+    pub key_link: Option<Vec<u8>>,
+    /// The links before `key_link`, oldest first: with it, one chain from an
+    /// earlier DID to this one.
+    pub prior_key_links: Vec<Vec<u8>>,
     /// The TLS exporter value of the connection being answered; empty over
     /// plaintext.
     pub tls_exporter: Vec<u8>,
+    /// The work asked of a DID this server has not admitted (JEP-0008
+    /// rule 15); `None` when admission asks none.
+    pub admit: Option<PowOffer>,
 }
 
 /// The client's hello, after it has parsed.
@@ -236,6 +294,13 @@ pub struct WelcomeStatement {
     pub server_nonce: String,
     /// base64, as on the wire; empty over plaintext.
     pub tls_exporter: String,
+    pub manifest: Option<ManifestRef>,
+    /// base64 COSE_Sign of a public key link to `server_did`.
+    pub key_link: Option<String>,
+    /// The admission work asked of a DID the server has not admitted.
+    pub admit: Option<PowOffer>,
+    /// base64 COSE_Sign of the links before `key_link`, oldest first.
+    pub prior_key_links: Vec<String>,
 }
 
 impl WelcomeStatement {
@@ -253,6 +318,33 @@ impl WelcomeStatement {
         push(&mut out, self.nonce.as_bytes());
         push(&mut out, self.server_nonce.as_bytes());
         push(&mut out, self.tls_exporter.as_bytes());
+        match &self.manifest {
+            None => push(&mut out, &[0]),
+            Some(m) => {
+                push(&mut out, &[1]);
+                push(&mut out, m.cid.as_bytes());
+                push(&mut out, &m.seq.to_le_bytes());
+            }
+        }
+        // The last field, and only when present: a welcome without a link
+        // signs the same bytes as before links existed, so welcomes kept
+        // verbatim (pins, evidence bundles) still verify.
+        if let Some(link) = &self.key_link {
+            push(&mut out, &[1]);
+            push(&mut out, link.as_bytes());
+        }
+        // After the link, under its own tag, and likewise only when present.
+        if let Some(admit) = &self.admit {
+            push(&mut out, &[2]);
+            push(&mut out, &admit.canonical_bytes());
+        }
+        // After both, under a tag of its own and only when there are any, so
+        // a welcome with one link (and admission work or not) signs what it
+        // did before chains.
+        if !self.prior_key_links.is_empty() {
+            push(&mut out, &[3]);
+            push(&mut out, &canonical_list(&self.prior_key_links));
+        }
         out
     }
 
@@ -264,6 +356,16 @@ impl WelcomeStatement {
         }
         if !self.suites.iter().any(|suite| suite == &self.frame_suite) {
             return Some("welcome is carried under a suite it does not advertise");
+        }
+        if self.key_link.is_none() && !self.prior_key_links.is_empty() {
+            return Some("welcome carries earlier key links but no key link to its own DID");
+        }
+        // Admission work is made under the empty salt (JEP-0008 rule 13).
+        if self
+            .admit
+            .is_some_and(|admit| admit.salt_id != jig_core::pow::EMPTY_SALT_ID)
+        {
+            return Some("welcome asks admission work under a salt admission does not use");
         }
         None
     }
@@ -364,6 +466,14 @@ pub struct VerifiedWelcome {
     pub server_nonce: String,
     /// The TLS exporter value the welcome is bound to; empty over plaintext.
     pub tls_exporter: Vec<u8>,
+    pub manifest: Option<ManifestRef>,
+    /// The admission work the server asks of a DID it has not admitted,
+    /// signed (JEP-0008 rule 15). `None` when it asks none, or predates it.
+    pub admit: Option<PowOffer>,
+    /// Set when the welcome is signed by another DID than the pinned one and
+    /// carries a public key link from the pinned DID to it, signed by both
+    /// keys: the pinned DID it moved from. The caller moves its pin.
+    pub moved_from: Option<String>,
     /// The frame text, kept so a later contradiction has something to show.
     pub evidence: String,
 }
@@ -425,7 +535,13 @@ impl PendingHello {
                 };
             }
         };
-        interpret_envelope(&env, text, &self.nonce, &self.offer, tls_exporter)
+        interpret_envelope(
+            &env,
+            text,
+            &self.nonce,
+            &self.offer,
+            Binding::Live(tls_exporter),
+        )
     }
 }
 
@@ -506,6 +622,14 @@ pub fn negotiate(
         nonce: hello.nonce.clone(),
         server_nonce: fresh_nonce(),
         tls_exporter: STANDARD.encode(&server.tls_exporter),
+        manifest: server.manifest.clone(),
+        key_link: server.key_link.as_ref().map(|l| STANDARD.encode(l)),
+        admit: server.admit,
+        prior_key_links: server
+            .prior_key_links
+            .iter()
+            .map(|l| STANDARD.encode(l))
+            .collect(),
     })
 }
 
@@ -525,6 +649,10 @@ pub fn seal(key: &SigningKey, mut statement: WelcomeStatement) -> Envelope {
         nonce: statement.nonce,
         server_nonce: statement.server_nonce,
         tls_exporter: statement.tls_exporter,
+        manifest: statement.manifest,
+        key_link: statement.key_link,
+        admit: statement.admit,
+        prior_key_links: statement.prior_key_links,
         sig,
     })
 }
@@ -593,15 +721,49 @@ pub fn seal_refusal(key: &SigningKey, refusal: &HelloRefusal, nonce: &str) -> En
     })
 }
 
-/// Whether two DID strings name the same key. Unparseable strings name
-/// nothing, so they match nothing.
+/// Whether two DID strings name the same key. A key has one spelling
+/// ([`Did::from_did_jig_string`] refuses any other), so this is string
+/// equality, and a string that is not a canonical DID matches nothing. A DID
+/// a person typed is canonicalized where it is read ([`Did::canonicalize`]).
 pub fn same_did(a: &str, b: &str) -> bool {
-    let key = |s: &str| {
-        Did::from_did_jig_string(s)
-            .and_then(|did| did.as_bytes())
-            .ok()
+    a == b && Did::from_did_jig_string(a).is_ok()
+}
+
+/// Check a kept welcome or refusal frame, long after its connection, as
+/// signed by `server_did`: its format, its signature and its own
+/// consistency, as [`PendingHello::interpret`] does, except that the nonce is
+/// taken from the frame. That proves the server signed it, not when or to
+/// whom: evidence bundles hold frames this way.
+pub fn verify_offline(text: &str, server_did: &str) -> HandshakeResult {
+    let env = match Envelope::parse(text) {
+        Ok(env) => env,
+        Err(e) => {
+            return HandshakeResult::FailClosed {
+                reason: format!("not a frame this build reads: {e}"),
+                evidence: Some(text.to_string()),
+            };
+        }
     };
-    matches!((key(a), key(b)), (Some(a), Some(b)) if a == b)
+    let nonce = match &env.frame {
+        Frame::Welcome { nonce, .. } | Frame::Refusal { nonce, .. } => nonce.clone(),
+        other => {
+            return HandshakeResult::FailClosed {
+                reason: format!("{} is not a signed handshake frame", frame_name(other)),
+                evidence: Some(text.to_string()),
+            };
+        }
+    };
+    let mut offer = ClientOffer {
+        versions: vec![u64::from(env.v)],
+        suites: vec![env.suite.as_str().to_string()],
+        pinned_server_did: Some(server_did.to_string()),
+        ..ClientOffer::default()
+    };
+    if let Frame::Welcome { suites, .. } = &env.frame {
+        offer.suites.extend(suites.iter().cloned());
+    }
+    // The session it was bound to is long gone: only the signature counts.
+    interpret_envelope(&env, text, &nonce, &offer, Binding::OfflineEvidence)
 }
 
 fn interpret_refusal(
@@ -678,12 +840,24 @@ fn interpret_refusal(
     })
 }
 
+/// What a welcome's `tls_exporter` is held to.
+#[derive(Debug, Clone, Copy)]
+enum Binding<'a> {
+    /// A connection being made, whose TLS exporter value (empty over
+    /// plaintext) the welcome must be bound to exactly.
+    Live(&'a [u8]),
+    /// A frame kept as evidence, whose session is long gone: only its
+    /// signature can be checked. [`verify_offline`] alone uses this; a
+    /// connection never does.
+    OfflineEvidence,
+}
+
 fn interpret_envelope(
     env: &Envelope,
     text: &str,
     nonce: &str,
     offer: &ClientOffer,
-    tls_exporter: &[u8],
+    binding: Binding<'_>,
 ) -> HandshakeResult {
     let Frame::Welcome {
         server_did,
@@ -693,6 +867,10 @@ fn interpret_envelope(
         nonce: echoed,
         server_nonce,
         tls_exporter: bound_to,
+        manifest,
+        key_link,
+        admit,
+        prior_key_links,
         sig,
     } = &env.frame
     else {
@@ -716,6 +894,10 @@ fn interpret_envelope(
         nonce: echoed.clone(),
         server_nonce: server_nonce.clone(),
         tls_exporter: bound_to.clone(),
+        manifest: manifest.clone(),
+        key_link: key_link.clone(),
+        admit: *admit,
+        prior_key_links: prior_key_links.clone(),
     };
 
     if echoed != nonce {
@@ -752,11 +934,29 @@ fn interpret_envelope(
             evidence: Some(text.to_string()),
         };
     }
+    // Another DID than the pinned one only through a public link the pinned
+    // key signed to it (JEP-0002 rule 14, JEP-0012).
+    let mut moved_from = None;
     if let Some(reason) = pin_mismatch(server_did, offer.pinned_server_did.as_deref()) {
-        return HandshakeResult::FailClosed {
-            reason,
-            evidence: Some(text.to_string()),
-        };
+        let pinned = offer.pinned_server_did.as_deref().unwrap_or_default();
+        match key_link.as_ref().map(|newest| {
+            let chain: Vec<String> = prior_key_links.iter().chain([newest]).cloned().collect();
+            chain_moves(&chain, pinned, server_did)
+        }) {
+            Some(Ok(_)) => moved_from = Some(pinned.to_string()),
+            Some(Err(why)) => {
+                return HandshakeResult::FailClosed {
+                    reason: format!("{reason}, and its key link does not move it: {why}"),
+                    evidence: Some(text.to_string()),
+                };
+            }
+            None => {
+                return HandshakeResult::FailClosed {
+                    reason,
+                    evidence: Some(text.to_string()),
+                };
+            }
+        }
     }
     let Ok(bound) = STANDARD.decode(bound_to) else {
         return HandshakeResult::FailClosed {
@@ -766,7 +966,9 @@ fn interpret_envelope(
     };
     // The welcome must be bound to this TLS session: one signed for another
     // session was relayed by whatever terminated TLS in between.
-    if bound != tls_exporter {
+    if let Binding::Live(tls_exporter) = binding
+        && bound != tls_exporter
+    {
         let reason = match (bound.is_empty(), tls_exporter.is_empty()) {
             (true, false) => "the welcome is not bound to a TLS session, but this one is TLS",
             (false, true) => "the welcome is bound to a TLS session this connection is not",
@@ -787,6 +989,9 @@ fn interpret_envelope(
         nonce: echoed.clone(),
         server_nonce: server_nonce.clone(),
         tls_exporter: bound,
+        manifest: manifest.clone(),
+        admit: *admit,
+        moved_from,
         evidence: text.to_string(),
     })
 }
@@ -850,6 +1055,108 @@ fn outside_offer(statement: &WelcomeStatement, offer: &ClientOffer) -> Option<&'
     None
 }
 
+/// The most key links a client follows from its pin, and a server serves.
+pub const MAX_KEY_LINK_HOPS: usize = 16;
+
+/// Whether the base64 key link `link_b64` moves `pinned` to `presented`: a
+/// chain of one ([`chain_moves`]).
+pub fn link_moves(link_b64: &str, pinned: &str, presented: &str) -> Result<(), String> {
+    chain_moves(&[link_b64.to_string()], pinned, presented).map(|_| ())
+}
+
+/// Whether `chain`, base64 key links oldest first, moves `pinned` to
+/// `presented`, hop by hop (JEP-0012): every link verifies under both its
+/// keys and is for everyone; each leaves the DID the one before moved to;
+/// no two leave the same DID (that would be a fork); the last moves to
+/// exactly `presented`; and one of them leaves the pinned DID. Returns the
+/// links from that one on: the hops this device follows, to keep.
+///
+/// `presented` comes from something the server signed, and a link's DIDs are
+/// canonical, so they are compared as written: another spelling of the same
+/// key is refused. `pinned` may be a local spelling, so it is compared by key.
+/// A chain that does not reach back to the pin is refused by name
+/// ([`rotated_past`]).
+pub fn chain_moves(chain: &[String], pinned: &str, presented: &str) -> Result<Vec<String>, String> {
+    let links = verified_chain(chain, presented)?;
+    match links.iter().position(|l| same_did(&l.old, pinned)) {
+        Some(i) => Ok(chain[i..].to_vec()),
+        None => Err(rotated_past(pinned, &links[0].old)),
+    }
+}
+
+/// The links of `chain`, checked as [`chain_moves`] checks them, apart from
+/// where the pin is.
+fn verified_chain(
+    chain: &[String],
+    presented: &str,
+) -> Result<Vec<jig_core::key_link::KeyLink>, String> {
+    use jig_core::key_link::{Audience, SignedKeyLink};
+    if chain.is_empty() {
+        return Err("there is no key link".to_string());
+    }
+    if chain.len() > MAX_KEY_LINK_HOPS {
+        return Err(format!(
+            "it serves {} key links, more than the {MAX_KEY_LINK_HOPS} a client follows",
+            chain.len()
+        ));
+    }
+    let mut links = Vec::with_capacity(chain.len());
+    for link_b64 in chain {
+        let bytes = STANDARD
+            .decode(link_b64)
+            .map_err(|_| "a key link is not base64".to_string())?;
+        let signed = SignedKeyLink::from_envelope(&bytes).map_err(|e| e.to_string())?;
+        if signed.link().audience != Audience::Public {
+            return Err("a key link is not a public one".to_string());
+        }
+        links.push(signed.link().clone());
+    }
+    for pair in links.windows(2) {
+        if pair[0].new != pair[1].old {
+            return Err(format!(
+                "its key links are not one chain: one moves to {}, and the next leaves {}",
+                pair[0].new, pair[1].old
+            ));
+        }
+    }
+    for (i, a) in links.iter().enumerate() {
+        if links[i + 1..].iter().any(|b| b.old == a.old) {
+            return Err(format!(
+                "two of its key links leave {}: a fork, refused (JEP-0012)",
+                a.old
+            ));
+        }
+    }
+    let last = links.last().expect("not empty");
+    if last.new != presented {
+        return Err(format!(
+            "its newest key link moves to {}, not to the welcome's DID",
+            last.new
+        ));
+    }
+    Ok(links)
+}
+
+/// The DID the oldest of `chain` leaves, when the chain is one
+/// [`chain_moves`] would follow to `presented` but none of it leaves
+/// `pinned`: what a server that changed its key more times than it serves
+/// links for serves, and what an impostor holding two keys can serve too.
+/// Either way it is refused; this only names it.
+pub fn link_from_elsewhere(chain: &[String], pinned: &str, presented: &str) -> Option<String> {
+    let links = verified_chain(chain, presented).ok()?;
+    (!links.iter().any(|l| same_did(&l.old, pinned))).then(|| links[0].old.clone())
+}
+
+/// Why a chain from `left`, not from `pinned`, is not followed.
+pub fn rotated_past(pinned: &str, left: &str) -> String {
+    format!(
+        "its oldest key link leaves {left}, a DID this device never pinned. Either the server \
+         changed its key more than once since it was pinned as {pinned}, or it is not that \
+         server. Either way it is refused: re-pinning would trust the new DID on first use \
+         again, so check it with the server's operator first"
+    )
+}
+
 fn pin_mismatch(server_did: &str, pinned: Option<&str>) -> Option<String> {
     let pinned = pinned?;
     (!same_did(pinned, server_did))
@@ -868,6 +1175,7 @@ fn frame_name(frame: &Frame) -> &'static str {
         Frame::Block { .. } => "block",
         Frame::Error { .. } => "error",
         Frame::PeerProof { .. } => "peer_proof",
+        Frame::Peer { .. } => "peer",
     }
 }
 
@@ -971,6 +1279,62 @@ mod tests {
         changed_nonce.nonce = "nonce-2".to_string();
         let mut changed_v = base.clone();
         changed_v.v = 9;
+        let mut changed_link = base.clone();
+        changed_link.key_link = Some("bGluaw".to_string());
+        let mut other_link = base.clone();
+        other_link.key_link = Some("b3RoZXI".to_string());
+        let admit = PowOffer {
+            alg: 1,
+            effort: 1 << 16,
+            salt_id: 0,
+            expires_at: 1_700_000_000,
+        };
+        let mut changed_admit = base.clone();
+        changed_admit.admit = Some(admit);
+        // With and without a link, so the admit section is never read as one.
+        let mut link_and_admit = changed_link.clone();
+        link_and_admit.admit = Some(admit);
+        assert_ne!(
+            link_and_admit.canonical_bytes(),
+            changed_link.canonical_bytes()
+        );
+        for (label, other) in [
+            ("admit.alg", PowOffer { alg: 2, ..admit }),
+            (
+                "admit.effort",
+                PowOffer {
+                    effort: 1 << 17,
+                    ..admit
+                },
+            ),
+            (
+                "admit.salt_id",
+                PowOffer {
+                    salt_id: 1,
+                    ..admit
+                },
+            ),
+            (
+                "admit.expires_at",
+                PowOffer {
+                    expires_at: 1_700_000_001,
+                    ..admit
+                },
+            ),
+        ] {
+            let mut changed = base.clone();
+            changed.admit = Some(other);
+            assert_ne!(
+                changed.canonical_bytes(),
+                changed_admit.canonical_bytes(),
+                "{label} must be covered by the signature"
+            );
+        }
+        assert_ne!(
+            changed_link.canonical_bytes(),
+            other_link.canonical_bytes(),
+            "the link's bytes must be covered by the signature"
+        );
 
         for (label, bytes) in [
             ("did", changed_did.canonical_bytes()),
@@ -981,12 +1345,111 @@ mod tests {
             ("reputation", changed_rep.canonical_bytes()),
             ("nonce", changed_nonce.canonical_bytes()),
             ("v", changed_v.canonical_bytes()),
+            ("key_link", changed_link.canonical_bytes()),
+            ("admit", changed_admit.canonical_bytes()),
         ] {
             assert_ne!(
                 base_bytes, bytes,
                 "{label} must be covered by the signature"
             );
         }
+    }
+
+    fn welcome_asking(admit: Option<PowOffer>) -> (PendingHello, Envelope) {
+        let key = generate_signing_key();
+        let (hello, pending) = begin(&ClientOffer::default());
+        let Frame::Hello { nonce, .. } = hello.frame else {
+            panic!("hello");
+        };
+        let offer = ServerOffer {
+            admit,
+            ..offer_server()
+        };
+        let welcome = seal(&key, negotiate(&hello_view(&nonce), &offer).unwrap());
+        (pending, welcome)
+    }
+
+    #[test]
+    fn the_admission_work_a_welcome_asks_is_signed() {
+        let admit = PowOffer {
+            alg: jig_core::pow::Alg::Blake3.id(),
+            effort: 1 << 20,
+            salt_id: jig_core::pow::EMPTY_SALT_ID,
+            expires_at: 1_700_000_000,
+        };
+        let (pending, welcome) = welcome_asking(Some(admit));
+        let text = serde_json::to_string(&welcome).unwrap();
+        assert!(text.contains("\"admit\":{\"alg\":1,\"effort\":1048576"));
+        match pending.interpret(&text) {
+            HandshakeResult::Established(verified) => {
+                assert_eq!(verified.admit, Some(admit));
+                let admit = verified.admit.unwrap();
+                assert_eq!(admit.alg(), Some(jig_core::pow::Alg::Blake3));
+                assert_eq!(admit.effort().map(|e| e.get()), Some(1 << 20));
+            }
+            other => panic!("expected a welcome, got {other:?}"),
+        }
+
+        // Lowering the ask in transit breaks the signature.
+        let (pending, mut welcome) = welcome_asking(Some(admit));
+        if let Frame::Welcome { admit, .. } = &mut welcome.frame {
+            admit.as_mut().unwrap().effort = 1;
+        }
+        assert!(matches!(
+            pending.interpret(&serde_json::to_string(&welcome).unwrap()),
+            HandshakeResult::FailClosed { reason, .. } if reason.contains("signature")
+        ));
+        // So does stripping it.
+        let (pending, mut welcome) = welcome_asking(Some(admit));
+        if let Frame::Welcome { admit, .. } = &mut welcome.frame {
+            *admit = None;
+        }
+        assert!(matches!(
+            pending.interpret(&serde_json::to_string(&welcome).unwrap()),
+            HandshakeResult::FailClosed { reason, .. } if reason.contains("signature")
+        ));
+    }
+
+    #[test]
+    fn a_welcome_that_asks_no_admission_work_omits_it() {
+        let (pending, welcome) = welcome_asking(None);
+        let text = serde_json::to_string(&welcome).unwrap();
+        assert!(!text.contains("admit"));
+        match pending.interpret(&text) {
+            HandshakeResult::Established(verified) => assert_eq!(verified.admit, None),
+            other => panic!("expected a welcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_algorithm_in_the_admit_offer_still_parses() {
+        let admit = PowOffer {
+            alg: 200,
+            effort: 1 << 20,
+            salt_id: jig_core::pow::EMPTY_SALT_ID,
+            expires_at: 1_700_000_000,
+        };
+        let (pending, welcome) = welcome_asking(Some(admit));
+        match pending.interpret(&serde_json::to_string(&welcome).unwrap()) {
+            HandshakeResult::Established(verified) => {
+                assert_eq!(verified.admit.unwrap().alg(), None);
+            }
+            other => panic!("expected a welcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admission_work_under_a_salt_contradicts_the_welcome() {
+        let (pending, welcome) = welcome_asking(Some(PowOffer {
+            alg: 1,
+            effort: 1 << 20,
+            salt_id: 3,
+            expires_at: 1_700_000_000,
+        }));
+        assert!(matches!(
+            pending.interpret(&serde_json::to_string(&welcome).unwrap()),
+            HandshakeResult::FailClosed { reason, .. } if reason.contains("salt")
+        ));
     }
 
     #[test]
@@ -1190,6 +1653,74 @@ mod tests {
     }
 
     #[test]
+    fn a_kept_frame_verifies_offline_against_its_signer_only() {
+        let key = generate_signing_key();
+        let did = Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
+        let other = Did::from_ed25519_pubkey(generate_signing_key().verifying_key().as_bytes())
+            .to_did_jig_string();
+        let (hello, pending) = begin(&ClientOffer::default());
+        let Frame::Hello { nonce, .. } = hello.frame else {
+            panic!("hello");
+        };
+        let welcome = serde_json::to_string(&seal(
+            &key,
+            negotiate(&hello_view(&nonce), &offer_server()).unwrap(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            verify_offline(&welcome, &did),
+            HandshakeResult::Established(w) if w.evidence == welcome
+        ));
+        let refusal = serde_json::to_string(&refusal_for(&pending, &key)).unwrap();
+        assert!(matches!(
+            verify_offline(&refusal, &did),
+            HandshakeResult::Incompatible(r) if r.evidence == refusal
+        ));
+        for text in [&welcome, &refusal] {
+            assert!(matches!(
+                verify_offline(text, &other),
+                HandshakeResult::FailClosed { .. }
+            ));
+        }
+        let tampered = welcome.replace("text-render", "text-rendex");
+        assert!(matches!(
+            verify_offline(&tampered, &did),
+            HandshakeResult::FailClosed { reason, .. } if reason.contains("signature")
+        ));
+        assert!(matches!(
+            verify_offline("{}", &did),
+            HandshakeResult::FailClosed { .. }
+        ));
+
+        // A welcome bound to a TLS session: kept, its signature still checks
+        // offline, while a live connection on another session refuses it.
+        let (hello, pending) = begin(&ClientOffer::default());
+        let Frame::Hello { nonce, .. } = hello.frame else {
+            panic!("hello");
+        };
+        let bound = serde_json::to_string(&seal(
+            &key,
+            negotiate(
+                &hello_view(&nonce),
+                &ServerOffer {
+                    tls_exporter: vec![9; TLS_EXPORTER_LEN],
+                    ..offer_server()
+                },
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            verify_offline(&bound, &did),
+            HandshakeResult::Established(_)
+        ));
+        assert!(matches!(
+            pending.interpret_on(&bound, &[8; TLS_EXPORTER_LEN]),
+            HandshakeResult::FailClosed { reason, .. } if reason.contains("another TLS session")
+        ));
+    }
+
+    #[test]
     fn a_welcome_holds_only_on_the_tls_session_it_was_signed_for() {
         let key = generate_signing_key();
         let session = [1u8; TLS_EXPORTER_LEN];
@@ -1284,6 +1815,235 @@ mod tests {
             hello.frame,
             Frame::Hello { peer_did: Some(ref d), .. } if d == "did:jig:zPeer"
         ));
+    }
+
+    #[test]
+    fn a_chain_is_followed_hop_by_hop_from_wherever_the_pin_is() {
+        use jig_core::key_link::{Audience, SignedKeyLink};
+        let keys: Vec<SigningKey> = (0..4).map(|_| generate_signing_key()).collect();
+        let did = |k: &SigningKey| {
+            Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let link = |a: &SigningKey, b: &SigningKey| {
+            STANDARD.encode(
+                SignedKeyLink::sign(a, b, Audience::Public, 1)
+                    .unwrap()
+                    .envelope(),
+            )
+        };
+        // A -> B -> C -> D, oldest first.
+        let chain: Vec<String> = keys.windows(2).map(|w| link(&w[0], &w[1])).collect();
+        let now = did(&keys[3]);
+        for (i, pinned) in keys[..3].iter().enumerate() {
+            assert_eq!(
+                chain_moves(&chain, &did(pinned), &now).unwrap(),
+                chain[i..].to_vec(),
+                "pinned {i} keys in"
+            );
+        }
+
+        // A gap: B -> C missing.
+        let gap = vec![chain[0].clone(), chain[2].clone()];
+        let why = chain_moves(&gap, &did(&keys[0]), &now).unwrap_err();
+        assert!(why.contains("not one chain"), "{why}");
+        // A chain that ends elsewhere.
+        let why = chain_moves(&chain[..2], &did(&keys[0]), &now).unwrap_err();
+        assert!(why.contains("newest key link"), "{why}");
+        // A fork inside it: A -> B and A -> X, contiguous with X -> D.
+        let x = generate_signing_key();
+        let forked = vec![
+            chain[0].clone(),
+            link(&keys[1], &keys[0]),
+            link(&keys[0], &x),
+            link(&x, &keys[3]),
+        ];
+        assert!(chain_moves(&forked, &did(&keys[0]), &now).is_err());
+        // One bad link anywhere refuses the whole chain.
+        let mut bad = chain.clone();
+        bad[0] = STANDARD.encode(b"not a link");
+        assert!(chain_moves(&bad, &did(&keys[2]), &now).is_err());
+        // Too long to follow.
+        let many: Vec<SigningKey> = (0..=MAX_KEY_LINK_HOPS + 1)
+            .map(|_| generate_signing_key())
+            .collect();
+        let long: Vec<String> = many.windows(2).map(|w| link(&w[0], &w[1])).collect();
+        let why = chain_moves(&long, &did(&many[0]), &did(many.last().unwrap())).unwrap_err();
+        assert!(why.contains("more than"), "{why}");
+    }
+
+    #[test]
+    fn a_welcome_signs_its_link_admission_work_and_earlier_links_apart() {
+        let statement = |link: bool, admit: bool, prior: bool| WelcomeStatement {
+            v: ENVELOPE_VERSION,
+            frame_suite: "none".into(),
+            server_did: "did:jig:zServer".into(),
+            suites: vec!["none".into()],
+            capabilities: Capabilities::default(),
+            reputation: Reputation::none(),
+            nonce: "n".into(),
+            server_nonce: "s".into(),
+            tls_exporter: String::new(),
+            manifest: None,
+            key_link: link.then(|| "bGluaw".into()),
+            admit: admit.then_some(PowOffer {
+                alg: 1,
+                effort: 2,
+                salt_id: jig_core::pow::EMPTY_SALT_ID,
+                expires_at: 3,
+            }),
+            prior_key_links: if prior {
+                vec!["ZWFybGllcg".into()]
+            } else {
+                vec![]
+            },
+        };
+        let none = statement(false, false, false).canonical_bytes();
+        let link = statement(true, false, false).canonical_bytes();
+        let link_admit = statement(true, true, false).canonical_bytes();
+        let link_prior = statement(true, false, true).canonical_bytes();
+        let all = statement(true, true, true).canonical_bytes();
+        let signed = [&none, &link, &link_admit, &link_prior, &all];
+        for (i, a) in signed.iter().enumerate() {
+            for b in &signed[i + 1..] {
+                assert_ne!(a, b, "two different welcomes sign the same bytes");
+            }
+        }
+        // Each optional part only adds to the end: a welcome without it signs
+        // exactly what it did before it existed.
+        assert!(link.starts_with(&none));
+        assert!(link_admit.starts_with(&link));
+        assert!(link_prior.starts_with(&link));
+        assert!(all.starts_with(&link_admit));
+        // Earlier links and admission work, each under its own tag: neither
+        // reads as the other.
+        assert_eq!(link_admit[link.len()..][8], 2);
+        assert_eq!(link_prior[link.len()..][8], 3);
+
+        let orphan = statement(false, false, true);
+        assert!(orphan.contradicts_itself().is_some());
+    }
+
+    #[test]
+    fn a_link_from_a_key_after_the_pin_is_refused_by_name() {
+        use jig_core::key_link::{Audience, SignedKeyLink};
+        let (a, b, c) = (
+            generate_signing_key(),
+            generate_signing_key(),
+            generate_signing_key(),
+        );
+        let did = |k: &SigningKey| {
+            Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let b_to_c = STANDARD.encode(
+            SignedKeyLink::sign(&b, &c, Audience::Public, 2)
+                .unwrap()
+                .envelope(),
+        );
+        assert!(link_moves(&b_to_c, &did(&b), &did(&c)).is_ok());
+        assert_eq!(
+            link_from_elsewhere(std::slice::from_ref(&b_to_c), &did(&b), &did(&c)),
+            None
+        );
+
+        let why = link_moves(&b_to_c, &did(&a), &did(&c)).unwrap_err();
+        assert!(
+            why.contains("more than once") && why.contains(&did(&a)),
+            "{why}"
+        );
+        assert_eq!(
+            link_from_elsewhere(std::slice::from_ref(&b_to_c), &did(&a), &did(&c)),
+            Some(did(&b))
+        );
+        // A link to another DID than the one presented is not this case.
+        assert_eq!(
+            link_from_elsewhere(std::slice::from_ref(&b_to_c), &did(&a), &did(&a)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_new_key_is_followed_only_along_a_link_the_pinned_key_signed() {
+        use jig_core::key_link::{Audience, SignedKeyLink};
+        let old = generate_signing_key();
+        let new = generate_signing_key();
+        let did = |k: &SigningKey| {
+            Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let welcome_with = |link: Option<Vec<u8>>| {
+            let (hello, pending) = begin(&ClientOffer {
+                pinned_server_did: Some(did(&old)),
+                ..ClientOffer::default()
+            });
+            let Frame::Hello { nonce, .. } = hello.frame else {
+                panic!("hello");
+            };
+            let offer = ServerOffer {
+                key_link: link,
+                ..offer_server()
+            };
+            let text =
+                serde_json::to_string(&seal(&new, negotiate(&hello_view(&nonce), &offer).unwrap()))
+                    .unwrap();
+            pending.interpret(&text)
+        };
+        let link = |a: &SigningKey, b: &SigningKey, audience| {
+            SignedKeyLink::sign(a, b, audience, 1_700_000_000)
+                .unwrap()
+                .envelope()
+                .to_vec()
+        };
+
+        match welcome_with(Some(link(&old, &new, Audience::Public))) {
+            HandshakeResult::Established(w) => {
+                assert_eq!(w.server_did, did(&new));
+                assert_eq!(w.moved_from, Some(did(&old)));
+            }
+            other => panic!("expected the move to be followed, got {other:?}"),
+        }
+        let refused = |result: HandshakeResult, why: &str| {
+            assert!(
+                matches!(&result, HandshakeResult::FailClosed { reason, .. } if reason.contains(why)),
+                "{why}: {result:?}"
+            );
+        };
+        refused(welcome_with(None), "does not match the pinned DID");
+        let stranger = generate_signing_key();
+        // A link to the presented DID from a key this device never pinned:
+        // a later rotation, or an impostor. Refused, and said so.
+        refused(
+            welcome_with(Some(link(&stranger, &new, Audience::Public))),
+            "never pinned",
+        );
+        refused(
+            welcome_with(Some(link(&old, &stranger, Audience::Public))),
+            "not to the welcome's DID",
+        );
+        refused(
+            welcome_with(Some(link(
+                &old,
+                &new,
+                Audience::Contact {
+                    did: did(&stranger),
+                },
+            ))),
+            "not a public one",
+        );
+        let mut tampered = link(&old, &new, Audience::Public);
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        refused(welcome_with(Some(tampered)), "key link does not move it");
+
+        // Another spelling of the new key is not the DID the link names.
+        let canonical = did(&new);
+        let recased = format!("did:jig:z{}", canonical["did:jig:z".len()..].to_uppercase());
+        assert!(
+            !same_did(&recased, &canonical),
+            "one key, one spelling: another is not it"
+        );
+        assert!(same_did(&canonical, &canonical));
+        let b64 = STANDARD.encode(link(&old, &new, Audience::Public));
+        assert!(link_moves(&b64, &did(&old), &canonical).is_ok());
+        assert!(link_moves(&b64, &did(&old), &recased).is_err());
     }
 
     #[test]

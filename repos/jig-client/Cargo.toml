@@ -9,7 +9,7 @@ description = "Client library for jig-protocol: WSS connection, identity loading
 [dependencies]
 # `keystore`: identity keys and MLS state sealed at rest (I1).
 jig-core = { workspace = true, features = ["keystore"] }
-jig-pipeline = { path = "../jig-pipeline" }
+jig-pipeline = { path = "../jig-pipeline", default-features = false }
 # The client half of MLS: group state, encrypt/decrypt (`secure`).
 jig-mls = { workspace = true }
 serde = { workspace = true }
@@ -63,8 +63,19 @@ zeroize = "1"
 keyring-core = "1"
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 
+[features]
+# Test helpers for crates that stand up servers (`server_key::credential_for_tests`).
+test-support = []
+# Run a block's component here and compare with the server's `exec` receipt
+# (JEP-0006 step 7). The runtime and the text-block component come through
+# jig-pipeline's `executor`, which jig-client otherwise leaves off so the
+# nameserver links no Wasm engine.
+verify = ["jig-pipeline/executor"]
+
 [dev-dependencies]
 tempfile = "3"
+# `verify` tests sign real exec receipts with the pipeline's test executor.
+jig-pipeline = { path = "../jig-pipeline", features = ["test-support"] }
 # `naming` tests stand up real TLS servers: one under a test CA, one
 # self-signed, to show `dns` discovery takes a CA-valid certificate only. Same
 # rustls stack as above (0.23, ring), as integration-tests uses.

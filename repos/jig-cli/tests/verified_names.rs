@@ -124,6 +124,11 @@ fn set_up(home: &Path, server: &str, authority: &str, nameserver: &str) {
     delegations.insert("jig".into(), jig.into());
     let mut naming = toml::Table::new();
     naming.insert("delegations".into(), delegations.into());
+    // The stub nameserver is plaintext on loopback.
+    naming.insert(
+        "dangerously_allow_plaintext_nameservers".into(),
+        true.into(),
+    );
     cfg.insert("naming".into(), naming.into());
     std::fs::write(&path, toml::to_string(&cfg).unwrap()).unwrap();
 }

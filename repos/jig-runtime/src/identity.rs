@@ -33,7 +33,7 @@ pub const WASMTIME_VERSION: &str = env!("JIG_WASMTIME_VERSION");
 /// metering half of the fix for RUSTSEC-2026-0223.
 pub const FUEL_SCHEDULE_VERSION: &str = "0.2.0";
 
-/// Identity of the engine a [`crate::Runtime`] executes with.
+/// Identity of the engine a [`crate::component::ComponentRuntime`] executes with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EngineIdentity {
     /// wasmtime crate version, e.g. `49.0.3`.

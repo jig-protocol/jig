@@ -1,7 +1,7 @@
 +++
 jep = 0006
 title = "Block ABI on the WebAssembly Component Model"
-status = "Draft"
+status = "Review"
 type = "Standards Track"
 category = "Core"
 authors = ["DJ <dev@jig.onl>"]
@@ -25,10 +25,12 @@ the WebAssembly Component Model. It defines:
 Hosts and clients run the same components under the same profile, so anyone holding a block
 and its inputs can re-execute it and check a receipt, on any architecture.
 
-**Draft status.** The maintainer decided the design questions on 2026-10-18 (decisions A1–A8
+**Status: Review.** The maintainer decided the design questions on 2026-10-18 (decisions A1–A8
 in the [design doc](../../../docs/superpowers/specs/2026-10-18-v0.3-block-abi-design.md), which
-holds the options and rationale). The JEP stays Draft until the reference implementation and test
-vectors exist. Nothing here is implemented yet.
+holds the options and rationale). The first slice of the reference implementation and its test
+vectors exist (see Reference Implementation and Test Vectors), so the maintainer moved the JEP to
+Review on 2026-10-25. It becomes Final once the cross-architecture matrix has stayed green
+through a release.
 
 # Motivation
 
@@ -65,8 +67,7 @@ every minor version is incompatible.
 - **Inputs are data.** Every input a block depends on, including time and sender, is a field of
   `invocation`.
 
-The normative WIT will live in `repos/jig-spec/wit/` once approved. The design doc holds the
-current sketch.
+The normative WIT is [`wit/jig-block/block.wit`](../wit/jig-block/block.wit).
 
 ## Determinism profile `jig-det-1`
 
@@ -88,7 +89,7 @@ deterministic fuel limit, and MAY also use a wall-clock deadline as a liveness g
 ## Runs and outcomes
 
 A run is identified by:
-- the component's CID;
+- the component's hash, BLAKE3 over its bytes;
 - the world and its version;
 - `invocation_hash`, BLAKE3 over the canonical encoding of the invocation value;
 - for `bot`, the hash of the state passed in and the content-addressed answers to its fetch
@@ -143,16 +144,35 @@ outcome and hash, on any architecture, operating system, engine or engine versio
 `incomplete` outcome asserts nothing about the block, and MUST NOT be compared or treated as
 evidence of misbehaviour.
 
-**Canonical encoding.** The canonical encoding of a WIT value is deterministic CBOR (RFC 8949
-§4.2) under a fixed type mapping, which this JEP will define before it leaves Draft.
+**Canonical encoding.** The canonical encoding of a WIT value is deterministic CBOR under the
+core deterministic rules of RFC 8949 §4.2.1, with each value mapped as follows:
+
+| WIT type | CBOR |
+| --- | --- |
+| `bool` | `true` / `false` |
+| `u8`…`u64`, `s8`…`s64` | integer (major type 0 or 1), shortest form |
+| `char` | text string holding that one character |
+| `string` | text string |
+| `list<u8>` | byte string |
+| any other `list<T>`, `tuple<…>` | array |
+| `record` | map from field name (text) to value, keys in canonical order |
+| `variant` case, `result` | array `[case]` or `[case, payload]`; `result` uses the cases `ok` and `err` |
+| `enum` case | text string |
+| `option<T>` | `none` is `null`; `some(x)` is the one-element array `[x]` |
+
+`option` wraps `some` in an array so that `option<option<T>>` stays unambiguous: `none` is
+`null`, `some(none)` is `[null]`. `f32`, `f64`, `flags`, resources, futures and streams have no
+mapping: `jig:block` uses none of them, and an encoder MUST refuse a value that needs one.
 
 ## Who executes
 
 - **Encrypted content.** A server MUST NOT execute it. Members execute it on their own devices.
   A sender SHOULD include its outcome hash inside the encrypted application message, so other
   members can compare.
-- **Third-party components.** A server MUST NOT execute one unless operator policy selects it
-  (by component CID or by signing author). The default policy selects none.
+- **Third-party components.** A server MUST NOT execute one unless its operator policy allows
+  it. JEP-0011 §5.1 defines that policy (`operator-policy`): programs are allowed by program
+  CID or by signing author, and renderers with no requests and no children also by component
+  hash. The default policy allows only the renderer components the server ships.
 
 ## Receipts
 
@@ -160,21 +180,63 @@ A receipt is a CBOR map with text keys, encoded under the core deterministic rul
 §4.2.1. It is signed by its executor as a COSE_Sign1 object (RFC 9052) with an attached payload,
 algorithm EdDSA (`-8`, Ed25519) and `kid` set to the executor's DID. Its fields:
 
-- `v`: `"0.3"`.
+- `domain`: `"jig-block-receipt-v1"`.
 - `kind`: `exec`, `sealed` or `accepted`.
-- `block_cid`, `executor` (DID), `role` (`server` or `member`) and `produced_at`.
+- `block_cid` (binary CID), `executor` (DID), `role` (`server` or `member`) and `produced_at`
+  (milliseconds since the Unix epoch).
 - For `exec` only:
-  - `component`, `world` and `invocation_hash`;
-  - `outcome`;
-  - `engine`: `name`, the exact `version`, `profile`, `pricing_schedule` and `fuel_used`.
+  - `component` (its hash, as in Runs and outcomes), `program` (the program's CID,
+    JEP-0011 §2), `world` and `invocation_hash`;
+  - `operator_policy_cid`: the CID of the operator policy (JEP-0011 §5.1) the run was allowed
+    under. Present exactly when `role` is `server`;
+  - `outcome`: `class` (`ok`, `error` or `incomplete`), with `hash` for `ok` and `error`, `trap`
+    for an `error` from a trap, and `reason` for `incomplete`;
+  - `limits` the run was held to: `fuel`, `max_wasm_stack`, `memory_max_pages` and
+    `timeout_ms`;
+  - `engine`: `name`, the exact `version`, `profile`, `config_fingerprint` and `fuel_used`.
 
 Rules:
 - `engine` is telemetry. Verifiers MUST NOT compare `fuel_used` across executors.
+- A server MUST NOT issue an `exec` receipt for encrypted content, and a verifier MUST refuse
+  one.
 - `cost` is reserved for pricing (billing is deferred to the distributed-OS phase). v0.3
   executors MUST NOT emit it; verifiers MUST ignore it.
 - A `sealed` receipt MUST NOT carry any content-derived value.
 - A member-signed receipt for encrypted content MUST travel only inside the group's encrypted
   messages.
+
+**Executing on ingest.** A server that executes a block when it ingests it builds the invocation
+from the block's signed `ingest` record (see Runs and outcomes), so it executes after the block
+lands. A landed block cannot be refused afterwards. Therefore:
+
+- Before landing, a server MAY run the block to decide whether to accept it. It MUST refuse a
+  block whose run is `incomplete`, since its receipt could not carry a comparable outcome.
+- After landing, a failure to execute or sign MUST NOT undo the block. The server issues an
+  `accepted` receipt in place of `exec`. If it cannot sign that either, the block stays without
+  a receipt, and the server issues one later, at the latest when it restarts.
+- A server keeps at most one receipt per block. A server that restarts before issuing it issues
+  it then. Until a receipt exists, readers SHOULD show the block as pending, not as unverified.
+
+**Checking a receipt (client).** A client that holds a block in plaintext MAY re-execute it and
+compare. A client that does:
+
+1. MUST check the `exec` receipt's signature, that its `executor` is the server that
+   delivered it, and that its `block_cid` is the block being checked. A receipt for another
+   block is not evidence about this one.
+2. MUST NOT execute or compare when the receipt's outcome is `incomplete`.
+3. MUST check that the block's `ingest` record names the block and is signed by the same server
+   as the receipt, before using it to build the invocation. A forged record would otherwise turn
+   an honest receipt into a false divergence.
+4. Compares only when it holds the component the receipt names. Otherwise the block is
+   unverified, not divergent.
+5. Rebuilds the invocation. A different `invocation_hash` is a divergence.
+6. Executes with fuel at most the receipt's `limits.fuel`, capped by its own limit. A local
+   `incomplete` is not comparable.
+7. Compares the outcome class and hash. Any difference is a divergence.
+
+Comparison keys on the component, world, invocation and outcome, never on the program CID,
+which differs between servers for the same component (JEP-0011 §5.1). A client MUST surface a
+divergence to its user. This JEP does not define what follows from one.
 
 ## Versioning and discovery
 
@@ -200,13 +262,22 @@ Rules:
 
 - The `text-render` kind moves to a `renderer` component. Its `render_hash` keeps its current
   definition, so servers running mixed versions keep agreeing.
-- The byte-payload ABI, the WASI preview 1 ABI and the four existing receipt formats are
-  removed once the component path is live. Stored receipts in the old formats stay readable.
+- The byte-payload ABI is removed: servers and clients run `text-block` only as a component.
+  The WASI preview 1 ABI and its v0.2 receipt follow once no caller remains. New receipts are
+  v0.3 only; stored receipts in the old formats stay readable.
 
 # Reference Implementation (if applicable)
 
-None yet. The first slice: `text-block` as a `renderer` component, executed by the server and
-by `jig-client`, with a CI determinism matrix on x86_64 and aarch64, native and Pulley.
+The first slice, in `repos/`:
+
+- `jig-core`: the canonical encoding and outcome hashes (`block_abi`), the component validator
+  for `jig-det-1` (`component_validation`) and v0.3 receipts (`block_receipt`).
+- `jig-runtime`: the component executor (`component`), on native Cranelift and on Pulley.
+- `text-block`: the `text-render` block as a `renderer` component.
+- `jig-pipeline`: the server executes it on ingest and signs `exec`, `sealed` and `accepted`
+  receipts.
+- `jig-client` (`verify` feature): the client re-executes and compares, as above.
+- CI runs the vectors on x86_64 and aarch64 Linux, native and Pulley.
 
 # Test Vectors
 
@@ -224,6 +295,10 @@ trap code or incomplete reason, and the outcome hash for a comparable outcome. T
 
 jig-runtime runs them on native Cranelift and on Pulley; CI runs them on x86_64 and aarch64
 Linux.
+
+[`vectors/operator-policy/`](../vectors/operator-policy/README.md) holds the JEP-0011 §5.1
+vectors that decide which components a server executes here. Each one gives a signed policy
+payload, a program's manifest facts and its pinned children, and whether the policy allows it.
 
 # LLM Influence (if applicable)
 

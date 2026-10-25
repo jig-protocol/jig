@@ -135,10 +135,19 @@ pub enum IngestError {
     InvalidSignature,
     #[error("disallowed block kind: `{kind}`")]
     DisallowedBlockKind { kind: String },
+    /// A write into the server's manifest log, or under its reserved slugs,
+    /// that is not the server's own (JEP-0002 rule 12).
+    #[error("refused for the manifest log: {reason}")]
+    ManifestLog { reason: String },
     #[error("malformed bundle: {0}")]
     BundleMalformed(String),
     #[error("manifest missing kind field — v0.0.2 blocks must declare kind")]
     KindRequired,
+    /// A DID in the manifest decodes to a key but is not spelled the way that
+    /// key encodes (an upper-cased body, say). The block is signed, so this
+    /// server cannot re-spell it, and a peer would refuse it anyway.
+    #[error("`{field}` is not a did:jig in its canonical lowercase spelling")]
+    NonCanonicalDid { field: String },
     /// The manifest's schema or encryption suite is one this server does not
     /// speak. Checked before the signature: what the signature covers is
     /// defined by the schema.
@@ -240,6 +249,19 @@ pub enum IngestError {
     /// A role block named a role this version does not define.
     #[error("unknown role `{role}`: the only role that can be assigned is `admin`")]
     UnknownRole { role: String },
+    /// A contract record from anyone but the channel's sequencer.
+    #[error(
+        "`{kind}` on `{slug}` refused: only the channel's sequencer records a contract, not `{sender}`"
+    )]
+    SequencerOnly {
+        kind: String,
+        slug: String,
+        sender: String,
+    },
+    /// A share block or contract record that does not say what its kind
+    /// needs, or whose signed messages do not check out.
+    #[error("`{kind}` refused: {detail}")]
+    BadContractBlock { kind: String, detail: String },
     /// A `channel-create` whose slug is outside the slug grammar, or in a
     /// reserved namespace its author may not create in
     /// ([`jig_core::slug::check_create`]).
@@ -330,14 +352,20 @@ pub async fn ingest(
     // Parse the manifest from canonical bytes on the bundle.
     let manifest = parse_manifest(bundle.manifest_bytes)?;
 
-    // Step 1: signature verification
+    // Step 1: signature verification, after the DIDs it and every later step
+    // compare are known to be in their one spelling.
+    check_manifest_dids(&manifest)?;
     let sender = verify_sig(bundle.manifest_bytes, bundle.code_bytes, &manifest, &sig)?;
 
     // Step 1b: admission, on the DID the signature just established. Before
     // the identity resolver, the kind whitelist and every channel lookup: a
     // caller this server will not deal with gets exactly one answer, whatever
     // they asked.
+    // The server always admits itself: its own blocks (the manifest log,
+    // fed-hello) are signed with its key.
+    let own = sender.to_did_jig_string() == ctx.server_did.to_did_jig_string();
     let admitted = match source {
+        _ if own => Ok(()),
         IngestSource::FederatedPeer { .. } | IngestSource::Bridge => {
             ctx.admission.admit_relayed(sender.as_str())
         }
@@ -387,10 +415,12 @@ pub async fn ingest(
         }
     }
 
-    // Step 3: block-kind whitelist
+    // Step 3: block-kind whitelist, after the manifest log's own gate: the
+    // server's writes into its log pass whatever kinds it relays.
     let kind = manifest.kind.ok_or(IngestError::KindRequired)?;
     let kind_str = kind.as_str();
-    if !ctx.allowed_block_kinds.iter().any(|k| k == kind_str) {
+    let own_log = manifest_log_write(ctx, kind, &manifest, &sender)?;
+    if !own_log && !ctx.allowed_block_kinds.iter().any(|k| k == kind_str) {
         return Err(IngestError::DisallowedBlockKind {
             kind: kind_str.to_string(),
         });
@@ -523,6 +553,12 @@ pub async fn ingest(
                 kind,
                 field: crate::roles::MEMBER_KEY.to_string(),
             },
+            WriteRefusal::SequencerOnly { slug, sender } => {
+                IngestError::SequencerOnly { kind, slug, sender }
+            }
+            WriteRefusal::BadContractBlock { detail } => {
+                IngestError::BadContractBlock { kind, detail }
+            }
         });
     }
 
@@ -530,25 +566,37 @@ pub async fn ingest(
     // terms alone. If so, the role must still hold at the seq the block is
     // given: the landing below re-checks it inside the transaction that
     // assigns that seq, which is the authoritative check (JEP-0005 rule 7b).
-    // Only `membership` is granted by a role and can be taken away; the
-    // owner role is fixed by the terms.
-    let guard_refusal = match resolved_channel.as_ref() {
-        Some(chan)
-            if matches!(kind, BlockKind::MemberAdd | BlockKind::MemberRemove)
-                && crate::authorize_write::authorize_block_with(
-                    kind,
-                    sender.as_str(),
-                    &manifest,
-                    Some(chan),
-                    membership,
-                    crate::roles::Rights::of_root(chan, sender.as_str()),
-                )
-                .is_err() =>
+    // Only `membership` and `share` are granted by a role and can be taken
+    // away; the owner role is fixed by the terms.
+    let guarded_right = match kind {
+        BlockKind::MemberAdd | BlockKind::MemberRemove => Some(crate::roles::Right::Membership),
+        BlockKind::ChannelShare | BlockKind::ChannelUnshare => Some(crate::roles::Right::Share),
+        _ => None,
+    };
+    let guard_refusal = match (resolved_channel.as_ref(), guarded_right) {
+        (Some(chan), Some(right))
+            if crate::authorize_write::authorize_block_with(
+                kind,
+                sender.as_str(),
+                &manifest,
+                Some(chan),
+                membership,
+                crate::roles::Rights::of_root(chan, sender.as_str()),
+            )
+            .is_err() =>
         {
-            Some(IngestError::NotChannelOwner {
-                kind: kind_str.to_string(),
-                slug: chan.slug.clone(),
-                sender: sender.as_str().to_string(),
+            Some(match right {
+                crate::roles::Right::Share => IngestError::MissingRight {
+                    kind: kind_str.to_string(),
+                    slug: chan.slug.clone(),
+                    sender: sender.as_str().to_string(),
+                    right: right.to_string(),
+                },
+                _ => IngestError::NotChannelOwner {
+                    kind: kind_str.to_string(),
+                    slug: chan.slug.clone(),
+                    sender: sender.as_str().to_string(),
+                },
             })
         }
         _ => None,
@@ -652,15 +700,35 @@ pub async fn ingest(
     )
     .map_err(|refusal| suite_refusal(refusal, &channel_label))?;
 
+    let mut render_input = match (&mls_plan, kind) {
+        (crate::mls_gate::MlsPlan::Sealed, _) => None,
+        (_, BlockKind::TextRender) => Some(text_render_input(ctx, &manifest, kind_str)?),
+        _ => None,
+    };
+    if render_input.is_some() && matches!(mls_plan, crate::mls_gate::MlsPlan::Advance { .. }) {
+        return Err(IngestError::MlsRejected {
+            detail: "an MLS commit cannot be a text-render block".to_string(),
+        });
+    }
+    if let Some(input) = &render_input {
+        check_text_render(ctx, input, &block_cid).await?;
+    }
     let (receipt_bytes, render_hash, is_synthetic) = match (&mls_plan, kind) {
         // Ciphertext cannot be executed, and the server does not pretend to.
-        (crate::mls_gate::MlsPlan::Sealed, _) => {
-            build_sealed_receipt(&block_cid, &ctx.server_did, &ctx.server_key)
-        }
-        (_, BlockKind::TextRender) => {
-            build_render_receipt(ctx, &manifest, &block_cid, kind_str).await?
-        }
-        _ => build_synth_receipt(&block_cid, &ctx.server_did, &ctx.server_key),
+        (crate::mls_gate::MlsPlan::Sealed, _) => (
+            crate::receipts::sealed(&block_cid, &ctx.server_key)
+                .map_err(|e| anyhow::anyhow!("signing the sealed receipt: {e}"))?,
+            None,
+            true,
+        ),
+        // Rendered after landing, from the block's ingest record (`render_after_landing`).
+        (_, BlockKind::TextRender) => (Vec::new(), None, false),
+        _ => (
+            crate::receipts::accepted(&block_cid, &ctx.server_key)
+                .map_err(|e| anyhow::anyhow!("signing the accepted receipt: {e}"))?,
+            None,
+            true,
+        ),
     };
 
     let canonical = bundle_canonical_bytes(bundle.manifest_bytes, bundle.code_bytes)
@@ -694,7 +762,7 @@ pub async fn ingest(
         },
     };
     let receipt_cid = format!("r_{}", &block_cid[..16.min(block_cid.len())]);
-    let stored_receipt = StoredReceipt {
+    let mut stored_receipt = StoredReceipt {
         cid: receipt_cid,
         block_cid: block_cid.clone(),
         server_id: ctx.server_did.to_string(),
@@ -723,11 +791,11 @@ pub async fn ingest(
     });
     let signer = signer.filter(|_| stored_block.channel_id.is_some());
     let sender_did = sender.to_did_jig_string();
-    let guard = match (&guard_refusal, resolved_channel.as_ref()) {
-        (Some(_), Some(chan)) => Some(crate::persist::RightGuard {
+    let guard = match (&guard_refusal, resolved_channel.as_ref(), guarded_right) {
+        (Some(_), Some(chan), Some(right)) => Some(crate::persist::RightGuard {
             channel: chan,
             did: &sender_did,
-            right: crate::roles::Right::Membership,
+            right,
         }),
         _ => None,
     };
@@ -779,14 +847,16 @@ pub async fn ingest(
                 });
             }
         }
-        // A membership block whose authority rests on a role: its effect,
-        // block and record land in one transaction, and only if the role
-        // still holds at the seq it is given.
+        // A membership or share block whose authority rests on a role: its
+        // effect, block and record land in one transaction, and only if the
+        // role still holds at the seq it is given.
         _ if guard.is_some() => {
             let Some(signer) = signer.as_ref() else {
                 return Err(refused_at_landing(guard_refusal, kind_str));
             };
-            if !manifest.metadata.contains_key("member_did") {
+            if guarded_right == Some(crate::roles::Right::Membership)
+                && !manifest.metadata.contains_key("member_did")
+            {
                 return Err(IngestError::MissingMetadata {
                     kind: kind_str.to_string(),
                     field: "member_did".to_string(),
@@ -794,16 +864,21 @@ pub async fn ingest(
             }
             let membership =
                 membership_change(kind, &manifest, resolved_channel.as_ref(), &block_cid);
-            match ctx.store.insert_block_sequenced_guarded(
+            let record = match ctx.store.insert_block_sequenced_guarded(
                 &stored_block,
                 signer,
                 &membership,
                 guard.as_ref(),
             )? {
-                crate::persist::Landing::Landed(_) => {}
+                crate::persist::Landing::Landed(record) => record,
                 _ => return Err(refused_at_landing(guard_refusal, kind_str)),
+            };
+            if let Some(input) = render_input.take() {
+                stored_receipt = receipt_after_landing(ctx, input, &block_cid, record).await;
             }
-            ctx.store.insert_receipt(&stored_receipt)?;
+            if !stored_receipt.receipt_bytes.is_empty() {
+                ctx.store.insert_receipt_once(&stored_receipt)?;
+            }
         }
         plan => {
             if let crate::mls_gate::MlsPlan::Genesis(mut group) = plan {
@@ -822,13 +897,21 @@ pub async fn ingest(
             )
             .await?;
             // Step 6: persist block (+ its record) + receipt
-            match signer.as_ref() {
-                Some(signer) => {
-                    ctx.store.insert_block_sequenced(&stored_block, signer)?;
+            let record = match signer.as_ref() {
+                Some(signer) => Some(ctx.store.insert_block_sequenced(&stored_block, signer)?),
+                None => {
+                    ctx.store.insert_block(&stored_block)?;
+                    None
                 }
-                None => ctx.store.insert_block(&stored_block)?,
+            };
+            // The receipt is written before fanout below, so no subscriber or peer sees the
+            // block without it.
+            if let Some(input) = render_input.take() {
+                stored_receipt = receipt_after_landing(ctx, input, &block_cid, record).await;
             }
-            ctx.store.insert_receipt(&stored_receipt)?;
+            if !stored_receipt.receipt_bytes.is_empty() {
+                ctx.store.insert_receipt_once(&stored_receipt)?;
+            }
         }
     }
 
@@ -1049,6 +1132,62 @@ pub fn channel_slug_of(kind: BlockKind, manifest: &jig_core::BlockManifest) -> O
 
 /// The metadata key under which a block of `kind` names its channel. See
 /// [`channel_slug_of`]; exposed for callers that peek at raw metadata.
+/// Whether this is the server's own write into its manifest log, which then
+/// skips the kind whitelist. Refuses everything else under the reserved
+/// slugs, and a `server-manifest` anywhere else or one that does not decode:
+/// only the server's DID writes its log, and only its channel-create and
+/// `server-manifest` blocks.
+fn manifest_log_write(
+    ctx: &IngestContext,
+    kind: BlockKind,
+    manifest: &jig_core::BlockManifest,
+    sender: &jig_core::did::Did,
+) -> Result<bool, IngestError> {
+    use crate::server_manifest::{LOG_SLUG, METADATA_KEY, RESERVED_PREFIX, ServerManifest};
+    let slug = channel_slug_of(kind, manifest);
+    // Case-insensitive, so `#JIG/manifest` is reserved too.
+    let reserved = slug.is_some_and(|s| s.to_ascii_lowercase().starts_with(RESERVED_PREFIX));
+    if !reserved && kind != BlockKind::ServerManifest {
+        return Ok(false);
+    }
+    let own = sender.to_did_jig_string() == ctx.server_did.to_did_jig_string();
+    // Who may create a channel under `#jig/` is the slug grammar's rule
+    // (`check_new_slug`); here only the log's own create skips the kind
+    // whitelist.
+    if kind == BlockKind::ChannelCreate {
+        return Ok(own && slug == Some(LOG_SLUG));
+    }
+    let refuse = |reason: &str| {
+        Err(IngestError::ManifestLog {
+            reason: reason.to_string(),
+        })
+    };
+    if !own {
+        return refuse("only this server writes its manifest log and its reserved channels");
+    }
+    if slug != Some(LOG_SLUG) {
+        return refuse(
+            "a server-manifest goes only into the manifest log, which is the only reserved channel",
+        );
+    }
+    match kind {
+        BlockKind::ServerManifest => {
+            use base64::Engine as _;
+            let decoded = manifest
+                .metadata
+                .get(METADATA_KEY)
+                .and_then(|v| v.as_str())
+                .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok());
+            match decoded.map(|bytes: Vec<u8>| ServerManifest::decode(&bytes)) {
+                Some(Ok(_)) => Ok(true),
+                Some(Err(e)) => refuse(&format!("the server-manifest does not decode: {e}")),
+                None => refuse("a server-manifest carries its document"),
+            }
+        }
+        _ => refuse("the manifest log takes only server-manifest blocks"),
+    }
+}
+
 pub fn channel_metadata_key(kind: BlockKind) -> &'static str {
     match kind {
         BlockKind::ChannelCreate => "slug",
@@ -1092,6 +1231,11 @@ fn requires_existing_channel(kind: BlockKind, _source: &IngestSource) -> bool {
             | BlockKind::ChannelArchive
             | BlockKind::RoleAssign
             | BlockKind::RoleUnassign
+            | BlockKind::ChannelShare
+            | BlockKind::ChannelUnshare
+            | BlockKind::ContractAccept
+            | BlockKind::ContractRefuse
+            | BlockKind::ContractEnd
     )
 }
 
@@ -1310,16 +1454,54 @@ fn bundle_canonical_bytes(manifest_bytes: &[u8], code_bytes: &[u8]) -> Result<Ve
     serde_json::to_vec(&payload).map_err(|e| e.to_string())
 }
 
+/// The manifest's DID fields that this pipeline reads, by the name an error
+/// reports them under: `member_did` (member-add), `member` (role-assign and
+/// role-unassign) and `ns_did`.
+const MANIFEST_DID_FIELDS: &[&str] = &["member_did", crate::roles::MEMBER_KEY, "ns_did"];
+
+/// Refuse a manifest carrying a key-derived DID in any spelling but the key's
+/// own. Legacy, non-key-derived DIDs (`did:jig:alice`) are opaque labels and
+/// are left to the steps that read them.
+fn check_manifest_dids(manifest: &jig_core::BlockManifest) -> Result<(), IngestError> {
+    let respelled = |did: &str| {
+        matches!(
+            Did::from_str_unchecked(did).as_bytes(),
+            Err(jig_core::did::DidError::NotLowercase)
+        )
+    };
+    if let Some(author) = manifest.authors.iter().find(|a| respelled(&a.did)) {
+        return Err(IngestError::NonCanonicalDid {
+            field: format!("authors[].did `{}`", author.did),
+        });
+    }
+    for field in MANIFEST_DID_FIELDS {
+        if let Some(did) = manifest.metadata.get(*field).and_then(|v| v.as_str())
+            && respelled(did)
+        {
+            return Err(IngestError::NonCanonicalDid {
+                field: (*field).to_string(),
+            });
+        }
+    }
+    // Signed too, and stored as the tie-break between equal clocks.
+    if let Some(hlc) = &manifest.hlc_ts
+        && respelled(hlc.server_did.as_str())
+    {
+        return Err(IngestError::NonCanonicalDid {
+            field: "hlc_ts.server_did".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Verify the sender's ed25519 signature over the bundle's canonical bytes.
 ///
 /// The signer is the first author in the manifest. If the DID is not in
 /// canonical `did:jig:z<base32>` form (e.g. a legacy test DID), decoding
 /// fails and we return `InvalidSignature` — no opaque-label fallback,
 /// because the ingest pipeline must never accept an unverifiable signature.
-/// Verify the author's signature and return the author's DID in canonical
-/// form — rebuilt from the key the signature verified against, not the
-/// spelling the manifest carried, so every downstream comparison sees one
-/// form.
+/// Verify the author's signature and return the author's DID. Its spelling
+/// is canonical: [`check_manifest_dids`] refused any other.
 fn verify_sig(
     manifest_bytes: &[u8],
     code_bytes: &[u8],
@@ -1346,197 +1528,305 @@ fn verify_sig(
     Ok(Did::from_ed25519_pubkey(&pubkey_bytes))
 }
 
-/// Execute the canonical text-render module and build a server-signed receipt
-/// carrying the resulting `render_hash`.
+/// The text-render input for a block, checked before the block lands: the body is required, and
+/// so is an executor.
 ///
-/// Returns `(receipt_bytes, Some(render_hash), is_synthetic = false)`.
-///
-/// # What is signed, and why the shape matters
-///
-/// The payload separates two kinds of claim, because they have different
-/// standing:
-///
-/// - `render` — the `render_hash`, the identity of the module that produced it,
-///   and the rendered length. Reproducible: any conforming runtime executing the
-///   same module over the same body derives the same hash, so this is what
-///   federated servers compare. The module identity is inside the SIGNED bytes
-///   deliberately; an unsigned provenance claim is not worth having, since a
-///   mismatch between peers is only diagnosable if you can trust which code each
-///   one ran.
-/// - `engine` — the engine name, its version, and fuel consumed. **Local
-///   telemetry, never comparable across servers.** There is no cross-runtime
-///   metering standard, no published conversion between engines, and wasmtime has
-///   changed its own cost schedule. Recording the version beside the number is
-///   what keeps it honest; nesting it separately is what stops a future reader
-///   mistaking it for part of the agreed value.
-///
-/// See `docs/investigations/2026-08-11-fuel-portability.md`.
-async fn build_render_receipt(
+/// Only `body_raw` reaches `render_hash`; the rest is passed so the guest has the block's context.
+/// The ingest clock and the channel CID in the invocation come from the block's ingest record, at
+/// render time ([`render_after_landing`]).
+fn text_render_input(
     ctx: &IngestContext,
     manifest: &jig_core::BlockManifest,
-    block_cid: &str,
     kind_str: &str,
-) -> Result<(Vec<u8>, Option<String>, bool), IngestError> {
-    use ed25519_dalek::Signer;
+) -> Result<text_block::Input, IngestError> {
+    if ctx.executor.is_none() {
+        return Err(IngestError::NoExecutor {
+            kind: kind_str.to_string(),
+        });
+    }
+    crate::executor::text_input(manifest).ok_or_else(|| IngestError::MissingMetadata {
+        kind: kind_str.to_string(),
+        field: "body".to_string(),
+    })
+}
 
+/// Render a landed `text-render` block and build its signed v0.3 receipt.
+///
+/// The `jig:block` invocation names the block's ingest record: its sequence, its clock and its
+/// channel. A client re-executing the block rebuilds the same invocation from the same record, so
+/// the receipt's invocation hash is one it can check. That record exists only once the block has
+/// landed, which is why rendering happens after landing and not before (JEP-0006).
+///
+/// A block with no record here (a relayed post for a channel another server sequences) gets an
+/// `accepted` receipt: without the record there is no invocation a client could rebuild.
+///
+/// Every run outcome gets an `exec` receipt, including a guest error, a trap and an incomplete
+/// run; only a successful render has a `render_hash`.
+async fn render_after_landing(
+    ctx: &IngestContext,
+    input: text_block::Input,
+    block_cid: &str,
+    record: Option<crate::ingest_record::IngestRecord>,
+) -> Result<StoredReceipt, IngestError> {
+    let record = match record {
+        Some(record) => Some(record),
+        None => ctx.store.get_ingest_record(block_cid)?,
+    };
+    let Some(record) = record else {
+        let bytes = crate::receipts::accepted(block_cid, &ctx.server_key)
+            .map_err(|e| anyhow::anyhow!("signing the accepted receipt: {e}"))?;
+        return Ok(stored_receipt(ctx, block_cid, bytes, None));
+    };
     let executor = ctx
         .executor
         .as_ref()
         .ok_or_else(|| IngestError::NoExecutor {
-            kind: kind_str.to_string(),
+            kind: BlockKind::TextRender.as_str().to_string(),
         })?;
+    exec_receipt(ctx, executor, input, block_cid, record).await
+}
 
-    // The body is required. Rendering the empty string in its absence would hash
-    // a message nobody sent and report it as a successful render.
-    let body = manifest
-        .metadata
-        .get("body")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| IngestError::MissingMetadata {
-            kind: kind_str.to_string(),
-            field: "body".to_string(),
-        })?;
+/// The signed `exec` receipt for rendering `input` against its ingest `record`.
+#[cfg(feature = "executor")]
+async fn exec_receipt(
+    ctx: &IngestContext,
+    executor: &Arc<crate::executor::BlockExecutor>,
+    input: text_block::Input,
+    block_cid: &str,
+    record: crate::ingest_record::IngestRecord,
+) -> Result<StoredReceipt, IngestError> {
+    let invocation = crate::executor::text_render_invocation(&input, block_cid, &record);
 
-    let channel = manifest
-        .metadata
-        .get("channel")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    let sender_did = manifest
-        .authors
-        .first()
-        .map(|a| a.did.to_string())
-        .unwrap_or_default();
-    let hlc = manifest.hlc_ts.as_ref();
+    let run = run_text_render(executor, invocation).await?;
 
-    // Only `body_raw` reaches the hash — `text_block::execute_pure` derives
-    // `canonical_text` from it alone. The rest is passed faithfully so the guest
-    // has full context if a future module version wants it, and so a receipt
-    // reader can see what the module was given.
-    let input = text_block::Input {
-        sender_did,
-        channel_id: channel.to_string(),
-        body_raw: body.to_string(),
-        hlc_wall_ms: hlc.map(|h| h.wall_ms).unwrap_or(0),
-        hlc_logical: hlc.map(|h| h.logical).unwrap_or(0),
-        hlc_origin: hlc.map(|h| h.server_did.to_string()).unwrap_or_default(),
-        client_version: manifest.version.to_string(),
+    let render_hash = run.text_output().ok().map(|o| o.render_hash);
+    let receipt = run.receipt(
+        crate::receipts::block_cid(block_cid)
+            .map_err(|e| anyhow::anyhow!("block CID for the receipt: {e}"))?,
+        crate::receipts::executor(&ctx.server_key),
+        crate::receipts::now_ms(),
+    );
+    let bytes = crate::receipts::sign(receipt, &ctx.server_key)
+        .map_err(|e| anyhow::anyhow!("signing the exec receipt: {e}"))?;
+    Ok(stored_receipt(ctx, block_cid, bytes, render_hash))
+}
+
+/// Built without the `executor` feature, no `BlockExecutor` exists, so this is never reached.
+#[cfg(not(feature = "executor"))]
+async fn exec_receipt(
+    _ctx: &IngestContext,
+    executor: &Arc<crate::executor::BlockExecutor>,
+    _input: text_block::Input,
+    _block_cid: &str,
+    _record: crate::ingest_record::IngestRecord,
+) -> Result<StoredReceipt, IngestError> {
+    match **executor {}
+}
+
+/// The receipt of a landed `text-render` block, whatever happens while rendering it.
+///
+/// Once the block and its record have landed, ingest must not report it as refused: it is in the
+/// channel's chain and history serves it. So a failure here (the render task dying, a store
+/// error reading the record, a signing error) is logged and the block gets an `accepted` receipt
+/// instead of an `exec` one. If even that cannot be signed, the receipt is left unwritten: readers
+/// see the block as pending, and the boot backfill tries again.
+async fn receipt_after_landing(
+    ctx: &IngestContext,
+    input: text_block::Input,
+    block_cid: &str,
+    record: Option<crate::ingest_record::IngestRecord>,
+) -> StoredReceipt {
+    #[cfg(test)]
+    let rendered = if FAIL_AFTER_LANDING.with(|f| f.replace(false)) {
+        Err(IngestError::RenderFailed {
+            kind: "text-render".into(),
+            detail: "injected by a test".into(),
+        })
+    } else {
+        render_after_landing(ctx, input, block_cid, record).await
     };
+    #[cfg(not(test))]
+    let rendered = render_after_landing(ctx, input, block_cid, record).await;
+    match rendered {
+        Ok(receipt) => receipt,
+        Err(e) => {
+            tracing::warn!(block_cid, error = %e, "rendering a landed block failed; writing an accepted receipt");
+            fallback_receipt(ctx, block_cid)
+        }
+    }
+}
 
-    // Off the async worker: `render_text` is synchronous end to end. It parks on
-    // a condvar waiting for a concurrency slot and then runs the guest on that
-    // same thread, so calling it inline would hold a tokio worker for the whole
-    // wait plus execution. Execution is bounded by the epoch deadline; the slot
-    // wait is NOT bounded, so under load enough workers could park to stall the
-    // runtime — including the tasks that would have freed the slots.
+/// An `accepted` receipt for a landed block that could not be rendered. Empty bytes if it cannot
+/// be signed; [`SqliteStore::insert_receipt_once`] callers skip those.
+fn fallback_receipt(ctx: &IngestContext, block_cid: &str) -> StoredReceipt {
+    match crate::receipts::accepted(block_cid, &ctx.server_key) {
+        Ok(bytes) => stored_receipt(ctx, block_cid, bytes, None),
+        Err(e) => {
+            tracing::error!(block_cid, error = %e, "signing an accepted receipt failed; the block stays pending");
+            stored_receipt(ctx, block_cid, Vec::new(), None)
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes the next render after landing fail, so a test can check ingest still reports the
+    /// landed block as accepted.
+    static FAIL_AFTER_LANDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run text-render once, off the async worker.
+///
+/// `render` parks on a condvar for a concurrency slot and then runs the guest on the same thread.
+/// Execution is bounded by the epoch deadline; the slot wait is not, so running it inline could
+/// park enough workers to stall the tasks that would free slots.
+#[cfg(feature = "executor")]
+async fn run_text_render(
+    executor: &Arc<crate::executor::BlockExecutor>,
+    invocation: jig_runtime::component::Invocation,
+) -> Result<crate::executor::ExecRun, IngestError> {
     let executor = Arc::clone(executor);
-    let kind_owned = kind_str.to_string();
-    let rendered = tokio::task::spawn_blocking(move || executor.render_text(&input))
+    let kind = BlockKind::TextRender.as_str().to_string();
+    tokio::task::spawn_blocking(move || executor.render(&invocation))
         .await
-        // A join error means the blocking task panicked or the pool shut down.
-        // Distinct from a render failure, and worth saying so: it points at the
-        // host, not the block.
+        // A join error points at the host (a panic, a pool shut down), not the block.
         .map_err(|e| IngestError::RenderFailed {
-            kind: kind_owned.clone(),
+            kind: kind.clone(),
             detail: format!("render task did not complete: {e}"),
         })?
         .map_err(|e| IngestError::RenderFailed {
-            kind: kind_owned,
+            kind,
             detail: e.to_string(),
+        })
+}
+
+/// Refuse, before it lands, a `text-render` block whose render runs out of fuel, stack or time,
+/// or faults the host.
+///
+/// An `incomplete` run asserts nothing about the block (JEP-0006), and nothing requires storing
+/// it. Storing it would let one post that exhausts the limits be fanned out and, in step 7,
+/// re-executed by every recipient. The receipt's run needs the block's ingest record, which
+/// exists only after landing, and a landed block cannot be unlanded (its record is in the
+/// channel's hash chain). So this check runs first, on the invocation without the record
+/// (sequence 0, the block's own clock); the receipt's run follows after landing.
+///
+/// Fuel and stack use do not depend on the record's values for a renderer that does not branch on
+/// them, which includes text-block. A deadline can still pass on the second run under load; that
+/// block lands with an `incomplete` receipt, which is never compared.
+async fn check_text_render(
+    ctx: &IngestContext,
+    input: &text_block::Input,
+    block_cid: &str,
+) -> Result<(), IngestError> {
+    let executor = ctx
+        .executor
+        .as_ref()
+        .ok_or_else(|| IngestError::NoExecutor {
+            kind: BlockKind::TextRender.as_str().to_string(),
         })?;
-
-    let canonical = serde_json::to_vec(&serde_json::json!({
-        "v": "0.3-render",
-        "block_cid": block_cid,
-        "server_did": ctx.server_did.to_string(),
-        "synthetic": false,
-        "render": {
-            "hash": rendered.output.render_hash,
-            "module": rendered.module_id,
-            "length_bytes": rendered.output.length_bytes,
-        },
-        "engine": {
-            "name": "wasmtime",
-            "identity": rendered.engine_identity,
-            "fuel_used": rendered.fuel_used,
-        },
-        "produced_at": chrono::Utc::now().timestamp(),
-    }))
-    .expect("render receipt JSON is always valid");
-
-    let sig = ctx.server_key.sign(&canonical);
-    let wrapped = serde_json::json!({
-        "canonical_hex": hex::encode(&canonical),
-        "sig_hex": hex::encode(sig.to_bytes()),
-    });
-    let bytes = serde_json::to_vec(&wrapped).expect("render receipt wrap is always valid");
-
-    Ok((bytes, Some(rendered.output.render_hash), false))
+    check_render_complete(executor, input, block_cid).await
 }
 
-/// Build a server-signed synthetic receipt for blocks that lack a Wasm artifact.
-///
-/// The receipt carries the server DID and a signature over a small JSON
-/// payload so clients can verify the server received and persisted the block.
-/// Phase D replaces this for `TextRender` once text-render.wasm is loaded.
-fn build_synth_receipt(
+#[cfg(feature = "executor")]
+async fn check_render_complete(
+    executor: &Arc<crate::executor::BlockExecutor>,
+    input: &text_block::Input,
     block_cid: &str,
-    server_did: &Did,
-    server_key: &ed25519_dalek::SigningKey,
-) -> (Vec<u8>, Option<String>, bool) {
-    use ed25519_dalek::Signer;
-
-    let canonical = serde_json::to_vec(&serde_json::json!({
-        "v": "0.2-synthetic",
-        "block_cid": block_cid,
-        "server_did": server_did.to_string(),
-        "synthetic": true,
-        "produced_at": chrono::Utc::now().timestamp(),
-    }))
-    .expect("synthetic receipt JSON is always valid");
-
-    let sig = server_key.sign(&canonical);
-
-    let wrapped = serde_json::json!({
-        "canonical_hex": hex::encode(&canonical),
-        "sig_hex": hex::encode(sig.to_bytes()),
-    });
-    let bytes = serde_json::to_vec(&wrapped).expect("synthetic receipt wrap is always valid");
-
-    // render_hash is None for synthetic receipts (no Wasm execution output).
-    (bytes, None, true)
+) -> Result<(), IngestError> {
+    let run = run_text_render(
+        executor,
+        crate::executor::text_invocation(input, block_cid.to_string(), 0),
+    )
+    .await?;
+    if let jig_runtime::component::RunOutcome::Incomplete(reason) = &run.outcome {
+        return Err(IngestError::RenderFailed {
+            kind: BlockKind::TextRender.as_str().to_string(),
+            detail: format!("the render is incomplete: {}", reason.as_str()),
+        });
+    }
+    Ok(())
 }
 
-/// Build a server-signed receipt for encrypted content.
-///
-/// Attests what the server actually checked — the author's signature, that
-/// the payload is an MLS application message for the channel's group at a
-/// current epoch, and that the block was persisted — and says plainly that
-/// nothing was executed. No `render_hash`: the server never saw the text.
-fn build_sealed_receipt(
-    block_cid: &str,
-    server_did: &Did,
-    server_key: &ed25519_dalek::SigningKey,
-) -> (Vec<u8>, Option<String>, bool) {
-    use ed25519_dalek::Signer;
+/// Built without the `executor` feature, no `BlockExecutor` exists, so this is never reached.
+#[cfg(not(feature = "executor"))]
+async fn check_render_complete(
+    executor: &Arc<crate::executor::BlockExecutor>,
+    _input: &text_block::Input,
+    _block_cid: &str,
+) -> Result<(), IngestError> {
+    match **executor {}
+}
 
-    let canonical = serde_json::to_vec(&serde_json::json!({
-        "v": "0.3-sealed",
-        "block_cid": block_cid,
-        "server_did": server_did.to_string(),
-        "synthetic": true,
-        "content": "sealed",
-        "suite": "mls",
-        "produced_at": chrono::Utc::now().timestamp(),
-    }))
-    .expect("sealed receipt JSON is always valid");
-    let sig = server_key.sign(&canonical);
-    let wrapped = serde_json::json!({
-        "canonical_hex": hex::encode(&canonical),
-        "sig_hex": hex::encode(sig.to_bytes()),
-    });
-    let bytes = serde_json::to_vec(&wrapped).expect("sealed receipt wrap is always valid");
-    (bytes, None, true)
+fn stored_receipt(
+    ctx: &IngestContext,
+    block_cid: &str,
+    receipt_bytes: Vec<u8>,
+    render_hash: Option<String>,
+) -> StoredReceipt {
+    StoredReceipt {
+        cid: format!("r_{}", &block_cid[..16.min(block_cid.len())]),
+        block_cid: block_cid.to_string(),
+        server_id: ctx.server_did.to_string(),
+        receipt_bytes,
+        render_hash,
+        produced_at: chrono::Utc::now().timestamp(),
+    }
+}
+
+/// Write the receipt of every `text-render` block that landed without one: the server stopped
+/// between landing a block and writing its receipt. Run at boot, before serving.
+///
+/// Rendering is deterministic, so a backfilled receipt states what the straight-through one would
+/// have. Writing is idempotent, so running this twice, or alongside ingest, stores one receipt per
+/// block. Returns how many receipts it wrote.
+pub async fn backfill_render_receipts(ctx: &IngestContext) -> Result<usize, IngestError> {
+    let kind = BlockKind::TextRender.as_str();
+    let mut written = 0;
+    let mut fell_back = 0;
+    for block in ctx
+        .store
+        .blocks_missing_receipt(kind, &ctx.server_did.to_string())?
+    {
+        // One block that cannot be rendered (a damaged bundle, a missing body) gets an
+        // `accepted` receipt and is logged, so it neither stops the blocks after it nor comes
+        // back on every boot.
+        let receipt = match backfill_input(ctx, &block, kind) {
+            Ok(input) => match render_after_landing(ctx, input, &block.cid, None).await {
+                Ok(receipt) => receipt,
+                Err(e) => {
+                    tracing::warn!(block_cid = %block.cid, error = %e, "backfill render failed");
+                    fell_back += 1;
+                    fallback_receipt(ctx, &block.cid)
+                }
+            },
+            Err(e) => {
+                tracing::warn!(block_cid = %block.cid, error = %e, "stored block cannot be rendered");
+                fell_back += 1;
+                fallback_receipt(ctx, &block.cid)
+            }
+        };
+        if !receipt.receipt_bytes.is_empty() && ctx.store.insert_receipt_once(&receipt)? {
+            written += 1;
+        }
+    }
+    if fell_back > 0 {
+        tracing::warn!(
+            fell_back,
+            "backfill wrote accepted receipts for blocks it could not render"
+        );
+    }
+    Ok(written)
+}
+
+fn backfill_input(
+    ctx: &IngestContext,
+    block: &StoredBlock,
+    kind: &str,
+) -> Result<text_block::Input, IngestError> {
+    let (manifest_bytes, _code): (Vec<u8>, Vec<u8>) =
+        serde_json::from_slice(&block.bundle_bytes)
+            .map_err(|e| IngestError::BundleMalformed(format!("stored bundle: {e}")))?;
+    text_render_input(ctx, &parse_manifest(&manifest_bytes)?, kind)
 }
 
 // ---- Tests ----------------------------------------------------------------
@@ -1558,6 +1848,61 @@ mod tests {
 
     fn test_ctx() -> IngestContext {
         test_ctx_allowing(&["text-render"])
+    }
+
+    /// Every key-derived DID a manifest carries, signed, is in its one
+    /// spelling: a role-assign's `member` and the clock's `server_did` too.
+    #[test]
+    fn a_recased_member_or_clock_server_did_is_refused() {
+        let key = random_signing_key();
+        let did = Did::from_ed25519_pubkey(key.verifying_key().as_bytes());
+        let recased = did
+            .to_did_jig_string()
+            .to_uppercase()
+            .replacen("DID:JIG:Z", "did:jig:z", 1);
+        let manifest = || {
+            BlockManifest::builder()
+                .version(Version::new(0, 1, 0))
+                .author(Author {
+                    did: did.clone(),
+                    public_key: None,
+                    roles: vec![],
+                })
+                .build()
+                .unwrap()
+                .with_kind(BlockKind::RoleAssign)
+        };
+        let mut role = manifest();
+        role.metadata
+            .insert(crate::roles::MEMBER_KEY.into(), serde_json::json!(recased));
+        assert!(matches!(
+            check_manifest_dids(&role),
+            Err(IngestError::NonCanonicalDid { ref field }) if field == "member"
+        ));
+
+        let mut clock = manifest();
+        clock.hlc_ts = Some(jig_core::HlcTimestamp {
+            wall_ms: 1,
+            logical: 0,
+            server_did: Did::from_str_unchecked(recased.clone()),
+        });
+        assert!(matches!(
+            check_manifest_dids(&clock),
+            Err(IngestError::NonCanonicalDid { ref field }) if field == "hlc_ts.server_did"
+        ));
+
+        // Canonical, and legacy labels, pass.
+        let mut fine = manifest();
+        fine.metadata.insert(
+            crate::roles::MEMBER_KEY.into(),
+            serde_json::json!(did.to_did_jig_string()),
+        );
+        fine.hlc_ts = Some(jig_core::HlcTimestamp {
+            wall_ms: 1,
+            logical: 0,
+            server_did: Did::from_str_unchecked("did:jig:server-test"),
+        });
+        assert!(check_manifest_dids(&fine).is_ok());
     }
 
     fn test_ctx_allowing(kinds: &[&str]) -> IngestContext {
@@ -1691,8 +2036,10 @@ mod tests {
     #[tokio::test]
     async fn ingest_persists_block_and_receipt() {
         let ctx = test_ctx();
+        seed_channel(&ctx, "#hello");
         let sender_key = random_signing_key();
-        let (mb, cb, sig) = build_bundle_parts(&sender_key, BlockKind::TextRender);
+        let (mb, cb, sig) =
+            build_bundle_parts_with_channel(&sender_key, BlockKind::TextRender, "#hello");
 
         let block_cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
             .await
@@ -1733,6 +2080,205 @@ mod tests {
             !stored.is_synthetic,
             "a block that executed must not be marked synthetic"
         );
+    }
+
+    fn exec_receipt(
+        ctx: &IngestContext,
+        block_cid: &str,
+    ) -> jig_core::block_receipt::SignedReceipt {
+        let stored = ctx
+            .store
+            .get_receipts_for_block(block_cid)
+            .unwrap()
+            .remove(0);
+        match crate::receipts::read(&stored.receipt_bytes).expect("the receipt verifies") {
+            crate::receipts::ReadReceipt::V03(r) => r,
+            other => panic!("a new receipt is v0.3, got {other:?}"),
+        }
+    }
+
+    async fn ingest_text(ctx: &IngestContext, body: &str) -> String {
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &random_signing_key(),
+            BlockKind::TextRender,
+            &[("channel", "#hello"), ("body", body)],
+        );
+        do_ingest(ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap()
+    }
+
+    /// The `exec` receipt is signed by this server and names the invocation a client rebuilds
+    /// from the block's ingest record: its seq, clock and channel.
+    #[tokio::test]
+    async fn a_text_render_gets_an_exec_receipt_for_the_invocation_its_record_names() {
+        use jig_core::block_receipt::Body;
+        let ctx = test_ctx();
+        seed_channel(&ctx, "#hello");
+        let cid = ingest_text(&ctx, TEST_BODY).await;
+
+        let signed = exec_receipt(&ctx, &cid);
+        assert_eq!(
+            signed.receipt.executor,
+            crate::receipts::executor(&ctx.server_key)
+        );
+        let Body::Exec(exec) = &signed.receipt.body else {
+            panic!("a rendered block gets an exec receipt");
+        };
+        assert!(matches!(
+            exec.outcome,
+            jig_core::block_receipt::Outcome::Ok { .. }
+        ));
+
+        let record = ctx
+            .store
+            .get_ingest_record(&cid)
+            .unwrap()
+            .expect("sequenced");
+        let block = ctx.store.get_block(&cid).unwrap().unwrap();
+        let (manifest_bytes, _): (Vec<u8>, Vec<u8>) =
+            serde_json::from_slice(&block.bundle_bytes).unwrap();
+        let input = text_render_input(
+            &ctx,
+            &parse_manifest(&manifest_bytes).unwrap(),
+            "text-render",
+        )
+        .unwrap();
+        let invocation = crate::executor::text_render_invocation(&input, &cid, &record);
+        assert_eq!(
+            exec.invocation_hash,
+            jig_runtime::component::hash_bytes(&jig_runtime::component::invocation_hash(
+                &invocation
+            )),
+            "a client rebuilding the invocation from the record must get the same hash"
+        );
+    }
+
+    /// Without an ingest record there is no invocation a client could rebuild, so the block is
+    /// stored with an `accepted` receipt and no render_hash.
+    #[tokio::test]
+    async fn a_text_render_with_no_ingest_record_gets_an_accepted_receipt() {
+        let ctx = test_ctx();
+        let (mb, cb, sig) = build_bundle_parts(&random_signing_key(), BlockKind::TextRender);
+        let cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap();
+        assert!(ctx.store.get_ingest_record(&cid).unwrap().is_none());
+        let stored = ctx.store.get_receipts_for_block(&cid).unwrap().remove(0);
+        assert_eq!(stored.render_hash, None);
+        assert_eq!(
+            exec_receipt(&ctx, &cid).receipt.body,
+            jig_core::block_receipt::Body::Accepted
+        );
+    }
+
+    /// A render that runs out of fuel is refused before the block lands: nothing is stored,
+    /// sequenced or fanned out.
+    #[tokio::test]
+    async fn a_text_render_that_exhausts_its_fuel_is_refused_before_landing() {
+        let mut ctx = test_ctx();
+        let mut config = jig_runtime::RuntimeConfig::default();
+        config.limits.fuel_max = 100; // far below what a render costs
+        ctx.executor = Some(Arc::new(
+            crate::executor::BlockExecutor::for_tests(config).unwrap(),
+        ));
+        seed_channel(&ctx, "#hello");
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &random_signing_key(),
+            BlockKind::TextRender,
+            &[("channel", "#hello"), ("body", "too expensive")],
+        );
+        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, IngestError::RenderFailed { detail, .. } if detail.contains("fuel-exhausted")),
+            "{err:?}"
+        );
+        assert!(
+            ctx.store
+                .list_blocks_by_channel("#hello", 10, None)
+                .unwrap()
+                .is_empty(),
+            "the refused block must not have landed"
+        );
+    }
+
+    /// A render that fails after the block has landed does not make ingest report the block as
+    /// refused: it is in the chain. It gets an `accepted` receipt and is delivered.
+    #[tokio::test]
+    async fn a_render_failure_after_landing_still_accepts_and_delivers_the_block() {
+        let ctx = test_ctx();
+        let channel_id = seed_channel(&ctx, "#hello");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.fanout
+            .subscribe_local(
+                crate::fanout::SubscriptionScope::Channel(channel_id),
+                crate::fanout::SubscriberIdentity::Unchecked,
+                tx,
+            )
+            .await;
+        super::FAIL_AFTER_LANDING.with(|f| f.set(true));
+        let cid = ingest_text(&ctx, "lands, then the render fails").await;
+
+        assert!(ctx.store.get_ingest_record(&cid).unwrap().is_some());
+        assert_eq!(
+            exec_receipt(&ctx, &cid).receipt.body,
+            jig_core::block_receipt::Body::Accepted
+        );
+        assert!(rx.try_recv().is_ok(), "the landed block must be delivered");
+    }
+
+    /// One stored block the backfill cannot render gets an `accepted` receipt; it does not stop
+    /// the blocks after it.
+    #[tokio::test]
+    async fn the_backfill_skips_past_a_block_it_cannot_render() {
+        let ctx = test_ctx();
+        seed_channel(&ctx, "#hello");
+        let bad = ingest_text(&ctx, "first").await;
+        let good = ingest_text(&ctx, "second").await;
+        ctx.store.delete_receipts_for_block(&bad).unwrap();
+        ctx.store.delete_receipts_for_block(&good).unwrap();
+        ctx.store.corrupt_bundle_for_test(&bad).unwrap();
+
+        assert_eq!(backfill_render_receipts(&ctx).await.unwrap(), 2);
+        assert_eq!(
+            exec_receipt(&ctx, &bad).receipt.body,
+            jig_core::block_receipt::Body::Accepted
+        );
+        assert!(matches!(
+            exec_receipt(&ctx, &good).receipt.body,
+            jig_core::block_receipt::Body::Exec(_)
+        ));
+    }
+
+    /// The server stops after landing a block and before writing its receipt. At the next boot
+    /// the backfill writes the receipt the straight-through path would have, and only once.
+    #[tokio::test]
+    async fn the_boot_backfill_writes_the_receipt_a_crash_skipped() {
+        let ctx = test_ctx();
+        seed_channel(&ctx, "#hello");
+        let cid = ingest_text(&ctx, "written before the crash").await;
+        let straight = exec_receipt(&ctx, &cid);
+        let render_hash = ctx.store.get_receipts_for_block(&cid).unwrap()[0]
+            .render_hash
+            .clone();
+
+        // The crash: the block and its record landed, the receipt did not.
+        ctx.store.delete_receipts_for_block(&cid).unwrap();
+        assert!(ctx.store.get_receipts_for_block(&cid).unwrap().is_empty());
+
+        assert_eq!(backfill_render_receipts(&ctx).await.unwrap(), 1);
+        let backfilled = exec_receipt(&ctx, &cid);
+        assert_eq!(backfilled.receipt.body, straight.receipt.body);
+        assert_eq!(
+            ctx.store.get_receipts_for_block(&cid).unwrap()[0].render_hash,
+            render_hash
+        );
+
+        // Idempotent: nothing left to write, and the receipt is not duplicated.
+        assert_eq!(backfill_render_receipts(&ctx).await.unwrap(), 0);
+        assert_eq!(ctx.store.get_receipts_for_block(&cid).unwrap().len(), 1);
     }
 
     /// Absent `metadata.body`, there is nothing to render. Ingest must say so
@@ -2143,7 +2689,12 @@ mod tests {
         );
         let receipt = ctx.store.get_receipts_for_block(&cid).unwrap().remove(0);
         assert_eq!(receipt.render_hash, None, "nothing was executed");
-        assert!(String::from_utf8_lossy(&receipt.receipt_bytes).contains(&hex::encode("sealed")));
+        let crate::receipts::ReadReceipt::V03(read) =
+            crate::receipts::read(&receipt.receipt_bytes).expect("the sealed receipt verifies")
+        else {
+            panic!("a new receipt is v0.3");
+        };
+        assert_eq!(read.receipt.body, jig_core::block_receipt::Body::Sealed);
         // Bob reads what the server cannot.
         let (_, bundle_msg) = (stored, msg);
         assert_eq!(
@@ -3121,7 +3672,7 @@ mod tests {
         assert!(row.co_owners.is_empty());
 
         // Naming this server explicitly is the same channel shape, and the
-        // co-owners are kept, canonical and without the creator.
+        // co-owners are kept once each and without the creator.
         let co = person();
         let cid = plain(
             &ctx,
@@ -3129,11 +3680,24 @@ mod tests {
             BlockKind::ChannelCreate,
             serde_json::json!({"slug": "#ours",
                 "sequencer": ctx.server_did.to_did_jig_string(),
-                "co_owners": [co.did.to_uppercase().replacen("DID:JIG:Z", "did:jig:z", 1),
-                              co.did, owner.did]}),
+                "co_owners": [co.did, co.did, owner.did]}),
         )
         .await
         .unwrap();
+        // A DID in signed terms is in its one canonical spelling: another
+        // spelling of the same key is refused, not read as it.
+        let recased = co.did.to_uppercase().replacen("DID:JIG:Z", "did:jig:z", 1);
+        let bad = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#recased", "co_owners": [recased]}),
+        )
+        .await;
+        assert!(
+            matches!(bad, Err(IngestError::InvalidTerms { ref field, .. }) if field == "co_owners"),
+            "{bad:?}"
+        );
         let row = ctx.store.get_channel_by_id(&cid).unwrap().unwrap();
         assert_eq!(row.sequencer_did, ctx.server_did.to_did_jig_string());
         assert_eq!(row.co_owners, vec![co.did.clone()]);
@@ -3428,6 +3992,59 @@ mod tests {
         .expect("role-assign on an mls channel");
     }
 
+    /// Sequence the owner's `role-unassign` of `admin` between the next
+    /// block's write gate and its landing. Says whether it ran.
+    fn unassign_before_landing(
+        ctx: &IngestContext,
+        owner: &Person,
+        admin: &Person,
+        chan: &str,
+    ) -> std::rc::Rc<std::cell::Cell<bool>> {
+        let (mb, cb, sig) = signed_parts(
+            &owner.key,
+            BlockKind::RoleUnassign,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
+        );
+        let unassign = StoredBlock {
+            cid: crate::ingest_record::label_cid("unassign in the window"),
+            channel_id: Some(chan.to_string()),
+            block_kind: "role-unassign".to_string(),
+            sender_did: owner.did.clone(),
+            sender_sig: sig,
+            bundle_bytes: serde_json::to_vec(&(&mb, &cb)).unwrap(),
+            is_synthetic: true,
+            hlc_wall_ms: 0,
+            hlc_logical: 0,
+            hlc_origin: String::new(),
+            posted_at: 0,
+            origin_server: String::new(),
+            federated_from: None,
+        };
+        let store = ctx.store.clone();
+        let key = ctx.server_key.clone();
+        let channel_id = chan.to_string();
+        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+        let ran_in_hook = ran.clone();
+        super::BEFORE_LANDING.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                ran_in_hook.set(true);
+                store
+                    .insert_block_sequenced(
+                        &unassign,
+                        &crate::ingest_record::RecordSigner {
+                            channel_id,
+                            key: &key,
+                            ingest_wall_ms: 0,
+                            ingest_logical: 0,
+                        },
+                    )
+                    .unwrap();
+            }));
+        });
+        ran
+    }
+
     /// The rights check is atomic with sequencing (JEP-0005 rule 7b): an
     /// admin's member-add passes the write gate, then a role-unassign for
     /// that admin is sequenced before the add lands. The landing transaction
@@ -3457,48 +4074,7 @@ mod tests {
 
         // The interleaving: between the gate and the landing, the owner's
         // role-unassign is sequenced.
-        let (mb, cb, sig) = signed_parts(
-            &owner.key,
-            BlockKind::RoleUnassign,
-            jig_core::EncryptionSuite::Unencrypted,
-            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
-        );
-        let unassign = StoredBlock {
-            cid: crate::ingest_record::label_cid("unassign in the window"),
-            channel_id: Some(chan.clone()),
-            block_kind: "role-unassign".to_string(),
-            sender_did: owner.did.clone(),
-            sender_sig: sig,
-            bundle_bytes: serde_json::to_vec(&(&mb, &cb)).unwrap(),
-            is_synthetic: true,
-            hlc_wall_ms: 0,
-            hlc_logical: 0,
-            hlc_origin: String::new(),
-            posted_at: 0,
-            origin_server: String::new(),
-            federated_from: None,
-        };
-        let store = ctx.store.clone();
-        let key = ctx.server_key.clone();
-        let channel_id = chan.clone();
-        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
-        let ran_in_hook = ran.clone();
-        super::BEFORE_LANDING.with(|h| {
-            *h.borrow_mut() = Some(Box::new(move || {
-                ran_in_hook.set(true);
-                store
-                    .insert_block_sequenced(
-                        &unassign,
-                        &crate::ingest_record::RecordSigner {
-                            channel_id,
-                            key: &key,
-                            ingest_wall_ms: 0,
-                            ingest_logical: 0,
-                        },
-                    )
-                    .unwrap();
-            }));
-        });
+        let ran = unassign_before_landing(&ctx, &owner, &admin, &chan);
 
         let add = plain(
             &ctx,
@@ -3778,5 +4354,275 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    // ---- The share flow's blocks (JEP-0005 rules 7-11) --------------------
+
+    /// A share needs the `share` right at its position in the chain, and only
+    /// the channel's sequencer, this server, records what came of it.
+    #[tokio::test]
+    async fn a_share_needs_the_right_and_only_the_sequencer_records_the_contract() {
+        use base64::Engine as _;
+        use jig_core::contract::{ContractAccept, ContractOffer, Grant, ManifestRef};
+        let ctx = test_ctx_allowing(&[
+            "channel-create",
+            "role-assign",
+            "channel-share",
+            "channel-unshare",
+            "contract-accept",
+        ]);
+        let owner = person();
+        let admin = person();
+        let follower = random_signing_key();
+        let follower_did = did_of(&follower);
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#shared"}),
+        )
+        .await
+        .unwrap();
+        let share = serde_json::json!({"channel_id": chan, "to": follower_did, "grant": "write"});
+
+        let before = plain(&ctx, &admin, BlockKind::ChannelShare, share.clone()).await;
+        assert!(
+            matches!(before, Err(IngestError::MissingRight { ref right, .. }) if right == "share"),
+            "no role yet: {before:?}"
+        );
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::RoleAssign,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
+        )
+        .await
+        .unwrap();
+        plain(&ctx, &admin, BlockKind::ChannelShare, share)
+            .await
+            .expect("an admin holds the share right");
+        let unnamed = plain(
+            &ctx,
+            &admin,
+            BlockKind::ChannelUnshare,
+            serde_json::json!({"channel_id": chan}),
+        )
+        .await;
+        assert!(
+            matches!(unnamed, Err(IngestError::BadContractBlock { .. })),
+            "an unshare names its server: {unnamed:?}"
+        );
+
+        // The record of the follower's accept, signed by this server.
+        let channel_id = chan.parse::<cid::Cid>().unwrap();
+        let offer = ContractOffer::sign(
+            &ctx.server_key,
+            &follower_did,
+            channel_id,
+            Grant::Write,
+            vec![],
+            vec![],
+            ManifestRef {
+                cid: channel_id,
+                seq: 1,
+            },
+            vec![],
+        );
+        let accept = ContractAccept::sign(
+            &follower,
+            &offer,
+            ManifestRef {
+                cid: channel_id,
+                seq: 2,
+            },
+            vec![],
+            vec![],
+        );
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let record = serde_json::json!({
+            "channel_id": chan,
+            "to": follower_did,
+            "offer": b64(&offer.envelope),
+            "accept": b64(&accept.envelope),
+        });
+        let by_owner = plain(&ctx, &owner, BlockKind::ContractAccept, record.clone()).await;
+        assert!(
+            matches!(by_owner, Err(IngestError::SequencerOnly { .. })),
+            "the channel's owner is not its sequencer: {by_owner:?}"
+        );
+        let (mb, cb, sig) = signed_parts(
+            &ctx.server_key,
+            BlockKind::ContractAccept,
+            jig_core::EncryptionSuite::Unencrypted,
+            record,
+        );
+        do_ingest(&ctx, mb, cb, sig, IngestSource::AdminEndpoint)
+            .await
+            .expect("the sequencer records the accept");
+    }
+
+    /// The share right is guarded at landing like `membership`: an admin
+    /// unassigned between the gate and the landing shares nothing.
+    #[tokio::test]
+    async fn a_share_right_taken_away_before_landing_refuses_the_share() {
+        let ctx = test_ctx_allowing(&[
+            "channel-create",
+            "role-assign",
+            "role-unassign",
+            "channel-share",
+        ]);
+        let owner = person();
+        let admin = person();
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#team"}),
+        )
+        .await
+        .unwrap();
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::RoleAssign,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
+        )
+        .await
+        .unwrap();
+        let ran = unassign_before_landing(&ctx, &owner, &admin, &chan);
+        let to = did_of(&random_signing_key());
+        let share = plain(
+            &ctx,
+            &admin,
+            BlockKind::ChannelShare,
+            serde_json::json!({"channel_id": chan, "to": to, "grant": "read"}),
+        )
+        .await;
+        assert!(ran.get(), "the share passed the write gate's early check");
+        assert!(
+            matches!(share, Err(IngestError::MissingRight { ref right, .. }) if right == "share"),
+            "the share must be refused at landing; got {share:?}"
+        );
+        let chain = ctx.store.list_ingest_records_by_id(&chan, 0, 50).unwrap();
+        assert_eq!(chain.len(), 3, "create, assign, and the unassign: no share");
+    }
+
+    /// What a share discloses (JEP-0005 Security Considerations, PV-05). On a
+    /// restricted MLS channel the server reads a share's `{to, grant}`, which
+    /// it needs to make the offer, and nothing of the content around it: an
+    /// application message on the same channel stays ciphertext to it. A
+    /// share cannot be sent encrypted instead, since the server must read it.
+    #[tokio::test]
+    async fn a_share_on_an_encrypted_channel_discloses_its_target_and_grant_only() {
+        let ctx = test_ctx_allowing(&[
+            "channel-create",
+            "member-add",
+            "text-render",
+            "channel-share",
+        ]);
+        let owner = person();
+        let bob = person();
+        let gid = create_sealed(&ctx, &owner).await;
+        add_to_sealed(&ctx, &owner, &bob, &gid).await;
+        let to = did_of(&random_signing_key());
+
+        let share = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelShare,
+            serde_json::json!({"channel": "#sealed", "to": to, "grant": "write"}),
+        )
+        .await
+        .expect("a share is a plaintext control block on an mls channel");
+        let stored = ctx.store.get_block(&share).unwrap().unwrap();
+        let (manifest_bytes, _): (Vec<u8>, Vec<u8>) =
+            serde_json::from_slice(&stored.bundle_bytes).unwrap();
+        let manifest: BlockManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(
+            crate::contracts::share_request(BlockKind::ChannelShare, &manifest).unwrap(),
+            crate::contracts::ShareRequest {
+                to: to.clone(),
+                grant: Some(jig_core::contract::Grant::Write),
+            },
+            "the server reads the target and the grant"
+        );
+        let mut keys: Vec<_> = manifest.metadata.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, ["channel", "grant", "to"], "and nothing else");
+
+        let (msg, _) = owner.mls.encrypt(&gid, b"the plan").unwrap();
+        let post = submit(
+            &ctx,
+            &owner,
+            BlockKind::TextRender,
+            jig_core::EncryptionSuite::Mls,
+            serde_json::json!({"channel": "#sealed", "mls_message": b64(&msg)}),
+        )
+        .await
+        .unwrap();
+        let stored = ctx.store.get_block(&post).unwrap().unwrap();
+        assert!(
+            !String::from_utf8_lossy(&stored.bundle_bytes).contains("the plan"),
+            "the content around it stays ciphertext"
+        );
+
+        let (sealed_share, _) = owner.mls.encrypt(&gid, b"{}").unwrap();
+        let hidden = submit(
+            &ctx,
+            &owner,
+            BlockKind::ChannelShare,
+            jig_core::EncryptionSuite::Mls,
+            serde_json::json!({"channel": "#sealed", "to": to, "grant": "read",
+                "mls_message": b64(&sealed_share)}),
+        )
+        .await;
+        assert!(
+            matches!(hidden, Err(IngestError::SuiteMismatch { .. })),
+            "a share the server cannot read is refused: {hidden:?}"
+        );
+    }
+
+    /// The server's share watcher (`Fanout::watch_kinds`) sees the share
+    /// kinds and nothing else: a restricted MLS channel's membership blocks
+    /// and application messages never reach it.
+    #[tokio::test]
+    async fn the_share_watcher_sees_shares_and_never_a_channels_content() {
+        let ctx = test_ctx_allowing(&[
+            "channel-create",
+            "member-add",
+            "text-render",
+            "channel-share",
+        ]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.fanout
+            .watch_kinds(&[BlockKind::ChannelShare, BlockKind::ChannelUnshare], tx);
+        let owner = person();
+        let bob = person();
+        let gid = create_sealed(&ctx, &owner).await;
+        add_to_sealed(&ctx, &owner, &bob, &gid).await;
+        let (msg, _) = owner.mls.encrypt(&gid, b"the plan").unwrap();
+        submit(
+            &ctx,
+            &owner,
+            BlockKind::TextRender,
+            jig_core::EncryptionSuite::Mls,
+            serde_json::json!({"channel": "#sealed", "mls_message": b64(&msg)}),
+        )
+        .await
+        .unwrap();
+        let share = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelShare,
+            serde_json::json!({"channel": "#sealed", "to": did_of(&random_signing_key()), "grant": "read"}),
+        )
+        .await
+        .unwrap();
+
+        let mut seen = Vec::new();
+        while let Ok((block, _)) = rx.try_recv() {
+            seen.push((block.cid, block.block_kind));
+        }
+        assert_eq!(seen, [(share, "channel-share".to_string())]);
     }
 }

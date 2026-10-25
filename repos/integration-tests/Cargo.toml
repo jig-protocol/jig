@@ -11,8 +11,9 @@ path = "src/lib.rs"
 [dependencies]
 jig-runtime = { workspace = true }
 jig-server = { path = "../jig-server" }
-jig-nameserver = { path = "../jig-nameserver" }
-jig-client = { path = "../jig-client" }
+jig-nameserver = { path = "../jig-nameserver", features = ["test-support"] }
+# `verify`: the client re-executes text-render blocks and checks the receipt.
+jig-client = { path = "../jig-client", features = ["test-support", "verify"] }
 jig-mls = { workspace = true }
 jig-pipeline = { path = "../jig-pipeline" }
 jig-core = { workspace = true }
@@ -39,8 +40,8 @@ hex = { workspace = true }
 blake3 = { workspace = true }
 # Native reference for render_hash expectations. H1 asserts the receipt's hash
 # equals what `execute_pure` derives for the submitted body, rather than merely
-# that the field is populated — jig-runtime's payload tests pin this native
-# function to the Wasm module, which is what makes it a valid oracle here.
+# that the field is populated — jig-runtime's text_block_component tests pin
+# this native function to the component, which is what makes it a valid oracle.
 text-block = { path = "../text-block" }
 # Matches jig-client/jig-server so the tests drive the same stack as production.
 tokio-tungstenite = { version = "0.30", default-features = false, features = [

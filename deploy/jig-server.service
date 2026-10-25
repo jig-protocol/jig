@@ -29,6 +29,14 @@ RestartSec=5s
 # When bridges are enabled the file must exist and be chmod 600 root:jig.
 EnvironmentFile=-/etc/jig/jig-server.env
 
+# The secret that opens the server's sealed key (server.jigkey), decrypted by
+# systemd at start (TPM-bound where there is a TPM) and handed over at
+# /run/credentials/jig-server.service/jig-server-key, readable only by this
+# service. Make it once (deploy/README.md, "Sealing the server key"), then
+# uncomment this AND [keys] unlock in /etc/jig/config.toml: either one alone
+# fails the boot.
+#LoadCredentialEncrypted=jig-server-key:/etc/credstore.encrypted/jig-server-key
+
 # One config file, parsed strictly: an unknown or removed key stops the boot
 # with an error naming it. See config.example.toml.
 ExecStart=/opt/jig/bin/jig-server --config /etc/jig/config.toml
@@ -37,9 +45,9 @@ WorkingDirectory=/var/lib/jig
 # systemd creates and chowns /var/lib/jig on first start (mode 0750).
 StateDirectory=jig
 StateDirectoryMode=0750
-# The server writes server.key and refuses to boot next time if that file is
-# group/other-readable (it hard-fails on any mode & 0o077). A permissive umask
-# inherited from the shell is the classic way to brick the second start.
+# The server writes its key (server.jigkey) owner-only, and refuses a raw key
+# that is group/other-readable (it hard-fails on any mode & 0o077). A
+# permissive umask inherited from the shell is the classic way to brick it.
 UMask=0077
 
 # --- hardening -------------------------------------------------------------

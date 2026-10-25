@@ -1,6 +1,12 @@
 //! Command implementations
 
 pub mod admission;
+pub mod block_build;
+#[cfg(feature = "local-runtime")]
+pub mod block_exec;
+pub mod block_lint;
+pub mod block_new;
+pub mod block_project;
 pub mod blocks_decode;
 pub mod channel;
 pub mod chat;
@@ -13,6 +19,7 @@ pub mod hub;
 pub mod init;
 pub mod keys;
 pub mod ns;
+pub mod ns_pow;
 pub mod passphrase;
 pub mod reader;
 pub mod receipt;

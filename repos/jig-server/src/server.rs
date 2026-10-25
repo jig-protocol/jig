@@ -6,8 +6,7 @@ use std::sync::Arc;
 use axum::Router;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
-use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::CertificateDer;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
@@ -46,9 +45,10 @@ pub struct JigServer {
 /// the `[execution]` limits make a valid runtime. Kept so that removing those
 /// routes does not also change which configs boot.
 fn boot_checks(config: &ServerConfig) -> Result<()> {
-    jig_runtime::Runtime::with_config(crate::v0_0_2::runtime_config_from(
-        &config.execution_config(),
-    ))
+    jig_runtime::component::ComponentRuntime::with_config(
+        &crate::v0_0_2::runtime_config_from(&config.execution_config()),
+        jig_runtime::component::Backend::Native,
+    )
     .map_err(|e| ServerError::Runtime(format!("failed to create jig-runtime: {e}")))?;
     Ok(())
 }
@@ -141,41 +141,12 @@ impl JigServer {
     }
 }
 
-/// Load a PEM cert chain + private key and build a rustls 0.22 ServerConfig.
-/// ALPN advertises only http/1.1 — it carries everything the edge needs today
-/// (Resend's inbound webhook POST plus client/federation WSS, which upgrade
-/// over http/1.1), so HTTP/2 is a deferred optimization rather than a
-/// requirement. Uses rustls 0.22's default `ring` provider (same as the
-/// federation client config in v0_0_2_federation_tls).
+/// [`jig_config::tls::load_rustls_config`], with its error as a config error.
 fn load_rustls_config(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
 ) -> Result<(RustlsServerConfig, CertificateDer<'static>)> {
-    // PEM parsing via rustls-pki-types rather than rustls-pemfile: the latter is
-    // unmaintained (RUSTSEC-2025-0134) and was only ever a thin wrapper over
-    // these same types. This also drops the manual File/BufReader dance.
-    let certs = CertificateDer::pem_file_iter(cert_path)
-        .map_err(|e| ServerError::Config(format!("opening TLS cert {}: {e}", cert_path.display())))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| ServerError::Config(format!("parsing TLS cert: {e}")))?;
-    if certs.is_empty() {
-        return Err(ServerError::Config(format!(
-            "no certificates in {}",
-            cert_path.display()
-        )));
-    }
-    let leaf = certs[0].clone();
-    let key = PrivateKeyDer::from_pem_file(key_path)
-        .map_err(|e| ServerError::Config(format!("reading TLS key {}: {e}", key_path.display())))?;
-    // TLS 1.3 only (transports.md, "TLS 1.3 Only").
-    let mut config = RustlsServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| ServerError::Config(format!("building rustls config: {e}")))?;
-    // http/1.1 only: it carries the webhook POST and the WSS upgrades, so
-    // HTTP/2 multiplexing isn't needed for the MVP edge (deferred).
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok((config, leaf))
+    jig_config::tls::load_rustls_config(cert_path, key_path).map_err(ServerError::Config)
 }
 
 /// Serve `router` over rustls on an already-bound TcpListener. Each accepted

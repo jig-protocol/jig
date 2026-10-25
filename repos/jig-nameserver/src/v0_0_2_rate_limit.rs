@@ -1,5 +1,5 @@
 //! Rate limits for the v0.0.2 alias-mutating routes (`POST /v1/register`,
-//! `/v1/rotate`, `/v1/renew`).
+//! `/v1/rotate`, `/v1/renew`), and for `GET /v1/challenge` per client IP.
 //!
 //! A middleware layer in front of the handlers, so the handlers stay
 //! untouched. Two kinds of bucket:
@@ -84,6 +84,21 @@ impl AliasRateLimiter {
         Ok(())
     }
 
+    /// `GET /v1/challenge`: its own per-IP bucket, charged when admitted.
+    fn admit_challenge(&self, now_secs: i64, ip_key: &str) -> Result<(), u64> {
+        let window = now_secs.div_euclid(WINDOW_SECS);
+        let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        if buckets.len() > PRUNE_THRESHOLD {
+            buckets.retain(|_, (w, _)| *w == window);
+        }
+        let key = format!("challenge:{ip_key}");
+        if used(&buckets, &key, window) >= self.cfg.challenge_per_ip_per_min {
+            return Err((WINDOW_SECS - now_secs.rem_euclid(WINDOW_SECS)) as u64);
+        }
+        bump(&mut buckets, key, window);
+        Ok(())
+    }
+
     /// Post-handler: charge each DID once the handler has verified its
     /// signature and succeeded.
     fn charge_dids(&self, now_secs: i64, dids: &[String]) {
@@ -94,23 +109,42 @@ impl AliasRateLimiter {
         }
     }
 
-    /// The connection's peer address, or with `trust_proxy` the **last**
-    /// entry of `proxy_ip_header`: the one the nearest proxy appended. Earlier
-    /// entries were written by the client and can be anything.
     fn client_ip(&self, req: &Request) -> Option<IpAddr> {
-        if self.network.trust_proxy
-            && let Some(ip) = req
-                .headers()
-                .get(&self.network.proxy_ip_header)
-                .and_then(|v| v.to_str().ok())
-                .and_then(last_forwarded)
-        {
-            return Some(ip);
-        }
-        req.extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|ConnectInfo(addr)| addr.ip())
+        client_ip(
+            &self.network,
+            req.headers(),
+            req.extensions().get::<ConnectInfo<SocketAddr>>(),
+        )
     }
+}
+
+/// The connection's peer address, or with `trust_proxy` the **last** entry of
+/// `proxy_ip_header`: the one the nearest proxy appended. Earlier entries were
+/// written by the client and can be anything.
+pub(crate) fn client_ip(
+    network: &NetworkConfig,
+    headers: &axum::http::HeaderMap,
+    peer: Option<&ConnectInfo<SocketAddr>>,
+) -> Option<IpAddr> {
+    if network.trust_proxy
+        && let Some(ip) = headers
+            .get(&network.proxy_ip_header)
+            .and_then(|v| v.to_str().ok())
+            .and_then(last_forwarded)
+    {
+        return Some(ip);
+    }
+    peer.map(|ConnectInfo(addr)| addr.ip())
+}
+
+/// The key penalties and buckets count a client under: its address as
+/// [`ip_key`] folds it, or `ip:unknown`.
+pub(crate) fn client_key(
+    network: &NetworkConfig,
+    headers: &axum::http::HeaderMap,
+    peer: Option<&ConnectInfo<SocketAddr>>,
+) -> String {
+    client_ip(network, headers, peer).map_or_else(|| "ip:unknown".to_string(), ip_key)
 }
 
 fn last_forwarded(header: &str) -> Option<IpAddr> {
@@ -153,6 +187,8 @@ fn refuse(status: StatusCode, code: &str, message: String, retry_after: Option<u
         Json(ErrorBody {
             code: code.to_string(),
             message,
+            pow_offer: None,
+            retry_after: None,
         }),
     )
         .into_response();
@@ -179,20 +215,36 @@ fn dids_in(body: &[u8]) -> Vec<String> {
     dids
 }
 
-/// `axum::middleware::from_fn_with_state` layer. Only POSTs are limited, so
-/// the same layer can sit on a router that also serves `GET /v1/challenge`.
+/// `axum::middleware::from_fn_with_state` layer. POSTs are limited per IP
+/// and per DID; `GET /v1/challenge` per IP, in a bucket of its own; any other
+/// GET passes.
 pub async fn limit(
     State(limiter): State<Arc<AliasRateLimiter>>,
     req: Request,
     next: Next,
 ) -> Response {
-    if !limiter.cfg.enabled || req.method() != Method::POST {
+    if !limiter.cfg.enabled {
+        return next.run(req).await;
+    }
+    let is_challenge = req.method() == Method::GET && req.uri().path() == "/v1/challenge";
+    if req.method() != Method::POST && !is_challenge {
         return next.run(req).await;
     }
     let ip_key = match limiter.client_ip(&req) {
         Some(ip) => ip_key(ip),
         None => "ip:unknown".to_string(),
     };
+    if is_challenge {
+        if let Err(retry_after) = limiter.admit_challenge(chrono::Utc::now().timestamp(), &ip_key) {
+            return refuse(
+                StatusCode::TOO_MANY_REQUESTS,
+                "RATE_LIMITED",
+                format!("too many challenges; retry in {retry_after}s"),
+                Some(retry_after),
+            );
+        }
+        return next.run(req).await;
+    }
     let (parts, body) = req.into_parts();
     let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
         return refuse(
@@ -230,6 +282,7 @@ mod tests {
                 enabled: true,
                 per_ip_per_min: per_ip,
                 per_did_per_min: per_did,
+                ..AliasRateLimitConfig::default()
             },
             NetworkConfig::default(),
         )

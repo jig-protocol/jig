@@ -8,8 +8,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use toml::Value as TomlValue;
 
-const DEFAULT_CONFIG_RELATIVE: &str = "config/jig-nameserver/jig-config.toml";
-
 fn merge_tables(target: &mut toml::value::Table, source: &toml::value::Table) {
     for (key, value) in source {
         let mut merged = false;
@@ -54,6 +52,9 @@ pub struct NameServerConfig {
     /// Per-IP and per-DID limits on the v0.0.2 `register`, `rotate` and
     /// `renew` routes (`[alias_rate_limits]`).
     pub alias_rate_limits: AliasRateLimitConfig,
+    /// TLS for the listener (`[tls]`), on by default with a self-signed
+    /// certificate the nameserver's DID vouches for at `/.well-known/jig-ns`.
+    pub tls: jig_config::tls::TlsConfig,
 }
 
 /// `JIG_NS_*` variables a removed feature read, with what removed it. Setting
@@ -141,6 +142,10 @@ const REMOVED_KEYS: &[(&str, &str)] = &[
     ("anomaly_detection", "the anomaly detector was removed"),
     ("hot", "the hot-state backends were removed"),
     ("federation", "nameserver federation was removed"),
+    (
+        "capabilities.federation_enabled",
+        "nameserver federation was removed",
+    ),
     ("storage.backend", "only SQLite storage remains"),
     ("storage.backend_config", "only SQLite storage remains"),
     ("analytics.backend", "only SQLite analytics remain"),
@@ -171,15 +176,29 @@ fn reject_removed_keys(table: &toml::value::Table) -> Result<()> {
     Ok(())
 }
 
+/// The config file to load: `--config`, else `JIG_NS_CONFIG`.
+fn config_path(explicit: Option<&Path>, env: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    explicit
+        .map(Path::to_path_buf)
+        .or_else(|| env.filter(|v| !v.is_empty()).map(PathBuf::from))
+        .ok_or_else(|| {
+            NameServerError::Other(anyhow::anyhow!(
+                "no nameserver config: pass --config <path> or set JIG_NS_CONFIG. The \
+                 nameserver no longer reads JIG_CONFIG, ~/.jig/config.toml or \
+                 ./config/jig-nameserver/jig-config.toml"
+            ))
+        })
+}
+
 impl NameServerConfig {
-    /// Load configuration from disk if available, otherwise fall back to env
-    /// defaults. The result is [`validate`](Self::validate)d, so a
-    /// misconfiguration surfaces as an `Err` the caller can log.
-    pub fn load() -> Result<Self> {
-        warn_removed_env_vars();
-        let cfg = Self::load_unvalidated()?;
-        cfg.validate()?;
-        Ok(cfg)
+    /// Load the config file named by `explicit` (the binary's `--config`), or
+    /// else by `JIG_NS_CONFIG`, then apply the environment overrides. There is
+    /// no default path: with neither set this fails, naming both. The result
+    /// is [`validate`](Self::validate)d, so a misconfiguration surfaces as an
+    /// `Err` the caller can log.
+    pub fn load(explicit: Option<&Path>) -> Result<Self> {
+        let path = config_path(explicit, std::env::var_os("JIG_NS_CONFIG"))?;
+        Self::load_from_path(path)
     }
 
     /// Operator-fixable-misconfiguration check. Separate from parsing so tests
@@ -191,35 +210,6 @@ impl NameServerConfig {
             .validate()
             .map_err(|e| NameServerError::Other(anyhow::anyhow!("[v0_0_2] {e}")))?;
         Ok(())
-    }
-
-    fn load_unvalidated() -> Result<Self> {
-        let env_profile = std::env::var("JIG_NS_PROFILE").ok();
-
-        if let Ok(explicit) = std::env::var("JIG_NS_CONFIG") {
-            return Self::load_from_path_with_profile(explicit, env_profile.clone());
-        }
-
-        if let Ok(global_path) = std::env::var("JIG_CONFIG")
-            && let Some(cfg) =
-                Self::load_from_global_path(&PathBuf::from(global_path), env_profile.clone())?
-        {
-            return Ok(cfg);
-        }
-
-        if let Some(cfg) =
-            Self::load_from_global_path(&jig_config::default_config_path(), env_profile.clone())?
-        {
-            return Ok(cfg);
-        }
-
-        if Path::new(DEFAULT_CONFIG_RELATIVE).exists() {
-            return Self::load_from_path_with_profile(DEFAULT_CONFIG_RELATIVE, env_profile);
-        }
-
-        let mut cfg = Self::from_env();
-        cfg.normalize();
-        Ok(cfg)
     }
 
     /// Load configuration from the given path. Validated like [`load`](Self::load).
@@ -247,53 +237,6 @@ impl NameServerConfig {
         cfg.apply_env_overrides();
         cfg.normalize();
         Ok(cfg)
-    }
-
-    fn load_from_global_path(
-        path: &Path,
-        profile_override: Option<String>,
-    ) -> Result<Option<Self>> {
-        let data = match fs::read_to_string(path) {
-            Ok(data) => data,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(NameServerError::Other(anyhow::anyhow!(format!(
-                    "read global config {}: {}",
-                    path.display(),
-                    e
-                ))));
-            }
-        };
-        let value: TomlValue = toml::from_str(&data).map_err(|e| {
-            NameServerError::Other(anyhow::anyhow!(format!("parse {}: {}", path.display(), e)))
-        })?;
-        let root = match value.as_table() {
-            Some(table) => table,
-            None => return Ok(None),
-        };
-        let nameserver_value = match root.get("nameserver") {
-            Some(value) => value,
-            None => return Ok(None),
-        };
-        let mut override_profile = profile_override;
-        if override_profile.is_none() {
-            override_profile = root
-                .get("deployment")
-                .and_then(|v| v.as_table())
-                .and_then(|tbl| tbl.get("mode"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-        }
-        let table = nameserver_value.as_table().cloned().ok_or_else(|| {
-            NameServerError::Other(anyhow::anyhow!(
-                "nameserver section in {} must be a table",
-                path.display()
-            ))
-        })?;
-        let mut cfg = Self::from_table(table, override_profile)?;
-        cfg.apply_env_overrides();
-        cfg.normalize();
-        Ok(Some(cfg))
     }
 
     pub(crate) fn from_table(
@@ -379,7 +322,18 @@ impl NameServerConfig {
             analytics: AnalyticsConfig::from_env(),
             v0_0_2: jig_config::v0_0_2_server::JigServerConfig::default(),
             alias_rate_limits: AliasRateLimitConfig::default(),
+            tls: jig_config::tls::TlsConfig::default(),
         }
+    }
+
+    /// Unsafe options this config sets, as `/.well-known/jig-ns` lists them
+    /// (JEP-0004 rule 12), named the way jig-server names its own.
+    pub fn unsafe_options_active(&self) -> Vec<String> {
+        let mut active = Vec::new();
+        if !self.tls.enabled {
+            active.push("tls.enabled=false".to_string());
+        }
+        active
     }
 
     fn apply_env_overrides(&mut self) {
@@ -512,6 +466,12 @@ pub struct AliasRateLimitConfig {
     pub per_ip_per_min: u32,
     /// Requests naming a given DID per minute (`did`, `old_did` or `new_did`).
     pub per_did_per_min: u32,
+    /// `GET /v1/challenge` requests per client IP per minute (JEP-0008 rule
+    /// 31): each one can make the nameserver sign an effort offer.
+    pub challenge_per_ip_per_min: u32,
+    /// Challenges issued and not yet used or expired. At the cap a new one is
+    /// refused with `503 BUSY`; live ones are never evicted.
+    pub max_pending_challenges: usize,
 }
 
 impl Default for AliasRateLimitConfig {
@@ -520,6 +480,8 @@ impl Default for AliasRateLimitConfig {
             enabled: true,
             per_ip_per_min: 30,
             per_did_per_min: 10,
+            challenge_per_ip_per_min: 60,
+            max_pending_challenges: 100_000,
         }
     }
 }
@@ -1005,7 +967,6 @@ pub struct CapabilitiesConfig {
     pub useful_work_types: Vec<String>,
     pub tribunal_enabled: bool,
     pub transparency_enabled: bool,
-    pub federation_enabled: bool,
     #[serde(default)]
     pub affordances: Vec<String>, // Phase C: e.g. ["email.delivered", "bridge.forwarded"]
 }
@@ -1022,7 +983,6 @@ impl Default for CapabilitiesConfig {
             ],
             tribunal_enabled: true,
             transparency_enabled: true,
-            federation_enabled: false,
             affordances: Vec::new(),
         }
     }
@@ -1067,10 +1027,6 @@ impl CapabilitiesConfig {
             records.push("jig-ns=transparency:enabled".into());
         }
 
-        if self.federation_enabled {
-            records.push("jig-ns=federation:enabled".into());
-        }
-
         // Phase C: Add affordances if present
         if !self.affordances.is_empty() {
             records.push(format!("jig-ns=affordances:{}", self.affordances.join(",")));
@@ -1109,14 +1065,6 @@ impl CapabilitiesConfig {
         lines.push(format!(
             "transparency: {}",
             if self.transparency_enabled {
-                "enabled"
-            } else {
-                "disabled"
-            }
-        ));
-        lines.push(format!(
-            "federation: {}",
-            if self.federation_enabled {
                 "enabled"
             } else {
                 "disabled"
@@ -1229,7 +1177,19 @@ trust_proxy = false
 proxy_ip_header = "x-forwarded-for"
 
 [storage]
+# Names where the nameserver keeps <stem>_v002.db (aliases) and <stem>_v002.key
+# (its signing key). The file itself is never created.
 database_path = "~/.jig/nameserver.db"
+
+# TLS, on by default. With neither path set, the nameserver makes a self-signed
+# certificate on first start (in nameserver/tls/ next to the database), and its
+# DID vouches for it at /.well-known/jig-ns. Set both paths to serve a
+# certificate a CA issued. `enabled = false` serves plaintext: an unsafe
+# option, listed in /.well-known/jig-ns under unsafe_options_active.
+[tls]
+enabled = true
+# cert_path = "/etc/jig/nameserver.crt"
+# key_path = "/etc/jig/nameserver.key"
 
 
 # v0.0.2 register / rotate / renew. Refused requests get HTTP 429 with code
@@ -1238,6 +1198,10 @@ database_path = "~/.jig/nameserver.db"
 enabled = true
 per_ip_per_min = 30
 per_did_per_min = 10
+# GET /v1/challenge per client IP per minute, and the most challenges pending
+# at once (past it, new ones get 503 BUSY).
+challenge_per_ip_per_min = 60
+max_pending_challenges = 100000
 
 [penalties]
 decay_secs = 300
@@ -1302,7 +1266,6 @@ version = "v1"
 useful_work_types = ["validate_block", "verify_observation", "audit_ruleset"]
 tribunal_enabled = true
 transparency_enabled = true
-federation_enabled = false
 
 # Phase F: Analytics configuration
 [analytics]
@@ -1340,6 +1303,32 @@ default_time_range = "last_day"  # Options: last_hour, last_day, last_week, last
 # [[v0_0_2.nameserver.alias_suffixes.registration_allow]]
 # did = "did:jig:z..."
 # aliases = ["alice"]
+#
+# # Proof-of-work on register, renew and rotate (JEP-0008). On by default
+# # at the values shown, which jig clients solve; min_effort = 0 turns it
+# # off. An allowlisted registration pays min_effort; an ordinary one pays
+# # min_effort x short_name_factor^(short_name_len - length), up to max_effort.
+# [v0_0_2.nameserver.alias_suffixes.pow]
+# alg = 1
+# min_effort = 1048576       # 2^20
+# max_effort = 16777216      # 2^24, about 3 s on one server core
+# max_solve_secs = 10
+# short_name_len = 5
+# short_name_factor = 4
+# renew_effort = 1
+# penalty_decay_secs = 600   # a penalty point's life; a repeat doubles it
+#
+# # The cap on registrations by DIDs registration_allow does not name. On by
+# # default at the values shown; jig clients wait out 503 REGISTRATION_BUSY
+# # and retry. enabled = false admits every stranger.
+# [v0_0_2.nameserver.alias_suffixes.pool]
+# enabled = true
+# strangers_per_hour = 60
+# burst = 10
+# controller = "doubling"    # double the effort after a window with the queue
+# controller_window_secs = 300  # full, halve it after a window with none queued
+# queue_len = 20             # held for a token, highest effort first
+# queue_wait_secs = 10       # then 503 REGISTRATION_BUSY with Retry-After
 
 [v0_0_2.server]
 # Ed25519 key that signs alias attestations. Left at the jig-server default
@@ -1477,7 +1466,6 @@ domain = "test.example.com"
 useful_work_types = ["custom"]
 tribunal_enabled = false
 transparency_enabled = true
-federation_enabled = true
 "#;
         let cfg: CapabilitiesConfig = toml::from_str(doc).unwrap();
 
@@ -1486,7 +1474,6 @@ federation_enabled = true
         assert_eq!(cfg.useful_work_types, vec!["custom"]);
         assert!(!cfg.tribunal_enabled);
         assert!(cfg.transparency_enabled);
-        assert!(cfg.federation_enabled);
     }
 
     #[test]
@@ -1495,7 +1482,6 @@ federation_enabled = true
         assert_eq!(cfg.capabilities.version, "v1");
         assert!(cfg.capabilities.tribunal_enabled);
         assert!(cfg.capabilities.transparency_enabled);
-        assert!(!cfg.capabilities.federation_enabled);
     }
 
     // --- [v0_0_2] alias-API section ----------------------------------------
@@ -1552,12 +1538,28 @@ federation_enabled = true
             include_str!("../examples/config/profile_federated.toml"),
             include_str!("../examples/config/profile_potato.toml"),
         ] {
-            let value: TomlValue = toml::from_str(example).expect("valid TOML");
-            let ns = value["nameserver"]
-                .as_table()
-                .expect("[nameserver]")
-                .clone();
-            NameServerConfig::from_table(ns, None).expect("example parses");
+            from_doc(example).expect("example parses");
+        }
+    }
+
+    /// `--config` wins over `JIG_NS_CONFIG`; with neither there is no default
+    /// path, and the error names both and the old fallbacks it no longer reads.
+    #[test]
+    fn the_config_path_is_explicit_or_from_jig_ns_config() {
+        let flag = Path::new("/etc/jig/flag.toml");
+        let env = || Some(std::ffi::OsString::from("/etc/jig/env.toml"));
+        assert_eq!(config_path(Some(flag), env()).unwrap(), flag);
+        assert_eq!(
+            config_path(None, env()).unwrap(),
+            Path::new("/etc/jig/env.toml")
+        );
+        for missing in [None, Some(std::ffi::OsString::new())] {
+            let err = config_path(None, missing).unwrap_err().to_string();
+            assert!(
+                err.contains("--config") && err.contains("JIG_NS_CONFIG"),
+                "{err}"
+            );
+            assert!(err.contains("~/.jig/config.toml"), "{err}");
         }
     }
 

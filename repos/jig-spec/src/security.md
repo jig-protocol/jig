@@ -228,7 +228,7 @@ Even if message content is encrypted, metadata reveals:
 
 ### Key Rotation
 
-**MUST support key rotation** (see [Crypto Primitives § Key Rotation](crypto.md#key-rotation-and-revocation)). *(not yet implemented: no rotation certificate exists, and a server whose key changes has a new DID.)*
+**MUST support key rotation** (see [Crypto Primitives § Key Rotation](crypto.md#key-rotation-and-revocation)). *(partial: no rotation certificate exists, and a server whose key changes has a new DID, but it can serve a key link (JEP-0012) from the old DID that clients follow (#241); no tool makes the link yet.)*
 
 **Process:**
 
@@ -243,7 +243,7 @@ Even if message content is encrypted, metadata reveals:
 
 ### Ephemeral Secret Handling
 
-**MUST keep ephemeral secrets in memory only.** Zeroize immediately after use. *(partial: the CLI persists each MLS group's current state, epoch secrets included, unencrypted under `~/.jig/`, so it can decrypt across runs; signing keys are zeroized on drop.)*
+**MUST keep ephemeral secrets in memory only.** Zeroize immediately after use. *(partial: the CLI persists each MLS group's current state, epoch secrets included, under `~/.jig/` so it can decrypt across runs; since #177 that state is sealed under keys derived from the identity's data key when the identity itself is sealed; with `JIG_KEYS_STORAGE=plaintext` the MLS state and cached plaintext stay unencrypted at rest. Signing keys are zeroized on drop.)*
 
 **What's ephemeral:**
 
@@ -299,7 +299,7 @@ void process_session_key(uint8_t *key, size_t len) {
 - `TLS_CHACHA20_POLY1305_SHA256`
 - `TLS_AES_128_GCM_SHA256`
 
-**For server operators:** Configure your TLS library:
+**For server operators:** Configure your TLS library. *(jig-server terminates TLS itself, and so does a nameserver serving `config`-rooted suffixes: the signed welcome and the nameserver's DID are bound to their own TLS session and certificate (#234, #262). A proxy in front must pass TLS through, so these settings apply to a proxy only where nothing jig serves sits behind it.)*
 
 ```
 # nginx example
@@ -424,7 +424,7 @@ After 5 seconds → both sent together
 
 **Don't:**
 
-- Store keys in plaintext files. *(the reference CLI and server do, with 0600 permissions on Unix; see [Crypto Primitives § Identity Keys](crypto.md#identity-keys-long-term))*
+- Store keys in plaintext files. *(the reference CLI, jig-server and jig-nameserver seal their keys and keep them in clear only with `JIG_KEYS_STORAGE=plaintext` or `[keys] storage = "plaintext"`, with a warning on every load (#177, #254); see [Crypto Primitives § Identity Keys](crypto.md#identity-keys-long-term))*
 - Commit keys to git.
 - Send keys via email or Slack.
 

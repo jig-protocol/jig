@@ -79,8 +79,8 @@ loopback and private tailnets.
 | Server-to-server federation over WSS | Implemented for open, unencrypted channels and covered by [`h3_federation.rs`](repos/integration-tests/tests/h3_federation.rs); never run between two hosts on the public internet |
 | Email bridge (Resend) | Implemented in-process, but inbound mail is refused until the bridge can join a thread's MLS group (D25); see [`bridges/email/README.md`](repos/bridges/email/README.md) |
 | Wasm block execution **on the server** | `text-render` executes for real on plaintext channels: the server runs its canonical module and signs the `render_hash` ([`jig-pipeline/src/ingest.rs`](repos/jig-pipeline/src/ingest.rs), step 4). Encrypted content is never executed and gets a `sealed` receipt; control-plane kinds take a synthetic one |
-| Wasm block execution in the CLI (`jig block run`) | Runs and emits a metered receipt for the runtime's own fixtures. It **rejects the workspace's own `text-block` build** with `MemoryMissingMaximum` from the determinism validator |
-| `jig block lint` / `sign` / `verify` / `capabilities` | Stubs; they print "not yet implemented" and exit 1 |
+| Wasm block execution in the CLI (`jig block run`, `jig block test`) | Works for `jig:block` components, through the same component path as the server and client. A core module is refused; `jig block build` makes a component |
+| `jig block new` / `build` / `lint` | Work: a project from a template, built into a component and checked against the determinism profile `jig-det-1` |
 | Authentication / authorization | Signed proof of possession on every read; `restricted` channels membership-gated for reading, listing, live delivery and posting; membership changes owner-signed; operator admission policy, with optional proof-of-work for new DIDs; per-DID and per-address rate limits |
 | Graphical client | None |
 | `jig read` | Works: the signed history endpoint, decrypting encrypted channels you belong to |

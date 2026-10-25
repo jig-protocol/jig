@@ -5,7 +5,7 @@
 //! ## Sections
 //! - `[server]`     — bind address, server DID keyfile, allowed block kinds
 //! - `[identity]`   — TOFU vs nameserver mode + trusted nameservers
-//! - `[federation]` — peers + TLS toggle
+//! - `[federation]` — peers, TLS toggle, the published peer policy
 //! - `[debug]`      — antipattern-flag-gated REST endpoints + nameserver enumeration
 //! - `[nameserver]` — alias suffixes this node serves (nameserver mode)
 //!
@@ -40,6 +40,34 @@ pub struct JigServerConfig {
     pub nameserver: NameserverSection,
     #[serde(default)]
     pub auth: AuthSection,
+    #[serde(default)]
+    pub keys: KeysSection,
+}
+
+/// `[keys]`: how this server opens its own signing key, a `.jigkey`.
+///
+/// A server boots unattended: it never prompts and never uses an OS keychain.
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeysSection {
+    /// The slot to open the key with, and to seal a new key with:
+    /// `credential:PATH` (a systemd credential, `LoadCredentialEncrypted=`),
+    /// `env:NAME`, or `passphrase` (read from `JIG_KEY_PASSPHRASE`).
+    /// `JIG_KEY_UNLOCK` and `JIG_KEY_PASSPHRASE` are tried too.
+    pub unlock: Option<String>,
+    /// `sealed` (the default) or `plaintext`, an antipattern: a raw 32-byte
+    /// key in clear, warned about on every boot. Deliberately not listed in
+    /// `unsafe_options_active`, which `/.well-known/jig` publishes: it would
+    /// mark this server as a soft target, and no client can verify it.
+    pub storage: KeyStorage,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyStorage {
+    #[default]
+    Sealed,
+    Plaintext,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -78,6 +106,9 @@ impl Default for ServerSection {
             // and leave) and channel-promote (opening a restricted channel or
             // DM up) are v0.2 channel dynamics, gated the same way.
             // role-assign and role-unassign (JEP-0005 rule 7b) are owner-only.
+            // channel-share and channel-unshare need the `share` right, and
+            // only the channel's sequencer writes the contract-* records of
+            // what came of a share (JEP-0005 rules 7-11).
             allowed_block_kinds: vec![
                 "text-render".to_string(),
                 "channel-create".to_string(),
@@ -87,6 +118,11 @@ impl Default for ServerSection {
                 "channel-archive".to_string(),
                 "role-assign".to_string(),
                 "role-unassign".to_string(),
+                "channel-share".to_string(),
+                "channel-unshare".to_string(),
+                "contract-accept".to_string(),
+                "contract-refuse".to_string(),
+                "contract-end".to_string(),
             ],
             max_future_skew_ms: DEFAULT_MAX_FUTURE_SKEW_MS,
         }
@@ -116,6 +152,46 @@ pub struct IdentitySection {
     /// here is refused when it is looked up; there is no discovery on the
     /// server side.
     pub delegations: BTreeMap<String, NameDelegation>,
+    /// Ask `http://` nameservers under `[identity.delegations]`. Off, a
+    /// nameserver is reached only over TLS one of its suffix's authorities
+    /// vouches for (its DID's binding for the certificate). For loopback or
+    /// local testing only: over plaintext anyone on the path sees which
+    /// aliases are looked up and can hide answers, though not forge them.
+    /// Listed in `unsafe_options_active`.
+    pub dangerously_allow_plaintext_nameservers: bool,
+    /// Suffixes under which every alias is refused, before any delegation,
+    /// including the built-in `jig` one, which a refused `jig` never gets.
+    /// Compared case-insensitively. A suffix may not be both here and in
+    /// `[identity.delegations]`. Logged at boot, not advertised.
+    pub refused_suffixes: Vec<String>,
+}
+
+impl IdentitySection {
+    /// `refused_suffixes`, lowercased, as aliases are.
+    pub fn refused(&self) -> std::collections::BTreeSet<String> {
+        self.refused_suffixes
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect()
+    }
+
+    /// Refuse a suffix that is both delegated and refused: which one the
+    /// operator meant cannot be guessed.
+    pub fn validate(&self) -> Result<(), String> {
+        let refused = self.refused();
+        match self
+            .delegations
+            .keys()
+            .map(|s| s.to_ascii_lowercase())
+            .find(|s| refused.contains(s))
+        {
+            Some(suffix) => Err(format!(
+                "`{suffix}` is both in [identity.delegations] and in [identity] \
+                 refused_suffixes; remove it from one"
+            )),
+            None => Ok(()),
+        }
+    }
 }
 
 /// One suffix's entry in `[identity.delegations]`.
@@ -138,6 +214,8 @@ impl Default for IdentitySection {
             cache_ttl_seconds: 300,
             naively_allow_unknown_handles_fallback: false,
             delegations: BTreeMap::new(),
+            dangerously_allow_plaintext_nameservers: false,
+            refused_suffixes: Vec::new(),
         }
     }
 }
@@ -317,7 +395,7 @@ pub struct ReputationRecord {
     pub score: i64,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FederationSection {
     pub peers: Vec<FederationPeer>,
@@ -327,6 +405,36 @@ pub struct FederationSection {
     /// still checked by the signed welcome, but nothing after the welcome is
     /// protected on a plaintext link. Surfaces in `unsafe_options_active`.
     pub dangerously_allow_plaintext_federation: bool,
+    /// The quota for every peer without its own `quota`, published in the
+    /// server manifest (JEP-0005 rule 16). Defaults to
+    /// [`DEFAULT_PEER_BLOCKS_PER_MIN`] blocks and [`DEFAULT_PEER_BYTES_PER_MIN`]
+    /// bytes a minute.
+    pub default_peer_quota: PeerQuotaConfig,
+    /// The name suffixes this server attests, published in the server
+    /// manifest.
+    pub attested_suffixes: Vec<AttestedSuffixConfig>,
+}
+
+/// Blocks a peer may relay to this server per minute, unless it has its own
+/// `quota`.
+pub const DEFAULT_PEER_BLOCKS_PER_MIN: u64 = 600;
+/// Bytes a peer may relay to this server per minute, unless it has its own
+/// `quota`: 8 MiB.
+pub const DEFAULT_PEER_BYTES_PER_MIN: u64 = 8 * 1024 * 1024;
+
+impl Default for FederationSection {
+    fn default() -> Self {
+        Self {
+            peers: Vec::new(),
+            dangerously_disable_federation_tls: false,
+            dangerously_allow_plaintext_federation: false,
+            default_peer_quota: PeerQuotaConfig {
+                blocks_per_min: DEFAULT_PEER_BLOCKS_PER_MIN,
+                bytes_per_min: DEFAULT_PEER_BYTES_PER_MIN,
+            },
+            attested_suffixes: Vec::new(),
+        }
+    }
 }
 
 /// A server this one federates with. Listing it is what makes it trusted:
@@ -340,6 +448,123 @@ pub struct FederationPeer {
     pub expected_did: String,
     #[serde(default)]
     pub alias: Option<String>,
+    /// List `expected_did` in the server manifest's `peers`. Off by default:
+    /// who a server federates with is the operator's to disclose.
+    #[serde(default)]
+    pub publish: bool,
+    /// This peer's own quota, in place of `default_peer_quota`. Published
+    /// only when `publish` is set: a quota names its peer.
+    #[serde(default)]
+    pub quota: Option<PeerQuotaConfig>,
+    /// What this server does with a channel this peer offers it (JEP-0005
+    /// rule 8): hold the offer for the operator (the default), or accept it.
+    /// An offer this server cannot honour is refused either way.
+    #[serde(default)]
+    pub offers: OfferPolicy,
+}
+
+/// What a server does with a contract offer from one peer.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OfferPolicy {
+    /// Keep the offer until the operator accepts or refuses it.
+    #[default]
+    Hold,
+    /// Accept every offer this server can honour.
+    Accept,
+}
+
+/// How much one peer may relay to this server.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerQuotaConfig {
+    pub blocks_per_min: u64,
+    pub bytes_per_min: u64,
+}
+
+/// A name suffix this server attests (JEP-0004).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttestedSuffixConfig {
+    pub suffix: String,
+    /// What the attestation rests on. Only `"dns"` for now.
+    pub root: String,
+}
+
+impl FederationSection {
+    /// Refuse a peer policy the server manifest could not publish, or should
+    /// not.
+    pub fn validate(&self) -> Result<(), String> {
+        let check_quota = |q: &PeerQuotaConfig, at: &str| {
+            // Zero would publish "send nothing", which no peer can honour
+            // while federating.
+            if q.blocks_per_min == 0 || q.bytes_per_min == 0 {
+                return Err(format!(
+                    "[federation] {at}: blocks_per_min and bytes_per_min must both be at least 1"
+                ));
+            }
+            Ok(())
+        };
+        check_quota(&self.default_peer_quota, "default_peer_quota")?;
+        let mut quotas: BTreeMap<&str, Option<PeerQuotaConfig>> = BTreeMap::new();
+        for (i, peer) in self.peers.iter().enumerate() {
+            if let Some(q) = &peer.quota {
+                check_quota(q, &format!("peers[{i}].quota"))?;
+            }
+            if let Some(earlier) = quotas.insert(&peer.expected_did, peer.quota)
+                && earlier != peer.quota
+            {
+                return Err(format!(
+                    "[federation] peers[{i}]: {} is listed more than once with different quotas",
+                    peer.expected_did
+                ));
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, entry) in self.attested_suffixes.iter().enumerate() {
+            let at = format!("[federation] attested_suffixes[{i}]");
+            match entry.root.as_str() {
+                "dns" => {}
+                "contract" => {
+                    return Err(format!(
+                        "{at}: contract-rooted suffixes are v0.3; only root = \"dns\" is \
+                         supported"
+                    ));
+                }
+                "config" => {
+                    return Err(format!(
+                        "{at}: a config-rooted suffix is never published (JEP-0004 rule 7); \
+                         only root = \"dns\" belongs here"
+                    ));
+                }
+                other => {
+                    return Err(format!(
+                        "{at}: unknown root `{other}`; only \"dns\" is supported"
+                    ));
+                }
+            }
+            let suffix = entry.suffix.to_lowercase();
+            // JEP-0004 rules 1 and 4: a dotted name of `[a-z0-9-]` labels that
+            // neither start nor end with a hyphen, and
+            // more than one, since a single label has no DNS name to root it.
+            let labels_ok = suffix.split('.').all(|label| {
+                !label.is_empty()
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            });
+            if suffix.split('.').count() < 2 || !labels_ok {
+                return Err(format!(
+                    "{at}: `{}` is not a multi-label DNS suffix of `[a-z0-9-]` labels (e.g. `names.example.org`)",
+                    entry.suffix
+                ));
+            }
+            if !seen.insert(suffix) {
+                return Err(format!("{at}: `{}` is listed more than once", entry.suffix));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
@@ -470,6 +695,142 @@ pub struct SuffixConfig {
     pub reserved_affixes: Vec<String>,
     #[serde(default)]
     pub registration_allow: Vec<AllowEntry>,
+    /// The proof-of-work register, renew and rotate carry (JEP-0008).
+    #[serde(default)]
+    pub pow: PowPolicy,
+    /// The cap on stranger registrations (JEP-0008 rules 17 and 21–24).
+    #[serde(default)]
+    pub pool: PoolPolicy,
+}
+
+/// `[v0_0_2.nameserver.alias_suffixes.pool]`: how many registrations by DIDs
+/// the allowlist does not name are admitted, however much work they bring
+/// (R1 decision 2), and how effort follows the demand.
+///
+/// On by default at [`PoolPolicy::recommended`], the opening value for `@jig`:
+/// `jig` waits out `503 REGISTRATION_BUSY` and retries (R1 slice 2).
+/// [`PoolPolicy::off`] admits every stranger.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PoolPolicy {
+    pub enabled: bool,
+    /// Stranger registrations admitted per hour.
+    pub strangers_per_hour: u32,
+    /// How many may be admitted at once after a quiet spell.
+    pub burst: u32,
+    /// How the suggested effort follows the queue. Only `doubling`.
+    pub controller: Controller,
+    /// One controller window.
+    pub controller_window_secs: u64,
+    /// Requests held for a token, highest effort first.
+    pub queue_len: usize,
+    /// The longest a held request waits before `503 REGISTRATION_BUSY`.
+    pub queue_wait_secs: u64,
+}
+
+/// How the suggested effort adapts (JEP-0008 rule 17).
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum Controller {
+    /// Double after a window with the queue full; halve after a window with
+    /// it empty throughout.
+    #[default]
+    Doubling,
+}
+
+impl Default for PoolPolicy {
+    fn default() -> Self {
+        Self::recommended()
+    }
+}
+
+impl PoolPolicy {
+    /// R1 decision 2: 60 an hour with a burst of 10 for `@jig`'s first week.
+    pub fn recommended() -> Self {
+        Self {
+            enabled: true,
+            strangers_per_hour: 60,
+            burst: 10,
+            controller: Controller::Doubling,
+            controller_window_secs: 300,
+            queue_len: 20,
+            queue_wait_secs: 10,
+        }
+    }
+
+    /// No pool: every stranger with valid work is admitted, with
+    /// [`PoolPolicy::recommended`]'s other values.
+    pub fn off() -> Self {
+        Self {
+            enabled: false,
+            ..Self::recommended()
+        }
+    }
+}
+
+/// `[v0_0_2.nameserver.alias_suffixes.pow]`: how much work a suffix asks for
+/// (JEP-0008 rules 16–31). Each challenge promises an effort, signed, and the
+/// proof is checked against that promise.
+///
+/// The default is [`PowPolicy::recommended`]: the CLI solves (R1 slice 2).
+/// `min_effort = 0` turns it off.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PowPolicy {
+    /// The puzzle algorithm (rule 8). Only `1`, BLAKE3, is registered.
+    pub alg: u8,
+    /// The effort an ordinary registration pays before the length multiplier;
+    /// the floor for strangers (rule 19). `0` asks no work of anyone on this
+    /// suffix.
+    pub min_effort: u64,
+    /// The most a registration is asked for. It must fit `max_solve_secs` on
+    /// the slowest client this suffix means to serve.
+    pub max_effort: u64,
+    /// What `max_effort` must be solvable in.
+    pub max_solve_secs: u64,
+    /// Aliases shorter than this pay the length multiplier.
+    pub short_name_len: usize,
+    /// Effort × `short_name_factor`^(`short_name_len` − length).
+    pub short_name_factor: u64,
+    /// What renew and rotate by the holder pay (rule 31). `0` asks none.
+    pub renew_effort: u64,
+    /// How long a penalty point lasts; each repeat offence before it lapses
+    /// doubles it (rule 27).
+    pub penalty_decay_secs: u64,
+}
+
+impl Default for PowPolicy {
+    fn default() -> Self {
+        Self::recommended()
+    }
+}
+
+impl PowPolicy {
+    /// The R1 plan's values: 2^20 to register, ×4 per letter under 5, at most
+    /// 2^24 (about 3 s on one server core); 1 to renew or rotate.
+    pub fn recommended() -> Self {
+        Self {
+            alg: 1,
+            min_effort: 1 << 20,
+            max_effort: 1 << 24,
+            max_solve_secs: 10,
+            short_name_len: 5,
+            short_name_factor: 4,
+            renew_effort: 1,
+            penalty_decay_secs: 600,
+        }
+    }
+
+    /// No work is asked on this suffix, with [`PowPolicy::recommended`]'s
+    /// other values.
+    pub fn off() -> Self {
+        Self {
+            min_effort: 0,
+            renew_effort: 0,
+            ..Self::recommended()
+        }
+    }
 }
 
 fn default_min_alias_len() -> usize {
@@ -521,6 +882,8 @@ impl SuffixConfig {
             reserved_contains: default_reserved_contains(),
             reserved_affixes: default_reserved_affixes(),
             registration_allow: Vec::new(),
+            pow: PowPolicy::default(),
+            pool: PoolPolicy::default(),
         }
     }
 
@@ -630,6 +993,9 @@ impl JigServerConfig {
         }
         if self.identity.naively_allow_unknown_handles_fallback {
             active.push("identity.naively_allow_unknown_handles_fallback".to_string());
+        }
+        if self.identity.dangerously_allow_plaintext_nameservers {
+            active.push("identity.dangerously_allow_plaintext_nameservers".to_string());
         }
         if self.debug.list_handles {
             active.push("debug.list_handles".to_string());
@@ -847,6 +1213,11 @@ mod tests {
             "channel-archive",
             "role-assign",
             "role-unassign",
+            "channel-share",
+            "channel-unshare",
+            "contract-accept",
+            "contract-refuse",
+            "contract-end",
         ] {
             assert!(
                 cfg.server.allowed_block_kinds.iter().any(|k| k == required),
@@ -872,6 +1243,24 @@ mod tests {
     }
 
     #[test]
+    fn keys_default_to_sealed_and_parse_when_set() {
+        let omitted: JigServerConfig = toml::from_str("").unwrap();
+        assert_eq!(omitted.keys, KeysSection::default());
+        assert_eq!(omitted.keys.storage, KeyStorage::Sealed);
+        let set: JigServerConfig = toml::from_str(
+            "[keys]\nunlock = \"credential:/run/credentials/jig-server.service/key\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            set.keys.unlock.as_deref(),
+            Some("credential:/run/credentials/jig-server.service/key")
+        );
+        let plain: JigServerConfig = toml::from_str("[keys]\nstorage = \"plaintext\"\n").unwrap();
+        assert_eq!(plain.keys.storage, KeyStorage::Plaintext);
+        assert!(toml::from_str::<JigServerConfig>("[keys]\nunlok = \"env:X\"\n").is_err());
+    }
+
+    #[test]
     fn the_skew_bound_defaults_when_omitted_and_parses_when_set() {
         let omitted: JigServerConfig =
             toml::from_str("[server]\nlisten = \"0.0.0.0:443\"\n").unwrap();
@@ -890,13 +1279,19 @@ mod tests {
         cfg.federation.dangerously_disable_federation_tls = true;
         cfg.federation.dangerously_allow_plaintext_federation = true;
         cfg.identity.naively_allow_unknown_handles_fallback = true;
+        cfg.identity.dangerously_allow_plaintext_nameservers = true;
         cfg.debug.list_handles = true;
         cfg.auth.require_authenticated_reads = false;
+        cfg.keys.storage = KeyStorage::Plaintext;
         let active = cfg.unsafe_options_active();
+        // Not published: it would point attackers at soft targets, and clients
+        // cannot verify an operator's word about it anyway. It warns at boot.
+        assert!(!active.iter().any(|o| o.starts_with("keys.")));
         assert!(active.contains(&"auth.require_authenticated_reads=false".to_string()));
         assert!(active.contains(&"federation.dangerously_disable_federation_tls".to_string()));
         assert!(active.contains(&"federation.dangerously_allow_plaintext_federation".to_string()));
         assert!(active.contains(&"identity.naively_allow_unknown_handles_fallback".to_string()));
+        assert!(active.contains(&"identity.dangerously_allow_plaintext_nameservers".to_string()));
         assert!(active.contains(&"debug.list_handles".to_string()));
         assert!(!active.contains(&"naively_unbounded_clock_skew".to_string()));
     }
@@ -933,6 +1328,132 @@ mod tests {
         assert_eq!(cfg.federation.peers.len(), 1);
         assert_eq!(cfg.federation.peers[0].alias.as_deref(), Some("deji.jig"));
         assert!(!cfg.debug.list_handles);
+    }
+
+    // --- [federation] peer policy ----------------------------------------
+
+    fn federation(doc: &str) -> Result<FederationSection, String> {
+        let cfg: JigServerConfig = toml::from_str(doc).map_err(|e| e.to_string())?;
+        cfg.federation.validate()?;
+        Ok(cfg.federation)
+    }
+
+    #[test]
+    fn the_peer_policy_defaults_publish_nothing_but_the_default_quota() {
+        let f = federation(
+            r#"
+            [[federation.peers]]
+            url = "wss://peer.example.org"
+            expected_did = "did:jig:zPeer"
+            "#,
+        )
+        .unwrap();
+        assert!(!f.peers[0].publish);
+        assert_eq!(f.peers[0].quota, None);
+        assert_eq!(
+            f.default_peer_quota,
+            PeerQuotaConfig {
+                blocks_per_min: 600,
+                bytes_per_min: 8 * 1024 * 1024,
+            }
+        );
+        assert!(f.attested_suffixes.is_empty());
+        JigServerConfig::default().federation.validate().unwrap();
+    }
+
+    #[test]
+    fn a_full_peer_policy_parses() {
+        let f = federation(
+            r#"
+            [federation.default_peer_quota]
+            blocks_per_min = 100
+            bytes_per_min = 1000
+
+            [[federation.peers]]
+            url = "wss://peer.example.org"
+            expected_did = "did:jig:zPeer"
+            publish = true
+            quota = { blocks_per_min = 5, bytes_per_min = 50 }
+
+            [[federation.attested_suffixes]]
+            suffix = "Names.Example.org"
+            root = "dns"
+            "#,
+        )
+        .unwrap();
+        assert!(f.peers[0].publish);
+        assert_eq!(
+            f.peers[0].quota,
+            Some(PeerQuotaConfig {
+                blocks_per_min: 5,
+                bytes_per_min: 50,
+            })
+        );
+        assert_eq!(f.default_peer_quota.blocks_per_min, 100);
+        assert_eq!(f.attested_suffixes[0].suffix, "Names.Example.org");
+    }
+
+    #[test]
+    fn a_bad_peer_policy_is_refused() {
+        let peer = |did: &str, quota: &str| {
+            format!(
+                "[[federation.peers]]\nurl = \"wss://peer.example.org\"\n\
+                 expected_did = \"{did}\"\n{quota}\n"
+            )
+        };
+        let suffix = |s: &str, root: &str| {
+            format!("[[federation.attested_suffixes]]\nsuffix = \"{s}\"\nroot = \"{root}\"\n")
+        };
+        for (doc, why) in [
+            (suffix("names.example.org", "contract"), "v0.3"),
+            (suffix("names.example.org", "config"), "never published"),
+            (suffix("names.example.org", "ens"), "unknown root"),
+            (suffix("jig", "dns"), "multi-label"),
+            (suffix("example.", "dns"), "multi-label"),
+            (suffix("ex ample.org", "dns"), "multi-label"),
+            (suffix("ex_ample.org", "dns"), "multi-label"),
+            (suffix("-ex.org", "dns"), "multi-label"),
+            (suffix("ex-.org", "dns"), "multi-label"),
+            (
+                suffix("names.example.org", "dns") + &suffix("NAMES.example.org", "dns"),
+                "more than once",
+            ),
+            (
+                "[federation.default_peer_quota]\nblocks_per_min = 0\nbytes_per_min = 1\n"
+                    .to_string(),
+                "at least 1",
+            ),
+            (
+                peer(
+                    "did:jig:zPeer",
+                    "quota = { blocks_per_min = 1, bytes_per_min = 0 }",
+                ),
+                "at least 1",
+            ),
+            (
+                peer(
+                    "did:jig:zPeer",
+                    "quota = { blocks_per_min = 1, bytes_per_min = 1 }",
+                ) + &peer(
+                    "did:jig:zPeer",
+                    "quota = { blocks_per_min = 2, bytes_per_min = 1 }",
+                ),
+                "different quotas",
+            ),
+            (
+                peer(
+                    "did:jig:zPeer",
+                    "quota = { blocks_per_min = 1, bytes_per_min = 1 }",
+                ) + &peer("did:jig:zPeer", ""),
+                "different quotas",
+            ),
+        ] {
+            let err = federation(&doc).expect_err(&doc);
+            assert!(err.contains(why), "{doc}: {err}");
+        }
+        // The same DID twice with the same quota is one peer.
+        let same = "quota = { blocks_per_min = 1, bytes_per_min = 1 }";
+        federation(&(peer("did:jig:zPeer", same) + &peer("did:jig:zPeer", same))).unwrap();
     }
 
     #[test]
@@ -1007,6 +1528,29 @@ mod tests {
         );
         assert_eq!(cfg.identity.delegations.len(), 1);
         assert!(IdentitySection::default().delegations.is_empty());
+    }
+
+    #[test]
+    fn a_suffix_both_delegated_and_refused_is_a_config_error() {
+        let cfg: JigServerConfig = toml::from_str(
+            r#"
+            [identity]
+            refused_suffixes = ["example.org"]
+
+            [identity.delegations."Example.ORG"]
+            authorities = ["did:jig:zA"]
+            nameservers = ["https://ns.example"]
+        "#,
+        )
+        .unwrap();
+        let err = cfg.identity.validate().unwrap_err();
+        assert!(err.contains("`example.org`"), "{err}");
+
+        let refused_only: JigServerConfig =
+            toml::from_str("[identity]\nrefused_suffixes = [\"JIG\"]\n").unwrap();
+        refused_only.identity.validate().unwrap();
+        assert!(refused_only.identity.refused().contains("jig"));
+        assert!(IdentitySection::default().refused_suffixes.is_empty());
     }
 
     #[test]

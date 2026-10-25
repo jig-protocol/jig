@@ -14,17 +14,18 @@
 use crate::runtime::ExecutionConfig;
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
-use jig_config::v0_0_2_server::{IdentityMode, JigServerConfig, NameDelegation};
+use jig_client::server_key::ServerKeyOptions;
+use jig_config::v0_0_2_server::{IdentityMode, IdentitySection, JigServerConfig, NameDelegation};
 use jig_core::Did;
 use jig_pipeline::{
-    executor::BlockExecutor,
+    executor::{BlockExecutor, text_block_program},
     fanout::Fanout,
     hlc::HlcClock,
     identity::{IdentityResolver, NameserverResolver, TofuResolver},
     ingest::IngestContext,
     persist::SqliteStore,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -57,6 +58,59 @@ pub struct AppState {
     /// once the listener has its certificate ([`Self::bind_tls_certificate`])
     /// and published at `/.well-known/jig`. Shared by every clone.
     pub tls_binding: Arc<std::sync::OnceLock<jig_core::tls_binding::TlsBinding>>,
+    /// The `server-manifest` every welcome cites, once
+    /// [`crate::v0_0_2_manifest_log::publish`] has run. Shared by every clone.
+    pub manifest: Arc<std::sync::RwLock<Option<jig_pipeline::handshake::ManifestRef>>>,
+    /// During a key change: the public link from this server's old DID to
+    /// its current one (JEP-0012), served in every welcome and at
+    /// `/.well-known/jig`, so clients and peers that pinned the old DID
+    /// follow it. Read from [`key_link_path`] at boot.
+    pub key_link: Option<Vec<u8>>,
+    /// The links before `key_link`, oldest first: with it, the chain clients
+    /// pinned on any earlier DID follow, hop by hop. Read from the
+    /// `<link>.N` files beside it ([`jig_client::server_key::key_chain`]).
+    pub prior_key_links: Vec<Vec<u8>>,
+    /// What handles frames between proven peers
+    /// ([`crate::v0_0_2_peer::PeerFrames`]), set once at boot by
+    /// [`Self::set_peer_frames`]. Shared by every clone.
+    pub peer_frames: Arc<std::sync::OnceLock<Arc<dyn crate::v0_0_2_peer::PeerFrames>>>,
+    /// The live connections to proven peers, whichever side dialed.
+    pub peers: Arc<crate::v0_0_2_peer::PeerRegistry>,
+}
+
+/// Where the server's key link is read from: beside its key file, with
+/// `.link` appended, where `jig-server keys rotate` and `keys link` write it
+/// ([`jig_client::server_key::key_link_path`]).
+pub fn key_link_path(keyfile: &std::path::Path) -> PathBuf {
+    jig_client::server_key::key_link_path(keyfile)
+}
+
+/// The chain of key links this server serves, as the newest and the ones
+/// before it ([`jig_client::server_key::key_chain`]). A newest link that does
+/// not verify, is not public, or does not move to `server_did` is a boot
+/// error: serving it would make every client that pinned the old DID refuse
+/// this server. A bad earlier link only shortens the chain, and is logged.
+/// The newest key link, and the ones before it, oldest first.
+type ServedChain = (Option<Vec<u8>>, Vec<Vec<u8>>);
+
+fn load_key_chain(keyfile: &std::path::Path, server_did: &Did) -> Result<ServedChain> {
+    let chain = jig_client::server_key::key_chain(keyfile, &server_did.to_did_jig_string())?;
+    for problem in &chain.problems {
+        tracing::error!(
+            "{problem}. Clients pinned on a DID before it are refused and must re-pin; restore \
+             the file from a backup to serve them"
+        );
+    }
+    let mut bytes: Vec<Vec<u8>> = chain.links.iter().map(|l| l.bytes.clone()).collect();
+    let newest = bytes.pop();
+    if let Some(first) = chain.links.first() {
+        tracing::info!(
+            from = %first.old,
+            hops = chain.links.len(),
+            "serving the key links from this server's earlier DIDs"
+        );
+    }
+    Ok((newest, bytes))
 }
 
 /// Gates 1 and 2 from `[auth]`, plus the federation peers from `[federation]`:
@@ -64,18 +118,48 @@ pub struct AppState {
 ///
 /// Every `AppState` constructor goes through here, so this is also where a
 /// peer that must not be dialed — a `ws://` URL without
-/// `dangerously_allow_plaintext_federation` — becomes a boot error.
+/// `dangerously_allow_plaintext_federation` — becomes a boot error, as does a
+/// peer policy the server manifest must not publish.
 fn build_auth(
     config: &JigServerConfig,
     store: Arc<SqliteStore>,
 ) -> anyhow::Result<Arc<crate::auth::AuthState>> {
     crate::v0_0_2_federation::check_federation_transport(&config.federation)?;
+    config.federation.validate().map_err(anyhow::Error::msg)?;
+    check_published_peer_dids(&config.federation)?;
     let auth = crate::auth::AuthState::from_config(&config.auth)?.with_proofs(store);
     for (i, peer) in config.federation.peers.iter().enumerate() {
         auth.trust_federation_peer(&peer.expected_did)
             .with_context(|| format!("[federation] peers[{i}].expected_did"))?;
     }
     Ok(Arc::new(auth))
+}
+
+/// A published peer's DID goes into the signed manifest as written, so it
+/// must be the canonical spelling: two spellings of one key would list the
+/// peer twice and match neither consistently.
+fn check_published_peer_dids(
+    federation: &jig_config::v0_0_2_server::FederationSection,
+) -> anyhow::Result<()> {
+    for (i, peer) in federation
+        .peers
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.publish)
+    {
+        // A re-cased spelling no longer parses strictly, so name the key's
+        // canonical DID from the lenient reading of what the operator wrote.
+        let Ok(canonical) = Did::canonicalize(&peer.expected_did).map(|d| d.to_did_jig_string())
+        else {
+            continue;
+        };
+        if canonical != peer.expected_did {
+            anyhow::bail!(
+                "[federation] peers[{i}].expected_did: a published peer's DID must be canonical: `{canonical}`"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Translate the operator's server-level execution settings into the runtime's
@@ -120,7 +204,25 @@ fn checked_skew_bound(config: &JigServerConfig) -> Result<u64> {
     Ok(skew)
 }
 
+/// `[identity]`, refused when a suffix is both delegated and refused.
+/// `ServerConfig::load` already checked a loaded config; one built in code
+/// has not been.
+fn checked_identity(config: &JigServerConfig) -> Result<()> {
+    config.identity.validate().map_err(anyhow::Error::msg)
+}
+
 impl AppState {
+    /// Register the handler for peer frames. Only the first call counts;
+    /// returns whether this one did.
+    pub fn set_peer_frames(&self, handler: Arc<dyn crate::v0_0_2_peer::PeerFrames>) -> bool {
+        self.peer_frames.set(handler).is_ok()
+    }
+
+    /// The registered peer-frame handler, if any.
+    pub fn peer_frame_handler(&self) -> Option<&dyn crate::v0_0_2_peer::PeerFrames> {
+        self.peer_frames.get().map(|h| h.as_ref())
+    }
+
     /// Vouch, with the server DID's key, for the certificate the listener
     /// serves (DER), so clients can trust it without a CA. The first call
     /// wins; the certificate does not change while the server runs.
@@ -146,8 +248,8 @@ impl AppState {
         execution: ExecutionConfig,
     ) -> Result<Self> {
         let store = Arc::new(SqliteStore::open(&db_path).context("opening SqliteStore")?);
-        let signing_key = load_or_generate_server_key(&config.server.server_did_keyfile)
-            .context("loading server signing key")?;
+        let signing_key =
+            load_or_generate_server_key(&config).context("loading server signing key")?;
         // Before anything logs a DID: tags are keyed by this server's seed.
         if !jig_core::did::set_log_tag_key(&signing_key.to_bytes()) {
             tracing::warn!(
@@ -155,6 +257,10 @@ impl AppState {
             );
         }
         let server_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
+        let (key_link, prior_key_links) = load_key_chain(
+            Path::new(shellexpand::tilde(&config.server.server_did_keyfile).as_ref()),
+            &server_did,
+        )?;
         // A store written before `ingest` records existed is sequenced once,
         // here: each local channel's chain starts at its channel-create and
         // follows the old history order (JEP-0002 rule 9).
@@ -177,6 +283,7 @@ impl AppState {
             );
         }
 
+        checked_identity(&config)?;
         let identity: Arc<dyn IdentityResolver> = match config.identity.mode {
             IdentityMode::Tofu => Arc::new(TofuResolver::new(store.clone())),
             IdentityMode::Nameserver => {
@@ -187,18 +294,13 @@ impl AppState {
                          [identity.delegations]"
                     );
                 }
-                if config.identity.delegations.is_empty() {
-                    tracing::warn!(
-                        "identity.mode = \"nameserver\" with no [identity.delegations]: \
-                         every alias will be refused"
-                    );
-                }
-                Arc::new(NameserverResolver::new(
-                    suffix_authorities(&with_default_jig_delegation(
-                        config.identity.delegations.clone(),
-                    )),
-                    config.identity.cache_ttl_seconds,
+                Arc::new(nameserver_resolver(
+                    &config.identity,
+                    jig_core::naming::default_jig_authority(),
                     store.clone(),
+                    Arc::new(crate::v0_0_2_nameserver_tls::BoundNameservers {
+                        allow_plaintext: config.identity.dangerously_allow_plaintext_nameservers,
+                    }),
                 ))
             }
         };
@@ -226,9 +328,17 @@ impl AppState {
         // `JigServerConfig`: both types would then parse the same TOML table under
         // different key names (`timeout_ms` here, `execution_timeout_ms` in
         // jig-config's own type), so one would silently fall back to its default.
+        //
+        // The server signs text-block's program manifest and its default operator
+        // policy here (JEP-0011 §5.1). Who should author built-in manifests (each
+        // server, or one project key) is still open, so the author key is a parameter
+        // of `text_block_program`.
+        let runtime_config = runtime_config_from(&execution);
+        let program = text_block_program(&signing_key, &runtime_config)
+            .context("signing text-block's program manifest")?;
         let executor = Arc::new(
-            BlockExecutor::with_config(runtime_config_from(&execution))
-                .context("compiling the canonical text-render module")?,
+            BlockExecutor::with_config(runtime_config, &signing_key, program)
+                .context("compiling the canonical text-render component")?,
         );
 
         // Built before the ingest context so gate 2 can be installed on it;
@@ -260,6 +370,11 @@ impl AppState {
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
             tls_binding: Default::default(),
+            manifest: Default::default(),
+            key_link,
+            prior_key_links,
+            peer_frames: Default::default(),
+            peers: Default::default(),
         })
     }
 
@@ -274,6 +389,7 @@ impl AppState {
         let signing_key = SigningKey::from_bytes(&secret);
         let server_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
 
+        checked_identity(&config)?;
         let identity: Arc<dyn IdentityResolver> = Arc::new(TofuResolver::new(store.clone()));
         let hlc_clock = Arc::new(
             HlcClock::new(server_did.clone()).with_max_future_skew_ms(checked_skew_bound(&config)?),
@@ -313,6 +429,11 @@ impl AppState {
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
             tls_binding: Default::default(),
+            manifest: Default::default(),
+            key_link: None,
+            prior_key_links: Vec::new(),
+            peer_frames: Default::default(),
+            peers: Default::default(),
         })
     }
 
@@ -363,51 +484,32 @@ impl AppState {
             bridge_router_mount: jig_bridge_core::RouterMount::new(),
             auth,
             tls_binding: Default::default(),
+            manifest: Default::default(),
+            key_link: None,
+            prior_key_links: Vec::new(),
+            peer_frames: Default::default(),
+            peers: Default::default(),
         })
     }
 }
 
-/// Load the server's ed25519 signing key from `path`, or generate + write
-/// it if the file doesn't exist. A generated file is created owner-only (0600
-/// on Unix) and its key comes from the protocol's one keygen path. The path supports `~` expansion (e.g. `~/.jig/server/server.key`).
-fn load_or_generate_server_key(path: &str) -> Result<SigningKey> {
-    let expanded = shellexpand::tilde(path).into_owned();
-    let path = Path::new(&expanded);
-    if path.exists() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(path)
-                .with_context(|| format!("stating keyfile at {}", path.display()))?
-                .permissions()
-                .mode()
-                & 0o777;
-            if mode & 0o077 != 0 {
-                anyhow::bail!(
-                    "server keyfile at {} has insecure permissions {:#o} (must be 0o600 — group/other access is forbidden)",
-                    path.display(),
-                    mode,
-                );
-            }
-        }
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("reading server keyfile at {}", path.display()))?;
-        if bytes.len() != 32 {
-            anyhow::bail!(
-                "server keyfile at {} is malformed: expected 32 bytes, got {}",
-                path.display(),
-                bytes.len()
-            );
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        Ok(SigningKey::from_bytes(&arr))
-    } else {
-        let signing = jig_core::crypto::ed25519::generate_signing_key();
-        jig_core::crypto::ed25519::write_new_key_file(path, &signing)
-            .with_context(|| format!("writing server keyfile to {}", path.display()))?;
-        Ok(signing)
-    }
+/// Load the server's signing key from `[server] server_did_keyfile`, or make
+/// and seal one if there is none, opening it as `[keys]` says
+/// ([`jig_client::server_key`]). The path supports `~` expansion.
+fn load_or_generate_server_key(config: &JigServerConfig) -> Result<SigningKey> {
+    let path = shellexpand::tilde(&config.server.server_did_keyfile).into_owned();
+    Ok(jig_client::server_key::load_or_create(
+        Path::new(&path),
+        &key_options(&config.keys),
+    )?)
+}
+
+/// How `jig-server` opens its key, from `[keys]`.
+pub fn key_options(keys: &jig_config::v0_0_2_server::KeysSection) -> ServerKeyOptions {
+    let mut opts = ServerKeyOptions::new("server", "jig-server");
+    opts.unlock = keys.unlock.clone();
+    opts.plaintext = keys.storage == jig_config::v0_0_2_server::KeyStorage::Plaintext;
+    opts
 }
 
 /// `[identity.delegations]` as the pipeline's resolver takes it.
@@ -428,26 +530,65 @@ pub fn suffix_authorities(
         .collect()
 }
 
+/// The resolver `[identity] mode = "nameserver"` boots with: the configured
+/// delegations plus the built-in `@jig` one, and the refused suffixes, which
+/// it logs. They are listed only here, in the operator's log: what a server
+/// refuses is its own policy, not something `/.well-known/jig` advertises.
+fn nameserver_resolver(
+    identity: &IdentitySection,
+    authority: Result<&str, jig_core::naming::NamingError>,
+    store: Arc<SqliteStore>,
+    transport: Arc<dyn jig_pipeline::identity::NameserverTransport>,
+) -> NameserverResolver {
+    let refused = identity.refused();
+    if !refused.is_empty() {
+        tracing::info!(
+            "identity.refused_suffixes: aliases under {} are refused",
+            refused.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+    let (delegations, warning) =
+        with_default_delegation(identity.delegations.clone(), &refused, authority);
+    if let Some(warning) = warning {
+        tracing::warn!("{warning}");
+    }
+    NameserverResolver::new(
+        suffix_authorities(&delegations),
+        refused,
+        identity.cache_ttl_seconds,
+        store,
+        transport,
+    )
+}
+
 /// `[identity.delegations]` plus the built-in delegation for
-/// `jig_core::naming::DEFAULT_SUFFIX`, when the config has none for it and
-/// this build has a real authority: `jig → {authorities: [DEFAULT_JIG_AUTHORITY],
+/// `jig_core::naming::DEFAULT_SUFFIX`, when the config neither has nor
+/// refuses one for it and this build has a real authority:
+/// `jig → {authorities: [DEFAULT_JIG_AUTHORITY],
 /// nameservers: [DEFAULT_JIG_NAMESERVER]}`. An operator overrides it with their
 /// own `[identity.delegations.jig]`. While the authority is the placeholder
 /// nothing is added and boot carries on; `@jig` names then fail closed at
 /// lookup, like any suffix without a delegation.
-fn with_default_jig_delegation(
-    delegations: BTreeMap<String, NameDelegation>,
-) -> BTreeMap<String, NameDelegation> {
-    with_default_delegation(delegations, jig_core::naming::default_jig_authority())
-}
-
+///
+/// Also returns the one boot warning the result calls for, judged on the
+/// delegations that will actually be used: none at all, or none for `@jig`.
 fn with_default_delegation(
     mut delegations: BTreeMap<String, NameDelegation>,
+    refused: &BTreeSet<String>,
     authority: Result<&str, jig_core::naming::NamingError>,
-) -> BTreeMap<String, NameDelegation> {
+) -> (BTreeMap<String, NameDelegation>, Option<String>) {
     use jig_core::naming::{DEFAULT_JIG_NAMESERVER, DEFAULT_SUFFIX};
     if delegations.contains_key(DEFAULT_SUFFIX) {
-        return delegations;
+        return (delegations, None);
+    }
+    if refused.contains(DEFAULT_SUFFIX) {
+        // The operator asked for this; say only what it adds up to.
+        let warning = delegations.is_empty().then(|| {
+            "identity.mode = \"nameserver\" with no [identity.delegations], and \
+             `jig` refused: every alias will be refused"
+                .to_string()
+        });
+        return (delegations, warning);
     }
     match authority {
         Ok(authority) => {
@@ -458,41 +599,220 @@ fn with_default_delegation(
                     nameservers: vec![DEFAULT_JIG_NAMESERVER.to_string()],
                 },
             );
+            (delegations, None)
         }
-        Err(e) => tracing::warn!(
-            "no built-in [identity.delegations.{DEFAULT_SUFFIX}]: {e}; `@{DEFAULT_SUFFIX}` \
-             aliases are refused unless the config delegates the suffix"
+        Err(e) if delegations.is_empty() => (
+            delegations,
+            Some(format!(
+                "identity.mode = \"nameserver\" with no [identity.delegations], and no \
+                 built-in `@{DEFAULT_SUFFIX}` delegation ({e}): every alias will be refused"
+            )),
+        ),
+        Err(e) => (
+            delegations,
+            Some(format!(
+                "no built-in [identity.delegations.{DEFAULT_SUFFIX}]: {e}; `@{DEFAULT_SUFFIX}` \
+                 aliases are refused unless the config delegates the suffix"
+            )),
         ),
     }
-    delegations
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_published_peer_needs_a_canonical_did() {
+        let mut config = crate::v0_0_2_manifest_log::tests::policy_config();
+        assert!(super::check_published_peer_dids(&config.federation).is_ok());
+        let canonical = config.federation.peers[0].expected_did.clone();
+        let body = canonical.strip_prefix("did:jig:z").unwrap();
+        // Still parses (the body decodes case-insensitively), but isn't canonical.
+        config.federation.peers[0].expected_did = format!("did:jig:z{}", body.to_uppercase());
+        let err = super::check_published_peer_dids(&config.federation).unwrap_err();
+        assert!(err.to_string().contains(&canonical), "{err}");
+        // An unpublished peer's spelling isn't published, so it's left alone.
+        config.federation.peers[0].publish = false;
+        assert!(super::check_published_peer_dids(&config.federation).is_ok());
+    }
+
+    #[test]
+    fn a_key_link_beside_the_key_is_served_only_if_it_moves_to_this_server() {
+        use jig_core::key_link::{Audience, SignedKeyLink};
+        let dir = tempfile::tempdir().unwrap();
+        let keyfile = dir.path().join("server.key");
+        let path = dir.path().join("server.key.link");
+        let (old, new) = (
+            jig_core::crypto::ed25519::generate_signing_key(),
+            jig_core::crypto::ed25519::generate_signing_key(),
+        );
+        let server_did = Did::from_ed25519_pubkey(new.verifying_key().as_bytes());
+        assert_eq!(
+            load_key_chain(&keyfile, &server_did).unwrap(),
+            (None, Vec::new()),
+            "no file, no link"
+        );
+        assert_eq!(
+            key_link_path(Path::new("/k/server.key")),
+            Path::new("/k/server.key.link")
+        );
+
+        let good = SignedKeyLink::sign(&old, &new, Audience::Public, 1).unwrap();
+        std::fs::write(&path, good.envelope()).unwrap();
+        assert_eq!(
+            load_key_chain(&keyfile, &server_did).unwrap(),
+            (Some(good.envelope().to_vec()), Vec::new())
+        );
+        // An earlier link that moves to the DID the newest leaves.
+        let older = jig_core::crypto::ed25519::generate_signing_key();
+        let before = SignedKeyLink::sign(&older, &old, Audience::Public, 1).unwrap();
+        std::fs::write(dir.path().join("server.key.link.1"), before.envelope()).unwrap();
+        assert_eq!(
+            load_key_chain(&keyfile, &server_did).unwrap(),
+            (
+                Some(good.envelope().to_vec()),
+                vec![before.envelope().to_vec()]
+            )
+        );
+        // A broken earlier link is left out; the server still boots.
+        std::fs::write(dir.path().join("server.key.link.1"), b"not a link").unwrap();
+        assert_eq!(
+            load_key_chain(&keyfile, &server_did).unwrap(),
+            (Some(good.envelope().to_vec()), Vec::new())
+        );
+
+        let elsewhere = SignedKeyLink::sign(&new, &old, Audience::Public, 1).unwrap();
+        std::fs::write(&path, elsewhere.envelope()).unwrap();
+        assert!(
+            load_key_chain(&keyfile, &server_did).is_err(),
+            "moves to another DID"
+        );
+        std::fs::write(&path, b"not a link").unwrap();
+        assert!(load_key_chain(&keyfile, &server_did).is_err());
+    }
+
     #[test]
     fn the_built_in_jig_delegation_is_added_only_with_a_real_authority() {
         use super::*;
         use jig_core::naming::{DEFAULT_JIG_NAMESERVER, DEFAULT_SUFFIX, NamingError};
-        let added = with_default_delegation(BTreeMap::new(), Ok("did:jig:zReal"));
+        let none = BTreeSet::new();
+        // With no config of its own, a real authority leaves nothing to warn
+        // about: `@jig` names resolve.
+        let (added, warning) = with_default_delegation(BTreeMap::new(), &none, Ok("did:jig:zReal"));
         assert_eq!(added[DEFAULT_SUFFIX].authorities, ["did:jig:zReal"]);
         assert_eq!(added[DEFAULT_SUFFIX].nameservers, [DEFAULT_JIG_NAMESERVER]);
+        assert_eq!(warning, None);
 
         // What every build without `test-default-authority` gets today:
-        // nothing added, and boot carries on.
-        let refused =
-            with_default_delegation(BTreeMap::new(), Err(NamingError::NoDefaultAuthority));
-        assert!(!refused.contains_key(DEFAULT_SUFFIX));
+        // nothing added, boot carries on, and one warning says every alias
+        // is refused.
+        let (refused, warning) =
+            with_default_delegation(BTreeMap::new(), &none, Err(NamingError::NoDefaultAuthority));
+        assert!(refused.is_empty());
+        let warning = warning.expect("one warning");
+        assert!(warning.contains("every alias will be refused"), "{warning}");
+
+        // Placeholder, but the config delegates another suffix: only `@jig`
+        // names are refused, and the warning says so.
+        let other = NameDelegation {
+            authorities: vec!["did:jig:zOther".into()],
+            nameservers: vec!["https://ns.other".into()],
+        };
+        let (some, warning) = with_default_delegation(
+            BTreeMap::from([("names.example.org".to_string(), other)]),
+            &none,
+            Err(NamingError::NoDefaultAuthority),
+        );
+        assert!(!some.contains_key(DEFAULT_SUFFIX));
+        let warning = warning.expect("one warning");
+        assert!(warning.contains("`@jig` aliases are refused"), "{warning}");
+        assert!(!warning.contains("every alias"), "{warning}");
 
         // The operator's own entry wins.
         let mine = NameDelegation {
             authorities: vec!["did:jig:zMine".into()],
             nameservers: vec!["https://ns.mine".into()],
         };
-        let kept = with_default_delegation(
-            BTreeMap::from([(DEFAULT_SUFFIX.to_string(), mine.clone())]),
+        for authority in [Ok("did:jig:zReal"), Err(NamingError::NoDefaultAuthority)] {
+            let (kept, warning) = with_default_delegation(
+                BTreeMap::from([(DEFAULT_SUFFIX.to_string(), mine.clone())]),
+                &none,
+                authority,
+            );
+            assert_eq!(kept[DEFAULT_SUFFIX], mine);
+            assert_eq!(warning, None, "the operator delegates `@jig` themselves");
+        }
+    }
+
+    /// A refused `jig` gets no built-in delegation, and its aliases are
+    /// refused before any nameserver is reached.
+    #[tokio::test]
+    async fn a_refused_jig_is_refused_despite_the_built_in_delegation() {
+        use super::*;
+        use jig_core::naming::DEFAULT_SUFFIX;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let refused = BTreeSet::from([DEFAULT_SUFFIX.to_string()]);
+        let (none, warning) =
+            with_default_delegation(BTreeMap::new(), &refused, Ok("did:jig:zReal"));
+        assert!(!none.contains_key(DEFAULT_SUFFIX), "{none:?}");
+        assert!(warning.expect("one warning").contains("every alias"));
+
+        /// Counts every nameserver the resolver tries to reach.
+        struct Counting(AtomicUsize);
+        #[async_trait::async_trait]
+        impl jig_pipeline::identity::NameserverTransport for Counting {
+            async fn client(&self, _: &str, _: &[String]) -> Result<reqwest::Client, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err("not reached in this test".into())
+            }
+        }
+        let counting = Arc::new(Counting(AtomicUsize::new(0)));
+        let identity = IdentitySection {
+            mode: IdentityMode::Nameserver,
+            refused_suffixes: vec!["JIG".into()],
+            ..IdentitySection::default()
+        };
+        let r = nameserver_resolver(
+            &identity,
             Ok("did:jig:zReal"),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            counting.clone(),
         );
-        assert_eq!(kept[DEFAULT_SUFFIX], mine);
+        let err = r.resolve("dj@jig").await.unwrap_err();
+        assert!(
+            matches!(err, jig_pipeline::identity::IdentityError::SuffixRefused(ref s) if s == "jig"),
+            "{err:?}"
+        );
+        assert_eq!(counting.0.load(Ordering::SeqCst), 0);
+
+        // Not refused, the same boot asks the built-in delegation's nameserver.
+        let r = nameserver_resolver(
+            &IdentitySection::default(),
+            Ok("did:jig:zReal"),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            counting.clone(),
+        );
+        r.resolve("dj@jig").await.unwrap_err();
+        assert_eq!(counting.0.load(Ordering::SeqCst), 1);
+    }
+
+    /// A config built in code is checked at boot as a loaded one is.
+    #[test]
+    fn a_suffix_both_delegated_and_refused_does_not_boot() {
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.identity.refused_suffixes = vec!["Example.ORG".into()];
+        config.identity.delegations.insert(
+            "example.org".into(),
+            jig_config::v0_0_2_server::NameDelegation {
+                authorities: vec!["did:jig:zA".into()],
+                nameservers: vec!["https://ns.example".into()],
+            },
+        );
+        let err = super::AppState::for_test_with_config(config)
+            .err()
+            .expect("an overlap must not boot");
+        assert!(format!("{err:#}").contains("`example.org`"), "{err:#}");
     }
 
     /// The configured bound is what ingest enforces and the welcome signs; one
@@ -588,22 +908,90 @@ mod tests {
         assert!(Arc::ptr_eq(&state.ingest_ctx, &cloned.ingest_ctx));
     }
 
+    fn keyed_config(dir: &Path, keyfile: &str) -> JigServerConfig {
+        let mut config = JigServerConfig::default();
+        config.server.server_did_keyfile = dir.join(keyfile).to_string_lossy().into_owned();
+        config.keys.unlock = Some(jig_client::server_key::credential_for_tests(dir));
+        config
+    }
+
     #[test]
-    fn load_or_generate_creates_keyfile_and_returns_signing_key() {
+    fn a_new_key_is_sealed_and_reloads_to_the_same_did() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("subdir/server.key");
-        assert!(!path.exists());
-        let key = load_or_generate_server_key(path.to_str().unwrap()).unwrap();
-        assert!(path.exists());
-        // Reloading returns the same signing key
-        let reloaded = load_or_generate_server_key(path.to_str().unwrap()).unwrap();
+        let config = keyed_config(dir.path(), "subdir/server.key");
+        let key = load_or_generate_server_key(&config).unwrap();
+        let sealed = dir.path().join("subdir/server.jigkey");
+        assert!(
+            sealed.exists(),
+            "the configured server.key names server.jigkey"
+        );
+        assert!(
+            !dir.path().join("subdir/server.key").exists(),
+            "nothing in clear"
+        );
+        assert!(jig_core::keystore::JigKey::from_bytes(&std::fs::read(&sealed).unwrap()).is_ok());
+        let reloaded = load_or_generate_server_key(&config).unwrap();
         assert_eq!(key.to_bytes(), reloaded.to_bytes());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "generated keyfile must be 0600 on Unix");
+            let mode = std::fs::metadata(&sealed).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "a sealed keyfile is 0600 too");
         }
+    }
+
+    #[test]
+    fn after_two_rotations_the_server_boots_with_the_new_did_and_serves_the_chain() {
+        let dir = tempdir().unwrap();
+        let mut config = keyed_config(dir.path(), "server.key");
+        let old = load_or_generate_server_key(&config).unwrap();
+        let next_dir = dir.path().join("next");
+        std::fs::create_dir_all(&next_dir).unwrap();
+        let next = jig_client::server_key::credential_for_tests(&next_dir);
+        let done = jig_client::server_key::rotate(
+            &dir.path().join("server.key"),
+            std::slice::from_ref(&next),
+            false,
+            &key_options(&config.keys),
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            done.old_did,
+            Did::from_ed25519_pubkey(old.verifying_key().as_bytes()).to_did_jig_string()
+        );
+
+        // Again: the first link is kept and served before the new one.
+        let third_dir = dir.path().join("third");
+        std::fs::create_dir_all(&third_dir).unwrap();
+        let third = jig_client::server_key::credential_for_tests(&third_dir);
+        config.keys.unlock = Some(next.clone());
+        let again = jig_client::server_key::rotate(
+            &dir.path().join("server.key"),
+            std::slice::from_ref(&third),
+            false,
+            &key_options(&config.keys),
+            2,
+        )
+        .unwrap();
+        assert_eq!(again.old_did, done.new_did);
+        let first_link = std::fs::read(again.archived.as_ref().unwrap().0.clone()).unwrap();
+        let done = again;
+        let next = third;
+
+        config.keys.unlock = Some(next);
+        let state = AppState::new(
+            config,
+            dir.path().join("jig.db"),
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(state.server_did.to_did_jig_string(), done.new_did);
+        assert_eq!(
+            state.key_link.as_deref(),
+            Some(std::fs::read(&done.link).unwrap().as_slice())
+        );
+        assert_eq!(state.prior_key_links, vec![first_link]);
     }
 
     #[test]
@@ -617,36 +1005,67 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
     }
 
-    #[test]
-    fn load_or_generate_errors_on_malformed_keyfile() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("bad.key");
-        std::fs::write(&path, b"too short").unwrap();
-        // Set 0600 so the permission check passes and we hit the length check.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        let err = load_or_generate_server_key(path.to_str().unwrap()).unwrap_err();
-        assert!(err.to_string().contains("malformed"));
+    #[cfg(unix)]
+    fn write_raw(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, [7u8; 32]).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
-    fn load_or_generate_rejects_world_readable_keyfile() {
-        use std::os::unix::fs::PermissionsExt;
+    fn a_raw_keyfile_is_refused_and_the_error_names_the_seal_command() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("server.key");
-        // Write a valid 32-byte keyfile but with permissive (0644) mode.
-        std::fs::write(&path, [0u8; 32]).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let config = keyed_config(dir.path(), "server.key");
+        write_raw(&dir.path().join("server.key"), 0o600);
+        let msg = load_or_generate_server_key(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("jig-server keys seal"), "{msg}");
+        assert!(msg.contains("storage = \"plaintext\""), "{msg}");
+    }
 
-        let err = load_or_generate_server_key(path.to_str().unwrap()).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("permissions") || msg.contains("0644") || msg.contains("0o644"),
-            "expected permission error, got: {msg}"
-        );
+    #[cfg(unix)]
+    #[test]
+    fn plaintext_storage_still_loads_a_raw_key_but_checks_it() {
+        let dir = tempdir().unwrap();
+        let mut config = keyed_config(dir.path(), "server.key");
+        config.keys.storage = jig_config::v0_0_2_server::KeyStorage::Plaintext;
+        let path = dir.path().join("server.key");
+        write_raw(&path, 0o600);
+        let key = load_or_generate_server_key(&config).unwrap();
+        assert_eq!(key.to_bytes(), [7u8; 32]);
+
+        write_raw(&path, 0o644);
+        let msg = load_or_generate_server_key(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("permissions"), "{msg}");
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&path, b"too short").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let msg = load_or_generate_server_key(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("malformed"), "{msg}");
+    }
+
+    #[test]
+    fn with_nothing_to_seal_with_a_new_key_is_refused() {
+        let dir = tempdir().unwrap();
+        let mut config = keyed_config(dir.path(), "server.key");
+        config.keys.unlock = None;
+        // The process may carry these; this test is about the config alone.
+        if std::env::var_os("JIG_KEY_UNLOCK").is_some()
+            || std::env::var_os("JIG_KEY_PASSPHRASE").is_some()
+        {
+            return;
+        }
+        let msg = load_or_generate_server_key(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("[keys] unlock"), "{msg}");
+        assert!(!dir.path().join("server.jigkey").exists());
     }
 }

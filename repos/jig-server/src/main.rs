@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use jig_server::{JigServer, ServerConfig};
 
 #[derive(Parser, Debug)]
@@ -27,6 +27,177 @@ struct Args {
     /// Override port.
     #[arg(long)]
     port: Option<u16>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// The server's own signing key.
+    Keys {
+        #[command(subcommand)]
+        keys: KeysCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum KeysCommand {
+    /// Seal a raw 32-byte keyfile, written by an older jig-server, into a
+    /// .jigkey beside it, then remove the raw file. The DID does not change.
+    Seal {
+        /// The raw keyfile. Defaults to `[server] server_did_keyfile`.
+        #[arg(long)]
+        keyfile: Option<PathBuf>,
+        /// A slot to seal it with: credential:PATH, env:NAME, or passphrase
+        /// (read from JIG_KEY_PASSPHRASE). Repeat for more than one, for
+        /// example a credential to boot with and a passphrase kept offline to
+        /// restore with on another machine.
+        #[arg(long = "slot", required = true)]
+        slots: Vec<String>,
+    },
+    /// Add a slot to the sealed key, opening it with `[keys] unlock`,
+    /// JIG_KEY_UNLOCK or JIG_KEY_PASSPHRASE.
+    AddSlot {
+        /// The keyfile. Defaults to `[server] server_did_keyfile`.
+        #[arg(long)]
+        keyfile: Option<PathBuf>,
+        /// The slot to add: credential:PATH, env:NAME or passphrase.
+        #[arg(long)]
+        slot: String,
+    },
+    /// Print the DID of the sealed key and which slots open it.
+    Show {
+        /// The keyfile. Defaults to `[server] server_did_keyfile`.
+        #[arg(long)]
+        keyfile: Option<PathBuf>,
+    },
+    /// Check that one secret opens the key, trying nothing configured: for
+    /// an offline passphrase or a new machine's credential, before relying
+    /// on it.
+    Verify {
+        /// The keyfile. Defaults to `[server] server_did_keyfile`.
+        #[arg(long)]
+        keyfile: Option<PathBuf>,
+        /// The slot to try: credential:PATH, env:NAME or passphrase.
+        #[arg(long)]
+        slot: String,
+    },
+    /// Make a new key, sealed with every slot named, where there is none. It
+    /// is never written in clear and never overwrites a key. Prints the DID.
+    Generate {
+        /// The keyfile. Defaults to `[server] server_did_keyfile`.
+        #[arg(long)]
+        keyfile: Option<PathBuf>,
+        /// A slot to seal it with: credential:PATH, env:NAME, or passphrase
+        /// (read from JIG_KEY_PASSPHRASE). Repeatable.
+        #[arg(long = "slot", required = true)]
+        slots: Vec<String>,
+    },
+    /// Replace the key with a new one, in place, and write a key link from
+    /// the old DID to the new one beside it (`<keyfile>.link`), signed by
+    /// both, so clients and peers that pinned the old DID follow it. An
+    /// earlier link is kept as `<keyfile>.link.N` and served too, so clients
+    /// pinned on any earlier DID follow every hop. The old key opens with
+    /// `[keys] unlock`, JIG_KEY_UNLOCK or JIG_KEY_PASSPHRASE, and is kept,
+    /// still sealed, as `<stem>.retired-<DID tail>.jigkey`. Restart the
+    /// server afterwards.
+    Rotate {
+        /// The keyfile. Defaults to `[server] server_did_keyfile`.
+        #[arg(long)]
+        keyfile: Option<PathBuf>,
+        /// A slot to seal the new key with: credential:PATH, env:NAME, or
+        /// passphrase (read from JIG_KEY_NEW_PASSPHRASE). Repeatable.
+        #[arg(long = "slot", required = true)]
+        slots: Vec<String>,
+        /// Accepted and ignored: an earlier link is now kept and served, so
+        /// rotating again needs nothing more.
+        #[arg(long, hide = true)]
+        replace_link: bool,
+        /// With a chain already as long as a client follows: stop serving its
+        /// oldest link (kept as `<link>.pruned-N`). A client still pinned on
+        /// the DID it leaves is then refused and must re-pin.
+        #[arg(long)]
+        prune_oldest: bool,
+    },
+    /// Write a key link from the DID of the sealed key at --old-keyfile to
+    /// that of the key at --keyfile, beside the latter, for a key made with
+    /// `keys generate`. `keys rotate` does this and the swap in one step.
+    Link {
+        /// The key being left. It opens with `[keys] unlock`, JIG_KEY_UNLOCK
+        /// or JIG_KEY_PASSPHRASE.
+        #[arg(long)]
+        old_keyfile: PathBuf,
+        /// The key taking over: the path the server will be configured with.
+        /// Defaults to `[server] server_did_keyfile`.
+        #[arg(long)]
+        keyfile: Option<PathBuf>,
+        /// What opens the new key: credential:PATH, env:NAME, or passphrase
+        /// (read from JIG_KEY_NEW_PASSPHRASE). Unset, what opens the old key
+        /// is tried.
+        #[arg(long)]
+        slot: Option<String>,
+    },
+}
+
+/// `jig-server keys ...`: works on the key file only, never starts the server.
+fn run_keys(keys: KeysCommand, config: &ServerConfig) -> Result<String, String> {
+    use jig_client::server_key::KeysAction;
+    let or_configured = |keyfile: Option<PathBuf>| {
+        keyfile.unwrap_or_else(|| {
+            PathBuf::from(shellexpand::tilde(&config.server.server_did_keyfile).into_owned())
+        })
+    };
+    let action = match keys {
+        KeysCommand::Seal { keyfile, slots } => KeysAction::Seal {
+            keyfile: or_configured(keyfile),
+            slots,
+        },
+        KeysCommand::AddSlot { keyfile, slot } => KeysAction::AddSlot {
+            keyfile: or_configured(keyfile),
+            slot,
+        },
+        KeysCommand::Show { keyfile } => KeysAction::Show {
+            keyfile: or_configured(keyfile),
+        },
+        KeysCommand::Verify { keyfile, slot } => KeysAction::Verify {
+            keyfile: or_configured(keyfile),
+            slot,
+        },
+        KeysCommand::Generate { keyfile, slots } => KeysAction::Generate {
+            keyfile: or_configured(keyfile),
+            slots,
+        },
+        KeysCommand::Rotate {
+            keyfile,
+            slots,
+            replace_link,
+            prune_oldest,
+        } => {
+            if replace_link {
+                eprintln!(
+                    "warning: --replace-link does nothing now: the earlier link is kept and \
+                     served beside the new one, and clients follow both"
+                );
+            }
+            KeysAction::Rotate {
+                keyfile: or_configured(keyfile),
+                slots,
+                prune_oldest,
+            }
+        }
+        KeysCommand::Link {
+            old_keyfile,
+            keyfile,
+            slot,
+        } => KeysAction::Link {
+            old_keyfile,
+            keyfile: or_configured(keyfile),
+            slot,
+        },
+    };
+    jig_client::server_key::run(action, &jig_server::v0_0_2::key_options(&config.keys))
+        .map_err(|e| e.to_string())
 }
 
 /// Load the `--config` file.
@@ -122,6 +293,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    if let Some(Command::Keys { keys }) = args.command {
+        match run_keys(keys, &config) {
+            Ok(out) => println!("{out}"),
+            Err(msg) => {
+                eprintln!("[jig-server] {msg}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
     let env_db = std::env::var("JIG_DB_PATH").ok().map(PathBuf::from);
     config.apply_overrides_explicit(args.db_path, env_db, args.bind, args.port);
 
@@ -174,6 +356,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "v0.0.2 module active: server_did = {}",
                     state.server_did.to_did_jig_string()
                 );
+                // Before serving: write the receipt of every text-render block
+                // that landed without one because the server stopped between
+                // landing it and rendering it.
+                match jig_pipeline::ingest::backfill_render_receipts(&state.ingest_ctx).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("wrote {n} receipt(s) owed from before the restart"),
+                    Err(e) => tracing::warn!("receipt backfill failed: {e}"),
+                }
                 for opt in state.config.unsafe_options_active() {
                     tracing::warn!("v0.0.2 unsafe option active: {}", opt);
                 }
@@ -183,7 +373,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Fatal: without the v0.0.2 module the server would serve only
                 // /.well-known/jig, /healthz and /metrics, which reads as "up"
                 // to every health check while accepting and serving nothing.
-                let msg = format!("v0.0.2 module failed to initialize: {e}");
+                let msg = format!("v0.0.2 module failed to initialize: {e:#}");
                 tracing::error!("{msg}");
                 eprintln!("[jig-server] FATAL: {msg}");
                 std::process::exit(1);
@@ -195,6 +385,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Done before handing state to JigServer so we hold a clone while the Arc is still
     // available. Tasks are fire-and-forget (reconnect internally on disconnect).
     if let Some(ref state) = v0_0_2_state {
+        // Before anything is served: every welcome cites the current manifest
+        // (JEP-0002 rule 12), and a server that cannot keep its log must not
+        // pretend to.
+        if let Err(e) = jig_server::v0_0_2_manifest_log::publish(state).await {
+            let msg = format!("manifest log: {e:#}");
+            tracing::error!("{msg}");
+            eprintln!("[jig-server] FATAL: {msg}");
+            std::process::exit(1);
+        }
+        // The contract's frames are handled from the first connection on.
+        jig_server::v0_0_2_contract::start(state);
         jig_server::v0_0_2_federation::spawn_federation_peers(state.clone());
         // Start config-permitted bridges before the router is built (they mount
         // their HTTP routes into bridge_router_mount, which build_v0_0_2_router

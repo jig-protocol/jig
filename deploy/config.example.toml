@@ -62,10 +62,11 @@ port = 7117
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 listen = "100.x.y.z:7117"
 
-# The ed25519 seed the server DID is derived from. BACK THIS UP OFFSITE.
-# Losing it changes the server DID and breaks TOFU pinning for every client.
-# The server generates it 0600 on first boot and REFUSES TO START if the file
-# is later group- or other-readable.
+# The ed25519 seed the server DID is derived from, sealed: this path names
+# /var/lib/jig/server.jigkey beside it. BACK IT UP OFFSITE, with a way to open
+# it (deploy/README.md). Losing it changes the server DID and breaks TOFU
+# pinning for every client. A raw server.key from an older release is refused
+# until `jig-server keys seal` converts it.
 server_did_keyfile = "/var/lib/jig/server.key"
 
 # channel-create, member-add and channel-archive are not optional extras:
@@ -75,8 +76,16 @@ server_did_keyfile = "/var/lib/jig/server.key"
 # owner-gated against channels.owner_did, so listing it does not let anyone
 # else retire your channels. member-remove (`jig channel kick` / `leave`) and
 # channel-promote (`jig channel promote`) are the v0.2 channel dynamics, gated
-# the same way.
-allowed_block_kinds = ["text-render", "channel-create", "member-add", "member-remove", "channel-promote", "channel-archive"]
+# the same way. role-assign and role-unassign (JEP-0005 rule 7b) are
+# owner-only. channel-share and channel-unshare need the `share` right, and
+# only the channel's sequencer writes the contract-accept, contract-refuse and
+# contract-end records of what came of a share (JEP-0005 rules 7-11).
+#
+# Leave allowed_block_kinds unset to track the built-in default as new kinds
+# ship. Today the default is:
+#   allowed_block_kinds = ["text-render", "channel-create", "member-add", "member-remove", "channel-promote", "channel-archive", "role-assign", "role-unassign", "channel-share", "channel-unshare", "contract-accept", "contract-refuse", "contract-end"]
+# To restrict it, uncomment that line and remove kinds. A list here is fixed:
+# kinds added in later releases stay refused until you add them.
 
 [identity]
 # tofu = trust the first key seen for a DID and pin it. No nameserver required.
@@ -90,6 +99,10 @@ allowed_block_kinds = ["text-render", "channel-create", "member-add", "member-re
 # suffix (alice@jig): the server ships the jig delegation built in, once the
 # project authority DID is published, and an [identity.delegations.jig] entry
 # here overrides it. trusted_nameservers is not used to resolve aliases.
+# To refuse every alias under a suffix, whatever would otherwise delegate it
+# (the built-in jig delegation included), list it in refused_suffixes. A
+# suffix may not be both delegated and refused. Logged at boot, not advertised.
+#   refused_suffixes = ["example.org"]
 mode = "tofu"
 trusted_nameservers = []
 cache_ttl_seconds = 300
@@ -136,6 +149,19 @@ per_ip_burst = 600
 per_ip_per_second = 100
 replay_per_did = 2000
 
+[keys]
+# What opens the sealed server key at boot. The server never prompts. The
+# systemd credential in jig-server.service (LoadCredentialEncrypted=), bound to
+# the TPM where there is one, is the recommended slot: see deploy/README.md,
+# "Sealing the server key", for what each choice protects against. With none
+# set, a new key is refused rather than written in clear.
+#
+# DO THESE TOGETHER: make the credential (systemd-creds encrypt), uncomment
+# LoadCredentialEncrypted= in jig-server.service, and uncomment this line.
+# Either one alone fails the boot.
+# unlock = "credential:/run/credentials/jig-server.service/jig-server-key"
+storage = "sealed"
+
 [debug]
 # Handle enumeration stays off — it dumps the registry to any caller.
 list_handles = false
@@ -153,6 +179,30 @@ list_handles = false
 # [[federation.peers]]
 # url = "wss://peer.example.ts.net:7117"
 # expected_did = "did:jig:..."
+# Name this peer in the signed server manifest's peer policy (JEP-0005 rule
+# 16). Off by default: who you federate with is yours to disclose.
+# publish = true
+# This peer's own quota, in place of default_peer_quota. Published only with
+# publish = true. Published, not yet enforced.
+# quota = { blocks_per_min = 1200, bytes_per_min = 16777216 }
+# What to do when this peer offers a channel (JEP-0005 rule 8). "hold" (the
+# default) keeps the offer for you to accept or refuse; "accept" accepts every
+# offer this server can honour. An offer it cannot honour (a suite it does not
+# carry, a name suffix you both claim) is refused either way.
+# offers = "hold"
+#
+# The quota published for every peer without its own. These are the defaults
+# (600 blocks and 8 MiB a minute); neither may be 0.
+# [federation.default_peer_quota]
+# blocks_per_min = 600
+# bytes_per_min = 8388608
+#
+# Name suffixes this server attests, published in its manifest. Only
+# root = "dns" with a multi-label suffix; a config-rooted suffix is never
+# published, and contract roots come in v0.3.
+# [[federation.attested_suffixes]]
+# suffix = "names.example.org"
+# root = "dns"
 
 # [bridges]
 # Deny-by-default: with no allow_list and no per_bridge entry, no bridge loads.

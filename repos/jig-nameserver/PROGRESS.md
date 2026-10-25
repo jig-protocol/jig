@@ -451,8 +451,6 @@ jig-ns export --format json/csv        # Export analytics data
 ```
 
 **Documentation:**
-- PHASE_F_ANALYTICS_SUMMARY.md - Complete analytics implementation guide
-- PHASE_F_CLI_SUMMARY.md - CLI usage and examples
 
 **Backend Composition Strategy:**
 - **Tier 1 (Potato):** SQLite only - zero additional dependencies, <60sec deploy

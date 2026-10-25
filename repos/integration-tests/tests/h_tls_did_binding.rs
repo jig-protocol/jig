@@ -210,6 +210,9 @@ async fn a_federation_peer_is_held_to_its_expected_did() {
         url: base.replacen("https://", "wss://", 1),
         expected_did,
         alias: None,
+        publish: false,
+        quota: None,
+        offers: Default::default(),
     };
     let federation = FederationSection::default();
 
@@ -227,4 +230,145 @@ async fn a_federation_peer_is_held_to_its_expected_did() {
         .err()
         .expect("a peer naming another DID is refused");
     assert!(err.to_string().contains("not the server"), "{err}");
+}
+
+/// A server that changed its key is followed only along a public link its old
+/// key signed to the new one (JEP-0012): the probe says where it moved from,
+/// and refuses a new DID with no link, or one signed by someone else.
+#[tokio::test]
+async fn a_pinned_server_is_followed_to_a_new_key_only_along_its_link() {
+    use base64::Engine as _;
+    use jig_core::key_link::{Audience, SignedKeyLink};
+    let (old, new, stranger) = (
+        SigningKey::from_bytes(&[3; 32]),
+        SigningKey::from_bytes(&[4; 32]),
+        SigningKey::from_bytes(&[5; 32]),
+    );
+    let real = cert();
+    let with_link = |link: Option<&SignedKeyLink>| {
+        let mut doc = well_known(&did(&new), &TlsBinding::sign(&new, real.der.as_ref()));
+        if let Some(link) = link {
+            doc["key_link"] = serde_json::json!(
+                base64::engine::general_purpose::STANDARD.encode(link.envelope())
+            );
+        }
+        doc
+    };
+
+    let link = SignedKeyLink::sign(&old, &new, Audience::Public, 1).unwrap();
+    let base = serve(&real, with_link(Some(&link))).await;
+    let probed = probe(&base, Some(&did(&old))).await.expect("followed");
+    assert_eq!(probed.moved_from.as_deref(), Some(did(&old).as_str()));
+    assert_eq!(probed.server_did.as_deref(), Some(did(&new).as_str()));
+    assert!(reaches(&base, &probed.config.unwrap()).await);
+
+    let forged = SignedKeyLink::sign(&stranger, &new, Audience::Public, 1).unwrap();
+    for doc in [with_link(None), with_link(Some(&forged))] {
+        let base = serve(&real, doc).await;
+        assert!(matches!(
+            probe(&base, Some(&did(&old))).await,
+            Err(TlsError::OtherServer { .. })
+        ));
+    }
+}
+
+/// A server that changed its key twice since a device pinned it serves only
+/// the second link: the device is refused, by name, and told that
+/// re-pinning would be trust on first use again. It never takes the new DID.
+#[tokio::test]
+async fn a_pin_two_keys_back_is_refused_and_says_why() {
+    use base64::Engine as _;
+    use jig_core::key_link::{Audience, SignedKeyLink};
+    let (a, b, c) = (
+        SigningKey::from_bytes(&[6; 32]),
+        SigningKey::from_bytes(&[7; 32]),
+        SigningKey::from_bytes(&[8; 32]),
+    );
+    let real = cert();
+    let mut doc = well_known(&did(&c), &TlsBinding::sign(&c, real.der.as_ref()));
+    let b_to_c = SignedKeyLink::sign(&b, &c, Audience::Public, 2).unwrap();
+    doc["key_link"] =
+        serde_json::json!(base64::engine::general_purpose::STANDARD.encode(b_to_c.envelope()));
+    let base = serve(&real, doc).await;
+
+    // Pinned one key back: followed.
+    let probed = probe(&base, Some(&did(&b))).await.expect("followed");
+    assert_eq!(probed.moved_from.as_deref(), Some(did(&b).as_str()));
+
+    // Pinned two keys back: refused, naming the pin and the DID the link left.
+    let Err(refused) = probe(&base, Some(&did(&a))).await else {
+        panic!("a pin two keys back was followed");
+    };
+    let TlsError::OtherServer {
+        expected,
+        presented,
+        rotated_past: Some(why),
+        ..
+    } = &refused
+    else {
+        panic!("{refused}");
+    };
+    assert_eq!((expected, presented), (&did(&a), &did(&c)));
+    assert!(why.contains(&did(&a)) && why.contains(&did(&b)), "{why}");
+    assert!(why.contains("more than once"), "{why}");
+    assert!(why.contains("first use"), "{why}");
+    let message = refused.to_string();
+    assert!(
+        message.contains(&did(&a)) && message.contains("more than once"),
+        "{message}"
+    );
+
+    // A link from a stranger is refused the same way: it cannot be told apart.
+    let mut doc = well_known(&did(&c), &TlsBinding::sign(&c, real.der.as_ref()));
+    let stranger = SigningKey::from_bytes(&[9; 32]);
+    let forged = SignedKeyLink::sign(&stranger, &c, Audience::Public, 2).unwrap();
+    doc["key_link"] =
+        serde_json::json!(base64::engine::general_purpose::STANDARD.encode(forged.envelope()));
+    let base = serve(&real, doc).await;
+    assert!(matches!(
+        probe(&base, Some(&did(&a))).await,
+        Err(TlsError::OtherServer {
+            rotated_past: Some(_),
+            ..
+        })
+    ));
+}
+
+/// A server that changed its key three times serves the whole chain: a
+/// device pinned on the first key follows every hop, and keeps each.
+#[tokio::test]
+async fn a_pin_three_keys_back_follows_the_whole_chain() {
+    use base64::Engine as _;
+    use jig_core::key_link::{Audience, SignedKeyLink};
+    let keys: Vec<SigningKey> = (10..14).map(|b| SigningKey::from_bytes(&[b; 32])).collect();
+    let b64 = |l: SignedKeyLink| base64::engine::general_purpose::STANDARD.encode(l.envelope());
+    let chain: Vec<String> = keys
+        .windows(2)
+        .map(|w| b64(SignedKeyLink::sign(&w[0], &w[1], Audience::Public, 1).unwrap()))
+        .collect();
+    let now = &keys[3];
+    let real = cert();
+    let mut doc = well_known(&did(now), &TlsBinding::sign(now, real.der.as_ref()));
+    doc["key_link"] = serde_json::json!(chain[2]);
+    doc["prior_key_links"] = serde_json::json!(chain[..2]);
+    let base = serve(&real, doc).await;
+
+    let probed = probe(&base, Some(&did(&keys[0]))).await.expect("followed");
+    assert_eq!(probed.moved_from.as_deref(), Some(did(&keys[0]).as_str()));
+    assert_eq!(probed.server_did.as_deref(), Some(did(now).as_str()));
+    assert_eq!(probed.followed, chain);
+    assert!(reaches(&base, &probed.config.unwrap()).await);
+    // Pinned in the middle: only the hops from there.
+    let probed = probe(&base, Some(&did(&keys[2]))).await.expect("followed");
+    assert_eq!(probed.followed, chain[2..].to_vec());
+
+    // A pin older than the chain still gets the loud refusal.
+    let older = SigningKey::from_bytes(&[20; 32]);
+    assert!(matches!(
+        probe(&base, Some(&did(&older))).await,
+        Err(TlsError::OtherServer {
+            rotated_past: Some(_),
+            ..
+        })
+    ));
 }

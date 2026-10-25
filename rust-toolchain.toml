@@ -3,11 +3,9 @@
 # and fix whatever the new clippy reports in the same change.
 #
 # Must stay >= `rust-version` in repos/Cargo.toml (the wasmtime floor).
-# wasm32-unknown-unknown is what text-block's canonical artifact uses. Nothing
+# wasm32-unknown-unknown is what text-block's canonical component uses. Nothing
 # builds wasm32-wasip1 any more: the release stopped shipping a wasip1
-# text-block (#110), and jig-runtime's WASI fixtures are committed .wasm files
-# whose regeneration script (repos/jig-runtime/tests/fixtures/build.sh) adds
-# that target itself.
+# text-block (#110), and jig-runtime no longer runs WASI modules at all.
 [toolchain]
 channel = "1.99.0"
 components = ["rustfmt", "clippy"]

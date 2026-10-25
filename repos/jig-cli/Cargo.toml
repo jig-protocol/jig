@@ -15,11 +15,14 @@ path = "src/main.rs"
 
 [features]
 default = ["local-runtime"]
-local-runtime = ["jig-runtime"]
+# The block runtime: `jig block run`, and checking each message against its
+# server's exec receipt (jig-client's `verify`).
+local-runtime = ["jig-runtime", "jig-client/verify"]
 
 [dependencies]
 # Core protocol
-jig-core = { path = "../jig-core" }
+# `ed25519` opens and verifies v0.3 receipts (`jig receipt`).
+jig-core = { path = "../jig-core", features = ["ed25519"] }
 jig-runtime = { workspace = true, optional = true }
 # Shared client library (added v0.0.2 C5).
 jig-client = { path = "../jig-client" }
@@ -57,6 +60,13 @@ url = "2"
 cid.workspace = true
 semver = "1.0"
 
+# `jig block build` and `lint`: wrap a core module as a component in-process (the version
+# wasmtime 49 already uses), and read core modules to explain determinism violations.
+wit-component = "0.258"
+wasmparser = "0.261"
+rustc-demangle = "0.1"
+blake3.workspace = true
+
 # Utils
 dirs = "7.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -75,5 +85,6 @@ integration-tests = { path = "../integration-tests" }
 # Lets tests resolve `@jig` under the placeholder authority; never in a build.
 jig-core = { path = "../jig-core", features = ["test-default-authority"] }
 tempfile = "3.8"
+wat = "1.0"
 time = { version = "0.3", features = ["serde"] }
 ed25519-dalek = { workspace = true }

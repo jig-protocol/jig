@@ -11,14 +11,14 @@
 >   proxy).
 > - Section 3, "Compromised nameserver": steps 1 to 3 and 5 to 7. Step 4's attestation-key
 >   rotation also still applies.
-> - Section 4: steps 5 and 6.
+> - Section 4 describes what applies now.
 >
 > A new runbook follows lane R's redesign: the [framing doc](../superpowers/specs/2026-10-18-reputation-pow-tribunals-framing.md) and the draft
 > [JEP-0008](../../repos/jig-spec/jep/jep-0008-proof-of-work.md), [JEP-0009](../../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) and [JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md).
 
 What a `jig-nameserver` operator does about harassment reports, registration and relay
-abuse, a compromised nameserver, and a rogue federated instance. Parameters and endpoints
-are the reference implementation's. Settings and defaults are listed in the
+abuse, a compromised nameserver, and a rogue or contradicting nameserver. Parameters and
+endpoints are the reference implementation's. Settings and defaults are listed in the
 [operator guide](../../repos/jig-nameserver/OPERATOR_GUIDE.md); the reasoning behind them is
 in [nameserver abuse economics](../security/nameserver-abuse-economics.md).
 
@@ -42,10 +42,8 @@ spreads further than the group.
   proof-of-work (it is rate-limited per client IP and per DID, `[alias_rate_limits]`). The
   shipped unit binds to the tailnet only ([`deploy/README.md`](../../deploy/README.md)). Keep it that way until these are
   authenticated.
-- **Know your files.** With the shipped unit: legacy store `/var/lib/jig/nameserver.db`
-  (penalties, rate windows, federation cache, reputation, tribunal records, the
-  `ns_identity` key), alias store `/var/lib/jig/nameserver_v002.db`, attestation signing key
-  `/var/lib/jig/nameserver_v002.key` (or `[v0_0_2.server] server_did_keyfile`), and any
+- **Know your files.** With the shipped unit: alias store `/var/lib/jig/nameserver_v002.db`,
+  attestation signing key `/var/lib/jig/nameserver_v002.jigkey`, sealed (or the `.jigkey` beside `[v0_0_2.server] server_did_keyfile`), and any
   `JIG_NS_*` settings in the optional `/etc/jig/jig-nameserver.env`. The nameserver has no
   `JIG_NS_SECRET` any more (#192).
 - **Know that settings are read at start-up.** Every `JIG_NS_*` change below needs
@@ -183,20 +181,21 @@ issue attestations, and read or change everything in its databases.
    attestation under the removed key is refused from then on. `trusted_nameservers` is no
    longer used. Clients that list your suffix under `[naming.delegations]` need the same
    change.
-3. **Find what changed.** Compare alias bindings in `nameserver_v002.db` and identities in
-   `nameserver.db` against your latest backup. List every alias whose DID changed.
+3. **Find what changed.** Compare alias bindings in `nameserver_v002.db` against your latest
+   backup. List every alias whose DID changed.
 4. **Rotate everything:**
    - `JIG_NS_ADMIN_TOKEN`: new value.
-   - Attestation key: move `nameserver_v002.key` aside and let the service mint a new one,
+   - Attestation key: move `nameserver_v002.jigkey` aside and let the service seal a new one,
      which gives the nameserver a new `ns_did`. Every attestation signed by the old key
      must be treated as untrusted. Dependent servers and clients accept the new key only
      once its `ns_did` is in their delegation's `authorities`, so tell them the new DID.
-   - `ns_identity` key: delete its row from `nameserver.db` so a new one is generated. This
-     changes the `ns_id` in `/.well-known/jig-ns`.
+   - A box upgraded from an older release may still hold `/var/lib/jig/nameserver.db`, whose
+     `ns_identity` table is a raw key that signs nothing any more. Delete it, and its copies
+     in old backups.
 5. **Restore bindings.** Revert changed aliases from backup. Ask users to renew
    (`POST /v1/renew`) so attestations are reissued under the new key. Users who rotated
    their DID since the backup must re-register.
-6. **Tell people.** Announce the new `ns_did` and `ns_id`, the window of compromise and the
+6. **Tell people.** Announce the new `ns_did`, the window of compromise and the
    affected aliases through channels your users already trust, and tell your federation
    peers directly. Clients that pinned DIDs will have flagged changed aliases; tell users
    to trust those warnings.
@@ -205,26 +204,41 @@ issue attestations, and read or change everything in its databases.
    group's tribunal so the other members can quarantine cross-registered records from the
    window of compromise, and check your transparency log against their copies.
 
-## 4. Rogue federated instance
+## 4. Rogue or contradicting nameserver
 
-**Signs:** a peer domain's handles resolving to conflicting DIDs, policy hashes from a peer
-changing often, junk gossip, or reports that names from one domain are unreliable.
+**Signs:** two valid attestations for one alias that name different DIDs over overlapping
+windows (equivocation, JEP-0004 rule 15), resolution evidence a client kept under
+`~/.jig/evidence/names/` (#227), or attestations that fail against the authority the
+suffix's delegation names.
 
-1. **Gather evidence.** Record the remote answers you saw (`GET /v1/resolve?name=<handle>`),
-   gossip and policy hashes (`GET /v1/federation/policy`), and timestamps.
-2. **Cut it off.** Add the domain to `JIG_NS_DENY_DOMAINS` (comma-separated, lowercase), or
-   remove it from `JIG_NS_ALLOW_DOMAINS` if you run an allow list, and restart. Deny wins
-   over allow.
-3. **Purge the cache.** Cached answers are served before the deny check, so bad records
-   from that domain live until `JIG_NS_CACHE_TTL` (default 300 s) expires. To drop them at
-   once, delete that domain's rows from the `cache_identities` table in `nameserver.db`.
-4. **Record it.** Open a case and record an observation with `"subject":"nameserver"` (or
-   `"server"`) and the domain or DID as `subject_id`.
-5. **Tell your peers** what you saw and what you did. They decide for themselves. No
-   nameserver, an anchor included, can defederate an instance on anyone else's behalf.
-6. **Reinstate deliberately.** Remove the domain from the deny list once the other operator
-   explains and fixes the problem, and watch its answers for a while.
-7. **(not yet implemented)** If the instance is in your ruleset group, take the evidence to
-   the group's tribunal. Members apply its outcome under the group's ruleset; an anchor
-   coordinates, it does not decide. A rogue instance outside your group is yours alone to
-   cut off.
+1. **Keep the evidence.** Save the attestations and evidence files exactly as served, with
+   timestamps. The nameserver signed each attestation, so anyone can check them without
+   trusting you.
+2. **Cut it off where lookups happen.** Remove or replace that suffix's delegation in
+   `[identity.delegations]` (jig-server) or `[naming.delegations]` (`cli.toml`).
+   - jig-server refuses a suffix with no entry. The exception is `jig`: without an entry the
+     server falls back to its built-in `@jig` delegation, once a build ships the project's
+     authority. This build ships none, so `@jig` names fail closed.
+   - The CLI falls back when `cli.toml` has no entry: to the suffix's DNS-rooted delegation
+     for a multi-label suffix, and to the built-in `@jig` delegation for `jig`. So deleting
+     an entry can land on the same nameserver again.
+   - To refuse every name under a suffix, with no fallback on either side, **refuse it
+     rather than delete it**: drop its delegation and list it in `[identity]
+     refused_suffixes` (jig-server) or `[naming] refused_suffixes` (`cli.toml`), e.g.
+     `refused_suffixes = ["example.org"]`. Matching is exact and ignores case. A refused
+     suffix is checked before every delegation source, and a suffix that is both delegated
+     and refused is a config error.
+
+   No nameserver can defederate another: each server and client decides whose attestations
+   it accepts.
+3. **Tell your peers** what you saw and what you changed. They decide for themselves.
+4. **(not yet implemented)** Shared lists and tribunal outcomes: the draft
+   [JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md).
+
+The deny and allow domain lists and the gossip this section used to describe were removed
+in #237. They never exchanged data with peers, and the routes they served were removed in
+#154.
+Where nameserver federation is headed (witnessed logs and rulesets within a ruleset group) is
+in the [roadmap](../ROADMAP.md) under "Nameserver federation (target)", and in the draft
+[JEP-0009](../../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) and
+[JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md).
