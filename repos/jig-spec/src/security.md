@@ -228,7 +228,7 @@ Even if message content is encrypted, metadata reveals:
 
 ### Key Rotation
 
-**MUST support key rotation** (see [Crypto Primitives § Key Rotation](crypto.md#key-rotation-and-revocation)). *(partial: no rotation certificate exists, and a server whose key changes has a new DID, but it can serve a key link (JEP-0012) from the old DID that clients follow (#241), written by `jig-server keys rotate` or `keys link` (#298); after several changes, clients follow the chain of links hop by hop, up to 16 (#302).)*
+**MUST support key rotation** (see [Crypto Primitives § Key Rotation](crypto.md#key-rotation-and-revocation)). *(partial: no rotation certificate exists, and a server whose key changes has a new DID, but it can serve a key link (JEP-0012) from the old DID that clients follow (#241), written by `jig-server keys rotate` or `jig-server keys link` (#298); after several changes, clients follow the chain of links hop by hop, up to 16 (#302).)*
 
 **Process:**
 
