@@ -6,8 +6,10 @@
 > - **Implemented:** `did:jig` identities, nameserver-attested aliases, TOFU resolution in
 >   servers, verified name resolution through per-suffix delegations in servers (#200) and
 >   clients (#201), the default `@jig` delegation (#214, #218), client name pins in `jig dm`,
->   `jig channel add` and `jig trust verify-name` (#213, #215), and operator-seeded
->   per-ruleset scores for server admission.
+>   `jig channel add` and `jig trust verify-name` (#213, #215), operator-seeded
+>   per-ruleset scores for server admission, and JEP-0008 proof-of-work with a per-suffix
+>   registration pool on the nameserver's binding endpoints (see
+>   [Nameserver mechanics](#nameserver-mechanics)).
 > - **Removed prototype:** the reference nameserver's earlier surface (proof-of-work
 >   challenges with penalties, `/v1/claim`, `/v1/alias`, reputation observations, tribunal
 >   case records, the transparency log, useful work and nameserver federation) is no longer
@@ -18,8 +20,8 @@
 >   [JEP-0009](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) rulesets, reputation and transparency logs, and
 >   [JEP-0010](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md) abuse reports, tribunals and server lists.
 > - **Required, not yet implemented or partial:** proof-of-work enforced by servers as a
->   ruleset-set cost (only one-time admission proof-of-work exists, off by default) and on
->   every nameserver binding endpoint, reputation reports from servers to nameservers and
+>   ruleset-set cost (only one-time admission proof-of-work exists, off by default), server
+>   capacity pools, reputation reports from servers to nameservers and
 >   net reputation computed by nameservers, reputation shared within a ruleset group,
 >   cross-registration within a high-sec ruleset group, tribunals held by nameservers,
 >   transparency logs at servers and nameservers, abuse reporting from encrypted channels,
@@ -128,7 +130,9 @@ operator's own entry for `jig` replaces it.
 a proof of control: the DID's COSE_Sign1 over the action, the nameserver's DID, the alias
 and that challenge (rule 10). A proof made for one action, name or nameserver does not
 verify for another, and a signature over the bare challenge is refused. The nameserver
-consumes the challenge on the first proof that verifies.
+consumes the challenge on the first proof that verifies. Register, renew and rotate also
+carry proof-of-work bound to the same challenge
+([Nameserver mechanics](#nameserver-mechanics)).
 
 **Rotation by link.** An alias moves to another DID only by a key link
 ([JEP-0012](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0012-key-links.md)) from the old DID to the new one, signed by both
@@ -166,11 +170,12 @@ Registering an alias creates a binding, so it MUST carry
   bare challenge, one by each key, and `links` is always empty. A client therefore sees a
   rotation as any other change of DID behind a pinned name, and moves the pin only when its
   user accepts the new DID (rule 18).
-- **No proof-of-work:** no nameserver endpoint requires it since the legacy claim and alias
-  routes were removed. `/v1/register`, `/v1/rotate` and `/v1/renew` are rate-limited per
-  client IP and per DID (`[alias_rate_limits]`, see [Rate limiting](#rate-limiting)).
-- **Plaintext nameserver:** the reference nameserver serves HTTP, not the TLS rule 12
-  requires (F1 slice 3).
+- **Proof-of-work:** `/v1/register`, `/v1/renew` and `/v1/rotate` carry JEP-0008
+  proof-of-work, on by default per suffix, and registrations by strangers pass a per-suffix
+  pool. They are also rate-limited per client IP and per DID (`[alias_rate_limits]`). See
+  [Nameserver mechanics](#nameserver-mechanics).
+- **TLS:** the reference nameserver serves TLS by default (rule 12). `[tls] enabled = false`
+  serves plaintext and is listed in `unsafe_options_active`.
 
 One nameserver serves several suffixes (#224). `[[v0_0_2.nameserver.alias_suffixes]]` is
 required, with no default, and each suffix sets its own policy: `registration` (`open` or
@@ -347,7 +352,8 @@ is bound by the other's ruleset without one. Interop between ruleset groups this
 possible but not a first priority; the priority is a shared ruleset within a group (D21).
 
 **Status:** rulesets and contracts are parsed and published in `/.well-known/jig-ns`, and
-nothing applies them: the nameserver serves no proof-of-work and no scores.
+nothing applies them. The nameserver's proof-of-work is set per suffix in its own config,
+not by a ruleset, and it serves no scores.
 
 ### Reputation is not a protocol gate
 
@@ -372,7 +378,9 @@ must not stay linearly cheap is standing: aliases, and reputation under a rulese
   cross-registration within the group and [soul validation](#proposed-soul-validation).
 - That input MUST NOT link identities to each other or to a person.
 
-**Status:** not yet designed. Today Sybil cost is linear.
+**Status:** not yet designed. Today Sybil cost is linear. The nameserver's registration pool
+caps how many names strangers get per hour on a suffix, whatever they spend, but it prices
+names, not identities.
 
 ### Proposed: soul validation
 
@@ -409,44 +417,70 @@ alias challenges; it is still parsed, no longer published (#192), and nothing ap
 ### Admission proof-of-work (servers)
 
 A server MAY ask a DID it has no record of to do proof-of-work once, before the server
-serves that DID anything. The work is not a challenge: the server holds no state for a DID
-until the work is done, and anyone can check it.
+serves that DID anything. The work is JEP-0008's `admit` action: admission mode, with an
+empty binding and salt, bound to the server's DID (the verifier) and the new DID (the
+subject). It cannot be reused for another server or another identity, and anyone can check
+it. The server holds no state for a DID until the work is done.
+[JEP-0008](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0008-proof-of-work.md)
+rules 6–15 are normative; this section describes the reference server.
 
-Both hashes below are BLAKE3 over labelled parts: for each `(label, value)` in order, the
-label's UTF-8 bytes, the value's length as a little-endian u64, then the value.
-
-- **Work.** The digest is over (`domain`, `jig-admission-pow-v1`), (`server`, the server's
-  DID), (`did`, the new DID) and (`nonce`, chosen by the client, at most 64 bytes). The work
-  is done when the digest has at least `bits` leading zero bits. It is bound to one server
-  and one DID, so it cannot be reused for another. A server MUST NOT ask for more than 28
-  bits, and a client SHOULD refuse to do more.
-- **Proof.** The client posts `{did, nonce, sig_b64}` to `POST /api/v1/admission`.
-  `nonce` is a JSON string; its UTF-8 bytes are what both hashes take, and there MUST be
-  no more than 64 of them. `sig_b64` is the DID's Ed25519 signature over the hash of (`domain`,
-  `jig-admission-v1`), (`server`), (`did`) and (`nonce`), so nobody can admit a key they do
-  not hold. The server MUST verify the signature and the work, and MUST refuse a banned
-  DID. It then records the DID as proven. A DID stays proven if the server later raises
-  `bits`.
-- **Standing.** A signed `GET /api/v1/admission` returns the caller's own `did`, `proven`
-  and `pow_bits`. `proven` is true when admission lets the DID in without (more) work: it
-  did the work, or the server has a record of it, or asks for none. Owing work is not a
-  refusal here, so a DID that owes it can ask; any other admission refusal is returned as
-  itself. It does not charge the caller's rate, and it never answers for any DID but the
-  signer's.
+- **Proof.** The client posts `{did, pow, sig_b64}` to `POST /api/v1/admission`. `pow` is
+  the rule-10 proof `{alg, effort, nonce, salt_id}`, with `salt_id = 0`. `sig_b64` is the
+  DID's Ed25519 signature over the labelled BLAKE3 hash of (`domain`, `jig-admission-v2`),
+  (`server`), (`did`), (`alg`), (`effort`), (`nonce`) and (`salt_id`), so nobody can admit
+  a key they do not hold.
+- **Order.** The server checks the work first (one digest, rule 10), then the signature,
+  then refuses a banned DID. It then records the DID as proven. A DID stays proven if the
+  server later asks for more.
+- **Legacy form, for one release.** The server still accepts `{did, nonce, sig_b64}` under
+  `jig-admission-pow-v1` (JEP-0008, Backwards Compatibility). Its digest is over
+  (`domain`, `jig-admission-pow-v1`), (`server`), (`did`) and (`nonce`, a JSON string of at
+  most 64 bytes), and needs `pow_bits` leading zero bits. Its `sig_b64` signs (`domain`,
+  `jig-admission-v1`), (`server`), (`did`) and (`nonce`). It is accepted for one release,
+  then refused.
+- **The ask.** When admission asks for work, the signed welcome states it as
+  `admit: {alg, effort, salt_id, expires_at}` (rule 15). `/.well-known/jig` repeats it as
+  unsigned hints: `admission_pow` (`alg`, `effort`, `salt_id`) and the legacy
+  `admission_pow_bits`.
+- **Standing.** A signed `GET /api/v1/admission` returns the caller's own `did`, `proven`,
+  `pow_bits` and `effort`. `proven` is true when admission lets the DID in without (more)
+  work: it did the work, or the server has a record of it, or asks for none. Owing work is
+  not a refusal here, so a DID that owes it can ask; any other admission refusal is
+  returned as itself. It does not charge the caller's rate, and it never answers for any
+  DID but the signer's.
 - **Refusal.** Until the DID is proven, admission refuses it on every read, subscription
-  and write with `403 PROOF_OF_WORK_REQUIRED`.
+  and write with `403 PROOF_OF_WORK_REQUIRED`. Work that does not verify is
+  `400 PROOF_OF_WORK_INSUFFICIENT`.
 - **Relayed authors.** The author of a block relayed by a federated peer or submitted by a
-  bridge never spoke to this server, so is not asked for the work. Bans, floors and rate
-  limits still apply to it.
+  bridge never spoke to this server, so is not asked for the work (rule 30). Bans, floors
+  and rate limits still apply to it.
 
-The server advertises the bit count as `admission_pow_bits` at `/.well-known/jig`.
+**Status:** partial. The reference server does this under `[auth.admission] unknown_dids =
+"proof-of-work"`. The effort is still set by `pow_bits` (default 20, accepted 1 to 28), as
+`2^pow_bits`. The default policy is still `admit`, and the effort is fixed: no controller
+adapts it to load and no ruleset sets it, so rule 33's adaptive default-on is not built
+yet. The CLI does the work the first time it talks to such a server, in the JEP-0008 form
+when the server advertises `admission_pow`, else in the legacy form. 2^20 digests take
+about 0.2 s on one server core and far less on a GPU. The work makes minting identities to
+spread a flood across rate-limit buckets cost something; it does not stop a determined
+Sybil (see [Sybil resistance](#sybil-resistance)).
 
-**Status:** the reference server does this under `[auth.admission] unknown_dids =
-"proof-of-work"` with `pow_bits` (default 20, accepted 1 to 28); the default policy is
-still `admit`. The CLI does the work the first time it talks to such a server. At 20 bits
-the work is about a million hashes: under a second on a laptop and far less on a GPU. It
-makes minting identities to spread a flood across rate-limit buckets cost something; it
-does not stop a determined Sybil. Reputation is the answer to that (JEP-0003).
+### Capacity pools (servers)
+
+<!-- R1 task 5a: confirm against the merged [auth.pools] PR -->
+
+JEP-0008 rules 21–23 divide a server's capacity between members, invited subjects and
+strangers, so a flood of fresh identities reaches only the stranger pool.
+
+- **Shares.** Each pool gets a share of the server's local writes. Strangers get at most
+  20 % and invited subjects at most 10 % by default. Members never wait on the other pools.
+- **Members**, until JEP-0009, are DIDs in the server's admission `records`, or DIDs whose
+  admission proof is at least `local_member_age_secs` old.
+- **Invited** stays empty until JEP-0009 defines invites.
+- **Strangers** are everyone else, and every `--anon` key.
+
+**Status:** not on `main`. It lands in a separate PR as `[auth.pools]`. Until then a server
+has only its per-DID and per-address rate limits (`[auth.rate_limit]`).
 
 ### Cross-registration within a ruleset group
 
@@ -483,17 +517,20 @@ Rules:
 
 ## Nameserver mechanics
 
-> **Mostly not served.** The reference nameserver serves `/.well-known/jig-ns`,
-> `/.well-known/jig-ns/capabilities`, `/.well-known/jig-ns-delegation`, `/v1/health`, `/v1/suffixes` and the alias routes
-> (`GET /v1/challenge`, `/v1/register`, `/v1/resolve/{alias}`, `/v1/rotate`, `/v1/renew`,
-> and `/v1/handles` behind `[debug] list_handles`). The proof-of-work challenge flow,
-> penalties, rate limiting, `/v1/policy`, `/v1/resolve?name=`, the transparency and admin
-> routes, and federation below described a prototype whose routes were removed (#154). They
-> stay here as the design input that prototype explored; their redesign is the
-> [JEP-0008](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0008-proof-of-work.md) draft. `/.well-known/jig-ns` no longer publishes proof-of-work
-> parameters (#192). It publishes the alias routes' enforced limits as
-> `policy.alias_rate_limits` (`enabled`, `per_ip_per_min`, `per_did_per_min`) (#197), and still
-> publishes the legacy `automation` parameters, which nothing enforces.
+> **Normative source:** [JEP-0008](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0008-proof-of-work.md)
+> (proof-of-work, pools, penalties) and
+> [JEP-0004](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0004-verified-naming.md)
+> (challenges, proofs of control). This section describes what the reference nameserver
+> serves. Where it and the JEPs differ, the JEPs govern and the difference is a gap in the
+> code.
+>
+> The prototype's proof-of-work challenges (`POST /v1/challenge`, `/v1/claim`, `/v1/alias`),
+> its penalties and rate keys, `/v1/policy`, `/v1/resolve?name=`, the transparency and admin
+> routes and nameserver federation were removed (#154) and are not served.
+> `/.well-known/jig-ns` publishes `policy.alias_rate_limits` (`enabled`, `per_ip_per_min`,
+> `per_did_per_min`), and still publishes the legacy `automation` and `reputation`
+> parameters, which nothing enforces. It publishes no proof-of-work or pool parameters: a
+> client learns the effort from the signed offer.
 
 ### Endpoints
 
@@ -501,133 +538,169 @@ Rules:
 | --- | --- | --- |
 | `/.well-known/jig-ns` | GET | Discovery document (JSON) |
 | `/.well-known/jig-ns/capabilities` | GET | Capability document (plain text) |
-| `/v1/policy` | GET | Policy snapshot (JSON) *(not served)* |
 | `/v1/health` | GET | Liveness |
-| `/v1/challenge` | GET | Alias registration nonce ([Aliases](#aliases)) |
-| `/v1/register`, `/v1/renew`, `/v1/rotate` | POST | Alias attestations |
+| `/v1/challenge` | GET | A challenge for one action, DID and name, with the signed effort offer |
+| `/v1/register` | POST | Bind an alias to a DID; carries `pow` |
+| `/v1/renew`, `/v1/rotate` | POST | Renew an alias, or move it to a new DID; carry `pow` |
 | `/v1/resolve/{alias}` | GET | Alias attestation lookup |
 | `/.well-known/jig-ns-delegation` | GET | Signed delegation for a DNS-rooted suffix |
 | `/v1/suffixes` | GET | Suffixes served, their registration mode, and the nameserver's DID |
-| `/v1/challenge` | POST | Proof-of-work challenge for `claim` or `alias` *(not served)* |
-| `/v1/claim` | POST | Bind a handle to a key, with proof-of-work *(not served)* |
-| `/v1/alias` | POST | Mint a scoped or anonymous alias, with proof-of-work *(not served)* |
-| `/v1/resolve?name=` | GET | Handle lookup: local, then cache, then federated *(not served)* |
-| `/v1/transparency/entries`, `/hashes`, `/verify` | GET | [Transparency log](#transparency-log) *(not served)* |
-| `/v1/admin/penalties`, `/v1/admin/rate` | GET, POST | Inspect or reset a penalty or rate key *(not served)* |
+| `/v1/handles` | GET | Every registered alias; served only with `[v0_0_2.debug] list_handles` |
 
 ### Challenge flow
 
-1. `POST /v1/challenge` with `action` (`claim` or `alias`), `subject` and, for `alias`,
-   `scope`. The response is `challenge_id`, `difficulty` and `expires_at` (Unix seconds;
-   default lifetime 600 s).
-2. The client finds a `nonce` that meets `difficulty`.
-3. `POST /v1/claim` with the signed claim and `pow: {challenge_id, nonce}`, or
-   `POST /v1/alias` with `scope`, optional `subject`, optional `ttl_seconds` (default 3600)
-   and `pow`.
+1. **Ask.** `GET /v1/challenge?action=register|renew|rotate&did=<did>&name=<alias@suffix>`.
+   For rotate, `did` is the old DID. A request with `action` but no `did` or `name` is
+   `400 BINDING_REQUIRED`.
+2. **Offer.** The reply is `{challenge, pow: {alg, effort, salt_id, expires_at}, pow_offer}`.
+   - `challenge` is 32 random bytes in hex, valid for 60 s.
+   - `pow_offer` is a COSE_Sign1 by the nameserver's DID over the deterministic-CBOR offer
+     (`jig-ns-pow-offer-v1`: `challenge`, `action`, `name`, `did`, `ns_did`, `alg`,
+     `effort`, `salt_id`, `expires_at`). This is rule 16's signed effort. A client verifies
+     it against the DID the suffix's delegation names.
+   - The nameserver records the action, DID, name and promised effort with the challenge.
+     It checks the proof against that promise, so an effort rise mid-solve never refuses a
+     client.
+3. **Cheap refusals first.** For `action=register`, the policy runs before any offer:
+   `REGISTRATION_CLOSED`, `ALIAS_TOO_SHORT`, `ALIAS_RESERVED`, and `ALIAS_TAKEN` by another
+   DID. Nobody solves work for a name they cannot have. Not `DID_HOLDS_NAME`: the request is
+   unauthenticated, and refusing there would tell anyone which name a DID holds.
+4. **Solve and send.** The client solves the offer and sends the proof as `pow`
+   (rule 10: `{alg, effort, nonce, salt_id}`, `salt_id = 0`, `effort` at least the offer's)
+   with `challenge` on register, renew or rotate.
 
-A challenge is bound to its action, subject and scope, and is single-use. The nameserver
-MUST refuse a used, expired or mismatched challenge.
+A bare `GET /v1/challenge` (no `action`) still works for clients from before R1. On a suffix
+that asks for work it can only lead to `428 POW_REQUIRED`.
 
 ### Proof-of-work
 
-Proof-of-work is required, not optional (D23). A server MUST enforce proof-of-work on the
-clients it serves, at the cost its ruleset sets. A nameserver MUST require a solved
-challenge on every request that creates a binding. A client MUST be able to solve a
-challenge from public information alone.
+Proof-of-work is required, not optional (D23):
 
-**Status:** partial. A server MAY require one proof from a DID it has not seen before
-admitting it, off by default (D26). That proof is bound to the server's DID and the new
-DID, uses no challenge, and is solvable from public information. It is a one-time cost, not
-a rate cost the ruleset sets. See [Admission proof-of-work](#admission-proof-of-work-servers).
+- A server MUST enforce proof-of-work on the clients it serves, at the cost its ruleset
+  sets.
+- A nameserver MUST require it on every request that creates or keeps a binding (rule 31).
+- A client MUST be able to solve it from public information alone (rule 9).
+- A nameserver that adopts a ruleset MUST scale effort by the subject's standing under it,
+  within the ruleset's bounds (rule 28), so standing moves the price but never becomes a
+  gate.
 
-A solution is valid when `BLAKE3(challenge_id|action|subject|scope|nonce)` has at least
-`difficulty` leading zero bits. Expected work is about 2^`difficulty` hashes.
+**Bindings (rule 11).** The work's subject and binding:
 
-**Status:** not served. No nameserver endpoint requires proof-of-work; `/v1/claim` and
-`/v1/alias`, the only ones that did, were removed. Their hash was keyed with
-`BLAKE3(server_secret)`, which clients do not hold; a replacement must be solvable from
-public information.
+| Request | Subject | Binding |
+| --- | --- | --- |
+| register | `did` | `proof_hash("register", ns_did, alias, challenge)` |
+| renew | `did` | `proof_hash("renew", ns_did, alias, challenge)` |
+| rotate | `old_did` | interim: BLAKE3 of the deterministic-CBOR map `{domain: "jig-alias-rotate-pow-v1", ns_did, alias, old_did, new_did, challenge}`, until JEP-0004 gains a rotate proof |
 
-The difficulty for a challenge is computed per rate key:
+So work done for one action, alias, nameserver or challenge fails for any other.
+
+**Order of checks in `register`.** Cheap refusals before work, work before any signature:
+
+1. Parse the alias, the suffix and the name.
+2. Suffix policy: closed, too short, reserved.
+3. The challenge: known, unexpired, and issued for this action, DID and alias. Otherwise
+   `401 CHALLENGE_UNKNOWN`, and the challenge stays usable by its rightful request.
+4. The work: one digest against the promised effort.
+5. The proof of control (the DID's signature), then the reachability record.
+6. `ALIAS_TAKEN` by another DID.
+7. The [registration pool](#the-registration-pool), for a stranger.
+8. Consume the challenge; `ALIAS_TAKEN` and `DID_HOLDS_NAME` again, since the store can
+   change meanwhile.
+
+Renew checks the work, then the proof of control, then consumes the challenge, then that
+the DID holds the alias. Rotate checks the work before both signatures, and consumes the
+challenge last. No refusal before the consume uses the challenge up.
+
+**Refusals.**
+
+| Refusal | When |
+| --- | --- |
+| `428 POW_REQUIRED` | No `pow` for a challenge that promised work; the body restates `pow_offer`. Also any request on a challenge issued without `action`, on a suffix that asks for work |
+| `400 POW_INVALID` | Another algorithm or salt, a nonce over 64 bytes, or a digest that misses the bid |
+| `400 POW_INSUFFICIENT` | A bid below the promised effort |
+| `503 REGISTRATION_BUSY` | The suffix's registration pool has no token for this stranger; `Retry-After` (and `retry_after` in the body) is the seconds until the next token |
+| `503 BUSY` | The challenge map is full (`max_pending_challenges`); live challenges are never evicted |
+
+A `pow` field that is not a proof object fails to parse, and the request is refused before
+any check.
+
+**Effort for one registration (rule 18).** Per suffix, in
+`[v0_0_2.nameserver.alias_suffixes.pow]`:
 
 ```
-p      = min(penalty_points(key), max_points)
-bits   = base_difficulty + step_bits × p
-m_rep  = reputation multiplier       (1.0 without a default ruleset or a score)
-m_auto = 1 + p^power_law_alpha × pile_on_factor, clamped to [1, max_multiplier]
-                                     (1.0 when automation is disabled)
-d      = round(bits × m_rep × m_auto)
-d      = max(d, floor)               (anonymous_min for an alias with no subject,
-                                      otherwise min_difficulty)
-d      = clamp(d, min_difficulty, max_difficulty)
+E = clamp( max(min_effort, suggested)
+           × short_name_factor ^ max(0, short_name_len − len(alias))
+           × 2 ^ penalty_points,
+           min_effort, max_effort )
 ```
 
-A nameserver that adopts a ruleset MUST scale difficulty by the subject's reputation under
-that ruleset, within the ruleset's `pow_policy` bounds, so that reputation lowers or raises
-the price of acting but never becomes a gate.
+- `suggested` is the pool's controller (below). `m_standing` is 1 until JEP-0009.
+- Defaults: `min_effort` 2^20, `max_effort` 2^24, `short_name_len` 5, `short_name_factor`
+  4. So 4 letters cost 4× and 3 letters 16× a name of 5 or more.
+- 1 and 2 letters are reserved: `min_alias_len = 3` refuses them, and only a
+  `registration_allow` entry can register them.
+- An allowlisted registration (`registration_allow`) pays `min_effort`, with no length
+  multiplier or penalty.
+- Renew and rotate pay `renew_effort` (default 1).
+- `min_effort = 0` turns proof-of-work off on the suffix, for all three actions.
+- Boot refuses a `max_effort` above 2^28, or one that does not fit `max_solve_secs` at
+  5.5 million digests a second, or a `max_solve_secs` above half the challenge lifetime.
 
-`m_rep` is the ruleset `multiplier` times `1 − 0.25 × score` (score clamped to [−1, 1]),
-pulled towards 1.0 when the score's weight is below 1, and clamped to [0.1, 8]. With a
-ruleset multiplier of 1.0, a good score lowers difficulty by at most a quarter and a bad
-one raises it by at most a quarter.
+### The registration pool
 
-**Status:** not served (see above).
+Per suffix, in `[v0_0_2.nameserver.alias_suffixes.pool]` (rules 17, 21–24). It bounds how
+many strangers register per hour, however much compute they bring.
 
-With the default parameters and no reputation score, a single penalty point raises `d` to
-`max_difficulty` (see [Penalties](#penalties)).
+- **Strangers** are registrants the suffix's `registration_allow` does not name. Renew and
+  rotate by the holder, and allowlisted registrations, skip the pool.
+- **Tokens.** A token bucket of `strangers_per_hour` (default 60) with `burst` (default 10).
+  A stranger whose work and signature verified takes a token.
+- **Queue.** With no token, the request waits in a queue of `queue_len` (default 20),
+  highest bid first, arrival order between equal bids. A full queue takes a newcomer only
+  if it bids more than the lowest waiting request, which is then refused. After
+  `queue_wait_secs` (default 10) without a token, the answer is `503 REGISTRATION_BUSY`.
+- **Replays.** The request claims its challenge before it queues, so a replay of the same
+  proof takes no second token.
+- **Controller** (`doubling`, per `controller_window_secs`, default 300). After a window in
+  which the queue was full, `suggested` doubles, up to `max_effort`. After a window in which
+  nothing queued, it halves, never below `min_effort`. New offers state the result.
+- `enabled = false` admits every stranger whose work verifies.
 
 ### Rate limiting
 
-Challenge issuance is limited per client IP and per rate key, in fixed one-minute windows.
+In `[alias_rate_limits]`, in fixed one-minute windows held in memory, per process:
 
-| Limit | Default | Key |
+| Limit | Default | Counted |
 | --- | --- | --- |
-| Per IP | 120 per minute (`JIG_NS_RATE_PER_IP_PER_MIN`, *removed in #197*) | `ip:<address>` |
-| Per key | 60 per minute (`JIG_NS_RATE_PER_MIN`, *removed in #197*) | `claim:subject:<handle>` or `alias:scope:<scope>:subject:<subject>` |
+| `per_ip_per_min` | 30 | Each `POST` to register, renew or rotate, per client address |
+| `per_did_per_min` | 10 | Each one that succeeds, per DID it names; success needs that DID's signature |
+| `challenge_per_ip_per_min` | 60 | Each `GET /v1/challenge`, per client address, in a bucket of its own |
+| `max_pending_challenges` | 100 000 | Challenges issued and not yet used or expired. A tenth is kept for renew and rotate |
 
-The client IP is the socket address, or the first entry of `JIG_NS_PROXY_IP_HEADER`
-(default `x-forwarded-for`) when `JIG_NS_TRUST_PROXY` is set. A refused request gets
-HTTP 429 and adds one penalty point to the key that refused it, so retrying raises the next
-difficulty.
-
-**Status:** not served. These limits applied only to the removed challenge route. The alias
-routes have their own limits instead: `POST /v1/register`, `/v1/rotate` and `/v1/renew` are
-limited per client IP (default 30 per minute; IPv6 per /64) and per DID (default 10 per
-minute, charged only when the request succeeds, which needs that DID's signature), in fixed
-one-minute windows held in memory (`[alias_rate_limits]`). Behind a proxy
-(`[network] trust_proxy`), the client IP is the last entry of `proxy_ip_header`. A refusal is
-HTTP 429 with code `RATE_LIMITED` and a `Retry-After` header, and adds no penalty.
+- IPv6 addresses count per /64. Behind a proxy (`[network] trust_proxy`), the address is
+  the last entry of `proxy_ip_header`.
+- A refusal is `429 RATE_LIMITED` with `Retry-After`. It charges no bucket and adds no
+  penalty.
+- Rate limits run before the pool (rule 23).
+- `enabled = false` turns the three per-minute limits off. `max_pending_challenges` always
+  applies.
 
 ### Penalties
 
-A nameserver keeps penalty points per rate key. One point is added for each of:
+Penalties raise the effort a registration is asked for (rules 26–27). They key on:
 
-- an invalid proof-of-work on `/v1/claim` or `/v1/alias`;
-- a refused challenge request (per-key or per-IP rate limit).
+- **`ip:<address>`** (IPv6 per /64), for work that does not verify on register
+  (`POW_INVALID`, `POW_INSUFFICIENT`). The work is checked before the signature, so the DID
+  it names is unproven; charging that DID would let anyone raise its price.
+- **`pair:<alias>|<did>`**, for a signed register attempt on an alias another DID holds.
+  Other DIDs asking for the same alias pay nothing more.
 
-Points raise difficulty by `step_bits` each, at most `max_points` of them count, and the
-result is clamped to `[min_difficulty, max_difficulty]` (formula above).
-
-**Decay is linear.** On each read, one point is removed for every full `decay_secs` since
-the key last changed, floored at 0. A new penalty resets that clock, so a key that keeps
-misbehaving does not decay.
-
-| Parameter | Default | Setting |
-| --- | --- | --- |
-| `base_difficulty` | 18 | `JIG_NS_POW_DIFFICULTY` *(removed in #192)* |
-| `min_difficulty` / `max_difficulty` | 8 / 28 | `JIG_NS_POW_MIN` / `JIG_NS_POW_MAX` *(removed in #192)* |
-| `anonymous_min` | 12 | `JIG_NS_ANON_MIN_POW` |
-| `step_bits` | 2 per point | `JIG_NS_PENALTY_STEP_BITS` |
-| `max_points` | 64 | `[penalties] max_points` |
-| `decay_secs` | 300 | `JIG_NS_PENALTY_DECAY` |
-| `power_law_alpha` / `pile_on_factor` / `max_multiplier` | 1.4 / 0.5 / 8.0 | `JIG_NS_AUTOMATION_ALPHA` / `_PILE_ON` / `_MAX` |
-
-A nameserver MUST raise difficulty monotonically with penalty points up to its maximum, and
-MUST let points decay to zero when no new penalties arrive.
-
-**Status:** not served. No route records or reads penalties since the legacy routes were
-removed, including the host-penalty ledger (`GET /v1/hosts/{did}/penalties`). Known weaknesses the design must close are listed in the
-[abuse economics](https://github.com/jig-protocol/jig/blob/main/docs/security/nameserver-abuse-economics.md#known-weaknesses-the-design-must-close).
+Each point doubles the effort: the pair's and the address's points add, up to 32 counted,
+and the result is clamped at `max_effort`. A penalty lives `penalty_decay_secs` (default
+600). A repeat offence before it lapses adds a point and doubles its life, up to a day; when
+the life ends, all its points lapse at once. At most 100 000 keys are held. Renew and rotate
+neither read nor add penalties. Penalties, the pool and the controller are in memory and
+per process, like the rate limits.
 
 ### Policy and discovery documents
 
@@ -771,13 +844,17 @@ not yet meet.
   enforce servers' good behaviour (nameservers) *(not yet implemented)*.
 - Enforce proof-of-work on the clients a server serves (servers) *(partial: admission
   proof-of-work, which the reference server offers but does not turn on by default)*.
-- Require proof-of-work, solvable from public information, on every request that creates a
-  binding (nameservers) *(partial)*.
-- Scale proof-of-work by reputation under an adopted ruleset, within its bounds
-  *(partial)*.
-- Refuse used, expired or mismatched proof-of-work challenges.
-- Raise difficulty monotonically with penalty points, clamped to the configured maximum,
-  and let points decay to zero without new penalties.
+- Require proof-of-work, solvable from public information, on register, renew and rotate,
+  checked before any signature (nameservers).
+- Cap stranger registrations per suffix with a pool that compute cannot raise
+  (nameservers).
+- Divide a server's capacity into member, invited and stranger pools (servers) *(not yet
+  implemented)*.
+- Scale proof-of-work by standing under an adopted ruleset, within its bounds *(not yet
+  implemented: standing is 1 until JEP-0009)*.
+- Refuse used, expired or mismatched challenges.
+- Raise effort monotonically with penalty points, clamped to the configured maximum, and
+  let points decay to zero without new penalties.
 - Close linear Sybil cost with an admission input for standing that costs more than
   hashing, without linking identities *(not yet implemented)*.
 - Cross-register identities within a high-sec ruleset group, and resolve another

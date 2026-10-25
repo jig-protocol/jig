@@ -166,6 +166,10 @@ Non-goals:
 
     The terms are defined in rules 26–28. A product that rounds below 1 means no work, unless
     `min_effort ≥ 1`.
+    - Where `min_effort(action) ≥ 1`, the floor is taken before the multipliers:
+      `suggested(action)` above is `max(min_effort(action), suggested(action))`.
+    - A name action (`ns-register`) MAY multiply by a target-dependent
+      `m_length = short_name_factor ^ max(0, short_name_len − len(alias))`.
 19. **Bounds.** `min_effort`, `max_effort` and `max_solve_secs` per action are ruleset
     parameters (JEP-0009). Without a ruleset they are server configuration.
     - A verifier MUST set `max_effort(action)` so that the slowest client it means to serve finishes
@@ -216,6 +220,7 @@ Non-goals:
     - The target is what the request acts on: the name, the alias scope or the subject.
     - The requester is the DID that signed the request.
     - A refused or invalid proof adds a point to the pair, and to the requester's address bucket.
+    - A failure before the requester's signature is verified charges the address bucket only.
     - `m_penalty` rises monotonically with points, up to `max_penalty_multiplier`.
 27. **Decay remembers repeat offenders.** Points decay one per `decay_secs`. Each new offence
     inside the ruleset's `offence_window` doubles that key's `decay_secs`, up to
