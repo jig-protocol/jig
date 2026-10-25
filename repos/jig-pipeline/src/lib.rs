@@ -10,6 +10,7 @@
 //! (B3 through B8) populate them.
 
 pub mod authorize_write;
+pub mod contracts;
 pub mod effect;
 pub mod envelope;
 #[cfg(feature = "executor")]

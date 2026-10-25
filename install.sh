@@ -311,7 +311,7 @@ listen = "$JIG_SERVER_LISTEN"
 server_did_keyfile = "$JIG_HOME/server/server.key"
 # allowed_block_kinds is left unset on purpose, so this server tracks the
 # built-in default as new kinds ship. Today that is:
-#   allowed_block_kinds = ["text-render", "channel-create", "member-add", "member-remove", "channel-promote", "channel-archive", "role-assign", "role-unassign"]
+#   allowed_block_kinds = ["text-render", "channel-create", "member-add", "member-remove", "channel-promote", "channel-archive", "role-assign", "role-unassign", "channel-share", "channel-unshare", "contract-accept", "contract-refuse", "contract-end"]
 # To restrict it, uncomment that line and remove kinds. A list here is fixed:
 # kinds added in later releases stay refused until you add them.
 

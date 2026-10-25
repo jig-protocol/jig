@@ -106,6 +106,9 @@ impl Default for ServerSection {
             // and leave) and channel-promote (opening a restricted channel or
             // DM up) are v0.2 channel dynamics, gated the same way.
             // role-assign and role-unassign (JEP-0005 rule 7b) are owner-only.
+            // channel-share and channel-unshare need the `share` right, and
+            // only the channel's sequencer writes the contract-* records of
+            // what came of a share (JEP-0005 rules 7-11).
             allowed_block_kinds: vec![
                 "text-render".to_string(),
                 "channel-create".to_string(),
@@ -115,6 +118,11 @@ impl Default for ServerSection {
                 "channel-archive".to_string(),
                 "role-assign".to_string(),
                 "role-unassign".to_string(),
+                "channel-share".to_string(),
+                "channel-unshare".to_string(),
+                "contract-accept".to_string(),
+                "contract-refuse".to_string(),
+                "contract-end".to_string(),
             ],
             max_future_skew_ms: DEFAULT_MAX_FUTURE_SKEW_MS,
         }
@@ -1189,6 +1197,11 @@ mod tests {
             "channel-archive",
             "role-assign",
             "role-unassign",
+            "channel-share",
+            "channel-unshare",
+            "contract-accept",
+            "contract-refuse",
+            "contract-end",
         ] {
             assert!(
                 cfg.server.allowed_block_kinds.iter().any(|k| k == required),
