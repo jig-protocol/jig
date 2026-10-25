@@ -21,10 +21,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use integration_tests::harness::TestNameserver;
 use jig_core::naming::Attestation;
 
-fn run(home: &Path, args: Vec<String>) -> (bool, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_jig"))
-        .args(&args)
-        .env("HOME", home)
+/// `jig`, with `HOME` at `home` and the environment every test here runs it in.
+fn jig_command(home: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_jig"));
+    cmd.env("HOME", home)
         // Never the developer's real keychain; seal test keys with a fixed secret.
         .env("JIG_KEYCHAIN", "none")
         .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
@@ -33,9 +33,12 @@ fn run(home: &Path, args: Vec<String>) -> (bool, String) {
             "jig cli tests: a fixed, public secret",
         )
         .env("JIG_NONINTERACTIVE", "1")
-        .env("RUST_BACKTRACE", "0")
-        .output()
-        .unwrap();
+        .env("RUST_BACKTRACE", "0");
+    cmd
+}
+
+fn run(home: &Path, args: Vec<String>) -> (bool, String) {
+    let out = jig_command(home).args(&args).output().unwrap();
     (
         out.status.success(),
         format!(
@@ -366,18 +369,9 @@ async fn a_full_pool_is_waited_out_and_the_registration_retried() {
     let (ok, out) = {
         let (ns, home) = (ns.clone(), home.path().to_path_buf());
         tokio::task::spawn_blocking(move || {
-            let mut child = Command::new(env!("CARGO_BIN_EXE_jig"))
+            let mut child = jig_command(&home)
                 .args(["init", "dj", "--request-alias", "deji", "--nameserver"])
                 .arg(ns.http_url())
-                .env("HOME", &home)
-                .env("JIG_KEYCHAIN", "none")
-                .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
-                .env(
-                    "JIG_TEST_KEY_SECRET",
-                    "jig cli tests: a fixed, public secret",
-                )
-                .env("JIG_NONINTERACTIVE", "1")
-                .env("RUST_BACKTRACE", "0")
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
