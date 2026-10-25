@@ -730,8 +730,15 @@ reputation, tribunal, transparency and federation) were removed:
 > last address in that header, the one your proxy appended. With one proxy in
 > front this is the client's address; behind several, the limit applies to the
 > nearest proxy. Without `trust_proxy`, every client behind the proxy shares
-> the proxy's address and its limit. Limits are in memory and reset when the
-> nameserver restarts.
+> the proxy's address and its limit. This applies only to a proxy that
+> terminates TLS, so only to a nameserver for a DNS-rooted suffix, whose clients
+> check its certificate against a CA. A nameserver for a `config` or `contract`
+> suffix must not sit behind one: clients accept only the certificate its DID
+> vouches for, so serve it directly or behind TCP/SNI passthrough. A
+> passthrough proxy cannot add `x-forwarded-for`, so leave `trust_proxy` off
+> there. Every client then shares the proxy's address and its limit: the
+> nameserver does not read PROXY protocol either. Limits are in memory and
+> reset when the nameserver restarts.
 
 Register, renew and rotate ask for proof-of-work only on a suffix whose
 `pow.min_effort` is above 0 (see **Proof-of-work** below).

@@ -183,7 +183,10 @@ Still to do in this phase:
   rotations back fails closed and must re-pin. The next step is a chain of links, followed hop by
   hop (a JEP-0002 and JEP-0012 change, lane I), because forcing a re-pin is a trust-on-first-use
   attack path.
-- ACME certificates. TLS on the nameserver, bound to its DID, landed in #262.
+- ACME certificates for DNS-rooted suffixes. TLS on the nameserver, bound to its DID, landed in #262.
+- PROXY protocol v2 on the nameserver listener, so its per-client rate limits still apply behind a
+  TCP/SNI passthrough proxy. A `config` or `contract` suffix needs passthrough, and today every
+  client behind one shares the proxy's limit.
 - Signed peer policy (federation already runs through the write gate). The policy is published in
   the signed server manifest since #275; its quotas are not enforced yet.
 - **One implementation of each thing:** remove the v0.0.1 paths that sit beside v0.0.2 ones, the
