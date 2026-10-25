@@ -11,7 +11,7 @@ path = "src/lib.rs"
 [dependencies]
 jig-runtime = { workspace = true }
 jig-server = { path = "../jig-server" }
-jig-nameserver = { path = "../jig-nameserver" }
+jig-nameserver = { path = "../jig-nameserver", features = ["test-support"] }
 # `verify`: the client re-executes text-render blocks and checks the receipt.
 jig-client = { path = "../jig-client", features = ["test-support", "verify"] }
 jig-mls = { workspace = true }

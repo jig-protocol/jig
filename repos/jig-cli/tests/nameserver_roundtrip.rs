@@ -339,16 +339,18 @@ async fn register_renew_and_rotate_solve_the_nameservers_proof_of_work() {
 /// A nameserver whose registration pool is full answers `503
 /// REGISTRATION_BUSY` with `Retry-After` (JEP-0008 rules 22–24). `jig` waits
 /// that long, says so, and registers on a fresh challenge.
+///
+/// Independent of timing: the test holds the pool so it never refills, so
+/// `jig`'s first attempt is refused however long it takes to arrive. Its
+/// `Retry-After` is the 5 s one token takes at 720 an hour. The test releases
+/// the pool only once `jig` says it is waiting, so the retry can succeed only
+/// by waiting and trying again.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_full_pool_is_waited_out_and_the_registration_retried() {
     use integration_tests::harness::{PoolPolicy, PowPolicy};
-    // One stranger every 10 s, and one token: the harness's own registration
-    // takes it, so the CLI's finds the pool empty. The window is wide enough
-    // for a debug `jig` on a loaded CI runner to start, probe TLS and reach
-    // /v1/register inside it; without proof-of-work there is nothing to
-    // solve first.
+    use std::io::{BufRead, Read};
     let pool = PoolPolicy {
-        strangers_per_hour: 360,
+        strangers_per_hour: 720,
         burst: 1,
         queue_wait_secs: 0,
         ..PoolPolicy::recommended()
@@ -356,32 +358,61 @@ async fn a_full_pool_is_waited_out_and_the_registration_retried() {
     let ns = TestNameserver::start_tls_with_policies("dj.jig", PowPolicy::off(), pool)
         .await
         .unwrap();
+    ns.hold_pool(true);
     ns.register("first").await.expect("takes the one token");
-    let url = ns.http_url();
+    let ns = std::sync::Arc::new(ns);
     let home = tempfile::tempdir().unwrap();
 
-    let (ok, out) = jig(
-        home.path(),
-        &[
-            "init",
-            "dj",
-            "--request-alias",
-            "deji",
-            "--nameserver",
-            &url,
-        ],
-    )
-    .await;
+    let (ok, out) = {
+        let (ns, home) = (ns.clone(), home.path().to_path_buf());
+        tokio::task::spawn_blocking(move || {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_jig"))
+                .args(["init", "dj", "--request-alias", "deji", "--nameserver"])
+                .arg(ns.http_url())
+                .env("HOME", &home)
+                .env("JIG_KEYCHAIN", "none")
+                .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+                .env(
+                    "JIG_TEST_KEY_SECRET",
+                    "jig cli tests: a fixed, public secret",
+                )
+                .env("JIG_NONINTERACTIVE", "1")
+                .env("RUST_BACKTRACE", "0")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            let stdout = std::thread::spawn(move || {
+                let mut s = String::new();
+                stdout.read_to_string(&mut s).unwrap();
+                s
+            });
+            let mut out = String::new();
+            for line in std::io::BufReader::new(child.stderr.take().unwrap()).lines() {
+                let line = line.unwrap();
+                if line.contains("taking no more new names for now; waiting") {
+                    // jig has seen the busy pool and is sleeping out its
+                    // Retry-After: let its retry through.
+                    ns.hold_pool(false);
+                }
+                out.push_str(&line);
+                out.push('\n');
+            }
+            let ok = child.wait().unwrap().success();
+            (ok, stdout.join().unwrap() + &out)
+        })
+        .await
+        .unwrap()
+    };
     assert!(ok, "jig init after a busy pool: {out}");
-    // The CLI saw REGISTRATION_BUSY and waited what its Retry-After said: at
-    // most the 10 s refill, never more.
     let waited: u64 = out
         .split("taking no more new names for now; waiting ")
         .nth(1)
         .and_then(|rest| rest.split('s').next())
         .and_then(|secs| secs.parse().ok())
         .unwrap_or_else(|| panic!("no busy refusal was waited out: {out}"));
-    assert!((1..=10).contains(&waited), "waited {waited}s: {out}");
+    assert_eq!(waited, 5, "jig waits exactly its Retry-After: {out}");
     assert_eq!(
         resolved(&ns, "deji@dj.jig").await.did,
         configured_did(home.path())

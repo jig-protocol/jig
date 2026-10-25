@@ -171,6 +171,13 @@ jobs:
           ! cargo tree --locked -e normal,features -i jig-client \
             -p jig-server -p jig-cli -p jig-nameserver \
             | grep 'jig-client feature "test-support"'
+      - name: No release binary enables jig-nameserver's test-support
+        # test-support compiles SuffixPolicy::hold_pool, which stops and
+        # refills a registration pool on demand. Only integration-tests enables it.
+        run: |
+          ! cargo tree --locked -e normal,features -i jig-nameserver \
+            -p jig-server -p jig-cli -p jig-nameserver \
+            | grep 'jig-nameserver feature "test-support"'
       - name: Clippy (jig-bridge-core web feature)
         # The webhook-mount path (RouterMount + cfg'd BridgeContext field) is
         # gated behind the `web` feature; lint it explicitly so it's covered.

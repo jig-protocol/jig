@@ -601,6 +601,17 @@ impl TestNameserver {
         &self.client
     }
 
+    /// Hold this nameserver's stranger pool: while `held` it does not
+    /// refill, so a test decides when a waiting registration gets through;
+    /// releasing it refills it at once.
+    pub fn hold_pool(&self, held: bool) {
+        self.state
+            .suffixes
+            .get(&self.alias_suffix)
+            .expect("the nameserver serves its suffix")
+            .hold_pool(held);
+    }
+
     /// The proof-of-work a test nameserver asks for unless told otherwise:
     /// on, at the recommended floor of 2^20 to register, but without the
     /// length multiplier, so a 3-letter test alias costs a tenth of a second
