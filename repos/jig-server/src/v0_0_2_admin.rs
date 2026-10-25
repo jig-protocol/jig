@@ -410,6 +410,7 @@ mod tests {
             tls_binding: Default::default(),
             manifest: Default::default(),
             key_link: None,
+            prior_key_links: Vec::new(),
             peer_frames: Default::default(),
             peers: Default::default(),
         })

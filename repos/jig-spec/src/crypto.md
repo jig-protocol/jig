@@ -199,9 +199,10 @@ Keys need to be rotated periodically (annual schedule) or immediately (after com
 
 > **Not implemented.** No rotation certificate, `/v1/identity/rotate` endpoint, grace period
 > or revocation certificate exists. A server whose key changes has a new DID. What exists is
-> the key link (JEP-0012): `jig-server keys rotate` signs one from the old DID to the new,
-> the server serves it, and clients and peers that pinned the old DID follow it one hop. A
-> client pinned two keys back is refused.
+> the key link (JEP-0012): `jig-server keys rotate` signs one from the old DID to the new
+> and keeps the earlier ones, the server serves them as a chain, and clients and peers
+> pinned on any DID in it follow every hop. A chain holds at most 16 links; a client pinned
+> on a DID the chain no longer reaches is refused.
 
 ### Rotation Certificate Format
 

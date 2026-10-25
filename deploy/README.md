@@ -675,6 +675,7 @@ the new one. In place, so the config and the drop-in do not change:
 | --- | --- |
 | `/var/lib/jig/server.jigkey` | the new key, opened by the new credential and the new passphrase |
 | `/var/lib/jig/server.key.link` | the link from the old DID to the new one: back it up with the key |
+| `/var/lib/jig/server.key.link.N` | the links of earlier rotations, still served: back them up too |
 | `/var/lib/jig/server.retired-<DID tail>.jigkey` | the old key, still sealed |
 | `/etc/credstore.encrypted/jig-server-key.retired-<time>` | the old credential |
 
@@ -690,12 +691,18 @@ new passphrase in `JIG_KEY_NEW_PASSPHRASE`. For a key made offline with
 `keys generate`, `jig-server keys link --old-keyfile OLD --keyfile NEW` writes
 only the link, beside `NEW`.
 
-**Rotate once per pin generation.** The server serves one link, and a client
-follows one: after a second rotation, a client still pinned on the first DID is
-refused, with an error saying the server changed its key more than once. It
-must re-pin, which trusts the server on first use again. So `--rotate` refuses
-a second rotation unless you pass `--replace-link`, and keeps the earlier link
-as `server.key.link.1`. Serving the whole chain is planned.
+**Every rotation is followed.** The earlier link is kept as `server.key.link.1`
+(then `.2`, and so on) and served with the new one, as a chain: a client pinned
+on any earlier DID follows every hop. Back up `server.key.link*`, not only
+`server.key.link`. A broken or missing earlier link only shortens the chain,
+and the server logs which file it left out; clients pinned behind it are
+refused until it is restored. A broken `server.key.link` stops the server.
+
+A chain holds at most 16 links, the most a client follows. After that,
+`--rotate --prune-oldest` moves the oldest aside (`server.key.link.pruned-1`,
+kept, not served): a client still pinned on the DID it leaves is refused, with
+an error saying the server changed its key more than once, and must re-pin,
+which trusts the server on first use again.
 
 A DID is linked to one new key only, ever: two links from one DID are what a
 stolen key looks like (JEP-0012), and clients that see both follow neither.

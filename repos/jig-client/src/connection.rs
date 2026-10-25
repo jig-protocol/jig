@@ -1612,6 +1612,7 @@ mod tests {
             manifest: None,
             key_link: None,
             admit: None,
+            prior_key_links: Vec::new(),
             sig: String::new(),
         }))
         .unwrap();

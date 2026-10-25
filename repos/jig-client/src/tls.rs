@@ -48,9 +48,10 @@ pub enum TlsError {
         server: String,
         expected: String,
         presented: String,
-        /// The key link it served, base64, if any: one that does not move
-        /// from `expected`, but may fork a link the caller already followed.
-        key_link: Option<String>,
+        /// The key links it served, base64, oldest first: ones that do not
+        /// move from `expected`, but may fork a link the caller already
+        /// followed.
+        key_links: Vec<String>,
         /// Set when that link moves to `presented` from another DID than
         /// `expected`: the server changed its key more than once since it
         /// was pinned, or is an impostor. Says so, and that re-pinning is
@@ -91,8 +92,11 @@ pub struct Probed {
     /// serves a public key link from that one to it (JEP-0012): the expected
     /// DID it moved from. The caller moves its pin ([`crate::pins::Pins::move_server`]).
     pub moved_from: Option<String>,
-    /// That link, base64, as served.
-    pub key_link: Option<String>,
+    /// The links the server serves, base64, oldest first, ending at its
+    /// DID: `prior_key_links` and then `key_link`.
+    pub key_links: Vec<String>,
+    /// When the pin moved: the links from `moved_from` on, the hops followed.
+    pub followed: Vec<String>,
 }
 
 /// Fetch `server`'s `/.well-known/jig` and work out which certificate to
@@ -144,35 +148,47 @@ pub async fn probe_at(
         server_did: Option<String>,
         tls_binding: Option<TlsBinding>,
         key_link: Option<String>,
+        #[serde(default)]
+        prior_key_links: Vec<String>,
     }
     let advertised: Advertised =
         serde_json::from_value(well_known.clone()).map_err(|e| fetch(e.to_string()))?;
     // Another DID than the expected one only through a public link the
     // expected key signed to it.
+    // The chain it serves, oldest first: earlier links, then the newest.
+    let key_links: Vec<String> = match &advertised.key_link {
+        Some(newest) => advertised
+            .prior_key_links
+            .iter()
+            .chain([newest])
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    };
     let mut moved_from = None;
+    let mut followed = Vec::new();
     if let (Some(expected), Some(presented)) = (expected_did, advertised.server_did.as_deref())
         && !jig_pipeline::handshake::same_did(expected, presented)
     {
-        let moves = advertised
-            .key_link
-            .as_deref()
-            .map(|link| jig_pipeline::handshake::link_moves(link, expected, presented));
-        if !matches!(moves, Some(Ok(()))) {
-            let rotated_past = advertised.key_link.as_deref().and_then(|link| {
-                jig_pipeline::handshake::link_from_elsewhere(link, expected, presented)
-                    .map(|left| jig_pipeline::handshake::rotated_past(expected, &left))
-            });
-            return Err(TlsError::OtherServer {
-                server: server.to_string(),
-                expected: expected.to_string(),
-                presented: presented.to_string(),
-                key_link: advertised.key_link.clone(),
-                rotated_past,
-            });
+        match jig_pipeline::handshake::chain_moves(&key_links, expected, presented) {
+            Ok(hops) => {
+                moved_from = Some(expected.to_string());
+                followed = hops;
+            }
+            Err(_) => {
+                let rotated_past =
+                    jig_pipeline::handshake::link_from_elsewhere(&key_links, expected, presented)
+                        .map(|left| jig_pipeline::handshake::rotated_past(expected, &left));
+                return Err(TlsError::OtherServer {
+                    server: server.to_string(),
+                    expected: expected.to_string(),
+                    presented: presented.to_string(),
+                    key_links,
+                    rotated_past,
+                });
+            }
         }
-        moved_from = Some(expected.to_string());
     }
-    let key_link = advertised.key_link.clone();
     let server_did = advertised.server_did.or(expected_did.map(str::to_string));
     if !tls {
         return Ok(Probed {
@@ -180,7 +196,8 @@ pub async fn probe_at(
             well_known,
             config: None,
             moved_from,
-            key_link,
+            key_links,
+            followed,
         });
     }
 
@@ -215,7 +232,8 @@ pub async fn probe_at(
             accepted, false, true,
         ))))),
         moved_from,
-        key_link,
+        key_links,
+        followed,
     })
 }
 
@@ -323,7 +341,8 @@ async fn probe_bound_to(
         // An authority is whoever the delegation lists: a key link from one
         // of them to another DID moves nothing here.
         moved_from: None,
-        key_link: None,
+        key_links: Vec::new(),
+        followed: Vec::new(),
     })
 }
 
