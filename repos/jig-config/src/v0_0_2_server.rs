@@ -52,7 +52,7 @@ pub struct JigServerConfig {
 ///
 /// Unset, each is the smallest limit that still carries every block a server
 /// accepts: one `jig_core::bundle::MAX_BUNDLE_BYTES` bundle in base64 plus its
-/// envelope (`jig_core::bundle::MAX_ENVELOPE_BYTES`, 2 861 740 bytes). The
+/// envelope (`jig_core::bundle::MAX_ENVELOPE_BYTES`, 2 162 688 bytes). The
 /// server refuses to boot with a smaller value, which would turn valid blocks
 /// away, or with a frame limit above the message limit.
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]

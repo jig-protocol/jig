@@ -99,3 +99,32 @@ async fn a_ws_message_at_the_limit_is_served_and_one_byte_over_closes() {
         "one byte over the limit closes the connection"
     );
 }
+
+/// The bundle limit's headroom, measured. A `text-render` (every chat
+/// message) names its program and is a few kilobytes. The largest bundle in
+/// use is one that ships a component itself: the text-block component, whose
+/// bytes serialize as a JSON number array, about 2.6 canonical bytes per raw
+/// byte. Both stay under a third of [`MAX_BUNDLE_BYTES`].
+#[tokio::test]
+async fn the_largest_bundles_in_use_have_headroom_under_the_limit() {
+    use jig_core::bundle::MAX_BUNDLE_BYTES;
+    let server = TestServer::unauthenticated();
+    let text = server
+        .text(&Identity::new(2), "#town", &"x".repeat(4096))
+        .canonical_bytes()
+        .len();
+    let component = jig_pipeline::text_block::canonical::CANONICAL_COMPONENT;
+    let shipped = serde_json::to_vec(&(Vec::<u8>::new(), component.to_vec()))
+        .unwrap()
+        .len();
+    println!(
+        "text-render {text} B; text-block component {} B raw, {shipped} B canonical; limit {MAX_BUNDLE_BYTES} B",
+        component.len()
+    );
+    for len in [text, shipped] {
+        assert!(
+            len * 3 < MAX_BUNDLE_BYTES,
+            "{len} bytes of {MAX_BUNDLE_BYTES}"
+        );
+    }
+}

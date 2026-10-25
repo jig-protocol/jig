@@ -335,8 +335,8 @@ once:
 | `max_ws_message_bytes` | one WebSocket message, on connections from clients and on the ones it dials to federation peers | the connection is closed |
 | `max_ws_frame_bytes` | one WebSocket frame, on the same connections | the connection is closed |
 
-Unset, each is 2 861 740 bytes (`jig_core::bundle::MAX_ENVELOPE_BYTES`): the
-largest block submission, a 2 MiB bundle (`MAX_BUNDLE_BYTES`) in base64 plus its
+Unset, each is 2 162 688 bytes (`jig_core::bundle::MAX_ENVELOPE_BYTES`): the
+largest block submission, a 1.5 MiB bundle (`MAX_BUNDLE_BYTES`) in base64 plus its
 envelope. That is the smallest value that still carries every valid block, so
 the server refuses to boot with a smaller one, or with a frame limit above the
 message limit. Raise them only if a proxy or a bridge in front of the server
@@ -344,9 +344,9 @@ needs it.
 
 ```toml
 [limits]
-# max_request_body_bytes = 2861740
-# max_ws_message_bytes = 2861740
-# max_ws_frame_bytes = 2861740
+# max_request_body_bytes = 2162688
+# max_ws_message_bytes = 2162688
+# max_ws_frame_bytes = 2162688
 ```
 
 The nameserver has its own body limit, `[network] max_body_bytes` (64 KiB by

@@ -8,10 +8,10 @@ use crate::wasm_validation::{HostImportAllowlist, policy_from_constraints, verif
 
 const RAW_CODEC: u64 = 0x55;
 
-/// The most canonical bundle bytes one block may carry: the `bundle_bytes` a
-/// server stores, which a submission sends base64-encoded as `bundle_b64`.
-/// Transport size limits are derived from it ([`MAX_ENVELOPE_BYTES`]).
-pub const MAX_BUNDLE_BYTES: usize = 2 * 1024 * 1024;
+/// The most a block's canonical bundle bytes may hold: the bytes a client's
+/// `bundle_b64` decodes to, stored as `bundle_bytes`. Every path that takes
+/// a block checks this one number.
+pub const MAX_BUNDLE_BYTES: usize = 1536 * 1024;
 
 /// Room for everything around the one base64-encoded bundle in the largest
 /// message that carries one: the JSON envelope, the author's signature, a
