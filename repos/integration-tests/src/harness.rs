@@ -118,6 +118,7 @@ impl TestJigServer {
             delegations: ns.delegations(),
             // TestNameserver serves plaintext on loopback.
             dangerously_allow_plaintext_nameservers: true,
+            refused_suffixes: vec![],
         };
         Self::start_with_config(config).await
     }

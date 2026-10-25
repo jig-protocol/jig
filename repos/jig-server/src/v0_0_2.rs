@@ -15,7 +15,7 @@ use crate::runtime::ExecutionConfig;
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use jig_client::server_key::ServerKeyOptions;
-use jig_config::v0_0_2_server::{IdentityMode, JigServerConfig, NameDelegation};
+use jig_config::v0_0_2_server::{IdentityMode, IdentitySection, JigServerConfig, NameDelegation};
 use jig_core::Did;
 use jig_pipeline::{
     executor::{BlockExecutor, text_block_program},
@@ -25,7 +25,7 @@ use jig_pipeline::{
     ingest::IngestContext,
     persist::SqliteStore,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -201,6 +201,13 @@ fn checked_skew_bound(config: &JigServerConfig) -> Result<u64> {
     Ok(skew)
 }
 
+/// `[identity]`, refused when a suffix is both delegated and refused.
+/// `ServerConfig::load` already checked a loaded config; one built in code
+/// has not been.
+fn checked_identity(config: &JigServerConfig) -> Result<()> {
+    config.identity.validate().map_err(anyhow::Error::msg)
+}
+
 impl AppState {
     /// Register the handler for peer frames. Only the first call counts;
     /// returns whether this one did.
@@ -275,6 +282,7 @@ impl AppState {
             );
         }
 
+        checked_identity(&config)?;
         let identity: Arc<dyn IdentityResolver> = match config.identity.mode {
             IdentityMode::Tofu => Arc::new(TofuResolver::new(store.clone())),
             IdentityMode::Nameserver => {
@@ -285,14 +293,9 @@ impl AppState {
                          [identity.delegations]"
                     );
                 }
-                let (delegations, warning) =
-                    with_default_jig_delegation(config.identity.delegations.clone());
-                if let Some(warning) = warning {
-                    tracing::warn!("{warning}");
-                }
-                Arc::new(NameserverResolver::new(
-                    suffix_authorities(&delegations),
-                    config.identity.cache_ttl_seconds,
+                Arc::new(nameserver_resolver(
+                    &config.identity,
+                    jig_core::naming::default_jig_authority(),
                     store.clone(),
                     Arc::new(crate::v0_0_2_nameserver_tls::BoundNameservers {
                         allow_plaintext: config.identity.dangerously_allow_plaintext_nameservers,
@@ -384,6 +387,7 @@ impl AppState {
         let signing_key = SigningKey::from_bytes(&secret);
         let server_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
 
+        checked_identity(&config)?;
         let identity: Arc<dyn IdentityResolver> = Arc::new(TofuResolver::new(store.clone()));
         let hlc_clock = Arc::new(
             HlcClock::new(server_did.clone()).with_max_future_skew_ms(checked_skew_bound(&config)?),
@@ -522,9 +526,41 @@ pub fn suffix_authorities(
         .collect()
 }
 
+/// The resolver `[identity] mode = "nameserver"` boots with: the configured
+/// delegations plus the built-in `@jig` one, and the refused suffixes, which
+/// it logs. They are listed only here, in the operator's log: what a server
+/// refuses is its own policy, not something `/.well-known/jig` advertises.
+fn nameserver_resolver(
+    identity: &IdentitySection,
+    authority: Result<&str, jig_core::naming::NamingError>,
+    store: Arc<SqliteStore>,
+    transport: Arc<dyn jig_pipeline::identity::NameserverTransport>,
+) -> NameserverResolver {
+    let refused = identity.refused();
+    if !refused.is_empty() {
+        tracing::info!(
+            "identity.refused_suffixes: aliases under {} are refused",
+            refused.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+    let (delegations, warning) =
+        with_default_delegation(identity.delegations.clone(), &refused, authority);
+    if let Some(warning) = warning {
+        tracing::warn!("{warning}");
+    }
+    NameserverResolver::new(
+        suffix_authorities(&delegations),
+        refused,
+        identity.cache_ttl_seconds,
+        store,
+        transport,
+    )
+}
+
 /// `[identity.delegations]` plus the built-in delegation for
-/// `jig_core::naming::DEFAULT_SUFFIX`, when the config has none for it and
-/// this build has a real authority: `jig → {authorities: [DEFAULT_JIG_AUTHORITY],
+/// `jig_core::naming::DEFAULT_SUFFIX`, when the config neither has nor
+/// refuses one for it and this build has a real authority:
+/// `jig → {authorities: [DEFAULT_JIG_AUTHORITY],
 /// nameservers: [DEFAULT_JIG_NAMESERVER]}`. An operator overrides it with their
 /// own `[identity.delegations.jig]`. While the authority is the placeholder
 /// nothing is added and boot carries on; `@jig` names then fail closed at
@@ -532,19 +568,23 @@ pub fn suffix_authorities(
 ///
 /// Also returns the one boot warning the result calls for, judged on the
 /// delegations that will actually be used: none at all, or none for `@jig`.
-fn with_default_jig_delegation(
-    delegations: BTreeMap<String, NameDelegation>,
-) -> (BTreeMap<String, NameDelegation>, Option<String>) {
-    with_default_delegation(delegations, jig_core::naming::default_jig_authority())
-}
-
 fn with_default_delegation(
     mut delegations: BTreeMap<String, NameDelegation>,
+    refused: &BTreeSet<String>,
     authority: Result<&str, jig_core::naming::NamingError>,
 ) -> (BTreeMap<String, NameDelegation>, Option<String>) {
     use jig_core::naming::{DEFAULT_JIG_NAMESERVER, DEFAULT_SUFFIX};
     if delegations.contains_key(DEFAULT_SUFFIX) {
         return (delegations, None);
+    }
+    if refused.contains(DEFAULT_SUFFIX) {
+        // The operator asked for this; say only what it adds up to.
+        let warning = delegations.is_empty().then(|| {
+            "identity.mode = \"nameserver\" with no [identity.delegations], and \
+             `jig` refused: every alias will be refused"
+                .to_string()
+        });
+        return (delegations, warning);
     }
     match authority {
         Ok(authority) => {
@@ -632,9 +672,10 @@ mod tests {
     fn the_built_in_jig_delegation_is_added_only_with_a_real_authority() {
         use super::*;
         use jig_core::naming::{DEFAULT_JIG_NAMESERVER, DEFAULT_SUFFIX, NamingError};
+        let none = BTreeSet::new();
         // With no config of its own, a real authority leaves nothing to warn
         // about: `@jig` names resolve.
-        let (added, warning) = with_default_delegation(BTreeMap::new(), Ok("did:jig:zReal"));
+        let (added, warning) = with_default_delegation(BTreeMap::new(), &none, Ok("did:jig:zReal"));
         assert_eq!(added[DEFAULT_SUFFIX].authorities, ["did:jig:zReal"]);
         assert_eq!(added[DEFAULT_SUFFIX].nameservers, [DEFAULT_JIG_NAMESERVER]);
         assert_eq!(warning, None);
@@ -643,7 +684,7 @@ mod tests {
         // nothing added, boot carries on, and one warning says every alias
         // is refused.
         let (refused, warning) =
-            with_default_delegation(BTreeMap::new(), Err(NamingError::NoDefaultAuthority));
+            with_default_delegation(BTreeMap::new(), &none, Err(NamingError::NoDefaultAuthority));
         assert!(refused.is_empty());
         let warning = warning.expect("one warning");
         assert!(warning.contains("every alias will be refused"), "{warning}");
@@ -656,6 +697,7 @@ mod tests {
         };
         let (some, warning) = with_default_delegation(
             BTreeMap::from([("names.example.org".to_string(), other)]),
+            &none,
             Err(NamingError::NoDefaultAuthority),
         );
         assert!(!some.contains_key(DEFAULT_SUFFIX));
@@ -671,11 +713,83 @@ mod tests {
         for authority in [Ok("did:jig:zReal"), Err(NamingError::NoDefaultAuthority)] {
             let (kept, warning) = with_default_delegation(
                 BTreeMap::from([(DEFAULT_SUFFIX.to_string(), mine.clone())]),
+                &none,
                 authority,
             );
             assert_eq!(kept[DEFAULT_SUFFIX], mine);
             assert_eq!(warning, None, "the operator delegates `@jig` themselves");
         }
+    }
+
+    /// A refused `jig` gets no built-in delegation, and its aliases are
+    /// refused before any nameserver is reached.
+    #[tokio::test]
+    async fn a_refused_jig_is_refused_despite_the_built_in_delegation() {
+        use super::*;
+        use jig_core::naming::DEFAULT_SUFFIX;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let refused = BTreeSet::from([DEFAULT_SUFFIX.to_string()]);
+        let (none, warning) =
+            with_default_delegation(BTreeMap::new(), &refused, Ok("did:jig:zReal"));
+        assert!(!none.contains_key(DEFAULT_SUFFIX), "{none:?}");
+        assert!(warning.expect("one warning").contains("every alias"));
+
+        /// Counts every nameserver the resolver tries to reach.
+        struct Counting(AtomicUsize);
+        #[async_trait::async_trait]
+        impl jig_pipeline::identity::NameserverTransport for Counting {
+            async fn client(&self, _: &str, _: &[String]) -> Result<reqwest::Client, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err("not reached in this test".into())
+            }
+        }
+        let counting = Arc::new(Counting(AtomicUsize::new(0)));
+        let identity = IdentitySection {
+            mode: IdentityMode::Nameserver,
+            refused_suffixes: vec!["JIG".into()],
+            ..IdentitySection::default()
+        };
+        let r = nameserver_resolver(
+            &identity,
+            Ok("did:jig:zReal"),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            counting.clone(),
+        );
+        let err = r.resolve("dj@jig").await.unwrap_err();
+        assert!(
+            matches!(err, jig_pipeline::identity::IdentityError::SuffixRefused(ref s) if s == "jig"),
+            "{err:?}"
+        );
+        assert_eq!(counting.0.load(Ordering::SeqCst), 0);
+
+        // Not refused, the same boot asks the built-in delegation's nameserver.
+        let r = nameserver_resolver(
+            &IdentitySection::default(),
+            Ok("did:jig:zReal"),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            counting.clone(),
+        );
+        r.resolve("dj@jig").await.unwrap_err();
+        assert_eq!(counting.0.load(Ordering::SeqCst), 1);
+    }
+
+    /// A config built in code is checked at boot as a loaded one is.
+    #[test]
+    fn a_suffix_both_delegated_and_refused_does_not_boot() {
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.identity.refused_suffixes = vec!["Example.ORG".into()];
+        config.identity.delegations.insert(
+            "example.org".into(),
+            jig_config::v0_0_2_server::NameDelegation {
+                authorities: vec!["did:jig:zA".into()],
+                nameservers: vec!["https://ns.example".into()],
+            },
+        );
+        let err = super::AppState::for_test_with_config(config)
+            .err()
+            .expect("an overlap must not boot");
+        assert!(format!("{err:#}").contains("`example.org`"), "{err:#}");
     }
 
     /// The configured bound is what ingest enforces and the welcome signs; one
