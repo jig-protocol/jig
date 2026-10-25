@@ -162,23 +162,30 @@ struct ChallengeResponse {
     pow_offer: Option<String>,
 }
 
-/// A 4xx a nameserver answered a register, renew or rotate with: it did not
-/// act. Carried in the `anyhow` error so a caller can tell which refusal it
-/// was.
+/// A refusal a nameserver answered a register, renew or rotate with, which
+/// says it did not act: a 4xx, or `503 REGISTRATION_BUSY` (the pool was full
+/// and the challenge was not consumed). Carried in the `anyhow` error so a
+/// caller can tell which refusal it was.
 #[derive(Debug, thiserror::Error)]
 #[error("POST {url}: {}", explain_nameserver_error(status.as_u16(), body))]
 pub(crate) struct Refusal {
     pub url: String,
     pub status: reqwest::StatusCode,
     pub body: String,
+    /// `Retry-After`, in seconds, when the nameserver sent one.
+    pub retry_after: Option<u64>,
 }
 
 impl Refusal {
     /// The `code` of the nameserver's error body, if it has one.
     pub(crate) fn code(&self) -> Option<String> {
-        let body: serde_json::Value = serde_json::from_str(&self.body).ok()?;
-        Some(body.get("code")?.as_str()?.to_string())
+        code_of(&self.body)
     }
+}
+
+fn code_of(body: &str) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_str(body).ok()?;
+    Some(body.get("code")?.as_str()?.to_string())
 }
 
 /// Body of GET `/.well-known/jig-ns-delegation`.
@@ -517,9 +524,19 @@ impl Nameserver {
             }
         };
         let status = resp.status();
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok()?.trim().parse().ok());
         if status.is_client_error() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(Refusal { url, status, body }.into());
+            return Err(Refusal {
+                url,
+                status,
+                body,
+                retry_after,
+            }
+            .into());
         }
         let text = match resp.text().await {
             Ok(text) => text,
@@ -529,6 +546,20 @@ impl Nameserver {
                 ))));
             }
         };
+        // The one 5xx that says nothing was done: the nameserver's own pool
+        // refusal, which it answers before the challenge is consumed. A
+        // proxy's 503 carries no such code and stays an unknown outcome.
+        if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            && code_of(&text).as_deref() == Some("REGISTRATION_BUSY")
+        {
+            return Err(Refusal {
+                url,
+                status,
+                body: text,
+                retry_after,
+            }
+            .into());
+        }
         if !status.is_success() {
             return Ok(Err(anyhow::anyhow!(
                 "POST {url}: {}",
