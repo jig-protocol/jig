@@ -1,8 +1,11 @@
 //! jig speaks one ciphersuite, and refuses MLS in any other before running its
-//! crypto. That is what makes the P-256 code openmls_rust_crypto links in
-//! (and RUSTSEC-2026-0387 in crypto-bigint 0.5 under it) unreachable: no
-//! P-256 key, secret or public, is generated, derived or verified for anything
-//! jig is handed. `deny.toml` relies on these tests.
+//! crypto, so no P-256 secret is ever generated or derived: the P-256 code
+//! openmls_rust_crypto links in (and RUSTSEC-2026-0387 in crypto-bigint 0.5
+//! under it) never touches a secret. `deny.toml` relies on these tests.
+//!
+//! Not covered here: an inline Add inside a member's signed commit, whose key
+//! package openmls verifies in its own ciphersuite before refusing it. That is
+//! public-key verification only; see the RUSTSEC-2026-0387 entry in `deny.toml`.
 
 use jig_core::Did;
 use jig_mls::delivery;
