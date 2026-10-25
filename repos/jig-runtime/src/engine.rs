@@ -29,7 +29,9 @@ pub(crate) const EPOCH_TICK: Duration = Duration::from_millis(10);
 ///
 /// Rounds **up** and then adds one. The extra tick is not slop: the ticker runs
 /// free, so a store created immediately before a tick would otherwise see that
-/// tick consume most of its first interval and be interrupted early. Overshooting
+/// tick consume most of its first interval and be interrupted early. One tick is
+/// enough only because the ticker spaces ticks at least a cadence apart, so a
+/// late tick never pulls the next one in (see `EpochTicker::start`). Overshooting
 /// is the safe direction — a run cut short reports a partial `fuel_used` that is
 /// not the program's cost, which is precisely the receipt corruption documented
 /// in `docs/investigations/2026-08-11-fuel-portability.md`.
@@ -106,16 +108,17 @@ impl EpochTicker {
                     }
                     drop(stopping);
 
-                    let now = Instant::now();
-                    if now >= next_tick {
+                    if Instant::now() >= next_tick {
                         engine.increment_epoch();
-                        next_tick += cadence;
-                        // If the thread was descheduled long enough to miss whole
-                        // ticks, resync rather than firing a burst to catch up:
-                        // the epoch is a deadline signal, not an event count.
-                        if next_tick <= now {
-                            next_tick = now + cadence;
-                        }
+                        // The next tick is a full cadence after this one, never on
+                        // the original schedule. A tick that fell due just before a
+                        // store set its deadline, but fired late, lands just after
+                        // it; on a fixed schedule the ticks behind it would keep
+                        // their slots, and the store's last tick would come up to a
+                        // cadence before its timeout. Spacing every tick at least a
+                        // cadence apart is what makes `deadline_ticks`'s extra
+                        // tick enough. It also means no burst after a stall.
+                        next_tick = Instant::now() + cadence;
                     }
                 }
             })
