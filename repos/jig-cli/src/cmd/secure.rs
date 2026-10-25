@@ -114,6 +114,10 @@ pub async fn connect_pinned(server: &str, identity: Identity) -> Result<Client> 
         offer: pins.offer(server),
         tls,
         on_contradiction: Some(crate::cmd::trust::evidence_hook(server)),
+        key_links: pins
+            .server(server)
+            .map(|p| p.links.clone())
+            .unwrap_or_default(),
     };
     let client = Client::connect_with_options(server, identity, options)
         .await

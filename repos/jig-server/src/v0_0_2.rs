@@ -70,6 +70,11 @@ pub struct AppState {
     /// pinned on any earlier DID follow, hop by hop. Read from the
     /// `<link>.N` files beside it ([`jig_client::server_key::key_chain`]).
     pub prior_key_links: Vec<Vec<u8>>,
+    /// The DIDs this server signed as before its current one, oldest first:
+    /// the ones its served key links leave ([`predecessor_dids`]). A link
+    /// moves a DID's standing (JEP-0012), so what they owned and sequenced
+    /// is this server's.
+    pub prior_dids: Vec<String>,
     /// What handles frames between proven peers
     /// ([`crate::v0_0_2_peer::PeerFrames`]), set once at boot by
     /// [`Self::set_peer_frames`]. Shared by every clone.
@@ -111,6 +116,19 @@ fn load_key_chain(keyfile: &std::path::Path, server_did: &Did) -> Result<ServedC
         );
     }
     Ok((newest, bytes))
+}
+
+/// The DIDs `prior_key_links` and `key_link` leave, oldest first. Both were
+/// verified as one chain at boot ([`load_key_chain`]), so each envelope
+/// opens; one that does not is left out.
+pub fn predecessor_dids(key_link: Option<&[u8]>, prior_key_links: &[Vec<u8>]) -> Vec<String> {
+    prior_key_links
+        .iter()
+        .map(Vec::as_slice)
+        .chain(key_link)
+        .filter_map(|bytes| jig_core::key_link::SignedKeyLink::from_envelope(bytes).ok())
+        .map(|link| link.link().old.clone())
+        .collect()
 }
 
 /// Gates 1 and 2 from `[auth]`, plus the federation peers from `[federation]`:
@@ -290,6 +308,27 @@ impl AppState {
                 "recorded this server as the sequencer of stored channels"
             );
         }
+        // After a key change, the channels this server sequenced under its
+        // earlier DIDs are still its own: the link moved the role
+        // (JEP-0012). Any other DID's channel stays carried.
+        let prior_dids = predecessor_dids(key_link.as_deref(), &prior_key_links);
+        let (moved, stuck) = store
+            .adopt_predecessor_sequencers(&prior_dids)
+            .context("moving channels from this server's earlier DIDs")?;
+        if moved > 0 {
+            tracing::info!(
+                moved,
+                "moved the channels this server sequenced under an earlier DID to its current one"
+            );
+        }
+        if stuck > 0 {
+            tracing::warn!(
+                stuck,
+                "channels sequenced under an earlier DID of this server share a slug with one \
+                 it sequences now, and were left under the earlier DID: they are reachable by \
+                 id only"
+            );
+        }
 
         checked_identity(&config)?;
         let identity: Arc<dyn IdentityResolver> = match config.identity.mode {
@@ -381,6 +420,7 @@ impl AppState {
             manifest: Default::default(),
             key_link,
             prior_key_links,
+            prior_dids,
             peer_frames: Default::default(),
             peers: Default::default(),
         })
@@ -440,6 +480,7 @@ impl AppState {
             manifest: Default::default(),
             key_link: None,
             prior_key_links: Vec::new(),
+            prior_dids: Vec::new(),
             peer_frames: Default::default(),
             peers: Default::default(),
         })
@@ -495,6 +536,7 @@ impl AppState {
             manifest: Default::default(),
             key_link: None,
             prior_key_links: Vec::new(),
+            prior_dids: Vec::new(),
             peer_frames: Default::default(),
             peers: Default::default(),
         })
@@ -1000,6 +1042,9 @@ mod tests {
             Some(std::fs::read(&done.link).unwrap().as_slice())
         );
         assert_eq!(state.prior_key_links, vec![first_link]);
+        let first_did =
+            Did::from_ed25519_pubkey(old.verifying_key().as_bytes()).to_did_jig_string();
+        assert_eq!(state.prior_dids, vec![first_did, done.old_did.clone()]);
     }
 
     #[test]

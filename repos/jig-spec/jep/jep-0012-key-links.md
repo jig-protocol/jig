@@ -21,11 +21,13 @@ contact, or the public (a server's own key change). This JEP specifies:
 
 - the link's payload and its COSE encoding;
 - how a verifier checks a link;
-- the fork rule: two links from one DID to different DIDs are evidence of a stolen key.
+- the fork rule: two links from one DID to different DIDs are evidence of a stolen key;
+- what a server's own public link moves: its channels and its sequencer role, and how a
+  client checks a channel's history across the change.
 
 Which records carry a link (the `key-link` and `server-rekey` blocks, `/v1/rotate`, the
-welcome) and what each audience then moves are specified where those records are. This
-JEP fixes only the link itself. Revocation (`jig-key-revoke-v1`) is a later JEP.
+welcome) and what each other audience then moves are specified where those records are.
+Revocation (`jig-key-revoke-v1`) is a later JEP.
 
 Design record, alternatives and prior art:
 [`docs/superpowers/specs/2026-10-18-identity-lifecycle-design.md`](../../../docs/superpowers/specs/2026-10-18-identity-lifecycle-design.md),
@@ -136,6 +138,55 @@ link that cannot be served stops it from starting. A server keeps every link it 
 signed, and once its chain holds 16 links it stops serving the oldest before it adds
 another, so the verifiers still holding that oldest DID are refused and must pin anew.
 
+## A server's standing
+
+A server's public link moves everything the server held as the old DID. That includes
+the channels it owns, such as its manifest log (JEP-0002 rule 12), and the sequencer role
+of every channel it sequences (JEP-0005). A server that changed its key:
+
+1. MUST treat a channel owned by a DID in its own verified chain (the links it serves, as
+   above) as its own, and go on writing into it as its current DID. It MUST NOT move such
+   a channel aside, or create another at its slug, as it would for a channel a stranger
+   holds.
+2. Sequences, as its current DID, every channel that a DID in its own verified chain
+   sequenced. It continues each channel's chain from the last record: the first record it
+   signs has the next `seq`, and its `prev` is the hash of the last record the earlier DID
+   signed. Records already signed are never signed again.
+3. Treats a channel owned or sequenced by a DID outside its verified chain exactly as
+   before the change: not its own.
+4. Publishes its manifest again, as its current DID, if the newest entry in its log was
+   written by an earlier DID, so that every welcome cites an entry signed by the DID that
+   signed the welcome.
+
+A server that leaves a DID out of the chain it serves (a broken or pruned link) also
+loses that DID's standing: its channels are no longer the server's.
+
+How a server that follows another server's channel follows that sequencer's key change
+is not specified yet. Until it is, a follower holds the sequencer it agreed terms with.
+
+### Checking a chain across a key change
+
+A channel's chain from a server that changed its key holds records signed by each of its
+DIDs in turn. A client checks it against the DIDs of the server's chain that it holds:
+the hops its pin followed, and the links the server serves that lead to the DID it pins,
+each verified as above. It takes them in link order, oldest first:
+
+1. A record MUST be signed by one of these DIDs. A record signed by any other DID is a
+   break, as before.
+2. Once the chain holds a record signed by one DID, a later record (a higher `seq`) signed
+   by a DID earlier in the link order MUST be refused as a break. The earlier key handed
+   its standing on, so it adds nothing after that. This is the ordered-log rule of
+   [Forks](#forks), applied to sequencing.
+3. A record before the client's head is history. It may be signed by any of these DIDs up
+   to the one that signed the head.
+4. Two records that contradict each other prove something against the sequencer only
+   when one DID signed both. Across a key change the two halves are two keys' words,
+   tied only by the link, so a client keeps them as a break but not as a signed proof.
+
+A client that holds no link to an earlier DID (it first pinned the server after the
+change and was served no chain) cannot check that DID's records, and refuses them as in
+rule 1.
+
 ## Forks
 
 Two verified links with the same `old` and different `new` are a **fork**. The old key
@@ -169,6 +220,11 @@ refuse to sign a second link from an `old` to a different `new`.
 - **A disclosed link is permanent and can be forwarded.** A signature proves the link to
   anyone the recipient shows it to, so the holder's choice of audience holds only as far as
   each recipient keeps the link to itself. Clients MUST say so before sending one.
+- **A retired server key.** Clients take records from a server's earlier DIDs only in link
+  order, so whoever holds a key the server rotated away from cannot add to a channel's
+  history after the newer key has signed in it. Before that point, on a channel a client
+  has not read past the change, it can: the same exposure the old key had before the
+  change.
 - **Replay.** A link is a statement of fact with no expiry. Showing it again changes
   nothing a verifier has not already acted on. `issued_at` orders links and lets a verifier
   apply its own age policy; it is not a validity window.
@@ -190,7 +246,11 @@ at `/v1/rotate`. Moving it onto links is a change to that endpoint, specified wi
 implements `jig_core::naming::AliasLink`, so `verify_rotation_chain` follows alias links.
 A server's chain: `jig_pipeline::handshake::chain_moves` follows it, and
 `jig_client::server_key::key_chain` builds what a server serves from its stored links;
-`jig-server keys rotate` signs and keeps them.
+`jig-server keys rotate` signs and keeps them. A server's standing: at boot
+`jig_pipeline::persist::SqliteStore::adopt_predecessor_sequencers` moves the channels its
+earlier DIDs sequenced, and `jig_server::v0_0_2_manifest_log::publish` keeps the log they
+own. A client checks a chain across the change with `jig_client::chain::ChannelChain::across`,
+fed the DIDs `jig_client::pins::ServerPin::sequencers` gives.
 
 # Test Vectors
 

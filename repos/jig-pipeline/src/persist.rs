@@ -820,6 +820,51 @@ impl SqliteStore {
         Ok(adopted)
     }
 
+    /// Move the channels this server sequenced under an earlier DID of its
+    /// own to the DID it adopted ([`Self::adopt_local_sequencer`]), after a
+    /// key change: a key link moves a DID's standing, the sequencer role
+    /// included (JEP-0012). `predecessors` are the DIDs the server's own
+    /// verified key-link chain leaves. A row sequenced by any other DID is
+    /// carried, and stays as it is.
+    ///
+    /// Returns how many rows moved, and how many could not: an earlier DID's
+    /// channel whose slug the current DID already sequences, which a server
+    /// that rotated without this step can have created. Those keep their old
+    /// sequencer, reached by id only, for the operator to resolve.
+    pub fn adopt_predecessor_sequencers(&self, predecessors: &[String]) -> Result<(usize, usize)> {
+        let local = self.local_sequencer();
+        if local.is_empty() {
+            return Err(PersistError::Corrupt(
+                "no sequencer adopted yet, so there is nothing to move channels to".to_string(),
+            ));
+        }
+        let old: Vec<&String> = predecessors.iter().filter(|d| *d != local).collect();
+        if old.is_empty() {
+            return Ok((0, 0));
+        }
+        let placeholders = vec!["?"; old.len()].join(", ");
+        let conn = self.conn.lock().expect("poisoned");
+        let tx = conn.unchecked_transaction()?;
+        let mut moving = vec![&local as &dyn rusqlite::ToSql];
+        moving.extend(old.iter().map(|d| *d as &dyn rusqlite::ToSql));
+        // OR IGNORE skips a row whose slug the current DID already holds
+        // (`UNIQUE(sequencer_did, slug)`) and moves the rest.
+        let moved = tx.execute(
+            &format!(
+                "UPDATE OR IGNORE channels SET sequencer_did = ?1
+                  WHERE sequencer_did IN ({placeholders})"
+            ),
+            moving.as_slice(),
+        )?;
+        let stuck: i64 = tx.query_row(
+            &format!("SELECT COUNT(*) FROM channels WHERE sequencer_did IN ({placeholders})"),
+            rusqlite::params_from_iter(old.iter()),
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok((moved, usize::try_from(stuck).unwrap_or(usize::MAX)))
+    }
+
     /// The DID adopted by [`Self::adopt_local_sequencer`], or `""` before it.
     pub fn local_sequencer(&self) -> &str {
         self.local_sequencer.get().map(String::as_str).unwrap_or("")
@@ -3040,6 +3085,79 @@ mod tests {
         let a = store.get_channel_by_slug("#a").unwrap().unwrap();
         assert_eq!(a.sequencer_did, "did:jig:zServer");
         assert!(a.co_owners.is_empty());
+    }
+
+    /// After a key change, the channels sequenced under the server's
+    /// earlier DIDs are its own again; a carried channel stays carried, and
+    /// one whose slug the new DID already holds stays where it is.
+    #[test]
+    fn a_rotated_server_takes_back_the_channels_its_earlier_dids_sequenced() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let first = "did:jig:zFirst".to_string();
+        let second = "did:jig:zSecond".to_string();
+        let channel = |id: &str, slug: &str, sequencer: &str| {
+            let mut c = sample_channel(id, slug);
+            c.sequencer_did = sequencer.to_string();
+            c
+        };
+        for c in [
+            channel("bafy_one", "#one", &first),
+            channel("bafy_two", "#two", &second),
+            channel("bafy_clash", "#clash", &first),
+            channel("bafy_carried", "#carried", "did:jig:zElsewhere"),
+        ] {
+            store.upsert_channel(&c).unwrap();
+        }
+        assert!(
+            store
+                .adopt_predecessor_sequencers(std::slice::from_ref(&first))
+                .is_err(),
+            "nothing to move to before a sequencer is adopted"
+        );
+        store.adopt_local_sequencer("did:jig:zNow").unwrap();
+        // Created at the new DID before this step existed.
+        store
+            .upsert_channel(&channel("bafy_clash_now", "#clash", "did:jig:zNow"))
+            .unwrap();
+        assert_eq!(store.get_channel_by_slug("#one").unwrap(), None);
+
+        let moved = store
+            .adopt_predecessor_sequencers(&[first.clone(), second.clone()])
+            .unwrap();
+        assert_eq!(moved, (2, 1));
+        for slug in ["#one", "#two"] {
+            let c = store.get_channel_by_slug(slug).unwrap().unwrap();
+            assert_eq!(c.sequencer_did, "did:jig:zNow", "{slug}");
+        }
+        assert_eq!(
+            store.get_channel_by_slug("#clash").unwrap().unwrap().id,
+            "bafy_clash_now"
+        );
+        assert_eq!(
+            store
+                .get_channel_by_id("bafy_clash")
+                .unwrap()
+                .unwrap()
+                .sequencer_did,
+            first,
+            "kept, by id"
+        );
+        assert_eq!(
+            store
+                .get_channel_by_id("bafy_carried")
+                .unwrap()
+                .unwrap()
+                .sequencer_did,
+            "did:jig:zElsewhere"
+        );
+        assert_eq!(
+            store
+                .adopt_predecessor_sequencers(&[first, second])
+                .unwrap(),
+            (0, 1),
+            "a second boot moves nothing more"
+        );
+        assert_eq!(store.adopt_predecessor_sequencers(&[]).unwrap(), (0, 0));
     }
 
     /// JEP-0005 rule 1: a slug is unique only per sequencer. A carried
