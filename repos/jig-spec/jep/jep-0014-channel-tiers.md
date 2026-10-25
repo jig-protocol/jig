@@ -6,7 +6,7 @@ type = "Standards Track"
 category = "Core"
 authors = ["DJ <dev@jig.onl>"]
 created = "2026-10-25"
-requires = ["0001", "0002", "0005", "0008", "0010"]
+requires = ["0001", "0002", "0005", "0006", "0007", "0008", "0010"]
 replaces = []
 superseded_by = []
 discussions_to = "https://github.com/jig-protocol/jig/issues"
@@ -54,7 +54,8 @@ It amends JEP-0001 and JEP-0005 where noted.
 **Non-goals:**
 - metadata privacy (OP-04 is accepted);
 - changing a channel's tier in place;
-- server-side execution of encrypted content (section 7.4 is a placeholder).
+- the agent capability model itself (JEP-0007) and enclave attestation (section 7.4's
+  research track).
 
 # Specification
 
@@ -82,7 +83,9 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
    `channel-create`. A server MAY refuse `public` channels by policy.
 6. **System channels are `public`.** The server's own channels under the reserved `#jig/`
    prefix carry what anyone must be able to verify. Today that is the manifest log
-   (`#jig/manifest`); it also covers any channel that carries key links.
+   (`#jig/manifest`). Key links stay where they are, at `/.well-known/jig` and in the welcome.
+   A `#jig/keys` channel is deferred until key links need an append-only history that anyone
+   can follow, for example JEP-0009's transparency logs.
 7. **DMs are `private`.** A DM is a `private` channel whose `#dm/` slug is derived from the
    pair of DIDs (`jig_core::dm`). Today's `restricted` channels are `private`.
 
@@ -96,11 +99,11 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
    - **`stranger`**: everyone else, including every `--anon` session key (D20).
 9. **The role is the server's local judgement,** made on its own clock and records, at the
    moment the join is checked. It is not carried to other servers.
-10. **Alignment with JEP-0008's capacity pools.** JEP-0008 rule 21 names three pools: members,
-    invited and strangers. `member` here is JEP-0008's member pool. JEP-0008 counts an
-    authenticated but unestablished DID as a stranger, where this JEP calls it a `guest`. Until
-    the two are reconciled (open question 1), a server MUST NOT admit to a join a DID its
-    capacity pools would refuse.
+10. **Join roles are not capacity pools.** JEP-0008 rule 21's pools (members, invited and
+    strangers) decide how much capacity a caller gets. The roles here decide who may join a
+    channel. A `member` is in JEP-0008's member pool. A `guest` counts as a stranger for capacity
+    (JEP-0008 rule 22) and as a guest for joining. A server MUST NOT admit to a join a DID its
+    capacity pools refuse at that moment.
 
 ## 3. Joining
 
@@ -186,13 +189,14 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 
 ## 7. Consequences
 
-25. **Block execution moves to clients.** A server executes nothing under an encrypted suite,
-    and its receipt for such a block is `sealed` (JEP-0001 open question 7; JEP-0005 rule 23).
+25. **Block execution moves to clients and agents.** A server executes nothing under an
+    encrypted suite, and its receipt for such a block is `sealed` (JEP-0001 open question 7;
+    JEP-0005 rule 23). Work that must run on a server runs as an agent (section 7.4).
     Clients run blocks on the plaintext they decrypt, and already check a server's `exec`
     receipt by running the same component (JEP-0006, #276). In `public` channels the server
     still executes, and clients still check it.
 26. **Search moves to clients.** A server cannot search content it cannot read. Search runs on
-    the client, over its own decrypted store. That store is sealed at rest, like the MLS
+    the client, over its own decrypted store, or in an agent the channel admits (section 7.4). That store is sealed at rest, like the MLS
     plaintext cache.
 27. **Bridges are visible members.** A bridge that carries content in or out of an encrypted
     channel is a member of the group under its own DID. Clients MUST show it as a bridge in the
@@ -202,20 +206,45 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
     through a member's report of a franked message (JEP-0010 rules 6 to 8a). It never relies on
     the server reading content, on escrow or on scanning (D22).
 
-### 7.4 Server-side execution
+### 7.4 Server-side execution: agents now, enclaves later
 
-> **TODO (DJ):** server-side execution for the distributed-OS model (phase 6) is under
-> discussion. This section will say whether and how a server, or an agent it runs, executes
-> blocks of an encrypted channel, and under what consent. Until it is written, rule 25 holds.
+Decided by DJ, 2026-10-25. The model is that of an operating system: the kernel cannot read
+process memory, and each process holds keys only for its own scope.
+
+29. **The server is the kernel.** It delivers, stores ciphertext and schedules. It MUST NOT hold
+    content keys for a `private`, `server` or `shared` channel.
+30. **Server-side work on encrypted content runs as agents.** Block execution, search
+    indexing, bridging and bots are all agents. An agent:
+    - is an ordinary MLS member with its own DID and its own sealed key;
+    - is added to a channel by someone the channel's join rules allow (section 3);
+    - is listed in the roster, and clients show it as an agent;
+    - is removable. After an MLS Remove it reads nothing from that epoch on.
+31. **Membership gives read; capabilities give act.** What an agent may do beyond reading is
+    bounded by the capability grants of JEP-0007. Its outputs are signed by its own DID, and
+    every receipt it produces names it as executor.
+32. **An agent may run on the server's machines.** Its key MUST be separate from the server's
+    DID key and MUST be sealed at rest on its own. The operator who runs an agent can read what
+    that agent reads. The roster makes that visible to every member.
+33. **`public` channels need no agent.** The server MAY execute blocks of a `public` channel
+    directly, as it does today.
+34. **Clients do the rest.** They run blocks deterministically and produce receipts that members
+    can compare (JEP-0006, #276), and they search their own decrypted store (rules 25 and 26).
+35. **Research track, not normative:** binding an agent's key to an attested enclave
+    measurement. Members could then check, before admitting the agent, that even the operator
+    cannot read through it.
+
+**Rejected:** the server holding a channel's key on opt-in. That access would be invisible to
+members, unlike an agent in the roster, and it breaks the tier model's promise that the server
+reads no encrypted tier.
 
 ## 8. Amendments
 
-29. **JEP-0001:**
+36. **JEP-0001:**
     - "Restricted channels are always MLS" becomes rule 3 above: every non-`public` tier uses an
       operator-confidential suite.
     - JEP-0001's Specification, which states that only `restricted` channels require an
       operator-confidential suite, follows this JEP's tier rules.
-30. **JEP-0005:**
+37. **JEP-0005:**
     - Rule 6, the terms of the contract, adds `tier`, `join`, `join_servers` and `history` to the
       creation block's fields, fixed for the channel's life.
     - Rule 7a's `member` grant also covers relayed self-joins (rule 13).
@@ -294,16 +323,12 @@ Drafted with an LLM coding assistant from DJ's decisions of 2026-10-25 and the c
 
 # Open Questions
 
-1. **Roles and capacity pools.** Section 2's `guest` (authenticated, not a member) and
-   JEP-0008's `invited` pool (admitted on an invite, not yet established) differ, and JEP-0008
-   counts an authenticated unknown DID as a stranger. There are two ways to reconcile them:
-   - **(a)** JEP-0008 adopts `guest` as a fourth pool;
-   - **(b)** join roles and capacity pools stay separate, and this JEP maps `guest` to
-     "JEP-0008 invited or stranger, authenticated".
+1. ~~Roles and capacity pools.~~ Decided (DJ, 2026-10-25): they stay separate, and a `guest`
+   counts as a stranger for capacity (rule 10).
 2. **`join_servers` for `shared`.** Is a follower's judgement of its own members enough for
    the owner, or should the owner name the follower servers whose members may self-join?
-3. **System channels and key links.** Today key links are served at `/.well-known/jig` and in
-   the welcome, not in a channel. Should rule 6 name a `#jig/keys` channel?
+3. ~~A `#jig/keys` system channel.~~ Deferred (DJ, 2026-10-25) until key links need an
+   append-only, followable history (rule 6).
 
 # Copyright
 
