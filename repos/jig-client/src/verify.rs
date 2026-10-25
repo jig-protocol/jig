@@ -82,9 +82,13 @@ pub fn verify_with(
     opened: &OpenedBlock,
     limits: ClientLimits,
 ) -> Verification {
-    let Some((exec, exec_signer)) = exec_receipt(delivered) else {
+    let Some((exec, exec_signer, receipt_block)) = exec_receipt(delivered) else {
         return Verification::Unverified("no server exec receipt".into());
     };
+    // A receipt for another block says nothing about this one: it is not a divergence.
+    if receipt_block != opened.cid {
+        return Verification::Unverified("the exec receipt names another block".into());
+    }
     if !exec.outcome.is_comparable() {
         return Verification::NotComparable("the server's run was incomplete".into());
     }
@@ -143,7 +147,7 @@ pub fn verify_with(
 
 /// The first server `exec` receipt that verifies and is signed by the server its `ReceiptRef`
 /// names, with that signer's DID.
-fn exec_receipt(delivered: &DeliveredBlock) -> Option<(Exec, String)> {
+fn exec_receipt(delivered: &DeliveredBlock) -> Option<(Exec, String, String)> {
     delivered.receipts.iter().find_map(|r| {
         let bytes = STANDARD.decode(&r.receipt_bytes_b64).ok()?;
         let ReadReceipt::V03(signed) = jig_pipeline::receipts::read(&bytes).ok()? else {
@@ -153,7 +157,11 @@ fn exec_receipt(delivered: &DeliveredBlock) -> Option<(Exec, String)> {
             return None;
         }
         match signed.receipt.body {
-            Body::Exec(exec) => Some((*exec, signed.receipt.executor)),
+            Body::Exec(exec) => Some((
+                *exec,
+                signed.receipt.executor,
+                signed.receipt.block_cid.to_string(),
+            )),
             _ => None,
         }
     })
@@ -249,16 +257,20 @@ mod tests {
     }
 
     /// Attach `exec` as the server's signed receipt.
-    fn with_receipt(
+    fn with_receipt(delivered: DeliveredBlock, exec: Exec, signer: &SigningKey) -> DeliveredBlock {
+        let block_cid = delivered.ingest.as_ref().unwrap().block_cid.clone();
+        with_receipt_for(delivered, exec, signer, &block_cid)
+    }
+
+    /// Attach `exec` as the server's signed receipt for `block_cid`.
+    fn with_receipt_for(
         mut delivered: DeliveredBlock,
         exec: Exec,
         signer: &SigningKey,
+        block_cid: &str,
     ) -> DeliveredBlock {
         let receipt = Receipt {
-            block_cid: jig_pipeline::receipts::block_cid(
-                &delivered.ingest.as_ref().unwrap().block_cid,
-            )
-            .unwrap(),
+            block_cid: jig_pipeline::receipts::block_cid(block_cid).unwrap(),
             executor: jig_pipeline::receipts::executor(signer),
             role: Role::Server,
             produced_at: 1,
@@ -301,6 +313,16 @@ mod tests {
             verify(&d, &opened),
             Verification::Diverge(Divergence::Invocation)
         );
+    }
+
+    /// A server's receipt for another block, delivered with this one, is not evidence about it:
+    /// without the check it would read as the server's render differing (a different invocation).
+    #[test]
+    fn a_receipt_for_another_block_is_unverified() {
+        let (d, opened, exec) = delivered("hello");
+        let other = jig_core::canonical_cid::of(b"another block").to_string();
+        let d = with_receipt_for(d, exec, &server_key(), &other);
+        assert!(matches!(verify(&d, &opened), Verification::Unverified(_)));
     }
 
     /// A record the server did not sign could carry any sequence or clock, so it is not used:

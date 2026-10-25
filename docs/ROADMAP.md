@@ -77,7 +77,8 @@ network is the machine: Alan Kay's "objects all the way down".
   [JEP-0004](../repos/jig-spec/jep/jep-0004-verified-naming.md)); elsewhere, the client's own order
   of local config, then a `contract`-rooted delegation, then DNS-rooted discovery. The v0.1
   gossip prototype was removed in #237: it exchanged nothing with peers, and its routes went in
-  #154. Its replacement is this work, not a revival.
+  #154. Its replacement is this work, not a revival. Nameservers will also register servers under
+  aliases, so servers can be discovered by name as well as users; that is not scoped yet.
 - **Keep the spec small.** `jig-spec` holds final decisions, normative and terse. Modelling,
   alternatives and justifications go in `docs/` and link to the spec.
 
@@ -176,12 +177,18 @@ Still to do in this phase:
   between jig servers (encrypted channels across servers, the suite fixed in the contract), with
   how names map to DIDs and who resolves them. Nameserver-led shared contracts for trusted subnets
   and ruleset groups follow. Federating with a differently built server comes after the MVP.
-- Multi-device and key rotation; a server-key rotation ceremony.
-- ACME certificates for DNS-rooted suffixes (the nameserver has served TLS by default since #262).
+- Multi-device and key rotation; a server-key rotation ceremony (clients follow a server's key link
+  since #241; no tool makes one yet).
+- **Server key rotation across several hops.** alpha.2 follows one key link: a client pinned two
+  rotations back fails closed and must re-pin. The next step is a chain of links, followed hop by
+  hop (a JEP-0002 and JEP-0012 change, lane I), because forcing a re-pin is a trust-on-first-use
+  attack path.
+- ACME certificates for DNS-rooted suffixes. TLS on the nameserver, bound to its DID, landed in #262.
 - PROXY protocol v2 on the nameserver listener, so its per-client rate limits still apply behind a
   TCP/SNI passthrough proxy. A `config` or `contract` suffix needs passthrough, and today every
   client behind one shares the proxy's limit.
-- Signed peer policy (federation already runs through the write gate).
+- Signed peer policy (federation already runs through the write gate). The policy is published in
+  the signed server manifest since #275; its quotas are not enforced yet.
 - **One implementation of each thing:** remove the v0.0.1 paths that sit beside v0.0.2 ones, the
   capability scaffolding that enforces nothing, and prototypes nothing calls.
 - An external security audit (D27), designed now and run once v0.2 is code-complete. It does not
