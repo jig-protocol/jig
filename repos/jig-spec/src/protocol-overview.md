@@ -141,9 +141,9 @@ All messages are signed by the sender's keypair. If E2EE is enabled, content is 
 
 If a message contains a block, here's what happens:
 
-1. **Validation** ([Block Execution Model § Validation](block-execution.md#41-validation-phase)): Host checks signatures, verifies capabilities are allowed, validates WebAssembly module structure.
+1. **Validation** ([Block Execution Model § Validation](block-execution.md#phase-1-validation)): Host checks signatures, verifies capabilities are allowed, validates WebAssembly module structure.
 
-2. **Execution** ([Block Execution Model § Execution](block-execution.md#42-execution-phase)): Wasm module runs in an isolated sandbox with fuel metering. Think Docker, but way lighter—just syscall filtering and CPU limits.
+2. **Execution** ([Block Execution Model § Execution](block-execution.md#phase-2-execution)): Wasm module runs in an isolated sandbox with fuel metering. Think Docker, but way lighter—just syscall filtering and CPU limits.
 
 3. **Receipt** ([Receipts](receipts.md)): Host emits a signed receipt with:
    - How much fuel was consumed (e.g., 421,337 units)

@@ -42,10 +42,8 @@ spreads further than the group.
   proof-of-work (it is rate-limited per client IP and per DID, `[alias_rate_limits]`). The
   shipped unit binds to the tailnet only ([`deploy/README.md`](../../deploy/README.md)). Keep it that way until these are
   authenticated.
-- **Know your files.** With the shipped unit: legacy store `/var/lib/jig/nameserver.db`
-  (penalties, rate windows, federation cache, reputation, tribunal records, the
-  `ns_identity` key), alias store `/var/lib/jig/nameserver_v002.db`, attestation signing key
-  `/var/lib/jig/nameserver_v002.jigkey`, sealed (or the `.jigkey` beside `[v0_0_2.server] server_did_keyfile`), and any
+- **Know your files.** With the shipped unit: alias store `/var/lib/jig/nameserver_v002.db`,
+  attestation signing key `/var/lib/jig/nameserver_v002.jigkey`, sealed (or the `.jigkey` beside `[v0_0_2.server] server_did_keyfile`), and any
   `JIG_NS_*` settings in the optional `/etc/jig/jig-nameserver.env`. The nameserver has no
   `JIG_NS_SECRET` any more (#192).
 - **Know that settings are read at start-up.** Every `JIG_NS_*` change below needs
@@ -183,20 +181,21 @@ issue attestations, and read or change everything in its databases.
    attestation under the removed key is refused from then on. `trusted_nameservers` is no
    longer used. Clients that list your suffix under `[naming.delegations]` need the same
    change.
-3. **Find what changed.** Compare alias bindings in `nameserver_v002.db` and identities in
-   `nameserver.db` against your latest backup. List every alias whose DID changed.
+3. **Find what changed.** Compare alias bindings in `nameserver_v002.db` against your latest
+   backup. List every alias whose DID changed.
 4. **Rotate everything:**
    - `JIG_NS_ADMIN_TOKEN`: new value.
    - Attestation key: move `nameserver_v002.jigkey` aside and let the service seal a new one,
      which gives the nameserver a new `ns_did`. Every attestation signed by the old key
      must be treated as untrusted. Dependent servers and clients accept the new key only
      once its `ns_did` is in their delegation's `authorities`, so tell them the new DID.
-   - `ns_identity` key: delete its row from `nameserver.db` so a new one is generated. This
-     changes the `ns_id` in `/.well-known/jig-ns`.
+   - A box upgraded from an older release may still hold `/var/lib/jig/nameserver.db`, whose
+     `ns_identity` table is a raw key that signs nothing any more. Delete it, and its copies
+     in old backups.
 5. **Restore bindings.** Revert changed aliases from backup. Ask users to renew
    (`POST /v1/renew`) so attestations are reissued under the new key. Users who rotated
    their DID since the backup must re-register.
-6. **Tell people.** Announce the new `ns_did` and `ns_id`, the window of compromise and the
+6. **Tell people.** Announce the new `ns_did`, the window of compromise and the
    affected aliases through channels your users already trust, and tell your federation
    peers directly. Clients that pinned DIDs will have flagged changed aliases; tell users
    to trust those warnings.

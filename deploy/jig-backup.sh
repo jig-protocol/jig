@@ -20,12 +20,14 @@
 #                     refuse it. The earlier links stop one DID being linked
 #                     twice, and later form the chain clients follow.
 #      server.retired-*.jigkey — keys a rotation retired, still sealed.
-#   3. nameserver.db, nameserver_v002.db and nameserver_v002.jigkey, when this
-#                     box runs jig-nameserver. nameserver_v002.db holds the
-#                     alias bindings; the key is the nameserver's signing key.
+#   3. nameserver_v002.db and nameserver_v002.jigkey, when this box runs
+#                     jig-nameserver. nameserver_v002.db holds the alias
+#                     bindings; the key is the nameserver's signing key.
 #                     Without it a restore gets a new nameserver DID, and every
 #                     attestation the old one signed stops verifying for anyone
-#                     whose delegation names the old DID.
+#                     whose delegation names the old DID. nameserver.db, the
+#                     legacy registry, is no longer used and is not backed up:
+#                     it holds a raw key (`ns_identity`).
 #
 # A sealed key restores only with a secret for one of its slots, and this
 # backup does not hold one: that is the point of sealing it. Keep a slot that
@@ -104,8 +106,7 @@ snapshot_db() {
 
 snapshot_db "$JIG_STATE_DIR/jig_v002.db"
 # Not strictly part of the server's state, but it lives on the same box and a
-# lost registry means every handle has to be re-registered.
-snapshot_db "$JIG_STATE_DIR/nameserver.db"
+# lost alias store means every handle has to be re-registered.
 snapshot_db "$JIG_STATE_DIR/nameserver_v002.db"
 
 # --- the irreplaceable ones -------------------------------------------------

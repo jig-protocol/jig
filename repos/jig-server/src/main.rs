@@ -96,10 +96,12 @@ enum KeysCommand {
     },
     /// Replace the key with a new one, in place, and write a key link from
     /// the old DID to the new one beside it (`<keyfile>.link`), signed by
-    /// both, so clients and peers that pinned the old DID follow it. The old
-    /// key opens with `[keys] unlock`, JIG_KEY_UNLOCK or JIG_KEY_PASSPHRASE,
-    /// and is kept, still sealed, as `<stem>.retired-<DID tail>.jigkey`.
-    /// Restart the server afterwards.
+    /// both, so clients and peers that pinned the old DID follow it. An
+    /// earlier link is kept as `<keyfile>.link.N` and served too, so clients
+    /// pinned on any earlier DID follow every hop. The old key opens with
+    /// `[keys] unlock`, JIG_KEY_UNLOCK or JIG_KEY_PASSPHRASE, and is kept,
+    /// still sealed, as `<stem>.retired-<DID tail>.jigkey`. Restart the
+    /// server afterwards.
     Rotate {
         /// The keyfile. Defaults to `[server] server_did_keyfile`.
         #[arg(long)]
@@ -108,10 +110,15 @@ enum KeysCommand {
         /// passphrase (read from JIG_KEY_NEW_PASSPHRASE). Repeatable.
         #[arg(long = "slot", required = true)]
         slots: Vec<String>,
-        /// Replace a key link left by an earlier rotation. A client still
-        /// pinned on the DID that link leaves is then refused and must re-pin.
-        #[arg(long)]
+        /// Accepted and ignored: an earlier link is now kept and served, so
+        /// rotating again needs nothing more.
+        #[arg(long, hide = true)]
         replace_link: bool,
+        /// With a chain already as long as a client follows: stop serving its
+        /// oldest link (kept as `<link>.pruned-N`). A client still pinned on
+        /// the DID it leaves is then refused and must re-pin.
+        #[arg(long)]
+        prune_oldest: bool,
     },
     /// Write a key link from the DID of the sealed key at --old-keyfile to
     /// that of the key at --keyfile, beside the latter, for a key made with
@@ -165,11 +172,20 @@ fn run_keys(keys: KeysCommand, config: &ServerConfig) -> Result<String, String> 
             keyfile,
             slots,
             replace_link,
-        } => KeysAction::Rotate {
-            keyfile: or_configured(keyfile),
-            slots,
-            replace_link,
-        },
+            prune_oldest,
+        } => {
+            if replace_link {
+                eprintln!(
+                    "warning: --replace-link does nothing now: the earlier link is kept and \
+                     served beside the new one, and clients follow both"
+                );
+            }
+            KeysAction::Rotate {
+                keyfile: or_configured(keyfile),
+                slots,
+                prune_oldest,
+            }
+        }
         KeysCommand::Link {
             old_keyfile,
             keyfile,
@@ -378,6 +394,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("[jig-server] FATAL: {msg}");
             std::process::exit(1);
         }
+        // The contract's frames are handled from the first connection on.
+        jig_server::v0_0_2_contract::start(state);
         jig_server::v0_0_2_federation::spawn_federation_peers(state.clone());
         // Start config-permitted bridges before the router is built (they mount
         // their HTTP routes into bridge_router_mount, which build_v0_0_2_router

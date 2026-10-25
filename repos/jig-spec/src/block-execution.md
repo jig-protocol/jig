@@ -2,14 +2,14 @@
 
 **Audience:** This chapter is primarily for **developers** building executable blocks and **protocol implementers** running hosts that execute blocks. **End users** don't need to understand block internals—your client handles execution automatically. **Server operators** might care about resource limits, capability policies, and security sandboxing.
 
-> **Mostly not implemented.** The reference server executes one module, its own canonical
-> `text-render` block, built for `wasm32-unknown-unknown` with no imports. It validates the
-> manifest schema and suite, the author's signature and the module's Wasm features, and
-> meters fuel, memory and time. It does not run third-party blocks, provide host functions
-> or capability handles, check capability policy, mount resources, or bill by outcome.
-> Capability-bearing blocks are phase 2 (`v0.3`) on the roadmap. Where this chapter says
-> `wasm32-wasi`, that Rust target no longer exists; its successor is `wasm32-wasip1`, and a
-> block that needs nothing from the host builds for `wasm32-unknown-unknown`.
+> **Partly implemented.** Blocks are components of the `jig:block` package
+> ([JEP-0006](../jep/jep-0006-block-abi.md)), checked against the determinism profile
+> `jig-det-1` and executed under fuel, stack, memory and deadline limits. The reference server
+> executes the `text-render` block's `renderer` component on ingest and signs a v0.3 receipt;
+> the reference client re-executes it to check that receipt. Third-party programs run only if
+> the server's operator policy allows them ([JEP-0011](../jep/jep-0011-block-programs.md) §5.1).
+> Host imports and capabilities (JEP-0007), resource mounts and outcome-based billing are not
+> implemented. The capability sections below describe that later design.
 
 ---
 
@@ -23,10 +23,10 @@ Executable blocks solve this:
 
 1. **Portable computation**: Write code once, run it anywhere (any Jig server, desktop client, CLI tool).
 2. **Outcome-based pricing**: Hosts charge based on what the block *does* (CPU used, network calls made), not just message size.
-3. **Deterministic verification**: Anyone can re-execute a block with the same inputs and verify the receipt matches (prevents billing fraud).
+3. **Deterministic verification**: Anyone can re-execute a block with the same invocation and check that the outcome matches the receipt.
 4. **Capability-based security**: Blocks start with zero permissions. Want network access? Declare it in the manifest. The host decides whether to grant it.
 
-**Real-world example:** Alice sends a block that fetches weather data from an API and formats it as JSON. The server executes it, charges Alice based on CPU used (fuel) and the network request, and emits a signed receipt proving the API call succeeded. Bob can verify the receipt by replaying the block—if the receipt says it used 500k fuel but Bob's replay only uses 100k, something's fishy.
+**Real-world example:** Alice sends a chat message. Her server renders it with the `text-render` block and signs a receipt naming the component, the invocation and the outcome hash. Bob's client runs the same component on the same invocation and gets the same outcome hash, or shows him that the server's render differs.
 
 **Trade-off:** More complexity. You need a WebAssembly compiler, a sandboxed runtime, fuel metering, and signature verification. But the payoff is programmable messages—entire categories of bots, automation, and integrations become possible without server-side changes.
 
@@ -366,375 +366,221 @@ The `render` field declares expected output:
 ## Execution Lifecycle
 
 Block execution proceeds in three phases: **Validation** → **Execution** → **Receipt**.
+[JEP-0006](../jep/jep-0006-block-abi.md) is normative for all three.
 
 ### Phase 1: Validation
 
-Before running any code, the host validates the block:
+Before running any code, the host checks:
 
-1. **Schema check**: Is `manifest.schema` a version we recognize? If not, reject.
-2. **CID verification**: Recompute block CID from `manifest + code + resources` and verify it matches `manifest.block_id`. If mismatched, reject (block was tampered with).
-3. **Signature verification**: Check `/proofs/manifest.sig` against author public keys. Invalid signature → reject.
-4. **Capability policy check**: Does the block request capabilities the host allows? If a `null_sec` user requests `net.fetch`, reject.
-5. **WebAssembly validation**: Parse `code.wasm` and check:
-   - It validates with only the [allowed feature set](#allowed-webassembly-features) enabled
-   - Imports limited to approved host functions (no sneaky syscalls)
-   - No floats (if `deterministic: true`)
-   - Memory limits within bounds
+1. **The program.** Its manifest is signed by its author, and the host's operator policy allows
+   it ([JEP-0011](../jep/jep-0011-block-programs.md) §5.1). A server's default policy allows
+   only the renderer components it ships.
+2. **The component, against `jig-det-1`:**
+   - it validates with exactly the WebAssembly 2.0 features minus SIMD, plus the component
+     model without async, threads or error context;
+   - no core module, at any depth, contains a scalar float instruction;
+   - every memory and table declares a maximum within the manifest's limits;
+   - it imports only what its world allows (no `wasi:*`) and exports exactly its world's
+     interface.
 
-If any validation step fails, execution **MUST NOT** proceed. The host emits a `hard_fail` receipt with the reason (e.g., `INVALID_SIGNATURE`, `CAPABILITY_DENIED`).
-
-**Why fail early:** Running invalid code wastes resources and opens security holes. Better to reject at validation than crash mid-execution.
+A host MUST refuse a component that fails any check, before compiling it.
 
 ### Phase 2: Execution
 
-Validation passed—time to run the code:
+1. **Build the invocation.** Every input is data in one `invocation` record: the triggering
+   block's CID, its sender, the channel's CID, and the `ingest-seq` and `ingest-hlc` from the
+   block's signed `ingest` record. A block has no clock, no randomness and no environment.
+2. **Call the world's export:** `render(invocation)` for a `renderer`,
+   `handle(invocation, state)` for a `bot`.
+3. **Enforce limits:** fuel (deterministic), and a wall-clock deadline as a liveness guard;
+   plus the stack limit and memory maxima.
+4. **Classify the outcome:**
+   - `ok`: the export returned a value;
+   - `error`: the guest returned a `block-error`, or a WebAssembly core trap occurred;
+   - `incomplete`: fuel or stack ran out, the deadline passed, or the host failed.
 
-1. **Instantiate WebAssembly module** in an isolated runtime (e.g., Wasmtime with seccomp sandbox).
-2. **Configure fuel metering** based on `constraints.max_fuel`.
-3. **Provide capability handles** (not raw host functions). Example: Instead of exposing `libc::fetch(url)`, expose a safe `jig_net_fetch(url)` that validates scope.
-4. **Mount resources** as read-only content-addressed files (block can't modify them).
-5. **Invoke entry function** (e.g., `_start()`).
-6. **Capture output** (stdout, return value) and measure fuel consumption.
+`ok` and `error` carry a hash over the canonical encoding of what was returned, and are
+comparable across executors. `incomplete` asserts nothing about the block.
 
-Execution may terminate early if:
+A `bot` never performs an effect during a call: it returns effects, which the host checks against
+the install's grants before applying them.
 
-- **Fuel exhausted**: Block ran out of CPU budget → `soft_fail` receipt (user pays partial cost).
-- **Memory limit exceeded**: Block tried to allocate more memory than allowed → `hard_fail`.
-- **Timeout reached**: Execution took longer than `max_execution_time_ms` → `soft_fail`.
-- **Capability denied**: Block tried to use a capability it didn't declare → `hard_fail`.
-
-**For implementers:** Use defense-in-depth:
-
-- **Process isolation** (seccomp on Linux, pledge on OpenBSD, AppContainer on Windows)
-- **Filesystem isolation** (mount only declared resources, not the entire filesystem)
-- **Network isolation** (firewall rules per capability scope)
-
-Even if the WebAssembly runtime has a vulnerability, these layers prevent escape.
+**For implementers:** the sandbox is one layer (threat SC-03). Run hosts with OS isolation as
+well; see [Security Considerations](#security-considerations).
 
 ### Phase 3: Receipt
 
-After execution (success or failure), the host emits a **receipt**—a signed attestation of what happened:
+The host signs a v0.3 receipt ([Receipts](receipts.md)): `exec` with the component, program,
+world, invocation hash, outcome, limits and engine; or `accepted` if it stored the block without
+executing it. A server never executes encrypted content: for that it signs `sealed`.
 
-```json
-{
-  "version": "0.2.0",
-  "block_id": "cid:bafyBlock123...",
-  "host": "did:jig:server:prod",
-  "executed_at": "2025-11-09T12:34:56Z",
-  "outcome": {
-    "status": "ok",
-    "affordances": ["net.http_2xx"]
-  },
-  "counters": {
-    "fuel_total": 873422,
-    "fuel_by_capability": {
-      "net.fetch": 800000,
-      "core.compute": 73422
-    }
-  },
-  "timings": {
-    "init_ms": 5,
-    "exec_ms": 45,
-    "total_ms": 50
-  },
-  "limits": {
-    "max_fuel": 5000000,
-    "max_memory_bytes": 1048576
-  },
-  "signature": {
-    "key": "ed25519:v1:hostKey...",
-    "signature": "ed25519:v1:sigBytes..."
-  }
-}
-```
-
-**What receipts enable:**
-
-1. **Outcome-based pricing**: Charge different rates for `ok` (full price), `soft_fail` (partial refund), `hard_fail` (no charge).
-2. **Per-capability billing**: Network calls cost more than pure CPU. Receipt breaks down fuel by capability.
-3. **Deterministic replay**: Anyone can re-execute the block and verify the receipt matches (fraud detection).
-4. **Audit trails**: Federation peers exchange receipts to prove work was done.
-
-See [Receipts](receipts.md) for the full v0.2 schema.
-
-**For end users:** Receipts are like itemized bills. If a server charges you $0.10 for a block but the receipt shows it only used $0.01 worth of fuel, you can dispute it (or downgrade that server's reputation).
+Anyone with the component and the block can re-execute it and compare outcomes. Fuel is
+recorded for diagnosis and never compared.
 
 ## Determinism Requirements
 
-Jig blocks are **deterministic by default**: same inputs → same outputs, every time.
+Two conforming executors that both reach `ok` or `error` for the same run MUST reach the same
+outcome and hash, on any architecture, operating system, engine or engine version. That is what
+lets a client check a server, and one server check another.
 
 **Why determinism matters:**
 
-- **Verifiable execution**: Anyone can replay a block and get the same result (prevents fraud).
-- **Reproducible billing**: Fuel consumption is deterministic (no "this block cost 500k fuel on Monday but 1M fuel on Tuesday").
-- **Cacheable results**: If the block and inputs haven't changed, the output hasn't either (hosts can cache aggressively).
+- **Verifiable execution**: Anyone can re-execute a block and get the same outcome.
+- **Federation**: Servers that render the same message agree on its outcome hash.
+- **Cacheable results**: If the component and invocation haven't changed, neither has the outcome.
 
-### Allowed WebAssembly features
+### The profile: `jig-det-1`
 
-Hosts **MUST** validate every block module with only the features of the WebAssembly 2.0 core specification enabled, **excluding SIMD**, and reject a module that fails. That set is: mutable globals, multi-value, sign extension, non-trapping float-to-int conversions, bulk memory and reference types.
+The rules are [JEP-0006's](../jep/jep-0006-block-abi.md#determinism-profile-jig-det-1): the
+feature set, no floats, declared memory maxima, no `wasi:*` imports, and exact exports. Hosts
+MUST configure their engine to the same feature set, and MUST enforce the profile as an
+allowlist, not as a list of forbidden instructions: a list misses every proposal its author did
+not know about.
 
-Everything else is outside it, including SIMD, relaxed SIMD, threads and shared memory, memory64, multi-memory, extended constant expressions, tail calls, exceptions, GC and the component model. A later version of this specification may add a feature; a host **MUST NOT** accept one before then.
+What the profile excludes, and why:
 
-Hosts **SHOULD** enforce this as an allowlist of features, not as a list of forbidden instructions. A list of instructions misses every proposal its author did not know about: SIMD's float lanes (`f32x4.add`) are float arithmetic that a check naming `f32.add` lets through, and relaxed SIMD is non-deterministic by definition.
+- **Floats** (`f32`, `f64`, and SIMD's float lanes): NaN payloads and rounding differ across
+  engines. Use fixed-point integers.
+- **WASI**: host answers to clocks, randomness and filesystem calls differ by OS.
+- **Threads and shared memory**: scheduling is not deterministic.
 
-The `deterministic` flag does not widen the set. It only decides whether the scalar float instructions below are allowed.
+**Time, sender and context** arrive in the invocation. A block never reads a clock.
 
-### Forbidden Operations
+**For developers:** Build with `jig block build`, which compiles for `wasm32-unknown-unknown`
+(no WASI) and checks the result against `jig-det-1`.
 
-When `constraints.deterministic = true` (the default), hosts MUST reject WebAssembly modules containing:
+### Canonical Encoding
 
-**Floating-point instructions**: `f32`, `f64` ops are non-deterministic (different CPUs, rounding modes, NaN handling). If you need math, use fixed-point integers.
-
-**Non-deterministic syscalls:**
-
-- `wasi_snapshot_preview1::random_get` (randomness is non-deterministic)
-- `wasi_snapshot_preview1::clock_time_get` (wall-clock time varies)
-- `wasi_snapshot_preview1::sock_*` (network sockets have non-deterministic latency)
-
-**Threading**: Shared memory, atomic wait/notify, etc. (race conditions are non-deterministic).
-
-**Exception:** Blocks MAY use time, randomness, or network data if provided via **capability handles**:
-
-- **Time**: Passed as an explicit argument (e.g., `render(timestamp: u64)`), not an ambient syscall.
-- **Randomness**: Derived from `BLAKE3(manifest.block_id || host_seed)` (deterministic for replay).
-- **Network**: Responses cached and replayed for deterministic re-execution.
-
-**For developers:** Build with `jig block build`, which compiles for `wasm32-unknown-unknown` (no WASI) and checks the result against `jig-det-1`. A block never reads a clock: time arrives in the invocation (`ingest-hlc`).
-
-### Canonical Serialization
-
-Render output MUST use canonical serialization:
-
-**JSON**: Keys sorted lexicographically, no whitespace, deterministic number formatting.
-
-**CBOR**: Deterministic CBOR (RFC 8949 § 4.2).
-
-**Why:** So everyone agrees on the output hash. If Alice's block outputs `{"a":1,"b":2}` and Bob's replay outputs `{"b":2,"a":1}` (different key order), the hashes won't match.
-
-**For implementers:** Use a canonicalization library (e.g., `jcs` for JSON Canonicalization Scheme, `minicbor` with deterministic encoding for CBOR).
+Outcome and invocation hashes are taken over the canonical encoding of a WIT value: deterministic
+CBOR (RFC 8949 §4.2.1) under JEP-0006's type mapping. The host computes them from the lifted
+value, so they never depend on how a guest language serialises its output.
 
 ## Security Considerations
 
 ### Capability-Based Security
 
-**Zero ambient authority**: Blocks start with no capabilities. The manifest explicitly declares what's needed.
+**Zero ambient authority**: Blocks start with no capabilities. A `renderer` imports nothing but
+types, and at most child renderers its manifest pins. A `bot` imports only the host interfaces
+its install grants (JEP-0007).
 
-**Explicit grants only**: The host reviews capability requests and grants them based on policy (reputation, quotas, etc.).
+**Explicit grants only**: The host checks a bot's returned effects against its grants before
+applying them.
 
-**Least privilege**: Grant minimum scope. If a block only needs to fetch from `https://api.example.com/v1/users/*`, don't grant `https://*`.
-
-**For server operators:** Review capability requests before granting. If a "hello world" block requests network access, that's suspicious.
+**Least privilege**: Grant minimum scope.
 
 ### Sandboxing
 
 Hosts SHOULD use defense-in-depth:
 
-**Process isolation**: Run each block in a separate process with seccomp (Linux), pledge (OpenBSD), or AppContainer (Windows). If the block exploits a Wasm runtime bug, it's still contained.
+**Process isolation**: seccomp (Linux), pledge (OpenBSD) or AppContainer (Windows) around the
+runtime. If a component exploits a Wasm runtime bug, it is still contained.
 
-**Filesystem isolation**: Mount only `/resources/<cid>` (read-only). Block can't read `/etc/passwd` or write to `/tmp`.
+**Resource limits**: fuel, stack, memory and a deadline on every run.
 
-**Network isolation**: Firewall rules per capability scope. If the block's scope is `https://api.example.com/*`, block all other outbound connections.
-
-**For implementers:** Use tools like systemd's `DynamicUser=true`, firejail, or Docker's `--security-opt` to layer isolation.
+**For implementers:** Use tools like systemd's `DynamicUser=true` to layer isolation.
 
 ### Supply Chain Security
 
-**Signed manifests**: Every manifest MUST be signed by at least one author. Hosts verify signatures before execution.
+**Signed manifests**: A program manifest is signed by its author ([JEP-0011](../jep/jep-0011-block-programs.md)).
 
-**Transparency logs**: Blocks SHOULD be published to transparency logs (e.g., Sigstore/Rekor) so anyone can audit what's been executed.
+**Operator policy**: A server executes only what its operator policy allows, and publishes that
+policy signed, so clients see exactly what it will run.
 
-**Multi-signature support**: High-risk blocks can require 2-of-3 tribunal signatures (e.g., a bot + 2 humans).
-
-**Reproducible builds**: If the block's source code is public, anyone can recompile and verify the `code.wasm` hash matches.
-
-**For developers:** Publish block source code alongside manifests. Use reproducible build tools (e.g., Nix, Bazel).
+**Reproducible builds are not assumed**: Wasm output differs across build hosts. Equivalence is
+checked by behaviour (the conformance vectors), not by bytes.
 
 ## Compatibility
 
 ### WebAssembly Target
 
-**Current**: Wasmtime with WASI preview1.
+Blocks are components of the `jig:block` package, at version `0.1.0` during v0.3 development.
+The WIT is [`wit/jig-block/block.wit`](../wit/jig-block/block.wit). Hosts MUST support:
 
-**Future**: Component Model (when stable).
+- the component model under `jig-det-1`;
+- fuel metering, stack limits and memory maxima;
+- the `renderer` world, and the `bot` world once JEP-0007 is implemented.
 
-Hosts MUST support:
-
-- WebAssembly MVP spec
-- Fuel metering
-- Memory limits
-- Imports restricted to declared capabilities
-
-**For implementers:** Use Wasmtime (Rust), wasmer (multi-language), or a similar runtime. Avoid browsers' WebAssembly APIs—they lack fuel metering.
+The reference host is wasmtime, on native Cranelift and on Pulley. The conformance vectors run
+on both, on x86_64 and aarch64.
 
 ### Language Support
 
-Blocks MAY be authored in any language compiling to WebAssembly:
+Blocks MAY be authored in any language that compiles to a component without floats or WASI
+imports:
 
-**Rust** (the only language with a template in v0.3): `jig block new <name>`, then `jig block build`
+**Rust** (the only language with a template in v0.3): `jig block new <name>`, then `jig block build`.
 
-**AssemblyScript** (TypeScript-like): Great for web developers.
+**For developers:** `wit-bindgen` generates the bindings for the `jig:block` worlds.
 
-**C/C++** (with wasi-sdk): For low-level code.
+## Example: the `text-render` block
 
-**Go** (with TinyGo): Standard `go` compiler produces large binaries; use TinyGo.
+The reference server's built-in renderer. Its source is `repos/text-block`.
 
-**For developers:** Use the Jig SDK for your language (provides capability bindings and manifest builders).
-
-## Example: Weather Fetcher Block
-
-Let's walk through a real block that fetches weather data from an API.
-
-### Manifest
-
-```json
-{
-  "schema": "https://jig.dev/schema/block-manifest/v0.2",
-  "block_id": "cid:bafyWeather123...",
-  "version": "1.0.0",
-  "authors": [
-    {
-      "did": "did:jig:alice",
-      "public_key": "ed25519:v1:PkQx...",
-      "roles": ["author"]
-    }
-  ],
-  "capabilities": [
-    {
-      "name": "net.fetch",
-      "scope": ["https://api.weather.gov/*"]
-    }
-  ],
-  "constraints": {
-    "max_fuel": 2000000,
-    "max_memory_pages": 16,
-    "max_execution_time_ms": 500
-  },
-  "render": {
-    "entry": "_start",
-    "output_type": "application/json"
-  }
-}
-```
-
-### Rust Code
+### The export
 
 ```rust
-use jig_sdk::capabilities::net;
-use serde_json::json;
-
-#[no_mangle]
-pub extern "C" fn _start() {
-    // Fetch weather data from API
-    let response = net::fetch("https://api.weather.gov/gridpoints/TOP/31,80/forecast")
-        .expect("Failed to fetch weather");
-
-    // Parse JSON response
-    let data: serde_json::Value = serde_json::from_str(&response.body)
-        .expect("Failed to parse JSON");
-
-    // Extract temperature from first period
-    let temp = data["properties"]["periods"][0]["temperature"]
-        .as_i64()
-        .expect("Missing temperature");
-
-    // Format output
-    let output = json!({
-        "temperature": temp,
-        "unit": "F",
-        "location": "San Francisco"
-    });
-
-    // Print to stdout (captured as render output)
-    println!("{}", serde_json::to_string(&output).unwrap());
+impl Guest for TextBlock {
+    fn render(inv: Invocation) -> Result<Payload, BlockError> {
+        let body_raw = String::from_utf8(inv.input.body)
+            .map_err(|_| BlockError::InvalidInput("message body is not UTF-8".into()))?;
+        let input = Input {
+            sender_did: inv.sender_did,
+            channel_id: inv.channel_cid,
+            body_raw,
+            hlc_wall_ms: inv.ingest_hlc.wall_ms,
+            hlc_logical: inv.ingest_hlc.logical,
+            hlc_origin: String::new(),
+            client_version: String::new(),
+        };
+        let body = postcard::to_allocvec(&execute_pure(&input))
+            .map_err(|_| BlockError::Failed("output did not encode".into()))?;
+        Ok(Payload {
+            media_type: COMPONENT_OUTPUT_MEDIA_TYPE.into(),
+            body,
+        })
+    }
 }
 ```
 
-### Execution Flow
+The body arrives as bytes. A body that is not UTF-8 is a guest `invalid-input` error: a
+comparable outcome, so every executor agrees on it.
 
-1. **Validation**: Host verifies `did:jig:alice` signed the manifest, checks `net.fetch` against policy (approved for `low_sec` users), validates WebAssembly module.
+### Execution flow
 
-2. **Execution**: Host instantiates the Wasm module, grants scoped `net.fetch` capability, calls `_start()`. Block fetches weather data, parses JSON, prints output. Total fuel used: 873k (800k for network, 73k for compute).
-
-3. **Receipt**: Host emits:
-
-```json
-{
-  "version": "0.2.0",
-  "block_id": "cid:bafyWeather123...",
-  "host": "did:jig:server:prod",
-  "executed_at": "2025-11-09T12:34:56Z",
-  "outcome": {
-    "status": "ok",
-    "affordances": ["net.http_2xx"]
-  },
-  "counters": {
-    "fuel_total": 873422,
-    "fuel_by_capability": {
-      "net.fetch": 800000,
-      "core.compute": 73422
-    },
-    "bytes_rx": 2048,
-    "bytes_tx": 128
-  },
-  "timings": {
-    "init_ms": 5,
-    "exec_ms": 120,
-    "total_ms": 125
-  },
-  "limits": {
-    "max_fuel": 2000000,
-    "max_memory_bytes": 1048576
-  },
-  "render": {
-    "output_hash": "blake3:9fa8...",
-    "output_size_bytes": 87
-  },
-  "signature": {
-    "key": "ed25519:v1:serverKey...",
-    "signature": "ed25519:v1:sigBytes..."
-  }
-}
-```
-
-**Outcome-based pricing:**
-
-- **Base cost**: 873,422 fuel × $0.000001/fuel = $0.87
-- **Network surcharge**: 1 HTTP request × $0.01/request = $0.01
-- **Total**: $0.88
-
-If the block had failed (network timeout), it would be a `soft_fail` with 50% refund (user pays $0.44 for the attempt).
-
-**Verification**: Alice can replay the block locally, fetch the same weather data (cached from the original request), and verify her replay also uses 873k fuel. If the server's receipt claimed 5M fuel, Alice knows they're overcharging.
+1. **Validation**: The server's default operator policy lists this component's hash, and the
+   component passes `jig-det-1`.
+2. **Execution**: After the message lands, the server builds the invocation from its `ingest`
+   record and calls `render`. The outcome is `ok`, with a hash over the returned
+   `result<payload, block-error>`.
+3. **Receipt**: The server signs `exec`, naming the component, its own program CID for it, the
+   invocation hash and the outcome.
+4. **Verification**: A client with the same component rebuilds the invocation from the block and
+   its `ingest` record, runs `render`, and compares the outcome hash. A second server does the
+   same under its own policy and program CID, and agrees.
 
 ## Normative Requirements Summary
 
 **MUST:**
 
-- Verify `manifest.block_id` matches computed CID before execution.
-- Verify at least one author signature on the manifest.
-- Reject blocks requesting capabilities beyond host policy (fail closed).
-- Meter fuel consumption and halt execution when `max_fuel` is exceeded.
-- Enforce memory limits (`max_memory_pages`) and timeouts (`max_execution_time_ms`).
-- Emit signed receipts after execution (success or failure).
-- Reject modules that use a feature outside the [allowed set](#allowed-webassembly-features).
-- Reject modules with floats, non-deterministic syscalls, or threading (when `deterministic: true`).
-- Use canonical serialization (JSON or CBOR) for render output.
+- Refuse a program its operator policy does not allow.
+- Refuse a component that fails `jig-det-1`, before compiling it.
+- Configure the engine to `jig-det-1`'s feature set.
+- Pass every input in the invocation; provide no clock, randomness or WASI.
+- Meter fuel and halt at the limit; enforce stack and memory limits.
+- Never execute encrypted content on a server.
+- Sign a v0.3 receipt for every block a server stores ([Receipts](receipts.md)).
+- Treat `incomplete` as not comparable.
 
 **SHOULD:**
 
-- Use process isolation (seccomp, pledge, AppContainer) for sandboxing.
-- Mount only declared resources (read-only) in the block's filesystem view.
-- Apply network firewall rules based on capability scope.
-- Publish blocks to transparency logs (e.g., Sigstore/Rekor).
-- Support reproducible builds (deterministic compilation).
+- Use process isolation (seccomp, pledge, AppContainer) around the runtime.
+- Use a wall-clock deadline as a liveness guard.
 
 **MAY:**
 
-- Cache block executions by `(block_id, inputs)` for performance.
-- Implement reputation-based capability policies (stricter for `null_sec`, looser for `verified`).
-- Support multiple WebAssembly entry points (e.g., `render_html`, `render_json`).
-- Add third-party attestations to `/proofs/attestations/` for supply chain auditing.
+- Cache outcomes by component and invocation hash.
 
 ---
 
-**Next:** With blocks defined, let's look at [Receipts](receipts.md) to see the full v0.2 receipt schema with fuel metering, outcome-based pricing, and affordances. Or jump to [Transports](transports.md) to see how blocks are transmitted over IRC, WebSocket, and SSH.
+**Next:** See [Receipts](receipts.md) for the v0.3 receipt and how a client checks it. Or jump
+to [Transports](transports.md) to see how blocks are transmitted over IRC, WebSocket, and SSH.

@@ -234,6 +234,7 @@ impl TestJigServer {
             alias: None,
             publish: false,
             quota: None,
+            offers: Default::default(),
         };
 
         // Listing a peer is what trusts it: `other` may now subscribe to our
@@ -600,6 +601,17 @@ impl TestNameserver {
     /// certificate the nameserver's DID vouches for and no other.
     pub fn client(&self) -> &reqwest::Client {
         &self.client
+    }
+
+    /// Hold this nameserver's stranger pool: while `held` it does not
+    /// refill, so a test decides when a waiting registration gets through;
+    /// releasing it refills it at once.
+    pub fn hold_pool(&self, held: bool) {
+        self.state
+            .suffixes
+            .get(&self.alias_suffix)
+            .expect("the nameserver serves its suffix")
+            .hold_pool(held);
     }
 
     /// The proof-of-work a test nameserver asks for unless told otherwise:

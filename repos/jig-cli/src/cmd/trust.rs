@@ -58,16 +58,23 @@ pub async fn server_tls(server: &str) -> Result<Config> {
                 );
             }
         };
-        match (&probed.server_did, &probed.moved_from, &probed.key_link) {
-            (Some(did), Some(from), Some(link)) => {
-                pins.move_server(server, from, did, link)?;
+        match (&probed.server_did, &probed.moved_from) {
+            (Some(did), Some(from)) => {
+                // Every link it serves, not only the hops this pin follows: a
+                // link before the pin can still fork one the pin followed.
+                if let Some(refused) =
+                    links_fork_in(&Pins::default_path(), server, &probed.key_links)?
+                {
+                    return Err(refused);
+                }
+                pins.move_server(server, from, did, &probed.followed)?;
                 // The DIDs are left out: `jig trust show` prints the pin.
                 eprintln!(
                     "note: {server} moved to a new key, and both keys signed the move \
                      (JEP-0012); this device's pin follows it. `jig trust show` shows it."
                 );
             }
-            (Some(did), _, _) => pins.check_server_did(server, did)?,
+            (Some(did), _) => pins.check_server_did(server, did)?,
             _ => {}
         }
         probed.config
@@ -295,18 +302,28 @@ fn link_fork_in(
     server: &str,
     e: &TlsError,
 ) -> Result<Option<anyhow::Error>> {
-    let TlsError::OtherServer {
-        key_link: Some(presented),
-        ..
-    } = e
-    else {
+    let TlsError::OtherServer { key_links, .. } = e else {
         return Ok(None);
     };
+    links_fork_in(pins_path, server, key_links)
+}
+
+/// [`link_fork_in`] for the links `server` serves, whether the probe moved
+/// the pin or was refused: any one of them that forks a link this pin
+/// followed is kept as evidence and refuses `server`.
+fn links_fork_in(
+    pins_path: &std::path::Path,
+    server: &str,
+    key_links: &[String],
+) -> Result<Option<anyhow::Error>> {
     let kept = Pins::load(pins_path)?
         .server(server)
         .map(|p| p.links.clone())
         .unwrap_or_default();
-    let Some((signer, proof)) = jig_client::evidence::key_link_fork(&kept, presented) else {
+    // Every hop it serves, each against every link this pin followed.
+    let Some((presented, (signer, proof))) = key_links.iter().find_map(|presented| {
+        jig_client::evidence::key_link_fork(&kept, presented).map(|fork| (presented, fork))
+    }) else {
         return Ok(None);
     };
     let reason = format!(
@@ -946,26 +963,31 @@ mod tests {
         let (old, new, thief) = (new_key(), new_key(), new_key());
         let mut pins = Pins::load(&path).unwrap();
         pins.check_server_did(server, &did(&old)).unwrap();
-        pins.move_server(server, &did(&old), &did(&new), &link(&old, &new))
+        pins.move_server(server, &did(&old), &did(&new), &[link(&old, &new)])
             .unwrap();
-        let other = |key_link: Option<String>| TlsError::OtherServer {
+        let other = |key_links: Vec<String>| TlsError::OtherServer {
             server: server.into(),
             expected: did(&new),
             presented: did(&thief),
-            key_link,
+            key_links,
             rotated_past: None,
         };
 
-        // No link, or one that forks nothing followed: an ordinary refusal.
-        for e in [other(None), other(Some(link(&thief, &new)))] {
+        // No link, or links that fork nothing followed: an ordinary refusal.
+        for e in [other(vec![]), other(vec![link(&thief, &new)])] {
             assert!(link_fork_in(&path, server, &e).unwrap().is_none());
         }
         assert!(Pins::load(&path).unwrap().refusal(server).is_none());
 
-        // The key the pin left, linked again to another DID.
-        let refused = link_fork_in(&path, server, &other(Some(link(&old, &thief))))
-            .unwrap()
-            .unwrap();
+        // The key the pin left, linked again to another DID, in the middle of
+        // the chain served: every hop is checked, not only the newest.
+        let (before, after) = (new_key(), new_key());
+        let chain = vec![
+            link(&before, &old),
+            link(&old, &thief),
+            link(&thief, &after),
+        ];
+        let refused = link_fork_in(&path, server, &other(chain)).unwrap().unwrap();
         let sticky = Pins::load(&path).unwrap().refusal(server).cloned().unwrap();
         assert!(refused.to_string().contains(&sticky.bundle), "{refused}");
         let bundle = jig_client::evidence::EvidenceStore::new(&evidence_dir(&path))
@@ -980,6 +1002,49 @@ mod tests {
                 .unwrap()
                 .proven
                 .is_some()
+        );
+    }
+
+    /// A chain the pin would follow, whose earlier part forks a link the pin
+    /// already followed: refused before the pin moves.
+    #[test]
+    fn a_followable_chain_with_an_earlier_fork_is_refused() {
+        use base64::Engine as _;
+        use jig_core::key_link::{Audience, SignedKeyLink};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let server = "https://jig.example";
+        let new_key = jig_core::crypto::ed25519::generate_signing_key;
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let link = |a, b| {
+            base64::engine::general_purpose::STANDARD.encode(
+                SignedKeyLink::sign(a, b, Audience::Public, 1)
+                    .unwrap()
+                    .envelope(),
+            )
+        };
+        // The pin followed X -> P.
+        let (x, p, w, q) = (new_key(), new_key(), new_key(), new_key());
+        let mut pins = Pins::load(&path).unwrap();
+        pins.check_server_did(server, &did(&x)).unwrap();
+        pins.move_server(server, &did(&x), &did(&p), &[link(&x, &p)])
+            .unwrap();
+        // It now serves X -> W -> P -> Q: one chain, which a client pinned on
+        // P would follow to Q, but X -> W forks X -> P.
+        let served = vec![link(&x, &w), link(&w, &p), link(&p, &q)];
+        let refused = links_fork_in(&path, server, &served).unwrap().unwrap();
+        assert!(refused.to_string().contains("refusing"), "{refused}");
+        assert!(Pins::load(&path).unwrap().refusal(server).is_some());
+        assert_eq!(
+            Pins::load(&path)
+                .unwrap()
+                .server(server)
+                .unwrap()
+                .server_did,
+            did(&p),
+            "the pin did not move"
         );
     }
 

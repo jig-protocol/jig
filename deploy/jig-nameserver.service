@@ -44,6 +44,8 @@ EnvironmentFile=-/etc/jig/jig-nameserver.env
 # `100.x.y.z` looked plausibly like an address and cost 600 restarts to spot.
 Environment=JIG_NS_BIND=REPLACE_WITH_TAILNET_IPV4
 Environment=JIG_NS_PORT=7070
+# Anchors the file names only: the nameserver keeps nameserver_v002.db and
+# nameserver_v002.key next to this path and never creates nameserver.db itself.
 Environment=JIG_NS_DB_PATH=/var/lib/jig/nameserver.db
 Environment=JIG_NS_CONFIG=/etc/jig/jig-nameserver.toml
 # Pin HOME so config discovery cannot wander into another account's ~/.jig.

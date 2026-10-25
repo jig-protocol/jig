@@ -247,75 +247,21 @@ The manifest is a JSON file describing the block. Here's what's in it:
 
 ## Execution Lifecycle
 
-When a host receives a block, it goes through three phases:
+An executable block is a component of the `jig:block` package
+([JEP-0006](../jep/jep-0006-block-abi.md)), named by a signed program manifest
+([JEP-0011](../jep/jep-0011-block-programs.md)). [Block Execution](block-execution.md) describes
+the three phases in full. In short:
 
-### Phase 1: Validation
+1. **Validation**: the manifest's signature, the host's operator policy, and the determinism
+   profile `jig-det-1`. Any failure refuses the block before its code is compiled.
+2. **Execution**: the host calls the world's export with an `invocation` record that carries
+   every input (no clock, no randomness, no WASI), under fuel, stack, memory and deadline
+   limits. The outcome is `ok`, `error` or `incomplete`.
+3. **Receipt**: the host signs a v0.3 receipt naming the component, the invocation hash and the
+   outcome hash ([Receipts](receipts.md)).
 
-**What happens:**
-
-1. **Schema check**: Is `manifest.json` valid? Does it have all required fields?
-2. **CID verification**: Re-compute the Merkle root. Does it match `block_id`?
-3. **Signature verification**: Check `proofs/manifest.sig`. Was this actually signed by the claimed author?
-4. **Transparency check**: Verify inclusion proof in key transparency log (prevents key substitution attacks).
-5. **Capability check**: Does the host allow the requested capabilities? If the block wants `net.fetch` for `https://evil.com/*`, reject it.
-6. **Wasm validation**: Is `code.wasm` a valid WebAssembly module? Does it only import approved host functions?
-
-**If any check fails:** Reject the block. Don't execute it. Log the failure for debugging.
-
-**For server operators:** Configure your validation policy in `jig-config.toml`. You can allowlist/denylist specific capability scopes, authors, or reputation tiers.
-
-### Phase 2: Execution
-
-**What happens:**
-
-1. **Instantiate Wasm module**: Load `code.wasm` into the runtime (Wasmtime with fuel metering enabled).
-2. **Provide capabilities**: Grant the requested capabilities as opaque handles (the block can't forge them).
-3. **Mount resources**: Make `data/*` files available as read-only mounts.
-4. **Run `_start()` or specified entry point**: The block's main function executes.
-5. **Capture outputs**: Collect stdout/stderr and the render output.
-6. **Track fuel usage**: Count how many instructions were executed, broken down by capability.
-
-**If execution fails:**
-
-- **Out of fuel**: Emit a receipt with `outcome.status = "hard_fail"` and `reason = "FUEL_EXHAUSTED"`.
-- **Timeout**: Emit `reason = "RUNTIME_TIMEOUT"`.
-- **Capability denied**: Emit `reason = "CAPABILITY_DENIED"`.
-- **Crash (Wasm trap)**: Emit `reason = "RUNTIME_TRAP"`.
-
-**For implementers:** Use Wasmtime's fuel API to meter execution. Every Wasm instruction costs fuel (exact costs are configurable, but roughly: arithmetic = 1 fuel, memory access = 2 fuel, capability call = thousands of fuel).
-
-### Phase 3: Receipt Generation
-
-**What happens:**
-
-1. **Hash the render output**: `render_hash = BLAKE3(output)`.
-2. **Compare to expected**: Does `render_hash` match `manifest.render.expected_hash`? If not, flag it (`renders_match = false`).
-3. **Collect counters**: Fuel used per capability, HTTP status codes, bytes transmitted/received.
-4. **Determine outcome**: Success (`ok`), soft fail (retry possible, e.g., network timeout), or hard fail (fatal error).
-5. **Sign the receipt**: Host signs the entire receipt with its keypair (proves this host executed it).
-6. **Emit receipt**: Return the receipt to the sender (so they can verify billing and debug failures).
-
-**Receipt example:**
-
-```json
-{
-  "block_id": "cid:bafyBlock123...",
-  "host": "did:jig:server:xyz",
-  "executed_at": "2025-11-09T12:34:56Z",
-  "render_hash": "blake3:d3...",
-  "renders_match": true,
-  "fuel_used": 421337,
-  "outcome": {
-    "status": "ok",
-    "affordances": ["net.http_2xx"]
-  },
-  "signature": "ed25519:receiptSig..."
-}
-```
-
-**For developers:** If your block's render output is non-deterministic (changes every time), set `manifest.render.expected_hash` to `null`. But this prevents receipt verification, so it's discouraged.
-
-**For end users:** Receipts are your proof-of-work. If a server claims your block used 5M fuel but you replay it and it only uses 500k, the server is cheating (or buggy). Report them to the tribunal.
+**For end users:** a receipt is a claim. Your client checks it by running the same component on
+the same invocation and comparing outcomes, never fuel.
 
 ## Signing & Transparency
 
@@ -373,49 +319,47 @@ Attestations are stored in `/proofs/attestations/` and include:
 
 ## WebAssembly Requirements
 
-Blocks are compiled to WebAssembly (Wasm) for portability and sandboxing.
+Blocks are WebAssembly components, for portability and sandboxing.
 
 ### Target Environment
 
-**Wasm version:** WASI 0.2 (WebAssembly System Interface preview 2).
+**Package:** `jig:block@0.1.0`, with the `renderer` and `bot` worlds
+([`wit/jig-block/block.wit`](../wit/jig-block/block.wit)).
 
-**Runtime:** Wasmtime (or compatible: Wasmer, wasmtime.js for browsers).
+**Runtime:** wasmtime, or any engine that implements the component model under `jig-det-1`.
 
-**Imports:** Blocks MAY only import approved host functions. The following are **forbidden**:
+**Imports:** a `renderer` imports only `jig:block/types` (types, no functions) and at most
+`jig:host/compose`. A `bot` imports only the `jig:host/*` interfaces its install grants. No
+`wasi:*` import is allowed.
 
-- `wasi:clocks/wall-clock` (non-deterministic—time changes every execution)
-- `wasi:random` (non-deterministic)
-- `wasi:filesystem/*` (no direct file access—use capabilities instead)
-- `wasi:sockets/*` (no direct network access—use `net.fetch` capability)
+**Exports:** exactly the world's interface: `render` for a `renderer`, `handler` for a `bot`.
 
-**Exports:** Blocks MUST export at least `_start()` (entry point) and optionally `render::main()` if they produce output.
-
-**For developers:** Use the Jig SDK to generate compliant Wasm modules. It automatically stubs out forbidden imports and wires up capabilities.
+**For developers:** `jig block new` and `jig block build` produce a compliant component.
 
 ### Determinism
 
-Blocks marked `deterministic: true` in the manifest MUST produce identical outputs when run with identical inputs.
+Every block is deterministic: the determinism profile `jig-det-1` admits no floats, no threads
+and no WASI, and every input arrives in the invocation. Two conforming executors that reach `ok`
+or `error` for the same run reach the same outcome hash.
 
-**What this means:**
-
-- No random numbers (unless passed as input via capability token).
-- No wall-clock timestamps (unless passed as input).
-- No environment variables (they differ across hosts).
-- No floating-point operations (unless compiled with deterministic rounding modes).
-
-**Why this matters:** Receipts are verifiable. If Alice runs a block and gets output A, Bob should get output A too (with the same inputs). If Bob gets output B, either the block is non-deterministic (bug) or someone's cheating.
-
-**For implementers:** Wasmtime supports deterministic mode (disable WASI clock/random, pin floating-point behavior). Enable it for `deterministic: true` blocks.
+**Why this matters:** receipts are checked by re-execution. If Bob's client gets a different
+outcome from the same component and invocation, the server's claim is wrong.
 
 ### Resource Limits
 
-**Fuel:** Every Wasm instruction costs fuel. Hosts MUST enforce `fuel_max` from the manifest.
+**Fuel:** deterministic metering. Hosts MUST enforce the manifest's fuel limit, capped by
+their own.
 
-**Memory:** Wasm modules have linear memory (array of bytes). Hosts MUST enforce `memory_max_mb`.
+**Memory:** every memory declares a maximum, and hosts MUST enforce the manifest's limit.
 
-**Stack depth:** Prevent infinite recursion. Wasmtime's default stack limit is 512KB (configurable).
+**Stack:** hosts MUST cap the stack (the reference host uses 512 KiB).
 
-**For server operators:** Adjust these limits based on your hardware. A Raspberry Pi might cap memory at 16MB. A beefy server might allow 128MB.
+A run that hits any limit is `incomplete`: it asserts nothing about the block and is never
+compared.
+
+**For server operators:** set the ceilings in the `[execution]` section of the server
+configuration. Fuel and memory get the lower of the manifest's limit and yours; the deadline is
+always yours.
 
 ## Normative Requirements Summary
 
@@ -425,11 +369,10 @@ Blocks marked `deterministic: true` in the manifest MUST produce identical outpu
 - Use content addressing (BLAKE3 Merkle roots) for block CIDs.
 - Verify CIDs match before execution (fail closed on mismatch).
 - Sign manifests with Ed25519 and store signatures in `/proofs/manifest.sig`.
-- Validate Wasm modules before instantiation (only approved imports).
+- Validate components against `jig-det-1` before compiling them.
 - Enforce fuel, memory, and timeout limits from manifest constraints.
-- Generate receipts after execution with render hash, fuel usage, and outcome.
-- Use WASI 0.2 (or newer) as the Wasm target environment.
-- Disable non-deterministic Wasm imports (clocks, random) for `deterministic: true` blocks.
+- Sign a v0.3 receipt after execution, with the component, invocation hash and outcome.
+- Target the `jig:block` component worlds; allow no `wasi:*` import.
 
 **SHOULD:**
 
@@ -442,7 +385,6 @@ Blocks marked `deterministic: true` in the manifest MUST produce identical outpu
 **MAY:**
 
 - Include zero-knowledge proofs in `/proofs/attestations/` for privacy-preserving claims.
-- Use the Wasm component model for multi-module blocks (experimental).
 - Support streaming execution for large media blocks (progressive rendering).
 
 ---
@@ -450,8 +392,8 @@ Blocks marked `deterministic: true` in the manifest MUST produce identical outpu
 **Related chapters:**
 
 - **[Block Execution](block-execution.md)**: How blocks are executed, capability security, fuel metering.
-- **[Receipts](receipts.md)**: Detailed receipt schema, outcome-based pricing, affordances.
+- **[Receipts](receipts.md)**: The v0.3 receipt, and how a client checks it.
 - **[Crypto Primitives](crypto.md)**: Ed25519 signing, BLAKE3 hashing, key rotation.
 - **[Zero-Trust Model](zero-trust.md)**: Why blocks need signatures, fail-closed semantics, adversarial assumptions.
 
-**Next:** Now that you know what blocks are and how they're structured, dive into [Block Execution](block-execution.md) to see how the runtime actually runs them (capability grants, fuel metering, sandboxing). Or check [Receipts](receipts.md) to understand how execution outcomes are metered and billed.
+**Next:** Now that you know what blocks are and how they're structured, dive into [Block Execution](block-execution.md) to see how the runtime actually runs them (capability grants, fuel metering, sandboxing). Or check [Receipts](receipts.md) to see how a host's execution claims are signed and checked.

@@ -1072,6 +1072,7 @@ async fn complete_hello(
             .clone(),
         key_link: state.key_link.clone(),
         admit: admit_offer(state.auth.pow_bits(), unix_now()),
+        prior_key_links: state.prior_key_links.clone(),
     };
     match jig_pipeline::handshake::negotiate(&hello, &offer) {
         Ok(statement) => {
@@ -2351,6 +2352,7 @@ mod tests {
             alias: None,
             publish: false,
             quota: None,
+            offers: Default::default(),
         }
     }
 

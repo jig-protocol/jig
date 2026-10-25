@@ -179,11 +179,14 @@ Still to do in this phase:
   and ruleset groups follow. Federating with a differently built server comes after the MVP.
 - Multi-device and key rotation; a server-key rotation ceremony (clients follow a server's key link
   since #241, and `jig-server keys rotate` writes one, #298).
-- **Server key rotation across several hops.** alpha.2 follows one key link: a client pinned two
-  rotations back fails closed and must re-pin. The next step is a chain of links, followed hop by
-  hop (a JEP-0002 and JEP-0012 change, lane I), because forcing a re-pin is a trust-on-first-use
-  attack path.
-- ACME certificates. TLS on the nameserver, bound to its DID, landed in #262.
+- **Server key rotation across several hops.** Done in #302: a server serves its key links as a
+  chain, and clients follow it hop by hop, checking every hop, up to 16 links, because forcing a
+  re-pin is a trust-on-first-use attack path. A client pinned further back than the chain reaches
+  must still re-pin.
+- ACME certificates for DNS-rooted suffixes. TLS on the nameserver, bound to its DID, landed in #262.
+- PROXY protocol v2 on the nameserver listener, so its per-client rate limits still apply behind a
+  TCP/SNI passthrough proxy. A `config` or `contract` suffix needs passthrough, and today every
+  client behind one shares the proxy's limit.
 - Signed peer policy (federation already runs through the write gate). The policy is published in
   the signed server manifest since #275; its quotas are not enforced yet.
 - **One implementation of each thing:** remove the v0.0.1 paths that sit beside v0.0.2 ones, the

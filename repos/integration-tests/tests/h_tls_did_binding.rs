@@ -212,6 +212,7 @@ async fn a_federation_peer_is_held_to_its_expected_did() {
         alias: None,
         publish: false,
         quota: None,
+        offers: Default::default(),
     };
     let federation = FederationSection::default();
 
@@ -326,6 +327,45 @@ async fn a_pin_two_keys_back_is_refused_and_says_why() {
     let base = serve(&real, doc).await;
     assert!(matches!(
         probe(&base, Some(&did(&a))).await,
+        Err(TlsError::OtherServer {
+            rotated_past: Some(_),
+            ..
+        })
+    ));
+}
+
+/// A server that changed its key three times serves the whole chain: a
+/// device pinned on the first key follows every hop, and keeps each.
+#[tokio::test]
+async fn a_pin_three_keys_back_follows_the_whole_chain() {
+    use base64::Engine as _;
+    use jig_core::key_link::{Audience, SignedKeyLink};
+    let keys: Vec<SigningKey> = (10..14).map(|b| SigningKey::from_bytes(&[b; 32])).collect();
+    let b64 = |l: SignedKeyLink| base64::engine::general_purpose::STANDARD.encode(l.envelope());
+    let chain: Vec<String> = keys
+        .windows(2)
+        .map(|w| b64(SignedKeyLink::sign(&w[0], &w[1], Audience::Public, 1).unwrap()))
+        .collect();
+    let now = &keys[3];
+    let real = cert();
+    let mut doc = well_known(&did(now), &TlsBinding::sign(now, real.der.as_ref()));
+    doc["key_link"] = serde_json::json!(chain[2]);
+    doc["prior_key_links"] = serde_json::json!(chain[..2]);
+    let base = serve(&real, doc).await;
+
+    let probed = probe(&base, Some(&did(&keys[0]))).await.expect("followed");
+    assert_eq!(probed.moved_from.as_deref(), Some(did(&keys[0]).as_str()));
+    assert_eq!(probed.server_did.as_deref(), Some(did(now).as_str()));
+    assert_eq!(probed.followed, chain);
+    assert!(reaches(&base, &probed.config.unwrap()).await);
+    // Pinned in the middle: only the hops from there.
+    let probed = probe(&base, Some(&did(&keys[2]))).await.expect("followed");
+    assert_eq!(probed.followed, chain[2..].to_vec());
+
+    // A pin older than the chain still gets the loud refusal.
+    let older = SigningKey::from_bytes(&[20; 32]);
+    assert!(matches!(
+        probe(&base, Some(&did(&older))).await,
         Err(TlsError::OtherServer {
             rotated_past: Some(_),
             ..

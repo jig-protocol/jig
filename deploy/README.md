@@ -478,7 +478,6 @@ so a rebooted box catches up). It snapshots:
 | What | Why |
 | --- | --- |
 | `/var/lib/jig/jig_v002.db` | **the v0.0.2 block store — where the actual messages are** |
-| `/var/lib/jig/nameserver.db` | the nameserver's legacy registry |
 | `/var/lib/jig/nameserver_v002.db` | **the nameserver's alias bindings** |
 | `/var/lib/jig/server.jigkey` | server identity, sealed |
 | `/var/lib/jig/server.key.link*` | the server's key links, when it serves one: the configured key path with `.link` appended, and earlier links kept as `.link.1`, `.link.2`, ... and `.link.pruned-N`. Without them, clients that pinned an earlier DID refuse the restored server |
@@ -505,6 +504,15 @@ verifying for servers and clients whose delegation names the old DID.
 unused; delete it yourself once no backup you keep needs it. Nothing deletes
 it for you.
 
+**`nameserver.db` is the same story, with a key in it.** `jig-nameserver`
+derives `nameserver_v002.db` and `nameserver_v002.key` from `database_path`
+(`JIG_NS_DB_PATH`) the same way, and no longer opens `nameserver.db` itself:
+its legacy registry, analytics and `analyze`/`export` subcommands were removed.
+That file's `ns_identity` table holds a raw signing seed that signs nothing any
+more. Once `nameserver_v002.db` and `nameserver_v002.key` are in place, delete
+`nameserver.db` **and every old backup that contains it**. Keep
+`JIG_NS_DB_PATH` set: it names where the `_v002` files live.
+
 Databases are copied with `sqlite3 … 'VACUUM INTO …'`, which takes a read lock
 and writes one consistent file, so snapshots are safe while the server is
 serving. `cp` of a live WAL database is not. The script aborts if `sqlite3` is
@@ -530,7 +538,7 @@ their passphrases into a password manager (top of this file).
 
 ```bash
 sudo systemctl stop jig-server jig-nameserver
-sudo cp /path/to/snapshot/{jig_v002.db,nameserver.db,nameserver_v002.db} /var/lib/jig/
+sudo cp /path/to/snapshot/{jig_v002.db,nameserver_v002.db} /var/lib/jig/
 sudo cp /path/to/snapshot/server.jigkey /var/lib/jig/server.jigkey
 sudo cp /path/to/snapshot/nameserver_v002.jigkey /var/lib/jig/nameserver_v002.jigkey
 sudo chown -R jig:jig /var/lib/jig          # -R, not /var/lib/jig/* — see the
@@ -667,6 +675,7 @@ the new one. In place, so the config and the drop-in do not change:
 | --- | --- |
 | `/var/lib/jig/server.jigkey` | the new key, opened by the new credential and the new passphrase |
 | `/var/lib/jig/server.key.link` | the link from the old DID to the new one: back it up with the key |
+| `/var/lib/jig/server.key.link.N` | the links of earlier rotations, still served: back them up too |
 | `/var/lib/jig/server.retired-<DID tail>.jigkey` | the old key, still sealed |
 | `/etc/credstore.encrypted/jig-server-key.retired-<time>` | the old credential |
 
@@ -682,12 +691,18 @@ new passphrase in `JIG_KEY_NEW_PASSPHRASE`. For a key made offline with
 `keys generate`, `jig-server keys link --old-keyfile OLD --keyfile NEW` writes
 only the link, beside `NEW`.
 
-**Rotate once per pin generation.** The server serves one link, and a client
-follows one: after a second rotation, a client still pinned on the first DID is
-refused, with an error saying the server changed its key more than once. It
-must re-pin, which trusts the server on first use again. So `--rotate` refuses
-a second rotation unless you pass `--replace-link`, and keeps the earlier link
-as `server.key.link.1`. Serving the whole chain is planned.
+**Every rotation is followed.** The earlier link is kept as `server.key.link.1`
+(then `.2`, and so on) and served with the new one, as a chain: a client pinned
+on any earlier DID follows every hop. Back up `server.key.link*`, not only
+`server.key.link`. A broken or missing earlier link only shortens the chain,
+and the server logs which file it left out; clients pinned behind it are
+refused until it is restored. A broken `server.key.link` stops the server.
+
+A chain holds at most 16 links, the most a client follows. After that,
+`--rotate --prune-oldest` moves the oldest aside (`server.key.link.pruned-1`,
+kept, not served): a client still pinned on the DID it leaves is refused, with
+an error saying the server changed its key more than once, and must re-pin,
+which trusts the server on first use again.
 
 A DID is linked to one new key only, ever: two links from one DID are what a
 stolen key looks like (JEP-0012), and clients that see both follow neither.
@@ -730,8 +745,15 @@ reputation, tribunal, transparency and federation) were removed:
 > last address in that header, the one your proxy appended. With one proxy in
 > front this is the client's address; behind several, the limit applies to the
 > nearest proxy. Without `trust_proxy`, every client behind the proxy shares
-> the proxy's address and its limit. Limits are in memory and reset when the
-> nameserver restarts.
+> the proxy's address and its limit. This applies only to a proxy that
+> terminates TLS, so only to a nameserver for a DNS-rooted suffix, whose clients
+> check its certificate against a CA. A nameserver for a `config` or `contract`
+> suffix must not sit behind one: clients accept only the certificate its DID
+> vouches for, so serve it directly or behind TCP/SNI passthrough. A
+> passthrough proxy cannot add `x-forwarded-for`, so leave `trust_proxy` off
+> there. Every client then shares the proxy's address and its limit: the
+> nameserver does not read PROXY protocol either. Limits are in memory and
+> reset when the nameserver restarts.
 
 Register, renew and rotate ask for proof-of-work only on a suffix whose
 `pow.min_effort` is above 0 (see **Proof-of-work** below).
