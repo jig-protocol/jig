@@ -418,6 +418,32 @@ async fn a_server_that_changes_its_key_twice_keeps_its_channels_log_and_clients(
         Err(ChainBreak::Unsigned(_))
     ));
 
+    // A device pinned to a DID the chain does not lead from is refused at
+    // the handshake, and its pin left as it was.
+    let carol = Device::new(root.path(), "carol");
+    let elsewhere =
+        jig_core::Did::from_ed25519_pubkey(stranger.verifying_key().as_bytes()).to_did_jig_string();
+    Pins::load(&carol.pins)
+        .unwrap()
+        .check_server_did(SERVER, &elsewhere)
+        .unwrap();
+    let pins = Pins::load(&carol.pins).unwrap();
+    let refused = Client::connect_with_options(
+        &server.ws_url(),
+        carol.identity(),
+        ConnectOptions {
+            offer: pins.offer(SERVER),
+            ..ConnectOptions::default()
+        },
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "the welcome does not move a pin it does not chain from"
+    );
+    assert_eq!(carol.pinned().server_did, elsewhere);
+    assert!(carol.pinned().links.is_empty());
+
     // No channel was left behind under an earlier DID.
     let store = &server.state.ingest_ctx.store;
     for c in store.list_channels_including_archived().unwrap() {
