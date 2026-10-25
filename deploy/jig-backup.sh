@@ -12,6 +12,14 @@
 #                     server.key names server.jigkey beside it). Losing it
 #                     changes the server's identity and breaks TOFU pinning for
 #                     every client that ever connected. See deploy/README.md.
+#      server.key.link* — the server's key link (JEP-0012, #241), when it
+#                     has one: the configured key path with ".link" appended,
+#                     plus earlier links kept beside it as .link.1, .link.2,
+#                     ... and .link.pruned-N. It is what lets clients that pinned an older DID
+#                     follow the server to this one; restored without it, they
+#                     refuse it. The earlier links stop one DID being linked
+#                     twice, and later form the chain clients follow.
+#      server.retired-*.jigkey — keys a rotation retired, still sealed.
 #   3. nameserver.db, nameserver_v002.db and nameserver_v002.jigkey, when this
 #                     box runs jig-nameserver. nameserver_v002.db holds the
 #                     alias bindings; the key is the nameserver's signing key.
@@ -160,6 +168,30 @@ case "$rc" in
     *) die "the server key could not be copied — refusing to record a backup
     without it" ;;
 esac
+
+# The server's key links, if it serves one: jig-server reads the current link
+# from the configured key path with ".link" appended, and a rotation keeps the
+# earlier ones beside it as .link.1, .link.2, ... (and .link.pruned-N, which are
+# not served but still count against linking one DID twice). They are public (they hold no
+# secret), but without them clients that pinned an earlier DID refuse the
+# server. Keys a rotation retired are kept sealed beside the key; copy them too.
+key_dir="$(dirname -- "$KEYFILE")"
+key_stem="$(basename -- "$KEYFILE")"
+key_stem="${key_stem%.*}"
+links=0
+retired=0
+for extra in "$KEYFILE".link "$KEYFILE".link.[0-9]* "$KEYFILE".link.pruned-[0-9]* \
+             "$key_dir/$key_stem".retired-*.jigkey; do
+    [ -f "$extra" ] || continue
+    cp -p -- "$extra" "$DEST/$(basename -- "$extra")" || die "could not copy $extra"
+    case "$extra" in
+        *.jigkey) chmod 600 -- "$DEST/$(basename -- "$extra")" || die "could not chmod a copy of $extra"
+                  log "key:  $extra -> $DEST/ (retired, sealed)"; retired=$((retired + 1)) ;;
+        *)        log "link: $extra -> $DEST/"; links=$((links + 1)) ;;
+    esac
+done
+[ "$links" -eq 0 ] || key_notes="$key_notes jig-server-links=$links"
+[ "$retired" -eq 0 ] || key_notes="$key_notes jig-server-retired=$retired"
 
 # The nameserver's signing key. The nameserver is optional on a box, so a
 # missing key is fatal only when its alias store exists: bindings without the

@@ -110,7 +110,7 @@ label that names no key.
 - Clients and servers MUST support key rotation (publishing new key signed by old key)
 - Rotation certificates MUST be published to nameserver and propagated via transparency log
 
-*(not yet implemented: a DID is its key, and nothing rotates it. The nameserver's `/v1/rotate` moves an alias to a new DID, with proofs from both keys; it is not a rotation certificate and no transparency log receives it.)*
+*(partial: a DID is its key, and no rotation certificate exists. A server whose key changes can serve a key link (JEP-0012) from its old DID to its new one, which clients follow to move their pin (#241); no tool makes the link yet. The nameserver's `/v1/rotate` moves an alias to a new DID, with proofs from both keys; it is not a rotation certificate and no transparency log receives it.)*
 
 **For end users:** Your keys = your identity. If you lose them, you lose your account. Back them up. If they're stolen, rotate immediately.
 
@@ -198,8 +198,10 @@ ed25519:v1:PkQx7TfHJ_3eLZ8YxH4YGJLXVJsJcZjYh7x_VJLXVJs
 Keys need to be rotated periodically (annual schedule) or immediately (after compromise).
 
 > **Not implemented.** No rotation certificate, `/v1/identity/rotate` endpoint, grace period
-> or revocation certificate exists. A server whose key changes has a new DID, and clients
-> that pinned the old one refuse it.
+> or revocation certificate exists. A server whose key changes has a new DID. What exists is
+> the key link (JEP-0012): `jig-server keys rotate` signs one from the old DID to the new,
+> the server serves it, and clients and peers that pinned the old DID follow it one hop. A
+> client pinned two keys back is refused.
 
 ### Rotation Certificate Format
 
@@ -332,7 +334,7 @@ chosen when it was created (`mls`). DMs are channels with locked membership, not
 - Constant-time operations (use vetted libraries)
 - Explicit algorithm negotiation (no silent downgrade)
 - Zeroize ephemeral secrets (explicit_bzero)
-- Support key rotation (dual-signature certificates) *(not yet implemented)*
+- Support key rotation (dual-signature certificates) *(partial: server key links, JEP-0012, #241)*
 
 **Test vectors:** See [Appendix § Test Vectors](appendix.md#test-vectors) for canonical examples.
 

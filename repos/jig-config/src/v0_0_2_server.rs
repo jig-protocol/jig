@@ -106,6 +106,9 @@ impl Default for ServerSection {
             // and leave) and channel-promote (opening a restricted channel or
             // DM up) are v0.2 channel dynamics, gated the same way.
             // role-assign and role-unassign (JEP-0005 rule 7b) are owner-only.
+            // channel-share and channel-unshare need the `share` right, and
+            // only the channel's sequencer writes the contract-* records of
+            // what came of a share (JEP-0005 rules 7-11).
             allowed_block_kinds: vec![
                 "text-render".to_string(),
                 "channel-create".to_string(),
@@ -115,6 +118,11 @@ impl Default for ServerSection {
                 "channel-archive".to_string(),
                 "role-assign".to_string(),
                 "role-unassign".to_string(),
+                "channel-share".to_string(),
+                "channel-unshare".to_string(),
+                "contract-accept".to_string(),
+                "contract-refuse".to_string(),
+                "contract-end".to_string(),
             ],
             max_future_skew_ms: DEFAULT_MAX_FUTURE_SKEW_MS,
         }
@@ -151,6 +159,39 @@ pub struct IdentitySection {
     /// aliases are looked up and can hide answers, though not forge them.
     /// Listed in `unsafe_options_active`.
     pub dangerously_allow_plaintext_nameservers: bool,
+    /// Suffixes under which every alias is refused, before any delegation,
+    /// including the built-in `jig` one, which a refused `jig` never gets.
+    /// Compared case-insensitively. A suffix may not be both here and in
+    /// `[identity.delegations]`. Logged at boot, not advertised.
+    pub refused_suffixes: Vec<String>,
+}
+
+impl IdentitySection {
+    /// `refused_suffixes`, lowercased, as aliases are.
+    pub fn refused(&self) -> std::collections::BTreeSet<String> {
+        self.refused_suffixes
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect()
+    }
+
+    /// Refuse a suffix that is both delegated and refused: which one the
+    /// operator meant cannot be guessed.
+    pub fn validate(&self) -> Result<(), String> {
+        let refused = self.refused();
+        match self
+            .delegations
+            .keys()
+            .map(|s| s.to_ascii_lowercase())
+            .find(|s| refused.contains(s))
+        {
+            Some(suffix) => Err(format!(
+                "`{suffix}` is both in [identity.delegations] and in [identity] \
+                 refused_suffixes; remove it from one"
+            )),
+            None => Ok(()),
+        }
+    }
 }
 
 /// One suffix's entry in `[identity.delegations]`.
@@ -174,6 +215,7 @@ impl Default for IdentitySection {
             naively_allow_unknown_handles_fallback: false,
             delegations: BTreeMap::new(),
             dangerously_allow_plaintext_nameservers: false,
+            refused_suffixes: Vec::new(),
         }
     }
 }
@@ -1155,6 +1197,11 @@ mod tests {
             "channel-archive",
             "role-assign",
             "role-unassign",
+            "channel-share",
+            "channel-unshare",
+            "contract-accept",
+            "contract-refuse",
+            "contract-end",
         ] {
             assert!(
                 cfg.server.allowed_block_kinds.iter().any(|k| k == required),
@@ -1465,6 +1512,29 @@ mod tests {
         );
         assert_eq!(cfg.identity.delegations.len(), 1);
         assert!(IdentitySection::default().delegations.is_empty());
+    }
+
+    #[test]
+    fn a_suffix_both_delegated_and_refused_is_a_config_error() {
+        let cfg: JigServerConfig = toml::from_str(
+            r#"
+            [identity]
+            refused_suffixes = ["example.org"]
+
+            [identity.delegations."Example.ORG"]
+            authorities = ["did:jig:zA"]
+            nameservers = ["https://ns.example"]
+        "#,
+        )
+        .unwrap();
+        let err = cfg.identity.validate().unwrap_err();
+        assert!(err.contains("`example.org`"), "{err}");
+
+        let refused_only: JigServerConfig =
+            toml::from_str("[identity]\nrefused_suffixes = [\"JIG\"]\n").unwrap();
+        refused_only.identity.validate().unwrap();
+        assert!(refused_only.identity.refused().contains("jig"));
+        assert!(IdentitySection::default().refused_suffixes.is_empty());
     }
 
     #[test]

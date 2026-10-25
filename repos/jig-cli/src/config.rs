@@ -53,11 +53,46 @@ pub struct NamingSection {
     /// vouches for.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dangerously_allow_plaintext_nameservers: bool,
+    /// Suffixes under which every name is refused, before any delegation
+    /// source. Deleting a `[naming.delegations]` entry falls back to `dns`
+    /// discovery or, for [`DEFAULT_SUFFIX`], the built-in delegation; this
+    /// does not. Compared case-insensitively. A suffix may not be both
+    /// delegated and refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused_suffixes: Vec<String>,
 }
 
 impl NamingSection {
     fn is_empty(&self) -> bool {
-        self.delegations.is_empty() && !self.dangerously_allow_plaintext_nameservers
+        self.delegations.is_empty()
+            && !self.dangerously_allow_plaintext_nameservers
+            && self.refused_suffixes.is_empty()
+    }
+
+    /// `refused_suffixes`, lowercased.
+    fn refused(&self) -> std::collections::BTreeSet<String> {
+        self.refused_suffixes
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect()
+    }
+
+    /// Refuse a suffix that is both delegated and refused: which one the
+    /// operator meant cannot be guessed.
+    fn validate(&self) -> Result<()> {
+        let refused = self.refused();
+        if let Some(suffix) = self
+            .delegations
+            .keys()
+            .map(|s| s.to_ascii_lowercase())
+            .find(|s| refused.contains(s))
+        {
+            anyhow::bail!(
+                "`{suffix}` is both in [naming.delegations] and in [naming] refused_suffixes; \
+                 remove it from one"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -106,7 +141,8 @@ fn delegation_for(
 }
 
 /// The delegations a resolver uses: `cli.toml`'s, plus the built-in one for
-/// [`DEFAULT_SUFFIX`] when `cli.toml` has none for it and this build has one.
+/// [`DEFAULT_SUFFIX`] when `cli.toml` neither has nor refuses one for it and
+/// this build has one, and the refused suffixes.
 pub fn delegations(cfg: &Config) -> jig_client::naming::Delegations {
     delegations_with_authority(cfg, jig_core::naming::default_jig_authority())
 }
@@ -124,7 +160,9 @@ fn delegations_with_authority(
         .iter()
         .map(|(suffix, e)| (suffix.to_ascii_lowercase(), e.clone()))
         .collect();
+    let refused = cfg.naming.refused();
     if !entries.contains_key(DEFAULT_SUFFIX)
+        && !refused.contains(DEFAULT_SUFFIX)
         && let Ok(default) = delegation_for(authority, cfg)
     {
         entries.insert(DEFAULT_SUFFIX.to_string(), default);
@@ -142,6 +180,7 @@ fn delegations_with_authority(
                 )
             })
             .collect(),
+        refused,
         dangerously_allow_plaintext_nameservers: cfg.naming.dangerously_allow_plaintext_nameservers,
     }
 }
@@ -199,7 +238,9 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
 
     if config_path.exists() {
         let contents = std::fs::read_to_string(&config_path)?;
-        Ok(toml::from_str(&contents)?)
+        let cfg: Config = toml::from_str(&contents)?;
+        cfg.naming.validate()?;
+        Ok(cfg)
     } else {
         Ok(Config::default())
     }
@@ -349,6 +390,41 @@ mod tests {
             delegations(&cfg).config[DEFAULT_SUFFIX].authorities,
             mine.authorities
         );
+    }
+
+    #[test]
+    fn a_refused_jig_gets_no_built_in_delegation() {
+        let mut cfg = with_nameserver("https://ns.example");
+        cfg.naming.refused_suffixes = vec!["JIG".into(), "Example.ORG".into()];
+        let d = delegations(&cfg);
+        assert!(!d.config.contains_key(DEFAULT_SUFFIX), "{:?}", d.config);
+        assert!(d.refuses(DEFAULT_SUFFIX));
+        assert!(d.refuses("example.org"));
+    }
+
+    #[test]
+    fn a_suffix_both_delegated_and_refused_fails_to_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cli.toml");
+        std::fs::write(
+            &path,
+            "[server]\nbase_url = \"https://127.0.0.1:7117\"\n\n\
+             [user]\ndid = \"did:jig:zA\"\ndisplay_name = \"dj\"\n\
+             default_channel = \"#general\"\n\n\
+             [naming]\nrefused_suffixes = [\"example.org\"]\n\n\
+             [naming.delegations.\"Example.ORG\"]\nauthorities = [\"did:jig:zA\"]\n\
+             nameservers = [\"https://ns.example.org\"]\n",
+        )
+        .unwrap();
+        let err = load_config(Some(&path)).unwrap_err().to_string();
+        assert!(err.contains("`example.org`"), "{err}");
+        assert!(err.contains("refused_suffixes"), "{err}");
+
+        // Refused alone loads, and round-trips.
+        let mut cfg = Config::default();
+        cfg.naming.refused_suffixes = vec!["example.org".into()];
+        save_config(&cfg, Some(&path)).unwrap();
+        assert_eq!(load_config(Some(&path)).unwrap().naming, cfg.naming);
     }
 
     #[test]

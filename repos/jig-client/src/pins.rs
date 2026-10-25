@@ -306,6 +306,18 @@ impl Pins {
         self.file.servers.get(&server_key(server))
     }
 
+    /// The servers pinned to `did`, as their pin keys: who this device knows
+    /// a signature by `did` to come from. Empty for a DID no server is pinned
+    /// to, whatever it signed.
+    pub fn servers_pinned_to(&self, did: &str) -> Vec<&str> {
+        self.file
+            .servers
+            .iter()
+            .filter(|(_, pin)| !pin.server_did.is_empty() && pin.server_did == did)
+            .map(|(server, _)| server.as_str())
+            .collect()
+    }
+
     /// The handshake offer for `server`: the default offer, with the pinned
     /// DID when there is one, so a welcome signed by another key fails closed,
     /// and the pinned suites, so a signed refusal that drops one is caught.

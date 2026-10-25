@@ -3,8 +3,9 @@
 //! [`NameResolver::resolve`] turns `alias@suffix` into a DID the client may
 //! act on:
 //!
-//! 1. Find the suffix's delegation: the client's own `config` entry first,
-//!    else `dns` discovery at `https://<suffix>/.well-known/jig-ns-delegation`,
+//! 1. Find the suffix's delegation: none at all for a suffix the client
+//!    refuses ([`Delegations::refused`]); else the client's own `config`
+//!    entry; else `dns` discovery at `https://<suffix>/.well-known/jig-ns-delegation`,
 //!    over a certificate a CA vouches for and nothing else.
 //! 2. Ask every nameserver the delegation names for `/v1/resolve/{alias}`,
 //!    and verify each attestation: signer authoritative for the suffix,
@@ -21,7 +22,7 @@
 //! `jig-evidence-v1` writer); this module reaches them through
 //! [`NamePins`] and [`NameEvidence`], so either side can land first.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,12 +53,24 @@ pub struct ConfigDelegation {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Delegations {
     pub config: BTreeMap<String, ConfigDelegation>,
+    /// Suffixes, lowercased, under which every name is refused before any
+    /// delegation source is consulted. Deleting a `config` entry falls back
+    /// to `dns` or a built-in default, which may be the very nameserver an
+    /// operator meant to cut off; a refusal has no fallback.
+    pub refused: BTreeSet<String>,
     /// Also ask `http://` nameservers in `config`. For loopback or local
     /// testing only: over plaintext anyone on the path sees which names are
     /// looked up, and can hide or delay answers. (It cannot forge one; every
     /// attestation is still verified.) Off, a `config` nameserver is reached
     /// only over TLS one of its authorities' DIDs vouches for.
     pub dangerously_allow_plaintext_nameservers: bool,
+}
+
+impl Delegations {
+    /// Whether every name under `suffix` is refused.
+    pub fn refuses(&self, suffix: &str) -> bool {
+        self.refused.contains(&suffix.to_ascii_lowercase())
+    }
 }
 
 /// What a name means (rule 6), and what a name pin is keyed by.
@@ -157,6 +170,8 @@ pub enum ResolveError {
     BadName(NamingError),
     #[error("no delegation for `{suffix}`: {reason}")]
     NoDelegation { suffix: String, reason: String },
+    #[error("names under `{suffix}` are refused by this client's configuration")]
+    SuffixRefused { suffix: String },
     #[error("refused: {0}")]
     Refused(NamingError),
     #[error("`{0}` is not registered")]
@@ -408,13 +423,19 @@ impl NameResolver {
         })
     }
 
-    /// Rule 4: `config` first, else `dns`.
+    /// Rule 4: `config` first, else `dns`; a refused suffix before either,
+    /// so nothing is asked about it.
     async fn authority(
         &self,
         name: &Name,
         delegations: &Delegations,
         now: i64,
     ) -> Result<Authority, ResolveError> {
+        if delegations.refuses(&name.suffix) {
+            return Err(ResolveError::SuffixRefused {
+                suffix: name.suffix.clone(),
+            });
+        }
         let key = |root, root_id: &str| NameKey {
             alias: name.alias.clone(),
             suffix: name.suffix.clone(),
@@ -798,6 +819,7 @@ mod tests {
                 },
             )]),
             // The stubs are plaintext.
+            refused: BTreeSet::new(),
             dangerously_allow_plaintext_nameservers: true,
         }
     }
@@ -1266,6 +1288,7 @@ mod tests {
                     nameservers: vec![plain.url()],
                 },
             )]),
+            refused: BTreeSet::new(),
             dangerously_allow_plaintext_nameservers: true,
         };
 
@@ -1323,6 +1346,7 @@ mod tests {
                     nameservers: vec![plain.url()],
                 },
             )]),
+            refused: BTreeSet::new(),
             dangerously_allow_plaintext_nameservers: true,
         };
         let got = r
@@ -1338,6 +1362,102 @@ mod tests {
             matches!(got, Verified::New(ref b) if b.did() == alice),
             "{got:?}"
         );
+    }
+
+    // ---- refused suffixes ----
+
+    #[tokio::test]
+    async fn a_refused_suffix_is_refused_before_config_or_dns_is_asked() {
+        let (roots, cert, cert_key) = ca_issued();
+        let (ns, alice) = (key(1), did_of(&key(9)));
+        // Both roots would resolve the name: a CA-valid dns delegation and a
+        // config nameserver, each serving a valid attestation.
+        let tls = Stub::start(Some((cert, cert_key))).await;
+        let deleg = SuffixDelegation::sign(&[&ns], SUFFIX, Root::Dns, SUFFIX, NOW + 1000);
+        tls.route(WELL_KNOWN, delegation_body(&deleg));
+        tls.route(
+            DNS_RESOLVE,
+            resolve_body(&attest(&ns, &alice, "dj@example.jig"), &[], None),
+        );
+        let plain = Stub::start(None).await;
+        plain.route(
+            DNS_RESOLVE,
+            resolve_body(&attest(&ns, &alice, "dj@example.jig"), &[], None),
+        );
+        let r = dns_resolver(roots, &tls);
+        let refused = BTreeSet::from([SUFFIX.to_string()]);
+
+        for delegations in [
+            Delegations {
+                refused: refused.clone(),
+                ..Delegations::default()
+            },
+            Delegations {
+                config: BTreeMap::from([(
+                    SUFFIX.to_string(),
+                    ConfigDelegation {
+                        authorities: vec![did_of(&ns)],
+                        nameservers: vec![plain.url()],
+                    },
+                )]),
+                refused: refused.clone(),
+                dangerously_allow_plaintext_nameservers: true,
+            },
+        ] {
+            let evidence = MemEvidence::default();
+            let err = r
+                .resolve(
+                    "dj@Example.JIG",
+                    &delegations,
+                    &MemPins::default(),
+                    &evidence,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ResolveError::SuffixRefused { ref suffix } if suffix == SUFFIX),
+                "{err:?}"
+            );
+            assert!(evidence.bundles().is_empty());
+        }
+        assert_eq!(tls.hits(), 0, "no discovery fetch, no dns nameserver");
+        assert_eq!(plain.hits(), 0, "no config nameserver");
+    }
+
+    #[tokio::test]
+    async fn a_refused_jig_is_refused_despite_a_jig_delegation() {
+        // What jig-cli would add as the built-in `@jig` delegation.
+        let (ns, alice) = (key(1), did_of(&key(9)));
+        let plain = Stub::start(None).await;
+        plain.route(
+            "/v1/resolve/dj@jig",
+            resolve_body(&attest(&ns, &alice, "dj@jig"), &[], None),
+        );
+        let delegations = Delegations {
+            config: BTreeMap::from([(
+                "jig".to_string(),
+                ConfigDelegation {
+                    authorities: vec![did_of(&ns)],
+                    nameservers: vec![plain.url()],
+                },
+            )]),
+            refused: BTreeSet::from(["jig".to_string()]),
+            dangerously_allow_plaintext_nameservers: true,
+        };
+        let err = resolver()
+            .resolve(
+                "dj@jig",
+                &delegations,
+                &MemPins::default(),
+                &MemEvidence::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ResolveError::SuffixRefused { ref suffix } if suffix == "jig"),
+            "{err:?}"
+        );
+        assert_eq!(plain.hits(), 0);
     }
 
     #[tokio::test]

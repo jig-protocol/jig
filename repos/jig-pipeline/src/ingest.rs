@@ -249,6 +249,19 @@ pub enum IngestError {
     /// A role block named a role this version does not define.
     #[error("unknown role `{role}`: the only role that can be assigned is `admin`")]
     UnknownRole { role: String },
+    /// A contract record from anyone but the channel's sequencer.
+    #[error(
+        "`{kind}` on `{slug}` refused: only the channel's sequencer records a contract, not `{sender}`"
+    )]
+    SequencerOnly {
+        kind: String,
+        slug: String,
+        sender: String,
+    },
+    /// A share block or contract record that does not say what its kind
+    /// needs, or whose signed messages do not check out.
+    #[error("`{kind}` refused: {detail}")]
+    BadContractBlock { kind: String, detail: String },
     /// A `channel-create` whose slug is outside the slug grammar, or in a
     /// reserved namespace its author may not create in
     /// ([`jig_core::slug::check_create`]).
@@ -540,6 +553,12 @@ pub async fn ingest(
                 kind,
                 field: crate::roles::MEMBER_KEY.to_string(),
             },
+            WriteRefusal::SequencerOnly { slug, sender } => {
+                IngestError::SequencerOnly { kind, slug, sender }
+            }
+            WriteRefusal::BadContractBlock { detail } => {
+                IngestError::BadContractBlock { kind, detail }
+            }
         });
     }
 
@@ -547,25 +566,37 @@ pub async fn ingest(
     // terms alone. If so, the role must still hold at the seq the block is
     // given: the landing below re-checks it inside the transaction that
     // assigns that seq, which is the authoritative check (JEP-0005 rule 7b).
-    // Only `membership` is granted by a role and can be taken away; the
-    // owner role is fixed by the terms.
-    let guard_refusal = match resolved_channel.as_ref() {
-        Some(chan)
-            if matches!(kind, BlockKind::MemberAdd | BlockKind::MemberRemove)
-                && crate::authorize_write::authorize_block_with(
-                    kind,
-                    sender.as_str(),
-                    &manifest,
-                    Some(chan),
-                    membership,
-                    crate::roles::Rights::of_root(chan, sender.as_str()),
-                )
-                .is_err() =>
+    // Only `membership` and `share` are granted by a role and can be taken
+    // away; the owner role is fixed by the terms.
+    let guarded_right = match kind {
+        BlockKind::MemberAdd | BlockKind::MemberRemove => Some(crate::roles::Right::Membership),
+        BlockKind::ChannelShare | BlockKind::ChannelUnshare => Some(crate::roles::Right::Share),
+        _ => None,
+    };
+    let guard_refusal = match (resolved_channel.as_ref(), guarded_right) {
+        (Some(chan), Some(right))
+            if crate::authorize_write::authorize_block_with(
+                kind,
+                sender.as_str(),
+                &manifest,
+                Some(chan),
+                membership,
+                crate::roles::Rights::of_root(chan, sender.as_str()),
+            )
+            .is_err() =>
         {
-            Some(IngestError::NotChannelOwner {
-                kind: kind_str.to_string(),
-                slug: chan.slug.clone(),
-                sender: sender.as_str().to_string(),
+            Some(match right {
+                crate::roles::Right::Share => IngestError::MissingRight {
+                    kind: kind_str.to_string(),
+                    slug: chan.slug.clone(),
+                    sender: sender.as_str().to_string(),
+                    right: right.to_string(),
+                },
+                _ => IngestError::NotChannelOwner {
+                    kind: kind_str.to_string(),
+                    slug: chan.slug.clone(),
+                    sender: sender.as_str().to_string(),
+                },
             })
         }
         _ => None,
@@ -760,11 +791,11 @@ pub async fn ingest(
     });
     let signer = signer.filter(|_| stored_block.channel_id.is_some());
     let sender_did = sender.to_did_jig_string();
-    let guard = match (&guard_refusal, resolved_channel.as_ref()) {
-        (Some(_), Some(chan)) => Some(crate::persist::RightGuard {
+    let guard = match (&guard_refusal, resolved_channel.as_ref(), guarded_right) {
+        (Some(_), Some(chan), Some(right)) => Some(crate::persist::RightGuard {
             channel: chan,
             did: &sender_did,
-            right: crate::roles::Right::Membership,
+            right,
         }),
         _ => None,
     };
@@ -816,14 +847,16 @@ pub async fn ingest(
                 });
             }
         }
-        // A membership block whose authority rests on a role: its effect,
-        // block and record land in one transaction, and only if the role
-        // still holds at the seq it is given.
+        // A membership or share block whose authority rests on a role: its
+        // effect, block and record land in one transaction, and only if the
+        // role still holds at the seq it is given.
         _ if guard.is_some() => {
             let Some(signer) = signer.as_ref() else {
                 return Err(refused_at_landing(guard_refusal, kind_str));
             };
-            if !manifest.metadata.contains_key("member_did") {
+            if guarded_right == Some(crate::roles::Right::Membership)
+                && !manifest.metadata.contains_key("member_did")
+            {
                 return Err(IngestError::MissingMetadata {
                     kind: kind_str.to_string(),
                     field: "member_did".to_string(),
@@ -1198,6 +1231,11 @@ fn requires_existing_channel(kind: BlockKind, _source: &IngestSource) -> bool {
             | BlockKind::ChannelArchive
             | BlockKind::RoleAssign
             | BlockKind::RoleUnassign
+            | BlockKind::ChannelShare
+            | BlockKind::ChannelUnshare
+            | BlockKind::ContractAccept
+            | BlockKind::ContractRefuse
+            | BlockKind::ContractEnd
     )
 }
 
@@ -1545,7 +1583,18 @@ async fn render_after_landing(
         .ok_or_else(|| IngestError::NoExecutor {
             kind: BlockKind::TextRender.as_str().to_string(),
         })?;
+    exec_receipt(ctx, executor, input, block_cid, record).await
+}
 
+/// The signed `exec` receipt for rendering `input` against its ingest `record`.
+#[cfg(feature = "executor")]
+async fn exec_receipt(
+    ctx: &IngestContext,
+    executor: &Arc<crate::executor::BlockExecutor>,
+    input: text_block::Input,
+    block_cid: &str,
+    record: crate::ingest_record::IngestRecord,
+) -> Result<StoredReceipt, IngestError> {
     let invocation = crate::executor::text_render_invocation(&input, block_cid, &record);
 
     let run = run_text_render(executor, invocation).await?;
@@ -1560,6 +1609,18 @@ async fn render_after_landing(
     let bytes = crate::receipts::sign(receipt, &ctx.server_key)
         .map_err(|e| anyhow::anyhow!("signing the exec receipt: {e}"))?;
     Ok(stored_receipt(ctx, block_cid, bytes, render_hash))
+}
+
+/// Built without the `executor` feature, no `BlockExecutor` exists, so this is never reached.
+#[cfg(not(feature = "executor"))]
+async fn exec_receipt(
+    _ctx: &IngestContext,
+    executor: &Arc<crate::executor::BlockExecutor>,
+    _input: text_block::Input,
+    _block_cid: &str,
+    _record: crate::ingest_record::IngestRecord,
+) -> Result<StoredReceipt, IngestError> {
+    match **executor {}
 }
 
 /// The receipt of a landed `text-render` block, whatever happens while rendering it.
@@ -1619,6 +1680,7 @@ thread_local! {
 /// `render` parks on a condvar for a concurrency slot and then runs the guest on the same thread.
 /// Execution is bounded by the epoch deadline; the slot wait is not, so running it inline could
 /// park enough workers to stall the tasks that would free slots.
+#[cfg(feature = "executor")]
 async fn run_text_render(
     executor: &Arc<crate::executor::BlockExecutor>,
     invocation: jig_runtime::component::Invocation,
@@ -1662,6 +1724,15 @@ async fn check_text_render(
         .ok_or_else(|| IngestError::NoExecutor {
             kind: BlockKind::TextRender.as_str().to_string(),
         })?;
+    check_render_complete(executor, input, block_cid).await
+}
+
+#[cfg(feature = "executor")]
+async fn check_render_complete(
+    executor: &Arc<crate::executor::BlockExecutor>,
+    input: &text_block::Input,
+    block_cid: &str,
+) -> Result<(), IngestError> {
     let run = run_text_render(
         executor,
         crate::executor::text_invocation(input, block_cid.to_string(), 0),
@@ -1674,6 +1745,16 @@ async fn check_text_render(
         });
     }
     Ok(())
+}
+
+/// Built without the `executor` feature, no `BlockExecutor` exists, so this is never reached.
+#[cfg(not(feature = "executor"))]
+async fn check_render_complete(
+    executor: &Arc<crate::executor::BlockExecutor>,
+    _input: &text_block::Input,
+    _block_cid: &str,
+) -> Result<(), IngestError> {
+    match **executor {}
 }
 
 fn stored_receipt(
@@ -3911,6 +3992,59 @@ mod tests {
         .expect("role-assign on an mls channel");
     }
 
+    /// Sequence the owner's `role-unassign` of `admin` between the next
+    /// block's write gate and its landing. Says whether it ran.
+    fn unassign_before_landing(
+        ctx: &IngestContext,
+        owner: &Person,
+        admin: &Person,
+        chan: &str,
+    ) -> std::rc::Rc<std::cell::Cell<bool>> {
+        let (mb, cb, sig) = signed_parts(
+            &owner.key,
+            BlockKind::RoleUnassign,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
+        );
+        let unassign = StoredBlock {
+            cid: crate::ingest_record::label_cid("unassign in the window"),
+            channel_id: Some(chan.to_string()),
+            block_kind: "role-unassign".to_string(),
+            sender_did: owner.did.clone(),
+            sender_sig: sig,
+            bundle_bytes: serde_json::to_vec(&(&mb, &cb)).unwrap(),
+            is_synthetic: true,
+            hlc_wall_ms: 0,
+            hlc_logical: 0,
+            hlc_origin: String::new(),
+            posted_at: 0,
+            origin_server: String::new(),
+            federated_from: None,
+        };
+        let store = ctx.store.clone();
+        let key = ctx.server_key.clone();
+        let channel_id = chan.to_string();
+        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+        let ran_in_hook = ran.clone();
+        super::BEFORE_LANDING.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                ran_in_hook.set(true);
+                store
+                    .insert_block_sequenced(
+                        &unassign,
+                        &crate::ingest_record::RecordSigner {
+                            channel_id,
+                            key: &key,
+                            ingest_wall_ms: 0,
+                            ingest_logical: 0,
+                        },
+                    )
+                    .unwrap();
+            }));
+        });
+        ran
+    }
+
     /// The rights check is atomic with sequencing (JEP-0005 rule 7b): an
     /// admin's member-add passes the write gate, then a role-unassign for
     /// that admin is sequenced before the add lands. The landing transaction
@@ -3940,48 +4074,7 @@ mod tests {
 
         // The interleaving: between the gate and the landing, the owner's
         // role-unassign is sequenced.
-        let (mb, cb, sig) = signed_parts(
-            &owner.key,
-            BlockKind::RoleUnassign,
-            jig_core::EncryptionSuite::Unencrypted,
-            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
-        );
-        let unassign = StoredBlock {
-            cid: crate::ingest_record::label_cid("unassign in the window"),
-            channel_id: Some(chan.clone()),
-            block_kind: "role-unassign".to_string(),
-            sender_did: owner.did.clone(),
-            sender_sig: sig,
-            bundle_bytes: serde_json::to_vec(&(&mb, &cb)).unwrap(),
-            is_synthetic: true,
-            hlc_wall_ms: 0,
-            hlc_logical: 0,
-            hlc_origin: String::new(),
-            posted_at: 0,
-            origin_server: String::new(),
-            federated_from: None,
-        };
-        let store = ctx.store.clone();
-        let key = ctx.server_key.clone();
-        let channel_id = chan.clone();
-        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
-        let ran_in_hook = ran.clone();
-        super::BEFORE_LANDING.with(|h| {
-            *h.borrow_mut() = Some(Box::new(move || {
-                ran_in_hook.set(true);
-                store
-                    .insert_block_sequenced(
-                        &unassign,
-                        &crate::ingest_record::RecordSigner {
-                            channel_id,
-                            key: &key,
-                            ingest_wall_ms: 0,
-                            ingest_logical: 0,
-                        },
-                    )
-                    .unwrap();
-            }));
-        });
+        let ran = unassign_before_landing(&ctx, &owner, &admin, &chan);
 
         let add = plain(
             &ctx,
@@ -4260,6 +4353,232 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    // ---- The share flow's blocks (JEP-0005 rules 7-11) --------------------
+
+    /// A share needs the `share` right at its position in the chain, and only
+    /// the channel's sequencer, this server, records what came of it.
+    #[tokio::test]
+    async fn a_share_needs_the_right_and_only_the_sequencer_records_the_contract() {
+        use base64::Engine as _;
+        use jig_core::contract::{ContractAccept, ContractOffer, Grant, ManifestRef};
+        let ctx = test_ctx_allowing(&[
+            "channel-create",
+            "role-assign",
+            "channel-share",
+            "channel-unshare",
+            "contract-accept",
+        ]);
+        let owner = person();
+        let admin = person();
+        let follower = random_signing_key();
+        let follower_did = did_of(&follower);
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#shared"}),
+        )
+        .await
+        .unwrap();
+        let share = serde_json::json!({"channel_id": chan, "to": follower_did, "grant": "write"});
+
+        let before = plain(&ctx, &admin, BlockKind::ChannelShare, share.clone()).await;
+        assert!(
+            matches!(before, Err(IngestError::MissingRight { ref right, .. }) if right == "share"),
+            "no role yet: {before:?}"
+        );
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::RoleAssign,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
+        )
+        .await
+        .unwrap();
+        plain(&ctx, &admin, BlockKind::ChannelShare, share)
+            .await
+            .expect("an admin holds the share right");
+        let unnamed = plain(
+            &ctx,
+            &admin,
+            BlockKind::ChannelUnshare,
+            serde_json::json!({"channel_id": chan}),
+        )
+        .await;
+        assert!(
+            matches!(unnamed, Err(IngestError::BadContractBlock { .. })),
+            "an unshare names its server: {unnamed:?}"
+        );
+
+        // The record of the follower's accept, signed by this server.
+        let channel_id = chan.parse::<cid::Cid>().unwrap();
+        let offer = ContractOffer::sign(
+            &ctx.server_key,
+            &follower_did,
+            channel_id,
+            Grant::Write,
+            vec![],
+            vec![],
+            ManifestRef {
+                cid: channel_id,
+                seq: 1,
+            },
+            vec![],
+        );
+        let accept = ContractAccept::sign(
+            &follower,
+            &offer,
+            ManifestRef {
+                cid: channel_id,
+                seq: 2,
+            },
+            vec![],
+            vec![],
+        );
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let record = serde_json::json!({
+            "channel_id": chan,
+            "to": follower_did,
+            "offer": b64(&offer.envelope),
+            "accept": b64(&accept.envelope),
+        });
+        let by_owner = plain(&ctx, &owner, BlockKind::ContractAccept, record.clone()).await;
+        assert!(
+            matches!(by_owner, Err(IngestError::SequencerOnly { .. })),
+            "the channel's owner is not its sequencer: {by_owner:?}"
+        );
+        let (mb, cb, sig) = signed_parts(
+            &ctx.server_key,
+            BlockKind::ContractAccept,
+            jig_core::EncryptionSuite::Unencrypted,
+            record,
+        );
+        do_ingest(&ctx, mb, cb, sig, IngestSource::AdminEndpoint)
+            .await
+            .expect("the sequencer records the accept");
+    }
+
+    /// The share right is guarded at landing like `membership`: an admin
+    /// unassigned between the gate and the landing shares nothing.
+    #[tokio::test]
+    async fn a_share_right_taken_away_before_landing_refuses_the_share() {
+        let ctx = test_ctx_allowing(&[
+            "channel-create",
+            "role-assign",
+            "role-unassign",
+            "channel-share",
+        ]);
+        let owner = person();
+        let admin = person();
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#team"}),
+        )
+        .await
+        .unwrap();
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::RoleAssign,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
+        )
+        .await
+        .unwrap();
+        let ran = unassign_before_landing(&ctx, &owner, &admin, &chan);
+        let to = did_of(&random_signing_key());
+        let share = plain(
+            &ctx,
+            &admin,
+            BlockKind::ChannelShare,
+            serde_json::json!({"channel_id": chan, "to": to, "grant": "read"}),
+        )
+        .await;
+        assert!(ran.get(), "the share passed the write gate's early check");
+        assert!(
+            matches!(share, Err(IngestError::MissingRight { ref right, .. }) if right == "share"),
+            "the share must be refused at landing; got {share:?}"
+        );
+        let chain = ctx.store.list_ingest_records_by_id(&chan, 0, 50).unwrap();
+        assert_eq!(chain.len(), 3, "create, assign, and the unassign: no share");
+    }
+
+    /// What a share discloses (JEP-0005 Security Considerations, PV-05). On a
+    /// restricted MLS channel the server reads a share's `{to, grant}`, which
+    /// it needs to make the offer, and nothing of the content around it: an
+    /// application message on the same channel stays ciphertext to it. A
+    /// share cannot be sent encrypted instead, since the server must read it.
+    #[tokio::test]
+    async fn a_share_on_an_encrypted_channel_discloses_its_target_and_grant_only() {
+        let ctx = test_ctx_allowing(&[
+            "channel-create",
+            "member-add",
+            "text-render",
+            "channel-share",
+        ]);
+        let owner = person();
+        let bob = person();
+        let gid = create_sealed(&ctx, &owner).await;
+        add_to_sealed(&ctx, &owner, &bob, &gid).await;
+        let to = did_of(&random_signing_key());
+
+        let share = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelShare,
+            serde_json::json!({"channel": "#sealed", "to": to, "grant": "write"}),
+        )
+        .await
+        .expect("a share is a plaintext control block on an mls channel");
+        let stored = ctx.store.get_block(&share).unwrap().unwrap();
+        let (manifest_bytes, _): (Vec<u8>, Vec<u8>) =
+            serde_json::from_slice(&stored.bundle_bytes).unwrap();
+        let manifest: BlockManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(
+            crate::contracts::share_request(BlockKind::ChannelShare, &manifest).unwrap(),
+            crate::contracts::ShareRequest {
+                to: to.clone(),
+                grant: Some(jig_core::contract::Grant::Write),
+            },
+            "the server reads the target and the grant"
+        );
+        let mut keys: Vec<_> = manifest.metadata.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, ["channel", "grant", "to"], "and nothing else");
+
+        let (msg, _) = owner.mls.encrypt(&gid, b"the plan").unwrap();
+        let post = submit(
+            &ctx,
+            &owner,
+            BlockKind::TextRender,
+            jig_core::EncryptionSuite::Mls,
+            serde_json::json!({"channel": "#sealed", "mls_message": b64(&msg)}),
+        )
+        .await
+        .unwrap();
+        let stored = ctx.store.get_block(&post).unwrap().unwrap();
+        assert!(
+            !String::from_utf8_lossy(&stored.bundle_bytes).contains("the plan"),
+            "the content around it stays ciphertext"
+        );
+
+        let (sealed_share, _) = owner.mls.encrypt(&gid, b"{}").unwrap();
+        let hidden = submit(
+            &ctx,
+            &owner,
+            BlockKind::ChannelShare,
+            jig_core::EncryptionSuite::Mls,
+            serde_json::json!({"channel": "#sealed", "to": to, "grant": "read",
+                "mls_message": b64(&sealed_share)}),
+        )
+        .await;
+        assert!(
+            matches!(hidden, Err(IngestError::SuiteMismatch { .. })),
+            "a share the server cannot read is refused: {hidden:?}"
         );
     }
 }
