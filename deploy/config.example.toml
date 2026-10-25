@@ -122,13 +122,21 @@ replay_capacity = 100000
 # Reputation is ruleset-scoped: a floor names its ruleset, and a DID with no
 # score under it is UNKNOWN for it — decided by `unknown_dids`, never by the
 # number. `unknown_dids = "refuse"` plus `records` is a members-only server.
-# `unknown_dids = "proof-of-work"` admits a new DID once it has done `pow_bits`
-# of work for this server (`POST /api/v1/admission`; the CLI does it on first
-# contact). Each bit doubles the cost; 20 is under a second on a laptop and
-# much less on a GPU, so it is a speed bump for identity floods, not a wall.
+# `unknown_dids = "proof-of-work"` admits a new DID once it has done the work
+# this server asks (`POST /api/v1/admission`; the CLI does it on first
+# contact). The effort is at least `min_effort` (expected hashes; 2^20 is under
+# a second on a laptop and much less on a GPU, so a speed bump for identity
+# floods, not a wall). Under a flood of new DIDs it doubles each window, up to
+# `max_effort`, and decays back when the flood stops. `min_effort = 0` asks no
+# work at all while the server is quiet. `pow_bits` (legacy, one release) is
+# `min_effort = 2^pow_bits`.
 [auth.admission]
 unknown_dids = "admit"
-# pow_bits = 20
+# min_effort = 1048576
+# max_effort = 16777216
+# controller_window_secs = 60
+# controller_target = 100
+# controller_start_effort = 65536
 banned_dids = []
 # [[auth.admission.floors]]
 # ruleset_key = "jig.highsec.v1"
