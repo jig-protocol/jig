@@ -153,6 +153,108 @@ impl ManifestRef {
     }
 }
 
+/// A name suffix a server attests, with the authority it attests it under
+/// (JEP-0004 rules 4 and 7), so two servers can tell one claim from two.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AttestedSuffix {
+    /// A normalised name suffix.
+    pub suffix: String,
+    pub authority: SuffixAuthority,
+}
+
+/// What a suffix's attestations rest on.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SuffixAuthority {
+    /// `config`: the DIDs a delegation names, canonical, sorted and distinct.
+    Config { authorities: Vec<String> },
+    /// `dns`: the DNS name whose zone roots the suffix.
+    Dns { domain: String },
+}
+
+impl AttestedSuffix {
+    /// A `config`-rooted suffix under `authorities`, in their canonical order.
+    pub fn config(
+        suffix: impl Into<String>,
+        authorities: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let mut authorities: Vec<String> = authorities.into_iter().collect();
+        authorities.sort();
+        authorities.dedup();
+        Self {
+            suffix: suffix.into(),
+            authority: SuffixAuthority::Config { authorities },
+        }
+    }
+
+    /// A `dns`-rooted suffix under `domain`.
+    pub fn dns(suffix: impl Into<String>, domain: impl Into<String>) -> Self {
+        Self {
+            suffix: suffix.into(),
+            authority: SuffixAuthority::Dns {
+                domain: domain.into(),
+            },
+        }
+    }
+
+    /// The two claim one suffix under different authorities: the contract
+    /// MUST be refused (`SUFFIX_CONFLICT`, JEP-0004 rule 7). The same suffix
+    /// under the same authority is one claim, and no conflict.
+    pub fn conflicts_with(&self, other: &AttestedSuffix) -> bool {
+        self.suffix == other.suffix && self.authority != other.authority
+    }
+
+    fn value(&self) -> Value {
+        match &self.authority {
+            SuffixAuthority::Config { authorities } => Value::text_map([
+                ("suffix", Value::text(self.suffix.clone())),
+                ("root", Value::text("config")),
+                ("authorities", texts(authorities)),
+            ]),
+            SuffixAuthority::Dns { domain } => Value::text_map([
+                ("suffix", Value::text(self.suffix.clone())),
+                ("root", Value::text("dns")),
+                ("domain", Value::text(domain.clone())),
+            ]),
+        }
+    }
+
+    fn read(v: &Value, what: &'static str) -> Result<Self, ContractError> {
+        let suffix = text(v, "suffix", what)?;
+        let bad = || ContractError::BadSuffix(suffix.clone());
+        if !is_suffix(&suffix) {
+            return Err(bad());
+        }
+        let entry = match text(v, "root", what)?.as_str() {
+            "config" => {
+                let authorities = array(v, "authorities", what)?
+                    .iter()
+                    .map(|a| a.as_text().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or(ContractError::BadPayload(what))?;
+                // One spelling for one set: canonical DIDs, ascending, none twice.
+                let canonical = authorities.iter().all(|a| is_canonical_did(a))
+                    && authorities.windows(2).all(|w| w[0] < w[1]);
+                if authorities.is_empty() || !canonical {
+                    return Err(bad());
+                }
+                Self::config(suffix.clone(), authorities)
+            }
+            "dns" => {
+                let domain = text(v, "domain", what)?;
+                if !is_suffix(&domain) {
+                    return Err(bad());
+                }
+                Self::dns(suffix.clone(), domain)
+            }
+            // `contract` roots come in v0.3; no other root exists.
+            _ => return Err(bad()),
+        };
+        // Exactly these fields: the re-encoding is compared with the signed
+        // bytes, which refuses any other key.
+        Ok(entry)
+    }
+}
+
 /// The owning server's offer of a channel to another server (rule 7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractOffer {
@@ -171,9 +273,10 @@ pub struct ContractOffer {
     /// The owner's current `ingest` head (JEP-0002), as it travels.
     pub ingest_head: Vec<u8>,
     pub manifest: ManifestRef,
-    /// The `config`-rooted suffixes the owner attests, never published
-    /// elsewhere (JEP-0004 rule 7).
-    pub private_suffixes: Vec<String>,
+    /// The suffixes the owner attests, each with its authority. A
+    /// `config`-rooted one is disclosed only here and in an accept, never
+    /// published (JEP-0004 rule 7).
+    pub private_suffixes: Vec<AttestedSuffix>,
     /// `owner`'s COSE_Sign1 over [`ContractOffer::payload`].
     pub envelope: Vec<u8>,
 }
@@ -191,7 +294,7 @@ impl ContractOffer {
             ("creation_block", Value::Bytes(self.creation_block.clone())),
             ("ingest_head", Value::Bytes(self.ingest_head.clone())),
             ("manifest", self.manifest.value()),
-            ("private_suffixes", texts(&self.private_suffixes)),
+            ("private_suffixes", suffix_values(&self.private_suffixes)),
         ]
     }
 
@@ -216,7 +319,7 @@ impl ContractOffer {
         creation_block: Vec<u8>,
         ingest_head: Vec<u8>,
         manifest: ManifestRef,
-        private_suffixes: Vec<String>,
+        private_suffixes: Vec<AttestedSuffix>,
     ) -> Self {
         let mut offer = Self {
             offer_id: [0; 32],
@@ -275,7 +378,8 @@ pub struct ContractAccept {
     /// The channel's sequencer, as the accepting server understands it.
     pub sequencer: String,
     pub manifest: ManifestRef,
-    pub private_suffixes: Vec<String>,
+    /// The suffixes the accepting server attests, each with its authority.
+    pub private_suffixes: Vec<AttestedSuffix>,
     /// On a sequencer move, the bot DIDs the new sequencer minted (rule
     /// 11a); otherwise empty.
     pub bot_dids: Vec<String>,
@@ -294,7 +398,7 @@ impl ContractAccept {
             ("offer_id", Value::Bytes(self.offer_id.to_vec())),
             ("sequencer", Value::text(self.sequencer.clone())),
             ("manifest", self.manifest.value()),
-            ("private_suffixes", texts(&self.private_suffixes)),
+            ("private_suffixes", suffix_values(&self.private_suffixes)),
             ("bot_dids", texts(&self.bot_dids)),
         ]))
     }
@@ -304,7 +408,7 @@ impl ContractAccept {
         server_key: &SigningKey,
         offer: &ContractOffer,
         manifest: ManifestRef,
-        private_suffixes: Vec<String>,
+        private_suffixes: Vec<AttestedSuffix>,
         bot_dids: Vec<String>,
     ) -> Self {
         let mut accept = Self {
@@ -527,18 +631,35 @@ fn cid(map: &Value, key: &str, what: &'static str) -> Result<Cid, ContractError>
     canonical_cid::from_bytes(&bytes(map, key, what)?).map_err(|_| ContractError::BadCid(what))
 }
 
-/// `private_suffixes`: each a normalised name suffix.
-fn suffixes(map: &Value, what: &'static str) -> Result<Vec<String>, ContractError> {
-    array(map, "private_suffixes", what)?
+/// `private_suffixes`: attested suffixes, each named once.
+fn suffixes(map: &Value, what: &'static str) -> Result<Vec<AttestedSuffix>, ContractError> {
+    let entries = array(map, "private_suffixes", what)?
         .iter()
-        .map(|v| {
-            let s = v.as_text().ok_or(ContractError::BadPayload(what))?;
-            match Name::parse(&format!("a@{s}")) {
-                Ok(n) if n.suffix == s => Ok(s.to_string()),
-                _ => Err(ContractError::BadSuffix(s.to_string())),
-            }
-        })
-        .collect()
+        .map(|v| AttestedSuffix::read(v, what))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (i, entry) in entries.iter().enumerate() {
+        if entries[..i].iter().any(|e| e.suffix == entry.suffix) {
+            return Err(ContractError::BadSuffix(entry.suffix.clone()));
+        }
+    }
+    Ok(entries)
+}
+
+fn suffix_values(entries: &[AttestedSuffix]) -> Value {
+    Value::Array(entries.iter().map(AttestedSuffix::value).collect())
+}
+
+/// A normalised name suffix, as a name's part after `@` parses.
+fn is_suffix(s: &str) -> bool {
+    matches!(Name::parse(&format!("a@{s}")), Ok(n) if n.suffix == s)
+}
+
+/// `did` is a did:jig in its canonical spelling.
+fn is_canonical_did(did: &str) -> bool {
+    Did::from_did_jig_string(did)
+        .ok()
+        .and_then(|d| d.as_bytes().ok())
+        .is_some_and(|key| Did::from_ed25519_pubkey(&key).to_did_jig_string() == did)
 }
 
 /// Open `envelope`, decode its payload and check its `domain`. The caller
@@ -587,7 +708,10 @@ mod tests {
             b"channel-create".to_vec(),
             b"ingest head".to_vec(),
             manifest(3),
-            vec!["internal.example".into()],
+            vec![AttestedSuffix::config(
+                "internal.example",
+                [did_of(&key(1))],
+            )],
         )
     }
 
@@ -746,20 +870,131 @@ mod tests {
         );
     }
 
+    /// Re-sign `o` with `entries` as its `private_suffixes`, as raw values.
+    fn with_suffix_values(mut o: ContractOffer, entries: Vec<Value>) -> Vec<u8> {
+        let mut fields = o.fields();
+        for (k, v) in fields.iter_mut() {
+            if *k == "private_suffixes" {
+                *v = Value::Array(entries.clone());
+            }
+        }
+        o.offer_id = *blake3::hash(&encode(Value::text_map(fields.clone()))).as_bytes();
+        fields.push(("offer_id", Value::Bytes(o.offer_id.to_vec())));
+        cose::sign1(&key(1), &encode(Value::text_map(fields)))
+    }
+
     #[test]
-    fn private_suffixes_must_be_normalised_suffixes() {
-        let mut o = offer(Grant::Write);
-        for bad in ["Internal.Example", "a@b", "", "x..y"] {
-            o.private_suffixes = vec![bad.into()];
-            let unidentified = o.unidentified();
-            o.offer_id = *blake3::hash(&unidentified).as_bytes();
-            let envelope = cose::sign1(&key(1), &o.payload());
+    fn private_suffixes_carry_one_authority_each() {
+        let (a, b) = (did_of(&key(1)), did_of(&key(2)));
+        let (low, high) = if a < b { (a, b) } else { (b, a) };
+        let config = |suffix: &str, dids: Vec<&str>| {
+            Value::text_map([
+                ("suffix", Value::text(suffix)),
+                ("root", Value::text("config")),
+                (
+                    "authorities",
+                    Value::Array(dids.into_iter().map(Value::text).collect()),
+                ),
+            ])
+        };
+        let dns = |suffix: &str, domain: &str| {
+            Value::text_map([
+                ("suffix", Value::text(suffix)),
+                ("root", Value::text("dns")),
+                ("domain", Value::text(domain)),
+            ])
+        };
+        let open = |entries| {
+            ContractOffer::from_envelope(&with_suffix_values(offer(Grant::Read), entries))
+        };
+
+        // Both roots round-trip.
+        let ok = open(vec![
+            config("internal.example", vec![&low, &high]),
+            dns("names.example.org", "names.example.org"),
+        ])
+        .unwrap();
+        assert_eq!(
+            ok.private_suffixes,
+            [
+                AttestedSuffix::config("internal.example", [high.clone(), low.clone()]),
+                AttestedSuffix::dns("names.example.org", "names.example.org"),
+            ]
+        );
+
+        // One spelling only: refused otherwise.
+        let upper = format!(
+            "did:jig:z{}",
+            low.strip_prefix("did:jig:z").unwrap().to_uppercase()
+        );
+        for (entries, suffix) in [
+            (
+                vec![config("Internal.Example", vec![&low])],
+                "Internal.Example",
+            ),
+            (vec![config("x..y", vec![&low])], "x..y"),
+            (vec![config("internal.example", vec![])], "internal.example"),
+            (
+                vec![config("internal.example", vec![&high, &low])],
+                "internal.example",
+            ),
+            (
+                vec![config("internal.example", vec![&low, &low])],
+                "internal.example",
+            ),
+            (
+                vec![config("internal.example", vec![&upper])],
+                "internal.example",
+            ),
+            (
+                vec![dns("names.example.org", "Names.Example.org")],
+                "names.example.org",
+            ),
+            (
+                vec![Value::text_map([
+                    ("suffix", Value::text("internal.example")),
+                    ("root", Value::text("contract")),
+                ])],
+                "internal.example",
+            ),
+            (
+                vec![
+                    config("internal.example", vec![&low]),
+                    dns("internal.example", "internal.example"),
+                ],
+                "internal.example",
+            ),
+        ] {
             assert_eq!(
-                ContractOffer::from_envelope(&envelope),
-                Err(ContractError::BadSuffix(bad.into())),
-                "{bad}"
+                open(entries),
+                Err(ContractError::BadSuffix(suffix.into())),
+                "{suffix}"
             );
         }
+        // A bare string, as the format had before authorities.
+        assert_eq!(
+            open(vec![Value::text("internal.example")]),
+            Err(ContractError::BadPayload("contract offer"))
+        );
+        // A field past the root's own.
+        let mut extra = config("internal.example", vec![&low]);
+        if let Value::Map(m) = &mut extra {
+            m.push((Value::text("domain"), Value::text("internal.example")));
+        }
+        assert!(open(vec![extra]).is_err());
+    }
+
+    #[test]
+    fn a_suffix_conflicts_only_under_another_authority() {
+        let (a, b) = (did_of(&key(1)), did_of(&key(2)));
+        let ours = AttestedSuffix::config("acme", [a.clone(), b.clone()]);
+        assert!(!ours.conflicts_with(&AttestedSuffix::config("acme", [b.clone(), a.clone()])));
+        assert!(ours.conflicts_with(&AttestedSuffix::config("acme", [a.clone()])));
+        assert!(ours.conflicts_with(&AttestedSuffix::dns("acme", "acme")));
+        assert!(!ours.conflicts_with(&AttestedSuffix::config("other", [a])));
+        let dns = AttestedSuffix::dns("names.example.org", "names.example.org");
+        assert!(!dns.conflicts_with(&dns.clone()));
+        assert!(dns.conflicts_with(&AttestedSuffix::dns("names.example.org", "example.org")));
     }
 
     fn vectors() -> serde_json::Value {
@@ -775,13 +1010,22 @@ mod tests {
                 cid: canonical_cid::of(b"owner manifest"),
                 seq: 3,
             },
-            vec!["internal.example".into()],
+            vec![AttestedSuffix::config("internal.example", [did_of(&owner)])],
         );
         let follower_manifest = ManifestRef {
             cid: canonical_cid::of(b"follower manifest"),
             seq: 9,
         };
-        let a = ContractAccept::sign(&follower, &o, follower_manifest, vec![], vec![]);
+        let a = ContractAccept::sign(
+            &follower,
+            &o,
+            follower_manifest,
+            vec![AttestedSuffix::dns(
+                "names.example.org",
+                "names.example.org",
+            )],
+            vec![],
+        );
         let r = ContractRefuse::sign(&follower, &o, RefuseCode::UnsupportedSuite);
         let e = ContractEnd::sign(&follower, o.channel_id, o.offer_id);
         serde_json::json!({

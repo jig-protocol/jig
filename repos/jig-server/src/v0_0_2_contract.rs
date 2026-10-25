@@ -15,10 +15,10 @@
 //! - `NOT_A_PEER`: the owner is not a configured peer;
 //! - `UNSUPPORTED_SUITE`: the channel's suite is not one this server carries.
 //!   There is no fallback (rule 9);
-//! - `SUFFIX_CONFLICT`: the owner privately attests a suffix this server
-//!   attests too. Its private suffixes are `config`-rooted and this server's
-//!   attested suffixes are `dns`-rooted, so the two claims are under
-//!   different authorities;
+//! - `SUFFIX_CONFLICT`: the owner attests a suffix this server attests too,
+//!   under a different authority (JEP-0004 rule 7). Each side lists the
+//!   suffixes it attests, each with its authority, so one suffix under one
+//!   authority is no conflict;
 //! - `POLICY_REFUSED`: the offer's creation block is not the channel's, or
 //!   names another sequencer.
 //!
@@ -43,7 +43,8 @@ use cid::Cid;
 use jig_config::v0_0_2_server::{FederationPeer, FederationSection, OfferPolicy};
 use jig_core::block_kind::BlockKind;
 use jig_core::contract::{
-    ContractAccept, ContractEnd, ContractOffer, ContractRefuse, Grant, ManifestRef, RefuseCode,
+    AttestedSuffix, ContractAccept, ContractEnd, ContractOffer, ContractRefuse, Grant, ManifestRef,
+    RefuseCode,
 };
 use jig_core::did::Did;
 use jig_core::{Author, BlockBundle, BlockManifest};
@@ -153,16 +154,31 @@ impl Contracts {
         })
     }
 
-    /// A suffix in `theirs` that this server attests too. Theirs are the
-    /// other side's private, `config`-rooted suffixes, and this server's are
-    /// `dns`-rooted, so a shared one is claimed under two authorities.
-    fn suffix_conflict(&self, theirs: &[String]) -> Option<String> {
-        theirs.iter().map(|s| s.to_lowercase()).find(|s| {
-            self.federation
-                .attested_suffixes
-                .iter()
-                .any(|a| a.suffix.to_lowercase() == *s)
-        })
+    /// The suffixes this server attests, as its contract messages list them:
+    /// its `[[federation.attested_suffixes]]`, each `dns`-rooted under its own
+    /// name. It attests no `config`-rooted suffix yet.
+    fn attested(&self) -> Vec<AttestedSuffix> {
+        let mut ours: Vec<AttestedSuffix> = self
+            .federation
+            .attested_suffixes
+            .iter()
+            .map(|a| {
+                let suffix = a.suffix.to_lowercase();
+                AttestedSuffix::dns(suffix.clone(), suffix)
+            })
+            .collect();
+        // `validate` refuses a repeated suffix; a message names each once.
+        ours.dedup_by(|a, b| a.suffix == b.suffix);
+        ours
+    }
+
+    /// A suffix in `theirs` that this server attests under another authority.
+    fn suffix_conflict(&self, theirs: &[AttestedSuffix]) -> Option<String> {
+        let ours = self.attested();
+        theirs
+            .iter()
+            .find(|t| ours.iter().any(|o| o.conflicts_with(t)))
+            .map(|t| t.suffix.clone())
     }
 
     /// Send `body` to `peer` on its live connection. A peer with none gets
@@ -257,7 +273,7 @@ impl Contracts {
             creation.bundle_bytes,
             head.encode(),
             self.manifest_ref()?,
-            Vec::new(),
+            self.attested(),
         );
         self.store().put_contract_offer(&StoredOffer {
             offer_id: offer.offer_id,
@@ -524,7 +540,7 @@ impl Contracts {
             &self.ctx.server_key,
             offer,
             self.manifest_ref()?,
-            Vec::new(),
+            self.attested(),
             Vec::new(),
         );
         self.store().move_contract_offer(
@@ -1274,7 +1290,7 @@ mod tests {
         follower: &AppState,
         owner: &SigningKey,
         (creation_block, channel_id): (Vec<u8>, Cid),
-        private_suffixes: &[&str],
+        private_suffixes: &[AttestedSuffix],
     ) -> ContractOffer {
         ContractOffer::sign(
             owner,
@@ -1287,7 +1303,7 @@ mod tests {
                 cid: channel_id,
                 seq: 0,
             },
-            private_suffixes.iter().map(|s| s.to_string()).collect(),
+            private_suffixes.to_vec(),
         )
     }
 
@@ -1332,15 +1348,34 @@ mod tests {
             answer_to(&contracts, &owner, &offer_to(&follower, &owner, suite, &[])).as_deref(),
             Some("UNSUPPORTED_SUITE")
         );
-        // A suffix the owner attests privately that this server attests too.
-        let suffix = offer_to(
+        // A suffix this server attests (`dns`, as `Names.Example.org`): the
+        // same claim from the owner is no conflict, and the same suffix under
+        // another authority is.
+        let same = offer_to(
+            &follower,
+            &owner,
+            creation(&owner, serde_json::json!({"v": 3})),
+            &[AttestedSuffix::dns(
+                "names.example.org",
+                "names.example.org",
+            )],
+        );
+        assert_eq!(
+            answer_to(&contracts, &owner, &same),
+            None,
+            "one claim, accepted"
+        );
+        let other = offer_to(
             &follower,
             &owner,
             creation(&owner, serde_json::json!({"v": 1})),
-            &["names.example.org"],
+            &[AttestedSuffix::config(
+                "names.example.org",
+                [did_of(&owner)],
+            )],
         );
         assert_eq!(
-            answer_to(&contracts, &owner, &suffix).as_deref(),
+            answer_to(&contracts, &owner, &other).as_deref(),
             Some("SUFFIX_CONFLICT")
         );
         // A creation block that is not the channel's, and one naming another
@@ -1432,7 +1467,7 @@ mod tests {
     /// The owner refuses an accept whose private suffixes it attests too: the
     /// contract is refused whichever side finds the conflict.
     #[tokio::test]
-    async fn an_accept_claiming_a_suffix_the_owner_attests_is_refused() {
+    async fn an_accept_claiming_the_owners_suffix_is_refused_only_under_another_authority() {
         let follower = SigningKey::from_bytes(&[9; 32]);
         let owner = state_with(
             vec![peer(
@@ -1455,55 +1490,72 @@ mod tests {
         .await
         .unwrap();
         let cid: Cid = channel.parse().unwrap();
-        let offer = ContractOffer::sign(
-            &owner.ingest_ctx.server_key,
-            &did_of(&follower),
-            cid,
-            Grant::Read,
-            vec![],
-            vec![],
-            ManifestRef { cid, seq: 1 },
-            vec![],
-        );
-        owner
-            .ingest_ctx
-            .store
-            .put_contract_offer(&StoredOffer {
-                offer_id: offer.offer_id,
-                channel_id: channel.clone(),
-                side: Side::Owner,
-                peer_did: did_of(&follower),
-                grant: Grant::Read,
-                state: OfferState::Offered,
-                offer: offer.envelope.clone(),
-                answer: None,
-                share_cid: None,
-            })
-            .unwrap();
-        let accept = ContractAccept::sign(
-            &follower,
-            &offer,
-            ManifestRef { cid, seq: 1 },
-            vec!["names.example.org".to_string()],
-            vec![],
-        );
-        let (out, _rx) = PeerSender::new(Did::from_ed25519_pubkey(
-            follower.verifying_key().as_bytes(),
-        ));
-        contracts
-            .on_peer_frame(out.peer(), ANSWER_FRAME, &accept.envelope, &out)
-            .unwrap();
-        let record = record_of(&owner, &channel, BlockKind::ContractRefuse).await;
-        assert_eq!(record.metadata["code"], "SUFFIX_CONFLICT");
-        assert_eq!(
+        // The follower claims the owner's suffix under another authority,
+        // then, on a second offer, under the same one.
+        for (grant, claim, state) in [
+            (
+                Grant::Read,
+                AttestedSuffix::config("names.example.org", [did_of(&follower)]),
+                OfferState::Refused,
+            ),
+            (
+                Grant::Write,
+                AttestedSuffix::dns("names.example.org", "names.example.org"),
+                OfferState::Accepted,
+            ),
+        ] {
+            let offer = ContractOffer::sign(
+                &owner.ingest_ctx.server_key,
+                &did_of(&follower),
+                cid,
+                grant,
+                vec![],
+                vec![],
+                ManifestRef { cid, seq: 1 },
+                vec![],
+            );
             owner
                 .ingest_ctx
                 .store
-                .get_contract_offer(&offer.offer_id)
-                .unwrap()
-                .unwrap()
-                .state,
-            OfferState::Refused
-        );
+                .put_contract_offer(&StoredOffer {
+                    offer_id: offer.offer_id,
+                    channel_id: channel.clone(),
+                    side: Side::Owner,
+                    peer_did: did_of(&follower),
+                    grant,
+                    state: OfferState::Offered,
+                    offer: offer.envelope.clone(),
+                    answer: None,
+                    share_cid: None,
+                })
+                .unwrap();
+            let accept = ContractAccept::sign(
+                &follower,
+                &offer,
+                ManifestRef { cid, seq: 1 },
+                vec![claim],
+                vec![],
+            );
+            let (out, _rx) = PeerSender::new(Did::from_ed25519_pubkey(
+                follower.verifying_key().as_bytes(),
+            ));
+            contracts
+                .on_peer_frame(out.peer(), ANSWER_FRAME, &accept.envelope, &out)
+                .unwrap();
+            let store = &owner.ingest_ctx.store;
+            eventually(&format!("the {grant:?} offer {state:?}"), || {
+                (store
+                    .get_contract_offer(&offer.offer_id)
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == state)
+                    .then_some(())
+            })
+            .await;
+        }
+        let record = record_of(&owner, &channel, BlockKind::ContractRefuse).await;
+        assert_eq!(record.metadata["code"], "SUFFIX_CONFLICT");
+        record_of(&owner, &channel, BlockKind::ContractAccept).await;
     }
 }

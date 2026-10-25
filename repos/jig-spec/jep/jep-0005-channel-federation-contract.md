@@ -106,8 +106,8 @@ Non-goals for v0.2:
    - the creation block;
    - the current `ingest` head (12);
    - the owner's current `server-manifest`, by CID and `seq` (16);
-   - any `config`-rooted suffixes the owner attests, which are never published (JEP-0004
-     rule 7).
+   - the name suffixes the owner attests, each with its authority (7c). A `config`-rooted
+     one is never published, and appears only in contract messages (JEP-0004 rule 7).
 
    Its payload is `{domain, owner, to, channel_id, grant, creation_block, ingest_head,
    manifest: {cid, seq}, private_suffixes, offer_id}`. `owner` is the signing server and
@@ -139,6 +139,17 @@ Non-goals for v0.2:
       is ordered in the `ingest` chain. From its `seq`, the owning server reads the old
       DID's roles and membership as the new DID's. The creator rule carries across the
       link. A link scoped to another channel, alias or contact moves nothing here.
+7c. `private_suffixes` lists every name suffix the signing server attests, each once, as one
+    of:
+    - `{suffix, root: "config", authorities}`: `authorities` is the delegation's DIDs, in
+      canonical form, sorted ascending and distinct, and never empty;
+    - `{suffix, root: "dns", domain}`: `domain` is the DNS name whose zone roots the suffix.
+
+    `suffix` and `domain` are normalised suffixes (JEP-0004 rule 1). There is no other root
+    in v0.2: a `contract` root comes in v0.3, and an entry in any other shape is refused.
+    Two entries name the same claim when their suffix, root and authority are equal. Each
+    side compares the other's list with its own, so it decides a conflict from the contract
+    messages alone, without fetching the other's manifest.
 8. The offered server MUST answer, signed by its DID, with exactly one of:
    - `contract-accept {server, channel_id, offer_id, sequencer, manifest, private_suffixes,
      bot_dids}`, where `server` is the signing server and `bot_dids` is empty except on a
@@ -146,12 +157,16 @@ Non-goals for v0.2:
      - `offer_id` names the exact offer accepted, under the follower's signature. An
        accept binds only the grant in that offer.
      - `manifest` names its current `server-manifest`.
-     - `private_suffixes` lists its `config`-rooted suffixes.
+     - `private_suffixes` lists the suffixes it attests, each with its authority (7c).
      - The accept states that the server implements the suite and will enforce the
        membership rule.
    - `contract-refuse {server, channel_id, offer_id, code}`, where `code` is one of `UNSUPPORTED_SUITE`,
-     `UNSUPPORTED_VERSION`, `POLICY_REFUSED`, `NOT_A_PEER` or `SUFFIX_CONFLICT` (the two
-     servers claim one name suffix under different authorities, JEP-0004).
+     `UNSUPPORTED_VERSION`, `POLICY_REFUSED`, `NOT_A_PEER` or `SUFFIX_CONFLICT`.
+     - `SUFFIX_CONFLICT`: the two servers claim one suffix under different authorities
+       (JEP-0004 rule 7): the same `suffix` with a different root, a different
+       `authorities` set or a different `domain`. The same suffix under the same
+       authority is one claim, and no conflict. The owner checks the accept's list the
+       same way, and refuses the contract on a conflict it finds.
 9. A server MUST refuse when it does not implement the suite. It MUST NOT fall back to
    another suite or relay plaintext.
 10. The owner MUST append each accept to the channel's log as a block, so members can see
@@ -344,7 +359,8 @@ In progress (milestone F2): the contract messages are `jig_core::contract`.
 `vectors/0005/vectors.json`: a `contract-offer` with its `offer_id`, and the
 `contract-accept`, `contract-refuse` and `contract-end` answering it, each as its
 deterministic payload and its `COSE_Sign1`, in hex, under fixed test keys. The offer's
-`creation_block` and `ingest_head` are placeholder bytes.
+`creation_block` and `ingest_head` are placeholder bytes. The offer lists one
+`config`-rooted suffix under the owner's DID, and the accept one `dns`-rooted suffix.
 
 To be added with F2:
 
