@@ -17,7 +17,7 @@ component-model = ["wasmtime/component-model"]
 thiserror = "2.0"
 
 # WASM Runtime
-wasmtime = { version = "49.0.2", features = ["cranelift", "pooling-allocator"] }
+wasmtime = { version = "50.0.0", features = ["cranelift", "pooling-allocator"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -32,7 +32,7 @@ jig-core = { path = "../jig-core" }
 [dev-dependencies]
 # Pulley, for tests/block_abi_vectors.rs, which runs every vector on both backends. Test builds
 # only: nothing in the shipped runtime selects Pulley yet.
-wasmtime = { version = "49.0.2", features = ["pulley"] }
+wasmtime = { version = "50.0.0", features = ["pulley"] }
 wat = "1.0"
 # For tests/text_block_component.rs, which runs the real canonical component.
 # text-block depends on no workspace crate, so this adds no cycle; jig-runtime
