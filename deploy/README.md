@@ -214,11 +214,11 @@ the root keys and every section in one file.
 | Check | Command | Expect |
 | --- | --- | --- |
 | Server liveness | `curl -k https://100.x.y.z:7117/healthz` | `200`, body `ok` |
-| Server identity | `curl -k https://100.x.y.z:7117/.well-known/jig` | `server_did`, `tls_binding` and `unsafe_options_active` |
+| Server identity | `curl -k https://100.x.y.z:7117/.well-known/jig` | `server_did` and `tls_binding`. `unsafe_options_active` is absent on a clean server and appears only when an unsafe option is on |
 | Server counters | `curl -k https://100.x.y.z:7117/metrics` | Prometheus text |
 | Channel list | `curl -k https://100.x.y.z:7117/api/v1/channels` | `401` `AUTH_REQUIRED` — reads are signed; use `jig channel list` instead |
 | Nameserver liveness | `curl -k https://100.x.y.z:7070/v1/health` | `{"status":"ok"}` |
-| Nameserver identity | `curl -k https://100.x.y.z:7070/.well-known/jig-ns` | `server_did`, `tls_binding` and `unsafe_options_active` |
+| Nameserver identity | `curl -k https://100.x.y.z:7070/.well-known/jig-ns` | `server_did`, `tls_binding`, and `unsafe_options_active`, which is always present and is `[]` on a clean nameserver |
 | Nameserver alias API | `curl -k https://100.x.y.z:7070/v1/challenge` | `{"challenge":"<64 hex>"}` |
 | Units | `systemctl status jig-server jig-nameserver` | both `active (running)` |
 
