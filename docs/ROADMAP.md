@@ -174,10 +174,11 @@ Since then, each in one or more PRs:
   runs through the suite registry, and `repos/jig-spec/vectors/suites/` holds vectors for
   `none`, `mls` and `test-aead`. MLS refuses every other ciphersuite before running its crypto
   (#303).
-- **The handshake (D11)**, slices 0 to 9 of the
-  [build plan](superpowers/plans/2026-10-18-d11-handshake-completion.md): close classes, a skew
-  bound, hash-chained `ingest` records, evidence and sticky refusals, the manifest log, a
-  mutual server-to-server handshake bound to the TLS session (#234), and name pins.
+- **The handshake (D11)**, slices 0 to 4 and 6 to 9 of the
+  [build plan](superpowers/plans/2026-10-18-d11-handshake-completion.md): close classes, plaintext
+  REST refused, a skew bound, hash-chained `ingest` records, evidence and sticky refusals, the
+  manifest log, a mutual server-to-server handshake bound to the TLS session (#234), and name
+  pins.
 - **Verified names (F1):** signed COSE attestations and per-suffix delegations, checked and
   pinned by the CLI.
 - **Keys at rest (I1):** identity keys, the MLS plaintext cache and the server's and
@@ -188,9 +189,9 @@ Since then, each in one or more PRs:
 - **Proof-of-work (R1):** one puzzle for nameserver registration and server admission; a
   nameserver prices registration by load and caps how fast strangers register (#248, #264, #266,
   #272). Admission proof-of-work stays off by default (D26).
-- **The federation contract (F2), Tasks 0 to 5** of the
-  [plan](superpowers/plans/2026-10-19-f2-channel-contract.md): channels keyed by CID, terms and
-  roles, signed contract messages, the peer policy in the server manifest, offers and answers,
+- **The federation contract (F2), Tasks 0a, 0b and 1 to 5** of the
+  [plan](superpowers/plans/2026-10-19-f2-channel-contract.md): channels keyed by CID in the store
+  and routes, terms and roles, signed contract messages, the peer policy in the server manifest, offers and answers,
   and the follower's stream (#309).
 - **One implementation of each thing:** the v0.0.1 store and `POST /blocks` route, both earlier
   block ABIs (#291, #299), the v0.2 receipt formats (#308) and the unused nameserver modules
@@ -202,19 +203,21 @@ Since then, each in one or more PRs:
 | --- | --- | --- |
 | 1 | The spec's privacy claims are true | Mostly. Each chapter's banner and the threat register's status column say what `main` implements (last re-checked in full on 2026-10-18; PRs since update the rows they change). Open channels are plaintext unless created `--encrypted`, and the spec says so |
 | 2 | The operator cannot read restricted content | Met (D25) |
-| 3 | A hostile operator's downgrade or false handshake is detected | Largely met: handshake slices 0 to 9 are merged; slice 10 (`sequencer-set`) lands with F2, and OP-01 and OP-02 still read Partial |
+| 3 | A hostile operator's downgrade or false handshake is detected | Largely met: the slices the D11 plan names for it (1, 3, 4a, 4b, 6, 7) are merged, as are 0, 2, 8 and 9. Slice 5 (`seen` and head gossip, so members compare chains) is not built, slice 10 (`sequencer-set`) lands with F2, and OP-01, OP-02 and TM-01 still read Partial |
 | 4 | Suites are pluggable, shown through the registry with conformance vectors | Met (#165) |
-| 5 | The federation contract is specified, and two jig servers federate an encrypted channel through it | Not met: F2 Tasks 6 to 11 remain (relayed writes, MLS across servers, custodians, sequencer moves, abuse defences, end to end) |
+| 5 | The federation contract is specified, and two jig servers federate an encrypted channel through it | Not met: F2 Tasks 6 to 11 remain (relayed writes, MLS across servers, custodians, sequencer moves, abuse defences, end to end), and Task 0c (clients address channels by `channel_id`) |
 | 6 | An external audit is scoped | Not started |
 
 Still to do in this phase:
 
-- **Federation (D12, D24), F2 Tasks 6 to 11:** writes relayed under grants, encrypted channels
+- **Federation (D12, D24), F2 Task 0c and Tasks 6 to 11:** clients that address channels by
+  `channel_id`, writes relayed under grants, encrypted channels
   across servers, key-package custodians, the contract half of a sequencer move, abuse defences
   on federation links, and the end-to-end test. Nameserver-led shared contracts for trusted
   subnets and ruleset groups follow. Federating with a differently built server comes after the
   MVP.
-- **Handshake slice 10 (`sequencer-set`)**, with F2, and the threat-register rows the D11 design
+- **Handshake slices 5 and 10:** `seen` and head gossip, so members compare chains and detect
+  omission (OP-06); `sequencer-set`, with F2. Then the threat-register rows the D11 design
   proposes for OP-01, OP-02 and TM-01.
 - Multi-device. One device per DID today.
 - ACME certificates for DNS-rooted suffixes.
