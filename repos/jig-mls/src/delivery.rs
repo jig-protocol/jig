@@ -11,9 +11,9 @@
 use openmls::messages::group_info::VerifiableGroupInfo;
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::{
-    GroupId, KeyPackageIn, MlsMessageBodyIn, MlsMessageIn, ProcessedMessageContent, ProposalStore,
-    ProposalType, ProtocolMessage, ProtocolVersion, PublicGroup, RatchetTreeIn, Sender,
-    StagedCommit,
+    Ciphersuite, GroupId, KeyPackageIn, MlsMessageBodyIn, MlsMessageIn, ProcessedMessageContent,
+    ProposalStore, ProposalType, ProtocolMessage, ProtocolVersion, PublicGroup, RatchetTreeIn,
+    Sender, StagedCommit,
 };
 use openmls_memory_storage::MemoryStorage;
 use openmls_rust_crypto::RustCrypto;
@@ -73,13 +73,6 @@ pub fn genesis(group_info: &[u8], ratchet_tree: &[u8], creator: &str) -> Result<
         ProposalStore::new(),
     )
     .map_err(rejected)?;
-    if group.ciphersuite() != crate::CIPHERSUITE {
-        return Err(MlsError::Rejected(format!(
-            "ciphersuite {:?} is not jig's {:?}",
-            group.ciphersuite(),
-            CIPHERSUITE
-        )));
-    }
     let epoch = group.group_context().epoch().as_u64();
     if epoch != 0 {
         return Err(MlsError::Rejected(format!(
@@ -234,16 +227,9 @@ pub fn group_info_epoch(group_info: &[u8]) -> Result<(Vec<u8>, u64)> {
 /// jig's ciphersuite, and bound to the DID whose key signed it.
 pub fn validate_key_package(bytes: &[u8]) -> Result<KeyPackageInfo> {
     let crypto = RustCrypto::default();
-    let package = KeyPackageIn::tls_deserialize_exact(bytes)
-        .map_err(malformed)?
+    let package = decode_key_package(bytes)?
         .validate(&crypto, ProtocolVersion::Mls10)
         .map_err(rejected)?;
-    if package.ciphersuite() != CIPHERSUITE {
-        return Err(MlsError::Rejected(format!(
-            "key package ciphersuite {:?} is not jig's",
-            package.ciphersuite()
-        )));
-    }
     let did = leaf_did(package.leaf_node())?;
     let reference = package.hash_ref(&crypto).map_err(internal)?;
     Ok(KeyPackageInfo {
@@ -269,13 +255,44 @@ fn load(state: &[u8], group_id: &[u8]) -> Result<(MemoryStorage, PublicGroup)> {
     Ok((storage, group))
 }
 
+/// Decode a group info, refusing any ciphersuite but jig's before its
+/// signature, or anything else in it, is checked.
 pub(crate) fn decode_group_info(bytes: &[u8]) -> Result<VerifiableGroupInfo> {
     match MlsMessageIn::tls_deserialize_exact(bytes)
         .map_err(malformed)?
         .extract()
     {
-        MlsMessageBodyIn::GroupInfo(info) => Ok(info),
+        MlsMessageBodyIn::GroupInfo(info) => {
+            require_ciphersuite(info.ciphersuite(), "group")?;
+            Ok(info)
+        }
         _ => Err(MlsError::Malformed("not an MLS group info".to_string())),
+    }
+}
+
+/// Decode a key package, refusing any ciphersuite but jig's before its
+/// signature is checked. openmls reads the ciphersuite only once it has
+/// verified the package, so it is taken from the encoding: RFC 9420 §10 puts
+/// it right after the two-byte protocol version.
+pub(crate) fn decode_key_package(bytes: &[u8]) -> Result<KeyPackageIn> {
+    let package = KeyPackageIn::tls_deserialize_exact(bytes).map_err(malformed)?;
+    let suite = u16::from_be_bytes([bytes[2], bytes[3]]);
+    let suite = Ciphersuite::try_from(suite).map_err(|_| {
+        MlsError::Rejected(format!("key package ciphersuite {suite:#06x} is not jig's"))
+    })?;
+    require_ciphersuite(suite, "key package")?;
+    Ok(package)
+}
+
+/// The one check every MLS structure jig is handed passes first: anything in
+/// another ciphersuite would run that suite's crypto (P-256, for one) on it.
+pub(crate) fn require_ciphersuite(suite: Ciphersuite, what: &str) -> Result<()> {
+    if suite == CIPHERSUITE {
+        Ok(())
+    } else {
+        Err(MlsError::Rejected(format!(
+            "{what} ciphersuite {suite:?} is not jig's {CIPHERSUITE:?}"
+        )))
     }
 }
 
