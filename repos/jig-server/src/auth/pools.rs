@@ -228,6 +228,36 @@ mod tests {
         );
     }
 
+    /// The guarantee rule 23 states: a member arriving while strangers hold
+    /// borrowed capacity is served at once from the reserved half of its
+    /// burst, and lending stops with that first request.
+    #[test]
+    fn a_member_arriving_mid_borrow_is_served_from_the_reserve_at_once() {
+        let t0 = Instant::now();
+        let pools = pools(t0);
+        // Strangers flood a quiet server and borrow members' capacity down
+        // to the reserve: 35 of members' 70.
+        assert_eq!(take_all(&pools, Pool::Stranger, t0), 20 + 5 + 35);
+        // A member burst arriving now: all 35 of the reserve, with no wait.
+        let t1 = t0 + ms(1);
+        for i in 0..35 {
+            assert!(pools.try_take(Pool::Member, t1), "member write {i} waited");
+        }
+        // Lending stopped at the first member request: strangers, still
+        // flooding, get only their own refill, none of members'.
+        let t2 = t1 + ms(500);
+        assert_eq!(
+            take_all(&pools, Pool::Stranger, t2),
+            10 + 5,
+            "own 10, invited's 5"
+        );
+        assert_eq!(
+            take_all(&pools, Pool::Member, t2),
+            35,
+            "members' own half-second refill"
+        );
+    }
+
     /// With no members and no invited at all, strangers get the whole
     /// capacity above the idle pools' reserves, so the pools cost a server
     /// without records nothing at a sustained rate.
