@@ -413,6 +413,7 @@ mod tests {
             prior_key_links: Vec::new(),
             peer_frames: Default::default(),
             peers: Default::default(),
+            relay: Default::default(),
         })
     }
 
