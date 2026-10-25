@@ -201,7 +201,7 @@ pub enum Side {
 }
 
 impl Side {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Side::Owner => "owner",
             Side::Follower => "follower",
@@ -234,6 +234,14 @@ pub enum OfferState {
     Superseded,
     /// Never answered, and taken back by a `channel-unshare`.
     Withdrawn,
+    /// Held, and the operator has decided to accept it: the running server
+    /// signs and sends the accept.
+    Accepting,
+    /// Held, and the operator has decided to refuse it.
+    Refusing,
+    /// A live share this side has decided to end. It stays here until the
+    /// signed end reaches the other side on a live connection.
+    Ending,
 }
 
 impl OfferState {
@@ -246,6 +254,9 @@ impl OfferState {
             OfferState::Ended => "ended",
             OfferState::Superseded => "superseded",
             OfferState::Withdrawn => "withdrawn",
+            OfferState::Accepting => "accepting",
+            OfferState::Refusing => "refusing",
+            OfferState::Ending => "ending",
         }
     }
 
@@ -258,6 +269,9 @@ impl OfferState {
             "ended" => OfferState::Ended,
             "superseded" => OfferState::Superseded,
             "withdrawn" => OfferState::Withdrawn,
+            "accepting" => OfferState::Accepting,
+            "refusing" => OfferState::Refusing,
+            "ending" => OfferState::Ending,
             _ => return None,
         })
     }
@@ -402,6 +416,18 @@ impl SqliteStore {
         }
         tx.commit()?;
         Ok(moved)
+    }
+
+    /// Every offer this server made or received, oldest first.
+    pub fn list_contract_offers(&self) -> crate::persist::Result<Vec<StoredOffer>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {OFFER_COLUMNS} FROM contract_offers ORDER BY rowid"
+        ))?;
+        let rows = stmt
+            .query_map([], offer_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Offers on `side` in `state`, oldest first.
