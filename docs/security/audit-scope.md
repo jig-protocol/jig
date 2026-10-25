@@ -488,8 +488,8 @@ Things on our side, in order:
 
 1. **Freeze a commit.** Tag it, and keep it buildable from a clean checkout with
    `rust-toolchain.toml` and `repos/Cargo.lock`.
-2. **Make the threat register's status cells true at that commit.** One row is known stale
-   today: AB-02 says the nameserver asks for no proof-of-work, and it has since #264.
+2. **Make the threat register's status cells true at that commit.** AB-02, which said the
+   nameserver asks for no proof-of-work, is corrected in #324.
 3. **Fix or remove the jig-runtime fuzz crate.** It does not build, and no CI job runs fuzzing.
    Firms will ask for working harnesses. A fuzz target for `decode_key_package`, `SignedReceipt::open`,
    COSE decoding and component validation would make the engagement cheaper.
