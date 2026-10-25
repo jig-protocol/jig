@@ -8,6 +8,23 @@ use crate::wasm_validation::{HostImportAllowlist, policy_from_constraints, verif
 
 const RAW_CODEC: u64 = 0x55;
 
+/// The most canonical bundle bytes one block may carry: the `bundle_bytes` a
+/// server stores, which a submission sends base64-encoded as `bundle_b64`.
+/// Transport size limits are derived from it ([`MAX_ENVELOPE_BYTES`]).
+pub const MAX_BUNDLE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Room for everything around the one base64-encoded bundle in the largest
+/// message that carries one: the JSON envelope, the author's signature, a
+/// `Block` frame's receipt and ingest record, or a contract offer's other
+/// fields.
+pub const ENVELOPE_OVERHEAD_BYTES: usize = 64 * 1024;
+
+/// The smallest request-body or WebSocket-message limit that still carries
+/// every block: one [`MAX_BUNDLE_BYTES`] bundle in base64, plus
+/// [`ENVELOPE_OVERHEAD_BYTES`]. A contract offer base64-encodes a message
+/// that embeds a creation block, which stays inside the same overhead.
+pub const MAX_ENVELOPE_BYTES: usize = MAX_BUNDLE_BYTES.div_ceil(3) * 4 + ENVELOPE_OVERHEAD_BYTES;
+
 /// Reference to an artifact that should be included when computing the block root.
 pub struct Artifact<'a> {
     pub label: &'a str,
