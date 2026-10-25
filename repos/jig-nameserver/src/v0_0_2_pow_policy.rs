@@ -79,6 +79,9 @@ struct State {
     queued_seen: bool,
     penalties: HashMap<String, Penalty>,
     stats: MarketStats,
+    /// Tests only: the pool does not refill ([`Market::hold`]).
+    #[cfg(feature = "test-support")]
+    held: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,6 +112,8 @@ impl Market {
                 queued_seen: false,
                 penalties: HashMap::new(),
                 stats: MarketStats::default(),
+                #[cfg(feature = "test-support")]
+                held: false,
             }),
             pow,
             pool,
@@ -309,7 +314,27 @@ impl Market {
         Duration::from_secs_f64(missing / rate)
     }
 
+    /// Tests only: while `held`, the pool does not refill, so a test can
+    /// keep it empty for as long as it needs. Releasing it refills it to
+    /// `burst` at once and wakes any request waiting for a token.
+    #[cfg(feature = "test-support")]
+    pub fn hold(&self, held: bool) {
+        let mut st = self.lock();
+        st.held = held;
+        if !held {
+            st.tokens = f64::from(self.pool.burst);
+            st.refilled = Instant::now();
+        }
+        drop(st);
+        self.changed.notify_waiters();
+    }
+
     fn refill(&self, st: &mut State, now: Instant) {
+        #[cfg(feature = "test-support")]
+        if st.held {
+            st.refilled = now;
+            return;
+        }
         let elapsed = now.saturating_duration_since(st.refilled).as_secs_f64();
         st.tokens = (st.tokens + elapsed * self.rate_per_sec()).min(f64::from(self.pool.burst));
         st.refilled = now;
@@ -393,6 +418,27 @@ mod tests {
             queue_wait_secs: 10,
             ..PoolPolicy::recommended()
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test(start_paused = true)]
+    async fn a_held_pool_does_not_refill_until_released() {
+        let m = Market::new(
+            pow(),
+            PoolPolicy {
+                queue_wait_secs: 0,
+                ..pool(3600, 1)
+            },
+        );
+        m.hold(true);
+        assert_eq!(m.admit(16).await, Ok(()), "the burst token");
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(
+            m.admit(16).await.is_err(),
+            "a minute at 3600/h refills nothing while held"
+        );
+        m.hold(false);
+        assert_eq!(m.admit(16).await, Ok(()), "released, the pool is full");
     }
 
     #[tokio::test(start_paused = true)]

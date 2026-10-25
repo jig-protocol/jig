@@ -72,6 +72,9 @@ libc = "0.2"
 
 [features]
 default = []
+# Test hooks (`SuffixPolicy::hold_pool`). Only integration-tests
+# enables it; ci.yml checks no release binary does.
+test-support = []
 # Profiling tools for performance analysis (not needed for core nameserver)
 profiling = ["dep:hdrhistogram", "dep:pprof"]
 

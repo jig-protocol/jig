@@ -89,6 +89,13 @@ impl Suffixes {
 }
 
 impl SuffixPolicy {
+    /// Tests only: hold this suffix's stranger pool empty of refills, or
+    /// release it full ([`Market::hold`]).
+    #[cfg(feature = "test-support")]
+    pub fn hold_pool(&self, held: bool) {
+        self.market.hold(held);
+    }
+
     fn from_config(cfg: &SuffixConfig) -> Result<Self> {
         jig_core::naming::Name::parse(&format!("x@{}", cfg.suffix)).with_context(|| {
             format!(
