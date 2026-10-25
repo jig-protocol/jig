@@ -348,9 +348,13 @@ async fn a_server_that_changes_its_key_twice_keeps_its_channels_log_and_clients(
             assert_eq!(signers.last(), Some(&third.as_str()), "{slug}");
         }
     }
-    let secret = read_secret(&server, &mls_server, &alice).await;
+    let decrypted = read_secret(&server, &mls_server, &alice).await;
     for text in ["sealed before", "sealed after one", "sealed after two"] {
-        assert!(secret.iter().any(|t| t == text), "{text} in {secret:?}");
+        // Only the expected text is named, never what was decrypted.
+        assert!(
+            decrypted.iter().any(|t| t == text),
+            "{text} does not decrypt"
+        );
     }
 
     // The manifest log goes on in the channel both devices pinned, each

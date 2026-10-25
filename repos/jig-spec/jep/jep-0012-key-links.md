@@ -224,7 +224,10 @@ refuse to sign a second link from an `old` to a different `new`.
   order, so whoever holds a key the server rotated away from cannot add to a channel's
   history after the newer key has signed in it. Before that point, on a channel a client
   has not read past the change, it can: the same exposure the old key had before the
-  change.
+  change. A client whose channel head was kept without its record (a pin written before
+  heads were kept whole) cannot tell which DID signed the head, so it applies the rule
+  only from the next record it accepts: until then an earlier key, given a path to that
+  client, can still append past the head.
 - **Replay.** A link is a statement of fact with no expiry. Showing it again changes
   nothing a verifier has not already acted on. `issued_at` orders links and lets a verifier
   apply its own age policy; it is not a validity window.
