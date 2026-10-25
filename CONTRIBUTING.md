@@ -2,6 +2,13 @@
 
 jig is pre-alpha. Read the status section of the [README](README.md) before you run a server anywhere reachable. v0.x has no compatibility guarantee.
 
+## Getting started
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) is a tour of the crates, the write path, identity, MLS, federation, the block runtime and the nameserver, and says where the specs and JEPs live.
+- [`scripts/dev-setup.sh`](scripts/dev-setup.sh) checks for the toolchain and tools CI uses; `scripts/dev-setup.sh --install` installs what is missing, and `--spec` adds the spec book's tools.
+- [`docs/OWNERSHIP.md`](docs/OWNERSHIP.md) says who reviews each area and what the review checks.
+- [`docs/GOOD_FIRST_CONTRIBUTIONS.md`](docs/GOOD_FIRST_CONTRIBUTIONS.md) lists small changes to start with.
+
 ## Code of conduct
 
 This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md). Report conduct issues to **dev@jig.onl**. Vulnerability reports go through [SECURITY.md](SECURITY.md), not that address.
@@ -33,12 +40,12 @@ Use the pull request template: what changed and why, a test plan, whether the sp
 
 ## Building and testing
 
-The Cargo workspace is [`repos/`](repos/), not the repository root. `rust-toolchain.toml` at the root is the toolchain CI uses; rustup installs it on its own.
+The Cargo workspace is [`repos/`](repos/), not the repository root. `rust-toolchain.toml` at the root is the toolchain CI uses, with the `wasm32-unknown-unknown` target; rustup installs it on its own. You also need a C compiler (SQLite is built from source), and `cargo-nextest`; `scripts/dev-setup.sh` checks for both.
 
 ```bash
 cd repos
-cargo build --workspace
-cargo nextest run --workspace
+CARGO_INCREMENTAL=0 cargo build --workspace
+CARGO_INCREMENTAL=0 cargo nextest run --workspace
 ```
 
 Each git worktree has its own `repos/target/`, which grows to tens of GB. `scripts/clean-build-artifacts.sh` lists the build output in every worktree of your clone, and deletes it with `--yes`. Agents working in this repository follow [AGENTS.md](AGENTS.md).
