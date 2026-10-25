@@ -191,6 +191,10 @@ pub enum Frame {
         /// to `server_did` (JEP-0012), base64 COSE_Sign.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key_link: Option<String>,
+        /// The admission work asked of a DID the server has not admitted
+        /// (JEP-0008 rule 15). Absent when it asks none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        admit: Option<crate::handshake::PowOffer>,
         /// base64 ed25519 over [`crate::handshake::WelcomeStatement::canonical_bytes`].
         sig: String,
     },
