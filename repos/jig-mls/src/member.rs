@@ -14,7 +14,7 @@
 use jig_core::Did;
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::{
-    Capabilities, CredentialWithKey, ExtensionType, GroupId, KeyPackage, KeyPackageIn, MlsGroup,
+    Capabilities, CredentialWithKey, ExtensionType, GroupId, KeyPackage, MlsGroup,
     MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProcessedMessageContent, ProtocolMessage,
     ProtocolVersion, Sender, StagedCommit, StagedWelcome,
 };
@@ -23,7 +23,7 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::OpenMlsProvider as _;
 
 use crate::credential::{bound_did, credential_for, leaf_did, signer_from_seed};
-use crate::delivery::decode_group_info;
+use crate::delivery::{decode_group_info, decode_key_package, require_ciphersuite};
 use crate::{CIPHERSUITE, MlsError, Result, internal, malformed, rejected, snapshot};
 
 pub struct Member {
@@ -210,8 +210,7 @@ impl Member {
     /// refused here rather than discovered later.
     pub fn add(&self, group_id: &[u8], key_package: &[u8], expected_did: &str) -> Result<Commit> {
         let mut group = self.load(group_id)?;
-        let package = KeyPackageIn::tls_deserialize_exact(key_package)
-            .map_err(malformed)?
+        let package = decode_key_package(key_package)?
             .validate(self.provider.crypto(), ProtocolVersion::Mls10)
             .map_err(rejected)?;
         let owner = leaf_did(package.leaf_node())?;
@@ -325,6 +324,7 @@ impl Member {
         else {
             return Err(MlsError::Malformed("not an MLS welcome".to_string()));
         };
+        require_ciphersuite(welcome.ciphersuite(), "welcome")?;
         let staged =
             StagedWelcome::new_from_welcome(&self.provider, &crate::join_config(), welcome, None)
                 .map_err(rejected)?;
