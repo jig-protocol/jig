@@ -41,7 +41,8 @@ pub enum TlsError {
     Fetch { url: String, reason: String },
     #[error(
         "{server} is not the server this device expects: it names itself {presented}, \
-         not {expected}"
+         not {expected}{}",
+        .rotated_past.as_ref().map(|r| format!("; {r}")).unwrap_or_default()
     )]
     OtherServer {
         server: String,
@@ -50,6 +51,11 @@ pub enum TlsError {
         /// The key link it served, base64, if any: one that does not move
         /// from `expected`, but may fork a link the caller already followed.
         key_link: Option<String>,
+        /// Set when that link moves to `presented` from another DID than
+        /// `expected`: the server changed its key more than once since it
+        /// was pinned, or is an impostor. Says so, and that re-pinning is
+        /// trust on first use again.
+        rotated_past: Option<String>,
     },
     #[error(
         "{server} presented a certificate no CA vouches for and its DID does not vouch for \
@@ -152,11 +158,16 @@ pub async fn probe_at(
             .as_deref()
             .map(|link| jig_pipeline::handshake::link_moves(link, expected, presented));
         if !matches!(moves, Some(Ok(()))) {
+            let rotated_past = advertised.key_link.as_deref().and_then(|link| {
+                jig_pipeline::handshake::link_from_elsewhere(link, expected, presented)
+                    .map(|left| jig_pipeline::handshake::rotated_past(expected, &left))
+            });
             return Err(TlsError::OtherServer {
                 server: server.to_string(),
                 expected: expected.to_string(),
                 presented: presented.to_string(),
                 key_link: advertised.key_link.clone(),
+                rotated_past,
             });
         }
         moved_from = Some(expected.to_string());
