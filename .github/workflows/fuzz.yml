@@ -1,0 +1,103 @@
+name: Fuzz
+
+# cargo-fuzz targets in repos/fuzz, over what jig decodes from the network:
+# dCBOR, COSE and the contract envelopes, IngestRecord, the follower stream's
+# peer frames, the WebSocket envelope, MLS messages, and a block's Wasm
+# component. A pull request touching any of them runs each target briefly;
+# workflow_dispatch runs longer. A crash fails the job and uploads the input
+# that caused it (repos/fuzz/README.md: reproducing a crash).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - repos/fuzz/**
+      - repos/jig-core/src/dcbor.rs
+      - repos/jig-core/src/cose.rs
+      - repos/jig-core/src/contract.rs
+      - repos/jig-pipeline/src/envelope.rs
+      - repos/jig-pipeline/src/handshake.rs
+      - repos/jig-pipeline/src/ingest_record.rs
+      - repos/jig-server/src/v0_0_2_stream.rs
+      - repos/jig-mls/src/**
+      - repos/jig-runtime/src/component.rs
+      - repos/Cargo.lock
+      - .github/workflows/fuzz.yml
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        required: true
+        default: '1800'
+      targets:
+        description: Targets to run (space-separated; empty = all)
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # cargo-fuzz needs nightly for -Zsanitizer. Pinned, so a new nightly cannot
+  # turn a pull request red; bump it deliberately.
+  NIGHTLY: nightly-2026-10-24
+
+jobs:
+  fuzz:
+    name: fuzz (${{ github.event_name == 'workflow_dispatch' && inputs.seconds || '30' }}s per target)
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 360 || 45 }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install nightly
+        run: rustup toolchain install "$NIGHTLY" --profile minimal
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # repos/.cargo/config.toml puts every build in repos/target.
+          workspaces: repos/fuzz -> ../target
+          key: fuzz
+      - name: Build every target
+        working-directory: repos/fuzz
+        env:
+          CARGO_INCREMENTAL: '0'
+        run: |
+          # The workspace's lockfile, so the targets fuzz the versions jig
+          # ships; cargo adds only libfuzzer-sys.
+          cp ../Cargo.lock Cargo.lock
+          cargo "+$NIGHTLY" fuzz build -O
+      - name: Run
+        working-directory: repos/fuzz
+        env:
+          SECONDS_PER_TARGET: ${{ github.event_name == 'workflow_dispatch' && inputs.seconds || '30' }}
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+          case "$SECONDS_PER_TARGET" in ''|*[!0-9]*) echo "seconds must be a number" >&2; exit 2 ;; esac
+          [ -n "$TARGETS" ] || TARGETS="$(cargo "+$NIGHTLY" fuzz list | tr '\n' ' ')"
+          failed=
+          for t in $TARGETS; do
+            echo "::group::$t"
+            if cargo "+$NIGHTLY" fuzz run -O "$t" -- \
+                -max_total_time="$SECONDS_PER_TARGET" -rss_limit_mb=2048 -timeout=30; then
+              echo "- \`$t\`: ${SECONDS_PER_TARGET}s, no crash" >> "$GITHUB_STEP_SUMMARY"
+            else
+              failed="$failed $t"
+              echo "- \`$t\`: **crashed** (artifact fuzz-crashes)" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then echo "::error::crashed:$failed"; exit 1; fi
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-crashes
+          path: repos/fuzz/artifacts/
+          if-no-files-found: ignore
