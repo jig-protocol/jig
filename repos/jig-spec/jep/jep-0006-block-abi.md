@@ -1,7 +1,7 @@
 +++
 jep = 0006
 title = "Block ABI on the WebAssembly Component Model"
-status = "Draft"
+status = "Review"
 type = "Standards Track"
 category = "Core"
 authors = ["DJ <dev@jig.onl>"]
@@ -25,11 +25,12 @@ the WebAssembly Component Model. It defines:
 Hosts and clients run the same components under the same profile, so anyone holding a block
 and its inputs can re-execute it and check a receipt, on any architecture.
 
-**Draft status.** The maintainer decided the design questions on 2026-10-18 (decisions A1–A8
+**Status: Review.** The maintainer decided the design questions on 2026-10-18 (decisions A1–A8
 in the [design doc](../../../docs/superpowers/specs/2026-10-18-v0.3-block-abi-design.md), which
 holds the options and rationale). The first slice of the reference implementation and its test
-vectors now exist (see Reference Implementation and Test Vectors). The JEP stays Draft until the
-maintainer moves it on.
+vectors exist (see Reference Implementation and Test Vectors), so the maintainer moved the JEP to
+Review on 2026-10-25. It becomes Final once the cross-architecture matrix has stayed green
+through a release.
 
 # Motivation
 
