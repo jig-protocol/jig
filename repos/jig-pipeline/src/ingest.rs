@@ -233,8 +233,8 @@ pub enum IngestError {
     /// A block for a channel another server sequences: this server carries
     /// it, and takes its blocks only from its sequencer (JEP-0005 rule 12).
     #[error(
-        "`{kind}` refused: channel {channel_id} is sequenced by `{sequencer}`; \
-         post it there, or through a share that relays writes"
+        "`{kind}` refused: this server is not the sequencer of channel {channel_id}; \
+         the channel is owned by `{sequencer}`. Post it there"
     )]
     CarriedChannel {
         kind: String,

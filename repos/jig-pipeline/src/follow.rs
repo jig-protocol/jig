@@ -11,6 +11,11 @@
 //!   record no link can follow, is a fork. Both records are kept as
 //!   evidence, and the channel takes nothing more until an operator looks
 //!   (rule 14);
+//! - the evidence is one fork per channel: the first stops it, and nothing
+//!   sent afterwards is kept, so an owner cannot grow it;
+//! - a block or record past [`MAX_CARRIED_BLOCK_BYTES`] or
+//!   [`MAX_RECORD_BYTES`], or a record not in its stored form, is refused
+//!   before anything is parsed or kept;
 //! - the author's signature is checked, but no write gate runs: the owner
 //!   gated the block before it sequenced it, and its order is what a
 //!   follower follows (rule 22a).
@@ -59,6 +64,13 @@ pub enum FollowError {
     /// The channel stopped at an earlier fork.
     #[error("channel {channel_id} is stopped at a fork")]
     Stopped { channel_id: String },
+    /// Larger than a carried block or record may be.
+    #[error("the {what} is {len} bytes; a follower takes at most {max}")]
+    TooLarge {
+        what: &'static str,
+        len: usize,
+        max: usize,
+    },
     /// Not followed in this slice.
     #[error("{0}")]
     Unsupported(&'static str),
@@ -77,7 +89,17 @@ pub enum Followed {
     Duplicate { block_cid: String, seq: u64 },
 }
 
+/// The most a carried block's manifest and code may hold together: the body
+/// limit a local client's post meets at the HTTP API (axum's default).
+pub const MAX_CARRIED_BLOCK_BYTES: usize = 2 * 1024 * 1024;
+
+/// The most a carried record's stored form may hold. A real one is under
+/// 1.5 KiB: two CIDs, a DID, a hash and a COSE_Sign1 of them.
+pub const MAX_RECORD_BYTES: usize = 4 * 1024;
+
 /// Two records that cannot both be the owner's chain, kept as they arrived.
+/// A channel keeps one: the first fork stops it, and nothing it is sent
+/// afterwards is kept, so a hostile owner cannot grow it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainEvidence {
     pub channel_id: String,
@@ -100,7 +122,7 @@ pub(crate) fn migrate(conn: &rusqlite::Connection) -> crate::persist::Result<()>
             held       BLOB NOT NULL,
             offered    BLOB NOT NULL,
             found_at   INTEGER NOT NULL,
-            PRIMARY KEY (channel_id, seq, offered)
+            PRIMARY KEY (channel_id)
         );
         "#,
     )?;
@@ -117,7 +139,8 @@ enum Landing {
 }
 
 impl SqliteStore {
-    /// Every piece of chain evidence kept for `channel_id`, oldest first.
+    /// The chain evidence kept for `channel_id`: none, or the one fork that
+    /// stopped it.
     pub fn chain_evidence(&self, channel_id: &str) -> crate::persist::Result<Vec<ChainEvidence>> {
         let conn = self.conn.lock().expect("poisoned");
         let mut stmt = conn.prepare(
@@ -257,6 +280,14 @@ pub async fn ingest_sequenced(
     record_bytes: &[u8],
     sequencer: &str,
 ) -> Result<Followed, FollowError> {
+    let too_large =
+        |what, len, max| (len > max).then_some(FollowError::TooLarge { what, len, max });
+    let block_len = bundle.manifest_bytes.len() + bundle.code_bytes.len();
+    if let Some(e) = too_large("block", block_len, MAX_CARRIED_BLOCK_BYTES)
+        .or_else(|| too_large("record", record_bytes.len(), MAX_RECORD_BYTES))
+    {
+        return Err(e);
+    }
     let manifest = crate::ingest::parse_manifest(bundle.manifest_bytes)?;
     crate::ingest::check_manifest_dids(&manifest)?;
     let sender =
@@ -264,6 +295,13 @@ pub async fn ingest_sequenced(
     let kind = manifest.kind.ok_or(IngestError::KindRequired)?;
 
     let record = IngestRecord::decode(record_bytes)?;
+    // The stored form exactly, as the owner stores it: nothing rides along
+    // outside the signed fields, and what a client is sent is what was signed.
+    if record.encode() != record_bytes {
+        return Err(FollowError::Mismatch(
+            "the record is not in its stored form",
+        ));
+    }
     let block_cid = bundle
         .block_cid()
         .map_err(|e| IngestError::BundleMalformed(e.to_string()))?
@@ -756,6 +794,160 @@ mod tests {
             take(&follower, &owner, &forged).await,
             Err(FollowError::Fork { seq: 1, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_hostile_owner_cannot_grow_the_evidence() {
+        let mut owner = Owner::new().await;
+        owner.text("one").await;
+        let follower = ctx();
+        take(&follower, &owner, &owner.sent[0]).await.unwrap();
+        take(&follower, &owner, &owner.sent[1]).await.unwrap();
+        let genesis = IngestRecord::decode(&owner.sent[0].record).unwrap();
+        for i in 0..20u64 {
+            let other = signed(
+                &owner.user,
+                BlockKind::TextRender,
+                serde_json::json!({"channel_id": owner.channel, "body": format!("fork {i}")}),
+            );
+            // Contradictions at the same seq, and at seqs no link follows.
+            let (seq, prev) = if i % 2 == 0 {
+                (1, genesis.hash())
+            } else {
+                (2, [i as u8; 32])
+            };
+            let forged = Sent {
+                record: owner.sign_at(&other, seq, prev),
+                parts: other,
+            };
+            let got = take(&follower, &owner, &forged).await;
+            match (i, got) {
+                (0, Err(FollowError::Fork { .. })) => {}
+                (_, Err(FollowError::Stopped { .. })) if i > 0 => {}
+                (_, other) => panic!("forgery {i}: {other:?}"),
+            }
+        }
+        assert_eq!(
+            follower.store.chain_evidence(&owner.channel).unwrap().len(),
+            1,
+            "only the fork that stopped the channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_carried_block_or_record_has_limits() {
+        let mut owner = Owner::new().await;
+        owner.text("one").await;
+        let follower = ctx();
+        take(&follower, &owner, &owner.sent[0]).await.unwrap();
+        let sent = &owner.sent[1];
+
+        // A record carrying more than its signed fields: refused whatever
+        // its size, so a client is sent only what was signed.
+        let mut padded: serde_json::Value = serde_json::from_slice(&sent.record).unwrap();
+        padded["note"] = serde_json::json!("x");
+        let padded_record = serde_json::to_vec(&padded).unwrap();
+        assert!(matches!(
+            ingest_sequenced(
+                &follower,
+                bundle(&sent.parts),
+                sent.parts.2.clone(),
+                &padded_record,
+                &owner.did()
+            )
+            .await,
+            Err(FollowError::Mismatch(_))
+        ));
+        padded["note"] = serde_json::json!("x".repeat(MAX_RECORD_BYTES));
+        let padded_record = serde_json::to_vec(&padded).unwrap();
+        assert!(matches!(
+            ingest_sequenced(
+                &follower,
+                bundle(&sent.parts),
+                sent.parts.2.clone(),
+                &padded_record,
+                &owner.did()
+            )
+            .await,
+            Err(FollowError::TooLarge { what: "record", .. })
+        ));
+
+        // A block past the limit is refused before it is parsed.
+        let code = vec![0u8; MAX_CARRIED_BLOCK_BYTES];
+        let big = BlockBundle {
+            manifest_bytes: &sent.parts.0,
+            code_bytes: &code,
+            resources: vec![],
+        };
+        assert!(matches!(
+            ingest_sequenced(
+                &follower,
+                big,
+                sent.parts.2.clone(),
+                &sent.record,
+                &owner.did()
+            )
+            .await,
+            Err(FollowError::TooLarge { what: "block", .. })
+        ));
+        // A kind this build does not know is refused as the manifest it is.
+        let mut manifest: serde_json::Value = serde_json::from_slice(&sent.parts.0).unwrap();
+        manifest["kind"] = serde_json::json!("not-a-kind");
+        let manifest = serde_json::to_vec(&manifest).unwrap();
+        let unknown = BlockBundle {
+            manifest_bytes: &manifest,
+            code_bytes: &sent.parts.1,
+            resources: vec![],
+        };
+        assert!(matches!(
+            ingest_sequenced(
+                &follower,
+                unknown,
+                sent.parts.2.clone(),
+                &sent.record,
+                &owner.did()
+            )
+            .await,
+            Err(FollowError::Block(IngestError::BundleMalformed(_)))
+        ));
+        // None of it was kept, and the real block still lands.
+        assert!(
+            follower
+                .store
+                .chain_evidence(&owner.channel)
+                .unwrap()
+                .is_empty()
+        );
+        take(&follower, &owner, sent).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_followers_client_gets_the_owners_cose_bytes() {
+        let mut owner = Owner::new().await;
+        let cids = [
+            owner.channel.clone(),
+            owner.text("one").await,
+            owner.text("two").await,
+        ];
+        let follower = ctx();
+        for sent in &owner.sent {
+            take(&follower, &owner, sent).await.unwrap();
+        }
+        for cid in &cids {
+            // What a client's `block` frame carries, on either server.
+            let at_owner = owner.ctx.store.get_ingest_record(cid).unwrap().unwrap();
+            let at_follower = follower.store.get_ingest_record(cid).unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_vec(&at_follower).unwrap(),
+                serde_json::to_vec(&at_owner).unwrap(),
+                "{cid}"
+            );
+            let envelope = |r: &IngestRecord| {
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &r.cose).unwrap()
+            };
+            assert_eq!(envelope(&at_follower), envelope(&at_owner), "{cid}");
+            at_follower.verify(&owner.did()).unwrap();
+        }
     }
 
     #[tokio::test]
