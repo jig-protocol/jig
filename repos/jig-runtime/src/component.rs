@@ -1,7 +1,7 @@
 //! Executes `jig:block` components (JEP-0006, first-slice step 4).
 //!
 //! This is the one execution path the design commits server, client and CLI to (decision A4).
-//! It sits beside the byte-payload ABI (`payload.rs`) until that is deleted.
+//! The byte-payload ABI it replaced (`payload.rs`, ABI 1) has been deleted.
 //!
 //! What it does, per decisions A2 and A3:
 //!

@@ -4,9 +4,9 @@
 //!
 //! Compiling a Wasm module is the dominant cost of running one: ~16 ms for the
 //! 178 KB canonical text-block, against ~85 µs to execute an already-compiled
-//! one. Calling `Runtime::execute_payload` per block would cap a server near 62
-//! messages/second where the protocol targets 10,000. So the compile happens
-//! once, here, and every message reuses the result.
+//! one. Compiling per block would cap a server near 62 messages/second where the
+//! protocol targets 10,000. So the compile happens once, here, and every message
+//! reuses the result.
 //!
 //! # Why the server runs its OWN module
 //!
@@ -39,6 +39,8 @@ use jig_runtime::component::{
     RunOutcome,
 };
 use text_block::canonical;
+
+pub use crate::text_input::text_input;
 
 /// The world text-block's program manifest declares.
 pub const RENDERER_WORLD: &str = "jig:block/renderer@0.1.0";
@@ -472,35 +474,6 @@ pub fn text_block_program(
     })
 }
 
-/// The text-render input a block's manifest gives: its body, author, channel name, clock and
-/// version. `None` when the manifest has no `body`, since rendering the empty string would hash a
-/// message nobody sent.
-///
-/// The server and every re-executing client build the input with this one function, so they
-/// cannot disagree on what was rendered.
-pub fn text_input(manifest: &jig_core::BlockManifest) -> Option<text_block::Input> {
-    let body = manifest.metadata.get("body")?.as_str()?;
-    let channel = manifest
-        .metadata
-        .get("channel")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    let hlc = manifest.hlc_ts.as_ref();
-    Some(text_block::Input {
-        sender_did: manifest
-            .authors
-            .first()
-            .map(|a| a.did.to_string())
-            .unwrap_or_default(),
-        channel_id: channel.to_string(),
-        body_raw: body.to_string(),
-        hlc_wall_ms: hlc.map(|h| h.wall_ms).unwrap_or(0),
-        hlc_logical: hlc.map(|h| h.logical).unwrap_or(0),
-        hlc_origin: hlc.map(|h| h.server_did.to_string()).unwrap_or_default(),
-        client_version: manifest.version.to_string(),
-    })
-}
-
 /// The invocation an `exec` receipt names for a landed chat message: the message text, and the
 /// block's ingest record's sequence, clock and channel CID (JEP-0006). A client rebuilds it from
 /// the same record to check the receipt.
@@ -606,22 +579,6 @@ mod tests {
             base.output.render_hash,
             "render_hash must depend only on the body, or servers cannot agree"
         );
-    }
-
-    #[test]
-    fn the_component_renders_what_the_abi_1_module_rendered() {
-        // render_hash must not move across the switch, or servers on mixed versions disagree.
-        let ex = BlockExecutor::shared();
-        for body in ["hello", "", "hi @deji https://jig.onl", "<b>&</b> 'x'"] {
-            let via_component = ex.render_text(&input(body)).expect("render").output;
-            let encoded = postcard::to_allocvec(&input(body)).unwrap();
-            let abi1 = jig_runtime::Runtime::new()
-                .unwrap()
-                .execute_payload(canonical::CANONICAL_WASM, canonical::ENTRY_POINT, &encoded)
-                .expect("ABI 1 render");
-            let abi1: text_block::Output = postcard::from_bytes(&abi1.bytes).unwrap();
-            assert_eq!(via_component.render_hash, abi1.render_hash, "body {body:?}");
-        }
     }
 
     #[test]

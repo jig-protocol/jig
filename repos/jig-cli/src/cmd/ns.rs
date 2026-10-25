@@ -4,6 +4,7 @@
 //! `[naming.delegations]` in `cli.toml` (or the built-in `@jig` one), else
 //! from `dns` discovery, and only an attestation from one of its authorities
 //! is printed, with whether it is pinned. It never prints an unverified DID.
+//! A suffix in `[naming] refused_suffixes` is refused before any of these.
 //!
 //! `list` is a debug diagnostic: `/v1/handles` is debug-gated behind
 //! `[debug] list_handles`, so its 404 means the route is not mounted.
@@ -271,6 +272,9 @@ impl Nameserver {
         delegations: &Delegations,
         purpose: Purpose,
     ) -> Result<Self> {
+        if let Some((_, suffix)) = who.split_once('@') {
+            not_refused(delegations, suffix)?;
+        }
         let base = ns_url.trim().trim_end_matches('/').to_string();
         let (http, bound) = bound_client(
             &base,
@@ -287,7 +291,9 @@ impl Nameserver {
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             // A nameserver from before multi-suffix serving: one suffix, named
             // by its own delegation.
-            return Self::connect_single_suffix(base, http, bound, who).await;
+            let ns = Self::connect_single_suffix(base, http, bound, who).await?;
+            not_refused(delegations, &ns.name.suffix)?;
+            return Ok(ns);
         }
         let mut served: SuffixesResponse = json_or_explain(resp, &url).await?;
         // Every check below is on this DID: under TLS it is the one the
@@ -306,6 +312,7 @@ impl Nameserver {
                 ),
             },
         };
+        not_refused(delegations, &name.suffix)?;
         let Some(info) = served
             .suffixes
             .iter()
@@ -733,6 +740,19 @@ impl NameEvidence for NoEvidence {
     }
 }
 
+/// Refuse `suffix` when `[naming] refused_suffixes` lists it.
+fn not_refused(delegations: &Delegations, suffix: &str) -> Result<()> {
+    if delegations.refuses(suffix) {
+        anyhow::bail!("{}", refused_message(suffix));
+    }
+    Ok(())
+}
+
+/// Why a name under `suffix` was not looked up.
+pub(crate) fn refused_message(suffix: &str) -> String {
+    format!("names under `{suffix}` are refused by [naming] refused_suffixes in cli.toml")
+}
+
 /// The delegations `jig ns resolve` uses. `--nameserver` replaces the URLs
 /// to ask for a `config`-rooted suffix; the authorities stay, so it changes
 /// where the client asks, never whose answer counts.
@@ -741,6 +761,16 @@ pub(crate) fn resolve_delegations(
     name: &Name,
     nameserver: Option<&str>,
 ) -> Result<Delegations> {
+    if cfg
+        .naming
+        .refused_suffixes
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(&name.suffix))
+    {
+        // The resolver refuses it before asking anyone; nothing here may
+        // stand in for the delegation it will not use.
+        return Ok(crate::config::delegations(cfg));
+    }
     // For `@jig` with no cli.toml entry, `--nameserver` is where the built-in
     // delegation asks, as `[server] nameserver_url` would be.
     let mut cfg = cfg.clone();
@@ -813,6 +843,7 @@ pub fn explain_resolve_error(name: &Name, delegations: &Delegations, e: &Resolve
              authorities and nameservers",
             suffix = name.suffix
         ),
+        ResolveError::SuffixRefused { suffix } => format!("{full}: {}", refused_message(suffix)),
         ResolveError::Unreachable(_) => {
             let asked = delegations
                 .config
@@ -1729,5 +1760,29 @@ mod tests {
         let dns = Name::parse("dj@example.org").unwrap();
         let err = resolve_delegations(&cfg, &dns, Some("http://127.0.0.1:9")).unwrap_err();
         assert!(err.to_string().contains("own domain"), "{err}");
+    }
+
+    #[test]
+    fn a_refused_suffix_reaches_the_resolver_refused_and_says_why() {
+        let mut cfg = crate::config::Config::default();
+        cfg.naming.refused_suffixes = vec!["Jig".into()];
+        let name = Name::parse("dj@jig").unwrap();
+        // No built-in delegation stands in for it, `--nameserver` included.
+        for nameserver in [None, Some("http://127.0.0.1:9")] {
+            let d = resolve_delegations(&cfg, &name, nameserver).unwrap();
+            assert!(d.refuses("jig"));
+            assert!(!d.config.contains_key("jig"), "{:?}", d.config);
+        }
+        let msg = explain_resolve_error(
+            &name,
+            &Delegations::default(),
+            &ResolveError::SuffixRefused {
+                suffix: "jig".into(),
+            },
+        );
+        assert!(
+            msg.contains("names under `jig` are refused by [naming] refused_suffixes"),
+            "{msg}"
+        );
     }
 }

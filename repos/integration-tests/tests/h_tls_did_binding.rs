@@ -270,3 +270,65 @@ async fn a_pinned_server_is_followed_to_a_new_key_only_along_its_link() {
         ));
     }
 }
+
+/// A server that changed its key twice since a device pinned it serves only
+/// the second link: the device is refused, by name, and told that
+/// re-pinning would be trust on first use again. It never takes the new DID.
+#[tokio::test]
+async fn a_pin_two_keys_back_is_refused_and_says_why() {
+    use base64::Engine as _;
+    use jig_core::key_link::{Audience, SignedKeyLink};
+    let (a, b, c) = (
+        SigningKey::from_bytes(&[6; 32]),
+        SigningKey::from_bytes(&[7; 32]),
+        SigningKey::from_bytes(&[8; 32]),
+    );
+    let real = cert();
+    let mut doc = well_known(&did(&c), &TlsBinding::sign(&c, real.der.as_ref()));
+    let b_to_c = SignedKeyLink::sign(&b, &c, Audience::Public, 2).unwrap();
+    doc["key_link"] =
+        serde_json::json!(base64::engine::general_purpose::STANDARD.encode(b_to_c.envelope()));
+    let base = serve(&real, doc).await;
+
+    // Pinned one key back: followed.
+    let probed = probe(&base, Some(&did(&b))).await.expect("followed");
+    assert_eq!(probed.moved_from.as_deref(), Some(did(&b).as_str()));
+
+    // Pinned two keys back: refused, naming the pin and the DID the link left.
+    let Err(refused) = probe(&base, Some(&did(&a))).await else {
+        panic!("a pin two keys back was followed");
+    };
+    let TlsError::OtherServer {
+        expected,
+        presented,
+        rotated_past: Some(why),
+        ..
+    } = &refused
+    else {
+        panic!("{refused}");
+    };
+    assert_eq!((expected, presented), (&did(&a), &did(&c)));
+    assert!(why.contains(&did(&a)) && why.contains(&did(&b)), "{why}");
+    assert!(why.contains("more than once"), "{why}");
+    assert!(why.contains("first use"), "{why}");
+    let message = refused.to_string();
+    assert!(
+        message.contains(&did(&a)) && message.contains("more than once"),
+        "{message}"
+    );
+
+    // A link from a stranger is refused the same way: it cannot be told apart.
+    let mut doc = well_known(&did(&c), &TlsBinding::sign(&c, real.der.as_ref()));
+    let stranger = SigningKey::from_bytes(&[9; 32]);
+    let forged = SignedKeyLink::sign(&stranger, &c, Audience::Public, 2).unwrap();
+    doc["key_link"] =
+        serde_json::json!(base64::engine::general_purpose::STANDARD.encode(forged.envelope()));
+    let base = serve(&real, doc).await;
+    assert!(matches!(
+        probe(&base, Some(&did(&a))).await,
+        Err(TlsError::OtherServer {
+            rotated_past: Some(_),
+            ..
+        })
+    ));
+}

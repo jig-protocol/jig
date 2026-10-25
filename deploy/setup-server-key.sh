@@ -27,6 +27,14 @@
 #
 # It never restarts the unit: that is the last step, and it says so.
 #
+# --rotate (jig-server only) replaces a key this script set up with a new one,
+# in place: a new credential secret and a new offline passphrase seal the new
+# key, and `jig-server keys rotate` writes a key link from the old DID to the
+# new one beside it, so clients and peers that pinned the old DID follow it.
+# The old key and the old credential are kept, never deleted. A second
+# rotation needs --replace-link: a client still pinned two keys back is then
+# refused and must re-pin.
+#
 # Running it again changes nothing. It refuses to replace a credential, a key,
 # or a different `unlock` it finds; --force moves the old credential and key
 # aside (never deletes them) and starts again with a NEW DID.
@@ -51,6 +59,8 @@ IMPORT=""
 FORCE=0
 NO_PASSPHRASE=0
 PASSPHRASE_ONLY=0
+ROTATE=0
+REPLACE_LINK=0
 
 BIN_DIR="${JIG_BIN_DIR:-/opt/jig/bin}"
 CREDSTORE="${JIG_CREDSTORE_DIR:-/etc/credstore.encrypted}"
@@ -61,6 +71,7 @@ usage() {
 usage: setup-server-key.sh [--nameserver] [--config PATH] [--keyfile PATH]
                            [--import SEED_FILE] [--no-passphrase]
                            [--passphrase-only] [--force]
+                           [--rotate [--replace-link]]
 
   --nameserver       set up jig-nameserver's key instead of jig-server's
   --config PATH      the config to set `unlock` in
@@ -74,6 +85,11 @@ usage: setup-server-key.sh [--nameserver] [--config PATH] [--keyfile PATH]
                      and the server needs JIG_KEY_PASSPHRASE to boot
   --force            move an existing credential and key aside and make new
                      ones: the server gets a NEW DID
+  --rotate           jig-server only: replace the key with a new one and link
+                     the old DID to it; the new passphrase is read from the
+                     terminal or JIG_KEY_NEW_PASSPHRASE
+  --replace-link     with --rotate: replace the key link an earlier rotation
+                     left. Clients still pinned on the DID it leaves must re-pin
 EOF
 }
 
@@ -92,6 +108,8 @@ while [ $# -gt 0 ]; do
     --no-passphrase) NO_PASSPHRASE=1 ;;
     --passphrase-only) PASSPHRASE_ONLY=1 ;;
     --force) FORCE=1 ;;
+    --rotate) ROTATE=1 ;;
+    --replace-link) REPLACE_LINK=1 ;;
     -h | --help) usage; exit 0 ;;
     *) usage >&2; die "unknown argument: $1" ;;
   esac
@@ -100,6 +118,13 @@ done
 
 [ "$NO_PASSPHRASE" = 1 ] && [ "$PASSPHRASE_ONLY" = 1 ] &&
   die "--no-passphrase and --passphrase-only leave the key with no slot"
+[ "$REPLACE_LINK" = 1 ] && [ "$ROTATE" = 0 ] && die "--replace-link goes with --rotate"
+if [ "$ROTATE" = 1 ]; then
+  [ "$ROLE" = server ] ||
+    die "--rotate is for jig-server: a nameserver serves no key link, so a new nameserver key is a new identity"
+  { [ -z "$IMPORT" ] && [ "$FORCE" = 0 ] && [ "$PASSPHRASE_ONLY" = 0 ]; } ||
+    die "--rotate does not combine with --import, --force or --passphrase-only (rotate by hand with \`jig-server keys rotate\`)"
+fi
 
 if [ "$ROLE" = server ]; then
   UNIT=jig-server.service
@@ -135,7 +160,7 @@ fi
 TMP=""
 cleanup() {
   [ -n "$TMP" ] && rm -rf "$TMP"
-  unset JIG_KEY_PASSPHRASE PASS
+  unset JIG_KEY_PASSPHRASE JIG_KEY_NEW_PASSPHRASE PASS
 }
 trap cleanup EXIT
 TMP="$(mktemp -d)"
@@ -235,21 +260,25 @@ fi
 
 # --- The passphrase ---------------------------------------------------------
 PASS=""
+# A rotation seals a new key: its passphrase is a new one, not the old key's.
+PASS_VAR=JIG_KEY_PASSPHRASE
+[ "$ROTATE" = 1 ] && PASS_VAR=JIG_KEY_NEW_PASSPHRASE
 if [ "$NO_PASSPHRASE" = 0 ]; then
-  if [ -n "${JIG_KEY_PASSPHRASE:-}" ]; then
-    PASS="$JIG_KEY_PASSPHRASE"
+  if [ -n "${!PASS_VAR:-}" ]; then
+    PASS="${!PASS_VAR}"
   elif [ -r /dev/tty ]; then
     say "the passphrase is the key's offline slot: it opens the key on other hardware."
+    [ "$ROTATE" = 1 ] && say "this is the NEW key's passphrase; choose a new one."
     read -rs -p "passphrase: " PASS </dev/tty; echo >/dev/tty
     read -rs -p "again: " again </dev/tty; echo >/dev/tty
     [ "$PASS" = "$again" ] || { unset again; die "the two passphrases differ"; }
     unset again
   else
-    die "no terminal to read a passphrase from: set JIG_KEY_PASSPHRASE, or pass --no-passphrase"
+    die "no terminal to read a passphrase from: set $PASS_VAR, or pass --no-passphrase"
   fi
   [ ${#PASS} -ge 12 ] || die "the passphrase is shorter than 12 characters"
 fi
-unset JIG_KEY_PASSPHRASE JIG_KEY_UNLOCK
+unset JIG_KEY_PASSPHRASE JIG_KEY_NEW_PASSPHRASE JIG_KEY_UNLOCK
 
 # Run the jig binary on the key. Only what is offered here opens it: not the
 # configured unlock (its /run/credentials path is the unit's, and absent here),
@@ -270,6 +299,52 @@ jig_keys_pass() {
 # A `--slot` that reads the credential's plaintext from a pipe, decrypted now.
 # Each use is read once, so each call to the binary gets its own.
 decrypt() { systemd-creds decrypt --name="$CRED_NAME" "$CRED" -; }
+
+# --- --rotate ------------------------------------------------------------------
+if [ "$ROTATE" = 1 ]; then
+  [ -e "$SEALED" ] || die "no sealed key at $SEALED to rotate: run this script without --rotate first"
+  [ -e "$RAW" ] && die "both $RAW and $SEALED exist; \`$BIN keys show\` or a boot says which to keep"
+  [ -e "$CRED" ] || die "no credential at $CRED to open the key with: run this script without --rotate first"
+  decrypt >/dev/null || die "$CRED does not decrypt on this machine (made on another?)"
+  [ -e "$CRED.new" ] &&
+    die "$CRED.new exists, left by an interrupted --rotate: if $SEALED opens with it (\`keys verify\`), it is the credential to keep; otherwise remove it"
+  # The new secret is in the credstore before the key needs it, so no step
+  # can leave the new key with its credential only in a temporary file.
+  head -c 48 /dev/urandom | base64 -w0 |
+    systemd-creds encrypt --with-key=auto --name="$CRED_NAME" - "$TMP/cred"
+  mv -- "$TMP/cred" "$CRED.new"
+  # The old credential is kept under its retired name before anything moves:
+  # after the rotation one rename, which replaces atomically, puts the new
+  # one in place.
+  ln -- "$CRED" "$CRED.retired-$stamp" || {
+    rm -f -- "$CRED.new"
+    die "could not keep $CRED as $CRED.retired-$stamp; nothing was changed"
+  }
+  rotate_args=(--slot "credential:/dev/fd/3")
+  if [ "$NO_PASSPHRASE" = 0 ]; then rotate_args+=(--slot passphrase); fi
+  if [ "$REPLACE_LINK" = 1 ]; then rotate_args+=(--replace-link); fi
+  # The old key opens with the old credential, on fd 4; the new one is sealed
+  # with the new credential, on fd 3, and the new passphrase.
+  if ! env -u JIG_KEY_PASSPHRASE JIG_KEY_UNLOCK="credential:/dev/fd/4" \
+    JIG_KEY_NEW_PASSPHRASE="$PASS" \
+    "$BIN" --config "$CONFIG" keys rotate --keyfile "$KEYFILE" "${rotate_args[@]}" \
+    3< <(systemd-creds decrypt --name="$CRED_NAME" "$CRED.new" -) 4< <(decrypt); then
+    rm -f -- "$CRED.new" "$CRED.retired-$stamp"
+    die "the key was not rotated; nothing was changed"
+  fi
+  mv -f -- "$CRED.new" "$CRED" ||
+    die "the key was rotated, but $CRED.new could not be moved to $CRED. The new key opens \
+with $CRED.new (and the new passphrase): run \`mv -f $CRED.new $CRED\` before restarting"
+  say "the old credential is kept as $CRED.retired-$stamp: with it, or the old passphrase, the retired key still opens. Move both offline; delete neither"
+  echo
+  jig_keys show
+  echo
+  say "next: systemctl restart $UNIT. Clients and peers that pinned the old DID follow the key link to the new one"
+  if [ "$NO_PASSPHRASE" = 0 ]; then
+    say "MUST DO NOW: store the NEW passphrase offline. The old one opens only the retired key"
+  fi
+  exit 0
+fi
 
 # --- 1. The credential ------------------------------------------------------
 if [ "$PASSPHRASE_ONLY" = 0 ]; then
