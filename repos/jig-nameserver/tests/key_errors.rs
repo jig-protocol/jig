@@ -46,6 +46,8 @@ fn no_key_and_nothing_to_seal_one_with_names_the_ways_to_give_one() {
         stderr.contains("JIG_KEY_UNLOCK or JIG_KEY_PASSPHRASE"),
         "{stderr}"
     );
+    // Its own table: a `[keys]` table stops a nameserver from starting.
+    assert!(stderr.contains("set [v0_0_2.keys] unlock"), "{stderr}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -56,5 +58,6 @@ fn a_raw_key_from_an_older_release_names_the_command_that_seals_it() {
     let stderr = serve(&dir);
     assert!(stderr.contains("is a raw nameserver key"), "{stderr}");
     assert!(stderr.contains("jig-nameserver keys seal"), "{stderr}");
+    assert!(stderr.contains("set [v0_0_2.keys] unlock"), "{stderr}");
     let _ = std::fs::remove_dir_all(&dir);
 }
