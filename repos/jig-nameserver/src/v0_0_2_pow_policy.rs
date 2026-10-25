@@ -41,6 +41,9 @@ const MAX_POINTS: u32 = 32;
 /// is repeated (rule 27's `max_decay_secs`).
 const MAX_PENALTY_LIFE: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// The shortest a waiter sleeps before it looks at the pool again.
+const MIN_WAIT: Duration = Duration::from_millis(1);
+
 /// The most (alias, DID) pairs and addresses held under penalty. Past it,
 /// lapsed penalties are swept, then the one nearest lapsing is dropped.
 const MAX_PENALTIES: usize = 100_000;
@@ -349,7 +352,10 @@ impl Market {
             return Duration::from_secs(self.pool.queue_wait_secs.max(1));
         }
         let missing = (1.0 - st.tokens).max(0.0);
-        Duration::from_secs_f64(missing / rate)
+        // Never zero: a count a float's breadth under 1.0 rounds the wait down
+        // to nothing, and a waiter that sleeps for nothing spins (or, on a
+        // paused test clock, livelocks, since time only advances when idle).
+        Duration::from_secs_f64(missing / rate).max(MIN_WAIT)
     }
 
     /// Tests only: while `held`, the pool does not refill, so a test can
@@ -611,6 +617,35 @@ mod tests {
         assert_eq!(m.stats().suggested_effort, 16, "halved");
         tokio::time::advance(Duration::from_secs(300)).await;
         assert_eq!(m.stats().suggested_effort, 16, "never below min_effort");
+    }
+
+    /// With the count a float's breadth under a token, the wait used to
+    /// round to zero: the waiter spun, and on a paused clock (which advances
+    /// only when every task is idle) it never let time move, so this hung.
+    #[tokio::test(start_paused = true)]
+    async fn a_count_just_under_a_token_waits_rather_than_spins() {
+        let m = std::sync::Arc::new(Market::new(
+            pow(),
+            PoolPolicy {
+                queue_wait_secs: 3600,
+                ..pool(3600, 1)
+            },
+        ));
+        assert_eq!(m.admit(16).await, Ok(()), "spends the one token");
+        m.lock().tokens = 1.0 - f64::EPSILON;
+        let contended = (0..2)
+            .map(|_| {
+                let m = m.clone();
+                tokio::spawn(async move { m.admit(16).await })
+            })
+            .collect::<Vec<_>>();
+        for waiter in contended {
+            assert_eq!(
+                waiter.await.unwrap(),
+                Ok(()),
+                "admitted once a token refills"
+            );
+        }
     }
 
     /// A client that hangs up while waiting gives its place back.
