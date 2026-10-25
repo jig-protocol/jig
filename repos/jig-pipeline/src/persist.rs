@@ -730,7 +730,7 @@ fn insert_receipt_on(conn: &Connection, r: &StoredReceipt) -> Result<()> {
     Ok(())
 }
 
-fn upsert_membership_on(conn: &Connection, m: &StoredMembership) -> Result<()> {
+pub(crate) fn upsert_membership_on(conn: &Connection, m: &StoredMembership) -> Result<()> {
     conn.execute(
         "INSERT INTO memberships (channel_id, member_did, role, joined_at, source_block_cid)
          VALUES (?,?,?,?,?)
@@ -1450,6 +1450,13 @@ impl SqliteStore {
                AND NOT EXISTS (
                    SELECT 1 FROM receipts r WHERE r.block_cid = b.cid AND r.server_id = ?2
                )
+               -- A block of a channel another server sequences is carried,
+               -- not executed here (JEP-0005 rule 12): it gets no receipt
+               -- of this server's.
+               AND NOT EXISTS (
+                   SELECT 1 FROM channels c
+                    WHERE c.id = b.channel_id AND c.sequencer_did NOT IN ('', ?2)
+               )
              ORDER BY b.posted_at, b.cid"
         ))?;
         let rows = stmt
@@ -1501,27 +1508,7 @@ impl SqliteStore {
     /// Nor the terms (`suite`, `sequencer_did`, `co_owners`): they are fixed
     /// for the channel's life (JEP-0005 rule 6).
     pub fn upsert_channel(&self, c: &StoredChannel) -> Result<()> {
-        self.conn.lock().expect("poisoned").execute(
-            "INSERT INTO channels
-                 (id, slug, visibility, created_at, owner_did, suite, sequencer_did, co_owners)
-             VALUES (?,?,?,?,?,?,?,?)
-             ON CONFLICT(id) DO UPDATE SET
-                slug = excluded.slug,
-                visibility = excluded.visibility,
-                owner_did = excluded.owner_did",
-            params![
-                c.id,
-                c.slug,
-                c.visibility,
-                c.created_at,
-                c.owner_did,
-                c.suite,
-                c.sequencer_did,
-                serde_json::to_string(&c.co_owners)
-                    .map_err(|e| PersistError::Corrupt(format!("co_owners: {e}")))?,
-            ],
-        )?;
-        Ok(())
+        upsert_channel_on(&self.conn.lock().expect("poisoned"), c)
     }
 
     /// Look up a live channel. Archived channels read as absent so ops that
@@ -1664,11 +1651,11 @@ impl SqliteStore {
 
     /// [`Self::archive_channel`] for the channel with this id.
     pub fn archive_channel_by_id(&self, channel_id: &str, archived_at: i64) -> Result<bool> {
-        let changed = self.conn.lock().expect("poisoned").execute(
-            "UPDATE channels SET archived_at = ?2 WHERE id = ?1 AND archived_at IS NULL",
-            params![channel_id, archived_at],
-        )?;
-        Ok(changed > 0)
+        archive_channel_by_id_on(
+            &self.conn.lock().expect("poisoned"),
+            channel_id,
+            archived_at,
+        )
     }
 
     /// Move channel `from` to slug `to`, and archive it there, in one
@@ -1806,14 +1793,7 @@ impl SqliteStore {
     /// [`Self::remove_membership`] for the channel with this id. Like the
     /// slug form, it touches only a live channel.
     pub fn remove_membership_by_id(&self, channel_id: &str, member_did: &str) -> Result<bool> {
-        let removed = self.conn.lock().expect("poisoned").execute(
-            "DELETE FROM memberships
-              WHERE channel_id = ?1 AND member_did = ?2
-                AND EXISTS (SELECT 1 FROM channels
-                             WHERE id = ?1 AND archived_at IS NULL)",
-            [channel_id, member_did],
-        )?;
-        Ok(removed > 0)
+        remove_membership_by_id_on(&self.conn.lock().expect("poisoned"), channel_id, member_did)
     }
 
     // --- MLS delivery service ---
@@ -2436,6 +2416,59 @@ impl SqliteStore {
     }
 }
 
+/// [`SqliteStore::upsert_channel`] on `conn`, inside a caller's transaction.
+pub(crate) fn upsert_channel_on(conn: &Connection, c: &StoredChannel) -> Result<()> {
+    conn.execute(
+        "INSERT INTO channels
+             (id, slug, visibility, created_at, owner_did, suite, sequencer_did, co_owners)
+         VALUES (?,?,?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET
+            slug = excluded.slug,
+            visibility = excluded.visibility,
+            owner_did = excluded.owner_did",
+        params![
+            c.id,
+            c.slug,
+            c.visibility,
+            c.created_at,
+            c.owner_did,
+            c.suite,
+            c.sequencer_did,
+            serde_json::to_string(&c.co_owners)
+                .map_err(|e| PersistError::Corrupt(format!("co_owners: {e}")))?,
+        ],
+    )?;
+    Ok(())
+}
+
+/// [`SqliteStore::remove_membership_by_id`] on `conn`.
+pub(crate) fn remove_membership_by_id_on(
+    conn: &Connection,
+    channel_id: &str,
+    member_did: &str,
+) -> Result<bool> {
+    let removed = conn.execute(
+        "DELETE FROM memberships
+          WHERE channel_id = ?1 AND member_did = ?2
+            AND EXISTS (SELECT 1 FROM channels
+                         WHERE id = ?1 AND archived_at IS NULL)",
+        [channel_id, member_did],
+    )?;
+    Ok(removed > 0)
+}
+
+/// [`SqliteStore::archive_channel_by_id`] on `conn`.
+pub(crate) fn archive_channel_by_id_on(
+    conn: &Connection,
+    channel_id: &str,
+    archived_at: i64,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE channels SET archived_at = ?2 WHERE id = ?1 AND archived_at IS NULL",
+        params![channel_id, archived_at],
+    )?;
+    Ok(changed > 0)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

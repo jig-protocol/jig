@@ -139,14 +139,19 @@ fn apply_channel_create(
     let sequencer = meta_str(m, crate::ingest::SEQUENCER_KEY)
         .map(canonical_did_string)
         .unwrap_or_else(|| store.local_sequencer().to_string());
-    apply_channel_create_under(store, m, block_cid, &sequencer)
+    apply_channel_create_under(
+        &store.conn.lock().expect("poisoned"),
+        m,
+        block_cid,
+        &sequencer,
+    )
 }
 
 /// A channel-create's row and its root owners' memberships, under
 /// `sequencer`: this server for a channel it sequences, the owner for one it
 /// carries (JEP-0005 rule 3).
 fn apply_channel_create_under(
-    store: &Arc<SqliteStore>,
+    conn: &rusqlite::Connection,
     m: &BlockManifest,
     block_cid: &str,
     sequencer: &str,
@@ -161,27 +166,33 @@ fn apply_channel_create_under(
     let terms = crate::ingest::channel_terms(m, sequencer)
         .map_err(|e| anyhow::anyhow!("channel-create terms: {e}"))?;
 
-    store.upsert_channel(&StoredChannel {
-        id: block_cid.to_string(),
-        slug: slug.to_string(),
-        visibility: visibility.to_string(),
-        created_at: now,
-        owner_did: owner_did.clone(),
-        suite: suite.as_str().to_string(),
-        sequencer_did: terms.sequencer,
-        co_owners: terms.co_owners.clone(),
-    })?;
+    crate::persist::upsert_channel_on(
+        conn,
+        &StoredChannel {
+            id: block_cid.to_string(),
+            slug: slug.to_string(),
+            visibility: visibility.to_string(),
+            created_at: now,
+            owner_did: owner_did.clone(),
+            suite: suite.as_str().to_string(),
+            sequencer_did: terms.sequencer,
+            co_owners: terms.co_owners.clone(),
+        },
+    )?;
     // The creator and every co-owner are members, with role `owner`: a
     // co-owner holds every right, so it can read what it can write and
     // manage.
     for member_did in std::iter::once(owner_did).chain(terms.co_owners) {
-        store.upsert_membership(&StoredMembership {
-            channel_id: block_cid.to_string(),
-            member_did,
-            role: "owner".to_string(),
-            joined_at: now,
-            source_block_cid: block_cid.to_string(),
-        })?;
+        crate::persist::upsert_membership_on(
+            conn,
+            &StoredMembership {
+                channel_id: block_cid.to_string(),
+                member_did,
+                role: "owner".to_string(),
+                joined_at: now,
+                source_block_cid: block_cid.to_string(),
+            },
+        )?;
     }
     Ok(())
 }
@@ -194,11 +205,16 @@ fn apply_member_add(
     let (named, channel) = channel_of(store, BlockKind::MemberAdd, m, block_cid, false)?;
     let channel = channel
         .ok_or_else(|| anyhow::anyhow!("member-add references unknown channel `{named}`"))?;
-    member_add_on(store, m, block_cid, &channel)
+    member_add_on(
+        &store.conn.lock().expect("poisoned"),
+        m,
+        block_cid,
+        &channel,
+    )
 }
 
 fn member_add_on(
-    store: &Arc<SqliteStore>,
+    conn: &rusqlite::Connection,
     m: &BlockManifest,
     block_cid: &str,
     channel: &StoredChannel,
@@ -206,13 +222,16 @@ fn member_add_on(
     let member_did = meta_str(m, "member_did")
         .map(canonical_did_string)
         .ok_or_else(|| anyhow::anyhow!("member-add missing `member_did` in metadata"))?;
-    store.upsert_membership(&StoredMembership {
-        channel_id: channel.id.clone(),
-        member_did,
-        role: "member".to_string(),
-        joined_at: chrono::Utc::now().timestamp(),
-        source_block_cid: block_cid.to_string(),
-    })?;
+    crate::persist::upsert_membership_on(
+        conn,
+        &StoredMembership {
+            channel_id: channel.id.clone(),
+            member_did,
+            role: "member".to_string(),
+            joined_at: chrono::Utc::now().timestamp(),
+            source_block_cid: block_cid.to_string(),
+        },
+    )?;
     Ok(())
 }
 
@@ -225,11 +244,11 @@ fn apply_member_remove(
     block_cid: &str,
 ) -> anyhow::Result<()> {
     let (_, channel) = channel_of(store, BlockKind::MemberRemove, m, block_cid, false)?;
-    member_remove_on(store, m, channel.as_ref())
+    member_remove_on(&store.conn.lock().expect("poisoned"), m, channel.as_ref())
 }
 
 fn member_remove_on(
-    store: &Arc<SqliteStore>,
+    conn: &rusqlite::Connection,
     m: &BlockManifest,
     channel: Option<&StoredChannel>,
 ) -> anyhow::Result<()> {
@@ -237,7 +256,7 @@ fn member_remove_on(
         .map(canonical_did_string)
         .ok_or_else(|| anyhow::anyhow!("member-remove missing `member_did` in metadata"))?;
     if let Some(channel) = channel {
-        store.remove_membership_by_id(&channel.id, &member_did)?;
+        crate::persist::remove_membership_by_id_on(conn, &channel.id, &member_did)?;
     }
     Ok(())
 }
@@ -250,12 +269,12 @@ fn apply_channel_promote(
     let (named, channel) = channel_of(store, BlockKind::ChannelPromote, m, block_cid, false)?;
     let channel = channel
         .ok_or_else(|| anyhow::anyhow!("channel-promote references unknown channel `{named}`"))?;
-    promote_on(store, channel)
+    promote_on(&store.conn.lock().expect("poisoned"), channel)
 }
 
-fn promote_on(store: &Arc<SqliteStore>, mut channel: StoredChannel) -> anyhow::Result<()> {
+fn promote_on(conn: &rusqlite::Connection, mut channel: StoredChannel) -> anyhow::Result<()> {
     channel.visibility = "open".to_string();
-    store.upsert_channel(&channel)?;
+    crate::persist::upsert_channel_on(conn, &channel)?;
     Ok(())
 }
 
@@ -307,11 +326,12 @@ fn apply_channel_archive(
         anyhow::bail!("channel-archive rejected: `{sender}` is not the owner of `{channel_slug}`");
     }
 
-    archive_on(store, &channel)
+    archive_on(&store.conn.lock().expect("poisoned"), &channel)
 }
 
-fn archive_on(store: &Arc<SqliteStore>, channel: &StoredChannel) -> anyhow::Result<()> {
-    if !store.archive_channel_by_id(&channel.id, chrono::Utc::now().timestamp())? {
+fn archive_on(conn: &rusqlite::Connection, channel: &StoredChannel) -> anyhow::Result<()> {
+    if !crate::persist::archive_channel_by_id_on(conn, &channel.id, chrono::Utc::now().timestamp())?
+    {
         anyhow::bail!("channel `{}` is already archived", channel.slug);
     }
     Ok(())
@@ -319,14 +339,16 @@ fn archive_on(store: &Arc<SqliteStore>, channel: &StoredChannel) -> anyhow::Resu
 
 /// The effect of a block in a channel this server carries for its owner
 /// (JEP-0005 rules 3 and 22a), on `channel`, the row the owner's record put
-/// it in; for a channel-create, the row it makes, under `sequencer`.
+/// it in; for a channel-create, the row it makes, under `sequencer`. On
+/// `conn`, inside the transaction that lands the block, so the block, its
+/// record and its effect land together or not at all.
 ///
 /// No ownership check: the owner ran its full gate before it sequenced the
 /// block, and its signed order is what this server follows. Kinds that are
 /// not channel content, the nameserver's and the federation handshake's,
 /// are refused: they have no place in a channel's chain.
 pub fn apply_carried_effect(
-    store: &Arc<SqliteStore>,
+    conn: &rusqlite::Connection,
     m: &BlockManifest,
     block_cid: &str,
     channel: Option<&StoredChannel>,
@@ -337,11 +359,11 @@ pub fn apply_carried_effect(
         .ok_or_else(|| anyhow::anyhow!("a carried block declares no kind"))?;
     let carried = || channel.ok_or_else(|| anyhow::anyhow!("no carried channel for the block"));
     match kind {
-        BlockKind::ChannelCreate => apply_channel_create_under(store, m, block_cid, sequencer),
-        BlockKind::MemberAdd => member_add_on(store, m, block_cid, carried()?),
-        BlockKind::MemberRemove => member_remove_on(store, m, channel),
-        BlockKind::ChannelPromote => promote_on(store, carried()?.clone()),
-        BlockKind::ChannelArchive => archive_on(store, carried()?),
+        BlockKind::ChannelCreate => apply_channel_create_under(conn, m, block_cid, sequencer),
+        BlockKind::MemberAdd => member_add_on(conn, m, block_cid, carried()?),
+        BlockKind::MemberRemove => member_remove_on(conn, m, channel),
+        BlockKind::ChannelPromote => promote_on(conn, carried()?.clone()),
+        BlockKind::ChannelArchive => archive_on(conn, carried()?),
         BlockKind::TextRender
         | BlockKind::EmailRender
         | BlockKind::EmailEncrypted
