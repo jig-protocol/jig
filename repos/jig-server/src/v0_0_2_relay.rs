@@ -240,6 +240,19 @@ pub struct Relay {
     in_flight: Arc<Mutex<HashMap<String, usize>>>,
 }
 
+/// One request waiting on its owner's answer, forgotten when its waiter goes,
+/// however it goes.
+struct Waiting<'a> {
+    relay: &'a Relay,
+    request_id: u64,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.relay.forget(self.request_id);
+    }
+}
+
 /// One relay counted against its client connection while it waits.
 struct InFlight {
     key: String,
@@ -391,6 +404,12 @@ impl Relay {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(request_id, (owner.clone(), tx));
+        // Forgotten however this waiter ends: answered, timed out, or dropped
+        // with the client's request.
+        let _pending = Waiting {
+            relay: self,
+            request_id,
+        };
         let body = Submit {
             request_id,
             channel_id: channel_id.to_string(),
@@ -399,14 +418,12 @@ impl Relay {
         }
         .encode();
         if sender.send(RELAY_SUBMIT_FRAME, body).is_err() {
-            self.forget(request_id);
             return Err(unreachable());
         }
         let answer = match tokio::time::timeout(RELAY_TIMEOUT, rx).await {
             Ok(Ok(answer)) => answer,
             // Timed out, or the connection went with the answer.
             _ => {
-                self.forget(request_id);
                 return Err(Refusal::new(
                     StatusCode::GATEWAY_TIMEOUT,
                     "RELAY_PENDING",
@@ -452,6 +469,12 @@ impl Relay {
             key: conn.to_string(),
             counts: self.in_flight.clone(),
         })
+    }
+
+    /// How many requests wait on an owner's answer.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.pending.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     fn forget(&self, request_id: u64) {

@@ -2581,6 +2581,21 @@ mod tests {
         let refused = client_post(&p.follower, &parts).await.unwrap_err();
         assert_eq!(refused.code, "RELAY_BUSY", "{refused:?}");
 
+        // A client that goes away while it waits leaves nothing waiting.
+        let relay = p.follower.relay.get().unwrap().clone();
+        let parts = signed(&author, BlockKind::TextRender, text_in(&channel, "gone"));
+        let gone = {
+            let follower = follower.clone();
+            tokio::spawn(async move {
+                crate::v0_0_2_relay::post(&follower, &parts.0, &parts.1, parts.2, 8, "ws:8").await
+            })
+        };
+        swallowed.recv().await.expect("its relay sent");
+        assert_eq!(relay.waiting(), crate::v0_0_2_relay::MAX_IN_FLIGHT + 1);
+        gone.abort();
+        let _ = gone.await;
+        assert_eq!(relay.waiting(), crate::v0_0_2_relay::MAX_IN_FLIGHT);
+
         // Unanswered, each is pending: the outcome is unknown, and resending
         // is safe.
         tokio::time::pause();
@@ -2593,6 +2608,7 @@ mod tests {
                 refused.message
             );
         }
+        assert_eq!(relay.waiting(), 0, "nothing left waiting");
     }
 
     #[tokio::test]
