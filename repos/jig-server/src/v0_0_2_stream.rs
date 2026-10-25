@@ -174,6 +174,30 @@ impl RecordsFrom {
     }
 }
 
+/// The entries of one [`RECORDS_FRAME`]: at most [`MAX_ENTRIES`], and past
+/// the first, at most [`FRAME_BUDGET`] bytes of them.
+#[derive(Default)]
+struct Packer {
+    entries: Vec<Entry>,
+    size: usize,
+}
+
+impl Packer {
+    /// Add `entry` if the frame has room for it. The check comes before each
+    /// entry after the first, so nothing follows a largest first entry.
+    fn add(&mut self, entry: Entry) -> bool {
+        let len = entry.bundle.len() + entry.sig.len() + entry.record.len();
+        let full = self.entries.len() == MAX_ENTRIES
+            || (!self.entries.is_empty() && self.size + len > FRAME_BUDGET);
+        if full {
+            return false;
+        }
+        self.size += len;
+        self.entries.push(entry);
+        true
+    }
+}
+
 /// What one peer streamed in the current minute.
 struct Window {
     start: Instant,
@@ -379,8 +403,7 @@ impl Stream {
         let records =
             self.store()
                 .list_ingest_records_by_id(channel_id, from_seq, MAX_ENTRIES + 1)?;
-        let mut entries = Vec::new();
-        let mut size = 0;
+        let mut frame = Packer::default();
         let mut more = false;
         for record in records {
             let Some(block) = self.store().get_block(&record.block_cid)? else {
@@ -389,17 +412,14 @@ impl Stream {
             let Some((_, _, entry)) = self.entry(&block)? else {
                 break;
             };
-            let len = entry.bundle.len() + entry.sig.len() + entry.record.len();
-            if entries.len() == MAX_ENTRIES || (!entries.is_empty() && size + len > FRAME_BUDGET) {
+            if !frame.add(entry) {
                 more = true;
                 break;
             }
-            size += len;
-            entries.push(entry);
         }
-        Ok((!entries.is_empty()).then(|| Records {
+        Ok((!frame.entries.is_empty()).then(|| Records {
             channel_id: channel_id.to_string(),
-            entries,
+            entries: frame.entries,
             more,
         }))
     }
@@ -572,6 +592,60 @@ mod tests {
             }],
             more: true,
         }
+    }
+
+    /// The largest frame the owner sends, wrapped as the peer connection
+    /// sends it, in bytes.
+    fn envelope_len(entries: Vec<Entry>) -> usize {
+        let body = Records {
+            channel_id: jig_pipeline::ingest_record::label_cid("a channel"),
+            entries,
+            more: true,
+        }
+        .encode();
+        let envelope = jig_pipeline::envelope::Envelope::new(jig_pipeline::envelope::Frame::Peer {
+            kind: RECORDS_FRAME.to_string(),
+            body,
+        });
+        serde_json::to_vec(&envelope).unwrap().len()
+    }
+
+    fn entry_of(bundle: usize) -> Entry {
+        Entry {
+            bundle: vec![0xff; bundle],
+            sig: vec![0xff; 64],
+            record: vec![b'x'; jig_pipeline::follow::MAX_RECORD_BYTES],
+        }
+    }
+
+    #[test]
+    fn the_largest_frames_fit_the_peer_connection() {
+        // TODO: `jig_core::bundle::MAX_ENVELOPE_BYTES` once #310 lands.
+        let max_envelope = jig_core::bundle::MAX_BUNDLE_BYTES.div_ceil(3) * 4 + 64 * 1024;
+        let max = jig_core::bundle::MAX_BUNDLE_BYTES;
+
+        // A largest block first: nothing follows it.
+        let mut one = Packer::default();
+        assert!(one.add(entry_of(max)));
+        assert!(!one.add(entry_of(1)), "nothing after a largest first entry");
+        let len = envelope_len(one.entries);
+        assert!(
+            len <= max_envelope,
+            "one largest entry: {len} > {max_envelope}"
+        );
+
+        // As many entries as a frame holds, filling the budget.
+        let per = FRAME_BUDGET / MAX_ENTRIES - 64 - jig_pipeline::follow::MAX_RECORD_BYTES;
+        let mut many = Packer::default();
+        for _ in 0..MAX_ENTRIES {
+            assert!(many.add(entry_of(per)));
+        }
+        assert!(!many.add(entry_of(1)), "no more than MAX_ENTRIES");
+        let len = envelope_len(many.entries);
+        assert!(
+            len <= max_envelope,
+            "{MAX_ENTRIES} entries: {len} > {max_envelope}"
+        );
     }
 
     #[test]
