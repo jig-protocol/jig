@@ -64,11 +64,17 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 ## 1. Tiers
 
 1. A `channel-create` block MUST carry `tier`: one of `private`, `server`, `shared` or
-   `public`. A server MUST refuse a `channel-create` with a missing or unknown `tier`
-   (`UNKNOWN_TIER`), except for the legacy channels in section 6.
+   `public`. A server MUST refuse an unknown `tier` (`UNKNOWN_TIER`). Channels created before
+   this JEP are read as section 6 says.
+   - A new `channel-create` without `tier`, from a client that predates this JEP, is mapped as
+     section 6's table maps stored channels: `restricted` with `mls` is `private`, and `open`
+     with `mls` is `server` with `join = guest`.
+   - A new `channel-create` without `tier` that would be `open` with `none` MUST be refused
+     (`UNKNOWN_TIER`). Otherwise an old client would create a `public` channel without the label
+     or the confirmation that rule 5 requires.
 2. **The tier is fixed for the channel's life**, like its suite (JEP-0001). Changing a tier
    means creating a new channel. A server MUST refuse any block that would change a
-   channel's tier.
+   channel's tier, `channel-promote` included.
 3. **Suites by tier:**
    - `private`, `server` and `shared` MUST use an operator-confidential suite (JEP-0001); today
      that is `mls`.
@@ -157,7 +163,9 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 ## 5. Group conversations from a DM
 
 18. **A 1:1 stays a pair.** Its `#dm/` slug is derived from the two DIDs, so a third member
-    cannot be added to it. A server MUST refuse a `member-add` to a `#dm/` channel.
+    cannot be added to it. A server MUST refuse a `member-add` to a `#dm/` channel of any DID
+    that is not one of the two the slug is derived from. Adding the other side of the pair, as
+    `jig dm` does after creating the channel, is allowed.
 19. **Adding someone to a 1:1 creates a new `private` channel** with all three members. Its
     `channel-create` carries `from_dm`, the 1:1's `channel_id`, so clients can link the two
     conversations. The 1:1 continues unchanged.
@@ -171,11 +179,14 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 
     | `visibility` | `suite` | Tier |
     | --- | --- | --- |
+    | any channel under the reserved `#jig/` prefix | `none` | `public` (rule 6) |
     | `restricted` | `mls` | `private` |
     | `open` | `mls` | `server`, with `join = guest`, which matches today's rule that any caller the server admits may join an open channel |
     | `open` | `none` | **frozen** |
     | `restricted` | `none` | **frozen**, as D25 already does |
 
+    The first row is checked first: a server's own system channels, such as `#jig/manifest`, are
+    `open` with `none` and would otherwise be frozen, which would stop the manifest log.
 22. **Frozen channels.** A frozen channel keeps its history readable to whoever could read it
     before. A server MUST refuse every new content or membership block in it (`CHANNEL_FROZEN`),
     except an archive by its owner.
@@ -245,8 +256,9 @@ reads no encrypted tier.
     - JEP-0001's Specification, which states that only `restricted` channels require an
       operator-confidential suite, follows this JEP's tier rules.
 37. **JEP-0005:**
-    - Rule 6, the terms of the contract, adds `tier`, `join`, `join_servers` and `history` to the
-      creation block's fields, fixed for the channel's life.
+    - Rule 6, the terms of the contract, adds `tier`, `join`, `join_servers`, `history`,
+      `from_dm` and `successor_of` to the creation block's fields, fixed for the channel's life.
+      `history`, `from_dm` and `successor_of` are reserved by this JEP.
     - Rule 7a's `member` grant also covers relayed self-joins (rule 13).
     - A `shared` channel is the only tier that may be offered under a contract. A `public`
       channel MAY federate as today's open channels do, read-only for followers without a
@@ -282,6 +294,13 @@ abuse), PV-04 (non-deniability), AB-06 (abuse in encrypted channels).
   - `private` is written `restricted`;
   - `server` and `shared` are written `open` with `suite = mls`;
   - `public` is written `open` with `suite = none`.
+- **Old clients creating channels.** A `channel-create` without `tier` is mapped as rule 1
+  says. An old client asking for a plaintext open channel is refused with `UNKNOWN_TIER`, so its
+  user must upgrade before creating one, and then confirms the `public` label.
+- **Two CLI paths go away.** Growing a DM into a group with `jig channel add`, and opening it
+  with `jig channel promote`, are both refused: the tier is fixed (rule 2), and a 1:1 stays a
+  pair (rule 18). The replacement is rule 19's new linked group. A legacy `#dm/` channel that
+  already has three or more members stays `private`, and rule 18 refuses any further add to it.
 - **Old clients cannot tell the tiers apart.** In particular they do not show the `public`
   label, which is a reason to ship the client change first.
 - **Old servers ignore `tier`** and fall back to `visibility`. A `server`-tier channel on an old
@@ -300,7 +319,8 @@ None yet. The pieces that exist:
 To be added with the implementation:
 - `channel-create` blocks for each tier;
 - refused tier and suite combinations;
-- a legacy-channel mapping table;
+- a legacy-channel mapping table, including `#jig/manifest` mapped to `public`;
+- a `member-add` to a `#dm/` channel: the pair's other DID accepted, a third DID refused;
 - a self-join refused for a role below `join`.
 
 # LLM Influence
