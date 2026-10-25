@@ -276,6 +276,12 @@ impl SqliteStore {
 /// The first block of a channel is its `channel-create` at seq 0, which makes
 /// the carried row: owned by `sequencer`, whatever this server's own DID.
 /// Every later block must be the next link of that channel's chain.
+///
+/// Precondition: the caller MUST have authenticated the connection the block
+/// came on as `sequencer`'s DID. This function cannot see the connection; it
+/// checks only that an accepted share of the channel with `sequencer` exists
+/// (`NoShare` otherwise), so a caller that passes a DID the peer merely
+/// claims lets that peer speak for any owner this server follows.
 pub async fn ingest_sequenced(
     ctx: &IngestContext,
     bundle: BlockBundle<'_>,
