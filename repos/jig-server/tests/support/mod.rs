@@ -655,6 +655,17 @@ impl TestServer {
         self.dispatch_full(http).await
     }
 
+    /// POST raw `body` bytes as JSON through the full v0.0.2 router.
+    pub async fn post_raw(&self, path: &str, body: Vec<u8>) -> (StatusCode, serde_json::Value) {
+        let http = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        self.dispatch_full(http).await
+    }
+
     async fn dispatch_full(&self, req: Request<Body>) -> (StatusCode, serde_json::Value) {
         let router = jig_server::v0_0_2_ws::build_v0_0_2_router(self.state.clone());
         let resp = router.oneshot(req).await.expect("router responds");
@@ -682,7 +693,7 @@ impl TestServer {
 }
 
 /// The `{ bundle_b64, sig_b64 }` body every submit-style endpoint takes.
-fn submission(block: &BuiltBlock) -> serde_json::Value {
+pub fn submission(block: &BuiltBlock) -> serde_json::Value {
     serde_json::json!({
         "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
         "sig_b64": base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),

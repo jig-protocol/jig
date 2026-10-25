@@ -222,7 +222,11 @@ pub async fn ws_handler(
     // What the welcome is bound to: this connection's TLS session, or
     // nothing over plaintext.
     let tls_exporter = exporter.map(|e| e.0.0.to_vec()).unwrap_or_default();
-    ws.on_upgrade(move |socket| handle_socket(socket, state, conn_id, ip, tls_exporter))
+    // `[limits]`: a message or frame over these closes the connection.
+    let limits = state.limits();
+    ws.max_message_size(limits.ws_message)
+        .max_frame_size(limits.ws_frame)
+        .on_upgrade(move |socket| handle_socket(socket, state, conn_id, ip, tls_exporter))
 }
 
 /// `[auth.rate_limit]` per remote address, on every request this router
@@ -285,7 +289,10 @@ pub fn build_v0_0_2_router(state: Arc<AppState>) -> Router {
     // only wraps the routes already present; `server.rs` merges these two
     // routers afterwards, so a single layer on one of them would leave the
     // other's routes untraced.
+    // `[limits]`: a body over this is refused with 413 before it is parsed.
+    let body_limit = axum::extract::DefaultBodyLimit::max(state.limits().request_body);
     router
+        .layer(body_limit)
         .layer(axum::middleware::from_fn_with_state(state, per_ip_rate))
         .layer(crate::handler::http_trace_layer())
 }

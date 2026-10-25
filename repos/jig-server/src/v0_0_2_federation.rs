@@ -33,7 +33,9 @@ use jig_pipeline::{
     persist::{StoredBlock, StoredReceipt},
 };
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, connect_async_tls_with_config, tungstenite::Message};
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config, tungstenite::Message,
+};
 use tracing::{debug, info, warn};
 
 use crate::v0_0_2::AppState;
@@ -350,6 +352,20 @@ pub(crate) fn tls_exporter_of(
     }
 }
 
+/// Dial a peer's `/api/v1/ws`, through `connector` when the peer is `wss://`.
+/// The connection holds what the peer sends to `[limits]`: a message or frame
+/// over them ends it.
+pub(crate) async fn dial_peer(
+    ws_url: &str,
+    connector: Option<Connector>,
+    limits: &crate::v0_0_2_limits::Limits,
+) -> anyhow::Result<(
+    WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    tokio_tungstenite::tungstenite::handshake::client::Response,
+)> {
+    Ok(connect_async_tls_with_config(ws_url, Some(limits.ws_config()), false, connector).await?)
+}
+
 pub(crate) async fn connect_and_relay(
     state: &Arc<AppState>,
     peer: &jig_config::v0_0_2_server::FederationPeer,
@@ -367,10 +383,7 @@ pub(crate) async fn connect_and_relay(
     // nothing and is advertised in `/.well-known/jig`.
     let connector =
         crate::v0_0_2_federation_tls::peer_connector(&state.config.federation, peer).await?;
-    let (mut ws, _resp) = match connector {
-        Some(c) => connect_async_tls_with_config(&ws_url, None, false, Some(c)).await?,
-        None => connect_async(&ws_url).await?,
-    };
+    let (mut ws, _resp) = dial_peer(&ws_url, connector, &state.limits()).await?;
     // Same hello/welcome a CLI client speaks. The fed-hello bundle below is a
     // block, not this handshake, and the server now refuses it until welcome.
     let tls_exporter = tls_exporter_of(ws.get_ref());
@@ -729,6 +742,41 @@ fn sign_synthetic_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer that sends one text message of each length in `lens`, in order.
+    async fn peer_sending(lens: Vec<usize>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/v1/ws", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for len in lens {
+                let _ = ws.send(Message::Text(" ".repeat(len).into())).await;
+            }
+            // Hold the connection until the dialer closes it.
+            while ws.next().await.is_some() {}
+        });
+        url
+    }
+
+    /// `[limits]` hold on the connections this server dials, not only on
+    /// the ones it accepts: what a peer sends past them ends the connection.
+    #[tokio::test]
+    async fn a_dialed_peer_is_held_to_the_message_limit() {
+        let limits = crate::v0_0_2_limits::Limits::resolve(&Default::default());
+        let max = limits.ws_message;
+        let url = peer_sending(vec![max, max + 1]).await;
+        let (mut ws, _) = dial_peer(&url, None, &limits).await.unwrap();
+
+        match ws.next().await {
+            Some(Ok(Message::Text(text))) => assert_eq!(text.len(), max),
+            other => panic!("a message at the limit is read, got {other:?}"),
+        }
+        match ws.next().await {
+            Some(Err(tokio_tungstenite::tungstenite::Error::Capacity(_))) => {}
+            other => panic!("one byte over the limit is refused, got {other:?}"),
+        }
+    }
 
     fn plaintext_peer() -> jig_config::v0_0_2_server::FederationPeer {
         jig_config::v0_0_2_server::FederationPeer {

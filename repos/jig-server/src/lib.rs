@@ -16,6 +16,7 @@ pub mod v0_0_2_contract;
 pub mod v0_0_2_federation;
 pub mod v0_0_2_federation_tls;
 pub mod v0_0_2_ingest_error;
+pub mod v0_0_2_limits;
 pub mod v0_0_2_manifest_log;
 pub mod v0_0_2_mls;
 pub mod v0_0_2_nameserver_tls;
