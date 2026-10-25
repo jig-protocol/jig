@@ -23,8 +23,11 @@
 //!   names another sequencer.
 //!
 //! Any other offer is accepted, or held for the operator
-//! ([`Contracts::answer_held`]), as the peer's `offers` setting says. Either
-//! side may end a live share. The follower does so with [`Contracts::end_share`].
+//! (`jig-server contracts accept` or `refuse`, [`operate`]), as the peer's
+//! `offers` setting says. Either side may end a live share: the owner on a
+//! `channel-unshare`, and the operator of either side with
+//! `jig-server contracts end`. An end is sent once the other side is
+//! connected, so it is not lost to a connection that is down.
 //!
 //! Each frame carries one signed message from [`jig_core::contract`]. A frame
 //! that does not parse, or that is signed by a server other than the
@@ -70,6 +73,10 @@ pub const END_FRAME: &str = "contract-end";
 /// offer sent twice is answered with the same message.
 pub const RESEND_EVERY: Duration = Duration::from_secs(30);
 
+/// How often the running server acts on its operator's decisions
+/// ([`operate`]) and sends the ends still waiting for a connection.
+pub const DECIDE_EVERY: Duration = Duration::from_secs(5);
+
 /// One server's side of every contract it takes part in.
 #[derive(Clone)]
 pub struct Contracts {
@@ -82,10 +89,34 @@ pub struct Contracts {
 /// Run the contract on `state`'s server:
 /// - register its peer-frame handler;
 /// - watch for share blocks;
-/// - resend unanswered offers every [`RESEND_EVERY`].
+/// - resend unanswered offers every [`RESEND_EVERY`];
+/// - act on the operator's decisions every [`DECIDE_EVERY`].
 ///
 /// Call once, at boot.
 pub fn start(state: &AppState) -> Contracts {
+    let contracts = handle(state);
+    let resender = contracts.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(RESEND_EVERY);
+        loop {
+            tick.tick().await;
+            resender.resend_offers();
+        }
+    });
+    let decider = contracts.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(DECIDE_EVERY);
+        loop {
+            tick.tick().await;
+            decider.act_on_decisions().await;
+        }
+    });
+    contracts
+}
+
+/// Register the peer-frame handler and watch for share blocks, with no
+/// timers: what [`start`] runs, less the resending and the decisions.
+fn handle(state: &AppState) -> Contracts {
     let contracts = Contracts::new(state);
     if !state.set_peer_frames(Arc::new(contracts.clone())) {
         tracing::warn!("a peer-frame handler was already registered; contract frames go to it");
@@ -101,14 +132,6 @@ pub fn start(state: &AppState) -> Contracts {
             if let Err(e) = watcher.on_share_block(&block).await {
                 tracing::warn!(block = %block.cid, "share not acted on: {e:#}");
             }
-        }
-    });
-    let resender = contracts.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(RESEND_EVERY);
-        loop {
-            tick.tick().await;
-            resender.resend_offers();
         }
     });
     contracts
@@ -296,17 +319,14 @@ impl Contracts {
         let channel_id: Cid = channel.id.parse()?;
         let store = self.store();
         for live in store.contract_offers_for(&channel.id, to, Side::Owner, OfferState::Accepted)? {
-            let end = ContractEnd::sign(&self.ctx.server_key, channel_id, live.offer_id);
-            if store.move_contract_offer(
+            store.move_contract_offer(
                 &live.offer_id,
                 OfferState::Accepted,
-                OfferState::Ended,
+                OfferState::Ending,
                 None,
-            )? {
-                self.send(to, END_FRAME, end.envelope.clone());
-                self.record_end(channel, to, &end).await?;
-            }
+            )?;
         }
+        self.deliver_ends().await;
         for pending in
             store.contract_offers_for(&channel.id, to, Side::Owner, OfferState::Offered)?
         {
@@ -376,7 +396,10 @@ impl Contracts {
                         }),
                     )
                     .await?;
-                } else if matches!(kept.state, OfferState::Withdrawn | OfferState::Ended) {
+                } else if matches!(
+                    kept.state,
+                    OfferState::Withdrawn | OfferState::Ending | OfferState::Ended
+                ) {
                     // Accepted after this side let it go: tell the follower,
                     // so it does not carry a share the owner does not.
                     let end =
@@ -489,8 +512,8 @@ impl Contracts {
             share_cid: None,
         })?;
         let answer = match self.judge(&offer) {
-            Err(code) => self.refuse(&offer, code)?,
-            Ok(OfferPolicy::Accept) => self.accept(&offer)?,
+            Err(code) => self.refuse(&offer, code, OfferState::Held)?,
+            Ok(OfferPolicy::Accept) => self.accept(&offer, OfferState::Held)?,
             Ok(OfferPolicy::Hold) => {
                 tracing::info!(
                     owner = %offer.owner,
@@ -534,8 +557,8 @@ impl Contracts {
         Ok(policy)
     }
 
-    /// Accept a held offer: sign, record, and return the accept.
-    fn accept(&self, offer: &ContractOffer) -> anyhow::Result<Vec<u8>> {
+    /// Accept an offer in `from`: sign, record, and return the accept.
+    fn accept(&self, offer: &ContractOffer, from: OfferState) -> anyhow::Result<Vec<u8>> {
         let accept = ContractAccept::sign(
             &self.ctx.server_key,
             offer,
@@ -545,71 +568,107 @@ impl Contracts {
         );
         self.store().move_contract_offer(
             &offer.offer_id,
-            OfferState::Held,
+            from,
             OfferState::Accepted,
             Some(&accept.envelope),
         )?;
         Ok(accept.envelope)
     }
 
-    /// Refuse a held offer with `code`: sign, record, and return the refusal.
-    fn refuse(&self, offer: &ContractOffer, code: RefuseCode) -> anyhow::Result<Vec<u8>> {
+    /// Refuse an offer in `from` with `code`: sign, record, and return the
+    /// refusal.
+    fn refuse(
+        &self,
+        offer: &ContractOffer,
+        code: RefuseCode,
+        from: OfferState,
+    ) -> anyhow::Result<Vec<u8>> {
         tracing::info!(owner = %offer.owner, channel = %offer.channel_id, code = code.as_str(), "refusing a contract offer");
         let refuse = ContractRefuse::sign(&self.ctx.server_key, offer, code);
         self.store().move_contract_offer(
             &offer.offer_id,
-            OfferState::Held,
+            from,
             OfferState::Refused,
             Some(&refuse.envelope),
         )?;
         Ok(refuse.envelope)
     }
 
-    /// The operator's answer to an offer held for it: accept it, or refuse it
-    /// (`POLICY_REFUSED`). The answer goes to the owner now if it is
-    /// connected, and otherwise when the owner sends the offer again.
-    pub fn answer_held(&self, offer_id: &[u8; 32], accept: bool) -> anyhow::Result<()> {
-        let kept = self
-            .store()
-            .get_contract_offer(offer_id)?
-            .filter(|o| o.side == Side::Follower && o.state == OfferState::Held)
-            .context("no offer is held with that id")?;
-        let offer = ContractOffer::from_envelope(&kept.offer)?;
-        let answer = if accept {
-            // What made the offer acceptable may have changed while it waited.
-            if let Err(code) = self.judge(&offer) {
-                anyhow::bail!(
-                    "this server can no longer honour the offer: {}",
-                    code.as_str()
-                );
-            }
-            self.accept(&offer)?
-        } else {
-            self.refuse(&offer, RefuseCode::PolicyRefused)?
+    /// Act on what the operator decided ([`operate`]):
+    /// - an offer to accept is accepted if this server can still honour it,
+    ///   and refused with the reason otherwise. What made it acceptable may
+    ///   have changed while it waited;
+    /// - an offer to refuse is refused (`POLICY_REFUSED`);
+    /// - a share to end is ended once the other side is connected.
+    ///
+    /// An answer goes to the owner now if it is connected, and otherwise when
+    /// the owner sends the offer again.
+    pub async fn act_on_decisions(&self) {
+        let store = self.store();
+        let decided = |state| {
+            store
+                .contract_offers_in(Side::Follower, state)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("listing decided offers: {e}");
+                    Vec::new()
+                })
         };
-        self.send(&kept.peer_did, ANSWER_FRAME, answer);
-        Ok(())
+        for (state, accepting) in [(OfferState::Accepting, true), (OfferState::Refusing, false)] {
+            for kept in decided(state) {
+                let answer = ContractOffer::from_envelope(&kept.offer)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|offer| match self.judge(&offer) {
+                        Ok(_) if accepting => self.accept(&offer, state),
+                        Ok(_) => self.refuse(&offer, RefuseCode::PolicyRefused, state),
+                        Err(code) => self.refuse(&offer, code, state),
+                    });
+                match answer {
+                    Ok(answer) => self.send(&kept.peer_did, ANSWER_FRAME, answer),
+                    Err(e) => tracing::warn!("contract offer not answered: {e:#}"),
+                }
+            }
+        }
+        self.deliver_ends().await;
     }
 
-    /// End a live share this server follows, as the follower (rule 11).
-    pub fn end_share(&self, offer_id: &[u8; 32]) -> anyhow::Result<()> {
-        let kept = self
-            .store()
-            .get_contract_offer(offer_id)?
-            .filter(|o| o.side == Side::Follower && o.state == OfferState::Accepted)
-            .context("this server follows no live share with that id")?;
+    /// Send each end this server decided on to the other side, and once it
+    /// is on a live connection, count the share ended. The owner records the
+    /// end in the channel's log.
+    async fn deliver_ends(&self) {
+        let store = self.store();
+        for side in [Side::Owner, Side::Follower] {
+            let ending = store
+                .contract_offers_in(side, OfferState::Ending)
+                .unwrap_or_default();
+            for kept in ending {
+                if let Err(e) = self.deliver_end(&kept).await {
+                    tracing::warn!(peer = %kept.peer_did, "contract end not delivered: {e:#}");
+                }
+            }
+        }
+    }
+
+    async fn deliver_end(&self, kept: &StoredOffer) -> anyhow::Result<()> {
+        let peer = Did::from_did_jig_string(&kept.peer_did)?;
+        let Some(sender) = self.peers.sender_for(&peer) else {
+            return Ok(());
+        };
         let end = ContractEnd::sign(
             &self.ctx.server_key,
             kept.channel_id.parse()?,
             kept.offer_id,
         );
-        self.store().move_contract_offer(
-            offer_id,
-            OfferState::Accepted,
+        sender.send(END_FRAME, end.envelope.clone())?;
+        if self.store().move_contract_offer(
+            &kept.offer_id,
+            OfferState::Ending,
             OfferState::Ended,
             None,
-        )?;
-        self.send(&kept.peer_did, END_FRAME, end.envelope);
+        )? && kept.side == Side::Owner
+            && let Some(channel) = self.store().get_channel_by_id(&kept.channel_id)?
+        {
+            self.record_end(&channel, &kept.peer_did, &end).await?;
+        }
         Ok(())
     }
 
@@ -617,24 +676,26 @@ impl Contracts {
     /// this server holds. The owner records an end in the channel's log.
     async fn on_end(&self, kept: StoredOffer, end: ContractEnd) -> anyhow::Result<()> {
         let store = self.store();
-        if store.move_contract_offer(
-            &kept.offer_id,
-            OfferState::Accepted,
-            OfferState::Ended,
-            None,
-        )? {
-            if kept.side == Side::Owner
-                && let Some(channel) = store.get_channel_by_id(&kept.channel_id)?
-            {
-                self.record_end(&channel, &kept.peer_did, &end).await?;
+        // A live share, or one this side was ending too.
+        for live in [OfferState::Accepted, OfferState::Ending] {
+            if store.move_contract_offer(&kept.offer_id, live, OfferState::Ended, None)? {
+                if kept.side == Side::Owner
+                    && let Some(channel) = store.get_channel_by_id(&kept.channel_id)?
+                {
+                    self.record_end(&channel, &kept.peer_did, &end).await?;
+                }
+                return Ok(());
             }
-        } else if kept.side == Side::Follower {
-            store.move_contract_offer(
-                &kept.offer_id,
+        }
+        // An offer withdrawn before this side answered it.
+        if kept.side == Side::Follower {
+            for waiting in [
                 OfferState::Held,
-                OfferState::Withdrawn,
-                None,
-            )?;
+                OfferState::Accepting,
+                OfferState::Refusing,
+            ] {
+                store.move_contract_offer(&kept.offer_id, waiting, OfferState::Withdrawn, None)?;
+            }
         }
         Ok(())
     }
@@ -740,6 +801,116 @@ impl Contracts {
             }
         }
     }
+}
+
+/// What the operator asks of this server's contracts, as
+/// `jig-server contracts ...`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Operation {
+    /// Every offer this server made or received.
+    List,
+    /// Accept a held offer.
+    Accept(String),
+    /// Refuse a held offer.
+    Refuse(String),
+    /// End a live share, on either side.
+    End(String),
+}
+
+/// Record the operator's decision in `store`, and say what was done. The
+/// running server acts on it within [`DECIDE_EVERY`]: it holds the key that
+/// signs, and the connection to the other side, so this needs neither.
+///
+/// An offer is named by its id in hex, or by a prefix of it that names one
+/// offer.
+pub fn operate(store: &SqliteStore, operation: Operation) -> anyhow::Result<String> {
+    let (id, side, from, to, verb) = match operation {
+        Operation::List => return list(store),
+        Operation::Accept(id) => (
+            id,
+            Some(Side::Follower),
+            OfferState::Held,
+            OfferState::Accepting,
+            "accepted",
+        ),
+        Operation::Refuse(id) => (
+            id,
+            Some(Side::Follower),
+            OfferState::Held,
+            OfferState::Refusing,
+            "refused",
+        ),
+        Operation::End(id) => (id, None, OfferState::Accepted, OfferState::Ending, "ended"),
+    };
+    let offer = find(store, &id)?;
+    if side.is_some_and(|side| side != offer.side) || offer.state != from {
+        anyhow::bail!(
+            "offer {} is {} on the {} side; only {} offers{} can be {verb}",
+            hex(&offer.offer_id),
+            offer.state.as_str(),
+            offer.side.as_str(),
+            from.as_str(),
+            if side.is_some() {
+                " this server received"
+            } else {
+                ""
+            },
+        );
+    }
+    if !store.move_contract_offer(&offer.offer_id, from, to, None)? {
+        anyhow::bail!(
+            "offer {} changed while this ran; list it again",
+            hex(&offer.offer_id)
+        );
+    }
+    Ok(format!(
+        "offer {} will be {verb} by the running server within {} seconds",
+        hex(&offer.offer_id),
+        DECIDE_EVERY.as_secs()
+    ))
+}
+
+fn list(store: &SqliteStore) -> anyhow::Result<String> {
+    let offers = store.list_contract_offers()?;
+    if offers.is_empty() {
+        return Ok("no contract offers".to_string());
+    }
+    Ok(offers
+        .iter()
+        .map(|o| {
+            format!(
+                "{}  {:<8} {:<10} {:<6} peer {}  channel {}",
+                hex(&o.offer_id),
+                o.side.as_str(),
+                o.state.as_str(),
+                o.grant.as_str(),
+                o.peer_did,
+                o.channel_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// The one offer whose hex id starts with `prefix`.
+fn find(store: &SqliteStore, prefix: &str) -> anyhow::Result<StoredOffer> {
+    let prefix = prefix.trim().to_ascii_lowercase();
+    if prefix.len() < 8 || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!("`{prefix}` is not an offer id: give at least 8 of its hex digits");
+    }
+    let mut found = store
+        .list_contract_offers()?
+        .into_iter()
+        .filter(|o| hex(&o.offer_id).starts_with(&prefix));
+    match (found.next(), found.next()) {
+        (Some(offer), None) => Ok(offer),
+        (None, _) => anyhow::bail!("no offer id starts with {prefix}"),
+        (Some(_), Some(_)) => anyhow::bail!("more than one offer id starts with {prefix}"),
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    hex::encode(bytes)
 }
 
 fn violation(why: impl std::fmt::Display) -> CloseReason {
@@ -870,8 +1041,9 @@ mod tests {
         crate::v0_0_2_manifest_log::publish(&follower)
             .await
             .unwrap();
-        start(&owner);
-        let follows = start(&follower);
+        // No timers: each test acts on decisions when it means to.
+        handle(&owner);
+        let follows = handle(&follower);
         tokio::spawn({
             let owner = owner.clone();
             async move { crate::v0_0_2_federation::connect_and_relay(&owner, &to_follower).await }
@@ -960,6 +1132,11 @@ mod tests {
             )
             .await
             .unwrap();
+        }
+
+        /// The follower's operator decides.
+        fn decide(&self, operation: Operation) -> Result<String, String> {
+            operate(&self.follower.ingest_ctx.store, operation).map_err(|e| e.to_string())
         }
 
         /// The offers on `side` of `channel` in `state`.
@@ -1118,18 +1295,26 @@ mod tests {
             p.offers(Side::Owner, &channel, OfferState::Offered).len(),
             1
         );
+        let id = hex(&held.offer_id);
+        let error = p.decide(Operation::End(id.clone())).unwrap_err();
         assert!(
-            p.follows.end_share(&held.offer_id).is_err(),
-            "a held offer is no live share"
+            error.contains("only accepted offers can be ended"),
+            "{error}"
         );
 
-        p.follows.answer_held(&held.offer_id, true).unwrap();
+        // The operator's decision, by a prefix of the id; the running server
+        // acts on it.
+        p.decide(Operation::Accept(id[..12].to_string())).unwrap();
+        assert_eq!(
+            p.offers(Side::Follower, &channel, OfferState::Accepting)
+                .len(),
+            1
+        );
+        p.follows.act_on_decisions().await;
         p.both(&channel, OfferState::Accepted).await;
         record_of(&p.owner, &channel, BlockKind::ContractAccept).await;
-        assert!(
-            p.follows.answer_held(&held.offer_id, false).is_err(),
-            "answered once"
-        );
+        let error = p.decide(Operation::Refuse(id)).unwrap_err();
+        assert!(error.contains("is accepted"), "answered once: {error}");
     }
 
     #[tokio::test]
@@ -1141,7 +1326,8 @@ mod tests {
             p.offers(Side::Follower, &channel, OfferState::Held).pop()
         })
         .await;
-        p.follows.answer_held(&held.offer_id, false).unwrap();
+        p.decide(Operation::Refuse(hex(&held.offer_id))).unwrap();
+        p.follows.act_on_decisions().await;
         p.both(&channel, OfferState::Refused).await;
         let record = record_of(&p.owner, &channel, BlockKind::ContractRefuse).await;
         assert_eq!(record.metadata["code"], "POLICY_REFUSED");
@@ -1161,7 +1347,8 @@ mod tests {
         // The follower ends it.
         p.share(&channel, "write").await;
         let (_, theirs) = p.both(&channel, OfferState::Accepted).await;
-        p.follows.end_share(&theirs.offer_id).unwrap();
+        p.decide(Operation::End(hex(&theirs.offer_id))).unwrap();
+        p.follows.act_on_decisions().await;
         p.both(&channel, OfferState::Ended).await;
         let record = record_of(&p.owner, &channel, BlockKind::ContractEnd).await;
         let end =
@@ -1557,5 +1744,89 @@ mod tests {
         let record = record_of(&owner, &channel, BlockKind::ContractRefuse).await;
         assert_eq!(record.metadata["code"], "SUFFIX_CONFLICT");
         record_of(&owner, &channel, BlockKind::ContractAccept).await;
+    }
+
+    /// An end waits for the other side to be connected: it is not counted
+    /// done, or recorded, until it is on a live connection.
+    #[tokio::test]
+    async fn an_end_waits_for_a_connection() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.channel().await;
+        p.share(&channel, "read").await;
+        let (ours, _) = p.both(&channel, OfferState::Accepted).await;
+
+        // The owner's operator ends it while the follower is not connected.
+        let unconnected = Contracts {
+            peers: Arc::new(PeerRegistry::default()),
+            ..Contracts::new(&p.owner)
+        };
+        operate(
+            &p.owner.ingest_ctx.store,
+            Operation::End(hex(&ours.offer_id)),
+        )
+        .unwrap();
+        unconnected.act_on_decisions().await;
+        assert_eq!(p.offers(Side::Owner, &channel, OfferState::Ending).len(), 1);
+        assert!(
+            !kinds_in(&p.owner, &channel)
+                .iter()
+                .any(|(k, _)| k == "contract-end"),
+            "not recorded before it is sent"
+        );
+
+        // Connected again: sent, counted, recorded, on both sides.
+        Contracts::new(&p.owner).act_on_decisions().await;
+        p.both(&channel, OfferState::Ended).await;
+        record_of(&p.owner, &channel, BlockKind::ContractEnd).await;
+    }
+
+    #[test]
+    fn the_operator_lists_offers_and_names_one_by_a_prefix() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert_eq!(
+            operate(&store, Operation::List).unwrap(),
+            "no contract offers"
+        );
+        let owner = SigningKey::from_bytes(&[3; 32]);
+        let (follower, _) = follower_of(&owner);
+        let offer = offer_to(
+            &follower,
+            &owner,
+            creation(&owner, serde_json::json!({})),
+            &[],
+        );
+        let row = StoredOffer {
+            offer_id: offer.offer_id,
+            channel_id: offer.channel_id.to_string(),
+            side: Side::Follower,
+            peer_did: offer.owner.clone(),
+            grant: Grant::Write,
+            state: OfferState::Held,
+            offer: offer.envelope.clone(),
+            answer: None,
+            share_cid: None,
+        };
+        store.put_contract_offer(&row).unwrap();
+        let id = hex(&offer.offer_id);
+        let listed = operate(&store, Operation::List).unwrap();
+        assert!(
+            listed.starts_with(&id) && listed.contains("follower") && listed.contains("held"),
+            "{listed}"
+        );
+        for bad in ["abc", "zzzzzzzzzz", "00000000"] {
+            assert!(
+                operate(&store, Operation::Accept(bad.into())).is_err(),
+                "{bad}"
+            );
+        }
+        operate(&store, Operation::Accept(id[..8].to_uppercase())).unwrap();
+        assert_eq!(
+            store
+                .get_contract_offer(&offer.offer_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            OfferState::Accepting
+        );
     }
 }

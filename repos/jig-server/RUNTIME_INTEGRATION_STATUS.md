@@ -1,5 +1,7 @@
 # Runtime Integration Status — Phase 1.3
 
+> **Historical.** Superseded by [JEP-0006](../jig-spec/jep/jep-0006-block-abi.md) and v0.3 receipts; the v0.2 `BlockReceipt` it describes no longer exists.
+
 **Date**: 2025-11-05  
 **Status**: `jig-runtime` baseline landed; v0.2 receipt mapping complete; capability alignment pending  
 **Context**: [IMPLEMENTATION_PLAN_FINAL.md](./IMPLEMENTATION_PLAN_FINAL.md)

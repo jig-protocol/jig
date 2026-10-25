@@ -4,24 +4,20 @@ version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
-description = "Unified WASM runtime for Jig Protocol with deterministic execution, WASI support, capability sandboxing, and instrumented fuel metering"
+description = "Executes jig:block components deterministically under the jig-det-1 profile"
 repository = "https://github.com/jig-protocol/repos"
-keywords = ["wasm", "runtime", "wasi", "capabilities", "deterministic"]
+keywords = ["wasm", "runtime", "component-model", "capabilities", "deterministic"]
 
 [features]
-default = ["wasi-preview2"]
+default = []
 component-model = ["wasmtime/component-model"]
-wasi-preview2 = ["wasmtime-wasi"]
-tracing = ["dep:tracing", "dep:tracing-subscriber"]
 
 [dependencies]
 # Core
-anyhow = "1.0"
 thiserror = "2.0"
 
 # WASM Runtime
 wasmtime = { version = "49.0.2", features = ["cranelift", "pooling-allocator"] }
-wasmtime-wasi = { version = "49.0.2", optional = true }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -31,15 +27,7 @@ toml = "1.1"
 # Cryptography
 blake3 = "1.5"
 
-# Logging (optional)
-tracing = { version = "0.1", optional = true }
-tracing-subscriber = { version = "0.3", optional = true }
-
-chrono = { workspace = true, features = ["serde"] }
 jig-core = { path = "../jig-core" }
-cid.workspace = true
-multihash-codetable.workspace = true
-time = { version = "0.3", features = ["serde"] }
 
 [dev-dependencies]
 # Pulley, for tests/block_abi_vectors.rs, which runs every vector on both backends. Test builds

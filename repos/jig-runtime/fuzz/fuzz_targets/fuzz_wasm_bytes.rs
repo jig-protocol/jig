@@ -1,7 +1,8 @@
 #![no_main]
 
+use jig_core::grant::Grant;
+use jig_runtime::component::ComponentRuntime;
 use libfuzzer_sys::fuzz_target;
-use jig_runtime::{BlockPackage, ExecutionContext, Runtime, RuntimeConfig};
 
 fuzz_target!(|data: &[u8]| {
     // Skip if data is too small
@@ -9,16 +10,11 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    // Create runtime with default config
-    let config = RuntimeConfig::default();
-    let Ok(runtime) = Runtime::with_config(config) else {
+    let Ok(runtime) = ComponentRuntime::new() else {
         return;
     };
 
-    // Try to execute the fuzzer-provided bytecode as WASM
-    let block = BlockPackage::from_wasm(vec![]).with_id("fuzz-001");
-    let context = ExecutionContext::default().with_block(block);
-
-    // We don't care about success/failure, just that it doesn't panic
-    let _ = runtime.execute(data, context);
+    // Validate and compile the fuzzer-provided bytes as a renderer component.
+    // We don't care about success/failure, just that it doesn't panic.
+    let _ = runtime.compile_renderer(data, &Grant::empty(), 16);
 });

@@ -1,5 +1,7 @@
 # Session Summary — Phase 1.0-1.2 Implementation
 
+> **Historical.** Superseded by [JEP-0006](../jig-spec/jep/jep-0006-block-abi.md) and v0.3 receipts; the v0.2 `BlockReceipt` it describes no longer exists.
+
 **Date**: 2025-11-03  
 **Duration**: ~4 hours  
 **Status**: ✅ Phase 1.0-1.2 Complete, Phase 1.3+ staged for runtime team

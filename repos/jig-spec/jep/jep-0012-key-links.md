@@ -111,6 +111,31 @@ Where JEP-0004 follows a chain of links for an alias (rule 18), each link MUST h
 `alias` audience naming that nameserver and alias. A link with any other audience breaks
 the chain.
 
+## Following a chain
+
+A server that changed its key more than once serves its links as a chain, oldest first:
+each link leaves the DID the one before it moved to, and the last moves to the DID it
+signs as now (JEP-0002 `prior_key_links` and `key_link`). A verifier holding an earlier
+DID follows the chain hop by hop. It MUST refuse the chain unless all of these hold:
+
+1. It has at most 16 links.
+2. Every link verifies as above and has audience `public`.
+3. Each link's `old` is exactly the `new` of the link before it.
+4. No two links have the same `old`: that is a fork (below), never followed.
+5. The last link's `new` is exactly the DID presented.
+6. One link's `old` is the DID the verifier holds. It follows from that link on.
+
+Every hop is checked against the links the verifier already kept, as below: a link it is
+offered that forks one it followed before is evidence, wherever in the chain it is.
+
+A server MUST NOT serve a chain that breaks these rules. When one of its stored earlier
+links is unreadable, does not verify, or leaves a gap, it serves the longest chain that
+ends at its DID and is still whole, and tells its operator which file it left out:
+verifiers holding a DID behind the break are refused, as with no chain. Only a newest
+link that cannot be served stops it from starting. A server keeps every link it ever
+signed, and once its chain holds 16 links it stops serving the oldest before it adds
+another, so the verifiers still holding that oldest DID are refused and must pin anew.
+
 ## Forks
 
 Two verified links with the same `old` and different `new` are a **fork**. The old key
@@ -163,6 +188,9 @@ at `/v1/rotate`. Moving it onto links is a change to that endpoint, specified wi
 `jig_core::key_link` (`repos/jig-core/src/key_link.rs`): `KeyLink`, `Audience`,
 `SignedKeyLink::sign`, `SignedKeyLink::from_envelope` and `fork`. `SignedKeyLink`
 implements `jig_core::naming::AliasLink`, so `verify_rotation_chain` follows alias links.
+A server's chain: `jig_pipeline::handshake::chain_moves` follows it, and
+`jig_client::server_key::key_chain` builds what a server serves from its stored links;
+`jig-server keys rotate` signs and keeps them.
 
 # Test Vectors
 
