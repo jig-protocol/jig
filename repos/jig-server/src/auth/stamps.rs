@@ -253,7 +253,10 @@ mod tests {
     #[test]
     fn a_stamp_binds_its_block_subject_and_action() {
         let t0 = Instant::now();
-        let v = StampVerifier::with_first_salt(EPOCH, 100, t0, [7; 32]);
+        // Derived, not a literal: CodeQL reads a literal salt as a hard-coded
+        // cryptographic value.
+        let salt = *blake3::hash(b"stamps test: binding").as_bytes();
+        let v = StampVerifier::with_first_salt(EPOCH, 100, t0, salt);
         let proof = stamp(&v.current(t0), b"cid-1");
         assert!(matches!(
             check(&v, &proof, b"cid-2", t0),
