@@ -335,7 +335,7 @@ impl Contracts {
                 // The contract is refused when the two servers claim one
                 // suffix under different authorities, whichever side found
                 // it (JEP-0004 rule 7).
-                if self.suffix_conflict(&accept.private_suffixes).is_some() {
+                if self.suffix_conflict(&accept.attested_suffixes).is_some() {
                     if self.store().move_contract_offer(
                         &kept.offer_id,
                         OfferState::Offered,
@@ -528,7 +528,7 @@ impl Contracts {
         if !suite.is_implemented() {
             return Err(RefuseCode::UnsupportedSuite);
         }
-        if self.suffix_conflict(&offer.private_suffixes).is_some() {
+        if self.suffix_conflict(&offer.attested_suffixes).is_some() {
             return Err(RefuseCode::SuffixConflict);
         }
         Ok(policy)
@@ -1290,7 +1290,7 @@ mod tests {
         follower: &AppState,
         owner: &SigningKey,
         (creation_block, channel_id): (Vec<u8>, Cid),
-        private_suffixes: &[AttestedSuffix],
+        attested_suffixes: &[AttestedSuffix],
     ) -> ContractOffer {
         ContractOffer::sign(
             owner,
@@ -1303,7 +1303,7 @@ mod tests {
                 cid: channel_id,
                 seq: 0,
             },
-            private_suffixes.to_vec(),
+            attested_suffixes.to_vec(),
         )
     }
 
@@ -1464,7 +1464,7 @@ mod tests {
         );
     }
 
-    /// The owner refuses an accept whose private suffixes it attests too: the
+    /// The owner refuses an accept claiming a suffix it attests under another authority: the
     /// contract is refused whichever side finds the conflict.
     #[tokio::test]
     async fn an_accept_claiming_the_owners_suffix_is_refused_only_under_another_authority() {

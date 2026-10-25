@@ -276,7 +276,7 @@ pub struct ContractOffer {
     /// The suffixes the owner attests, each with its authority. A
     /// `config`-rooted one is disclosed only here and in an accept, never
     /// published (JEP-0004 rule 7).
-    pub private_suffixes: Vec<AttestedSuffix>,
+    pub attested_suffixes: Vec<AttestedSuffix>,
     /// `owner`'s COSE_Sign1 over [`ContractOffer::payload`].
     pub envelope: Vec<u8>,
 }
@@ -294,7 +294,7 @@ impl ContractOffer {
             ("creation_block", Value::Bytes(self.creation_block.clone())),
             ("ingest_head", Value::Bytes(self.ingest_head.clone())),
             ("manifest", self.manifest.value()),
-            ("private_suffixes", suffix_values(&self.private_suffixes)),
+            ("attested_suffixes", suffix_values(&self.attested_suffixes)),
         ]
     }
 
@@ -319,7 +319,7 @@ impl ContractOffer {
         creation_block: Vec<u8>,
         ingest_head: Vec<u8>,
         manifest: ManifestRef,
-        private_suffixes: Vec<AttestedSuffix>,
+        attested_suffixes: Vec<AttestedSuffix>,
     ) -> Self {
         let mut offer = Self {
             offer_id: [0; 32],
@@ -330,7 +330,7 @@ impl ContractOffer {
             creation_block,
             ingest_head,
             manifest,
-            private_suffixes,
+            attested_suffixes,
             envelope: Vec::new(),
         };
         offer.offer_id = *blake3::hash(&offer.unidentified()).as_bytes();
@@ -350,7 +350,7 @@ impl ContractOffer {
             creation_block: bytes(&p, "creation_block", Self::WHAT)?,
             ingest_head: bytes(&p, "ingest_head", Self::WHAT)?,
             manifest: ManifestRef::read(field(&p, "manifest", Self::WHAT)?, Self::WHAT)?,
-            private_suffixes: suffixes(&p, Self::WHAT)?,
+            attested_suffixes: suffixes(&p, Self::WHAT)?,
             envelope: envelope.to_vec(),
         };
         offer.verify()?;
@@ -379,7 +379,7 @@ pub struct ContractAccept {
     pub sequencer: String,
     pub manifest: ManifestRef,
     /// The suffixes the accepting server attests, each with its authority.
-    pub private_suffixes: Vec<AttestedSuffix>,
+    pub attested_suffixes: Vec<AttestedSuffix>,
     /// On a sequencer move, the bot DIDs the new sequencer minted (rule
     /// 11a); otherwise empty.
     pub bot_dids: Vec<String>,
@@ -398,7 +398,7 @@ impl ContractAccept {
             ("offer_id", Value::Bytes(self.offer_id.to_vec())),
             ("sequencer", Value::text(self.sequencer.clone())),
             ("manifest", self.manifest.value()),
-            ("private_suffixes", suffix_values(&self.private_suffixes)),
+            ("attested_suffixes", suffix_values(&self.attested_suffixes)),
             ("bot_dids", texts(&self.bot_dids)),
         ]))
     }
@@ -408,7 +408,7 @@ impl ContractAccept {
         server_key: &SigningKey,
         offer: &ContractOffer,
         manifest: ManifestRef,
-        private_suffixes: Vec<AttestedSuffix>,
+        attested_suffixes: Vec<AttestedSuffix>,
         bot_dids: Vec<String>,
     ) -> Self {
         let mut accept = Self {
@@ -417,7 +417,7 @@ impl ContractAccept {
             offer_id: offer.offer_id,
             sequencer: offer.owner.clone(),
             manifest,
-            private_suffixes,
+            attested_suffixes,
             bot_dids,
             envelope: Vec::new(),
         };
@@ -438,7 +438,7 @@ impl ContractAccept {
             offer_id: digest(&p, "offer_id", Self::WHAT)?,
             sequencer: text(&p, "sequencer", Self::WHAT)?,
             manifest: ManifestRef::read(field(&p, "manifest", Self::WHAT)?, Self::WHAT)?,
-            private_suffixes: suffixes(&p, Self::WHAT)?,
+            attested_suffixes: suffixes(&p, Self::WHAT)?,
             bot_dids,
             envelope: envelope.to_vec(),
         };
@@ -631,9 +631,9 @@ fn cid(map: &Value, key: &str, what: &'static str) -> Result<Cid, ContractError>
     canonical_cid::from_bytes(&bytes(map, key, what)?).map_err(|_| ContractError::BadCid(what))
 }
 
-/// `private_suffixes`: attested suffixes, each named once.
+/// `attested_suffixes`: attested suffixes, each named once.
 fn suffixes(map: &Value, what: &'static str) -> Result<Vec<AttestedSuffix>, ContractError> {
-    let entries = array(map, "private_suffixes", what)?
+    let entries = array(map, "attested_suffixes", what)?
         .iter()
         .map(|v| AttestedSuffix::read(v, what))
         .collect::<Result<Vec<_>, _>>()?;
@@ -870,11 +870,11 @@ mod tests {
         );
     }
 
-    /// Re-sign `o` with `entries` as its `private_suffixes`, as raw values.
+    /// Re-sign `o` with `entries` as its `attested_suffixes`, as raw values.
     fn with_suffix_values(mut o: ContractOffer, entries: Vec<Value>) -> Vec<u8> {
         let mut fields = o.fields();
         for (k, v) in fields.iter_mut() {
-            if *k == "private_suffixes" {
+            if *k == "attested_suffixes" {
                 *v = Value::Array(entries.clone());
             }
         }
@@ -884,7 +884,7 @@ mod tests {
     }
 
     #[test]
-    fn private_suffixes_carry_one_authority_each() {
+    fn attested_suffixes_carry_one_authority_each() {
         let (a, b) = (did_of(&key(1)), did_of(&key(2)));
         let (low, high) = if a < b { (a, b) } else { (b, a) };
         let config = |suffix: &str, dids: Vec<&str>| {
@@ -915,7 +915,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(
-            ok.private_suffixes,
+            ok.attested_suffixes,
             [
                 AttestedSuffix::config("internal.example", [high.clone(), low.clone()]),
                 AttestedSuffix::dns("names.example.org", "names.example.org"),
