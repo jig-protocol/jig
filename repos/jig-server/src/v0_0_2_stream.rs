@@ -58,7 +58,7 @@ pub const PULL_EVERY: Duration = Duration::from_secs(10);
 
 /// The most block, signature and record bytes the owner packs into one
 /// frame, beyond its first entry: one largest block. Base64 on the wire, a
-/// frame is then about 2 MiB.
+/// frame then fits `jig_core::bundle::MAX_ENVELOPE_BYTES`.
 const FRAME_BUDGET: usize = jig_core::bundle::MAX_BUNDLE_BYTES;
 
 /// Frames waiting to be landed. A frame that finds the queue full is dropped,
@@ -620,8 +620,7 @@ mod tests {
 
     #[test]
     fn the_largest_frames_fit_the_peer_connection() {
-        // TODO: `jig_core::bundle::MAX_ENVELOPE_BYTES` once #310 lands.
-        let max_envelope = jig_core::bundle::MAX_BUNDLE_BYTES.div_ceil(3) * 4 + 64 * 1024;
+        let max_envelope = jig_core::bundle::MAX_ENVELOPE_BYTES;
         let max = jig_core::bundle::MAX_BUNDLE_BYTES;
 
         // A largest block first: nothing follows it.
