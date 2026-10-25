@@ -20,6 +20,7 @@ pub mod v0_0_2_manifest_log;
 pub mod v0_0_2_mls;
 pub mod v0_0_2_nameserver_tls;
 pub mod v0_0_2_peer;
+pub mod v0_0_2_stream;
 pub mod v0_0_2_ws;
 
 pub use config::ServerConfig;
