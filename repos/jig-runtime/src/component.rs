@@ -350,7 +350,7 @@ impl ComponentRuntime {
     }
 
     /// A runtime under operator-supplied limits: `runtime_config`'s pooling ceilings and stack
-    /// size apply to this engine exactly as they do to [`crate::WasmEngine`]. Per-run fuel and
+    /// size apply to this engine. Per-run fuel and
     /// deadline come from [`RenderLimits`], not from here.
     pub fn with_config(runtime_config: &RuntimeConfig, backend: Backend) -> Result<Self> {
         let mut config = deterministic_config(runtime_config)?;
