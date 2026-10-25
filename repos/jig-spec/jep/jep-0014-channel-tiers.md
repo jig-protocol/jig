@@ -1,0 +1,310 @@
++++
+jep = 0014
+title = "Channel Tiers: Visibility, Joining and Encryption"
+status = "Draft"
+type = "Standards Track"
+category = "Core"
+authors = ["DJ <dev@jig.onl>"]
+created = "2026-10-25"
+requires = ["0001", "0002", "0005", "0008", "0010"]
+replaces = []
+superseded_by = []
+discussions_to = "https://github.com/jig-protocol/jig/issues"
++++
+
+# Abstract
+
+Every channel belongs to one of four **tiers**, fixed when it is created:
+
+| Tier | Who joins | Encrypted |
+| --- | --- | --- |
+| `private` | added by a member or admin | yes, MLS |
+| `server` | anyone holding the required server role joins themselves | yes, MLS |
+| `shared` | as `server`, across servers under a federation contract | yes, MLS |
+| `public` | anyone | **no**: signed, readable by anyone, the server operator included |
+
+Three tiers are encrypted, and the operator cannot read them. `public` is the only plaintext
+tier. Choosing it is explicit, it is labelled wherever it is shown, and no existing channel can
+be switched into it.
+
+This JEP settles the question D25 left open: whether every channel is encrypted by default
+after the v0.2 tag. It is, except a channel created as `public`. The JEP also specifies:
+- the server roles a join rule can name;
+- what a joiner can read;
+- how a 1:1 grows into a group;
+- how today's plaintext open channels migrate;
+- what moves from the server to clients as a result.
+
+It amends JEP-0001 and JEP-0005 where noted.
+
+# Motivation
+
+- **Operators are untrusted** (D11). Under D25 today, restricted channels and DMs are always
+  MLS, but an open channel is plaintext unless its creator asks for `--encrypted`, and the
+  operator reads it. Product constraint 4 is "secure and E2EE by default".
+- **Joining should not need the server to read content.** An open channel is open because
+  anyone the server admits can join. MLS external commits (RFC 9420 §12.4.3.2) let a joiner
+  add itself, and `jig-mls` already supports them (`Member::join_external`,
+  `delivery::Intent::Join`). The server can gate the join on who the joiner is, without ever
+  holding a group secret.
+- **Plaintext should be a decision, not a default.** Announcements, a server's own system
+  channels and public archives need content that anyone can verify and read. That is the
+  `public` tier, and it says so.
+
+**Non-goals:**
+- metadata privacy (OP-04 is accepted);
+- changing a channel's tier in place;
+- server-side execution of encrypted content (section 7.4 is a placeholder).
+
+# Specification
+
+The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
+
+## 1. Tiers
+
+1. A `channel-create` block MUST carry `tier`: one of `private`, `server`, `shared` or
+   `public`. A server MUST refuse a `channel-create` with a missing or unknown `tier`
+   (`UNKNOWN_TIER`), except for the legacy channels in section 6.
+2. **The tier is fixed for the channel's life**, like its suite (JEP-0001). Changing a tier
+   means creating a new channel. A server MUST refuse any block that would change a
+   channel's tier.
+3. **Suites by tier:**
+   - `private`, `server` and `shared` MUST use an operator-confidential suite (JEP-0001); today
+     that is `mls`.
+   - `public` MUST use `none`. A server MUST refuse a `public` channel under any other suite,
+     and an encrypted tier under `none` (`TIER_SUITE_MISMATCH`).
+4. **`public` is never a destination.** No block, migration or successor (section 6) turns an
+   encrypted channel, or its history, into a `public` one. A `public` channel's successor MAY be
+   encrypted; the reverse is not allowed.
+5. **The `public` label.** A client MUST show a `public` channel's tier wherever it shows the
+   channel, with words to the effect of "anyone, including the server operator, can read
+   this". A client MUST ask the creator to confirm before it signs a `public`
+   `channel-create`. A server MAY refuse `public` channels by policy.
+6. **System channels are `public`.** The server's own channels under the reserved `#jig/`
+   prefix carry what anyone must be able to verify. Today that is the manifest log
+   (`#jig/manifest`); it also covers any channel that carries key links.
+7. **DMs are `private`.** A DM is a `private` channel whose `#dm/` slug is derived from the
+   pair of DIDs (`jig_core::dm`). Today's `restricted` channels are `private`.
+
+## 2. Server roles
+
+8. **Every authenticated caller has one server role** on a given server:
+   - **`member`**: a DID the server's admission policy records as a member. Until JEP-0009,
+     that is local policy: admission `records`, or JEP-0008 rule 21's member pool.
+   - **`guest`**: a DID that has proven possession of its key (JEP-0002 request proofs) and
+     that admission lets through, but that is not a member.
+   - **`stranger`**: everyone else, including every `--anon` session key (D20).
+9. **The role is the server's local judgement,** made on its own clock and records, at the
+   moment the join is checked. It is not carried to other servers.
+10. **Alignment with JEP-0008's capacity pools.** JEP-0008 rule 21 names three pools: members,
+    invited and strangers. `member` here is JEP-0008's member pool. JEP-0008 counts an
+    authenticated but unestablished DID as a stranger, where this JEP calls it a `guest`. Until
+    the two are reconciled (open question 1), a server MUST NOT admit to a join a DID its
+    capacity pools would refuse.
+
+## 3. Joining
+
+11. **`private`:** members join only when a DID holding the `membership` right adds them
+    (JEP-0005 rule 7b): the owner or an admin. Self-join is refused. This is today's
+    `restricted`.
+12. **`server`:** the `channel-create` block carries `join`, either `member` (the default) or
+    `guest`, the lowest server role that may join. A joiner joins itself with an MLS external
+    commit, carried in a `member-add` block it signs for itself. The server, acting as
+    delivery service:
+    - MUST check the joiner's server role (section 2) against `join` before it accepts the
+      commit;
+    - MUST validate the external commit against the group's public state, as it does today
+      (`delivery::Intent::Join`);
+    - holds no group secret and reads no content.
+
+    A `stranger` never self-joins a `server` channel. A DID with the `membership` right MAY
+    still add anyone, as in `private`.
+13. **`shared`:** as `server`, across servers under a JEP-0005 contract. The `channel-create`
+    block carries `join` as in rule 12, plus `join_servers`: either `owner` (only the owning
+    server's roles count) or `granted` (a follower's roles count too).
+    - A self-join through a follower is relayed only under a `member` grant (JEP-0005 rule
+      7a).
+    - The follower checks the joiner's role on the follower, and the owner checks that the
+      follower holds the grant and that `join_servers` is `granted`.
+    - The owner MUST refuse a relayed self-join that fails either check.
+14. **`public`:** anyone the server admits reads it. Who may post is the existing write gate
+    (membership and roles); nothing is encrypted.
+15. **Leaving and removal** are unchanged: a `member-remove` block, by the member or by a DID
+    with the `membership` right, with its MLS commit.
+
+## 4. History
+
+16. **By default, a joiner reads from the epoch it joins.** MLS gives a new member no key for
+    earlier epochs, and jig adds nothing that would.
+17. **Re-sharing history is reserved.** A later JEP MAY specify a `history-share` mechanism,
+    within these constraints, which this JEP fixes now:
+    - Only a client re-shares: a member's device, or an agent the owner runs as a member of
+      the channel with its own DID. The server MUST NOT re-share, and holds nothing it could
+      re-share with.
+    - Re-shared content keeps every original author's signature and franking tag (JEP-0010
+      rule 6), so the joiner can check who said what and can report it.
+    - The channel's creation block states whether re-sharing is allowed (`history`: `none`, the
+      default, or `members-may-share`). A client MUST NOT re-share history from a channel whose
+      creation block says `none`.
+    - Re-sharing travels encrypted to the joiner alone: in the channel at the joiner's epoch,
+      or in a `private` channel with the joiner.
+
+    The block kind `history-share` and the creation field `history` are reserved.
+
+## 5. Group conversations from a DM
+
+18. **A 1:1 stays a pair.** Its `#dm/` slug is derived from the two DIDs, so a third member
+    cannot be added to it. A server MUST refuse a `member-add` to a `#dm/` channel.
+19. **Adding someone to a 1:1 creates a new `private` channel** with all three members. Its
+    `channel-create` carries `from_dm`, the 1:1's `channel_id`, so clients can link the two
+    conversations. The 1:1 continues unchanged.
+20. **Later adds** to the group are ordinary `member-add` blocks with MLS commits. A group never
+    turns back into a 1:1.
+
+## 6. Migration
+
+21. **Legacy channels.** A channel created before this JEP has no `tier`. Its tier is read from
+    its stored `visibility` and `suite`:
+
+    | `visibility` | `suite` | Tier |
+    | --- | --- | --- |
+    | `restricted` | `mls` | `private` |
+    | `open` | `mls` | `server`, with `join = guest`, which matches today's rule that any caller the server admits may join an open channel |
+    | `open` | `none` | **frozen** |
+    | `restricted` | `none` | **frozen**, as D25 already does |
+
+22. **Frozen channels.** A frozen channel keeps its history readable to whoever could read it
+    before. A server MUST refuse every new content or membership block in it (`CHANNEL_FROZEN`),
+    except an archive by its owner.
+23. **Successors.** The owner of a frozen channel MAY create an encrypted successor: a new
+    channel whose `channel-create` carries `successor_of`, the frozen channel's `channel_id`.
+    - Clients SHOULD follow the link and show the two channels as one conversation.
+    - No history moves into the successor, except by section 4's re-sharing, done by a client.
+24. **"No plaintext is stored" is forward-looking.** From this JEP on, a server stores no
+    plaintext except in `public` channels. Frozen history stays where it is. An operator MAY
+    delete it, and the release notes for the change say both things.
+
+## 7. Consequences
+
+25. **Block execution moves to clients.** A server executes nothing under an encrypted suite,
+    and its receipt for such a block is `sealed` (JEP-0001 open question 7; JEP-0005 rule 23).
+    Clients run blocks on the plaintext they decrypt, and already check a server's `exec`
+    receipt by running the same component (JEP-0006, #276). In `public` channels the server
+    still executes, and clients still check it.
+26. **Search moves to clients.** A server cannot search content it cannot read. Search runs on
+    the client, over its own decrypted store. That store is sealed at rest, like the MLS
+    plaintext cache.
+27. **Bridges are visible members.** A bridge that carries content in or out of an encrypted
+    channel is a member of the group under its own DID. Clients MUST show it as a bridge in the
+    member list, so every member knows that content leaves through it. A bridge never reads a
+    channel it is not a member of. The email bridge's inbound path depends on this.
+28. **Moderation uses reports and franking.** Abuse in an encrypted channel reaches a tribunal
+    through a member's report of a franked message (JEP-0010 rules 6 to 8a). It never relies on
+    the server reading content, on escrow or on scanning (D22).
+
+### 7.4 Server-side execution
+
+> **TODO (DJ):** server-side execution for the distributed-OS model (phase 6) is under
+> discussion. This section will say whether and how a server, or an agent it runs, executes
+> blocks of an encrypted channel, and under what consent. Until it is written, rule 25 holds.
+
+## 8. Amendments
+
+29. **JEP-0001:**
+    - "Restricted channels are always MLS" becomes rule 3 above: every non-`public` tier uses an
+      operator-confidential suite.
+    - JEP-0001's Specification, which states that only `restricted` channels require an
+      operator-confidential suite, follows this JEP's tier rules.
+30. **JEP-0005:**
+    - Rule 6, the terms of the contract, adds `tier`, `join`, `join_servers` and `history` to the
+      creation block's fields, fixed for the channel's life.
+    - Rule 7a's `member` grant also covers relayed self-joins (rule 13).
+    - A `shared` channel is the only tier that may be offered under a contract. A `public`
+      channel MAY federate as today's open channels do, read-only for followers without a
+      `write` grant.
+
+# Security Considerations (Zero-Trust)
+
+Threat-register rows: OP-05 (content disclosure), OP-03 (suite downgrade), OP-09 (federation
+abuse), PV-04 (non-deniability), AB-06 (abuse in encrypted channels).
+
+- **The server learns who joins, not what is said.** Checking a role on a self-join reveals the
+  joiner's DID and time to the operator, as membership blocks already do. It reveals no
+  content (OP-04, accepted).
+- **A hostile server can refuse a join, or admit one it should have refused.** Admitting a DID
+  that does not hold the role exposes future content to that DID. Members see every join as a
+  signed `member-add` with its MLS commit, so a member's client SHOULD surface joins and MAY
+  leave the channel. This is the same trust a channel puts in an admin.
+- **Downgrade.** The tier and the suite are fixed by the signed creation block, which clients
+  pin (JEP-0002). An operator cannot turn a channel `public`. It can only refuse to host
+  encrypted ones, and that is visible.
+- **The `public` label is a safety property.** A client that hides it lets users write to the
+  operator believing they are writing privately.
+- **History re-sharing is a disclosure decision** made by a member, not the server. The
+  creation block's `history` field makes it a channel policy that every member can see before
+  joining.
+- **Bridges carry content out.** A bridge's DID in the member list is the only signal members
+  get, and rule 27 makes it mandatory.
+
+# Backwards Compatibility
+
+- **Legacy channels** map to tiers or are frozen, as section 6 sets out. Clients that do not
+  know `tier` see the new channels' `visibility` and `suite` fields unchanged:
+  - `private` is written `restricted`;
+  - `server` and `shared` are written `open` with `suite = mls`;
+  - `public` is written `open` with `suite = none`.
+- **Old clients cannot tell the tiers apart.** In particular they do not show the `public`
+  label, which is a reason to ship the client change first.
+- **Old servers ignore `tier`** and fall back to `visibility`. A `server`-tier channel on an old
+  server admits any authenticated joiner, as `open` does today, which is `join = guest`.
+
+# Reference Implementation
+
+None yet. The pieces that exist:
+- external-commit self-join (`jig_mls::Member::join_external`, `delivery::Intent::Join`);
+- the MLS gate (`jig-pipeline/src/mls_gate.rs`);
+- frozen plaintext restricted channels;
+- client re-execution of receipts (#276).
+
+# Test Vectors
+
+To be added with the implementation:
+- `channel-create` blocks for each tier;
+- refused tier and suite combinations;
+- a legacy-channel mapping table;
+- a self-join refused for a role below `join`.
+
+# LLM Influence
+
+Drafted with an LLM coding assistant from DJ's decisions of 2026-10-25 and the code on `main`
+(a740fa8), and reviewed by the author.
+
+# Rejected Alternatives
+
+- **Encrypted by default, with an opt-out flag on any channel.** A flag can be flipped. A
+  fixed `public` tier, chosen at creation and labelled, cannot be confused with an encrypted
+  channel.
+- **The server re-shares history to joiners.** It would have to hold the plaintext, which is
+  what the encrypted tiers exist to prevent.
+- **Adding a third member to a 1:1.** The `#dm/` slug names the pair, and growing it would
+  change what the slug means. A new linked group keeps the 1:1's meaning.
+- **Converting plaintext open channels in place.** Their history is already readable by the
+  operator. Encrypting new content in the same channel would suggest otherwise. A frozen
+  channel and an encrypted successor say exactly what is true.
+
+# Open Questions
+
+1. **Roles and capacity pools.** Section 2's `guest` (authenticated, not a member) and
+   JEP-0008's `invited` pool (admitted on an invite, not yet established) differ, and JEP-0008
+   counts an authenticated unknown DID as a stranger. There are two ways to reconcile them:
+   - **(a)** JEP-0008 adopts `guest` as a fourth pool;
+   - **(b)** join roles and capacity pools stay separate, and this JEP maps `guest` to
+     "JEP-0008 invited or stranger, authenticated".
+2. **`join_servers` for `shared`.** Is a follower's judgement of its own members enough for
+   the owner, or should the owner name the follower servers whose members may self-join?
+3. **System channels and key links.** Today key links are served at `/.well-known/jig` and in
+   the welcome, not in a channel. Should rule 6 name a `#jig/keys` channel?
+
+# Copyright
+
+This document is licensed under CC-BY-4.0.
