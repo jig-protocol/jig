@@ -1,5 +1,7 @@
 # jig-runtime Execution Closure Plan (Executable Internet v0.2)
 
+> **Historical.** Superseded by [JEP-0006](../jig-spec/jep/jep-0006-block-abi.md) and v0.3 receipts; the v0.2 `BlockReceipt` it describes no longer exists.
+
 **Scope.** Lock the shared runtime behind deterministic execution, canonical receipts, and auditable pricing without bloating the crate or churning signatures. All work items must preserve the `curl → hello-world` ≤ 60s KPI and keep defaults turnkey for potato hardware.
 
 **LOE guardrail.** Each step is sized to land as small, debuggable patches (≤ ~200 LoC per module touch) and maintain tight hot paths. Use instrumentation only where it directly feeds receipts or golden tests.
