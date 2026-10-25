@@ -851,8 +851,8 @@ pub struct PowPolicy {
     pub short_name_factor: u64,
     /// What renew and rotate by the holder pay (rule 31). `0` asks none.
     pub renew_effort: u64,
-    /// How long a penalty point lasts; each repeat offence before it lapses
-    /// doubles it (rule 27).
+    /// How long one penalty point takes to decay; each repeat offence while
+    /// points remain doubles it, up to a day (rule 27).
     pub penalty_decay_secs: u64,
 }
 

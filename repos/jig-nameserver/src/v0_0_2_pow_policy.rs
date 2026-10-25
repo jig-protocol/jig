@@ -15,8 +15,13 @@
 //! - **The controller** (`doubling`) doubles the suggested effort after a
 //!   window in which the queue was full, and halves it after a window in
 //!   which nothing queued, never below `min_effort` nor above `max_effort`.
-//! - **Penalties** last `penalty_decay_secs`; a repeat offence before one
-//!   lapses adds a point and doubles its life (rule 27).
+//! - **Penalties** decay one point per `penalty_decay_secs`; a repeat
+//!   offence while points remain adds a point and doubles the decay, up to a
+//!   day; a key whose points have all decayed starts over (rule 27). Points
+//!   past those that reach `max_effort` are not kept, so a key never decays
+//!   for longer than its price can matter.
+//! - **Bids** order the queue only up to `max_effort`: more work than the
+//!   most this suffix asks buys no further priority.
 //!
 //! Everything is in memory and per process, like the rate limits.
 
@@ -32,7 +37,8 @@ use tokio::time::Instant;
 /// long before this.
 const MAX_POINTS: u32 = 32;
 
-/// The longest a penalty lives, however often it is repeated.
+/// The longest one penalty point takes to decay, however often the offence
+/// is repeated (rule 27's `max_decay_secs`).
 const MAX_PENALTY_LIFE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The most (alias, DID) pairs and addresses held under penalty. Past it,
@@ -92,9 +98,28 @@ struct Waiter {
 
 #[derive(Debug, Clone, Copy)]
 struct Penalty {
+    /// Points at `at`.
     points: u32,
+    /// How long one point takes to decay.
     life: Duration,
-    expires: Instant,
+    at: Instant,
+}
+
+impl Penalty {
+    /// Points still live at `now`: one decays per `life`.
+    fn live(&self, now: Instant) -> u32 {
+        let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
+        let decayed = (elapsed / self.life.as_secs_f64().max(1.0)).floor();
+        self.points
+            .saturating_sub(decayed.min(f64::from(u32::MAX)) as u32)
+    }
+
+    /// When the last point decays.
+    fn expires(&self) -> Instant {
+        self.at
+            .checked_add(self.life.saturating_mul(self.points))
+            .unwrap_or(self.at)
+    }
 }
 
 impl Market {
@@ -166,35 +191,46 @@ impl Market {
     fn penalize(&self, key: String) {
         let now = Instant::now();
         let base = Duration::from_secs(self.pow.penalty_decay_secs).min(MAX_PENALTY_LIFE);
+        let most = self.points_that_matter();
         let mut st = self.lock();
-        let (points, life) = match st.penalties.get(&key) {
-            Some(p) if p.expires > now => (
-                (p.points + 1).min(MAX_POINTS),
-                p.life.saturating_mul(2).min(MAX_PENALTY_LIFE),
+        let (points, life) = match st.penalties.get(&key).map(|p| (p.live(now), p.life)) {
+            Some((live, life)) if live > 0 => (
+                (live + 1).min(most),
+                life.saturating_mul(2).min(MAX_PENALTY_LIFE),
             ),
             _ => (1, base),
         };
         if !st.penalties.contains_key(&key) && st.penalties.len() >= MAX_PENALTIES {
-            st.penalties.retain(|_, p| p.expires > now);
+            st.penalties.retain(|_, p| p.expires() > now);
             if st.penalties.len() >= MAX_PENALTIES
                 && let Some(nearest) = st
                     .penalties
                     .iter()
-                    .min_by_key(|(_, p)| p.expires)
+                    .min_by_key(|(_, p)| p.expires())
                     .map(|(k, _)| k.clone())
             {
                 st.penalties.remove(&nearest);
             }
         }
-        let expires = now.checked_add(life).unwrap_or(now);
         st.penalties.insert(
             key,
             Penalty {
                 points,
                 life,
-                expires,
+                at: now,
             },
         );
+    }
+
+    /// The fewest points at which the multiplier alone takes `min_effort` to
+    /// `max_effort`: more change no price, so they are not kept.
+    fn points_that_matter(&self) -> u32 {
+        let (min, max) = (self.pow.min_effort.max(1), self.pow.max_effort);
+        let mut points = 1;
+        while points < MAX_POINTS && min.saturating_mul(1u64 << points) < max {
+            points += 1;
+        }
+        points
     }
 
     /// Admit a stranger registration that bid `effort`: take a token, or wait
@@ -203,6 +239,8 @@ impl Market {
         if !self.pool.enabled {
             return Ok(());
         }
+        // Priority stops at the most this suffix asks (JEP-0008 rule 20).
+        let effort = effort.min(self.pow.max_effort);
         let wait = Duration::from_secs(self.pool.queue_wait_secs);
         let deadline = Instant::now() + wait;
         let id = {
@@ -386,14 +424,15 @@ fn ip_key(ip: &str) -> String {
     format!("ip:{ip}")
 }
 
-/// Live points under `key`, dropping a lapsed penalty.
+/// Live points under `key`, dropping a penalty whose points have all
+/// decayed.
 fn points(st: &mut State, key: &str, now: Instant) -> u32 {
-    match st.penalties.get(key) {
-        Some(p) if p.expires > now => p.points,
-        Some(_) => {
+    match st.penalties.get(key).map(|p| p.live(now)) {
+        Some(0) => {
             st.penalties.remove(key);
             0
         }
+        Some(live) => live,
         None => 0,
     }
 }
@@ -537,10 +576,17 @@ mod tests {
         tokio::time::advance(Duration::from_secs(300)).await;
         m.penalize_ip("1.1.1.1");
         assert_eq!(m.register_effort("alice", "did:a", "1.1.1.1"), 64);
-        // 600 s base, doubled to 1200 s from the second offence.
+        // 600 s a point, doubled to 1200 s by the second offence: one point
+        // decays per 1200 s from then (rule 27), not all at once.
         tokio::time::advance(Duration::from_secs(1100)).await;
         assert_eq!(m.register_effort("alice", "did:a", "1.1.1.1"), 64);
         tokio::time::advance(Duration::from_secs(200)).await;
+        assert_eq!(
+            m.register_effort("alice", "did:a", "1.1.1.1"),
+            32,
+            "one point left"
+        );
+        tokio::time::advance(Duration::from_secs(1200)).await;
         assert_eq!(m.register_effort("alice", "did:a", "1.1.1.1"), 16, "lapsed");
     }
 
@@ -587,14 +633,54 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_penalty_repeated_without_end_lives_at_most_a_day() {
+    async fn a_penalty_repeated_without_end_decays_a_point_a_day() {
         let m = Market::new(pow(), pool(60, 10));
         for _ in 0..200 {
             m.penalize_ip("1.1.1.1");
         }
         assert_eq!(m.register_effort("alice", "did:a", "1.1.1.1"), 1 << 16);
+        // 16 × 2^12 reaches max_effort: only those 12 points are kept, each
+        // decaying in at most a day.
+        assert_eq!(m.points_that_matter(), 12);
         tokio::time::advance(MAX_PENALTY_LIFE + Duration::from_secs(1)).await;
+        assert_eq!(
+            m.register_effort("alice", "did:a", "1.1.1.1"),
+            1 << 15,
+            "one point gone"
+        );
+        tokio::time::advance(MAX_PENALTY_LIFE * 11).await;
         assert_eq!(m.register_effort("alice", "did:a", "1.1.1.1"), 16, "lapsed");
+    }
+
+    /// A bid above `max_effort` buys no more priority than `max_effort`:
+    /// between two such bids, arrival order decides.
+    #[tokio::test(start_paused = true)]
+    async fn bids_above_max_effort_buy_no_more_priority() {
+        let m = std::sync::Arc::new(Market::new(
+            pow(),
+            PoolPolicy {
+                queue_wait_secs: 7200,
+                ..pool(1, 1)
+            },
+        ));
+        assert_eq!(m.admit(16).await, Ok(()), "spends the one token");
+        let first = tokio::spawn({
+            let m = m.clone();
+            async move { m.admit(1 << 16).await }
+        });
+        tokio::task::yield_now().await;
+        let second = tokio::spawn({
+            let m = m.clone();
+            async move { m.admit(1 << 28).await }
+        });
+        tokio::task::yield_now().await;
+        // One token in the hour: the earlier of two equal (capped) bids
+        // gets it, though the later one did 4096 times the work.
+        tokio::time::advance(Duration::from_secs(3601)).await;
+        assert_eq!(first.await.unwrap(), Ok(()));
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished(), "the higher bid still waits");
+        second.abort();
     }
 
     #[tokio::test(start_paused = true)]
