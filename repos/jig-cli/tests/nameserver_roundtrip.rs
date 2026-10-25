@@ -414,6 +414,11 @@ async fn a_full_pool_is_waited_out_and_the_registration_retried() {
         .unwrap_or_else(|| panic!("no busy refusal was waited out: {out}"));
     assert_eq!(waited, 5, "jig waits exactly its Retry-After: {out}");
     assert_eq!(
+        out.matches("taking no more new names for now").count(),
+        1,
+        "one busy refusal, then the retry got through: {out}"
+    );
+    assert_eq!(
         resolved(&ns, "deji@dj.jig").await.did,
         configured_did(home.path())
     );
