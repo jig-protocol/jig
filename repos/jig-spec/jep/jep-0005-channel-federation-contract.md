@@ -175,9 +175,11 @@ Non-goals for v0.2:
       signed offer and accept, each base64. A member checks that the sequencer signed the
       offer to `to`, and that `to` signed an accept of it.
     - The owner records a refusal the same way, as a `contract-refuse` block carrying
-      `{to, code, offer, refuse}`. When the owner refuses a share itself, because the
-      target is not a configured peer (17), no offer was sent, and the block carries only
-      `{to, code}`.
+      `{to, code, offer, refuse}`. When the owner refuses a share itself, the block
+      carries only `{to, code}`, and `code` is the owner's own reason: `NOT_A_PEER` when
+      the target is not a configured peer (17), so no offer was sent, or `SUFFIX_CONFLICT`
+      when the target's accept claims one of the owner's suffixes under another authority
+      (8). A refusal with any other code carries the target's signed message.
     - Only the channel's sequencer writes `contract-accept`, `contract-refuse` and
       `contract-end` blocks. A server MUST refuse one signed by anyone else.
 11. Either side ends a share with a signed `contract-end {server, channel_id, offer_id}`,

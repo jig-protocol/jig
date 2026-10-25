@@ -126,9 +126,17 @@ pub fn check_record(
             let code = RefuseCode::parse(
                 meta_str(manifest, CODE_KEY).ok_or(ContractBlockError::Missing(CODE_KEY))?,
             )?;
-            // The owning server's own refusal (a target that is not a peer)
-            // has no message from the target to carry.
+            // The owning server's own refusal has no message from the target
+            // to carry: a target that is not a peer, or an accept claiming one
+            // of the owner's suffixes under another authority. Any other code
+            // is the target's reason, so it comes with the target's message.
             if !manifest.metadata.contains_key(REFUSE_KEY) {
+                let owners = matches!(code, RefuseCode::NotAPeer | RefuseCode::SuffixConflict);
+                if !owners || manifest.metadata.contains_key(OFFER_KEY) {
+                    return Err(ContractBlockError::Mismatch(
+                        "a refusal without the target's message is the owner's own: NOT_A_PEER or SUFFIX_CONFLICT, with no offer",
+                    ));
+                }
                 return Ok(());
             }
             let refuse = ContractRefuse::from_envelope(&envelope(manifest, REFUSE_KEY)?)?;
@@ -728,6 +736,35 @@ pub(crate) mod tests {
             json!({"to": did(&p.follower), "code": "NOT_A_PEER"}),
         );
         assert_eq!(check(&p, BlockKind::ContractRefuse, &own), Ok(()));
+        let conflict = block(
+            BlockKind::ContractRefuse,
+            &did(&p.owner),
+            json!({"to": did(&p.follower), "code": "SUFFIX_CONFLICT"}),
+        );
+        assert_eq!(check(&p, BlockKind::ContractRefuse, &conflict), Ok(()));
+        // The target's reasons need the target's message, and an owner's
+        // refusal carries no offer.
+        let mismatch = Err(ContractBlockError::Mismatch(
+            "a refusal without the target's message is the owner's own: NOT_A_PEER or SUFFIX_CONFLICT, with no offer",
+        ));
+        for code in ["POLICY_REFUSED", "UNSUPPORTED_SUITE", "UNSUPPORTED_VERSION"] {
+            let unsigned = block(
+                BlockKind::ContractRefuse,
+                &did(&p.owner),
+                json!({"to": did(&p.follower), "code": code}),
+            );
+            assert_eq!(
+                check(&p, BlockKind::ContractRefuse, &unsigned),
+                mismatch,
+                "{code}"
+            );
+        }
+        let with_offer = block(
+            BlockKind::ContractRefuse,
+            &did(&p.owner),
+            json!({"to": did(&p.follower), "code": "NOT_A_PEER", "offer": b64(&offer.envelope)}),
+        );
+        assert_eq!(check(&p, BlockKind::ContractRefuse, &with_offer), mismatch);
     }
 
     #[test]
