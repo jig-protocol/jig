@@ -345,6 +345,41 @@ pub(crate) fn read_unlock_spec(
     read_unlock_spec_from(spec, "JIG_KEY_UNLOCK")
 }
 
+/// Whether a `credential:` file at `path`, with permission bits `mode`, may
+/// open a key.
+///
+/// - In systemd's `$CREDENTIALS_DIRECTORY` (`cred_dir`), read by owner and
+///   group only: 0400 or 0440. systemd hands a unit its credentials there,
+///   readable by the unit's group, in a directory only the unit can enter.
+/// - Anywhere else, owner only: no bit for group or others (0600, 0400).
+///
+/// Both paths are canonicalized first, so a link into the directory counts as
+/// inside it, and a link in it to a file elsewhere does not.
+#[cfg(unix)]
+fn credential_mode_ok(path: &Path, mode: u32, cred_dir: Option<&Path>) -> Result<(), String> {
+    let in_cred_dir = cred_dir.is_some_and(|dir| match (path.canonicalize(), dir.canonicalize()) {
+        (Ok(path), Ok(dir)) => path.starts_with(dir),
+        _ => false,
+    });
+    if in_cred_dir {
+        if mode & !0o440 != 0 {
+            return Err(format!(
+                "{} is in $CREDENTIALS_DIRECTORY with mode {mode:o}; a credential there must be \
+                 readable by its owner and group only, and not writable or executable (0400 or \
+                 0440)",
+                path.display()
+            ));
+        }
+    } else if mode & 0o077 != 0 {
+        return Err(format!(
+            "{} is readable by others (mode {mode:o}); a credential outside \
+             $CREDENTIALS_DIRECTORY opens the key, so it must be 0600 or 0400",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// [`read_unlock_spec`], with `var` naming where the spec came from in errors.
 ///
 /// A `credential:` file is key material: whoever reads it can open the key. So
@@ -371,12 +406,8 @@ pub(crate) fn read_unlock_spec_from(
                 .permissions()
                 .mode()
                 & 0o777;
-            if mode & 0o077 != 0 {
-                return Err(bad(format!(
-                    "{path} is readable by others (mode {mode:o}); a credential opens the key, \
-                     so it must be 0600 or 0400"
-                )));
-            }
+            let cred_dir = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from);
+            credential_mode_ok(Path::new(path), mode, cred_dir.as_deref()).map_err(bad)?;
         }
         let mut bytes = Zeroizing::new(Vec::new());
         std::io::Read::read_to_end(&mut file, &mut bytes)
@@ -1454,6 +1485,47 @@ pub fn default_keys_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// systemd hands a unit its credentials at 0440 in its own
+    /// $CREDENTIALS_DIRECTORY: accepted there, and only there.
+    #[cfg(unix)]
+    #[test]
+    fn a_credential_may_be_group_readable_only_in_credentials_directory() {
+        let creds = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let inside = creds.path().join("jig-server-key");
+        let outside = elsewhere.path().join("key");
+        std::fs::write(&inside, "x").unwrap();
+        std::fs::write(&outside, "x").unwrap();
+        let dir = Some(creds.path());
+
+        // In the directory: owner and group may read, nothing more.
+        for mode in [0o400, 0o440] {
+            credential_mode_ok(&inside, mode, dir).unwrap();
+        }
+        for mode in [0o444, 0o404, 0o600, 0o640, 0o540] {
+            let err = credential_mode_ok(&inside, mode, dir).unwrap_err();
+            assert!(err.contains("in $CREDENTIALS_DIRECTORY with mode"), "{err}");
+        }
+
+        // Elsewhere, and with no directory at all: owner only, as before.
+        for mode in [0o400, 0o600] {
+            credential_mode_ok(&outside, mode, dir).unwrap();
+        }
+        for (path, cred_dir) in [(&outside, dir), (&inside, None)] {
+            let err = credential_mode_ok(path, 0o440, cred_dir).unwrap_err();
+            assert!(err.contains("outside $CREDENTIALS_DIRECTORY"), "{err}");
+        }
+
+        // A link is where it points.
+        let link_out = creds.path().join("link-to-elsewhere");
+        std::os::unix::fs::symlink(&outside, &link_out).unwrap();
+        let err = credential_mode_ok(&link_out, 0o440, dir).unwrap_err();
+        assert!(err.contains("outside $CREDENTIALS_DIRECTORY"), "{err}");
+        let link_in = elsewhere.path().join("link-to-credential");
+        std::os::unix::fs::symlink(&inside, &link_in).unwrap();
+        credential_mode_ok(&link_in, 0o440, dir).unwrap();
+    }
     use crate::keychain::MemoryKeychain;
     use tempfile::tempdir;
 
