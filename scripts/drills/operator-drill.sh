@@ -50,7 +50,10 @@ log() { printf '\n== %s\n' "$*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 wait_for() { # URL
-  for _ in $(seq 1 100); do curl -fsk -o /dev/null "$1" && return 0; sleep 0.2; done
+  for _ in $(seq 1 100); do
+    curl -fsk --connect-timeout 1 --max-time 2 -o /dev/null "$1" && return 0
+    sleep 0.2
+  done
   return 1
 }
 
@@ -90,6 +93,10 @@ seal_keys() {
   log "seal both keys (deploy/setup-server-key.sh, $SLOTS)"
   local args=()
   if [ "$SLOTS" = passphrase ]; then
+    # EnvironmentFile= unquotes and trims a value: refuse what it would change.
+    case "$DRILL_PASSPHRASE" in
+      *\\* | *\"* | *\'* | [[:space:]]* | *[[:space:]]) fail "DRILL_PASSPHRASE: no quotes, backslashes or edge whitespace in passphrase mode" ;;
+    esac
     args=(--passphrase-only)
     for env in /etc/jig/jig-server.env /etc/jig/jig-nameserver.env; do
       install -m 0600 /dev/null "$env"
@@ -115,7 +122,9 @@ for k in ("server_did", "tls_binding"):
     assert k in d, k
 # Left out when nothing unsafe is on, though the README lists it.
 assert d.get("unsafe_options_active", []) == [], d["unsafe_options_active"]' || fail "/.well-known/jig"
-  curl -fsSk "$SERVER/metrics" | grep -q '^# TYPE' || fail "/metrics is not Prometheus text"
+  local metrics
+  metrics="$(curl -fsSk --max-time 10 "$SERVER/metrics")" || fail "/metrics"
+  grep -q '^# TYPE' <<<"$metrics" || fail "/metrics is not Prometheus text"
   [ "$(curl -sk -o /dev/null -w '%{http_code}' "$SERVER/api/v1/channels")" = 401 ] \
     || fail "an unsigned channel list is not refused with 401"
   curl -fsSk "$NS/v1/health" | grep -q '"ok"' || fail "nameserver /v1/health"
@@ -147,9 +156,15 @@ step_mdwe() {
   local since
   since="$(date '+%Y-%m-%d %H:%M:%S')"
   systemctl restart jig-server || true
-  local up=0
-  for _ in $(seq 1 25); do
-    if curl -fsk -o /dev/null "$SERVER/healthz"; then up=1; break; fi
+  # Until it serves, or the journal says why it cannot: journald may write
+  # the line a moment after the process exits.
+  local up=0 denied=0
+  for _ in $(seq 1 50); do
+    if curl -fsk --connect-timeout 1 --max-time 2 -o /dev/null "$SERVER/healthz"; then up=1; break; fi
+    if journalctl -u jig-server --since "$since" --no-pager | grep -q "unable to make memory executable"; then
+      denied=1
+      break
+    fi
     sleep 0.2
   done
   rm /etc/systemd/system/jig-server.service.d/zz-drill-mdwe.conf
@@ -161,8 +176,7 @@ step_mdwe() {
     fail "jig-server served under MemoryDenyWriteExecute=yes: its unit's reason for leaving it off is stale"
   fi
   # For the reason the unit gives, not some other failure.
-  journalctl -u jig-server --since "$since" --no-pager | grep -q "unable to make memory executable" \
-    || fail "jig-server failed under MemoryDenyWriteExecute=yes, but not because the JIT was denied"
+  [ "$denied" = 1 ] || fail "jig-server failed under MemoryDenyWriteExecute=yes, but not because the JIT was denied"
   echo "jig-server: fails under MemoryDenyWriteExecute=yes, as its unit says; back up without it"
 }
 

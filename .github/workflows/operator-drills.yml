@@ -16,6 +16,9 @@ on:
       - repos/jig-server/src/main.rs
       - repos/jig-nameserver/src/main.rs
       - repos/jig-core/src/keystore.rs
+      - repos/jig-client/src/server_key.rs
+      - repos/jig-nameserver/src/config.rs
+      - repos/jig-config/**
       - .github/workflows/operator-drills.yml
   workflow_dispatch:
 
@@ -35,6 +38,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The drills run as root; nothing after checkout needs the token.
+          persist-credentials: false
       - name: Install Rust toolchain
         working-directory: repos
         run: rustup toolchain install --profile minimal
