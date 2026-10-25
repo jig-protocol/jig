@@ -120,8 +120,8 @@ import json, sys
 d = json.load(sys.stdin)
 for k in ("server_did", "tls_binding"):
     assert k in d, k
-# Left out when nothing unsafe is on, though the README lists it.
-assert d.get("unsafe_options_active", []) == [], d["unsafe_options_active"]' || fail "/.well-known/jig"
+# jig-server leaves the key out when nothing unsafe is on.
+assert "unsafe_options_active" not in d, d["unsafe_options_active"]' || fail "/.well-known/jig"
   local metrics
   metrics="$(curl -fsSk --max-time 10 "$SERVER/metrics")" || fail "/metrics"
   grep -q '^# TYPE' <<<"$metrics" || fail "/metrics is not Prometheus text"
@@ -133,7 +133,8 @@ import json, sys
 d = json.load(sys.stdin)
 for k in ("server_did", "tls_binding"):
     assert k in d, k
-assert d.get("unsafe_options_active", []) == [], d["unsafe_options_active"]' || fail "/.well-known/jig-ns"
+# jig-nameserver always sends it: [] when nothing unsafe is on.
+assert d["unsafe_options_active"] == [], d["unsafe_options_active"]' || fail "/.well-known/jig-ns"
   curl -fsSk "$NS/v1/challenge" | grep -Eq '"challenge":"[0-9a-f]{64}"' || fail "nameserver /v1/challenge"
   systemctl is-active --quiet jig-server jig-nameserver || fail "a unit is not active"
   echo "every row of the table checks"
