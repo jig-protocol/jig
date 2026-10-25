@@ -1,8 +1,8 @@
 # External security audit: scope (D27)
 
-**Status:** proposal for DJ, 2026-10-25. When accepted, it settles
-[ROADMAP](../ROADMAP.md) still-open question 5, "How the external audit is split (D27)", and the
-decisions log records the answer.
+**Status:** the split is decided (DJ, 2026-10-25): **Option A**, one firm in two phases, with
+Phase 1 starting before G3 (section 4). This settles [ROADMAP](../ROADMAP.md) still-open
+question 5. Budget, timing, the formal model and publication (section 7) are still open.
 
 **Decision it builds on (D27):** the audit is designed now and runs once v0.2 is code-complete
 (gate G3), so it reviews code that will not be replaced soon. It does not block development.
@@ -442,7 +442,7 @@ need a second, smaller review when they land.
 
 Three options, from cheapest in coordination to cheapest in calendar time.
 
-**Option A: one firm, two phases (recommended).**
+**Option A: one firm, two phases (decided).**
 - **Phase 1, as soon as a firm is engaged:** areas 3, 4, 5 and 7, plus single-server MLS (area 1
   without federation). This code is complete and unlikely to be replaced, which is D27's test.
 - **Phase 2, at G3:** area 6, the federated half of area 1, and area 2 once slices 5 and 10 have
@@ -450,7 +450,7 @@ Three options, from cheapest in coordination to cheapest in calendar time.
 
 One firm keeps one picture of the system, and the COSE and deterministic-CBOR layer is reviewed
 once. Phase 1 starts before G3, which reads D27 as "review code that is done" rather than "wait
-until everything is done". DJ decides whether that reading holds.
+until everything is done". DJ confirmed that reading on 2026-10-25.
 
 **Option B: two firms, split by expertise.**
 - **A cryptographic-protocol firm:** areas 1, 2, 3 and 4. They share the identity, COSE and TLS
@@ -502,8 +502,8 @@ Things on our side, in order:
 
 ## 7. Questions for DJ
 
-1. Option A, B or C? This document recommends A.
-2. Does Phase 1 starting before G3 fit D27, or should the decision be restated?
+1. ~~Option A, B or C?~~ Decided: Option A.
+2. ~~Does Phase 1 starting before G3 fit D27?~~ Decided: yes.
 3. Budget and timing, which decide how deep each area goes.
 4. Is the formal model in 3.2 wanted?
 5. Is publishing the report, or a summary, the default?

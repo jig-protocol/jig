@@ -296,7 +296,7 @@ Settled on 2026-10-05 unless noted. Open items follow the table.
 | D24 | Who owns a channel? | Exactly one owning server. How members on other servers write to it is to be designed from prior art (XMPP MUC, IRC, Matrix, ActivityPub groups). Settled 2026-10-16. |
 | D25 | Are channels encrypted by default? | Restricted channels are always MLS from v0.2, with no opt-out: a plaintext restricted channel would be readable by the operator (exit criterion 2). A creator who wants plaintext makes an open channel, so server-run blocks and bridges that need to read content use open channels. Whether every channel is encrypted by default, after the v0.2 tag, waits on the federation-contract and block-ABI designs: an encrypted channel cannot federate until the contract exists, and a server cannot execute its blocks. Settled 2026-10-18. |
 | D26 | Is admission proof-of-work on by default? | No. It stays off until a proof-of-work design covers registration at nameservers, challenges anyone can solve, and what the cost buys against identity farming. Settled 2026-10-18. |
-| D27 | When does the external audit run? | It is designed now and runs once v0.2 is code-complete, so it reviews code that will not be replaced soon. It does not block development. How it is split is open. Settled 2026-10-18. |
+| D27 | When does the external audit run? | It is designed now and runs once v0.2 is code-complete, so it reviews code that will not be replaced soon. It does not block development. Settled 2026-10-18. Split: one firm in two phases, Phase 1 before G3 on code that is already complete ([`security/audit-scope.md`](security/audit-scope.md)), decided 2026-10-25. |
 | D28 | Does the v0.0.1 `POST /blocks` route stay? | No. It executes sender-supplied code without a signature check; it is removed before blocks get host functions. Settled 2026-10-18. |
 
 D3, D14, D16 and D17 concern the Riverdance GUI's licence and internal hosting and are tracked
@@ -310,5 +310,5 @@ outside this repo.
    an older signing key; `main` pins the key the signing secret holds, so the next release is a
    fresh tag from `main`.
 4. Whether every channel is encrypted by default after the v0.2 tag (D25).
-5. How the external audit is split (D27). Proposal: [`security/audit-scope.md`](security/audit-scope.md),
-   for DJ to decide.
+5. ~~How the external audit is split (D27).~~ Decided 2026-10-25: one firm in two phases, Phase 1
+   before G3 on the areas already code-complete ([`security/audit-scope.md`](security/audit-scope.md)).
