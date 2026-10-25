@@ -27,6 +27,29 @@ work is (`local_member_age_secs`).
 
 ---
 
+## What proof-of-work does not do (the flood benchmark)
+
+Lane Q measured the nameserver's registration pool against an agent flood
+([`docs/investigations/2026-10-25-admission-flood.md`](../../investigations/2026-10-25-admission-flood.md), #337),
+at R1's recommended prices. This is the case for R2, stated plainly:
+
+- **The pool bounds minting, and only that.** About 61 names an hour get in, whatever the flood.
+- **Honest users get roughly capacity ÷ demand:** 57 % at 10 agents to 1 human, 6 % at 100:1,
+  0–2 % at 1000:1. At these prices proof-of-work does not tell a person from an agent.
+- **Outbidding is cheap.** Agents that bid 4× the asked effort always beat the honest client's
+  "what is asked, then 2× once". Sixty of them an hour cut honest success from 94 % to 58 %, for
+  about 1 % of one machine. #328 caps a bid's priority at `max_effort`, which stops buying
+  priority above the cap but not below it.
+- **With the pool off, the controller never moves** (it reads the queue), and everyone gets in,
+  agents included.
+- **Raising the client's bids is not the answer.** Escalating bids is an arms race that the side
+  with less compute loses, and that is the honest side. The CLI's bid policy stays as it is.
+
+So keeping people admitted against an agent flood needs something an agent cannot buy with
+compute: **standing** (R2.4 locally, then R3) and **invites** (R7). R2.4's member pool is
+where an established subject stops competing with strangers at all. A server's pool (#318)
+already gives members their own share; R2.4 is what lets an honest newcomer become a member.
+
 ## The naming question first (decision 1)
 
 The framing's milestone table defines **R2** as "rulesets declared and acknowledged". That covers
