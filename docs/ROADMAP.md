@@ -191,8 +191,8 @@ Since then, each in one or more PRs:
   #272). Admission proof-of-work stays off by default (D26).
 - **The federation contract (F2), Tasks 0a, 0b and 1 to 5** of the
   [plan](superpowers/plans/2026-10-19-f2-channel-contract.md): channels keyed by CID in the store
-  and routes, terms and roles, signed contract messages, the peer policy in the server manifest, offers and answers,
-  and the follower's stream (#309).
+  and routes, terms and roles, signed contract messages, the peer policy in the server
+  manifest, offers and answers, and the follower's stream (#309).
 - **One implementation of each thing:** the v0.0.1 store and `POST /blocks` route, both earlier
   block ABIs (#291, #299), the v0.2 receipt formats (#308) and the unused nameserver modules
   are gone.
@@ -218,8 +218,11 @@ Still to do in this phase:
   MVP.
 - **Handshake slices 5 and 10:** `seen` and head gossip, so members compare chains and detect
   omission (OP-06); `sequencer-set`, with F2. Then the threat-register rows the D11 design
-  proposes for OP-01, OP-02 and TM-01.
+  proposes for OP-01, OP-02 and TM-01. Reputation in the welcome stays `null` until the
+  reputation design (D15, D21) lands.
 - Multi-device. One device per DID today.
+- A documented server-key rotation ceremony. Rotation works (#298, #302), but a link is signed by
+  the old key, so a lost key still means restoring it from backup.
 - ACME certificates for DNS-rooted suffixes.
 - PROXY protocol v2 on the nameserver listener, so its per-client rate limits still apply behind a
   TCP/SNI passthrough proxy. A `config` or `contract` suffix needs passthrough, and today every
