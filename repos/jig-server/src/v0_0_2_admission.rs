@@ -155,7 +155,9 @@ async fn prove(
             format!("the nonce is longer than {MAX_NONCE_LEN} bytes"),
         ));
     }
-    let did = jig_core::Did::from_did_jig_string(proof.did().trim())
+    // Only the canonical DID and the bits are kept, never the proof itself,
+    // so a re-cased spelling is read as its key.
+    let did = jig_core::Did::canonicalize(proof.did().trim())
         .map_err(|_| refuse(StatusCode::BAD_REQUEST, "BAD_DID", "not a did:jig DID"))?;
     let key_bytes = did
         .as_bytes()

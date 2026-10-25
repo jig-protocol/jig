@@ -270,6 +270,9 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         IngestError::KindRequired => SubmitDenied::PolicyBlocked {
             reason: "block kind required".into(),
         },
+        ref e @ IngestError::NonCanonicalDid { .. } => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
         IngestError::InvalidSignature => SubmitDenied::PolicyBlocked {
             reason: "invalid signature".into(),
         },

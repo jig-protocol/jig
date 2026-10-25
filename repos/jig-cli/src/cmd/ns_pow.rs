@@ -5,9 +5,11 @@
 //! signed offer asks for, and sends it. An offer above what this machine
 //! solves in `JIG_POW_MAX_SOLVE_SECS` (default
 //! [`jig_client::pow::DEFAULT_MAX_SOLVE_SECS`]) is refused before any work.
-//! A `428 POW_REQUIRED` or `400 POW_INSUFFICIENT` gets one retry on a fresh
-//! challenge, bidding at least twice the last bid; a second refusal stops
-//! with the nameserver named as under load.
+//! A `428 POW_REQUIRED`, `400 POW_INSUFFICIENT` or `503 REGISTRATION_BUSY`
+//! gets one retry on a fresh challenge, bidding at least twice the last bid;
+//! a second refusal stops with the nameserver named as under load. Before
+//! retrying a busy refusal the client waits out its `Retry-After`, up to
+//! [`MAX_BUSY_WAIT_SECS`]; a longer wait is left to the user.
 //!
 //! The work is a lottery, so an unlucky solve can outlive its challenge. It
 //! stops before the challenge expires, and so does a proof the nameserver
@@ -17,15 +19,19 @@
 //! expiry likelier.
 
 use std::num::NonZeroU64;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use std::time::Instant;
 
 use jig_client::pow::{Cap, PROGRESS_AFTER, PowClientError, Puzzle, SEND_MARGIN, retry_bid};
 use jig_core::naming::Name;
 use jig_core::pow::{Action, Proof};
 
 use crate::cmd::ns::{Challenge, Nameserver, Refusal};
+
+/// The longest this client waits on a full registration pool before one
+/// retry. Past it, the user is told when to try again.
+pub(crate) const MAX_BUSY_WAIT_SECS: u64 = 60;
 
 /// What one request proves work for.
 pub(crate) struct Work<'a> {
@@ -98,6 +104,21 @@ pub(crate) async fn with_pow<T>(
         };
         let sent_at = Instant::now();
         match send(challenge, proof).await {
+            Err(e) if busy(&e).is_some() => {
+                let secs = busy(&e).expect("checked");
+                if attempt > 0 || secs > MAX_BUSY_WAIT_SECS {
+                    return Err(e.context(format!(
+                        "the nameserver is taking no more new names for now; try again in \
+                         about {secs}s"
+                    )));
+                }
+                eprintln!(
+                    "the nameserver is taking no more new names for now; waiting {secs}s, then \
+                     trying once more"
+                );
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+                expired = false;
+            }
             Err(e) if expired_in_flight(&e, sent_at, deadline) => {
                 if attempt == 0 {
                     eprintln!(
@@ -123,6 +144,13 @@ pub(crate) async fn with_pow<T>(
         }
     }
     unreachable!("the second attempt always returns")
+}
+
+/// The seconds to wait when `e` is the registration pool's `503
+/// REGISTRATION_BUSY`, from its `Retry-After` (a few if it sent none).
+fn busy(e: &anyhow::Error) -> Option<u64> {
+    let r = e.downcast_ref::<Refusal>()?;
+    (r.code().as_deref() == Some("REGISTRATION_BUSY")).then(|| r.retry_after.unwrap_or(5))
 }
 
 /// What to bid on `attempt`: the offer, except on the retry after a refusal
@@ -224,8 +252,30 @@ mod tests {
             url: "https://ns.example/v1/register".into(),
             status: reqwest::StatusCode::from_u16(status).unwrap(),
             body: serde_json::json!({ "code": code, "message": "m" }).to_string(),
+            retry_after: None,
         }
         .into()
+    }
+
+    #[test]
+    fn a_busy_pool_says_how_long_to_wait() {
+        let mut busy_503: anyhow::Error = Refusal {
+            url: "u".into(),
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            body: r#"{"code":"REGISTRATION_BUSY","message":"m","retry_after":7}"#.into(),
+            retry_after: Some(7),
+        }
+        .into();
+        assert_eq!(busy(&busy_503), Some(7));
+        busy_503 = Refusal {
+            url: "u".into(),
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            body: r#"{"code":"REGISTRATION_BUSY","message":"m"}"#.into(),
+            retry_after: None,
+        }
+        .into();
+        assert_eq!(busy(&busy_503), Some(5), "a few seconds when none is given");
+        assert_eq!(busy(&refusal(428, "POW_REQUIRED")), None);
     }
 
     #[test]

@@ -1,0 +1,163 @@
+{
+  "cases": [
+    {
+      "allowed": true,
+      "children": [],
+      "name": "another-servers-text-block-runs-by-component",
+      "policy": "default",
+      "program": {
+        "author": "did:jig:zserverX",
+        "children_none": true,
+        "component": "7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b",
+        "program": "bafkr4ibjeys2orp7cwfuz4ro2ef47j5di65ecvr6adhqm6goweupfcyoyu",
+        "requests_none": true,
+        "world": "jig:block/renderer@0.1.0"
+      }
+    },
+    {
+      "allowed": false,
+      "children": [],
+      "name": "a-bot-is-not-allowed-by-component",
+      "policy": "default",
+      "program": {
+        "author": "did:jig:zstranger",
+        "children_none": true,
+        "component": "7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b",
+        "program": "bafkr4icpwmk45bqxnbvvq5gnv3vl5fhdevd3mpqt2iw7vokiva5gsqeb24",
+        "requests_none": true,
+        "world": "jig:block/bot@0.1.0"
+      }
+    },
+    {
+      "allowed": false,
+      "children": [],
+      "name": "a-renderer-requesting-a-capability-is-not-allowed-by-component",
+      "policy": "default",
+      "program": {
+        "author": "did:jig:zstranger",
+        "children_none": true,
+        "component": "7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b",
+        "program": "bafkr4iauhvc63k6uc5g6casmy5ukhvs56vqnyx647j7i6ajv6h5u36k7xq",
+        "requests_none": false,
+        "world": "jig:block/renderer@0.1.0"
+      }
+    },
+    {
+      "allowed": false,
+      "children": [],
+      "name": "a-renderer-pinning-a-child-is-not-allowed-by-component",
+      "policy": "default",
+      "program": {
+        "author": "did:jig:zstranger",
+        "children_none": false,
+        "component": "7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b",
+        "program": "bafkr4idkxg2s7524n2gilcmpexcky7vjiwfble2fnze6oluf2wip67zjpe",
+        "requests_none": true,
+        "world": "jig:block/renderer@0.1.0"
+      }
+    },
+    {
+      "allowed": false,
+      "children": [],
+      "name": "an-unlisted-component-is-refused",
+      "policy": "default",
+      "program": {
+        "author": "did:jig:zstranger",
+        "children_none": true,
+        "component": "0909090909090909090909090909090909090909090909090909090909090909",
+        "program": "bafkr4ifc6b2fadbldrpltsxyysntk7skyai4cawwgussgzayu2a35r7igq",
+        "requests_none": true,
+        "world": "jig:block/renderer@0.1.0"
+      }
+    },
+    {
+      "allowed": true,
+      "children": [],
+      "name": "a-listed-program-runs-in-any-world",
+      "policy": "by-program",
+      "program": {
+        "author": "did:jig:zstranger",
+        "children_none": false,
+        "component": "0909090909090909090909090909090909090909090909090909090909090909",
+        "program": "bafkr4ib47hubbg3e3lg5ppnneak7gzsbf2v6dvhyp4zxivdrt4flilqqom",
+        "requests_none": false,
+        "world": "jig:block/bot@0.1.0"
+      }
+    },
+    {
+      "allowed": true,
+      "children": [],
+      "name": "an-allowed-author-runs-in-any-world",
+      "policy": "by-author",
+      "program": {
+        "author": "did:jig:ztrusted",
+        "children_none": true,
+        "component": "0909090909090909090909090909090909090909090909090909090909090909",
+        "program": "bafkr4ihf6xntqao4cp3rug5dm7m4z3b2iuobiuq3fau6o37ls6hj73l45y",
+        "requests_none": true,
+        "world": "jig:block/bot@0.1.0"
+      }
+    },
+    {
+      "allowed": false,
+      "children": [
+        {
+          "author": "did:jig:zstranger",
+          "children_none": true,
+          "component": "0909090909090909090909090909090909090909090909090909090909090909",
+          "program": "bafkr4ibnixmsiwycm6dtijyfknqbaiatknffn5tw5md7tq3sm2k5fevlfq",
+          "requests_none": true,
+          "world": "jig:block/renderer@0.1.0"
+        }
+      ],
+      "name": "an-authors-allowance-does-not-cover-a-strangers-child",
+      "policy": "by-author",
+      "program": {
+        "author": "did:jig:ztrusted",
+        "children_none": false,
+        "component": "0909090909090909090909090909090909090909090909090909090909090909",
+        "program": "bafkr4ierrcbnugg5fcekal3zfimvvs4mwzofla26t4lmvn67d4ug3yploq",
+        "requests_none": true,
+        "world": "jig:block/renderer@0.1.0"
+      }
+    },
+    {
+      "allowed": true,
+      "children": [
+        {
+          "author": "did:jig:zstranger",
+          "children_none": true,
+          "component": "7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b",
+          "program": "bafkr4ihwavdgkzmslincypeo43fwrq24dlp4tart2loyb7kdyoaiftyjru",
+          "requests_none": true,
+          "world": "jig:block/renderer@0.1.0"
+        }
+      ],
+      "name": "a-text-block-child-is-allowed-on-its-own",
+      "policy": "by-author",
+      "program": {
+        "author": "did:jig:ztrusted",
+        "children_none": false,
+        "component": "0909090909090909090909090909090909090909090909090909090909090909",
+        "program": "bafkr4ierrcbnugg5fcekal3zfimvvs4mwzofla26t4lmvn67d4ug3yploq",
+        "requests_none": true,
+        "world": "jig:block/renderer@0.1.0"
+      }
+    }
+  ],
+  "policies": [
+    {
+      "name": "default",
+      "payload": "a4637365710065616c6c6f77a367617574686f7273806870726f6772616d73806a636f6d706f6e656e74738158207b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b66646f6d61696e766a69672d6f70657261746f722d706f6c6963792d763166736572766572706469643a6a69673a7a73657276657259"
+    },
+    {
+      "name": "by-program",
+      "payload": "a4637365710165616c6c6f77a367617574686f7273806870726f6772616d7381582401551e203cf9e8109b64dacdd7bdad2015f366412eabe1d4f87f337454719f0ab42e10736a636f6d706f6e656e74738158207b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b66646f6d61696e766a69672d6f70657261746f722d706f6c6963792d763166736572766572706469643a6a69673a7a73657276657259"
+    },
+    {
+      "name": "by-author",
+      "payload": "a4637365710265616c6c6f77a367617574686f727381706469643a6a69673a7a747275737465646870726f6772616d73806a636f6d706f6e656e74738158207b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b66646f6d61696e766a69672d6f70657261746f722d706f6c6963792d763166736572766572706469643a6a69673a7a73657276657259"
+    }
+  ],
+  "version": 1
+}
