@@ -65,8 +65,11 @@ included, without a flag day. It specifies:
 - Hash-function agility. BLAKE3 is not affected by the quantum threats above; CIDs already
   carry a multihash code.
 
-**Position (DJ, 2026-10-25).** The work is post-GA. jig does not build its own suite. It
-adopts a vetted, pluggable suite when one exists, and this JEP is the plan on jig's side.
+**Position (DJ, 2026-10-25).** jig does not build its own suite. It adopts a vetted, pluggable
+suite when one exists, and this JEP is the plan on jig's side. Step A (section 5), the
+signature-algorithm registry, strict verification and a domain string on block signatures,
+is pre-GA hardening. The key-hash DID form and post-quantum suites (steps B to E) stay
+post-GA.
 
 ## Where the algorithm is fixed today
 
@@ -316,7 +319,7 @@ a later JEP retires them.
 
 | Step | What | Gate |
 | --- | --- | --- |
-| A | The registry (section 1), strict verification, the successors in section 3.3, and parsers that take the algorithm from the DID. Nothing changes algorithm yet | May land before GA if DJ chooses; it hardens ed25519 too |
+| A | The registry (section 1), strict verification, the successors in section 3.3, and parsers that take the algorithm from the DID. Nothing changes algorithm yet | **Before GA** (DJ, 2026-10-25), as hardening of ed25519 |
 | B | Register a hybrid post-quantum-KEM MLS suite with ed25519 signatures (section 4.3, first case) | After GA, once a candidate meets section 6 |
 | C | Register `ed25519+ml-dsa-65` and the `k` DID form; holders migrate by key link | After GA, once an ML-DSA implementation meets section 6 |
 | D | Separate the MLS leaf key from the DID key, or require `k` DIDs for post-quantum-signature suites; then register one | After C |
