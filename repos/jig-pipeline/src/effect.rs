@@ -132,15 +132,6 @@ fn apply_channel_create(
     m: &BlockManifest,
     block_cid: &str,
 ) -> anyhow::Result<()> {
-    let slug = meta_str(m, "slug")
-        .ok_or_else(|| anyhow::anyhow!("channel-create missing `slug` in metadata"))?;
-    let visibility = meta_str(m, "visibility").unwrap_or("open");
-    // Validated by the suite gate before any effect runs; parsed again here so
-    // an unknown suite can never be written even if a caller skipped it.
-    let suite = crate::mls_gate::requested_suite(m)
-        .map_err(|_| anyhow::anyhow!("channel-create names an unknown suite"))?;
-    let now = chrono::Utc::now().timestamp();
-    let owner_did = sender_did_string(m);
     // The gate is ingest's (`ingest::channel_terms` refuses a sequencer that
     // is not this server). Here the row records the terms the block carries:
     // its declared sequencer, else this store's server (or, before boot
@@ -148,30 +139,60 @@ fn apply_channel_create(
     let sequencer = meta_str(m, crate::ingest::SEQUENCER_KEY)
         .map(canonical_did_string)
         .unwrap_or_else(|| store.local_sequencer().to_string());
-    let terms = crate::ingest::channel_terms(m, &sequencer)
+    apply_channel_create_under(
+        &store.conn.lock().expect("poisoned"),
+        m,
+        block_cid,
+        &sequencer,
+    )
+}
+
+/// A channel-create's row and its root owners' memberships, under
+/// `sequencer`: this server for a channel it sequences, the owner for one it
+/// carries (JEP-0005 rule 3).
+fn apply_channel_create_under(
+    conn: &rusqlite::Connection,
+    m: &BlockManifest,
+    block_cid: &str,
+    sequencer: &str,
+) -> anyhow::Result<()> {
+    let slug = meta_str(m, "slug")
+        .ok_or_else(|| anyhow::anyhow!("channel-create missing `slug` in metadata"))?;
+    let visibility = meta_str(m, "visibility").unwrap_or("open");
+    let suite = crate::mls_gate::requested_suite(m)
+        .map_err(|_| anyhow::anyhow!("channel-create names an unknown suite"))?;
+    let now = chrono::Utc::now().timestamp();
+    let owner_did = sender_did_string(m);
+    let terms = crate::ingest::channel_terms(m, sequencer)
         .map_err(|e| anyhow::anyhow!("channel-create terms: {e}"))?;
 
-    store.upsert_channel(&StoredChannel {
-        id: block_cid.to_string(),
-        slug: slug.to_string(),
-        visibility: visibility.to_string(),
-        created_at: now,
-        owner_did: owner_did.clone(),
-        suite: suite.as_str().to_string(),
-        sequencer_did: terms.sequencer,
-        co_owners: terms.co_owners.clone(),
-    })?;
+    crate::persist::upsert_channel_on(
+        conn,
+        &StoredChannel {
+            id: block_cid.to_string(),
+            slug: slug.to_string(),
+            visibility: visibility.to_string(),
+            created_at: now,
+            owner_did: owner_did.clone(),
+            suite: suite.as_str().to_string(),
+            sequencer_did: terms.sequencer,
+            co_owners: terms.co_owners.clone(),
+        },
+    )?;
     // The creator and every co-owner are members, with role `owner`: a
     // co-owner holds every right, so it can read what it can write and
     // manage.
     for member_did in std::iter::once(owner_did).chain(terms.co_owners) {
-        store.upsert_membership(&StoredMembership {
-            channel_id: block_cid.to_string(),
-            member_did,
-            role: "owner".to_string(),
-            joined_at: now,
-            source_block_cid: block_cid.to_string(),
-        })?;
+        crate::persist::upsert_membership_on(
+            conn,
+            &StoredMembership {
+                channel_id: block_cid.to_string(),
+                member_did,
+                role: "owner".to_string(),
+                joined_at: now,
+                source_block_cid: block_cid.to_string(),
+            },
+        )?;
     }
     Ok(())
 }
@@ -182,18 +203,35 @@ fn apply_member_add(
     block_cid: &str,
 ) -> anyhow::Result<()> {
     let (named, channel) = channel_of(store, BlockKind::MemberAdd, m, block_cid, false)?;
+    let channel = channel
+        .ok_or_else(|| anyhow::anyhow!("member-add references unknown channel `{named}`"))?;
+    member_add_on(
+        &store.conn.lock().expect("poisoned"),
+        m,
+        block_cid,
+        &channel,
+    )
+}
+
+fn member_add_on(
+    conn: &rusqlite::Connection,
+    m: &BlockManifest,
+    block_cid: &str,
+    channel: &StoredChannel,
+) -> anyhow::Result<()> {
     let member_did = meta_str(m, "member_did")
         .map(canonical_did_string)
         .ok_or_else(|| anyhow::anyhow!("member-add missing `member_did` in metadata"))?;
-    let channel = channel
-        .ok_or_else(|| anyhow::anyhow!("member-add references unknown channel `{named}`"))?;
-    store.upsert_membership(&StoredMembership {
-        channel_id: channel.id,
-        member_did,
-        role: "member".to_string(),
-        joined_at: chrono::Utc::now().timestamp(),
-        source_block_cid: block_cid.to_string(),
-    })?;
+    crate::persist::upsert_membership_on(
+        conn,
+        &StoredMembership {
+            channel_id: channel.id.clone(),
+            member_did,
+            role: "member".to_string(),
+            joined_at: chrono::Utc::now().timestamp(),
+            source_block_cid: block_cid.to_string(),
+        },
+    )?;
     Ok(())
 }
 
@@ -206,11 +244,19 @@ fn apply_member_remove(
     block_cid: &str,
 ) -> anyhow::Result<()> {
     let (_, channel) = channel_of(store, BlockKind::MemberRemove, m, block_cid, false)?;
+    member_remove_on(&store.conn.lock().expect("poisoned"), m, channel.as_ref())
+}
+
+fn member_remove_on(
+    conn: &rusqlite::Connection,
+    m: &BlockManifest,
+    channel: Option<&StoredChannel>,
+) -> anyhow::Result<()> {
     let member_did = meta_str(m, "member_did")
         .map(canonical_did_string)
         .ok_or_else(|| anyhow::anyhow!("member-remove missing `member_did` in metadata"))?;
     if let Some(channel) = channel {
-        store.remove_membership_by_id(&channel.id, &member_did)?;
+        crate::persist::remove_membership_by_id_on(conn, &channel.id, &member_did)?;
     }
     Ok(())
 }
@@ -221,10 +267,14 @@ fn apply_channel_promote(
     block_cid: &str,
 ) -> anyhow::Result<()> {
     let (named, channel) = channel_of(store, BlockKind::ChannelPromote, m, block_cid, false)?;
-    let mut channel = channel
+    let channel = channel
         .ok_or_else(|| anyhow::anyhow!("channel-promote references unknown channel `{named}`"))?;
+    promote_on(&store.conn.lock().expect("poisoned"), channel)
+}
+
+fn promote_on(conn: &rusqlite::Connection, mut channel: StoredChannel) -> anyhow::Result<()> {
     channel.visibility = "open".to_string();
-    store.upsert_channel(&channel)?;
+    crate::persist::upsert_channel_on(conn, &channel)?;
     Ok(())
 }
 
@@ -276,10 +326,65 @@ fn apply_channel_archive(
         anyhow::bail!("channel-archive rejected: `{sender}` is not the owner of `{channel_slug}`");
     }
 
-    if !store.archive_channel_by_id(&channel.id, chrono::Utc::now().timestamp())? {
-        anyhow::bail!("channel `{channel_slug}` is already archived");
+    archive_on(&store.conn.lock().expect("poisoned"), &channel)
+}
+
+fn archive_on(conn: &rusqlite::Connection, channel: &StoredChannel) -> anyhow::Result<()> {
+    if !crate::persist::archive_channel_by_id_on(conn, &channel.id, chrono::Utc::now().timestamp())?
+    {
+        anyhow::bail!("channel `{}` is already archived", channel.slug);
     }
     Ok(())
+}
+
+/// The effect of a block in a channel this server carries for its owner
+/// (JEP-0005 rules 3 and 22a), on `channel`, the row the owner's record put
+/// it in; for a channel-create, the row it makes, under `sequencer`. On
+/// `conn`, inside the transaction that lands the block, so the block, its
+/// record and its effect land together or not at all.
+///
+/// No ownership check: the owner ran its full gate before it sequenced the
+/// block, and its signed order is what this server follows. Kinds that are
+/// not channel content, the nameserver's and the federation handshake's,
+/// are refused: they have no place in a channel's chain.
+pub fn apply_carried_effect(
+    conn: &rusqlite::Connection,
+    m: &BlockManifest,
+    block_cid: &str,
+    channel: Option<&StoredChannel>,
+    sequencer: &str,
+) -> anyhow::Result<()> {
+    let kind = m
+        .kind
+        .ok_or_else(|| anyhow::anyhow!("a carried block declares no kind"))?;
+    let carried = || channel.ok_or_else(|| anyhow::anyhow!("no carried channel for the block"));
+    match kind {
+        BlockKind::ChannelCreate => apply_channel_create_under(conn, m, block_cid, sequencer),
+        BlockKind::MemberAdd => member_add_on(conn, m, block_cid, carried()?),
+        BlockKind::MemberRemove => member_remove_on(conn, m, channel),
+        BlockKind::ChannelPromote => promote_on(conn, carried()?.clone()),
+        BlockKind::ChannelArchive => archive_on(conn, carried()?),
+        BlockKind::TextRender
+        | BlockKind::EmailRender
+        | BlockKind::EmailEncrypted
+        | BlockKind::TimeAttestation
+        | BlockKind::Receipt
+        | BlockKind::RoleAssign
+        | BlockKind::RoleUnassign
+        | BlockKind::ChannelShare
+        | BlockKind::ChannelUnshare
+        | BlockKind::ContractAccept
+        | BlockKind::ContractRefuse
+        | BlockKind::ContractEnd => Ok(()),
+        BlockKind::FedHello
+        | BlockKind::NsRegister
+        | BlockKind::NsRotate
+        | BlockKind::NsRenew
+        | BlockKind::NsAttestation
+        | BlockKind::ServerManifest => {
+            anyhow::bail!("a `{}` block is not channel content", kind.as_str())
+        }
+    }
 }
 
 fn apply_fed_hello(

@@ -468,6 +468,29 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// Whether this server follows `channel_id` for `owner_did` under an
+    /// accepted share: the follower side of rule 9's accept.
+    pub fn has_accepted_share(
+        &self,
+        channel_id: &str,
+        owner_did: &str,
+    ) -> crate::persist::Result<bool> {
+        let canonical = crate::effect::canonical_did_string(owner_did);
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM contract_offers
+             WHERE channel_id = ?1 AND peer_did IN (?2, ?3) AND side = ?4 AND state = ?5)",
+            params![
+                channel_id,
+                owner_did,
+                canonical,
+                Side::Follower.as_str(),
+                OfferState::Accepted.as_str()
+            ],
+            |r| r.get(0),
+        )?)
+    }
+
     /// The newest record of `channel_id`'s chain: its `ingest` head.
     pub fn latest_ingest_record(
         &self,
