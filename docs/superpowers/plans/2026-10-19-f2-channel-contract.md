@@ -213,13 +213,13 @@ the domains rule 0 lists.
     - the creation block's bytes;
     - the `ingest` head;
     - the owner manifest's CID and `seq`;
-    - `private_suffixes`.
+    - `attested_suffixes`.
   - `ContractAccept`:
     - `channel_id`;
     - `offer_id`;
     - `sequencer`;
     - the manifest's CID and `seq`;
-    - `private_suffixes`;
+    - `attested_suffixes`;
     - `bot_dids`, empty except on a sequencer move.
   - `ContractRefuse`: `channel_id`, `offer_id`, and one of five codes.
   - `ContractEnd`: `channel_id`, the ending server, and a reason.

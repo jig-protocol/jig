@@ -212,6 +212,7 @@ async fn a_federation_peer_is_held_to_its_expected_did() {
         alias: None,
         publish: false,
         quota: None,
+        offers: Default::default(),
     };
     let federation = FederationSection::default();
 

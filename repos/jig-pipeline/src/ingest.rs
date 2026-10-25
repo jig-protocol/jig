@@ -4581,4 +4581,48 @@ mod tests {
             "a share the server cannot read is refused: {hidden:?}"
         );
     }
+
+    /// The server's share watcher (`Fanout::watch_kinds`) sees the share
+    /// kinds and nothing else: a restricted MLS channel's membership blocks
+    /// and application messages never reach it.
+    #[tokio::test]
+    async fn the_share_watcher_sees_shares_and_never_a_channels_content() {
+        let ctx = test_ctx_allowing(&[
+            "channel-create",
+            "member-add",
+            "text-render",
+            "channel-share",
+        ]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.fanout
+            .watch_kinds(&[BlockKind::ChannelShare, BlockKind::ChannelUnshare], tx);
+        let owner = person();
+        let bob = person();
+        let gid = create_sealed(&ctx, &owner).await;
+        add_to_sealed(&ctx, &owner, &bob, &gid).await;
+        let (msg, _) = owner.mls.encrypt(&gid, b"the plan").unwrap();
+        submit(
+            &ctx,
+            &owner,
+            BlockKind::TextRender,
+            jig_core::EncryptionSuite::Mls,
+            serde_json::json!({"channel": "#sealed", "mls_message": b64(&msg)}),
+        )
+        .await
+        .unwrap();
+        let share = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelShare,
+            serde_json::json!({"channel": "#sealed", "to": did_of(&random_signing_key()), "grant": "read"}),
+        )
+        .await
+        .unwrap();
+
+        let mut seen = Vec::new();
+        while let Ok((block, _)) = rx.try_recv() {
+            seen.push((block.cid, block.block_kind));
+        }
+        assert_eq!(seen, [(share, "channel-share".to_string())]);
+    }
 }
