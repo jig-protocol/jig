@@ -130,7 +130,7 @@ mod tests {
             );
         }
         assert!(
-            text.contains("jig_ns_suggested_effort{suffix=\"dj.jig\"} 262144"),
+            text.contains("jig_ns_suggested_effort{suffix=\"dj.jig\"} 1048576"),
             "idle at the recommended floor: {text}"
         );
     }

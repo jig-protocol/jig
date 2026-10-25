@@ -66,9 +66,9 @@ Each suffix sets the JEP-0008 work its register, renew and rotate requests carry
 
 ```toml
 [v0_0_2.nameserver.alias_suffixes.pow]
-min_effort = 262144      # 2^18: an ordinary registration of 5 letters or more
-max_effort = 16777216    # 2^24: the most any registration is asked for
-max_solve_secs = 10      # max_effort must fit this at 5.5M digests/s, or boot fails
+min_effort = 1048576     # 2^20: an ordinary registration of 5 letters or more
+max_effort = 67108864    # 2^26: the most any registration is asked for; 4x above a 3-letter name
+max_solve_secs = 13      # max_effort must fit this at 5.5M digests/s, or boot fails
 short_name_len = 5       # shorter names pay short_name_factor per missing letter
 short_name_factor = 4
 renew_effort = 1         # renew and rotate by the holder

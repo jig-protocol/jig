@@ -1326,9 +1326,9 @@ default_time_range = "last_day"  # Options: last_hour, last_day, last_week, last
 # # min_effort x short_name_factor^(short_name_len - length), up to max_effort.
 # [v0_0_2.nameserver.alias_suffixes.pow]
 # alg = 1
-# min_effort = 262144        # 2^18; a 3-letter name pays 16x, 2^22
-# max_effort = 16777216      # 2^24, about 3 s on one server core
-# max_solve_secs = 10
+# min_effort = 1048576       # 2^20; a 3-letter name pays 16x, 2^24
+# max_effort = 67108864      # 2^26, about 12 s on one server core
+# max_solve_secs = 13
 # short_name_len = 5
 # short_name_factor = 4
 # renew_effort = 1
