@@ -1,13 +1,6 @@
 # Jig Nameserver
 
-The Jig nameserver anchors decentralized identity, reputation, and tribunal governance for the executable internet. Every handle → DID mapping, proof-of-useful-work adjustment, and tribunal escalation flows through here—backed by the same ruleset metadata we expose via `.well-known/jig-ns`.
-
-## Why It Exists
-
-- **Identity Resolution:** Accept signed claims (Ed25519) and publish identity records for clients via `GET /v1/resolve`.
-- **Adaptive Proof-of-Work:** Issue challenges with difficulty adjusted by penalty ledgers, reputation scores, and ruleset contracts.
-- **Reputation Aggregation:** Ingest reputation observations (`POST /v1/reputation/observe`), aggregate them per ruleset, and store weighted scores.
-- **Tribunal Automation:** Open cases, record decisions, and expose status streams so the graph can defend itself in near real-time.
+The Jig nameserver binds human-readable aliases (`alice@names.example.org`) to DIDs. It serves each binding as a signed attestation that a resolver checks itself, so a client never has to trust the transport. Normative behaviour is in the spec's [Identity and Reputation](../jig-spec/src/identity-and-reputation.md) chapter (JEP-0004).
 
 ## Configuration
 
@@ -29,285 +22,30 @@ suffix = "names.example.org"
 
 For more examples, see [`examples/config`](examples/config/).
 
-## Core Endpoints
+## Routes
 
-| Endpoint | Purpose |
-| --- | --- |
-| `GET /v1/resolve?name=<handle>` | Lookup identity records.
-| `POST /v1/challenge` | Request PoW challenge (`action = claim | alias`).
-| `POST /v1/claim` | Submit signed identity claim with solved PoW.
-| `POST /v1/alias` | Mint scoped aliases (optional anonymous subject).
-| `POST /v1/reputation/observe` | Record reputation observations for ruleset aggregation.
-| `GET /v1/reputation/:subject/:id` | Summary of aggregated reputation across rulesets.
-| `GET /v1/reputation/:subject/:id/observations` | Raw observation listing (recent window).
-| `GET /v1/tribunal/cases` | List tribunal cases (filter by status).
-| `POST /v1/tribunal/cases` | Create a tribunal case.
-| `GET /v1/tribunal/cases/:id` | Fetch case details + decisions.
-| `POST /v1/tribunal/cases/:id/decision` | Append case decision (sustain, modify, escalate…).
-| `POST /v1/work/enqueue` | Enqueue useful work assignment (admin-only).
-| `POST /v1/work/assign` | Claim work assignments for a worker.
-| `POST /v1/work/:id/result` | Submit work completion result.
-| `GET /v1/transparency/entries` | List transparency log entries (filter by time/kind).
-| `GET /v1/transparency/hashes` | List hourly hash checkpoints.
-| `GET /v1/transparency/verify` | Verify chain integrity.
+| Route | Method | Purpose |
+| --- | --- | --- |
+| `/v1/challenge` | GET | one-time nonce that register, renew and rotate sign, with the signed proof-of-work offer |
+| `/v1/register` | POST | bind an alias to a DID |
+| `/v1/resolve/{alias}` | GET | the signed attestation, links and reachability for an alias |
+| `/v1/rotate` | POST | move an alias to a new key (signed by both keys) |
+| `/v1/renew` | POST | refresh an alias's validity window |
+| `/v1/suffixes` | GET | the suffixes served and this nameserver's DID |
+| `/.well-known/jig-ns-delegation` | GET | signed delegation for a DNS-rooted suffix |
+| `/.well-known/jig-ns` | GET | discovery document, including the published rate limits |
+| `/.well-known/jig-ns/capabilities` | GET | capabilities as plain text |
+| `/v1/health` | GET | liveness |
+| `/v1/handles` | GET | every registered alias; mounted only with `[v0_0_2.debug] list_handles = true` |
 
-Responses are JSON and mirror the `types` module (see `src/types.rs`).
+[`OPERATOR_GUIDE.md`](OPERATOR_GUIDE.md) covers the rate limits on the write routes and running behind a reverse proxy. A nameserver for a `config` or `contract` suffix serves its own certificate, which clients accept on its DID's word: put it on the internet directly or behind a TLS passthrough (TCP or SNI) proxy, never one that terminates TLS. [`deploy/README.md`](../../deploy/README.md) covers suffix and registration policy.
 
-## Reputation Flow
+## Commands
 
-1. Observers (nameservers or automated agents) post observations:
-   ```json
-   {
-     "subject": "user",
-     "subject_id": "alice@example.com",
-     "ruleset": "high-sec",
-     "score": 0.82,
-     "weight": 1.3,
-     "observer": "did:jig:ns:alpha",
-     "evidence": "block://bafyobs",
-     "expires_at": "2025-11-02T18:34:12Z"
-   }
-   ```
-2. We aggregate observations (weighted average, ruleset multiplier) and persist `ReputationScore`.
-3. Challenge issuance (`/v1/challenge`) asks storage for the aggregated score and adjusts difficulty accordingly.
-4. `GET /v1/reputation/:subject/:id` provides both aggregated and raw observations for transparent auditing.
-
-## Tribunal Flow
-
-1. Automated monitors or nameservers open cases:
-   ```json
-   {
-     "subject": "user",
-     "subject_id": "eve@example.net",
-     "ruleset": "high-sec",
-     "reason": "Automated escalation: repeated phishing blocks",
-     "reporter": "did:jig:ns:alpha",
-     "severity": "high",
-     "metadata": {
-       "observations": ["block://bafycaseobs1", "block://bafycaseobs2"],
-       "escalated_by": "useful-work-monitor"
-     }
-   }
-   ```
-2. Decisions append to cases (`sustain`, `modify`, `overturn`, `dismiss`, `escalate`).
-3. Case status transitions automatically (`resolved`, `dismissed`, `escalated`).
-4. Future work: stream decisions into transparency logs and propagate reputation deltas.
-
-## Useful Work System
-
-The nameserver coordinates distributed "useful work" assignments that help offset computational costs of E2EE operations, block validation, and governance tasks. Work assignments are prioritized queues where workers claim tasks, execute them, and submit results.
-
-### Work Types
-
-- **`validate_block`** – Validate Wasm blocks (E2EE decryption, signature checks, fuel metering).
-- **`verify_observation`** – Verify reputation observation evidence.
-- **`audit_ruleset`** – Audit ruleset compliance for tribunal cases.
-- **`custom`** – Extensible work type for future use.
-
-### Configuration
-
-```toml
-[nameserver.useful_work]
-assignment_ttl_secs = 600           # Assignments expire after 10 minutes
-max_assignments_per_worker = 5     # Each worker can have max 5 inflight tasks
-result_retention_secs = 86400      # Keep results for 24 hours
-max_queue_depth = 1024             # Maximum queued + inflight assignments
-```
-
-Environment variables:
-- `JIG_NS_WORK_TTL` – Assignment TTL in seconds (min 60)
-- `JIG_NS_WORK_MAX_PER_WORKER` – Max assignments per worker
-- `JIG_NS_WORK_RESULT_RETENTION` – Result retention in seconds
-- `JIG_NS_WORK_QUEUE_DEPTH` – Max queue depth
-
-### Workflow
-
-1. **Enqueue work** (admin-only):
-   ```bash
-   curl -X POST http://localhost:8070/v1/work/enqueue \
-     -H "X-Admin-Token: $ADMIN_TOKEN" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "kind": "validate_block",
-       "subject": "block-abc123",
-       "ruleset": "high-sec",
-       "payload": {"block_cid": "bafyreiabc123..."},
-       "priority": 10,
-       "assignment_ttl_secs": 300
-     }'
-   ```
-
-2. **Claim work** (worker):
-   ```bash
-   curl -X POST http://localhost:8070/v1/work/assign \
-     -H "Content-Type: application/json" \
-     -d '{
-       "worker": "worker-001",
-       "limit": 3
-     }'
-   ```
-
-   Returns up to 3 assignments sorted by priority (highest first), then oldest first.
-
-3. **Submit result**:
-   ```bash
-   curl -X POST http://localhost:8070/v1/work/$ASSIGNMENT_ID/result \
-     -H "Content-Type: application/json" \
-     -d '{
-       "worker": "worker-001",
-       "status": "completed",
-       "output": {"validation": "passed", "fuel_used": 12500},
-       "metadata": {"duration_ms": 450}
-     }'
-   ```
-
-### Queue Management
-
-- Assignments expire automatically after TTL; expired work transitions to `failed` status.
-- Workers can claim up to `max_assignments_per_worker` concurrent tasks.
-- Queue depth is capped at `max_queue_depth` (enqueue requests return `429` if full).
-- Priority ordering ensures high-priority work (e.g., block validation) completes first.
-
-### Integration with E2EE and Blocks
-
-In the executable internet architecture, useful work assignments can:
-- **Validate blocks** – Verify Wasm execution receipts, check signatures, enforce fuel limits.
-- **Distribute E2EE costs** – Workers can help with encryption/decryption operations (future work with MPC/threshold crypto).
-- **Generate evidence** – Blocks themselves can generate provenance for whether work was performed correctly or rulesets were violated.
-
-This creates an economic feedback loop where useful work earns reputation, and reputation influences PoW difficulty and tribunal outcomes.
-
-## Transparency Log
-
-The nameserver maintains an append-only transparency log of all governance actions, providing cryptographic auditability and chain-of-custody for tribunal decisions, reputation updates, and useful work completion.
-
-### Log Structure
-
-- **Entries**: Individual events (tribunal_decision, reputation_update, useful_work_completed, penalty_applied, identity_claimed)
-- **Hourly Hashes**: Merkle root computed every hour, chaining previous hash for tamper-evidence
-- **Verification**: Public endpoints allow anyone to verify chain integrity
-
-### Event Types
-
-- `tribunal_decision` – Tribunal case decisions with outcomes
-- `reputation_update` – Reputation score changes
-- `useful_work_completed` – Validated useful work results
-- `penalty_applied` – Penalty points applied to identities
-- `identity_claimed` – New identity registrations
-
-### Endpoints
-
-```bash
-# List recent log entries (filter by time range, event kind)
-curl "http://localhost:8070/v1/transparency/entries?limit=50&event_kind=tribunal_decision"
-
-# List hourly hash checkpoints
-curl "http://localhost:8070/v1/transparency/hashes?limit=24"
-
-# Verify chain integrity
-curl "http://localhost:8070/v1/transparency/verify"
-```
-
-### Query Parameters
-
-- `start` – RFC3339 timestamp (e.g., `2025-10-29T00:00:00Z`)
-- `end` – RFC3339 timestamp
-- `event_kind` – Filter by event type
-- `limit` – Max results (default 100, max 1000)
-
-### Hash Computation
-
-The system automatically computes merkle roots every hour:
-
-1. Collect all entries in the period (1-hour window)
-2. Hash each entry (BLAKE3)
-3. Build merkle tree by hashing pairs recursively
-4. Chain previous merkle root
-5. Store hash checkpoint with metadata
-
-Verification checks that each hash's `previous_hash` matches the prior period's `merkle_root`, ensuring an unbroken chain.
-
-### Integration
-
-Transparency logging is automatic for:
-- Tribunal decisions (`POST /v1/tribunal/cases/:id/decision`)
-- Reputation updates (`POST /v1/reputation/observe`)
-- Useful work completion (`POST /v1/work/:id/result`)
-- Penalty applications (automatic via rate limiting)
-
-This provides an immutable audit trail for all governance actions, supporting accountability and dispute resolution in decentralized systems.
-
-## DNS Capability Advertisement
-
-The nameserver publishes its capabilities via DNS TXT records and a well-known endpoint, enabling federated discovery and automatic capability negotiation.
-
-### Configuration
-
-```toml
-[nameserver.capabilities]
-version = "v1"
-domain = "ns.example.com"  # Your nameserver domain
-useful_work_types = ["validate_block", "verify_observation", "audit_ruleset"]
-tribunal_enabled = true
-transparency_enabled = true
-federation_enabled = false
-```
-
-Environment variables:
-- `JIG_NS_DOMAIN` – Nameserver domain for DNS records
-- `JIG_NS_VERSION` – Protocol version (default: v1)
-
-### DNS TXT Records
-
-Generate DNS TXT records from your config:
-
-```bash
-cargo run --bin dns-txt
-```
-
-Output:
-```
-_jig-ns.example.com  IN  TXT  "jig-ns=version:v1"
-_jig-ns.example.com  IN  TXT  "jig-ns=work:validate_block,verify_observation,audit_ruleset"
-_jig-ns.example.com  IN  TXT  "jig-ns=tribunal:enabled"
-_jig-ns.example.com  IN  TXT  "jig-ns=transparency:enabled"
-```
-
-Add these records to your DNS zone to advertise capabilities to the federation network.
-
-### Well-Known Endpoint
-
-The capabilities are also available as plain text at `/.well-known/jig-ns/capabilities`:
-
-```bash
-curl http://localhost:8070/.well-known/jig-ns/capabilities
-```
-
-Output:
-```
-# Jig Nameserver Capabilities
-version: v1
-domain: ns.example.com
-
-# Useful Work Types
-work: validate_block
-work: verify_observation
-work: audit_ruleset
-
-# Features
-tribunal: enabled
-transparency: enabled
-federation: disabled
-```
-
-### Discovery Flow
-
-1. Client queries `_jig-ns.<domain>` TXT records
-2. Parses `jig-ns=` prefixed key-value pairs
-3. Determines compatible protocol version and features
-4. Falls back to `/.well-known/jig-ns/capabilities` for HTTP-based discovery
-
-This lightweight, TOML-first approach keeps dependencies minimal while enabling robust federation without JSON/YAML overhead.
+- `jig-nameserver serve` (the default): run the HTTP server. `--bind` and `--port` override the config.
+- `jig-nameserver keygen --out <path> --slot <slot>`: write a new signing key, sealed with each `--slot` (`passphrase`, `credential:PATH` or `env:NAME`), and print its DID, for a key ceremony before a server exists. It never overwrites a file.
+- `jig-nameserver keys seal|add-slot|show|verify|generate`: manage the sealed signing key the config names (`--keyfile` for another).
+- `dns-txt [CONFIG]`: print DNS TXT records advertising the `[capabilities]` section.
 
 ## Running Locally
 
@@ -317,16 +55,6 @@ cargo run -p jig-nameserver -- --config ./my-nameserver.toml serve
 
 ## Tests
 
-We use `cargo nextest` for speed and isolation:
-
 ```bash
 cargo nextest run -p jig-nameserver
 ```
-
-Integration tests under `src/server.rs` cover alias minting, reputation flow, and tribunal flow. Use `cargo test -p jig-nameserver server::tests::tribunal_case_flow` to focus on tribunal logic.
-
-## Further Reading
-
-- [`examples/requests/`](examples/requests/) – interactive payloads for reputation + tribunal APIs.
-- [`src/config.rs`](src/config.rs) – loader that merges profiles + env.
-- [`QUICK_NOTE_ON_REPUTATION_COMPATIBILITY.md`](QUICK_NOTE_ON_REPUTATION_COMPATIBILITY.md) – design principles for decentralized reputation.
