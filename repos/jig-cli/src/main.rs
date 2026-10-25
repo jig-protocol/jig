@@ -3,7 +3,6 @@
 mod channel_arg;
 mod cmd;
 mod config;
-mod receipt;
 
 use anyhow::Result;
 use channel_arg::ChannelArg;
@@ -547,14 +546,17 @@ enum KeysAction {
 
 #[derive(Subcommand, Debug)]
 enum ReceiptAction {
-    /// View a receipt from a file
+    /// Show a v0.3 block receipt from a file, once its signature verifies, with its signer and
+    /// whether that DID is a server this device pinned. The file holds the receipt's bytes, raw
+    /// or base64 (as the server delivers them in `receipt_bytes_b64`).
     View {
-        /// Path to the receipt JSON
+        /// Path to the receipt
         #[arg(long)]
         file: String,
     },
 
-    /// Compare two receipt files (for parity testing)
+    /// Compare two exec receipts on component, world, invocation and outcome, with each
+    /// signer's pin; a divergence exits non-zero
     Compare {
         /// First receipt file
         first: String,
@@ -939,10 +941,16 @@ async fn run() -> Result<()> {
             cmd::chat::run(&ctx, cmd::chat::ChatArgs { channel }).await?;
         }
         Some(Commands::Receipt { action }) => match action {
-            ReceiptAction::View { file } => cmd::receipt::view_receipt(&file, cli.json)?,
-            ReceiptAction::Compare { first, second } => {
-                cmd::receipt::compare_receipts(&first, &second)?
-            }
+            ReceiptAction::View { file } => cmd::receipt::view_receipt(
+                &file,
+                cli.json,
+                &jig_client::pins::Pins::default_path(),
+            )?,
+            ReceiptAction::Compare { first, second } => cmd::receipt::compare_receipts(
+                &first,
+                &second,
+                &jig_client::pins::Pins::default_path(),
+            )?,
         },
         Some(Commands::Block { action }) => match action {
             BlockAction::New { .. } | BlockAction::Build { .. } | BlockAction::Lint { .. } => {
