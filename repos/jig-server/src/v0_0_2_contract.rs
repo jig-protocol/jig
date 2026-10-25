@@ -2054,4 +2054,192 @@ mod tests {
             "nothing past the quota this minute"
         );
     }
+
+    // ---- The owner's limit on records-from ---------------------------------
+
+    /// What a peer connection carried: each frame's kind and body.
+    fn sent(
+        rx: &mut tokio::sync::mpsc::Receiver<jig_pipeline::envelope::Envelope>,
+    ) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        while let Ok(envelope) = rx.try_recv() {
+            if let jig_pipeline::envelope::Frame::Peer { kind, body } = envelope.frame {
+                out.push((kind, body));
+            }
+        }
+        out
+    }
+
+    fn ask(channel: &str) -> Vec<u8> {
+        let body = jig_core::dcbor::Value::text_map([
+            ("channel_id", jig_core::dcbor::Value::text(channel)),
+            ("from_seq", jig_core::dcbor::Value::Unsigned(0)),
+        ]);
+        jig_core::dcbor::encode(&body).unwrap()
+    }
+
+    /// An owner with one channel, shared with every DID in `followers`.
+    async fn owner_sharing(followers: &[&Did]) -> (AppState, String) {
+        let owner = state_with(vec![], &[]);
+        let user = SigningKey::from_bytes(&rand::random());
+        let channel = post(
+            &owner,
+            &user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#limited"}),
+        )
+        .await
+        .unwrap();
+        for follower in followers {
+            owner
+                .ingest_ctx
+                .store
+                .put_contract_offer(&StoredOffer {
+                    offer_id: rand::random(),
+                    channel_id: channel.clone(),
+                    side: Side::Owner,
+                    peer_did: follower.to_did_jig_string(),
+                    grant: Grant::Read,
+                    state: OfferState::Accepted,
+                    offer: vec![],
+                    answer: None,
+                    share_cid: None,
+                })
+                .unwrap();
+        }
+        (owner, channel)
+    }
+
+    fn a_did() -> Did {
+        Did::from_ed25519_pubkey(
+            SigningKey::from_bytes(&rand::random())
+                .verifying_key()
+                .as_bytes(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_follower_looping_on_records_from_is_cut_off_at_the_limit() {
+        let (looping, polite) = (a_did(), a_did());
+        let (owner, channel) = owner_sharing(&[&looping, &polite]).await;
+        let stream = Contracts::new(&owner).stream;
+        let limit = owner.config.federation.records_from;
+
+        // One follower asks in a loop: its burst is answered, the rest are
+        // refused with when to ask again, none dropped.
+        let (out, mut rx) = PeerSender::new(looping.clone());
+        for _ in 0..50 {
+            stream
+                .on_peer_frame(
+                    &looping,
+                    crate::v0_0_2_stream::RECORDS_FROM_FRAME,
+                    &ask(&channel),
+                    &out,
+                )
+                .unwrap()
+                .unwrap();
+        }
+        let frames = sent(&mut rx);
+        assert_eq!(frames.len(), 50, "every request answered");
+        let records = frames
+            .iter()
+            .filter(|(k, _)| k == crate::v0_0_2_stream::RECORDS_FRAME)
+            .count();
+        assert_eq!(records, limit.burst as usize);
+        let refusals: Vec<_> = frames
+            .iter()
+            .filter(|(k, _)| k == crate::v0_0_2_stream::RECORDS_LATER_FRAME)
+            .collect();
+        assert_eq!(refusals.len(), 50 - limit.burst as usize);
+        let retry_after = jig_core::dcbor::decode(&refusals[0].1)
+            .unwrap()
+            .get("retry_after_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap();
+        assert_eq!(retry_after, 60_000 / u64::from(limit.per_min));
+
+        // Meanwhile a follower polling every 10 s is answered every time.
+        let (out, mut polite_rx) = PeerSender::new(polite.clone());
+        for _ in 0..30 {
+            stream
+                .on_peer_frame(
+                    &polite,
+                    crate::v0_0_2_stream::RECORDS_FROM_FRAME,
+                    &ask(&channel),
+                    &out,
+                )
+                .unwrap()
+                .unwrap();
+            tokio::time::advance(crate::v0_0_2_stream::PULL_EVERY).await;
+        }
+        assert!(
+            sent(&mut polite_rx)
+                .iter()
+                .all(|(k, _)| k == crate::v0_0_2_stream::RECORDS_FRAME),
+            "a polling follower is never refused"
+        );
+
+        // And the looping one, once it waits, is answered again.
+        let (out, mut rx) = PeerSender::new(looping.clone());
+        stream
+            .on_peer_frame(
+                &looping,
+                crate::v0_0_2_stream::RECORDS_FROM_FRAME,
+                &ask(&channel),
+                &out,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(sent(&mut rx)[0].0, crate::v0_0_2_stream::RECORDS_FRAME);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_follower_waits_as_long_as_the_owner_says() {
+        let follower = state_with(vec![], &[]);
+        let stream = Contracts::new(&follower).stream;
+        let owner = a_did();
+        let channel = jig_pipeline::ingest_record::label_cid("a channel");
+        let later = jig_core::dcbor::encode(&jig_core::dcbor::Value::text_map([
+            ("channel_id", jig_core::dcbor::Value::text(&channel)),
+            ("retry_after_ms", jig_core::dcbor::Value::Unsigned(3_000)),
+        ]))
+        .unwrap();
+        let (out, _rx) = PeerSender::new(owner.clone());
+        stream
+            .on_peer_frame(
+                &owner,
+                crate::v0_0_2_stream::RECORDS_LATER_FRAME,
+                &later,
+                &out,
+            )
+            .unwrap()
+            .unwrap();
+        let owner = owner.to_did_jig_string();
+        let at = stream.retry_at(&owner, &channel).expect("held back");
+        assert_eq!(at - tokio::time::Instant::now(), Duration::from_secs(3));
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert_eq!(stream.retry_at(&owner, &channel), None, "free to ask again");
+
+        // A wait past the cap is held to it.
+        let long = jig_core::dcbor::encode(&jig_core::dcbor::Value::text_map([
+            ("channel_id", jig_core::dcbor::Value::text(&channel)),
+            ("retry_after_ms", jig_core::dcbor::Value::Unsigned(u64::MAX)),
+        ]))
+        .unwrap();
+        let owner_did = Did::from_did_jig_string(&owner).unwrap();
+        stream
+            .on_peer_frame(
+                &owner_did,
+                crate::v0_0_2_stream::RECORDS_LATER_FRAME,
+                &long,
+                &out,
+            )
+            .unwrap()
+            .unwrap();
+        let at = stream.retry_at(&owner, &channel).unwrap();
+        assert_eq!(
+            at - tokio::time::Instant::now(),
+            crate::v0_0_2_stream::MAX_RETRY_AFTER
+        );
+    }
 }

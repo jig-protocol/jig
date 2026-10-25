@@ -183,7 +183,7 @@ list_handles = false
 # 16). Off by default: who you federate with is yours to disclose.
 # publish = true
 # This peer's own quota, in place of default_peer_quota. Published only with
-# publish = true. Published, not yet enforced.
+# publish = true. Enforced on the channels this peer streams to you.
 # quota = { blocks_per_min = 1200, bytes_per_min = 16777216 }
 # What to do when this peer offers a channel (JEP-0005 rule 8). "hold" (the
 # default) keeps the offer for you to accept or refuse with
@@ -198,6 +198,13 @@ list_handles = false
 # [federation.default_peer_quota]
 # blocks_per_min = 600
 # bytes_per_min = 8388608
+#
+# How often a follower may ask you for one channel's records: a burst, then
+# per_min a minute, for each peer and channel. A request past it is refused
+# with the time to ask again. These are the defaults; neither may be 0.
+# [federation.records_from]
+# burst = 8
+# per_min = 20
 #
 # Name suffixes this server attests, published in its manifest. Only
 # root = "dns" with a multi-label suffix; a config-rooted suffix is never
