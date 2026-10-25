@@ -149,6 +149,19 @@ per_ip_burst = 600
 per_ip_per_second = 100
 replay_per_did = 2000
 
+# Write capacity shared by members, invited and strangers (JEP-0008 rules
+# 21-23). Members are DIDs in [auth.admission] records, or DIDs whose admission
+# proof of work is local_member_age_secs old; everyone else is a stranger.
+# Strangers get stranger_share_pct of the writes. They borrow members' share
+# only while no member is writing, so a flood of fresh keys cannot crowd out
+# members. writes_per_second = 0 turns the pools off.
+[auth.pools]
+writes_per_second = 1000
+writes_burst = 2000
+stranger_share_pct = 20
+invited_share_pct = 10
+local_member_age_secs = 604800
+
 [keys]
 # What opens the sealed server key at boot. The server never prompts. The
 # systemd credential in jig-server.service (LoadCredentialEncrypted=), bound to
