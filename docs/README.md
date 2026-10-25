@@ -40,6 +40,7 @@ should not be read as a status page.
 | Doc | Status | What it is |
 | --- | --- | --- |
 | [`../SECURITY.md`](../SECURITY.md) | CURRENT | How to report a vulnerability, response targets, disclosure policy and scope. |
+| [`security/audit-scope.md`](security/audit-scope.md) | CURRENT | Proposed scope for the external security audit (D27): seven areas by priority, entry points and threat-register rows for each, how to split the work, and what must be code-complete first. |
 | [`security/operator-threat-model.md`](security/operator-threat-model.md) | CURRENT | The model and evidence behind the spec's operator [threat register](../repos/jig-spec/src/threat-register.md). |
 | [`security/encryption.md`](security/encryption.md) | CURRENT | Why encryption is shaped as it is: suite field, refusals, MLS, DMs as locked channels, the DID key as MLS signer, a validating delivery service, the client plaintext cache. |
 | [`security/nameserver-abuse-economics.md`](security/nameserver-abuse-economics.md) | CURRENT | Why nameserver proof-of-work, rate limits and penalties are shaped as they are: Sybil and spam cost models, decay, griefing, federation, tribunals per ruleset group, and the known weaknesses the design must close. Rationale for the spec's [Identity and Reputation](../repos/jig-spec/src/identity-and-reputation.md) chapter. |

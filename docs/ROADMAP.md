@@ -310,4 +310,5 @@ outside this repo.
    an older signing key; `main` pins the key the signing secret holds, so the next release is a
    fresh tag from `main`.
 4. Whether every channel is encrypted by default after the v0.2 tag (D25).
-5. How the external audit is split (D27).
+5. How the external audit is split (D27). Proposal: [`security/audit-scope.md`](security/audit-scope.md),
+   for DJ to decide.
