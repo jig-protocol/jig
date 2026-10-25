@@ -515,7 +515,8 @@ git clone git@github.com:jig-protocol/jig.git ~/jig
 cd ~/jig/repos
 git checkout main          # NOT a worktree branch — see the dogfood plan's "rule zero"
 
-cargo build --release -p jig-server -p jig-cli -p jig-nameserver
+cargo build --release -p jig-server -p jig-cli
+cargo build --release -p jig-nameserver   # on its own: no Wasm engine linked
 ```
 
 Run it under `tmux` or `screen` so a dropped hotel wifi connection does not kill
@@ -533,7 +534,9 @@ downgrade the link without touching a committed file:
 
 ```bash
 CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
-  cargo build --release -p jig-server -p jig-cli -p jig-nameserver
+  cargo build --release -p jig-server -p jig-cli
+CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  cargo build --release -p jig-nameserver
 ```
 
 That trades a few percent of runtime performance and some binary size for a

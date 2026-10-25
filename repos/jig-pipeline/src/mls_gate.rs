@@ -178,7 +178,15 @@ pub fn plan(
         // judge later blocks, so they are plaintext on every suite. They carry
         // no commit: a role changes who may sign, not who is in the group.
         // Who may sign one is the write gate's call, from the chain.
-        BlockKind::RoleAssign | BlockKind::RoleUnassign => {
+        // Share blocks and contract records are control plane too: the
+        // servers read them, and members check their signed envelopes.
+        BlockKind::RoleAssign
+        | BlockKind::RoleUnassign
+        | BlockKind::ChannelShare
+        | BlockKind::ChannelUnshare
+        | BlockKind::ContractAccept
+        | BlockKind::ContractRefuse
+        | BlockKind::ContractEnd => {
             require_plaintext_block(manifest, block_suite)?;
             Ok(MlsPlan::Nothing)
         }

@@ -80,8 +80,11 @@ connection's TLS exporter. The client refuses a welcome whose exporter differs f
 own, so a welcome cannot be replayed into another TLS session, and a TLS-terminating proxy
 in front of the server makes every remote client refuse it (#234). The client keeps the
 frame when the signature fails or the welcome contradicts itself, and checks every later
-frame against the welcome (#140): a contradiction closes the connection (4003). That
-evidence is not yet stored or shown to anyone else.
+frame against the welcome (#140): a contradiction closes the connection (4003). The CLI
+keeps evidence under `~/.jig/evidence/` (#227), fetches the `server-manifest` the welcome
+cites, and refuses a server that will not serve it or cannot prove it its own; a manifest
+contradiction or a key-link fork is kept as evidence and refuses the server until
+`jig trust accept` (#261).
 
 ### OP-03: suite downgrade
 
@@ -173,7 +176,7 @@ author (TM-02), not the server. Since #161 the server signs an `ingest` record f
 block of a channel it holds: `seq`, `prev` (the hash of the record before) and its own clock
 reading, as COSE (`jig-pipeline/src/ingest_record.rs`). History is ordered by `seq`, and
 the record is served with each block on history and WebSocket frames and at
-`GET /api/v1/channels/{slug}/records`. Since #169 clients check it: history, `jig read`,
+`GET /api/v1/channels/{channel}/records` (by id or slug, #274). Since #169 clients check it: history, `jig read`,
 `jig tail` and `jig chat` verify each record's signature, `seq`, `prev` and clock against the
 chain the device pinned (`jig-client/src/chain.rs`), refuse a fork or a rewritten record, and
 fetch a gap in history from the records route, warning when the server does not serve it. A
@@ -186,8 +189,9 @@ two different chains is caught only if they compare them.
 fuel, or withholds receipts.
 
 **Decision rationale.** A receipt is a signed claim by one server, so a false one is
-attributable but not prevented. Cross-server `render_hash` parity is the only independent
-check today. Making divergence a refusal rather than a warning needs deterministic,
+attributable but not prevented. Since #276 the CLI re-runs each `text-render` it reads and
+compares it with the server's `exec` receipt, marking the line `[unverified]` or
+`[server render differs]`; cross-server `render_hash` parity is the other check. Making divergence a refusal rather than a warning needs deterministic,
 portable fuel (see `docs/investigations/2026-08-11-fuel-portability.md`).
 
 **Status evidence.** Receipts are server-signed. `integration-tests/tests/h4_parity_warning.rs`
@@ -206,11 +210,13 @@ pins into something verifiable; that is future work.
 
 **Status evidence.** The CLI pins each server's DID on its first signed welcome
 (`jig_client::pins`, `~/.jig/pins.json`). A later welcome signed by another key fails
-closed with an explanation, for every WebSocket connection and once per process before
+closed with an explanation, unless it carries a public key link (JEP-0012) from the pinned
+DID to its own, which moves the pin (#241), for every WebSocket connection and once per process before
 `Secure`'s first REST request (REST has no handshake of its own). `jig server forget`
 drops a server's pins. Over TLS, the default since TLS on by default landed, every REST
 and WebSocket connection is tied to the pinned DID as well: once per process the CLI
-fetches `/.well-known/jig`, requires the DID it names to be the pinned one, and then
+fetches `/.well-known/jig`, requires the DID it names to be the pinned one (or linked from
+it), and then
 accepts only the certificate that DID vouches for there (`tls_binding`), or one a CA
 issued (`jig_client::tls`). The CLI refuses plaintext REST and WebSocket connections to
 anything but this machine, since nothing would tie their answers to the pinned server

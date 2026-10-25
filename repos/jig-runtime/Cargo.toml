@@ -46,9 +46,9 @@ time = { version = "0.3", features = ["serde"] }
 # only: nothing in the shipped runtime selects Pulley yet.
 wasmtime = { version = "49.0.2", features = ["pulley"] }
 wat = "1.0"
-# For tests/text_block_payload.rs, which runs the real canonical module through
-# the byte-payload convention. text-block depends on no workspace crate, so this
-# adds no cycle; jig-runtime does not depend on it outside tests.
+# For tests/text_block_component.rs, which runs the real canonical component.
+# text-block depends on no workspace crate, so this adds no cycle; jig-runtime
+# does not depend on it outside tests.
 text-block = { path = "../text-block" }
 # The block ABI codec; the test encodes Input and decodes Output host-side.
 postcard = { workspace = true }

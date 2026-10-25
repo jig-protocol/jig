@@ -3,10 +3,6 @@
 mod channel_arg;
 mod cmd;
 mod config;
-mod receipt;
-
-#[cfg(feature = "local-runtime")]
-mod runtime;
 
 use anyhow::Result;
 use channel_arg::ChannelArg;
@@ -420,9 +416,9 @@ enum BlockAction {
         max_memory_pages: u32,
     },
 
-    /// Run a block once, locally. A component (a block project, or a .wasm component) runs
-    /// through the same component path as the server and client; a core module runs on the
-    /// legacy ABI and gets a v0.2 receipt.
+    /// Run a block once, locally: a block project, or a .wasm component, through the same
+    /// component path as the server and client. A core module is refused; `jig block build`
+    /// makes a component.
     #[cfg(feature = "local-runtime")]
     Run {
         /// A block project directory, or a .wasm file
@@ -453,37 +449,17 @@ enum BlockAction {
         #[arg(long)]
         seq: Option<u64>,
 
-        /// Deterministic seed for RNG (for reproducible execution)
-        #[arg(long)]
-        seed: Option<u64>,
-
         /// Maximum fuel budget
         #[arg(long)]
         fuel: Option<u64>,
-
-        /// Maximum memory in MB
-        #[arg(long)]
-        memory: Option<u32>,
 
         /// Execution timeout in milliseconds
         #[arg(long)]
         timeout: Option<u64>,
 
-        /// Enable capability (can be specified multiple times)
-        #[arg(long = "cap")]
-        capabilities: Vec<String>,
-
-        /// Write receipt JSON to file
-        #[arg(long)]
-        receipt: Option<String>,
-
         /// Output as JSON instead of pretty format
         #[arg(long)]
         json: bool,
-
-        /// Enable pricing in receipt
-        #[arg(long)]
-        pricing: bool,
     },
 
     /// Run a block project's vectors (tests/vectors/*.toml) and compare their outcomes
@@ -570,14 +546,17 @@ enum KeysAction {
 
 #[derive(Subcommand, Debug)]
 enum ReceiptAction {
-    /// View a receipt from a file
+    /// Show a v0.3 block receipt from a file, once its signature verifies, with its signer and
+    /// whether that DID is a server this device pinned. The file holds the receipt's bytes, raw
+    /// or base64 (as the server delivers them in `receipt_bytes_b64`).
     View {
-        /// Path to the receipt JSON
+        /// Path to the receipt
         #[arg(long)]
         file: String,
     },
 
-    /// Compare two receipt files (for parity testing)
+    /// Compare two exec receipts on component, world, invocation and outcome, with each
+    /// signer's pin; a divergence exits non-zero
     Compare {
         /// First receipt file
         first: String,
@@ -633,15 +612,15 @@ fn run_local_block_action(action: &BlockAction, global_json: bool) -> Option<Res
             fuel,
             timeout,
             json,
-            ..
         } => {
             let target = match cmd::block_exec::load_target(std::path::Path::new(wasm)) {
                 Ok(t) => t,
                 Err(e) => return Some(Err(e)),
             };
-            // A core module takes the legacy path, after the config is loaded.
             if !cmd::block_exec::is_component(&target.bytes) {
-                return None;
+                return Some(Err(anyhow::anyhow!(
+                    "{wasm} is a core module; `jig block build` makes a component"
+                )));
             }
             cmd::block_run::run_component(
                 &target,
@@ -962,10 +941,16 @@ async fn run() -> Result<()> {
             cmd::chat::run(&ctx, cmd::chat::ChatArgs { channel }).await?;
         }
         Some(Commands::Receipt { action }) => match action {
-            ReceiptAction::View { file } => cmd::receipt::view_receipt(&file, cli.json)?,
-            ReceiptAction::Compare { first, second } => {
-                cmd::receipt::compare_receipts(&first, &second)?
-            }
+            ReceiptAction::View { file } => cmd::receipt::view_receipt(
+                &file,
+                cli.json,
+                &jig_client::pins::Pins::default_path(),
+            )?,
+            ReceiptAction::Compare { first, second } => cmd::receipt::compare_receipts(
+                &first,
+                &second,
+                &jig_client::pins::Pins::default_path(),
+            )?,
         },
         Some(Commands::Block { action }) => match action {
             BlockAction::New { .. } | BlockAction::Build { .. } | BlockAction::Lint { .. } => {
@@ -974,47 +959,7 @@ async fn run() -> Result<()> {
             #[cfg(feature = "local-runtime")]
             BlockAction::Test { .. } => unreachable!("handled before the config is loaded"),
             #[cfg(feature = "local-runtime")]
-            BlockAction::Run {
-                wasm,
-                seed,
-                fuel,
-                memory,
-                timeout,
-                capabilities,
-                receipt,
-                json,
-                pricing,
-                input,
-                input_file,
-                sender,
-                channel,
-                seq,
-                ..
-            } => {
-                use cmd::block_run::{RunBlockArgs, run_block};
-                if input.is_some()
-                    || input_file.is_some()
-                    || sender.is_some()
-                    || channel.is_some()
-                    || seq.is_some()
-                {
-                    anyhow::bail!(
-                        "{wasm} is a core module; --input, --input-file, --sender, --channel and \
-                         --seq apply only to components (`jig block build` makes one)"
-                    );
-                }
-                run_block(RunBlockArgs {
-                    wasm_path: &wasm,
-                    seed,
-                    fuel,
-                    memory_mb: memory,
-                    timeout_ms: timeout,
-                    capabilities,
-                    receipt_out: receipt.as_deref(),
-                    json_output: json || cli.json,
-                    enable_pricing: pricing,
-                })?;
-            }
+            BlockAction::Run { .. } => unreachable!("handled before the config is loaded"),
         },
         Some(Commands::Init { .. }) => unreachable!("init handled earlier"),
         Some(Commands::Keys { .. }) => unreachable!("keys handled earlier"),

@@ -61,6 +61,23 @@ pub enum BlockKind {
     /// server, only into its manifest log. Synthetic: the document is in its
     /// metadata (`jig_pipeline::server_manifest`).
     ServerManifest,
+    /// Shares a channel with another server under a grant (JEP-0005 rule 7):
+    /// the owning server then offers it the contract. Signed by a DID that
+    /// holds the `share` right at the block's position in the chain.
+    ChannelShare,
+    /// Ends a share the channel made (JEP-0005 rule 11): the owning server
+    /// then sends the follower a `contract-end`. Needs the `share` right.
+    ChannelUnshare,
+    /// The record of a server's acceptance (JEP-0005 rule 10), carrying the
+    /// offer and the signed accept. Written only by the channel's sequencer.
+    ContractAccept,
+    /// The record of a refused share, carrying the target's signed refusal,
+    /// or none when the owning server refused it itself (a target that is
+    /// not a configured peer). Written only by the channel's sequencer.
+    ContractRefuse,
+    /// The record of an ended share, carrying the signed `contract-end` of
+    /// whichever side ended it. Written only by the channel's sequencer.
+    ContractEnd,
 }
 
 impl BlockKind {
@@ -85,6 +102,11 @@ impl BlockKind {
             Self::EmailEncrypted => "email-encrypted",
             Self::Receipt => "receipt",
             Self::ServerManifest => "server-manifest",
+            Self::ChannelShare => "channel-share",
+            Self::ChannelUnshare => "channel-unshare",
+            Self::ContractAccept => "contract-accept",
+            Self::ContractRefuse => "contract-refuse",
+            Self::ContractEnd => "contract-end",
         }
     }
 
@@ -118,6 +140,11 @@ impl std::str::FromStr for BlockKind {
             "email-encrypted" => Ok(Self::EmailEncrypted),
             "receipt" => Ok(Self::Receipt),
             "server-manifest" => Ok(Self::ServerManifest),
+            "channel-share" => Ok(Self::ChannelShare),
+            "channel-unshare" => Ok(Self::ChannelUnshare),
+            "contract-accept" => Ok(Self::ContractAccept),
+            "contract-refuse" => Ok(Self::ContractRefuse),
+            "contract-end" => Ok(Self::ContractEnd),
             _ => Err(BlockKindError::Unknown(s.to_string())),
         }
     }
@@ -155,6 +182,11 @@ mod tests {
             ("email-encrypted", BlockKind::EmailEncrypted),
             ("receipt", BlockKind::Receipt),
             ("server-manifest", BlockKind::ServerManifest),
+            ("channel-share", BlockKind::ChannelShare),
+            ("channel-unshare", BlockKind::ChannelUnshare),
+            ("contract-accept", BlockKind::ContractAccept),
+            ("contract-refuse", BlockKind::ContractRefuse),
+            ("contract-end", BlockKind::ContractEnd),
         ];
         for (s, k) in kinds {
             assert_eq!(k.as_str(), s);
