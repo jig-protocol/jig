@@ -193,7 +193,7 @@ match.
 | `CONTRIBUTING.md` (root) | Yes | Build, test and pull-request rules, including the DAG rule. `repos/jig-spec/CONTRIBUTING.md` covers the spec book. |
 | `CODE_OF_CONDUCT.md` | Yes | At the repo root. |
 | `SECURITY.md` (root) | Yes | See §1.8. |
-| Deployment docs | Yes, strong | `deploy/README.md` (426 lines: install, tailnet security model, TLS via `tailscale cert`, teammate onboarding, backups, restore, gotchas), `docs/deployment/gcp-vps-runbook.md` (940 lines), plus dogfood runbooks and an install benchmark. |
+| Deployment docs | Yes | [`deploy/README.md`](../deploy/README.md): systemd units, the security model with a private network as defence in depth, install, TLS, backups, restore, sealing and rotating the server key, the nameserver, and gotchas. [`deployment/install-benchmark.md`](deployment/install-benchmark.md) measures the 60-second install. |
 | Per-crate rustdoc | Partial | Module- and item-level doc comments are dense and unusually good (the `//!` headers carry real rationale). But **no crate sets `#![warn(missing_docs)]`** and none carries `[package.metadata.docs.rs]`, so there is no rendered API reference anywhere. Only `integration-tests` sets `publish = false`; the rest are publishable-by-accident. |
 | `jig-spec` book | Yes | mdbook under `repos/jig-spec/`. Describes much unshipped behaviour. Each chapter's banner, and the threat register's status column, say what the reference implementation does (re-checked 2026-10-18); `message-format.md` is bannered as historical, not the wire format. |
 | Riverdance | Not in this repo | The unfinished GUI is not part of this repository. Its licence is undecided, and it is not a working client. |

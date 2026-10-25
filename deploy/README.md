@@ -1,8 +1,10 @@
-# Deploying jig on a tailnet VPS
+# Deploying jig on a VPS behind a private network
 
 Systemd units, a config template, and a backup job for running
-`jig-server` + `jig-nameserver` on a single small VPS reachable **only over
-Tailscale**.
+`jig-server` + `jig-nameserver` on a single small VPS reachable **only over a
+private network**. The examples use a tailnet (Tailscale): its `100.x` addresses,
+the `tailscaled` ordering and `tailscale cert`. Any private network that gives the
+host a stable address works the same way.
 
 | File | Purpose |
 | --- | --- |
@@ -64,13 +66,13 @@ Two related traps:
 - Restoring the key onto a *different* host is what you want. Restoring the
   databases without it is not.
 
-Teammates have the same problem one level down: see
-[Teammate onboarding](#teammate-onboarding) — `~/.jig/keys/*.jigkey` is the only
-copy of a person's identity.
+Users have the same problem one level down: `~/.jig/keys/<did>.jigkey` is the only
+copy of a person's identity. Each user should keep a second slot or a recovery kit
+for it (`jig keys protect`, `jig keys --help`).
 
 ---
 
-## Security model: identity in the server, the tailnet as defence in depth
+## Security model: identity in the server, the private network as defence in depth
 
 The server authenticates and authorizes on its own. Network placement is a
 second layer, not the only one — but it is still a layer you want, because the
@@ -136,7 +138,7 @@ the default):
   is no proof to admit — but never for writes.
 
 What it does not enforce yet — the reasons to keep `bind_address` on the
-tailnet:
+private network:
 
 - **No reputation scoring.** Admission consumes scores the operator wrote
   down; nothing computes or exchanges them yet. With the default
@@ -157,11 +159,12 @@ tailnet:
   all of them. See `docs/RELEASE_READINESS.md` §1.3.
 - The nameserver's `/v1/register` has no auth beyond proof-of-control of a
   self-minted key. Its config default `bind` is `127.0.0.1`, but the unit
-  overrides it with `JIG_NS_BIND` — set that to the tailnet IP, not `0.0.0.0`.
+  overrides it with `JIG_NS_BIND` — set that to the private-network IP, not
+  `0.0.0.0`.
 
-Removing someone from the tailnet still removes their access, and until a
-`member-remove` block exists it is still the operator's only lever short of
-editing the database.
+Removing a device from the private network still removes its access to the
+server altogether. Inside the server, a channel owner removes a member with a
+signed `member-remove` block, and an admission ban refuses a DID everywhere.
 
 ---
 
@@ -413,88 +416,6 @@ hot reload). Certs are ~90 days, so re-run `tailscale cert` and restart the
 service on a monthly timer. Each restart, the server DID vouches for whatever
 certificate it serves, so `jig` clients follow a renewal without re-pinning.
 Or remove `cert_path`/`key_path` to go back to the self-signed certificate.
-
----
-
-## Teammate onboarding
-
-Do these **in order**. Steps 1–2 are where a group session actually stalls: the
-invite email and the per-device approval click are asynchronous and often cross
-a timezone. Send the invites before anyone builds anything.
-
-| # | Who | Step | Command / action |
-| --- | --- | --- | --- |
-| 1 | You | Send the Tailscale invite | tailnet admin console → Invite external user |
-| 2 | Them | Install Tailscale, sign in, **wait for your approval** | `tailscale up`, then you approve the device |
-| 3 | Them | Confirm they can see the box | `tailscale ping <host>` |
-| 4 | You | Get them the `jig` binary | AirDrop or `tailscale file cp` |
-| 5 | Them | Clear the macOS quarantine flag | `xattr -d com.apple.quarantine ./jig` |
-| 6 | Them | Confirm the server is reachable | `curl -k https://100.x.y.z:7117/healthz` |
-| 7 | Them | Create an identity | `./jig init <nickname>` |
-| 8 | Them | Point at the server | `./jig server set https://100.x.y.z:7117` |
-| 9 | Them | **Back up `~/.jig/keys/*.key`** | copy into a password manager |
-| 10 | Them | Chat | `./jig chat '#gigue'` |
-
-You create `#gigue` once, from any machine: `jig channel create '#gigue'`.
-Teammates do **not** need `jig channel join` for an `open` channel — v0.0.2
-stores membership as derived state for bridge dispatch and does not gate reads
-or sends on it. Run `jig channel join` only for a `restricted` channel.
-
-### Step 5 — macOS Gatekeeper
-
-The `jig` binary is unsigned and unnotarised. Anything that arrives by download
-or AirDrop is tagged `com.apple.quarantine`, and Gatekeeper refuses to run it —
-the failure is a modal dialog, or a bare `zsh: killed`, neither of which says
-"quarantine".
-
-```bash
-xattr -d com.apple.quarantine ./jig
-xattr -l ./jig                       # no com.apple.quarantine line
-```
-
-Build one binary per architecture if anyone is on Intel: `aarch64-apple-darwin`
-for Apple Silicon, `x86_64-apple-darwin` for Intel. A binary of the wrong arch
-fails with `Bad CPU type in executable`, which looks nothing like an arch
-mismatch either. Ship the right one, or ship both under distinct names.
-
-### Step 9 — their key is the only copy
-
-`jig init` writes `~/.jig/keys/<did>.key` (0600) and `~/.jig/cli.toml`. **There
-is no recovery and no key escrow.** Losing that file means losing the identity:
-a new `jig init` produces a new DID, and their message history is attributed to
-a DID nobody controls any more.
-
-```bash
-base64 ~/.jig/keys/*.key    # into 1Password, once, on day one
-```
-
-Restoring means putting the file back at that path with mode 0600 and keeping
-`cli.toml`'s `did` pointed at it.
-
-### Step 10 — staying connected
-
-`jig chat` and `jig tail` do **not** reconnect on their own, but they now *detect*
-a dropped connection: both exit non-zero with `connection lost` instead of hanging
-or returning success. That makes a supervising loop work:
-
-```bash
-scripts/jig-room.sh '#gigue'
-```
-
-which is just `until jig chat "$1"; do sleep 2; done`. Use the same shape for
-`jig tail`. This is the deliberate stand-in for real reconnect-with-backoff, and
-it is load-bearing on the non-zero exit — if a future change makes either command
-exit 0 on disconnect, the loop silently stops retrying.
-
-Three smaller sharp edges:
-
-- `jig tail` prints the raw 61-char DID and raw epoch-millis per line. Nicer rendering
-  (`HH:MM`, a `[contacts]` name map, an inbound bell) is **in flight in this same batch**
-  — check whether `jig-cli/src/cmd/display.rs` is wired up before promising it.
-- `jig --version` is not implemented. Identify a build by its file hash.
-- `--server`, `--config`, and `--did` are honoured by every subcommand,
-  including `init`, `keys`, `server`, and `channel` (they were silently ignored
-  for those four until recently). `--config <path>` requires the file to exist.
 
 ---
 
