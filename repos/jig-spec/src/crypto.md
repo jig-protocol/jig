@@ -110,7 +110,7 @@ label that names no key.
 - Clients and servers MUST support key rotation (publishing new key signed by old key)
 - Rotation certificates MUST be published to nameserver and propagated via transparency log
 
-*(partial: a DID is its key, and no rotation certificate exists. A server whose key changes can serve a key link (JEP-0012) from its old DID to its new one, which clients follow to move their pin (#241); no tool makes the link yet. The nameserver's `/v1/rotate` moves an alias to a new DID, with proofs from both keys; it is not a rotation certificate and no transparency log receives it.)*
+*(partial: a DID is its key, and no rotation certificate exists. A server whose key changes can serve a key link (JEP-0012) from its old DID to its new one, which clients follow to move their pin (#241); `jig-server keys rotate` and `keys link` write it (#298). Clients follow one link, not a chain. The nameserver's `/v1/rotate` moves an alias to a new DID, with proofs from both keys; it is not a rotation certificate and no transparency log receives it.)*
 
 **For end users:** Your keys = your identity. If you lose them, you lose your account. Back them up. If they're stolen, rotate immediately.
 

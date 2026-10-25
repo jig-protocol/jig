@@ -178,7 +178,7 @@ Still to do in this phase:
   how names map to DIDs and who resolves them. Nameserver-led shared contracts for trusted subnets
   and ruleset groups follow. Federating with a differently built server comes after the MVP.
 - Multi-device and key rotation; a server-key rotation ceremony (clients follow a server's key link
-  since #241; no tool makes one yet).
+  since #241, and `jig-server keys rotate` writes one, #298).
 - **Server key rotation across several hops.** alpha.2 follows one key link: a client pinned two
   rotations back fails closed and must re-pin. The next step is a chain of links, followed hop by
   hop (a JEP-0002 and JEP-0012 change, lane I), because forcing a re-pin is a trust-on-first-use
