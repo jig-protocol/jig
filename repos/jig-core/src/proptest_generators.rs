@@ -5,7 +5,6 @@
 
 use crate::capability_scope::CapabilityScopePattern;
 use crate::manifest::*;
-use crate::receipt::{HashAlgorithms, RECEIPT_SCHEMA_VERSION};
 use cid::Cid;
 use proptest::prelude::*;
 use semver::Version;
@@ -304,57 +303,6 @@ impl Arbitrary for BlockManifest {
     }
 }
 
-impl Arbitrary for crate::receipt::BlockReceipt {
-    type Parameters = ();
-    type Strategy = BoxedStrategy<Self>;
-
-    fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-        (
-            cid_strategy(),
-            did_strategy(),
-            timestamp_strategy(),
-            hash_hex_strategy(),
-            100_000u64..10_000_000u64,
-            prop::option::of(8u32..256u32),
-            prop::collection::vec(capability_name_strategy(), 0..5),
-            prop::option::of(prop::string::string_regex("sig:[a-f0-9]{128}").unwrap()),
-        )
-            .prop_map(
-                |(
-                    block_id,
-                    host,
-                    executed_at,
-                    render_hash,
-                    fuel_used,
-                    memory_peak_mb,
-                    capabilities_used,
-                    signature,
-                )| {
-                    crate::receipt::BlockReceipt {
-                        receipt_schema_version: RECEIPT_SCHEMA_VERSION.to_string(),
-                        block_id,
-                        host,
-                        executed_at,
-                        render_hash,
-                        fuel_used,
-                        memory_peak_mb,
-                        renders_match: None,
-                        counters: None,
-                        timings_ms: None,
-                        limits: None,
-                        outcome: None,
-                        hash_algorithms: HashAlgorithms::default(),
-                        capabilities_used,
-                        attestations: vec![],
-                        signature,
-                        metadata: BTreeMap::new(),
-                    }
-                },
-            )
-            .boxed()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,11 +337,6 @@ mod tests {
             assert!(manifest.version.major < 5);
         }
 
-        #[test]
-        fn receipt_generates_valid(receipt in any::<crate::receipt::BlockReceipt>()) {
-            assert!(!receipt.render_hash.is_empty());
-            assert!(receipt.fuel_used >= 100_000);
-        }
 
         /// Test CID stability: serialize → deserialize → serialize produces identical bytes.
         #[test]
@@ -413,13 +356,6 @@ mod tests {
             prop_assert_eq!(json1, json2, "Field order unstable");
         }
 
-        /// Test receipt roundtrip without data loss.
-        #[test]
-        fn receipt_validates_after_roundtrip(receipt in any::<crate::receipt::BlockReceipt>()) {
-            let json = serde_json::to_string(&receipt).unwrap();
-            let parsed: crate::receipt::BlockReceipt = serde_json::from_str(&json).unwrap();
-            prop_assert_eq!(receipt, parsed);
-        }
 
         /// Test optional fields are preserved.
         #[test]

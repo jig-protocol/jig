@@ -83,14 +83,15 @@ pub enum ServerKeyError {
     #[error("{0}")]
     BadUnlock(String),
     #[error(
-        "{path:?} already moves {previous} to this key, since {since}. Rotating again replaces \
-         that link, and a client still pinned on {previous} can then follow neither: it is \
-         refused, and re-pinning trusts the server on first use again. Pass --replace-link to \
-         rotate anyway; the old link is kept beside it as {path:?}.N"
+        "{path:?} ends a chain of {hops} key links, the most a client follows. Rotating again \
+         needs --prune-oldest, which stops serving the oldest, from {oldest} (made {since}): a \
+         client still pinned on {oldest} is then refused, and re-pinning trusts the server on \
+         first use again"
     )]
-    Linked {
+    TooManyHops {
         path: PathBuf,
-        previous: String,
+        hops: usize,
+        oldest: String,
         since: String,
     },
     #[error(
@@ -655,6 +656,162 @@ pub struct Rotated {
     pub link: PathBuf,
     /// Where the link it replaced was kept, and the DID that link left.
     pub archived: Option<(PathBuf, String)>,
+    /// With `prune_oldest`: where the oldest link went, no longer served, and
+    /// the DID it left. A client still pinned on that DID must re-pin.
+    pub pruned: Option<(PathBuf, String)>,
+}
+
+/// One link of a server's chain, as [`key_chain`] read it.
+#[derive(Debug, Clone)]
+pub struct ChainLink {
+    pub path: PathBuf,
+    pub old: String,
+    pub new: String,
+    pub issued_at: i64,
+    /// The COSE_Sign bytes, as served.
+    pub bytes: Vec<u8>,
+}
+
+/// What a server serves: its key links, oldest first, the last ending at its
+/// DID, and what was wrong with any link file it left out.
+#[derive(Debug, Default)]
+pub struct KeyChain {
+    pub links: Vec<ChainLink>,
+    /// Each names a file, and why it is not served.
+    pub problems: Vec<String>,
+}
+
+/// The chain of key links a server with `keyfile` and `server_did` serves
+/// (JEP-0012), oldest first: the newest is `<keyfile>.link`, and each one
+/// before it is the `<keyfile>.link.N` that moves to the DID the next one
+/// leaves. At most [`jig_pipeline::handshake::MAX_KEY_LINK_HOPS`].
+///
+/// Only the newest decides whether the server can boot: missing, there is no
+/// chain; unreadable, unverifiable, not public, or not moving to
+/// `server_did`, it is an error, since every client that pinned the old DID
+/// would refuse the server. A bad or missing older link only ends the chain
+/// there: what is served is still all verified, and clients pinned behind
+/// the break get the loud refusal they would get with no chain. Each such
+/// file is named in `problems`, for the server to log.
+pub fn key_chain(keyfile: &Path, server_did: &str) -> Result<KeyChain> {
+    let link_path = key_link_path(keyfile);
+    let read = |path: &Path| -> std::result::Result<ChainLink, String> {
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let signed =
+            jig_core::key_link::SignedKeyLink::from_envelope(&bytes).map_err(|e| e.to_string())?;
+        let link = signed.link();
+        if link.audience != jig_core::key_link::Audience::Public {
+            return Err("the key link is not a public one".to_string());
+        }
+        Ok(ChainLink {
+            path: path.to_path_buf(),
+            old: link.old.clone(),
+            new: link.new.clone(),
+            issued_at: link.issued_at,
+            bytes,
+        })
+    };
+    let files = link_files(&link_path)?;
+    let mut chain = KeyChain::default();
+    if !link_path.exists() {
+        if !files.archives.is_empty() {
+            chain.problems.push(format!(
+                "{} is missing, so none of the earlier links beside it is served",
+                link_path.display()
+            ));
+        }
+        return Ok(chain);
+    }
+    let newest = read(&link_path).map_err(|reason| ServerKeyError::BadLink {
+        path: link_path.clone(),
+        reason,
+    })?;
+    if newest.new != server_did {
+        return Err(ServerKeyError::BadLink {
+            path: link_path,
+            reason: format!(
+                "the key link moves to {}, not to this server's DID {server_did}",
+                newest.new
+            ),
+        });
+    }
+    let mut archives = Vec::new();
+    for path in &files.archives {
+        match read(path) {
+            Ok(link) => archives.push(link),
+            Err(reason) => chain
+                .problems
+                .push(format!("{} is not served: {reason}", path.display())),
+        }
+    }
+    let mut seen = vec![server_did.to_string(), newest.old.clone()];
+    let mut links = vec![newest];
+    let max = jig_pipeline::handshake::MAX_KEY_LINK_HOPS;
+    loop {
+        let leaves = links[0].old.clone();
+        let into: Vec<&ChainLink> = archives.iter().filter(|l| l.new == leaves).collect();
+        let Some(&before) = into.first() else {
+            break;
+        };
+        let stop = |why: String| format!("the chain stops at {leaves}: {why}");
+        if into.len() > 1 {
+            let names: Vec<String> = into.iter().map(|l| l.path.display().to_string()).collect();
+            chain.problems.push(stop(format!(
+                "{} all move to it; serve one of them",
+                names.join(", ")
+            )));
+            break;
+        }
+        if seen.contains(&before.old) {
+            chain.problems.push(stop(format!(
+                "{} leaves {}, already in the chain",
+                before.path.display(),
+                before.old
+            )));
+            break;
+        }
+        if let Some(fork) = archives
+            .iter()
+            .chain(links.iter())
+            .find(|l| l.old == before.old && l.new != before.new)
+        {
+            chain.problems.push(stop(format!(
+                "{} and {} both leave {}: a fork, never served (JEP-0012)",
+                before.path.display(),
+                fork.path.display(),
+                before.old
+            )));
+            break;
+        }
+        if links.len() == max {
+            chain.problems.push(stop(format!(
+                "a client follows at most {max} links, so {} and any before it are not served",
+                before.path.display()
+            )));
+            break;
+        }
+        seen.push(before.old.clone());
+        links.insert(0, before.clone());
+    }
+    for unused in archives
+        .iter()
+        .filter(|a| !links.iter().any(|l| l.path == a.path))
+    {
+        if !chain
+            .problems
+            .iter()
+            .any(|p| p.contains(&*unused.path.to_string_lossy()))
+        {
+            chain.problems.push(format!(
+                "{} is not served: it moves {} to {}, which no later link leaves",
+                unused.path.display(),
+                unused.old,
+                unused.new
+            ));
+        }
+    }
+    chain.links = links;
+    Ok(chain)
 }
 
 /// Replace the server's key at `keyfile` with a new one sealed with one slot
@@ -666,10 +823,14 @@ pub struct Rotated {
 /// The old key is opened as `opts` says, like [`add_slot`]. A `passphrase`
 /// slot for the new key reads `JIG_KEY_NEW_PASSPHRASE`, not the old one's.
 ///
-/// A link already beside the key is replaced only with `replace_link`: a
-/// client still pinned two keys back follows neither link and is refused.
-/// It is kept as `<link>.N`. A DID that any of those links already leaves is
-/// never linked again.
+/// A link already beside the key is kept as `<link>.N`, so the chain the
+/// server serves ([`key_chain`]) grows by one: clients pinned on any DID in
+/// it follow every hop. A chain already
+/// [`jig_pipeline::handshake::MAX_KEY_LINK_HOPS`] long grows only with
+/// `prune_oldest`, which moves the oldest link aside as `<link>.pruned-N`,
+/// no longer served: a client still pinned on the DID it leaves must re-pin.
+/// A DID that any link beside the key, pruned or not, already leaves is never
+/// linked again.
 ///
 /// The new key and the link are staged, read back and checked first: every
 /// slot opens the new key, and the link verifies from the old DID to the new.
@@ -678,7 +839,7 @@ pub struct Rotated {
 pub fn rotate(
     keyfile: &Path,
     specs: &[String],
-    replace_link: bool,
+    prune_oldest: bool,
     opts: &ServerKeyOptions,
     now: i64,
 ) -> Result<Rotated> {
@@ -698,29 +859,25 @@ pub fn rotate(
         });
     }
     let link_path = key_link_path(keyfile);
-    let links = links_beside(&link_path)?;
-    refuse_relink(&links, &old_did)?;
-    let current = links.iter().find(|(p, _)| *p == link_path);
-    if let Some((_, current)) = current {
-        let previous = &current.link().old;
-        if current.link().new != old_did {
-            return Err(ServerKeyError::BadLink {
-                path: link_path,
-                reason: format!(
-                    "it moves {previous} to {}, not to this key ({old_did}), so the server would \
-                     refuse to boot with it. Find out why before rotating",
-                    current.link().new
-                ),
-            });
+    refuse_relink(&links_beside(&link_path)?, &old_did)?;
+    // What the server serves now, ending at the key being replaced. A newest
+    // link that would stop the server booting stops this too.
+    let chain = key_chain(keyfile, &old_did)?;
+    let max = jig_pipeline::handshake::MAX_KEY_LINK_HOPS;
+    let prune = match chain.links.first() {
+        Some(oldest) if chain.links.len() >= max => {
+            if !prune_oldest {
+                return Err(ServerKeyError::TooManyHops {
+                    path: link_path,
+                    hops: chain.links.len(),
+                    oldest: oldest.old.clone(),
+                    since: utc(oldest.issued_at),
+                });
+            }
+            Some(oldest.clone())
         }
-        if !replace_link {
-            return Err(ServerKeyError::Linked {
-                path: link_path,
-                previous: previous.clone(),
-                since: utc(current.link().issued_at),
-            });
-        }
-    }
+        _ => None,
+    };
     if specs.is_empty() {
         return Err(ServerKeyError::BadUnlock(
             "name at least one --slot for the new key: credential:PATH, env:NAME or passphrase"
@@ -787,14 +944,34 @@ pub fn rotate(
     // Keep what is replaced under names nothing else uses, then rename the
     // new files over the old ones: each rename is atomic, and a link,
     // unlike a rename, never replaces a file that is already there.
+    // Every name is chosen before the first file is made, so a failure here
+    // leaves nothing behind.
+    let names = (|| {
+        let archive_to = match chain.links.last() {
+            Some(_) => Some(next_archive(&link_path)?),
+            None => None,
+        };
+        let prune_to = match &prune {
+            Some(_) => Some(next_pruned(&link_path)?),
+            None => None,
+        };
+        Ok::<_, ServerKeyError>((archive_to, prune_to))
+    })();
+    let (archive_to, prune_to) = match names {
+        Ok(names) => names,
+        Err(e) => {
+            unstage();
+            return Err(e);
+        }
+    };
     let retired = retired_path(&sealed, &old_did);
     if let Err(e) = link_new(&sealed, &retired) {
         unstage();
         return Err(e);
     }
-    let archived = match current {
-        Some((_, current)) => match link_new(&link_path, &next_archive(&link_path)) {
-            Ok(archived) => Some((archived, current.link().old.clone())),
+    let archived = match chain.links.last().zip(archive_to) {
+        Some((current, to)) => match link_new(&link_path, &to) {
+            Ok(archived) => Some((archived, current.old.clone())),
             Err(e) => {
                 unstage();
                 let _ = std::fs::remove_file(&retired);
@@ -803,12 +980,44 @@ pub fn rotate(
         },
         None => None,
     };
+    // Kept, under a name the chain is not read from.
+    let pruned = match prune.zip(prune_to) {
+        Some((oldest, to)) => {
+            let moved = link_new(&oldest.path, &to).and_then(|to| {
+                std::fs::remove_file(&oldest.path)
+                    .map(|()| to)
+                    .map_err(|source| ServerKeyError::Io {
+                        path: oldest.path.clone(),
+                        source,
+                    })
+            });
+            match moved {
+                Ok(to) => Some((to, oldest.old, oldest.path)),
+                Err(e) => {
+                    unstage();
+                    let _ = std::fs::remove_file(&retired);
+                    if let Some((archived, _)) = &archived {
+                        let _ = std::fs::remove_file(archived);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        None => None,
+    };
     let io = |path: &Path| {
         let path = path.to_path_buf();
         move |source| ServerKeyError::Io { path, source }
     };
+    // A pruned link goes back where it was served from.
+    let unprune = || {
+        if let Some((to, _, from)) = &pruned {
+            let _ = std::fs::rename(to, from);
+        }
+    };
     if let Err(e) = std::fs::rename(&tmp_key, &sealed) {
         unstage();
+        unprune();
         let _ = std::fs::remove_file(&retired);
         if let Some((archived, _)) = &archived {
             let _ = std::fs::remove_file(archived);
@@ -820,6 +1029,7 @@ pub fn rotate(
         // so the server keeps booting as the DID its clients pinned.
         let restored = std::fs::rename(&retired, &sealed);
         let _ = std::fs::remove_file(&tmp_link);
+        unprune();
         if let Some((archived, _)) = &archived {
             let _ = std::fs::remove_file(archived);
         }
@@ -845,6 +1055,7 @@ pub fn rotate(
         retired,
         link: link_path,
         archived,
+        pruned: pruned.map(|(to, left, _)| (to, left)),
     })
 }
 
@@ -930,16 +1141,68 @@ pub fn link(
     Ok((old_did, new_did, link_path))
 }
 
-/// The key links at `link_path` and at `<link_path>.N` beside it, each
-/// verified: a file there that does not verify is an error, not skipped.
+/// The files beside `link_path` that hold links: the earlier links
+/// (`<link_path>.N`) and the pruned ones (`<link_path>.pruned-N`), each list
+/// sorted by N.
+struct LinkFiles {
+    archives: Vec<PathBuf>,
+    pruned: Vec<PathBuf>,
+}
+
+fn link_files(link_path: &Path) -> Result<LinkFiles> {
+    let dir = match link_path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let name = link_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut archives: Vec<(u32, PathBuf)> = Vec::new();
+    let mut pruned: Vec<(u32, PathBuf)> = Vec::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LinkFiles {
+                archives: Vec::new(),
+                pruned: Vec::new(),
+            });
+        }
+        Err(source) => return Err(ServerKeyError::Io { path: dir, source }),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|source| ServerKeyError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        let file = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = file.strip_prefix(&name).and_then(|r| r.strip_prefix('.')) else {
+            continue;
+        };
+        let number = |digits: &str| digits.parse::<u32>().ok().filter(|_| !digits.is_empty());
+        if let Some(n) = number(rest) {
+            archives.push((n, entry.path()));
+        } else if let Some(n) = rest.strip_prefix("pruned-").and_then(number) {
+            pruned.push((n, entry.path()));
+        }
+    }
+    archives.sort();
+    pruned.sort();
+    Ok(LinkFiles {
+        archives: archives.into_iter().map(|(_, p)| p).collect(),
+        pruned: pruned.into_iter().map(|(_, p)| p).collect(),
+    })
+}
+
+/// Every link beside `link_path`: the newest, the earlier ones and the
+/// pruned ones, each verified. A file there that does not verify is an error,
+/// not skipped: which DID it leaves cannot be known.
 fn links_beside(link_path: &Path) -> Result<Vec<(PathBuf, jig_core::key_link::SignedKeyLink)>> {
+    let files = link_files(link_path)?;
     let mut found = Vec::new();
-    let mut paths = vec![link_path.to_path_buf()];
-    paths.extend(
-        (1..)
-            .map(|n| archive_path(link_path, n))
-            .take_while(|p| p.exists()),
-    );
+    let paths = std::iter::once(link_path.to_path_buf())
+        .chain(files.archives)
+        .chain(files.pruned);
     for path in paths {
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
@@ -949,7 +1212,10 @@ fn links_beside(link_path: &Path) -> Result<Vec<(PathBuf, jig_core::key_link::Si
         let link = jig_core::key_link::SignedKeyLink::from_envelope(&bytes).map_err(|e| {
             ServerKeyError::BadLink {
                 path: path.clone(),
-                reason: e.to_string(),
+                reason: format!(
+                    "{e}. Which DID it leaves cannot be read, so no key is linked until it is \
+                     moved aside"
+                ),
             }
         })?;
         found.push((path, link));
@@ -1006,12 +1272,32 @@ fn archive_path(link_path: &Path, n: u32) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// The first `<link_path>.N` that does not exist.
-fn next_archive(link_path: &Path) -> PathBuf {
-    (1..)
-        .map(|n| archive_path(link_path, n))
-        .find(|p| !p.exists())
-        .expect("some N is free")
+fn pruned_path(link_path: &Path, n: u32) -> PathBuf {
+    let mut name = link_path.as_os_str().to_owned();
+    name.push(format!(".pruned-{n}"));
+    PathBuf::from(name)
+}
+
+/// `<link_path>.N` for the N after the highest there is.
+fn next_archive(link_path: &Path) -> Result<PathBuf> {
+    let n = link_files(link_path)?
+        .archives
+        .iter()
+        .filter_map(|p| p.extension()?.to_str()?.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+    Ok(archive_path(link_path, n + 1))
+}
+
+/// `<link_path>.pruned-N` for the N after the highest there is.
+fn next_pruned(link_path: &Path) -> Result<PathBuf> {
+    let n = link_files(link_path)?
+        .pruned
+        .iter()
+        .filter_map(|p| p.to_str()?.rsplit_once(".pruned-")?.1.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+    Ok(pruned_path(link_path, n + 1))
 }
 
 /// Hard-link `from` to `to`, refusing an existing `to`. Returns `to`.
@@ -1065,7 +1351,7 @@ pub enum KeysAction {
     Rotate {
         keyfile: PathBuf,
         slots: Vec<String>,
-        replace_link: bool,
+        prune_oldest: bool,
     },
     /// Link one sealed key's DID to another's ([`link`]).
     Link {
@@ -1109,9 +1395,9 @@ pub fn run(action: KeysAction, opts: &ServerKeyOptions) -> Result<String> {
         KeysAction::Rotate {
             keyfile,
             slots,
-            replace_link,
+            prune_oldest,
         } => {
-            let done = rotate(&keyfile, &slots, replace_link, opts, unix_now())?;
+            let done = rotate(&keyfile, &slots, prune_oldest, opts, unix_now())?;
             let mut out = format!(
                 "rotated {} to {}\nsealed the new key into {}\nwrote the key link to {}\nkept \
                  the old key, still sealed, as {}: move it offline, and keep it",
@@ -1121,11 +1407,19 @@ pub fn run(action: KeysAction, opts: &ServerKeyOptions) -> Result<String> {
                 done.link.display(),
                 done.retired.display()
             );
-            if let Some((archived, previous)) = &done.archived {
+            if let Some((archived, _)) = &done.archived {
                 out.push_str(&format!(
-                    "\nkept the previous link as {}: clients still pinned on {previous} are \
-                     refused and must re-pin",
+                    "\nkept the previous link as {}, still served: clients pinned on any \
+                     earlier DID follow every link",
                     archived.display()
+                ));
+            }
+            if let Some((pruned, left)) = &done.pruned {
+                out.push_str(&format!(
+                    "\nWARNING: the oldest link, from {left}, is no longer served (kept as {}). \
+                     A client still pinned on {left} is refused and must re-pin, which trusts \
+                     this server on first use again",
+                    pruned.display()
                 ));
             }
             out.push_str(&format!(
@@ -1668,48 +1962,156 @@ mod tests {
         assert_eq!(did_of_key(&retired), done.old_did);
     }
 
+    /// Rotate the key at `path`, opened by `from`, to one opened by a new
+    /// credential named `to`; returns that credential.
+    fn rotate_to(dir: &Path, path: &Path, from: &str, to: &str, prune: bool) -> (Rotated, String) {
+        let next = credential_in(dir, to);
+        let done = rotate(
+            path,
+            std::slice::from_ref(&next),
+            prune,
+            &opts(Some(from.to_string())),
+            1,
+        )
+        .unwrap();
+        (done, next)
+    }
+
     #[test]
-    fn a_second_rotation_needs_replace_link_and_keeps_the_first_link() {
+    fn a_second_rotation_grows_the_chain_the_server_serves() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.key");
         let a = credential_in(dir.path(), "a");
         load_or_create(&path, &opts(Some(a.clone()))).unwrap();
-        let b = credential_in(dir.path(), "b");
-        let first = rotate(&path, std::slice::from_ref(&b), false, &opts(Some(a)), 1).unwrap();
-
-        let c = credential_in(dir.path(), "c");
-        let refused = rotate(
-            &path,
-            std::slice::from_ref(&c),
-            false,
-            &opts(Some(b.clone())),
-            2,
-        )
-        .unwrap_err();
-        let ServerKeyError::Linked {
-            previous, since, ..
-        } = &refused
-        else {
-            panic!("{refused}");
-        };
-        assert_eq!(previous, &first.old_did);
-        assert!(since.starts_with("1970-01-01"), "{since}");
-        assert!(refused.to_string().contains("--replace-link"));
-        // Nothing moved.
-        assert_eq!(
-            did_of_key(&load_or_create(&path, &opts(Some(b.clone()))).unwrap()),
-            first.new_did
-        );
-
+        let (first, b) = rotate_to(dir.path(), &path, &a, "b", false);
         let first_link = std::fs::read(&first.link).unwrap();
-        let second = rotate(&path, std::slice::from_ref(&c), true, &opts(Some(b)), 2).unwrap();
+        let (second, _) = rotate_to(dir.path(), &path, &b, "c", false);
+
         assert_eq!(second.old_did, first.new_did);
         let (archived, left) = second.archived.clone().unwrap();
         assert_eq!(archived, dir.path().join("server.key.link.1"));
         assert_eq!(left, first.old_did);
         assert_eq!(std::fs::read(&archived).unwrap(), first_link);
-        assert_ne!(first.retired, second.retired);
         assert!(first.retired.exists() && second.retired.exists());
+        assert!(second.pruned.is_none());
+
+        let chain = key_chain(&path, &second.new_did).unwrap();
+        assert!(chain.problems.is_empty(), "{:?}", chain.problems);
+        let hops: Vec<(&str, &str)> = chain
+            .links
+            .iter()
+            .map(|l| (l.old.as_str(), l.new.as_str()))
+            .collect();
+        assert_eq!(
+            hops,
+            [
+                (first.old_did.as_str(), first.new_did.as_str()),
+                (second.old_did.as_str(), second.new_did.as_str())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_full_chain_grows_again_only_by_pruning_its_oldest_link() {
+        let max = jig_pipeline::handshake::MAX_KEY_LINK_HOPS;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.key");
+        let mut cred = credential_in(dir.path(), "k0");
+        load_or_create(&path, &opts(Some(cred.clone()))).unwrap();
+        let mut first_did = None;
+        for n in 1..=max {
+            let (done, next) = rotate_to(dir.path(), &path, &cred, &format!("k{n}"), false);
+            first_did.get_or_insert(done.old_did);
+            cred = next;
+        }
+        let first_did = first_did.unwrap();
+        let current = describe(&path).unwrap().0;
+        assert_eq!(key_chain(&path, &current).unwrap().links.len(), max);
+
+        let next = credential_in(dir.path(), "over");
+        let refused = rotate(
+            &path,
+            std::slice::from_ref(&next),
+            false,
+            &opts(Some(cred.clone())),
+            2,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&refused, ServerKeyError::TooManyHops { hops, oldest, .. }
+                if *hops == max && *oldest == first_did),
+            "{refused}"
+        );
+        assert!(refused.to_string().contains("--prune-oldest"), "{refused}");
+        assert_eq!(describe(&path).unwrap().0, current, "nothing moved");
+
+        let (done, _) = rotate_to(dir.path(), &path, &cred, "over2", true);
+        let (pruned, left) = done.pruned.clone().unwrap();
+        assert_eq!(left, first_did);
+        assert_eq!(pruned, dir.path().join("server.key.link.pruned-1"));
+        assert!(pruned.exists(), "kept, not deleted");
+        let chain = key_chain(&path, &done.new_did).unwrap();
+        assert_eq!(chain.links.len(), max);
+        assert_ne!(chain.links[0].old, first_did);
+        assert!(chain.problems.is_empty(), "{:?}", chain.problems);
+        // The pruned link still counts: its DID is never linked again.
+        assert!(
+            links_beside(&key_link_path(&path))
+                .unwrap()
+                .iter()
+                .any(|(_, l)| l.link().old == first_did)
+        );
+    }
+
+    #[test]
+    fn a_broken_earlier_link_shortens_the_chain_and_a_broken_newest_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.key");
+        let a = credential_in(dir.path(), "a");
+        load_or_create(&path, &opts(Some(a.clone()))).unwrap();
+        let (_, b) = rotate_to(dir.path(), &path, &a, "b", false);
+        let (_, c) = rotate_to(dir.path(), &path, &b, "c", false);
+        let (third, _) = rotate_to(dir.path(), &path, &c, "d", false);
+        let did = third.new_did.clone();
+        assert_eq!(key_chain(&path, &did).unwrap().links.len(), 3);
+
+        // The oldest, corrupt: the two after it are still served.
+        let oldest = dir.path().join("server.key.link.1");
+        let kept = std::fs::read(&oldest).unwrap();
+        std::fs::write(&oldest, b"not a link").unwrap();
+        let chain = key_chain(&path, &did).unwrap();
+        assert_eq!(chain.links.len(), 2);
+        assert!(
+            chain
+                .problems
+                .iter()
+                .any(|p| p.contains(&*oldest.to_string_lossy())),
+            "{:?}",
+            chain.problems
+        );
+        std::fs::write(&oldest, kept).unwrap();
+
+        // A gap in the middle: only the newest is served, and the link
+        // stranded behind the gap is named.
+        let middle = dir.path().join("server.key.link.2");
+        std::fs::rename(&middle, dir.path().join("elsewhere")).unwrap();
+        let chain = key_chain(&path, &did).unwrap();
+        assert_eq!(chain.links.len(), 1);
+        assert!(
+            chain
+                .problems
+                .iter()
+                .any(|p| p.contains(&*oldest.to_string_lossy())),
+            "{:?}",
+            chain.problems
+        );
+
+        // The newest, corrupt: the server must not boot with it.
+        std::fs::write(key_link_path(&path), b"not a link").unwrap();
+        assert!(matches!(
+            key_chain(&path, &did),
+            Err(ServerKeyError::BadLink { .. })
+        ));
     }
 
     #[test]

@@ -45,9 +45,10 @@ pub struct JigServer {
 /// the `[execution]` limits make a valid runtime. Kept so that removing those
 /// routes does not also change which configs boot.
 fn boot_checks(config: &ServerConfig) -> Result<()> {
-    jig_runtime::Runtime::with_config(crate::v0_0_2::runtime_config_from(
-        &config.execution_config(),
-    ))
+    jig_runtime::component::ComponentRuntime::with_config(
+        &crate::v0_0_2::runtime_config_from(&config.execution_config()),
+        jig_runtime::component::Backend::Native,
+    )
     .map_err(|e| ServerError::Runtime(format!("failed to create jig-runtime: {e}")))?;
     Ok(())
 }

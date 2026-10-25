@@ -31,9 +31,11 @@
 # in place: a new credential secret and a new offline passphrase seal the new
 # key, and `jig-server keys rotate` writes a key link from the old DID to the
 # new one beside it, so clients and peers that pinned the old DID follow it.
-# The old key and the old credential are kept, never deleted. A second
-# rotation needs --replace-link: a client still pinned two keys back is then
-# refused and must re-pin.
+# The old key and the old credential are kept, never deleted. An earlier key
+# link is kept beside the new one and served too, so a client pinned on any
+# earlier DID follows every hop. Once the chain is as long as a client
+# follows, rotating again needs --prune-oldest: a client still pinned on the
+# oldest DID is then refused and must re-pin.
 #
 # Running it again changes nothing. It refuses to replace a credential, a key,
 # or a different `unlock` it finds; --force moves the old credential and key
@@ -60,7 +62,7 @@ FORCE=0
 NO_PASSPHRASE=0
 PASSPHRASE_ONLY=0
 ROTATE=0
-REPLACE_LINK=0
+PRUNE_OLDEST=0
 
 BIN_DIR="${JIG_BIN_DIR:-/opt/jig/bin}"
 CREDSTORE="${JIG_CREDSTORE_DIR:-/etc/credstore.encrypted}"
@@ -71,7 +73,7 @@ usage() {
 usage: setup-server-key.sh [--nameserver] [--config PATH] [--keyfile PATH]
                            [--import SEED_FILE] [--no-passphrase]
                            [--passphrase-only] [--force]
-                           [--rotate [--replace-link]]
+                           [--rotate [--prune-oldest]]
 
   --nameserver       set up jig-nameserver's key instead of jig-server's
   --config PATH      the config to set `unlock` in
@@ -88,8 +90,9 @@ usage: setup-server-key.sh [--nameserver] [--config PATH] [--keyfile PATH]
   --rotate           jig-server only: replace the key with a new one and link
                      the old DID to it; the new passphrase is read from the
                      terminal or JIG_KEY_NEW_PASSPHRASE
-  --replace-link     with --rotate: replace the key link an earlier rotation
-                     left. Clients still pinned on the DID it leaves must re-pin
+  --prune-oldest     with --rotate, once the chain of key links is as long as
+                     a client follows: stop serving the oldest. Clients still
+                     pinned on the DID it leaves must re-pin
 EOF
 }
 
@@ -109,7 +112,8 @@ while [ $# -gt 0 ]; do
     --passphrase-only) PASSPHRASE_ONLY=1 ;;
     --force) FORCE=1 ;;
     --rotate) ROTATE=1 ;;
-    --replace-link) REPLACE_LINK=1 ;;
+    --replace-link) echo "setup-server-key: warning: --replace-link does nothing now: earlier key links are kept and served" >&2 ;;
+    --prune-oldest) PRUNE_OLDEST=1 ;;
     -h | --help) usage; exit 0 ;;
     *) usage >&2; die "unknown argument: $1" ;;
   esac
@@ -118,7 +122,7 @@ done
 
 [ "$NO_PASSPHRASE" = 1 ] && [ "$PASSPHRASE_ONLY" = 1 ] &&
   die "--no-passphrase and --passphrase-only leave the key with no slot"
-[ "$REPLACE_LINK" = 1 ] && [ "$ROTATE" = 0 ] && die "--replace-link goes with --rotate"
+[ "$PRUNE_OLDEST" = 1 ] && [ "$ROTATE" = 0 ] && die "--prune-oldest goes with --rotate"
 if [ "$ROTATE" = 1 ]; then
   [ "$ROLE" = server ] ||
     die "--rotate is for jig-server: a nameserver serves no key link, so a new nameserver key is a new identity"
@@ -322,7 +326,7 @@ if [ "$ROTATE" = 1 ]; then
   }
   rotate_args=(--slot "credential:/dev/fd/3")
   if [ "$NO_PASSPHRASE" = 0 ]; then rotate_args+=(--slot passphrase); fi
-  if [ "$REPLACE_LINK" = 1 ]; then rotate_args+=(--replace-link); fi
+  if [ "$PRUNE_OLDEST" = 1 ]; then rotate_args+=(--prune-oldest); fi
   # The old key opens with the old credential, on fd 4; the new one is sealed
   # with the new credential, on fd 3, and the new passphrase.
   if ! env -u JIG_KEY_PASSPHRASE JIG_KEY_UNLOCK="credential:/dev/fd/4" \

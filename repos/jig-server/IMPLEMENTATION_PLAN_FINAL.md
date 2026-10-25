@@ -1,5 +1,7 @@
 # jig-server Runtime Spine Implementation Plan — FINAL
 
+> **Historical.** Superseded by [JEP-0006](../jig-spec/jep/jep-0006-block-abi.md) and v0.3 receipts; the v0.2 `BlockReceipt` it describes no longer exists.
+
 **Status**: ✅ **APPROVED — CLEAR TO EXECUTE**  
 **Date**: 2025-11-02  
 **Updated**: 2025-11-09  
