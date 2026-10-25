@@ -9,7 +9,7 @@ name: Fuzz
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - repos/fuzz/**
       - repos/jig-core/src/dcbor.rs
@@ -45,10 +45,15 @@ env:
   # cargo-fuzz needs nightly for -Zsanitizer. Pinned, so a new nightly cannot
   # turn a pull request red; bump it deliberately.
   NIGHTLY: nightly-2026-10-24
+  # cargo-fuzz defaults to the target it was itself built for; the prebuilt
+  # binary is a musl build, and the nightly here has only the gnu std.
+  TARGET: x86_64-unknown-linux-gnu
 
 jobs:
   fuzz:
     name: fuzz (${{ github.event_name == 'workflow_dispatch' && inputs.seconds || '30' }}s per target)
+    # Drafts skip it; marking the PR ready for review runs it.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 360 || 45 }}
     steps:
@@ -71,7 +76,7 @@ jobs:
           # The workspace's lockfile, so the targets fuzz the versions jig
           # ships; cargo adds only libfuzzer-sys.
           cp ../Cargo.lock Cargo.lock
-          cargo "+$NIGHTLY" fuzz build -O
+          cargo "+$NIGHTLY" fuzz build -O --target "$TARGET"
       - name: Run
         working-directory: repos/fuzz
         env:
@@ -81,11 +86,15 @@ jobs:
           set -euo pipefail
           case "$SECONDS_PER_TARGET" in ''|*[!0-9]*) echo "seconds must be a number" >&2; exit 2 ;; esac
           [ -n "$TARGETS" ] || TARGETS="$(cargo "+$NIGHTLY" fuzz list | tr '\n' ' ')"
+          # One allocation over 512 MiB fails a target: what a decoder must
+          # never do on a bounded input. The RSS ceiling is higher: libFuzzer's
+          # own RSS creeps past 2 GiB over a long run with no input at fault.
           failed=
           for t in $TARGETS; do
             echo "::group::$t"
-            if cargo "+$NIGHTLY" fuzz run -O "$t" -- \
-                -max_total_time="$SECONDS_PER_TARGET" -rss_limit_mb=2048 -timeout=30; then
+            if cargo "+$NIGHTLY" fuzz run -O --target "$TARGET" "$t" -- \
+                -max_total_time="$SECONDS_PER_TARGET" -timeout=30 \
+                -rss_limit_mb=4096 -malloc_limit_mb=512; then
               echo "- \`$t\`: ${SECONDS_PER_TARGET}s, no crash" >> "$GITHUB_STEP_SUMMARY"
             else
               failed="$failed $t"
