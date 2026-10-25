@@ -645,8 +645,9 @@ A nameserver publishes its policy at three paths:
   certificate is bound to. The document is unsigned, so `server_did` is a hint only: clients
   authenticate a nameserver by its TLS binding and the suffix's delegation.
 - **`GET /.well-known/jig-ns/capabilities`** (plain text): `version`, optional `domain`,
-  one `work:` line per useful-work type, `tribunal:`, `transparency:` and `federation:`
-  (`enabled` or `disabled`), and optional `affordance:` lines.
+  one `work:` line per useful-work type, `tribunal:` and `transparency:` (`enabled` or
+  `disabled`), and optional `affordance:` lines. The `federation:` line is no longer served
+  (#259).
 - **`GET /v1/policy`** (JSON) *(not served: removed with the legacy routes)*: `pow` (`base_difficulty`, `min_difficulty`,
   `max_difficulty`, `anonymous_min_difficulty`), `rate_limits`, `automation` and
   `reputation`.
