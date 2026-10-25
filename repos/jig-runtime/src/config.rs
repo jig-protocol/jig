@@ -102,8 +102,8 @@ pub struct ResourceLimits {
     /// Wall-clock execution timeout in milliseconds
     pub execution_timeout_ms: u64,
 
-    /// Maximum instances a SINGLE execution may create. One, always, for the
-    /// byte-payload convention: a block gets one instance per invocation.
+    /// Maximum instances a SINGLE execution may create. One, always: a block
+    /// gets one instance per invocation.
     ///
     /// Not to be confused with [`ResourceLimits::max_concurrent_instances`],
     /// which bounds how many executions can be in flight at once. Conflating the

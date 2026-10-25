@@ -193,9 +193,9 @@ fn test_wasi_matches_golden() {
     // aarch64 macOS.
     //
     // Confined to WASI: the `deterministic` fixture imports nothing, is 2512 on
-    // all four hosts, and still asserts its exact fuel. That is the case jig
-    // actually executes, since the byte-payload convention refuses modules with
-    // imports. See docs/investigations/2026-08-11-fuel-portability.md.
+    // all four hosts, and still asserts its exact fuel. That was the case jig
+    // executed, since the byte-payload convention (since deleted) refused modules
+    // with imports. See docs/investigations/2026-08-11-fuel-portability.md.
     //
     // Bounded rather than pinned, so a runaway or a run that never happened is
     // still caught:

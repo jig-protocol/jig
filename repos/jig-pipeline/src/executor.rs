@@ -4,9 +4,9 @@
 //!
 //! Compiling a Wasm module is the dominant cost of running one: ~16 ms for the
 //! 178 KB canonical text-block, against ~85 µs to execute an already-compiled
-//! one. Calling `Runtime::execute_payload` per block would cap a server near 62
-//! messages/second where the protocol targets 10,000. So the compile happens
-//! once, here, and every message reuses the result.
+//! one. Compiling per block would cap a server near 62 messages/second where the
+//! protocol targets 10,000. So the compile happens once, here, and every message
+//! reuses the result.
 //!
 //! # Why the server runs its OWN module
 //!
@@ -579,22 +579,6 @@ mod tests {
             base.output.render_hash,
             "render_hash must depend only on the body, or servers cannot agree"
         );
-    }
-
-    #[test]
-    fn the_component_renders_what_the_abi_1_module_rendered() {
-        // render_hash must not move across the switch, or servers on mixed versions disagree.
-        let ex = BlockExecutor::shared();
-        for body in ["hello", "", "hi @deji https://jig.onl", "<b>&</b> 'x'"] {
-            let via_component = ex.render_text(&input(body)).expect("render").output;
-            let encoded = postcard::to_allocvec(&input(body)).unwrap();
-            let abi1 = jig_runtime::Runtime::new()
-                .unwrap()
-                .execute_payload(canonical::CANONICAL_WASM, canonical::ENTRY_POINT, &encoded)
-                .expect("ABI 1 render");
-            let abi1: text_block::Output = postcard::from_bytes(&abi1.bytes).unwrap();
-            assert_eq!(via_component.render_hash, abi1.render_hash, "body {body:?}");
-        }
     }
 
     #[test]

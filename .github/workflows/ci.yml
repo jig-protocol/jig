@@ -241,10 +241,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # Builds for wasm32-unknown-unknown (listed in rust-toolchain.toml), NOT
-      # wasm32-wasip1. text-block is a pure function; the unknown-unknown target
-      # emits a module with no imports, which is what lets jig-runtime
-      # instantiate it under a no-imports policy. A wasip1 build imports
-      # wasi_snapshot_preview1 and gets rejected at load.
+      # wasm32-wasip1. text-block is a pure function; a wasip1 build imports
+      # wasi_snapshot_preview1, which the renderer world does not grant.
       - name: Install pinned toolchain (rust-toolchain.toml)
         # Channel, components and targets all come from rust-toolchain.toml at
         # the repo root, so CI builds with exactly what a contributor gets.
@@ -255,8 +253,8 @@ jobs:
           key: wasm32-unknown-unknown
       - name: Install wasm-tools
         run: cargo install wasm-tools --locked
-      # The committed artifact is what jig-pipeline embeds and executes, so it
-      # must stay faithful to this source. It is checked by FUNCTIONAL
+      # The committed component is what jig-pipeline and jig-client embed and
+      # execute, so it must stay faithful to this source. It is checked by FUNCTIONAL
       # equivalence, not byte-identity.
       #
       # Byte-identity was tried and does not work: Wasm output here is not
@@ -265,32 +263,22 @@ jobs:
       # `--remap-path-prefix` does not close the gap. It is not even stable
       # across target-directory states on one machine.
       #
-      # So: rebuild (build-artifact.sh enforces no floats, no imports, required
-      # exports, declared memory max), then run jig-runtime's payload suite twice
-      # — once against the committed artifact, once against the fresh build.
-      # Both runs assert agreement with text-block's native `execute_pure`, which
-      # makes it the shared oracle. A source change that alters rendering fails
-      # the fresh run while the committed artifact still passes its own, which is
-      # exactly the drift this needs to catch.
-      # Step order matters: build-artifact.sh OVERWRITES the committed artifact,
-      # so the committed artifact has to be exercised before that happens.
-      - name: Committed artifact behaves correctly
-        working-directory: repos
-        run: cargo test -p jig-runtime --test text_block_payload
-      # The same check for the jig:block/renderer component (JEP-0006): it passes jig-core's
-      # component validator, agrees with `execute_pure`, and keeps the module's render_hash.
-      # build-artifact.sh rebuilds it too, so it is exercised here first for the same reason.
+      # So: rebuild (build-artifact.sh enforces no floats, no WASI imports and a
+      # declared memory max), then run jig-runtime's text_block_component suite
+      # twice — once against the committed component, once against the fresh
+      # build. Both runs check jig-core's component validator, agreement with
+      # text-block's native `execute_pure` (the shared oracle), and the pinned
+      # render_hash values. A source change that alters rendering fails the fresh
+      # run while the committed component still passes its own, which is exactly
+      # the drift this needs to catch.
+      # Step order matters: build-artifact.sh OVERWRITES the committed component,
+      # so it has to be exercised before that happens.
       - name: Committed component behaves correctly
         working-directory: repos
         run: cargo test -p jig-runtime --test text_block_component
-      - name: Rebuild the canonical artifact (enforces structural invariants)
+      - name: Rebuild the canonical component (enforces structural invariants)
         working-directory: repos
         run: ./text-block/build-artifact.sh
-      - name: Fresh build behaves identically
-        working-directory: repos
-        env:
-          JIG_TEXT_BLOCK_WASM: target/wasm32-unknown-unknown/release/text_block.wasm
-        run: cargo test -p jig-runtime --test text_block_payload
       - name: Fresh component behaves identically
         working-directory: repos
         env:

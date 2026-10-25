@@ -38,7 +38,6 @@ pub mod component;
 pub mod config;
 pub mod error;
 pub mod grant_linker;
-pub mod payload;
 
 // Internal implementation modules
 mod engine;
@@ -53,7 +52,6 @@ pub use engine::MAX_WASM_STACK;
 pub use error::{Result, RuntimeError};
 
 pub use identity::{EngineIdentity, FUEL_SCHEDULE_VERSION, WASMTIME_VERSION};
-pub use payload::{CompiledBlock, PayloadOutput, RC_OUTPUT_TOO_SMALL};
 pub use receipt::{
     CapabilityCall, ExecutionOutcome, ModuleHash, Receipt, ReceiptBuilder, ReceiptError,
     ReceiptPricing,
