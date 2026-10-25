@@ -644,78 +644,6 @@ pub fn check_imports(code_bytes: &[u8], allowlist: &HostImportAllowlist) -> Resu
     Ok(())
 }
 
-/// Infer appropriate execution limits from Wasm module structure.
-///
-/// Analyzes the module to suggest safe execution limits without inspecting code contents.
-/// This is critical for E2EE scenarios where block contents are encrypted but limits
-/// must still be set appropriately to distinguish real failures from insufficient resources.
-pub fn infer_limits(code_bytes: &[u8]) -> Result<crate::receipt::Limits> {
-    use wasmparser::{Parser, Payload};
-
-    let mut instruction_count = 0u64;
-    let mut import_count = 0u64;
-    let mut max_memory_pages = 1u32; // 64KB default
-    let mut function_count = 0u64;
-
-    let parser = Parser::new(0);
-
-    for payload in parser.parse_all(code_bytes) {
-        let payload = payload.map_err(|e| JigError::Validation(format!("wasm parse: {e}")))?;
-
-        match payload {
-            Payload::ImportSection(reader) => {
-                import_count = reader.count() as u64;
-            }
-            Payload::FunctionSection(reader) => {
-                function_count = reader.count() as u64;
-            }
-            Payload::MemorySection(reader) => {
-                for memory in reader {
-                    let memory =
-                        memory.map_err(|e| JigError::Validation(format!("memory section: {e}")))?;
-                    max_memory_pages = max_memory_pages.max(memory.initial as u32);
-                }
-            }
-            Payload::CodeSectionEntry(body) => {
-                let mut reader = body
-                    .get_operators_reader()
-                    .map_err(|e| JigError::Validation(format!("code section: {e}")))?;
-
-                while !reader.eof() {
-                    reader
-                        .read()
-                        .map_err(|e| JigError::Validation(format!("operator read: {e}")))?;
-                    instruction_count += 1;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let base_fuel = 100_000u64;
-    let instruction_fuel = instruction_count.saturating_mul(10);
-    let import_fuel = import_count.saturating_mul(50_000);
-    let function_fuel = function_count.saturating_mul(1_000);
-    let calculated_fuel = base_fuel
-        .saturating_add(instruction_fuel)
-        .saturating_add(import_fuel)
-        .saturating_add(function_fuel);
-
-    let fuel_max = calculated_fuel.max(100_000);
-
-    let memory_max_mb = (max_memory_pages * 64 / 1024).max(16);
-
-    let complexity_units = (instruction_count + import_count + function_count) / 1000;
-    let execution_timeout_ms =
-        5000u32.saturating_add((complexity_units as u32).saturating_mul(100));
-
-    Ok(crate::receipt::Limits {
-        fuel_max,
-        memory_max_mb,
-        execution_timeout_ms,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -939,26 +867,6 @@ mod tests {
                 .iter()
                 .any(|v| matches!(v, DeterminismViolation::TableMissingMaximum))
         );
-    }
-
-    #[test]
-    fn infer_limits_respects_module_structure() {
-        let wasm = wat::parse_str(
-            r#"
-            (module
-                (memory 2)
-                (func (export "add") (param i32 i32) (result i32)
-                    local.get 0
-                    local.get 1
-                    i32.add)
-            )
-            "#,
-        )
-        .unwrap();
-
-        let limits = infer_limits(&wasm).unwrap();
-        assert!(limits.fuel_max >= 100_000);
-        assert!(limits.memory_max_mb >= 16);
     }
 
     #[test]

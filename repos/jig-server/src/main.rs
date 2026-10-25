@@ -39,6 +39,63 @@ enum Command {
         #[command(subcommand)]
         keys: KeysCommand,
     },
+    /// The channel contracts this server takes part in (JEP-0005): offers
+    /// it made or received, and the shares they started. A decision is
+    /// recorded in the database; the running server acts on it.
+    Contracts {
+        #[command(subcommand)]
+        contracts: ContractsCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ContractsCommand {
+    /// Every offer, with its id, side, state, grant, peer and channel.
+    List,
+    /// Accept an offer held for you.
+    Accept {
+        /// The offer id, or at least 8 of its leading hex digits.
+        offer: String,
+    },
+    /// Refuse an offer held for you (POLICY_REFUSED).
+    Refuse {
+        /// The offer id, or at least 8 of its leading hex digits.
+        offer: String,
+    },
+    /// End a live share, whichever side of it this server is.
+    End {
+        /// The offer id, or at least 8 of its leading hex digits.
+        offer: String,
+    },
+}
+
+/// `jig-server contracts ...`: works on the database only, never starts the
+/// server.
+fn run_contracts(contracts: ContractsCommand, db_path: &Path) -> Result<String, String> {
+    use jig_server::v0_0_2_contract::{Operation, operate};
+    let store = jig_pipeline::persist::SqliteStore::open(db_path)
+        .map_err(|e| format!("opening {}: {e}", db_path.display()))?;
+    let operation = match contracts {
+        ContractsCommand::List => Operation::List,
+        ContractsCommand::Accept { offer } => Operation::Accept(offer),
+        ContractsCommand::Refuse { offer } => Operation::Refuse(offer),
+        ContractsCommand::End { offer } => Operation::End(offer),
+    };
+    operate(&store, operation).map_err(|e| format!("{e:#}"))
+}
+
+/// The v0.0.2 pipeline's database: beside the configured one, with
+/// `_v002.db` in place of its extension.
+fn v0_0_2_db_path(config: &ServerConfig) -> PathBuf {
+    config.database_path.with_file_name(
+        config
+            .database_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+            + "_v002.db",
+    )
 }
 
 #[derive(Subcommand, Debug)]
@@ -307,6 +364,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let env_db = std::env::var("JIG_DB_PATH").ok().map(PathBuf::from);
     config.apply_overrides_explicit(args.db_path, env_db, args.bind, args.port);
 
+    if let Some(Command::Contracts { contracts }) = args.command {
+        match run_contracts(contracts, &v0_0_2_db_path(&config)) {
+            Ok(out) => println!("{out}"),
+            Err(msg) => {
+                eprintln!("[jig-server] {msg}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
     tracing::info!("Starting Jig server v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("Database: {}", config.database_path.display());
     for opt in config.unsafe_options_active() {
@@ -337,15 +405,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("[jig-server] WARN: {warning}");
         }
 
-        let db_path = config.database_path.with_file_name(
-            config
-                .database_path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
-                + "_v002.db",
-        );
+        let db_path = v0_0_2_db_path(&config);
         // The operator's `[execution]` limits live on `ServerConfig`, so they are
         // handed over explicitly — this is what makes the ingest render path honour
         // configured fuel, memory, timeout and concurrency.
@@ -487,5 +547,30 @@ mod tests {
 
         // Port-only drift is the same trap.
         assert!(listen_disagreement_warning("127.0.0.1:7118", "127.0.0.1", 7117).is_some());
+    }
+
+    /// `jig-server contracts` opens the v0.0.2 database beside the
+    /// configured one, and reports a bad id without changing anything.
+    #[test]
+    fn contracts_commands_work_on_the_v0_0_2_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ServerConfig {
+            database_path: dir.path().join("jig.db"),
+            ..ServerConfig::default()
+        };
+        let db = v0_0_2_db_path(&config);
+        assert_eq!(db, dir.path().join("jig_v002.db"));
+        assert_eq!(
+            run_contracts(ContractsCommand::List, &db).unwrap(),
+            "no contract offers"
+        );
+        let err = run_contracts(
+            ContractsCommand::Accept {
+                offer: "0123456789abcdef".into(),
+            },
+            &db,
+        )
+        .unwrap_err();
+        assert!(err.contains("no offer id starts with"), "{err}");
     }
 }

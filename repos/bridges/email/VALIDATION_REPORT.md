@@ -1,5 +1,7 @@
 # Jig Email Bridge - Validation Report
 
+> **Historical.** Superseded by [JEP-0006](../../jig-spec/jep/jep-0006-block-abi.md) and v0.3 receipts; the v0.2 `BlockReceipt` it describes no longer exists.
+
 **Date:** 2025-10-29  
 **Status:** ✅ **ALL CRITERIA MET**
 
