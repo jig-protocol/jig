@@ -1,6 +1,6 @@
 # Release readiness: internal → external
 
-The gate between "we dogfood jig on our own tailnet" and "we tell strangers to
+The gate between "jig runs on private deployments" and "we tell strangers to
 run `curl -fsSL https://jig.onl/install.sh | bash`".
 
 jig is MIT OR Apache-2.0 source in a public repository, and it publishes signed
