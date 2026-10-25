@@ -139,6 +139,8 @@ jig-core = { path = "../jig-core", features = ["test-suite"] }
 jig-mls = { workspace = true, features = ["conformance"] }
 # `BlockExecutor::shared` for the test `AppState`s (see jig-pipeline's `test-support`).
 jig-pipeline = { path = "../jig-pipeline", features = ["test-support"] }
+# Paused time (`start_paused`, `time::advance`) for the stream's limits.
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 default = ["sqlite"]

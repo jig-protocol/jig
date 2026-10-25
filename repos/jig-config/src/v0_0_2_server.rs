@@ -438,6 +438,10 @@ pub struct FederationSection {
     /// The name suffixes this server attests, published in the server
     /// manifest.
     pub attested_suffixes: Vec<AttestedSuffixConfig>,
+    /// How often a follower may ask this server for one channel's records
+    /// (`records-from`). Defaults to a burst of [`DEFAULT_RECORDS_FROM_BURST`]
+    /// and [`DEFAULT_RECORDS_FROM_PER_MIN`] a minute.
+    pub records_from: RecordsFromLimit,
 }
 
 /// Blocks a peer may relay to this server per minute, unless it has its own
@@ -446,6 +450,13 @@ pub const DEFAULT_PEER_BLOCKS_PER_MIN: u64 = 600;
 /// Bytes a peer may relay to this server per minute, unless it has its own
 /// `quota`: 8 MiB.
 pub const DEFAULT_PEER_BYTES_PER_MIN: u64 = 8 * 1024 * 1024;
+
+/// `records-from` requests one peer may make for one channel back to back.
+pub const DEFAULT_RECORDS_FROM_BURST: u32 = 8;
+/// `records-from` requests one peer may make for one channel per minute, once
+/// its burst is spent. A follower polls each channel 6 times a minute, and
+/// catching up at the default peer quota takes about 10 full frames a minute.
+pub const DEFAULT_RECORDS_FROM_PER_MIN: u32 = 20;
 
 impl Default for FederationSection {
     fn default() -> Self {
@@ -458,6 +469,10 @@ impl Default for FederationSection {
                 bytes_per_min: DEFAULT_PEER_BYTES_PER_MIN,
             },
             attested_suffixes: Vec::new(),
+            records_from: RecordsFromLimit {
+                burst: DEFAULT_RECORDS_FROM_BURST,
+                per_min: DEFAULT_RECORDS_FROM_PER_MIN,
+            },
         }
     }
 }
@@ -507,6 +522,16 @@ pub struct PeerQuotaConfig {
     pub bytes_per_min: u64,
 }
 
+/// How often one peer may ask this server for one channel's records: a token
+/// bucket per peer and channel, holding `burst` requests and refilled at
+/// `per_min` a minute. A request past it is refused with the time to retry.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordsFromLimit {
+    pub burst: u32,
+    pub per_min: u32,
+}
+
 /// A name suffix this server attests (JEP-0004).
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -531,6 +556,12 @@ impl FederationSection {
             Ok(())
         };
         check_quota(&self.default_peer_quota, "default_peer_quota")?;
+        if self.records_from.burst == 0 || self.records_from.per_min == 0 {
+            // Zero would refuse every follower, the first request included.
+            return Err(
+                "[federation] records_from: burst and per_min must both be at least 1".to_string(),
+            );
+        }
         let mut quotas: BTreeMap<&str, Option<PeerQuotaConfig>> = BTreeMap::new();
         for (i, peer) in self.peers.iter().enumerate() {
             if let Some(q) = &peer.quota {
@@ -1447,6 +1478,14 @@ mod tests {
                 "[federation.default_peer_quota]\nblocks_per_min = 0\nbytes_per_min = 1\n"
                     .to_string(),
                 "at least 1",
+            ),
+            (
+                "[federation.records_from]\nburst = 0\nper_min = 20\n".to_string(),
+                "records_from",
+            ),
+            (
+                "[federation.records_from]\nburst = 8\nper_min = 0\n".to_string(),
+                "records_from",
             ),
             (
                 peer(

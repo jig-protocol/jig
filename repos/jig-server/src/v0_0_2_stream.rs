@@ -11,7 +11,11 @@
 //! - every [`PULL_EVERY`], which is also how it catches up after a
 //!   reconnect, and how it starts once it accepts a share.
 //!
-//! The owner answers only a peer holding an accepted share of the channel.
+//! The owner answers only a peer holding an accepted share of the channel,
+//! and only as often as `[federation.records_from]` allows: a token bucket
+//! per peer and channel. A request past it is answered with a
+//! [`RECORDS_LATER_FRAME`] naming when to ask again, never dropped, and the
+//! follower asks nothing more for that channel until then.
 //!
 //! The follower lands each entry with [`ingest_sequenced`], one frame at a
 //! time in the order frames came, with the connection's proven peer as the
@@ -24,7 +28,7 @@
 //! Entries past it are not landed; a later pull fetches them once the minute
 //! turns.
 //!
-//! Both frames are deterministic CBOR (`jig_core::dcbor`), with the block,
+//! The frames are deterministic CBOR (`jig_core::dcbor`), with the block,
 //! its signature and its record as byte strings, so a frame's base64 on the
 //! wire is the only expansion.
 
@@ -32,7 +36,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use jig_config::v0_0_2_server::{FederationSection, PeerQuotaConfig};
+use jig_config::v0_0_2_server::{FederationSection, PeerQuotaConfig, RecordsFromLimit};
 use jig_core::BlockBundle;
 use jig_core::dcbor::{self, Value};
 use jig_core::did::Did;
@@ -48,6 +52,15 @@ use crate::v0_0_2_peer::{CloseReason, PeerRegistry, PeerSender};
 pub const RECORDS_FRAME: &str = "channel-records";
 /// A follower's request for one channel's records from a `seq`.
 pub const RECORDS_FROM_FRAME: &str = "records-from";
+
+/// The owner's refusal of a `records-from` past its limit, with when to ask
+/// again.
+pub const RECORDS_LATER_FRAME: &str = "records-later";
+
+/// The longest a follower waits on one [`RECORDS_LATER_FRAME`]: a longer
+/// `retry_after_ms` is taken as this, so an owner cannot silence a follower
+/// for good with one frame.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
 
 /// The most entries one [`RECORDS_FRAME`] carries.
 pub const MAX_ENTRIES: usize = 64;
@@ -88,6 +101,12 @@ pub(crate) struct Records {
 struct RecordsFrom {
     channel_id: String,
     from_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordsLater {
+    channel_id: String,
+    retry_after_ms: u64,
 }
 
 /// A map with exactly `keys`, or `None`.
@@ -174,6 +193,80 @@ impl RecordsFrom {
     }
 }
 
+impl RecordsLater {
+    fn encode(&self) -> Vec<u8> {
+        dcbor::encode(&Value::text_map([
+            ("channel_id", Value::text(&self.channel_id)),
+            ("retry_after_ms", Value::Unsigned(self.retry_after_ms)),
+        ]))
+        .expect("text keys never repeat")
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let value = dcbor::decode(bytes).ok()?;
+        let [channel_id, retry_after_ms] = fields(&value, &["channel_id", "retry_after_ms"])?[..]
+        else {
+            return None;
+        };
+        Some(RecordsLater {
+            channel_id: channel_id.as_text()?.to_string(),
+            retry_after_ms: retry_after_ms.as_u64()?,
+        })
+    }
+}
+
+/// How often each peer may send `records-from` for each channel: a token
+/// bucket per (peer, channel), holding `burst` and refilled at `per_min` a
+/// minute. Keyed only for peers holding a share of the channel, so it holds
+/// at most one bucket per live share.
+pub(crate) struct RequestLimit {
+    burst: f64,
+    per_sec: f64,
+    buckets: Mutex<HashMap<(String, String), Bucket>>,
+}
+
+struct Bucket {
+    tokens: f64,
+    at: tokio::time::Instant,
+}
+
+impl RequestLimit {
+    pub(crate) fn new(limit: RecordsFromLimit) -> Self {
+        RequestLimit {
+            burst: f64::from(limit.burst),
+            per_sec: f64::from(limit.per_min) / 60.0,
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Take one request for `peer` and `channel_id` at `now`, or say how long
+    /// until one is free.
+    pub(crate) fn take(
+        &self,
+        peer: &str,
+        channel_id: &str,
+        now: tokio::time::Instant,
+    ) -> Result<(), Duration> {
+        let mut buckets = self.buckets.lock().unwrap_or_else(|p| p.into_inner());
+        let bucket = buckets
+            .entry((peer.to_string(), channel_id.to_string()))
+            .or_insert(Bucket {
+                tokens: self.burst,
+                at: now,
+            });
+        let elapsed = now.saturating_duration_since(bucket.at).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * self.per_sec).min(self.burst);
+        bucket.at = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            return Ok(());
+        }
+        Err(Duration::from_secs_f64(
+            (1.0 - bucket.tokens) / self.per_sec,
+        ))
+    }
+}
+
 /// The entries of one [`RECORDS_FRAME`]: at most [`MAX_ENTRIES`], and past
 /// the first, at most [`FRAME_BUDGET`] bytes of them.
 #[derive(Default)]
@@ -218,6 +311,11 @@ pub struct Stream {
     /// The queue's other end, until [`Stream::run`] takes it.
     frames: Arc<Mutex<Option<mpsc::Receiver<Queued>>>>,
     used: Arc<Mutex<HashMap<String, Window>>>,
+    /// The owner's limit on each follower's `records-from`.
+    requests: Arc<RequestLimit>,
+    /// The follower's side of it: per (owner, channel), when the owner said
+    /// to ask again.
+    retry_at: Arc<Mutex<HashMap<(String, String), tokio::time::Instant>>>,
 }
 
 impl Stream {
@@ -228,6 +326,7 @@ impl Stream {
         peers: Arc<PeerRegistry>,
     ) -> Self {
         let (queue, frames) = mpsc::channel(QUEUE);
+        let requests = Arc::new(RequestLimit::new(federation.records_from));
         Stream {
             ctx,
             federation,
@@ -235,6 +334,8 @@ impl Stream {
             queue,
             frames: Arc::new(Mutex::new(Some(frames))),
             used: Arc::new(Mutex::new(HashMap::new())),
+            requests,
+            retry_at: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -284,6 +385,7 @@ impl Stream {
         match kind {
             RECORDS_FRAME => Some(self.on_records(peer, body)),
             RECORDS_FROM_FRAME => Some(self.on_records_from(peer, body, out)),
+            RECORDS_LATER_FRAME => Some(self.on_records_later(peer, body)),
             _ => None,
         }
     }
@@ -383,6 +485,26 @@ impl Stream {
             );
             return Ok(());
         }
+        if let Err(wait) = self
+            .requests
+            .take(peer, &ask.channel_id, tokio::time::Instant::now())
+        {
+            let retry_after_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).max(1);
+            tracing::info!(
+                peer,
+                channel_id = ask.channel_id,
+                retry_after_ms,
+                "records-from past the limit"
+            );
+            let later = RecordsLater {
+                channel_id: ask.channel_id.clone(),
+                retry_after_ms,
+            };
+            if let Err(e) = out.send(RECORDS_LATER_FRAME, later.encode()) {
+                tracing::info!(peer, "records-later not sent: {e}");
+            }
+            return Ok(());
+        }
         let Some(records) = self.records_from(&ask.channel_id, ask.from_seq)? else {
             return Ok(());
         };
@@ -441,8 +563,59 @@ impl Stream {
         Ok(())
     }
 
-    /// Ask `peer` for `channel_id`'s records from `from_seq`.
+    /// The owner `peer` said to ask again for `channel_id` later: ask nothing
+    /// more for it until then, and then ask from the head.
+    fn on_records_later(&self, peer: &Did, body: &[u8]) -> Result<(), CloseReason> {
+        let later =
+            RecordsLater::decode(body).ok_or_else(|| violation("malformed records-later"))?;
+        let peer = peer.to_did_jig_string();
+        let wait = Duration::from_millis(later.retry_after_ms).min(MAX_RETRY_AFTER);
+        self.retry_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                (peer.clone(), later.channel_id.clone()),
+                tokio::time::Instant::now() + wait,
+            );
+        tracing::info!(
+            peer,
+            channel_id = later.channel_id,
+            "the owner limits records-from; asking again in {wait:?}"
+        );
+        let stream = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            stream.pull_from_head(&peer, &later.channel_id);
+        });
+        Ok(())
+    }
+
+    /// When the owner `peer` said this server may ask for `channel_id` again,
+    /// if that is still to come.
+    pub(crate) fn retry_at(&self, peer: &str, channel_id: &str) -> Option<tokio::time::Instant> {
+        let mut retry_at = self.retry_at.lock().unwrap_or_else(|p| p.into_inner());
+        let key = (peer.to_string(), channel_id.to_string());
+        match retry_at.get(&key) {
+            Some(at) if *at > tokio::time::Instant::now() => Some(*at),
+            Some(_) => {
+                retry_at.remove(&key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Ask `peer` for `channel_id`'s records from `from_seq`, unless the
+    /// owner said to wait.
     fn pull(&self, peer: &str, channel_id: &str, from_seq: u64) {
+        if self.retry_at(peer, channel_id).is_some() {
+            tracing::debug!(
+                peer,
+                channel_id,
+                "records-from held back: the owner said to wait"
+            );
+            return;
+        }
         let body = RecordsFrom {
             channel_id: channel_id.to_string(),
             from_seq,
@@ -473,14 +646,15 @@ impl Stream {
             if stopped {
                 continue;
             }
-            let from = match self.store().latest_ingest_record(&share.channel_id) {
-                Ok(head) => head.map_or(0, |h| h.seq + 1),
-                Err(e) => {
-                    tracing::warn!(channel_id = share.channel_id, "reading the head: {e}");
-                    continue;
-                }
-            };
-            self.pull(&share.peer_did, &share.channel_id, from);
+            self.pull_from_head(&share.peer_did, &share.channel_id);
+        }
+    }
+
+    /// Ask `peer` for `channel_id`'s records past this server's head.
+    fn pull_from_head(&self, peer: &str, channel_id: &str) {
+        match self.store().latest_ingest_record(channel_id) {
+            Ok(head) => self.pull(peer, channel_id, head.map_or(0, |h| h.seq + 1)),
+            Err(e) => tracing::warn!(channel_id, "reading the head: {e}"),
         }
     }
 
@@ -648,9 +822,41 @@ mod tests {
     }
 
     #[test]
+    fn the_limit_is_a_bucket_per_peer_and_channel() {
+        // Two at once, then one every 10 s.
+        let limit = RequestLimit::new(RecordsFromLimit {
+            burst: 2,
+            per_min: 6,
+        });
+        let t0 = tokio::time::Instant::now();
+        let take = |peer: &str, channel: &str, at: Duration| limit.take(peer, channel, t0 + at);
+        assert_eq!(take("a", "c", Duration::ZERO), Ok(()));
+        assert_eq!(take("a", "c", Duration::ZERO), Ok(()));
+        assert_eq!(take("a", "c", Duration::ZERO), Err(Duration::from_secs(10)));
+        // Each peer and each channel has its own.
+        assert_eq!(take("a", "other", Duration::ZERO), Ok(()));
+        assert_eq!(take("b", "c", Duration::ZERO), Ok(()));
+        // The wait it named is the wait it means.
+        let at = Duration::from_secs(4);
+        assert_eq!(take("a", "c", at), Err(Duration::from_secs(6)));
+        assert_eq!(take("a", "c", Duration::from_secs(10)), Ok(()));
+        assert!(take("a", "c", Duration::from_secs(10)).is_err());
+        // Idle time refills no more than the burst.
+        let later = Duration::from_secs(3600);
+        assert_eq!(take("a", "c", later), Ok(()));
+        assert_eq!(take("a", "c", later), Ok(()));
+        assert!(take("a", "c", later).is_err());
+    }
+
+    #[test]
     fn frames_round_trip() {
         let r = records();
         assert_eq!(Records::decode(&r.encode()), Some(r));
+        let later = RecordsLater {
+            channel_id: "bafkchannel".to_string(),
+            retry_after_ms: 3000,
+        };
+        assert_eq!(RecordsLater::decode(&later.encode()), Some(later));
         let ask = RecordsFrom {
             channel_id: "bafkchannel".to_string(),
             from_seq: 7,
