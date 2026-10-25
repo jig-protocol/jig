@@ -119,12 +119,14 @@ fn load_key_chain(keyfile: &std::path::Path, server_did: &Did) -> Result<ServedC
 /// Every `AppState` constructor goes through here, so this is also where a
 /// peer that must not be dialed — a `ws://` URL without
 /// `dangerously_allow_plaintext_federation` — becomes a boot error, as does a
-/// peer policy the server manifest must not publish.
+/// peer policy the server manifest must not publish, and so are `[limits]`
+/// that would turn valid blocks away.
 fn build_auth(
     config: &JigServerConfig,
     store: Arc<SqliteStore>,
 ) -> anyhow::Result<Arc<crate::auth::AuthState>> {
     crate::v0_0_2_federation::check_federation_transport(&config.federation)?;
+    crate::v0_0_2_limits::Limits::validate(&config.limits).map_err(anyhow::Error::msg)?;
     config.federation.validate().map_err(anyhow::Error::msg)?;
     check_published_peer_dids(&config.federation)?;
     let auth = crate::auth::AuthState::from_config(&config.auth)?.with_proofs(store);
@@ -212,6 +214,12 @@ fn checked_identity(config: &JigServerConfig) -> Result<()> {
 }
 
 impl AppState {
+    /// `[limits]`, defaults filled in. Boot has already refused limits that
+    /// would turn valid blocks away ([`build_auth`]).
+    pub fn limits(&self) -> crate::v0_0_2_limits::Limits {
+        crate::v0_0_2_limits::Limits::resolve(&self.config.limits)
+    }
+
     /// Register the handler for peer frames. Only the first call counts;
     /// returns whether this one did.
     pub fn set_peer_frames(&self, handler: Arc<dyn crate::v0_0_2_peer::PeerFrames>) -> bool {

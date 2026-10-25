@@ -211,6 +211,12 @@ pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
         ));
     }
 
+    // `[network] max_body_bytes` on every route, rather than axum's implicit
+    // default.
+    let router = router.layer(axum::extract::DefaultBodyLimit::max(
+        cfg.network.max_body_bytes,
+    ));
+
     Ok(NameServerApp {
         router,
         v0_0_2_state,
@@ -653,6 +659,45 @@ mod tests {
         let (status, body) = get(router, "/v1/challenge").await;
         assert_eq!(status, StatusCode::OK);
         body["challenge"].as_str().unwrap().to_string()
+    }
+
+    /// `[network] max_body_bytes`: a body at the limit reaches the handler,
+    /// one byte over is refused with 413 before it is parsed.
+    #[tokio::test]
+    async fn a_body_over_max_body_bytes_is_413() {
+        let dir = ScratchDir::new("body-limit");
+        let mut cfg = scratch_config(&dir, "dj.jig");
+        cfg.network.max_body_bytes = 4096;
+        let router = build_app(&cfg).expect("build_app");
+        let post = |len: usize| {
+            let mut body = b"{}".to_vec();
+            body.resize(len, b' ');
+            router.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+        let at = post(4096).await.unwrap();
+        assert_ne!(at.status(), StatusCode::PAYLOAD_TOO_LARGE, "at the limit");
+        let over = post(4097).await.unwrap();
+        assert_eq!(
+            over.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "one byte over"
+        );
+    }
+
+    #[test]
+    fn a_zero_body_limit_does_not_boot() {
+        let dir = ScratchDir::new("body-limit-zero");
+        let mut cfg = scratch_config(&dir, "dj.jig");
+        cfg.network.max_body_bytes = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_body_bytes"), "{err}");
     }
 
     /// `GET /v1/challenge` has a per-IP bucket of its own (JEP-0008 rule 31).
