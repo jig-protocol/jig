@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use jig_config::v0_0_2_server::{
     AuthSection, BridgesSection, DebugSection, FederationSection, IdentitySection, JigServerConfig,
-    KeysSection, NameserverSection, ServerSection,
+    KeysSection, LimitsSection, NameserverSection, ServerSection,
 };
 
 use crate::runtime::ExecutionConfig;
@@ -62,6 +62,8 @@ pub struct ServerConfig {
     pub auth: AuthSection,
     #[serde(default)]
     pub keys: KeysSection,
+    #[serde(default)]
+    pub limits: LimitsSection,
 }
 
 /// Keys jig-server once accepted and no longer does, as a dotted path and the
@@ -135,6 +137,7 @@ impl Default for ServerConfig {
             nameserver: NameserverSection::default(),
             auth: AuthSection::default(),
             keys: KeysSection::default(),
+            limits: LimitsSection::default(),
         }
     }
 }
@@ -187,6 +190,7 @@ impl ServerConfig {
             nameserver: self.nameserver.clone(),
             auth: self.auth.clone(),
             keys: self.keys.clone(),
+            limits: self.limits.clone(),
         }
     }
 
@@ -424,6 +428,17 @@ storage = "sealed"
 [debug]
 # Handle enumeration stays off — it dumps the registry to any caller.
 list_handles = {list_handles}
+
+[limits]
+# The most bytes one HTTP request body, one WebSocket message and one WebSocket
+# frame may carry, on connections from clients and to federation peers. A body
+# over the limit gets 413; a message or frame over it closes the connection.
+# Unset, each is {envelope} bytes: the largest block submission, a
+# {bundle}-byte bundle in base64 and its envelope. A smaller value would refuse
+# valid blocks, so the server will not boot with one.
+# max_request_body_bytes = {envelope}
+# max_ws_message_bytes = {envelope}
+# max_ws_frame_bytes = {envelope}
 "#,
         listen = listen,
         keyfile = defaults.server.server_did_keyfile,
@@ -440,6 +455,8 @@ list_handles = {list_handles}
         cache_ttl = defaults.identity.cache_ttl_seconds,
         unknown_handles = defaults.identity.naively_allow_unknown_handles_fallback,
         list_handles = defaults.debug.list_handles,
+        envelope = jig_core::bundle::MAX_ENVELOPE_BYTES,
+        bundle = jig_core::bundle::MAX_BUNDLE_BYTES,
     )
 }
 

@@ -295,8 +295,8 @@ ExecStartPre=/usr/bin/tailscale ip -4
 
 `main.rs` loads `--config` once, into one `ServerConfig`. Root-level keys
 (`database_path`, `bind_address`, `port`, `[tls]`, `[execution]`) are **what
-actually binds**. `[server]`, `[identity]`, `[auth]`, `[federation]`, `[debug]`
-and `[bridges]` configure the pipeline. Every table denies unknown fields, so a
+actually binds**. `[server]`, `[identity]`, `[auth]`, `[federation]`, `[debug]`,
+`[bridges]` and `[limits]` configure the pipeline. Every table denies unknown fields, so a
 typo or a key in the wrong section stops the boot with serde's error, which names
 the key and lists the valid ones. A key jig-server used to accept and has since
 removed fails with `` `<key>` is no longer a jig-server config key: <why>. Delete
@@ -323,6 +323,34 @@ Three landmines:
   `dangerously_enable_v0_0_1_rest` flag is a removed key: a config that sets it
   refuses to boot. `jig read` uses the
   signed history endpoint, `GET /api/v1/channels/<slug>/blocks`.
+
+### Size limits
+
+`[limits]` sets explicit, configurable limits on how much jig-server reads at
+once:
+
+| Key | Covers | Over the limit |
+|---|---|---|
+| `max_request_body_bytes` | every HTTP request body, bridge webhooks included | `413 Payload Too Large`, before the body is parsed |
+| `max_ws_message_bytes` | one WebSocket message, on connections from clients and on the ones it dials to federation peers | the connection is closed |
+| `max_ws_frame_bytes` | one WebSocket frame, on the same connections | the connection is closed |
+
+Unset, each is 2 861 740 bytes (`jig_core::bundle::MAX_ENVELOPE_BYTES`): the
+largest block submission, a 2 MiB bundle (`MAX_BUNDLE_BYTES`) in base64 plus its
+envelope. That is the smallest value that still carries every valid block, so
+the server refuses to boot with a smaller one, or with a frame limit above the
+message limit. Raise them only if a proxy or a bridge in front of the server
+needs it.
+
+```toml
+[limits]
+# max_request_body_bytes = 2861740
+# max_ws_message_bytes = 2861740
+# max_ws_frame_bytes = 2861740
+```
+
+The nameserver has its own body limit, `[network] max_body_bytes` (64 KiB by
+default): see `repos/jig-nameserver/OPERATOR_GUIDE.md`.
 
 ### Reading history
 

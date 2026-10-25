@@ -42,6 +42,31 @@ pub struct JigServerConfig {
     pub auth: AuthSection,
     #[serde(default)]
     pub keys: KeysSection,
+    #[serde(default)]
+    pub limits: LimitsSection,
+}
+
+/// `[limits]`: the most bytes one HTTP request body or one WebSocket message
+/// may carry. The WebSocket limits hold on every connection this server
+/// accepts and on the ones it dials to its federation peers.
+///
+/// Unset, each is the smallest limit that still carries every block a server
+/// accepts: one `jig_core::bundle::MAX_BUNDLE_BYTES` bundle in base64 plus its
+/// envelope (`jig_core::bundle::MAX_ENVELOPE_BYTES`, 2 861 740 bytes). The
+/// server refuses to boot with a smaller value, which would turn valid blocks
+/// away, or with a frame limit above the message limit.
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsSection {
+    /// Largest HTTP request body, in bytes. A body over it is refused with
+    /// `413 Payload Too Large` before it is parsed.
+    pub max_request_body_bytes: Option<usize>,
+    /// Largest WebSocket message, in bytes, after its frames are joined. A
+    /// connection that sends a bigger one is closed.
+    pub max_ws_message_bytes: Option<usize>,
+    /// Largest single WebSocket frame, in bytes. A connection that sends a
+    /// bigger one is closed.
+    pub max_ws_frame_bytes: Option<usize>,
 }
 
 /// `[keys]`: how this server opens its own signing key, a `.jigkey`.
