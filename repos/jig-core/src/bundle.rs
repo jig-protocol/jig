@@ -8,6 +8,11 @@ use crate::wasm_validation::{HostImportAllowlist, policy_from_constraints, verif
 
 const RAW_CODEC: u64 = 0x55;
 
+/// The most a block's canonical bundle bytes may hold: the bytes a client's
+/// `bundle_b64` decodes to, stored as `bundle_bytes`. Every path that takes
+/// a block checks this one number.
+pub const MAX_BUNDLE_BYTES: usize = 2 * 1024 * 1024;
+
 /// Reference to an artifact that should be included when computing the block root.
 pub struct Artifact<'a> {
     pub label: &'a str,

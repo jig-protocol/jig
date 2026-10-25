@@ -13,9 +13,13 @@
 //!   (rule 14);
 //! - the evidence is one fork per channel: the first stops it, and nothing
 //!   sent afterwards is kept, so an owner cannot grow it;
-//! - a block or record past [`MAX_CARRIED_BLOCK_BYTES`] or
+//! - a block or record past [`jig_core::bundle::MAX_BUNDLE_BYTES`] or
 //!   [`MAX_RECORD_BYTES`], or a record not in its stored form, is refused
 //!   before anything is parsed or kept;
+//! - every block needs an accepted share of its channel with its sequencer
+//!   (`contract_offers`, follower side): a create from a server this one
+//!   never agreed to follow makes no row, and an ended share takes nothing
+//!   more;
 //! - the author's signature is checked, but no write gate runs: the owner
 //!   gated the block before it sequenced it, and its order is what a
 //!   follower follows (rule 22a).
@@ -64,13 +68,16 @@ pub enum FollowError {
     /// The channel stopped at an earlier fork.
     #[error("channel {channel_id} is stopped at a fork")]
     Stopped { channel_id: String },
-    /// Larger than a carried block or record may be.
-    #[error("the {what} is {len} bytes; a follower takes at most {max}")]
-    TooLarge {
-        what: &'static str,
-        len: usize,
-        max: usize,
+    /// No accepted share with this sequencer names the channel: this server
+    /// never agreed to carry it.
+    #[error("no accepted share of channel {channel_id} with {sequencer}")]
+    NoShare {
+        channel_id: String,
+        sequencer: String,
     },
+    /// The record is larger than any record is.
+    #[error("the record is {len} bytes; a follower takes at most {max}")]
+    RecordTooLarge { len: usize, max: usize },
     /// Not followed in this slice.
     #[error("{0}")]
     Unsupported(&'static str),
@@ -88,10 +95,6 @@ pub enum Followed {
     /// Already held, with this same record.
     Duplicate { block_cid: String, seq: u64 },
 }
-
-/// The most a carried block's manifest and code may hold together: the body
-/// limit a local client's post meets at the HTTP API (axum's default).
-pub const MAX_CARRIED_BLOCK_BYTES: usize = 2 * 1024 * 1024;
 
 /// The most a carried record's stored form may hold. A real one is under
 /// 1.5 KiB: two CIDs, a DID, a hash and a COSE_Sign1 of them.
@@ -280,13 +283,12 @@ pub async fn ingest_sequenced(
     record_bytes: &[u8],
     sequencer: &str,
 ) -> Result<Followed, FollowError> {
-    let too_large =
-        |what, len, max| (len > max).then_some(FollowError::TooLarge { what, len, max });
-    let block_len = bundle.manifest_bytes.len() + bundle.code_bytes.len();
-    if let Some(e) = too_large("block", block_len, MAX_CARRIED_BLOCK_BYTES)
-        .or_else(|| too_large("record", record_bytes.len(), MAX_RECORD_BYTES))
-    {
-        return Err(e);
+    crate::ingest::check_bundle_size(bundle.manifest_bytes, bundle.code_bytes)?;
+    if record_bytes.len() > MAX_RECORD_BYTES {
+        return Err(FollowError::RecordTooLarge {
+            len: record_bytes.len(),
+            max: MAX_RECORD_BYTES,
+        });
     }
     let manifest = crate::ingest::parse_manifest(bundle.manifest_bytes)?;
     crate::ingest::check_manifest_dids(&manifest)?;
@@ -362,6 +364,14 @@ pub async fn ingest_sequenced(
         }
         Some(chan)
     };
+    // This server carries only what it agreed to: an accepted share of the
+    // channel, with this sequencer.
+    if !ctx.store.has_accepted_share(&channel_id, sequencer)? {
+        return Err(FollowError::NoShare {
+            channel_id,
+            sequencer: sequencer.to_string(),
+        });
+    }
     // Rule 12: the owner's signature, exactly, and nothing of this server's.
     record.verify(sequencer)?;
 
@@ -567,6 +577,13 @@ mod tests {
             self.ctx.server_did.to_did_jig_string()
         }
 
+        /// A server that accepted this owner's share of its channel.
+        fn follower(&self) -> IngestContext {
+            let follower = ctx();
+            share(&follower, &self.channel, &self.did());
+            follower
+        }
+
         /// Post through the owner's own gate, and keep what it would send.
         async fn post(&mut self, kind: BlockKind, meta: serde_json::Value) -> String {
             let parts = signed(&self.user, kind, meta);
@@ -620,6 +637,27 @@ mod tests {
         }
     }
 
+    /// Keep an accepted share of `channel` from `owner`, on the follower's
+    /// side. Its id, for ending it.
+    fn share(follower: &IngestContext, channel: &str, owner: &str) -> [u8; 32] {
+        let offer_id: [u8; 32] = rand::random();
+        follower
+            .store
+            .put_contract_offer(&crate::contracts::StoredOffer {
+                offer_id,
+                channel_id: channel.to_string(),
+                side: crate::contracts::Side::Follower,
+                peer_did: owner.to_string(),
+                grant: jig_core::contract::Grant::Read,
+                state: crate::contracts::OfferState::Accepted,
+                offer: vec![],
+                answer: None,
+                share_cid: None,
+            })
+            .unwrap();
+        offer_id
+    }
+
     async fn take(
         follower: &IngestContext,
         owner: &Owner,
@@ -648,7 +686,7 @@ mod tests {
             .await;
         owner.text("two").await;
 
-        let follower = ctx();
+        let follower = owner.follower();
         for (seq, sent) in owner.sent.iter().enumerate() {
             match take(&follower, &owner, sent).await.unwrap() {
                 Followed::Landed { seq: got, .. } => assert_eq!(got, seq as u64),
@@ -703,7 +741,7 @@ mod tests {
         let mut owner = Owner::new().await;
         owner.text("one").await;
         owner.text("two").await;
-        let follower = ctx();
+        let follower = owner.follower();
         take(&follower, &owner, &owner.sent[0]).await.unwrap();
         match take(&follower, &owner, &owner.sent[2]).await {
             Err(FollowError::Gap {
@@ -731,7 +769,7 @@ mod tests {
                 .is_empty()
         );
         // A channel's first record must be its genesis.
-        let fresh = ctx();
+        let fresh = owner.follower();
         assert!(matches!(
             take(&fresh, &owner, &owner.sent[1]).await,
             Err(FollowError::NotCarried { .. })
@@ -743,7 +781,7 @@ mod tests {
         let mut owner = Owner::new().await;
         owner.text("one").await;
         owner.text("two").await;
-        let follower = ctx();
+        let follower = owner.follower();
         take(&follower, &owner, &owner.sent[0]).await.unwrap();
         take(&follower, &owner, &owner.sent[1]).await.unwrap();
 
@@ -779,7 +817,7 @@ mod tests {
         // The next seq, but a `prev` naming something else, forks too.
         let mut owner = Owner::new().await;
         owner.text("one").await;
-        let follower = ctx();
+        let follower = owner.follower();
         take(&follower, &owner, &owner.sent[0]).await.unwrap();
         let next = signed(
             &owner.user,
@@ -800,7 +838,7 @@ mod tests {
     async fn a_hostile_owner_cannot_grow_the_evidence() {
         let mut owner = Owner::new().await;
         owner.text("one").await;
-        let follower = ctx();
+        let follower = owner.follower();
         take(&follower, &owner, &owner.sent[0]).await.unwrap();
         take(&follower, &owner, &owner.sent[1]).await.unwrap();
         let genesis = IngestRecord::decode(&owner.sent[0].record).unwrap();
@@ -838,7 +876,7 @@ mod tests {
     async fn a_carried_block_or_record_has_limits() {
         let mut owner = Owner::new().await;
         owner.text("one").await;
-        let follower = ctx();
+        let follower = owner.follower();
         take(&follower, &owner, &owner.sent[0]).await.unwrap();
         let sent = &owner.sent[1];
 
@@ -869,27 +907,46 @@ mod tests {
                 &owner.did()
             )
             .await,
-            Err(FollowError::TooLarge { what: "record", .. })
+            Err(FollowError::RecordTooLarge { .. })
         ));
 
-        // A block past the limit is refused before it is parsed.
-        let code = vec![0u8; MAX_CARRIED_BLOCK_BYTES];
-        let big = BlockBundle {
-            manifest_bytes: &sent.parts.0,
-            code_bytes: &code,
-            resources: vec![],
-        };
-        assert!(matches!(
-            ingest_sequenced(
+        // One canonical byte past the limit is refused before it is parsed;
+        // the limit itself is not.
+        let max = jig_core::bundle::MAX_BUNDLE_BYTES;
+        for (len, refused) in [(max, false), (max + 1, true)] {
+            let code = code_for(&sent.parts.0, len);
+            let got = ingest_sequenced(
                 &follower,
-                big,
+                BlockBundle {
+                    manifest_bytes: &sent.parts.0,
+                    code_bytes: &code,
+                    resources: vec![],
+                },
                 sent.parts.2.clone(),
                 &sent.record,
-                &owner.did()
+                &owner.did(),
             )
-            .await,
-            Err(FollowError::TooLarge { what: "block", .. })
-        ));
+            .await;
+            let too_large = matches!(
+                got,
+                Err(FollowError::Block(IngestError::BundleTooLarge { .. }))
+            );
+            assert_eq!(too_large, refused, "{len} bytes: {got:?}");
+            // The same number bounds a local post.
+            let got = ingest(
+                &owner.ctx,
+                BlockBundle {
+                    manifest_bytes: &sent.parts.0,
+                    code_bytes: &code,
+                    resources: vec![],
+                },
+                sent.parts.2.clone(),
+                IngestSource::LocalClient { conn_id: 1 },
+            )
+            .await;
+            let too_large = matches!(got, Err(IngestError::BundleTooLarge { .. }));
+            assert_eq!(too_large, refused, "a local post of {len} bytes: {got:?}");
+        }
         // A kind this build does not know is refused as the manifest it is.
         let mut manifest: serde_json::Value = serde_json::from_slice(&sent.parts.0).unwrap();
         manifest["kind"] = serde_json::json!("not-a-kind");
@@ -921,6 +978,65 @@ mod tests {
         take(&follower, &owner, sent).await.unwrap();
     }
 
+    /// Code that makes `manifest`'s canonical bundle exactly `len` bytes.
+    fn code_for(manifest: &[u8], len: usize) -> Vec<u8> {
+        let canonical = |code: &[u8]| serde_json::to_vec(&(manifest, code)).unwrap().len();
+        // Each byte is `0,` in the JSON; a `10` makes up an odd length.
+        let base = canonical(&[]);
+        let mut code = vec![0u8; (len - base).div_ceil(2)];
+        if canonical(&code) < len {
+            code[0] = 10;
+        }
+        assert_eq!(canonical(&code), len);
+        code
+    }
+
+    #[tokio::test]
+    async fn only_an_accepted_share_is_followed() {
+        let mut owner = Owner::new().await;
+        owner.text("one").await;
+        owner.text("two").await;
+
+        // A create from a server this one never agreed to follow: no row.
+        let stranger = ctx();
+        assert!(matches!(
+            take(&stranger, &owner, &owner.sent[0]).await,
+            Err(FollowError::NoShare { .. })
+        ));
+        assert!(
+            stranger
+                .store
+                .get_channel_by_id_including_archived(&owner.channel)
+                .unwrap()
+                .is_none()
+        );
+        // A share of the channel with another server is not one with this
+        // owner.
+        let other = Owner::new().await;
+        share(&stranger, &owner.channel, &other.did());
+        assert!(matches!(
+            take(&stranger, &owner, &owner.sent[0]).await,
+            Err(FollowError::NoShare { .. })
+        ));
+
+        // Once the share ends, the channel takes nothing more.
+        let follower = ctx();
+        let offer_id = share(&follower, &owner.channel, &owner.did());
+        take(&follower, &owner, &owner.sent[0]).await.unwrap();
+        take(&follower, &owner, &owner.sent[1]).await.unwrap();
+        use crate::contracts::OfferState;
+        assert!(
+            follower
+                .store
+                .move_contract_offer(&offer_id, OfferState::Accepted, OfferState::Ended, None)
+                .unwrap()
+        );
+        assert!(matches!(
+            take(&follower, &owner, &owner.sent[2]).await,
+            Err(FollowError::NoShare { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn a_followers_client_gets_the_owners_cose_bytes() {
         let mut owner = Owner::new().await;
@@ -929,7 +1045,7 @@ mod tests {
             owner.text("one").await,
             owner.text("two").await,
         ];
-        let follower = ctx();
+        let follower = owner.follower();
         for sent in &owner.sent {
             take(&follower, &owner, sent).await.unwrap();
         }
@@ -954,7 +1070,7 @@ mod tests {
     async fn only_the_owners_signature_places_a_block() {
         let mut owner = Owner::new().await;
         owner.text("one").await;
-        let follower = ctx();
+        let follower = owner.follower();
         take(&follower, &owner, &owner.sent[0]).await.unwrap();
 
         // Signed by another server: refused, and nothing kept.
@@ -1009,7 +1125,7 @@ mod tests {
     #[tokio::test]
     async fn a_follower_runs_no_write_gate_of_its_own() {
         let owner = Owner::new().await;
-        let follower = ctx();
+        let follower = owner.follower();
         take(&follower, &owner, &owner.sent[0]).await.unwrap();
         // A stranger's member-add of someone else: the owner's gate refuses
         // it, but this owner signed it anyway.
@@ -1048,7 +1164,7 @@ mod tests {
     #[tokio::test]
     async fn the_follower_writes_nothing_of_its_own_into_a_carried_channel() {
         let owner = Owner::new().await;
-        let follower = ctx();
+        let follower = owner.follower();
         take(&follower, &owner, &owner.sent[0]).await.unwrap();
         let parts = signed(
             &owner.user,
@@ -1088,6 +1204,7 @@ mod tests {
             serde_json::json!({"slug": "#sealed", "suite": "mls"}),
         );
         let cid = bundle(&parts).block_cid().unwrap().to_string();
+        share(&follower, &cid, &owner.did());
         let record = RecordSigner {
             channel_id: cid.clone(),
             key: &owner.ctx.server_key,

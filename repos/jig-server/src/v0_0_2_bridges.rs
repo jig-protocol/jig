@@ -279,6 +279,9 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         IngestError::BundleMalformed(m) => SubmitDenied::PolicyBlocked {
             reason: format!("bundle malformed: {m}"),
         },
+        ref e @ IngestError::BundleTooLarge { .. } => SubmitDenied::PolicyBlocked {
+            reason: e.to_string(),
+        },
         ref e @ IngestError::ManifestGate(_) => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },

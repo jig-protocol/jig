@@ -141,6 +141,9 @@ pub enum IngestError {
     ManifestLog { reason: String },
     #[error("malformed bundle: {0}")]
     BundleMalformed(String),
+    /// Past [`jig_core::bundle::MAX_BUNDLE_BYTES`].
+    #[error("the bundle is {len} bytes; a block holds at most {max}")]
+    BundleTooLarge { len: usize, max: usize },
     #[error("manifest missing kind field — v0.0.2 blocks must declare kind")]
     KindRequired,
     /// A DID in the manifest decodes to a key but is not spelled the way that
@@ -360,6 +363,7 @@ pub async fn ingest(
     sig: Vec<u8>,
     source: IngestSource,
 ) -> Result<String, IngestError> {
+    check_bundle_size(bundle.manifest_bytes, bundle.code_bytes)?;
     // Parse the manifest from canonical bytes on the bundle.
     let manifest = parse_manifest(bundle.manifest_bytes)?;
 
@@ -1468,6 +1472,32 @@ pub(crate) fn parse_manifest(
         .map_err(|e| IngestError::BundleMalformed(format!("manifest parse: {e}")))?;
     manifest.check_gates()?;
     Ok(manifest)
+}
+
+/// Refuse a bundle whose canonical bytes would be past
+/// [`jig_core::bundle::MAX_BUNDLE_BYTES`], counted without building them.
+pub(crate) fn check_bundle_size(
+    manifest_bytes: &[u8],
+    code_bytes: &[u8],
+) -> Result<(), IngestError> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, &(manifest_bytes, code_bytes))
+        .map_err(|e| IngestError::BundleMalformed(e.to_string()))?;
+    let max = jig_core::bundle::MAX_BUNDLE_BYTES;
+    if count.0 > max {
+        return Err(IngestError::BundleTooLarge { len: count.0, max });
+    }
+    Ok(())
 }
 
 /// Canonical bytes over which signatures and CIDs are computed.

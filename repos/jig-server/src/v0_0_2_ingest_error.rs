@@ -124,6 +124,11 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         // rule 5). Policy, not a malformed request: the same block is fine
         // on the server it names.
         IngestError::NotSequencer { .. } => (StatusCode::FORBIDDEN, "NOT_SEQUENCER", e.to_string()),
+        IngestError::BundleTooLarge { .. } => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "BUNDLE_TOO_LARGE",
+            e.to_string(),
+        ),
         // 403: the channel is carried here for the server that sequences it.
         IngestError::CarriedChannel { .. } => {
             (StatusCode::FORBIDDEN, "CARRIED_CHANNEL", e.to_string())
@@ -214,6 +219,10 @@ mod tests {
                 field: "member_did".to_string(),
             },
             IngestError::BundleMalformed("bad tuple".to_string()),
+            IngestError::BundleTooLarge {
+                len: jig_core::bundle::MAX_BUNDLE_BYTES + 1,
+                max: jig_core::bundle::MAX_BUNDLE_BYTES,
+            },
             IngestError::ManifestGate(jig_core::ManifestGateError::UnsupportedSchema(
                 "https://example.com/v9".to_string(),
             )),
