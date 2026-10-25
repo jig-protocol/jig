@@ -21,6 +21,7 @@ This guide covers what an operator configures on a v0.0.2 nameserver: the routes
 | `/v1/rotate` | POST | move an alias to a new key |
 | `/v1/renew` | POST | renew an alias |
 | `/v1/suffixes` | GET | suffixes served and this nameserver's DID |
+| `/metrics` | GET | each suffix's pool and effort, Prometheus text format; names no DID or alias |
 | `/.well-known/jig-ns-delegation` | GET | signed delegation for a DNS-rooted suffix |
 | `/v1/handles` | GET | list every alias; **debug-gated** behind `[v0_0_2.debug] list_handles` |
 
@@ -65,7 +66,7 @@ Each suffix sets the JEP-0008 work its register, renew and rotate requests carry
 
 ```toml
 [v0_0_2.nameserver.alias_suffixes.pow]
-min_effort = 1048576     # 2^20: an ordinary registration of 5 letters or more
+min_effort = 262144      # 2^18: an ordinary registration of 5 letters or more
 max_effort = 16777216    # 2^24: the most any registration is asked for
 max_solve_secs = 10      # max_effort must fit this at 5.5M digests/s, or boot fails
 short_name_len = 5       # shorter names pay short_name_factor per missing letter
@@ -77,7 +78,7 @@ renew_effort = 1         # renew and rotate by the holder
 - **Refused before any work.** For `register`, the challenge request already refuses a closed suffix, a short or reserved alias and a taken alias. `register` checks them again, and refuses a second name for the DID once the DID has signed (not before, since the refusal names the alias it holds).
 - **Order of checks.** The work is checked (one hash) before any signature. Bad work is `400 POW_INVALID`, too little is `400 POW_INSUFFICIENT`, missing work is `428 POW_REQUIRED` with the offer restated. None of them consumes the challenge.
 - **Allowlisted names** (`registration_allow`) pay `min_effort`, with no length multiplier.
-- **Penalties.** Work that does not verify adds a point to the client's address (never to the DID it names, which is unproven at that stage). A signed attempt on a name another DID holds adds a point to that (alias, DID) pair only. Each point doubles the effort asked; it lasts `penalty_decay_secs` (600), and a repeat before it lapses adds a point and doubles its life.
+- **Penalties.** Work that does not verify adds a point to the client's address (never to the DID it names, which is unproven at that stage). A signed attempt on a name another DID holds adds a point to that (alias, DID) pair only. Each point doubles the effort asked. One point decays per `penalty_decay_secs` (600); a repeat while points remain adds a point and doubles the decay, up to a day. Points beyond those that already reach `max_effort` are not kept.
 - **Off:** `min_effort = 0`. A challenge requested without `action` still works on such a suffix; on one that asks for work it can only lead to `428`.
 
 ## Registration pool
@@ -100,6 +101,8 @@ queue_wait_secs = 10
 - On a suffix that asks for no work (`min_effort = 0`), every stranger bids 0, so the queue is first come, first served: a `pow` field the nameserver did not check never orders it.
 - **The controller.** After a window in which the queue filled, the effort asked doubles (up to `max_effort`); after a window in which nothing queued, it halves (never below `min_effort`). New challenges state the current effort.
 - Allowlisted registrations skip the pool and pay `min_effort`.
+- Bids order the queue only up to `max_effort`: more work than that buys no more priority.
+- **Metrics** at `/metrics`, per suffix: `jig_ns_registrations_admitted_total`, `jig_ns_registrations_busy_total`, `jig_ns_suggested_effort`, `jig_ns_pool_queued` and `jig_ns_pool_tokens`. A rising busy count with `jig_ns_suggested_effort` at `max_effort` is a flood the pool is holding back.
 - The pool, controller and penalties are in memory and per process.
 
 ## Rate limits

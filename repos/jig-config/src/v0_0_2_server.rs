@@ -863,12 +863,14 @@ impl Default for PowPolicy {
 }
 
 impl PowPolicy {
-    /// The R1 plan's values: 2^20 to register, ×4 per letter under 5, at most
-    /// 2^24 (about 3 s on one server core); 1 to renew or rotate.
+    /// 2^18 to register, ×4 per letter under 5, at most 2^24 (about 3 s on
+    /// one server core); 1 to renew or rotate. A three-letter name starts at
+    /// 2^22, so the controller and penalties can still raise it fourfold
+    /// before the cap; at the R1 plan's 2^20 it started at the cap.
     pub fn recommended() -> Self {
         Self {
             alg: 1,
-            min_effort: 1 << 20,
+            min_effort: 1 << 18,
             max_effort: 1 << 24,
             max_solve_secs: 10,
             short_name_len: 5,

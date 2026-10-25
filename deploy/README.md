@@ -802,8 +802,8 @@ names this nameserver's DID.
 
 **Proof-of-work.** Register, renew and rotate can carry JEP-0008
 proof-of-work, set per suffix in `[v0_0_2.nameserver.alias_suffixes.pow]`. It
-is on by default, at the recommended values: 2^20 to register, 4× more per
-letter under 5, at most 2^24, and 1 to renew or rotate. `jig` solves it;
+is on by default, at the recommended values: 2^18 to register, 4× more per
+letter under 5 (2^22 for three letters), at most 2^24, and 1 to renew or rotate. `jig` solves it;
 `min_effort = 0` turns it off. A client asks
 `GET /v1/challenge?action=register|renew|rotate&did=&name=`, and the reply
 states the effort, signed by the nameserver (`pow_offer`). The policy's
