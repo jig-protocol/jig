@@ -139,6 +139,8 @@ enum Landing {
     Gap(Option<u64>),
     Fork,
     Stopped,
+    /// The block's effect failed; nothing was kept.
+    EffectFailed(anyhow::Error),
 }
 
 impl SqliteStore {
@@ -188,6 +190,7 @@ impl SqliteStore {
         block: &StoredBlock,
         record: &IngestRecord,
         record_bytes: &[u8],
+        effect: impl FnOnce(&rusqlite::Connection) -> anyhow::Result<()>,
     ) -> crate::persist::Result<Landing> {
         let mut conn = self.conn.lock().expect("poisoned");
         let tx = conn.transaction()?;
@@ -265,6 +268,11 @@ impl SqliteStore {
             "INSERT INTO ingest_records (block_cid, channel_id, seq, record) VALUES (?1, ?2, ?3, ?4)",
             params![record.block_cid, channel_id, record.seq as i64, record_bytes],
         )?;
+        // The effect lands with the block, or neither does: a record whose
+        // effect failed can come again.
+        if let Err(e) = effect(&tx) {
+            return Ok(Landing::EffectFailed(e));
+        }
         tx.commit()?;
         Ok(Landing::Landed)
     }
@@ -400,7 +408,19 @@ pub async fn ingest_sequenced(
         federated_from: Some(sequencer.to_string()),
     };
     let seq = record.seq;
-    match ctx.store.land_carried(&stored, &record, record_bytes)? {
+    let effect = |conn: &rusqlite::Connection| {
+        crate::effect::apply_carried_effect(
+            conn,
+            &manifest,
+            &block_cid,
+            channel.as_ref(),
+            sequencer,
+        )
+    };
+    match ctx
+        .store
+        .land_carried(&stored, &record, record_bytes, effect)?
+    {
         Landing::Duplicate => return Ok(Followed::Duplicate { block_cid, seq }),
         Landing::Gap(head) => {
             return Err(FollowError::Gap {
@@ -419,16 +439,9 @@ pub async fn ingest_sequenced(
             return Err(FollowError::Fork { channel_id, seq });
         }
         Landing::Stopped => return Err(FollowError::Stopped { channel_id }),
+        Landing::EffectFailed(e) => return Err(FollowError::Other(e)),
         Landing::Landed => {}
     }
-
-    crate::effect::apply_carried_effect(
-        &ctx.store,
-        &manifest,
-        &block_cid,
-        channel.as_ref(),
-        sequencer,
-    )?;
     deliver(ctx, &stored, &channel_id).await;
     Ok(Followed::Landed { block_cid, seq })
 }
@@ -735,6 +748,18 @@ mod tests {
             .unwrap();
         assert!(records.iter().all(|r| r.sequencer == owner.did()));
 
+        // Carried, not executed: the boot backfill renders none of it.
+        assert!(
+            follower
+                .store
+                .blocks_missing_receipt(
+                    BlockKind::TextRender.as_str(),
+                    &follower.server_did.to_string()
+                )
+                .unwrap()
+                .is_empty()
+        );
+
         // The same block again is one block.
         assert!(matches!(
             take(&follower, &owner, &owner.sent[1]).await.unwrap(),
@@ -838,6 +863,61 @@ mod tests {
             take(&follower, &owner, &forged).await,
             Err(FollowError::Fork { seq: 1, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_block_whose_effect_fails_lands_nothing() {
+        let mut owner = Owner::new().await;
+        let member = did(&SigningKey::from_bytes(&[6; 32]));
+        owner
+            .post(
+                BlockKind::MemberAdd,
+                serde_json::json!({"channel_id": owner.channel, "member_did": member}),
+            )
+            .await;
+        let follower = owner.follower();
+        take(&follower, &owner, &owner.sent[0]).await.unwrap();
+        // The membership the effect writes is made to fail.
+        follower
+            .store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER no_members BEFORE INSERT ON memberships
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            take(&follower, &owner, &owner.sent[1]).await,
+            Err(FollowError::Other(_))
+        ));
+        assert!(
+            follower
+                .store
+                .ingest_record_bytes(&owner.channel, 1)
+                .unwrap()
+                .is_none(),
+            "no record without its effect"
+        );
+        // Once the effect can land, the same record lands with it.
+        follower
+            .store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER no_members;")
+            .unwrap();
+        assert!(matches!(
+            take(&follower, &owner, &owner.sent[1]).await,
+            Ok(Followed::Landed { seq: 1, .. })
+        ));
+        assert!(
+            follower
+                .store
+                .is_member_by_id(&owner.channel, &member)
+                .unwrap()
+        );
     }
 
     #[tokio::test]
