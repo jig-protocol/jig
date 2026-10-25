@@ -1988,26 +1988,32 @@ mod tests {
         let url = format!("ws://{}/api/v1/ws", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        // The hello is the first of three.
+        // The hello is the first of three. 1/s is the slowest refill there
+        // is, so a slow runner may see one between frames: count frames up to
+        // the first refusal rather than assume exactly two more get in.
+        let start = std::time::Instant::now();
         let mut ws = established(&url).await;
-        for _ in 0..2 {
+        let mut processed = 0u32;
+        loop {
             ws.send(TMessage::Text("not valid json".into()))
                 .await
                 .unwrap();
             match next_frame(&mut ws).await.frame {
-                Frame::Error { code, .. } => assert_ne!(code, "RATE_LIMITED"),
+                Frame::Error { status, code, .. } if code == "RATE_LIMITED" => {
+                    assert_eq!(status, Some(429));
+                    break;
+                }
+                Frame::Error { .. } => processed += 1,
                 other => panic!("expected an error frame, got {other:?}"),
             }
+            assert!(processed <= 64, "the address was never limited");
         }
-        ws.send(TMessage::Text("not valid json".into()))
-            .await
-            .unwrap();
-        match next_frame(&mut ws).await.frame {
-            Frame::Error { status, code, .. } => {
-                assert_eq!((status, code.as_str()), (Some(429), "RATE_LIMITED"));
-            }
-            other => panic!("expected RATE_LIMITED, got {other:?}"),
-        }
+        let refilled = start.elapsed().as_secs() as u32 + 1;
+        assert!(
+            (2..=2 + refilled).contains(&processed),
+            "{processed} frames after the hello got in over {:?}",
+            start.elapsed()
+        );
     }
 
     /// A well-formed frame at a version or suite this server does not speak,
