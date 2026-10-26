@@ -785,6 +785,12 @@ once. The other server keeps the copy it holds and lands nothing after.
 Today, only open, unencrypted channels can be shared, and the other server
 does not yet relay writes back: its users post on this server.
 
+> **Known issue: sharing does not deliver yet.** Peers also relay every open
+> channel to each other the older way, within seconds of its creation, and
+> the other server takes a channel that reaches it like that as its own. The
+> share is then accepted, but nothing it carries lands there. Until that is
+> fixed, the steps above set a share up without delivering it.
+
 ---
 
 ## The nameserver
