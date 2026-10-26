@@ -1,0 +1,76 @@
+name: Soak smoke
+
+# scripts/soak/two-host-soak.sh in local mode: two federated jig-servers on
+# the runner, a post each way every 5 s for a few minutes, every message
+# checked across. This keeps the harness working; real soaks run it in
+# remote mode against two hosts, from an operator's machine, never here.
+#
+# No restarts are injected yet: a post made while a peer's subscription is
+# down is never relayed (scripts/soak/README.md), so a run with
+# SOAK_RESTART_EVERY fails on main until federation catches up on
+# resubscribe. workflow_dispatch can run that case on demand.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - scripts/soak/**
+      - repos/jig-server/src/v0_0_2_federation.rs
+      - .github/workflows/soak-smoke.yml
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: Seconds of sends
+        default: '300'
+      restart_every:
+        description: Seconds between restarts of server B (0 for none)
+        default: '0'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: soak-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  soak:
+    name: two local servers, federated, every message checked
+    # Drafts skip it; marking the PR ready for review runs it.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        working-directory: repos
+        run: rustup toolchain install --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: repos
+          # The same release build as install-smoke's.
+          key: install-smoke
+      - name: Build
+        working-directory: repos
+        env:
+          CARGO_INCREMENTAL: '0'
+        run: cargo build --release --locked -p jig-server -p jig-cli
+      - name: Soak
+        env:
+          SOAK_DURATION: ${{ inputs.duration || '180' }}
+          SOAK_RESTART_EVERY: ${{ inputs.restart_every || '0' }}
+          SOAK_INTERVAL: '5'
+          SOAK_POLL: '3'
+          SOAK_DEADLINE: '60'
+          SOAK_HEALTH_EVERY: '20'
+          SOAK_OUT: soak-out
+        run: |
+          status=0
+          scripts/soak/two-host-soak.sh || status=$?
+          cat soak-out/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          exit "$status"
+      - name: Server logs
+        if: failure()
+        run: tail -n 100 soak-out/work/server-*/server.log
