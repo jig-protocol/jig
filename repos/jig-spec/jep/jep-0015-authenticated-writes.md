@@ -156,11 +156,12 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 16. **An out-of-process bridge uses a declared delegation.** A bridge that connects to a
     server as a client proves its own DID like any client (rules 6 and 10). It MAY submit
     blocks signed by another DID only if the server's config lists that bridge DID as
-    allowed to submit for the DIDs it custodies (open question 1). The submitter is then the bridge DID, and rule 4 is met when the signer is the
-    submitter or a DID in its custody. Admission and limits for such a block apply to both
-    the signer and the bridge.
-17. A bridge is a visible member under its own DID wherever it carries content in or out
-    of an encrypted channel (JEP-0014 rule 27). The DIDs it custodies are listed with it.
+    allowed to submit for the DIDs it custodies (open question 1). The submitter is then
+    the bridge DID, and rule 4 is met when the signer is the submitter or a DID in its
+    custody. Admission and limits for such a block apply to both the signer and the bridge.
+17. Clients show every DID a bridge signs as, its own and those in its custody, as a
+    bridge's wherever it carries content in or out of an encrypted channel (JEP-0014
+    rule 27).
 
 ## 7. Compatibility and rollout
 
