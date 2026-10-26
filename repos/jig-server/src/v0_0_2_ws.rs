@@ -31,13 +31,11 @@ use axum::{
     routing::get,
 };
 use base64::Engine as _;
-use jig_core::BlockBundle;
 use jig_pipeline::{
     Envelope, Frame, ReceiptRef, Scope, SubscriptionScope,
     envelope::EnvelopeParseError,
     fanout::SubscriberIdentity,
     handshake::{HelloRefusal, close},
-    ingest::{IngestSource, ingest},
 };
 use tokio::sync::mpsc;
 
@@ -935,20 +933,16 @@ async fn handle_client_frame(
                     }
                 };
 
-            // 3. Construct a BlockBundle borrowing from the local vecs.
-            //    Both vecs live for the duration of this block, so the lifetimes hold.
-            let bundle = BlockBundle {
-                manifest_bytes: &manifest_bytes,
-                code_bytes: &code_bytes,
-                resources: vec![],
-            };
-
-            // 4. Run ingest; reply Ack or a typed Error frame.
-            match ingest(
-                &state.ingest_ctx,
-                bundle,
+            // 3. Post it: ingest here, or relayed to the channel's owner when
+            //    this server carries the channel (JEP-0005 rule 15). Reply Ack
+            //    or a typed Error frame.
+            match crate::v0_0_2_relay::post(
+                state,
+                &manifest_bytes,
+                &code_bytes,
                 sig,
-                IngestSource::LocalClient { conn_id },
+                conn_id,
+                &format!("ws:{conn_id}"),
             )
             .await
             {
@@ -960,17 +954,16 @@ async fn handle_client_frame(
                     };
                     let _ = socket.send(Message::Text(json.into())).await;
                 }
-                // One classifier for every surface. `v0_0_2_ingest_error.rs`
-                // exists because two HTTP surfaces once drifted apart on the
-                // same variant; a hand-copied table here was the third copy.
-                Err(e) => {
-                    let (status, code, message) =
-                        crate::v0_0_2_ingest_error::classify_ingest_error(&e);
+                // One classifier for every surface (`Refusal::of`, over
+                // `v0_0_2_ingest_error.rs`): two HTTP surfaces once drifted
+                // apart on the same variant; a hand-copied table here was the
+                // third copy.
+                Err(refusal) => {
                     // Name the block refused. A client can have a subscribe
                     // and several submits in flight on one connection, and a
                     // refused subscribe also answers with an `Error`; the CID
                     // is what tells this refusal apart (`Ack` carries it too).
-                    let ref_cid = BlockBundle {
+                    let ref_cid = jig_core::BlockBundle {
                         manifest_bytes: &manifest_bytes,
                         code_bytes: &code_bytes,
                         resources: vec![],
@@ -978,8 +971,14 @@ async fn handle_client_frame(
                     .block_cid()
                     .ok()
                     .map(|cid| cid.to_string());
-                    let _ =
-                        send_error(socket, Some(status.as_u16()), code, ref_cid, &message).await;
+                    let _ = send_error(
+                        socket,
+                        Some(refusal.status.as_u16()),
+                        &refusal.code,
+                        ref_cid,
+                        &refusal.message,
+                    )
+                    .await;
                 }
             }
             Ok(())
@@ -1211,6 +1210,11 @@ fn channel_label(state: &AppState, manifest_bytes: &[u8]) -> Option<String> {
 /// The shared metrics label for channels whose slug is not disclosed.
 pub const RESTRICTED_LABEL: &str = "(restricted)";
 
+/// Invariant: every Error answers exactly one client frame (Subscribe or
+/// Submit), and names it by `ref_cid` where it can. The client matches
+/// an unnamed Error to the oldest request still open, so a server-initiated
+/// Error would be taken as that request's answer. None exists today; adding
+/// one needs a code the client (`jig_client::connection::answer`) skips.
 async fn send_error(
     socket: &mut WebSocket,
     status: Option<u16>,
