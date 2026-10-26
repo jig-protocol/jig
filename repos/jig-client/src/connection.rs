@@ -162,6 +162,11 @@ pub struct ConnectOptions {
     /// `None` uses the system's CA roots alone ([`Client::connect_with_tls`]).
     pub tls: Option<std::sync::Arc<rustls::ClientConfig>>,
     pub on_contradiction: Option<ContradictionHook>,
+    /// The public key links this device holds for the server (base64, as
+    /// [`crate::pins::ServerPin::links`] keeps them). With those the welcome
+    /// serves, they give the DIDs the server signed its channels' earlier
+    /// records as ([`crate::chain::ChannelChain::across`]).
+    pub key_links: Vec<String>,
 }
 
 /// Per-channel delivery senders, keyed by channel slug.
@@ -289,7 +294,7 @@ impl Client {
             ConnectOptions {
                 offer,
                 tls,
-                on_contradiction: None,
+                ..ConnectOptions::default()
             },
         )
         .await
@@ -306,6 +311,7 @@ impl Client {
             offer,
             tls,
             on_contradiction,
+            key_links,
         } = options;
         let url = Url::parse(server_url).map_err(|e| ClientError::BadUrl(e.to_string()))?;
         // Map http(s) → ws(s) if user gave HTTP scheme; otherwise leave alone.
@@ -359,6 +365,11 @@ impl Client {
         };
         let welcome_did = welcome.server_did.clone();
         let welcome_text = welcome.evidence.clone();
+        // Who signs this server's records: its DID now and, along the key
+        // links held and served, the ones before it, oldest first (JEP-0012).
+        let mut links = key_links;
+        links.extend(crate::pins::welcome_key_links(&welcome.evidence));
+        let sequencers = crate::pins::dids_along(&links, &welcome_did);
         let contradiction: Arc<StdMutex<Option<Contradiction>>> = Arc::new(StdMutex::new(None));
 
         let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Message>();
@@ -473,16 +484,17 @@ impl Client {
                             }
                             // The block's record must continue its channel's
                             // chain as this session has seen it, signed by the
-                            // server that signed the welcome. A break is a
+                            // server that signed the welcome or, for history,
+                            // a DID it linked from. A break is a
                             // contradiction; a gap is the caller's to fill.
                             if let Some(record) = &ingest {
                                 let cid = block_cid_of(&bundle_b64);
                                 let mut chains = lock_chains(&chains_for_reader);
                                 let chain =
                                     chains.entry(record.channel_id.clone()).or_insert_with(|| {
-                                        crate::chain::ChannelChain::new(
+                                        crate::chain::ChannelChain::across(
                                             &record.channel_id,
-                                            &welcome_did,
+                                            sequencers.clone(),
                                             None,
                                         )
                                     });
