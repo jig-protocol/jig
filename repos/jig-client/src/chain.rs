@@ -973,6 +973,22 @@ mod tests {
             Err(ChainBreak::ClockBackwards { head: 0, seq: 1 })
         );
 
+        // Across a key change: the head is the old DID's, the next record
+        // the new one's, 10 ms lower. Two keys' clocks are not one
+        // sequencer's defect: a contradiction, which proves nothing alone.
+        let mut rotated = Seq::new();
+        let old_did = rotated.did();
+        let before = rotated.push("bafyCreate", 5_000);
+        rotated.rotate();
+        let new_did = rotated.did();
+        let after = rotated.push("bafyAfter", 4_990);
+        let mut chain = ChannelChain::across(&create, vec![old_did, new_did], None);
+        chain.accept(&before, None).unwrap();
+        let broke = chain.accept(&after, None).unwrap_err();
+        assert_eq!(broke, ChainBreak::ClockBackwards { head: 0, seq: 1 });
+        assert_eq!(chain.proof(&after, &broke), None);
+        assert!(chain.take_clock_defects().is_empty());
+
         // A record from another key altogether is refused as unsigned.
         let mut chain = ChannelChain::new(&create, &did, None);
         chain.accept(&first, None).unwrap();
