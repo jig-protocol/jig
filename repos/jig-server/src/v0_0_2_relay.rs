@@ -195,6 +195,9 @@ pub struct Refusal {
     pub status: StatusCode,
     pub code: String,
     pub message: String,
+    /// How long to wait before posting again, for a refusal waiting changes:
+    /// the client's `Error` frame carries it as `retry_after_ms`.
+    pub retry_after_ms: Option<u64>,
 }
 
 impl Refusal {
@@ -203,6 +206,7 @@ impl Refusal {
             status,
             code: code.to_string(),
             message: message.into(),
+            retry_after_ms: None,
         }
     }
 
@@ -212,15 +216,18 @@ impl Refusal {
         Refusal::new(status, code, message)
     }
 
-    /// `message`, with the wait in it: the client-facing error frames carry no
-    /// retry field.
+    /// A refusal with when to post again: in `retry_after_ms`, and in the
+    /// message for whoever reads it.
     fn retry(status: StatusCode, code: &str, message: &str, wait: Duration) -> Self {
-        let ms = wait.as_millis().max(1);
-        Refusal::new(
-            status,
-            code,
-            format!("{message}; try again in {ms} ms (retry_after_ms={ms})"),
-        )
+        let ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).max(1);
+        Refusal {
+            retry_after_ms: Some(ms),
+            ..Refusal::new(
+                status,
+                code,
+                format!("{message}; try again in {ms} ms (retry_after_ms={ms})"),
+            )
+        }
     }
 }
 
@@ -615,24 +622,36 @@ pub async fn post(
     conn_id: u64,
     conn: &str,
 ) -> Result<String, Refusal> {
-    if let Some(relay) = state.relay.get() {
-        return relay
-            .submit(manifest_bytes, code_bytes, sig, conn_id, conn)
-            .await;
-    }
-    let bundle = BlockBundle {
-        manifest_bytes,
-        code_bytes,
-        resources: vec![],
+    let posted = match state.relay.get() {
+        Some(relay) => {
+            relay
+                .submit(manifest_bytes, code_bytes, sig, conn_id, conn)
+                .await
+        }
+        None => {
+            let bundle = BlockBundle {
+                manifest_bytes,
+                code_bytes,
+                resources: vec![],
+            };
+            ingest(
+                &state.ingest_ctx,
+                bundle,
+                sig,
+                IngestSource::LocalClient { conn_id },
+            )
+            .await
+            .map_err(|e| Refusal::of(&e))
+        }
     };
-    ingest(
-        &state.ingest_ctx,
-        bundle,
-        sig,
-        IngestSource::LocalClient { conn_id },
-    )
-    .await
-    .map_err(|e| Refusal::of(&e))
+    // An author refused for its rate (here, or at an owner that gave no
+    // time) gets a token back within one refill of this server's rate.
+    posted.map_err(|mut refusal| {
+        if refusal.code == "RATE_LIMITED" && refusal.retry_after_ms.is_none() {
+            refusal.retry_after_ms = state.auth.did_retry_after_ms();
+        }
+        refusal
+    })
 }
 
 fn refused_by(request_id: u64, e: &IngestError) -> Answer {
@@ -691,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wait_rides_in_the_message() {
+    fn a_wait_rides_in_its_field_and_the_message() {
         let refusal = Refusal::retry(
             StatusCode::SERVICE_UNAVAILABLE,
             "OWNER_UNREACHABLE",
@@ -699,10 +718,41 @@ mod tests {
             Duration::from_millis(1_500),
         );
         assert_eq!(refusal.code, "OWNER_UNREACHABLE");
+        assert_eq!(refusal.retry_after_ms, Some(1_500));
         assert!(
             refusal.message.ends_with("(retry_after_ms=1500)"),
             "{}",
             refusal.message
         );
+    }
+
+    /// An author refused for its rate is told when it may post again: one
+    /// token's refill of this server's rate.
+    #[tokio::test]
+    async fn an_author_over_its_rate_is_told_when_to_post_again() {
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.auth.rate_limit.per_did_burst = 1;
+        config.auth.rate_limit.per_did_per_second = 4;
+        let state = crate::v0_0_2::AppState::for_test_with_config(config).unwrap();
+        let author = jig_client::Identity::generate_for_tests(&tempfile::tempdir().unwrap().keep());
+        let mut refusals = Vec::new();
+        for body in ["first", "second"] {
+            let hlc = jig_core::HlcTimestamp::now_wall(author.did().clone());
+            let block = jig_client::blocks::build_text_render(&author, "#nowhere", body, hlc);
+            let posted = post(
+                &state,
+                &block.manifest_bytes,
+                &block.code_bytes,
+                block.sender_sig.clone(),
+                1,
+                "ws:1",
+            )
+            .await;
+            refusals.push(posted.unwrap_err());
+        }
+        assert_ne!(refusals[0].code, "RATE_LIMITED", "{:?}", refusals[0]);
+        assert_eq!(refusals[0].retry_after_ms, None);
+        assert_eq!(refusals[1].code, "RATE_LIMITED", "{:?}", refusals[1]);
+        assert_eq!(refusals[1].retry_after_ms, Some(250));
     }
 }

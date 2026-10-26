@@ -2543,6 +2543,10 @@ mod tests {
         let refused = client_post(&p.follower, &parts).await.unwrap_err();
         assert_eq!(refused.code, "RELAY_RATE_LIMITED", "{refused:?}");
         assert!(
+            refused.retry_after_ms.is_some_and(|ms| ms > 0),
+            "{refused:?}"
+        );
+        assert!(
             refused.message.contains("retry_after_ms="),
             "{}",
             refused.message
@@ -2647,6 +2651,7 @@ mod tests {
         let parts = signed(&author, BlockKind::TextRender, text_in(&channel, "hello"));
         let refused = client_post(&follower, &parts).await.unwrap_err();
         assert_eq!(refused.code, "OWNER_UNREACHABLE", "{refused:?}");
+        assert_eq!(refused.retry_after_ms, Some(5_000));
         assert!(
             refused.message.contains("retry_after_ms=5000"),
             "{}",

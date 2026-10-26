@@ -193,6 +193,18 @@ impl AuthState {
         }
     }
 
+    /// How long a DID refused for its rate (`RATE_LIMITED`) waits before a
+    /// retry is taken, in milliseconds: one token's refill. `None` when that
+    /// rate is off.
+    pub fn did_retry_after_ms(&self) -> Option<u64> {
+        self.did_rate.as_ref().map(|r| millis(r.refill_interval()))
+    }
+
+    /// [`Self::did_retry_after_ms`], for an address's rate.
+    pub fn ip_retry_after_ms(&self) -> Option<u64> {
+        self.ip_rate.as_ref().map(|r| millis(r.refill_interval()))
+    }
+
     /// Take one request's worth from `ip`'s bucket. False when it is over.
     pub fn charge_ip(&self, ip: std::net::IpAddr) -> bool {
         self.ip_rate
@@ -296,6 +308,13 @@ fn admission_policy(section: &AdmissionSection, banned_dids: BTreeSet<String>) -
             .collect(),
         banned_dids,
     }
+}
+
+/// `d` in whole milliseconds, rounded up, and at least one.
+fn millis(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_micros().div_ceil(1000))
+        .unwrap_or(u64::MAX)
+        .max(1)
 }
 
 #[cfg(test)]
