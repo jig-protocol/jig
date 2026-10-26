@@ -79,7 +79,10 @@ impl Reader {
                 Vec::new(),
             ));
         };
-        match secure.sync(&self.slug).await {
+        match secure
+            .recent(&self.slug, history::DEFAULT_HISTORY_LIMIT)
+            .await
+        {
             Ok(synced) => {
                 // A catch-up can replay many pages; the pane shows the tail.
                 let mut lines: Vec<DecodedBlock> = synced

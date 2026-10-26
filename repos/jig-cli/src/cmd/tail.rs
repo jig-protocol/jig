@@ -75,7 +75,7 @@ pub async fn read(ctx: &CliContext, channel: String, limit: usize, json: bool) -
     // Unlike chat and tail, a failed fetch is this command's failure, not
     // something to degrade around.
     let lines = if let Some(secure) = reader.secure() {
-        let synced = secure.sync(&channel).await?;
+        let synced = secure.recent(&channel, limit).await?;
         // Awaited, not spawned: this process exits as soon as it has printed.
         for did in &synced.tidy {
             let _ = secure.tidy(&channel, did).await;
