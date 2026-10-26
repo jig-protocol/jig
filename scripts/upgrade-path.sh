@@ -96,8 +96,11 @@ mkdir -p "$(home_of alice)" "$(home_of bob)" "$(home_of carol)"
 
 log() { printf '\n== %s\n' "$*"; }
 note() { echo "- $*" >> "$summary"; echo "   $*"; }
+# The console's stderr, kept: an install step runs with its output sent to a
+# file the cleanup removes, and a failure inside it must still be seen.
+exec 9>&2
 fail() {
-  echo "FAIL: $*" >&2
+  echo "FAIL: $*" >&9
   echo "- **FAIL**: $*" >> "$summary"
   exit 1
 }
@@ -336,9 +339,17 @@ verify_installer() {
   esac
   curl -fsSL "$url/SHA256SUMS" -o "$sandbox/SHA256SUMS" || fail "could not fetch SHA256SUMS for $step"
   curl -fsSL "$url/SHA256SUMS.sig" -o "$sandbox/SHA256SUMS.sig" || fail "could not fetch SHA256SUMS.sig for $step"
-  ssh-keygen -Y verify -f "$signers" -I jig-release -n jig-release \
-    -s "$sandbox/SHA256SUMS.sig" < "$sandbox/SHA256SUMS" >/dev/null \
-    || fail "SHA256SUMS for $step is not signed by the release key"
+  # As install.sh: only an explicit 0 skips the signature, never the checksum.
+  case "${JIG_VERIFY_SIGNATURE:-1}" in
+    0) note "JIG_VERIFY_SIGNATURE=0: SHA256SUMS for $step not checked against its signature" ;;
+    1)
+      command -v ssh-keygen >/dev/null || fail "ssh-keygen is needed to verify SHA256SUMS (JIG_VERIFY_SIGNATURE=0 skips it)"
+      ssh-keygen -Y verify -f "$signers" -I jig-release -n jig-release \
+        -s "$sandbox/SHA256SUMS.sig" < "$sandbox/SHA256SUMS" >/dev/null \
+        || fail "SHA256SUMS for $step is not signed by the release key"
+      ;;
+    *) fail "JIG_VERIFY_SIGNATURE must be 1 or 0, not '$JIG_VERIFY_SIGNATURE'" ;;
+  esac
   want="$(awk '$2 == "install.sh" || $2 == "*install.sh" { print $1 }' "$sandbox/SHA256SUMS")"
   [ -n "$want" ] || fail "SHA256SUMS for $step does not list install.sh"
   if command -v sha256sum >/dev/null; then
