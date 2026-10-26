@@ -126,8 +126,9 @@ Rules:
    takes a JEP and a release note; it is never a flag day for reading history.
 4. **Strict verification.** Every algorithm's verification MUST be its strict form. For
    ed25519 that means refusing non-canonical points and S values (`verify_strict` in
-   ed25519-dalek). Today the welcome, block, TLS-binding and request-proof checks use
-   the non-strict form, and they move to strict when their successors land (section 3).
+   ed25519-dalek). Today the welcome, peer-proof, block, TLS-binding, request-proof and
+   admission-proof checks use the non-strict form, and they move to strict when their
+   successors land (section 3). Only COSE objects and receipts verify strictly today.
 5. **Composite keys verify every component.** A composite signature verifies only if every
    component signature verifies over the same message (AND, never OR).
 
@@ -209,11 +210,11 @@ use the successor.
 | Today | Successor | Also fixes |
 | --- | --- | --- |
 | Welcome `jig-handshake-welcome-v2` | `jig-handshake-welcome-v3`, the same fields as a CBOR map | strict verification |
-| Peer proof `jig-handshake-peer-v1` | `jig-handshake-peer-v2` | — |
+| Peer proof `jig-handshake-peer-v1` | `jig-handshake-peer-v2` | strict verification |
 | TLS binding `jig-tls-binding-v1` | `jig-tls-binding-v2` | strict verification |
-| Request proof `jig-request-auth-v1` | `jig-request-auth-v2`, with the DID inside the signed hash | binds the proof to its claimed signer, and does not rely on the header alone |
+| Request proof `jig-request-auth-v1` | `jig-request-auth-v2`, with the DID inside the signed hash | binds the proof to its claimed signer, and does not rely on the header alone; strict verification |
 | Block signature (no domain) | `jig-block-sig-v1`, signing the bundle's CID | domain separation; strict verification |
-| Admission proof `jig-admission-v2` | `jig-admission-v3` | — |
+| Admission proof `jig-admission-v2` | `jig-admission-v3` | strict verification |
 
 The handshake advertises which successors a server accepts, in its capabilities
 (JEP-0002), and a client uses the newest version both sides support. A server MUST NOT
