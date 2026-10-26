@@ -31,13 +31,11 @@ use axum::{
     routing::get,
 };
 use base64::Engine as _;
-use jig_core::BlockBundle;
 use jig_pipeline::{
     Envelope, Frame, ReceiptRef, Scope, SubscriptionScope,
     envelope::EnvelopeParseError,
     fanout::SubscriberIdentity,
     handshake::{HelloRefusal, close},
-    ingest::{IngestSource, ingest},
 };
 use tokio::sync::mpsc;
 
@@ -949,20 +947,16 @@ async fn handle_client_frame(
                     }
                 };
 
-            // 3. Construct a BlockBundle borrowing from the local vecs.
-            //    Both vecs live for the duration of this block, so the lifetimes hold.
-            let bundle = BlockBundle {
-                manifest_bytes: &manifest_bytes,
-                code_bytes: &code_bytes,
-                resources: vec![],
-            };
-
-            // 4. Run ingest; reply Ack or a typed Error frame.
-            match ingest(
-                &state.ingest_ctx,
-                bundle,
+            // 3. Post it: ingest here, or relayed to the channel's owner when
+            //    this server carries the channel (JEP-0005 rule 15). Reply Ack
+            //    or a typed Error frame.
+            match crate::v0_0_2_relay::post(
+                state,
+                &manifest_bytes,
+                &code_bytes,
                 sig,
-                IngestSource::LocalClient { conn_id },
+                conn_id,
+                &format!("ws:{conn_id}"),
             )
             .await
             {
@@ -974,13 +968,19 @@ async fn handle_client_frame(
                     };
                     let _ = socket.send(Message::Text(json.into())).await;
                 }
-                // One classifier for every surface. `v0_0_2_ingest_error.rs`
-                // exists because two HTTP surfaces once drifted apart on the
-                // same variant; a hand-copied table here was the third copy.
-                Err(e) => {
-                    let (status, code, message) =
-                        crate::v0_0_2_ingest_error::classify_ingest_error(&e);
-                    let _ = send_error(socket, Some(status.as_u16()), code, None, &message).await;
+                // One classifier for every surface (`Refusal::of`, over
+                // `v0_0_2_ingest_error.rs`): two HTTP surfaces once drifted
+                // apart on the same variant; a hand-copied table here was the
+                // third copy.
+                Err(refusal) => {
+                    let _ = send_error(
+                        socket,
+                        Some(refusal.status.as_u16()),
+                        &refusal.code,
+                        None,
+                        &refusal.message,
+                    )
+                    .await;
                 }
             }
             Ok(())

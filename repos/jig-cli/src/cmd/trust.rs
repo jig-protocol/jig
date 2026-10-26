@@ -628,10 +628,10 @@ async fn check_manifest_in(
         "{server} did not serve the manifest its welcome cites: GET {url} returned {}",
         resp.status()
     );
-    let served: Served = resp
-        .json()
-        .await
-        .with_context(|| format!("decoding {url}"))?;
+    let served: Served =
+        jig_client::limits::json_capped(resp, jig_client::limits::history_page_bytes(1))
+            .await
+            .with_context(|| format!("reading {url}"))?;
     let record = fetch_records(who, server, LOG_SLUG, cited.seq, cited.seq + 1)
         .await?
         .into_iter()
@@ -756,10 +756,10 @@ pub async fn show(who: &jig_client::Identity, server: &str) -> Result<()> {
         "GET {url} returned {}",
         resp.status()
     );
-    let entries: Vec<Entry> = resp
-        .json()
-        .await
-        .with_context(|| format!("decoding {url}"))?;
+    let entries: Vec<Entry> =
+        jig_client::limits::json_capped(resp, jig_client::limits::history_page_bytes(200))
+            .await
+            .with_context(|| format!("reading {url}"))?;
     let records: Vec<_> = entries.iter().filter_map(|e| e.ingest.clone()).collect();
     if !records.is_empty() {
         check_channel_chain(who, server, LOG_SLUG, &records).await?;
@@ -842,10 +842,13 @@ async fn fetch_records(
         if !resp.status().is_success() {
             anyhow::bail!("GET {url} returned {}", resp.status());
         }
-        let page: Vec<jig_client::chain::IngestRecord> = resp
-            .json()
-            .await
-            .with_context(|| format!("decoding {url}"))?;
+        let page: Vec<jig_client::chain::IngestRecord> = jig_client::limits::json_capped(
+            resp,
+            // The server serves at most 200 records a page, whatever is asked.
+            jig_client::limits::records_page_bytes(((to - next) as usize).min(200)),
+        )
+        .await
+        .with_context(|| format!("reading {url}"))?;
         let Some(last) = page.last() else { break };
         next = last.seq + 1;
         out.extend(page.into_iter().filter(|r| r.seq < to));

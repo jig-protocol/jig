@@ -17,9 +17,7 @@ use axum::{
     routing::{get, post},
 };
 use base64::Engine as _;
-use jig_core::BlockBundle;
 use jig_pipeline::envelope::ReceiptRef;
-use jig_pipeline::ingest::{IngestError, IngestSource, ingest};
 use jig_pipeline::persist::MAX_HISTORY_LIMIT;
 use serde::{Deserialize, Serialize};
 
@@ -56,13 +54,26 @@ pub(crate) fn err(
     )
 }
 
-/// Thin wrapper around the shared classifier (`v0_0_2_ingest_error`): decide
-/// the (status, code) here once, wrap it in this endpoint's `ErrorBody`.
-/// `pub(crate)` so the cross-wrapper agreement test in that module can call
-/// it directly.
-pub(crate) fn map_ingest_error(e: IngestError) -> (StatusCode, Json<ErrorBody>) {
-    let (status, code, message) = crate::v0_0_2_ingest_error::classify_ingest_error(&e);
-    err(status, code, message)
+/// This endpoint's answer to a refused write: the shared classifier's
+/// (status, code) (`v0_0_2_ingest_error`, through
+/// [`crate::v0_0_2_relay::Refusal`]) in this endpoint's `ErrorBody`.
+fn refusal_response(refusal: crate::v0_0_2_relay::Refusal) -> (StatusCode, Json<ErrorBody>) {
+    (
+        refusal.status,
+        Json(ErrorBody {
+            code: refusal.code,
+            message: refusal.message,
+        }),
+    )
+}
+
+/// [`refusal_response`] for an ingest error, for the cross-wrapper agreement
+/// test in `v0_0_2_ingest_error`.
+#[cfg(test)]
+pub(crate) fn map_ingest_error(
+    e: jig_pipeline::ingest::IngestError,
+) -> (StatusCode, Json<ErrorBody>) {
+    refusal_response(crate::v0_0_2_relay::Refusal::of(&e))
 }
 
 /// POST /api/v1/blocks — submit a signed block bundle (non-streaming alt to WSS).
@@ -104,21 +115,22 @@ pub async fn submit_block(
             )
         })?;
 
-    let bundle = BlockBundle {
-        manifest_bytes: &manifest_bytes,
-        code_bytes: &code_bytes,
-        resources: vec![],
-    };
-
-    // conn_id 0 signals REST origin — no persistent WebSocket connection.
-    let cid = ingest(
-        &state.ingest_ctx,
-        bundle,
+    // conn_id 0 signals REST origin — no persistent WebSocket connection, so
+    // the relay's in-flight cap counts per author instead.
+    let author = serde_json::from_slice::<jig_core::BlockManifest>(&manifest_bytes)
+        .ok()
+        .and_then(|m| m.authors.first().map(|a| a.did.to_string()))
+        .unwrap_or_default();
+    let cid = crate::v0_0_2_relay::post(
+        &state,
+        &manifest_bytes,
+        &code_bytes,
         sig,
-        IngestSource::LocalClient { conn_id: 0 },
+        0,
+        &format!("rest:{author}"),
     )
     .await
-    .map_err(map_ingest_error)?;
+    .map_err(refusal_response)?;
 
     Ok(Json(SubmitResult { block_cid: cid }))
 }

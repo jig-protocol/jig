@@ -11,6 +11,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use jig_client::blocks::BuiltBlock;
+use jig_client::limits;
 use jig_client::open::open;
 use jig_client::pins::{ChannelPin, Pins, names_another_server, prove_carried, prove_channel};
 use jig_client::read_auth::{ReadProof, signable_path};
@@ -26,9 +27,9 @@ use crate::cmd::common::CliContext;
 use crate::cmd::history::{DEFAULT_HISTORY_LIMIT, history_url, parse_history};
 
 /// The most a server returns per history request.
-const MAX_HISTORY_PAGE: usize = 200;
+pub(crate) const MAX_HISTORY_PAGE: usize = 200;
 /// Pages of older history to fetch before giving up on catching up.
-const MAX_CATCH_UP_PAGES: usize = 50;
+pub(crate) const MAX_CATCH_UP_PAGES: usize = 50;
 
 /// Packages a DID keeps published, so it can be added while offline.
 const KEY_PACKAGE_TARGET: u64 = 10;
@@ -151,6 +152,8 @@ pub struct Synced {
     pub tidy: Vec<String>,
     /// Every block the history held, by CID.
     pub cids: std::collections::HashSet<String>,
+    /// The same blocks by delivery CID, the key a live delivery carries.
+    pub deliveries: Vec<String>,
 }
 
 /// One identity's encrypted-channel state, bound to one server.
@@ -224,7 +227,7 @@ impl Secure {
 
     async fn refusal(resp: reqwest::Response) -> Refused {
         let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
+        let body = limits::error_text(resp).await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
         Refused {
             status,
@@ -233,8 +236,14 @@ impl Secure {
         }
     }
 
-    /// A signed GET returning JSON.
+    /// A signed GET returning a JSON document of at most
+    /// [`limits::MAX_DOCUMENT_BYTES`].
     pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        self.get_json_capped(path, limits::MAX_DOCUMENT_BYTES).await
+    }
+
+    /// A signed GET returning JSON of at most `max` bytes.
+    pub async fn get_json_capped<T: DeserializeOwned>(&self, path: &str, max: usize) -> Result<T> {
         self.ensure_pinned().await?;
         let url = format!("{}{path}", self.base);
         let proof = ReadProof::sign(&self.identity, "GET", signable_path(&url));
@@ -246,7 +255,9 @@ impl Secure {
         if !resp.status().is_success() {
             return Err(Self::refusal(resp).await.into());
         }
-        resp.json().await.with_context(|| format!("decoding {url}"))
+        limits::json_capped(resp, max)
+            .await
+            .with_context(|| format!("reading {url}"))
     }
 
     /// Submit a signed block through `POST /api/v1/blocks`. A refusal comes
@@ -269,7 +280,9 @@ impl Secure {
         if !resp.status().is_success() {
             return Err(Self::refusal(resp).await.into());
         }
-        let v: serde_json::Value = resp.json().await.context("decoding submit result")?;
+        let v: serde_json::Value = limits::json_capped(resp, limits::MAX_DOCUMENT_BYTES)
+            .await
+            .context("reading the submit result")?;
         Ok(v["block_cid"].as_str().unwrap_or_default().to_string())
     }
 
@@ -376,7 +389,10 @@ impl Secure {
             sig_b64: Option<String>,
         }
         let served: Served = self
-            .get_json(&format!("/api/v1/blocks/{}", info.id))
+            .get_json_capped(
+                &format!("/api/v1/blocks/{}", info.id),
+                limits::history_page_bytes(1),
+            )
             .await
             .with_context(|| format!("fetching the block that created {}", info.slug))?;
         let sig = served.sig_b64.with_context(|| {
@@ -489,7 +505,10 @@ impl Secure {
     /// device's epoch ([`history_reaches`]), or to the start of the channel.
     pub async fn sync(&self, slug: &str) -> Result<Synced> {
         let mut delivered = self.history_page(slug, DEFAULT_HISTORY_LIMIT, None).await?;
-        let mut more = delivered.len() >= DEFAULT_HISTORY_LIMIT;
+        // Only an empty page ends the history. A server may send fewer
+        // blocks than asked, to keep a page within a byte budget, so a short
+        // page is not the start of the channel.
+        let mut more = !delivered.is_empty();
         let epoch = self.session.epoch(&self.server, slug)?;
         let me = self.session.did().to_string();
         let mut pages = 1;
@@ -498,7 +517,7 @@ impl Secure {
                 eprintln!(
                     "warning: {slug} has moved on more than {} blocks since this device \
                      last followed it; ask its owner to re-add you",
-                    pages * MAX_HISTORY_PAGE
+                    delivered.len()
                 );
                 break;
             }
@@ -508,7 +527,7 @@ impl Secure {
             let mut older = self
                 .history_page(slug, MAX_HISTORY_PAGE, Some(&oldest.cid))
                 .await?;
-            more = older.len() >= MAX_HISTORY_PAGE;
+            more = !older.is_empty();
             older.append(&mut delivered);
             delivered = older;
             pages += 1;
@@ -524,12 +543,17 @@ impl Secure {
         limit: usize,
         before: Option<&str>,
     ) -> Result<Vec<DeliveredBlock>> {
-        let mut url = history_url(&self.server, slug, limit);
+        // This is the one path that pages on until an empty page, so the one
+        // that may ask the server to cut a page at its byte budget. A server
+        // that predates the budget ignores it.
+        let mut url = history_url(&self.server, slug, limit) + "&budget=1";
         if let Some(cid) = before {
             url.push_str(&format!("&before={cid}"));
         }
         let path = url.strip_prefix(&self.base).unwrap_or(&url).to_string();
-        let body: serde_json::Value = self.get_json(&path).await?;
+        let body: serde_json::Value = self
+            .get_json_capped(&path, limits::history_page_bytes(limit))
+            .await?;
         parse_history(&body.to_string())
     }
 
@@ -581,7 +605,13 @@ impl Secure {
             }
             None => Vec::new(),
         };
-        Synced { lines, tidy, cids }
+        let deliveries = delivered.iter().map(|d| d.delivery_cid.clone()).collect();
+        Synced {
+            lines,
+            tidy,
+            cids,
+            deliveries,
+        }
     }
 
     /// Build a commit, submit the block carrying it, and merge it once the
