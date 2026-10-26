@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use jig_config::v0_0_2_server::{FederationSection, PeerQuotaConfig, RecordsFromLimit};
+use jig_config::v0_0_2_server::{FederationSection, PeerQuotaConfig, RateLimit};
 use jig_core::BlockBundle;
 use jig_core::dcbor::{self, Value};
 use jig_core::did::Did;
@@ -231,7 +231,7 @@ struct Bucket {
 }
 
 impl RequestLimit {
-    pub(crate) fn new(limit: RecordsFromLimit) -> Self {
+    pub(crate) fn new(limit: RateLimit) -> Self {
         RequestLimit {
             burst: f64::from(limit.burst),
             per_sec: f64::from(limit.per_min) / 60.0,
@@ -824,7 +824,7 @@ mod tests {
     #[test]
     fn the_limit_is_a_bucket_per_peer_and_channel() {
         // Two at once, then one every 10 s.
-        let limit = RequestLimit::new(RecordsFromLimit {
+        let limit = RequestLimit::new(RateLimit {
             burst: 2,
             per_min: 6,
         });

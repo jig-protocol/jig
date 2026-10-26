@@ -91,13 +91,13 @@ pub async fn info(ctx: &CliContext, override_url: Option<&str>) -> Result<()> {
         anyhow::bail!(
             "GET {endpoint} returned {}: {}",
             resp.status(),
-            resp.text().await.unwrap_or_default()
+            jig_client::limits::error_text(resp).await
         );
     }
-    let body: ServerInfoResponse = resp
-        .json()
-        .await
-        .context("decoding /.well-known/jig response")?;
+    let body: ServerInfoResponse =
+        jig_client::limits::json_capped(resp, jig_client::limits::MAX_DOCUMENT_BYTES)
+            .await
+            .context("reading the /.well-known/jig response")?;
     print_server_info(&base, &body);
     Ok(())
 }

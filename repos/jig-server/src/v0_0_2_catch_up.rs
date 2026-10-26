@@ -562,7 +562,7 @@ fn save(store: &SqliteStore, peer: &FederationPeer, after: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jig_config::v0_0_2_server::RecordsFromLimit;
+    use jig_config::v0_0_2_server::RateLimit;
 
     fn page_of(entries: Vec<Entry>) -> Page {
         Page {
@@ -666,7 +666,7 @@ mod tests {
         assert!(c.take(quota, 1).is_err());
     }
 
-    fn replay_for(peer: &Did, limit: RecordsFromLimit) -> Replay {
+    fn replay_for(peer: &Did, limit: RateLimit) -> Replay {
         let state = AppState::for_test().unwrap();
         let mut federation = state.config.federation.clone();
         federation.records_from = limit;
@@ -703,7 +703,7 @@ mod tests {
         let peer = a_did();
         let replay = replay_for(
             &peer,
-            RecordsFromLimit {
+            RateLimit {
                 burst: 2,
                 per_min: 6,
             },
@@ -732,7 +732,7 @@ mod tests {
         let peer = a_did();
         let replay = replay_for(
             &peer,
-            RecordsFromLimit {
+            RateLimit {
                 burst: 10,
                 per_min: 60,
             },
