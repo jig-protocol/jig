@@ -1,6 +1,7 @@
 //! What a server legitimately sends a client fits the client's read limits:
 //! the largest block a server takes is delivered over the WebSocket in one
-//! message under `jig_client::limits::MAX_WS_MESSAGE_BYTES`.
+//! message under `jig_client::limits::MAX_WS_MESSAGE_BYTES`, and a
+//! `jig_client::Client`, connected with those limits, receives it.
 
 use std::time::Duration;
 
@@ -62,23 +63,40 @@ async fn the_largest_block_is_delivered_under_the_clients_ws_limit() {
     ws.send(Message::Text(serde_json::to_string(&sub).unwrap().into()))
         .await
         .expect("subscribe");
+    // The client as `jig` connects it, with the limits under test.
+    let client = jig_client::Client::connect(&server.ws_url(), test_identity())
+        .await
+        .expect("client connects");
+    let mut stream = client.subscribe_channel("#big").await.expect("subscribe");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let body_len = largest_accepted(&server, &alice).await;
 
     // The largest of the frames that arrive is the largest block's.
     let mut largest = 0;
+    let mut largest_bundle = 0;
     while let Ok(Some(Ok(Message::Text(text)))) =
         tokio::time::timeout(Duration::from_secs(5), ws.next()).await
     {
         if let Ok(Envelope {
-            frame: Frame::Block { .. },
+            frame: Frame::Block { bundle_b64, .. },
             ..
         }) = serde_json::from_str::<Envelope>(&text)
         {
             largest = largest.max(text.len());
+            largest_bundle = largest_bundle.max(bundle_b64.len());
         }
     }
+    // The client received that block too: a message past its limit would
+    // have ended the connection, and with it the stream, instead.
+    let mut client_largest = 0;
+    while let Ok(Some(block)) = tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+        client_largest = client_largest.max(block.bundle_b64.len());
+    }
+    assert_eq!(
+        client_largest, largest_bundle,
+        "the client did not receive the largest block"
+    );
     eprintln!(
         "largest block: {body_len} B of padding, delivered in a {largest} B frame; \
          the client takes up to {} B",
