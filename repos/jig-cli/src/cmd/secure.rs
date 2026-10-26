@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use jig_client::blocks::BuiltBlock;
 use jig_client::open::open;
-use jig_client::pins::{ChannelPin, Pins, prove_channel};
+use jig_client::pins::{ChannelPin, Pins, names_another_server, prove_carried, prove_channel};
 use jig_client::read_auth::{ReadProof, signable_path};
 use jig_client::secure::{CommitLock, Seen, Session, history_reaches, replay_order};
 use jig_client::{Client, ClientError, DeliveredBlock, Identity};
@@ -76,6 +76,13 @@ pub struct ChannelInfo {
     pub slug: String,
     #[serde(default = "none_suite")]
     pub suite: String,
+    /// The server that orders the channel, as the listing says. Taken from
+    /// another server only with `share` ([`Secure::channel`]).
+    #[serde(default)]
+    pub sequencer: String,
+    /// The owner's signed offer, for a channel the server carries.
+    #[serde(default)]
+    pub share: Option<String>,
 }
 
 fn none_suite() -> String {
@@ -118,6 +125,7 @@ pub async fn connect_pinned(server: &str, identity: Identity) -> Result<Client> 
             .server(server)
             .map(|p| p.links.clone())
             .unwrap_or_default(),
+        carried: pins.carried(server),
     };
     let client = Client::connect_with_options(server, identity, options)
         .await
@@ -279,10 +287,18 @@ impl Secure {
             channels: Vec<ChannelInfo>,
         }
         let listing: Listing = self.get_json("/api/v1/channels").await?;
-        let Some(mut info) = listing.channels.into_iter().find(|c| c.slug == slug) else {
+        // By its slug, or by its id: a channel this server carries for its
+        // owner is named by id here (a slug names a channel only where it
+        // is ordered).
+        let Some(mut info) = listing
+            .channels
+            .into_iter()
+            .find(|c| c.slug == slug || (!c.id.is_empty() && c.id == slug))
+        else {
             return Ok(None);
         };
         let pin = self.proven(&info).await?;
+        self.anchor(&info)?;
         if pin.suite != info.suite {
             eprintln!(
                 "warning: the server lists {slug} as `{}`, but its owner created it `{}`; \
@@ -301,6 +317,41 @@ impl Secure {
             );
         }
         Ok(Some(info))
+    }
+
+    /// Pin which server orders `info`'s channel. One the listing says
+    /// another server orders is carried for that owner only if the owner's
+    /// signed offer to this server proves it ([`prove_carried`]); then its
+    /// records are held to the owner. A server cannot name another
+    /// sequencer, or take a carried channel back as its own
+    /// ([`Pins::anchor_channel`]).
+    fn anchor(&self, info: &ChannelInfo) -> Result<()> {
+        let mut pins = Pins::load(&Pins::default_path())?;
+        let ours = pins
+            .server(&self.server)
+            .map(|p| p.sequencers())
+            .unwrap_or_default();
+        let other = names_another_server(&ours, &info.sequencer).then_some(info.sequencer.as_str());
+        let owner = match other {
+            Some(sequencer) => Some(prove_carried(
+                &self.server,
+                &info.slug,
+                &info.id,
+                sequencer,
+                &ours,
+                info.share.as_deref(),
+            )?),
+            None => None,
+        };
+        if pins.anchor_channel(&self.server, &info.slug, owner.as_deref())? {
+            eprintln!(
+                "note: {} is now carried here for {}, which orders it; its history is checked \
+                 against that server's records from now on",
+                info.slug,
+                owner.as_deref().unwrap_or_default()
+            );
+        }
+        Ok(())
     }
 
     /// What `info`'s creation block proves, from the pin when it names the

@@ -1579,6 +1579,26 @@ impl SqliteStore {
         .map_err(Into::into)
     }
 
+    /// A live open channel another server orders under `slug`, which a slug
+    /// lookup ([`Self::get_channel_by_slug`]) never finds: a slug names a
+    /// channel only on the server that orders it (JEP-0005 rule 1), so this
+    /// one is reached by its id.
+    pub fn carried_channel_by_slug(&self, slug: &str) -> Result<Option<StoredChannel>> {
+        let conn = self.conn.lock().expect("poisoned");
+        conn.query_row(
+            &format!(
+                "SELECT {CHANNEL_COLUMNS} FROM channels
+                  WHERE slug = ?1 AND NOT {LOCAL_SEQUENCER} AND archived_at IS NULL
+                    AND visibility = 'open'
+                  ORDER BY rowid LIMIT 1"
+            ),
+            params![slug, self.local_sequencer()],
+            row_to_stored_channel,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// Look up a channel whether or not it is archived. Used by the archive
     /// path itself (which must distinguish "no such channel" from "already
     /// archived") and by diagnostics.
