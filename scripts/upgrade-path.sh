@@ -21,7 +21,8 @@
 #
 # STEP is one of:
 #   vX.Y.Z...       a published release: install.sh and the tarball from its
-#                   GitHub Release, verified against the release key.
+#                   GitHub Release, verified against the release key
+#                   (.github/release/allowed_signers).
 #   mirror=URL      a local mirror laid out like a release (install.sh,
 #                   SHA256SUMS, SHA256SUMS.sig, jig-<os>-<arch>.tar.gz), signed
 #                   by $JIG_UPGRADE_MIRROR_SIGNER (an allowed_signers line).
@@ -29,9 +30,10 @@
 # Upgrades the way the docs describe: jig-server is stopped before install.sh
 # runs again, and a nameserver whose key an older release wrote unencrypted is
 # sealed with `jig-nameserver keys seal` (deploy/README.md, "Sealing the server
-# key"). Two upgrade paths are known not to work; each is checked on every run
-# and reported as a known gap (see KNOWN GAPS below). One that stops
-# reproducing fails the run, so the list cannot go stale.
+# key"). install.sh itself is checked against the step's signed SHA256SUMS
+# before it runs. Upgrade paths known not to work are checked on every run and
+# reported as known gaps (see KNOWN GAPS below). A known gap of this build
+# that stops reproducing fails the run, so the list cannot go stale.
 #
 # Env: JIG_REPO (default jig-protocol/jig), JIG_VERIFY_SIGNATURE (passed on),
 # JIG_UPGRADE_KNOWN_GAPS (overrides the list below), JIG_UPGRADE_KEEP=1 keeps
@@ -42,15 +44,25 @@ set -euo pipefail
 
 JIG_REPO="${JIG_REPO:-jig-protocol/jig}"
 
-# KNOWN GAPS. Each name is checked on every run; see `gap` below.
+# KNOWN GAPS of this build: the mirror step and the key rotation after the
+# last step. Each must reproduce on every run, or the run fails: a gap that
+# was fixed is dropped from the list here, and from then on fails if it comes
+# back. See `gap` below.
 #   install-reuses-old-server: re-running install.sh while jig-server runs
 #     replaces the binaries but leaves the old server process answering, so the
 #     new client talks to the old server (alpha.1 → alpha.2: "malformed
-#     handshake frame", and a hint to `jig server forget`).
+#     handshake frame", and a hint to `jig server forget`). Fixed by #334.
+KNOWN_GAPS="${JIG_UPGRADE_KNOWN_GAPS-install-reuses-old-server}"
+# Gaps a published release has, and always will: expected on a release step
+# and reported there, but never counted for KNOWN_GAPS, since a step that
+# cannot change cannot show that a gap is still there.
+#   install-reuses-old-server: above.
 #   rotate-locks-out-clients: after `jig-server keys rotate`, clients follow the
 #     key link but then refuse #jig/manifest, which the server re-created under
-#     its new DID ("is not the channel this device pinned").
-KNOWN_GAPS="${JIG_UPGRADE_KNOWN_GAPS-install-reuses-old-server rotate-locks-out-clients}"
+#     its new DID ("is not the channel this device pinned"). Fixed by #335, so
+#     it fails the run when the last step is this build.
+RELEASED_GAPS="install-reuses-old-server rotate-locks-out-clients"
+ALLOWED_SIGNERS="$(cd "$(dirname "$0")/.." && pwd)/.github/release/allowed_signers"
 
 SUFFIX=upgrade.jig
 sandbox="$(mktemp -d "${TMPDIR:-/tmp}/jig-upgrade.XXXXXX")"
@@ -108,9 +120,20 @@ cleanup() {
 }
 trap 'cleanup "$@"' EXIT
 
-# A known gap reproduced. Listed: report it and go on. Not listed: fail.
+# A known gap reproduced on a step of KIND (release or mirror). On a release
+# step, one of RELEASED_GAPS is reported and nothing else is allowed. On this
+# build, one of KNOWN_GAPS is reported and counted; anything else fails.
 gap() {
-  local name="$1" what="$2"
+  local name="$1" what="$2" kind="$3"
+  if [ "$kind" = release ]; then
+    case " $RELEASED_GAPS " in
+      *" $name "*)
+        note "released gap \`$name\` (a published release; fixed only in later ones): $what"
+        return
+        ;;
+      *) fail "upgrade gap $name in a published release: $what" ;;
+    esac
+  fi
   case " $KNOWN_GAPS " in
     *" $name "*)
       seen_gaps="$seen_gaps$name "
@@ -298,7 +321,32 @@ install_step() {
     *) fail "unknown step $step" ;;
   esac
   curl -fsSL "$url/install.sh" -o "$sandbox/install.sh" || fail "could not fetch install.sh for $step"
+  verify_installer "$step" "$url"
   env "${envs[@]}" bash "$sandbox/install.sh"
+}
+
+# install.sh runs as the user, so it is checked before it runs: against the
+# step's SHA256SUMS, whose signature is checked against the release key (or,
+# for a mirror, $JIG_UPGRADE_MIRROR_SIGNER).
+verify_installer() {
+  local step="$1" url="$2" signers="$sandbox/allowed_signers" want got
+  case "$step" in
+    mirror=*) echo "$JIG_UPGRADE_MIRROR_SIGNER" > "$signers" ;;
+    *) cp "$ALLOWED_SIGNERS" "$signers" ;;
+  esac
+  curl -fsSL "$url/SHA256SUMS" -o "$sandbox/SHA256SUMS" || fail "could not fetch SHA256SUMS for $step"
+  curl -fsSL "$url/SHA256SUMS.sig" -o "$sandbox/SHA256SUMS.sig" || fail "could not fetch SHA256SUMS.sig for $step"
+  ssh-keygen -Y verify -f "$signers" -I jig-release -n jig-release \
+    -s "$sandbox/SHA256SUMS.sig" < "$sandbox/SHA256SUMS" >/dev/null \
+    || fail "SHA256SUMS for $step is not signed by the release key"
+  want="$(awk '$2 == "install.sh" || $2 == "*install.sh" { print $1 }' "$sandbox/SHA256SUMS")"
+  [ -n "$want" ] || fail "SHA256SUMS for $step does not list install.sh"
+  if command -v sha256sum >/dev/null; then
+    got="$(sha256sum "$sandbox/install.sh" | cut -d' ' -f1)"
+  else
+    got="$(shasum -a 256 "$sandbox/install.sh" | cut -d' ' -f1)"
+  fi
+  [ "$got" = "$want" ] || fail "install.sh for $step does not match its signed SHA256SUMS"
 }
 
 # --- state ---------------------------------------------------------------------------
@@ -363,13 +411,25 @@ for step in "$@"; do
     ns_is_legacy || delegate_suffix
   else
     # The path a user takes first: install.sh again, server still running.
+    kind=release
+    case "$step" in mirror=*) kind=mirror ;; esac
     old_pid="$(cat "$ALICE_JIG_HOME/jig-server.pid")"
     stop_ns
-    if ! install_step "$step" > "$sandbox/install-running.out" 2>&1; then
+    installed=1
+    install_step "$step" > "$sandbox/install-running.out" 2>&1 || installed=0
+    reused=0
+    kill -0 "$old_pid" 2>/dev/null && reused=1
+    if [ "$installed" = 0 ]; then
       tail -5 "$sandbox/install-running.out"
+      # A published installer that leaves the old server answering then fails
+      # to talk to it (alpha.2: "malformed handshake frame"): that failure is
+      # the released gap itself. Any other failure fails the run.
+      if [ "$kind" = mirror ] || [ "$reused" = 0 ]; then
+        fail "install.sh ($step) failed over a running jig-server"
+      fi
     fi
-    if kill -0 "$old_pid" 2>/dev/null; then
-      gap install-reuses-old-server "re-running install.sh ($step) left the previous release's jig-server (pid $old_pid) running"
+    if [ "$reused" = 1 ]; then
+      gap install-reuses-old-server "re-running install.sh ($step) left the previous release's jig-server (pid $old_pid) running" "$kind"
     fi
     # The documented path: stop the server, then install.
     stop_server
@@ -387,6 +447,8 @@ done
 
 # Key rotation on the last release: every client pinned on the old DID must
 # follow the key link.
+last_kind=release
+case "${*: -1}" in mirror=*) last_kind=mirror ;; esac
 log "rotating jig-server's key"
 unlock="$(sed -n 's/^unlock = "\(.*\)"$/\1/p' "$ALICE_JIG_HOME/config.toml" | head -1)"
 [ -n "$unlock" ] || fail "no [keys] unlock in jig-server's config to seal the new key with"
@@ -400,7 +462,7 @@ note "rotated jig-server's key to $new_did"
 rotate_out="$sandbox/after-rotate.out"
 if ! as alice read '#enc' > "$rotate_out" 2>&1; then
   if grep -q "is not the channel this device pinned" "$rotate_out"; then
-    gap rotate-locks-out-clients "after keys rotate, a client pinned on the old DID refuses the re-created #jig/manifest: $(grep -m1 'not the channel' "$rotate_out" | cut -c1-200)"
+    gap rotate-locks-out-clients "after keys rotate, a client pinned on the old DID refuses the re-created #jig/manifest: $(grep -m1 'not the channel' "$rotate_out" | cut -c1-200)" "$last_kind"
   else
     cat "$rotate_out" >&2
     fail "alice cannot reach the server after its key rotated"

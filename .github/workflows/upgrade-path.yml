@@ -41,6 +41,9 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Nothing after checkout needs the token.
+          persist-credentials: false
       - name: Install Rust toolchain
         shell: bash
         working-directory: repos
