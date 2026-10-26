@@ -263,15 +263,20 @@ impl SqliteStore {
             }
             None => {}
         }
-        // A block held already belongs to a relayed copy this server set
-        // aside ([`SqliteStore::quarantine_relayed_copy`]): one CID is one
-        // block, so the owner's chain takes it back into the channel.
-        let held: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM blocks WHERE cid = ?1)",
-            [&block.cid],
+        // A block held already in a relayed copy of this channel, set aside
+        // ([`SqliteStore::quarantine_relayed_copy`]): one CID is one block, so
+        // the owner's chain takes it back into the channel. A block held in
+        // any other channel stays where it is, and the insert refuses it: a
+        // block named by slug can sit in this server's own channel of the
+        // same slug, whose chain still names it.
+        let in_copy: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM blocks b JOIN quarantined_copies q
+                 ON b.channel_id = q.copy_id
+             WHERE b.cid = ?1 AND q.channel_id = ?2)",
+            params![block.cid, channel_id],
             |r| r.get(0),
         )?;
-        if held {
+        if in_copy {
             tx.execute(
                 "UPDATE blocks SET channel_id = ?2 WHERE cid = ?1",
                 params![block.cid, channel_id],
@@ -786,6 +791,31 @@ mod tests {
             take(&follower, &owner, &owner.sent[1]).await.unwrap(),
             Followed::Duplicate { seq: 1, .. }
         ));
+    }
+
+    /// The owner's chain takes back a block only from this channel's relayed
+    /// copy. The same CID held in another of the follower's channels stays
+    /// there, and the record for it does not land.
+    #[tokio::test]
+    async fn a_block_held_in_another_channel_is_not_taken() {
+        let mut owner = Owner::new().await;
+        let text = owner.text("one").await;
+        let follower = owner.follower();
+        let mut held = owner.ctx.store.get_block(&text).unwrap().unwrap();
+        held.channel_id = Some("bafyours".to_string());
+        follower.store.insert_block(&held).unwrap();
+
+        take(&follower, &owner, &owner.sent[0]).await.unwrap();
+        assert!(take(&follower, &owner, &owner.sent[1]).await.is_err());
+        let block = follower.store.get_block(&text).unwrap().unwrap();
+        assert_eq!(block.channel_id.as_deref(), Some("bafyours"));
+        assert_eq!(
+            follower
+                .store
+                .ingest_record_bytes(&owner.channel, 1)
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
