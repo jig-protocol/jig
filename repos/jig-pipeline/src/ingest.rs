@@ -901,6 +901,7 @@ pub async fn ingest(
                 crate::persist::Landing::Landed(record) => record,
                 _ => return Err(refused_at_landing(guard_refusal, kind_str)),
             };
+            witness_record(ctx, record.as_ref());
             if let Some(input) = render_input.take() {
                 stored_receipt = receipt_after_landing(ctx, input, &block_cid, record).await;
             }
@@ -932,6 +933,7 @@ pub async fn ingest(
                     None
                 }
             };
+            witness_record(ctx, record.as_ref());
             // The receipt is written before fanout below, so no subscriber or peer sees the
             // block without it.
             if let Some(input) = render_input.take() {
@@ -1165,6 +1167,16 @@ pub fn channel_slug_of(kind: BlockKind, manifest: &jig_core::BlockManifest) -> O
 /// slugs, and a `server-manifest` anywhere else or one that does not decode:
 /// only the server's DID writes its log, and only its channel-create and
 /// `server-manifest` blocks.
+/// Keep this server's clock at or after the clock its newest record was
+/// signed with: the store may have moved it past the reading ingest took
+/// ([`crate::persist`]'s `sequence_on`).
+fn witness_record(ctx: &IngestContext, record: Option<&crate::ingest_record::IngestRecord>) {
+    if let Some(record) = record {
+        ctx.hlc_clock
+            .witness(record.ingest_wall_ms, record.ingest_logical);
+    }
+}
+
 fn manifest_log_write(
     ctx: &IngestContext,
     kind: BlockKind,
@@ -2090,6 +2102,74 @@ mod tests {
             resources: vec![],
         };
         ingest(ctx, bundle, sig, source).await
+    }
+
+    /// Many writers into one channel at once: every record the server signs
+    /// comes after the one before it in clock order as well as in `seq`,
+    /// though each reads the clock before it takes its place in the chain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_writers_never_sign_a_clock_that_runs_backwards() {
+        let ctx = Arc::new(test_ctx());
+        let channel = seed_channel(&ctx, "#busy");
+        const WRITERS: usize = 8;
+        const EACH: usize = 40;
+        let mut tasks = Vec::new();
+        for w in 0..WRITERS {
+            let ctx = ctx.clone();
+            tasks.push(tokio::spawn(async move {
+                let key = random_signing_key();
+                for i in 0..EACH {
+                    let body = format!("writer {w} message {i}");
+                    let (m, c, sig) = build_bundle_parts_with_meta(
+                        &key,
+                        BlockKind::TextRender,
+                        &[("channel", "#busy"), ("body", &body)],
+                    );
+                    do_ingest(
+                        &ctx,
+                        m,
+                        c,
+                        sig,
+                        IngestSource::LocalClient { conn_id: w as u64 },
+                    )
+                    .await
+                    .unwrap();
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let mut records = Vec::new();
+        loop {
+            let page = ctx
+                .store
+                .list_ingest_records_by_id(&channel, records.len() as u64, 200)
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            records.extend(page);
+        }
+        assert_eq!(records.len(), WRITERS * EACH);
+        for pair in records.windows(2) {
+            assert!(pair[1].follows(&pair[0]));
+            assert!(
+                (pair[1].ingest_wall_ms, pair[1].ingest_logical)
+                    > (pair[0].ingest_wall_ms, pair[0].ingest_logical),
+                "record {} at {}/{} after record {} at {}/{}",
+                pair[1].seq,
+                pair[1].ingest_wall_ms,
+                pair[1].ingest_logical,
+                pair[0].seq,
+                pair[0].ingest_wall_ms,
+                pair[0].ingest_logical
+            );
+        }
+        // The server's clock is past the last record it signed.
+        let last = records.last().unwrap();
+        let now = ctx.hlc_clock.current();
+        assert!((now.wall_ms, now.logical) >= (last.ingest_wall_ms, last.ingest_logical));
     }
 
     #[tokio::test]

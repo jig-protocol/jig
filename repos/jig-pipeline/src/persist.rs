@@ -592,13 +592,29 @@ fn sequence_on(
             |r| r.get(0),
         )
         .optional()?;
-    let (seq, prev) = match last {
-        None => (0, GENESIS_PREV),
+    let (seq, prev, after) = match last {
+        None => (0, GENESIS_PREV, None),
         Some(bytes) => {
             let last = IngestRecord::decode(&bytes)
                 .map_err(|e| PersistError::Corrupt(format!("ingest record: {e}")))?;
-            (last.seq + 1, last.hash())
+            (
+                last.seq + 1,
+                last.hash(),
+                Some((last.ingest_wall_ms, last.ingest_logical)),
+            )
         }
+    };
+    // The clock was read before this transaction, so a block sequenced
+    // after another can carry an earlier reading than it. Its record must
+    // still come after the last one in clock order too (JEP-0002 rule 9),
+    // or every client holds the chain to be a clock running backwards.
+    let (ingest_wall_ms, ingest_logical) =
+        clock_after((signer.ingest_wall_ms, signer.ingest_logical), after);
+    let signer = RecordSigner {
+        channel_id: signer.channel_id.clone(),
+        key: signer.key,
+        ingest_wall_ms,
+        ingest_logical,
     };
     let record = signer
         .sign(seq, block_cid, prev)
@@ -609,6 +625,19 @@ fn sequence_on(
         params![block_cid, record.channel_id, seq as i64, record.encode()],
     )?;
     Ok(record)
+}
+
+/// `reading`, or, when it is not strictly after `last` (the channel's last
+/// record's clock), the next clock after `last`: its logical counter plus
+/// one, or the next millisecond once the counter is spent.
+fn clock_after(reading: (u64, u32), last: Option<(u64, u32)>) -> (u64, u32) {
+    match last {
+        Some(last) if reading <= last => match last.1.checked_add(1) {
+            Some(logical) => (last.0, logical),
+            None => (last.0.saturating_add(1), 0),
+        },
+        _ => reading,
+    }
 }
 
 /// A right a block's signer must still hold at the block's own position in
@@ -2579,6 +2608,51 @@ mod tests {
                 .unwrap(),
             from_one
         );
+    }
+
+    /// A block whose clock was read before another's, but sequenced after
+    /// it, still gets a record strictly after the last in clock order: the
+    /// order clients hold a chain to (`chain-clock-backwards`).
+    #[test]
+    fn a_record_signed_with_an_earlier_reading_still_comes_after_the_last() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.upsert_channel(&seq_channel()).unwrap();
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let did =
+            jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
+        let reading = |wall, logical| RecordSigner {
+            ingest_logical: logical,
+            ..test_signer(&key, wall)
+        };
+        let clock = |r: &IngestRecord| (r.ingest_wall_ms, r.ingest_logical);
+        let land = |cid: &str, signer: &RecordSigner<'_>| {
+            store
+                .insert_block_sequenced(&at_hlc(cid, 1), signer)
+                .unwrap()
+        };
+        let create = land(&c("bafy_create"), &reading(100, 1));
+        // Read at logical 0, landing after the one read at logical 1.
+        let late = land(&c("bafy_late"), &reading(100, 0));
+        assert_eq!(clock(&late), (100, 2));
+        // The same reading again, and one from a millisecond before.
+        let same = land(&c("bafy_same"), &reading(100, 2));
+        assert_eq!(clock(&same), (100, 3));
+        let behind = land(&c("bafy_behind"), &reading(99, 7));
+        assert_eq!(clock(&behind), (100, 4));
+        // A reading ahead of the chain is kept as it is.
+        let ahead = land(&c("bafy_ahead"), &reading(101, 0));
+        assert_eq!(clock(&ahead), (101, 0));
+        let records = [create, late, same, behind, ahead];
+        for pair in records.windows(2) {
+            assert!(pair[1].follows(&pair[0]));
+            assert!(clock(&pair[1]) > clock(&pair[0]), "{:?}", pair);
+        }
+        for record in &records {
+            record.verify(&did).unwrap();
+        }
+        // The counter spent: the next millisecond.
+        assert_eq!(clock_after((5, 0), Some((5, u32::MAX))), (6, 0));
+        assert_eq!(clock_after((5, 0), None), (5, 0));
     }
 
     fn block_cids(blocks: Vec<StoredBlock>) -> Vec<String> {
