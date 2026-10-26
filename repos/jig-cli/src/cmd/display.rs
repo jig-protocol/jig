@@ -87,6 +87,15 @@ pub fn connection_lost(channel: &str) -> anyhow::Error {
     anyhow::anyhow!("connection lost while subscribed to {channel} — the server closed the stream")
 }
 
+/// The stream ended because this reader fell behind the server, not because
+/// the connection closed ([`jig_client::BlockStream::lagged`]).
+pub fn fell_behind(channel: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "fell behind {channel}: the server sent faster than this terminal read, so the \
+         subscription was ended; run the command again to catch up from history"
+    )
+}
+
 /// Ring once for a batch of `count` inbound messages, and not at all when
 /// the batch is empty. Batching matters on reconnect, where a backlog would
 /// otherwise arrive as one bell per message.

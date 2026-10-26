@@ -72,7 +72,7 @@ pub enum ClientError {
 pub struct Client {
     identity: Arc<Identity>,
     write_tx: mpsc::UnboundedSender<Message>,
-    inbound_rx: Mutex<mpsc::UnboundedReceiver<Frame>>,
+    inbound_rx: Mutex<mpsc::Receiver<Frame>>,
     pending_subscriptions: SubscriptionMap,
     last_cursors: Arc<Mutex<HashMap<String, HlcCursor>>>,
     /// Set by [`ReaderCleanup`] when the reader task exits. Lets `submit`
@@ -168,13 +168,31 @@ pub struct ConnectOptions {
 ///
 /// A `std` mutex, not a `tokio` one, so [`ReaderCleanup::drop`] can clear the
 /// map — `Drop` cannot await. Nothing holds this guard across an await point.
-type SubscriptionMap = Arc<StdMutex<HashMap<String, mpsc::UnboundedSender<DeliveredBlock>>>>;
+type SubscriptionMap = Arc<StdMutex<HashMap<String, Subscription>>>;
+
+/// How many deliveries one subscription holds before its reader takes them.
+/// Past this the subscriber has fallen behind: its stream ends, marked
+/// [`BlockStream::lagged`], and it catches up from history. Holding more
+/// would let a server fill this process's memory through a slow reader; at
+/// the largest block (`crate::limits::MAX_WS_MESSAGE_BYTES`) this is about
+/// 138 MB, and a few hundred kilobytes for chat.
+pub const SUBSCRIPTION_QUEUE: usize = 64;
+
+/// How many frames other than deliveries (`Ack`, `Error`) wait for a
+/// `submit` to take them. Only one submit waits at a time, so more are
+/// unsolicited: past this they are dropped.
+const INBOUND_QUEUE: usize = 64;
+
+/// A channel subscription's end of the reader task.
+struct Subscription {
+    tx: mpsc::Sender<DeliveredBlock>,
+    /// Set when the reader dropped this subscription because it was full.
+    lagged: Arc<AtomicBool>,
+}
 
 /// Lock the subscription map, recovering from poisoning: a panicking holder
 /// must not wedge every live [`BlockStream`] for the rest of the process.
-fn lock_subscriptions(
-    map: &SubscriptionMap,
-) -> MutexGuard<'_, HashMap<String, mpsc::UnboundedSender<DeliveredBlock>>> {
+fn lock_subscriptions(map: &SubscriptionMap) -> MutexGuard<'_, HashMap<String, Subscription>> {
     map.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -227,7 +245,8 @@ pub struct DeliveredBlock {
 /// Stream of [`DeliveredBlock`] items for a subscribed channel. Returned
 /// by [`Client::subscribe_channel`].
 pub struct BlockStream {
-    rx: mpsc::UnboundedReceiver<DeliveredBlock>,
+    rx: mpsc::Receiver<DeliveredBlock>,
+    lagged: Arc<AtomicBool>,
 }
 
 impl BlockStream {
@@ -237,6 +256,13 @@ impl BlockStream {
     /// blocking here forever. Callers should treat `None` as "disconnected".
     pub async fn next(&mut self) -> Option<DeliveredBlock> {
         self.rx.recv().await
+    }
+
+    /// Whether the stream ended because this reader fell [`SUBSCRIPTION_QUEUE`]
+    /// deliveries behind, not because the connection closed. The connection
+    /// is still up: subscribe again, and fill the gap from history.
+    pub fn lagged(&self) -> bool {
+        self.lagged.load(Ordering::SeqCst)
     }
 }
 
@@ -362,7 +388,7 @@ impl Client {
         let contradiction: Arc<StdMutex<Option<Contradiction>>> = Arc::new(StdMutex::new(None));
 
         let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Message>();
-        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<Frame>();
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Frame>(INBOUND_QUEUE);
         let pending_subscriptions: SubscriptionMap = Arc::new(StdMutex::new(HashMap::new()));
         let last_cursors: Arc<Mutex<HashMap<String, HlcCursor>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -529,11 +555,26 @@ impl Client {
                             // could come from different channels — for v0.0.2
                             // one sub per channel slug suffices, and the
                             // server already filtered).
+                            //
+                            // A subscriber that is full has fallen behind: it
+                            // loses its subscription rather than this reader
+                            // waiting on it, which would hold up every other
+                            // subscription and every submit's answer.
                             {
-                                let subs = lock_subscriptions(&pending_subs_for_reader);
-                                for tx in subs.values() {
-                                    let _ = tx.send(delivered.clone());
-                                }
+                                let mut subs = lock_subscriptions(&pending_subs_for_reader);
+                                subs.retain(|slug, sub| match sub.tx.try_send(delivered.clone()) {
+                                    Ok(()) => true,
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        tracing::warn!(
+                                            channel = %slug,
+                                            "a subscriber fell {SUBSCRIPTION_QUEUE} deliveries behind; \
+                                             ending its stream"
+                                        );
+                                        sub.lagged.store(true, Ordering::SeqCst);
+                                        false
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                                });
                             }
                             // Update cursor for delivery_cid (placeholder —
                             // Phase D will swap in HLC cursor parsed from the
@@ -548,7 +589,9 @@ impl Client {
                             );
                         }
                         other => {
-                            let _ = inbound_tx.send(other);
+                            if inbound_tx.try_send(other).is_err() {
+                                tracing::debug!("dropping a frame no submit is waiting for");
+                            }
                         }
                     }
                 }
@@ -663,13 +706,20 @@ impl Client {
         // half-registered subscription behind.
         let json = serde_json::to_string(&env)?;
 
-        let (delivery_tx, delivery_rx) = mpsc::unbounded_channel();
+        let (delivery_tx, delivery_rx) = mpsc::channel(SUBSCRIPTION_QUEUE);
+        let lagged = Arc::new(AtomicBool::new(false));
         {
             let mut subs = lock_subscriptions(&self.pending_subscriptions);
             if self.closed.load(Ordering::SeqCst) {
                 return Err(ClientError::ConnectionClosed);
             }
-            subs.insert(slug.to_string(), delivery_tx);
+            subs.insert(
+                slug.to_string(),
+                Subscription {
+                    tx: delivery_tx,
+                    lagged: lagged.clone(),
+                },
+            );
         }
 
         if self.write_tx.send(Message::Text(json.into())).is_err() {
@@ -677,7 +727,10 @@ impl Client {
             return Err(ClientError::ConnectionClosed);
         }
 
-        Ok(BlockStream { rx: delivery_rx })
+        Ok(BlockStream {
+            rx: delivery_rx,
+            lagged,
+        })
     }
 
     /// Submit a built block and await its `Ack` (or `Error`). Returns the

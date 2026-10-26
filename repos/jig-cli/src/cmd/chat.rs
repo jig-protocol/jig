@@ -31,14 +31,22 @@ use jig_core::HlcTimestamp;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     io::{Stdout, stdout},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::mpsc;
 
 use crate::cmd::chat_view::{ChatState, Message, drain_inbound, render, submit_failure_status};
 use crate::cmd::common::CliContext;
-use crate::cmd::display::{bell_on_inbound, connection_lost};
+use crate::cmd::display::{bell_on_inbound, connection_lost, fell_behind};
+
+/// Decoded lines waiting for the pane. Past this the pump waits, and the
+/// subscription's own queue (`jig_client::connection::SUBSCRIPTION_QUEUE`)
+/// takes the overflow until it ends the stream as lagged.
+const CHAT_QUEUE: usize = 256;
 use crate::cmd::reader::Reader;
 
 /// Args struct for `jig chat <channel>`. Lives here (rather than in
@@ -118,11 +126,14 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
         .await
         .with_context(|| format!("subscribing to {}", args.channel))?;
 
-    // Pump inbound blocks into an unbounded mpsc. The render loop
-    // drains via `try_recv` each tick, so a fast-burst from the
-    // server can't starve user input. Unbounded is fine here — chat
-    // volume is small and the channel is dropped on exit.
-    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<Message>();
+    // Pump inbound blocks into a queue the render loop drains each tick, so
+    // a burst from the server can't starve user input. Bounded: when the
+    // pane falls behind, the pump waits, the subscription's own queue fills,
+    // and the stream ends as lagged rather than this process holding
+    // whatever the server sends.
+    let (msg_tx, mut msg_rx) = mpsc::channel::<Message>(CHAT_QUEUE);
+    let lagged = Arc::new(AtomicBool::new(false));
+    let lagged_for_stream = lagged.clone();
     let reader_for_stream = reader.clone();
     tokio::spawn(async move {
         while let Some(block) = stream.next().await {
@@ -134,7 +145,7 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
                     let Some(decoded) = read.line else {
                         continue;
                     };
-                    if msg_tx.send(decoded.into()).is_err() {
+                    if msg_tx.send(decoded.into()).await.is_err() {
                         break;
                     }
                 }
@@ -143,15 +154,18 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
                     // so the operator sees that something arrived but
                     // couldn't be parsed. v0.0.2 is single-server so
                     // this is essentially never reached.
-                    let _ = msg_tx.send(Message {
-                        sender: "<decode-error>".into(),
-                        body: format!("{e}"),
-                        ts: 0,
-                        parity_warning: false,
-                    });
+                    let _ = msg_tx
+                        .send(Message {
+                            sender: "<decode-error>".into(),
+                            body: format!("{e}"),
+                            ts: 0,
+                            parity_warning: false,
+                        })
+                        .await;
                 }
             }
         }
+        lagged_for_stream.store(stream.lagged(), Ordering::SeqCst);
     });
 
     // Submit failures travel on their own channel: `msg_tx` belongs to the
@@ -180,6 +194,7 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
         &client,
         &ctx,
         &reader,
+        &lagged,
     )
     .await;
 
@@ -199,12 +214,13 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
 async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &mut ChatState,
-    msg_rx: &mut mpsc::UnboundedReceiver<Message>,
+    msg_rx: &mut mpsc::Receiver<Message>,
     status_rx: &mut mpsc::UnboundedReceiver<String>,
     status_tx: &mpsc::UnboundedSender<String>,
     client: &Arc<Client>,
     ctx: &Arc<CliContext>,
     reader: &Arc<Reader>,
+    lagged: &AtomicBool,
 ) -> Result<()> {
     loop {
         // Drain any inbound messages before redrawing so we paint the
@@ -223,6 +239,9 @@ async fn event_loop(
             // Paint the backlog we just drained before tearing the TUI down,
             // so the last messages are not lost with the connection.
             terminal.draw(|f| render(f, state)).context("draw frame")?;
+            if lagged.load(Ordering::SeqCst) {
+                return Err(fell_behind(&state.channel));
+            }
             return Err(connection_lost(&state.channel));
         }
 

@@ -117,11 +117,20 @@ pub async fn read(ctx: &CliContext, channel: String, limit: usize, json: bool) -
 /// live socket. `jig_client::BlockStream` is the only production impl.
 pub trait BlockSource {
     fn next_block(&mut self) -> impl std::future::Future<Output = Option<DeliveredBlock>> + Send;
+
+    /// Whether it ended because its reader fell behind, not on a disconnect.
+    fn lagged(&self) -> bool {
+        false
+    }
 }
 
 impl BlockSource for jig_client::BlockStream {
     fn next_block(&mut self) -> impl std::future::Future<Output = Option<DeliveredBlock>> + Send {
         self.next()
+    }
+
+    fn lagged(&self) -> bool {
+        jig_client::BlockStream::lagged(self)
     }
 }
 
@@ -153,6 +162,9 @@ async fn pump(
             // know data was dropped.
             Err(e) => eprintln!("[skip block: {e}]"),
         }
+    }
+    if source.lagged() {
+        return Err(crate::cmd::display::fell_behind(channel));
     }
     Err(connection_lost(channel))
 }
@@ -350,6 +362,7 @@ mod tests {
     /// ends — exactly what a dropped connection looks like to the caller.
     struct FiniteSource {
         items: std::collections::VecDeque<DeliveredBlock>,
+        lagged: bool,
     }
 
     impl BlockSource for FiniteSource {
@@ -358,6 +371,10 @@ mod tests {
         ) -> impl std::future::Future<Output = Option<DeliveredBlock>> + Send {
             let next = self.items.pop_front();
             async move { next }
+        }
+
+        fn lagged(&self) -> bool {
+            self.lagged
         }
     }
 
@@ -410,6 +427,7 @@ mod tests {
         // exit 0 on a server restart.
         let mut source = FiniteSource {
             items: [one_text_block()].into(),
+            lagged: false,
         };
         let err = pump(
             &mut source,
@@ -431,6 +449,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pump_says_it_fell_behind_when_the_stream_lagged() {
+        let mut source = FiniteSource {
+            items: [one_text_block()].into(),
+            lagged: true,
+        };
+        let err = pump(
+            &mut source,
+            "#hello",
+            &BTreeMap::new(),
+            &Reader::plain("#hello"),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("fell behind #hello"), "{msg}");
+        assert!(!msg.contains("connection lost"), "{msg}");
+    }
+
+    #[tokio::test]
     async fn pump_keeps_going_past_an_undecodable_block() {
         // One bad block must not end the tail early — it should be skipped
         // and the stream drained to its real end.
@@ -440,6 +477,7 @@ mod tests {
                 one_text_block(),
             ]
             .into(),
+            lagged: false,
         };
         let err = pump(
             &mut source,
