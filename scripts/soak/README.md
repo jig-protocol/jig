@@ -148,7 +148,9 @@ Latency is the first sighting minus the send time, so its resolution is
   signed record 605 with an older clock than record 604 within two minutes.
   Alice's client kept the proof (`chain-clock-backwards`) and refused her
   own server from then on, so every later send from A failed. With 4 writers
-  a side the race did not show in two minutes: use 16 or more.
+  a side the race did not show in two minutes: use 16 or more. On main
+  with #347, the same run for three minutes delivered 1424 of 1424 each way,
+  and both clients verified the chain to record 2850.
 - **The warm-up exists for the same reason.** Before sending, the harness
   waits until a post crosses each way, re-posting until one does. Posts made
   before both links are up would otherwise be lost the same way.
