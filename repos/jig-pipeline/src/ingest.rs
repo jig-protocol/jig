@@ -705,15 +705,18 @@ pub async fn ingest(
             &server_did,
             &source,
         )?;
-        channel_terms(&manifest, &server_did)?;
+        let peer = matches!(source, IngestSource::FederatedPeer { .. });
+        if peer && RELAY_COPIES_PEER_CREATES {
+            channel_terms(&as_relayed_copy(&manifest), &server_did)?;
+        } else {
+            channel_terms(&manifest, &server_did)?;
+        }
         // A channel names the server that orders it, so a create signed for
-        // one server is valid on no other. A peer's create is the relay's to
-        // judge (a peer's channel names that peer), and an in-process
-        // bridge's reaches no other server.
-        if !matches!(
-            source,
-            IngestSource::FederatedPeer { .. } | IngestSource::Bridge
-        ) && !manifest.metadata.contains_key(SEQUENCER_KEY)
+        // one server is valid on no other. An in-process bridge's create
+        // reaches no other server.
+        if !peer
+            && !matches!(source, IngestSource::Bridge)
+            && !manifest.metadata.contains_key(SEQUENCER_KEY)
         {
             return Err(IngestError::SequencerRequired { server: server_did });
         }
@@ -996,11 +999,12 @@ pub async fn ingest(
                 ctx.store.put_mls_group(&group)?;
             }
             // Step 5: apply effect
-            crate::effect::apply_effect(
+            crate::effect::apply_effect_as(
                 &ctx.store,
                 &bundle,
                 &stored_receipt.receipt_bytes,
                 &block_cid,
+                RELAY_COPIES_PEER_CREATES && matches!(source, IngestSource::FederatedPeer { .. }),
             )
             .await?;
             // Step 6: persist block (+ its record) + receipt
@@ -1401,6 +1405,21 @@ pub fn check_create_slug(
 
 /// The metadata key a `channel-create` names its sequencer under.
 pub const SEQUENCER_KEY: &str = "sequencer";
+
+/// Whether a peer's `channel-create` reaching this server over the legacy
+/// relay makes a relayed copy this server sequences, whatever server the
+/// block names: the relay's behaviour from before creates named their
+/// sequencer. `false` refuses such a create here (`NotSequencer`), so a
+/// channel reaches a peer only by contract.
+pub const RELAY_COPIES_PEER_CREATES: bool = true;
+
+/// `manifest` without the server its creator named: what a relayed copy is
+/// judged and stored as ([`RELAY_COPIES_PEER_CREATES`]).
+pub(crate) fn as_relayed_copy(manifest: &jig_core::BlockManifest) -> jig_core::BlockManifest {
+    let mut copy = manifest.clone();
+    copy.metadata.remove(SEQUENCER_KEY);
+    copy
+}
 /// The metadata key a `channel-create` lists its co-owners under.
 pub const CO_OWNERS_KEY: &str = "co_owners";
 
@@ -3909,6 +3928,44 @@ mod tests {
             matches!(not_a_did, Err(IngestError::InvalidTerms { ref field, .. }) if field == "sequencer"),
             "got {not_a_did:?}"
         );
+    }
+
+    /// A peer's create reaches this server over the legacy relay naming the
+    /// peer as its sequencer. With [`RELAY_COPIES_PEER_CREATES`] it is a
+    /// relayed copy this server sequences, as before creates named one;
+    /// without, it is refused.
+    #[tokio::test]
+    async fn a_peers_create_over_the_relay_is_a_copy_this_server_sequences() {
+        let ctx = roles_ctx();
+        let owner = person();
+        let peer = random_signing_key();
+        let (mb, cb, sig) = signed_parts(
+            &owner.key,
+            BlockKind::ChannelCreate,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"slug": "#theirs", "sequencer": did_of(&peer)}),
+        );
+        let landed = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::FederatedPeer {
+                peer_did: Did::from_ed25519_pubkey(peer.verifying_key().as_bytes()),
+                peer_url: "wss://peer".to_string(),
+            },
+        )
+        .await;
+        if RELAY_COPIES_PEER_CREATES {
+            let cid = landed.unwrap();
+            let row = ctx.store.get_channel_by_id(&cid).unwrap().unwrap();
+            assert_eq!(row.sequencer_did, ctx.server_did.to_did_jig_string());
+        } else {
+            assert!(
+                matches!(landed, Err(IngestError::NotSequencer { .. })),
+                "{landed:?}"
+            );
+        }
     }
 
     #[tokio::test]

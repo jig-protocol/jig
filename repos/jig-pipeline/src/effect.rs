@@ -27,10 +27,26 @@ use crate::persist::{
 pub async fn apply_effect(
     store: &Arc<SqliteStore>,
     bundle: &BlockBundle<'_>,
-    _receipt_bytes: &[u8],
+    receipt_bytes: &[u8],
     block_cid: &str,
 ) -> anyhow::Result<()> {
-    let manifest: BlockManifest = serde_json::from_slice(bundle.manifest_bytes)?;
+    apply_effect_as(store, bundle, receipt_bytes, block_cid, false).await
+}
+
+/// [`apply_effect`], with a `channel-create` stored as a relayed copy this
+/// server sequences when `relayed_copy` is set
+/// ([`crate::ingest::RELAY_COPIES_PEER_CREATES`]).
+pub async fn apply_effect_as(
+    store: &Arc<SqliteStore>,
+    bundle: &BlockBundle<'_>,
+    _receipt_bytes: &[u8],
+    block_cid: &str,
+    relayed_copy: bool,
+) -> anyhow::Result<()> {
+    let mut manifest: BlockManifest = serde_json::from_slice(bundle.manifest_bytes)?;
+    if relayed_copy {
+        manifest = crate::ingest::as_relayed_copy(&manifest);
+    }
     let Some(kind) = manifest.kind else {
         // No kind field — pre-v0.0.2 fixture or malformed; no effect.
         return Ok(());
