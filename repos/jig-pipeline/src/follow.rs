@@ -457,7 +457,13 @@ async fn deliver(ctx: &IngestContext, block: &StoredBlock, channel_id: &str) {
                 .list_members(&chan.id)
                 .map(|ms| ms.into_iter().map(|m| m.member_did).collect())
                 .unwrap_or_default();
-            DeliveryPolicy::for_channel(&chan, members)
+            // Not to this server's federation subscribers either: a peer of
+            // this one would take the channel as a copy of its own, and a
+            // channel has one sequencer (JEP-0005 rule 1).
+            DeliveryPolicy {
+                federates: false,
+                ..DeliveryPolicy::for_channel(&chan, members)
+            }
         }
         // Narrow delivery on any doubt, never widen it.
         _ => DeliveryPolicy::default(),

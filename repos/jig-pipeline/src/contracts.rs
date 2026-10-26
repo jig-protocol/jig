@@ -491,6 +491,93 @@ impl SqliteStore {
         )?)
     }
 
+    /// Whether this server carries `channel_id` under a share it accepted,
+    /// live or ended: its blocks reach it from the owner's stream, never by
+    /// the federation relay.
+    pub fn is_followed(&self, channel_id: &str) -> crate::persist::Result<bool> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM contract_offers
+             WHERE channel_id = ?1 AND side = ?2 AND state IN (?3, ?4, ?5))",
+            params![
+                channel_id,
+                Side::Follower.as_str(),
+                OfferState::Accepted.as_str(),
+                OfferState::Ending.as_str(),
+                OfferState::Ended.as_str()
+            ],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The channels this server holds as copies the federation relay made:
+    /// a row it sequences, created by a `channel-create` a peer relayed.
+    /// Every server peered the older way holds one per open channel of its
+    /// peers.
+    pub fn relayed_copies(&self) -> crate::persist::Result<Vec<String>> {
+        let local = self.local_sequencer().to_string();
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT c.id FROM channels c JOIN blocks b ON b.cid = c.id
+             WHERE (c.sequencer_did = '' OR c.sequencer_did = ?1)
+               AND b.federated_from IS NOT NULL
+             ORDER BY c.id",
+        )?;
+        let rows = stmt
+            .query_map([local], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Drop this server's relayed copy of `channel_id` ([`Self::relayed_copies`]):
+    /// its row, blocks, receipts, records, memberships, and any offer it made
+    /// as though it owned the channel. What the owner's stream lands next
+    /// replaces it, from the channel's first block. Nothing else is touched,
+    /// and nothing at all unless `channel_id` is such a copy. Whether it was.
+    pub fn drop_relayed_copy(&self, channel_id: &str) -> crate::persist::Result<bool> {
+        let local = self.local_sequencer().to_string();
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let copy: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM channels c JOIN blocks b ON b.cid = c.id
+             WHERE c.id = ?1 AND (c.sequencer_did = '' OR c.sequencer_did = ?2)
+               AND b.federated_from IS NOT NULL)",
+            params![channel_id, local],
+            |r| r.get(0),
+        )?;
+        if !copy {
+            return Ok(false);
+        }
+        let of_channel = "SELECT cid FROM blocks WHERE channel_id = ?1 OR cid = ?1";
+        tx.execute(
+            &format!("DELETE FROM receipts WHERE block_cid IN ({of_channel})"),
+            [channel_id],
+        )?;
+        tx.execute(
+            "DELETE FROM ingest_records WHERE channel_id = ?1",
+            [channel_id],
+        )?;
+        tx.execute(
+            "DELETE FROM blocks WHERE channel_id = ?1 OR cid = ?1",
+            [channel_id],
+        )?;
+        tx.execute(
+            "DELETE FROM memberships WHERE channel_id = ?1",
+            [channel_id],
+        )?;
+        tx.execute(
+            "DELETE FROM chain_evidence WHERE channel_id = ?1",
+            [channel_id],
+        )?;
+        tx.execute(
+            "DELETE FROM contract_offers WHERE channel_id = ?1 AND side = ?2",
+            params![channel_id, Side::Owner.as_str()],
+        )?;
+        tx.execute("DELETE FROM channels WHERE id = ?1", [channel_id])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// The newest record of `channel_id`'s chain: its `ingest` head.
     pub fn latest_ingest_record(
         &self,
