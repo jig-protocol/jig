@@ -2567,6 +2567,36 @@ mod tests {
         );
     }
 
+    /// The live push need not reach `a` in `b`'s order: two ingests racing
+    /// on `b` can fan out the later one first. Here `a` took `b`'s second
+    /// post live, not its first, when the link dropped: the reconnect's
+    /// overlap still brings the first.
+    #[tokio::test]
+    async fn a_block_pushed_out_of_order_is_caught_up_after_a_reconnect() {
+        let l = legacy().await;
+        let channel = l.channel("#open").await;
+        let texts = l.texts(&channel, 2).await;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        for cid in [&channel, &texts[1]] {
+            let block = l.b.ingest_ctx.store.get_block(cid).unwrap().unwrap();
+            crate::v0_0_2_federation::ingest_peer_block(
+                &l.a,
+                &l.to_b,
+                &base64::Engine::encode(&b64, &block.bundle_bytes),
+                Some(&base64::Engine::encode(&b64, &block.sender_sig)),
+                "live",
+            )
+            .await
+            .unwrap();
+        }
+        assert!(!held(&l.a, &texts[0]));
+        let newest = l.a.ingest_ctx.store.newest_block_from(&l.to_b.url).unwrap();
+        assert_eq!(newest.as_deref(), Some(texts[1].as_str()));
+
+        l.dial(&l.a);
+        Legacy::holds(&l.a, &texts[..1]).await;
+    }
+
     #[tokio::test]
     async fn catch_up_pages_past_one_frame() {
         let l = legacy().await;
