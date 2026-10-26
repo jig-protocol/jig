@@ -148,13 +148,13 @@ of every channel it sequences (JEP-0005). A server that changed its key:
    above) as its own, and go on writing into it as its current DID. It MUST NOT move such
    a channel aside, or create another at its slug, as it would for a channel a stranger
    holds.
-2. Sequences, as its current DID, every channel that a DID in its own verified chain
+2. MUST sequence, as its current DID, every channel that a DID in its own verified chain
    sequenced. It continues each channel's chain from the last record: the first record it
    signs has the next `seq`, and its `prev` is the hash of the last record the earlier DID
-   signed. Records already signed are never signed again.
-3. Treats a channel owned or sequenced by a DID outside its verified chain exactly as
+   signed. Records already signed MUST NOT be signed again.
+3. MUST treat a channel owned or sequenced by a DID outside its verified chain exactly as
    before the change: not its own.
-4. Publishes its manifest again, as its current DID, if the newest entry in its log was
+4. MUST publish its manifest again, as its current DID, if the newest entry in its log was
    written by an earlier DID, so that every welcome cites an entry signed by the DID that
    signed the welcome.
 
@@ -177,11 +177,12 @@ each verified as above. It takes them in link order, oldest first:
    by a DID earlier in the link order MUST be refused as a break. The earlier key handed
    its standing on, so it adds nothing after that. This is the ordered-log rule of
    [Forks](#forks), applied to sequencing.
-3. A record before the client's head is history. It may be signed by any of these DIDs up
+3. A record before the client's head is history. It MAY be signed by any of these DIDs up
    to the one that signed the head.
 4. Two records that contradict each other prove something against the sequencer only
    when one DID signed both. Across a key change the two halves are two keys' words,
-   tied only by the link, so a client keeps them as a break but not as a signed proof.
+   tied only by the link, so a client MUST treat them as a break and MUST NOT offer them
+   as a signed proof.
 
 A client that holds no link to an earlier DID (it first pinned the server after the
 change and was served no chain) cannot check that DID's records, and refuses them as in

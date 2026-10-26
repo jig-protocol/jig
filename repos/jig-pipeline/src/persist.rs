@@ -827,6 +827,9 @@ impl SqliteStore {
     /// verified key-link chain leaves. A row sequenced by any other DID is
     /// carried, and stays as it is.
     ///
+    /// `predecessors` are oldest first, as the chain is served; where two of
+    /// them hold one slug, the newer one's channel takes it.
+    ///
     /// Returns how many rows moved, and how many could not: an earlier DID's
     /// channel whose slug the current DID already sequences, which a server
     /// that rotated without this step can have created. Those keep their old
@@ -842,20 +845,20 @@ impl SqliteStore {
         if old.is_empty() {
             return Ok((0, 0));
         }
-        let placeholders = vec!["?"; old.len()].join(", ");
         let conn = self.conn.lock().expect("poisoned");
         let tx = conn.unchecked_transaction()?;
-        let mut moving = vec![&local as &dyn rusqlite::ToSql];
-        moving.extend(old.iter().map(|d| *d as &dyn rusqlite::ToSql));
-        // OR IGNORE skips a row whose slug the current DID already holds
-        // (`UNIQUE(sequencer_did, slug)`) and moves the rest.
-        let moved = tx.execute(
-            &format!(
-                "UPDATE OR IGNORE channels SET sequencer_did = ?1
-                  WHERE sequencer_did IN ({placeholders})"
-            ),
-            moving.as_slice(),
-        )?;
+        // Newest DID first, one at a time: where two earlier DIDs hold one
+        // slug, the newer one's channel is the one clients reached by it
+        // last, so it takes the slug. OR IGNORE skips a row whose slug the
+        // current DID already holds (`UNIQUE(sequencer_did, slug)`).
+        let mut moved = 0;
+        for did in old.iter().rev() {
+            moved += tx.execute(
+                "UPDATE OR IGNORE channels SET sequencer_did = ?1 WHERE sequencer_did = ?2",
+                params![local, did],
+            )?;
+        }
+        let placeholders = vec!["?"; old.len()].join(", ");
         let stuck: i64 = tx.query_row(
             &format!("SELECT COUNT(*) FROM channels WHERE sequencer_did IN ({placeholders})"),
             rusqlite::params_from_iter(old.iter()),
@@ -3158,6 +3161,40 @@ mod tests {
             "a second boot moves nothing more"
         );
         assert_eq!(store.adopt_predecessor_sequencers(&[]).unwrap(), (0, 0));
+    }
+
+    /// Two earlier DIDs hold one slug and the current one none: the newer
+    /// DID's channel, the one clients reached by the slug last, takes it.
+    #[test]
+    fn of_two_earlier_dids_with_one_slug_the_newer_ones_channel_takes_it() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for (id, sequencer) in [
+            ("bafy_older", "did:jig:zFirst"),
+            ("bafy_newer", "did:jig:zSecond"),
+        ] {
+            let mut c = sample_channel(id, "#general");
+            c.sequencer_did = sequencer.to_string();
+            store.upsert_channel(&c).unwrap();
+        }
+        store.adopt_local_sequencer("did:jig:zNow").unwrap();
+        let predecessors = ["did:jig:zFirst".to_string(), "did:jig:zSecond".to_string()];
+        assert_eq!(
+            store.adopt_predecessor_sequencers(&predecessors).unwrap(),
+            (1, 1)
+        );
+        assert_eq!(
+            store.get_channel_by_slug("#general").unwrap().unwrap().id,
+            "bafy_newer"
+        );
+        assert_eq!(
+            store
+                .get_channel_by_id("bafy_older")
+                .unwrap()
+                .unwrap()
+                .sequencer_did,
+            "did:jig:zFirst",
+            "kept, by id"
+        );
     }
 
     /// JEP-0005 rule 1: a slug is unique only per sequencer. A carried
