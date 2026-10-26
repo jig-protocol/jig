@@ -966,7 +966,20 @@ async fn handle_client_frame(
                 Err(e) => {
                     let (status, code, message) =
                         crate::v0_0_2_ingest_error::classify_ingest_error(&e);
-                    let _ = send_error(socket, Some(status.as_u16()), code, None, &message).await;
+                    // Name the block refused. A client can have a subscribe
+                    // and several submits in flight on one connection, and a
+                    // refused subscribe also answers with an `Error`; the CID
+                    // is what tells this refusal apart (`Ack` carries it too).
+                    let ref_cid = BlockBundle {
+                        manifest_bytes: &manifest_bytes,
+                        code_bytes: &code_bytes,
+                        resources: vec![],
+                    }
+                    .block_cid()
+                    .ok()
+                    .map(|cid| cid.to_string());
+                    let _ =
+                        send_error(socket, Some(status.as_u16()), code, ref_cid, &message).await;
                 }
             }
             Ok(())
@@ -1386,7 +1399,9 @@ mod tests {
         let reply_env: Envelope = serde_json::from_str(&reply).unwrap();
         match reply_env.frame {
             Frame::Ack { block_cid } => {
-                assert!(!block_cid.is_empty(), "ack must carry a block_cid");
+                // The CID the sender computes: clients match an answer to
+                // its submit by it.
+                assert_eq!(block_cid, block.cid(), "ack must carry the block's CID");
             }
             other => panic!("expected Ack, got {other:?}"),
         }
@@ -1424,8 +1439,14 @@ mod tests {
         };
         let reply_env: Envelope = serde_json::from_str(&reply).unwrap();
         match reply_env.frame {
-            Frame::Error { status, code, .. } => {
+            Frame::Error {
+                status,
+                code,
+                ref_cid,
+                ..
+            } => {
                 assert_eq!(code, "INVALID_SIG");
+                assert_eq!(ref_cid.as_deref(), Some(block.cid().as_str()));
                 // Pins the number actually on the wire. Both Frame::Error
                 // consumers currently drop `status`, so without this nothing in
                 // the system would notice a wrong value.
@@ -1470,10 +1491,13 @@ mod tests {
                 status,
                 code,
                 message,
-                ..
+                ref_cid,
             } => {
                 assert_eq!(code, "UNKNOWN_CHANNEL");
                 assert_eq!(status, Some(404));
+                // Names the block it refuses, so a client can tell this
+                // answer from a refused subscribe's.
+                assert_eq!(ref_cid.as_deref(), Some(block.cid().as_str()));
                 assert!(message.contains("#gigeu"), "must name the slug: {message}");
                 assert!(
                     message.contains("jig channel create"),
