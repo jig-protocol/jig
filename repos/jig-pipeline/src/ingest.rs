@@ -1160,13 +1160,6 @@ pub fn channel_slug_of(kind: BlockKind, manifest: &jig_core::BlockManifest) -> O
         .and_then(|v| v.as_str())
 }
 
-/// The metadata key under which a block of `kind` names its channel. See
-/// [`channel_slug_of`]; exposed for callers that peek at raw metadata.
-/// Whether this is the server's own write into its manifest log, which then
-/// skips the kind whitelist. Refuses everything else under the reserved
-/// slugs, and a `server-manifest` anywhere else or one that does not decode:
-/// only the server's DID writes its log, and only its channel-create and
-/// `server-manifest` blocks.
 /// Keep this server's clock at or after the clock its newest record was
 /// signed with: the store may have moved it past the reading ingest took
 /// ([`crate::persist`]'s `sequence_on`).
@@ -1177,6 +1170,13 @@ fn witness_record(ctx: &IngestContext, record: Option<&crate::ingest_record::Ing
     }
 }
 
+/// The metadata key under which a block of `kind` names its channel. See
+/// [`channel_slug_of`]; exposed for callers that peek at raw metadata.
+/// Whether this is the server's own write into its manifest log, which then
+/// skips the kind whitelist. Refuses everything else under the reserved
+/// slugs, and a `server-manifest` anywhere else or one that does not decode:
+/// only the server's DID writes its log, and only its channel-create and
+/// `server-manifest` blocks.
 fn manifest_log_write(
     ctx: &IngestContext,
     kind: BlockKind,
