@@ -874,6 +874,9 @@ pub async fn ingest(
                     got: from_epoch,
                 });
             }
+            if let crate::persist::Landing::Landed(record) = &landing {
+                witness_record(ctx, record.as_ref());
+            }
         }
         // A membership or share block whose authority rests on a role: its
         // effect, block and record land in one transaction, and only if the
