@@ -39,7 +39,8 @@
 #                      posting on the same tick, so each server takes its
 #                      own client's posts and the other server's relayed ones
 #                      into the channel at the same moment
-#   SOAK_WRITERS       concurrent: writers per side (default 4)
+#   SOAK_WRITERS       concurrent: writers per side (default 16; 4 did not
+#                      reach #347's race in two minutes)
 #   SOAK_RESTART_EVERY seconds between server restarts (default 0: none)
 #   SOAK_RESTART_SIDE  b (default), a, or alternate: which server restarts
 #   SOAK_A_RESTART_CMD remote: command that restarts server A (e.g. over ssh)
@@ -80,7 +81,7 @@ RESTART_SIDE="${SOAK_RESTART_SIDE:-b}"
 FED_PATH="${SOAK_PATH:-legacy}"
 SETUP="${SOAK_CONTRACT_SETUP:-isolated}"
 INGEST="${SOAK_INGEST:-paced}"
-WRITERS="${SOAK_WRITERS:-4}"
+WRITERS="${SOAK_WRITERS:-16}"
 case "$FED_PATH" in legacy | contract) ;; *) echo "SOAK_PATH is legacy or contract" >&2; exit 1 ;; esac
 case "$SETUP" in isolated | steady) ;; *) echo "SOAK_CONTRACT_SETUP is isolated or steady" >&2; exit 1 ;; esac
 case "$RESTART_SIDE" in a | b | alternate) ;; *) echo "SOAK_RESTART_SIDE is a, b or alternate" >&2; exit 1 ;; esac

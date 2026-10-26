@@ -13,6 +13,7 @@ The summary names the servers A and B only, never their URLs.
 
 import csv
 import os
+import re
 import sys
 
 
@@ -166,10 +167,12 @@ def main():
         lines.append(f"- {side.upper()}: " + (f"verified up to record {max(seqs)}" if seqs
                                               else "not checked (the client holds no chain pin for the channel)"))
     for e in evidence:
-        lines.append(f"- Evidence kept on {e['side'].upper()}: `{e['code']}` ({e['status']}): {e['reason']}")
+        reason = re.sub(r"\b\w+://\S+", "(server)", e["reason"])
+        lines.append(f"- Evidence kept on {e['side'].upper()}: `{e['code']}` ({e['status']}): {reason}")
     if read_errors:
-        lines.append(f"- {len(read_errors)} read(s) refused on a contradiction; the first: "
-                     f"{read_errors[0]['error']}")
+        # Counted, not quoted: the client's message names the server's URL.
+        lines.append(f"- {len(read_errors)} read(s) refused on a contradiction "
+                     "(read-errors.tsv has the messages)")
     lines.append("")
     # A send can fail while a server is restarting; with none injected,
     # any failed send is the system refusing work.

@@ -55,7 +55,7 @@ at setup, naming that collision, until it is fixed.
 ## Concurrent ingest
 
 `SOAK_INGEST=concurrent` (legacy path only) runs `SOAK_WRITERS` writers on
-each side (4 by default), and every writer on both sides posts on the same
+each side (16 by default), and every writer on both sides posts on the same
 tick. Each server then orders its own client's posts and the other server's
 relayed ones into the channel at the same moment. Every read holds the page
 to the chain of signed ingest records the reader pinned for the channel; a
@@ -143,6 +143,12 @@ Latency is the first sighting minus the send time, so its resolution is
   relayed to it: a `channel-share` relayed from A makes B log its own
   `contract-refuse`. A share then delivers nothing. `SOAK_CONTRACT_SETUP=steady`
   shows it.
+- **Concurrent ingest signed a clock that ran backwards (fixed by #347).**
+  With 16 writers a side posting on the same tick, a build without #347
+  signed record 605 with an older clock than record 604 within two minutes.
+  Alice's client kept the proof (`chain-clock-backwards`) and refused her
+  own server from then on, so every later send from A failed. With 4 writers
+  a side the race did not show in two minutes: use 16 or more.
 - **The warm-up exists for the same reason.** Before sending, the harness
   waits until a post crosses each way, re-posting until one does. Posts made
   before both links are up would otherwise be lost the same way.
