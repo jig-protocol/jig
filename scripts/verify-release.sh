@@ -134,7 +134,13 @@ ok "all $listed assets match the signed SHA256SUMS"
 
 # --- 5. the key install.sh pins ----------------------------------------------------
 
-pinned="$(bash -c "$(grep '^JIG_RELEASE_SIGNER=' "$dl/install.sh"); printf '%s' \"\$JIG_RELEASE_SIGNER\"")"
+# Read as text, never run: the line must be exactly the default form below,
+# with a plain ed25519 key, or it fails.
+line="$(grep -c '^JIG_RELEASE_SIGNER=' "$dl/install.sh" || true)"
+[ "$line" = 1 ] || fail "the release's install.sh sets JIG_RELEASE_SIGNER on $line lines, not one"
+# shellcheck disable=SC2016 # the ${...} is matched literally, not expanded
+pinned="$(sed -n 's/^JIG_RELEASE_SIGNER="\${JIG_RELEASE_SIGNER:-\(jig-release namespaces=\\"jig-release\\" ssh-ed25519 AAAA[A-Za-z0-9+/]*=\{0,2\}\)}"$/\1/p' "$dl/install.sh" | sed 's/\\"/"/g')"
+[ -n "$pinned" ] || fail "the release's install.sh does not pin a plain ed25519 key in the expected form"
 [ "$pinned" = "$(cat "$ALLOWED_SIGNERS")" ] \
   || fail "the release's install.sh pins a different key from .github/release/allowed_signers"
 ok "install.sh pins the release key"
