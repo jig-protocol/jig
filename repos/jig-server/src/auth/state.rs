@@ -180,15 +180,21 @@ impl AuthState {
         self.admission.banned_dids.contains(did)
     }
 
+    /// Read both rate limits' time from `clock`: tests hold it still, so a
+    /// rate test sees exactly the configured burst and refill.
+    pub fn set_rate_clock(&self, clock: &super::rate::ManualClock) {
+        for rate in [&self.did_rate, &self.ip_rate].into_iter().flatten() {
+            rate.set_clock(clock.clone());
+        }
+    }
+
     /// Gate 2, then the DID's rate: what every read, subscription and write
     /// runs on the identity gate 1 verified. Admission first, so a refused
     /// caller spends nothing and learns nothing about its rate.
     pub fn admit_and_charge(&self, did: &str) -> Result<(), GateOutcome> {
         self.admit(did)?;
         match &self.did_rate {
-            Some(rate) if !rate.try_take(did, std::time::Instant::now()) => {
-                Err(GateOutcome::RateLimited)
-            }
+            Some(rate) if !rate.take(did) => Err(GateOutcome::RateLimited),
             _ => Ok(()),
         }
     }
@@ -197,7 +203,7 @@ impl AuthState {
     pub fn charge_ip(&self, ip: std::net::IpAddr) -> bool {
         self.ip_rate
             .as_ref()
-            .is_none_or(|rate| rate.try_take(&ip.to_string(), std::time::Instant::now()))
+            .is_none_or(|rate| rate.take(&ip.to_string()))
     }
 
     /// Gate 2 for `did`, which must be the identity gate 1 VERIFIED — never
@@ -222,9 +228,7 @@ impl AuthState {
                 view.proven = true;
                 admit(did, &view, &admit_all)?;
                 match &self.did_rate {
-                    Some(rate) if !rate.try_take(did, std::time::Instant::now()) => {
-                        Err(GateOutcome::RateLimited)
-                    }
+                    Some(rate) if !rate.take(did) => Err(GateOutcome::RateLimited),
                     _ => Ok(()),
                 }
             }

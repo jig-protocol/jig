@@ -8,14 +8,42 @@
 //! whoever is flooding the table a fresh burst.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 pub struct RateLimiter {
     burst: f64,
     per_second: f64,
     max_tracked: usize,
     buckets: Mutex<HashMap<String, Bucket>>,
+    /// Real time unless a test set one.
+    clock: OnceLock<ManualClock>,
+}
+
+/// A clock a test holds still and moves by hand, so that it sees exactly the
+/// burst and refill it configured however slow the machine running it.
+#[derive(Clone)]
+pub struct ManualClock(Arc<Mutex<Instant>>);
+
+impl ManualClock {
+    /// A clock that stands still until [`ManualClock::advance`] moves it.
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    pub fn now(&self) -> Instant {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn advance(&self, by: Duration) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) += by;
+    }
+}
+
+impl Default for ManualClock {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -42,7 +70,20 @@ impl RateLimiter {
             per_second: f64::from(per_second),
             max_tracked: max_tracked.max(1),
             buckets: Mutex::new(HashMap::new()),
+            clock: OnceLock::new(),
         })
+    }
+
+    /// Read the time from `clock` instead of the real one. Once only: false
+    /// if a clock was already set.
+    pub fn set_clock(&self, clock: ManualClock) -> bool {
+        self.clock.set(clock).is_ok()
+    }
+
+    /// Take one token for `key` now, by this limiter's clock.
+    pub fn take(&self, key: &str) -> bool {
+        let now = self.clock.get().map_or_else(Instant::now, ManualClock::now);
+        self.try_take(key, now)
     }
 
     /// Take one token for `key` at `now`. False when its bucket is empty, or
@@ -76,7 +117,6 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn a_burst_then_the_refill_rate() {
@@ -108,6 +148,19 @@ mod tests {
         // Once both have idled back to full, they can be forgotten.
         let later = t0 + Duration::from_secs(5);
         assert!(limiter.try_take("new", later));
+    }
+
+    #[test]
+    fn a_manual_clock_moves_only_when_told() {
+        let limiter = RateLimiter::new(1, 1000, 10).unwrap();
+        let clock = ManualClock::new();
+        assert!(limiter.set_clock(clock.clone()));
+        assert!(limiter.take("a"));
+        // At 1000/s, 20 ms of real time would refill twenty.
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!limiter.take("a"), "real time passing refills nothing");
+        clock.advance(Duration::from_millis(1));
+        assert!(limiter.take("a"), "a millisecond on the clock refills one");
     }
 
     #[test]
