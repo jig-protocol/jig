@@ -145,12 +145,12 @@ async fn post_channel_op(base: &str, suffix: &str, block: &BuiltBlock) -> Result
         .with_context(|| format!("POST {url}"))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = jig_client::limits::error_text(resp).await;
         return Err(ChannelOpError { url, status, body }.into());
     }
-    resp.json()
+    jig_client::limits::json_capped(resp, jig_client::limits::MAX_DOCUMENT_BYTES)
         .await
-        .with_context(|| format!("decoding {url} response"))
+        .with_context(|| format!("reading the {url} response"))
 }
 
 // ============================================================================
@@ -794,13 +794,13 @@ pub async fn list(ctx: &CliContext) -> Result<()> {
         anyhow::bail!(
             "GET {url} returned {}: {}",
             resp.status(),
-            resp.text().await.unwrap_or_default()
+            jig_client::limits::error_text(resp).await
         );
     }
-    let body: ChannelsResponse = resp
-        .json()
-        .await
-        .context("decoding /api/v1/channels response")?;
+    let body: ChannelsResponse =
+        jig_client::limits::json_capped(resp, jig_client::limits::MAX_DOCUMENT_BYTES)
+            .await
+            .context("reading the /api/v1/channels response")?;
     print_channels(&body.channels);
     Ok(())
 }
