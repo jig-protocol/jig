@@ -72,6 +72,10 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
    - A new `channel-create` without `tier` that would be `open` with `none` MUST be refused
      (`UNKNOWN_TIER`). Otherwise an old client would create a `public` channel without the label
      or the confirmation that rule 5 requires.
+   - A server that implements this JEP advertises the `tiers` feature in its `welcome`
+     capabilities (JEP-0002). A client MUST NOT send a `channel-create` with `tier` `server` or
+     `shared` to a server that does not advertise it: such a server ignores `tier`, reads the
+     channel as `open`, and admits any authenticated joiner.
 2. **The tier is fixed for the channel's life**, like its suite (JEP-0001). Changing a tier
    means creating a new channel. A server MUST refuse any block that would change a
    channel's tier, `channel-promote` included.
@@ -87,6 +91,10 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
    channel, with words to the effect of "anyone, including the server operator, can read
    this". A client MUST ask the creator to confirm before it signs a `public`
    `channel-create`. A server MAY refuse `public` channels by policy.
+   - A client that implements this JEP requests the `tiers` capability in its `hello`
+     (JEP-0002). A server MUST refuse a content block in a `public` channel from a connection
+     that did not request it (`TIER_UNSUPPORTED`). An older client cannot show the label, so it
+     may read a `public` channel but not post to it.
 6. **System channels are `public`.** The server's own channels under the reserved `#jig/`
    prefix carry what anyone must be able to verify. Today that is the manifest log
    (`#jig/manifest`). Key links stay where they are, at `/.well-known/jig` and in the welcome.
@@ -107,9 +115,10 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
    moment the join is checked. It is not carried to other servers.
 10. **Join roles are not capacity pools.** JEP-0008 rule 21's pools (members, invited and
     strangers) decide how much capacity a caller gets. The roles here decide who may join a
-    channel. A `member` is in JEP-0008's member pool. A `guest` counts as a stranger for capacity
-    (JEP-0008 rule 22) and as a guest for joining. A server MUST NOT admit to a join a DID its
-    capacity pools refuse at that moment.
+    channel. A `member` is in JEP-0008's member pool. A `guest` is in whichever other pool
+    JEP-0008 puts it: the invited pool if it was admitted on an invite, the stranger pool
+    otherwise (JEP-0008 rules 21 and 22). Either way it is a `guest` for joining. A server MUST
+    NOT admit to a join a DID its capacity pools refuse at that moment.
 
 ## 3. Joining
 
@@ -118,8 +127,9 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
     `restricted`.
 12. **`server`:** the `channel-create` block carries `join`, either `member` (the default) or
     `guest`, the lowest server role that may join. A joiner joins itself with an MLS external
-    commit, carried in a `member-add` block it signs for itself. The server, acting as
-    delivery service:
+    commit, carried in a `member-add` block it signs for itself. The role check stands in for
+    JEP-0005 rule 7b's `membership` right, which a self-join does not need (rule 37). The server,
+    acting as delivery service:
     - MUST check the joiner's server role (section 2) against `join` before it accepts the
       commit;
     - MUST validate the external commit against the group's public state, as it does today
@@ -133,22 +143,30 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
     server's roles count) or `granted` (a follower's roles count too).
     - A self-join through a follower is relayed only under a `member` grant (JEP-0005 rule
       7a).
-    - The follower checks the joiner's role on the follower, and the owner checks that the
-      follower holds the grant and that `join_servers` is `granted`.
-    - The owner MUST refuse a relayed self-join that fails either check.
+    - The follower MUST check the joiner's role on the follower (rule 9) before it relays the
+      self-join. The owner cannot check that role: it is the follower's local judgement.
+    - The owner MUST check that the follower holds the grant and that `join_servers` is
+      `granted`, and MUST refuse a relayed self-join that fails either. It also validates the
+      external commit, as in rule 12.
+    - The owner trusts the follower's role decision. That trust is what the `member` grant
+      means; an owner that stops trusting a follower withdraws the grant.
     - The servers whose members may self-join are exactly those holding a `member` grant. The
       grant is signed by the owner per channel and per follower, and changes with a new offer,
       so the creation block lists no servers.
 14. **`public`:** anyone the server admits reads it. Who may post is the existing write gate
     (membership and roles); nothing is encrypted.
 15. **Leaving and removal** are unchanged: a `member-remove` block, by the member or by a DID
-    with the `membership` right, with its MLS commit.
+    with the `membership` right. In the encrypted tiers it carries an MLS commit. In `public`
+    there is no group, so membership blocks carry no commit: membership there decides who may
+    post (rule 14), not who reads, and removal stops only posting.
 
 ## 4. History
 
-16. **By default, a joiner reads from the epoch it joins.** MLS gives a new member no key for
-    earlier epochs, and jig adds nothing that would.
-17. **Re-sharing history is reserved.** A later JEP MAY specify a `history-share` mechanism,
+16. **In the encrypted tiers, by default, a joiner reads from the epoch it joins.** MLS gives a
+    new member no key for earlier epochs, and jig adds nothing that would. A `public` channel's
+    whole history is readable by anyone the server admits.
+17. **Re-sharing history is reserved,** for the encrypted tiers only; `public` needs none. A
+    later JEP MAY specify a `history-share` mechanism,
     within these constraints, which this JEP fixes now:
     - Only a client re-shares: a member's device, or an agent the owner runs as a member of
       the channel with its own DID. The server MUST NOT re-share, and holds nothing it could
@@ -158,8 +176,9 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
     - The channel's creation block states whether re-sharing is allowed (`history`: `none`, the
       default, or `members-may-share`). A client MUST NOT re-share history from a channel whose
       creation block says `none`.
-    - Re-sharing travels encrypted to the joiner alone: in the channel at the joiner's epoch,
-      or in a `private` channel with the joiner.
+    - Re-sharing travels encrypted to the joiner alone, in a `private` channel whose members
+      are the re-sharing client and the joiner, such as their 1:1. It MUST NOT be sent in the
+      channel itself, where every member at that epoch would receive it.
 
     The block kind `history-share` and the creation field `history` are reserved.
 
@@ -262,7 +281,13 @@ reads no encrypted tier.
     - Rule 6, the terms of the contract, adds `tier`, `join`, `join_servers`, `history`,
       `from_dm` and `successor_of` to the creation block's fields, fixed for the channel's life.
       `history`, `from_dm` and `successor_of` are reserved by this JEP.
+    - Rule 7b: a `member-add` whose signer is the DID it adds, carrying an MLS external commit,
+      to a `server` or `shared` channel, is authorized by the role check of rule 12 or 13
+      instead of the `membership` right. Every other membership block still needs the right.
     - Rule 7a's `member` grant also covers relayed self-joins (rule 13).
+    - An owner MUST NOT offer a `shared` channel to a follower whose manifest does not
+      advertise the `tiers` feature (rule 1). Such a follower would read the channel as `open`
+      and relay self-joins without a role check.
     - `shared` and `public` channels may be offered under a contract; `private` and `server`
       channels may not.
     - **`public` channels federate under contracts** (DJ, 2026-10-25), once F2's first phase has
@@ -287,6 +312,10 @@ abuse), PV-04 (non-deniability), AB-06 (abuse in encrypted channels).
 - **The server learns who joins, not what is said.** Checking a role on a self-join reveals the
   joiner's DID and time to the operator, as membership blocks already do. It reveals no
   content (OP-04, accepted).
+- **A follower decides its own members' roles.** Under a `member` grant, the owner accepts a
+  follower's self-joins on the follower's word (rule 13). A hostile follower can admit anyone
+  to a `shared` channel with `join_servers = granted`. The owner limits this by granting
+  `member` only to followers it trusts, and members see each join as below.
 - **A hostile server can refuse a join, or admit one it should have refused.** Admitting a DID
   that does not hold the role exposes future content to that DID. Members see every join as a
   signed `member-add` with its MLS commit, so a member's client SHOULD surface joins and MAY
@@ -317,9 +346,11 @@ abuse), PV-04 (non-deniability), AB-06 (abuse in encrypted channels).
   pair (rule 18). The replacement is rule 19's new linked group. A legacy `#dm/` channel that
   already has three or more members stays `private`, and rule 18 refuses any further add to it.
 - **Old clients cannot tell the tiers apart.** In particular they do not show the `public`
-  label, which is a reason to ship the client change first.
-- **Old servers ignore `tier`** and fall back to `visibility`. A `server`-tier channel on an old
-  server admits any authenticated joiner, as `open` does today, which is `join = guest`.
+  label, so a server refuses their posts to `public` channels (rule 5) and they can only read
+  them.
+- **Old servers ignore `tier`** and fall back to `visibility`, so a `server` or `shared`
+  channel on one would admit any authenticated joiner. Clients and owners therefore create or
+  offer those tiers only to servers that advertise `tiers` (rules 1 and 37).
 
 # Reference Implementation
 
@@ -337,6 +368,7 @@ To be added with the implementation:
 - a legacy-channel mapping table, including `#jig/manifest` mapped to `public`;
 - a `member-add` to a `#dm/` channel: the pair's other DID accepted, a third DID refused;
 - a self-join refused for a role below `join`.
+- a post to a `public` channel refused on a connection without the `tiers` capability.
 
 # LLM Influence
 
