@@ -22,8 +22,8 @@ whose signer is not that DID.
 The JEP amends JEP-0002 in three ways:
 - a client proves its DID once per WebSocket connection, bound to the handshake transcript;
 - a REST write carries a request proof by the signer, as REST reads already do;
-- the exemptions are named: relayed and carried blocks, server-originated blocks, and
-  bridges, which submit as their own DID.
+- the exemptions are named: relayed and carried blocks, and server-originated blocks,
+  in-process bridges among them, which may sign only as the DIDs they have registered.
 
 It also sets the rollout.
 
@@ -144,31 +144,42 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 
 ## 6. Bridges
 
-15. **A bridge submits as its own DID.**
-    - A bridge holds its own key. Every block it submits is signed by that DID, and its
-      submitter is that DID. An in-process bridge's submitter is the DID in its
-      registration; an out-of-process bridge proves it as a client does.
-    - Content a bridge carries in from outside is signed by the bridge. The outside sender
-      is named in the content, not as a signer.
-    - This matches JEP-0014 rule 27: a bridge is a visible member under its own DID.
-16. A bridge MUST NOT submit a block signed by a DID it does not hold. Today's email bridge
-    signs as a per-sender shadow DID it derives. Under rule 15 it signs as the bridge DID
-    instead, and names the sender in the block.
+15. **An in-process bridge is part of the server.** Every bridge today runs in the server's
+    process and submits through its `BridgeContext` (`IngestSource::Bridge`). Its
+    submissions are not local submissions, for the same reason as the server's own blocks
+    (rule 14): no client session carries them.
+    - The server MUST refuse a bridge submission whose signer is not a DID that bridge has
+      registered as its own (`ManagedDidRegistrar`). This is the declared delegation the
+      server already keeps, so it routes those DIDs' deliveries to the bridge.
+    - Per-sender shadow DIDs, such as the email bridge's, keep working, and so does
+      per-sender attribution.
+16. **An out-of-process bridge uses a declared delegation.** A bridge that connects to a
+    server as a client proves its own DID like any client (rules 6 and 10). It MAY submit
+    blocks signed by another DID only if the server's config lists that bridge DID as
+    allowed to submit for the DIDs it custodies (open question 1). The submitter is then the bridge DID, and rule 4 is met when the signer is the
+    submitter or a DID in its custody. Admission and limits for such a block apply to both
+    the signer and the bridge.
+17. A bridge is a visible member under its own DID wherever it carries content in or out
+    of an encrypted channel (JEP-0014 rule 27). The DIDs it custodies are listed with it.
 
 ## 7. Compatibility and rollout
 
-17. A server that implements this JEP advertises the `authenticated-writes` feature in its
-    `welcome` capabilities (JEP-0002). A client that sees it sends `client_did` and
-    `client_proof`, and request proofs on REST writes.
-18. Rollout has three steps, each in a release note:
+18. A client that implements this JEP requests the `authenticated-writes` feature in its
+    `hello` capabilities. A server that implements it includes the feature in its signed
+    `welcome` only when the `hello` requested it, and the client then sends `client_did`
+    and `client_proof`, and request proofs on REST writes.
+    - The server MUST NOT add the feature to a `welcome` the `hello` did not ask for. An old
+      client checks the `welcome` signature over bytes it rebuilds from the fields it knows,
+      so any unrecognised field in a signed `welcome` makes the signature fail for it.
+19. Rollout has three steps, each in a release note:
     1. **Report.** Servers verify `client_proof` and REST write proofs when present, and
        count local submissions that would fail rule 4. They refuse nothing new. Clients
        send the proofs.
     2. **Enforce by default.** `[auth] require_authenticated_writes` defaults to `true`. An
        operator MAY set it to `false` for one release, to give old clients time.
     3. **Always.** The option is removed.
-19. **Timing (DJ, 2026-10-26):** designed now; built after F2 phase 1 and before R2.4.
-20. Operators of servers that are not open to the public SHOULD meanwhile set
+20. **Timing (DJ, 2026-10-26):** designed now; built after F2 phase 1 and before R2.4.
+21. Operators of servers that are not open to the public SHOULD meanwhile set
     `[auth.admission] unknown_dids` to `"proof-of-work"` or `"refuse"`.
 
 # Security Considerations (Zero-Trust)
@@ -190,19 +201,24 @@ OP-09 (federation abuse), GV-03 (penalty propagation without consent or evidence
   `peer_proof`).
 - **Ruleset penalties.** GV-03 requires evidence for a penalty. A penalty for a local
   submission can now cite a submission the penalized DID provably made.
-- **Bridges.** A bridge's writes are its own (rule 15). Abuse that arrives through a bridge
-  is charged to the bridge's DID and its operator, not to a DID the bridge invented.
+- **Bridges.** An in-process bridge may sign only as DIDs it has registered with the server
+  (rule 15), and an out-of-process bridge only as itself or as DIDs its declared delegation
+  names (rule 16). Abuse that arrives through a bridge is charged to the bridge and its
+  operator as well as to the signer.
 
 # Backwards Compatibility
 
 - **Old clients** submit without `client_proof` or REST write proofs. They keep working
   through rollout step 1. From step 2 they are refused with `AUTH_REQUIRED` unless the
   operator turns enforcement off, and from step 3 they must upgrade.
-- **Old servers** do not know `client_proof`. A client MUST NOT send `client_did` or
-  `client_proof` to a server whose `welcome` does not advertise `authenticated-writes`
-  (rule 17). It submits to such a server as it does today.
-- **The email bridge** changes signer (rule 16). Blocks it already wrote keep their shadow
-  signers.
+- **Old clients and the `welcome`.** A server adds `authenticated-writes` to its `welcome`
+  only when the `hello` asks for it (rule 18), so an old client never sees a field it would
+  drop before checking the signature.
+- **Old servers** do not know `client_proof`, and do not echo the feature. A client MUST
+  NOT send `client_did` or `client_proof` to a server whose `welcome` does not include
+  `authenticated-writes` (rule 18). It submits to such a server as it does today.
+- **Bridges** are unchanged. The email bridge runs in-process, and its shadow DIDs are
+  already registered with the server (rule 15).
 - **Subscriptions** are unchanged (rule 9).
 
 # Reference Implementation
@@ -235,18 +251,27 @@ Drafted with an LLM coding assistant from DJ's decisions of 2026-10-26 and the c
   The binding belongs to the session, not the block.
 - **Prove per submit frame instead of per connection.** One proof per connection, bound to
   the transcript, does the same work with one signature.
-- **Let a bridge sign as the outside sender's shadow DID.** The bridge holds those keys, so
-  the signatures only restate the bridge's word. They also make bridged content look like
-  native members' content.
+- **Make every bridge sign as itself.** Per-sender shadow DIDs would give way to one bridge
+  DID, and bridged content would lose its per-sender attribution, which per-sender
+  admission, limits and reports rely on. A declared delegation (rules 15 and 16) binds the
+  bridge just as well and keeps attribution.
 
 # Open Questions
 
-1. **Bridged attribution.** How a bridged block names the outside sender (a content field,
-   or a signed claim by the bridge), and how franking (JEP-0010) treats it.
+1. **The custody rule for an out-of-process bridge.** How a server's config states which
+   DIDs a bridge custodies (an explicit list, or a derivation such as the email bridge's
+   shadow DIDs), and whether the delegation is also published, for example in the server's
+   manifest, so other servers can see it.
 2. **Subscriptions on a proven connection.** Whether a proven connection can drop the
    per-subscription proof (rule 9).
 3. **Multi-author blocks.** Whether a co-authored block needs every author's session or
    only the signer's. Rule 4 requires only the signer's.
+4. **Verifying the `welcome` over its received bytes.** Rule 18's request-then-sign step is
+   needed only because a client checks the `welcome` signature over bytes rebuilt from the
+   fields it parsed. If JEP-0002 instead had a client verify the signature over the
+   canonical bytes it received, a server could add fields that old clients ignore while
+   still checking the signature. Later features would not need this step. That is a change
+   to JEP-0002 rule 2 and its implementation, outside this JEP.
 
 # Copyright
 
