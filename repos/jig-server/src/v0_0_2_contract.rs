@@ -1003,7 +1003,7 @@ fn list(store: &SqliteStore) -> anyhow::Result<String> {
     if offers.is_empty() {
         return Ok("no contract offers".to_string());
     }
-    Ok(offers
+    let mut lines = offers
         .iter()
         .map(|o| {
             format!(
@@ -1016,8 +1016,16 @@ fn list(store: &SqliteStore) -> anyhow::Result<String> {
                 o.channel_id
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n"))
+        .collect::<Vec<_>>();
+    // A carried channel that cannot take its owner's next record, and why
+    // (deploy/README.md, "A stalled carried channel").
+    lines.extend(
+        store
+            .carried_stalls()?
+            .iter()
+            .map(|stall| format!("stalled: {stall}")),
+    );
+    Ok(lines.join("\n"))
 }
 
 /// The one offer whose hex id starts with `prefix`.
@@ -2687,6 +2695,106 @@ mod tests {
         .await;
         let on_a = m.text(&m.a, &elsewhere, "from a").await.unwrap();
         eventually("a's post on b", || Mutual::held(&m.b, &on_a).then_some(())).await;
+    }
+
+    /// Two peers that each have their own `#general`: the relay lands `a`'s
+    /// posts, which name the channel by slug as clients post them, in `b`'s
+    /// own `#general`. Once `b` follows `a`'s, `a`'s chain names a block `b`
+    /// holds in its own channel. `b` leaves it there, stalls, and says so.
+    #[tokio::test]
+    async fn a_same_slug_channel_stalls_the_carried_one_visibly() {
+        let m = mutual().await;
+        // Made by another user: the same author's create of the same slug is
+        // the same block, so the same channel.
+        let ours = post(
+            &m.b,
+            &SigningKey::from_bytes(&rand::random()),
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#general"}),
+        )
+        .await
+        .unwrap();
+        let channel = post(
+            &m.a,
+            &m.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#general"}),
+        )
+        .await
+        .unwrap();
+        let text = post(
+            &m.a,
+            &m.user,
+            BlockKind::TextRender,
+            serde_json::json!({"channel": "#general", "body": "by slug"}),
+        )
+        .await
+        .unwrap();
+        eventually("a's post in b's own #general", || {
+            Mutual::held(&m.b, &text).then_some(())
+        })
+        .await;
+        let b_store = &m.b.ingest_ctx.store;
+        assert_eq!(
+            b_store
+                .get_block(&text)
+                .unwrap()
+                .unwrap()
+                .channel_id
+                .as_deref(),
+            Some(ours.as_str())
+        );
+
+        post(
+            &m.a,
+            &m.user,
+            BlockKind::ChannelShare,
+            serde_json::json!({
+                "channel_id": channel,
+                "to": m.b.server_did.to_did_jig_string(),
+                "grant": "read",
+            }),
+        )
+        .await
+        .unwrap();
+        let a_did = m.a.server_did.to_did_jig_string();
+        eventually("the share accepted", || {
+            b_store
+                .has_accepted_share(&channel, &a_did)
+                .unwrap()
+                .then_some(())
+        })
+        .await;
+        m.b_follows.stream.pull_all();
+        let stall = eventually("the stall", || b_store.carried_stalls().unwrap().pop()).await;
+        assert_eq!(
+            (
+                stall.channel_id.as_str(),
+                stall.seq,
+                stall.block_cid.as_str()
+            ),
+            (channel.as_str(), 1, text.as_str())
+        );
+        assert_eq!(stall.holder, ours);
+        // `b`'s own channel keeps its block, and its chain still names it.
+        assert_eq!(
+            b_store
+                .get_block(&text)
+                .unwrap()
+                .unwrap()
+                .channel_id
+                .as_deref(),
+            Some(ours.as_str())
+        );
+        assert_eq!(b_store.get_ingest_record(&text).unwrap().unwrap().seq, 1);
+        // An operator sees it without reading logs.
+        let listed = operate(b_store, Operation::List).unwrap();
+        assert!(
+            listed.contains(&format!(
+                "stalled: channel {channel} stalled at seq 1: block {text} is held in channel {ours}"
+            )),
+            "{listed}"
+        );
     }
 
     /// A share the relay brings is refused: it is a request to the channel's

@@ -847,6 +847,46 @@ passthrough) without terminating it.
 
 ---
 
+## A stalled carried channel
+
+A channel this server follows for another server (an accepted share) can
+stall. That happens when the owner's chain names a block this server already
+holds in one of **its own** channels. One block belongs to one channel, so the
+owner's record for it cannot land. Nothing is moved and nothing is deleted:
+this server's channel keeps the block and its history, and the carried channel
+takes nothing past that record.
+
+**When it happens.** Both servers have a channel with the same name, say
+`#general`, and they were peered before the share. Clients post by channel
+name, so the federation relay lands each server's posts in the other's
+same-name channel. Share one of them, and the carried channel stalls at the
+first post the relay brought across. Two servers peered under v0.2.0-alpha.2
+that each have a `#general` will hit this on the first share of it.
+
+**How to confirm it.**
+
+- `jig-server contracts list` ends with one line per stalled channel:
+  `stalled: channel <id> stalled at seq <n>: block <cid> is held in channel <id>`.
+- The log has a WARN, `a carried channel is stalled`, with `channel_id`, `seq`,
+  `block_cid`, `holder` and the owner's DID as `sequencer`. It repeats each time
+  the owner sends that record again.
+
+**What to do.** There is no safe way to fix it in place yet. Moving the block
+into the carried channel breaks your own channel's chain, which still names
+it. Deleting it does the same. Your options:
+
+- **Leave it.** The carried channel shows everything up to the stall. Your own
+  channel is untouched.
+- **End the share** with `jig-server contracts end <offer>` (the offer id is in
+  `contracts list`). This server stops following the channel. What it already
+  carried stays readable.
+- **Avoid it.** Before sharing a channel, ask the peer's operator whether their
+  server has a channel of its own with the same name. If it has, don't share
+  that channel yet.
+
+A carried channel that can hold a block this server also holds elsewhere is
+planned for after v0.2.0-alpha.3.
+
 ## Gotchas worth knowing before they cost you an evening
 
 - **`jig-nameserver serve --bind/--port` ARE honoured**, and they win over both
