@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Summarise a two-host-soak.sh run as Markdown. Exits 1 if a message was
-lost or a server failed the end-of-run check.
+lost or seen only past the deadline, if a send failed in a run with no
+restarts, if nothing was delivered at all, or if a server failed the
+end-of-run check.
 
 Usage: summarize.py OUT RUN_ID MODE DURATION INTERVAL POLL DEADLINE
                     RESTART_EVERY FINAL_OK PATH RESTART_SIDE
@@ -78,6 +80,9 @@ def main():
         "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     lost_total = 0
+    late_total = 0
+    errors_total = 0
+    delivered_total = 0
     hourly = {}
     for sender, reader in (("a", "b"), ("b", "a")):
         mine = [s for s in sends if s["side"] == sender]
@@ -104,6 +109,9 @@ def main():
                 lost += 1
                 bucket[1] += 1
         lost_total += lost
+        late_total += late
+        errors_total += errors
+        delivered_total += len(latencies) - late
         lines.append(
             f"| {sender.upper()} → {reader.upper()} | {len(ok)} | {errors} | "
             f"{len(latencies)} | {late} | {lost} | {unver} | "
@@ -139,13 +147,22 @@ def main():
     lines.append(f"Restarts injected: {len(restarts)}. Visibility gaps: {len(gaps)}. "
                  "Ingest counters are per process and start again after a restart.")
     lines.append("")
-    ok = lost_total == 0 and final_ok == "1"
-    verdict = "PASS" if ok else "FAIL"
+    # A send can fail while a server is restarting; with none injected,
+    # any failed send is the system refusing work.
+    restarted = restart_every != "0" or len(restarts) > 0
     reasons = []
     if lost_total:
         reasons.append(f"{lost_total} lost")
+    if late_total:
+        reasons.append(f"{late_total} seen only after the {deadline} s deadline, so lost")
+    if errors_total and not restarted:
+        reasons.append(f"{errors_total} sends failed with no restart injected")
+    if delivered_total == 0:
+        reasons.append("nothing was delivered")
     if final_ok != "1":
         reasons.append("a server failed the end-of-run check")
+    ok = not reasons
+    verdict = "PASS" if ok else "FAIL"
     lines.append(f"**{verdict}**" + (f": {', '.join(reasons)}" if reasons else ""))
     print("\n".join(lines))
     return 0 if ok else 1

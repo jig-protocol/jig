@@ -93,8 +93,13 @@ Everything lands in `SOAK_OUT`, by default `soak-out/RUN_ID`:
 | `summary.md` | The verdict, per direction and per hour. |
 
 The summary names the servers A and B, never their URLs, so it can be shared
-as is. The run exits 1 when any message is lost, or when a server stops
-answering or changes its DID by the end.
+as is. The run exits 1 when:
+
+- any message is lost, including one first seen after `SOAK_DEADLINE`;
+- any send fails in a run with no restarts injected (with restarts, a send
+  can fail while a server is down);
+- nothing was delivered at all;
+- a server stops answering or changes its DID by the end.
 
 Latency is the first sighting minus the send time, so its resolution is
 `SOAK_POLL`.
