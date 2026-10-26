@@ -3,9 +3,11 @@ name: Fuzz
 # cargo-fuzz targets in repos/fuzz, over what jig decodes from the network:
 # dCBOR, COSE and the contract envelopes, IngestRecord, the follower stream's
 # peer frames, the WebSocket envelope, MLS messages, and a block's Wasm
-# component. A pull request touching any of them runs each target briefly;
-# workflow_dispatch runs longer. A crash fails the job and uploads the input
-# that caused it (repos/fuzz/README.md: reproducing a crash).
+# component. A pull request touching any of them runs each target briefly; a
+# weekly run goes longer, so a dependency bump is fuzzed within the week
+# without each one paying for a full build; workflow_dispatch runs as long as
+# asked. A crash fails the job and uploads the input that caused it
+# (repos/fuzz/README.md: reproducing a crash).
 
 on:
   pull_request:
@@ -21,8 +23,10 @@ on:
       - repos/jig-server/src/v0_0_2_stream.rs
       - repos/jig-mls/src/**
       - repos/jig-runtime/src/component.rs
-      - repos/Cargo.lock
       - .github/workflows/fuzz.yml
+  schedule:
+    # Sundays, 03:17 UTC.
+    - cron: '17 3 * * 0'
   workflow_dispatch:
     inputs:
       seconds:
@@ -51,13 +55,16 @@ env:
 
 jobs:
   fuzz:
-    name: fuzz (${{ github.event_name == 'workflow_dispatch' && inputs.seconds || '30' }}s per target)
+    name: fuzz (${{ github.event_name == 'workflow_dispatch' && inputs.seconds || github.event_name == 'schedule' && '300' || '30' }}s per target)
     # Drafts skip it; marking the PR ready for review runs it.
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-24.04
-    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 360 || 45 }}
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 360 || github.event_name == 'schedule' && 90 || 45 }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Nothing after checkout needs the token.
+          persist-credentials: false
       - name: Install nightly
         run: rustup toolchain install "$NIGHTLY" --profile minimal
       - uses: taiki-e/install-action@v2
@@ -80,7 +87,7 @@ jobs:
       - name: Run
         working-directory: repos/fuzz
         env:
-          SECONDS_PER_TARGET: ${{ github.event_name == 'workflow_dispatch' && inputs.seconds || '30' }}
+          SECONDS_PER_TARGET: ${{ github.event_name == 'workflow_dispatch' && inputs.seconds || github.event_name == 'schedule' && '300' || '30' }}
           TARGETS: ${{ inputs.targets }}
         run: |
           set -euo pipefail
