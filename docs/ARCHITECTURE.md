@@ -35,7 +35,7 @@ docs, scripts, the installer and CI.
 | [`jig-nameserver`](../repos/jig-nameserver/) | Verified names: registration with proof-of-work, resolution, rotation; links no Wasm engine | jig-core, jig-config, jig-pipeline, jig-client |
 | [`jig-runtime`](../repos/jig-runtime/) | Runs `jig:block` components on wasmtime under the `jig-det-1` determinism profile | jig-core |
 | [`text-block`](../repos/text-block/) | The canonical text-render block, built as a `jig:block/renderer` component and committed under `artifacts/` | none |
-| [`bridges/core`](../repos/bridges/core/), [`bridges/email`](../repos/bridges/email/) | The bridge trait, and the in-process email bridge | jig-core, jig-client |
+| [`bridges/core`](../repos/bridges/core/), [`bridges/email`](../repos/bridges/email/) | The bridge trait, and the in-process email bridge | core: none; email: bridges/core, jig-core, jig-client |
 | [`integration-tests`](../repos/integration-tests/) | Starts real servers and nameservers on loopback; the `h*` tests are end-to-end scenarios | everything |
 | [`jig-spec`](../repos/jig-spec/) | The specification (mdBook), JEPs, schemas, vectors and WIT. Not a workspace member | — |
 
