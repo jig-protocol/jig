@@ -158,7 +158,11 @@ the DID's ed25519 key ([`credential.rs`](../repos/jig-mls/src/credential.rs) bin
   [`v0_0_2_contract.rs`](../repos/jig-server/src/v0_0_2_contract.rs)). A follower then takes the
   owner's blocks and records on the follower stream described above. The peer policy is published
   in the signed server manifest ([`server_manifest.rs`](../repos/jig-pipeline/src/server_manifest.rs)).
-- **Not built yet:** writes relayed under a grant, and MLS channels across servers. The follower
+- **Writes through a follower** ([`v0_0_2_relay.rs`](../repos/jig-server/src/v0_0_2_relay.rs)): a
+  client writing to a channel its server carries for the owner has the write relayed to the owner,
+  if the share's grant covers it. The owner runs it through `ingest` as a relayed write, and the
+  block comes back on the follower stream with the owner's record.
+- **Not built yet:** MLS channels across servers. The follower
   stream refuses MLS channels. The build plan is
   [`2026-10-19-f2-channel-contract.md`](superpowers/plans/2026-10-19-f2-channel-contract.md).
 
