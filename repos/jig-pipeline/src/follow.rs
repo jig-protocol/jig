@@ -263,7 +263,22 @@ impl SqliteStore {
             }
             None => {}
         }
-        crate::persist::insert_block_on(&tx, block)?;
+        // A block held already belongs to a relayed copy this server set
+        // aside ([`SqliteStore::quarantine_relayed_copy`]): one CID is one
+        // block, so the owner's chain takes it back into the channel.
+        let held: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM blocks WHERE cid = ?1)",
+            [&block.cid],
+            |r| r.get(0),
+        )?;
+        if held {
+            tx.execute(
+                "UPDATE blocks SET channel_id = ?2 WHERE cid = ?1",
+                params![block.cid, channel_id],
+            )?;
+        } else {
+            crate::persist::insert_block_on(&tx, block)?;
+        }
         tx.execute(
             "INSERT INTO ingest_records (block_cid, channel_id, seq, record) VALUES (?1, ?2, ?3, ?4)",
             params![record.block_cid, channel_id, record.seq as i64, record_bytes],

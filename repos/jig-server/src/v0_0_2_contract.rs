@@ -163,27 +163,32 @@ fn handle(state: &AppState) -> Contracts {
     contracts
 }
 
-/// Drop this server's relayed copy of `channel_id`, if it holds one, now that
-/// it follows the channel's owner for it: the owner's stream lands the
-/// channel again from its first block, in the owner's order.
-fn drop_relayed_copy(store: &SqliteStore, channel_id: &str) {
-    match store.drop_relayed_copy(channel_id) {
-        Ok(true) => tracing::info!(
+/// Set aside this server's relayed copy of `channel_id`, if it holds one,
+/// now that it follows the channel's owner for it: the owner's stream lands
+/// the channel under its own id, from its first block, in the owner's order.
+/// The copy is kept, whole ([`SqliteStore::quarantine_relayed_copy`]).
+fn quarantine_relayed_copy(store: &SqliteStore, channel_id: &str) {
+    match store.quarantine_relayed_copy(channel_id) {
+        Ok(Some(copy)) => tracing::warn!(
             channel_id,
-            "dropped the federation relay's copy of a channel this server now follows"
+            copy_id = copy.copy_id,
+            slug = copy.slug,
+            own_blocks = copy.own_blocks,
+            "set aside the federation relay's copy of a channel this server now follows; \
+             blocks this server's users posted in it stay in the copy"
         ),
-        Ok(false) => {}
+        Ok(None) => {}
         Err(e) => tracing::warn!(
             channel_id,
-            "the relayed copy of a followed channel was not dropped: {e:#}"
+            "the relayed copy of a followed channel was not set aside: {e:#}"
         ),
     }
 }
 
 /// At boot: a server that accepted a share while it held the relay's copy of
 /// the channel (before this was handled) sequences a copy of a channel it
-/// follows, and its stream refuses the owner's every record. Drop each such
-/// copy, so the stream lands the channel again. Report the copies left: the
+/// follows, and its stream refuses the owner's every record. Set each such
+/// copy aside, so the stream lands the channel. Report the copies left: the
 /// relay keeps one of each open channel of a peer, until it is shared.
 fn repair_relayed_copies(store: &SqliteStore) {
     let copies = match store.relayed_copies() {
@@ -197,17 +202,19 @@ fn repair_relayed_copies(store: &SqliteStore) {
     for channel_id in &copies {
         if store.is_followed(channel_id).unwrap_or(false) {
             followed += 1;
-            tracing::warn!(
-                channel_id,
-                "this server sequenced a copy of a channel it follows; dropping it"
-            );
-            drop_relayed_copy(store, channel_id);
+            quarantine_relayed_copy(store, channel_id);
         }
+    }
+    if followed > 0 {
+        tracing::warn!(
+            followed,
+            "set aside relayed copies of channels this server follows"
+        );
     }
     if copies.len() > followed {
         tracing::info!(
             copies = copies.len() - followed,
-            "channels held as federation relay copies; sharing one replaces its copy"
+            "channels held as federation relay copies; sharing one sets its copy aside"
         );
     }
 }
@@ -633,7 +640,7 @@ impl Contracts {
         }
         // A channel of this server's own under the offered id: it cannot
         // follow another sequencer for it. A copy the federation relay made
-        // is not one; accepting replaces it.
+        // is not one; accepting sets it aside.
         let local = self.store().local_sequencer().to_string();
         let owned_here = self
             .store()
@@ -668,7 +675,7 @@ impl Contracts {
             OfferState::Accepted,
             Some(&accept.envelope),
         )?;
-        drop_relayed_copy(self.store(), &offer.channel_id.to_string());
+        quarantine_relayed_copy(self.store(), &offer.channel_id.to_string());
         Ok(accept.envelope)
     }
 
@@ -2403,6 +2410,47 @@ mod tests {
         fn held(state: &AppState, cid: &str) -> bool {
             state.ingest_ctx.store.get_block(cid).unwrap().is_some()
         }
+
+        /// A post in `channel` that only `b` holds, as its own user's.
+        fn own_post(&self, channel: &str) -> String {
+            use ed25519_dalek::Signer as _;
+            let manifest_bytes = BlockManifest::builder()
+                .version(semver::Version::new(0, 1, 0))
+                .author(Author {
+                    did: did_of(&self.user).into(),
+                    public_key: None,
+                    roles: vec![],
+                })
+                .metadata_entry("channel_id", serde_json::json!(channel))
+                .metadata_entry("body", serde_json::json!("only on b"))
+                .build()
+                .unwrap()
+                .with_kind(BlockKind::TextRender)
+                .to_canonical_bytes()
+                .unwrap();
+            let bundle_bytes = serde_json::to_vec(&(&manifest_bytes, &Vec::<u8>::new())).unwrap();
+            let cid = crate::v0_0_2_federation::peer_block_cid(&bundle_bytes).unwrap();
+            self.b
+                .ingest_ctx
+                .store
+                .insert_block(&StoredBlock {
+                    cid: cid.clone(),
+                    channel_id: Some(channel.to_string()),
+                    block_kind: BlockKind::TextRender.as_str().to_string(),
+                    sender_did: did_of(&self.user),
+                    sender_sig: self.user.sign(&bundle_bytes).to_bytes().to_vec(),
+                    bundle_bytes,
+                    is_synthetic: false,
+                    hlc_wall_ms: 0,
+                    hlc_logical: 0,
+                    hlc_origin: String::new(),
+                    posted_at: 0,
+                    origin_server: self.b.server_url.clone(),
+                    federated_from: None,
+                })
+                .unwrap();
+            cid
+        }
     }
 
     /// The collision this guards against: the relay landed `a`'s channel on
@@ -2422,6 +2470,9 @@ mod tests {
         .await
         .unwrap();
         let first = m.text(&m.a, &channel, "before the share").await.unwrap();
+        // A post only `b` holds: its user posted it in `b`'s copy, and `a`
+        // never took it (stored as such, as a lost relay leaves it).
+        let own = m.own_post(&channel);
         eventually("the relay's copy on b", || {
             Mutual::held(&m.b, &first).then_some(())
         })
@@ -2461,10 +2512,19 @@ mod tests {
         })
         .await;
 
-        // `b` never acted as the owner: no offer of its own, and its copy is
-        // gone, to be replaced by `a`'s chain.
+        // `b` never acted as the owner, and its copy is set aside, whole,
+        // under its own id: `a`'s chain lands under the channel's.
         let b_store = &m.b.ingest_ctx.store;
         assert!(b_store.relayed_copies().unwrap().is_empty());
+        let copy_id = jig_pipeline::ingest_record::label_cid(&format!("relayed-copy:{channel}"));
+        let copy = b_store.get_channel_by_id(&copy_id).unwrap().unwrap();
+        assert!(copy.slug.starts_with("#jig/relayed-"), "{}", copy.slug);
+        let kept = b_store.quarantined_records(&copy_id).unwrap();
+        assert_eq!(
+            kept.len(),
+            2,
+            "b's records of its copy, kept: the create and the first post"
+        );
         for state in [OfferState::Held, OfferState::Accepted, OfferState::Refused] {
             assert!(
                 b_store
@@ -2528,6 +2588,12 @@ mod tests {
             "no refusal of b's in a's log: {kinds:?}"
         );
         assert_eq!(kinds_in(&m.b, &channel).len(), kinds.len());
+        // What `a` never took stays in the copy; what `a`'s chain landed
+        // came back into the channel.
+        let own_block = b_store.get_block(&own).unwrap().unwrap();
+        assert_eq!(own_block.channel_id.as_deref(), Some(copy_id.as_str()));
+        let back = b_store.get_block(&first).unwrap().unwrap();
+        assert_eq!(back.channel_id.as_deref(), Some(channel.as_str()));
 
         let mut relayed_any = Vec::new();
         while let Ok((block, _)) = relayed_rx.try_recv() {
@@ -2606,9 +2672,10 @@ mod tests {
     }
 
     /// A server that accepted a share while it held the relay's copy (as one
-    /// running the release before this fix did) drops the copy at boot.
+    /// running the release before this fix did) sets the copy aside at boot,
+    /// keeping all of it.
     #[tokio::test]
-    async fn a_forked_copy_is_dropped_at_boot() {
+    async fn a_forked_copy_is_set_aside_at_boot() {
         let m = mutual().await;
         let followed = post(
             &m.a,
@@ -2646,10 +2713,22 @@ mod tests {
             })
             .unwrap();
 
-        let create = m.a.ingest_ctx.store.get_block(&followed).unwrap().unwrap();
+        let from_a_store = m.a.ingest_ctx.store.get_block(&followed).unwrap().unwrap();
+        let records = store
+            .list_ingest_records_by_id(&followed, 0, 100)
+            .unwrap()
+            .len();
         repair_relayed_copies(store);
         assert!(store.get_channel_by_id(&followed).unwrap().is_none());
-        assert!(!Mutual::held(&m.b, &followed));
+        let copy_id = jig_pipeline::ingest_record::label_cid(&format!("relayed-copy:{followed}"));
+        assert!(store.get_channel_by_id(&copy_id).unwrap().is_some());
+        assert_eq!(store.quarantined_records(&copy_id).unwrap().len(), records);
+        let create = store.get_block(&followed).unwrap().unwrap();
+        assert_eq!(
+            create.channel_id.as_deref(),
+            Some(copy_id.as_str()),
+            "kept, aside"
+        );
 
         // Until the owner's stream lands it again, the relay cannot bring the
         // copy back (a catch-up replays a peer's channels from their start).
@@ -2662,8 +2741,8 @@ mod tests {
         crate::v0_0_2_federation::ingest_peer_block(
             &m.b,
             &from_a,
-            &base64::Engine::encode(&b64, &create.bundle_bytes),
-            Some(&base64::Engine::encode(&b64, &create.sender_sig)),
+            &base64::Engine::encode(&b64, &from_a_store.bundle_bytes),
+            Some(&base64::Engine::encode(&b64, &from_a_store.sender_sig)),
             "replayed",
         )
         .await

@@ -358,6 +358,39 @@ mod tests {
         );
     }
 
+    /// A follower that carried a channel as the federation relay's copy, then
+    /// follows it from its owner, serves the owner's records under the same
+    /// channel and seqs (jig-server sets the copy aside on the accept). A
+    /// client that pinned the copy's records cannot make the follower out to
+    /// have contradicted itself: the two chains are signed by two keys.
+    #[test]
+    fn a_new_sequencer_for_a_channel_proves_nothing_against_the_old_one() {
+        let (mut copy, mut owner) = (Seq::new(), Seq::new());
+        let channel = label_cid("bafyCreate");
+        let pinned = [copy.push("bafyCreate", 10), copy.push("bafyPost", 20)];
+        let landed = [owner.push("bafyCreate", 10), owner.push("bafyPost", 30)];
+
+        // Held to the follower's key, as a client holds its server's.
+        let mut chain = ChannelChain::new(&channel, &copy.did(), None);
+        for record in &pinned {
+            chain.accept(record, None).unwrap();
+        }
+        let broke = chain.accept(&landed[1], None).unwrap_err();
+        assert!(matches!(broke, ChainBreak::Unsigned(_)), "{broke}");
+        assert!(!broke.is_signed_proof());
+        assert!(chain.proof(&landed[1], &broke).is_none());
+
+        // Held to the owner's key, over the pinned head: the two records
+        // differ at seq 1, but the head is not the owner's, so no proof
+        // built from them verifies.
+        let mut chain = ChannelChain::new(&channel, &owner.did(), chain.head().cloned());
+        let broke = chain.accept(&landed[1], None).unwrap_err();
+        let proof = chain
+            .proof(&landed[1], &broke)
+            .expect("a rewrite, on its face");
+        assert!(proof.verify().is_err());
+    }
+
     #[test]
     fn a_skipped_entry_is_a_gap_to_fill_not_a_contradiction() {
         let mut server = Seq::new();
