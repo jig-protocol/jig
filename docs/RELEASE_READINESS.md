@@ -44,6 +44,9 @@ channel is closed and proven by fault injection at each gate, and an operator ca
 now refuse and rate-limit callers; what remains is scoring and the tier-1
 fast path, not the absence of a model.
 
+**Hardening:** operators should set `[auth.admission] unknown_dids = "proof-of-work"` (or
+`"refuse"`) on servers that are not open to the public.
+
 ### 1.2 `visibility = "restricted"` is enforced
 
 | | |
