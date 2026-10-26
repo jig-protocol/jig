@@ -1,0 +1,65 @@
+name: Operator drills
+
+# deploy/README.md's procedures, run as written on a runner with systemd as
+# PID 1 (scripts/drills/run-drills.sh): install the units and seal both keys
+# with deploy/setup-server-key.sh (systemd credential + offline passphrase),
+# verify the deploy, check MemoryDenyWriteExecute on both units, back up with
+# jig-backup.service, wipe the machine down to its host credential key, then
+# restore onto it and check that the DIDs and a user's pins still hold.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - deploy/**
+      - scripts/drills/**
+      - repos/jig-server/src/main.rs
+      - repos/jig-nameserver/src/main.rs
+      - repos/jig-core/src/keystore.rs
+      - repos/jig-client/src/server_key.rs
+      - repos/jig-nameserver/src/config.rs
+      - repos/jig-config/**
+      - .github/workflows/operator-drills.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: operator-drills-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  drills:
+    name: install, MDWE, backup → restore onto a fresh machine
+    # Drafts skip it; marking the PR ready for review runs it.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The drills run as root; nothing after checkout needs the token.
+          persist-credentials: false
+      - name: Install Rust toolchain
+        working-directory: repos
+        run: rustup toolchain install --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: repos
+          # The same release build as install-smoke's.
+          key: install-smoke
+      - name: Build
+        working-directory: repos
+        env:
+          CARGO_INCREMENTAL: '0'
+        run: |
+          # jig-nameserver alone, so it links no wasmtime (see release.yml):
+          # MemoryDenyWriteExecute on its unit depends on it.
+          cargo build --release --locked -p jig-server -p jig-cli
+          cargo build --release --locked -p jig-nameserver
+      - name: Drills
+        run: sudo --preserve-env=GITHUB_STEP_SUMMARY scripts/drills/run-drills.sh repos/target/release
+      - name: Journals
+        if: failure()
+        run: sudo journalctl -u jig-server -u jig-nameserver -u jig-backup --no-pager | tail -200
