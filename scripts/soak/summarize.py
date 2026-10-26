@@ -56,6 +56,8 @@ def main():
     chain = rows(out, "chain.tsv")
     read_errors = rows(out, "read-errors.tsv")
 
+    # Concurrent writers append out of order: the run starts at the earliest.
+    start_ms = min((int(s["sent_ms"]) for s in sends), default=0)
     first_seen = {}
     for r in seen:
         key = (r["sender"], int(r["seq"]))
@@ -102,7 +104,7 @@ def main():
         for s in ok:
             key = (sender, int(s["seq"]))
             sent_ms = int(s["sent_ms"])
-            hour = (sent_ms - int(sends[0]["sent_ms"])) // 3_600_000
+            hour = (sent_ms - start_ms) // 3_600_000
             bucket = hourly.setdefault((sender, hour), [0, 0, []])
             bucket[0] += 1
             if key in first_seen:
@@ -186,6 +188,12 @@ def main():
         reasons.append(f"{len(evidence)} contradiction(s) kept as evidence ({', '.join(codes)})")
     elif read_errors:
         reasons.append(f"{len(read_errors)} read(s) refused on a contradiction")
+    # The concurrent mode exists to hold the chain to account: a side that
+    # verified none of it checked nothing.
+    if writers > 1:
+        for side in ("a", "b"):
+            if not any(c["side"] == side for c in chain):
+                reasons.append(f"{side.upper()}'s client verified none of the channel's signed history")
     if final_ok != "1":
         reasons.append("a server failed the end-of-run check")
     ok = not reasons
