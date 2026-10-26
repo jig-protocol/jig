@@ -744,6 +744,49 @@ new identity.
 
 ---
 
+## Federation: sharing a channel with another server
+
+Two servers federate only if each lists the other under `[[federation.peers]]`
+(see `config.example.toml`), with the other's `/.well-known/jig` `server_did`
+as `expected_did`. Restart both after editing.
+
+To carry a channel on the other server (JEP-0005), so its users can read it
+there in this server's order:
+
+1. **The channel's owner, or an admin with the `share` right**, on this
+   server:
+
+   ```sh
+   jig channel share '#team' did:jig:<other server> --grant read
+   ```
+
+   `--grant` is `read`, `write` or `member` (JEP-0005 rule 7a). The server
+   checks the signer's right, and refuses a share naming a server that is not
+   one of its peers: the refusal shows in the channel as `NOT_A_PEER`.
+2. **The other server's operator** accepts the offer:
+
+   ```sh
+   sudo -u jig /opt/jig/bin/jig-server --config /etc/jig/config.toml contracts list
+   sudo -u jig /opt/jig/bin/jig-server --config /etc/jig/config.toml contracts accept <offer-id>
+   ```
+
+   As `jig`, not root: the command writes to the server's database. The
+   running server acts on it within 5 seconds. Skip this step by setting
+   `offers = "accept"` in that server's peer entry for this one. `contracts
+   refuse <offer-id>` turns an offer down.
+3. **Users of the other server** read the channel by its id, which `jig channel
+   share` prints: `jig read <channel-id>`. A slug names a channel only on the
+   server that orders it, so `jig read '#team'` there finds nothing.
+
+`jig channel unshare '#team' did:jig:<other server>` (or `contracts end
+<offer-id>` on either server) ends the share. This server stops sending at
+once. The other server keeps the copy it holds and lands nothing after.
+
+Today, only open, unencrypted channels can be shared, and the other server
+does not yet relay writes back: its users post on this server.
+
+---
+
 ## The nameserver
 
 The binary serves the alias API and its discovery documents. The legacy routes
