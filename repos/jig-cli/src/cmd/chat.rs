@@ -31,21 +31,20 @@ use jig_core::HlcTimestamp;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     io::{Stdout, stdout},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::sync::mpsc;
 
 use crate::cmd::chat_view::{ChatState, Message, drain_inbound, render, submit_failure_status};
 use crate::cmd::common::CliContext;
-use crate::cmd::display::{bell_on_inbound, connection_lost, fell_behind};
+use crate::cmd::display::{bell_on_inbound, connection_lost};
+use crate::cmd::follow::{self, Feed, Follower, Live};
 
 /// Decoded lines waiting for the pane. Past this the pump waits, and the
 /// subscription's own queue (`jig_client::connection::SUBSCRIPTION_QUEUE`)
-/// takes the overflow until it ends the stream as lagged.
+/// takes the overflow until it ends the stream as lagged, and the follower
+/// catches up from history.
 const CHAT_QUEUE: usize = 256;
 use crate::cmd::reader::Reader;
 
@@ -108,64 +107,68 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
     // Configs + a PathBuf) and keeps `main.rs` free of Arc bookkeeping.
     let ctx = Arc::new(ctx.clone());
 
-    // Fetch history BEFORE the terminal goes into raw mode: any warning
-    // from a server without the history endpoint has to print as ordinary
-    // text, not into the alternate screen we would otherwise already own.
-    // On an encrypted channel the reader replays it through the MLS session.
+    // Connect and fetch history BEFORE the terminal goes into raw mode: any
+    // warning from a server without the history endpoint has to print as
+    // ordinary text, not into the alternate screen we would otherwise
+    // already own. On an encrypted channel the reader replays it through the
+    // MLS session.
     let reader = Arc::new(Reader::open(&ctx, &args.channel).await?);
-    let (backlog, tidy) = reader.backlog(&id, &server_url).await?;
-    reader.tidy(tidy);
-
     let client = crate::cmd::secure::connect_pinned(&server_url, id)
         .await
         .with_context(|| format!("connecting to {server_url}"))?;
     let client = Arc::new(client);
 
-    let mut stream = client
-        .subscribe_channel(&args.channel)
-        .await
-        .with_context(|| format!("subscribing to {}", args.channel))?;
+    // Subscribe before reading the backlog: anything posted meanwhile queues
+    // on the stream, and the follower skips what the backlog already showed.
+    let feed = Live {
+        client: client.clone(),
+        server_url: server_url.clone(),
+        slug: args.channel.clone(),
+    };
+    let stream = feed.subscribe().await?;
+    let backlog = reader.backlog(client.identity(), &server_url).await?;
+    reader.tidy(backlog.tidy);
+    let mut follower = Follower::new(
+        feed,
+        stream,
+        reader.clone(),
+        &args.channel,
+        backlog.deliveries,
+    );
 
     // Pump inbound blocks into a queue the render loop drains each tick, so
     // a burst from the server can't starve user input. Bounded: when the
     // pane falls behind, the pump waits, the subscription's own queue fills,
-    // and the stream ends as lagged rather than this process holding
-    // whatever the server sends.
+    // and the follower catches up from history rather than this process
+    // holding whatever the server sends. Why it stopped, when it does, is
+    // left in `ended` for the render loop to report.
     let (msg_tx, mut msg_rx) = mpsc::channel::<Message>(CHAT_QUEUE);
-    let lagged = Arc::new(AtomicBool::new(false));
-    let lagged_for_stream = lagged.clone();
-    let reader_for_stream = reader.clone();
+    let ended = Arc::new(Mutex::new(None::<anyhow::Error>));
+    let ended_by_follower = ended.clone();
     tokio::spawn(async move {
-        while let Some(block) = stream.next().await {
-            match reader_for_stream.read(&block) {
-                Ok(read) => {
-                    if let Some(did) = read.tidy {
-                        reader_for_stream.tidy(vec![did]);
-                    }
-                    let Some(decoded) = read.line else {
-                        continue;
-                    };
-                    if msg_tx.send(decoded.into()).await.is_err() {
-                        break;
-                    }
-                }
+        loop {
+            let message = match follower.next().await {
+                Ok(follow::Event::Line(decoded)) => decoded.into(),
+                // Surface the decoder error as a synthetic message so the
+                // operator sees that something arrived but couldn't be
+                // parsed.
+                Ok(follow::Event::Unreadable(e)) => Message {
+                    sender: "<decode-error>".into(),
+                    body: e,
+                    ts: 0,
+                    parity_warning: false,
+                },
+                // The pane shows the lines; how they arrived is no news.
+                Ok(follow::Event::CaughtUp { .. }) => continue,
                 Err(e) => {
-                    // Surface the decoder error as a synthetic message
-                    // so the operator sees that something arrived but
-                    // couldn't be parsed. v0.0.2 is single-server so
-                    // this is essentially never reached.
-                    let _ = msg_tx
-                        .send(Message {
-                            sender: "<decode-error>".into(),
-                            body: format!("{e}"),
-                            ts: 0,
-                            parity_warning: false,
-                        })
-                        .await;
+                    *ended_by_follower.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                    break;
                 }
+            };
+            if msg_tx.send(message).await.is_err() {
+                break;
             }
         }
-        lagged_for_stream.store(stream.lagged(), Ordering::SeqCst);
     });
 
     // Submit failures travel on their own channel: `msg_tx` belongs to the
@@ -181,7 +184,7 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
 
     let mut state = ChatState::with_history(
         args.channel.clone(),
-        backlog,
+        backlog.lines,
         ctx.effective().contacts.clone(),
     );
 
@@ -194,7 +197,7 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
         &client,
         &ctx,
         &reader,
-        &lagged,
+        &ended,
     )
     .await;
 
@@ -220,7 +223,7 @@ async fn event_loop(
     client: &Arc<Client>,
     ctx: &Arc<CliContext>,
     reader: &Arc<Reader>,
-    lagged: &AtomicBool,
+    ended: &Mutex<Option<anyhow::Error>>,
 ) -> Result<()> {
     loop {
         // Drain any inbound messages before redrawing so we paint the
@@ -239,10 +242,8 @@ async fn event_loop(
             // Paint the backlog we just drained before tearing the TUI down,
             // so the last messages are not lost with the connection.
             terminal.draw(|f| render(f, state)).context("draw frame")?;
-            if lagged.load(Ordering::SeqCst) {
-                return Err(fell_behind(&state.channel));
-            }
-            return Err(connection_lost(&state.channel));
+            let why = ended.lock().unwrap_or_else(|p| p.into_inner()).take();
+            return Err(why.unwrap_or_else(|| connection_lost(&state.channel)));
         }
 
         terminal.draw(|f| render(f, state)).context("draw frame")?;

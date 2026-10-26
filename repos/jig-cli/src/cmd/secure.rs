@@ -26,9 +26,9 @@ use crate::cmd::common::CliContext;
 use crate::cmd::history::{DEFAULT_HISTORY_LIMIT, history_url, parse_history};
 
 /// The most a server returns per history request.
-const MAX_HISTORY_PAGE: usize = 200;
+pub(crate) const MAX_HISTORY_PAGE: usize = 200;
 /// Pages of older history to fetch before giving up on catching up.
-const MAX_CATCH_UP_PAGES: usize = 50;
+pub(crate) const MAX_CATCH_UP_PAGES: usize = 50;
 
 /// Packages a DID keeps published, so it can be added while offline.
 const KEY_PACKAGE_TARGET: u64 = 10;
@@ -139,6 +139,8 @@ pub struct Synced {
     pub tidy: Vec<String>,
     /// Every block the history held, by CID.
     pub cids: std::collections::HashSet<String>,
+    /// The same blocks by delivery CID, the key a live delivery carries.
+    pub deliveries: Vec<String>,
 }
 
 /// One identity's encrypted-channel state, bound to one server.
@@ -526,7 +528,13 @@ impl Secure {
             }
             None => Vec::new(),
         };
-        Synced { lines, tidy, cids }
+        let deliveries = delivered.iter().map(|d| d.delivery_cid.clone()).collect();
+        Synced {
+            lines,
+            tidy,
+            cids,
+            deliveries,
+        }
     }
 
     /// Build a commit, submit the block carrying it, and merge it once the
