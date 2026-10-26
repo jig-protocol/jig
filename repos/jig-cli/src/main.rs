@@ -246,8 +246,11 @@ enum ChannelAction {
         /// The other server's DID, as its `/.well-known/jig` gives it.
         #[arg()]
         server_did: String,
-        /// `read`, `write` or `member`: what the other server may relay
-        /// back to this one (JEP-0005 rule 7a).
+        /// The grant recorded with the share (JEP-0005 rule 7a). Under any
+        /// grant the other server carries the whole channel; the grant says
+        /// what it may later relay back here: `read`, only protocol
+        /// traffic; `write`, also its users' posts; `member`, also
+        /// membership changes. It relays nothing back yet.
         #[arg(long, value_parser = ["read", "write", "member"])]
         grant: String,
     },
