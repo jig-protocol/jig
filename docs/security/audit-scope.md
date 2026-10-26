@@ -68,7 +68,7 @@ Line counts are approximate and include in-file unit tests.
 | 3 | Key links and chains | A wrong link check hands one server's standing to an attacker's key | ~4k lines | Yes |
 | 4 | Keys at rest | Identity seeds, MLS secrets and the plaintext cache on disk | ~6k lines | Yes |
 | 5 | Proof-of-work and admission | Abuse cost at nameservers and servers; request authentication | ~6k lines | Yes, except capacity pools at servers |
-| 6 | The federation contract and the follower stream | Cross-server trust: a follower carries what the owner sequenced | ~9k lines | No: F2 Tasks 0c and 6 to 11 remain |
+| 6 | The federation contract and the follower stream | Cross-server trust: a follower carries what the owner sequenced | ~9k lines | No: F2 Tasks 0c and 7 to 11 remain |
 | 7 | The Wasm sandbox and receipts | Executes sender-supplied code on the server | ~6k lines | Yes, for the one world that runs (`renderer`) |
 
 ### 3.1 MLS integration and the ciphersuite gate
@@ -344,8 +344,10 @@ cover them.
   did not sequence?
 - Is a fork in the owner's chain always detected, and is the evidence bounded?
 - Can a peer exhaust another server through the stream?
+- Can a follower relay a write the owner should refuse: into a channel it does not share, past
+  its grant, from a banned author, or faster than the owner's limit for it?
 
-**Threat-register rows:** OP-09, OP-06, PV-05, AB-03, PV-01 (accepted).
+**Threat-register rows:** OP-09, OP-06, PV-05, AB-03, AB-07, PV-01 (accepted).
 
 **Entry points.**
 
@@ -361,6 +363,8 @@ cover them.
   - `v0_0_2_contract.rs`: offers and answers;
   - `v0_0_2_peer.rs`: peer frames after the peer proof;
   - `v0_0_2_stream.rs`: the follower stream and its per-peer limits;
+  - `v0_0_2_relay.rs`: writes a follower relays to the owner (JEP-0005 rule 15), and their
+    per-follower, per-channel limit;
   - `v0_0_2_federation.rs`: the older relay of open channels to listed peers.
 
 **Spec:** [JEP-0005](../../repos/jig-spec/jep/jep-0005-channel-federation-contract.md),
@@ -376,8 +380,8 @@ Build plan:
 
 **Out of scope:** federation with an implementation other than jig's. That comes after the MVP.
 
-**Must be code-complete first.** F2 Tasks 6 to 11 must be merged before this area is audited:
-- relayed writes under grants;
+**Must be code-complete first.** F2 Tasks 7 to 11 must be merged before this area is audited
+(relayed writes, Task 6, are merged, #316):
 - MLS channels across servers;
 - custodians;
 - the contract half of a sequencer move;
@@ -498,7 +502,7 @@ Things on our side, in order:
    servers and a nameserver on loopback. The `integration-tests` harness does this already; it
    needs a short README.
 5. **Name a contact** for questions during the engagement, with an agreed response time.
-6. **For Phase 2:** F2 Tasks 0c and 6 to 11, and D11 slices 5 and 10, merged; JEP-0005 and
+6. **For Phase 2:** F2 Tasks 0c and 7 to 11, and D11 slices 5 and 10, merged; JEP-0005 and
    JEP-0002 updated to match.
 
 ## 7. Questions for DJ
