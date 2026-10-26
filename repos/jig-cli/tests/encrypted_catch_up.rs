@@ -7,10 +7,17 @@
 //! messages before it. This runs the real `jig` binary as the device, against
 //! a real server, with an owner posting in-process.
 //!
+//! It runs three ways: against a server that pages history forward
+//! (`after=`) and says so; through a proxy that drops `after` and hides that
+//! it can, as a server from before it does; and through one that says it can
+//! but drops `after`, as a broken or lying server might.
+//!
 //! `HOME` points at a tempdir, so the pin store and MLS state are this test's.
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -122,6 +129,138 @@ async fn say(server: &TestJigServer, m: &Member, slug: &str, text: &str) {
     post(server, "/api/v1/blocks", &block).await;
 }
 
+/// How [`proxy`] stands in for a server.
+#[derive(Clone, Copy, PartialEq)]
+enum Serves {
+    /// Passes everything through: a server that pages forward.
+    Forward,
+    /// Drops `after=` and the `history_after` advertisement: a server from
+    /// before `after`.
+    Old,
+    /// Drops `after=` but keeps the advertisement: it says it pages forward
+    /// and sends the newest page instead.
+    Lying,
+}
+
+/// A proxy in front of `server`, serving as `serves` says, that counts the
+/// requests paging history forward (`after` without `before`). Read proofs
+/// sign the path, not the query, so dropping a parameter breaks nothing
+/// else.
+///
+/// It works on the bytes: each request head is read and its target
+/// rewritten, responses are copied back (with the advertisement renamed,
+/// keeping its length, for [`Serves::Old`]), and a WebSocket upgrade (the
+/// client's handshake) is passed through untouched from then on.
+async fn proxy(server: &TestJigServer, serves: Serves) -> (String, Arc<AtomicUsize>) {
+    let upstream = server.http_url().trim_start_matches("http://").to_string();
+    let forward_pages = Arc::new(AtomicUsize::new(0));
+    let counted = forward_pages.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let (upstream, counted) = (upstream.clone(), counted.clone());
+            tokio::spawn(async move {
+                let _ = relay(client, &upstream, serves, &counted).await;
+            });
+        }
+    });
+    (url, forward_pages)
+}
+
+/// One client connection through [`proxy`].
+async fn relay(
+    client: tokio::net::TcpStream,
+    upstream: &str,
+    serves: Serves,
+    counted: &AtomicUsize,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let up = tokio::net::TcpStream::connect(upstream).await?;
+    let (mut from_client, mut to_client) = client.into_split();
+    let (mut from_up, mut to_up) = up.into_split();
+    tokio::spawn(async move {
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            let n = from_up.read(&mut chunk).await?;
+            if n == 0 {
+                return Ok::<_, std::io::Error>(());
+            }
+            let mut out = chunk[..n].to_vec();
+            if serves == Serves::Old {
+                const FROM: &[u8] = b"\"history_after\":true";
+                const TO: &[u8] = b"\"history_gone_\":true";
+                while let Some(at) = out.windows(FROM.len()).position(|w| w == FROM) {
+                    out[at..at + FROM.len()].copy_from_slice(TO);
+                }
+            }
+            to_client.write_all(&out).await?;
+        }
+    });
+    let ignore_after = serves != Serves::Forward;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        let head_end = loop {
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+            let n = from_client.read(&mut chunk).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+        let lower = head.to_ascii_lowercase();
+        let body_len = lower
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while buf.len() < head_end + body_len {
+            let n = from_client.read(&mut chunk).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let (line, rest) = head.split_once("\r\n").unwrap_or((&head, ""));
+        let mut parts = line.splitn(3, ' ');
+        let (method, target, version) = (
+            parts.next().unwrap_or(""),
+            parts.next().unwrap_or(""),
+            parts.next().unwrap_or(""),
+        );
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        let params: Vec<&str> = query.split('&').filter(|p| !p.is_empty()).collect();
+        let after = params.iter().any(|p| p.starts_with("after="));
+        let before = params.iter().any(|p| p.starts_with("before="));
+        if after && !before {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }
+        let kept: Vec<&str> = params
+            .into_iter()
+            .filter(|p| !(ignore_after && p.starts_with("after=")))
+            .collect();
+        let target = if kept.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{}", kept.join("&"))
+        };
+        to_up
+            .write_all(format!("{method} {target} {version}\r\n{rest}").as_bytes())
+            .await?;
+        to_up.write_all(&buf[head_end..head_end + body_len]).await?;
+        buf.drain(..head_end + body_len);
+        if lower.contains("upgrade: websocket") {
+            to_up.write_all(&buf).await?;
+            tokio::io::copy(&mut from_client, &mut to_up).await?;
+            return Ok(());
+        }
+    }
+}
+
 /// `jig read` as the device, and its output.
 fn read(home: &Path, limit: usize) -> String {
     let out = jig(home)
@@ -134,14 +273,47 @@ fn read(home: &Path, limit: usize) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_away_for_more_than_a_page_reads_every_message() {
+    let forward_pages = away_and_back(Serves::Forward).await;
+    assert!(
+        forward_pages > 0,
+        "the catch-up must page forward from the head on a server that can"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn on_a_server_without_after_the_device_pages_back_and_reads_every_message() {
+    let forward_pages = away_and_back(Serves::Old).await;
+    assert_eq!(
+        forward_pages, 0,
+        "a server that does not advertise `after` must be paged back, never forward"
+    );
+}
+
+/// The advertisement is unsigned: a server that makes it and then sends the
+/// newest page breaks the chain on the first page, and the device pages back
+/// instead, missing nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_that_advertises_after_but_ignores_it_costs_time_not_messages() {
+    let forward_pages = away_and_back(Serves::Lying).await;
+    assert_eq!(
+        forward_pages, 1,
+        "one forward page, refused for breaking the chain, then back"
+    );
+}
+
+/// The device joins, reads, is away for [`AWAY`] messages, and reads again:
+/// every message must show, and none fail to decrypt. Returns how many
+/// history requests paged forward.
+async fn away_and_back(serves: Serves) -> usize {
     let server = TestJigServer::start().await.expect("start");
+    let (url, forward_pages) = proxy(&server, serves).await;
     let owner = Member::new();
 
     let device = tempfile::tempdir().unwrap();
     let out = jig(device.path()).args(["init", "me"]).output().unwrap();
     assert!(out.status.success(), "jig init: {out:?}");
     let out = jig(device.path())
-        .args(["server", "set", &server.http_url()])
+        .args(["server", "set", &url])
         .output()
         .unwrap();
     assert!(out.status.success(), "jig server set: {out:?}");
@@ -190,4 +362,5 @@ async fn a_device_away_for_more_than_a_page_reads_every_message() {
         shown.lines().take(5).collect::<Vec<_>>().join("\n")
     );
     assert!(!shown.contains("cannot decrypt"), "{shown}");
+    forward_pages.load(Ordering::SeqCst)
 }

@@ -128,6 +128,10 @@ struct Groups {
     /// starts after it.
     #[serde(default)]
     heads: HashMap<String, String>,
+    /// `server|slug` → the sequencer's record of the head block, when it has
+    /// one: what a page of history after the head must continue.
+    #[serde(default)]
+    head_records: HashMap<String, crate::chain::ChainHead>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -521,13 +525,31 @@ impl Session {
     }
 
     /// Record that everything in `slug`'s history up to and including the
-    /// block `cid` has been processed.
-    pub fn set_head(&self, server: &str, slug: &str, cid: &str) -> Result<()> {
+    /// block `cid` has been processed. `record` is the sequencer's record of
+    /// that block, when it came with one.
+    pub fn set_head(
+        &self,
+        server: &str,
+        slug: &str,
+        cid: &str,
+        record: Option<&crate::chain::IngestRecord>,
+    ) -> Result<()> {
         let key = group_key(server, slug);
         self.with_member(|_, g| {
-            g.heads.insert(key, cid.to_string());
+            g.heads.insert(key.clone(), cid.to_string());
+            match record {
+                Some(r) => g.head_records.insert(key, crate::chain::ChainHead::of(r)),
+                None => g.head_records.remove(&key),
+            };
             Ok(())
         })
+    }
+
+    /// The sequencer's record of the head block ([`Self::head`]), if it came
+    /// with one.
+    pub fn head_record(&self, server: &str, slug: &str) -> Result<Option<crate::chain::ChainHead>> {
+        let key = group_key(server, slug);
+        self.with_member(|_, g| Ok(g.head_records.get(&key).cloned()))
     }
 
     /// Apply a delivered block to this member's state and say what it meant.
