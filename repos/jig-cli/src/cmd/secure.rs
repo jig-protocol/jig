@@ -300,14 +300,11 @@ impl Secure {
             channels: Vec<ChannelInfo>,
         }
         let listing: Listing = self.get_json("/api/v1/channels").await?;
-        // By its slug, or by its id: a channel this server carries for its
-        // owner is named by id here (a slug names a channel only where it
-        // is ordered).
-        let Some(mut info) = listing
-            .channels
-            .into_iter()
-            .find(|c| c.slug == slug || (!c.id.is_empty() && c.id == slug))
-        else {
+        let ours = Pins::load(&Pins::default_path())?
+            .server(&self.server)
+            .map(|p| p.sequencers())
+            .unwrap_or_default();
+        let Some(mut info) = pick(listing.channels, slug, &ours)? else {
             return Ok(None);
         };
         let pin = self.proven(&info).await?;
@@ -738,6 +735,41 @@ pub fn mls_fields(c: &Commit) -> serde_json::Value {
     v
 }
 
+/// The listed channel `reference` names: the one whose id it is, else the
+/// one this server orders under that slug (`ours`, the server's DIDs). A
+/// slug names a channel only where it is ordered, so a channel this server
+/// carries for its owner is named by its id here, whatever order the listing
+/// is in: a carried channel and this server's own may share a slug.
+fn pick(
+    channels: Vec<ChannelInfo>,
+    reference: &str,
+    ours: &[String],
+) -> Result<Option<ChannelInfo>> {
+    let mut carried = None;
+    let mut by_slug = None;
+    for channel in channels {
+        if !channel.id.is_empty() && channel.id == reference {
+            return Ok(Some(channel));
+        }
+        if channel.slug == reference && by_slug.is_none() {
+            if names_another_server(ours, &channel.sequencer) {
+                carried.get_or_insert(channel);
+            } else {
+                by_slug = Some(channel);
+            }
+        }
+    }
+    match (by_slug, carried) {
+        (Some(own), _) => Ok(Some(own)),
+        (None, Some(c)) => anyhow::bail!(
+            "{reference} here is a channel this server carries for {}; name it by its id, {}",
+            c.sequencer,
+            c.id
+        ),
+        (None, None) => Ok(None),
+    }
+}
+
 fn jig_pipeline_slug(kind: jig_core::BlockKind, m: &jig_core::BlockManifest) -> Option<String> {
     let key = if kind == jig_core::BlockKind::ChannelCreate {
         "slug"
@@ -752,7 +784,47 @@ fn jig_pipeline_slug(kind: jig_core::BlockKind, m: &jig_core::BlockManifest) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::must_encrypt;
+    use super::{ChannelInfo, must_encrypt, pick};
+
+    fn listed(id: &str, slug: &str, sequencer: &str) -> ChannelInfo {
+        ChannelInfo {
+            id: id.to_string(),
+            slug: slug.to_string(),
+            suite: "none".to_string(),
+            sequencer: sequencer.to_string(),
+            share: None,
+        }
+    }
+
+    /// A slug names the channel this server orders, never one it carries,
+    /// whatever order the listing is in; a carried channel is named by id.
+    #[test]
+    fn a_slug_names_the_servers_own_channel_not_a_carried_one() {
+        let ours = vec!["did:jig:zfollower".to_string()];
+        let carried = listed("bafycarried", "#shared", "did:jig:zowner");
+        let own = listed("bafyown", "#shared", "did:jig:zfollower");
+        for listing in [
+            vec![carried.clone(), own.clone()],
+            vec![own.clone(), carried.clone()],
+        ] {
+            let got = pick(listing.clone(), "#shared", &ours).unwrap().unwrap();
+            assert_eq!(got.id, "bafyown");
+            let got = pick(listing, "bafycarried", &ours).unwrap().unwrap();
+            assert_eq!(got.id, "bafycarried");
+        }
+        // Only a carried channel under the slug: refused, naming its id.
+        let error = pick(vec![carried], "#shared", &ours)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bafycarried"), "{error}");
+        // A listing that names no sequencer is the server's own.
+        let legacy = listed("bafylegacy", "#old", "");
+        assert_eq!(
+            pick(vec![legacy], "#old", &ours).unwrap().unwrap().id,
+            "bafylegacy"
+        );
+        assert!(pick(vec![], "#none", &ours).unwrap().is_none());
+    }
 
     /// A server can say anything about a channel's suite. A device that
     /// holds the group never takes its word for "unencrypted" (OP-03).
