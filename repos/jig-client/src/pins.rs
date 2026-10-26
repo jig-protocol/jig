@@ -715,7 +715,10 @@ impl Pins {
     }
 
     /// Hold `slug` on `server` to the server that orders it: `None` for
-    /// `server` itself, else a DID [`prove_carried`] proved. A channel
+    /// `server` itself, else a DID [`prove_carried`] proved for the channel
+    /// `create_cid`. The proof is for that channel only: if `slug` is pinned
+    /// to another creation block, nothing moves and the substitution is
+    /// [`PinError::ChannelReplaced`]. A channel
     /// pinned as `server`'s own may come to be carried for a proven owner
     /// (the server set its own copy aside and follows the owner, JEP-0005):
     /// its chain then starts again from the owner's records, the old head
@@ -725,6 +728,7 @@ impl Pins {
         &mut self,
         server: &str,
         slug: &str,
+        create_cid: &str,
         sequencer: Option<&str>,
     ) -> Result<bool, PinError> {
         self.update(|file| {
@@ -735,6 +739,14 @@ impl Pins {
             else {
                 return Ok((false, false));
             };
+            if pin.create_cid != create_cid {
+                return Err(PinError::ChannelReplaced {
+                    server: server.to_string(),
+                    slug: slug.to_string(),
+                    pinned: pin.create_cid.clone(),
+                    presented: create_cid.to_string(),
+                });
+            }
             match (pin.sequencer.as_deref(), sequencer) {
                 (None, None) => Ok((false, false)),
                 (Some(pinned), Some(presented)) if pinned == presented => Ok((false, false)),
@@ -1972,10 +1984,14 @@ mod tests {
         )
         .unwrap();
         pins.advance_chain(server, "#team", &head).unwrap();
-        assert!(!pins.anchor_channel(server, "#team", None).unwrap());
+        assert!(
+            !pins
+                .anchor_channel(server, "#team", "bafycreate", None)
+                .unwrap()
+        );
 
         assert!(
-            pins.anchor_channel(server, "#team", Some("did:jig:zowner"))
+            pins.anchor_channel(server, "#team", "bafycreate", Some("did:jig:zowner"))
                 .unwrap()
         );
         let pin = pins.channel(server, "#team").unwrap();
@@ -1987,22 +2003,75 @@ mod tests {
         );
         assert!(
             !pins
-                .anchor_channel(server, "#team", Some("did:jig:zowner"))
+                .anchor_channel(server, "#team", "bafycreate", Some("did:jig:zowner"))
                 .unwrap()
         );
 
         // A hostile follower naming itself, or another server.
         assert!(matches!(
-            pins.anchor_channel(server, "#team", None),
+            pins.anchor_channel(server, "#team", "bafycreate", None),
             Err(PinError::SequencerChanged { .. })
         ));
         assert!(matches!(
-            pins.anchor_channel(server, "#team", Some("did:jig:zother")),
+            pins.anchor_channel(server, "#team", "bafycreate", Some("did:jig:zother")),
             Err(PinError::SequencerChanged { .. })
         ));
         assert_eq!(
             pins.channel(server, "#team").unwrap().sequencer.as_deref(),
             Some("did:jig:zowner")
         );
+    }
+
+    /// A follower cannot re-point a pinned slug at another channel with a
+    /// valid proof for that other channel. `#team` is pinned on the follower
+    /// as its own channel Y; the follower then lists `#team` as X, a channel
+    /// it does carry for the owner, with the owner's real offer for X. The
+    /// proof holds for X, but the slug stays bound to Y.
+    #[test]
+    fn a_valid_proof_for_one_channel_cannot_re_point_a_slug_pinned_to_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pins = Pins::load(&dir.path().join("pins.json")).unwrap();
+        let server = "wss://follower";
+        let local = "bafylocalteam".to_string();
+        let pin = |create_cid: &str| ChannelPin {
+            create_cid: create_cid.to_string(),
+            suite: "none".to_string(),
+            owner_did: "did:jig:zuser".to_string(),
+            chain_head: None,
+            sequencer: None,
+        };
+        pins.check_channel(server, "#team", pin(&local)).unwrap();
+
+        let x = carried();
+        let owner = did_of_key(&x.owner);
+        assert_ne!(x.channel_id, local);
+        // The proof is sound for X.
+        assert_eq!(
+            prove_carried(
+                server,
+                "#team",
+                &x.channel_id,
+                &owner,
+                std::slice::from_ref(&x.follower),
+                Some(&x.offer_b64)
+            )
+            .unwrap(),
+            owner
+        );
+        // The creation check refuses X under the slug pinned to Y.
+        assert!(matches!(
+            pins.check_channel(server, "#team", pin(&x.channel_id)),
+            Err(PinError::ChannelReplaced { .. })
+        ));
+        // And so does the anchor, on its own.
+        assert!(matches!(
+            pins.anchor_channel(server, "#team", &x.channel_id, Some(&owner)),
+            Err(PinError::ChannelReplaced { .. })
+        ));
+        let after = pins.channel(server, "#team").unwrap();
+        assert_eq!(after.create_cid, local);
+        assert_eq!(after.sequencer, None);
+        assert!(pins.carried(server).is_empty());
+        assert_eq!(pins.channel_by_ref(server, &x.channel_id), None);
     }
 }

@@ -356,7 +356,7 @@ impl Secure {
             )?),
             None => None,
         };
-        if pins.anchor_channel(&self.server, &info.slug, owner.as_deref())? {
+        if pins.anchor_channel(&self.server, &info.slug, &info.id, owner.as_deref())? {
             eprintln!(
                 "note: {} is now carried here for {}, which orders it; its history is checked \
                  against that server's records from now on",

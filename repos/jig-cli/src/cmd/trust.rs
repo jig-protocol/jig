@@ -1127,7 +1127,7 @@ mod tests {
             .to_did_jig_string();
         Pins::load(&path)
             .unwrap()
-            .anchor_channel(SERVER, "#ops", Some(&owner_did))
+            .anchor_channel(SERVER, "#ops", &label_cid("bafyCreate"), Some(&owner_did))
             .unwrap();
 
         let r0 = sign(&owner, 0, "bafyCreate", GENESIS_PREV);
