@@ -90,9 +90,8 @@ the default):
   channels reach any authenticated caller; `restricted` ones reach the owner
   and members only. The listing does not name restricted channels — or their
   owner — to non-members. Live delivery is re-checked on every block, so
-  removing a membership stops an already-open subscription. (There is no
-  `member-remove` block or CLI verb yet: today a removal is the operator
-  deleting the `memberships` row, or archiving the channel.)
+  removing a membership stops an already-open subscription. A removal is a
+  signed `member-remove` block; the owner sends one with `jig channel kick`.
 - **Membership is the owner's to grant.** `member-add` onto a restricted
   channel, or of anyone but yourself onto any channel, must be signed by the
   channel owner; `channel-promote` likewise. Self-join (`jig channel join`)
