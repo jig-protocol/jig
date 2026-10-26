@@ -316,6 +316,8 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         // retry, so the bridge bounces it.
         ref e @ (IngestError::NotSequencer { .. }
         | IngestError::CarriedChannel { .. }
+        | IngestError::RelayedOutsideShare { .. }
+        | IngestError::GrantRefused { .. }
         | IngestError::InvalidTerms { .. }
         | IngestError::MissingRight { .. }
         | IngestError::RootOwnerRole { .. }

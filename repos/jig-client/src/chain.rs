@@ -16,6 +16,13 @@
 //! The last kind is a contradiction: the server signed two incompatible
 //! things. A gap is not, on its own: the server may simply not have sent the
 //! records in between yet.
+//!
+//! A server that changed its key (JEP-0012) signed its channels' earlier
+//! records with its earlier DIDs. A chain built [`ChannelChain::across`] the
+//! key links this client followed takes records from each of them, in link
+//! order and one way only: once a record from a newer DID is in the chain, a
+//! later one from an older DID is a break ([`ChainBreak::RetiredKey`]), so a
+//! key the server left cannot add to its history.
 
 /// For tests and tools that need a chain to check against.
 pub use jig_pipeline::ingest_record::{GENESIS_PREV, RECORD_FORMAT, RecordSigner, label_cid};
@@ -93,6 +100,18 @@ pub enum ChainBreak {
     ClockBackwards { head: u64, seq: u64 },
     #[error("the chain does not start at a channel-create: record 0 names a previous record")]
     BadGenesis,
+    /// A record signed by a DID the server linked away from, after records
+    /// signed by a newer one: the old key adding to history it handed over.
+    #[error(
+        "record {seq} is signed by {signer}, a key this server left: record {head} is already \
+         signed by {newer}"
+    )]
+    RetiredKey {
+        head: u64,
+        seq: u64,
+        signer: String,
+        newer: String,
+    },
 }
 
 impl ChainBreak {
@@ -106,6 +125,7 @@ impl ChainBreak {
             Self::Rewritten { .. } => "chain-rewritten",
             Self::ClockBackwards { .. } => "chain-clock-backwards",
             Self::BadGenesis => "chain-bad-genesis",
+            Self::RetiredKey { .. } => "chain-retired-key",
         }
     }
 
@@ -115,7 +135,9 @@ impl ChainBreak {
     /// record 0 that names a previous one. A record that does not verify, or
     /// one delivered with another block or on another channel, proves nothing
     /// against the sequencer: anyone can sign with their own key, and which
-    /// record came with which block is not signed.
+    /// record came with which block is not signed. Nor does a retired key's
+    /// record: it is one key's word against another's, and only the key link
+    /// ties them.
     pub fn is_signed_proof(&self) -> bool {
         matches!(
             self,
@@ -164,7 +186,9 @@ impl ChainProof {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelChain {
     channel_id: String,
-    sequencer: String,
+    /// The DIDs the sequencer signs as, in key-link order: the last is the
+    /// one it signs as now. Never empty.
+    sequencers: Vec<String>,
     head: Option<ChainHead>,
 }
 
@@ -172,11 +196,45 @@ impl ChannelChain {
     /// A chain for `channel_id`, signed by `sequencer`, verified up to
     /// `head` (`None` when this client has seen none of it).
     pub fn new(channel_id: &str, sequencer: &str, head: Option<ChainHead>) -> Self {
+        Self::across(channel_id, vec![sequencer.to_string()], head)
+    }
+
+    /// [`Self::new`] for a sequencer that changed its key: `sequencers` are
+    /// the DIDs it signed as, oldest first, along the key links this client
+    /// followed (JEP-0012), the last the one it signs as now. Each may sign
+    /// records, but only in that order. An empty list is a chain no record
+    /// verifies against.
+    pub fn across(channel_id: &str, sequencers: Vec<String>, head: Option<ChainHead>) -> Self {
+        let sequencers = if sequencers.is_empty() {
+            vec![String::new()]
+        } else {
+            sequencers
+        };
         Self {
             channel_id: channel_id.to_string(),
-            sequencer: sequencer.to_string(),
+            sequencers,
             head,
         }
+    }
+
+    /// The DID the sequencer signs as now.
+    pub fn sequencer(&self) -> &str {
+        self.sequencers.last().expect("never empty")
+    }
+
+    /// Where `did` is in [`Self::sequencers`], compared by key.
+    fn position(&self, did: &str) -> Option<usize> {
+        self.sequencers
+            .iter()
+            .rposition(|s| jig_pipeline::handshake::same_did(s, did))
+    }
+
+    /// Where the DID that signed the head is: no record from a DID before
+    /// it may follow. `None` for a head kept without its record, or signed
+    /// by a DID outside the chain.
+    fn head_signer(&self) -> Option<usize> {
+        let record = self.head.as_ref()?.record.as_ref()?;
+        self.position(&record.sequencer)
     }
 
     pub fn head(&self) -> Option<&ChainHead> {
@@ -195,9 +253,18 @@ impl ChannelChain {
             ChainBreak::BadGenesis => None,
             _ => Some(self.head.as_ref()?.record.clone()?),
         };
+        // Two records prove something against one key. Across a key change
+        // the halves are two keys' words, tied only by a key link the proof
+        // does not carry.
+        if head
+            .as_ref()
+            .is_some_and(|h| !jig_pipeline::handshake::same_did(&h.sequencer, &record.sequencer))
+        {
+            return None;
+        }
         Some(ChainProof {
             channel_id: self.channel_id.clone(),
-            sequencer: self.sequencer.clone(),
+            sequencer: record.sequencer.clone(),
             head,
             record: record.clone(),
         })
@@ -210,7 +277,11 @@ impl ChannelChain {
         record: &IngestRecord,
         block_cid: Option<&str>,
     ) -> Result<Step, ChainBreak> {
-        record.verify(&self.sequencer)?;
+        // Which of the sequencer's DIDs signed it; one outside the chain is
+        // held to the current DID, and fails as before.
+        let signer = self.position(&record.sequencer);
+        let expected = signer.map_or(self.sequencer(), |i| &self.sequencers[i]);
+        record.verify(expected)?;
         if record.channel_id != self.channel_id {
             return Err(ChainBreak::OtherChannel {
                 expected: self.channel_id.clone(),
@@ -247,6 +318,20 @@ impl ChannelChain {
             } else {
                 Err(ChainBreak::Rewritten { seq: record.seq })
             };
+        }
+        // One way only (JEP-0012): once a newer DID's record is in the
+        // chain, an older DID signs nothing after it. Records before the
+        // head are history, and may be any DID's up to the head's.
+        if let (Some(at), Some(signer)) = (self.head_signer(), signer)
+            && record.seq > head.seq
+            && signer < at
+        {
+            return Err(ChainBreak::RetiredKey {
+                head: head.seq,
+                seq: record.seq,
+                signer: record.sequencer.clone(),
+                newer: self.sequencers[at].clone(),
+            });
         }
         if record.seq < head.seq {
             return Ok(Step::Behind);
@@ -331,6 +416,130 @@ mod tests {
         }
     }
 
+    impl Seq {
+        /// The same chain, signed from here on by a new key. Returns the
+        /// key it signed with before.
+        fn rotate(&mut self) -> ed25519_dalek::SigningKey {
+            std::mem::replace(&mut self.key, generate_signing_key())
+        }
+
+        /// This chain so far, signed on by `key`.
+        fn fork_with(&self, key: ed25519_dalek::SigningKey) -> Self {
+            Self {
+                key,
+                records: self.records.clone(),
+            }
+        }
+    }
+
+    /// History that spans two key changes verifies across the chain of DIDs,
+    /// in order: each key signs its stretch, and once a newer one has
+    /// signed, an older one adds nothing.
+    #[test]
+    fn a_chain_spans_the_key_links_one_way_only() {
+        let mut server = Seq::new();
+        let first = server.did();
+        server.push("bafyCreate", 10);
+        server.push("b1", 20);
+        let first_key = server.rotate();
+        let second = server.did();
+        server.push("b2", 30);
+        let at_second = server.fork_with(first_key.clone());
+        server.rotate();
+        let third = server.did();
+        server.push("b3", 40);
+        let records = server.records.clone();
+        let dids = vec![first.clone(), second.clone(), third.clone()];
+        let create = label_cid("bafyCreate");
+
+        // Read from the start, again as pages, or on from a pinned head.
+        let mut chain = ChannelChain::across(&create, dids.clone(), None);
+        for r in &records {
+            assert_eq!(chain.accept(r, None), Ok(Step::Next));
+        }
+        assert_eq!(chain.sequencer(), third);
+        for r in &records {
+            assert_eq!(chain.accept(r, None), Ok(Step::Behind), "a page of history");
+        }
+        let mut pinned =
+            ChannelChain::across(&create, dids.clone(), Some(ChainHead::of(&records[1])));
+        assert_eq!(
+            pinned.accept(&records[3], None),
+            Ok(Step::Gap { from: 2, to: 3 })
+        );
+        assert_eq!(pinned.accept(&records[2], None), Ok(Step::Next));
+        assert_eq!(pinned.accept(&records[3], None), Ok(Step::Next));
+
+        // After the second DID's first record, the first key signs on.
+        let mut chain = ChannelChain::across(&create, dids.clone(), None);
+        for r in &records[..3] {
+            chain.accept(r, None).unwrap();
+        }
+        let mut retired = at_second;
+        let replay = retired.push("bReplay", 50);
+        let broke = chain.clone().accept(&replay, None).unwrap_err();
+        assert_eq!(
+            broke,
+            ChainBreak::RetiredKey {
+                head: 2,
+                seq: 3,
+                signer: first.clone(),
+                newer: second.clone(),
+            }
+        );
+        assert_eq!(broke.code(), "chain-retired-key");
+        assert!(!broke.is_signed_proof());
+        assert_eq!(chain.proof(&replay, &broke), None);
+        // Past a gap, and on a live stream, too.
+        let further = retired.push("bFurther", 60);
+        assert!(matches!(
+            chain.clone().accept_live(&further, None),
+            Err(ChainBreak::RetiredKey { .. })
+        ));
+
+        // A DID outside the chain is refused as before.
+        let mut outsider = server.fork_with(generate_signing_key());
+        let stranger = outsider.push("bStranger", 70);
+        assert!(matches!(
+            chain.accept(&stranger, None),
+            Err(ChainBreak::Unsigned(RecordError::WrongSequencer { .. }))
+        ));
+
+        // A chain that knows only the first DID refuses the later ones.
+        let mut unfollowed = ChannelChain::new(&create, &first, None);
+        unfollowed.accept(&records[0], None).unwrap();
+        unfollowed.accept(&records[1], None).unwrap();
+        assert!(matches!(
+            unfollowed.accept(&records[2], None),
+            Err(ChainBreak::Unsigned(RecordError::WrongSequencer { .. }))
+        ));
+    }
+
+    /// A rewrite signed by one key across a key change still proves itself;
+    /// the proof names the key that signed both halves.
+    #[test]
+    fn a_rewrite_after_a_key_change_proves_itself_with_the_new_key() {
+        let mut server = Seq::new();
+        let first = server.did();
+        server.push("bafyCreate", 10);
+        server.rotate();
+        let second = server.did();
+        server.push("b1", 20);
+        let mut fork = server.fork_with(server.key.clone());
+        let honest = server.push("b2", 30);
+        let other = fork.push("bOther", 30);
+        let mut chain =
+            ChannelChain::across(&label_cid("bafyCreate"), vec![first, second.clone()], None);
+        for r in &server.records {
+            chain.accept(r, None).unwrap();
+        }
+        assert_eq!(chain.head().unwrap().hash, hex::encode(honest.hash()));
+        let broke = chain.accept(&other, None).unwrap_err();
+        let proof = chain.proof(&other, &broke).expect("one key signed both");
+        assert_eq!(proof.sequencer, second);
+        assert_eq!(proof.verify(), Ok(broke));
+    }
+
     #[test]
     fn a_chain_read_in_order_moves_its_head() {
         let mut server = Seq::new();
@@ -381,14 +590,15 @@ mod tests {
         assert!(chain.proof(&landed[1], &broke).is_none());
 
         // Held to the owner's key, over the pinned head: the two records
-        // differ at seq 1, but the head is not the owner's, so no proof
-        // built from them verifies.
+        // differ at seq 1, but the head is not the owner's, so no proof is
+        // built from them, or none that verifies.
         let mut chain = ChannelChain::new(&channel, &owner.did(), chain.head().cloned());
         let broke = chain.accept(&landed[1], None).unwrap_err();
-        let proof = chain
-            .proof(&landed[1], &broke)
-            .expect("a rewrite, on its face");
-        assert!(proof.verify().is_err());
+        assert!(
+            chain
+                .proof(&landed[1], &broke)
+                .is_none_or(|proof| proof.verify().is_err())
+        );
     }
 
     #[test]
