@@ -260,9 +260,21 @@ reads no encrypted tier.
       `from_dm` and `successor_of` to the creation block's fields, fixed for the channel's life.
       `history`, `from_dm` and `successor_of` are reserved by this JEP.
     - Rule 7a's `member` grant also covers relayed self-joins (rule 13).
-    - A `shared` channel is the only tier that may be offered under a contract. A `public`
-      channel MAY federate as today's open channels do, read-only for followers without a
-      `write` grant.
+    - `shared` and `public` channels may be offered under a contract; `private` and `server`
+      channels may not.
+    - **`public` channels federate under contracts** (DJ, 2026-10-25), once F2's first phase has
+      landed. The defaults:
+      - the owner offers a `public` channel to every server on its peer list;
+      - followers receive a `write` grant;
+      - a server accepts an offer for a `public` channel automatically, even when its peer
+        policy is `offers = "hold"`.
+
+      Until then, the legacy relay carries `public` channels to listed peers, with catch-up
+      after an outage (#340).
+    - **A channel is carried by the relay or by a contract, never both** (#344). Relayed, a
+      channel gets a second sequencer on the receiving server, and that server then refuses
+      the owner's records. So a channel is relayed until it is shared with a peer, and the
+      contract carries it from the accept on.
 
 # Security Considerations (Zero-Trust)
 
