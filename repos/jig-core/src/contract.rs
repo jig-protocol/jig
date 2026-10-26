@@ -92,6 +92,29 @@ impl Grant {
     }
 }
 
+/// Whether a follower holding `grant` may relay a block of `kind` (rule 7a).
+///
+/// - `write` carries content: text, and the email bridge's two kinds.
+/// - `member` carries content and the membership blocks; the owner's gate
+///   still decides, by the signer's rights (rule 7b), which of those the
+///   channel's rule allows.
+/// - `read` carries only MLS protocol traffic, which this build does not
+///   relay yet: nothing.
+///
+/// No grant relays a channel's terms, shares, roles or lifecycle
+/// (`channel-create`, `channel-share`, `role-assign`, `channel-archive` and
+/// the like), or a server's own kinds: those go to the owner directly.
+pub fn grant_allows(grant: Grant, kind: crate::BlockKind) -> bool {
+    use crate::BlockKind as K;
+    let content = matches!(kind, K::TextRender | K::EmailRender | K::EmailEncrypted);
+    let membership = matches!(kind, K::MemberAdd | K::MemberRemove);
+    match grant {
+        Grant::Read => false,
+        Grant::Write => content,
+        Grant::Member => content || membership,
+    }
+}
+
 /// Why a server refused an offer (rule 8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefuseCode {
@@ -686,6 +709,32 @@ fn verify_envelope(envelope: &[u8], payload: &[u8], did: &str) -> Result<(), Con
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_grant_relays_its_kinds_and_nothing_else() {
+        use crate::BlockKind as K;
+        for kind in [K::TextRender, K::EmailRender, K::EmailEncrypted] {
+            assert!(!grant_allows(Grant::Read, kind), "{kind:?}");
+            assert!(grant_allows(Grant::Write, kind), "{kind:?}");
+            assert!(grant_allows(Grant::Member, kind), "{kind:?}");
+        }
+        for kind in [K::MemberAdd, K::MemberRemove] {
+            assert!(!grant_allows(Grant::Write, kind), "{kind:?}");
+            assert!(grant_allows(Grant::Member, kind), "{kind:?}");
+        }
+        for kind in [
+            K::ChannelCreate,
+            K::ChannelShare,
+            K::ChannelUnshare,
+            K::RoleAssign,
+            K::ChannelArchive,
+            K::ChannelPromote,
+            K::ContractAccept,
+            K::ServerManifest,
+        ] {
+            assert!(!grant_allows(Grant::Member, kind), "{kind:?}");
+        }
+    }
 
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])

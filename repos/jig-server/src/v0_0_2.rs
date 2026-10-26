@@ -81,6 +81,10 @@ pub struct AppState {
     pub peer_frames: Arc<std::sync::OnceLock<Arc<dyn crate::v0_0_2_peer::PeerFrames>>>,
     /// The live connections to proven peers, whichever side dialed.
     pub peers: Arc<crate::v0_0_2_peer::PeerRegistry>,
+    /// Writes relayed to and from the owners of shared channels
+    /// ([`crate::v0_0_2_relay`]), set once the contract runs. Shared by
+    /// every clone.
+    pub relay: Arc<std::sync::OnceLock<Arc<crate::v0_0_2_relay::Relay>>>,
 }
 
 /// Where the server's key link is read from: beside its key file, with
@@ -422,6 +426,7 @@ impl AppState {
             prior_key_links,
             prior_dids,
             peer_frames: Default::default(),
+            relay: Default::default(),
             peers: Default::default(),
         })
     }
@@ -482,6 +487,7 @@ impl AppState {
             prior_key_links: Vec::new(),
             prior_dids: Vec::new(),
             peer_frames: Default::default(),
+            relay: Default::default(),
             peers: Default::default(),
         })
     }
@@ -538,6 +544,7 @@ impl AppState {
             prior_key_links: Vec::new(),
             prior_dids: Vec::new(),
             peer_frames: Default::default(),
+            relay: Default::default(),
             peers: Default::default(),
         })
     }

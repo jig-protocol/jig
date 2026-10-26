@@ -31,6 +31,20 @@ pub enum IngestSource {
     /// inbound mail). Behaves like a local submission for fanout + origin
     /// tagging.
     Bridge,
+    /// A client's block a follower relayed to this server, the channel's
+    /// owner, under its share of `channel_id` with `grant` (JEP-0005 rule 15).
+    /// `via` is the follower's proven DID, recorded with the block.
+    ///
+    /// Admission is the relayed one ([`Admission::admit_relayed`]): the
+    /// follower ran its own admission and proof of work on the client, and
+    /// is answerable for it through the share. This server still refuses a
+    /// banned author or one below its floors, checks the author's signature,
+    /// and runs its full write gate, plus the grant.
+    Relayed {
+        via: Did,
+        channel_id: String,
+        grant: jig_core::contract::Grant,
+    },
 }
 
 /// All resources the ingest pipeline needs. Constructed once at server
@@ -244,6 +258,25 @@ pub enum IngestError {
         channel_id: String,
         sequencer: String,
     },
+    /// A relayed block for a channel the relaying server's share does not
+    /// cover (JEP-0005 rule 15).
+    #[error("`{kind}` refused: `{via}` relayed it outside its share of channel {channel_id}")]
+    RelayedOutsideShare {
+        kind: String,
+        channel_id: String,
+        via: String,
+    },
+    /// A relayed block of a kind the share's grant does not carry (JEP-0005
+    /// rule 7a). The author can post it to the owner directly.
+    #[error(
+        "`{kind}` refused: `{via}` holds a `{grant}` share, which does not relay it; \
+         post it to the channel's owner directly"
+    )]
+    GrantRefused {
+        kind: String,
+        grant: &'static str,
+        via: String,
+    },
     /// A channel term (`sequencer`, `co_owners`) is malformed.
     #[error("channel-create term `{field}` is invalid: {detail}")]
     InvalidTerms { field: String, detail: String },
@@ -381,9 +414,9 @@ pub async fn ingest(
     let own = sender.to_did_jig_string() == ctx.server_did.to_did_jig_string();
     let admitted = match source {
         _ if own => Ok(()),
-        IngestSource::FederatedPeer { .. } | IngestSource::Bridge => {
-            ctx.admission.admit_relayed(sender.as_str())
-        }
+        IngestSource::FederatedPeer { .. }
+        | IngestSource::Bridge
+        | IngestSource::Relayed { .. } => ctx.admission.admit_relayed(sender.as_str()),
         IngestSource::LocalClient { .. } | IngestSource::AdminEndpoint => {
             ctx.admission.admit(sender.as_str())
         }
@@ -489,6 +522,30 @@ pub async fn ingest(
         return Err(IngestError::UnknownChannel {
             slug: named.to_string(),
         });
+    }
+    // A relayed block goes only into the channel its share covers, and only
+    // as a kind its grant carries (JEP-0005 rules 7a, 15). A channel-create
+    // resolves to no live channel, so it is outside every share.
+    if let IngestSource::Relayed {
+        via,
+        channel_id: shared,
+        grant,
+    } = &source
+    {
+        if resolved_channel.as_ref().map(|c| c.id.as_str()) != Some(shared.as_str()) {
+            return Err(IngestError::RelayedOutsideShare {
+                kind: kind_str.to_string(),
+                channel_id: shared.clone(),
+                via: via.to_did_jig_string(),
+            });
+        }
+        if !jig_core::contract::grant_allows(*grant, kind) {
+            return Err(IngestError::GrantRefused {
+                kind: kind_str.to_string(),
+                grant: grant.as_str(),
+                via: via.to_did_jig_string(),
+            });
+        }
     }
     // A channel another server sequences takes its blocks only from that
     // server, with that server's records (`crate::follow`): this server never
@@ -786,6 +843,8 @@ pub async fn ingest(
         },
         federated_from: match &source {
             IngestSource::FederatedPeer { peer_url, .. } => Some(peer_url.clone()),
+            // The relaying server's DID (JEP-0005 rule 15).
+            IngestSource::Relayed { via, .. } => Some(via.to_did_jig_string()),
             _ => None,
         },
     };
@@ -1029,7 +1088,10 @@ pub async fn ingest(
                 .dispatch_to_bridges_public(&stored_block, &stored_receipt, policy.as_ref())
                 .await;
         }
-        IngestSource::LocalClient { .. } | IngestSource::AdminEndpoint | IngestSource::Bridge => {
+        IngestSource::LocalClient { .. }
+        | IngestSource::AdminEndpoint
+        | IngestSource::Bridge
+        | IngestSource::Relayed { .. } => {
             ctx.fanout
                 .broadcast_with_members(&stored_block, &stored_receipt, policy.as_ref())
                 .await
