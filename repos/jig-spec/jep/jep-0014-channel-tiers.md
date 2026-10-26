@@ -72,10 +72,15 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
    - A new `channel-create` without `tier` that would be `open` with `none` MUST be refused
      (`UNKNOWN_TIER`). Otherwise an old client would create a `public` channel without the label
      or the confirmation that rule 5 requires.
-   - A server that implements this JEP advertises the `tiers` feature in its `welcome`
-     capabilities (JEP-0002). A client MUST NOT send a `channel-create` with `tier` `server` or
-     `shared` to a server that does not advertise it: such a server ignores `tier`, reads the
-     channel as `open`, and admits any authenticated joiner.
+   - A client that implements this JEP requests the `tiers` feature in its `hello`
+     (JEP-0002). A server that implements it signs `tiers` into its `welcome` capabilities
+     only when the `hello` requested it, after the fields defined before it. A `welcome` to a
+     client that did not ask therefore signs the same bytes as before: an old client checks
+     the signature over bytes it rebuilds from the fields it knows, and an unrequested field
+     would make the check fail for it. Server-to-server dials request `tiers` like any client.
+   - A client MUST NOT send a `channel-create` with `tier` `server` or `shared` to a server
+     whose `welcome` does not carry `tiers`: such a server ignores `tier`, reads the channel
+     as `open`, and admits any authenticated joiner.
 2. **The tier is fixed for the channel's life**, like its suite (JEP-0001). Changing a tier
    means creating a new channel. A server MUST refuse any block that would change a
    channel's tier, `channel-promote` included.
@@ -91,9 +96,9 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
    channel, with words to the effect of "anyone, including the server operator, can read
    this". A client MUST ask the creator to confirm before it signs a `public`
    `channel-create`. A server MAY refuse `public` channels by policy.
-   - A client that implements this JEP requests the `tiers` capability in its `hello`
-     (JEP-0002). A server MUST refuse a content block in a `public` channel from a connection
-     that did not request it (`TIER_UNSUPPORTED`). An older client cannot show the label, so it
+   - A server MUST refuse a content block in a `public` channel from a connection whose
+     `hello` did not request `tiers` (rule 1; `TIER_UNSUPPORTED`). The one request serves both
+     rules. An older client cannot show the label, so it
      may read a `public` channel but not post to it.
 6. **System channels are `public`.** The server's own channels under the reserved `#jig/`
    prefix carry what anyone must be able to verify. Today that is the manifest log
@@ -286,8 +291,10 @@ reads no encrypted tier.
       to a `server` or `shared` channel, is authorized by the role check of rule 12 or 13
       instead of the `membership` right. Every other membership block still needs the right.
     - Rule 7a's `member` grant also covers relayed self-joins (rule 13).
-    - An owner MUST NOT offer a `shared` channel to a follower whose manifest does not
-      advertise the `tiers` feature (rule 1). Such a follower would read the channel as `open`
+    - The signed server manifest (JEP-0002 rule 12) gains `features`, an array of strings. A
+      server that implements this JEP lists `"tiers"` in it.
+    - An owner MUST NOT offer a `shared` channel to a follower whose manifest does not list
+      `"tiers"` in `features`. Such a follower would read the channel as `open`
       and relay self-joins without a role check.
     - `shared` and `public` channels may be offered under a contract; `private` and `server`
       channels may not.
@@ -353,7 +360,10 @@ admission).
   them.
 - **Old servers ignore `tier`** and fall back to `visibility`, so a `server` or `shared`
   channel on one would admit any authenticated joiner. Clients and owners therefore create or
-  offer those tiers only to servers that advertise `tiers` (rules 1 and 37).
+  offer those tiers only to servers whose `welcome` carries `tiers` or whose manifest lists it
+  (rules 1 and 37).
+- **Old clients and the `welcome`.** A server signs `tiers` into a `welcome` only when the
+  `hello` asked for it (rule 1), so an old client's signature check is unchanged.
 
 # Reference Implementation
 
@@ -371,7 +381,8 @@ To be added with the implementation:
 - a legacy-channel mapping table, including `#jig/manifest` mapped to `public`;
 - a `member-add` to a `#dm/` channel: the pair's other DID accepted, a third DID refused;
 - a self-join refused for a role below `join`.
-- a post to a `public` channel refused on a connection without the `tiers` capability.
+- a post to a `public` channel refused on a connection whose `hello` did not request `tiers`;
+- a `welcome` to a `hello` without `tiers`, byte-identical to one from a server without this JEP.
 
 # LLM Influence
 
