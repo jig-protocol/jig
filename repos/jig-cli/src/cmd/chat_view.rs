@@ -104,10 +104,7 @@ pub struct Drained {
 /// Messages already buffered are drained *before* the disconnect is
 /// reported, so the last thing the server said is not thrown away with the
 /// connection.
-pub(crate) fn drain_inbound(
-    state: &mut ChatState,
-    rx: &mut mpsc::UnboundedReceiver<Message>,
-) -> Drained {
+pub(crate) fn drain_inbound(state: &mut ChatState, rx: &mut mpsc::Receiver<Message>) -> Drained {
     let mut count = 0usize;
     loop {
         match rx.try_recv() {
@@ -455,8 +452,8 @@ mod tests {
         // The reader task drops `msg_tx` when the BlockStream ends, so a
         // disconnected receiver IS the disconnect signal. Before Task 4 the
         // loop swallowed it and sat on a dead pane forever.
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        tx.send(Message {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(Message {
             sender: "dj".into(),
             body: "last words".into(),
             ts: 1,
@@ -482,7 +479,7 @@ mod tests {
 
     #[test]
     fn drain_inbound_stays_connected_while_the_sender_lives() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let (tx, mut rx) = mpsc::channel::<Message>(8);
         let mut state = ChatState::new("#x".into());
         let drained = drain_inbound(&mut state, &mut rx);
         assert_eq!(drained.count, 0);
