@@ -17,7 +17,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.0.1"
+version = "0.2.0-alpha.3"
 edition = "2024"
 # Floor set by wasmtime 48.x. Inherited by jig-runtime and jig-server via
 # `rust-version.workspace = true`; other members do not opt in, so this is not

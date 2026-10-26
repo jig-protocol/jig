@@ -1,6 +1,6 @@
 [package]
 name = "jig-mls"
-version = "0.0.2"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license = "MIT OR Apache-2.0"

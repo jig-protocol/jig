@@ -128,6 +128,32 @@ jobs:
           rustup target add ${{ matrix.target }}
           rustc -V
 
+      # The binaries report the workspace version (`--version`), so a tag that
+      # names another one would ship mislabeled binaries, as v0.2.0-alpha.2's
+      # did ("jig 0.0.1"). Every workspace crate must carry one version, and on
+      # a tag it must be the tag's. Bump `[workspace.package] version` in
+      # repos/Cargo.toml before tagging.
+      - name: The workspace version is the tag's
+        working-directory: repos
+        shell: bash
+        run: |
+          set -euo pipefail
+          versions=$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '[.packages[].version] | unique | .[]')
+          if [ "$(printf '%s\n' "$versions" | wc -l)" -ne 1 ]; then
+            echo "workspace crates carry more than one version: $(echo $versions)" >&2
+            exit 1
+          fi
+          echo "JIG_WORKSPACE_VERSION=$versions" >> "$GITHUB_ENV"
+          if [ "${{ github.ref_type }}" = tag ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [ "$tag" != "$versions" ]; then
+              echo "tag $GITHUB_REF_NAME does not match the workspace version $versions" >&2
+              exit 1
+            fi
+          fi
+          echo "workspace version $versions" | tee -a "$GITHUB_STEP_SUMMARY"
+
       # musl targets cross-link with zig: no musl-gcc or aarch64 sysroot to
       # maintain, and ring/sqlite/zstd's C code builds with zig cc.
       - name: Install zig + cargo-zigbuild
@@ -177,7 +203,15 @@ jobs:
           case "${{ matrix.target }}" in
             x86_64-unknown-linux-musl|aarch64-apple-darwin)
               "$bin/jig" --help >/dev/null
-              "$bin/jig-server" --help >/dev/null ;;
+              "$bin/jig-server" --help >/dev/null
+              # What they report is what the tag names (checked above).
+              for b in jig jig-server jig-nameserver; do
+                got="$("$bin/$b" --version)"
+                if [ "$got" != "$b $JIG_WORKSPACE_VERSION" ]; then
+                  echo "$b --version prints '$got', not '$b $JIG_WORKSPACE_VERSION'" >&2
+                  exit 1
+                fi
+              done ;;
           esac
           ls -lh "$bin/jig" "$bin/jig-server" "$bin/jig-nameserver"
 
