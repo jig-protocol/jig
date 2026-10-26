@@ -256,6 +256,33 @@ fn sequenced_history_sql(with_before: bool) -> String {
     )
 }
 
+/// A sequenced channel's history just after the block at `seq` ?3, oldest
+/// first: forward paging along the chain.
+fn sequenced_history_after_sql() -> String {
+    let columns = BLOCK_COLUMNS
+        .split(", ")
+        .map(|c| format!("b.{}", c.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT {columns} FROM ingest_records r JOIN blocks b ON b.cid = r.block_cid \
+         WHERE r.channel_id = ?1 AND r.seq > ?3 ORDER BY r.seq ASC LIMIT ?2"
+    )
+}
+
+/// The statement behind [`SqliteStore::list_blocks_after_by_channel_id`] on a
+/// channel with no chain: the page just newer than a cursor block, oldest
+/// first, in history's total order, on the same index.
+fn history_after_sql() -> String {
+    format!(
+        "SELECT {BLOCK_COLUMNS} FROM blocks \
+         WHERE channel_id = ?1 \
+           AND (hlc_wall_ms, hlc_logical, hlc_origin, cid) > (?2, ?3, ?4, ?5) \
+         ORDER BY hlc_wall_ms ASC, hlc_logical ASC, hlc_origin ASC, cid ASC \
+         LIMIT ?6"
+    )
+}
+
 /// The statement behind [`SqliteStore::list_blocks_before`]: the page just
 /// older than a cursor block, newest first, on the same index and order.
 fn history_before_sql() -> String {
@@ -1391,6 +1418,56 @@ impl SqliteStore {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         newest_first.reverse();
         Ok(Some(newest_first))
+    }
+
+    /// The oldest `limit` blocks of the channel `channel_id` strictly newer
+    /// than the block `after`, oldest first: the page that continues a window
+    /// ending at `after`. `None` when `after` is not a block of that channel,
+    /// as for [`Self::list_blocks_before_by_channel_id`].
+    ///
+    /// Newer is history order: `seq` when the cursor has a record (a
+    /// sequenced channel, where it is exact), else (HLC wall, logical,
+    /// origin, CID).
+    pub fn list_blocks_after_by_channel_id(
+        &self,
+        channel_id: &str,
+        limit: usize,
+        after: &str,
+    ) -> Result<Option<Vec<StoredBlock>>> {
+        let Some(cursor) = self.get_block(after)? else {
+            return Ok(None);
+        };
+        if cursor.channel_id.as_deref() != Some(channel_id) {
+            return Ok(None);
+        }
+        let limit = limit.min(MAX_HISTORY_LIMIT) as i64;
+        let cursor_seq = self.get_ingest_record(&cursor.cid)?.map(|r| r.seq);
+        let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
+        if let Some(cursor_seq) = cursor_seq {
+            let mut stmt = conn.prepare(&sequenced_history_after_sql())?;
+            let blocks = stmt
+                .query_map(
+                    params![channel_id, limit, cursor_seq as i64],
+                    row_to_stored_block,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            return Ok(Some(blocks));
+        }
+        let mut stmt = conn.prepare(&history_after_sql())?;
+        let blocks = stmt
+            .query_map(
+                params![
+                    channel_id,
+                    cursor.hlc_wall_ms as i64,
+                    cursor.hlc_logical as i64,
+                    cursor.hlc_origin,
+                    cursor.cid,
+                    limit
+                ],
+                row_to_stored_block,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Some(blocks))
     }
 
     // --- receipts ---
@@ -2570,6 +2647,18 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(older, order[..2].to_vec(), "paging back follows seq too");
+        let channel_id = c("bafy_create");
+        let after = |cursor: &str, limit| {
+            block_cids(
+                store
+                    .list_blocks_after_by_channel_id(&channel_id, limit, cursor)
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(after(&order[0], 2), order[1..3].to_vec(), "and forward");
+        assert_eq!(after(&order[2], 50), order[3..].to_vec());
+        assert_eq!(after(&order[3], 50), Vec::<String>::new(), "the head");
 
         let from_one = store.list_ingest_records("#seq", 1, 2).unwrap();
         assert_eq!(from_one, records[1..3].to_vec());
@@ -4326,6 +4415,31 @@ mod tests {
     }
 
     #[test]
+    fn list_blocks_after_pages_forwards_without_gaps_or_overlap() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        seed_two_channel_timeline(&store);
+        let id = store
+            .get_channel_by_slug_including_archived("#hello")
+            .unwrap()
+            .unwrap()
+            .id;
+        let page = |after: &str, limit| -> Option<Vec<String>> {
+            store
+                .list_blocks_after_by_channel_id(&id, limit, after)
+                .unwrap()
+                .map(|blocks| blocks.into_iter().map(|b| b.cid).collect())
+        };
+        assert_eq!(page("bafy_h1", 1), Some(vec!["bafy_h2".to_string()]));
+        assert_eq!(
+            page("bafy_h1", 50),
+            Some(vec!["bafy_h2".to_string(), "bafy_h3".to_string()])
+        );
+        assert_eq!(page("bafy_h3", 50), Some(vec![]), "the newest block");
+        assert_eq!(page("bafy_o2", 50), None, "another channel's block");
+        assert_eq!(page("bafy_nope", 50), None, "an unknown block");
+    }
+
+    #[test]
     fn a_page_boundary_between_identical_hlcs_skips_nothing() {
         // One author, one millisecond: every block shares (wall, logical,
         // origin), and only the CID orders them.
@@ -4355,6 +4469,26 @@ mod tests {
             seen,
             vec!["bafy_t1", "bafy_t2", "bafy_t3", "bafy_t4", "bafy_t5"]
         );
+        // Forward from the first, two at a time, meets the same five.
+        let id = store
+            .get_channel_by_slug_including_archived("#tie")
+            .unwrap()
+            .unwrap()
+            .id;
+        let mut forward = vec!["bafy_t1".to_string()];
+        loop {
+            let newer = cids(
+                store
+                    .list_blocks_after_by_channel_id(&id, 2, forward.last().unwrap())
+                    .unwrap()
+                    .unwrap(),
+            );
+            if newer.is_empty() {
+                break;
+            }
+            forward.extend(newer);
+        }
+        assert_eq!(forward, seen);
     }
 
     #[test]
@@ -4383,10 +4517,11 @@ mod tests {
 
         // EXPLAIN QUERY PLAN keeps the statement's bound parameters, so each
         // variant has to be given its full arity before it will step.
-        let variants: [(String, Vec<i64>); 3] = [
+        let variants: [(String, Vec<i64>); 4] = [
             (history_sql(false), vec![0, 50]),
             (history_sql(true), vec![0, 0, 0, 50]),
             (history_before_sql(), vec![0, 0, 0, 0, 0, 50]),
+            (history_after_sql(), vec![0, 0, 0, 0, 0, 50]),
         ];
         for (sql, args) in variants {
             let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();

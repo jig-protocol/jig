@@ -376,6 +376,9 @@ pub struct HistoryQuery {
     /// A block CID: return the page of blocks just older than it, for paging
     /// back through history. Omitted means the newest page.
     pub before: Option<String>,
+    /// A block CID: return the page of blocks just newer than it, for paging
+    /// forward from where a reader left off. Not with `before`.
+    pub after: Option<String>,
 }
 
 /// One entry of a channel timeline.
@@ -601,23 +604,41 @@ pub async fn get_channel_history(
     // A reference that names no channel has no history, as the slug
     // wrappers answer: an empty page, or a cursor that is none of its blocks.
     let limit = query.limit.unwrap_or(MAX_HISTORY_LIMIT);
-    let blocks = match (query.before.as_deref(), channel.as_ref()) {
-        (None, None) => Vec::new(),
-        (None, Some(channel)) => store
+    let bad_cursor = |name: &str| {
+        err(
+            StatusCode::BAD_REQUEST,
+            "BAD_CURSOR",
+            format!("`{name}` is not a block of {channel_ref}"),
+        )
+    };
+    let blocks = match (
+        query.before.as_deref(),
+        query.after.as_deref(),
+        channel.as_ref(),
+    ) {
+        (Some(_), Some(_), _) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "BAD_CURSOR",
+                "give `before` or `after`, not both".to_string(),
+            ));
+        }
+        (None, None, None) => Vec::new(),
+        (None, None, Some(channel)) => store
             .list_blocks_by_channel_id(&channel.id, limit, None)
             .map_err(persist_err)?,
-        (Some(before), channel) => channel
+        (Some(before), None, channel) => channel
             .map(|c| store.list_blocks_before_by_channel_id(&c.id, limit, before))
             .transpose()
             .map_err(persist_err)?
             .flatten()
-            .ok_or_else(|| {
-                err(
-                    StatusCode::BAD_REQUEST,
-                    "BAD_CURSOR",
-                    format!("`before` is not a block of {channel_ref}"),
-                )
-            })?,
+            .ok_or_else(|| bad_cursor("before"))?,
+        (None, Some(after), channel) => channel
+            .map(|c| store.list_blocks_after_by_channel_id(&c.id, limit, after))
+            .transpose()
+            .map_err(persist_err)?
+            .flatten()
+            .ok_or_else(|| bad_cursor("after"))?,
     };
 
     let mut timeline = Vec::with_capacity(blocks.len());
@@ -1182,6 +1203,70 @@ mod tests {
             .map(|b| text_of(b["bundle_b64"].as_str().unwrap()))
             .collect();
         assert_eq!(texts, vec!["b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn channel_history_pages_forward_from_an_after_cursor() {
+        let state = Arc::new(unauthenticated_state());
+        let router = build_blocks_router(state.clone());
+        let id = test_identity();
+        submit_texts(&state, &router, &id, "#hello", &["a", "b", "c", "d"]).await;
+        submit_texts(&state, &router, &id, "#other", &["elsewhere"]).await;
+
+        let page = |body: &serde_json::Value| -> Vec<String> {
+            body.as_array()
+                .unwrap()
+                .iter()
+                .map(|b| text_of(b["bundle_b64"].as_str().unwrap()))
+                .collect()
+        };
+        let cid_of = |b: &serde_json::Value| {
+            b["delivery_cid"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("delivery:")
+                .to_string()
+        };
+        let (_, all) = get_path(router.clone(), "/api/v1/channels/%23hello/blocks").await;
+        let texts = page(&all);
+        let a = cid_of(&all[texts.iter().position(|t| t == "a").unwrap()]);
+
+        // Forward two at a time from `a` meets everything after it, once.
+        let mut forward = Vec::new();
+        let mut cursor = a;
+        loop {
+            let (status, newer) = get_path(
+                router.clone(),
+                &format!("/api/v1/channels/%23hello/blocks?limit=2&after={cursor}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let Some(last) = newer.as_array().unwrap().last() else {
+                break;
+            };
+            cursor = cid_of(last);
+            forward.extend(page(&newer));
+        }
+        assert_eq!(forward, vec!["b", "c", "d"]);
+
+        let (_, other) = get_path(router.clone(), "/api/v1/channels/%23other/blocks").await;
+        let foreign = cid_of(&other[0]);
+        for cursor in [foreign.as_str(), "bafy-unknown"] {
+            let (status, body) = get_path(
+                router.clone(),
+                &format!("/api/v1/channels/%23hello/blocks?after={cursor}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["code"], "BAD_CURSOR");
+        }
+        let (status, body) = get_path(
+            router.clone(),
+            &format!("/api/v1/channels/%23hello/blocks?after={cursor}&before={cursor}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "BAD_CURSOR");
     }
 
     #[tokio::test]
