@@ -21,6 +21,17 @@ pub struct Reader {
     secure: Option<Arc<Secure>>,
 }
 
+/// A channel's recent history, as a pane opens with it.
+#[derive(Default)]
+pub struct Backlog {
+    /// What to show, oldest first.
+    pub lines: Vec<DecodedBlock>,
+    /// Departed members still in this member's copy of the tree.
+    pub tidy: Vec<String>,
+    /// The delivery CID of every block the history held.
+    pub deliveries: Vec<String>,
+}
+
 /// One delivered block, read.
 pub struct Read {
     pub line: Option<DecodedBlock>,
@@ -67,17 +78,16 @@ impl Reader {
     /// The channel's recent history, read. Departed members still in the
     /// tree come back for tidying. Fails only when the server contradicts
     /// the history this device pinned.
-    pub async fn backlog(
-        &self,
-        who: &Identity,
-        server_url: &str,
-    ) -> Result<(Vec<DecodedBlock>, Vec<String>)> {
+    pub async fn backlog(&self, who: &Identity, server_url: &str) -> Result<Backlog> {
         let Some(secure) = &self.secure else {
-            return Ok((
+            let (lines, deliveries) =
                 history::backfill(who, server_url, &self.slug, history::DEFAULT_HISTORY_LIMIT)
-                    .await?,
-                Vec::new(),
-            ));
+                    .await?;
+            return Ok(Backlog {
+                lines,
+                tidy: Vec::new(),
+                deliveries,
+            });
         };
         match secure
             .recent(&self.slug, history::DEFAULT_HISTORY_LIMIT)
@@ -91,13 +101,33 @@ impl Reader {
                     .filter(|d| d.is_message())
                     .collect();
                 lines.drain(..lines.len().saturating_sub(history::DEFAULT_HISTORY_LIMIT));
-                Ok((lines, synced.tidy))
+                Ok(Backlog {
+                    lines,
+                    tidy: synced.tidy,
+                    deliveries: synced.deliveries,
+                })
             }
             Err(e) => {
                 eprintln!("warning: could not load history for {}: {e:#}", self.slug);
-                Ok((Vec::new(), Vec::new()))
+                Ok(Backlog::default())
             }
         }
+    }
+
+    /// Blocks a live stream missed, read in one go, oldest first. On an
+    /// encrypted channel they replay through the session in epoch order, the
+    /// way [`Secure::sync`] does, so a commit among them is applied before the
+    /// messages that need it.
+    pub fn read_missed(&self, blocks: &[DeliveredBlock]) -> Vec<Result<DecodedBlock>> {
+        let Some(secure) = &self.secure else {
+            return blocks
+                .iter()
+                .filter_map(|d| self.read(d).map(|r| r.line).transpose())
+                .collect();
+        };
+        let synced = secure.replay(blocks);
+        self.tidy(synced.tidy);
+        synced.lines.into_iter().map(Ok).collect()
     }
 
     pub fn read(&self, d: &DeliveredBlock) -> Result<Read> {
