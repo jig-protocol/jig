@@ -4,8 +4,9 @@
 Phase 1 starting before G3 (section 4). This settles [ROADMAP](../ROADMAP.md) still-open
 question 5. Budget, timing, the formal model and publication (section 7) are still open.
 
-**Decision it builds on (D27):** the audit is designed now and runs once v0.2 is code-complete
-(gate G3), so it reviews code that will not be replaced soon. It does not block development.
+**Decision it builds on (D27):** the audit reviews code that will not be replaced soon, and it
+does not block development. As decided on 2026-10-25, Phase 1 covers the code already complete
+and starts before gate G3; Phase 2 follows once v0.2 is code-complete (section 4).
 
 This document is written to be sent to audit firms as it stands. It names code paths, spec
 chapters and threat-register rows. It describes no deployment: the audit covers the
