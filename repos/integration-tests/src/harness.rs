@@ -1035,6 +1035,9 @@ fn build_legacy_routes(
                 "unsafe_options_active": state.config.unsafe_options_active(),
                 "allowed_block_kinds": state.config.server.allowed_block_kinds,
                 "peers": peers,
+                // The v0.0.2 router above pages history forward, as
+                // `jig_server::handler::server_info` advertises.
+                "history_after": true,
             }))
         }
     };
