@@ -76,6 +76,9 @@ pub const SCAN: usize = 512;
 pub const OVERLAP: u64 = 32;
 /// The longest the dialer waits on one [`LATER_FRAME`].
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
+/// How long the dialer waits to ask again after its own store failed to
+/// land a block.
+pub const STORE_RETRY: Duration = Duration::from_secs(5);
 
 /// The most block and signature bytes a page packs, unless its first block
 /// fills it alone: one largest bundle. Base64 on the wire, a page then fits
@@ -524,6 +527,16 @@ async fn land(
             )
             .await
             {
+                // This server's store failed (a busy database, say), not the
+                // block: keep the place before it and ask again, or the block
+                // is skipped for good. A block the peer got wrong is skipped,
+                // or it would stall the catch-up.
+                if failed_here(&e) {
+                    tracing::warn!(peer_url = %peer.url, "a caught-up block did not land; asking again in {STORE_RETRY:?}: {e:#}");
+                    save(store, peer, Some(&resume.after));
+                    catching.ask(out, resume, STORE_RETRY);
+                    return Ok(());
+                }
                 tracing::warn!(peer_url = %peer.url, "a caught-up block did not land: {e:#}");
             }
         }
@@ -546,6 +559,15 @@ async fn land(
         tracing::debug!(peer_url = %peer.url, "caught up");
     }
     Ok(())
+}
+
+/// Whether `ingest_peer_block` failed in this server's store rather than on
+/// the block: every store failure it returns is a [`PersistError`].
+///
+/// [`PersistError`]: jig_pipeline::persist::PersistError
+fn failed_here(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<jig_pipeline::persist::PersistError>()
+        .is_some()
 }
 
 /// Keep how far the catch-up from `peer` got, or drop it at the end.
@@ -643,6 +665,25 @@ mod tests {
             blocks: 0,
             bytes: 0,
         }
+    }
+
+    /// A store failure while landing a caught-up block is asked again; a
+    /// block the peer got wrong is not.
+    #[test]
+    fn only_a_store_failure_is_asked_again() {
+        use jig_pipeline::persist::PersistError;
+        let corrupt = || PersistError::Corrupt("x".into());
+        // As `ingest_peer_block` returns them: by `?`, and from ingest.
+        let by_question_mark = || -> anyhow::Result<()> { Err(corrupt())? };
+        assert!(failed_here(&by_question_mark().unwrap_err()));
+        assert!(failed_here(&anyhow::Error::from(corrupt())));
+
+        let base64 = || -> anyhow::Result<Vec<u8>> {
+            Ok(base64::engine::general_purpose::STANDARD.decode("!")?)
+        };
+        assert!(!failed_here(&base64().unwrap_err()));
+        let json = || -> anyhow::Result<Vec<u8>> { Ok(serde_json::from_slice(b"{")?) };
+        assert!(!failed_here(&json().unwrap_err()));
     }
 
     #[tokio::test(start_paused = true)]

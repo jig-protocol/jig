@@ -923,6 +923,9 @@ impl SqliteStore {
             DROP INDEX IF EXISTS blocks_channel_hlc;
             CREATE INDEX IF NOT EXISTS blocks_channel_hlc_cid
                 ON blocks(channel_id, hlc_wall_ms, hlc_logical, hlc_origin, cid);
+            -- The newest block from a peer, where a catch-up starts.
+            CREATE INDEX IF NOT EXISTS blocks_federated_from
+                ON blocks(federated_from);
 
             CREATE TABLE IF NOT EXISTS receipts (
                 cid            TEXT PRIMARY KEY,
@@ -3027,6 +3030,33 @@ mod tests {
             render_hash: render_hash.map(String::from),
             produced_at: 1747680001,
         }
+    }
+
+    /// Where a catch-up starts is found by index, not by walking `blocks`
+    /// back from the newest row.
+    #[test]
+    fn the_newest_block_from_a_peer_is_found_by_index() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN \
+                 SELECT cid FROM blocks WHERE federated_from = ?1 ORDER BY rowid DESC LIMIT 1",
+            )
+            .unwrap()
+            .query_map(["wss://peer"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("blocks_federated_from")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
     }
 
     #[test]
