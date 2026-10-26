@@ -52,6 +52,20 @@ this needs `SOAK_B_STOP_CMD` and `SOAK_B_START_CMD`.
 `SOAK_CONTRACT_SETUP=steady` shares with both up instead, and the run fails
 at setup, naming that collision, until it is fixed.
 
+## Concurrent ingest
+
+`SOAK_INGEST=concurrent` (legacy path only) runs `SOAK_WRITERS` writers on
+each side (4 by default), and every writer on both sides posts on the same
+tick. Each server then orders its own client's posts and the other server's
+relayed ones into the channel at the same moment. Every read holds the page
+to the chain of signed ingest records the reader pinned for the channel; a
+server that signs two records with one sequence number, rewinds its clock or
+rewrites a record breaks that chain, and the client keeps the evidence.
+
+```sh
+SOAK_INGEST=concurrent SOAK_INTERVAL=2 SOAK_DURATION=600 scripts/soak/two-host-soak.sh
+```
+
 ## Remote mode
 
 Remote mode runs against two servers you have deployed. **Each must already
@@ -90,6 +104,9 @@ Everything lands in `SOAK_OUT`, by default `soak-out/RUN_ID`:
 | `seen.tsv` | The first time each post was seen on the other server. |
 | `gaps.tsv` | Stretches no read could cover: a read returns at most 200 messages. Messages in a gap count as unverifiable, not lost. |
 | `health.tsv` | `/healthz` status and time, RSS, fds, and `jig_blocks_ingested_total{source="federation"}` per server. The counter is per process: it starts again from 0 after a restart. |
+| `evidence.tsv` | Every evidence bundle a client kept against its server, with its code (`chain-forked`, `chain-clock-backwards`, ...). |
+| `chain.tsv` | How far each client verified the channel's signed chain. |
+| `read-errors.tsv` | Reads refused because the server contradicted itself. |
 | `summary.md` | The verdict, per direction and per hour. |
 
 The summary names the servers A and B, never their URLs, so it can be shared
@@ -99,6 +116,8 @@ as is. The run exits 1 when:
 - any send fails in a run with no restarts injected (with restarts, a send
   can fail while a server is down);
 - nothing was delivered at all;
+- a client kept evidence that its server contradicted itself, such as any
+  `chain-*` break in the channel's signed history;
 - a server stops answering or changes its DID by the end.
 
 Latency is the first sighting minus the send time, so its resolution is

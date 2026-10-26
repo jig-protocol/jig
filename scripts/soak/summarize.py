@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Summarise a two-host-soak.sh run as Markdown. Exits 1 if a message was
 lost or seen only past the deadline, if a send failed in a run with no
-restarts, if nothing was delivered at all, or if a server failed the
-end-of-run check.
+restarts, if nothing was delivered at all, if a client kept evidence that
+its server contradicted itself (a `chain-*` break, say), or if a server
+failed the end-of-run check.
 
 Usage: summarize.py OUT RUN_ID MODE DURATION INTERVAL POLL DEADLINE
-                    RESTART_EVERY FINAL_OK PATH RESTART_SIDE
+                    RESTART_EVERY FINAL_OK PATH RESTART_SIDE [WRITERS]
 
 The summary names the servers A and B only, never their URLs.
 """
@@ -44,12 +45,16 @@ def num(v):
 def main():
     (out, run_id, mode, duration, interval, poll, deadline, restart_every,
      final_ok, path, restart_side) = sys.argv[1:12]
+    writers = int(sys.argv[12]) if len(sys.argv) > 12 else 1
     deadline_s = float(deadline)
     sends = rows(out, "sends.tsv")
     seen = rows(out, "seen.tsv")
     gaps = rows(out, "gaps.tsv")
     health = rows(out, "health.tsv")
     restarts = rows(out, "restarts.tsv")
+    evidence = rows(out, "evidence.tsv")
+    chain = rows(out, "chain.tsv")
+    read_errors = rows(out, "read-errors.tsv")
 
     first_seen = {}
     for r in seen:
@@ -66,9 +71,12 @@ def main():
     lines = [
         f"# Two-host soak {run_id}",
         "",
-        f"- Mode {mode}, path {path}; {duration} s of sends, one message "
-        f"{'from A' if path == 'contract' else 'each way'} every {interval} s; "
-        f"reads every {poll} s; a message unseen after {deadline} s is lost.",
+        (f"- Mode {mode}, path {path}; {duration} s of sends, one message "
+         f"{'from A' if path == 'contract' else 'each way'} every {interval} s; "
+         if writers == 1 else
+         f"- Mode {mode}, path {path}, concurrent ingest; {duration} s of sends, "
+         f"{writers} messages each way at once every {interval} s; ")
+        + f"reads every {poll} s; a message unseen after {deadline} s is lost.",
         (f"- Server {'A and B in turn' if restart_side == 'alternate' else restart_side.upper()} "
          f"restarted every {restart_every} s.")
         if restart_every != "0" else "- No restarts injected.",
@@ -147,6 +155,20 @@ def main():
     lines.append(f"Restarts injected: {len(restarts)}. Visibility gaps: {len(gaps)}. "
                  "Ingest counters are per process and start again after a restart.")
     lines.append("")
+    # How far each reader held its server's signed chain for the channel.
+    # None means no read was checked against a pin, so a break could not
+    # have shown.
+    lines += ["## Signed history", ""]
+    for side in ("a", "b"):
+        seqs = [int(c["chain_seq"]) for c in chain if c["side"] == side and num(c["chain_seq"]) is not None]
+        lines.append(f"- {side.upper()}: " + (f"verified up to record {max(seqs)}" if seqs
+                                              else "not checked (the client holds no chain pin for the channel)"))
+    for e in evidence:
+        lines.append(f"- Evidence kept on {e['side'].upper()}: `{e['code']}` ({e['status']}): {e['reason']}")
+    if read_errors:
+        lines.append(f"- {len(read_errors)} read(s) refused on a contradiction; the first: "
+                     f"{read_errors[0]['error']}")
+    lines.append("")
     # A send can fail while a server is restarting; with none injected,
     # any failed send is the system refusing work.
     restarted = restart_every != "0" or len(restarts) > 0
@@ -159,6 +181,11 @@ def main():
         reasons.append(f"{errors_total} sends failed with no restart injected")
     if delivered_total == 0:
         reasons.append("nothing was delivered")
+    if evidence:
+        codes = sorted({e["code"] for e in evidence})
+        reasons.append(f"{len(evidence)} contradiction(s) kept as evidence ({', '.join(codes)})")
+    elif read_errors:
+        reasons.append(f"{len(read_errors)} read(s) refused on a contradiction")
     if final_ok != "1":
         reasons.append("a server failed the end-of-run check")
     ok = not reasons

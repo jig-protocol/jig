@@ -34,6 +34,12 @@
 #   SOAK_SETTLE        seconds to keep reading after the last send (default
 #                      SOAK_DEADLINE)
 #   SOAK_HEALTH_EVERY  seconds between health samples (default 60)
+#   SOAK_INGEST        paced (default): one writer per side. concurrent
+#                      (legacy path only): SOAK_WRITERS writers per side, all
+#                      posting on the same tick, so each server takes its
+#                      own client's posts and the other server's relayed ones
+#                      into the channel at the same moment
+#   SOAK_WRITERS       concurrent: writers per side (default 4)
 #   SOAK_RESTART_EVERY seconds between server restarts (default 0: none)
 #   SOAK_RESTART_SIDE  b (default), a, or alternate: which server restarts
 #   SOAK_A_RESTART_CMD remote: command that restarts server A (e.g. over ssh)
@@ -47,9 +53,11 @@
 #   SOAK_PORT_A        local: A's port (default 47501)
 #   SOAK_PORT_B        local: B's port (default 47502)
 #
-# Output in SOAK_OUT: sends.tsv, seen.tsv, gaps.tsv, health.tsv and
-# summary.md. Exits 1 if a message was lost, or a server stopped answering
-# at the end.
+# Output in SOAK_OUT: sends.tsv, seen.tsv, gaps.tsv, health.tsv,
+# evidence.tsv, chain.tsv and summary.md. Exits 1 if a message was lost, a
+# client kept evidence that a server contradicted itself (a `chain-*` break
+# in the channel's signed history, say), or a server stopped answering at
+# the end. See scripts/soak/README.md.
 
 set -euo pipefail
 
@@ -71,9 +79,16 @@ RESTART_EVERY="${SOAK_RESTART_EVERY:-0}"
 RESTART_SIDE="${SOAK_RESTART_SIDE:-b}"
 FED_PATH="${SOAK_PATH:-legacy}"
 SETUP="${SOAK_CONTRACT_SETUP:-isolated}"
+INGEST="${SOAK_INGEST:-paced}"
+WRITERS="${SOAK_WRITERS:-4}"
 case "$FED_PATH" in legacy | contract) ;; *) echo "SOAK_PATH is legacy or contract" >&2; exit 1 ;; esac
 case "$SETUP" in isolated | steady) ;; *) echo "SOAK_CONTRACT_SETUP is isolated or steady" >&2; exit 1 ;; esac
 case "$RESTART_SIDE" in a | b | alternate) ;; *) echo "SOAK_RESTART_SIDE is a, b or alternate" >&2; exit 1 ;; esac
+case "$INGEST" in paced) WRITERS=1 ;; concurrent) ;; *) echo "SOAK_INGEST is paced or concurrent" >&2; exit 1 ;; esac
+if [ "$INGEST" = concurrent ] && [ "$FED_PATH" != legacy ]; then
+  echo "SOAK_INGEST=concurrent needs SOAK_PATH=legacy: on the contract path only A posts" >&2; exit 1
+fi
+case "$WRITERS" in '' | *[!0-9]* | 0) echo "SOAK_WRITERS is a whole number from 1" >&2; exit 1 ;; esac
 # Whether B comes up only after the channel is shared.
 LATE_B=0
 if [ "$FED_PATH" = contract ] && [ "$SETUP" = isolated ]; then LATE_B=1; fi
@@ -317,7 +332,7 @@ else
   client_init b
   warm_up a b "$READ_B" 120
   warm_up b a "$READ_A" 120
-  log "run $RUN_ID: channel $CHANNEL, ${DURATION}s of sends every ${INTERVAL}s each way"
+  log "run $RUN_ID: channel $CHANNEL, ${DURATION}s of sends every ${INTERVAL}s each way, $WRITERS writer(s) per side"
 fi
 
 # --- the run ---------------------------------------------------------------------
@@ -327,17 +342,28 @@ printf 'reader\tsender\tseq\tseen_ms\n' > "$OUT/seen.tsv"
 printf 'reader\tat_ms\tafter_seq\tnext_seen\n' > "$OUT/gaps.tsv"
 printf 'at_ms\tside\thealthz\tlatency_s\trss_kb\tfds\tfederation_ingested\n' > "$OUT/health.tsv"
 printf 'at_ms\tside\n' > "$OUT/restarts.tsv"
+printf 'at_ms\treader\terror\n' > "$OUT/read-errors.tsv"
 
 END_SEND=$(( $(date +%s) + DURATION ))
 
+# Writer W (0-based) of WRITERS on SIDE. Its sequence numbers are W+1,
+# W+1+WRITERS, ..., so a side's writers never share one. With more than one
+# writer, every writer on both sides posts on the same tick (a multiple of
+# INTERVAL on the clock), and the servers take local and relayed posts at
+# once.
 sender() {
-  local side="$1" seq=0 ok
+  local side="$1" w="${2:-0}" n=0 seq ok
   while [ "$(date +%s)" -lt "$END_SEND" ]; do
-    seq=$((seq + 1))
+    if [ "$WRITERS" -gt 1 ]; then
+      local now_s; now_s="$(date +%s)"
+      sleep "$(( INTERVAL - now_s % INTERVAL ))"
+      [ "$(date +%s)" -lt "$END_SEND" ] || break
+    fi
+    seq=$(( n * WRITERS + w + 1 )); n=$((n + 1))
     local at; at="$(now_ms)"
     if as "$side" send --channel "$CHANNEL" "soak $RUN_ID $side $seq" >/dev/null 2>&1; then ok=1; else ok=0; fi
     printf '%s\t%s\t%s\t%s\n' "$side" "$seq" "$at" "$ok" >> "$OUT/sends.tsv"
-    sleep "$INTERVAL"
+    [ "$WRITERS" -gt 1 ] || sleep "$INTERVAL"
   done
 }
 
@@ -352,7 +378,9 @@ reader() {
   : > "$state"
   while :; do
     local at
-    if as "$side" --json read "$ref" --limit 200 > "$WORK/read-$side.json" 2>/dev/null; then
+    # `jig read` holds the page to the channel chain this device pinned; a
+    # break fails the read and is kept as evidence (collected at the end).
+    if as "$side" --json read "$ref" --limit 200 > "$WORK/read-$side.json" 2> "$WORK/read-$side.err"; then
       # Seen by the time the read returned: never earlier than the send.
       at="$(now_ms)"
       python3 - "$WORK/read-$side.json" "$state" "$OUT/seen.tsv" "$OUT/gaps.tsv" \
@@ -398,6 +426,8 @@ seen.update(new)
 with open(state_path, "w") as f:
     f.write(" ".join(map(str, sorted(seen))))
 PY
+    elif grep -q "contradicted" "$WORK/read-$side.err"; then
+      printf '%s\t%s\t%s\n' "$(now_ms)" "$side" "$(head -c 300 "$WORK/read-$side.err" | tr '\t\n' '  ')" >> "$OUT/read-errors.tsv"
     fi
     sleep "$POLL"
   done
@@ -434,10 +464,11 @@ restarter() {
 health & PIDS+=($!)
 reader b "$READ_B" & PIDS+=($!)
 if [ "$RESTART_EVERY" -gt 0 ]; then restarter & PIDS+=($!); fi
-sender a & SENDERS=($!)
+SENDERS=()
+for ((w = 0; w < WRITERS; w++)); do sender a "$w" & SENDERS+=($!); done
 if [ "$FED_PATH" = legacy ]; then
   reader a "$READ_A" & PIDS+=($!)
-  sender b & SENDERS+=($!)
+  for ((w = 0; w < WRITERS; w++)); do sender b "$w" & SENDERS+=($!); done
 fi
 PIDS+=("${SENDERS[@]}")
 wait "${SENDERS[@]}"
@@ -456,8 +487,44 @@ for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
 wait "${PIDS[@]}" 2>/dev/null || true
 PIDS=()
 
+# What each client holds against its server: every evidence bundle it kept
+# (a contradiction, `chain-*` or otherwise, fails the run), and how far it
+# verified the channel's signed chain, so a run that checked nothing shows.
+printf 'side\tid\tcode\tstatus\treason\n' > "$OUT/evidence.tsv"
+printf 'side\tslug\tchain_seq\n' > "$OUT/chain.tsv"
+for side in a b; do
+  [ -d "$WORK/client-$side" ] || continue
+  as "$side" trust evidence list 2>/dev/null | while IFS=$'\t' read -r id status reason; do
+    [ -n "$reason" ] || continue
+    code="$(as "$side" trust evidence export "$id" 2>/dev/null \
+      | python3 -c 'import json, sys; print(json.load(sys.stdin).get("code", "?"))' || echo "?")"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$side" "$id" "$code" "$status" "${reason//$'\t'/ }" >> "$OUT/evidence.tsv"
+  done
+  python3 - "$WORK/client-$side/.jig/pins.json" "$side" "$CHANNEL" >> "$OUT/chain.tsv" <<'PY' || true
+import json, sys
+path, side, channel = sys.argv[1:]
+try:
+    pins = json.load(open(path))
+except (OSError, ValueError):
+    sys.exit(0)
+# A client talks only to its own server, so any chain head pinned under the
+# channel's slug is that server's.
+def walk(node, keys):
+    if isinstance(node, dict):
+        head = node.get("chain_head")
+        if isinstance(head, dict) and "seq" in head and channel in keys:
+            print(f"{side}\t{channel}\t{head['seq']}")
+        for k, v in node.items():
+            walk(v, keys + [k])
+    elif isinstance(node, list):
+        for v in node:
+            walk(v, keys + [v.get("slug")] if isinstance(v, dict) else keys)
+walk(pins, [])
+PY
+done
+
 STATUS=0
 python3 "$ROOT/scripts/soak/summarize.py" "$OUT" "$RUN_ID" "$MODE" "$DURATION" "$INTERVAL" \
-  "$POLL" "$DEADLINE" "$RESTART_EVERY" "$FINAL_OK" "$FED_PATH" "$RESTART_SIDE" > "$OUT/summary.md" || STATUS=$?
+  "$POLL" "$DEADLINE" "$RESTART_EVERY" "$FINAL_OK" "$FED_PATH" "$RESTART_SIDE" "$WRITERS" > "$OUT/summary.md" || STATUS=$?
 cat "$OUT/summary.md"
 exit "$STATUS"
