@@ -21,7 +21,7 @@ use jig_pipeline::envelope::{
     Envelope, EnvelopeParseError, Frame, HlcCursor, ReceiptRef, Scope, SubscribeAuth,
 };
 use tokio::sync::{Mutex, mpsc};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async_with_config, tungstenite::Message};
 use url::Url;
 
 use crate::blocks::BuiltBlock;
@@ -320,17 +320,20 @@ impl Client {
         let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
         let ws_url = format!("{scheme}://{host}{port}/api/v1/ws");
 
+        // A server's messages are held to what a legitimate one sends
+        // (`crate::limits`), not tungstenite's 64 MiB default.
+        let ws_config = Some(crate::limits::ws_config());
         let (ws, _resp) = match tls {
             Some(config) => {
                 tokio_tungstenite::connect_async_tls_with_config(
                     &ws_url,
-                    None,
+                    ws_config,
                     false,
                     Some(tokio_tungstenite::Connector::Rustls(config)),
                 )
                 .await
             }
-            None => connect_async(&ws_url).await,
+            None => connect_async_with_config(&ws_url, ws_config, false).await,
         }
         .map_err(|e| ClientError::Connect(e.to_string()))?;
         // What the welcome must be bound to (JEP-0002 rule 12).
