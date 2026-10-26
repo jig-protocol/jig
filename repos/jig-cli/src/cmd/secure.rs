@@ -486,7 +486,10 @@ impl Secure {
         limit: usize,
         before: Option<&str>,
     ) -> Result<Vec<DeliveredBlock>> {
-        let mut url = history_url(&self.server, slug, limit);
+        // This is the one path that pages on until an empty page, so the one
+        // that may ask the server to cut a page at its byte budget. A server
+        // that predates the budget ignores it.
+        let mut url = history_url(&self.server, slug, limit) + "&budget=1";
         if let Some(cid) = before {
             url.push_str(&format!("&before={cid}"));
         }
