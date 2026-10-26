@@ -455,7 +455,9 @@ impl Nameserver {
             );
         }
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
+            // Bounded, like every read from a server: a truncated body
+            // simply has no parseable code.
+            let text = jig_client::limits::error_text(resp).await;
             let code = serde_json::from_str::<serde_json::Value>(&text)
                 .ok()
                 .and_then(|v| v["code"].as_str().map(str::to_string));
@@ -476,10 +478,10 @@ impl Nameserver {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| chrono::DateTime::parse_from_rfc2822(v).ok())
             .map(|t| t.timestamp());
-        let body: ChallengeResponse = resp
-            .json()
-            .await
-            .with_context(|| format!("decoding the response to GET {url}"))?;
+        let body: ChallengeResponse =
+            jig_client::limits::json_capped(resp, jig_client::limits::MAX_NAMESERVER_BYTES)
+                .await
+                .with_context(|| format!("reading the response to GET {url}"))?;
         let offer = body
             .pow_offer
             .map(|offer| {
@@ -535,7 +537,7 @@ impl Nameserver {
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok()?.trim().parse().ok());
         if status.is_client_error() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = jig_client::limits::error_text(resp).await;
             return Err(Refusal {
                 url,
                 status,
@@ -544,7 +546,14 @@ impl Nameserver {
             }
             .into());
         }
-        let text = match resp.text().await {
+        let read = if status.is_success() {
+            jig_client::limits::read_capped(resp, jig_client::limits::MAX_NAMESERVER_BYTES)
+                .await
+                .map(|body| String::from_utf8_lossy(&body).into_owned())
+        } else {
+            Ok(jig_client::limits::error_text(resp).await)
+        };
+        let text = match read {
             Ok(text) => text,
             Err(e) => {
                 return Ok(Err(anyhow::Error::new(e).context(format!(
@@ -625,17 +634,16 @@ async fn json_or_explain<T: serde::de::DeserializeOwned>(
     url: &str,
 ) -> Result<T> {
     let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .with_context(|| format!("reading body of {url}"))?;
     if !status.is_success() {
+        let text = jig_client::limits::error_text(resp).await;
         anyhow::bail!(
             "{url}: {}",
             explain_nameserver_error(status.as_u16(), &text)
         );
     }
-    serde_json::from_str(&text).with_context(|| format!("decoding the response from {url}"))
+    jig_client::limits::json_capped(resp, jig_client::limits::MAX_NAMESERVER_BYTES)
+        .await
+        .with_context(|| format!("reading the response from {url}"))
 }
 
 /// Turn a nameserver's refusal into an operator message: its own message and
@@ -871,13 +879,16 @@ pub async fn list(ctx: &CliContext, nameserver: Option<String>) -> Result<()> {
         .await
         .with_context(|| format!("GET {url}"))?;
     let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .with_context(|| format!("reading body of GET {url}"))?;
     if !status.is_success() {
+        let body = jig_client::limits::error_text(resp).await;
         anyhow::bail!("{}", explain_list_error(status.as_u16(), &body));
     }
+    // Every alias the nameserver lists: it grows with them, so the document
+    // limit, not a nameserver object's.
+    let body = jig_client::limits::read_capped(resp, jig_client::limits::MAX_DOCUMENT_BYTES)
+        .await
+        .with_context(|| format!("reading GET {url}"))?;
+    let body = String::from_utf8_lossy(&body);
 
     let handles: HandlesList =
         serde_json::from_str(&body).context("decoding /v1/handles response")?;

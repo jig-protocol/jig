@@ -58,6 +58,7 @@ use jig_pipeline::persist::{SqliteStore, StoredBlock, StoredChannel};
 
 use crate::v0_0_2::AppState;
 use crate::v0_0_2_peer::{CloseReason, PeerFrames, PeerRegistry, PeerSender};
+use crate::v0_0_2_relay::Relay;
 use crate::v0_0_2_stream::Stream;
 
 /// The owner's offer: one signed `contract-offer`.
@@ -87,6 +88,9 @@ pub struct Contracts {
     manifest: Arc<RwLock<Option<jig_pipeline::handshake::ManifestRef>>>,
     peers: Arc<PeerRegistry>,
     stream: Stream,
+    /// The same [`Relay`] as `AppState::relay`, once [`handle`] has set it:
+    /// one table of requests waiting on owners.
+    relay: Arc<Relay>,
 }
 
 /// Run the contract on `state`'s server:
@@ -149,6 +153,9 @@ fn handle(state: &AppState) -> Contracts {
         }
     });
     contracts.stream.run();
+    if state.relay.set(contracts.relay.clone()).is_err() {
+        tracing::warn!("a relay was already set; relayed writes go through it");
+    }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     state.ingest_ctx.fanout.watch_all(tx);
     let streamer = contracts.stream.clone();
@@ -170,7 +177,18 @@ impl Contracts {
             federation: federation.clone(),
             manifest: state.manifest.clone(),
             peers: state.peers.clone(),
-            stream: Stream::new(state.ingest_ctx.clone(), federation, state.peers.clone()),
+            stream: Stream::new(
+                state.ingest_ctx.clone(),
+                federation.clone(),
+                state.peers.clone(),
+            ),
+            relay: state.relay.get().cloned().unwrap_or_else(|| {
+                Arc::new(Relay::new(
+                    state.ingest_ctx.clone(),
+                    &federation,
+                    state.peers.clone(),
+                ))
+            }),
         }
     }
 
@@ -745,6 +763,9 @@ impl PeerFrames for Contracts {
         if let Some(handled) = self.stream.on_peer_frame(peer, kind, body, out) {
             return handled;
         }
+        if let Some(handled) = self.relay.on_peer_frame(peer, kind, body, out) {
+            return handled;
+        }
         let peer = peer.to_did_jig_string();
         match kind {
             OFFER_FRAME => {
@@ -1003,6 +1024,15 @@ mod tests {
     }
 
     fn state_with(peers: Vec<FederationPeer>, attested: &[&str]) -> AppState {
+        state_tuned(peers, attested, |_| {})
+    }
+
+    /// [`state_with`], with `tune` applied to the configuration first.
+    fn state_tuned(
+        peers: Vec<FederationPeer>,
+        attested: &[&str],
+        tune: impl FnOnce(&mut JigServerConfig),
+    ) -> AppState {
         let mut config = JigServerConfig::default();
         config.federation.dangerously_allow_plaintext_federation = true;
         config.federation.peers = peers;
@@ -1013,6 +1043,7 @@ mod tests {
                 root: "dns".to_string(),
             })
             .collect();
+        tune(&mut config);
         AppState::for_test_with_config(config).unwrap()
     }
 
@@ -1058,7 +1089,16 @@ mod tests {
         offers: OfferPolicy,
         quota: Option<jig_config::v0_0_2_server::PeerQuotaConfig>,
     ) -> Pair {
-        let mut owner = state_with(vec![], &[]);
+        pair_tuned(offers, quota, |_| {}).await
+    }
+
+    /// [`pair_with`], with `tune` applied to the owner's configuration.
+    async fn pair_tuned(
+        offers: OfferPolicy,
+        quota: Option<jig_config::v0_0_2_server::PeerQuotaConfig>,
+        tune: impl FnOnce(&mut JigServerConfig),
+    ) -> Pair {
+        let mut owner = state_tuned(vec![], &[], tune);
         let follower = state_with(
             vec![FederationPeer {
                 quota,
@@ -1687,7 +1727,7 @@ mod tests {
         // A kind this server does not speak is left alone.
         assert!(
             contracts
-                .on_peer_frame(out.peer(), "relay-submit", b"", &out)
+                .on_peer_frame(out.peer(), "a-later-slice", b"", &out)
                 .is_ok()
         );
     }
@@ -2240,6 +2280,377 @@ mod tests {
         assert_eq!(
             at - tokio::time::Instant::now(),
             crate::v0_0_2_stream::MAX_RETRY_AFTER
+        );
+    }
+
+    // ---- Writes through a follower (JEP-0005 rules 7a, 15) -----------------
+
+    use crate::v0_0_2_relay::{Refusal, Submit};
+
+    /// A block signed by `key`: its manifest, code and signature.
+    fn signed(
+        key: &SigningKey,
+        kind: BlockKind,
+        meta: serde_json::Value,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        use ed25519_dalek::Signer as _;
+        let mut builder = BlockManifest::builder()
+            .version(semver::Version::new(0, 1, 0))
+            .author(Author {
+                did: did_of(key).into(),
+                public_key: None,
+                roles: vec![],
+            });
+        if let serde_json::Value::Object(map) = meta {
+            for (k, v) in map {
+                builder = builder.metadata_entry(&k, v);
+            }
+        }
+        let manifest = builder
+            .build()
+            .unwrap()
+            .with_kind(kind)
+            .to_canonical_bytes()
+            .unwrap();
+        let code: Vec<u8> = Vec::new();
+        let sig = key
+            .sign(&serde_json::to_vec(&(&manifest, &code)).unwrap())
+            .to_bytes()
+            .to_vec();
+        (manifest, code, sig)
+    }
+
+    /// Post `parts` as a client of `state` would.
+    async fn client_post(
+        state: &AppState,
+        parts: &(Vec<u8>, Vec<u8>, Vec<u8>),
+    ) -> Result<String, Refusal> {
+        crate::v0_0_2_relay::post(state, &parts.0, &parts.1, parts.2.clone(), 7, "ws:7").await
+    }
+
+    /// The submit a follower would send for `parts`, into `channel`.
+    fn submit_of(channel: &str, parts: &(Vec<u8>, Vec<u8>, Vec<u8>)) -> Submit {
+        Submit {
+            request_id: 1,
+            channel_id: channel.to_string(),
+            bundle: serde_json::to_vec(&(&parts.0, &parts.1)).unwrap(),
+            sig: parts.2.clone(),
+        }
+    }
+
+    fn text_in(channel: &str, body: &str) -> serde_json::Value {
+        serde_json::json!({"channel_id": channel, "body": body})
+    }
+
+    impl Pair {
+        /// A channel shared with `grant`, accepted, and carried by the
+        /// follower.
+        async fn carried(&self, grant: &str) -> String {
+            let channel = self.channel().await;
+            self.share(&channel, grant).await;
+            self.both(&channel, OfferState::Accepted).await;
+            self.follows.stream.pull_all();
+            self.caught_up(&channel).await;
+            channel
+        }
+
+        fn owner_relay(&self) -> Arc<Relay> {
+            self.owner.relay.get().unwrap().clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_through_a_write_follower_lands_at_the_owner_and_comes_back() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.carried("write").await;
+        let author = SigningKey::from_bytes(&rand::random());
+        let parts = signed(&author, BlockKind::TextRender, text_in(&channel, "hello"));
+
+        let cid = client_post(&p.follower, &parts).await.unwrap();
+        let owner = &p.owner.ingest_ctx.store;
+        let block = owner.get_block(&cid).unwrap().expect("landed at the owner");
+        assert_eq!(block.channel_id.as_deref(), Some(channel.as_str()));
+        assert_eq!(
+            block.federated_from.as_deref(),
+            Some(p.follower.server_did.to_did_jig_string().as_str()),
+            "the owner records the relaying server"
+        );
+        // Back through the owner's stream, with the owner's record.
+        let head = p.caught_up(&channel).await;
+        let record = p
+            .follower
+            .ingest_ctx
+            .store
+            .get_ingest_record(&cid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.seq, head);
+        assert_eq!(record.sequencer, p.owner.server_did.to_did_jig_string());
+
+        // The same signed block again is the block already taken.
+        assert_eq!(client_post(&p.follower, &parts).await.unwrap(), cid);
+        assert_eq!(Pair::head(&p.owner, &channel), Some(head), "it landed once");
+    }
+
+    #[tokio::test]
+    async fn a_read_follower_relays_no_content_and_the_owner_refuses_it_too() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.carried("read").await;
+        let author = SigningKey::from_bytes(&rand::random());
+        let parts = signed(&author, BlockKind::TextRender, text_in(&channel, "hi"));
+        let refused = client_post(&p.follower, &parts).await.unwrap_err();
+        assert_eq!(refused.code, "GRANT_REFUSED", "{refused:?}");
+
+        // A follower that relays it anyway meets the owner's own check.
+        let answer = p
+            .owner_relay()
+            .accept(&p.follower.server_did, submit_of(&channel, &parts))
+            .await;
+        assert_eq!(answer.code, "GRANT_REFUSED", "{answer:?}");
+        assert!(
+            p.owner
+                .ingest_ctx
+                .store
+                .get_block(&answer.block_cid)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn membership_goes_only_through_a_member_follower() {
+        let member = did_of(&SigningKey::from_bytes(&rand::random()));
+        let add = |channel: &str| serde_json::json!({"channel_id": channel, "member_did": member});
+
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.carried("write").await;
+        let parts = signed(&p.user, BlockKind::MemberAdd, add(&channel));
+        let refused = client_post(&p.follower, &parts).await.unwrap_err();
+        assert_eq!(refused.code, "GRANT_REFUSED", "{refused:?}");
+
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.carried("member").await;
+        let parts = signed(&p.user, BlockKind::MemberAdd, add(&channel));
+        client_post(&p.follower, &parts).await.unwrap();
+        assert!(
+            p.owner
+                .ingest_ctx
+                .store
+                .is_member_by_id(&channel, &member)
+                .unwrap()
+        );
+        // As the channel's rule allows: a stranger may not add members.
+        let stranger = SigningKey::from_bytes(&rand::random());
+        let parts = signed(&stranger, BlockKind::MemberAdd, add(&channel));
+        let refused = client_post(&p.follower, &parts).await.unwrap_err();
+        assert_ne!(
+            refused.code, "GRANT_REFUSED",
+            "the owner's gate, not the grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relayed_block_needs_its_authors_signature_whatever_the_grant() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.carried("member").await;
+        let author = SigningKey::from_bytes(&rand::random());
+        let mut parts = signed(&author, BlockKind::TextRender, text_in(&channel, "forged"));
+        parts.2[0] ^= 1;
+        let refused = client_post(&p.follower, &parts).await.unwrap_err();
+        assert_eq!(refused.code, "INVALID_SIG", "{refused:?}");
+        let answer = p
+            .owner_relay()
+            .accept(&p.follower.server_did, submit_of(&channel, &parts))
+            .await;
+        assert_eq!(answer.code, "INVALID_SIG", "{answer:?}");
+    }
+
+    #[tokio::test]
+    async fn a_follower_relays_only_into_the_channel_it_shares_and_never_a_banned_author() {
+        let banned = SigningKey::from_bytes(&rand::random());
+        let banned_did = did_of(&banned);
+        let p = pair_tuned(OfferPolicy::Accept, None, |c| {
+            c.auth.admission.banned_dids = vec![banned_did.clone()];
+        })
+        .await;
+        let channel = p.carried("write").await;
+        let unshared = post(
+            &p.owner,
+            &p.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#unshared"}),
+        )
+        .await
+        .unwrap();
+        let author = SigningKey::from_bytes(&rand::random());
+        let relay = p.owner_relay();
+        let follower = &p.follower.server_did;
+
+        // A block for another channel, sent under this share.
+        let elsewhere = signed(&author, BlockKind::TextRender, text_in(&unshared, "in"));
+        let answer = relay
+            .accept(follower, submit_of(&channel, &elsewhere))
+            .await;
+        assert_eq!(answer.code, "RELAY_OUTSIDE_SHARE", "{answer:?}");
+        // A channel the share does not cover.
+        let answer = relay
+            .accept(follower, submit_of(&unshared, &elsewhere))
+            .await;
+        assert_eq!(answer.code, "NOT_SHARED", "{answer:?}");
+        // A channel-create is outside every share.
+        let create = signed(
+            &author,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#new"}),
+        );
+        let answer = relay.accept(follower, submit_of(&channel, &create)).await;
+        assert_eq!(answer.code, "RELAY_OUTSIDE_SHARE", "{answer:?}");
+        assert!(
+            p.owner
+                .ingest_ctx
+                .store
+                .get_block(&unshared)
+                .unwrap()
+                .is_some()
+        );
+
+        // An author the owner bans, admitted by the follower.
+        let parts = signed(&banned, BlockKind::TextRender, text_in(&channel, "banned"));
+        let refused = client_post(&p.follower, &parts).await.unwrap_err();
+        assert_eq!(refused.code, "NOT_ADMITTED", "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn a_follower_relaying_too_fast_is_told_to_wait() {
+        let p = pair_tuned(OfferPolicy::Accept, None, |c| {
+            c.federation.relayed_writes = jig_config::v0_0_2_server::RateLimit {
+                burst: 2,
+                per_min: 6,
+            };
+        })
+        .await;
+        let channel = p.carried("write").await;
+        let author = SigningKey::from_bytes(&rand::random());
+        for i in 0..2 {
+            let parts = signed(
+                &author,
+                BlockKind::TextRender,
+                text_in(&channel, &format!("{i}")),
+            );
+            client_post(&p.follower, &parts).await.unwrap();
+        }
+        let parts = signed(&author, BlockKind::TextRender, text_in(&channel, "third"));
+        let refused = client_post(&p.follower, &parts).await.unwrap_err();
+        assert_eq!(refused.code, "RELAY_RATE_LIMITED", "{refused:?}");
+        assert!(
+            refused.message.contains("retry_after_ms="),
+            "{}",
+            refused.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relay_the_owner_does_not_answer_is_pending_and_held_to_a_cap() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.carried("write").await;
+        // The follower's newest connection to the owner swallows every frame.
+        let (silent, mut swallowed) = PeerSender::new(p.owner.server_did.clone());
+        let _registration = p.follower.peers.register(silent);
+        let follower = p.follower.clone();
+        let author = SigningKey::from_bytes(&rand::random());
+        let mut waiting = Vec::new();
+        for i in 0..crate::v0_0_2_relay::MAX_IN_FLIGHT {
+            let parts = signed(
+                &author,
+                BlockKind::TextRender,
+                text_in(&channel, &format!("{i}")),
+            );
+            let follower = follower.clone();
+            waiting.push(tokio::spawn(
+                async move { client_post(&follower, &parts).await },
+            ));
+        }
+        for _ in 0..crate::v0_0_2_relay::MAX_IN_FLIGHT {
+            swallowed.recv().await.expect("a relay sent");
+        }
+        let parts = signed(
+            &author,
+            BlockKind::TextRender,
+            text_in(&channel, "one more"),
+        );
+        let refused = client_post(&p.follower, &parts).await.unwrap_err();
+        assert_eq!(refused.code, "RELAY_BUSY", "{refused:?}");
+
+        // A client that goes away while it waits leaves nothing waiting.
+        let relay = p.follower.relay.get().unwrap().clone();
+        let parts = signed(&author, BlockKind::TextRender, text_in(&channel, "gone"));
+        let gone = {
+            let follower = follower.clone();
+            tokio::spawn(async move {
+                crate::v0_0_2_relay::post(&follower, &parts.0, &parts.1, parts.2, 8, "ws:8").await
+            })
+        };
+        swallowed.recv().await.expect("its relay sent");
+        assert_eq!(relay.waiting(), crate::v0_0_2_relay::MAX_IN_FLIGHT + 1);
+        gone.abort();
+        let _ = gone.await;
+        assert_eq!(relay.waiting(), crate::v0_0_2_relay::MAX_IN_FLIGHT);
+
+        // Unanswered, each is pending: the outcome is unknown, and resending
+        // is safe.
+        tokio::time::pause();
+        for task in waiting {
+            let refused = task.await.unwrap().unwrap_err();
+            assert_eq!(refused.code, "RELAY_PENDING", "{refused:?}");
+            assert!(
+                refused.message.contains("again is safe"),
+                "{}",
+                refused.message
+            );
+        }
+        assert_eq!(relay.waiting(), 0, "nothing left waiting");
+    }
+
+    #[tokio::test]
+    async fn a_write_for_an_owner_not_connected_is_refused_with_when_to_retry() {
+        let follower = state_with(vec![], &[]);
+        handle(&follower);
+        let owner = did_of(&SigningKey::from_bytes(&rand::random()));
+        let channel = jig_pipeline::ingest_record::label_cid("carried");
+        let store = &follower.ingest_ctx.store;
+        store
+            .upsert_channel(&StoredChannel {
+                id: channel.clone(),
+                slug: "#carried".to_string(),
+                visibility: "open".to_string(),
+                created_at: 0,
+                owner_did: owner.clone(),
+                suite: jig_core::EncryptionSuite::Unencrypted.as_str().to_string(),
+                sequencer_did: owner.clone(),
+                co_owners: vec![],
+            })
+            .unwrap();
+        store
+            .put_contract_offer(&StoredOffer {
+                offer_id: rand::random(),
+                channel_id: channel.clone(),
+                side: Side::Follower,
+                peer_did: owner.clone(),
+                grant: Grant::Write,
+                state: OfferState::Accepted,
+                offer: vec![],
+                answer: None,
+                share_cid: None,
+            })
+            .unwrap();
+        let author = SigningKey::from_bytes(&rand::random());
+        let parts = signed(&author, BlockKind::TextRender, text_in(&channel, "hello"));
+        let refused = client_post(&follower, &parts).await.unwrap_err();
+        assert_eq!(refused.code, "OWNER_UNREACHABLE", "{refused:?}");
+        assert!(
+            refused.message.contains("retry_after_ms=5000"),
+            "{}",
+            refused.message
         );
     }
 }
