@@ -30,7 +30,9 @@ const MAX_HISTORY_PAGE: usize = 200;
 /// Pages of older history to fetch before giving up on catching up.
 const MAX_CATCH_UP_PAGES: usize = 50;
 /// The first page a catch-up from a known head asks for: a device that
-/// synced recently is usually a few blocks behind, if any.
+/// synced recently is usually a few blocks behind, if any. Pages after it
+/// are [`MAX_HISTORY_PAGE`], so [`MAX_CATCH_UP_PAGES`] reach 16 + 49 × 200 =
+/// 9,816 blocks back.
 const SINCE_HEAD_FIRST_PAGE: usize = 16;
 
 /// Packages a DID keeps published, so it can be added while offline.
@@ -469,10 +471,14 @@ impl Secure {
                 return Ok(delivered.split_off(at + 1));
             }
             if pages == MAX_CATCH_UP_PAGES {
+                // About ten thousand blocks: past that, the blocks before
+                // this window are skipped, and MLS will refuse them later.
                 eprintln!(
-                    "warning: {slug} has moved on more than {} blocks since this device \
-                     last followed it; older messages will not be readable here",
-                    pages * MAX_HISTORY_PAGE
+                    "warning: more than {} blocks reached {slug} since this device last \
+                     read it. The newest {} are read; every older one is skipped, and \
+                     may never be readable on this device.",
+                    delivered.len(),
+                    delivered.len()
                 );
                 return Ok(delivered);
             }
