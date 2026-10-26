@@ -9,6 +9,9 @@ name: Soak smoke
 # down is never relayed (scripts/soak/README.md), so a run with
 # SOAK_RESTART_EVERY fails on main until federation catches up on
 # resubscribe. workflow_dispatch can run that case on demand.
+#
+# The contract path (SOAK_PATH=contract) needs `jig channel share`, which
+# this smoke can run once the CLI on main has it.
 
 on:
   pull_request:

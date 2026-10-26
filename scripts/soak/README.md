@@ -24,6 +24,34 @@ scripts/soak/two-host-soak.sh ~/soak.env
 
 Every setting is listed at the top of the script.
 
+## Two paths
+
+`SOAK_PATH` picks how the channel reaches B:
+
+- **`legacy`** (the default): the relay every pair of peers runs for open
+  channels. Both sides post.
+- **`contract`**: A shares the channel with B (JEP-0005, `jig channel
+  share`), and B follows A's ordered records, pulling what it missed after
+  any outage. Only A posts, because B does not relay writes back yet, and B
+  reads the channel by its id. B's peer entry for A must accept offers:
+  local mode sets `offers = "accept"`, and in remote mode you set it.
+
+```sh
+# The contract path, with A and B restarted in turn every 5 minutes:
+SOAK_PATH=contract SOAK_RESTART_EVERY=300 SOAK_RESTART_SIDE=alternate \
+  SOAK_DURATION=3600 scripts/soak/two-host-soak.sh
+```
+
+Between peers that are both up, the legacy relay delivers a new open channel
+to B within seconds, and B takes it as a channel it orders itself. A share
+made after that is accepted but carries nothing. So the contract path's
+default setup, `SOAK_CONTRACT_SETUP=isolated`, creates and shares the channel
+while B is down: the legacy relay is live-only, so it never brings that
+channel to B, and everything B gets comes by the contract. In remote mode
+this needs `SOAK_B_STOP_CMD` and `SOAK_B_START_CMD`.
+`SOAK_CONTRACT_SETUP=steady` shares with both up instead, and the run fails
+at setup, naming that collision, until it is fixed.
+
 ## Remote mode
 
 Remote mode runs against two servers you have deployed. **Each must already
@@ -82,6 +110,15 @@ Latency is the first sighting minus the send time, so its resolution is
 
   With `SOAK_RESTART_EVERY` set, a run on main loses one or two messages per
   restart and FAILs.
+- **The contract path catches up.** With A and B restarted in turn every
+  40 s, the contract path (isolated setup) delivered every post: 35 of 35,
+  p95 3 s, at most 8 s just after a restart. B pulls A's records from its own
+  head after each reconnect.
+- **Between peers that are both up, the legacy relay takes the channel
+  first.** B orders the channel itself, and acts on owner-only blocks
+  relayed to it: a `channel-share` relayed from A makes B log its own
+  `contract-refuse`. A share then delivers nothing. `SOAK_CONTRACT_SETUP=steady`
+  shows it.
 - **The warm-up exists for the same reason.** Before sending, the harness
   waits until a post crosses each way, re-posting until one does. Posts made
   before both links are up would otherwise be lost the same way.

@@ -12,6 +12,16 @@
 #   SOAK_MODE          local (default): boot two servers on this machine,
 #                      peered over loopback. remote: use two servers that are
 #                      already running and list each other as peers.
+#   SOAK_PATH          legacy (default): the channel crosses by the peers'
+#                      open-channel relay, and both sides post. contract: A
+#                      shares the channel with B (JEP-0005, `jig channel
+#                      share`), B follows A's records, and only A posts:
+#                      B does not relay writes back yet.
+#   SOAK_CONTRACT_SETUP isolated (default): create and share the channel
+#                      while B is down, so only the contract can bring it to
+#                      B. steady: with both up, where the legacy relay gets
+#                      there first (see README). Remote isolated mode needs
+#                      SOAK_B_STOP_CMD and SOAK_B_START_CMD.
 #   SOAK_A_URL         remote: server A's base URL, https://HOST:PORT
 #   SOAK_B_URL         remote: server B's base URL
 #   SOAK_BIN           directory holding jig (and jig-server for local mode);
@@ -24,9 +34,12 @@
 #   SOAK_SETTLE        seconds to keep reading after the last send (default
 #                      SOAK_DEADLINE)
 #   SOAK_HEALTH_EVERY  seconds between health samples (default 60)
-#   SOAK_RESTART_EVERY seconds between restarts of server B (default 0: none)
+#   SOAK_RESTART_EVERY seconds between server restarts (default 0: none)
+#   SOAK_RESTART_SIDE  b (default), a, or alternate: which server restarts
 #   SOAK_A_RESTART_CMD remote: command that restarts server A (e.g. over ssh)
 #   SOAK_B_RESTART_CMD remote: command that restarts server B
+#   SOAK_B_STOP_CMD    remote, contract isolated setup: stops server B
+#   SOAK_B_START_CMD   remote, contract isolated setup: starts it again
 #   SOAK_A_PROBE_CMD   remote, optional: command printing "RSS_KB FDS" for
 #                      server A's process; local mode reads /proc itself
 #   SOAK_B_PROBE_CMD   remote, optional: the same for B
@@ -55,6 +68,15 @@ DEADLINE="${SOAK_DEADLINE:-300}"
 SETTLE="${SOAK_SETTLE:-$DEADLINE}"
 HEALTH_EVERY="${SOAK_HEALTH_EVERY:-60}"
 RESTART_EVERY="${SOAK_RESTART_EVERY:-0}"
+RESTART_SIDE="${SOAK_RESTART_SIDE:-b}"
+FED_PATH="${SOAK_PATH:-legacy}"
+SETUP="${SOAK_CONTRACT_SETUP:-isolated}"
+case "$FED_PATH" in legacy | contract) ;; *) echo "SOAK_PATH is legacy or contract" >&2; exit 1 ;; esac
+case "$SETUP" in isolated | steady) ;; *) echo "SOAK_CONTRACT_SETUP is isolated or steady" >&2; exit 1 ;; esac
+case "$RESTART_SIDE" in a | b | alternate) ;; *) echo "SOAK_RESTART_SIDE is a, b or alternate" >&2; exit 1 ;; esac
+# Whether B comes up only after the channel is shared.
+LATE_B=0
+if [ "$FED_PATH" = contract ] && [ "$SETUP" = isolated ]; then LATE_B=1; fi
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
 OUT="${SOAK_OUT:-$PWD/soak-out/$RUN_ID}"
 CHANNEL="#soak-${RUN_ID,,}"
@@ -167,6 +189,24 @@ restart_server() {
   fi
 }
 
+# Contract isolated setup, remote: take B down until the channel is shared.
+remote_b() {
+  local what="$1" cmd
+  if [ "$what" = stop ]; then cmd="${SOAK_B_STOP_CMD:-}"; else cmd="${SOAK_B_START_CMD:-}"; fi
+  [ -n "$cmd" ] || fail "the isolated contract setup needs SOAK_B_STOP_CMD and SOAK_B_START_CMD in remote mode (or SOAK_CONTRACT_SETUP=steady)"
+  bash -c "$cmd" >/dev/null 2>&1 || fail "SOAK_B_${what^^}_CMD failed"
+  local _
+  for _ in $(seq 1 120); do
+    if [ "$what" = stop ]; then
+      curl -fsk -o /dev/null --max-time 2 "$(url_of b)/healthz" || return 0
+    else
+      curl -fsk -o /dev/null --max-time 2 "$(url_of b)/healthz" && return 0
+    fi
+    sleep 1
+  done
+  fail "server B did not $what"
+}
+
 # "RSS_KB FDS" for a server's process, or "- -".
 probe() {
   local side="$1" pid cmd
@@ -193,13 +233,20 @@ if [ "$MODE" = local ]; then
     "$(local_port b)" "$(cat "$(local_dir b)/did")" >> "$(local_dir a)/config.toml"
   printf '\n[[federation.peers]]\nurl = "wss://127.0.0.1:%s"\nexpected_did = "%s"\n' \
     "$(local_port a)" "$(cat "$(local_dir a)/did")" >> "$(local_dir b)/config.toml"
-  local_start a; local_start b
+  # B takes A's offers without an operator.
+  [ "$FED_PATH" = contract ] && echo 'offers = "accept"' >> "$(local_dir b)/config.toml"
+  local_start a
+  [ "$LATE_B" = 1 ] || local_start b
 elif [ "$MODE" != remote ]; then
   fail "SOAK_MODE is local or remote, not $MODE"
 fi
 URL_A="$(url_of a)"; URL_B="$(url_of b)"
 DID_A="$(server_did "$URL_A")" || fail "server A does not answer /.well-known/jig"
-DID_B="$(server_did "$URL_B")" || fail "server B does not answer /.well-known/jig"
+if [ "$MODE" = local ] && [ "$LATE_B" = 1 ]; then
+  DID_B="$(cat "$(local_dir b)/did")"
+else
+  DID_B="$(server_did "$URL_B")" || fail "server B does not answer /.well-known/jig"
+fi
 
 # --- clients -------------------------------------------------------------------
 
@@ -215,33 +262,63 @@ as() {
     "$BIN/jig" "$@"
 }
 
-for side in a b; do
+client_init() {
+  local side="$1" name
   mkdir -p "$WORK/client-$side"
   name="$([ "$side" = a ] && echo alice || echo bob)"
   as "$side" init "$name" >"$WORK/client-$side.init" 2>&1 || { cat "$WORK/client-$side.init" >&2; fail "jig init on $side"; }
   as "$side" server set "$(url_of "$side")" >/dev/null 2>&1 || fail "jig server set on $side"
-done
-as a channel create "$CHANNEL" >/dev/null 2>&1 || fail "could not create $CHANNEL on A"
+}
 
-# Wait until each side's posts reach the other: this checks the peering, and
-# keeps the time before both federation links are up out of the numbers.
-# Posts made while a link is down never cross later (no catch-up on
-# resubscribe), so the warm-up posts again until one is seen.
+# Wait until FROM's posts are read on TO's server, through REF (the slug, or
+# on a follower the channel's id): this checks the peering, and keeps the
+# time before the links are up out of the numbers. Posts made while a link
+# is down never cross later on the legacy relay, so the warm-up posts again
+# until one is seen.
 warm_up() {
-  local from="$1" to="$2" n=0 deadline=$(( $(date +%s) + 120 ))
+  local from="$1" to="$2" ref="$3" wait="$4" n=0 deadline
+  deadline=$(( $(date +%s) + wait ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     n=$((n + 1))
     as "$from" send --channel "$CHANNEL" "soak $RUN_ID warmup $from $n" >/dev/null 2>&1 || true
-    sleep 3
-    if as "$to" --json read "$CHANNEL" --limit 200 2>/dev/null | grep -qF "soak $RUN_ID warmup $from "; then
+    sleep 5
+    if as "$to" --json read "$ref" --limit 200 2>/dev/null | grep -qF "soak $RUN_ID warmup $from "; then
       return 0
     fi
   done
-  fail "nothing posted on ${from^^} reached ${to^^} within 120 s: do the servers list each other as federation peers?"
+  fail "nothing posted on ${from^^} reached ${to^^} within ${wait} s: do the servers list each other as federation peers?"
 }
-warm_up a b
-warm_up b a
-log "run $RUN_ID: channel $CHANNEL, ${DURATION}s of sends every ${INTERVAL}s each way"
+
+client_init a
+as a channel create "$CHANNEL" >/dev/null 2>&1 || fail "could not create $CHANNEL on A"
+READ_A="$CHANNEL"; READ_B="$CHANNEL"
+if [ "$FED_PATH" = contract ]; then
+  as a channel share --help >/dev/null 2>&1 || fail "$BIN/jig has no \`channel share\`: build one that does"
+  if [ "$LATE_B" = 1 ] && [ "$MODE" = remote ]; then remote_b stop; fi
+  as a channel share "$CHANNEL" "$DID_B" --grant write > "$WORK/share.out" 2>&1 || { cat "$WORK/share.out" >&2; fail "jig channel share"; }
+  READ_B="$(sed -n 's/.*read it by its id: jig read \(.*\)$/\1/p' "$WORK/share.out")"
+  [ -n "$READ_B" ] || { cat "$WORK/share.out" >&2; fail "no channel id in jig channel share's output"; }
+  if [ "$LATE_B" = 1 ]; then
+    if [ "$MODE" = local ]; then local_start b; else remote_b start; fi
+  fi
+  client_init b
+  # B accepts within a resend of the offer (30 s), then pulls every 10 s.
+  warm_up a b "$READ_B" 240
+  # A followed channel has no slug on B. If B serves A's posts by slug, B
+  # took the channel as its own from the legacy relay, and what B shows is
+  # that copy, not the contract's.
+  if as b --json read "$CHANNEL" --limit 200 2>/dev/null | grep -qF "soak $RUN_ID warmup a "; then
+    printf '# Two-host soak %s\n\n**FAIL**: server B holds %s as a channel it sequences itself (it came by the legacy relay before the share), so the contract carries nothing to it. See scripts/soak/README.md.\n' \
+      "$RUN_ID" "$CHANNEL" | tee "$OUT/summary.md"
+    exit 1
+  fi
+  log "run $RUN_ID: $CHANNEL shared with B (id $READ_B), ${DURATION}s of posts on A every ${INTERVAL}s"
+else
+  client_init b
+  warm_up a b "$READ_B" 120
+  warm_up b a "$READ_A" 120
+  log "run $RUN_ID: channel $CHANNEL, ${DURATION}s of sends every ${INTERVAL}s each way"
+fi
 
 # --- the run ---------------------------------------------------------------------
 
@@ -269,13 +346,13 @@ sender() {
 # when the oldest of them is past the last one seen, what fell between could
 # not be checked, and that is recorded as a gap rather than a loss.
 reader() {
-  local side="$1" other state
+  local side="$1" ref="$2" other state
   other="$([ "$side" = a ] && echo b || echo a)"
   state="$WORK/reader-$side.state"
   : > "$state"
   while :; do
     local at
-    if as "$side" --json read "$CHANNEL" --limit 200 > "$WORK/read-$side.json" 2>/dev/null; then
+    if as "$side" --json read "$ref" --limit 200 > "$WORK/read-$side.json" 2>/dev/null; then
       # Seen by the time the read returned: never earlier than the send.
       at="$(now_ms)"
       python3 - "$WORK/read-$side.json" "$state" "$OUT/seen.tsv" "$OUT/gaps.tsv" \
@@ -294,10 +371,12 @@ for line in open(path):
         body = json.loads(line).get("body", "")
     except ValueError:
         continue
+    # The sequence number, then whatever the client appends (a follower,
+    # which keeps no receipt of its own, marks the line `[unverified]`).
     if isinstance(body, str) and body.startswith(prefix):
         try:
-            seqs.append(int(body[len(prefix):]))
-        except ValueError:
+            seqs.append(int(body[len(prefix):].split()[0]))
+        except (ValueError, IndexError):
             pass
 seen = set()
 try:
@@ -339,23 +418,29 @@ health() {
 }
 
 restarter() {
+  local n=0 side
   while :; do
     sleep "$RESTART_EVERY"
     [ "$(date +%s)" -lt "$END_SEND" ] || return 0
-    log "restarting server B"
-    printf '%s\tb\n' "$(now_ms)" >> "$OUT/restarts.tsv"
-    restart_server b
+    n=$((n + 1))
+    side="$RESTART_SIDE"
+    if [ "$side" = alternate ]; then side="$([ $((n % 2)) = 1 ] && echo b || echo a)"; fi
+    log "restarting server ${side^^}"
+    printf '%s\t%s\n' "$(now_ms)" "$side" >> "$OUT/restarts.tsv"
+    restart_server "$side"
   done
 }
 
 health & PIDS+=($!)
-reader a & PIDS+=($!)
-reader b & PIDS+=($!)
+reader b "$READ_B" & PIDS+=($!)
 if [ "$RESTART_EVERY" -gt 0 ]; then restarter & PIDS+=($!); fi
-sender a & SEND_A=$!
-sender b & SEND_B=$!
-PIDS+=("$SEND_A" "$SEND_B")
-wait "$SEND_A" "$SEND_B"
+sender a & SENDERS=($!)
+if [ "$FED_PATH" = legacy ]; then
+  reader a "$READ_A" & PIDS+=($!)
+  sender b & SENDERS+=($!)
+fi
+PIDS+=("${SENDERS[@]}")
+wait "${SENDERS[@]}"
 log "sending done; reading for ${SETTLE}s more"
 sleep "$SETTLE"
 
@@ -373,6 +458,6 @@ PIDS=()
 
 STATUS=0
 python3 "$ROOT/scripts/soak/summarize.py" "$OUT" "$RUN_ID" "$MODE" "$DURATION" "$INTERVAL" \
-  "$POLL" "$DEADLINE" "$RESTART_EVERY" "$FINAL_OK" > "$OUT/summary.md" || STATUS=$?
+  "$POLL" "$DEADLINE" "$RESTART_EVERY" "$FINAL_OK" "$FED_PATH" "$RESTART_SIDE" > "$OUT/summary.md" || STATUS=$?
 cat "$OUT/summary.md"
 exit "$STATUS"

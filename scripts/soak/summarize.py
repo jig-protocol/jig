@@ -3,7 +3,7 @@
 lost or a server failed the end-of-run check.
 
 Usage: summarize.py OUT RUN_ID MODE DURATION INTERVAL POLL DEADLINE
-                    RESTART_EVERY FINAL_OK
+                    RESTART_EVERY FINAL_OK PATH RESTART_SIDE
 
 The summary names the servers A and B only, never their URLs.
 """
@@ -41,7 +41,7 @@ def num(v):
 
 def main():
     (out, run_id, mode, duration, interval, poll, deadline, restart_every,
-     final_ok) = sys.argv[1:10]
+     final_ok, path, restart_side) = sys.argv[1:12]
     deadline_s = float(deadline)
     sends = rows(out, "sends.tsv")
     seen = rows(out, "seen.tsv")
@@ -64,10 +64,11 @@ def main():
     lines = [
         f"# Two-host soak {run_id}",
         "",
-        f"- Mode {mode}; {duration} s of sends, one message each way every "
-        f"{interval} s; reads every {poll} s; a message unseen after "
-        f"{deadline} s is lost.",
-        f"- Server B restarted every {restart_every} s"
+        f"- Mode {mode}, path {path}; {duration} s of sends, one message "
+        f"{'from A' if path == 'contract' else 'each way'} every {interval} s; "
+        f"reads every {poll} s; a message unseen after {deadline} s is lost.",
+        (f"- Server {'A and B in turn' if restart_side == 'alternate' else restart_side.upper()} "
+         f"restarted every {restart_every} s.")
         if restart_every != "0" else "- No restarts injected.",
         f"- Latency is first sighting minus send time, so it is rounded up "
         f"to the next read ({poll} s).",
@@ -80,6 +81,8 @@ def main():
     hourly = {}
     for sender, reader in (("a", "b"), ("b", "a")):
         mine = [s for s in sends if s["side"] == sender]
+        if not mine:
+            continue
         ok = [s for s in mine if s["ok"] == "1"]
         errors = len(mine) - len(ok)
         latencies, late, lost, unver = [], 0, 0, 0
