@@ -279,8 +279,7 @@ and install through the verified `curl | bash` path. What decides it now:
 - Encrypted channels do not federate yet: a server can follow an open channel
   another server sequences (#309), but relayed writes and MLS across servers
   (F2 Tasks 6 to 11) are still to build.
-- Nothing has had an outside review. The audit (D27) is designed to run once v0.2
-  is code-complete, and its scope is not yet commissioned.
+- Nothing has had an outside review yet. The audit is scoped (D27, decided 2026-10-25): Phase 1 before G3, Phase 2 after code-complete.
 - Admission rests on operator-written config, not earned reputation.
 
 ### Minimum credible blocker set, ordered

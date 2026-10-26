@@ -206,7 +206,7 @@ Since then, each in one or more PRs:
 | 3 | A hostile operator's downgrade or false handshake is detected | Largely met: the slices the D11 plan names for it (1, 3, 4a, 4b, 6, 7) are merged, as are 0, 2, 8 and 9. Slice 5 (`seen` and head gossip, so members compare chains) is not built, slice 10 (`sequencer-set`) lands with F2, and OP-01, OP-02 and TM-01 still read Partial |
 | 4 | Suites are pluggable, shown through the registry with conformance vectors | Met (#165) |
 | 5 | The federation contract is specified, and two jig servers federate an encrypted channel through it | Not met: F2 Tasks 6 to 11 remain (relayed writes, MLS across servers, custodians, sequencer moves, abuse defences, end to end), and Task 0c (clients address channels by `channel_id`) |
-| 6 | An external audit is scoped | Not started |
+| 6 | An external audit is scoped | Scoped (D27, decided 2026-10-25): Phase 1 before G3, Phase 2 after code-complete |
 
 Still to do in this phase:
 
@@ -229,8 +229,8 @@ Still to do in this phase:
   client behind one shares the proxy's limit.
 - Peer-policy quotas. The policy is published in the signed server manifest since #275; its
   quotas are not enforced yet.
-- An external security audit (D27), designed now and run once v0.2 is code-complete. It does not
-  block development.
+- An external security audit (D27): one firm in two phases. Phase 1 runs before G3 on the code
+  that is already complete, and Phase 2 after v0.2 is code-complete. It does not block development.
 
 ### Phase 2: executable blocks (`v0.3`)
 
