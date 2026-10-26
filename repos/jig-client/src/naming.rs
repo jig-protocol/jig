@@ -36,7 +36,7 @@ use serde::Deserialize;
 
 /// The largest response read from a nameserver or delegation host. Every
 /// object served is a few hundred bytes.
-const MAX_RESPONSE: usize = 64 * 1024;
+const MAX_RESPONSE: usize = crate::limits::MAX_NAMESERVER_BYTES;
 
 /// One suffix in the client's `[naming.delegations]`: a `config` root.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -550,7 +550,7 @@ const NS_WELL_KNOWN: &str = "/.well-known/jig-ns";
 
 /// GET `url`, at most [`MAX_RESPONSE`] bytes. `Ok(None)` is a 404.
 async fn fetch(http: &reqwest::Client, url: &str) -> Result<Option<Vec<u8>>, String> {
-    let mut resp = http
+    let resp = http
         .get(url)
         .send()
         .await
@@ -561,17 +561,9 @@ async fn fetch(http: &reqwest::Client, url: &str) -> Result<Option<Vec<u8>>, Str
     if !resp.status().is_success() {
         return Err(format!("fetching {url}: HTTP {}", resp.status()));
     }
-    let mut body = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
+    let body = crate::limits::read_capped(resp, MAX_RESPONSE)
         .await
-        .map_err(|e| format!("reading {url}: {e}"))?
-    {
-        if body.len() + chunk.len() > MAX_RESPONSE {
-            return Err(format!("{url}: response too large"));
-        }
-        body.extend_from_slice(&chunk);
-    }
+        .map_err(|e| format!("{url}: {e}"))?;
     Ok(Some(body))
 }
 

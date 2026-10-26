@@ -82,17 +82,17 @@ pub async fn fetch_history(
     }
     let resp = req.send().await.with_context(|| format!("GET {url}"))?;
     let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .with_context(|| format!("reading body of GET {url}"))?;
     if !status.is_success() {
         // Read the body rather than reporting a bare status: a 404 here is
         // most likely a server that predates the history endpoint, and the
         // body is what says so.
+        let body = jig_client::limits::error_text(resp).await;
         anyhow::bail!("GET {url} returned {status}: {body}");
     }
-    parse_history(&body)
+    let body = jig_client::limits::read_capped(resp, jig_client::limits::history_page_bytes(limit))
+        .await
+        .with_context(|| format!("reading GET {url}"))?;
+    parse_history(&String::from_utf8_lossy(&body))
 }
 
 /// Fetch + decode a backlog, degrading to an empty one on a failed fetch.
