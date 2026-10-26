@@ -198,7 +198,7 @@ Since then, each in one or more PRs:
   block ABIs (#291, #299), the v0.2 receipt formats (#308) and the unused nameserver modules
   are gone.
 
-**Exit criteria, as of 2026-10-25:**
+**Exit criteria, as of 2026-10-26:**
 
 | # | Criterion | State |
 | --- | --- | --- |
