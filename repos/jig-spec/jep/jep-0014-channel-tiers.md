@@ -136,6 +136,9 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
     - The follower checks the joiner's role on the follower, and the owner checks that the
       follower holds the grant and that `join_servers` is `granted`.
     - The owner MUST refuse a relayed self-join that fails either check.
+    - The servers whose members may self-join are exactly those holding a `member` grant. The
+      grant is signed by the owner per channel and per follower, and changes with a new offer,
+      so the creation block lists no servers.
 14. **`public`:** anyone the server admits reads it. Who may post is the existing write gate
     (membership and roles); nothing is encrypted.
 15. **Leaving and removal** are unchanged: a `member-remove` block, by the member or by a DID
@@ -357,8 +360,8 @@ Drafted with an LLM coding assistant from DJ's decisions of 2026-10-25 and the c
 
 1. ~~Roles and capacity pools.~~ Decided (DJ, 2026-10-25): they stay separate, and a `guest`
    counts as a stranger for capacity (rule 10).
-2. **`join_servers` for `shared`.** Is a follower's judgement of its own members enough for
-   the owner, or should the owner name the follower servers whose members may self-join?
+2. ~~`join_servers` for `shared`.~~ Decided (DJ, 2026-10-26): the follower's `member` grant is
+   enough, and the creation block names no servers (rule 13).
 3. ~~A `#jig/keys` system channel.~~ Deferred (DJ, 2026-10-25) until key links need an
    append-only, followable history (rule 6).
 
