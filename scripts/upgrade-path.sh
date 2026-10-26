@@ -342,7 +342,7 @@ verify_installer() {
   # As install.sh: only an explicit 0 skips the signature, never the checksum.
   case "${JIG_VERIFY_SIGNATURE:-1}" in
     0) note "JIG_VERIFY_SIGNATURE=0: SHA256SUMS for $step not checked against its signature" ;;
-    1)
+    1 | auto)
       command -v ssh-keygen >/dev/null || fail "ssh-keygen is needed to verify SHA256SUMS (JIG_VERIFY_SIGNATURE=0 skips it)"
       ssh-keygen -Y verify -f "$signers" -I jig-release -n jig-release \
         -s "$sandbox/SHA256SUMS.sig" < "$sandbox/SHA256SUMS" >/dev/null \
