@@ -137,15 +137,19 @@ Draft. Field names are provisional. The design behind this revision is
    continuity, the `prev` chain, `channel_id`, `block_cid`, that `ingest_hlc` does not
    decrease, and on live delivery that `ingest_hlc` is within its own skew tolerance of
    its clock. A failure is a contradiction, with one exception. A record whose
-   `ingest_hlc` is lower than the previous record's by at most 1000 ms of wall time
-   (0 ms when only the logical counter is lower), signed by the key that signed the
-   previous record, with `seq` and `prev` intact, is a sequencer defect. A client
-   SHOULD accept it and report it to the person it acts for, not treat it as a
-   contradiction: servers before v0.2.0-alpha.3 signed such records under concurrent
-   ingest, and those records stay in their chains. A larger decrease, or one from
-   another key, is a contradiction. A client that kept the previous record's hash but
-   not the record itself cannot tell who signed it, and treats any decrease as a
-   contradiction. History is ordered by `seq`. A block's `hlc_ts` is its author's
+   `ingest_hlc` is lower than the previous record's is a sequencer defect when all of
+   these hold: it is signed by the key that signed the previous record, `seq` and `prev`
+   are intact, and it is not more than 1000 ms of wall time below the highest
+   `ingest_hlc` already accepted for the channel (a decrease of only the logical counter
+   counts as 0 ms). A client SHOULD accept such a record and report it to the person it
+   acts for, not treat it as a contradiction: servers before v0.2.0-alpha.3 signed such
+   records under concurrent ingest, and those records stay in their chains. Measuring
+   from the highest clock, not the previous record's, keeps successive steps from adding
+   up; a client keeps that highest clock with its pin. Any other decrease is a
+   contradiction: one more than 1000 ms below the highest clock accepted, or one from
+   another key. So is any record, after a gap too, more than 1000 ms below the highest
+   clock accepted. A client that kept the previous record's hash but not the record
+   itself cannot tell who signed it, and treats any decrease as a contradiction. History is ordered by `seq`. A block's `hlc_ts` is its author's
    claim.
 10. Every block a member authors into a channel, except the `channel-create`, carries
     `seen`: the latest `ingest` record its author verified for that channel. A client,
@@ -250,8 +254,9 @@ Known limits:
 - Withholding from a whole carrier is detected only once a member on another carrier
   posts. A channel with a single poster has no detection against its sequencer.
 - `timer-fire` blocks are the sequencer's word, bounded by the install's grant.
-- A sequencer can backdate a record by up to 1000 ms of `ingest_hlc` relative to the
-  record before it, and clients report it as a defect rather than refuse it (rule 9).
+- A sequencer can backdate a record by up to 1000 ms of `ingest_hlc` below the highest
+  clock the channel has reached, and clients report it as a defect rather than refuse
+  it (rule 9). The bound is from that highest clock, so steps do not add up.
   It cannot reorder or rewrite anything this way, since `seq` and `prev` still have to
   hold, and on live delivery the client's skew bound still applies.
 

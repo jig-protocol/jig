@@ -1186,6 +1186,7 @@ mod tests {
                 ingest_wall_ms: 0,
                 ingest_logical: 0,
                 record: None,
+                high: None,
             },
         )
         .unwrap();
