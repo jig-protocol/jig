@@ -77,6 +77,11 @@ pub async fn server_tls(server: &str) -> Result<Config> {
             (Some(did), _) => pins.check_server_did(server, did)?,
             _ => {}
         }
+        // The chain it serves to that DID: the DIDs its channels' earlier
+        // records are checked against (`check_channel_chain`).
+        if probed.server_did.is_some() {
+            pins.keep_links(server, &probed.key_links)?;
+        }
         probed.config
     };
     PROBED
@@ -414,7 +419,8 @@ pub enum ChainCheck {
 
 /// Hold `records` (from a page of history or a live stream) to the chain
 /// this device pinned for `slug` on `server`: each must continue it, signed
-/// by the server's pinned DID (JEP-0002 rule 9). Gaps are filled from the
+/// by the server's pinned DID or, before it in the chain, one the pin's key
+/// links lead from (JEP-0002 rule 9, JEP-0012). Gaps are filled from the
 /// records endpoint, signed as `who`. A break is an error naming what the
 /// server contradicted; the pin moves forward only over what verified.
 pub async fn check_channel_chain(
@@ -435,11 +441,13 @@ async fn check_chain_in(
 ) -> Result<ChainCheck> {
     use jig_client::chain::{ChannelChain, Step};
     let mut pins = Pins::load(pins_path)?;
-    let (Some(channel), Some(sequencer)) = (
+    // The server's DID and, along the key links this device holds for it,
+    // the DIDs it signed as before (JEP-0012).
+    let (Some(channel), Some(sequencers)) = (
         pins.channel(server, slug).cloned(),
         pins.server(server)
-            .map(|p| p.server_did.clone())
-            .filter(|d| !d.is_empty()),
+            .filter(|p| !p.server_did.is_empty())
+            .map(|p| p.sequencers()),
     ) else {
         return Ok(ChainCheck::Unpinned);
     };
@@ -464,7 +472,7 @@ async fn check_chain_in(
         }
         head => head,
     };
-    let mut chain = ChannelChain::new(&channel.create_cid, &sequencer, head);
+    let mut chain = ChannelChain::across(&channel.create_cid, sequencers, head);
     let mut sorted: Vec<_> = records.iter().collect();
     sorted.sort_by_key(|r| r.seq);
     let mut outcome = ChainCheck::Verified;
@@ -607,10 +615,10 @@ async fn check_manifest_in(
         "{server} did not serve the manifest its welcome cites: GET {url} returned {}",
         resp.status()
     );
-    let served: Served = resp
-        .json()
-        .await
-        .with_context(|| format!("decoding {url}"))?;
+    let served: Served =
+        jig_client::limits::json_capped(resp, jig_client::limits::history_page_bytes(1))
+            .await
+            .with_context(|| format!("reading {url}"))?;
     let record = fetch_records(who, server, LOG_SLUG, cited.seq, cited.seq + 1)
         .await?
         .into_iter()
@@ -734,22 +742,36 @@ pub async fn show(who: &jig_client::Identity, server: &str) -> Result<()> {
         "GET {url} returned {}",
         resp.status()
     );
-    let entries: Vec<Entry> = resp
-        .json()
-        .await
-        .with_context(|| format!("decoding {url}"))?;
+    let entries: Vec<Entry> =
+        jig_client::limits::json_capped(resp, jig_client::limits::history_page_bytes(200))
+            .await
+            .with_context(|| format!("reading {url}"))?;
     let records: Vec<_> = entries.iter().filter_map(|e| e.ingest.clone()).collect();
     if !records.is_empty() {
         check_channel_chain(who, server, LOG_SLUG, &records).await?;
     }
     println!("manifest log ({LOG_SLUG}):");
+    // Entries from before a key change are the earlier DID's, which the
+    // chain check above has held to its place in the log.
+    let sequencers = pin.sequencers();
+    let key = |did: &str| {
+        jig_core::Did::from_did_jig_string(did)
+            .and_then(|d| d.as_bytes())
+            .ok()
+    };
     for entry in &entries {
         let seq = entry
             .ingest
             .as_ref()
             .map_or("-".to_string(), |r| r.seq.to_string());
+        let author = entry
+            .ingest
+            .as_ref()
+            .map(|r| r.sequencer.as_str())
+            .filter(|s| key(s).is_some() && sequencers.iter().any(|d| key(d) == key(s)))
+            .unwrap_or(&pin.server_did);
         match read_entry(
-            &pin.server_did,
+            author,
             &entry.bundle_b64,
             entry.sig_b64.as_deref().unwrap_or_default(),
         ) {
@@ -806,10 +828,13 @@ async fn fetch_records(
         if !resp.status().is_success() {
             anyhow::bail!("GET {url} returned {}", resp.status());
         }
-        let page: Vec<jig_client::chain::IngestRecord> = resp
-            .json()
-            .await
-            .with_context(|| format!("decoding {url}"))?;
+        let page: Vec<jig_client::chain::IngestRecord> = jig_client::limits::json_capped(
+            resp,
+            // The server serves at most 200 records a page, whatever is asked.
+            jig_client::limits::records_page_bytes(((to - next) as usize).min(200)),
+        )
+        .await
+        .with_context(|| format!("reading {url}"))?;
         let Some(last) = page.last() else { break };
         next = last.seq + 1;
         out.extend(page.into_iter().filter(|r| r.seq < to));

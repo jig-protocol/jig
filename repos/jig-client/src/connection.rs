@@ -21,7 +21,7 @@ use jig_pipeline::envelope::{
     Envelope, EnvelopeParseError, Frame, HlcCursor, ReceiptRef, Scope, SubscribeAuth,
 };
 use tokio::sync::{Mutex, mpsc};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async_with_config, tungstenite::Message};
 use url::Url;
 
 use crate::blocks::BuiltBlock;
@@ -72,7 +72,7 @@ pub enum ClientError {
 pub struct Client {
     identity: Arc<Identity>,
     write_tx: mpsc::UnboundedSender<Message>,
-    inbound_rx: Mutex<mpsc::UnboundedReceiver<Frame>>,
+    inbound_rx: Mutex<mpsc::Receiver<Frame>>,
     pending_subscriptions: SubscriptionMap,
     last_cursors: Arc<Mutex<HashMap<String, HlcCursor>>>,
     /// Set by [`ReaderCleanup`] when the reader task exits. Lets `submit`
@@ -173,19 +173,42 @@ pub struct ConnectOptions {
     /// `None` uses the system's CA roots alone ([`Client::connect_with_tls`]).
     pub tls: Option<std::sync::Arc<rustls::ClientConfig>>,
     pub on_contradiction: Option<ContradictionHook>,
+    /// The public key links this device holds for the server (base64, as
+    /// [`crate::pins::ServerPin::links`] keeps them). With those the welcome
+    /// serves, they give the DIDs the server signed its channels' earlier
+    /// records as ([`crate::chain::ChannelChain::across`]).
+    pub key_links: Vec<String>,
 }
 
 /// Per-channel delivery senders, keyed by channel slug.
 ///
 /// A `std` mutex, not a `tokio` one, so [`ReaderCleanup::drop`] can clear the
 /// map — `Drop` cannot await. Nothing holds this guard across an await point.
-type SubscriptionMap = Arc<StdMutex<HashMap<String, mpsc::UnboundedSender<DeliveredBlock>>>>;
+type SubscriptionMap = Arc<StdMutex<HashMap<String, Subscription>>>;
+
+/// How many deliveries one subscription holds before its reader takes them.
+/// Past this the subscriber has fallen behind: its stream ends, marked
+/// [`BlockStream::lagged`], and it catches up from history. Holding more
+/// would let a server fill this process's memory through a slow reader; at
+/// the largest block (`crate::limits::MAX_WS_MESSAGE_BYTES`) this is about
+/// 138 MB, and a few hundred kilobytes for chat.
+pub const SUBSCRIPTION_QUEUE: usize = 64;
+
+/// How many frames other than deliveries (`Ack`, `Error`) wait for a
+/// `submit` to take them. Only one submit waits at a time, so more are
+/// unsolicited: past this they are dropped.
+const INBOUND_QUEUE: usize = 64;
+
+/// A channel subscription's end of the reader task.
+struct Subscription {
+    tx: mpsc::Sender<DeliveredBlock>,
+    /// Set when the reader dropped this subscription because it was full.
+    lagged: Arc<AtomicBool>,
+}
 
 /// Lock the subscription map, recovering from poisoning: a panicking holder
 /// must not wedge every live [`BlockStream`] for the rest of the process.
-fn lock_subscriptions(
-    map: &SubscriptionMap,
-) -> MutexGuard<'_, HashMap<String, mpsc::UnboundedSender<DeliveredBlock>>> {
+fn lock_subscriptions(map: &SubscriptionMap) -> MutexGuard<'_, HashMap<String, Subscription>> {
     map.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -238,7 +261,8 @@ pub struct DeliveredBlock {
 /// Stream of [`DeliveredBlock`] items for a subscribed channel. Returned
 /// by [`Client::subscribe_channel`].
 pub struct BlockStream {
-    rx: mpsc::UnboundedReceiver<DeliveredBlock>,
+    rx: mpsc::Receiver<DeliveredBlock>,
+    lagged: Arc<AtomicBool>,
 }
 
 impl BlockStream {
@@ -248,6 +272,13 @@ impl BlockStream {
     /// blocking here forever. Callers should treat `None` as "disconnected".
     pub async fn next(&mut self) -> Option<DeliveredBlock> {
         self.rx.recv().await
+    }
+
+    /// Whether the stream ended because this reader fell [`SUBSCRIPTION_QUEUE`]
+    /// deliveries behind, not because the connection closed. The connection
+    /// is still up: subscribe again, and fill the gap from history.
+    pub fn lagged(&self) -> bool {
+        self.lagged.load(Ordering::SeqCst)
     }
 }
 
@@ -300,7 +331,7 @@ impl Client {
             ConnectOptions {
                 offer,
                 tls,
-                on_contradiction: None,
+                ..ConnectOptions::default()
             },
         )
         .await
@@ -317,6 +348,7 @@ impl Client {
             offer,
             tls,
             on_contradiction,
+            key_links,
         } = options;
         let url = Url::parse(server_url).map_err(|e| ClientError::BadUrl(e.to_string()))?;
         // Map http(s) → ws(s) if user gave HTTP scheme; otherwise leave alone.
@@ -331,17 +363,20 @@ impl Client {
         let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
         let ws_url = format!("{scheme}://{host}{port}/api/v1/ws");
 
+        // A server's messages are held to what a legitimate one sends
+        // (`crate::limits`), not tungstenite's 64 MiB default.
+        let ws_config = Some(crate::limits::ws_config());
         let (ws, _resp) = match tls {
             Some(config) => {
                 tokio_tungstenite::connect_async_tls_with_config(
                     &ws_url,
-                    None,
+                    ws_config,
                     false,
                     Some(tokio_tungstenite::Connector::Rustls(config)),
                 )
                 .await
             }
-            None => connect_async(&ws_url).await,
+            None => connect_async_with_config(&ws_url, ws_config, false).await,
         }
         .map_err(|e| ClientError::Connect(e.to_string()))?;
         // What the welcome must be bound to (JEP-0002 rule 12).
@@ -370,10 +405,15 @@ impl Client {
         };
         let welcome_did = welcome.server_did.clone();
         let welcome_text = welcome.evidence.clone();
+        // Who signs this server's records: its DID now and, along the key
+        // links held and served, the ones before it, oldest first (JEP-0012).
+        let mut links = key_links;
+        links.extend(crate::pins::welcome_key_links(&welcome.evidence));
+        let sequencers = crate::pins::dids_along(&links, &welcome_did);
         let contradiction: Arc<StdMutex<Option<Contradiction>>> = Arc::new(StdMutex::new(None));
 
         let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Message>();
-        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<Frame>();
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Frame>(INBOUND_QUEUE);
         let pending_subscriptions: SubscriptionMap = Arc::new(StdMutex::new(HashMap::new()));
         let last_cursors: Arc<Mutex<HashMap<String, HlcCursor>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -487,16 +527,17 @@ impl Client {
                             }
                             // The block's record must continue its channel's
                             // chain as this session has seen it, signed by the
-                            // server that signed the welcome. A break is a
+                            // server that signed the welcome or, for history,
+                            // a DID it linked from. A break is a
                             // contradiction; a gap is the caller's to fill.
                             if let Some(record) = &ingest {
                                 let cid = block_cid_of(&bundle_b64);
                                 let mut chains = lock_chains(&chains_for_reader);
                                 let chain =
                                     chains.entry(record.channel_id.clone()).or_insert_with(|| {
-                                        crate::chain::ChannelChain::new(
+                                        crate::chain::ChannelChain::across(
                                             &record.channel_id,
-                                            &welcome_did,
+                                            sequencers.clone(),
                                             None,
                                         )
                                     });
@@ -548,11 +589,26 @@ impl Client {
                             // could come from different channels — for v0.0.2
                             // one sub per channel slug suffices, and the
                             // server already filtered).
+                            //
+                            // A subscriber that is full has fallen behind: it
+                            // loses its subscription rather than this reader
+                            // waiting on it, which would hold up every other
+                            // subscription and every submit's answer.
                             {
-                                let subs = lock_subscriptions(&pending_subs_for_reader);
-                                for tx in subs.values() {
-                                    let _ = tx.send(delivered.clone());
-                                }
+                                let mut subs = lock_subscriptions(&pending_subs_for_reader);
+                                subs.retain(|slug, sub| match sub.tx.try_send(delivered.clone()) {
+                                    Ok(()) => true,
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        tracing::warn!(
+                                            channel = %slug,
+                                            "a subscriber fell {SUBSCRIPTION_QUEUE} deliveries behind; \
+                                             ending its stream"
+                                        );
+                                        sub.lagged.store(true, Ordering::SeqCst);
+                                        false
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                                });
                             }
                             // Update cursor for delivery_cid (placeholder —
                             // Phase D will swap in HLC cursor parsed from the
@@ -567,7 +623,9 @@ impl Client {
                             );
                         }
                         other => {
-                            let _ = inbound_tx.send(other);
+                            if inbound_tx.try_send(other).is_err() {
+                                tracing::debug!("dropping a frame no submit is waiting for");
+                            }
                         }
                     }
                 }
@@ -690,13 +748,20 @@ impl Client {
         // half-registered subscription behind.
         let json = serde_json::to_string(&env)?;
 
-        let (delivery_tx, delivery_rx) = mpsc::unbounded_channel();
+        let (delivery_tx, delivery_rx) = mpsc::channel(SUBSCRIPTION_QUEUE);
+        let lagged = Arc::new(AtomicBool::new(false));
         {
             let mut subs = lock_subscriptions(&self.pending_subscriptions);
             if self.closed.load(Ordering::SeqCst) {
                 return Err(ClientError::ConnectionClosed);
             }
-            subs.insert(slug.to_string(), delivery_tx);
+            subs.insert(
+                slug.to_string(),
+                Subscription {
+                    tx: delivery_tx,
+                    lagged: lagged.clone(),
+                },
+            );
         }
 
         if self.write_tx.send(Message::Text(json.into())).is_err() {
@@ -704,7 +769,10 @@ impl Client {
             return Err(ClientError::ConnectionClosed);
         }
 
-        Ok(BlockStream { rx: delivery_rx })
+        Ok(BlockStream {
+            rx: delivery_rx,
+            lagged,
+        })
     }
 
     /// Submit a built block and await its `Ack` (or `Error`). Returns the
