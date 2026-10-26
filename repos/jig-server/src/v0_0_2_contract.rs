@@ -1252,10 +1252,17 @@ mod tests {
         state: &AppState,
         key: &SigningKey,
         kind: BlockKind,
-        meta: serde_json::Value,
+        mut meta: serde_json::Value,
         hlc: Option<jig_core::HlcTimestamp>,
     ) -> Result<String, IngestError> {
         use ed25519_dalek::Signer as _;
+        // A channel-create names the server it is created on.
+        if kind == BlockKind::ChannelCreate
+            && meta.get(jig_pipeline::ingest::SEQUENCER_KEY).is_none()
+        {
+            meta[jig_pipeline::ingest::SEQUENCER_KEY] =
+                serde_json::json!(state.server_did.to_did_jig_string());
+        }
         let mut builder = BlockManifest::builder()
             .version(semver::Version::new(0, 1, 0))
             .author(Author {

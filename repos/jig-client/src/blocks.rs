@@ -97,10 +97,13 @@ pub fn build_text_render_with_nickname(
 /// The block names no suite, so it is plaintext: servers refuse it unless
 /// `visibility` is `open` (restricted channels are always MLS). An encrypted
 /// channel is created with [`build_with_metadata`] and its MLS fields.
+/// `sequencer` is the DID of the server the channel is created on: the
+/// signed block is valid there only.
 pub fn build_channel_create(
     sender: &Identity,
     slug: &str,
     visibility: &str,
+    sequencer: &str,
     hlc: HlcTimestamp,
 ) -> BuiltBlock {
     build_with_metadata(
@@ -110,6 +113,7 @@ pub fn build_channel_create(
         json!({
             "slug": slug,
             "visibility": visibility,
+            "sequencer": sequencer,
         }),
     )
 }
@@ -398,9 +402,13 @@ mod tests {
     fn build_channel_create_metadata_includes_slug_and_visibility() {
         let id = test_identity();
         let hlc = test_hlc(&id);
-        let block = build_channel_create(&id, "#room", "restricted", hlc);
+        let block = build_channel_create(&id, "#room", "restricted", "did:jig:zserver", hlc);
         let manifest: BlockManifest = serde_json::from_slice(&block.manifest_bytes).unwrap();
         assert_eq!(manifest.kind, Some(BlockKind::ChannelCreate));
+        assert_eq!(
+            manifest.metadata.get("sequencer").and_then(|v| v.as_str()),
+            Some("did:jig:zserver")
+        );
         assert_eq!(
             manifest.metadata.get("slug").and_then(|v| v.as_str()),
             Some("#room")

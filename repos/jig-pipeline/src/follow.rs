@@ -745,7 +745,10 @@ mod tests {
         }
 
         /// Post through the owner's own gate, and keep what it would send.
-        async fn post(&mut self, kind: BlockKind, meta: serde_json::Value) -> String {
+        async fn post(&mut self, kind: BlockKind, mut meta: serde_json::Value) -> String {
+            if kind == BlockKind::ChannelCreate {
+                meta[crate::ingest::SEQUENCER_KEY] = serde_json::json!(self.did());
+            }
             let parts = signed(&self.user, kind, meta);
             let cid = ingest(
                 &self.ctx,

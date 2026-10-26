@@ -1076,6 +1076,19 @@ pub fn prove_carried(
     if created.to_string() != channel_id {
         return Err(unproven("the offer's creation block is another channel's"));
     }
+    // The creator named the server that orders the channel in the block it
+    // signed: the offer's signer must be that server.
+    let manifest: jig_core::BlockManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|_| unproven("the offer's creation block is malformed"))?;
+    match manifest
+        .metadata
+        .get(jig_pipeline::ingest::SEQUENCER_KEY)
+        .and_then(|v| v.as_str())
+    {
+        Some(named) if canonical(named) == canonical(sequencer) => {}
+        Some(_) => return Err(unproven("the channel's creator named another server")),
+        None => return Err(unproven("the channel's creation block names no server")),
+    }
     Ok(canonical(sequencer))
 }
 
@@ -1123,7 +1136,7 @@ mod tests {
     fn served(id: &Identity, slug: &str, suite: Option<&str>) -> (String, String, String) {
         let hlc = HlcTimestamp::now_wall(id.did().clone());
         let block = match suite {
-            None => build_channel_create(id, slug, "open", hlc),
+            None => build_channel_create(id, slug, "open", "did:jig:zserver", hlc),
             Some(s) => build_with_metadata(
                 id,
                 BlockKind::ChannelCreate,
@@ -1853,20 +1866,31 @@ mod tests {
 
     /// A channel created on `owner`'s server and offered to `follower`.
     fn carried() -> Carried {
-        use base64::Engine as _;
         let owner = jig_core::crypto::ed25519::generate_signing_key();
+        let named = did_of_key(&owner);
+        carried_naming(owner, Some(&named))
+    }
+
+    /// A share of a channel whose creation block names `named` as the server
+    /// that orders it (or no server), offered by `owner`.
+    fn carried_naming(owner: ed25519_dalek::SigningKey, named: Option<&str>) -> Carried {
+        use base64::Engine as _;
         let follower = Did::from_ed25519_pubkey(
             jig_core::crypto::ed25519::generate_signing_key()
                 .verifying_key()
                 .as_bytes(),
         )
         .to_did_jig_string();
-        let create = build_channel_create(
-            &identity(),
-            "#team",
-            "open",
-            HlcTimestamp::now_wall(Did::from_ed25519_pubkey(&[1; 32])),
-        );
+        let hlc = HlcTimestamp::now_wall(Did::from_ed25519_pubkey(&[1; 32]));
+        let create = match named {
+            Some(named) => build_channel_create(&identity(), "#team", "open", named, hlc),
+            None => build_with_metadata(
+                &identity(),
+                BlockKind::ChannelCreate,
+                hlc,
+                json!({"slug": "#team", "visibility": "open"}),
+            ),
+        };
         let creation_block =
             serde_json::to_vec(&(&create.manifest_bytes, &create.code_bytes)).unwrap();
         let channel_id = jig_core::BlockBundle {
@@ -1899,6 +1923,42 @@ mod tests {
 
     fn did_of_key(key: &ed25519_dalek::SigningKey) -> String {
         Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string()
+    }
+
+    /// The offer proves who orders a channel only together with the creation
+    /// block: its signed `sequencer` must name the offer's signer. A server
+    /// that mints a key and offers itself another server's channel proves
+    /// nothing, nor does an offer for a channel whose creator named no server.
+    #[test]
+    fn the_creation_block_names_who_orders_a_carried_channel() {
+        let minted = jig_core::crypto::ed25519::generate_signing_key();
+        let real = did_of_key(&jig_core::crypto::ed25519::generate_signing_key());
+        let c = carried_naming(minted.clone(), Some(&real));
+        let error = prove_carried(
+            "wss://follower",
+            "#team",
+            &c.channel_id,
+            &did_of_key(&minted),
+            std::slice::from_ref(&c.follower),
+            Some(&c.offer_b64),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("named another server"),
+            "{error}"
+        );
+
+        let c = carried_naming(minted.clone(), None);
+        let error = prove_carried(
+            "wss://follower",
+            "#team",
+            &c.channel_id,
+            &did_of_key(&minted),
+            std::slice::from_ref(&c.follower),
+            Some(&c.offer_b64),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("names no server"), "{error}");
     }
 
     #[test]

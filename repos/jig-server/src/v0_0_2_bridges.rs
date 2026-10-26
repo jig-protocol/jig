@@ -315,6 +315,7 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         // Channel terms and roles: the same signed block is refused again on
         // retry, so the bridge bounces it.
         ref e @ (IngestError::NotSequencer { .. }
+        | IngestError::SequencerRequired { .. }
         | IngestError::CarriedChannel { .. }
         | IngestError::RelayedOutsideShare { .. }
         | IngestError::GrantRefused { .. }

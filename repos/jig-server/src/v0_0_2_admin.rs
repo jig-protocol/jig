@@ -453,7 +453,13 @@ mod tests {
 
         let id = test_identity();
         let hlc = test_hlc(&id);
-        let block = build_channel_create(&id, "#hello", "open", hlc);
+        let block = build_channel_create(
+            &id,
+            "#hello",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            hlc,
+        );
 
         let (status, body) = post_json(router, "/api/v1/channels", submission_from(&block)).await;
         assert_eq!(status, StatusCode::OK, "body={body}");
@@ -490,7 +496,13 @@ mod tests {
         let hlc = test_hlc(&id);
 
         // First create the channel
-        let create_block = build_channel_create(&id, "#room", "open", hlc.clone());
+        let create_block = build_channel_create(
+            &id,
+            "#room",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            hlc.clone(),
+        );
         let (status, _) = post_json(
             router.clone(),
             "/api/v1/channels",
@@ -548,8 +560,9 @@ mod tests {
 
     /// Create `slug` owned by `owner` and return the router used to do it.
     async fn router_with_channel(state: Arc<AppState>, owner: &Identity, slug: &str) -> Router {
+        let sequencer = state.server_did.to_did_jig_string();
         let router = build_channel_ops_router(state);
-        let create = build_channel_create(owner, slug, "open", test_hlc(owner));
+        let create = build_channel_create(owner, slug, "open", &sequencer, test_hlc(owner));
         let (status, body) =
             post_json(router.clone(), "/api/v1/channels", submission_from(&create)).await;
         assert_eq!(status, StatusCode::OK, "setup create failed: {body}");
@@ -784,11 +797,17 @@ mod tests {
     #[tokio::test]
     async fn create_channel_rejects_invalid_signature() {
         let state = state_with_channel_kinds_allowed();
-        let router = build_channel_ops_router(state);
+        let router = build_channel_ops_router(state.clone());
 
         let id = test_identity();
         let hlc = test_hlc(&id);
-        let block = build_channel_create(&id, "#hello", "open", hlc);
+        let block = build_channel_create(
+            &id,
+            "#hello",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            hlc,
+        );
 
         // Corrupt the signature — all zeros
         let submission = serde_json::json!({

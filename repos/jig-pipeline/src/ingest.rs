@@ -244,9 +244,14 @@ pub enum IngestError {
     /// channel sequenced elsewhere reaches it by contract.
     #[error(
         "channel-create names sequencer `{sequencer}`, but this server is `{server}`; \
-         create the channel on its sequencer, or omit `sequencer`"
+         create the channel on its sequencer"
     )]
     NotSequencer { sequencer: String, server: String },
+    /// A `channel-create` submitted here that does not name its sequencer.
+    /// A channel names the server that orders it in its signed creation
+    /// block, so the block is valid on that server only.
+    #[error("channel-create must name its sequencer, this server `{server}`; upgrade jig")]
+    SequencerRequired { server: String },
     /// A block for a channel another server sequences: this server carries
     /// it, and takes its blocks only from its sequencer (JEP-0005 rule 12).
     #[error(
@@ -701,6 +706,17 @@ pub async fn ingest(
             &source,
         )?;
         channel_terms(&manifest, &server_did)?;
+        // A channel names the server that orders it, so a create signed for
+        // one server is valid on no other. A peer's create is the relay's to
+        // judge (a peer's channel names that peer), and an in-process
+        // bridge's reaches no other server.
+        if !matches!(
+            source,
+            IngestSource::FederatedPeer { .. } | IngestSource::Bridge
+        ) && !manifest.metadata.contains_key(SEQUENCER_KEY)
+        {
+            return Err(IngestError::SequencerRequired { server: server_did });
+        }
     }
 
     // Step 3: HLC update on receive, within the advertised skew bound. A
@@ -2041,9 +2057,43 @@ mod tests {
         assert!(check_manifest_dids(&fine).is_ok());
     }
 
+    /// The server key of every test context here, so a test's channel-create
+    /// can name this server as its sequencer ([`name_the_test_server`]).
+    fn test_server_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x5e; 32])
+    }
+
+    fn test_server_did() -> String {
+        Did::from_ed25519_pubkey(test_server_key().verifying_key().as_bytes()).to_did_jig_string()
+    }
+
+    /// A channel-create names the server it is created on: the test server,
+    /// unless the test names another, or sets `sequencer` to null to name
+    /// none.
+    fn name_the_test_server(
+        kind: BlockKind,
+        metadata: &mut std::collections::BTreeMap<String, serde_json::Value>,
+    ) {
+        if kind != BlockKind::ChannelCreate {
+            return;
+        }
+        match metadata.get(SEQUENCER_KEY) {
+            Some(serde_json::Value::Null) => {
+                metadata.remove(SEQUENCER_KEY);
+            }
+            Some(_) => {}
+            None => {
+                metadata.insert(
+                    SEQUENCER_KEY.to_string(),
+                    serde_json::json!(test_server_did()),
+                );
+            }
+        }
+    }
+
     fn test_ctx_allowing(kinds: &[&str]) -> IngestContext {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let server_key = random_signing_key();
+        let server_key = test_server_key();
         let server_did = Did::from_ed25519_pubkey(server_key.verifying_key().as_bytes());
         IngestContext {
             store: store.clone(),
@@ -2143,6 +2193,7 @@ mod tests {
                 .metadata
                 .insert((*k).to_string(), serde_json::json!(v));
         }
+        name_the_test_server(kind, &mut manifest.metadata);
         let manifest_bytes = manifest.to_canonical_bytes().unwrap();
         let code_bytes: Vec<u8> = vec![];
         let canonical = serde_json::to_vec(&(&manifest_bytes, &code_bytes)).unwrap();
@@ -2686,6 +2737,7 @@ mod tests {
         if let serde_json::Value::Object(map) = meta {
             manifest.metadata.extend(map);
         }
+        name_the_test_server(kind, &mut manifest.metadata);
         manifest.hlc_ts = Some(jig_core::HlcTimestamp {
             wall_ms,
             logical: 0,
@@ -3860,9 +3912,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_channel_create_without_a_sequencer_is_this_servers() {
+    async fn a_channel_create_names_its_sequencer() {
         let ctx = roles_ctx();
         let owner = person();
+        // Submitted here, a create must name this server: one signed for a
+        // server is valid on no other.
+        let refused = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#mine", "sequencer": null}),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(IngestError::SequencerRequired { .. })),
+            "{refused:?}"
+        );
+        assert!(ctx.store.get_channel_by_slug("#mine").unwrap().is_none());
         let cid = plain(
             &ctx,
             &owner,
