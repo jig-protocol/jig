@@ -189,10 +189,11 @@ Since then, each in one or more PRs:
 - **Proof-of-work (R1):** one puzzle for nameserver registration and server admission; a
   nameserver prices registration by load and caps how fast strangers register (#248, #264, #266,
   #272). Admission proof-of-work stays off by default (D26).
-- **The federation contract (F2), Tasks 0a, 0b and 1 to 5** of the
+- **The federation contract (F2), Tasks 0a, 0b and 1 to 6** of the
   [plan](superpowers/plans/2026-10-19-f2-channel-contract.md): channels keyed by CID in the store
   and routes, terms and roles, signed contract messages, the peer policy in the server
-  manifest, offers and answers, and the follower's stream (#309).
+  manifest, offers and answers, the follower's stream (#309), and writes relayed through a
+  follower under its grant (#316).
 - **One implementation of each thing:** the v0.0.1 store and `POST /blocks` route, both earlier
   block ABIs (#291, #299), the v0.2 receipt formats (#308) and the unused nameserver modules
   are gone.
@@ -205,13 +206,13 @@ Since then, each in one or more PRs:
 | 2 | The operator cannot read restricted content | Met (D25) |
 | 3 | A hostile operator's downgrade or false handshake is detected | Largely met: the slices the D11 plan names for it (1, 3, 4a, 4b, 6, 7) are merged, as are 0, 2, 8 and 9. Slice 5 (`seen` and head gossip, so members compare chains) is not built, slice 10 (`sequencer-set`) lands with F2, and OP-01, OP-02 and TM-01 still read Partial |
 | 4 | Suites are pluggable, shown through the registry with conformance vectors | Met (#165) |
-| 5 | The federation contract is specified, and two jig servers federate an encrypted channel through it | Not met: F2 Tasks 6 to 11 remain (relayed writes, MLS across servers, custodians, sequencer moves, abuse defences, end to end), and Task 0c (clients address channels by `channel_id`) |
+| 5 | The federation contract is specified, and two jig servers federate an encrypted channel through it | Not met: relayed writes are merged (Task 6, #316); Tasks 7 to 11 remain (MLS across servers, custodians, sequencer moves, abuse defences, end to end), and Task 0c (clients address channels by `channel_id`) |
 | 6 | An external audit is scoped | Scoped (D27, decided 2026-10-25): Phase 1 before G3, Phase 2 after code-complete |
 
 Still to do in this phase:
 
-- **Federation (D12, D24), F2 Task 0c and Tasks 6 to 11:** clients that address channels by
-  `channel_id`, writes relayed under grants, encrypted channels
+- **Federation (D12, D24), F2 Task 0c and Tasks 7 to 11:** clients that address channels by
+  `channel_id`, encrypted channels
   across servers, key-package custodians, the contract half of a sequencer move, abuse defences
   on federation links, and the end-to-end test. Nameserver-led shared contracts for trusted
   subnets and ruleset groups follow. Federating with a differently built server comes after the

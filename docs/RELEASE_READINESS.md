@@ -277,9 +277,10 @@ and install through the verified `curl | bash` path. What decides it now:
 - Encryption is not the default for open channels (restricted channels are always MLS
   since D25), and the email bridge refuses inbound mail until it can join MLS groups.
 - Encrypted channels do not federate yet: a server can follow an open channel
-  another server sequences (#309), but relayed writes and MLS across servers
-  (F2 Tasks 6 to 11) are still to build.
-- Nothing has had an outside review yet. The audit is scoped (D27, decided 2026-10-25): Phase 1 before G3, Phase 2 after code-complete.
+  another server sequences (#309) and relay its users' writes to the owner (#316), but MLS
+  across servers and the rest of F2 (Tasks 7 to 11) are still to build.
+- Nothing has had an outside review yet. The audit is scoped (D27, decided 2026-10-25):
+  Phase 1 before G3, Phase 2 after code-complete.
 - Admission rests on operator-written config, not earned reputation.
 
 ### Minimum credible blocker set, ordered
