@@ -149,7 +149,8 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
       `granted`, and MUST refuse a relayed self-join that fails either. It also validates the
       external commit, as in rule 12.
     - The owner trusts the follower's role decision. That trust is what the `member` grant
-      means; an owner that stops trusting a follower withdraws the grant.
+      means, as JEP-0005 rule 15 already delegates admission of relayed writes to the
+      follower; an owner that stops trusting a follower withdraws the grant.
     - The servers whose members may self-join are exactly those holding a `member` grant. The
       grant is signed by the owner per channel and per follower, and changes with a new offer,
       so the creation block lists no servers.
@@ -307,7 +308,8 @@ reads no encrypted tier.
 # Security Considerations (Zero-Trust)
 
 Threat-register rows: OP-05 (content disclosure), OP-03 (suite downgrade), OP-09 (federation
-abuse), PV-04 (non-deniability), AB-06 (abuse in encrypted channels).
+abuse), PV-04 (non-deniability), AB-06 (abuse in encrypted channels), AB-07 (delegated
+admission).
 
 - **The server learns who joins, not what is said.** Checking a role on a self-join reveals the
   joiner's DID and time to the operator, as membership blocks already do. It reveals no
@@ -315,7 +317,8 @@ abuse), PV-04 (non-deniability), AB-06 (abuse in encrypted channels).
 - **A follower decides its own members' roles.** Under a `member` grant, the owner accepts a
   follower's self-joins on the follower's word (rule 13). A hostile follower can admit anyone
   to a `shared` channel with `join_servers = granted`. The owner limits this by granting
-  `member` only to followers it trusts, and members see each join as below.
+  `member` only to followers it trusts, and members see each join as below. This is the
+  delegation of AB-07, extended from writes to joins.
 - **A hostile server can refuse a join, or admit one it should have refused.** Admitting a DID
   that does not hold the role exposes future content to that DID. Members see every join as a
   signed `member-add` with its MLS commit, so a member's client SHOULD surface joins and MAY
