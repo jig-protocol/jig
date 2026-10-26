@@ -1,127 +1,47 @@
-# Jig Protocol - Workspace
+# The jig workspace
 
-**WebAssembly-first messaging protocol with deterministic execution and capability security.**
+This directory is the Cargo workspace: every crate of the reference implementation, the
+integration tests, and the specification. Build and test from here. The repository root
+holds the docs, scripts, installer and CI; start with the root [`README.md`](../README.md)
+and [`CONTRIBUTING.md`](../CONTRIBUTING.md).
 
----
+## Crates
 
-## Architecture
+| Crate | Role |
+| --- | --- |
+| [`jig-core`](jig-core/) | Protocol primitives: DIDs, signing, COSE and deterministic CBOR, manifests and bundles, request auth, key links, the key store, the suite registry, receipts, naming objects, proof-of-work, contract messages, Wasm and component validation |
+| [`jig-pipeline`](jig-pipeline/) | The write path shared by server and nameserver (`ingest`, the write gate, the MLS gate, effects, SQLite persistence, fanout), `ingest` records, the follower stream and the handshake |
+| [`jig-server`](jig-server/) | The reference server, binary `jig-server` |
+| [`jig-client`](jig-client/) | Client library: connections and handshake checks, pins, identity and keychain, proof-of-work, re-execution of receipts |
+| [`jig-cli`](jig-cli/) | The `jig` binary |
+| [`jig-config`](jig-config/) | The server's config types |
+| [`jig-mls`](jig-mls/) | MLS (RFC 9420) on openmls: the server's validating delivery service and the client's group member |
+| [`jig-nameserver`](jig-nameserver/) | Verified names: registration with proof-of-work, resolution and rotation, binary `jig-nameserver` |
+| [`jig-runtime`](jig-runtime/) | Runs `jig:block` components on wasmtime under the `jig-det-1` determinism profile. No WASI |
+| [`text-block`](text-block/) | The canonical text-render block, built as a `jig:block/renderer` component |
+| [`bridges/core`](bridges/core/), [`bridges/email`](bridges/email/) | The bridge trait, and the in-process email bridge |
+| [`integration-tests`](integration-tests/) | Starts real servers and nameservers on loopback and runs end-to-end scenarios |
 
-Jig Protocol has adopted **WebAssembly (WASM) as the single unified runtime** for block execution.
+[`jig-spec/`](jig-spec/) is the specification (an mdBook), with the JEPs, schemas, test
+vectors and WIT. It is not a workspace member.
 
-### Active Components
-
-- **jig-core** - Protocol primitives (manifests, bundles, receipts, CIDs)
-- **jig-runtime** - Unified WASM runtime (deterministic execution, fuel metering, Receipt v0.2)
-- **jig-server** - Reference server implementation
-- **jig-cli** - Command-line client
-- **jig-bridge-email** - Email gateway
-- **jig-nameserver** - DNS/discovery service
-- **jig-config** - Shared configuration
-- **integration-tests** - Cross-component tests
-
-### Archived Components (WASM-Only Migration)
-
-The following repositories are **archived** and no longer maintained:
-
-- **jig-wasmtime** - Trait-based Wasmtime wrapper (replaced by jig-runtime)
-- **jig-docker** - Container-based runtime (replaced by WASM)
-- **jig-podman** - Podman runtime (replaced by WASM)
-- **jig-runtime-select** - Multi-engine dispatcher (no longer needed)
-
-See individual repo READMEs for migration guides.
-
----
-
-## Why WASM-Only?
-
-1. **Determinism**: Reproducible execution across hosts
-2. **Security**: Fine-grained capability sandboxing
-3. **Performance**: Sub-millisecond cold starts
-4. **Portability**: Same blocks run everywhere (server, CLI, browser)
-5. **Simplicity**: One execution model, one receipt format
-
----
-
-## Quick Start
-
-### Build Workspace
+## Build and test
 
 ```bash
-cargo build --workspace --release
+cargo build --workspace
+cargo nextest run --workspace
 ```
 
-### Run Tests
+The toolchain is pinned in the root `rust-toolchain.toml` (rustup installs it), with the
+`wasm32-unknown-unknown` target; the workspace's minimum Rust version is 1.95. CI runs
+`fmt`, `clippy` and `nextest` on every crate above; [`CONTRIBUTING.md`](../CONTRIBUTING.md)
+has the details.
 
-```bash
-cargo test --workspace
-```
-
-### Execute a Block (CLI)
-
-```bash
-jig-cli run block.wasm --runtime-config runtime.toml
-```
-
-### Start Server
-
-```bash
-jig-server --config server.toml
-```
-
----
-
-## Documentation
-
-- **Runtime Architecture**: [jig-runtime/README.md](jig-runtime/README.md)
-- **Protocol Spec**: [jig-core/README.md](jig-core/README.md)
-- **Server Integration**: [jig-server/src/runtime/mod.rs](jig-server/src/runtime/mod.rs)
-
----
-
-## Development
-
-### Prerequisites
-
-- Rust 1.75+ (edition 2024)
-- Wasm target for blocks: `rustup target add wasm32-unknown-unknown` (`jig block new` sets it in each block project)
-
-### Workspace Structure
-
-```
-repos/
-├── jig-core/           # Protocol primitives
-├── jig-runtime/        # WASM execution engine
-├── jig-server/         # Server implementation
-├── jig-cli/            # CLI client
-├── jig-bridge-email/   # Email gateway
-├── jig-nameserver/     # DNS/discovery
-├── jig-config/         # Shared config
-├── integration-tests/  # Cross-component tests
-└── (archived repos)    # See individual READMEs
-```
-
----
+Two binaries are built for operators, `jig-server` and `jig-nameserver`, and one for
+users, `jig`. A block is run locally with `jig block run`.
 
 ## License
 
 Every crate in this workspace is licensed `MIT OR Apache-2.0`, at your option. The spec
 (`jig-spec/`) is CC-BY-4.0. See the root [`README.md`](../README.md#license) and
 `LICENSE-MIT` / `LICENSE-APACHE`.
-
----
-
-## Contributing
-
-1. All block execution must target WASM
-2. Follow existing patterns in jig-server/jig-cli integrations
-3. Maintain Receipt v0.2 compatibility
-4. Add tests for new features
-5. Update documentation
-
-For questions: Open an issue in the relevant component repo.
-
----
-
-**Status:** Active development (M3 complete, M4 in progress)  
-**Runtime API:** Stable (jig-runtime v0.2)  
-**Protocol Version:** Receipt v0.2
