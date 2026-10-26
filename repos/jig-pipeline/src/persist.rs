@@ -975,6 +975,13 @@ impl SqliteStore {
                 expires_at   INTEGER,
                 PRIMARY KEY (bridge_name, ns, key)
             );
+
+            -- A federation catch-up this server has not finished: the peer's
+            -- block it resumes after. Removed when a catch-up reaches the end.
+            CREATE TABLE IF NOT EXISTS catch_up_cursors (
+                peer_server_url  TEXT PRIMARY KEY,
+                after_cid        TEXT NOT NULL
+            );
             "#,
         )?;
 
@@ -1232,6 +1239,51 @@ impl SqliteStore {
             [channel_id],
             |r| r.get(0),
         )?)
+    }
+
+    /// Block `cid`'s position in this store's own order: the order it took
+    /// its blocks in. A cursor in this server's terms, whatever clock the
+    /// block names.
+    pub fn block_position(&self, cid: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn
+            .query_row("SELECT rowid FROM blocks WHERE cid = ?1", [cid], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    /// Up to `limit` blocks after position `after` ([`Self::block_position`]),
+    /// in this store's order: each one's position, CID and channel, without
+    /// its bytes.
+    pub fn block_ids_after(
+        &self,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, Option<String>)>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT rowid, cid, channel_id FROM blocks WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![after, limit as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The newest block this store took from `federated_from` (a peer's URL),
+    /// in its own order.
+    pub fn newest_block_from(&self, federated_from: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT cid FROM blocks WHERE federated_from = ?1 ORDER BY rowid DESC LIMIT 1",
+                [federated_from],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     pub fn get_block(&self, cid: &str) -> Result<Option<StoredBlock>> {
@@ -2313,6 +2365,40 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    // --- catch-up cursors ---
+
+    /// Where an unfinished catch-up from `peer_server_url` resumes: the
+    /// peer's block it got to, or `""` for its start.
+    pub fn catch_up_cursor(&self, peer_server_url: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT after_cid FROM catch_up_cursors WHERE peer_server_url = ?1",
+                [peer_server_url],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Record how far the catch-up from `peer_server_url` got.
+    pub fn set_catch_up_cursor(&self, peer_server_url: &str, after_cid: &str) -> Result<()> {
+        self.conn.lock().expect("poisoned").execute(
+            "INSERT INTO catch_up_cursors (peer_server_url, after_cid) VALUES (?1, ?2)
+             ON CONFLICT(peer_server_url) DO UPDATE SET after_cid = excluded.after_cid",
+            params![peer_server_url, after_cid],
+        )?;
+        Ok(())
+    }
+
+    /// The catch-up from `peer_server_url` reached the end.
+    pub fn clear_catch_up_cursor(&self, peer_server_url: &str) -> Result<()> {
+        self.conn.lock().expect("poisoned").execute(
+            "DELETE FROM catch_up_cursors WHERE peer_server_url = ?1",
+            [peer_server_url],
+        )?;
+        Ok(())
+    }
+
     // --- subscription cursors ---
 
     pub fn upsert_cursor(&self, c: &StoredCursor) -> Result<()> {
@@ -2828,6 +2914,7 @@ mod tests {
         for required in [
             "alias_attestations",
             "blocks",
+            "catch_up_cursors",
             "channels",
             "memberships",
             "peers",

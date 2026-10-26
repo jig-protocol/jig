@@ -2413,8 +2413,11 @@ mod tests {
             ),
             "the dialer's handler sees the DID the welcome proved"
         );
+        // The dialer's catch-up ask comes first ([`crate::v0_0_2_catch_up`]).
+        let seen = dialed_seen.wait_for(2).await;
+        assert_eq!(seen[0].1, crate::v0_0_2_catch_up::CATCH_UP_FRAME);
         assert_eq!(
-            dialed_seen.wait_for(1).await[0],
+            seen[1],
             (
                 dialing_did.clone(),
                 "contract-answer".into(),
@@ -2429,7 +2432,7 @@ mod tests {
             .expect("the dialed peer is live on the dialer too")
             .send("note", b"from-dialing".to_vec())
             .unwrap();
-        assert_eq!(dialed_seen.wait_for(2).await[1].2, b"from-dialing");
+        assert_eq!(dialed_seen.wait_for(3).await[2].2, b"from-dialing");
 
         // The dialer's handler closes; the connection ends as a contract close.
         to_dialing.send("contract-end", vec![]).unwrap();

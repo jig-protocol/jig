@@ -87,6 +87,8 @@ pub struct Contracts {
     manifest: Arc<RwLock<Option<jig_pipeline::handshake::ManifestRef>>>,
     peers: Arc<PeerRegistry>,
     stream: Stream,
+    /// Serves `federation-catch-up` to the peers that dial this server.
+    replay: crate::v0_0_2_catch_up::Replay,
 }
 
 /// Run the contract on `state`'s server:
@@ -170,7 +172,12 @@ impl Contracts {
             federation: federation.clone(),
             manifest: state.manifest.clone(),
             peers: state.peers.clone(),
-            stream: Stream::new(state.ingest_ctx.clone(), federation, state.peers.clone()),
+            stream: Stream::new(
+                state.ingest_ctx.clone(),
+                federation.clone(),
+                state.peers.clone(),
+            ),
+            replay: crate::v0_0_2_catch_up::Replay::new(state.ingest_ctx.clone(), federation),
         }
     }
 
@@ -745,6 +752,9 @@ impl PeerFrames for Contracts {
         if let Some(handled) = self.stream.on_peer_frame(peer, kind, body, out) {
             return handled;
         }
+        if let Some(handled) = self.replay.on_peer_frame(peer, kind, body, out) {
+            return handled;
+        }
         let peer = peer.to_did_jig_string();
         match kind {
             OFFER_FRAME => {
@@ -1047,6 +1057,8 @@ mod tests {
         follower: Arc<AppState>,
         follows: Contracts,
         user: SigningKey,
+        /// The owner's dial to the follower.
+        dial: tokio::task::JoinHandle<anyhow::Result<()>>,
     }
 
     async fn pair(offers: OfferPolicy) -> Pair {
@@ -1085,7 +1097,7 @@ mod tests {
         // No timers: each test acts on decisions when it means to.
         handle(&owner);
         let follows = handle(&follower);
-        tokio::spawn({
+        let dial = tokio::spawn({
             let owner = owner.clone();
             async move { crate::v0_0_2_federation::connect_and_relay(&owner, &to_follower).await }
         });
@@ -1100,6 +1112,7 @@ mod tests {
             follower,
             follows,
             user: SigningKey::from_bytes(&rand::random()),
+            dial,
         }
     }
 
@@ -1109,6 +1122,17 @@ mod tests {
         key: &SigningKey,
         kind: BlockKind,
         meta: serde_json::Value,
+    ) -> Result<String, IngestError> {
+        post_at(state, key, kind, meta, None).await
+    }
+
+    /// [`post`], with the author's clock at `hlc`.
+    async fn post_at(
+        state: &AppState,
+        key: &SigningKey,
+        kind: BlockKind,
+        meta: serde_json::Value,
+        hlc: Option<jig_core::HlcTimestamp>,
     ) -> Result<String, IngestError> {
         use ed25519_dalek::Signer as _;
         let mut builder = BlockManifest::builder()
@@ -1123,12 +1147,11 @@ mod tests {
                 builder = builder.metadata_entry(&k, v);
             }
         }
-        let manifest_bytes = builder
-            .build()
-            .unwrap()
-            .with_kind(kind)
-            .to_canonical_bytes()
-            .unwrap();
+        let mut manifest = builder.build().unwrap().with_kind(kind);
+        if let Some(hlc) = hlc {
+            manifest = manifest.with_hlc(hlc);
+        }
+        let manifest_bytes = manifest.to_canonical_bytes().unwrap();
         let code_bytes: Vec<u8> = Vec::new();
         let sig = key
             .sign(&serde_json::to_vec(&(&manifest_bytes, &code_bytes)).unwrap())
@@ -2241,5 +2264,453 @@ mod tests {
             at - tokio::time::Instant::now(),
             crate::v0_0_2_stream::MAX_RETRY_AFTER
         );
+    }
+
+    // ---- Federation catch-up, the legacy path (v0_0_2_catch_up) ------------
+
+    /// Two servers on the legacy federation path, not yet connected: `a`
+    /// dials `b` and subscribes to its federation stream.
+    struct Legacy {
+        a: Arc<AppState>,
+        b: Arc<AppState>,
+        /// `b`, as `a` lists it.
+        to_b: FederationPeer,
+        user: SigningKey,
+    }
+
+    async fn legacy() -> Legacy {
+        let mut a = state_with(vec![], &[]);
+        let b = state_with(
+            vec![peer(
+                "ws://127.0.0.1:1",
+                a.server_did.to_did_jig_string(),
+                OfferPolicy::Hold,
+            )],
+            &[],
+        );
+        let (b, url) = serve(b).await;
+        let to_b = peer(&url, b.server_did.to_did_jig_string(), OfferPolicy::Hold);
+        a.config.federation.peers = vec![to_b.clone()];
+        let a = Arc::new(a);
+        crate::v0_0_2_manifest_log::publish(&a).await.unwrap();
+        crate::v0_0_2_manifest_log::publish(&b).await.unwrap();
+        handle(&a);
+        handle(&b);
+        Legacy {
+            a,
+            b,
+            to_b,
+            user: SigningKey::from_bytes(&rand::random()),
+        }
+    }
+
+    impl Legacy {
+        /// `a` holds `b` to `quota` from its next dial.
+        fn held_to(&mut self, quota: Option<jig_config::v0_0_2_server::PeerQuotaConfig>) {
+            self.to_b.quota = quota;
+        }
+
+        /// `a` dials `b`, as `spawn_federation_peers` does.
+        fn dial(&self, a: &Arc<AppState>) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+            let (a, to_b) = (a.clone(), self.to_b.clone());
+            tokio::spawn(
+                async move { crate::v0_0_2_federation::connect_and_relay(&a, &to_b).await },
+            )
+        }
+
+        /// An open channel on `b`.
+        async fn channel(&self, slug: &str) -> String {
+            post(
+                &self.b,
+                &self.user,
+                BlockKind::ChannelCreate,
+                serde_json::json!({"slug": slug}),
+            )
+            .await
+            .unwrap()
+        }
+
+        /// A restricted channel on `b` the user owns, unencrypted (as the
+        /// federation tests make one: creating it takes an MLS group).
+        fn restricted(&self, slug: &str) -> String {
+            let id = jig_pipeline::ingest_record::label_cid(slug);
+            self.b
+                .ingest_ctx
+                .store
+                .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                    id: id.clone(),
+                    slug: slug.into(),
+                    visibility: "restricted".into(),
+                    created_at: 0,
+                    owner_did: did_of(&self.user),
+                    suite: "none".into(),
+                    sequencer_did: String::new(),
+                    co_owners: Vec::new(),
+                })
+                .unwrap();
+            id
+        }
+
+        /// `n` posts to the restricted `channel` on `b`, put in its store as
+        /// a frozen channel holds them: ingest takes no new ones.
+        fn stored_texts(&self, channel: &str, n: usize) -> Vec<String> {
+            use ed25519_dalek::Signer as _;
+            (0..n)
+                .map(|i| {
+                    let manifest_bytes = BlockManifest::builder()
+                        .version(semver::Version::new(0, 1, 0))
+                        .author(Author {
+                            did: did_of(&self.user).into(),
+                            public_key: None,
+                            roles: vec![],
+                        })
+                        .metadata_entry("channel_id", serde_json::json!(channel))
+                        .metadata_entry("body", serde_json::json!(format!("closed {i}")))
+                        .build()
+                        .unwrap()
+                        .with_kind(BlockKind::TextRender)
+                        .to_canonical_bytes()
+                        .unwrap();
+                    let bundle_bytes =
+                        serde_json::to_vec(&(&manifest_bytes, &Vec::<u8>::new())).unwrap();
+                    let cid = crate::v0_0_2_federation::peer_block_cid(&bundle_bytes).unwrap();
+                    self.b
+                        .ingest_ctx
+                        .store
+                        .insert_block(&jig_pipeline::persist::StoredBlock {
+                            cid: cid.clone(),
+                            channel_id: Some(channel.to_string()),
+                            block_kind: "text-render".into(),
+                            sender_did: did_of(&self.user),
+                            sender_sig: self.user.sign(&bundle_bytes).to_bytes().to_vec(),
+                            bundle_bytes,
+                            is_synthetic: false,
+                            hlc_wall_ms: 0,
+                            hlc_logical: 0,
+                            hlc_origin: String::new(),
+                            posted_at: 0,
+                            origin_server: self.b.server_did.to_did_jig_string(),
+                            federated_from: None,
+                        })
+                        .unwrap();
+                    cid
+                })
+                .collect()
+        }
+
+        /// How many of `b`'s blocks federate so far: its own manifest log's,
+        /// before a test posts anything.
+        fn federating(&self) -> usize {
+            self.page("", 0).entries.len()
+        }
+
+        /// `n` posts to `channel` on `b`.
+        async fn texts(&self, channel: &str, n: usize) -> Vec<String> {
+            let mut cids = Vec::new();
+            for i in 0..n {
+                cids.push(
+                    post(
+                        &self.b,
+                        &self.user,
+                        BlockKind::TextRender,
+                        serde_json::json!({
+                            "channel_id": channel,
+                            "body": format!("text {i} {}", rand::random::<u64>()),
+                        }),
+                    )
+                    .await
+                    .unwrap(),
+                );
+            }
+            cids
+        }
+
+        fn cursor(&self, state: &AppState) -> Option<String> {
+            state
+                .ingest_ctx
+                .store
+                .catch_up_cursor(&self.to_b.url)
+                .unwrap()
+        }
+
+        /// `b`'s answer to a catch-up after `after`.
+        fn page(&self, after: &str, overlap: u64) -> crate::v0_0_2_catch_up::Page {
+            Contracts::new(&self.b)
+                .replay
+                .page(&crate::v0_0_2_catch_up::Ask {
+                    after: after.to_string(),
+                    overlap,
+                })
+                .unwrap()
+        }
+
+        /// Wait for `state` to hold every block of `cids`.
+        async fn holds(state: &AppState, cids: &[String]) {
+            eventually("the blocks caught up", || {
+                cids.iter().all(|cid| held(state, cid)).then_some(())
+            })
+            .await
+        }
+    }
+
+    fn held(state: &AppState, cid: &str) -> bool {
+        state.ingest_ctx.store.get_block(cid).unwrap().is_some()
+    }
+
+    /// This server again, on the same store and key: a restart.
+    async fn restarted(state: &AppState) -> Arc<AppState> {
+        let state = Arc::new(
+            AppState::for_test_from(
+                state.config.clone(),
+                state.ingest_ctx.store.clone(),
+                state.ingest_ctx.server_key.clone(),
+            )
+            .unwrap(),
+        );
+        crate::v0_0_2_manifest_log::publish(&state).await.unwrap();
+        handle(&state);
+        state
+    }
+
+    #[tokio::test]
+    async fn a_dialer_gets_what_the_peer_took_before_its_first_dial() {
+        let l = legacy().await;
+        let channel = l.channel("#open").await;
+        let mut before = vec![channel.clone()];
+        before.extend(l.texts(&channel, 3).await);
+
+        // No block from `b` yet: the first catch-up starts from `b`'s start.
+        l.dial(&l.a);
+        Legacy::holds(&l.a, &before).await;
+        eventually("the catch-up done", || {
+            l.cursor(&l.a).is_none().then_some(())
+        })
+        .await;
+
+        // From then on, the live push.
+        let live = l.texts(&channel, 1).await;
+        Legacy::holds(&l.a, &live).await;
+    }
+
+    #[tokio::test]
+    async fn catch_up_replays_only_the_channels_that_federate() {
+        let l = legacy().await;
+        let own = l.federating();
+        let open = l.channel("#open").await;
+        let first = l.texts(&open, 1).await;
+        let restricted = l.restricted("#closed");
+        let closed = l.stored_texts(&restricted, 2);
+        let last = l.texts(&open, 1).await;
+
+        let page = l.page("", 0);
+        let replayed: Vec<String> = page.entries[own..]
+            .iter()
+            .map(|e| crate::v0_0_2_federation::peer_block_cid(&e.bundle).unwrap())
+            .collect();
+        assert_eq!(replayed, [open.clone(), first[0].clone(), last[0].clone()]);
+        assert!(!page.more);
+
+        l.dial(&l.a);
+        Legacy::holds(&l.a, &last).await;
+        assert!(closed.iter().all(|cid| !held(&l.a, cid)));
+    }
+
+    #[tokio::test]
+    async fn the_cursor_is_a_block_in_the_peers_own_order() {
+        let l = legacy().await;
+        let channel = l.channel("#open").await;
+        let early = l.texts(&channel, 2).await;
+        // Taken last, with an author's clock older than every block before
+        // it: still after them in `b`'s order.
+        let backdated = post_at(
+            &l.b,
+            &l.user,
+            BlockKind::TextRender,
+            serde_json::json!({"channel_id": channel, "body": "backdated"}),
+            Some(jig_core::HlcTimestamp {
+                wall_ms: 1,
+                logical: 0,
+                server_did: l.b.server_did.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let after = |cid: &str| -> Vec<String> {
+            l.page(cid, 0)
+                .entries
+                .iter()
+                .map(|e| crate::v0_0_2_federation::peer_block_cid(&e.bundle).unwrap())
+                .collect()
+        };
+        assert_eq!(after(&early[0]), [early[1].clone(), backdated.clone()]);
+        assert_eq!(after(&backdated), Vec::<String>::new());
+
+        l.dial(&l.a);
+        Legacy::holds(&l.a, std::slice::from_ref(&backdated)).await;
+        // `a` keeps each block under `b`'s CID, byte for byte: the cursor it
+        // sends next is a block `b` finds in its own store.
+        for cid in [&channel, &early[0], &early[1], &backdated] {
+            let ours = l.a.ingest_ctx.store.get_block(cid).unwrap().unwrap();
+            let theirs = l.b.ingest_ctx.store.get_block(cid).unwrap().unwrap();
+            assert_eq!(ours.bundle_bytes, theirs.bundle_bytes);
+            assert_eq!(ours.federated_from.as_deref(), Some(l.to_b.url.as_str()));
+        }
+        let next = l.a.ingest_ctx.store.newest_block_from(&l.to_b.url).unwrap();
+        assert_eq!(next.as_deref(), Some(backdated.as_str()));
+        assert!(
+            l.b.ingest_ctx
+                .store
+                .block_position(&backdated)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn catch_up_pages_past_one_frame() {
+        let l = legacy().await;
+        let channel = l.channel("#open").await;
+        let texts = l
+            .texts(&channel, crate::v0_0_2_catch_up::MAX_ENTRIES * 2 + 5)
+            .await;
+
+        let first = l.page("", 0);
+        assert_eq!(first.entries.len(), crate::v0_0_2_catch_up::MAX_ENTRIES);
+        assert!(first.more);
+
+        l.dial(&l.a);
+        Legacy::holds(&l.a, &texts).await;
+    }
+
+    #[tokio::test]
+    async fn catch_up_stops_at_the_quota_and_keeps_its_place() {
+        let mut l = legacy().await;
+        // `b`'s own blocks, then its channel and two posts, this minute.
+        let quota = jig_config::v0_0_2_server::PeerQuotaConfig {
+            blocks_per_min: l.federating() as u64 + 3,
+            bytes_per_min: 8 * 1024 * 1024,
+        };
+        l.held_to(Some(quota));
+        let channel = l.channel("#open").await;
+        let texts = l.texts(&channel, 6).await;
+
+        l.dial(&l.a);
+        Legacy::holds(&l.a, &texts[..2]).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            texts[2..].iter().all(|cid| !held(&l.a, cid)),
+            "nothing past the quota this minute"
+        );
+        assert_eq!(l.cursor(&l.a).as_deref(), Some(texts[1].as_str()));
+    }
+
+    /// The legacy path across a restart of the dialer part way through a
+    /// catch-up, with the live push landing blocks past the gap first: the
+    /// restarted server resumes where the catch-up got to, not after the
+    /// newest block it holds.
+    #[tokio::test]
+    async fn a_dialer_restarted_mid_catch_up_misses_nothing() {
+        let mut l = legacy().await;
+        let quota = jig_config::v0_0_2_server::PeerQuotaConfig {
+            blocks_per_min: l.federating() as u64 + 5,
+            bytes_per_min: 8 * 1024 * 1024,
+        };
+        l.held_to(Some(quota));
+        let channel = l.channel("#open").await;
+        // More than the reconnect's overlap past where the quota stops it.
+        let gap = l
+            .texts(&channel, crate::v0_0_2_catch_up::OVERLAP as usize + 30)
+            .await;
+
+        let dial = l.dial(&l.a);
+        Legacy::holds(&l.a, &gap[..4]).await;
+        let live = l.texts(&channel, 1).await;
+        Legacy::holds(&l.a, &live).await;
+        assert!(!held(&l.a, gap.last().unwrap()), "stopped at the quota");
+        dial.abort();
+        let _ = dial.await;
+
+        // Down: `b` takes more.
+        let while_down = l.texts(&channel, 3).await;
+
+        l.held_to(None);
+        let a = restarted(&l.a).await;
+        l.dial(&a);
+        Legacy::holds(&a, &gap).await;
+        Legacy::holds(&a, &while_down).await;
+        eventually("the catch-up done", || l.cursor(&a).is_none().then_some(())).await;
+    }
+
+    /// The contract path across a restart of the follower while the owner
+    /// streams to it: the owner's records past the follower's head arrive
+    /// once it is back.
+    #[tokio::test]
+    async fn a_follower_restarted_mid_stream_catches_up() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.shared(0).await;
+        p.follows.stream.pull_all();
+        p.caught_up(&channel).await;
+        for i in 0..5 {
+            p.text(&channel, &format!("live {i}")).await;
+        }
+        p.dial.abort();
+        // Down: the owner takes more, past one frame.
+        for i in 0..crate::v0_0_2_stream::MAX_ENTRIES + 6 {
+            p.text(&channel, &format!("while down {i}")).await;
+        }
+
+        // Back, on the same store and key, at a new address.
+        let (follower, url) = serve(
+            AppState::for_test_from(
+                p.follower.config.clone(),
+                p.follower.ingest_ctx.store.clone(),
+                p.follower.ingest_ctx.server_key.clone(),
+            )
+            .unwrap(),
+        )
+        .await;
+        crate::v0_0_2_manifest_log::publish(&follower)
+            .await
+            .unwrap();
+        let follows = handle(&follower);
+        let to_follower = peer(
+            &url,
+            follower.server_did.to_did_jig_string(),
+            OfferPolicy::Hold,
+        );
+        tokio::spawn({
+            let owner = p.owner.clone();
+            async move { crate::v0_0_2_federation::connect_and_relay(&owner, &to_follower).await }
+        });
+        eventually("the connection", || {
+            (p.owner.peers.sender_for(&follower.server_did).is_some()
+                && follower.peers.sender_for(&p.owner.server_did).is_some())
+            .then_some(())
+        })
+        .await;
+
+        // What a follower does every `PULL_EVERY`.
+        follows.stream.pull_all();
+        let want = Pair::head(&p.owner, &channel).unwrap();
+        eventually("the restarted follower at the owner's head", || {
+            (Pair::head(&follower, &channel) == Some(want)).then_some(())
+        })
+        .await;
+        for seq in 0..=want {
+            assert_eq!(
+                follower
+                    .ingest_ctx
+                    .store
+                    .ingest_record_bytes(&channel, seq)
+                    .unwrap(),
+                p.owner
+                    .ingest_ctx
+                    .store
+                    .ingest_record_bytes(&channel, seq)
+                    .unwrap(),
+                "seq {seq}"
+            );
+        }
     }
 }
