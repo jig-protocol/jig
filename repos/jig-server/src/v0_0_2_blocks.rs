@@ -17,9 +17,7 @@ use axum::{
     routing::{get, post},
 };
 use base64::Engine as _;
-use jig_core::BlockBundle;
 use jig_pipeline::envelope::ReceiptRef;
-use jig_pipeline::ingest::{IngestError, IngestSource, ingest};
 use jig_pipeline::persist::MAX_HISTORY_LIMIT;
 
 /// The most a page of history carries, in bytes of its JSON entries, past
@@ -64,13 +62,26 @@ pub(crate) fn err(
     )
 }
 
-/// Thin wrapper around the shared classifier (`v0_0_2_ingest_error`): decide
-/// the (status, code) here once, wrap it in this endpoint's `ErrorBody`.
-/// `pub(crate)` so the cross-wrapper agreement test in that module can call
-/// it directly.
-pub(crate) fn map_ingest_error(e: IngestError) -> (StatusCode, Json<ErrorBody>) {
-    let (status, code, message) = crate::v0_0_2_ingest_error::classify_ingest_error(&e);
-    err(status, code, message)
+/// This endpoint's answer to a refused write: the shared classifier's
+/// (status, code) (`v0_0_2_ingest_error`, through
+/// [`crate::v0_0_2_relay::Refusal`]) in this endpoint's `ErrorBody`.
+fn refusal_response(refusal: crate::v0_0_2_relay::Refusal) -> (StatusCode, Json<ErrorBody>) {
+    (
+        refusal.status,
+        Json(ErrorBody {
+            code: refusal.code,
+            message: refusal.message,
+        }),
+    )
+}
+
+/// [`refusal_response`] for an ingest error, for the cross-wrapper agreement
+/// test in `v0_0_2_ingest_error`.
+#[cfg(test)]
+pub(crate) fn map_ingest_error(
+    e: jig_pipeline::ingest::IngestError,
+) -> (StatusCode, Json<ErrorBody>) {
+    refusal_response(crate::v0_0_2_relay::Refusal::of(&e))
 }
 
 /// POST /api/v1/blocks — submit a signed block bundle (non-streaming alt to WSS).
@@ -112,21 +123,22 @@ pub async fn submit_block(
             )
         })?;
 
-    let bundle = BlockBundle {
-        manifest_bytes: &manifest_bytes,
-        code_bytes: &code_bytes,
-        resources: vec![],
-    };
-
-    // conn_id 0 signals REST origin — no persistent WebSocket connection.
-    let cid = ingest(
-        &state.ingest_ctx,
-        bundle,
+    // conn_id 0 signals REST origin — no persistent WebSocket connection, so
+    // the relay's in-flight cap counts per author instead.
+    let author = serde_json::from_slice::<jig_core::BlockManifest>(&manifest_bytes)
+        .ok()
+        .and_then(|m| m.authors.first().map(|a| a.did.to_string()))
+        .unwrap_or_default();
+    let cid = crate::v0_0_2_relay::post(
+        &state,
+        &manifest_bytes,
+        &code_bytes,
         sig,
-        IngestSource::LocalClient { conn_id: 0 },
+        0,
+        &format!("rest:{author}"),
     )
     .await
-    .map_err(map_ingest_error)?;
+    .map_err(refusal_response)?;
 
     Ok(Json(SubmitResult { block_cid: cid }))
 }
@@ -263,6 +275,14 @@ pub struct ChannelView {
     pub created_at: i64,
     /// `none` or `mls`, fixed at creation.
     pub suite: String,
+    /// The server that orders the channel: this one, or the owner of a
+    /// channel this server carries (JEP-0005). Unsigned: a client takes
+    /// another server's word only with `share`.
+    pub sequencer: String,
+    /// For a channel this server carries, the offer its owner signed to this
+    /// server (base64): what proves `sequencer` to a client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -306,16 +326,61 @@ pub async fn list_channels(
                 continue;
             }
         }
-        channels.push(ChannelView {
-            id: c.id,
-            slug: c.slug,
-            visibility: c.visibility,
-            owner_did: c.owner_did,
-            created_at: c.created_at,
-            suite: c.suite,
-        });
+        channels.push(view_of(&state, c).map_err(persist_err)?);
     }
     Ok(Json(ChannelsResponse { channels }))
+}
+
+/// How `c` is listed: its unsigned fields, the server that orders it, and,
+/// for a channel this server carries, the offer that proves its owner.
+pub(crate) fn view_of(
+    state: &AppState,
+    c: jig_pipeline::persist::StoredChannel,
+) -> jig_pipeline::persist::Result<ChannelView> {
+    let local = state.server_did.to_did_jig_string();
+    let sequencer = if c.sequencer_did.is_empty() {
+        local.clone()
+    } else {
+        jig_pipeline::effect::canonical_did_string(&c.sequencer_did)
+    };
+    let share = if sequencer == local {
+        None
+    } else {
+        followed_offer(&state.ingest_ctx.store, &c.id, &sequencer)?
+    };
+    Ok(ChannelView {
+        id: c.id,
+        slug: c.slug,
+        visibility: c.visibility,
+        owner_did: c.owner_did,
+        created_at: c.created_at,
+        suite: c.suite,
+        sequencer,
+        share,
+    })
+}
+
+/// The offer `owner` signed for `channel_id` that this server accepted
+/// (base64), live or since ended: it proves who orders the channel.
+fn followed_offer(
+    store: &jig_pipeline::persist::SqliteStore,
+    channel_id: &str,
+    owner: &str,
+) -> jig_pipeline::persist::Result<Option<String>> {
+    use base64::Engine as _;
+    use jig_pipeline::contracts::{OfferState, Side};
+    for state in [OfferState::Accepted, OfferState::Ending, OfferState::Ended] {
+        if let Some(kept) = store
+            .contract_offers_for(channel_id, owner, Side::Follower, state)?
+            .into_iter()
+            .next()
+        {
+            return Ok(Some(
+                base64::engine::general_purpose::STANDARD.encode(&kept.offer),
+            ));
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Serialize)]
@@ -622,6 +687,23 @@ pub async fn get_channel_history(
             .map_err(persist_err)?,
     };
 
+    // A slug that names only a channel this server carries for another: a
+    // slug names a channel only where it is ordered, so this one is read by
+    // its id. Saying so beats an empty page that looks like an empty channel.
+    if channel.is_none()
+        && let Some(carried) = store
+            .carried_channel_by_slug(&channel_ref)
+            .map_err(persist_err)?
+    {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            "CARRIED_CHANNEL",
+            format!(
+                "{channel_ref} here is carried for {}, which orders it; read it by its id: {}",
+                carried.sequencer_did, carried.id
+            ),
+        ));
+    }
     // A reference that names no channel has no history, as the slug
     // wrappers answer: an empty page, or a cursor that is none of its blocks.
     let limit = query.limit.unwrap_or(MAX_HISTORY_LIMIT);
@@ -1380,6 +1462,36 @@ mod tests {
         let (status, body) = get_path(router, "/api/v1/channels/%23nope/blocks").await;
         assert_eq!(status, StatusCode::OK, "an unread channel is not an error");
         assert_eq!(body.as_array().map(|a| a.len()), Some(0));
+    }
+
+    /// A slug that names only a channel this server carries for another is
+    /// no empty channel: the answer says to read it by its id.
+    #[tokio::test]
+    async fn channel_history_by_a_carried_channels_slug_names_its_id() {
+        let state = Arc::new(unauthenticated_state());
+        let id = jig_pipeline::ingest_record::label_cid("a carried channel");
+        state
+            .ingest_ctx
+            .store
+            .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                id: id.clone(),
+                slug: "#team".to_string(),
+                visibility: "open".to_string(),
+                created_at: 0,
+                owner_did: "did:jig:zuser".to_string(),
+                suite: "none".to_string(),
+                sequencer_did: "did:jig:zowner".to_string(),
+                co_owners: Vec::new(),
+            })
+            .unwrap();
+        let router = build_blocks_router(state);
+
+        let (status, body) = get_path(router, "/api/v1/channels/%23team/blocks").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "CARRIED_CHANNEL");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains(&id), "{message}");
+        assert!(message.contains("did:jig:zowner"), "{message}");
     }
 
     #[tokio::test]

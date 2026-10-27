@@ -109,7 +109,7 @@ debug = true
 
 # Debug info for dependencies only, not our own crates.
 #
-# The wasmtime tree (cranelift, pulley, wasm-tools, zstd, rayon) is enormous,
+# The wasmtime tree (cranelift, pulley, wasm-tools, rayon) is enormous,
 # and integration-tests builds 12 separate binaries that each statically link
 # all of it. With full debug info on those rlibs, linking several at once
 # exhausted the GitHub runner and `ld` died with SIGBUS. Our own crates keep

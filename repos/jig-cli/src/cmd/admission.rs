@@ -68,7 +68,11 @@ pub async fn ensure_for(server: &str, identity: &Identity) -> Result<()> {
         Err(e) => return Err(e),
     };
     let advertised: Option<Advertised> = match http.get(well_known_url(server)).send().await {
-        Ok(resp) if resp.status().is_success() => resp.json().await.ok(),
+        Ok(resp) if resp.status().is_success() => {
+            jig_client::limits::json_capped(resp, jig_client::limits::MAX_DOCUMENT_BYTES)
+                .await
+                .ok()
+        }
         _ => None,
     };
     let Some(Advertised {
@@ -104,7 +108,13 @@ pub async fn ensure_for(server: &str, identity: &Identity) -> Result<()> {
     }
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
-            if resp.json::<Status>().await.is_ok_and(|s| s.proven) {
+            if jig_client::limits::json_capped::<Status>(
+                resp,
+                jig_client::limits::MAX_DOCUMENT_BYTES,
+            )
+            .await
+            .is_ok_and(|s| s.proven)
+            {
                 return Ok(());
             }
         }
@@ -159,7 +169,8 @@ pub async fn ensure_for(server: &str, identity: &Identity) -> Result<()> {
     .with_context(|| format!("POST {url}"))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let body: serde_json::Value =
+            serde_json::from_str(&jig_client::limits::error_text(resp).await).unwrap_or_default();
         anyhow::bail!(
             "{server} refused the admission proof ({status} {}): {}",
             body["code"].as_str().unwrap_or("HTTP_ERROR"),

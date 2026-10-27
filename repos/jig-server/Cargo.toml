@@ -105,7 +105,8 @@ rustls = { version = "0.23", default-features = false, features = [
 rustls-pki-types = "1.0"
 dashmap = "6"
 jsonwebtoken = "11"
-wasmtime = { version = "49.0.2", features = ["async"] }
+# Defaults off, as in jig-runtime: they would turn wasmtime's `cache` back on.
+wasmtime = { version = "49.0.2", default-features = false, features = ["async"] }
 
 # Capability enforcement (Phase 1)
 hmac = "0.13"
@@ -145,3 +146,6 @@ tokio = { workspace = true, features = ["test-util"] }
 [features]
 default = ["sqlite"]
 sqlite = []
+# `v0_0_2_stream::fuzz_decode_frame`, for the fuzz targets in repos/fuzz only.
+# CI checks that no release binary enables it.
+fuzzing = []
