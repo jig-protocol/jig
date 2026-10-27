@@ -106,6 +106,15 @@ impl TestJigServer {
         Self::start().await
     }
 
+    /// Start a server that copies the channels its peers create, under
+    /// `[federation] naively_accept_peer_relayed_creates`: the legacy relay's
+    /// behaviour, for tests of that relay.
+    pub async fn start_copying_peers_channels() -> Result<Self> {
+        let mut config = base_config()?;
+        config.federation.naively_accept_peer_relayed_creates = true;
+        Self::start_with_config(config).await
+    }
+
     /// Start in nameserver mode pointed at the given NS. `alias_suffix` is
     /// the `.jig` namespace the NS is authoritative for (e.g. `"dj.jig"`).
     pub async fn start_with_nameserver(ns: &TestNameserver, _alias_suffix: &str) -> Result<Self> {

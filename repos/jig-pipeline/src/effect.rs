@@ -35,7 +35,7 @@ pub async fn apply_effect(
 
 /// [`apply_effect`], with a `channel-create` stored as a relayed copy this
 /// server sequences when `relayed_copy` is set
-/// ([`crate::ingest::RELAY_COPIES_PEER_CREATES`]).
+/// ([`crate::ingest::copies_relayed_create`]).
 pub async fn apply_effect_as(
     store: &Arc<SqliteStore>,
     bundle: &BlockBundle<'_>,

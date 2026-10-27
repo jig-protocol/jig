@@ -484,6 +484,7 @@ mod tests {
             fanout: fanout.clone(),
             server_url: "ws://127.0.0.1:0".to_string(),
             naively_allow_unknown_handles_fallback: false,
+            naively_accept_peer_relayed_creates: false,
             executor: Some(BlockExecutor::shared()),
         });
         (store, ingest_ctx, fanout, RouterMount::new())

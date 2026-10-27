@@ -186,6 +186,11 @@ list_handles = false
 # DID is still checked at the handshake, but nothing after it is protected;
 # the flag is advertised in /.well-known/jig. Prefer wss://.
 # dangerously_allow_plaintext_federation = false
+# A new channel reaches a peer only once it is shared. Set this only if you
+# fully trust every listed peer: it makes this server copy the channels a peer
+# creates, as releases before v0.2.0-alpha.3 did. It is advertised in
+# /.well-known/jig as an unsafe option.
+# naively_accept_peer_relayed_creates = false
 # Listing a peer is what trusts it: this server dials `url` (it appends
 # /api/v1/ws), refuses a welcome signed by any DID but `expected_did`, and
 # lets only listed DIDs subscribe to its own federation stream. Both servers

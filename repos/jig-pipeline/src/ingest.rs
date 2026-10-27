@@ -129,6 +129,10 @@ pub struct IngestContext {
     /// anyway. Wired from `[identity] naively_allow_unknown_handles_fallback`.
     /// Surfaces in `unsafe_options_active`.
     pub naively_allow_unknown_handles_fallback: bool,
+    /// Take a `channel-create` a configured peer relays as a copy this
+    /// server sequences, whatever server it names ([`copies_relayed_create`]).
+    /// Wired from `[federation] naively_accept_peer_relayed_creates`.
+    pub naively_accept_peer_relayed_creates: bool,
     /// Executes canonical Wasm block modules, holding them pre-compiled.
     ///
     /// `None` is a statement that this server does not execute Wasm-backed kinds
@@ -705,20 +709,18 @@ pub async fn ingest(
             &server_did,
             &source,
         )?;
-        let peer = matches!(source, IngestSource::FederatedPeer { .. });
-        if peer && RELAY_COPIES_PEER_CREATES {
+        if copies_relayed_create(ctx, &source) {
             channel_terms(&as_relayed_copy(&manifest), &server_did)?;
         } else {
             channel_terms(&manifest, &server_did)?;
-        }
-        // A channel names the server that orders it, so a create signed for
-        // one server is valid on no other. An in-process bridge's create
-        // reaches no other server.
-        if !peer
-            && !matches!(source, IngestSource::Bridge)
-            && !manifest.metadata.contains_key(SEQUENCER_KEY)
-        {
-            return Err(IngestError::SequencerRequired { server: server_did });
+            // A channel names the server that orders it, so a create signed
+            // for one server is valid on no other. An in-process bridge's
+            // create reaches no other server.
+            if !matches!(source, IngestSource::Bridge)
+                && !manifest.metadata.contains_key(SEQUENCER_KEY)
+            {
+                return Err(IngestError::SequencerRequired { server: server_did });
+            }
         }
     }
 
@@ -1004,7 +1006,7 @@ pub async fn ingest(
                 &bundle,
                 &stored_receipt.receipt_bytes,
                 &block_cid,
-                RELAY_COPIES_PEER_CREATES && matches!(source, IngestSource::FederatedPeer { .. }),
+                copies_relayed_create(ctx, &source),
             )
             .await?;
             // Step 6: persist block (+ its record) + receipt
@@ -1406,15 +1408,19 @@ pub fn check_create_slug(
 /// The metadata key a `channel-create` names its sequencer under.
 pub const SEQUENCER_KEY: &str = "sequencer";
 
-/// Whether a peer's `channel-create` reaching this server over the legacy
-/// relay makes a relayed copy this server sequences, whatever server the
-/// block names: the relay's behaviour from before creates named their
-/// sequencer. `false` refuses such a create here (`NotSequencer`), so a
-/// channel reaches a peer only by contract.
-pub const RELAY_COPIES_PEER_CREATES: bool = true;
+/// Whether a block from `source` that creates a channel is taken as a copy
+/// this server sequences, whatever server it names: only a block a configured
+/// peer relayed ([`IngestSource::FederatedPeer`]: a connection this server
+/// dialed to a listed peer, its DID checked at the handshake), and only under
+/// `[federation] naively_accept_peer_relayed_creates`. Otherwise a create is
+/// held to the server it names like any other, so a channel reaches a peer
+/// only once it is shared (JEP-0005).
+pub fn copies_relayed_create(ctx: &IngestContext, source: &IngestSource) -> bool {
+    ctx.naively_accept_peer_relayed_creates && matches!(source, IngestSource::FederatedPeer { .. })
+}
 
 /// `manifest` without the server its creator named: what a relayed copy is
-/// judged and stored as ([`RELAY_COPIES_PEER_CREATES`]).
+/// judged and stored as ([`copies_relayed_create`]).
 pub(crate) fn as_relayed_copy(manifest: &jig_core::BlockManifest) -> jig_core::BlockManifest {
     let mut copy = manifest.clone();
     copy.metadata.remove(SEQUENCER_KEY);
@@ -2125,6 +2131,7 @@ mod tests {
             fanout: Arc::new(Fanout::new()),
             server_url: "ws://127.0.0.1:7117".to_string(),
             naively_allow_unknown_handles_fallback: false,
+            naively_accept_peer_relayed_creates: false,
             // Shared, so the ~16ms module compile is paid once for the whole
             // test binary rather than per test.
             executor: Some(crate::executor::BlockExecutor::shared()),
@@ -3930,40 +3937,58 @@ mod tests {
         );
     }
 
-    /// A peer's create reaches this server over the legacy relay naming the
-    /// peer as its sequencer. With [`RELAY_COPIES_PEER_CREATES`] it is a
-    /// relayed copy this server sequences, as before creates named one;
-    /// without, it is refused.
+    /// A create relayed by a configured peer names that peer, or no server.
+    /// By default it is held to the server it names like any other create,
+    /// and refused here; under `naively_accept_peer_relayed_creates` it is a
+    /// copy this server sequences. A client's create naming another server is
+    /// refused either way: only a peer's relay is ever taken as a copy.
     #[tokio::test]
-    async fn a_peers_create_over_the_relay_is_a_copy_this_server_sequences() {
-        let ctx = roles_ctx();
-        let owner = person();
+    async fn a_relayed_create_is_a_copy_only_when_the_operator_opts_in() {
         let peer = random_signing_key();
-        let (mb, cb, sig) = signed_parts(
-            &owner.key,
-            BlockKind::ChannelCreate,
-            jig_core::EncryptionSuite::Unencrypted,
-            serde_json::json!({"slug": "#theirs", "sequencer": did_of(&peer)}),
-        );
-        let landed = do_ingest(
-            &ctx,
-            mb,
-            cb,
-            sig,
-            IngestSource::FederatedPeer {
-                peer_did: Did::from_ed25519_pubkey(peer.verifying_key().as_bytes()),
-                peer_url: "wss://peer".to_string(),
-            },
-        )
-        .await;
-        if RELAY_COPIES_PEER_CREATES {
-            let cid = landed.unwrap();
-            let row = ctx.store.get_channel_by_id(&cid).unwrap().unwrap();
-            assert_eq!(row.sequencer_did, ctx.server_did.to_did_jig_string());
-        } else {
+        let relayed = || IngestSource::FederatedPeer {
+            peer_did: Did::from_ed25519_pubkey(peer.verifying_key().as_bytes()),
+            peer_url: "wss://peer".to_string(),
+        };
+        for opted_in in [false, true] {
+            let mut ctx = roles_ctx();
+            ctx.naively_accept_peer_relayed_creates = opted_in;
+            let owner = person();
+            let create = |slug: &str, sequencer: serde_json::Value| {
+                signed_parts(
+                    &owner.key,
+                    BlockKind::ChannelCreate,
+                    jig_core::EncryptionSuite::Unencrypted,
+                    serde_json::json!({"slug": slug, "sequencer": sequencer}),
+                )
+            };
+
+            let (mb, cb, sig) = create("#theirs", serde_json::json!(did_of(&peer)));
+            let named = do_ingest(&ctx, mb, cb, sig, relayed()).await;
+            let (mb, cb, sig) = create("#unnamed", serde_json::Value::Null);
+            let unnamed = do_ingest(&ctx, mb, cb, sig, relayed()).await;
+            if opted_in {
+                for cid in [named.unwrap(), unnamed.unwrap()] {
+                    let row = ctx.store.get_channel_by_id(&cid).unwrap().unwrap();
+                    assert_eq!(row.sequencer_did, ctx.server_did.to_did_jig_string());
+                }
+            } else {
+                assert!(
+                    matches!(named, Err(IngestError::NotSequencer { .. })),
+                    "{named:?}"
+                );
+                assert!(
+                    matches!(unnamed, Err(IngestError::SequencerRequired { .. })),
+                    "{unnamed:?}"
+                );
+            }
+
+            // The same block from a client is never a copy.
+            let (mb, cb, sig) = create("#from-a-client", serde_json::json!(did_of(&peer)));
+            let from_client =
+                do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 }).await;
             assert!(
-                matches!(landed, Err(IngestError::NotSequencer { .. })),
-                "{landed:?}"
+                matches!(from_client, Err(IngestError::NotSequencer { .. })),
+                "opted in: {opted_in}: {from_client:?}"
             );
         }
     }
