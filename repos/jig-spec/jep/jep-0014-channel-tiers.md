@@ -72,6 +72,14 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
    - A new `channel-create` without `tier` that would be `open` with `none` MUST be refused
      (`UNKNOWN_TIER`). Otherwise an old client would create a `public` channel without the label
      or the confirmation that rule 5 requires.
+   - **A `channel-create` relayed by a configured peer over the legacy relay meets the same
+     rules as any other** (DJ, 2026-10-27). It MUST carry `tier` and MUST name this server as
+     its sequencer. Otherwise it is refused: `UNKNOWN_TIER`, or `NOT_SEQUENCER` /
+     `SEQUENCER_REQUIRED`. Relayed creates get no exemption and no default mapping.
+   - **The one exception is an antipattern flag**:
+     `federation.naively_accept_peer_relayed_creates`. It defaults to `false`, and a server lists it in `unsafe_options_active` when it is set.
+     With it set, a `channel-create` relayed by a configured peer skips both checks, and a
+     tier-less plaintext `open` create is recorded as `public`.
    - A client that implements this JEP requests the `tiers` feature in its `hello`
      (JEP-0002). A server that implements it signs `tiers` into its `welcome` capabilities
      only when the `hello` requested it, after the fields defined before it. A `welcome` to a
@@ -305,8 +313,11 @@ reads no encrypted tier.
       - a server accepts an offer for a `public` channel automatically, even when its peer
         policy is `offers = "hold"`.
 
-      Until then, the legacy relay carries `public` channels to listed peers, with catch-up
-      after an outage (#340).
+      Until then, the legacy relay carries existing `public` channels to listed peers, with
+      catch-up after an outage (#340). A new open channel reaches a peer only by a share,
+      since rule 1 refuses its relayed `channel-create`, unless the receiving server sets
+      `federation.naively_accept_peer_relayed_creates`. Channels that already exist on both
+      sides are unaffected.
     - **A channel is carried by the relay or by a contract, never both** (#344). Relayed, a
       channel gets a second sequencer on the receiving server, and that server then refuses
       the owner's records. So a channel is relayed until it is shared with a peer, and the
