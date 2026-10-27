@@ -247,13 +247,13 @@ pub(crate) fn deterministic_config(config: &RuntimeConfig) -> Result<Config> {
     pooling.max_memory_size(memory_limit_bytes as usize);
     wasm_config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling));
 
-    // Module caching (only if explicitly enabled)
-    if config.engine.enable_cache
-        && let Some(cache_dir) = &config.engine.cache_dir
-    {
-        let cache = Cache::from_file(Some(std::path::Path::new(cache_dir)))
-            .map_err(|e| RuntimeError::InvalidConfig(format!("Cache config: {e}")))?;
-        wasm_config.cache(Some(cache));
+    // wasmtime is built without its module cache (its zstd dependency carries
+    // RUSTSEC-2026-0403), so a config that asks for it is refused rather than
+    // quietly run uncached.
+    if config.engine.enable_cache {
+        return Err(RuntimeError::InvalidConfig(
+            "the module cache is not built into this runtime: set enable_cache = false".into(),
+        ));
     }
 
     Ok(wasm_config)
@@ -262,6 +262,21 @@ pub(crate) fn deterministic_config(config: &RuntimeConfig) -> Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The module cache is not built in, so asking for it is an error, not a
+    /// silently uncached engine.
+    #[test]
+    fn a_config_that_enables_the_module_cache_is_refused() {
+        let mut config = RuntimeConfig::default();
+        config.engine.enable_cache = true;
+        config.engine.cache_dir = Some("/nonexistent".into());
+        let err = deterministic_config(&config).expect_err("refused");
+        assert!(
+            matches!(&err, RuntimeError::InvalidConfig(msg) if msg.contains("module cache")),
+            "{err:?}"
+        );
+        assert!(deterministic_config(&RuntimeConfig::default()).is_ok());
+    }
 
     /// The engine refuses the same features the determinism validator does.
     ///
