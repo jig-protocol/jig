@@ -354,8 +354,9 @@ impl Default for RateLimitSection {
 /// strangers, so a flood of fresh identities cannot take the capacity members
 /// write with, however many identities it brings.
 ///
-/// - **Members** are DIDs with an `[auth.admission] records` entry, and DIDs
-///   whose admission proof of work is at least `local_member_age_secs` old.
+/// - **Members** are DIDs with a nonempty `[auth.admission] records` entry
+///   holding no negative score, and DIDs whose admission proof of work is at
+///   least `local_member_age_secs` old.
 /// - **Invited** is empty until invites exist (JEP-0009).
 /// - **Strangers** are everyone else.
 ///

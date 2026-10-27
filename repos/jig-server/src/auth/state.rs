@@ -550,8 +550,8 @@ mod tests {
     fn relayed_writes_are_not_charged_to_the_pools() {
         use jig_pipeline::ingest::Admission as _;
         let mut section = AuthSection::default();
-        section.pools.writes_per_second = 5;
-        section.pools.writes_burst = 5;
+        section.pools.writes_per_second = 10;
+        section.pools.writes_burst = 10;
         let state = AuthState::from_config(&section).unwrap();
         for i in 0..20 {
             assert_eq!(

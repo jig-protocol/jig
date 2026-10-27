@@ -86,7 +86,8 @@ pub struct WritePools {
 
 impl WritePools {
     /// `None` when `writes_per_second` is 0: the pools are off. Fails on
-    /// shares that leave members nothing.
+    /// shares that leave members nothing, and on a nonzero share whose burst
+    /// is under one write.
     pub fn new(section: &PoolsSection, now: Instant) -> anyhow::Result<Option<Self>> {
         let (stranger, invited) = (section.stranger_share_pct, section.invited_share_pct);
         if u16::from(stranger) + u16::from(invited) >= 100 {
@@ -108,6 +109,20 @@ impl WritePools {
             demand: None,
         };
         let member = 100.0 - f64::from(stranger) - f64::from(invited);
+        // A share whose burst is under one token could never serve a write
+        // from its own bucket.
+        for (name, pct) in [
+            ("member", member),
+            ("invited", f64::from(invited)),
+            ("stranger", f64::from(stranger)),
+        ] {
+            if pct > 0.0 && burst * pct / 100.0 < 1.0 {
+                anyhow::bail!(
+                    "[auth.pools] the {name} share of writes_burst {burst} is under one write; \
+                     raise writes_burst or set that share to 0"
+                );
+            }
+        }
         Ok(Some(Self {
             buckets: Mutex::new([
                 bucket(member),
@@ -296,6 +311,27 @@ mod tests {
             };
             assert!(err.to_string().contains("stranger_share_pct"), "{err}");
         }
+    }
+
+    #[test]
+    fn a_share_whose_burst_is_under_one_write_is_refused() {
+        let section = PoolsSection {
+            writes_per_second: 1,
+            writes_burst: 1,
+            ..PoolsSection::default()
+        };
+        let err = match WritePools::new(&section, Instant::now()) {
+            Ok(_) => panic!("a burst of 0.2 strangers must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("writes_burst"), "{err}");
+        // Enough burst for every share: 5 × 20 % is one stranger write.
+        let section = PoolsSection {
+            writes_per_second: 1,
+            writes_burst: 10,
+            ..section
+        };
+        assert!(WritePools::new(&section, Instant::now()).unwrap().is_some());
     }
 
     /// A stranger share of 0: strangers write only what idle pools lend.

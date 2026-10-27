@@ -146,8 +146,8 @@ tailnet:
   identity flood but does not stop one. What bounds a flood is
   `[auth.pools]`: strangers share `stranger_share_pct` (20 %) of the
   server's write capacity, so however many keys a flood brings, members keep
-  the rest. Members are the DIDs in `records`, plus those whose admission
-  proof is `local_member_age_secs` old.
+  the rest. Members are the DIDs in `records` with no negative score, plus
+  those whose admission proof is `local_member_age_secs` old.
 - **Federated peers vouch for their authors.** Blocks relayed from a peer run
   the same admission, write and suite gates as local ones, except that their
   authors are not asked for proof-of-work: they never spoke to this server.
