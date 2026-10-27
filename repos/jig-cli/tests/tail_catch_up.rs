@@ -81,27 +81,37 @@ fn read_until<R: BufRead + Send + 'static>(mut out: R, prefix: &'static str) -> 
         .unwrap_or_else(|_| panic!("no line starting {prefix:?}"))
 }
 
-/// How long the encrypted tail may go with no line shown and no message
-/// read before the test calls it stalled.
+/// How long a tail may go with no line shown and no sign of work before the
+/// test calls it stalled.
 const STALL: Duration = Duration::from_secs(60);
+
+/// The most a whole catch-up may take, however busy the tail stays: a tail
+/// that spins forever shows work and nothing else.
+const CATCH_UP: Duration = Duration::from_secs(600);
 
 /// The tail's next line. The catch-up shows nothing while it works, and
 /// under a loaded test run it can take longer than any fixed wait, so this
-/// waits as long as the reader is still reading: its plaintext store, which
-/// gains a record for each message it decrypts, keeps growing. `None` once
-/// neither a line nor a record has come for [`STALL`], or the tail is gone.
-fn next_line(stdout: &mpsc::Receiver<String>, store: &Path) -> Option<String> {
-    let len = || std::fs::metadata(store).map_or(0, |m| m.len());
-    let mut size = len();
+/// waits as long as `progress` (a count that grows while the tail works)
+/// keeps changing. `None` once neither a line nor progress has come for
+/// [`STALL`], once `started` is [`CATCH_UP`] ago, or when the tail is gone.
+fn next_line(
+    stdout: &mpsc::Receiver<String>,
+    started: Instant,
+    progress: impl Fn() -> u64,
+) -> Option<String> {
+    let mut seen = progress();
     let mut since = Instant::now();
     loop {
         match stdout.recv_timeout(Duration::from_secs(1)) {
             Ok(line) => return Some(line),
             Err(mpsc::RecvTimeoutError::Disconnected) => return None,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let now = len();
-                if now != size {
-                    size = now;
+                let now = progress();
+                if started.elapsed() > CATCH_UP {
+                    return None;
+                }
+                if now != seen {
+                    seen = now;
                     since = Instant::now();
                 } else if since.elapsed() > STALL {
                     return None;
@@ -109,6 +119,29 @@ fn next_line(stdout: &mpsc::Receiver<String>, store: &Path) -> Option<String> {
             }
         }
     }
+}
+
+/// CPU time `pid` has used, in clock ticks: it grows while the process
+/// works, and stops when it blocks or hangs. 0 where `/proc` is missing,
+/// so the wait falls back to [`STALL`] from the last line.
+fn cpu_ticks(pid: u32) -> u64 {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return 0;
+    };
+    // utime and stime, the 14th and 15th fields: the 12th and 13th after
+    // the command name, which is in parentheses and may hold spaces.
+    let fields: Vec<&str> = stat
+        .rsplit_once(')')
+        .map_or("", |(_, rest)| rest)
+        .split_whitespace()
+        .collect();
+    let at = |i: usize| {
+        fields
+            .get(i)
+            .and_then(|f| f.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    at(11) + at(12)
 }
 
 /// The reader's plaintext store (`jig_client::secure`): one sealed record
@@ -171,10 +204,15 @@ async fn a_tail_that_falls_behind_catches_up_with_nothing_missed_or_repeated() {
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     let last = format!("burst-{:04}", BURST - 1);
     let mut posted_after = false;
+    let pid = tail.id();
+    let started = Instant::now();
     loop {
-        let line = stdout
-            .recv_timeout(Duration::from_secs(60))
-            .unwrap_or_else(|_| panic!("stalled; shown so far: {}", seen.len()));
+        let line = next_line(&stdout, started, || cpu_ticks(pid)).unwrap_or_else(|| {
+            panic!(
+                "stalled: nothing shown and no work done for {STALL:?}; shown so far: {}",
+                seen.len()
+            )
+        });
         let Some(m) = message(&line) else { continue };
         *seen.entry(m.clone()).or_default() += 1;
         if m == last && !posted_after {
@@ -378,10 +416,16 @@ async fn an_encrypted_tail_that_falls_behind_catches_up_across_a_commit() {
 
     let stdout = lines(stdout);
     let store = plaintext_store(reader.path(), &reader_did);
+    let pid = tail.id();
+    let started = Instant::now();
     let mut shown: Vec<String> = Vec::new();
     let last = format!("burst-{:04}", ENCRYPTED_BURST - 1);
     loop {
-        let line = next_line(&stdout, &store).unwrap_or_else(|| {
+        // Work is a decrypted message recorded, or CPU time spent.
+        let line = next_line(&stdout, started, || {
+            std::fs::metadata(&store).map_or(0, |m| m.len()) + cpu_ticks(pid)
+        })
+        .unwrap_or_else(|| {
             panic!("stalled: nothing shown or read for {STALL:?}; shown so far: {shown:?}")
         });
         if line.contains(" was added") {

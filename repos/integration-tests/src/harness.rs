@@ -166,7 +166,10 @@ impl TestJigServer {
         let state = Arc::new(jig_server::v0_0_2::AppState::new(
             config,
             db_path,
-            Default::default(),
+            jig_server::runtime::ExecutionConfig {
+                timeout_ms: TEST_RENDER_TIMEOUT_MS,
+                ..Default::default()
+            },
         )?);
         let server_did_string = state.server_did.to_did_jig_string();
 
@@ -955,6 +958,14 @@ fn submission_payload(block: &BuiltBlock) -> serde_json::Value {
         "sig_b64": base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
     })
 }
+
+/// The wall-clock deadline for each render on a test server, in ms. Fuel
+/// bounds what a render may cost; the deadline is a backstop against a slow
+/// or loaded machine, and the default (250 ms) is shorter than a render can
+/// wait for a CPU on a CI runner busy with the whole test suite. A render
+/// that ran out of time there failed its send with `RENDER_FAILED
+/// deadline-exceeded`, and the test with it.
+const TEST_RENDER_TIMEOUT_MS: u64 = 10_000;
 
 fn base_config() -> Result<JigServerConfig> {
     Ok(JigServerConfig {
