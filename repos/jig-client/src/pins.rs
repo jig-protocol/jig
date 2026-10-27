@@ -1971,6 +1971,7 @@ mod tests {
             ingest_wall_ms: 1,
             ingest_logical: 0,
             record: None,
+            high: None,
         };
         pins.check_channel(
             server,
