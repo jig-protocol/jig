@@ -198,10 +198,11 @@ pub struct EngineConfig {
     /// Enable component model
     pub component_model: bool,
 
-    /// Enable module caching (ensure determinism is preserved)
+    /// Enable module caching. This runtime is built without wasmtime's module
+    /// cache, so `true` is refused when the engine is configured.
     pub enable_cache: bool,
 
-    /// Cache directory path
+    /// Cache directory path. Unused while the module cache is not built in.
     pub cache_dir: Option<String>,
 }
 

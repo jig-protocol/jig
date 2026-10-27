@@ -62,6 +62,26 @@ pub enum PinError {
     #[error("the creation block for {slug} does not prove its suite: {reason}")]
     Unproven { slug: String, reason: String },
     #[error(
+        "{server} says {slug} is ordered by {sequencer}, another server, but does not prove \
+         it: {reason}"
+    )]
+    CarriedUnproven {
+        server: String,
+        slug: String,
+        sequencer: String,
+        reason: String,
+    },
+    #[error(
+        "{server} says {slug} is ordered by {presented}, but this device pinned it as ordered \
+         by {pinned}; a channel's history is held to the server that orders it"
+    )]
+    SequencerChanged {
+        server: String,
+        slug: String,
+        pinned: String,
+        presented: String,
+    },
+    #[error(
         "{name} is pinned to {pinned}, but now resolves to {presented}; if its holder confirms \
          the change, `jig trust accept-name {name} --did {presented}` moves the pin"
     )]
@@ -104,6 +124,13 @@ pub struct ChannelPin {
     /// ([`crate::chain`]); the server is held to it on every later read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_head: Option<crate::chain::ChainHead>,
+    /// The server that orders the channel when it is not the pinned server
+    /// itself: a channel the pinned server carries for its owner (JEP-0005),
+    /// proven by the owner's signed offer ([`prove_carried`]). Its records
+    /// are held to this DID, never to the server serving them. `None` for a
+    /// channel the pinned server orders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequencer: Option<String>,
 }
 
 impl ChannelPin {
@@ -130,11 +157,110 @@ pub struct ServerPin {
     /// ([`crate::manifest`]); a welcome citing it needs no second check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<jig_pipeline::handshake::ManifestRef>,
-    /// The public key links this pin moved along, base64 as served, oldest
-    /// first: a later link out of one of their DIDs to another is a fork
-    /// ([`crate::evidence::key_link_fork`]).
+    /// The public key links this pin moved along, and those the server
+    /// served leading to its pinned DID, base64 as served: a later link out
+    /// of one of their DIDs to another is a fork
+    /// ([`crate::evidence::key_link_fork`]), and the DIDs they leave are the
+    /// ones its earlier records are checked against ([`Self::sequencers`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<String>,
+}
+
+impl ServerPin {
+    /// The DIDs this server signed as, in key-link order, ending at the one
+    /// pinned: each hop of [`Self::links`] that leads to it, walking back
+    /// from the pinned DID. A channel's earlier records are checked against
+    /// them ([`crate::chain::ChannelChain::across`]).
+    pub fn sequencers(&self) -> Vec<String> {
+        dids_along(&self.links, &self.server_did)
+    }
+}
+
+/// Add to `pin.links` each of `links` on the way to its pinned DID
+/// ([`links_along`]). Returns whether any was new.
+fn keep_links_on(pin: &mut ServerPin, links: &[String]) -> bool {
+    let mut added = false;
+    for link in links_along(links, &pin.server_did) {
+        if !pin.links.contains(&link) {
+            pin.links.push(link);
+            added = true;
+        }
+    }
+    added
+}
+
+/// The public key links among `links` (base64, as served) that lead to
+/// `to`, oldest first: from `to`, the one link that moves to it, then the
+/// one that moves to the DID that link leaves, and so on, each verified as
+/// signed by both its keys (JEP-0012). The walk stops where no link, or more
+/// than one, moves to the DID reached, where a DID repeats, and after
+/// [`jig_pipeline::handshake::MAX_KEY_LINK_HOPS`] links. Order in `links`
+/// does not matter.
+pub fn links_along(links: &[String], to: &str) -> Vec<String> {
+    use jig_core::key_link::{Audience, KeyLink, SignedKeyLink};
+    use jig_pipeline::handshake::same_did;
+    let mut verified: Vec<(&String, KeyLink)> = Vec::new();
+    for b64 in links {
+        let Some(signed) = STANDARD
+            .decode(b64)
+            .ok()
+            .and_then(|bytes| SignedKeyLink::from_envelope(&bytes).ok())
+        else {
+            continue;
+        };
+        let link = signed.link();
+        if link.audience == Audience::Public
+            && !verified
+                .iter()
+                .any(|(_, l)| l.old == link.old && l.new == link.new)
+        {
+            verified.push((b64, link.clone()));
+        }
+    }
+    let mut dids = vec![to.to_string()];
+    let mut path = Vec::new();
+    while path.len() < jig_pipeline::handshake::MAX_KEY_LINK_HOPS {
+        let into: Vec<&(&String, KeyLink)> = verified
+            .iter()
+            .filter(|(_, l)| same_did(&l.new, &dids[0]))
+            .collect();
+        let [(b64, link)] = into.as_slice() else {
+            break;
+        };
+        if dids.iter().any(|d| same_did(d, &link.old)) {
+            break;
+        }
+        dids.insert(0, link.old.clone());
+        path.insert(0, (*b64).clone());
+    }
+    path
+}
+
+/// The DIDs [`links_along`] passes through to reach `to`, oldest first and
+/// ending at `to`.
+pub fn dids_along(links: &[String], to: &str) -> Vec<String> {
+    let mut dids: Vec<String> = links_along(links, to)
+        .iter()
+        .filter_map(|b64| STANDARD.decode(b64).ok())
+        .filter_map(|bytes| jig_core::key_link::SignedKeyLink::from_envelope(&bytes).ok())
+        .map(|signed| signed.link().old.clone())
+        .collect();
+    dids.push(to.to_string());
+    dids
+}
+
+/// The key links a welcome carries, base64 as served, oldest first: its
+/// `prior_key_links` then its `key_link`. Empty for text that is not a
+/// welcome, or one with no link.
+pub fn welcome_key_links(evidence: &str) -> Vec<String> {
+    match jig_pipeline::envelope::Envelope::parse(evidence).map(|env| env.frame) {
+        Ok(jig_pipeline::envelope::Frame::Welcome {
+            key_link: Some(newest),
+            prior_key_links,
+            ..
+        }) => prior_key_links.into_iter().chain([newest]).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// A server this device refuses until its user accepts it again, after it
@@ -357,6 +483,44 @@ impl Pins {
                     suite: dropped.clone(),
                 });
             }
+            // A welcome signed by another DID than the pinned one moves the
+            // pin only along key links that verify hop by hop forward from
+            // the pinned DID to the welcome's (JEP-0012), as `move_server`
+            // moves it. The welcome is the server's word, and over a
+            // plaintext connection nothing else vouches for it, so anything
+            // short of that is refused and nothing is recorded.
+            if !pin.server_did.is_empty()
+                && pin.server_did != welcome.server_did
+                && !jig_pipeline::handshake::same_did(&pin.server_did, &welcome.server_did)
+            {
+                let replaced = || PinError::ServerReplaced {
+                    server: server.to_string(),
+                    pinned: pin.server_did.clone(),
+                    presented: welcome.server_did.clone(),
+                };
+                if !welcome
+                    .moved_from
+                    .as_deref()
+                    .is_some_and(|from| jig_pipeline::handshake::same_did(from, &pin.server_did))
+                {
+                    return Err(replaced());
+                }
+                let Ok(followed) = jig_pipeline::handshake::chain_moves(
+                    &welcome_key_links(&welcome.evidence),
+                    &pin.server_did,
+                    &welcome.server_did,
+                ) else {
+                    return Err(replaced());
+                };
+                for link in followed {
+                    if !pin.links.contains(&link) {
+                        pin.links.push(link);
+                    }
+                }
+                // What the old key's welcome was checked against says
+                // nothing about the new one's.
+                pin.manifest = None;
+            }
             let changed = first
                 || pin.suites != advertised
                 || pin.server_did != welcome.server_did
@@ -366,7 +530,10 @@ impl Pins {
                 pin.server_did.clone_from(&welcome.server_did);
                 pin.welcome = Some(welcome.evidence.clone());
             }
-            Ok(((), changed))
+            // The links it serves to its DID, kept as `move_server` keeps
+            // the hops it follows ([`ServerPin::sequencers`]).
+            let kept = keep_links_on(pin, &welcome_key_links(&welcome.evidence));
+            Ok(((), changed || kept))
         })
     }
 
@@ -432,6 +599,19 @@ impl Pins {
         })
     }
 
+    /// Keep the key links `server` serves (base64, as served) that lead to
+    /// the DID pinned for it, as [`Self::check_welcome`] does for a welcome's:
+    /// for a server first pinned from a TLS probe, they are how its earlier
+    /// DIDs' records are checked ([`ServerPin::sequencers`]).
+    pub fn keep_links(&mut self, server: &str, links: &[String]) -> Result<(), PinError> {
+        self.update(|file| {
+            let Some(pin) = file.servers.get_mut(&server_key(server)) else {
+                return Ok(((), false));
+            };
+            Ok(((), keep_links_on(pin, links)))
+        })
+    }
+
     /// Record that `server`'s welcome was checked against `manifest`.
     pub fn set_manifest(
         &mut self,
@@ -449,6 +629,15 @@ impl Pins {
     /// The pin for `slug` on `server`, if this device has one.
     pub fn channel(&self, server: &str, slug: &str) -> Option<&ChannelPin> {
         self.server(server).and_then(|p| p.channels.get(slug))
+    }
+
+    /// The channel pinned on `server` under `reference`, a slug or the id of
+    /// its creation block, with the slug it is pinned under.
+    pub fn channel_by_ref(&self, server: &str, reference: &str) -> Option<(&str, &ChannelPin)> {
+        let pins = &self.server(server)?.channels;
+        pins.get_key_value(reference)
+            .or_else(|| pins.iter().find(|(_, c)| c.create_cid == reference))
+            .map(|(slug, pin)| (slug.as_str(), pin))
     }
 
     /// Check a channel's proven creation against the pin, and pin it on first
@@ -507,6 +696,72 @@ impl Pins {
                 pin.chain_head = Some(head.clone());
             }
             Ok((true, ahead))
+        })
+    }
+
+    /// The channels pinned on `server` as carried for their owners, by
+    /// channel id, each with its owner ([`Self::anchor_channel`]): what a
+    /// live session holds their records to
+    /// ([`crate::connection::ConnectOptions::carried`]).
+    pub fn carried(&self, server: &str) -> std::collections::HashMap<String, String> {
+        self.server(server)
+            .map(|p| {
+                p.channels
+                    .values()
+                    .filter_map(|c| Some((c.create_cid.clone(), c.sequencer.clone()?)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Hold `slug` on `server` to the server that orders it: `None` for
+    /// `server` itself, else a DID [`prove_carried`] proved for the channel
+    /// `create_cid`. The proof is for that channel only: if `slug` is pinned
+    /// to another creation block, nothing moves and the substitution is
+    /// [`PinError::ChannelReplaced`]. A channel
+    /// pinned as `server`'s own may come to be carried for a proven owner
+    /// (the server set its own copy aside and follows the owner, JEP-0005):
+    /// its chain then starts again from the owner's records, the old head
+    /// signed by another key. Nothing else moves the pin: not back to
+    /// `server`, not to another owner. Returns whether the pin moved.
+    pub fn anchor_channel(
+        &mut self,
+        server: &str,
+        slug: &str,
+        create_cid: &str,
+        sequencer: Option<&str>,
+    ) -> Result<bool, PinError> {
+        self.update(|file| {
+            let Some(pin) = file
+                .servers
+                .get_mut(&server_key(server))
+                .and_then(|p| p.channels.get_mut(slug))
+            else {
+                return Ok((false, false));
+            };
+            if pin.create_cid != create_cid {
+                return Err(PinError::ChannelReplaced {
+                    server: server.to_string(),
+                    slug: slug.to_string(),
+                    pinned: pin.create_cid.clone(),
+                    presented: create_cid.to_string(),
+                });
+            }
+            match (pin.sequencer.as_deref(), sequencer) {
+                (None, None) => Ok((false, false)),
+                (Some(pinned), Some(presented)) if pinned == presented => Ok((false, false)),
+                (None, Some(presented)) => {
+                    pin.sequencer = Some(presented.to_string());
+                    pin.chain_head = None;
+                    Ok((true, true))
+                }
+                (Some(pinned), presented) => Err(PinError::SequencerChanged {
+                    server: server.to_string(),
+                    slug: slug.to_string(),
+                    pinned: pinned.to_string(),
+                    presented: presented.unwrap_or(server).to_string(),
+                }),
+            }
         })
     }
 
@@ -748,7 +1003,80 @@ pub fn prove_channel(
         suite: suite.as_str().to_string(),
         owner_did: Did::from_ed25519_pubkey(&key_bytes).to_did_jig_string(),
         chain_head: None,
+        sequencer: None,
     })
+}
+
+/// Whether `sequencer`, as a listing names it, is a server other than the
+/// one whose DIDs are `server_dids` (its DID and those its key links lead
+/// from). An empty name is the server's own.
+pub fn names_another_server(server_dids: &[String], sequencer: &str) -> bool {
+    let canonical = jig_pipeline::effect::canonical_did_string;
+    !sequencer.is_empty()
+        && !server_dids
+            .iter()
+            .any(|did| canonical(did) == canonical(sequencer))
+}
+
+/// Prove that `sequencer`, not the server serving it, orders the channel
+/// created by `channel_id`, from the offer `sequencer` signed to that server
+/// (base64, as the server lists it, JEP-0005 rule 7). The serving server's
+/// word for who orders a channel is not taken: a follower naming another
+/// sequencer, or itself, proves nothing. The offer must:
+///
+/// - verify as signed by `sequencer`;
+/// - be for `channel_id`, with the creation block that hashes to it;
+/// - be made to the serving server, one of `server_dids` (its DID and the
+///   ones its key links lead from).
+///
+/// Returns the sequencer's DID, canonical.
+pub fn prove_carried(
+    server: &str,
+    slug: &str,
+    channel_id: &str,
+    sequencer: &str,
+    server_dids: &[String],
+    offer_b64: Option<&str>,
+) -> Result<String, PinError> {
+    let unproven = |reason: &str| PinError::CarriedUnproven {
+        server: server.to_string(),
+        slug: slug.to_string(),
+        sequencer: sequencer.to_string(),
+        reason: reason.to_string(),
+    };
+    let canonical = jig_pipeline::effect::canonical_did_string;
+    let offer_b64 = offer_b64.ok_or_else(|| unproven("it shows no offer from that server"))?;
+    let envelope = base64::engine::general_purpose::STANDARD
+        .decode(offer_b64)
+        .map_err(|_| unproven("its offer is not base64"))?;
+    let offer = jig_core::contract::ContractOffer::from_envelope(&envelope)
+        .map_err(|e| unproven(&format!("its offer does not verify: {e}")))?;
+    if canonical(&offer.owner) != canonical(sequencer) {
+        return Err(unproven("the offer is signed by another server"));
+    }
+    if offer.channel_id.to_string() != channel_id {
+        return Err(unproven("the offer is for another channel"));
+    }
+    if !server_dids
+        .iter()
+        .any(|did| canonical(did) == canonical(&offer.to))
+    {
+        return Err(unproven("the offer was made to another server"));
+    }
+    let (manifest_bytes, code_bytes): (Vec<u8>, Vec<u8>) =
+        serde_json::from_slice(&offer.creation_block)
+            .map_err(|_| unproven("the offer's creation block is malformed"))?;
+    let created = jig_core::BlockBundle {
+        manifest_bytes: &manifest_bytes,
+        code_bytes: &code_bytes,
+        resources: vec![],
+    }
+    .block_cid()
+    .map_err(|_| unproven("the offer's creation block is malformed"))?;
+    if created.to_string() != channel_id {
+        return Err(unproven("the offer's creation block is another channel's"));
+    }
+    Ok(canonical(sequencer))
 }
 
 /// The resolver's view of the pins (JEP-0004 rule 17): lookup only; the
@@ -839,6 +1167,7 @@ mod tests {
             suite: suite.into(),
             owner_did: "did:jig:zA".into(),
             chain_head: None,
+            sequencer: None,
         };
         assert!(!pin("none").encrypted());
         assert!(pin("mls").encrypted());
@@ -960,6 +1289,7 @@ mod tests {
             suite: "mls".into(),
             owner_did: "did:jig:zOwner".into(),
             chain_head: None,
+            sequencer: None,
         };
         assert_eq!(
             pins.check_channel(server, "#ops", first.clone()).unwrap(),
@@ -1043,6 +1373,7 @@ mod tests {
             suite: "mls".into(),
             owner_did: "did:jig:zOwner".into(),
             chain_head: None,
+            sequencer: None,
         };
         chat.check_channel(server, "#a", pin("bafyA")).unwrap();
         send.check_channel(server, "#b", pin("bafyB")).unwrap();
@@ -1069,6 +1400,7 @@ mod tests {
             ingest_wall_ms: seq,
             ingest_logical: 0,
             record: None,
+            high: None,
         };
         assert!(
             !pins.advance_chain(server, "#ops", &head(1)).unwrap(),
@@ -1082,6 +1414,7 @@ mod tests {
                 suite: "mls".into(),
                 owner_did: "did:jig:zOwner".into(),
                 chain_head: None,
+                sequencer: None,
             },
         )
         .unwrap();
@@ -1201,6 +1534,229 @@ mod tests {
         assert_eq!(pins.server(server).unwrap().manifest, None);
     }
 
+    /// A welcome that moved the pin itself (no TLS probe in front) leaves
+    /// the hops it followed in the pin, so the DIDs before the current one
+    /// are known: the history they signed checks against them.
+    #[test]
+    fn a_welcome_that_moves_the_pin_keeps_the_hops_and_the_dids_along_them() {
+        use base64::Engine as _;
+        use jig_core::key_link::{Audience, SignedKeyLink};
+        use jig_pipeline::envelope::{Envelope, Frame};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let server = "ws://127.0.0.1:7117";
+        let key = jig_core::crypto::ed25519::generate_signing_key;
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let (a, b, c) = (key(), key(), key());
+        let link = |x, y| {
+            base64::engine::general_purpose::STANDARD.encode(
+                SignedKeyLink::sign(x, y, Audience::Public, 1)
+                    .unwrap()
+                    .envelope(),
+            )
+        };
+        let signed_by = |k: &ed25519_dalek::SigningKey, links: &[String], moved: Option<String>| {
+            let (newest, prior) = match links.split_last() {
+                Some((n, p)) => (Some(n.clone()), p.to_vec()),
+                None => (None, Vec::new()),
+            };
+            let mut w = welcome(&did(k), &["none"]);
+            w.moved_from = moved;
+            w.evidence = serde_json::to_string(&Envelope::new(Frame::Welcome {
+                server_did: did(k),
+                suites: vec!["none".into()],
+                capabilities: Default::default(),
+                reputation: jig_pipeline::handshake::Reputation::none(),
+                nonce: "n".into(),
+                server_nonce: "s".into(),
+                tls_exporter: String::new(),
+                manifest: None,
+                key_link: newest,
+                admit: None,
+                prior_key_links: prior,
+                sig: String::new(),
+            }))
+            .unwrap();
+            w
+        };
+        let (ab, bc) = (link(&a, &b), link(&b, &c));
+        assert_eq!(
+            welcome_key_links(&signed_by(&c, &[ab.clone(), bc.clone()], None).evidence),
+            [ab.clone(), bc.clone()]
+        );
+        assert!(welcome_key_links("not a frame").is_empty());
+
+        let mut pins = Pins::load(&path).unwrap();
+        pins.check_welcome(server, &signed_by(&a, &[], None))
+            .unwrap();
+        assert_eq!(pins.server(server).unwrap().sequencers(), [did(&a)]);
+        pins.check_welcome(
+            server,
+            &signed_by(&b, std::slice::from_ref(&ab), Some(did(&a))),
+        )
+        .unwrap();
+        pins.check_welcome(
+            server,
+            &signed_by(&c, &[ab.clone(), bc.clone()], Some(did(&b))),
+        )
+        .unwrap();
+        let pinned = Pins::load(&path).unwrap().server(server).unwrap().clone();
+        assert_eq!(pinned.server_did, did(&c));
+        assert_eq!(pinned.links, [ab.clone(), bc.clone()]);
+        assert_eq!(pinned.sequencers(), [did(&a), did(&b), did(&c)]);
+
+        // Only links that lead to the pinned DID count, in any order; two
+        // that move to one DID lead nowhere.
+        let (s1, s2, s3) = (key(), key(), key());
+        let stray = link(&s1, &s2);
+        assert_eq!(
+            dids_along(&[bc.clone(), stray.clone(), ab.clone()], &did(&c)),
+            [did(&a), did(&b), did(&c)]
+        );
+        assert_eq!(dids_along(&[ab.clone(), bc.clone()], &did(&a)), [did(&a)]);
+        assert_eq!(dids_along(&[stray], &did(&c)), [did(&c)]);
+        let also_to_b = link(&s3, &b);
+        assert_eq!(
+            dids_along(&[ab.clone(), also_to_b, bc.clone()], &did(&c)),
+            [did(&b), did(&c)]
+        );
+
+        // A server first pinned at its newest DID keeps the chain it serves.
+        let fresh = "ws://127.0.0.1:7118";
+        let mut pins = Pins::load(&path).unwrap();
+        pins.check_welcome(fresh, &signed_by(&c, &[ab.clone(), bc.clone()], None))
+            .unwrap();
+        assert_eq!(
+            pins.server(fresh).unwrap().sequencers(),
+            [did(&a), did(&b), did(&c)]
+        );
+        let probed = "https://probed:7117";
+        pins.check_server_did(probed, &did(&c)).unwrap();
+        pins.keep_links(probed, &[ab, bc]).unwrap();
+        assert_eq!(
+            Pins::load(&path)
+                .unwrap()
+                .server(probed)
+                .unwrap()
+                .sequencers(),
+            [did(&a), did(&b), did(&c)]
+        );
+    }
+
+    /// A welcome from another DID moves the pin only along links that chain
+    /// forward from the pinned DID; a forged or unchained one, or none,
+    /// leaves the pin as it was and is refused.
+    #[test]
+    fn a_welcome_with_links_that_do_not_chain_from_the_pin_is_refused() {
+        use base64::Engine as _;
+        use jig_core::key_link::{Audience, SignedKeyLink};
+        use jig_pipeline::envelope::{Envelope, Frame};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let server = "ws://127.0.0.1:7117";
+        let key = jig_core::crypto::ed25519::generate_signing_key;
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let (pinned, new, stranger, middle) = (key(), key(), key(), key());
+        let link = |x, y| {
+            base64::engine::general_purpose::STANDARD.encode(
+                SignedKeyLink::sign(x, y, Audience::Public, 1)
+                    .unwrap()
+                    .envelope(),
+            )
+        };
+        let signed_by = |links: Vec<String>, moved: Option<String>| {
+            let (newest, prior) = match links.split_last() {
+                Some((n, p)) => (Some(n.clone()), p.to_vec()),
+                None => (None, Vec::new()),
+            };
+            let mut w = welcome(&did(&new), &["none"]);
+            w.moved_from = moved;
+            w.evidence = serde_json::to_string(&Envelope::new(Frame::Welcome {
+                server_did: did(&new),
+                suites: vec!["none".into()],
+                capabilities: Default::default(),
+                reputation: jig_pipeline::handshake::Reputation::none(),
+                nonce: "n".into(),
+                server_nonce: "s".into(),
+                tls_exporter: String::new(),
+                manifest: None,
+                key_link: newest,
+                admit: None,
+                prior_key_links: prior,
+                sig: String::new(),
+            }))
+            .unwrap();
+            w
+        };
+        let mut pins = Pins::load(&path).unwrap();
+        pins.check_welcome(server, &welcome(&did(&pinned), &["none"]))
+            .unwrap();
+        let before = Pins::load(&path).unwrap().server(server).unwrap().clone();
+
+        // A link whose old key's signature is damaged: the envelope ends
+        // with the new key's signature (72 bytes with its headers), and the
+        // old key's 64 bytes come just before.
+        let mut forged = SignedKeyLink::sign(&pinned, &new, Audience::Public, 1)
+            .unwrap()
+            .envelope()
+            .to_vec();
+        let at = forged.len() - 72 - 1;
+        forged[at] ^= 1;
+        assert!(SignedKeyLink::from_envelope(&forged).is_err());
+        let forged = base64::engine::general_purpose::STANDARD.encode(&forged);
+
+        for (case, w) in [
+            ("no moved_from", signed_by(vec![link(&pinned, &new)], None)),
+            ("no link", signed_by(vec![], Some(did(&pinned)))),
+            (
+                "a link from another DID",
+                signed_by(vec![link(&stranger, &new)], Some(did(&pinned))),
+            ),
+            (
+                "a chain that skips the pin",
+                signed_by(
+                    vec![link(&stranger, &middle), link(&middle, &new)],
+                    Some(did(&pinned)),
+                ),
+            ),
+            (
+                "moved_from another DID",
+                signed_by(vec![link(&stranger, &new)], Some(did(&stranger))),
+            ),
+            (
+                "a forged signature",
+                signed_by(vec![forged.clone()], Some(did(&pinned))),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    pins.check_welcome(server, &w),
+                    Err(PinError::ServerReplaced { .. })
+                ),
+                "{case}"
+            );
+            assert_eq!(
+                Pins::load(&path).unwrap().server(server).unwrap(),
+                &before,
+                "{case}: the pin is as it was"
+            );
+        }
+
+        // The real chain moves it.
+        pins.check_welcome(
+            server,
+            &signed_by(vec![link(&pinned, &new)], Some(did(&pinned))),
+        )
+        .unwrap();
+        let after = Pins::load(&path).unwrap().server(server).unwrap().clone();
+        assert_eq!(after.server_did, did(&new));
+        assert_eq!(after.sequencers(), [did(&pinned), did(&new)]);
+    }
+
     #[test]
     fn a_store_that_does_not_parse_is_an_error_not_a_reset() {
         let dir = tempfile::tempdir().unwrap();
@@ -1284,5 +1840,240 @@ mod tests {
         pins.pin_name(&config).unwrap();
         assert_eq!(pins.name_pin(&dns.key).unwrap().did, "did:jig:zAlice");
         assert_eq!(pins.name_pin(&config.key).unwrap().did, "did:jig:zOther");
+    }
+
+    // ---- Channels a server carries for their owners ------------------------
+
+    struct Carried {
+        owner: ed25519_dalek::SigningKey,
+        follower: String,
+        channel_id: String,
+        offer_b64: String,
+    }
+
+    /// A channel created on `owner`'s server and offered to `follower`.
+    fn carried() -> Carried {
+        use base64::Engine as _;
+        let owner = jig_core::crypto::ed25519::generate_signing_key();
+        let follower = Did::from_ed25519_pubkey(
+            jig_core::crypto::ed25519::generate_signing_key()
+                .verifying_key()
+                .as_bytes(),
+        )
+        .to_did_jig_string();
+        let create = build_channel_create(
+            &identity(),
+            "#team",
+            "open",
+            HlcTimestamp::now_wall(Did::from_ed25519_pubkey(&[1; 32])),
+        );
+        let creation_block =
+            serde_json::to_vec(&(&create.manifest_bytes, &create.code_bytes)).unwrap();
+        let channel_id = jig_core::BlockBundle {
+            manifest_bytes: &create.manifest_bytes,
+            code_bytes: &create.code_bytes,
+            resources: vec![],
+        }
+        .block_cid()
+        .unwrap();
+        let offer = jig_core::contract::ContractOffer::sign(
+            &owner,
+            &follower,
+            channel_id,
+            jig_core::contract::Grant::Read,
+            creation_block,
+            Vec::new(),
+            jig_core::contract::ManifestRef {
+                cid: channel_id,
+                seq: 0,
+            },
+            Vec::new(),
+        );
+        Carried {
+            owner,
+            follower,
+            channel_id: channel_id.to_string(),
+            offer_b64: base64::engine::general_purpose::STANDARD.encode(&offer.envelope),
+        }
+    }
+
+    fn did_of_key(key: &ed25519_dalek::SigningKey) -> String {
+        Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string()
+    }
+
+    #[test]
+    fn the_owners_offer_proves_who_orders_a_carried_channel() {
+        let c = carried();
+        let owner = did_of_key(&c.owner);
+        let prove = |sequencer: &str, to: &[String], offer: Option<&str>, channel: &str| {
+            prove_carried("wss://follower", "#team", channel, sequencer, to, offer)
+        };
+        let ours = vec![c.follower.clone()];
+        assert_eq!(
+            prove(&owner, &ours, Some(&c.offer_b64), &c.channel_id).unwrap(),
+            owner
+        );
+
+        // The follower's word alone proves nothing.
+        assert!(matches!(
+            prove(&owner, &ours, None, &c.channel_id),
+            Err(PinError::CarriedUnproven { .. })
+        ));
+        // A follower naming a third server as sequencer, with the real
+        // owner's offer: the offer is not that server's.
+        let third = did_of_key(&jig_core::crypto::ed25519::generate_signing_key());
+        assert!(matches!(
+            prove(&third, &ours, Some(&c.offer_b64), &c.channel_id),
+            Err(PinError::CarriedUnproven { .. })
+        ));
+        // An offer made to another server, replayed here.
+        assert!(matches!(
+            prove(
+                &owner,
+                std::slice::from_ref(&third),
+                Some(&c.offer_b64),
+                &c.channel_id
+            ),
+            Err(PinError::CarriedUnproven { .. })
+        ));
+        // The offer for another channel.
+        let other = carried();
+        assert!(matches!(
+            prove(&owner, &ours, Some(&other.offer_b64), &c.channel_id),
+            Err(PinError::CarriedUnproven { .. })
+        ));
+        // A forged one.
+        let mut forged = base64::engine::general_purpose::STANDARD
+            .decode(&c.offer_b64)
+            .unwrap();
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        let forged = base64::engine::general_purpose::STANDARD.encode(&forged);
+        assert!(matches!(
+            prove(&owner, &ours, Some(&forged), &c.channel_id),
+            Err(PinError::CarriedUnproven { .. })
+        ));
+    }
+
+    /// Once a channel is pinned as carried for its owner, the server serving
+    /// it cannot take it back as its own, nor name another owner. A channel
+    /// pinned as the server's own may come to be carried (the server set its
+    /// copy aside and follows the owner): its chain then starts again.
+    #[test]
+    fn who_orders_a_channel_moves_one_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pins = Pins::load(&dir.path().join("pins.json")).unwrap();
+        let server = "wss://follower";
+        let head = crate::chain::ChainHead {
+            format: crate::chain::RECORD_FORMAT.to_string(),
+            seq: 3,
+            hash: "aa".to_string(),
+            ingest_wall_ms: 1,
+            ingest_logical: 0,
+            record: None,
+            high: None,
+        };
+        pins.check_channel(
+            server,
+            "#team",
+            ChannelPin {
+                create_cid: "bafycreate".to_string(),
+                suite: "none".to_string(),
+                owner_did: "did:jig:zuser".to_string(),
+                chain_head: None,
+                sequencer: None,
+            },
+        )
+        .unwrap();
+        pins.advance_chain(server, "#team", &head).unwrap();
+        assert!(
+            !pins
+                .anchor_channel(server, "#team", "bafycreate", None)
+                .unwrap()
+        );
+
+        assert!(
+            pins.anchor_channel(server, "#team", "bafycreate", Some("did:jig:zowner"))
+                .unwrap()
+        );
+        let pin = pins.channel(server, "#team").unwrap();
+        assert_eq!(pin.sequencer.as_deref(), Some("did:jig:zowner"));
+        assert_eq!(pin.chain_head, None, "the owner's chain starts afresh");
+        assert_eq!(
+            pins.carried(server).get("bafycreate").map(String::as_str),
+            Some("did:jig:zowner")
+        );
+        assert!(
+            !pins
+                .anchor_channel(server, "#team", "bafycreate", Some("did:jig:zowner"))
+                .unwrap()
+        );
+
+        // A hostile follower naming itself, or another server.
+        assert!(matches!(
+            pins.anchor_channel(server, "#team", "bafycreate", None),
+            Err(PinError::SequencerChanged { .. })
+        ));
+        assert!(matches!(
+            pins.anchor_channel(server, "#team", "bafycreate", Some("did:jig:zother")),
+            Err(PinError::SequencerChanged { .. })
+        ));
+        assert_eq!(
+            pins.channel(server, "#team").unwrap().sequencer.as_deref(),
+            Some("did:jig:zowner")
+        );
+    }
+
+    /// A follower cannot re-point a pinned slug at another channel with a
+    /// valid proof for that other channel. `#team` is pinned on the follower
+    /// as its own channel Y; the follower then lists `#team` as X, a channel
+    /// it does carry for the owner, with the owner's real offer for X. The
+    /// proof holds for X, but the slug stays bound to Y.
+    #[test]
+    fn a_valid_proof_for_one_channel_cannot_re_point_a_slug_pinned_to_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pins = Pins::load(&dir.path().join("pins.json")).unwrap();
+        let server = "wss://follower";
+        let local = "bafylocalteam".to_string();
+        let pin = |create_cid: &str| ChannelPin {
+            create_cid: create_cid.to_string(),
+            suite: "none".to_string(),
+            owner_did: "did:jig:zuser".to_string(),
+            chain_head: None,
+            sequencer: None,
+        };
+        pins.check_channel(server, "#team", pin(&local)).unwrap();
+
+        let x = carried();
+        let owner = did_of_key(&x.owner);
+        assert_ne!(x.channel_id, local);
+        // The proof is sound for X.
+        assert_eq!(
+            prove_carried(
+                server,
+                "#team",
+                &x.channel_id,
+                &owner,
+                std::slice::from_ref(&x.follower),
+                Some(&x.offer_b64)
+            )
+            .unwrap(),
+            owner
+        );
+        // The creation check refuses X under the slug pinned to Y.
+        assert!(matches!(
+            pins.check_channel(server, "#team", pin(&x.channel_id)),
+            Err(PinError::ChannelReplaced { .. })
+        ));
+        // And so does the anchor, on its own.
+        assert!(matches!(
+            pins.anchor_channel(server, "#team", &x.channel_id, Some(&owner)),
+            Err(PinError::ChannelReplaced { .. })
+        ));
+        let after = pins.channel(server, "#team").unwrap();
+        assert_eq!(after.create_cid, local);
+        assert_eq!(after.sequencer, None);
+        assert!(pins.carried(server).is_empty());
+        assert_eq!(pins.channel_by_ref(server, &x.channel_id), None);
     }
 }

@@ -31,13 +31,11 @@ use axum::{
     routing::get,
 };
 use base64::Engine as _;
-use jig_core::BlockBundle;
 use jig_pipeline::{
     Envelope, Frame, ReceiptRef, Scope, SubscriptionScope,
     envelope::EnvelopeParseError,
     fanout::SubscriberIdentity,
     handshake::{HelloRefusal, close},
-    ingest::{IngestSource, ingest},
 };
 use tokio::sync::mpsc;
 
@@ -821,6 +819,20 @@ async fn handle_client_frame(
                     return Ok(());
                 }
             };
+            // A slug that names only a channel this server carries for its
+            // owner would wait for a creation that never comes here: a slug
+            // names a channel only where it is ordered. Name its id instead.
+            if channel.is_none()
+                && let Scope::Channel { slug } = &scope
+                && let Ok(Some(carried)) = state.ingest_ctx.store.carried_channel_by_slug(slug)
+            {
+                let message = format!(
+                    "{slug} here is carried for {}, which orders it; subscribe to it by its id: {}",
+                    carried.sequencer_did, carried.id
+                );
+                let _ = send_error(socket, Some(404), "CARRIED_CHANNEL", None, &message).await;
+                return Ok(());
+            }
             if let SubscriberIdentity::Did(did) = &who
                 && let Some(channel) = &channel
             {
@@ -935,20 +947,16 @@ async fn handle_client_frame(
                     }
                 };
 
-            // 3. Construct a BlockBundle borrowing from the local vecs.
-            //    Both vecs live for the duration of this block, so the lifetimes hold.
-            let bundle = BlockBundle {
-                manifest_bytes: &manifest_bytes,
-                code_bytes: &code_bytes,
-                resources: vec![],
-            };
-
-            // 4. Run ingest; reply Ack or a typed Error frame.
-            match ingest(
-                &state.ingest_ctx,
-                bundle,
+            // 3. Post it: ingest here, or relayed to the channel's owner when
+            //    this server carries the channel (JEP-0005 rule 15). Reply Ack
+            //    or a typed Error frame.
+            match crate::v0_0_2_relay::post(
+                state,
+                &manifest_bytes,
+                &code_bytes,
                 sig,
-                IngestSource::LocalClient { conn_id },
+                conn_id,
+                &format!("ws:{conn_id}"),
             )
             .await
             {
@@ -960,13 +968,19 @@ async fn handle_client_frame(
                     };
                     let _ = socket.send(Message::Text(json.into())).await;
                 }
-                // One classifier for every surface. `v0_0_2_ingest_error.rs`
-                // exists because two HTTP surfaces once drifted apart on the
-                // same variant; a hand-copied table here was the third copy.
-                Err(e) => {
-                    let (status, code, message) =
-                        crate::v0_0_2_ingest_error::classify_ingest_error(&e);
-                    let _ = send_error(socket, Some(status.as_u16()), code, None, &message).await;
+                // One classifier for every surface (`Refusal::of`, over
+                // `v0_0_2_ingest_error.rs`): two HTTP surfaces once drifted
+                // apart on the same variant; a hand-copied table here was the
+                // third copy.
+                Err(refusal) => {
+                    let _ = send_error(
+                        socket,
+                        Some(refusal.status.as_u16()),
+                        &refusal.code,
+                        None,
+                        &refusal.message,
+                    )
+                    .await;
                 }
             }
             Ok(())
@@ -1501,6 +1515,45 @@ mod tests {
             panic!("expected text, got {msg:?}");
         };
         serde_json::from_str(&text).expect("frame parses")
+    }
+
+    /// A subscription by the slug of a channel this server only carries for
+    /// its owner would never deliver: it is refused, naming the channel's id.
+    #[tokio::test]
+    async fn a_subscribe_by_a_carried_channels_slug_names_its_id() {
+        let (state, url) = start_test_server().await;
+        let id = jig_pipeline::ingest_record::label_cid("a carried channel");
+        state
+            .ingest_ctx
+            .store
+            .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                id: id.clone(),
+                slug: "#team".to_string(),
+                visibility: "open".to_string(),
+                created_at: 0,
+                owner_did: "did:jig:zuser".to_string(),
+                suite: "none".to_string(),
+                sequencer_did: "did:jig:zowner".to_string(),
+                co_owners: Vec::new(),
+            })
+            .unwrap();
+        let mut ws = established(&url).await;
+        let sub = signed_subscribe_frame(
+            &test_identity(),
+            Scope::Channel {
+                slug: "#team".to_string(),
+            },
+        );
+        ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
+            .await
+            .unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { code, message, .. } => {
+                assert_eq!(code, "CARRIED_CHANNEL");
+                assert!(message.contains(&id), "{message}");
+            }
+            other => panic!("expected an error frame, got {other:?}"),
+        }
     }
 
     /// An unsigned subscribe must be refused. Before this, `Frame::Subscribe`
@@ -2413,8 +2466,11 @@ mod tests {
             ),
             "the dialer's handler sees the DID the welcome proved"
         );
+        // The dialer's catch-up ask comes first ([`crate::v0_0_2_catch_up`]).
+        let seen = dialed_seen.wait_for(2).await;
+        assert_eq!(seen[0].1, crate::v0_0_2_catch_up::CATCH_UP_FRAME);
         assert_eq!(
-            dialed_seen.wait_for(1).await[0],
+            seen[1],
             (
                 dialing_did.clone(),
                 "contract-answer".into(),
@@ -2429,7 +2485,7 @@ mod tests {
             .expect("the dialed peer is live on the dialer too")
             .send("note", b"from-dialing".to_vec())
             .unwrap();
-        assert_eq!(dialed_seen.wait_for(2).await[1].2, b"from-dialing");
+        assert_eq!(dialed_seen.wait_for(3).await[2].2, b"from-dialing");
 
         // The dialer's handler closes; the connection ends as a contract close.
         to_dialing.send("contract-end", vec![]).unwrap();
