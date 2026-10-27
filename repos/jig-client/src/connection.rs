@@ -89,6 +89,9 @@ pub struct Client {
     /// Ranges of channel chains this session skipped over, for the caller to
     /// fill from the records endpoint.
     gaps: Arc<StdMutex<Vec<ChainGap>>>,
+    /// Small clock steps back this session accepted as the server's defect
+    /// ([`crate::chain::ClockDefect`]), for the caller to show.
+    clock_defects: Arc<StdMutex<Vec<crate::chain::ClockDefect>>>,
 }
 
 /// Entries of a channel's chain a live stream did not deliver: `from..to`.
@@ -110,6 +113,14 @@ fn lock_chains(
 
 fn lock_gaps(gaps: &StdMutex<Vec<ChainGap>>) -> MutexGuard<'_, Vec<ChainGap>> {
     gaps.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_defects(
+    defects: &StdMutex<Vec<crate::chain::ClockDefect>>,
+) -> MutexGuard<'_, Vec<crate::chain::ClockDefect>> {
+    defects
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The CID of a delivered bundle, or `None` when it does not decode; opening
@@ -430,6 +441,9 @@ impl Client {
         let gaps: Arc<StdMutex<Vec<ChainGap>>> = Arc::new(StdMutex::new(Vec::new()));
         let chains_for_reader = chains.clone();
         let gaps_for_reader = gaps.clone();
+        let clock_defects: Arc<StdMutex<Vec<crate::chain::ClockDefect>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let defects_for_reader = clock_defects.clone();
         let write_tx_for_reader = write_tx.clone();
         let hook_for_reader = on_contradiction.clone();
         tokio::spawn(async move {
@@ -527,7 +541,12 @@ impl Client {
                                             None,
                                         )
                                     });
-                                match chain.accept_live(record, cid.as_deref()) {
+                                let step = chain.accept_live(record, cid.as_deref());
+                                for defect in chain.take_clock_defects() {
+                                    tracing::warn!("{defect}");
+                                    lock_defects(&defects_for_reader).push(defect);
+                                }
+                                match step {
                                     Ok(crate::chain::Step::Gap { from, to }) => {
                                         lock_gaps(&gaps_for_reader).push(ChainGap {
                                             channel_id: record.channel_id.clone(),
@@ -626,6 +645,7 @@ impl Client {
             contradiction,
             on_contradiction,
             gaps,
+            clock_defects,
         })
     }
 
@@ -638,6 +658,13 @@ impl Client {
     /// skipped, to fill from the records endpoint before trusting what follows.
     pub fn take_chain_gaps(&self) -> Vec<ChainGap> {
         std::mem::take(&mut *lock_gaps(&self.gaps))
+    }
+
+    /// Take the clock defects this session has accepted so far: records
+    /// whose clock stepped back a little from the one before, which the
+    /// server signed but which contradict nothing (JEP-0002 rule 9).
+    pub fn take_clock_defects(&self) -> Vec<crate::chain::ClockDefect> {
+        std::mem::take(&mut *lock_defects(&self.clock_defects))
     }
 
     /// Set once the server has contradicted its signed welcome. The

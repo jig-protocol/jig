@@ -30,6 +30,11 @@ use crate::cmd::history::{DEFAULT_HISTORY_LIMIT, history_url, parse_history};
 pub(crate) const MAX_HISTORY_PAGE: usize = 200;
 /// Pages of older history to fetch before giving up on catching up.
 pub(crate) const MAX_CATCH_UP_PAGES: usize = 50;
+/// The first page a catch-up from a known head asks for: a device that
+/// synced recently is usually a few blocks behind, if any. Pages after it
+/// are [`MAX_HISTORY_PAGE`], so [`MAX_CATCH_UP_PAGES`] reach 16 + 49 × 200 =
+/// 9,816 blocks back.
+const SINCE_HEAD_FIRST_PAGE: usize = 16;
 
 /// Packages a DID keeps published, so it can be added while offline.
 const KEY_PACKAGE_TARGET: u64 = 10;
@@ -444,15 +449,86 @@ impl Secure {
             .context("group info is not base64")
     }
 
-    /// Replay the channel's history through the session: join from a
-    /// welcome, follow commits, read messages. Run before building a commit
-    /// so it is built on the channel's current epoch.
+    /// Bring the session up to date with the channel: join from a welcome,
+    /// follow commits, read messages. Run before building a commit so it is
+    /// built on the channel's current epoch. Returns what the blocks it
+    /// processed meant.
     ///
-    /// The newest page usually holds everything this device is missing. When
-    /// it has been away for longer — more than a page of blocks, commits among
-    /// them — older pages are fetched until history reaches back to this
-    /// device's epoch ([`history_reaches`]), or to the start of the channel.
+    /// Every block is processed once, in history order, from the session's
+    /// head ([`Session::head`]) on. That matters for more than cost: MLS lets a
+    /// sender's messages be read only a few generations out of order (openmls
+    /// keeps 5 behind the newest it has read), so a block skipped now could
+    /// never be decrypted later.
+    ///
+    /// The first sync, with no head yet, reads the newest page, and older
+    /// pages until history reaches back to this device's epoch
+    /// ([`history_reaches`]) or to the start of the channel.
     pub async fn sync(&self, slug: &str) -> Result<Synced> {
+        let delivered = match self.session.head(&self.server, slug)? {
+            Some(head) => self.since(slug, &head).await?,
+            None => self.newest_to_epoch(slug).await?,
+        };
+        let synced = self.replay(&delivered);
+        if let Some(newest) = delivered.iter().rev().find_map(|d| open(d).ok()) {
+            self.session.set_head(&self.server, slug, &newest.cid)?;
+        }
+        Ok(synced)
+    }
+
+    /// The blocks after `head`, oldest first. Pages back until a page holds
+    /// `head`: never on a page's length, which a server's byte budget can cut
+    /// short.
+    async fn since(&self, slug: &str, head: &str) -> Result<Vec<DeliveredBlock>> {
+        let at_head = |page: &[DeliveredBlock]| {
+            page.iter()
+                .position(|d| open(d).is_ok_and(|o| o.cid == head))
+        };
+        let mut delivered = self.history_page(slug, SINCE_HEAD_FIRST_PAGE, None).await?;
+        let mut found = at_head(&delivered);
+        let mut pages = 1;
+        loop {
+            if let Some(at) = found {
+                return Ok(delivered.split_off(at + 1));
+            }
+            if pages == MAX_CATCH_UP_PAGES {
+                // About ten thousand blocks: past that, the blocks before
+                // this window are skipped, and MLS will refuse them later.
+                eprintln!(
+                    "warning: more than {} blocks reached {slug} since this device last \
+                     read it. The newest {} are read; every older one is skipped, and \
+                     may never be readable on this device.",
+                    delivered.len(),
+                    delivered.len()
+                );
+                return Ok(delivered);
+            }
+            let Some(oldest) = delivered.first().and_then(|d| open(d).ok()) else {
+                return Ok(delivered);
+            };
+            let mut older = self
+                .history_page(slug, MAX_HISTORY_PAGE, Some(&oldest.cid))
+                .await?;
+            if older.is_empty() {
+                // The head is not in this history: the server dropped it, or
+                // the channel was replaced. Read what there is.
+                eprintln!(
+                    "warning: {slug}'s history no longer holds the last block this \
+                     device read; reading it from the start"
+                );
+                return Ok(delivered);
+            }
+            // Only the new page is searched; it goes in front, so an index
+            // into it is an index into the whole.
+            found = at_head(&older);
+            older.append(&mut delivered);
+            delivered = older;
+            pages += 1;
+        }
+    }
+
+    /// A first catch-up: the newest page, and older pages until history
+    /// reaches back to this device's epoch.
+    async fn newest_to_epoch(&self, slug: &str) -> Result<Vec<DeliveredBlock>> {
         let mut delivered = self.history_page(slug, DEFAULT_HISTORY_LIMIT, None).await?;
         // Only an empty page ends the history. A server may send fewer
         // blocks than asked, to keep a page within a byte budget, so a short
@@ -481,7 +557,40 @@ impl Secure {
             delivered = older;
             pages += 1;
         }
-        Ok(self.replay(&delivered))
+        Ok(delivered)
+    }
+
+    /// The channel's newest `limit` blocks, read, for showing: what `jig read`
+    /// prints and a pane opens with. Syncs first, so every block shown has
+    /// been processed in order, and replaying it only recalls what it meant.
+    /// Departed members to tidy come from the sync.
+    pub async fn recent(&self, slug: &str, limit: usize) -> Result<Synced> {
+        let synced = self.sync(slug).await?;
+        let mut delivered = self
+            .history_page(slug, limit.min(MAX_HISTORY_PAGE), None)
+            .await?;
+        while delivered.len() < limit {
+            let Some(oldest) = delivered.first().and_then(|d| open(d).ok()) else {
+                break;
+            };
+            let mut older = self
+                .history_page(
+                    slug,
+                    (limit - delivered.len()).min(MAX_HISTORY_PAGE),
+                    Some(&oldest.cid),
+                )
+                .await?;
+            if older.is_empty() {
+                break;
+            }
+            older.append(&mut delivered);
+            delivered = older;
+        }
+        let shown = self.replay(&delivered);
+        Ok(Synced {
+            tidy: synced.tidy,
+            ..shown
+        })
     }
 
     /// One page of the channel's history, oldest first: the newest `limit`

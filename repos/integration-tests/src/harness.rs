@@ -187,7 +187,7 @@ impl TestJigServer {
         });
 
         // Update server_url in the IngestContext to match the bound port,
-        // so any fed-hello bundles advertise the right URL. Since the
+        // so the URL it advertises is right. Since the
         // server_url field on IngestContext is set at boot from
         // config.server.listen (which was "127.0.0.1:0"), no good fix
         // is possible without redesigning AppState — but the URL is
