@@ -20,9 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Resource exhaustion (memory, fuel, concurrent execution)
   - Malicious WASM (invalid bytecode, traps, bad imports)
   - Golden receipts (regression detection)
-- **Fuzzing Infrastructure** - cargo-fuzz setup for continuous testing
-  - `fuzz_wasm_bytes` target for arbitrary bytecode
-  - README with usage instructions
+- **Fuzzing** - moved out of this crate. The workspace's cargo-fuzz targets live in
+  `repos/fuzz` (#331); `wasm_component` covers block components.
 - **Test Fixtures** - Version-controlled WASM modules
   - `deterministic.wasm` - Pure computation (464 bytes)
   - `fuel_heavy.wasm` - Heavy loop for exhaustion tests (453 bytes)
