@@ -2159,6 +2159,19 @@ impl SqliteStore {
         )?)
     }
 
+    /// When `did` first did this server's admission proof of work, in Unix
+    /// seconds on this server's clock; `None` when it has not.
+    pub fn admission_proven_at(&self, did: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().expect("poisoned");
+        conn.query_row(
+            "SELECT proven_at FROM admission_proofs WHERE did = ?",
+            [did],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// Record that `did` did `bits` of admission proof of work. A later,
     /// larger proof replaces a smaller one.
     pub fn record_admission_proof(&self, did: &str, bits: u8) -> Result<()> {
