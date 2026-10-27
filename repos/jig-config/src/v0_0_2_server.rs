@@ -925,8 +925,8 @@ pub struct PowPolicy {
     pub short_name_factor: u64,
     /// What renew and rotate by the holder pay (rule 31). `0` asks none.
     pub renew_effort: u64,
-    /// How long a penalty point lasts; each repeat offence before it lapses
-    /// doubles it (rule 27).
+    /// How long one penalty point takes to decay; each repeat offence while
+    /// points remain doubles it, up to a day (rule 27).
     pub penalty_decay_secs: u64,
 }
 
@@ -937,14 +937,16 @@ impl Default for PowPolicy {
 }
 
 impl PowPolicy {
-    /// The R1 plan's values: 2^20 to register, ×4 per letter under 5, at most
-    /// 2^24 (about 3 s on one server core); 1 to renew or rotate.
+    /// 2^20 to register, ×4 per letter under 5, at most 2^26 (about 12 s on
+    /// one server core, so `max_solve_secs` is 13); 1 to renew or rotate. A
+    /// three-letter name starts at 2^24, so the controller and penalties can
+    /// still raise it fourfold before the cap (DJ, 2026-10-25).
     pub fn recommended() -> Self {
         Self {
             alg: 1,
             min_effort: 1 << 20,
-            max_effort: 1 << 24,
-            max_solve_secs: 10,
+            max_effort: 1 << 26,
+            max_solve_secs: 13,
             short_name_len: 5,
             short_name_factor: 4,
             renew_effort: 1,
