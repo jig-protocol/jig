@@ -22,11 +22,11 @@ carry sandboxed WebAssembly. It is written in Rust, in one Cargo workspace under
 
 - **Identity is a key.** A `did:jig` is an ed25519 public key. Every block, receipt, record and
   attestation is signed by a DID and checked against the DID itself.
-- **Server operators are untrusted** (D11). Malicious operators are in the threat model. Clients
-  pin what a server signs and fail closed when it later contradicts itself.
-- **Encryption is per channel.** MLS (RFC 9420, via openmls) is the one real suite. Restricted
-  channels and DMs always use it (D25), and the server acts as a validating delivery service
-  that holds no group secret.
+- **_All_ operators are untrusted** (D11). Malicious operators are in the threat model: clients,
+  servers, and nameservers alike. 
+- **Encryption is per-channel.** MLS (RFC 9420, via openmls) is the one real suite, with additional
+  pluggable suites planned. Restricted channels and DMs always use it (D25), and the server acts as
+  a validating delivery service that holds no group secret.
 - **Federation is a signed contract between servers** ([JEP-0005](../../repos/jig-spec/jep/jep-0005-channel-federation-contract.md)).
   Each channel has one sequencing server, and followers carry its signed, hash-chained record.
 - **Blocks may carry a Wasm component** that the server runs in a deterministic sandbox and
