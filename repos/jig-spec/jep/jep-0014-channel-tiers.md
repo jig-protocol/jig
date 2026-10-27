@@ -417,8 +417,9 @@ Drafted with an LLM coding assistant from DJ's decisions of 2026-10-25 and the c
 
 # Open Questions
 
-1. ~~Roles and capacity pools.~~ Decided (DJ, 2026-10-25): they stay separate, and a `guest`
-   counts as a stranger for capacity (rule 10).
+1. ~~Roles and capacity pools.~~ Decided (DJ, 2026-10-25): they stay separate. A `guest`
+   takes whichever capacity pool JEP-0008 puts it in: invited if it was admitted on an invite,
+   stranger otherwise (rule 10).
 2. ~~`join_servers` for `shared`.~~ Decided (DJ, 2026-10-26): the follower's `member` grant is
    enough, and the creation block names no servers (rule 13).
 3. ~~A `#jig/keys` system channel.~~ Deferred (DJ, 2026-10-25) until key links need an
