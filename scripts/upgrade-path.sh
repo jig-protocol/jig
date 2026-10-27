@@ -48,15 +48,16 @@ JIG_REPO="${JIG_REPO:-jig-protocol/jig}"
 # last step. Each must reproduce on every run, or the run fails: a gap that
 # was fixed is dropped from the list here, and from then on fails if it comes
 # back. See `gap` below.
-#   install-reuses-old-server: re-running install.sh while jig-server runs
-#     replaces the binaries but leaves the old server process answering, so the
-#     new client talks to the old server (alpha.1 → alpha.2: "malformed
-#     handshake frame", and a hint to `jig server forget`). Fixed by #334.
-KNOWN_GAPS="${JIG_UPGRADE_KNOWN_GAPS-install-reuses-old-server}"
+# None today.
+KNOWN_GAPS="${JIG_UPGRADE_KNOWN_GAPS-}"
 # Gaps a published release has, and always will: expected on a release step
 # and reported there, but never counted for KNOWN_GAPS, since a step that
 # cannot change cannot show that a gap is still there.
-#   install-reuses-old-server: above.
+#   install-reuses-old-server: re-running install.sh while jig-server runs
+#     replaces the binaries but leaves the old server process answering, so the
+#     new client talks to the old server (alpha.1 → alpha.2: "malformed
+#     handshake frame", and a hint to `jig server forget`). Fixed by #334, so
+#     this build's installer fails the run if it leaves the old server up.
 #   rotate-locks-out-clients: after `jig-server keys rotate`, clients follow the
 #     key link but then refuse #jig/manifest, which the server re-created under
 #     its new DID ("is not the channel this device pinned"). Fixed by #335, so
