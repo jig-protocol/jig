@@ -10,10 +10,10 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -79,6 +79,45 @@ fn read_until<R: BufRead + Send + 'static>(mut out: R, prefix: &'static str) -> 
     });
     rx.recv_timeout(Duration::from_secs(60))
         .unwrap_or_else(|_| panic!("no line starting {prefix:?}"))
+}
+
+/// How long the encrypted tail may go with no line shown and no message
+/// read before the test calls it stalled.
+const STALL: Duration = Duration::from_secs(60);
+
+/// The tail's next line. The catch-up shows nothing while it works, and
+/// under a loaded test run it can take longer than any fixed wait, so this
+/// waits as long as the reader is still reading: its plaintext store, which
+/// gains a record for each message it decrypts, keeps growing. `None` once
+/// neither a line nor a record has come for [`STALL`], or the tail is gone.
+fn next_line(stdout: &mpsc::Receiver<String>, store: &Path) -> Option<String> {
+    let len = || std::fs::metadata(store).map_or(0, |m| m.len());
+    let mut size = len();
+    let mut since = Instant::now();
+    loop {
+        match stdout.recv_timeout(Duration::from_secs(1)) {
+            Ok(line) => return Some(line),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let now = len();
+                if now != size {
+                    size = now;
+                    since = Instant::now();
+                } else if since.elapsed() > STALL {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// The reader's plaintext store (`jig_client::secure`): one sealed record
+/// per message it has decrypted.
+fn plaintext_store(home: &Path, did: &str) -> PathBuf {
+    home.join(".jig")
+        .join("mls")
+        .join(did)
+        .join("plaintext.jsonl")
 }
 
 /// The burst message a line shows, if it shows one.
@@ -338,12 +377,13 @@ async fn an_encrypted_tail_that_falls_behind_catches_up_across_a_commit() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let stdout = lines(stdout);
+    let store = plaintext_store(reader.path(), &reader_did);
     let mut shown: Vec<String> = Vec::new();
     let last = format!("burst-{:04}", ENCRYPTED_BURST - 1);
     loop {
-        let line = stdout
-            .recv_timeout(Duration::from_secs(60))
-            .unwrap_or_else(|_| panic!("stalled; shown so far: {shown:?}"));
+        let line = next_line(&stdout, &store).unwrap_or_else(|| {
+            panic!("stalled: nothing shown or read for {STALL:?}; shown so far: {shown:?}")
+        });
         if line.contains(" was added") {
             shown.push("added".to_string());
             continue;

@@ -1400,6 +1400,7 @@ mod tests {
             ingest_wall_ms: seq,
             ingest_logical: 0,
             record: None,
+            high: None,
         };
         assert!(
             !pins.advance_chain(server, "#ops", &head(1)).unwrap(),
