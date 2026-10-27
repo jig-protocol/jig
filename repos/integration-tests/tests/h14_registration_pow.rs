@@ -15,6 +15,9 @@
 //!    reserved names are refused before any work, a taken name is refused
 //!    before any work, and work that does not verify doubles what its
 //!    address is asked next.
+//! 4. A client that predates proof-of-work gets a clear 428, not a 500.
+//! 5. One address trying every three-letter name is stopped by its rate
+//!    limit; many DIDs are bounded by the pool (test 1).
 
 use std::time::{Duration, Instant};
 
@@ -244,4 +247,97 @@ async fn short_names_cost_more_and_squatting_is_refused_before_work() {
     assert_eq!(attempt.status, StatusCode::BAD_REQUEST, "{attempt:?}");
     assert_eq!(attempt.body["code"], "POW_INVALID", "{attempt:?}");
     assert_eq!(effort_for(&ns, "abcdef").await, 2 * FLOOR);
+}
+
+/// 4. A client that predates proof-of-work gets a clear `428 POW_REQUIRED`,
+///    never a 500: whether it fetched a bare challenge, or an action-bound
+///    one and then sent no `pow`. The second answer carries the signed offer,
+///    so a newer client can solve it.
+#[tokio::test]
+async fn an_old_client_gets_a_clear_428() {
+    let ns = TestNameserver::start_with_pow("old.jig", pow(FLOOR, 1))
+        .await
+        .expect("start ns");
+    let key = jig_core::crypto::ed25519::generate_signing_key();
+
+    // An action-bound challenge, and no `pow` sent.
+    let mut body = ns
+        .prepare_registration("oldtimer", &key)
+        .await
+        .expect("body");
+    body.as_object_mut().expect("a JSON object").remove("pow");
+    let attempt = ns.submit_registration(&body).await.expect("submit");
+    assert_eq!(
+        attempt.status,
+        StatusCode::PRECONDITION_REQUIRED,
+        "{attempt:?}"
+    );
+    assert_eq!(attempt.body["code"], "POW_REQUIRED", "{attempt:?}");
+    assert!(
+        attempt.body["pow_offer"].is_string(),
+        "the refusal carries the signed offer: {attempt:?}"
+    );
+
+    // A bare challenge, as the pre-JEP-0008 CLI fetched it.
+    let bare: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/v1/challenge", ns.http_url()))
+        .send()
+        .await
+        .expect("GET /v1/challenge")
+        .json()
+        .await
+        .expect("challenge body is JSON");
+    body["challenge"] = bare["challenge"].clone();
+    let attempt = ns.submit_registration(&body).await.expect("submit");
+    assert_eq!(
+        attempt.status,
+        StatusCode::PRECONDITION_REQUIRED,
+        "{attempt:?}"
+    );
+    assert_eq!(attempt.body["code"], "POW_REQUIRED", "{attempt:?}");
+}
+
+/// 5. Squatting every three-letter name from one address is stopped by the
+///    per-address challenge limit before any work is asked. The limit counts
+///    in one-minute windows on the wall clock, so the test asserts the bound
+///    for any two windows the loop may straddle, never an exact count: two
+///    hundred requests sent in well under a minute get at most two windows'
+///    worth of challenges.
+#[tokio::test]
+async fn one_address_squatting_short_names_is_bounded_by_its_rate() {
+    let ns = TestNameserver::start_with_pow("squat.jig", pow(FLOOR, 4))
+        .await
+        .expect("start ns");
+    let per_minute =
+        jig_nameserver::config::AliasRateLimitConfig::default().challenge_per_ip_per_min;
+    let squatter = did_of(&jig_core::crypto::ed25519::generate_signing_key());
+    let names = (b'a'..=b'z')
+        .flat_map(|a| (b'a'..=b'z').map(move |b| [a, b, b'x']))
+        .map(|n| String::from_utf8(n.to_vec()).expect("ascii"))
+        .take(200);
+    let started = Instant::now();
+    let (mut offered, mut limited, mut reserved) = (0u32, 0u32, 0u32);
+    for name in names {
+        let (status, body) = register_challenge(&ns, &squatter, &name).await;
+        match status {
+            StatusCode::OK => offered += 1,
+            StatusCode::TOO_MANY_REQUESTS => {
+                assert_eq!(body["code"], "RATE_LIMITED", "{name}: {body}");
+                limited += 1;
+            }
+            // A name the reserved lists catch is refused too, still charged.
+            StatusCode::FORBIDDEN if body["code"] == "ALIAS_RESERVED" => reserved += 1,
+            other => panic!("{name}: unexpected {other}: {body}"),
+        }
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "the bound below holds only for a loop inside two windows"
+    );
+    assert!(
+        offered + reserved <= 2 * per_minute,
+        "{offered} offers from one address"
+    );
+    assert_eq!(offered + limited + reserved, 200);
+    assert!(limited >= 200 - 2 * per_minute);
 }

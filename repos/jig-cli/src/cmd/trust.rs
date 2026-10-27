@@ -502,6 +502,11 @@ async fn check_chain_in(
             }
         }
     }
+    // Accepted, and the user told: the server signed them out of clock
+    // order, which a fixed server never does.
+    for defect in chain.take_clock_defects() {
+        eprintln!("warning: {server} {slug}: {defect}.");
+    }
     if let Some(head) = chain.head() {
         pins.advance_chain(server, slug, head)?;
     }
@@ -1206,6 +1211,7 @@ mod tests {
                 ingest_wall_ms: 0,
                 ingest_logical: 0,
                 record: None,
+                high: None,
             },
         )
         .unwrap();

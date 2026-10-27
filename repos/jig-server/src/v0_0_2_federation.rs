@@ -1,5 +1,5 @@
-//! Federation peer manager — connects to configured peers, exchanges
-//! fed-hello bundles, relays blocks bidirectionally.
+//! Federation peer manager — connects to configured peers, catches up on
+//! what each took while unconnected, relays blocks bidirectionally.
 //!
 //! A block a peer relays is ingested like a local submission
 //! ([`ingest_peer_block`]): the same gates, the same write gate and suite
@@ -24,7 +24,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use ed25519_dalek::Signer;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
-use jig_core::{Author, BlockKind, BlockManifest};
+use jig_core::{BlockKind, BlockManifest};
 use jig_pipeline::{
     Envelope, Frame, Scope,
     envelope::ReceiptRef,
@@ -384,8 +384,7 @@ pub(crate) async fn connect_and_relay(
     let connector =
         crate::v0_0_2_federation_tls::peer_connector(&state.config.federation, peer).await?;
     let (mut ws, _resp) = dial_peer(&ws_url, connector, &state.limits()).await?;
-    // Same hello/welcome a CLI client speaks. The fed-hello bundle below is a
-    // block, not this handshake, and the server now refuses it until welcome.
+    // Same hello/welcome a CLI client speaks.
     let tls_exporter = tls_exporter_of(ws.get_ref());
     let welcome = complete_peer_handshake(
         &mut ws,
@@ -404,17 +403,7 @@ pub(crate) async fn connect_and_relay(
     let registration = state.peers.register(peer_sender.clone());
     info!(peer_url = %peer.url, "federation peer connected");
 
-    // 1. Send fed-hello synthetic bundle as the handshake.
-    let hello_bundle = build_fed_hello_bundle(state)?;
-    let (hello_canonical, hello_sig) = sign_synthetic_bundle(state, &hello_bundle)?;
-    let hello_env = Envelope::new(Frame::Submit {
-        bundle_b64: base64::engine::general_purpose::STANDARD.encode(&hello_canonical),
-        sig_b64: base64::engine::general_purpose::STANDARD.encode(&hello_sig),
-    });
-    sink.send(Message::Text(serde_json::to_string(&hello_env)?.into()))
-        .await?;
-
-    // 2. Subscribe federation scope so the peer pushes us their block stream.
+    // 1. Subscribe federation scope so the peer pushes us their block stream.
     //
     // Signed with this server's OWN identity. A peer that requires
     // authentication refuses an unsigned subscribe, so federation between two
@@ -429,6 +418,11 @@ pub(crate) async fn connect_and_relay(
     });
     sink.send(Message::Text(serde_json::to_string(&sub_env)?.into()))
         .await?;
+
+    // 2. Ask for what the peer took while we were not subscribed: the live
+    //    push carries only what lands from now on
+    //    ([`crate::v0_0_2_catch_up`]).
+    let mut catching = crate::v0_0_2_catch_up::CatchingUp::start(state, peer, &peer_sender)?;
 
     // 3. Register a peer subscriber on our Fanout so OUR locally-ingested
     //    blocks are pushed out to this peer.
@@ -458,7 +452,7 @@ pub(crate) async fn connect_and_relay(
                         if let Some(refusal) = subscription_refusal(&text) {
                             break Err(anyhow::anyhow!("peer refused our federation subscription: {refusal}"));
                         }
-                        match handle_inbound_frame(state, peer, &peer_sender, &text).await {
+                        match handle_inbound_frame(state, peer, &peer_sender, &mut catching, &text).await {
                             Ok(Some(reason)) => {
                                 let _ = sink
                                     .send(Message::Close(Some(
@@ -516,10 +510,16 @@ async fn handle_inbound_frame(
     state: &Arc<AppState>,
     peer: &jig_config::v0_0_2_server::FederationPeer,
     sender: &crate::v0_0_2_peer::PeerSender,
+    catching: &mut crate::v0_0_2_catch_up::CatchingUp,
     text: &str,
 ) -> anyhow::Result<Option<crate::v0_0_2_peer::CloseReason>> {
     let env: Envelope = serde_json::from_str(text)?;
     if let Frame::Peer { kind, body } = &env.frame {
+        if let Some(handled) =
+            crate::v0_0_2_catch_up::on_dialer_frame(state, peer, sender, catching, kind, body).await
+        {
+            return Ok(handled.err());
+        }
         return Ok(
             crate::v0_0_2_peer::dispatch(state.peer_frame_handler(), sender, kind, body).err(),
         );
@@ -726,49 +726,6 @@ async fn forward_outbound(
     Ok(())
 }
 
-/// Re-verify the sender's ed25519 signature on an inbound peer block.
-///
-/// Build the fed-hello manifest + (empty) code bytes for the handshake.
-///
-/// The fed-hello bundle carries our server DID, URL, advertised block kinds,
-/// and active unsafe options so the receiving peer can validate our config.
-fn build_fed_hello_bundle(state: &Arc<AppState>) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-    use serde_json::json;
-
-    let manifest = BlockManifest::builder()
-        .version(semver::Version::new(0, 1, 0))
-        .author(Author {
-            did: state.server_did.to_did_jig_string().into(),
-            public_key: None,
-            roles: vec!["jig-server".to_string()],
-        })
-        .metadata_entry("server_url", json!(state.server_url.clone()))
-        .metadata_entry(
-            "advertised_block_kinds",
-            json!(state.config.server.allowed_block_kinds.clone()),
-        )
-        .metadata_entry("server_version", json!(env!("CARGO_PKG_VERSION")))
-        .metadata_entry(
-            "unsafe_options_active",
-            json!(state.config.unsafe_options_active()),
-        )
-        .build()?
-        .with_kind(BlockKind::FedHello);
-
-    let manifest_bytes = manifest.to_canonical_bytes()?;
-    Ok((manifest_bytes, vec![]))
-}
-
-/// Serialize and sign the fed-hello bundle with the server's own key.
-fn sign_synthetic_bundle(
-    state: &Arc<AppState>,
-    bundle: &(Vec<u8>, Vec<u8>),
-) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-    let canonical = serde_json::to_vec(bundle)?;
-    let sig = state.ingest_ctx.server_key.sign(&canonical);
-    Ok((canonical, sig.to_bytes().to_vec()))
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -776,6 +733,7 @@ fn sign_synthetic_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jig_core::{Author, BlockKind};
 
     /// A peer that sends one text message of each length in `lens`, in order.
     async fn peer_sending(lens: Vec<usize>) -> String {
@@ -916,44 +874,6 @@ mod tests {
         let state = Arc::new(AppState::for_test().unwrap());
         spawn_federation_peers(state);
         // No panic, no hang.
-    }
-
-    #[tokio::test]
-    async fn build_fed_hello_bundle_carries_server_metadata() {
-        let state = Arc::new(AppState::for_test().unwrap());
-        let (manifest_bytes, code_bytes) = build_fed_hello_bundle(&state).unwrap();
-        assert!(
-            code_bytes.is_empty(),
-            "fed-hello code payload must be empty in v0.0.2"
-        );
-        let manifest: BlockManifest = serde_json::from_slice(&manifest_bytes).unwrap();
-        assert_eq!(manifest.kind, Some(BlockKind::FedHello));
-        assert!(
-            manifest
-                .metadata
-                .get("server_url")
-                .and_then(|v| v.as_str())
-                .is_some(),
-            "fed-hello must carry server_url metadata"
-        );
-        assert!(
-            manifest.metadata.contains_key("unsafe_options_active"),
-            "fed-hello must carry unsafe_options_active metadata"
-        );
-    }
-
-    #[tokio::test]
-    async fn sign_synthetic_bundle_produces_verifiable_signature() {
-        use ed25519_dalek::Verifier;
-        let state = Arc::new(AppState::for_test().unwrap());
-        let bundle = build_fed_hello_bundle(&state).unwrap();
-        let (canonical, sig_bytes) = sign_synthetic_bundle(&state, &bundle).unwrap();
-        let sig = ed25519_dalek::Signature::from_slice(&sig_bytes).unwrap();
-        let pubkey = state.ingest_ctx.server_key.verifying_key();
-        assert!(
-            pubkey.verify(&canonical, &sig).is_ok(),
-            "signature over canonical bytes must verify against server verifying key"
-        );
     }
 
     #[tokio::test]
