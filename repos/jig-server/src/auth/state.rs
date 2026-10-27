@@ -21,6 +21,7 @@ use anyhow::Context as _;
 use jig_config::v0_0_2_server::{AdmissionSection, AuthSection, UnknownDidsPolicy};
 
 use crate::auth::admission::{Floor, SeededRecords, UnknownDids};
+use crate::auth::admission_effort::{EffortConfig, EffortController, bits_at_least};
 use crate::auth::pools::{Pool, WritePools};
 use crate::auth::rate::RateLimiter;
 use crate::auth::{
@@ -46,6 +47,9 @@ pub struct AuthState {
     did_rate: Option<RateLimiter>,
     /// `[auth.rate_limit]` per remote address; `None` when off.
     ip_rate: Option<RateLimiter>,
+    /// The admission effort controller; `Some` under `unknown_dids =
+    /// "proof-of-work"`.
+    effort: Option<EffortController>,
     /// `[auth.pools]`: local write capacity shared by members, invited and
     /// strangers; `None` when off.
     write_pools: Option<WritePools>,
@@ -93,16 +97,13 @@ impl AuthState {
                     .map_err(|e| anyhow::anyhow!("[auth.admission] records[{i}].did: {e}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        // Zero bits is no work; past the maximum clients refuse to do it.
-        if auth.admission.unknown_dids == UnknownDidsPolicy::ProofOfWork
-            && !(1..=jig_core::admission_pow::MAX_BITS).contains(&auth.admission.pow_bits)
-        {
-            anyhow::bail!(
-                "[auth.admission] pow_bits must be 1..={} under \"proof-of-work\"; got {}",
-                jig_core::admission_pow::MAX_BITS,
-                auth.admission.pow_bits
-            );
-        }
+        let effort = match auth.admission.unknown_dids {
+            UnknownDidsPolicy::ProofOfWork => Some(EffortController::new(
+                effort_config(&auth.admission)?,
+                std::time::Instant::now(),
+            )),
+            _ => None,
+        };
 
         let limits = &auth.rate_limit;
         Ok(Self {
@@ -123,6 +124,7 @@ impl AuthState {
                 limits.per_ip_per_second,
                 limits.max_tracked,
             ),
+            effort,
             write_pools: WritePools::new(&auth.pools, std::time::Instant::now())?,
             local_member_age_secs: auth.pools.local_member_age_secs,
             proofs: None,
@@ -159,12 +161,31 @@ impl AuthState {
         self
     }
 
-    /// The bits of work this server asks of a new DID, when it asks for any.
+    /// The effort this server asks of a new DID now, when it asks for any.
+    pub fn admission_effort(&self) -> Option<std::num::NonZeroU64> {
+        self.admission_effort_at(std::time::Instant::now())
+    }
+
+    fn admission_effort_at(&self, now: std::time::Instant) -> Option<std::num::NonZeroU64> {
+        self.effort
+            .as_ref()
+            .and_then(|c| std::num::NonZeroU64::new(c.effort(now)))
+    }
+
+    /// The least effort a proof posted now must carry: the lowest this
+    /// server asked within an offer's lifetime. `None` when it has asked no
+    /// work in that time, and so records no proof.
+    pub fn admission_floor(&self) -> Option<std::num::NonZeroU64> {
+        self.effort
+            .as_ref()
+            .and_then(|c| c.accepted_floor(std::time::Instant::now()))
+    }
+
+    /// [`Self::admission_effort`] as leading zero bits, rounded up, for the
+    /// surfaces that still state bits (`admission_pow_bits`, legacy proofs,
+    /// the refusal): never less work than the effort.
     pub fn pow_bits(&self) -> Option<u8> {
-        match self.admission.unknown_dids {
-            Some(UnknownDids::ProofOfWork { bits }) => Some(bits),
-            _ => None,
-        }
+        self.admission_effort().map(bits_at_least)
     }
 
     /// Whether `did` has done this server's proof of work.
@@ -193,6 +214,10 @@ impl AuthState {
     /// caller spends nothing and learns nothing about its rate.
     pub fn admit_and_charge(&self, did: &str) -> Result<(), GateOutcome> {
         self.admit(did)?;
+        self.charge_did(did)
+    }
+
+    fn charge_did(&self, did: &str) -> Result<(), GateOutcome> {
         match &self.did_rate {
             Some(rate) if !rate.try_take(did, std::time::Instant::now()) => {
                 Err(GateOutcome::RateLimited)
@@ -257,10 +282,38 @@ impl AuthState {
     /// Gate 2 for `did`, which must be the identity gate 1 VERIFIED — never
     /// one merely claimed. Pure apart from the view lookup.
     pub fn admit(&self, did: &str) -> Result<(), GateOutcome> {
+        self.admit_at(did, std::time::Instant::now(), true)
+    }
+
+    /// [`Self::admit`] at `now`. With `count`, an unknown DID without a proof
+    /// counts as a stranger arriving, for the effort controller; relayed
+    /// authors do not (JEP-0008 rule 30).
+    fn admit_at(&self, did: &str, now: std::time::Instant, count: bool) -> Result<(), GateOutcome> {
         let mut view = self.reputation.view(did);
+        let Some(controller) = &self.effort else {
+            return admit(did, &view, &self.admission);
+        };
         // Only a proof-of-work policy reads it: no store lookup otherwise.
-        view.proven = self.pow_bits().is_some() && self.proven(did);
-        admit(did, &view, &self.admission)
+        view.proven = self.proven(did);
+        let effort = self.admission_effort_at(now);
+        let mut policy = self.admission.clone();
+        policy.unknown_dids = Some(UnknownDids::ProofOfWork {
+            bits: effort.map_or(1, bits_at_least),
+        });
+        match admit(did, &view, &policy) {
+            Err(GateOutcome::AdmissionProofRequired { bits }) => {
+                if count {
+                    controller.observe_stranger(did, now);
+                }
+                // At zero effort the request proceeds as if a proof were
+                // given (rule 17).
+                match effort {
+                    Some(_) => Err(GateOutcome::AdmissionProofRequired { bits }),
+                    None => Ok(()),
+                }
+            }
+            other => other,
+        }
     }
 
     /// Gate 2 for the author of a block a peer relayed or a bridge submitted.
@@ -268,19 +321,17 @@ impl AuthState {
     /// author never spoke to this server, so it could not have done it. Bans,
     /// floors and the rate still apply.
     fn admit_relayed_and_charge(&self, did: &str) -> Result<(), GateOutcome> {
-        match self.admit_and_charge(did) {
+        let admitted = self
+            .admit_at(did, std::time::Instant::now(), false)
+            .and_then(|()| self.charge_did(did));
+        match admitted {
             Err(GateOutcome::AdmissionProofRequired { .. }) => {
                 let mut admit_all = self.admission.clone();
                 admit_all.unknown_dids = Some(UnknownDids::Admit);
                 let mut view = self.reputation.view(did);
                 view.proven = true;
                 admit(did, &view, &admit_all)?;
-                match &self.did_rate {
-                    Some(rate) if !rate.try_take(did, std::time::Instant::now()) => {
-                        Err(GateOutcome::RateLimited)
-                    }
-                    _ => Ok(()),
-                }
+                self.charge_did(did)
             }
             other => other,
         }
@@ -341,9 +392,8 @@ fn admission_policy(section: &AdmissionSection, banned_dids: BTreeSet<String>) -
         unknown_dids: Some(match section.unknown_dids {
             UnknownDidsPolicy::Admit => UnknownDids::Admit,
             UnknownDidsPolicy::Refuse => UnknownDids::Refuse,
-            UnknownDidsPolicy::ProofOfWork => UnknownDids::ProofOfWork {
-                bits: section.pow_bits,
-            },
+            // The bits are set per request from the controller.
+            UnknownDidsPolicy::ProofOfWork => UnknownDids::ProofOfWork { bits: 1 },
         }),
         floors: section
             .floors
@@ -355,6 +405,53 @@ fn admission_policy(section: &AdmissionSection, banned_dids: BTreeSet<String>) -
             .collect(),
         banned_dids,
     }
+}
+
+/// The controller's settings from `[auth.admission]`, checked: a floor above
+/// the cap, or a cap clients refuse, is a boot error, not a server nobody can
+/// join.
+fn effort_config(section: &AdmissionSection) -> anyhow::Result<EffortConfig> {
+    let cap = jig_core::pow::MAX_EFFORT;
+    let pow_bits = (section.pow_bits != 0).then_some(section.pow_bits);
+    let min_effort = match (pow_bits, section.min_effort) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("[auth.admission] set min_effort or the legacy pow_bits, not both")
+        }
+        (Some(bits), None) => {
+            if !(1..=jig_core::admission_pow::MAX_BITS).contains(&bits) {
+                anyhow::bail!(
+                    "[auth.admission] pow_bits must be 1..={} under \"proof-of-work\"; got {bits}",
+                    jig_core::admission_pow::MAX_BITS
+                );
+            }
+            1u64 << bits
+        }
+        (None, Some(effort)) => effort,
+        (None, None) => 1 << 20,
+    };
+    // An unset maximum makes room for a legacy `pow_bits` above it, so a
+    // config that booted before `max_effort` existed still boots.
+    let max_effort = section.max_effort.unwrap_or(match pow_bits {
+        Some(_) => min_effort.max(1 << 24),
+        None => 1 << 24,
+    });
+    if !(1..=cap).contains(&max_effort) || min_effort > max_effort {
+        anyhow::bail!(
+            "[auth.admission] needs min_effort <= max_effort <= {cap}; got {min_effort} and {max_effort}"
+        );
+    }
+    if section.controller_window_secs == 0 || section.controller_start_effort == 0 {
+        anyhow::bail!(
+            "[auth.admission] controller_window_secs and controller_start_effort must be above 0"
+        );
+    }
+    Ok(EffortConfig {
+        min_effort,
+        max_effort,
+        start_effort: section.controller_start_effort.min(max_effort),
+        window: std::time::Duration::from_secs(section.controller_window_secs),
+        target: usize::try_from(section.controller_target).unwrap_or(usize::MAX),
+    })
 }
 
 #[cfg(test)]
@@ -562,10 +659,10 @@ mod tests {
         }
     }
 
-    /// Zero bits is no work, and past the maximum clients refuse to do it.
+    /// Past the maximum clients refuse to do it; `0` is unset, the default.
     #[test]
     fn pow_bits_out_of_range_is_refused_at_boot() {
-        for bits in [0, 29, 255] {
+        for bits in [29, 255] {
             let mut section = AuthSection::default();
             section.admission.unknown_dids = UnknownDidsPolicy::ProofOfWork;
             section.admission.pow_bits = bits;
@@ -577,8 +674,99 @@ mod tests {
         }
         // Only under proof-of-work: the knob is inert otherwise.
         let mut section = AuthSection::default();
-        section.admission.pow_bits = 0;
+        section.admission.pow_bits = 29;
         assert!(AuthState::from_config(&section).is_ok());
+    }
+
+    fn pow_section() -> AuthSection {
+        let mut section = AuthSection::default();
+        section.admission.unknown_dids = UnknownDidsPolicy::ProofOfWork;
+        section
+    }
+
+    /// The legacy `pow_bits` is `min_effort = 2^pow_bits`; unset, the floor
+    /// is 2^20, today's price. Setting both, a floor over the cap, or a cap
+    /// over 2^28 does not boot.
+    #[test]
+    fn effort_settings_are_read_and_checked_at_boot() {
+        let mut section = pow_section();
+        section.admission.pow_bits = 12;
+        let state = AuthState::from_config(&section).unwrap();
+        assert_eq!(state.admission_effort().map(|e| e.get()), Some(1 << 12));
+        assert_eq!(state.pow_bits(), Some(12));
+
+        let state = AuthState::from_config(&pow_section()).unwrap();
+        assert_eq!(state.admission_effort().map(|e| e.get()), Some(1 << 20));
+
+        let refused = |edit: &dyn Fn(&mut AdmissionSection)| {
+            let mut section = pow_section();
+            edit(&mut section.admission);
+            AuthState::from_config(&section).is_err()
+        };
+        assert!(refused(&|a| {
+            a.pow_bits = 12;
+            a.min_effort = Some(1 << 12);
+        }));
+        assert!(refused(&|a| a.min_effort = Some((1 << 24) + 1)));
+        assert!(refused(&|a| a.max_effort = Some((1 << 28) + 1)));
+        // A legacy pow_bits above the default maximum still boots, unless an
+        // explicit maximum is below it.
+        let mut section = pow_section();
+        section.admission.pow_bits = 26;
+        let state = AuthState::from_config(&section).unwrap();
+        assert_eq!(state.admission_effort().map(|e| e.get()), Some(1 << 26));
+        assert!(refused(&|a| {
+            a.pow_bits = 26;
+            a.max_effort = Some(1 << 24);
+        }));
+        assert!(refused(&|a| a.controller_window_secs = 0));
+    }
+
+    /// An effort that is not a power of two is stated to the bit surfaces as
+    /// at least as much work.
+    #[test]
+    fn bits_round_up() {
+        let bits = |e: u64| bits_at_least(std::num::NonZeroU64::new(e).unwrap());
+        assert_eq!(bits(1), 1);
+        assert_eq!(bits(1 << 20), 20);
+        assert_eq!(bits((1 << 20) + 1), 21);
+        assert_eq!(bits(3 << 18), 20);
+    }
+
+    /// With no floor (rule 33's shape), an idle server admits an unknown DID
+    /// without work; a flood of strangers raises the effort, and then an
+    /// unproven DID is asked for work. Relayed authors never move it.
+    #[test]
+    fn with_no_floor_admission_is_free_until_a_flood() {
+        let mut section = pow_section();
+        section.admission.min_effort = Some(0);
+        section.admission.controller_target = 10;
+        let state = AuthState::from_config(&section).unwrap();
+        let t0 = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(60);
+        let newcomer = did_for(200);
+
+        assert_eq!(state.admit_at(&newcomer, t0, true), Ok(()));
+        assert_eq!(state.admission_effort_at(t0), None);
+
+        // Relayed authors are not strangers arriving here.
+        for seed in 0..50u8 {
+            assert_eq!(state.admit_at(&did_for(seed), t0, false), Ok(()));
+        }
+        assert_eq!(state.admission_effort_at(t0 + window), None);
+
+        for seed in 0..50u8 {
+            let _ = state.admit_at(&did_for(seed), t0 + window, true);
+        }
+        let flooded = t0 + 2 * window;
+        assert_eq!(
+            state.admission_effort_at(flooded).map(|e| e.get()),
+            Some(1 << 16)
+        );
+        assert_eq!(
+            state.admit_at(&newcomer, flooded, true),
+            Err(GateOutcome::AdmissionProofRequired { bits: 16 })
+        );
     }
 
     /// A server with no admission section admits everyone: the section
