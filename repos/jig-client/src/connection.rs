@@ -210,7 +210,13 @@ enum Asked {
 /// What the server said to a submit.
 enum Answer {
     Ack(String),
-    Refused { code: String, message: String },
+    Refused {
+        code: String,
+        message: String,
+    },
+    /// A later request was answered first, so this one's answer never came:
+    /// the one case an older server cannot match exactly. Read as a timeout.
+    Missed,
 }
 
 type AskedQueue = Arc<StdMutex<VecDeque<Asked>>>;
@@ -268,8 +274,17 @@ fn answer(asked: &mut VecDeque<Asked>, frame: Frame) {
         return;
     };
     // A submit that timed out stays here until answered; its reply then
-    // goes nowhere, rather than to the next submit.
-    if let Some(Asked::Submit { reply, .. }) = asked.drain(..=at).next_back() {
+    // goes nowhere, rather than to the next submit. One still waiting ahead
+    // of the matched request was passed over: say so, rather than drop its
+    // reply, which `submit` would read as the connection closing.
+    let mut passed: Vec<Asked> = asked.drain(..=at).collect();
+    let matched = passed.pop();
+    for earlier in passed {
+        if let Asked::Submit { reply, .. } = earlier {
+            let _ = reply.send(Answer::Missed);
+        }
+    }
+    if let Some(Asked::Submit { reply, .. }) = matched {
         let _ = reply.send(answer);
     }
 }
@@ -882,6 +897,7 @@ impl Client {
         };
         match answer {
             Answer::Ack(block_cid) => Ok(block_cid),
+            Answer::Missed => Err(ClientError::AckTimeout(self.submit_ack_timeout_seconds)),
             Answer::Refused { code, message } => {
                 // Refusing a kind the welcome advertised contradicts it.
                 if code == DISALLOWED_BLOCK_KIND
@@ -1105,6 +1121,46 @@ pub mod envelope {
 
 #[cfg(test)]
 mod tests {
+    /// A submit passed over by an answer to a later one hears that it was
+    /// missed, and the connection is not reported closed.
+    #[test]
+    fn a_submit_passed_over_is_told_it_was_missed() {
+        use std::collections::VecDeque;
+        let (a_tx, mut a_rx) = oneshot::channel();
+        let (b_tx, mut b_rx) = oneshot::channel();
+        let mut asked: VecDeque<Asked> = VecDeque::from([
+            Asked::Subscribe,
+            Asked::Submit {
+                cid: "a".into(),
+                reply: a_tx,
+            },
+            Asked::Submit {
+                cid: "b".into(),
+                reply: b_tx,
+            },
+        ]);
+        // An old server's refusal of `a` names no block, so it answers the
+        // oldest request, the subscribe; then `b`'s Ack names `b`.
+        answer(
+            &mut asked,
+            Frame::Error {
+                status: None,
+                code: "RATE_LIMITED".into(),
+                ref_cid: None,
+                message: String::new(),
+            },
+        );
+        answer(
+            &mut asked,
+            Frame::Ack {
+                block_cid: "b".into(),
+            },
+        );
+        assert!(asked.is_empty());
+        assert!(matches!(a_rx.try_recv(), Ok(Answer::Missed)));
+        assert!(matches!(b_rx.try_recv(), Ok(Answer::Ack(cid)) if cid == "b"));
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio_tungstenite::accept_async;
