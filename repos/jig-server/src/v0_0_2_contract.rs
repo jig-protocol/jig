@@ -1976,6 +1976,51 @@ mod tests {
         }
     }
 
+    /// A follower lists a channel it carries as ordered by its owner, with
+    /// the owner's offer: what lets a client hold the channel's records to
+    /// the owner without taking the follower's word for it.
+    #[tokio::test]
+    async fn a_follower_lists_a_carried_channel_with_its_owners_offer() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.shared(1).await;
+        p.follows.stream.pull_all();
+        p.caught_up(&channel).await;
+        let owner = p.owner.server_did.to_did_jig_string();
+        let follower = p.follower.server_did.to_did_jig_string();
+
+        let row = p
+            .follower
+            .ingest_ctx
+            .store
+            .get_channel_by_id(&channel)
+            .unwrap()
+            .unwrap();
+        let view = crate::v0_0_2_blocks::view_of(&p.follower, row).unwrap();
+        assert_eq!(view.sequencer, owner);
+        let proven = jig_client::pins::prove_carried(
+            "wss://follower",
+            &view.slug,
+            &view.id,
+            &view.sequencer,
+            std::slice::from_ref(&follower),
+            view.share.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(proven, owner);
+
+        // The owner lists its own channel as its own, with nothing to prove.
+        let row = p
+            .owner
+            .ingest_ctx
+            .store
+            .get_channel_by_id(&channel)
+            .unwrap()
+            .unwrap();
+        let view = crate::v0_0_2_blocks::view_of(&p.owner, row).unwrap();
+        assert_eq!(view.sequencer, owner);
+        assert!(view.share.is_none());
+    }
+
     #[tokio::test]
     async fn a_follower_carries_the_owners_chain_as_signed() {
         let p = pair(OfferPolicy::Accept).await;
