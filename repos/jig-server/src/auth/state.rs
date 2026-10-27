@@ -21,6 +21,7 @@ use anyhow::Context as _;
 use jig_config::v0_0_2_server::{AdmissionSection, AuthSection, UnknownDidsPolicy};
 
 use crate::auth::admission::{Floor, SeededRecords, UnknownDids};
+use crate::auth::pools::{Pool, WritePools};
 use crate::auth::rate::RateLimiter;
 use crate::auth::{
     AdmissionPolicy, DisclosurePolicy, GateOutcome, ReplayGuard, ReputationSource, admit,
@@ -45,6 +46,11 @@ pub struct AuthState {
     did_rate: Option<RateLimiter>,
     /// `[auth.rate_limit]` per remote address; `None` when off.
     ip_rate: Option<RateLimiter>,
+    /// `[auth.pools]`: local write capacity shared by members, invited and
+    /// strangers; `None` when off.
+    write_pools: Option<WritePools>,
+    /// `[auth.pools] local_member_age_secs`.
+    local_member_age_secs: u64,
     /// Where admission proofs of work are recorded; `None` in a state built
     /// without a store, where no DID is ever proven.
     proofs: Option<Arc<jig_pipeline::persist::SqliteStore>>,
@@ -117,6 +123,8 @@ impl AuthState {
                 limits.per_ip_per_second,
                 limits.max_tracked,
             ),
+            write_pools: WritePools::new(&auth.pools, std::time::Instant::now())?,
+            local_member_age_secs: auth.pools.local_member_age_secs,
             proofs: None,
             federation_peers: RwLock::new(BTreeSet::new()),
         })
@@ -193,6 +201,52 @@ impl AuthState {
         }
     }
 
+    /// The capacity pool `did`'s requests are served from (JEP-0008 rule
+    /// 21), at `now_unix` on this server's clock. `did` must be the identity
+    /// gate 1 VERIFIED.
+    ///
+    /// A member is a DID the operator recorded with no negative score, or one
+    /// whose admission proof of work is at least `local_member_age_secs` old.
+    /// No DID is invited until invites exist (JEP-0009). Everyone else is a
+    /// stranger. This server keeps no penalty history yet, so "without a
+    /// penalty" (rule 21) adds nothing to the age test.
+    pub fn pool_of(&self, did: &str, now_unix: i64) -> Pool {
+        let view = self.reputation.view(did);
+        if !view.is_empty() && view.scores.values().all(|score| *score >= 0) {
+            return Pool::Member;
+        }
+        let age = i64::try_from(self.local_member_age_secs).unwrap_or(i64::MAX);
+        let aged = self
+            .proofs
+            .as_ref()
+            .and_then(|store| store.admission_proven_at(did).ok().flatten())
+            .is_some_and(|at| now_unix.saturating_sub(at) >= age);
+        if aged { Pool::Member } else { Pool::Stranger }
+    }
+
+    /// Gate 2, the DID's rate, then its pool's share of the write capacity:
+    /// what a write from a local client runs on its author. Rate limits come
+    /// before the pool (JEP-0008 rule 23), so one identity cannot spend its
+    /// pool's share by itself.
+    pub fn admit_write_at(
+        &self,
+        did: &str,
+        now: std::time::Instant,
+        now_unix: i64,
+    ) -> Result<(), GateOutcome> {
+        self.admit_and_charge(did)?;
+        let Some(pools) = &self.write_pools else {
+            return Ok(());
+        };
+        let pool = self.pool_of(did, now_unix);
+        if pools.try_take(pool, now) {
+            Ok(())
+        } else {
+            tracing::debug!(?pool, "write refused: its capacity pool is spent");
+            Err(GateOutcome::RateLimited)
+        }
+    }
+
     /// Take one request's worth from `ip`'s bucket. False when it is over.
     pub fn charge_ip(&self, ip: std::net::IpAddr) -> bool {
         self.ip_rate
@@ -256,7 +310,12 @@ fn admission_refusal(outcome: GateOutcome) -> jig_pipeline::ingest::AdmissionRef
 /// depends on this crate's outcomes.
 impl jig_pipeline::ingest::Admission for AuthState {
     fn admit(&self, sender_did: &str) -> Result<(), jig_pipeline::ingest::AdmissionRefusal> {
-        self.admit_and_charge(sender_did).map_err(admission_refusal)
+        self.admit_write_at(
+            sender_did,
+            std::time::Instant::now(),
+            chrono::Utc::now().timestamp(),
+        )
+        .map_err(admission_refusal)
     }
 
     fn admit_relayed(
@@ -312,6 +371,7 @@ mod tests {
             replay_capacity: 7,
             admission: AdmissionSection::default(),
             rate_limit: Default::default(),
+            pools: Default::default(),
         };
         let state = AuthState::from_config(&section).unwrap();
         let mut guard = state.replay_guard.lock().unwrap();
@@ -400,6 +460,106 @@ mod tests {
         );
         assert_eq!(state.admit_relayed(&stranger), Ok(()));
         assert_eq!(state.admit_relayed(&bad), Err(AdmissionRefusal::Banned));
+    }
+
+    /// Rule 21's local membership: a recorded DID with no negative score, or
+    /// one whose admission proof is `local_member_age_secs` old. Rule 22: no
+    /// record and no aged proof (a fresh DID, or an `--anon` key, which a
+    /// server cannot tell apart from one) is a stranger.
+    #[test]
+    fn pools_are_assigned_by_record_and_proof_age() {
+        use jig_config::v0_0_2_server::ReputationRecord;
+        let (recorded, negative, proven, fresh) = (did_for(1), did_for(2), did_for(3), did_for(4));
+        let mut section = AuthSection::default();
+        section.pools.local_member_age_secs = 100;
+        section.admission.records = vec![
+            ReputationRecord {
+                did: recorded.clone(),
+                ruleset_key: "r".to_string(),
+                score: 0,
+            },
+            ReputationRecord {
+                did: negative.clone(),
+                ruleset_key: "r".to_string(),
+                score: -1,
+            },
+        ];
+        let store = Arc::new(jig_pipeline::persist::SqliteStore::open_in_memory().unwrap());
+        let state = AuthState::from_config(&section)
+            .unwrap()
+            .with_proofs(store.clone());
+        state.record_proof(&proven, 20).unwrap();
+        let proven_at = store.admission_proven_at(&proven).unwrap().unwrap();
+
+        assert_eq!(state.pool_of(&recorded, proven_at), Pool::Member);
+        assert_eq!(state.pool_of(&negative, proven_at), Pool::Stranger);
+        assert_eq!(state.pool_of(&fresh, proven_at + 1_000), Pool::Stranger);
+        assert_eq!(state.pool_of(&proven, proven_at + 99), Pool::Stranger);
+        assert_eq!(state.pool_of(&proven, proven_at + 100), Pool::Member);
+    }
+
+    /// The flood test through the write gate, on injected time: a thousand
+    /// fresh DIDs spend the stranger share, and an active member still has
+    /// all of its own.
+    #[test]
+    fn a_stranger_flood_through_the_write_gate_leaves_members_writing() {
+        use jig_config::v0_0_2_server::ReputationRecord;
+        let member = did_for(1);
+        let mut section = AuthSection::default();
+        section.pools.writes_per_second = 50;
+        section.pools.writes_burst = 50;
+        section.admission.records = vec![ReputationRecord {
+            did: member.clone(),
+            ruleset_key: "r".to_string(),
+            score: 1,
+        }];
+        let state = AuthState::from_config(&section).unwrap();
+        let now = std::time::Instant::now();
+        assert_eq!(
+            state.admit_write_at(&member, now, 0),
+            Ok(()),
+            "members are active"
+        );
+        let admitted = (0..1_000u32)
+            .filter(|i| {
+                let key = ed25519_dalek::SigningKey::from_bytes(&{
+                    let mut seed = [7u8; 32];
+                    seed[..4].copy_from_slice(&i.to_le_bytes());
+                    seed
+                });
+                let did = jig_core::did::Did::from_ed25519_pubkey(&key.verifying_key().to_bytes())
+                    .to_did_jig_string();
+                state.admit_write_at(&did, now, 0).is_ok()
+            })
+            .count();
+        // 20 % of a burst of 50, and invited's idle 2 above half; nothing of
+        // the active members'.
+        assert_eq!(admitted, 10 + 2);
+        for i in 0..34 {
+            assert_eq!(
+                state.admit_write_at(&member, now, 0),
+                Ok(()),
+                "member write {i}"
+            );
+        }
+    }
+
+    /// Relayed and bridged authors are not charged to the pools: the peer
+    /// pays at its own ingress (JEP-0008 rule 30).
+    #[test]
+    fn relayed_writes_are_not_charged_to_the_pools() {
+        use jig_pipeline::ingest::Admission as _;
+        let mut section = AuthSection::default();
+        section.pools.writes_per_second = 10;
+        section.pools.writes_burst = 10;
+        let state = AuthState::from_config(&section).unwrap();
+        for i in 0..20 {
+            assert_eq!(
+                state.admit_relayed(&did_for(9)),
+                Ok(()),
+                "relayed write {i}"
+            );
+        }
     }
 
     /// Zero bits is no work, and past the maximum clients refuse to do it.

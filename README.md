@@ -121,7 +121,7 @@ In another shell, make an identity, point the client at the server, create a cha
 open the TUI:
 
 ```bash
-jig init <nickname>                 # writes ~/.jig/cli.toml + ~/.jig/keys/<did>.key
+jig init <nickname>                 # writes ~/.jig/cli.toml + ~/.jig/keys/<did>.jigkey
 jig server set https://127.0.0.1:7117   # pins the server's DID, which vouches for its certificate
 jig channel create '#hello'
 jig chat '#hello'                   # Enter sends; Ctrl+Q or Esc quits
@@ -237,7 +237,7 @@ required check. Jobs that build install the toolchain `rust-toolchain.toml` pins
 | Report a vulnerability | [`SECURITY.md`](SECURITY.md) (security@jig.onl) |
 | Know what a hostile server operator can and cannot do | the [threat register](repos/jig-spec/src/threat-register.md) and [`docs/security/`](docs/security/operator-threat-model.md) |
 
-Back up `server.key` before you do anything else. Losing it changes the server's DID, so
+Back up `server.jigkey`, and a way to open it, before you do anything else. Losing it changes the server's DID, so
 the server comes back as a different identity: its receipts are signed by a new key, and
 federation peers that list it by `expected_did` hold a stale value. The CLI pins each server's
 DID on first contact (JEP-0002, threat-register OP-08), so a lost key looks like a
