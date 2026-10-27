@@ -1,81 +1,155 @@
 # Nameserver abuse runbook
 
-> **Superseded.** This runbook described the nameserver's legacy prototype. #154 removed the
-> routes most steps below call: `/v1/admin/*`,
-> `/v1/policy`, `/v1/tribunal/*`, `/v1/reputation/*`, `/v1/work/*`, `/v1/hosts/*`,
-> `/v1/resolve?name=`, `/v1/federation/*`, and the proof-of-work challenges for `/v1/claim`
-> and `/v1/alias`. The `JIG_NS_POW_*`, `JIG_NS_PENALTY_*`, `JIG_NS_ANON_*` and
-> `JIG_NS_RATE_*` settings no longer affect any served route. What still applies:
-> - Section 1: steps 1, 2, 5 and 6.
-> - Section 2: step 5 (rate-limit `/v1/register`, `/v1/rotate` and `/v1/renew` at the reverse
->   proxy).
-> - Section 3, "Compromised nameserver": steps 1 to 3 and 5 to 7. Step 4's attestation-key
->   rotation also still applies.
-> - Section 4 describes what applies now.
->
-> A new runbook follows lane R's redesign: the [framing doc](../superpowers/specs/2026-10-18-reputation-pow-tribunals-framing.md) and the draft
-> [JEP-0008](../../repos/jig-spec/jep/jep-0008-proof-of-work.md), [JEP-0009](../../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) and [JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md).
+What a `jig-nameserver` operator does about a registration flood, squatting, a harassment
+report, a compromised nameserver, and a rogue or contradicting nameserver.
 
-What a `jig-nameserver` operator does about harassment reports, registration and relay
-abuse, a compromised nameserver, and a rogue or contradicting nameserver. Parameters and
-endpoints are the reference implementation's. Settings and defaults are listed in the
-[operator guide](../../repos/jig-nameserver/OPERATOR_GUIDE.md); the reasoning behind them is
-in [nameserver abuse economics](../security/nameserver-abuse-economics.md).
-
-Every step marked **(not yet implemented)** depends on tribunals, cross-registration within
-a ruleset group, the transparency log or encrypted-abuse reporting. The spec requires all
-four; the code does not have them yet. Skip those steps today, and do not treat their
-absence as the intended design.
+- Settings and defaults: the [operator guide](../../repos/jig-nameserver/OPERATOR_GUIDE.md).
+- What the nameserver does: the spec's
+  [Nameserver mechanics](../../repos/jig-spec/src/identity-and-reputation.md#nameserver-mechanics);
+  normative source [JEP-0008](../../repos/jig-spec/jep/jep-0008-proof-of-work.md).
+- Why the parameters are what they are:
+  [nameserver abuse economics](../security/nameserver-abuse-economics.md).
 
 There is no global ledger and no central blocklist. Every decision below is yours, for your
-nameserver. Tell your peers what you did; they decide for themselves. If you belong to a
-ruleset group, its members apply shared outcomes under the group's ruleset; nothing
-spreads further than the group.
+nameserver. Tell your peers what you did; they decide for themselves.
+
+Steps marked **(not yet implemented)** depend on tribunals, cross-registration, the
+transparency log or signed operator removal. The spec requires them; the code does not
+have them yet. Skip those steps today.
 
 ## Before an incident
 
-- **Set `JIG_NS_ADMIN_TOKEN`.** Without it, `/v1/admin/*` and `/v1/work/enqueue` accept
-  anyone. With it, they require the `x-admin-token` header.
-- **Restrict every write endpoint at the reverse proxy.** The admin token does not cover
-  `/v1/reputation/observe`, `/v1/tribunal/cases*`, `/v1/receipts/submit`,
-  `/v1/attestations/submit` or `/v1/federation/gossip`, and `/v1/register` has no
-  proof-of-work (it is rate-limited per client IP and per DID, `[alias_rate_limits]`). The
-  shipped unit binds to the tailnet only ([`deploy/README.md`](../../deploy/README.md)). Keep it that way until these are
-  authenticated.
-- **Know your files.** With the shipped unit: alias store `/var/lib/jig/nameserver_v002.db`,
-  attestation signing key `/var/lib/jig/nameserver_v002.jigkey`, sealed (or the `.jigkey` beside `[v0_0_2.server] server_did_keyfile`), and any
-  `JIG_NS_*` settings in the optional `/etc/jig/jig-nameserver.env`. The nameserver has no
-  `JIG_NS_SECRET` any more (#192).
-- **Know that settings are read at start-up.** Every `JIG_NS_*` change below needs
-  `sudo systemctl restart jig-nameserver`. A restart does not reset the legacy penalties or
-  rate windows, which live in the database. It does reset the `[alias_rate_limits]`
-  buckets on `/v1/register`, `/v1/rotate` and `/v1/renew`, which are held in memory.
-- **Turn on a default ruleset** (`[reputation] default_ruleset`) if you want reputation
-  observations to affect proof-of-work. Without one, they are recorded and ignored.
+- **Know that settings are read at start-up.** Every change below is a config edit and a
+  restart of the service. There is no reload and no admin endpoint.
+- **Know what a restart resets.** The rate-limit buckets, the penalties, each suffix's
+  pool and controller, and the pending challenges are all in memory. A restart:
+  - refills every pool to its `burst`;
+  - drops every penalty;
+  - sets the suggested effort back to `min_effort`;
+  - drops every pending challenge, so requests in flight get `CHALLENGE_UNKNOWN` and must
+    start again.
 
-Admin calls used below (add `-H 'x-admin-token: <token>'` when the token is set):
+  During a flood, a restart hands the attacker a fresh burst at the lowest price. Make the
+  change you need in one restart.
+- **Know your files.** The alias store is `<stem>_v002.db` beside `[storage]
+  database_path`. The signing key is the sealed `.jigkey` that `[v0_0_2.server]
+  server_did_keyfile` names (by default beside the store). Back both up
+  ([`deploy/README.md`](../../deploy/README.md)).
+- **Set `[network] trust_proxy`** if a TLS-terminating proxy sits in front, or every client
+  shares the proxy's address, its rate limits and its penalties. A nameserver for a
+  `config` or `contract` suffix must not sit behind one (operator guide, "Behind a reverse
+  proxy").
 
-```bash
-# Penalty points on a key (decay is applied on read)
-curl -s 'http://127.0.0.1:7070/v1/admin/penalties?key=claim:subject:alice@example.com'
+## 1. Registration flood
 
-# Clear a key's penalty points
-curl -sX POST http://127.0.0.1:7070/v1/admin/penalties \
-  -H 'content-type: application/json' -d '{"key":"claim:subject:alice@example.com"}'
+**Signs:** many `503 REGISTRATION_BUSY`, `429 RATE_LIMITED` or `503 BUSY` answers in your
+proxy or client reports; users saying registration is slow or always busy.
 
-# Current one-minute rate window for a key, and reset it
-curl -s 'http://127.0.0.1:7070/v1/admin/rate?key=ip:203.0.113.7'
-curl -sX POST http://127.0.0.1:7070/v1/admin/rate \
-  -H 'content-type: application/json' -d '{"key":"ip:203.0.113.7"}'
+### Read the pool and the effort
 
-# Effective policy, to confirm a change took
-curl -s http://127.0.0.1:7070/v1/policy
-```
+The nameserver exports **no metrics**. It counts admitted and refused registrations, the
+suggested effort, the queue and the tokens per suffix in memory, but no route, log line or
+metrics endpoint publishes them. It logs nothing per request, except an info line for each
+allowlisted registration. What you can see today:
 
-Rate keys: `claim:subject:<handle>`, `alias:scope:<scope>:subject:<subject-or-empty>`,
-`ip:<address>`.
+- **The effort asked now.** Ask for a challenge as a client would, for a name of 5 or more
+  letters, with any valid `did:jig`:
 
-## 1. Harassment report
+  ```bash
+  curl -s "https://<nameserver>/v1/challenge?action=register&did=<did>&name=<longname>@<suffix>"
+  ```
+
+  `pow.effort` is `max(min_effort, suggested)`, times your own address's penalties. Above
+  `min_effort` means the controller has raised it: the queue was full in a recent window.
+  It costs one challenge, which expires in 60 s, and one of your 60 challenges a minute.
+  Against a self-signed certificate, curl needs `-k`; the number is only a reading, and the
+  offer that carries it is signed.
+- **Refusals.** Count `503` responses with code `REGISTRATION_BUSY` at your proxy, if you
+  have one, or ask users for the `Retry-After` they were given.
+- **The suffix's mode.** `GET /v1/suffixes` lists each suffix and whether its registration
+  is `open` or `closed`.
+
+### Respond
+
+1. **Usually nothing.** The pool already caps strangers at `strangers_per_hour`, and the
+   controller doubles the effort after each window in which the queue filled. A flood buys
+   at most the pool's rate, whatever it spends.
+2. **Lower the pool** to admit fewer strangers per hour. In the suffix's entry:
+
+   ```toml
+   [v0_0_2.nameserver.alias_suffixes.pool]
+   strangers_per_hour = 20     # default 60
+   burst = 3                   # default 10
+   ```
+
+   Each must be at least 1 while the pool is on. Raise them the same way when demand is
+   honest and the queue is busy. `enabled = false` turns the pool off and admits every
+   stranger whose work verifies: do not do that during a flood.
+3. **Raise the price.** `min_effort` (default 2^20) is the floor every stranger pays;
+   `max_effort` (default 2^24) caps the controller and the penalties. Boot refuses a
+   `max_effort` that does not fit `max_solve_secs` at 5.5 million digests a second, or one
+   above 2^28. A higher price slows phones as well as bots, and `jig` refuses an offer it
+   cannot solve within its own time cap.
+4. **Lower the rate limits** in `[alias_rate_limits]`: `per_ip_per_min` (default 30),
+   `challenge_per_ip_per_min` (default 60). They bound one address, not a botnet.
+5. **Close the suffix** if none of this is enough ([section 2](#2-close-a-suffix-fast)).
+6. **Step back down** once traffic is normal. A raised floor taxes every honest user.
+
+## 2. Close a suffix fast
+
+1. In the suffix's entry, set:
+
+   ```toml
+   registration = "closed"
+   ```
+
+2. Restart the service.
+3. Check `GET /v1/suffixes` shows `"registration": "closed"`.
+
+What a closed suffix does:
+
+- New registrations are refused with `403 REGISTRATION_CLOSED`, at `GET /v1/challenge`
+  before any work, and again at `POST /v1/register`.
+- Existing names still resolve, renew and rotate.
+- The nameserver still takes `registration_allow` entries, at `min_effort`, past the pool,
+  and logs each one.
+- But `jig` reads `/v1/suffixes` and stops on a closed suffix before it asks for a
+  challenge, allowlisted or not. With today's CLI, an allowlisted DID cannot register while
+  the suffix is closed.
+
+To reopen, set `registration = "open"` and restart. Consider lowering `strangers_per_hour`
+for the first days.
+
+## 3. Squatting complaint
+
+**Signs:** someone says a name that is theirs (a project, a person, a trademark) was
+registered by another DID.
+
+What exists today:
+
+- **No removal.** There is no endpoint, command or config that removes or reassigns a
+  binding. Decision 5 of the R1 plan (operator removal, signed, logged and with a published
+  reason) is a follow-up that is not built yet. Do not edit the alias store by hand: nothing
+  would sign or log the change, and clients that pinned the name will refuse the new DID
+  anyway.
+- **Expiry.** A binding is valid for 90 days, and only its holder can renew it. If the
+  holder stops renewing, the name lapses.
+- **Stop it happening again.** Add the word to the suffix's `reserved` (or
+  `reserved_contains`, `reserved_affixes`), and restart. New registrations of it, and its
+  normalized near-misses, are refused. This does not touch the current binding: renew and
+  rotate do not check the reserved lists.
+- **Hand it over later.** Add a `registration_allow` entry for the complainant's DID and
+  the exact alias. If the name lapses, the nameserver lets that DID register it, even while
+  it is reserved. Until then, it gets `409 ALIAS_TAKEN` like anyone else. (On a closed
+  suffix, today's `jig` will not try: see [section 2](#2-close-a-suffix-fast).)
+
+Record what you were told and what you did. Then:
+
+1. **(not yet implemented)** Signed, logged operator removal (decision 5).
+2. **(not yet implemented)** A tribunal ruling on the dispute
+   ([JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md)).
+
+## 4. Harassment report
 
 Harassment happens in channels, which the nameserver never sees. Its part is the identities:
 the DIDs that sent the blocks and the aliases that name them. Each channel has exactly one
@@ -88,123 +162,52 @@ owning server.
    sender or the blocks. The nameserver cannot. If the channel is encrypted, neither that
    server nor you can read it: the evidence is whatever the reporter, as a recipient,
    chooses to disclose. Record it by reference. Never ask a reporter for their keys.
-3. **Record the case:**
-
-   ```bash
-   curl -sX POST http://127.0.0.1:7070/v1/tribunal/cases \
-     -H 'content-type: application/json' \
-     -d '{"subject":"user","subject_id":"did:jig:...","reason":"harassment report",
-          "severity":"high","metadata":{"evidence_cids":["..."],"channel":"..."}}'
-   ```
-
-   Pass `"ruleset"` if no default ruleset is configured. The case is a record. It changes
-   nothing by itself.
-4. **Record a negative observation** if you run a default ruleset. It raises the subject's
-   proof-of-work by at most a quarter of the bits on your nameserver:
-
-   ```bash
-   curl -sX POST http://127.0.0.1:7070/v1/reputation/observe \
-     -H 'content-type: application/json' \
-     -d '{"subject":"user","subject_id":"did:jig:...","score":-1.0,"weight":1.0,
-          "evidence":"case <id>","expires_at":"2026-12-31T00:00:00Z"}'
-   ```
-
-   Set `expires_at`, so the mark falls away.
-5. **If an alias impersonates the victim**, check `GET /v1/resolve/<alias>`. There is no
-   revocation endpoint yet. Record the case, and ask servers that trust you to block the
-   DID locally.
-6. **Do not try to connect identities.** If the harasser is anonymous, the protocol has no
+3. **If an alias impersonates the victim**, check `GET /v1/resolve/<alias>`, and treat it as
+   [squatting](#3-squatting-complaint): there is no revocation yet. Ask servers that trust
+   you to block the DID locally.
+4. **Do not try to connect identities.** If the harasser is anonymous, the protocol has no
    link from that identity to a DID, by design. Do not correlate addresses, timing or
    devices to build one.
-7. **Close the case** with `POST /v1/tribunal/cases/<id>/decision`
-   (`{"outcome":"sustain","notes":"..."}`, or `dismiss`). A `penalty_delta` is stored, not
-   applied yet; the spec requires decisions to be applied and logged.
-8. **(not yet implemented)** In a high-sec ruleset group, refer the case to the group's
-   tribunal and apply its outcome under the group's ruleset. For an encrypted channel, the
-   reporter submits effective proof of the reported messages through the victim-key
-   delegation path the spec requires.
+5. **(not yet implemented)** Record a case, and in a high-sec ruleset group refer it to the
+   group's tribunal. For an encrypted channel, the reporter submits effective proof of the
+   reported messages through the victim-key delegation path the spec requires.
 
-## 2. Registration and relay abuse
+## 5. Compromised nameserver
 
-**Signs:** a run of HTTP 429s at the proxy, many fresh handles or aliases in a short time, or
-one scope collecting aliases.
-
-1. **Find the key.** Check the hottest addresses and keys with `GET /v1/admin/rate` and
-   `GET /v1/admin/penalties`. A single address points to the per-IP limit. A single
-   subject or scope points to the per-key limit.
-2. **Flood on one key (spam).** The defaults already price it: any penalty point takes the
-   key to `JIG_NS_POW_MAX` (28 bits) until the points decay at one per `JIG_NS_PENALTY_DECAY`
-   (300 s). Usually nothing more is needed. To hold the price longer, raise
-   `JIG_NS_PENALTY_DECAY` (for example to 600 or 1800).
-3. **Many fresh keys (Sybil).** Penalties do not help, because each key is new. Raise
-   `JIG_NS_POW_DIFFICULTY` by 2 to 4 bits (each bit doubles the work) and lower
-   `JIG_NS_RATE_PER_IP_PER_MIN` (for example from 120 to 30). Keep `JIG_NS_POW_MAX` at least
-   a few bits above the base, or penalties lose their range.
-4. **Anonymous aliases.** Raise `JIG_NS_ANON_MIN_POW` above the base (24 is a reasonable
-   open-instance value; its default of 12 does nothing while the base is 18). If that is not
-   enough, block `POST /v1/alias` at the reverse proxy until the flood stops. Do **not**
-   set `JIG_NS_ANON_ENABLED=false` for this: it removes the anonymous floor but does not
-   stop anonymous aliases being minted.
-5. **Abuse of `/v1/register`.** It has no proof-of-work. It is rate-limited per client IP
-   and per DID (`[alias_rate_limits]`, defaults 30 and 10 per minute); lower
-   `per_ip_per_min` for the duration, or close it to all but known clients at the reverse
-   proxy.
-6. **Behind a proxy**, set `JIG_NS_TRUST_PROXY=true` and `JIG_NS_PROXY_IP_HEADER` to the
-   header your proxy sets, or every request shares the proxy's address and one bucket.
-7. **Griefing.** If a legitimate user's key was pushed to the maximum by someone else's
-   requests, clear it with `POST /v1/admin/penalties`. If it recurs, raise
-   `JIG_NS_RATE_PER_MIN` for the duration.
-8. **Relay abuse by a federated server** (junk relayed into channels) is handled in that
-   server's federation settings, not here (threat
-   [OP-09](../../repos/jig-spec/src/threat-register.md)). On the nameserver, record a case
-   and an observation with `"subject":"server"`. Receipt anomalies are ledgered separately
-   at `GET /v1/hosts/<did>/penalties`.
-9. **Step back down.** Once traffic is normal, return the settings to their defaults.
-   Leaving the base raised taxes every honest user.
-
-## 3. Compromised nameserver
-
-**Signs:** aliases resolving to DIDs their owners did not register, unexpected changes to
-`/v1/policy`, the database or key files modified outside the service, or an admin token
-seen where it should not be.
+**Signs:** aliases resolving to DIDs their owners did not register, the database or key files
+modified outside the service, or a config change you did not make.
 
 A compromised nameserver cannot forge a block: blocks are signed by their senders' DIDs. It
 can point an alias at the wrong DID ([OP-08](../../repos/jig-spec/src/threat-register.md)),
-issue attestations, and read or change everything in its databases.
+issue attestations, and read or change everything in its store.
 
-1. **Contain.** Stop the service (`sudo systemctl stop jig-nameserver`) or firewall it. Keep
-   copies of both databases, the key file and the logs before changing anything.
+1. **Contain.** Stop the service or firewall it. Keep copies of the store, the key file, the
+   config and the logs before changing anything.
 2. **Cut dependent servers loose.** Operators of servers with `[identity] mode =
    "nameserver"` remove your nameserver's `ns_did` from the `authorities` of each suffix
    under `[identity.delegations]` (and your URL from its `nameservers`), or switch to
    `tofu`, and restart. Servers accept only attestations an authority signed (#200), so an
-   attestation under the removed key is refused from then on. `trusted_nameservers` is no
-   longer used. Clients that list your suffix under `[naming.delegations]` need the same
-   change.
-3. **Find what changed.** Compare alias bindings in `nameserver_v002.db` against your latest
-   backup. List every alias whose DID changed.
-4. **Rotate everything:**
-   - `JIG_NS_ADMIN_TOKEN`: new value.
-   - Attestation key: move `nameserver_v002.jigkey` aside and let the service seal a new one,
-     which gives the nameserver a new `ns_did`. Every attestation signed by the old key
-     must be treated as untrusted. Dependent servers and clients accept the new key only
-     once its `ns_did` is in their delegation's `authorities`, so tell them the new DID.
-   - A box upgraded from an older release may still hold `/var/lib/jig/nameserver.db`, whose
-     `ns_identity` table is a raw key that signs nothing any more. Delete it, and its copies
-     in old backups.
+   attestation under the removed key is refused from then on. Clients that list your suffix
+   under `[naming.delegations]` need the same change.
+3. **Find what changed.** Compare alias bindings in the store against your latest backup.
+   List every alias whose DID changed.
+4. **Rotate the signing key.** Move the `.jigkey` aside and let the service seal a new one,
+   which gives the nameserver a new `ns_did`. Treat every attestation signed by the old key
+   as untrusted. Dependent servers and clients accept the new key only once its `ns_did` is
+   in their delegation's `authorities`, so tell them the new DID. A box upgraded from an
+   older release may still hold a `nameserver.db` whose `ns_identity` table is a raw key
+   that signs nothing: delete it, and its copies in old backups.
 5. **Restore bindings.** Revert changed aliases from backup. Ask users to renew
-   (`POST /v1/renew`) so attestations are reissued under the new key. Users who rotated
+   (`jig keys renew`) so attestations are reissued under the new key. Users who rotated
    their DID since the backup must re-register.
-6. **Tell people.** Announce the new `ns_did`, the window of compromise and the
-   affected aliases through channels your users already trust, and tell your federation
-   peers directly. Clients that pinned DIDs will have flagged changed aliases; tell users
-   to trust those warnings.
+6. **Tell people.** Announce the new `ns_did`, the window of compromise and the affected
+   aliases through channels your users already trust. Clients that pinned DIDs will have
+   flagged changed aliases; tell users to trust those warnings.
 7. **Write it up**: timeline, cause, what was exposed, what changed.
 8. **(not yet implemented)** In a high-sec ruleset group, open an incident case with the
-   group's tribunal so the other members can quarantine cross-registered records from the
-   window of compromise, and check your transparency log against their copies.
+   group's tribunal, and check your transparency log against the members' copies.
 
-## 4. Rogue or contradicting nameserver
+## 6. Rogue or contradicting nameserver
 
 **Signs:** two valid attestations for one alias that name different DIDs over overlapping
 windows (equivocation, JEP-0004 rule 15), resolution evidence a client kept under
@@ -218,7 +221,7 @@ suffix's delegation names.
    `[identity.delegations]` (jig-server) or `[naming.delegations]` (`cli.toml`).
    - jig-server refuses a suffix with no entry. The exception is `jig`: without an entry the
      server falls back to its built-in `@jig` delegation, once a build ships the project's
-     authority. This build ships none, so `@jig` names fail closed.
+     authority. A build without it ships none, so `@jig` names fail closed.
    - The CLI falls back when `cli.toml` has no entry: to the suffix's DNS-rooted delegation
      for a multi-label suffix, and to the built-in `@jig` delegation for `jig`. So deleting
      an entry can land on the same nameserver again.
@@ -234,11 +237,3 @@ suffix's delegation names.
 3. **Tell your peers** what you saw and what you changed. They decide for themselves.
 4. **(not yet implemented)** Shared lists and tribunal outcomes: the draft
    [JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md).
-
-The deny and allow domain lists and the gossip this section used to describe were removed
-in #237. They never exchanged data with peers, and the routes they served were removed in
-#154.
-Where nameserver federation is headed (witnessed logs and rulesets within a ruleset group) is
-in the [roadmap](../ROADMAP.md) under "Nameserver federation (target)", and in the draft
-[JEP-0009](../../repos/jig-spec/jep/jep-0009-rulesets-reputation-logs.md) and
-[JEP-0010](../../repos/jig-spec/jep/jep-0010-reports-tribunals-lists.md).
