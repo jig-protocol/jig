@@ -325,6 +325,17 @@ fn offer_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredOffer> {
     })
 }
 
+/// A relayed copy set aside ([`SqliteStore::quarantine_relayed_copy`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantinedCopy {
+    /// The copy's own id, under which its row and blocks are kept.
+    pub copy_id: String,
+    pub slug: String,
+    /// Blocks this server's own users posted in the copy, which no peer
+    /// relayed: the owner may never have taken them.
+    pub own_blocks: u64,
+}
+
 /// The `contract_offers` table, created by [`SqliteStore`]'s migration.
 pub(crate) fn migrate(conn: &rusqlite::Connection) -> crate::persist::Result<()> {
     conn.execute_batch(
@@ -342,6 +353,25 @@ pub(crate) fn migrate(conn: &rusqlite::Connection) -> crate::persist::Result<()>
         );
         CREATE INDEX IF NOT EXISTS contract_offers_share
             ON contract_offers(channel_id, peer_did, side, state);
+
+        -- A copy of a channel the federation relay made, set aside when this
+        -- server came to follow the channel's owner for it
+        -- ([`SqliteStore::quarantine_relayed_copy`]): kept, never relayed or
+        -- followed. Its rows live on under `copy_id`; its records, whose
+        -- blocks the owner's chain lands again, here.
+        CREATE TABLE IF NOT EXISTS quarantined_copies (
+            copy_id       TEXT PRIMARY KEY,
+            channel_id    TEXT NOT NULL,
+            own_blocks    INTEGER NOT NULL,
+            quarantined_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS quarantined_records (
+            copy_id    TEXT NOT NULL,
+            block_cid  TEXT NOT NULL,
+            seq        INTEGER NOT NULL,
+            record     BLOB NOT NULL,
+            PRIMARY KEY (copy_id, seq)
+        );
         "#,
     )?;
     Ok(())
@@ -489,6 +519,163 @@ impl SqliteStore {
             ],
             |r| r.get(0),
         )?)
+    }
+
+    /// Whether this server carries `channel_id` under a share it accepted,
+    /// live or ended: its blocks reach it from the owner's stream, never by
+    /// the federation relay.
+    pub fn is_followed(&self, channel_id: &str) -> crate::persist::Result<bool> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM contract_offers
+             WHERE channel_id = ?1 AND side = ?2 AND state IN (?3, ?4, ?5))",
+            params![
+                channel_id,
+                Side::Follower.as_str(),
+                OfferState::Accepted.as_str(),
+                OfferState::Ending.as_str(),
+                OfferState::Ended.as_str()
+            ],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The channels this server holds as copies the federation relay made:
+    /// a row it sequences, created by a `channel-create` a peer relayed.
+    /// Every server peered the older way holds one per open channel of its
+    /// peers.
+    pub fn relayed_copies(&self) -> crate::persist::Result<Vec<String>> {
+        let local = self.local_sequencer().to_string();
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT c.id FROM channels c JOIN blocks b ON b.cid = c.id
+             WHERE (c.sequencer_did = '' OR c.sequencer_did = ?1)
+               AND b.federated_from IS NOT NULL
+             ORDER BY c.id",
+        )?;
+        let rows = stmt
+            .query_map([local], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Set aside this server's relayed copy of `channel_id`
+    /// ([`Self::relayed_copies`]), now that it follows the channel's owner
+    /// for it, so the owner's stream can land the channel under its own id.
+    /// Nothing is deleted, in one transaction:
+    ///
+    /// - the row moves to the copy's own id and a `#jig/relayed-…` slug, so
+    ///   it is readable by that id, never relayed (`#jig/` channels do not
+    ///   federate), and never followed;
+    /// - its blocks, memberships and chain evidence move with it, as do any
+    ///   offers this server made as though it owned the channel, ended so
+    ///   that nothing acts on them;
+    /// - its records, signed by this server, move to `quarantined_records`:
+    ///   the owner's chain signs its own records for the same blocks, which
+    ///   take them back into the channel as they land
+    ///   ([`crate::follow::ingest_sequenced`]).
+    ///
+    /// The blocks the owner's chain never lands, such as posts this server's
+    /// users made that the owner never took, stay in the copy. `None` unless
+    /// `channel_id` is such a copy.
+    pub fn quarantine_relayed_copy(
+        &self,
+        channel_id: &str,
+    ) -> crate::persist::Result<Option<QuarantinedCopy>> {
+        let local = self.local_sequencer().to_string();
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let copy: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM channels c JOIN blocks b ON b.cid = c.id
+             WHERE c.id = ?1 AND (c.sequencer_did = '' OR c.sequencer_did = ?2)
+               AND b.federated_from IS NOT NULL)",
+            params![channel_id, local],
+            |r| r.get(0),
+        )?;
+        if !copy {
+            return Ok(None);
+        }
+        let copy_id = crate::ingest_record::label_cid(&format!("relayed-copy:{channel_id}"));
+        let slug = format!(
+            "#jig/relayed-{}",
+            &copy_id[copy_id.len().saturating_sub(40)..]
+        );
+        let own_blocks: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM blocks
+             WHERE (channel_id = ?1 OR cid = ?1) AND federated_from IS NULL",
+            [channel_id],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "UPDATE channels SET id = ?2, slug = ?3 WHERE id = ?1",
+            params![channel_id, copy_id, slug],
+        )?;
+        tx.execute(
+            "UPDATE blocks SET channel_id = ?2 WHERE channel_id = ?1 OR cid = ?1",
+            params![channel_id, copy_id],
+        )?;
+        tx.execute(
+            "INSERT INTO quarantined_records (copy_id, block_cid, seq, record)
+             SELECT ?2, block_cid, seq, record FROM ingest_records WHERE channel_id = ?1",
+            params![channel_id, copy_id],
+        )?;
+        tx.execute(
+            "DELETE FROM ingest_records WHERE channel_id = ?1",
+            [channel_id],
+        )?;
+        tx.execute(
+            "UPDATE memberships SET channel_id = ?2 WHERE channel_id = ?1",
+            params![channel_id, copy_id],
+        )?;
+        tx.execute(
+            "UPDATE chain_evidence SET channel_id = ?2 WHERE channel_id = ?1",
+            params![channel_id, copy_id],
+        )?;
+        tx.execute(
+            "UPDATE contract_offers SET channel_id = ?2, state = ?4
+             WHERE channel_id = ?1 AND side = ?3",
+            params![
+                channel_id,
+                copy_id,
+                Side::Owner.as_str(),
+                OfferState::Ended.as_str()
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO quarantined_copies (copy_id, channel_id, own_blocks, quarantined_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                copy_id,
+                channel_id,
+                own_blocks,
+                chrono::Utc::now().timestamp()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Some(QuarantinedCopy {
+            copy_id,
+            slug,
+            own_blocks: own_blocks as u64,
+        }))
+    }
+
+    /// The records of a quarantined copy ([`Self::quarantine_relayed_copy`]),
+    /// in seq order, as this server signed them.
+    pub fn quarantined_records(
+        &self,
+        copy_id: &str,
+    ) -> crate::persist::Result<Vec<(u64, String, Vec<u8>)>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT seq, block_cid, record FROM quarantined_records
+             WHERE copy_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt
+            .query_map([copy_id], |r| {
+                Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// The newest record of `channel_id`'s chain: its `ingest` head.
@@ -963,5 +1150,121 @@ pub(crate) mod tests {
                 .len(),
             1
         );
+    }
+
+    /// Setting a relayed copy aside deletes nothing: its row, blocks,
+    /// records, memberships, chain evidence and owner-side offers all move
+    /// under the copy's id, and the offers are ended.
+    #[test]
+    fn a_quarantined_copy_keeps_everything() {
+        use crate::persist::{StoredBlock, StoredChannel, StoredMembership};
+        let store = SqliteStore::open_in_memory().unwrap();
+        let local = "did:jig:zlocal";
+        store.adopt_local_sequencer(local).unwrap();
+        let channel = crate::ingest_record::label_cid("a relayed channel");
+        let block = |cid: &str, federated_from: Option<&str>| StoredBlock {
+            cid: cid.to_string(),
+            channel_id: Some(channel.clone()),
+            block_kind: "text-render".to_string(),
+            sender_did: "did:jig:zuser".to_string(),
+            sender_sig: vec![1],
+            bundle_bytes: vec![2],
+            is_synthetic: false,
+            hlc_wall_ms: 0,
+            hlc_logical: 0,
+            hlc_origin: String::new(),
+            posted_at: 0,
+            origin_server: String::new(),
+            federated_from: federated_from.map(str::to_string),
+        };
+        store
+            .insert_block(&block(&channel, Some("ws://peer")))
+            .unwrap();
+        let own = crate::ingest_record::label_cid("a post only here");
+        store.insert_block(&block(&own, None)).unwrap();
+        store
+            .upsert_channel(&StoredChannel {
+                id: channel.clone(),
+                slug: "#k".to_string(),
+                visibility: "open".to_string(),
+                created_at: 0,
+                owner_did: "did:jig:zuser".to_string(),
+                suite: "none".to_string(),
+                sequencer_did: local.to_string(),
+                co_owners: Vec::new(),
+            })
+            .unwrap();
+        store
+            .upsert_membership(&StoredMembership {
+                channel_id: channel.clone(),
+                member_did: "did:jig:zuser".to_string(),
+                role: "owner".to_string(),
+                joined_at: 0,
+                source_block_cid: channel.clone(),
+            })
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO ingest_records (block_cid, channel_id, seq, record) VALUES (?1, ?2, 0, x'01')",
+                params![channel, channel],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chain_evidence (channel_id, seq, held, offered, found_at)
+                 VALUES (?1, 1, x'02', x'03', 0)",
+                [&channel],
+            )
+            .unwrap();
+        }
+        store
+            .put_contract_offer(&StoredOffer {
+                offer_id: rand::random(),
+                channel_id: channel.clone(),
+                side: Side::Owner,
+                peer_did: "did:jig:zelsewhere".to_string(),
+                grant: Grant::Read,
+                state: OfferState::Held,
+                offer: vec![],
+                answer: None,
+                share_cid: None,
+            })
+            .unwrap();
+
+        let copy = store.quarantine_relayed_copy(&channel).unwrap().unwrap();
+        assert_eq!(copy.own_blocks, 1);
+        assert!(store.get_channel_by_id(&channel).unwrap().is_none());
+        let row = store.get_channel_by_id(&copy.copy_id).unwrap().unwrap();
+        assert_eq!(row.slug, copy.slug);
+        assert_eq!(
+            jig_core::slug::classify_slug(&row.slug),
+            Ok(jig_core::slug::SlugClass::Server)
+        );
+        for cid in [&channel, &own] {
+            let kept = store.get_block(cid).unwrap().unwrap();
+            assert_eq!(kept.channel_id.as_deref(), Some(copy.copy_id.as_str()));
+        }
+        assert_eq!(store.quarantined_records(&copy.copy_id).unwrap().len(), 1);
+        assert!(store.latest_ingest_record(&channel).unwrap().is_none());
+        assert_eq!(store.chain_evidence(&copy.copy_id).unwrap().len(), 1);
+        assert!(
+            store
+                .is_member_by_id(&copy.copy_id, "did:jig:zuser")
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .contract_offers_for(
+                    &copy.copy_id,
+                    "did:jig:zelsewhere",
+                    Side::Owner,
+                    OfferState::Ended
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        // Once only: it is no longer a relayed copy.
+        assert!(store.quarantine_relayed_copy(&channel).unwrap().is_none());
     }
 }
