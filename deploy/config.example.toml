@@ -129,7 +129,7 @@ replay_capacity = 100000
 # floods, not a wall). Under a flood of new DIDs it doubles each window, up to
 # `max_effort`, and decays back when the flood stops. `min_effort = 0` asks no
 # work at all while the server is quiet. `pow_bits` (legacy, one release) is
-# `min_effort = 2^pow_bits`.
+# `min_effort = 2^pow_bits`; an unset `max_effort` (2^24) rises to meet it.
 [auth.admission]
 unknown_dids = "admit"
 # min_effort = 1048576

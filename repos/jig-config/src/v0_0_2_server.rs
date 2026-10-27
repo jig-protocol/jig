@@ -429,8 +429,9 @@ pub struct AdmissionSection {
     /// work while the server is idle (rule 17). Unset: `2^20`, under a second
     /// on a laptop.
     pub min_effort: Option<u64>,
-    /// The most effort the controller asks, at most `2^28`.
-    pub max_effort: u64,
+    /// The most effort the controller asks, at most `2^28`. Unset: `2^24`,
+    /// or the legacy `pow_bits` effort if that is higher.
+    pub max_effort: Option<u64>,
     /// The controller (rule 17): after a window in which more than
     /// `controller_target` distinct unknown DIDs arrived, the effort asked
     /// above `min_effort` doubles, starting from `controller_start_effort`;
@@ -454,7 +455,7 @@ impl Default for AdmissionSection {
             unknown_dids: UnknownDidsPolicy::default(),
             pow_bits: 0,
             min_effort: None,
-            max_effort: 1 << 24,
+            max_effort: None,
             controller_window_secs: 60,
             controller_target: 100,
             controller_start_effort: 1 << 16,

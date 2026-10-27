@@ -37,7 +37,8 @@ pub struct AdmissionStatus {
     pub proven: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pow_bits: Option<u8>,
-    /// The same work as a JEP-0008 effort, `2^pow_bits`.
+    /// The exact JEP-0008 effort this server asks now. `pow_bits` is the
+    /// least bit count whose effort is at least this.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<u64>,
 }

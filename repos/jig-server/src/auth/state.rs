@@ -429,10 +429,15 @@ fn effort_config(section: &AdmissionSection) -> anyhow::Result<EffortConfig> {
         (None, Some(effort)) => effort,
         (None, None) => 1 << 20,
     };
-    if !(1..=cap).contains(&section.max_effort) || min_effort > section.max_effort {
+    // An unset maximum makes room for a legacy `pow_bits` above it, so a
+    // config that booted before `max_effort` existed still boots.
+    let max_effort = section.max_effort.unwrap_or(match pow_bits {
+        Some(_) => min_effort.max(1 << 24),
+        None => 1 << 24,
+    });
+    if !(1..=cap).contains(&max_effort) || min_effort > max_effort {
         anyhow::bail!(
-            "[auth.admission] needs min_effort <= max_effort <= {cap}; got {min_effort} and {}",
-            section.max_effort
+            "[auth.admission] needs min_effort <= max_effort <= {cap}; got {min_effort} and {max_effort}"
         );
     }
     if section.controller_window_secs == 0 || section.controller_start_effort == 0 {
@@ -442,8 +447,8 @@ fn effort_config(section: &AdmissionSection) -> anyhow::Result<EffortConfig> {
     }
     Ok(EffortConfig {
         min_effort,
-        max_effort: section.max_effort,
-        start_effort: section.controller_start_effort.min(section.max_effort),
+        max_effort,
+        start_effort: section.controller_start_effort.min(max_effort),
         window: std::time::Duration::from_secs(section.controller_window_secs),
         target: usize::try_from(section.controller_target).unwrap_or(usize::MAX),
     })
@@ -703,7 +708,17 @@ mod tests {
             a.min_effort = Some(1 << 12);
         }));
         assert!(refused(&|a| a.min_effort = Some((1 << 24) + 1)));
-        assert!(refused(&|a| a.max_effort = (1 << 28) + 1));
+        assert!(refused(&|a| a.max_effort = Some((1 << 28) + 1)));
+        // A legacy pow_bits above the default maximum still boots, unless an
+        // explicit maximum is below it.
+        let mut section = pow_section();
+        section.admission.pow_bits = 26;
+        let state = AuthState::from_config(&section).unwrap();
+        assert_eq!(state.admission_effort().map(|e| e.get()), Some(1 << 26));
+        assert!(refused(&|a| {
+            a.pow_bits = 26;
+            a.max_effort = Some(1 << 24);
+        }));
         assert!(refused(&|a| a.controller_window_secs = 0));
     }
 
