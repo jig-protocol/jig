@@ -1,11 +1,13 @@
 # jig roadmap
 
 Where jig is going, in phases from a public alpha (`v0.1`) to a distributed OS (`v1+`), and the
-decisions that shape the path. Last updated 2026-10-18.
+decisions that shape the path. Last updated 2026-10-25.
 
-**Status in one line:** v0.1 groundwork is tagged (`v0.1.0-alpha.1`, no published release yet),
-and on `main` v0.2 has per-channel MLS encryption, TLS by default, clients that pin the server's
-identity and each channel's suite, rate limits and opt-in proof-of-work at admission. For what
+**Status in one line:** two signed v0.2 prereleases are published and install through
+`install.sh` (`v0.2.0-alpha.1` and `v0.2.0-alpha.2`), and on `main` v0.2 has per-channel MLS
+encryption with restricted channels always encrypted, TLS by default bound to the server's DID, a
+signed handshake bound to the TLS session, clients that pin servers, names and each channel's
+suite, rate limits and proof-of-work at admission. The federation contract is half built. For what
 works today, gate by gate, see [`RELEASE_READINESS.md`](RELEASE_READINESS.md). This doc is the
 direction, not the status page.
 
@@ -106,7 +108,7 @@ reserve the hooks for encryption so that turning it on in v0.2 changes a value, 
 | # | Item | Status |
 | --- | --- | --- |
 | 1 | Green `main`: patch advisories, pinned toolchain (`rust-toolchain.toml`), daily advisory check | Done |
-| 2 | Release pipeline: static musl x86_64/aarch64 + Apple Silicon, checksums, signatures | Pipeline built and dry-run green; **`v0.1.0-alpha.1` release runs failed, no release published** |
+| 2 | Release pipeline: static musl x86_64/aarch64 + Apple Silicon, checksums, signatures | Done: `v0.1.0-alpha.1` never shipped binaries; `v0.2.0-alpha.1` (2026-10-19) and `v0.2.0-alpha.2` (2026-10-25) are published, signed, and install-smoked against the published release on Linux and macOS |
 | 3 | 60-second default path: working `install.sh`, channel ops out of `[debug]`, CI smoke test | Done (`install-smoke.yml`, Linux + macOS) |
 | 4 | Security communication: root `SECURITY.md`, private vulnerability reporting, "not implemented" banners on the spec | Done |
 | 5 | Scrub history, go public with full history, archive the pre-monorepo repos | Done |
@@ -164,35 +166,72 @@ Then the smaller hardening items, each one PR:
 - TLS on by default: a self-signed certificate that the server's DID vouches for at
   `/.well-known/jig`, so clients trust it through the DID they pin; TLS 1.3 only (#95).
 
+Since then, each in one or more PRs:
+
+- **Restricted channels are always MLS (D25)** (#105, #142, #204): no restricted channel is
+  readable by the operator.
+- **A test-only second suite with per-suite conformance vectors (D13)** (#165): `test-aead`
+  runs through the suite registry, and `repos/jig-spec/vectors/suites/` holds vectors for
+  `none`, `mls` and `test-aead`. MLS refuses every other ciphersuite before running its crypto
+  (#303).
+- **The handshake (D11)**, slices 0 to 4 and 6 to 9 of the
+  [build plan](superpowers/plans/2026-10-18-d11-handshake-completion.md): close classes, plaintext
+  REST refused, a skew bound, hash-chained `ingest` records, evidence and sticky refusals, the
+  manifest log, a mutual server-to-server handshake bound to the TLS session (#234), and name
+  pins.
+- **Verified names (F1):** signed COSE attestations and per-suffix delegations, checked and
+  pinned by the CLI.
+- **Keys at rest (I1):** identity keys, the MLS plaintext cache and the server's and
+  nameserver's keys are sealed (#177, #254, #284). Nameservers serve TLS bound to their DID (#262).
+- **Server key rotation:** `jig-server keys rotate` writes a key link (#298), and a server serves
+  its links as a chain that clients follow hop by hop, up to 16 links (#241, #302). A client
+  pinned further back than the chain reaches must still re-pin.
+- **Proof-of-work (R1):** one puzzle for nameserver registration and server admission; a
+  nameserver prices registration by load and caps how fast strangers register (#248, #264, #266,
+  #272). Admission proof-of-work stays off by default (D26).
+- **The federation contract (F2), Tasks 0a, 0b and 1 to 6** of the
+  [plan](superpowers/plans/2026-10-19-f2-channel-contract.md): channels keyed by CID in the store
+  and routes, terms and roles, signed contract messages, the peer policy in the server
+  manifest, offers and answers, the follower's stream (#309), and writes relayed through a
+  follower under its grant (#316).
+- **One implementation of each thing:** the v0.0.1 store and `POST /blocks` route, both earlier
+  block ABIs (#291, #299), the v0.2 receipt formats (#308) and the unused nameserver modules
+  are gone.
+
+**Exit criteria, as of 2026-10-26:**
+
+| # | Criterion | State |
+| --- | --- | --- |
+| 1 | The spec's privacy claims are true | Mostly. Each chapter's banner and the threat register's status column say what `main` implements (last re-checked in full on 2026-10-18; PRs since update the rows they change). Open channels are plaintext unless created `--encrypted`, and the spec says so |
+| 2 | The operator cannot read restricted content | Met (D25) |
+| 3 | A hostile operator's downgrade or false handshake is detected | Largely met: the slices the D11 plan names for it (1, 3, 4a, 4b, 6, 7) are merged, as are 0, 2, 8 and 9. Slice 5 (`seen` and head gossip, so members compare chains) is not built, slice 10 (`sequencer-set`) lands with F2, and OP-01, OP-02 and TM-01 still read Partial |
+| 4 | Suites are pluggable, shown through the registry with conformance vectors | Met (#165) |
+| 5 | The federation contract is specified, and two jig servers federate an encrypted channel through it | Not met: relayed writes are merged (Task 6, #316); Tasks 7 to 11 remain (MLS across servers, custodians, sequencer moves, abuse defences, end to end), and Task 0c (clients address channels by `channel_id`) |
+| 6 | An external audit is scoped | Scoped (D27, decided 2026-10-25): Phase 1 before G3, Phase 2 after code-complete |
+
 Still to do in this phase:
 
-- **Restricted channels are always MLS (D25):** a creator who wants plaintext makes an open
-  channel. No restricted channel is readable by the operator.
-- **Pluggable suites (D13, deferred):** keep the suite layer composable and prove it with a
-  test-only second suite and per-suite conformance vectors. A production second suite (PQ-hybrid
-  MLS, or Signal's post-quantum protocol) is a stretch goal.
-- **Full handshake (D11):** reputation and real suites; clients detect false answers and
-  downgrades, mitigating each threat-register entry.
-- **Federation as a data contract (D12, D24) and naming:** specify and build a channel's contract
-  between jig servers (encrypted channels across servers, the suite fixed in the contract), with
-  how names map to DIDs and who resolves them. Nameserver-led shared contracts for trusted subnets
-  and ruleset groups follow. Federating with a differently built server comes after the MVP.
-- Multi-device and key rotation; a server-key rotation ceremony (clients follow a server's key link
-  since #241, and `jig-server keys rotate` writes one, #298).
-- **Server key rotation across several hops.** Done in #302: a server serves its key links as a
-  chain, and clients follow it hop by hop, checking every hop, up to 16 links, because forcing a
-  re-pin is a trust-on-first-use attack path. A client pinned further back than the chain reaches
-  must still re-pin.
-- ACME certificates for DNS-rooted suffixes. TLS on the nameserver, bound to its DID, landed in #262.
+- **Federation (D12, D24), F2 Task 0c and Tasks 7 to 11:** clients that address channels by
+  `channel_id`, encrypted channels
+  across servers, key-package custodians, the contract half of a sequencer move, abuse defences
+  on federation links, and the end-to-end test. Nameserver-led shared contracts for trusted
+  subnets and ruleset groups follow. Federating with a differently built server comes after the
+  MVP.
+- **Handshake slices 5 and 10:** `seen` and head gossip, so members compare chains and detect
+  omission (OP-06); `sequencer-set`, with F2. Then the threat-register rows the D11 design
+  proposes for OP-01, OP-02 and TM-01. Reputation in the welcome stays `null` until the
+  reputation design (D15, D21) lands.
+- Multi-device. One device per DID today.
+- A documented server-key rotation ceremony. Rotation works (#298, #302), but a link is signed by
+  the old key, so a lost key still means restoring it from backup.
+- ACME certificates for DNS-rooted suffixes.
 - PROXY protocol v2 on the nameserver listener, so its per-client rate limits still apply behind a
   TCP/SNI passthrough proxy. A `config` or `contract` suffix needs passthrough, and today every
   client behind one shares the proxy's limit.
-- Signed peer policy (federation already runs through the write gate). The policy is published in
-  the signed server manifest since #275; its quotas are not enforced yet.
-- **One implementation of each thing:** remove the v0.0.1 paths that sit beside v0.0.2 ones, the
-  capability scaffolding that enforces nothing, and prototypes nothing calls.
-- An external security audit (D27), designed now and run once v0.2 is code-complete. It does not
-  block development.
+- Peer-policy quotas. The policy is published in the signed server manifest since #275; its
+  quotas are not enforced yet.
+- An external security audit (D27): one firm in two phases. Phase 1 runs before G3 on the code
+  that is already complete, and Phase 2 after v0.2 is code-complete. It does not block development.
 
 ### Phase 2: executable blocks (`v0.3`)
 
@@ -306,8 +345,8 @@ outside this repo.
 
 1. Where the public trial server runs, and whether it tracks the canary or `main` (D4).
 2. Which production second suite to build, if any, after v0.2 (D13).
-3. Publishing a release. Every `v0.1.0-alpha.1` attempt re-ran the tag's own commit, which pins
-   an older signing key; `main` pins the key the signing secret holds, so the next release is a
-   fresh tag from `main`.
+3. ~~Publishing a release.~~ Done: `v0.2.0-alpha.1` (2026-10-19) and `v0.2.0-alpha.2`
+   (2026-10-25) were cut as fresh tags from `main`, signed, and install-smoked against the
+   published release.
 4. Whether every channel is encrypted by default after the v0.2 tag (D25).
 5. How the external audit is split (D27).
