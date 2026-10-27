@@ -8,7 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **WASI Preview1 Support** - Automatic detection and deterministic sandboxing
+- **WASI Preview1 Support** (superseded: blocks are `jig:block` components only, with no WASI)
+  - Automatic detection and deterministic sandboxing
   - Captured stdin/stdout/stderr (memory-backed pipes)
   - No filesystem, time, or entropy access by default
   - Non-WASI modules continue to work with zero overhead
