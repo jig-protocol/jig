@@ -1,15 +1,16 @@
 # Release readiness: internal → external
 
-The gate between "we dogfood jig on our own tailnet" and "we tell strangers to
+The gate between "jig runs on private deployments" and "we tell strangers to
 run `curl -fsSL https://jig.onl/install.sh | bash`".
 
-jig is MIT OR Apache-2.0 source in a public-shaped repo, but it has never been
-announced, never been deployed to a public address, and has never had a user
-outside the team. This document is the checklist for changing that. Every
-"current state" row below was checked against the code at merge commit
-`1fa5681`; §1.3, §1.5 to §1.8, the binary install row, §3, §4, §6 and the verdict
-were re-checked against `d16f26a` on 2026-10-18. Where a claim could not be
-verified from the tree it says so.
+jig is MIT OR Apache-2.0 source in a public repository, and it publishes signed
+alpha prereleases, but it has never been announced, never been deployed to a
+public address, and has never had a user outside the team. This document is the
+checklist for changing that. Every "current state" row below was checked against
+the code at merge commit `1fa5681`; §1.3, §1.5, §1.8 and §4 were re-checked
+against `d16f26a` on 2026-10-18; §1.1, §1.6, §1.7, the binary install row, §3,
+§6 and the verdict were re-checked against `a740fa8` on 2026-10-25. Where a claim
+could not be verified from the tree it says so.
 
 **Verdict vocabulary**
 
@@ -36,12 +37,15 @@ phases 1–3) moved identity into the server; the tailnet is now defence in dept
 | --- | --- |
 | **Current state** | Three gates, in order: authenticate, admit, authorize ([`jig-server/src/auth/`](../repos/jig-server/src/auth/)). **Authenticate** holds: every REST read and every WSS subscribe carries a per-request ed25519 proof over a canonical hash of the request (`jig-core::request_auth`), verified against the caller's DID, with a fail-closed replay guard; `[auth] require_authenticated_reads` defaults to `true`, and the documented escape hatch restores the old behaviour only when set explicitly. **Authorize** holds for channels: history, the listing, live WSS delivery (re-checked per block) and posting all run `authorize_read`/`authorize_block` against `visibility`, `owner_did` and the memberships table; membership changes and `channel-promote` are owner-signed. Refusals go through one disclosure point per surface (`GateOutcome` → `DisclosurePolicy`), truthful by default. **Admit** holds: `[auth.admission]` (`banned_dids`, ruleset-scoped `floors`, an explicit `unknown_dids` choice, operator-seeded `records`) runs on every read and every write — inside `ingest` for writes, so REST, WSS, admin and bridge paths agree — after gate 1 and before any channel lookup, as a pure function (`auth/admission.rs`) shaped to later run as a policy block. |
 | **Ready means** | A caller's identity is established per request, reads/writes are checked against channel membership before data leaves the process, and a server can refuse callers it does not want (reputation, bans, rate limits). |
-| **Gap** | Reputation is consumed, not computed: the view is what the operator wrote in config, there is no ledger and no exchange of scores. Per-DID and per-address rate limits (`[auth.rate_limit]`) sit in front of the gates, and `unknown_dids = "proof-of-work"` makes each new DID pay once before it is served; the work is a speed bump, not Sybil resistance, and it is off by default. Tier-1 trusted connections (phase 5) are not built. Blocks relayed by a federated peer run through `ingest` like local ones, and peers are pinned and listed, but only open, unencrypted channels federate until the federation contract (D12) says how an encrypted group spans two servers. Revocation is a signed `member-remove` block (owner kick or self-leave) since v0.2. |
+| **Gap** | Reputation is consumed, not computed: the view is what the operator wrote in config, there is no ledger and no exchange of scores. Per-DID and per-address rate limits (`[auth.rate_limit]`) sit in front of the gates, and `unknown_dids = "proof-of-work"` makes each new DID pay once before it is served; the work is a speed bump, not Sybil resistance, and it is off by default. Tier-1 trusted connections (phase 5) are not built. Blocks relayed by a federated peer run through `ingest` like local ones, and peers are pinned and listed. Under the federation contract (JEP-0005), a server can now accept a share of a channel another server sequences and follow it, checking the owner's signed record chain (#309), but the follower stream refuses MLS channels, and writes relayed under a grant are not built: an encrypted group cannot yet span two servers. Legacy peering, which relays open channels to listed peers, is live only: a block posted while a peer is down is never replayed to it, because `Frame::CatchUp` is a stub. The block stays on its origin server, so the two servers' copies of the channel diverge for good (a restart soak, #338, loses one or two posts per peer restart, in both directions). There is no workaround yet. Legacy peering also merges same-named open channels by name: a post to `#general` on one server appears in `#general` on every peered server that has a channel of that name, re-sequenced and signed by each receiver. Author signatures still hold, but which server a post was made on is lost, and the copies can diverge. It is the pre-contract federation model (the F2 design spec: "channels are identified by slug alone"). Public channels move onto contracts after F2 phase 1 (DJ's decision), which ends it for new posts; #357 tracks posts that have already crossed. Contract shares do replay missed records across restarts: in the same soak, with both sides restarting in turn, a follower lost nothing, pulling the owner's records from its own head after each reconnect. But between peers that are both up, the legacy relay delivers a new open channel first, the follower takes it as a channel of its own, and the share then delivers nothing; a fix is pending. On a follower, a followed channel is read by its id (`jig read <channel-id>`): reading it by slug returns an empty page until clients address channels by id (F2 Task 0c). Revocation is a signed `member-remove` block (owner kick or self-leave) since v0.2. |
 
 **Verdict: GAP** (was BLOCKER). The part that let strangers read and write every
 channel is closed and proven by fault injection at each gate, and an operator can
 now refuse and rate-limit callers; what remains is scoring and the tier-1
 fast path, not the absence of a model.
+
+**Hardening:** operators should set `[auth.admission] unknown_dids = "proof-of-work"` (or
+`"refuse"`) on servers that are not open to the public.
 
 ### 1.2 `visibility = "restricted"` is enforced
 
@@ -96,18 +100,19 @@ ingest, and the working path needs no `[debug]` flag.
 
 | | |
 | --- | --- |
-| **Current state** | Tighter than the rest of the system. `build_wasi_context` ([`jig-runtime/src/engine.rs:458`](../repos/jig-runtime/src/engine.rs)) grants an empty stdin pipe and an in-memory stdout buffer — no host stdio, no preopened directories, no sockets. Store limits pin one instance, one memory, 10 tables, 10k table elements; fuel and an epoch deadline bound runtime. Server defaults: 5,000,000 fuel, 64 MB, plus a timeout ([`jig-server/src/config.rs:446-452`](../repos/jig-server/src/config.rs)). wasmtime is 49.0.3, with no wasmtime advisory suppressed in `deny.toml` — including RUSTSEC-2026-0096 (aarch64 Cranelift guest-heap miscompile → sandbox escape). |
-| **Gap** | None material for external use. This is the strongest part of the security story. |
+| **Current state** | Tighter than the rest of the system. Blocks are `jig:block` components (JEP-0006), and there is one execution path, [`jig-runtime/src/component.rs`](../repos/jig-runtime/src/component.rs); the byte-payload ABI and the WASI path were deleted (#291, #299). A component is checked against jig-core's `jig-det-1` profile before it is compiled, and the linker defines only the imports its grant names; no host interface has a provider yet, so a component that imports anything is refused at link time. There is no WASI: no stdio, filesystem, sockets or clocks. Every run is bounded by fuel, a wall-clock epoch deadline and a memory cap, on a pooling allocator with one memory per module ([`engine.rs`](../repos/jig-runtime/src/engine.rs)). Server defaults: 5,000,000 fuel, 64 MB, 250 ms ([`jig-server/src/config.rs`](../repos/jig-server/src/config.rs)). wasmtime is 49.0.4 (#280), with no wasmtime advisory suppressed in `deny.toml`, including RUSTSEC-2026-0096 (aarch64 Cranelift guest-heap miscompile → sandbox escape). |
+| **Gap** | None material for external use. This is the strongest part of the security story, and it has had no outside review. |
 
 **Verdict: READY.**
 
 ### 1.7 Advisory suppressions (`deny.toml`)
 
-One RustSec ignore, and `yanked = "deny"`.
+Two RustSec ignores, and `yanked = "deny"`.
 
 | Category | IDs | Matters to an external user? |
 | --- | --- | --- |
 | Build-time only (proc macro) | RUSTSEC-2026-0173 (`proc-macro-error2`, unmaintained, no vulnerability), reached through `jig-mls` → `openmls_rust_crypto` → `hpke-rs` → `libcrux-sha3` → `hax-lib` | No. Never linked into a shipped binary. |
+| Linked, unreachable secret (#303) | RUSTSEC-2026-0387 (`crypto-bigint` 0.5, secret-dependent branches), reached through `openmls_rust_crypto` 0.6 → `elliptic-curve` 0.13; no compatible bump exists | No secret reaches it: jig holds no elliptic-curve secret, and `jig-mls` refuses group infos, key packages and welcomes in any other ciphersuite before running their crypto. One path verifies a P-256 signature over public values only. `deny.toml` says when the ignore goes. |
 
 The twelve other ignores this section used to list are gone, resolved rather than
 re-annotated: the `time`, `tracing-subscriber` and `rand` fixes arrived with later
@@ -135,7 +140,7 @@ file records each removal.
 | Item | Current state (verified) | Ready means | Verdict |
 | --- | --- | --- | --- |
 | Install (source) | `install.sh` detects a source checkout and runs `cargo build --release` for `jig-server`, `jig-cli`, and `text-block` (wasm32-wasip1). Works. | Same. | READY |
-| Install (binary) | `install.sh` downloads the tarball and `SHA256SUMS` from the GitHub Release (or a `JIG_RELEASES_BASE` mirror), verifies the checksum, and verifies `SHA256SUMS.sig` with `ssh-keygen -Y` against a pinned release key. A missing signature file, a bad signature or a missing `ssh-keygen` is refused; only an explicit `JIG_VERIFY_SIGNATURE=0` installs on the checksum alone. `install-smoke.yml` runs the `curl \| bash` path on every PR that touches the installer, against that PR's build signed with a throwaway key, and after each release against the published tag on Linux and macOS. No release has been published yet. | URL points where artifacts actually are; paths match the tarball layout; checksum and signature verified before extraction. | GAP: no published release |
+| Install (binary) | `install.sh` downloads the tarball and `SHA256SUMS` from the GitHub Release (or a `JIG_RELEASES_BASE` mirror), verifies the checksum, and verifies `SHA256SUMS.sig` with `ssh-keygen -Y` against a pinned release key. A missing signature file, a bad signature or a missing `ssh-keygen` is refused; only an explicit `JIG_VERIFY_SIGNATURE=0` installs on the checksum alone. `install-smoke.yml` runs the `curl \| bash` path on every PR that touches the installer, against that PR's build signed with a throwaway key, and after each release against the published tag on Linux and macOS. `v0.2.0-alpha.1` (2026-10-19) and `v0.2.0-alpha.2` (2026-10-25) are published, signed and installable this way; each release run passed the install smoke against its published release on Ubuntu and macOS. The `v0.1.0-alpha.1` prerelease page has no assets and cannot be installed. | URL points where artifacts actually are; paths match the tarball layout; checksum and signature verified before extraction. | READY |
 | Upgrade path | None. No `jig upgrade`, no version pinning, no store migration story. `install.sh` overwrites `$JIG_HOME/bin` in place. | A documented upgrade that states what happens to `jig_v002.db`, and to the `jig.db` an older release left behind (no longer opened since #196; `deploy/README.md` says the operator may delete it). | GAP |
 | Backup | `deploy/jig-backup.sh` + systemd timer. Genuinely good: `VACUUM INTO` (not `cp`) for the block store `jig_v002.db` and the nameserver's `nameserver.db` and `nameserver_v002.db`, the sealed `server.jigkey` and `nameserver_v002.jigkey` included (a nameserver store without its key is refused; a key still in clear is copied with a warning), `umask 077`, partial snapshots removed on failure, retention pruning with `DRY_RUN`. | Same, plus offsite. | READY |
 | Restore | Documented in `deploy/README.md` ("Restore"), including the `chmod 600` on the `.jigkey` files, adding a slot on another machine, and a post-restore `server_did` check. | Same. | READY |
@@ -151,36 +156,28 @@ file records each removal.
 | --- | --- | --- |
 | WSS envelope | Yes — `Envelope { v: u8 }`, always `1`, plus `suite` ([`envelope.rs`](../repos/jig-pipeline/src/envelope.rs)) | **Yes.** A frame with any other `v` is refused `UNSUPPORTED_VERSION`, and any frame suite other than `none` `UNSUPPORTED_SUITE` (content suites, `mls` included, are per block), before the frame is read. |
 | Block manifest | Yes — `BlockManifest.schema`, default `https://jig.dev/schema/block-manifest/v0.1` ([`manifest.rs`](../repos/jig-core/src/manifest.rs)) | **Yes.** `ingest` runs `BlockManifest::check_gates`, which refuses any schema outside `SUPPORTED_SCHEMAS` and any unimplemented encryption suite. The URI still says `jig.dev`, which is not our domain. |
-| Receipt | Yes — every v0.3 receipt carries `domain: "jig-block-receipt-v1"` ([`block_receipt.rs`](../repos/jig-core/src/block_receipt.rs)); receipts stored before v0.3 are JSON objects tagged `"v"` (`0.3-render`, `0.3-sealed`, `0.2-synthetic`), read by [`receipts.rs`](../repos/jig-pipeline/src/receipts.rs). The spec's [Receipts](../repos/jig-spec/src/receipts.md) chapter describes both | **Yes.** `SignedReceipt::open` refuses any other `domain`; legacy receipts are read and checked, never written. |
-| Fuel pricing | Yes — `PricingConfig::schedule_version`, now `"0.2.0"` ([`jig-runtime/src/config.rs:215`](../repos/jig-runtime/src/config.rs)) | Advisory. Carried into receipts and into `runtime/mod.rs` metadata; nothing rejects a mismatch. |
-
-The `0.1.0 → 0.2.0` pricing bump is the clearest example of why external users
-cannot yet assume stability: wasmtime 47 bills bulk memory ops (`memory.copy`,
-`memory.fill`) **per byte** where 24.x charged flat. The same block costs
-materially more fuel — the WASI reference fixture went from 1,713 to 18,098,
-almost all of it a 16 KiB memcpy in `_start`. Per-operator costs for ordinary
-compute are unchanged.
+| Receipt | Yes — every receipt is a COSE_Sign1 over deterministic CBOR whose payload carries `domain: "jig-block-receipt-v1"` and a `kind` (`exec`, `sealed`, `accepted`) ([`block_receipt.rs`](../repos/jig-core/src/block_receipt.rs), JEP-0006 A5). Receipts stored before v0.3 are JSON objects tagged `"v"` (`0.3-render`, `0.3-sealed`, `0.2-synthetic`), read by [`receipts.rs`](../repos/jig-pipeline/src/receipts.rs). The spec's [Receipts](../repos/jig-spec/src/receipts.md) chapter describes both | **Yes.** `SignedReceipt::open` refuses any other `domain`; legacy receipts are read and checked, never written. |
+| Fuel schedule | Yes — `FUEL_SCHEDULE_VERSION`, `"0.2.0"`, a constant in [`jig-runtime/src/identity.rs`](../repos/jig-runtime/src/identity.rs); an operator can no longer set it | Not needed. An `exec` receipt reports fuel as engine telemetry, and fuel is never compared (JEP-0006). |
 
 **Will receipts issued today validate tomorrow?** A receipt's *signature* will
-still verify — that is just ed25519 over bytes. But a receipt is a claim about
-determinism and cost, and both halves are unstable:
+still verify: it is ed25519 over bytes. What a receipt claims is an outcome:
+two `exec` receipts for the same component, world and invocation that both
+reached `ok` or `error` must agree on the class, trap code and outcome hash
+([`compare`](../repos/jig-core/src/block_receipt.rs)). A client checks a
+server's claim by re-running the component and comparing
+(`integration-tests/tests/client_verifies_render.rs`). Fuel, limits and engine
+details ride along as telemetry, so a cost-table change between wasmtime
+versions (wasmtime 47 began billing `memory.copy` and `memory.fill` per byte)
+no longer changes what a receipt asserts. Two servers whose render receipts
+disagree are surfaced to the reader as a warning, not refused
+(`h4_parity_warning`).
 
-- **Cost** is not comparable across `schedule_version` values. A `0.1.0`
-  receipt and a `0.2.0` receipt for the same block disagree by an order of
-  magnitude on a memcpy-heavy workload. The version string is the *only*
-  signal a consumer gets, and nothing enforces that they check it.
-- **Render-hash parity** across servers depends on both running the same
-  wasmtime. Integration test `h4_parity_warning` covers the divergence case;
-  the outcome is a warning, not a rejection.
-
-**Verdict: BLOCKER for any compatibility promise; READY if we promise nothing.**
-The envelope version, the encryption suite and the manifest schema are now gates; the
-receipt and pricing versions are still labels. External users
-must be told, in the README and on the release page, that v0.0.x makes no wire
-or receipt compatibility guarantee and that breaking changes ship without a
-migration. Crate versions already say this (`0.0.1`–`0.0.3`) and
-`release.yml` marks every `v0.0.*` tag `prerelease: true` — the docs need to
-match.
+**Verdict: READY, because we promise nothing.** The envelope version, the
+encryption suite, the manifest schema and the receipt domain are gates. The
+README (*"v0.x makes no compatibility guarantee"*) and every release's notes
+say that pre-1.0 releases make no wire, receipt or storage compatibility
+guarantee, and `release.yml` publishes every tag as a prerelease. A
+compatibility promise is still a BLOCKER for the day one is made.
 
 ---
 
@@ -257,7 +254,7 @@ registry, or copied code may appear anywhere under `repos/`. This belongs in
 | `CODEOWNERS` | DJ owns everything, repeated on sensitive paths | READY |
 | Discussion / support channel | dev@jig.onl and issues; security reports go to security@jig.onl or GitHub private reporting. No public chat. | GAP |
 | Triage owner | DJ, named in `SECURITY.md` for vulnerability reports. No rotation or SLA for ordinary issues. | GAP |
-| Release cadence | Undefined. `release.yml` is tag-triggered and marks every v0.x tag a prerelease; no release has been published. | GAP |
+| Release cadence | Two signed prereleases so far, `v0.2.0-alpha.1` (2026-10-19) and `v0.2.0-alpha.2` (2026-10-25), each with notes in [`.github/release/notes/`](../.github/release/notes/). `release.yml` is tag-triggered, waits for a maintainer's approval in the `release` environment, refuses notes that do not list the threat-register entries mitigated, and publishes every tag as a prerelease. No cadence is promised. | GAP |
 | CI coverage | `changes`, `workspace` (fmt, clippy and nextest on every workspace crate), `wasm-build` and `dependency-policy` (also daily at 07:17 UTC against `main`). A `nightly` job on the same schedule runs doc tests, skips nights when nothing under `repos/` (Markdown aside) and not `rust-toolchain.toml` changed, and does not gate merges. Drafts and docs-only PRs skip the build jobs; the merge queue runs everything. Linux only for the workspace job; macOS runs in the install smoke test inside `release.yml` and after each release, and in `block-abi-vectors.yml` on manual dispatch only. | GAP |
 
 **Test counts, measured at `1fa5681`** (`cargo nextest list`, stable 1.97.1): 1,054 tests in
@@ -272,21 +269,22 @@ precise number goes in a README, re-measure it there.
 
 **No. jig is not ready for external users today.**
 
-The sentence that used to decide it — *a jig server has no authentication and
-no authorization* — is no longer true: reads require proof of possession,
+The sentence that used to decide it, *a jig server has no authentication and
+no authorization*, is no longer true: reads require proof of possession,
 restricted channels are membership-gated on every surface, membership changes
-are owner-signed, and rate limits are on by default. Nor are the next three: DMs
-restricted channels and `--encrypted` open channels are end-to-end encrypted with MLS, the binary
-installer verifies a signed checksum, and `SECURITY.md` gives a disclosure path.
-What decides it now:
+are owner-signed, and rate limits are on by default. Nor are the next four: DMs,
+restricted channels and `--encrypted` open channels are end-to-end encrypted with
+MLS; `SECURITY.md` gives a disclosure path; and two signed releases are published
+and install through the verified `curl | bash` path. What decides it now:
 
 - Encryption is not the default for open channels (restricted channels are always MLS
   since D25), and the email bridge refuses inbound mail until it can join MLS groups.
-- Encrypted channels do not federate, and nothing has had an outside review (the
-  audit, D27, runs once v0.2 is code-complete).
+- Encrypted channels do not federate yet: a server can follow an open channel
+  another server sequences (#309) and relay its users' writes to the owner (#316), but MLS
+  across servers and the rest of F2 (Tasks 7 to 11) are still to build.
+- Nothing has had an outside review yet. The audit is scoped (D27, decided 2026-10-25):
+  Phase 1 before G3, Phase 2 after code-complete.
 - Admission rests on operator-written config, not earned reputation.
-- No real release has been published; the `curl | bash` path has run only against
-  CI builds and a throwaway prerelease (`v0.0.0-relpipe.1`).
 
 ### Minimum credible blocker set, ordered
 
@@ -295,13 +293,13 @@ What decides it now:
 | ~~1~~ | ~~**Authn + authz on `jig-server`**~~ | **Phases 1–4 DONE 2026-09-11** — per-request proof of possession on reads, `visibility`/membership enforced on history, listing, live delivery and posting, owner-signed membership changes, and an admission policy (bans, ruleset floors, explicit unknown-DID choice) on every read and write. Rate limits (#92) and optional admission proof-of-work (#94) followed. Still open from the same design: trusted connections (phase 5); see §1.1. |
 | ~~2~~ | ~~**Root `SECURITY.md` with an external reporting path**~~ | **DONE 2026-10-05** — `SECURITY.md`: security@jig.onl, 1/7/28-day targets, 90-day disclosure, malicious operators in scope. |
 | ~~3~~ | ~~**Root `LICENSE` + consistent per-crate SPDX ids**~~ | **DONE 2026-08-06** — dual-licensed MIT OR Apache-2.0, root licence pair added, every protocol crate aligned. `jig-spec` moved to CC-BY-4.0 on 2026-10-05. |
-| 4 | **Publish a release the installer can install** | The installer is fixed: it fetches from GitHub Releases, verifies `SHA256SUMS` and its signature, and `install-smoke.yml` tests it on PRs. What is missing is a published release; every `v0.1.0-alpha.1` attempt failed (see the roadmap). |
-| 5 | **Say plainly that v0.x has no compatibility guarantee** | README and spec done 2026-10-05; release notes still to do. `Envelope.v`, the manifest `schema` and the encryption suite are gates; receipt and pricing versions are labels (§3). |
+| ~~4~~ | ~~**Publish a release the installer can install**~~ | **DONE 2026-10-19** — `v0.2.0-alpha.1`, then `v0.2.0-alpha.2` on 2026-10-25: built, signed and published by `release.yml`, and installed by `install.sh` against the published release on Ubuntu and macOS in the same run. |
+| ~~5~~ | ~~**Say plainly that v0.x has no compatibility guarantee**~~ | **DONE** — README and spec 2026-10-05; every release's notes since `v0.2.0-alpha.1` ([`.github/release/notes/`](../.github/release/notes/)). `Envelope.v`, the manifest `schema`, the encryption suite and the receipt domain are gates (§3). |
 | ~~6~~ | ~~**Implementation-status banner on `jig-spec`**~~ | **DONE 2026-10-05**, re-checked 2026-10-18 — every chapter's banner and the threat register's status column match `main`. |
-| ~~7~~ | ~~**Clear the reachable advisory suppressions**~~ | **DONE** — one build-time-only ignore left (§1.7). |
+| ~~7~~ | ~~**Clear the reachable advisory suppressions**~~ | **DONE** — two ignores left: one build-time only, one linked where no secret reaches it (§1.7). |
 | 8 | **Publish a support channel** | DJ is the named triage owner for security reports, and dev@jig.onl takes everything else. No public discussion channel, and no SLA for ordinary issues. |
 
-Until those land, along with the encryption and review items above, the honest
+Until blocker 8 lands, along with the encryption, federation and review items above, the honest
 external posture is still: **source-available for reading and auditing, not for
 running on a public address.** That is a defensible thing to announce — "here is
 a protocol implementation, here is what works, here is the security model, do
