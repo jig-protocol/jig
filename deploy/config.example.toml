@@ -219,6 +219,14 @@ list_handles = false
 # burst = 8
 # per_min = 20
 #
+# How often a follower may relay its clients' writes into one channel you
+# own: a burst, then per_min a minute, for each peer and channel. A write
+# past it is refused with the time to try again. These are the defaults;
+# neither may be 0.
+# [federation.relayed_writes]
+# burst = 30
+# per_min = 120
+#
 # Name suffixes this server attests, published in its manifest. Only
 # root = "dns" with a multi-label suffix; a config-rooted suffix is never
 # published, and contract roots come in v0.3.

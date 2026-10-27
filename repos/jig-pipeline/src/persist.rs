@@ -592,13 +592,29 @@ fn sequence_on(
             |r| r.get(0),
         )
         .optional()?;
-    let (seq, prev) = match last {
-        None => (0, GENESIS_PREV),
+    let (seq, prev, after) = match last {
+        None => (0, GENESIS_PREV, None),
         Some(bytes) => {
             let last = IngestRecord::decode(&bytes)
                 .map_err(|e| PersistError::Corrupt(format!("ingest record: {e}")))?;
-            (last.seq + 1, last.hash())
+            (
+                last.seq + 1,
+                last.hash(),
+                Some((last.ingest_wall_ms, last.ingest_logical)),
+            )
         }
+    };
+    // The clock was read before this transaction, so a block sequenced
+    // after another can carry an earlier reading than it. Its record must
+    // still come after the last one in clock order too (JEP-0002 rule 9),
+    // or every client holds the chain to be a clock running backwards.
+    let (ingest_wall_ms, ingest_logical) =
+        clock_after((signer.ingest_wall_ms, signer.ingest_logical), after);
+    let signer = RecordSigner {
+        channel_id: signer.channel_id.clone(),
+        key: signer.key,
+        ingest_wall_ms,
+        ingest_logical,
     };
     let record = signer
         .sign(seq, block_cid, prev)
@@ -609,6 +625,19 @@ fn sequence_on(
         params![block_cid, record.channel_id, seq as i64, record.encode()],
     )?;
     Ok(record)
+}
+
+/// `reading`, or, when it is not strictly after `last` (the channel's last
+/// record's clock), the next clock after `last`: its logical counter plus
+/// one, or the next millisecond once the counter is spent.
+fn clock_after(reading: (u64, u32), last: Option<(u64, u32)>) -> (u64, u32) {
+    match last {
+        Some(last) if reading <= last => match last.1.checked_add(1) {
+            Some(logical) => (last.0, logical),
+            None => (last.0.saturating_add(1), 0),
+        },
+        _ => reading,
+    }
 }
 
 /// A right a block's signer must still hold at the block's own position in
@@ -818,6 +847,54 @@ impl SqliteStore {
             [server_did],
         )?;
         Ok(adopted)
+    }
+
+    /// Move the channels this server sequenced under an earlier DID of its
+    /// own to the DID it adopted ([`Self::adopt_local_sequencer`]), after a
+    /// key change: a key link moves a DID's standing, the sequencer role
+    /// included (JEP-0012). `predecessors` are the DIDs the server's own
+    /// verified key-link chain leaves. A row sequenced by any other DID is
+    /// carried, and stays as it is.
+    ///
+    /// `predecessors` are oldest first, as the chain is served; where two of
+    /// them hold one slug, the newer one's channel takes it.
+    ///
+    /// Returns how many rows moved, and how many could not: an earlier DID's
+    /// channel whose slug the current DID already sequences, which a server
+    /// that rotated without this step can have created. Those keep their old
+    /// sequencer, reached by id only, for the operator to resolve.
+    pub fn adopt_predecessor_sequencers(&self, predecessors: &[String]) -> Result<(usize, usize)> {
+        let local = self.local_sequencer();
+        if local.is_empty() {
+            return Err(PersistError::Corrupt(
+                "no sequencer adopted yet, so there is nothing to move channels to".to_string(),
+            ));
+        }
+        let old: Vec<&String> = predecessors.iter().filter(|d| *d != local).collect();
+        if old.is_empty() {
+            return Ok((0, 0));
+        }
+        let conn = self.conn.lock().expect("poisoned");
+        let tx = conn.unchecked_transaction()?;
+        // Newest DID first, one at a time: where two earlier DIDs hold one
+        // slug, the newer one's channel is the one clients reached by it
+        // last, so it takes the slug. OR IGNORE skips a row whose slug the
+        // current DID already holds (`UNIQUE(sequencer_did, slug)`).
+        let mut moved = 0;
+        for did in old.iter().rev() {
+            moved += tx.execute(
+                "UPDATE OR IGNORE channels SET sequencer_did = ?1 WHERE sequencer_did = ?2",
+                params![local, did],
+            )?;
+        }
+        let placeholders = vec!["?"; old.len()].join(", ");
+        let stuck: i64 = tx.query_row(
+            &format!("SELECT COUNT(*) FROM channels WHERE sequencer_did IN ({placeholders})"),
+            rusqlite::params_from_iter(old.iter()),
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok((moved, usize::try_from(stuck).unwrap_or(usize::MAX)))
     }
 
     /// The DID adopted by [`Self::adopt_local_sequencer`], or `""` before it.
@@ -2594,6 +2671,51 @@ mod tests {
         );
     }
 
+    /// A block whose clock was read before another's, but sequenced after
+    /// it, still gets a record strictly after the last in clock order: the
+    /// order clients hold a chain to (`chain-clock-backwards`).
+    #[test]
+    fn a_record_signed_with_an_earlier_reading_still_comes_after_the_last() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.upsert_channel(&seq_channel()).unwrap();
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let did =
+            jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
+        let reading = |wall, logical| RecordSigner {
+            ingest_logical: logical,
+            ..test_signer(&key, wall)
+        };
+        let clock = |r: &IngestRecord| (r.ingest_wall_ms, r.ingest_logical);
+        let land = |cid: &str, signer: &RecordSigner<'_>| {
+            store
+                .insert_block_sequenced(&at_hlc(cid, 1), signer)
+                .unwrap()
+        };
+        let create = land(&c("bafy_create"), &reading(100, 1));
+        // Read at logical 0, landing after the one read at logical 1.
+        let late = land(&c("bafy_late"), &reading(100, 0));
+        assert_eq!(clock(&late), (100, 2));
+        // The same reading again, and one from a millisecond before.
+        let same = land(&c("bafy_same"), &reading(100, 2));
+        assert_eq!(clock(&same), (100, 3));
+        let behind = land(&c("bafy_behind"), &reading(99, 7));
+        assert_eq!(clock(&behind), (100, 4));
+        // A reading ahead of the chain is kept as it is.
+        let ahead = land(&c("bafy_ahead"), &reading(101, 0));
+        assert_eq!(clock(&ahead), (101, 0));
+        let records = [create, late, same, behind, ahead];
+        for pair in records.windows(2) {
+            assert!(pair[1].follows(&pair[0]));
+            assert!(clock(&pair[1]) > clock(&pair[0]), "{:?}", pair);
+        }
+        for record in &records {
+            record.verify(&did).unwrap();
+        }
+        // The counter spent: the next millisecond.
+        assert_eq!(clock_after((5, 0), Some((5, u32::MAX))), (6, 0));
+        assert_eq!(clock_after((5, 0), None), (5, 0));
+    }
+
     fn block_cids(blocks: Vec<StoredBlock>) -> Vec<String> {
         blocks.into_iter().map(|b| b.cid).collect()
     }
@@ -3053,6 +3175,113 @@ mod tests {
         let a = store.get_channel_by_slug("#a").unwrap().unwrap();
         assert_eq!(a.sequencer_did, "did:jig:zServer");
         assert!(a.co_owners.is_empty());
+    }
+
+    /// After a key change, the channels sequenced under the server's
+    /// earlier DIDs are its own again; a carried channel stays carried, and
+    /// one whose slug the new DID already holds stays where it is.
+    #[test]
+    fn a_rotated_server_takes_back_the_channels_its_earlier_dids_sequenced() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let first = "did:jig:zFirst".to_string();
+        let second = "did:jig:zSecond".to_string();
+        let channel = |id: &str, slug: &str, sequencer: &str| {
+            let mut c = sample_channel(id, slug);
+            c.sequencer_did = sequencer.to_string();
+            c
+        };
+        for c in [
+            channel("bafy_one", "#one", &first),
+            channel("bafy_two", "#two", &second),
+            channel("bafy_clash", "#clash", &first),
+            channel("bafy_carried", "#carried", "did:jig:zElsewhere"),
+        ] {
+            store.upsert_channel(&c).unwrap();
+        }
+        assert!(
+            store
+                .adopt_predecessor_sequencers(std::slice::from_ref(&first))
+                .is_err(),
+            "nothing to move to before a sequencer is adopted"
+        );
+        store.adopt_local_sequencer("did:jig:zNow").unwrap();
+        // Created at the new DID before this step existed.
+        store
+            .upsert_channel(&channel("bafy_clash_now", "#clash", "did:jig:zNow"))
+            .unwrap();
+        assert_eq!(store.get_channel_by_slug("#one").unwrap(), None);
+
+        let moved = store
+            .adopt_predecessor_sequencers(&[first.clone(), second.clone()])
+            .unwrap();
+        assert_eq!(moved, (2, 1));
+        for slug in ["#one", "#two"] {
+            let c = store.get_channel_by_slug(slug).unwrap().unwrap();
+            assert_eq!(c.sequencer_did, "did:jig:zNow", "{slug}");
+        }
+        assert_eq!(
+            store.get_channel_by_slug("#clash").unwrap().unwrap().id,
+            "bafy_clash_now"
+        );
+        assert_eq!(
+            store
+                .get_channel_by_id("bafy_clash")
+                .unwrap()
+                .unwrap()
+                .sequencer_did,
+            first,
+            "kept, by id"
+        );
+        assert_eq!(
+            store
+                .get_channel_by_id("bafy_carried")
+                .unwrap()
+                .unwrap()
+                .sequencer_did,
+            "did:jig:zElsewhere"
+        );
+        assert_eq!(
+            store
+                .adopt_predecessor_sequencers(&[first, second])
+                .unwrap(),
+            (0, 1),
+            "a second boot moves nothing more"
+        );
+        assert_eq!(store.adopt_predecessor_sequencers(&[]).unwrap(), (0, 0));
+    }
+
+    /// Two earlier DIDs hold one slug and the current one none: the newer
+    /// DID's channel, the one clients reached by the slug last, takes it.
+    #[test]
+    fn of_two_earlier_dids_with_one_slug_the_newer_ones_channel_takes_it() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for (id, sequencer) in [
+            ("bafy_older", "did:jig:zFirst"),
+            ("bafy_newer", "did:jig:zSecond"),
+        ] {
+            let mut c = sample_channel(id, "#general");
+            c.sequencer_did = sequencer.to_string();
+            store.upsert_channel(&c).unwrap();
+        }
+        store.adopt_local_sequencer("did:jig:zNow").unwrap();
+        let predecessors = ["did:jig:zFirst".to_string(), "did:jig:zSecond".to_string()];
+        assert_eq!(
+            store.adopt_predecessor_sequencers(&predecessors).unwrap(),
+            (1, 1)
+        );
+        assert_eq!(
+            store.get_channel_by_slug("#general").unwrap().unwrap().id,
+            "bafy_newer"
+        );
+        assert_eq!(
+            store
+                .get_channel_by_id("bafy_older")
+                .unwrap()
+                .unwrap()
+                .sequencer_did,
+            "did:jig:zFirst",
+            "kept, by id"
+        );
     }
 
     /// JEP-0005 rule 1: a slug is unique only per sequencer. A carried
