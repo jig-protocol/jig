@@ -495,9 +495,12 @@ Things on our side, in order:
    `rust-toolchain.toml` and `repos/Cargo.lock`.
 2. **Make the threat register's status cells true at that commit.** AB-02, which said the
    nameserver asks for no proof-of-work, is corrected in #324.
-3. **Fix or remove the jig-runtime fuzz crate.** It does not build, and no CI job runs fuzzing.
-   Firms will ask for working harnesses. A fuzz target for `decode_key_package`, `SignedReceipt::open`,
-   COSE decoding and component validation would make the engagement cheaper.
+3. ~~**Fix or remove the jig-runtime fuzz crate.**~~ Done (#331). The broken crate is gone,
+   and [`repos/fuzz`](../../repos/fuzz/) has eight cargo-fuzz targets over what jig decodes
+   from the network: COSE, dCBOR, the WebSocket envelope, `ingest` records, MLS delivery and
+   group messages, the follower stream's peer frames, and a block's Wasm component. The
+   `Fuzz` workflow runs each briefly on a pull request that touches them, and longer once a
+   week. `SignedReceipt::open` has no target yet.
 4. **Write a reviewer's quick start:** how to build, run the integration tests, and start two
    servers and a nameserver on loopback. The `integration-tests` harness does this already; it
    needs a short README.
