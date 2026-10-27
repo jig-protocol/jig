@@ -146,3 +146,6 @@ tokio = { workspace = true, features = ["test-util"] }
 [features]
 default = ["sqlite"]
 sqlite = []
+# `v0_0_2_stream::fuzz_decode_frame`, for the fuzz targets in repos/fuzz only.
+# CI checks that no release binary enables it.
+fuzzing = []

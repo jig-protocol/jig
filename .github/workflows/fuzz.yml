@@ -1,0 +1,119 @@
+name: Fuzz
+
+# cargo-fuzz targets in repos/fuzz, over what jig decodes from the network:
+# dCBOR, COSE and the contract envelopes, IngestRecord, the follower stream's
+# peer frames, the WebSocket envelope, MLS messages, and a block's Wasm
+# component. A pull request touching any of them runs each target briefly; a
+# weekly run goes longer, so a dependency bump is fuzzed within the week
+# without each one paying for a full build; workflow_dispatch runs as long as
+# asked. A crash fails the job and uploads the input that caused it
+# (repos/fuzz/README.md: reproducing a crash).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - repos/fuzz/**
+      - repos/jig-core/src/dcbor.rs
+      - repos/jig-core/src/cose.rs
+      - repos/jig-core/src/contract.rs
+      - repos/jig-pipeline/src/envelope.rs
+      - repos/jig-pipeline/src/handshake.rs
+      - repos/jig-pipeline/src/ingest_record.rs
+      - repos/jig-server/src/v0_0_2_stream.rs
+      - repos/jig-mls/src/**
+      - repos/jig-runtime/src/component.rs
+      - .github/workflows/fuzz.yml
+  schedule:
+    # Sundays, 03:17 UTC.
+    - cron: '17 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        required: true
+        default: '1800'
+      targets:
+        description: Targets to run (space-separated; empty = all)
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # cargo-fuzz needs nightly for -Zsanitizer. Pinned, so a new nightly cannot
+  # turn a pull request red; bump it deliberately.
+  NIGHTLY: nightly-2026-10-24
+  # cargo-fuzz defaults to the target it was itself built for; the prebuilt
+  # binary is a musl build, and the nightly here has only the gnu std.
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  fuzz:
+    name: fuzz (${{ github.event_name == 'workflow_dispatch' && inputs.seconds || github.event_name == 'schedule' && '300' || '30' }}s per target)
+    # Drafts skip it; marking the PR ready for review runs it.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 360 || github.event_name == 'schedule' && 90 || 45 }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Nothing after checkout needs the token.
+          persist-credentials: false
+      - name: Install nightly
+        run: rustup toolchain install "$NIGHTLY" --profile minimal
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # repos/.cargo/config.toml puts every build in repos/target.
+          workspaces: repos/fuzz -> ../target
+          key: fuzz
+      - name: Build every target
+        working-directory: repos/fuzz
+        env:
+          CARGO_INCREMENTAL: '0'
+        run: |
+          # The workspace's lockfile, so the targets fuzz the versions jig
+          # ships; cargo adds only libfuzzer-sys.
+          cp ../Cargo.lock Cargo.lock
+          cargo "+$NIGHTLY" fuzz build -O --target "$TARGET"
+      - name: Run
+        working-directory: repos/fuzz
+        env:
+          SECONDS_PER_TARGET: ${{ github.event_name == 'workflow_dispatch' && inputs.seconds || github.event_name == 'schedule' && '300' || '30' }}
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+          case "$SECONDS_PER_TARGET" in ''|*[!0-9]*) echo "seconds must be a number" >&2; exit 2 ;; esac
+          [ -n "$TARGETS" ] || TARGETS="$(cargo "+$NIGHTLY" fuzz list | tr '\n' ' ')"
+          # One allocation over 512 MiB fails a target: what a decoder must
+          # never do on a bounded input. The RSS ceiling is higher: libFuzzer's
+          # own RSS creeps past 2 GiB over a long run with no input at fault.
+          failed=
+          for t in $TARGETS; do
+            echo "::group::$t"
+            if cargo "+$NIGHTLY" fuzz run -O --target "$TARGET" "$t" -- \
+                -max_total_time="$SECONDS_PER_TARGET" -timeout=30 \
+                -rss_limit_mb=4096 -malloc_limit_mb=512; then
+              echo "- \`$t\`: ${SECONDS_PER_TARGET}s, no crash" >> "$GITHUB_STEP_SUMMARY"
+            else
+              failed="$failed $t"
+              echo "- \`$t\`: **crashed** (artifact fuzz-crashes)" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then echo "::error::crashed:$failed"; exit 1; fi
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-crashes
+          path: repos/fuzz/artifacts/
+          if-no-files-found: ignore
