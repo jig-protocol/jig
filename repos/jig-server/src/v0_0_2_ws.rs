@@ -819,6 +819,20 @@ async fn handle_client_frame(
                     return Ok(());
                 }
             };
+            // A slug that names only a channel this server carries for its
+            // owner would wait for a creation that never comes here: a slug
+            // names a channel only where it is ordered. Name its id instead.
+            if channel.is_none()
+                && let Scope::Channel { slug } = &scope
+                && let Ok(Some(carried)) = state.ingest_ctx.store.carried_channel_by_slug(slug)
+            {
+                let message = format!(
+                    "{slug} here is carried for {}, which orders it; subscribe to it by its id: {}",
+                    carried.sequencer_did, carried.id
+                );
+                let _ = send_error(socket, Some(404), "CARRIED_CHANNEL", None, &message).await;
+                return Ok(());
+            }
             if let SubscriberIdentity::Did(did) = &who
                 && let Some(channel) = &channel
             {
@@ -1501,6 +1515,45 @@ mod tests {
             panic!("expected text, got {msg:?}");
         };
         serde_json::from_str(&text).expect("frame parses")
+    }
+
+    /// A subscription by the slug of a channel this server only carries for
+    /// its owner would never deliver: it is refused, naming the channel's id.
+    #[tokio::test]
+    async fn a_subscribe_by_a_carried_channels_slug_names_its_id() {
+        let (state, url) = start_test_server().await;
+        let id = jig_pipeline::ingest_record::label_cid("a carried channel");
+        state
+            .ingest_ctx
+            .store
+            .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                id: id.clone(),
+                slug: "#team".to_string(),
+                visibility: "open".to_string(),
+                created_at: 0,
+                owner_did: "did:jig:zuser".to_string(),
+                suite: "none".to_string(),
+                sequencer_did: "did:jig:zowner".to_string(),
+                co_owners: Vec::new(),
+            })
+            .unwrap();
+        let mut ws = established(&url).await;
+        let sub = signed_subscribe_frame(
+            &test_identity(),
+            Scope::Channel {
+                slug: "#team".to_string(),
+            },
+        );
+        ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
+            .await
+            .unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { code, message, .. } => {
+                assert_eq!(code, "CARRIED_CHANNEL");
+                assert!(message.contains(&id), "{message}");
+            }
+            other => panic!("expected an error frame, got {other:?}"),
+        }
     }
 
     /// An unsigned subscribe must be refused. Before this, `Frame::Subscribe`

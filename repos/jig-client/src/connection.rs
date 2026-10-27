@@ -178,6 +178,11 @@ pub struct ConnectOptions {
     /// serves, they give the DIDs the server signed its channels' earlier
     /// records as ([`crate::chain::ChannelChain::across`]).
     pub key_links: Vec<String>,
+    /// The channels the server carries for their owners, by channel id, each
+    /// with the owner's DID as this device proved it
+    /// ([`crate::pins::prove_carried`]): their records are held to the owner,
+    /// not to the server. Every other channel is held to the server.
+    pub carried: HashMap<String, String>,
 }
 
 /// Per-channel delivery senders, keyed by channel slug.
@@ -349,6 +354,7 @@ impl Client {
             tls,
             on_contradiction,
             key_links,
+            carried,
         } = options;
         let url = Url::parse(server_url).map_err(|e| ClientError::BadUrl(e.to_string()))?;
         // Map http(s) → ws(s) if user gave HTTP scheme; otherwise leave alone.
@@ -535,9 +541,13 @@ impl Client {
                                 let mut chains = lock_chains(&chains_for_reader);
                                 let chain =
                                     chains.entry(record.channel_id.clone()).or_insert_with(|| {
+                                        let signers = match carried.get(&record.channel_id) {
+                                            Some(owner) => vec![owner.clone()],
+                                            None => sequencers.clone(),
+                                        };
                                         crate::chain::ChannelChain::across(
                                             &record.channel_id,
-                                            sequencers.clone(),
+                                            signers,
                                             None,
                                         )
                                     });
@@ -1828,6 +1838,67 @@ mod tests {
             }]
         );
         assert_eq!(*close_code.lock().unwrap(), None);
+    }
+
+    /// A channel the server carries for its owner: its records are the
+    /// owner's, and the session holds them to the owner, as the device
+    /// proved it ([`ConnectOptions::carried`]). Records for it signed by the
+    /// server itself (a follower forging the owner's history) break it.
+    #[tokio::test]
+    async fn a_carried_channel_is_held_to_its_owner_not_the_server() {
+        let (follower, owner) = (test_signing_key(), test_signing_key());
+        let owner_did = jig_core::Did::from_ed25519_pubkey(owner.verifying_key().as_bytes())
+            .to_did_jig_string();
+        let carried =
+            || HashMap::from([(crate::chain::label_cid("bafyCreate"), owner_did.clone())]);
+        let blocks = bundles(3);
+        let cids: Vec<&str> = blocks.iter().map(|(_, c)| c.as_str()).collect();
+
+        // The owner's records, through the follower: delivered, no break.
+        let records = records_for(&owner, &cids[..2]);
+        let frames = (0..2)
+            .map(|i| block_frame(&records[i], &blocks[i].0))
+            .collect();
+        let (url, _) = start_scripted_server_with_key(follower.clone(), frames).await;
+        let options = ConnectOptions {
+            carried: carried(),
+            ..ConnectOptions::default()
+        };
+        let client = Client::connect_with_options(&url, test_identity(), options)
+            .await
+            .unwrap();
+        let mut stream = client.subscribe_channel("#hello").await.unwrap();
+        for expected in [0u64, 1] {
+            assert_eq!(stream.next().await.unwrap().ingest.unwrap().seq, expected);
+        }
+        assert!(client.contradiction().is_none());
+
+        // Without the proof, the same records break the session: the
+        // follower's word that another server orders the channel is not
+        // taken.
+        let frames = (0..2)
+            .map(|i| block_frame(&records[i], &blocks[i].0))
+            .collect();
+        let (url, _) = start_scripted_server_with_key(follower.clone(), frames).await;
+        let client = Client::connect(&url, test_identity()).await.unwrap();
+        let _stream = client.subscribe_channel("#hello").await.unwrap();
+        assert_eq!(await_contradiction(&client).await.code, "chain-unsigned");
+
+        // The follower signing the carried channel's history itself.
+        let forged = records_for(&follower, &cids);
+        let frames = (0..3)
+            .map(|i| block_frame(&forged[i], &blocks[i].0))
+            .collect();
+        let (url, _) = start_scripted_server_with_key(follower, frames).await;
+        let options = ConnectOptions {
+            carried: carried(),
+            ..ConnectOptions::default()
+        };
+        let client = Client::connect_with_options(&url, test_identity(), options)
+            .await
+            .unwrap();
+        let _stream = client.subscribe_channel("#hello").await.unwrap();
+        assert_eq!(await_contradiction(&client).await.code, "chain-unsigned");
     }
 
     #[tokio::test]
