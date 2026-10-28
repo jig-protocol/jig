@@ -699,7 +699,7 @@ pub async fn get_channel_history(
             StatusCode::NOT_FOUND,
             "CARRIED_CHANNEL",
             format!(
-                "{channel_ref} here is carried for {}, which orders it; read it by its id: {}",
+                "{channel_ref} here is carried for {}, which orders it; name it by its id: {}",
                 carried.sequencer_did, carried.id
             ),
         ));

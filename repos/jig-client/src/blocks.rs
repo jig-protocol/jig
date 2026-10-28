@@ -252,6 +252,25 @@ pub fn build_with_metadata(
     )
 }
 
+/// A block names the channel it acts on as the caller gave it: a `#` slug
+/// under `channel`, or the channel's id, the canonical text of its CID,
+/// under `channel_id`. A slug resolves only on the server that orders the
+/// channel, so a channel this server carries for another is named by id.
+///
+/// Plaintext blocks only: an MLS block's group is found by its slug
+/// ([`crate::secure`]), and no server carries an MLS channel yet.
+fn name_channel_by_id(metadata: &mut serde_json::Map<String, Value>) {
+    let mls = metadata.keys().any(|k| k.starts_with("mls_"));
+    let by_id = !mls
+        && metadata
+            .get("channel")
+            .and_then(Value::as_str)
+            .is_some_and(jig_core::canonical_cid::is_canonical_text);
+    if by_id && let Some(id) = metadata.remove("channel") {
+        metadata.insert(jig_pipeline::ingest::CHANNEL_ID_KEY.to_string(), id);
+    }
+}
+
 /// [`build_with_metadata`] with the content suite declared in
 /// `privacy.encryption`. `none` leaves `privacy` out, so plaintext blocks
 /// keep the exact bytes (and CIDs) they always had.
@@ -276,7 +295,10 @@ pub fn build_with_suite(
             metadata_visibility: Default::default(),
         });
     }
-    if let Value::Object(map) = metadata {
+    if let Value::Object(mut map) = metadata {
+        if suite == jig_core::EncryptionSuite::Unencrypted {
+            name_channel_by_id(&mut map);
+        }
         for (k, v) in map {
             builder = builder.metadata_entry(&k, v);
         }
@@ -319,6 +341,35 @@ mod tests {
             logical: 0,
             server_did: id.did().clone(),
         }
+    }
+
+    /// A channel named by its id is named under `channel_id`, where a
+    /// server resolves it, carried or not; a slug stays under `channel`.
+    #[test]
+    fn a_channel_named_by_its_id_is_named_under_channel_id() {
+        let id = test_identity();
+        let channel =
+            build_channel_create(&id, "#hello", "open", "did:jig:zserver", test_hlc(&id)).cid();
+        let meta = |block: &BuiltBlock| {
+            serde_json::from_slice::<BlockManifest>(&block.manifest_bytes)
+                .unwrap()
+                .metadata
+        };
+        let by_id = meta(&build_text_render(&id, &channel, "hi", test_hlc(&id)));
+        assert_eq!(
+            by_id.get("channel_id").and_then(|v| v.as_str()),
+            Some(channel.as_str())
+        );
+        assert!(!by_id.contains_key("channel"), "{by_id:?}");
+        let by_slug = meta(&build_text_render(&id, "#hello", "hi", test_hlc(&id)));
+        assert_eq!(
+            by_slug.get("channel").and_then(|v| v.as_str()),
+            Some("#hello")
+        );
+        assert!(!by_slug.contains_key("channel_id"), "{by_slug:?}");
+        // An MLS block keeps its slug key: the client finds its group by it.
+        let sealed = meta(&build_sealed_text(&id, &channel, b"ct", 1, test_hlc(&id)));
+        assert!(!sealed.contains_key("channel_id"), "{sealed:?}");
     }
 
     #[test]
