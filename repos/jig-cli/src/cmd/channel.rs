@@ -474,6 +474,73 @@ pub async fn promote(ctx: &CliContext, slug: String) -> Result<()> {
     Ok(())
 }
 
+/// The step left to the target server's operator, unless its peer entry for
+/// this server accepts offers by itself (`offers = "accept"`).
+const ACCEPT_STEP: &str = "its operator accepts with `jig-server contracts list`, then \
+                           `jig-server contracts accept <offer-id>`, unless its \
+                           [[federation.peers]] entry for this server says offers = \"accept\"";
+
+/// Apply `jig channel share <slug> <server-did> --grant <grant>` (JEP-0005
+/// rule 7). The server decides whether the caller may share, and offers the
+/// channel only to one of its configured peers; a share naming any other
+/// server is refused in the channel's log (`NOT_A_PEER`).
+pub async fn share(ctx: &CliContext, slug: String, to: String, grant: String) -> Result<()> {
+    let to = canonical_did(&to)?;
+    let grant = jig_core::contract::Grant::parse(&grant)
+        .map_err(|_| anyhow::anyhow!("--grant is read, write or member, not `{grant}`"))?;
+    let secure = Secure::open(ctx)?;
+    let info = visible_channel(&secure, &slug).await?;
+    if info.encrypted() {
+        // The server would take the share and the target would accept it,
+        // but a follower carries no MLS channel yet (JEP-0005 rule 19): its
+        // stream refuses the first block, so nothing would ever reach it.
+        anyhow::bail!(
+            "{slug} is end-to-end encrypted, and servers cannot carry an encrypted channel \
+             for each other yet: only open, unencrypted channels can be shared"
+        );
+    }
+    let id = secure.identity();
+    let cid = secure
+        .submit(&jig_client::blocks::build_channel_share(
+            id,
+            &slug,
+            &to,
+            grant,
+            now(id),
+        ))
+        .await?;
+    println!("asked to share {slug} with {to} ({} grant)", grant.as_str());
+    println!("  block_cid: {cid}");
+    println!(
+        "  this server offers it if {to} is one of its [[federation.peers]], and records \
+         NOT_A_PEER in the channel otherwise; {ACCEPT_STEP}"
+    );
+    if !info.id.is_empty() {
+        // A slug names a channel only on the server that sequences it
+        // (JEP-0005 rule 1): there, the channel is known by its id.
+        println!("  on that server, read it by its id: jig read {}", info.id);
+    }
+    Ok(())
+}
+
+/// Apply `jig channel unshare <slug> <server-did>` (JEP-0005 rule 11).
+pub async fn unshare(ctx: &CliContext, slug: String, to: String) -> Result<()> {
+    let to = canonical_did(&to)?;
+    let secure = Secure::open(ctx)?;
+    let id = secure.identity();
+    let cid = secure
+        .submit(&jig_client::blocks::build_channel_unshare(
+            id,
+            &slug,
+            &to,
+            now(id),
+        ))
+        .await?;
+    println!("asked to stop sharing {slug} with {to}");
+    println!("  block_cid: {cid}");
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct MemberView {
     did: String,

@@ -164,6 +164,49 @@ pub fn build_channel_promote(
     )
 }
 
+/// Build a signed `channel-share` block: ask the channel's server to offer
+/// the channel to the server `to` under `grant` (JEP-0005 rules 7, 7a).
+/// `to` is the target server's DID in canonical form. The owner, or a DID
+/// holding the `share` right, signs it; the server checks which.
+pub fn build_channel_share(
+    sender: &Identity,
+    channel_slug: &str,
+    to: &str,
+    grant: jig_core::contract::Grant,
+    hlc: HlcTimestamp,
+) -> BuiltBlock {
+    build_with_metadata(
+        sender,
+        BlockKind::ChannelShare,
+        hlc,
+        json!({
+            "channel": channel_slug,
+            "to": to,
+            "grant": grant.as_str(),
+        }),
+    )
+}
+
+/// Build a signed `channel-unshare` block: ask the channel's server to end
+/// its share with the server `to`, or withdraw an offer not yet answered
+/// (JEP-0005 rule 11). Signed as a `channel-share` must be.
+pub fn build_channel_unshare(
+    sender: &Identity,
+    channel_slug: &str,
+    to: &str,
+    hlc: HlcTimestamp,
+) -> BuiltBlock {
+    build_with_metadata(
+        sender,
+        BlockKind::ChannelUnshare,
+        hlc,
+        json!({
+            "channel": channel_slug,
+            "to": to,
+        }),
+    )
+}
+
 /// Build an encrypted chat message: a `text-render` whose content is an MLS
 /// application message for the channel's group. No `body` — a server
 /// refuses plaintext on an encrypted channel.

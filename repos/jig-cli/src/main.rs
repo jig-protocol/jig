@@ -223,6 +223,54 @@ enum ChannelAction {
         slug: String,
     },
 
+    /// Share a channel with another server (JEP-0005): its users then read
+    /// it there, as it lands here, in this server's order.
+    ///
+    /// The owner, or an admin holding the `share` right, may share; the
+    /// server checks. It offers the channel only to a server listed in its
+    /// own `[[federation.peers]]`, and records `NOT_A_PEER` in the channel
+    /// otherwise. The other server's operator then accepts with
+    /// `jig-server contracts list` and `jig-server contracts accept
+    /// <offer-id>`, unless its peer entry for this server says
+    /// `offers = "accept"`.
+    ///
+    /// On the other server the channel is known by its id, not its slug (a
+    /// slug names a channel only on the server that orders it): its users
+    /// read it with `jig read <channel-id>`, the id this command prints.
+    ///
+    /// Only open, unencrypted channels can be shared for now. Writes made on
+    /// the other server are not relayed back yet: its users write here.
+    Share {
+        #[arg()]
+        slug: String,
+        /// The other server's DID, as its `/.well-known/jig` gives it.
+        #[arg()]
+        server_did: String,
+        /// The grant recorded with the share (JEP-0005 rule 7a). Under any
+        /// grant the other server carries the whole channel; the grant says
+        /// what it may later relay back here: `read`, only protocol
+        /// traffic; `write`, also its users' posts; `member`, also
+        /// membership changes. It relays nothing back yet.
+        #[arg(long, value_parser = ["read", "write", "member"])]
+        grant: String,
+    },
+
+    /// Stop sharing a channel with another server.
+    ///
+    /// An offer not yet answered is withdrawn. A live share ends at once
+    /// here: this server sends that server nothing more of the channel, and
+    /// tells it the share is over once they are connected. That server
+    /// keeps the copy it holds, up to the last block it landed, and lands
+    /// nothing after; the end is recorded in the channel as a
+    /// `contract-end`. Same rights as `share`.
+    Unshare {
+        #[arg()]
+        slug: String,
+        /// The other server's DID.
+        #[arg()]
+        server_did: String,
+    },
+
     /// List a channel's members.
     Members {
         #[arg()]
@@ -865,6 +913,14 @@ async fn run() -> Result<()> {
             ChannelAction::Kick { slug, who } => cmd::channel::kick(&ctx, slug, who).await?,
             ChannelAction::Leave { slug } => cmd::channel::leave(&ctx, slug).await?,
             ChannelAction::Promote { slug } => cmd::channel::promote(&ctx, slug).await?,
+            ChannelAction::Share {
+                slug,
+                server_did,
+                grant,
+            } => cmd::channel::share(&ctx, slug, server_did, grant).await?,
+            ChannelAction::Unshare { slug, server_did } => {
+                cmd::channel::unshare(&ctx, slug, server_did).await?
+            }
             ChannelAction::Members { slug } => cmd::channel::members(&ctx, slug).await?,
             ChannelAction::Join { slug } => {
                 cmd::channel::join(&ctx, slug).await?;
