@@ -110,6 +110,13 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
      `hello` did not request `tiers` (rule 1; `TIER_UNSUPPORTED`). The one request serves both
      rules. An older client cannot show the label, so it
      may read a `public` channel but not post to it.
+   - A request made outside a connection, such as a REST block submission, has no `hello`. It
+     declares the features its client implements in a `Jig-Capabilities` header, a
+     comma-separated list. A server treats a request whose header does not list `tiers` as a
+     connection that did not request it.
+   - The gate applies to blocks from the server's own clients. The server's own blocks and its
+     in-process bridges are exempt. A follower applies the gate to its own clients before it
+     relays their blocks, because the owner cannot see the client's connection.
 6. **System channels are `public`.** The server's own channels under the reserved `#jig/`
    prefix carry what anyone must be able to verify. Today that is the manifest log
    (`#jig/manifest`). Key links stay where they are, at `/.well-known/jig` and in the welcome.
@@ -301,11 +308,13 @@ reads no encrypted tier.
       to a `server` or `shared` channel, is authorized by the role check of rule 12 or 13
       instead of the `membership` right. Every other membership block still needs the right.
     - Rule 7a's `member` grant also covers relayed self-joins (rule 13).
-    - The signed server manifest (JEP-0002 rule 12) gains `features`, an array of strings. A
-      server that implements this JEP lists `"tiers"` in it.
-    - An owner MUST NOT offer a `shared` channel to a follower whose manifest does not list
-      `"tiers"` in `features`. Such a follower would read the channel as `open`
-      and relay self-joins without a role check.
+    - An owner MUST NOT offer a `shared` channel to a follower whose `welcome`, on the owner's
+      own connection to it, does not carry the `tiers` feature (rule 1). Such a follower would
+      read the channel as `open` and relay self-joins without a role check.
+    - The signed server manifest (JEP-0002 rule 12) is unchanged. Its decoder refuses unknown
+      keys and any document that does not re-encode to its own bytes, and a client that cannot
+      decode the manifest a `welcome` cites treats it as a contradiction. A new key there would
+      make every older client refuse the server for good.
     - `shared` and `public` channels may be offered under a contract; `private` and `server`
       channels may not.
     - **`public` channels federate under contracts** (DJ, 2026-10-25), once F2's first phase has
@@ -373,8 +382,7 @@ admission).
   them.
 - **Old servers ignore `tier`** and fall back to `visibility`, so a `server` or `shared`
   channel on one would admit any authenticated joiner. Clients and owners therefore create or
-  offer those tiers only to servers whose `welcome` carries `tiers` or whose manifest lists it
-  (rules 1 and 37).
+  offer those tiers only to servers whose `welcome` carries `tiers` (rules 1 and 37).
 - **Old clients and the `welcome`.** A server signs `tiers` into a `welcome` only when the
   `hello` asked for it (rule 1), so an old client's signature check is unchanged.
 
@@ -394,7 +402,8 @@ To be added with the implementation:
 - a legacy-channel mapping table, including `#jig/manifest` mapped to `public`;
 - a `member-add` to a `#dm/` channel: the pair's other DID accepted, a third DID refused;
 - a self-join refused for a role below `join`.
-- a post to a `public` channel refused on a connection whose `hello` did not request `tiers`;
+- a post to a `public` channel refused on a connection whose `hello` did not request `tiers`,
+  and on a REST request whose `Jig-Capabilities` header does not list it;
 - a `welcome` to a `hello` without `tiers`, byte-identical to one from a server without this JEP.
 
 # LLM Influence
