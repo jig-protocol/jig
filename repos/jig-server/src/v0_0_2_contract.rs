@@ -3619,6 +3619,143 @@ mod tests {
         }
     }
 
+    /// JEP-0014 rule 13 across servers: a `shared` MLS channel on its owner,
+    /// shared with a follower. A member whose client is on the follower joins
+    /// by Welcome and posts through it; the owner's member reads the post.
+    /// Neither server ever holds the plaintext.
+    #[tokio::test]
+    async fn a_shared_mls_channel_is_written_through_its_follower_and_read_at_its_owner() {
+        use jig_mls::member::Member;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let did = |key: &SigningKey| {
+            jig_core::did::Did::from_ed25519_pubkey(key.verifying_key().as_bytes())
+        };
+        let p = pair(OfferPolicy::Accept).await;
+        let creator = Member::new(&p.user.to_bytes(), &did(&p.user)).unwrap();
+        let created = creator.create_group().unwrap();
+        let gid = created.group_id.clone();
+        let channel = post(
+            &p.owner,
+            &p.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({
+                "slug": "#across",
+                "tier": "shared",
+                "suite": "mls",
+                "mls_group_info": b64(&created.group_info),
+                "mls_ratchet_tree": b64(&created.ratchet_tree),
+            }),
+        )
+        .await
+        .unwrap();
+        p.share(&channel, "write").await;
+        p.both(&channel, OfferState::Accepted).await;
+
+        // A member whose client is on the follower, added on the owner. Its
+        // key package reaches the creator directly (custodians: Task 8).
+        let remote_key = SigningKey::from_bytes(&rand::random());
+        let remote = Member::new(&remote_key.to_bytes(), &did(&remote_key)).unwrap();
+        let kp = remote.key_packages(1, false).unwrap().remove(0);
+        let remote_did = did(&remote_key).to_did_jig_string();
+        let commit = creator.add(&gid, &kp, &remote_did).unwrap();
+        post(
+            &p.owner,
+            &p.user,
+            BlockKind::MemberAdd,
+            serde_json::json!({
+                "channel_id": channel,
+                "member_did": remote_did,
+                "mls_commit": b64(&commit.commit),
+                "mls_welcome": b64(commit.welcome.as_ref().unwrap()),
+            }),
+        )
+        .await
+        .unwrap();
+        creator.confirm(&gid).unwrap();
+        assert_eq!(
+            remote
+                .join_welcome(commit.welcome.as_ref().unwrap())
+                .unwrap(),
+            gid
+        );
+        p.follows.stream.pull_all();
+        p.caught_up(&channel).await;
+        assert_eq!(
+            p.follower
+                .ingest_ctx
+                .store
+                .get_mls_group_by_id(&channel)
+                .unwrap()
+                .unwrap()
+                .epoch,
+            1,
+            "the follower's mirror moved with the commit"
+        );
+
+        // The remote member posts through the follower.
+        let secret = "the meeting moved to thursday";
+        let (ct, epoch) = remote.encrypt(&gid, secret.as_bytes()).unwrap();
+        let parts = {
+            use ed25519_dalek::Signer as _;
+            let manifest = BlockManifest::builder()
+                .version(semver::Version::new(0, 1, 0))
+                .author(Author {
+                    did: did(&remote_key),
+                    public_key: None,
+                    roles: vec![],
+                })
+                .privacy(jig_core::Privacy {
+                    encryption: jig_core::EncryptionSuite::Mls,
+                    recipients: vec![],
+                    metadata_visibility: Default::default(),
+                })
+                .metadata_entry("channel_id", serde_json::json!(channel))
+                .metadata_entry("mls_message", serde_json::json!(b64(&ct)))
+                .metadata_entry("mls_epoch", serde_json::json!(epoch))
+                .build()
+                .unwrap()
+                .with_kind(BlockKind::TextRender)
+                .to_canonical_bytes()
+                .unwrap();
+            let code: Vec<u8> = Vec::new();
+            let sig = remote_key
+                .sign(&serde_json::to_vec(&(&manifest, &code)).unwrap())
+                .to_bytes()
+                .to_vec();
+            (manifest, code, sig)
+        };
+        let cid = client_post(&p.follower, &parts).await.unwrap();
+        let at_owner = p
+            .owner
+            .ingest_ctx
+            .store
+            .get_block(&cid)
+            .unwrap()
+            .expect("landed at the owner");
+        assert_eq!(at_owner.channel_id.as_deref(), Some(channel.as_str()));
+        p.caught_up(&channel).await;
+
+        // The owner's member reads it from what the owner stored.
+        let (stored, _): (Vec<u8>, Vec<u8>) =
+            serde_json::from_slice(&at_owner.bundle_bytes).unwrap();
+        let stored: BlockManifest = serde_json::from_slice(&stored).unwrap();
+        let ct = base64::engine::general_purpose::STANDARD
+            .decode(stored.metadata["mls_message"].as_str().unwrap())
+            .unwrap();
+        let read = creator.decrypt(&gid, &ct).unwrap();
+        assert_eq!(read.plaintext, secret.as_bytes());
+
+        // Neither server holds the plaintext, in any block of the channel.
+        for state in [&p.owner, &p.follower] {
+            for (_, manifest) in kinds_in(state, &channel) {
+                assert!(
+                    !serde_json::to_string(&manifest).unwrap().contains(secret),
+                    "a server holds the plaintext"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_write_through_a_write_follower_lands_at_the_owner_and_comes_back() {
         let p = pair(OfferPolicy::Accept).await;
