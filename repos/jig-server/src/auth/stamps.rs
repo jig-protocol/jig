@@ -69,10 +69,12 @@ struct Inner {
 }
 
 impl StampVerifier {
-    /// Epochs of `epoch_len`, holding at most `max_held` spent digests.
+    /// Epochs of `epoch_len` in whole seconds (at least one), holding at
+    /// most `max_held` spent digests.
     pub fn new(epoch_len: Duration, max_held: usize, now: Instant) -> Self {
         Self {
-            epoch_len: epoch_len.max(Duration::from_secs(1)),
+            // Whole seconds, as `roll` counts epochs in them.
+            epoch_len: Duration::from_secs(epoch_len.as_secs().max(1)),
             max_held: max_held.max(1),
             inner: Mutex::new(Inner {
                 epoch: 1,
@@ -245,6 +247,17 @@ mod tests {
             check(&v, &proof, b"cid-1", much_later),
             Err(StampError::OtherEpoch { .. })
         ));
+    }
+
+    /// A fractional length is cut to whole seconds, so the epoch count never
+    /// runs ahead of the time that has passed.
+    #[test]
+    fn a_fractional_epoch_length_counts_whole_seconds() {
+        let t0 = Instant::now();
+        let v = StampVerifier::new(Duration::from_millis(1_500), 100, t0);
+        // A jump of several epochs at once, then one more second.
+        assert_eq!(v.current(t0 + Duration::from_secs(3)).epoch, 4);
+        assert_eq!(v.current(t0 + Duration::from_secs(4)).epoch, 5);
     }
 
     /// With a fixed salt the nonce is fixed, so whether a wrong puzzle's
