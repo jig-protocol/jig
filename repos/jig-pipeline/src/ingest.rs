@@ -198,7 +198,13 @@ pub enum IngestError {
     /// a legitimate message — visible and loud, rather than a quietly degraded
     /// receipt.
     #[error("executing the `{kind}` module failed: {detail}")]
-    RenderFailed { kind: String, detail: String },
+    RenderFailed {
+        kind: String,
+        /// Why, as far as the client's next move is concerned: retry, change the block, or
+        /// neither.
+        cause: RenderCause,
+        detail: String,
+    },
     /// A control-plane block was signed by someone the channel does not
     /// answer to. See [`crate::authorize_write`] for the rules.
     #[error("`{kind}` on `{slug}` refused: `{sender}` is not the channel owner")]
@@ -1759,6 +1765,48 @@ async fn exec_receipt(
     match **executor {}
 }
 
+/// Why a render did not produce a usable result.
+///
+/// jig-pipeline's own copy of the runtime's `IncompleteReason`, so that [`IngestError`] exists
+/// in builds without the `executor` feature (the nameserver links no wasmtime).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderCause {
+    /// The wall-clock deadline passed. This host was too slow or too loaded this time; the
+    /// same block may well render on a retry.
+    DeadlineExceeded,
+    /// The block needs more fuel than this server allows. It does every time.
+    FuelExhausted,
+    /// The block needs more stack than this server allows. It does every time.
+    StackExhausted,
+    /// The host failed: the engine reported a fault, the render task died, or the executor
+    /// refused. Nothing about the block says whether a retry helps.
+    HostFault,
+}
+
+impl RenderCause {
+    /// Whether the block itself exceeds this server's limits, so that resending it unchanged
+    /// cannot succeed.
+    pub fn is_too_expensive(self) -> bool {
+        matches!(
+            self,
+            RenderCause::FuelExhausted | RenderCause::StackExhausted
+        )
+    }
+}
+
+#[cfg(feature = "executor")]
+impl From<&jig_runtime::component::IncompleteReason> for RenderCause {
+    fn from(reason: &jig_runtime::component::IncompleteReason) -> Self {
+        use jig_runtime::component::IncompleteReason;
+        match reason {
+            IncompleteReason::DeadlineExceeded => RenderCause::DeadlineExceeded,
+            IncompleteReason::FuelExhausted => RenderCause::FuelExhausted,
+            IncompleteReason::StackExhausted => RenderCause::StackExhausted,
+            IncompleteReason::HostFault(_) => RenderCause::HostFault,
+        }
+    }
+}
+
 /// The receipt of a landed `text-render` block, whatever happens while rendering it.
 ///
 /// Once the block and its record have landed, ingest must not report it as refused: it is in the
@@ -1776,6 +1824,7 @@ async fn receipt_after_landing(
     let rendered = if FAIL_AFTER_LANDING.with(|f| f.replace(false)) {
         Err(IngestError::RenderFailed {
             kind: "text-render".into(),
+            cause: RenderCause::HostFault,
             detail: "injected by a test".into(),
         })
     } else {
@@ -1828,10 +1877,12 @@ async fn run_text_render(
         // A join error points at the host (a panic, a pool shut down), not the block.
         .map_err(|e| IngestError::RenderFailed {
             kind: kind.clone(),
+            cause: RenderCause::HostFault,
             detail: format!("render task did not complete: {e}"),
         })?
         .map_err(|e| IngestError::RenderFailed {
             kind,
+            cause: RenderCause::HostFault,
             detail: e.to_string(),
         })
 }
@@ -1877,6 +1928,7 @@ async fn check_render_complete(
     if let jig_runtime::component::RunOutcome::Incomplete(reason) = &run.outcome {
         return Err(IngestError::RenderFailed {
             kind: BlockKind::TextRender.as_str().to_string(),
+            cause: RenderCause::from(reason),
             detail: format!("the render is incomplete: {}", reason.as_str()),
         });
     }
@@ -2376,6 +2428,39 @@ mod tests {
         );
     }
 
+    /// Each runtime reason maps to the cause the client is told about; only fuel and stack say
+    /// the block itself is too expensive.
+    #[test]
+    fn each_incomplete_reason_maps_to_its_render_cause() {
+        use jig_runtime::component::IncompleteReason;
+        let cases = [
+            (
+                IncompleteReason::DeadlineExceeded,
+                RenderCause::DeadlineExceeded,
+                false,
+            ),
+            (
+                IncompleteReason::FuelExhausted,
+                RenderCause::FuelExhausted,
+                true,
+            ),
+            (
+                IncompleteReason::StackExhausted,
+                RenderCause::StackExhausted,
+                true,
+            ),
+            (
+                IncompleteReason::HostFault("trap".to_string()),
+                RenderCause::HostFault,
+                false,
+            ),
+        ];
+        for (reason, cause, too_expensive) in cases {
+            assert_eq!(RenderCause::from(&reason), cause, "{reason:?}");
+            assert_eq!(cause.is_too_expensive(), too_expensive, "{cause:?}");
+        }
+    }
+
     /// A render that runs out of fuel is refused before the block lands: nothing is stored,
     /// sequenced or fanned out.
     #[tokio::test]
@@ -2396,7 +2481,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, IngestError::RenderFailed { detail, .. } if detail.contains("fuel-exhausted")),
+            matches!(&err, IngestError::RenderFailed { cause: RenderCause::FuelExhausted, detail, .. } if detail.contains("fuel-exhausted")),
             "{err:?}"
         );
         assert!(

@@ -1526,6 +1526,50 @@ mod tests {
         }
     }
 
+    /// A post too expensive to render comes back as a 422 Error frame that
+    /// does not invite a retry, the same answer REST gives.
+    #[tokio::test]
+    async fn ws_submit_too_expensive_to_render_returns_block_too_expensive() {
+        let mut state = AppState::for_test().unwrap();
+        let mut config = jig_runtime::RuntimeConfig::default();
+        config.limits.fuel_max = 100; // far below what a render costs
+        Arc::get_mut(&mut state.ingest_ctx)
+            .expect("the test state shares its ingest context with nothing yet")
+            .executor = Some(Arc::new(
+            jig_pipeline::executor::BlockExecutor::for_tests(config).unwrap(),
+        ));
+        seed_channel(&state, "#hello");
+        let (_state, url) = start_test_server_with(state).await;
+        let mut ws = established(&url).await;
+
+        let id = test_identity();
+        let block = build_text_render(&id, "#hello", "too expensive", test_hlc(&id));
+        let submit = Envelope::new(Frame::Submit {
+            bundle_b64: base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
+            sig_b64: base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
+        });
+        ws.send(TMessage::Text(
+            serde_json::to_string(&submit).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+
+        match next_frame(&mut ws).await.frame {
+            Frame::Error {
+                status,
+                code,
+                message,
+                ..
+            } => {
+                assert_eq!(code, "BLOCK_TOO_EXPENSIVE");
+                assert_eq!(status, Some(422));
+                assert!(message.contains("fuel-exhausted"), "{message}");
+                assert!(!message.contains("transient"), "{message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
     // --- subscribe + submit → Block delivered to subscriber -----------------
 
     /// Read one frame, or fail loudly rather than hanging.

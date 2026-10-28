@@ -15,7 +15,13 @@
 //! than an HTTP status.
 
 use axum::http::StatusCode;
-use jig_pipeline::ingest::IngestError;
+use jig_pipeline::ingest::{IngestError, RenderCause};
+use std::time::Duration;
+
+/// How long a client refused for a render deadline is told to wait. The
+/// deadline (250 ms by default) passed because this host was loaded; one
+/// second lets a burst drain without the client giving up.
+pub const RENDER_DEADLINE_RETRY: Duration = Duration::from_secs(1);
 
 /// Classify an ingest failure into `(status, error_code, message)`. Callers
 /// wrap this triple in whatever JSON body type their endpoint uses.
@@ -68,8 +74,30 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
             "NO_EXECUTOR",
             e.to_string(),
         ),
-        // 500: the block was acceptable and executing it failed here. May be
-        // transient, so the message says so rather than implying a bad request.
+        // 422: the block needs more fuel or stack than this server allows, and it
+        // will every time. Resending it unchanged cannot help, so nothing here says
+        // it might.
+        IngestError::RenderFailed { cause, .. } if cause.is_too_expensive() => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "BLOCK_TOO_EXPENSIVE",
+            format!("{e}; the block exceeds this server's render limits"),
+        ),
+        // 503: the render ran out of wall-clock time, which is this host's load,
+        // not the block. Same code as a host fault, so a client that matches on it
+        // still does; the status and the wait say this one is worth retrying.
+        IngestError::RenderFailed {
+            cause: RenderCause::DeadlineExceeded,
+            ..
+        } => {
+            let ms = RENDER_DEADLINE_RETRY.as_millis();
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "RENDER_FAILED",
+                format!("{e}; this server is busy, try again in {ms} ms (retry_after_ms={ms})"),
+            )
+        }
+        // 500: the host failed (an engine fault, a render task that died, an
+        // executor that refused). The block may be fine, so a retry may work.
         IngestError::RenderFailed { .. } => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "RENDER_FAILED",
@@ -247,6 +275,22 @@ mod tests {
             },
             IngestError::RenderFailed {
                 kind: "text-render".to_string(),
+                cause: RenderCause::DeadlineExceeded,
+                detail: "boom".to_string(),
+            },
+            IngestError::RenderFailed {
+                kind: "text-render".to_string(),
+                cause: RenderCause::FuelExhausted,
+                detail: "boom".to_string(),
+            },
+            IngestError::RenderFailed {
+                kind: "text-render".to_string(),
+                cause: RenderCause::StackExhausted,
+                detail: "boom".to_string(),
+            },
+            IngestError::RenderFailed {
+                kind: "text-render".to_string(),
+                cause: RenderCause::HostFault,
                 detail: "boom".to_string(),
             },
             IngestError::NotChannelOwner {
@@ -352,6 +396,41 @@ mod tests {
                 reason: "uppercase".to_string(),
             },
         ]
+    }
+
+    fn render_failed(cause: RenderCause) -> IngestError {
+        IngestError::RenderFailed {
+            kind: "text-render".to_string(),
+            cause,
+            detail: "the render is incomplete".to_string(),
+        }
+    }
+
+    /// A block too expensive for this server is a 422 that never suggests a
+    /// retry; a missed deadline is a 503 that says how long to wait; a host
+    /// fault keeps the 500 it always had.
+    #[test]
+    fn a_render_failure_is_classified_by_its_cause() {
+        for cause in [RenderCause::FuelExhausted, RenderCause::StackExhausted] {
+            let (status, code, message) = classify_ingest_error(&render_failed(cause));
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{cause:?}");
+            assert_eq!(code, "BLOCK_TOO_EXPENSIVE", "{cause:?}");
+            assert!(
+                !message.contains("transient") && !message.contains("retry"),
+                "{cause:?}: {message}"
+            );
+        }
+
+        let (status, code, message) =
+            classify_ingest_error(&render_failed(RenderCause::DeadlineExceeded));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "RENDER_FAILED");
+        assert!(message.ends_with("(retry_after_ms=1000)"), "{message}");
+
+        let (status, code, message) = classify_ingest_error(&render_failed(RenderCause::HostFault));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "RENDER_FAILED");
+        assert!(message.contains("may be transient"), "{message}");
     }
 
     /// The property this module exists to guarantee: the REST (`v0_0_2_blocks`)
