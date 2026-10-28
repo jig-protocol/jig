@@ -935,6 +935,6 @@ planned for after v0.2.0-alpha.3.
   separate blast radius.
 - **Building on the VPS needs a toolchain first.** A fresh box has no rustup, no
   C compiler, and no pkg-config; `ring` needs a C compiler. The workspace MSRV
-  is **1.95** (`jig-runtime` and `jig-server` inherit it), set by wasmtime 48.
+  is **1.97** (`jig-runtime` and `jig-server` inherit it), set by wasmtime 50.
   A 1 vCPU box wants ~2 GB of swap and 45–90 minutes. Cross-building on your Mac
   and copying the binary over is usually the better trade.
