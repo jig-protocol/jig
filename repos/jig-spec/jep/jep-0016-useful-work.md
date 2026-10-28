@@ -98,9 +98,17 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
 4. A **worker** is a client DID that is enrolled (rule 9) and eligible (rule 8).
 5. A **task** is one unit of useful work: one log checkpoint to witness, one evidence sample to
    validate, or one retrievability challenge to answer. It has a `task_id` (rule 13).
-6. An **epoch** is the ruleset's epoch, as R2.1 defines it for `f`. The **beacon** of an epoch is
-   the hash of the group log's first witnessed checkpoint at or after the epoch's start
-   (JEP-0009 rule 33), as for tribunal panels (JEP-0010 rule 20).
+6. An **epoch** is the ruleset's epoch, as R2.1 defines it for `f`: a range of positions in the
+   group log, never a span of wall-clock time. Every window in this JEP is counted in group-log
+   positions or epochs (TM-01, TM-02).
+6a. The **beacon** of an epoch is the labelled BLAKE3 hash of:
+   - (`domain`, `jig-uw-beacon-v1`);
+   - (`checkpoint`, the group log's first checkpoint at or after the epoch's start);
+   - one (`cosig`, signature) part for every cosignature of that checkpoint by a group witness
+     (JEP-0009 rule 33) received within `beacon_positions`, in the order of the witnesses' keys.
+
+   The log's owner fixes the checkpoint before any witness signs it, and cannot compute a
+   witness's signature, so it cannot grind the beacon alone (Security Considerations).
 7. **Content** is anything a channel's members encrypted, and anything inside a franking opening
    (JEP-0010 rule 8). A block's CID, its signed outer fields, `ingest` records, counters, proofs
    and log records are not content.
@@ -111,10 +119,11 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
    - it is established under the group's ruleset (JEP-0009 rule 16);
    - it has an enrolment that was included in a witnessed checkpoint before the epoch's beacon
      (rule 9);
-   - it has passed a retrievability challenge within the ruleset's `retrievability_window`
+   - it has passed a retrievability challenge within the last `retrievability_epochs`
      (rule 28), except that a worker's first retrievability task is open to an enrolled,
      established DID without one;
-   - it is not opted out (rule 10).
+   - it is not opted out (rule 10);
+   - it is not paused for missed reveals (rule 17a).
 
    An `--anon` session key is never eligible (JEP-0009 rule 22).
 9. **Enrolment.** A client enrols by sending an `uw-enrol` record to any of the group's
@@ -137,7 +146,8 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
 10. **Opting out** is always allowed. An `uw-withdraw` record `{v, did, ruleset: hash, at}`
     ends the enrolment from the next epoch.
     - Opting out, failing to reveal (rule 17) and not taking a task are never ruleset events.
-      They earn no credit and cost nothing.
+      They earn no credit and cost no standing. Repeated missed reveals pause eligibility
+      (rule 17a), which is not a score.
     - A client MUST offer the holder the choice, and MUST NOT enrol a DID without the holder's
       consent.
 11. **No status.** The role is not shown anywhere.
@@ -167,8 +177,7 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
     - Nobody but the worker knows it is assigned until it submits. The beacon is public, but
       `out` needs the worker's VRF secret key.
     - The worker cannot grind: its VRF key was fixed before the beacon (rule 9), and the
-      beacon is a witnessed checkpoint (JEP-0009 rule 33). Bias by the log's owner is a
-      residual risk (Security Considerations).
+      beacon mixes witnesses' cosignatures that the log's owner cannot compute (rule 6a).
     - The number assigned varies around `n`. Rule 19 says what happens when too few submit.
 13. **Tasks are derived, not handed out.** Every party computes the epoch's tasks from public
     data, so no one picks a task for a particular worker. Labelled BLAKE3 throughout, with
@@ -182,8 +191,12 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
     - **`retrieve`:** one task per stored object per epoch (section 8). `task_id` =
       H(domain, `retrieve`, object CID, epoch).
 14. **Conflicts.** A worker MUST NOT submit for a task whose subject is itself, or a server or
-    nameserver it operates. Skipping a task is never an
-    event (rule 10).
+    nameserver it operates. Skipping a task is never an event (rule 10).
+14a. **Same-subject cooldown.** An auditor MUST NOT validate the same subject twice within
+    `same_subject_cooldown_epochs`. It learns the subject when it fetches the body (rule 24), and
+    MUST skip such a task. A nameserver MUST refuse a `validate` commit from a DID that committed
+    on the same subject within the cooldown. The group's nameservers share what they need for
+    this under their data contract.
 15. **Proof at submission.** The worker proves its assignment when it submits (rule 16), by
     sending `π` and its enrolment's CID to the nameserver it submits to.
     - The nameserver MUST verify `π` against the enrolled `vrf_key`, `alpha` and the threshold,
@@ -194,8 +207,8 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
 
 ## 5. Commit and reveal
 
-16. **Commit.** Within `commit_secs` of the task's start, an assigned worker sends its group's
-    nameservers an `uw-commit`:
+16. **Commit.** Within `commit_positions` of the beacon's checkpoint, an assigned worker sends
+    its group's nameservers an `uw-commit`:
 
     ```
     {v, task_id, assign_commit, result_commit}
@@ -210,17 +223,25 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
       connection authenticated as its DID. The nameserver checks the proof as in rule 15.
     - The nameserver logs the `uw-commit` signed by itself, not by the worker. Nothing in the
       logged record identifies the worker, or links two commits to the same worker.
-17. **Reveal.** After `commit_secs`, and within `reveal_secs`, the worker sends `uw-reveal
-    {v, task_id, result, nonce_r}`.
-    - A reveal without a matching commit, or after `reveal_secs`, is ignored.
+17. **Reveal.** After the commit window closes, and within a further `reveal_positions`, the
+    worker sends `uw-reveal {v, task_id, result, nonce_r}`.
+    - A reveal without a matching commit, or after the reveal window, is ignored.
     - A worker that does not reveal earns no credit for the task (rule 10).
     - No worker's result is visible to any other worker before every commit for the task has
       closed, so nobody can copy a result or vote with a majority it has seen.
+17a. **Missed reveals.** A worker that commits and does not reveal lowers the task's chance of a
+    quorum at no cost to itself. So a DID with `max_missed` missed reveals within
+    `miss_window_epochs` is paused for `miss_pause_epochs`: it is not eligible (rule 8), and the
+    group's nameservers refuse its commits.
+    - The nameserver that received the commit knows the DID, and shares the miss with the
+      group's nameservers under their data contract.
+    - A pause is not a ruleset event, is not logged against the DID, and is visible only to the
+      group's nameservers and the DID's holder.
 18. **Assignment stays committed.** The group's nameservers log the `uw-commit` with its
     `assign_commit`, and log the accepted outcome (rule 20). They do not log `π` or the DID.
     - `assign_commit` is opened, by the worker or by the nameserver that verified `π`, only in a
       dispute: a fraud proof (rule 21), or a challenge that a submission was not assigned.
-    - The nameserver keeps `π` and `nonce_a` for `dispute_retention` (ruleset).
+    - The nameserver keeps `π` and `nonce_a` for `dispute_retention_epochs` (ruleset).
 19. **Quorum.** A task's outcome is **accepted** when at least `k` revealed results agree and
     none disagrees.
     - If fewer than `k` reveal, the task carries to the next epoch under a new `task_id` (the
@@ -231,15 +252,21 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
     `alpha` with label `jig-uw-escalate-v1`, excluding everyone who committed in the first
     round.
     - Its outcome is accepted when at least `k_escalate` agree.
-    - The accepted outcome is logged as an `uw-result` leaf
-      `{v, task_id, kind, outcome, result_commits: [CID], epoch}`.
-    - If the escalated round also has a dissent, the task goes to the group's tribunal as an
-      evidence-track case (JEP-0010 rule 13), since every result here is deterministic.
+    - The accepted outcome is logged as an `uw-result` leaf (rule 20a).
+    - If the escalated round also has a dissent, every dissenting result is checked as a fraud
+      proof (rule 21).
+20a. **The result leaf.** Every accepted, carried or unresolved task is logged as
+    `uw-result {v, task_id, kind, outcome, assign_commits: [hash], result_commits: [hash],
+    epoch}`. It names no worker. `f` (R2.1) reads these leaves.
 21. **Fraud proofs.** A revealed result that contradicts the deterministic recomputation of its
     task is a **fraud proof** against the worker who revealed it. The proof is
     `{task_id, the uw-commit, the uw-reveal, the opened assign_commit, the inputs}`.
-    - It is an evidence-track case (JEP-0010 rules 13–15).
-    - A verdict that sustains it is reported as `useful-work-fraud` (rule 29).
+    - It verifies itself: any party recomputes the task from the inputs under the named ruleset,
+      with no panel. A group nameserver that verifies one reports `useful-work-fraud`
+      (rule 29), citing it.
+    - Inputs are never content (rule 7), so a fraud proof never needs a tribunal to read content.
+      A nameserver that disputes another's fraud proof MAY open an evidence-track case
+      (JEP-0010 rules 13–15); its verdict then decides.
     - **Being in the minority is not fraud.** Only a result shown false by recomputation is.
       An honest worker whose input was withheld or corrupted reports that (rules 22 and 25),
       which is a result, not a dissent.
@@ -280,8 +307,8 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
     - recomputing `f` for the leaf's subject and period from the committed inputs gives the
       committed result.
 
-    A body that no holder releases within `commit_secs` is a result too: `{valid: false,
-    reason: "withheld"}`.
+    A body that no holder releases before the commit window closes is a result too:
+    `{valid: false, reason: "withheld"}`.
 26. **Execution in the encrypted tiers** is checked by members, not auditors. A server
     executes nothing under an encrypted suite (JEP-0014 rule 25), and the members' clients
     produce receipts that other members re-execute (JEP-0014 rule 34).
@@ -307,17 +334,27 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
 ## 9. Credit
 
 29. **Ruleset events.** Under JEP-0009 rule 9, the group's nameservers report:
-    - `useful-work`, positive, count 1, `ref` = the kind, for each well-formed, on-time reveal,
-      **whatever result it revealed and whatever the task's outcome**;
-    - `useful-work-fraud`, negative, citing the sustaining verdict (rule 21).
+    - `useful-work`, positive, `ref` = the kind, with `count` = the number of the worker's
+      well-formed, on-time reveals in the period, **whatever results it revealed and whatever
+      the tasks' outcomes**;
+    - `useful-work-fraud`, negative, citing the fraud proof (rule 21).
+
+    `useful-work` is reported **once per worker per period, as an aggregate**, never per task.
+    Its evidence is one commitment to the list of the worker's `assign_commit`s for the period,
+    opened only in a dispute. A per-task report would let the public log rebuild who audited
+    whom from task identifiers and timing.
 
     No event rewards agreeing with the majority, and no bounty rewards finding a fault. A
     worker that reports a split view or a withheld body is credited as for any other result.
 30. **Flat credit.** The weight of `useful-work` is the ruleset's `credit[kind]`. It does not
     depend on the result, the subject or the time spent.
 31. **Accrual stays gated by time.** Credits count towards positive evidence `r` (JEP-0009
-    rule 14), inside `accrual_per_period` (JEP-0009 rule 17). Useful work lets an established
-    subject keep or regain standing. It cannot buy standing faster than time allows.
+    rule 14), inside `accrual_per_period` (JEP-0009 rule 17), and within that inside
+    `credit_cap_per_period`, a fraction of `accrual_per_period` (R2.1 reference: at most half).
+    - Useful work lets an established subject keep or regain standing. It cannot buy standing
+      faster than time allows.
+    - Standing cannot come from useful work alone: witnessing is cheap for a farm of DIDs that
+      has passed the retrievability gate.
 32. **What credit is not.** It is not a payment, a token or a transferable balance. It cannot be
     redeemed, and it does not raise a server's capacity (D32).
 
@@ -344,14 +381,19 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
     | `n_escalate`, `k_escalate` | the same, for escalation |
     | `sample_rate` | the fraction of log leaves sampled per epoch for `validate` |
     | `retrieve_samples` | chunks per retrievability challenge |
-    | `commit_secs`, `reveal_secs` | the commit and reveal windows |
+    | `beacon_positions` | group-log positions after the checkpoint within which cosignatures count towards the beacon |
+    | `commit_positions`, `reveal_positions` | the commit and reveal windows, in group-log positions |
     | `max_carry` | epochs a task may carry before it is `unresolved` |
-    | `retrievability_window` | how recent a passed challenge must be for eligibility |
-    | `dispute_retention` | how long a nameserver keeps `π` and `nonce_a` |
+    | `same_subject_cooldown_epochs` | epochs before an auditor may validate the same subject again |
+    | `max_missed`, `miss_window_epochs`, `miss_pause_epochs` | the missed-reveal pause (rule 17a) |
+    | `retrievability_epochs` | how recent a passed challenge must be for eligibility |
+    | `dispute_retention_epochs` | how long a nameserver keeps `π` and `nonce_a` |
     | `credit[kind]` | the flat weight of `useful-work` |
-    | `fraud_weight` | the weight of `useful-work-fraud` |
+    | `credit_cap_per_period` | the most `useful-work` weight counted per period, as a fraction of `accrual_per_period` |
+    | `fraud_weight` | the weight of `useful-work-fraud`, more than one period's capped credit |
 
-    R2.1 sets the reference values.
+    No parameter is in seconds. R2.1 sets the reference values. Its starting points are `n` = 5,
+    `k` = 3, `n_escalate` = 11 and `k_escalate` = 7.
 
 # Security Considerations (Zero-Trust)
 
@@ -366,8 +408,10 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
   cannot identify in advance (rule 12), several of them (rule 19), who commit before they see
   each other's results (rule 17), and whose false result is a fraud proof (rule 21). Nothing in
   the role pays more for any particular result (rules 29–30), so there is nothing to sell.
-- **Auditors choosing targets.** Assignment comes from a key fixed before a beacon nobody
-  controls (rules 9 and 12), and the sample from the beacon (rule 13).
+- **Auditors choosing targets.** Assignment comes from a key fixed before the beacon (rules 9
+  and 12), and the sample from the beacon (rule 13). The same subject cannot be drawn twice by
+  one auditor within the cooldown (rule 14a).
+- **Withholding reveals to stall quorums.** Repeated misses pause the worker (rule 17a).
 - **NS-02, equivocation.** Workers witness logs from more than one path, and a split view is
   evidence (rule 22).
 - **OP-07, forged receipts.** Members re-execute in the encrypted tiers and anyone can in
@@ -380,16 +424,17 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
 
 **Residual risks:**
 
-- **A holder learns its auditor** when it releases a body (rule 15). It has at most
-  `commit_secs` to approach that auditor, and still has to corrupt `k` of them. Fetching from a
+- **A holder learns its auditor** when it releases a body (rule 15). It has at most the commit
+  window to approach that auditor, and still has to corrupt `k` of them. Fetching from a
   `retrieve` worker's copy instead of the log's owner narrows this, once encrypted copies exist
   (open question 2).
 - **A party with many established DIDs** is assigned in proportion to how many it holds. Each
   established DID costs time under JEP-0009 rule 17, and invite budgets bound the rest.
-- **Beacon bias.** The owner of the group log chooses which leaves a checkpoint includes, and so
-  can try several checkpoints for one that assigns workers it likes. Witnesses bound how long it
-  can withhold one. Panels share this risk (JEP-0010 rule 20), and a randomness beacon that no
-  log owner influences would close it for both.
+- **Beacon bias.** The beacon mixes the witnesses' cosignatures into the checkpoint (rule 6a),
+  so the log's owner cannot grind it alone: it would have to predict signatures it cannot
+  compute. A witness still chooses whether to cosign in time, and each colluding witness can
+  bias the beacon by that one choice. Tribunal panels (JEP-0010 rule 20) seed from the bare
+  checkpoint and are exposed to the owner's grinding; they could adopt rule 6a.
 - **Dormant encrypted channels** get no execution check (rule 26).
 - **Liveness.** A task whose workers do not reveal carries forward and can end `unresolved`
   (rule 19). Unresolved is logged, so the gap is visible.
@@ -453,8 +498,8 @@ JEP-0009, JEP-0010 and JEP-0014 on `main`, and reviewed by the author.
 2. **Encrypted evidence copies.** Which scheme lets a `retrieve` worker hold an evidence body
    that only the DID it concerns and an assigned auditor can decrypt, without the holder
    learning who is assigned?
-3. **Separate cap.** Whether `useful-work` credit needs its own cap per period, inside
-   `accrual_per_period`.
+3. ~~Separate cap.~~ Agreed with R2.1: `credit_cap_per_period`, inside `accrual_per_period`
+   (rule 31).
 4. **Re-execution credit.** D32 lists receipt re-execution as useful work. Here it is the
    members' check (rule 26), and it earns no credit: members are known, so their assignment
    cannot be secret, and outsiders cannot re-check an encrypted result. Should members' verified
