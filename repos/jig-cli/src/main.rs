@@ -485,6 +485,19 @@ enum BlockAction {
 
 #[derive(Subcommand, Debug)]
 enum KeysAction {
+    /// Register an alias for this identity (`--did` or `[user] did`), not a
+    /// new one: how a DID a closed suffix's allowlist names registers there.
+    Register {
+        /// The alias to register, e.g. `deji@dj.jig`, or `deji` when the
+        /// nameserver serves one suffix.
+        #[arg()]
+        alias: String,
+
+        /// Nameserver base URL (e.g. http://127.0.0.1:7070).
+        #[arg(long)]
+        nameserver: String,
+    },
+
     /// Renew the validity window of an existing alias attestation
     /// (same DID, extended TTL).
     Renew {
@@ -727,6 +740,10 @@ async fn run() -> Result<()> {
     // HTTP client.
     if let Some(Commands::Keys { action }) = cli.command {
         match action {
+            KeysAction::Register { alias, nameserver } => {
+                cmd::keys::register(&ctx, cmd::keys::KeysRegisterArgs { alias, nameserver })
+                    .await?;
+            }
             KeysAction::Renew { alias, nameserver } => {
                 cmd::keys::renew(&ctx, cmd::keys::KeysRenewArgs { alias, nameserver }).await?;
             }

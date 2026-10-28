@@ -40,6 +40,15 @@ use serde::{Deserialize, Serialize};
 use crate::cmd::common::CliContext;
 use crate::cmd::ns::{Nameserver, b64u};
 
+/// Parsed flags for `jig keys register`.
+#[derive(Debug, Clone)]
+pub struct KeysRegisterArgs {
+    /// The alias to register (`deji@dj.jig`, or bare when unambiguous).
+    pub alias: String,
+    /// Nameserver base URL.
+    pub nameserver: String,
+}
+
 /// Parsed flags for `jig keys renew`.
 #[derive(Debug, Clone)]
 pub struct KeysRenewArgs {
@@ -84,6 +93,31 @@ pub(crate) struct RotateRequestBody {
     /// JEP-0008 proof-of-work by the old DID, when the suffix asks for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pow: Option<jig_core::pow::Proof>,
+}
+
+// ============================================================================
+// register
+// ============================================================================
+
+/// Register an alias for the active identity. `jig init --request-alias`
+/// registers the DID it has just made; this registers one that already
+/// exists, such as a DID an operator put on a closed suffix's allowlist.
+pub async fn register(ctx: &CliContext, args: KeysRegisterArgs) -> Result<()> {
+    let id = ctx.identity()?;
+    let delegations = crate::config::delegations(ctx.effective());
+    let attestation = crate::cmd::init::register_with_nameserver(
+        &id,
+        &args.alias,
+        &args.nameserver,
+        &delegations,
+    )
+    .await?;
+    let ttl_days = (attestation.valid_until - attestation.valid_from) / 86_400;
+    println!(
+        "alias attestation verified: {} (valid {ttl_days}d, ns={})",
+        attestation.alias, attestation.ns_did
+    );
+    Ok(())
 }
 
 // ============================================================================

@@ -464,8 +464,10 @@ impl Nameserver {
             if code.as_deref() == Some("REGISTRATION_CLOSED") {
                 anyhow::bail!(
                     "registration on `{}` is closed at {}: only the DIDs its allowlist names \
-                     can register, and {did} is not listed for `{alias}`",
+                     can register, and {did} is not listed for `{alias}`. Once the operator \
+                     lists it, run `jig keys register {alias} --nameserver {}`",
                     name.suffix,
+                    self.base,
                     self.base
                 );
             }
