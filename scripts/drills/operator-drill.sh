@@ -186,7 +186,7 @@ step_client_setup() {
   mkdir -p "$CLIENT_HOME"
   client init drill-user >/dev/null
   client server set "$SERVER" >/dev/null
-  client channel create '#drill' >/dev/null
+  client channel create '#drill' --tier public --yes >/dev/null
   client channel create '#drill-sealed' --encrypted >/dev/null
   client send --channel '#drill' "before the backup" >/dev/null
   client send --channel '#drill-sealed' "sealed before the backup" >/dev/null

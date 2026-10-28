@@ -173,19 +173,36 @@ enum ChannelAction {
         #[arg()]
         slug: String,
 
-        /// Channel visibility — `open` (anyone can read; default) or
-        /// `restricted` (members only, and always end-to-end encrypted).
-        #[arg(long, default_value = "open")]
-        visibility: String,
+        /// Who joins and whether it is encrypted, fixed for the channel's
+        /// life: `private` (the default: members are added, end-to-end
+        /// encrypted), `server` (anyone holding the `--join` role on this
+        /// server joins, encrypted), `shared` (as `server`, across servers
+        /// under a share) or `public` (anyone, including the server operator,
+        /// can read it; asks you to confirm).
+        #[arg(long)]
+        tier: Option<String>,
+
+        /// For `server` and `shared`: the lowest server role that may join,
+        /// `member` (default) or `guest`.
+        #[arg(long)]
+        join: Option<String>,
+
+        /// Confirm a `public` channel without being asked (needed when stdin
+        /// is not a terminal).
+        #[arg(long)]
+        yes: bool,
 
         /// Succeed (exit 0) if the channel already exists instead of failing.
         #[arg(long)]
         exist_ok: bool,
 
-        /// End-to-end encrypt the channel with MLS: the server stores and
-        /// relays ciphertext it cannot read. Fixed at creation. Restricted
-        /// channels are always encrypted, so this only changes open ones.
-        #[arg(long)]
+        /// Older form of `--tier`: `restricted` is `private`, `open` is
+        /// `public` (or `server` with `--encrypted`).
+        #[arg(long, hide = true)]
+        visibility: Option<String>,
+
+        /// Older form of `--tier server --join guest`.
+        #[arg(long, hide = true)]
         encrypted: bool,
     },
 
@@ -855,11 +872,20 @@ async fn run() -> Result<()> {
         match action {
             ChannelAction::Create {
                 slug,
-                visibility,
+                tier,
+                join,
+                yes,
                 exist_ok,
+                visibility,
                 encrypted,
             } => {
-                cmd::channel::create(&ctx, slug, visibility, exist_ok, encrypted).await?;
+                let choice = cmd::channel::choose_tier(
+                    tier.as_deref(),
+                    join.as_deref(),
+                    visibility.as_deref(),
+                    encrypted,
+                )?;
+                cmd::channel::create(&ctx, slug, choice, exist_ok, yes).await?;
             }
             ChannelAction::Add { slug, who } => cmd::channel::add(&ctx, slug, who).await?,
             ChannelAction::Kick { slug, who } => cmd::channel::kick(&ctx, slug, who).await?,

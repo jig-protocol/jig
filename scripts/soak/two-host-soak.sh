@@ -306,7 +306,7 @@ warm_up() {
 }
 
 client_init a
-as a channel create "$CHANNEL" >/dev/null 2>&1 || fail "could not create $CHANNEL on A"
+as a channel create "$CHANNEL" --tier public --yes >/dev/null 2>&1 || fail "could not create $CHANNEL on A"
 READ_A="$CHANNEL"; READ_B="$CHANNEL"
 if [ "$FED_PATH" = contract ]; then
   as a channel share --help >/dev/null 2>&1 || fail "$BIN/jig has no \`channel share\`: build one that does"
