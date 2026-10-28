@@ -322,6 +322,7 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         | IngestError::UnknownTier { .. }
         | IngestError::TierSuiteMismatch { .. }
         | IngestError::TierFixed { .. }
+        | IngestError::TierUnsupported { .. }
         | IngestError::MissingRight { .. }
         | IngestError::RootOwnerRole { .. }
         | IngestError::UnknownRole { .. }
@@ -704,7 +705,10 @@ mod tests {
             &ingest_ctx,
             bundle,
             block.sender_sig.clone(),
-            IngestSource::LocalClient { conn_id: 1 },
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
         )
         .await
         .unwrap();

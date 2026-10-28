@@ -70,6 +70,7 @@ impl Member {
 async fn post(server: &TestJigServer, path: &str, block: &BuiltBlock) {
     let resp = reqwest::Client::new()
         .post(format!("{}{path}", server.http_url()))
+        .header("jig-capabilities", "tiers")
         .json(&json!({
             "bundle_b64": STANDARD.encode(block.canonical_bytes()),
             "sig_b64": STANDARD.encode(&block.sender_sig),

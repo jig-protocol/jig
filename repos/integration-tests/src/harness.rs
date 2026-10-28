@@ -471,6 +471,8 @@ impl TestJigServer {
         let client = reqwest::Client::new();
         let resp = client
             .post(format!("{}/api/v1/blocks", self.http_url()))
+            // As a current client: it labels `public` channels (JEP-0014).
+            .header("jig-capabilities", "tiers")
             .json(&submission_payload(block))
             .send()
             .await

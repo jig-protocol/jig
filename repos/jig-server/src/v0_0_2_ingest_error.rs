@@ -193,6 +193,11 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         ),
         // 409: the block is well formed; the channel's tier is fixed (rule 2).
         IngestError::TierFixed { .. } => (StatusCode::CONFLICT, "TIER_FIXED", e.to_string()),
+        // 403: the client may read the channel, not post to it, until it
+        // supports tiers (rule 5).
+        IngestError::TierUnsupported { .. } => {
+            (StatusCode::FORBIDDEN, "TIER_UNSUPPORTED", e.to_string())
+        }
         // 409: someone else committed first. The client catches up and
         // rebuilds; nothing about the request itself was wrong.
         IngestError::StaleEpoch { .. } => (StatusCode::CONFLICT, "STALE_EPOCH", e.to_string()),
@@ -313,6 +318,9 @@ mod tests {
             IngestError::TierFixed {
                 kind: "channel-promote".to_string(),
                 slug: "#team".to_string(),
+            },
+            IngestError::TierUnsupported {
+                slug: "#news".to_string(),
             },
             IngestError::StaleEpoch {
                 slug: "#sealed".to_string(),

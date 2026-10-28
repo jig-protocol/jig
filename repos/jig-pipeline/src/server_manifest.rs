@@ -212,6 +212,9 @@ impl ServerManifest {
                 execution: boolean(caps, "execution")?,
                 federation: boolean(caps, "federation")?,
                 max_future_skew_ms: uint(caps, "max_future_skew_ms")?,
+                // Not in the document: a key old decoders do not know would
+                // make them refuse it. A welcome carries it (`Capabilities::tiers`).
+                tiers: false,
             },
             peer_policy: PeerPolicy {
                 relayed_kinds: text_list(&doc, "relayed_kinds")?,
@@ -375,6 +378,7 @@ mod tests {
                 execution: false,
                 federation: true,
                 max_future_skew_ms: 300_000,
+                tiers: false,
             },
             peer_policy: PeerPolicy::default(),
         }

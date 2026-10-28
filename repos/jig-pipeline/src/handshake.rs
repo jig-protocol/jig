@@ -100,6 +100,13 @@ pub struct Capabilities {
     pub federation: bool,
     #[serde(default = "default_future_skew_ms")]
     pub max_future_skew_ms: u64,
+    /// Channel tiers (JEP-0014). In a hello, the client asks for them; in a
+    /// welcome, the server implements them and the hello asked. Never part of
+    /// [`Capabilities::canonical_bytes`]: a welcome signs it under its own tag,
+    /// and only when set, so a client that predates tiers checks the same
+    /// bytes it always did.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tiers: bool,
 }
 
 fn default_future_skew_ms() -> u64 {
@@ -113,6 +120,7 @@ impl Default for Capabilities {
             execution: false,
             federation: false,
             max_future_skew_ms: DEFAULT_FUTURE_SKEW_MS,
+            tiers: false,
         }
     }
 }
@@ -195,7 +203,12 @@ impl Default for ClientOffer {
         Self {
             versions: vec![u64::from(ENVELOPE_VERSION)],
             suites: implemented_suite_names(),
-            capabilities: Capabilities::default(),
+            // This build implements channel tiers (JEP-0014), as a client and
+            // as a dialing server, so it asks for them.
+            capabilities: Capabilities {
+                tiers: true,
+                ..Capabilities::default()
+            },
             pinned_server_did: None,
             pinned_suites: Vec::new(),
             peer_did: None,
@@ -344,6 +357,13 @@ impl WelcomeStatement {
         if !self.prior_key_links.is_empty() {
             push(&mut out, &[3]);
             push(&mut out, &canonical_list(&self.prior_key_links));
+        }
+        // Tiers (JEP-0014), signed only into a welcome to a hello that asked
+        // for them: a client that predates them never asks, and checks the
+        // bytes it always did.
+        if self.capabilities.tiers {
+            push(&mut out, &[4]);
+            push(&mut out, jig_core::tier::TIERS_FEATURE.as_bytes());
         }
         out
     }
@@ -617,7 +637,11 @@ pub fn negotiate(
         frame_suite: EncryptionSuite::Unencrypted.as_str().to_string(),
         server_did: String::new(),
         suites,
-        capabilities: server.capabilities.clone(),
+        capabilities: Capabilities {
+            // Only to a hello that asked: see `Capabilities::tiers`.
+            tiers: server.capabilities.tiers && hello.capabilities.tiers,
+            ..server.capabilities.clone()
+        },
         reputation: Reputation::none(),
         nonce: hello.nonce.clone(),
         server_nonce: fresh_nonce(),
@@ -1450,6 +1474,105 @@ mod tests {
             pending.interpret(&serde_json::to_string(&welcome).unwrap()),
             HandshakeResult::FailClosed { reason, .. } if reason.contains("salt")
         ));
+    }
+
+    /// JEP-0014 rule 1: a server signs `tiers` into a welcome only when the
+    /// hello asked, so a client that predates them never sees them.
+    #[test]
+    fn tiers_are_signed_only_into_a_welcome_whose_hello_asked() {
+        let key = generate_signing_key();
+        let server = |tiers| ServerOffer {
+            capabilities: Capabilities {
+                tiers,
+                ..offer_server().capabilities
+            },
+            ..offer_server()
+        };
+        for (asked, implemented, expect) in [
+            (true, true, true),
+            (false, true, false),
+            (true, false, false),
+            (false, false, false),
+        ] {
+            let (hello, pending) = begin(&ClientOffer {
+                capabilities: Capabilities {
+                    tiers: asked,
+                    ..Capabilities::default()
+                },
+                ..ClientOffer::default()
+            });
+            let Frame::Hello { nonce, .. } = hello.frame else {
+                panic!("hello");
+            };
+            let mut view = hello_view(&nonce);
+            view.capabilities.tiers = asked;
+            let welcome = seal(&key, negotiate(&view, &server(implemented)).unwrap());
+            let text = serde_json::to_string(&welcome).unwrap();
+            assert_eq!(text.contains("\"tiers\""), expect, "{text}");
+            match pending.interpret(&text) {
+                HandshakeResult::Established(verified) => {
+                    assert_eq!(
+                        verified.capabilities.tiers, expect,
+                        "asked {asked}, implemented {implemented}"
+                    )
+                }
+                other => panic!("expected a welcome, got {other:?}"),
+            }
+        }
+    }
+
+    /// A welcome without `tiers` signs exactly the bytes it did before tiers
+    /// existed; with them, those bytes and a tagged section after them.
+    #[test]
+    fn a_welcome_without_tiers_signs_what_it_always_did() {
+        let statement = negotiate(&hello_view("bm9uY2U="), &offer_server()).unwrap();
+        assert!(!statement.capabilities.tiers);
+        let before = statement.canonical_bytes();
+        let mut with = statement.clone();
+        with.capabilities.tiers = true;
+        let after = with.canonical_bytes();
+        assert!(after.len() > before.len() && after.starts_with(&before));
+        // The capabilities' own bytes never carry the flag.
+        assert_eq!(
+            statement.capabilities.canonical_bytes(),
+            with.capabilities.canonical_bytes()
+        );
+    }
+
+    /// A hello and a welcome from before tiers parse, as not asking and not
+    /// granting them; a welcome stripped of a signed `tiers` fails.
+    #[test]
+    fn tiers_parse_absent_and_cannot_be_stripped() {
+        let old: Capabilities = serde_json::from_str(
+            r#"{"block_kinds":[],"execution":false,"federation":true,"max_future_skew_ms":300000}"#,
+        )
+        .unwrap();
+        assert!(!old.tiers);
+        let key = generate_signing_key();
+        let (hello, pending) = begin(&ClientOffer::default());
+        let Frame::Hello {
+            nonce,
+            capabilities,
+            ..
+        } = hello.frame
+        else {
+            panic!("hello");
+        };
+        assert!(capabilities.tiers, "this build asks for tiers");
+        let mut view = hello_view(&nonce);
+        view.capabilities.tiers = true;
+        let mut server = offer_server();
+        server.capabilities.tiers = true;
+        let mut welcome = seal(&key, negotiate(&view, &server).unwrap());
+        if let Frame::Welcome { capabilities, .. } = &mut welcome.frame {
+            capabilities.tiers = false;
+        }
+        let HandshakeResult::FailClosed { reason, .. } =
+            pending.interpret(&serde_json::to_string(&welcome).unwrap())
+        else {
+            panic!("a stripped tiers flag must fail closed");
+        };
+        assert!(reason.contains("signature does not verify"), "{reason}");
     }
 
     #[test]

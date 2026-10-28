@@ -278,6 +278,9 @@ impl Secure {
             .http()
             .await?
             .post(&url)
+            // Outside a connection, the features a hello would ask for
+            // (JEP-0014 rule 5): this client labels `public` channels.
+            .header("jig-capabilities", jig_core::tier::TIERS_FEATURE)
             .json(&body)
             .send()
             .await

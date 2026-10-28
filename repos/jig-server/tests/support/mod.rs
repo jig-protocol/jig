@@ -474,6 +474,7 @@ impl TestServer {
             .method("POST")
             .uri("/api/v1/blocks")
             .header("Content-Type", "application/json")
+            .header("jig-capabilities", "tiers")
             .body(Body::from(serde_json::to_vec(&submission(block)).unwrap()))
             .unwrap();
         self.dispatch(http).await
@@ -502,6 +503,7 @@ impl TestServer {
             .method("POST")
             .uri("/api/v1/blocks")
             .header("Content-Type", "application/json")
+            .header("jig-capabilities", "tiers")
             .body(Body::from(serde_json::to_vec(&submission(block)).unwrap()))
             .unwrap();
         self.dispatch(http).await
@@ -662,6 +664,7 @@ impl TestServer {
             .method("POST")
             .uri(path)
             .header("Content-Type", "application/json")
+            .header("jig-capabilities", "tiers")
             .body(Body::from(body))
             .unwrap();
         self.dispatch_full(http).await

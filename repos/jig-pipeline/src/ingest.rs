@@ -21,6 +21,12 @@ use crate::persist::{SqliteStore, StoredBlock, StoredReceipt};
 pub enum IngestSource {
     LocalClient {
         conn_id: u64,
+        /// Whether the client implements channel tiers (JEP-0014): it asked
+        /// for `tiers` in its hello, or, outside a connection, declared it in
+        /// a `Jig-Capabilities` header. A client that does not cannot show
+        /// the `public` label, so it may not post to a `public` channel
+        /// (rule 5).
+        tiers: bool,
     },
     FederatedPeer {
         peer_did: Did,
@@ -301,6 +307,14 @@ pub enum IngestError {
          make a new channel instead"
     )]
     TierFixed { kind: String, slug: String },
+    /// Content for a `public` channel from a client that did not ask for
+    /// channel tiers, and so cannot label the channel as readable by anyone
+    /// (JEP-0014 rule 5).
+    #[error(
+        "channel '{slug}' is public: anyone, the server operator included, can read it. \
+         This client does not support channel tiers, so it cannot say so; upgrade it to post here"
+    )]
+    TierUnsupported { slug: String },
     /// The signer lacks the right the block needs as of its position in the
     /// channel's ingest chain (JEP-0005 rule 7b).
     #[error("`{kind}` on `{slug}` refused: `{sender}` does not hold the `{right}` right")]
@@ -570,6 +584,19 @@ pub async fn ingest(
                 via: via.to_did_jig_string(),
             });
         }
+    }
+    // JEP-0014 rule 5: a client that predates tiers cannot show the `public`
+    // label, so it may read a `public` channel but not post to one. Checked
+    // before a carried channel is refused here, so a follower refuses its own
+    // old clients before relaying: the owner cannot see their connection.
+    if let IngestSource::LocalClient { tiers: false, .. } = &source
+        && let Some(chan) = resolved_channel.as_ref()
+        && chan.tiering.tier.tier() == Some(jig_core::tier::Tier::Public)
+        && !crate::authorize_write::changes_the_channel(kind)
+    {
+        return Err(IngestError::TierUnsupported {
+            slug: chan.slug.clone(),
+        });
     }
     // A channel another server sequences takes its blocks only from that
     // server, with that server's records (`crate::follow`): this server never
@@ -2461,7 +2488,10 @@ mod tests {
                         m,
                         c,
                         sig,
-                        IngestSource::LocalClient { conn_id: w as u64 },
+                        IngestSource::LocalClient {
+                            conn_id: w as u64,
+                            tiers: true,
+                        },
                     )
                     .await
                     .unwrap();
@@ -2511,9 +2541,18 @@ mod tests {
         let (mb, cb, sig) =
             build_bundle_parts_with_channel(&sender_key, BlockKind::TextRender, "#hello");
 
-        let block_cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .unwrap();
+        let block_cid = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .unwrap();
 
         assert!(ctx.store.get_block(&block_cid).unwrap().is_some());
         let receipts = ctx.store.get_receipts_for_block(&block_cid).unwrap();
@@ -2573,9 +2612,18 @@ mod tests {
             BlockKind::TextRender,
             &[("channel", "#hello"), ("body", body)],
         );
-        do_ingest(ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .unwrap()
+        do_ingest(
+            ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .unwrap()
     }
 
     /// The `exec` receipt is signed by this server and names the invocation a client rebuilds
@@ -2630,9 +2678,18 @@ mod tests {
     async fn a_text_render_with_no_ingest_record_gets_an_accepted_receipt() {
         let ctx = test_ctx();
         let (mb, cb, sig) = build_bundle_parts(&random_signing_key(), BlockKind::TextRender);
-        let cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .unwrap();
+        let cid = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .unwrap();
         assert!(ctx.store.get_ingest_record(&cid).unwrap().is_none());
         let stored = ctx.store.get_receipts_for_block(&cid).unwrap().remove(0);
         assert_eq!(stored.render_hash, None);
@@ -2658,9 +2715,18 @@ mod tests {
             BlockKind::TextRender,
             &[("channel", "#hello"), ("body", "too expensive")],
         );
-        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .unwrap_err();
+        let err = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(&err, IngestError::RenderFailed { detail, .. } if detail.contains("fuel-exhausted")),
             "{err:?}"
@@ -2765,9 +2831,18 @@ mod tests {
             &[("channel", "#hello")],
         );
 
-        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .unwrap_err();
+        let err = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(&err, IngestError::MissingMetadata { field, .. } if field == "body"),
@@ -2794,9 +2869,18 @@ mod tests {
         let (mb, cb, sig) =
             build_bundle_parts_with_channel(&sender_key, BlockKind::TextRender, "#hello");
 
-        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .unwrap_err();
+        let err = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(&err, IngestError::NoExecutor { kind } if kind == "text-render"),
@@ -2819,9 +2903,18 @@ mod tests {
                 BlockKind::TextRender,
                 &[("channel", "#hello"), ("body", body)],
             );
-            let cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-                .await
-                .expect("ingest");
+            let cid = do_ingest(
+                &ctx,
+                mb,
+                cb,
+                sig,
+                IngestSource::LocalClient {
+                    conn_id: 1,
+                    tiers: true,
+                },
+            )
+            .await
+            .expect("ingest");
             ctx.store.get_receipts_for_block(&cid).unwrap()[0]
                 .render_hash
                 .clone()
@@ -2844,9 +2937,18 @@ mod tests {
         let sender_key = random_signing_key();
         let (mb, cb, sig) = build_bundle_parts(&sender_key, BlockKind::ChannelCreate);
 
-        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .unwrap_err();
+        let err = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, IngestError::DisallowedBlockKind { .. }));
     }
 
@@ -2862,7 +2964,10 @@ mod tests {
             mb,
             cb,
             bad_sig,
-            IngestSource::LocalClient { conn_id: 1 },
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
         )
         .await
         .unwrap_err();
@@ -2894,7 +2999,10 @@ mod tests {
                 manifest_bytes,
                 code_bytes,
                 sig,
-                IngestSource::LocalClient { conn_id: 1 },
+                IngestSource::LocalClient {
+                    conn_id: 1,
+                    tiers: true,
+                },
             )
             .await
             .unwrap_err();
@@ -2990,7 +3098,17 @@ mod tests {
         meta: serde_json::Value,
     ) -> Result<String, IngestError> {
         let (mb, cb, sig) = signed_parts(&who.key, kind, suite, meta);
-        do_ingest(ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 }).await
+        do_ingest(
+            ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
     }
 
     /// A block further ahead of the server's clock than the advertised bound
@@ -3013,7 +3131,18 @@ mod tests {
         };
 
         let (mb, cb, sig) = create("#ahead", now + 2 * bound);
-        match do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 }).await {
+        match do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        {
             Err(IngestError::ClockSkew {
                 ahead_ms, bound_ms, ..
             }) => {
@@ -3029,9 +3158,18 @@ mod tests {
 
         for (slug, wall_ms) in [("#near", now + bound / 2), ("#old", 1)] {
             let (mb, cb, sig) = create(slug, wall_ms);
-            do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-                .await
-                .unwrap_or_else(|e| panic!("{slug}: {e}"));
+            do_ingest(
+                &ctx,
+                mb,
+                cb,
+                sig,
+                IngestSource::LocalClient {
+                    conn_id: 1,
+                    tiers: true,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{slug}: {e}"));
         }
     }
 
@@ -3333,9 +3471,18 @@ mod tests {
         let (mb, cb, sig) =
             build_bundle_parts_with_channel(&sender_key, BlockKind::TextRender, "#gigeu");
 
-        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .unwrap_err();
+        let err = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(&err, IngestError::UnknownChannel { slug } if slug == "#gigeu"),
@@ -3366,9 +3513,18 @@ mod tests {
         let (mb, cb, sig) =
             build_bundle_parts_with_channel(&sender_key, BlockKind::TextRender, "#hello");
 
-        let cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .expect("existing channel must still accept text-render");
+        let cid = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .expect("existing channel must still accept text-render");
         assert!(ctx.store.get_block(&cid).unwrap().is_some());
     }
 
@@ -3385,9 +3541,18 @@ mod tests {
             &[("slug", "#first"), ("visibility", "open")],
         );
 
-        do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .expect("channel-create must bootstrap on an empty server");
+        do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .expect("channel-create must bootstrap on an empty server");
         assert!(ctx.store.get_channel_by_slug("#first").unwrap().is_some());
     }
 
@@ -3401,9 +3566,18 @@ mod tests {
             BlockKind::ChannelCreate,
             &[("slug", "#first"), ("visibility", "open")],
         );
-        let cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .unwrap();
+        let cid = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .unwrap();
         let stored = ctx.store.get_block(&cid).unwrap().unwrap();
         assert_eq!(stored.channel_id.as_deref(), Some(cid.as_str()));
         assert_eq!(
@@ -3432,14 +3606,32 @@ mod tests {
             BlockKind::ChannelCreate,
             &[("slug", "#later"), ("visibility", "open")],
         );
-        let channel_cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .unwrap();
+        let channel_cid = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .unwrap();
         let (mb, cb, sig) =
             build_bundle_parts_with_channel(&owner, BlockKind::TextRender, "#later");
-        do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .unwrap();
+        do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .unwrap();
         for kind in ["channel-create", "text-render"] {
             let got = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
                 .await
@@ -3461,9 +3653,18 @@ mod tests {
             BlockKind::TextRender,
             &[("channel_id", channel_id.as_str()), ("body", TEST_BODY)],
         );
-        let cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .unwrap();
+        let cid = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .unwrap();
         let stored = ctx.store.get_block(&cid).unwrap().unwrap();
         assert_eq!(stored.channel_id.as_deref(), Some(channel_id.as_str()));
         assert_eq!(
@@ -3496,9 +3697,18 @@ mod tests {
                     ("member_did", "did:jig:zX"),
                 ],
             );
-            let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-                .await
-                .unwrap_err();
+            let err = do_ingest(
+                &ctx,
+                mb,
+                cb,
+                sig,
+                IngestSource::LocalClient {
+                    conn_id: 1,
+                    tiers: true,
+                },
+            )
+            .await
+            .unwrap_err();
             assert!(
                 matches!(&err, IngestError::UnknownChannel { slug } if slug == named),
                 "{kind:?} naming {named}: expected UnknownChannel, got {err:?}"
@@ -3530,9 +3740,18 @@ mod tests {
                     ("body", TEST_BODY),
                 ],
             );
-            let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-                .await
-                .unwrap_err();
+            let err = do_ingest(
+                &ctx,
+                mb,
+                cb,
+                sig,
+                IngestSource::LocalClient {
+                    conn_id: 1,
+                    tiers: true,
+                },
+            )
+            .await
+            .unwrap_err();
             assert!(
                 matches!(&err, IngestError::UnknownChannel { slug } if *slug == hello),
                 "channel {slug}: expected UnknownChannel, got {err:?}"
@@ -3547,9 +3766,18 @@ mod tests {
                 ("body", TEST_BODY),
             ],
         );
-        let cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .unwrap();
+        let cid = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(
             ctx.store.get_block(&cid).unwrap().unwrap().channel_id,
             Some(hello)
@@ -3567,9 +3795,18 @@ mod tests {
             BlockKind::TextRender,
             &[("channel_id", channel_id.as_str()), ("body", TEST_BODY)],
         );
-        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .unwrap_err();
+        let err = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, IngestError::ChannelArchived { .. }),
             "expected ChannelArchived, got {err:?}"
@@ -3587,9 +3824,18 @@ mod tests {
             &[("channel", "#hello"), ("member_did", "did:jig:zDeji")],
         );
 
-        do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .expect("member-add by the owner against an existing channel must succeed");
+        do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .expect("member-add by the owner against an existing channel must succeed");
         let members = ctx.store.list_members(&channel_id).unwrap();
         assert!(members.iter().any(|m| m.member_did == "did:jig:zDeji"));
     }
@@ -3625,9 +3871,18 @@ mod tests {
             ],
         );
 
-        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .expect_err("a banned sender must be refused");
+        let err = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .expect_err("a banned sender must be refused");
         assert!(
             matches!(
                 &err,
@@ -3655,9 +3910,18 @@ mod tests {
         let other = random_signing_key();
         let (mb, cb, sig) =
             build_bundle_parts_with_channel(&other, BlockKind::TextRender, "#nowhere");
-        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .expect_err("unknown channel");
+        let err = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .expect_err("unknown channel");
         assert!(
             matches!(err, IngestError::UnknownChannel { .. }),
             "got {err:?}"
@@ -3687,9 +3951,18 @@ mod tests {
             ),
         ] {
             let (mb, cb, sig) = build_bundle_parts_with_meta(key, kind, &meta);
-            let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-                .await
-                .expect_err("an archived channel must refuse");
+            let err = do_ingest(
+                &ctx,
+                mb,
+                cb,
+                sig,
+                IngestSource::LocalClient {
+                    conn_id: 1,
+                    tiers: true,
+                },
+            )
+            .await
+            .expect_err("an archived channel must refuse");
             assert!(
                 matches!(err, IngestError::ChannelArchived { .. }),
                 "{kind:?}: expected ChannelArchived, got {err:?}"
@@ -3709,9 +3982,18 @@ mod tests {
             BlockKind::ChannelCreate,
             &[("slug", "#hello"), ("visibility", "open")],
         );
-        do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .expect("first create");
+        do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .expect("first create");
 
         for key in [random_signing_key(), owner.clone()] {
             let (mb, cb, sig) = build_bundle_parts_with_meta(
@@ -3719,9 +4001,18 @@ mod tests {
                 BlockKind::ChannelCreate,
                 &[("slug", "#hello"), ("visibility", "restricted")],
             );
-            let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-                .await
-                .expect_err("slug is taken");
+            let err = do_ingest(
+                &ctx,
+                mb,
+                cb,
+                sig,
+                IngestSource::LocalClient {
+                    conn_id: 1,
+                    tiers: true,
+                },
+            )
+            .await
+            .expect_err("slug is taken");
             assert!(
                 matches!(&err, IngestError::ChannelExists { slug } if slug == "#hello"),
                 "got {err:?}"
@@ -3738,9 +4029,18 @@ mod tests {
             BlockKind::ChannelCreate,
             &[("slug", "#retired"), ("visibility", "open")],
         );
-        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .expect_err("an archived slug stays taken");
+        let err = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .expect_err("an archived slug stays taken");
         assert!(
             matches!(err, IngestError::ChannelExists { .. }),
             "got {err:?}"
@@ -3766,7 +4066,10 @@ mod tests {
             mb.clone(),
             cb.clone(),
             sig.clone(),
-            IngestSource::LocalClient { conn_id: 1 },
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
         )
         .await
         .expect("first ingest");
@@ -3777,9 +4080,18 @@ mod tests {
                 .unwrap()
         );
 
-        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .expect_err("the same block a second time must be refused");
+        let err = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .expect_err("the same block a second time must be refused");
         assert!(
             matches!(err, IngestError::DuplicateBlock { .. }),
             "got {err:?}"
@@ -3805,9 +4117,18 @@ mod tests {
             &[("channel", "#hello"), ("member_did", "did:jig:zDeji")],
         );
 
-        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .expect_err("a non-owner must not enrol anyone");
+        let err = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .expect_err("a non-owner must not enrol anyone");
         assert!(
             matches!(err, IngestError::NotChannelOwner { .. }),
             "expected NotChannelOwner, got {err:?}"
@@ -3914,9 +4235,18 @@ mod tests {
         let sender_key = random_signing_key();
         let (mb, cb, sig) =
             build_bundle_parts_with_channel(&sender_key, BlockKind::TextRender, "#hello");
-        let cid = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .unwrap();
+        let cid = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .unwrap();
         let stored = ctx.store.get_block(&cid).unwrap().unwrap();
         assert_eq!(stored.channel_id.as_deref(), Some(channel_id.as_str()));
     }
@@ -3964,9 +4294,18 @@ mod tests {
         // bob posts a text-render to #dm/x.
         let (mb, cb, sig) =
             build_bundle_parts_with_channel(&bob_key, BlockKind::TextRender, "#dm/x");
-        do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .unwrap();
+        do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .unwrap();
 
         let got = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
             .await
@@ -4026,9 +4365,18 @@ mod tests {
         // bob posts a text-render to #dm/z (the slug — what manifest metadata carries).
         let (mb, cb, sig) =
             build_bundle_parts_with_channel(&bob_key, BlockKind::TextRender, "#dm/z");
-        do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 })
-            .await
-            .unwrap();
+        do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .unwrap();
 
         let got = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
             .await
@@ -4723,8 +5071,17 @@ mod tests {
             serde_json::json!({"slug": "#old", "visibility": "open", "suite": "none"}),
         ] {
             let (mb, cb, sig) = untiered(&who.key, BlockKind::ChannelCreate, meta.clone());
-            let refused =
-                do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 }).await;
+            let refused = do_ingest(
+                &ctx,
+                mb,
+                cb,
+                sig,
+                IngestSource::LocalClient {
+                    conn_id: 1,
+                    tiers: true,
+                },
+            )
+            .await;
             assert!(
                 matches!(refused, Err(IngestError::UnknownTier { .. })),
                 "{meta}: {refused:?}"
@@ -4737,7 +5094,17 @@ mod tests {
             BlockKind::ChannelCreate,
             serde_json::json!({"slug": "#old", "visibility": "restricted"}),
         );
-        let refused = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 }).await;
+        let refused = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await;
         assert!(
             matches!(refused, Err(IngestError::RestrictedRequiresMls { .. })),
             "{refused:?}"
@@ -5004,6 +5371,74 @@ mod tests {
         .expect("the owner archives a frozen channel");
     }
 
+    /// Rule 5: a client that did not ask for tiers reads a `public` channel
+    /// but does not post to it. Channel changes, other tiers and the server's
+    /// own blocks are not its gate's.
+    #[tokio::test]
+    async fn a_client_without_tiers_does_not_post_to_a_public_channel() {
+        let ctx = tiers_ctx();
+        let owner = person();
+        let public = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#news"}),
+        )
+        .await
+        .unwrap();
+        let post = |source: IngestSource, body: &str| {
+            let (mb, cb, sig) = signed_parts(
+                &owner.key,
+                BlockKind::TextRender,
+                jig_core::EncryptionSuite::Unencrypted,
+                serde_json::json!({"channel_id": public, "body": body}),
+            );
+            do_ingest(&ctx, mb, cb, sig, source)
+        };
+        let old = post(
+            IngestSource::LocalClient {
+                conn_id: 2,
+                tiers: false,
+            },
+            "from an old client",
+        )
+        .await;
+        match old {
+            Err(IngestError::TierUnsupported { slug }) => assert_eq!(slug, "#news"),
+            other => panic!("expected TIER_UNSUPPORTED, got {other:?}"),
+        }
+        post(
+            IngestSource::LocalClient {
+                conn_id: 3,
+                tiers: true,
+            },
+            "from a current one",
+        )
+        .await
+        .expect("a client that knows tiers posts");
+        post(IngestSource::AdminEndpoint, "from the server")
+            .await
+            .expect("the server posts");
+        let (mb, cb, sig) = signed_parts(
+            &owner.key,
+            BlockKind::MemberAdd,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel_id": public, "member_did": person().did}),
+        );
+        do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 2,
+                tiers: false,
+            },
+        )
+        .await
+        .expect("membership is not content");
+    }
+
     // ---- Slug grammar (jig_core::slug) ------------------------------------
 
     async fn create_from(
@@ -5022,7 +5457,10 @@ mod tests {
     }
 
     fn local() -> IngestSource {
-        IngestSource::LocalClient { conn_id: 1 }
+        IngestSource::LocalClient {
+            conn_id: 1,
+            tiers: true,
+        }
     }
 
     fn invalid_slug(r: &Result<String, IngestError>) -> bool {
