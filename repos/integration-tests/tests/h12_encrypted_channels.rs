@@ -69,6 +69,7 @@ impl Api<'_> {
     async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
         let resp = reqwest::Client::new()
             .post(self.url(path))
+            .header("jig-capabilities", "tiers")
             .json(body)
             .send()
             .await

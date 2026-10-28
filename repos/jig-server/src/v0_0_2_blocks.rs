@@ -957,6 +957,7 @@ mod tests {
             .method("POST")
             .uri(path)
             .header("Content-Type", "application/json")
+            .header(CAPABILITIES_HEADER, jig_core::tier::TIERS_FEATURE)
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
