@@ -9,6 +9,9 @@
 //! denormalized columns (`render_hash`, `sender_did`, `block_kind`, etc.)
 //! are read-optimization indexes whose source of truth is the canonical bytes.
 
+use jig_core::tier::{
+    HistoryPolicy, JoinRole, JoinServers, LegacyTier, StoredTier, Tier, legacy_tier,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -91,6 +94,75 @@ pub struct StoredChannel {
     /// channel's life. With `owner_did` (the creator) they are the channel's
     /// root owners: every right, never unassigned (JEP-0005 rule 7b).
     pub co_owners: Vec<String>,
+    /// The channel's tier and the terms that go with it (JEP-0014), fixed at
+    /// creation. A channel from before tiers holds what rule 21 maps it to.
+    pub tiering: ChannelTiering,
+}
+
+/// A channel's tier and its tier terms, as stored (JEP-0014). Fixed for the
+/// channel's life, like its suite.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ChannelTiering {
+    pub tier: StoredTier,
+    /// The lowest server role that may self-join: set for `server` and
+    /// `shared` channels only (rules 12 and 13).
+    pub join: Option<JoinRole>,
+    /// Whose roles count for a self-join: set for `shared` channels only
+    /// (rule 13).
+    pub join_servers: Option<JoinServers>,
+    /// Whether members may re-share history (rule 17, reserved).
+    pub history: HistoryPolicy,
+    /// The 1:1 a group was grown from (rule 19), as a channel id.
+    pub from_dm: Option<String>,
+    /// The frozen channel this one succeeds (rule 23), as a channel id.
+    pub successor_of: Option<String>,
+}
+
+impl ChannelTiering {
+    /// `tier`, with the defaults its creation block would carry: `join =
+    /// member` for `server` and `shared`, `join_servers = owner` for `shared`.
+    pub fn of(tier: Tier) -> Self {
+        Self {
+            tier: tier.into(),
+            join: tier.takes_join().then_some(JoinRole::default()),
+            join_servers: tier.takes_join_servers().then_some(JoinServers::default()),
+            history: HistoryPolicy::default(),
+            from_dm: None,
+            successor_of: None,
+        }
+    }
+
+    /// The tier a channel with this stored visibility and suite has when it
+    /// was created with one: `open` plaintext is `public`, `open` `mls` is
+    /// `server` with `join = guest`, `restricted` `mls` is `private`. A
+    /// `restricted` plaintext channel has no tier and is frozen. For rows a
+    /// caller writes directly, such as fixtures; ingest reads the block's own
+    /// terms instead.
+    pub fn current(visibility: &str, suite: &str) -> Self {
+        let open = crate::visibility::is_open(visibility);
+        match (suite, open) {
+            ("none", true) => Self::of(Tier::Public),
+            ("mls", true) => Self {
+                join: Some(JoinRole::Guest),
+                ..Self::of(Tier::Server)
+            },
+            ("mls", false) => Self::of(Tier::Private),
+            _ => Self::legacy("", visibility, suite),
+        }
+    }
+
+    /// What a channel created before tiers is read as (rule 21).
+    pub fn legacy(slug: &str, visibility: &str, suite: &str) -> Self {
+        let LegacyTier { tier, join } = legacy_tier(slug, visibility, suite);
+        Self {
+            tier,
+            join,
+            join_servers: None,
+            history: HistoryPolicy::default(),
+            from_dm: None,
+            successor_of: None,
+        }
+    }
 }
 
 impl StoredChannel {
@@ -509,11 +581,46 @@ fn row_to_stored_alias_attestation(
     })
 }
 
+/// Parse a stored identifier, or fail the row: a value this build does not know
+/// is corruption, never a default.
+fn parse_column<T: std::str::FromStr>(r: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<T>
+where
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    let text: String = r.get(idx)?;
+    text.parse().map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
+
+fn parse_optional_column<T: std::str::FromStr>(
+    r: &rusqlite::Row<'_>,
+    idx: usize,
+) -> rusqlite::Result<Option<T>>
+where
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    match r.get::<_, Option<String>>(idx)? {
+        None => Ok(None),
+        Some(text) => text.parse().map(Some).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(e))
+        }),
+    }
+}
+
 fn row_to_stored_channel(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChannel> {
     let co_owners: String = r.get(7)?;
     let co_owners: Vec<String> = serde_json::from_str(&co_owners).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
     })?;
+    let tiering = ChannelTiering {
+        tier: parse_column(r, 8)?,
+        join: parse_optional_column(r, 9)?,
+        join_servers: parse_optional_column(r, 10)?,
+        history: parse_column(r, 11)?,
+        from_dm: r.get(12)?,
+        successor_of: r.get(13)?,
+    };
     Ok(StoredChannel {
         id: r.get(0)?,
         slug: r.get(1)?,
@@ -523,11 +630,46 @@ fn row_to_stored_channel(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChanne
         suite: r.get(5)?,
         sequencer_did: r.get(6)?,
         co_owners,
+        tiering,
     })
 }
 
-const CHANNEL_COLUMNS: &str =
-    "id, slug, visibility, created_at, owner_did, suite, sequencer_did, co_owners";
+const CHANNEL_COLUMNS: &str = "id, slug, visibility, created_at, owner_did, suite, sequencer_did, \
+     co_owners, tier, join_role, join_servers, history, from_dm, successor_of";
+
+/// Add the tier columns (JEP-0014) and give every row without a tier the one
+/// rule 21 maps it to: `#jig/` plaintext channels are `public`, `restricted`
+/// `mls` ones `private`, `open` `mls` ones `server` with `join = guest`, and
+/// plaintext channels otherwise `frozen`.
+///
+/// `tier` is added as `NOT NULL DEFAULT ''`, and `''` means "not yet mapped":
+/// the backfill runs on every open, so a row can never keep it. Runs after
+/// [`rebuild_channels_slug_per_sequencer`], which rebuilds the table without
+/// these columns.
+fn add_channel_tiers(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "channels", "tier", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "channels", "join_role", "TEXT")?;
+    add_column_if_missing(conn, "channels", "join_servers", "TEXT")?;
+    add_column_if_missing(conn, "channels", "history", "TEXT NOT NULL DEFAULT 'none'")?;
+    add_column_if_missing(conn, "channels", "from_dm", "TEXT")?;
+    add_column_if_missing(conn, "channels", "successor_of", "TEXT")?;
+    let tx = conn.unchecked_transaction()?;
+    let untiered: Vec<(String, String, String, String)> = {
+        let mut stmt =
+            tx.prepare("SELECT id, slug, visibility, suite FROM channels WHERE tier = ''")?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, slug, visibility, suite) in untiered {
+        let mapped = ChannelTiering::legacy(&slug, &visibility, &suite);
+        tx.execute(
+            "UPDATE channels SET tier = ?2, join_role = ?3 WHERE id = ?1",
+            params![id, mapped.tier.as_str(), mapped.join.map(JoinRole::as_str)],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
 
 /// The `WHERE` term that keeps a slug lookup to the channels this server
 /// sequences: a slug is unique only per sequencer (JEP-0005 rule 1), and
@@ -1134,6 +1276,7 @@ impl SqliteStore {
         add_column_if_missing(conn, "channels", "suite", "TEXT NOT NULL DEFAULT 'none'")?;
         rekey_channels_by_id(conn)?;
         rebuild_channels_slug_per_sequencer(conn)?;
+        add_channel_tiers(conn)?;
         rebuild_alias_attestations_with_suffix(conn)?;
         crate::contracts::migrate(conn)?;
         crate::follow::migrate(conn)?;
@@ -2721,8 +2864,9 @@ impl SqliteStore {
 pub(crate) fn upsert_channel_on(conn: &Connection, c: &StoredChannel) -> Result<()> {
     conn.execute(
         "INSERT INTO channels
-             (id, slug, visibility, created_at, owner_did, suite, sequencer_did, co_owners)
-         VALUES (?,?,?,?,?,?,?,?)
+             (id, slug, visibility, created_at, owner_did, suite, sequencer_did, co_owners,
+              tier, join_role, join_servers, history, from_dm, successor_of)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET
             slug = excluded.slug,
             visibility = excluded.visibility,
@@ -2737,6 +2881,12 @@ pub(crate) fn upsert_channel_on(conn: &Connection, c: &StoredChannel) -> Result<
             c.sequencer_did,
             serde_json::to_string(&c.co_owners)
                 .map_err(|e| PersistError::Corrupt(format!("co_owners: {e}")))?,
+            c.tiering.tier.as_str(),
+            c.tiering.join.map(JoinRole::as_str),
+            c.tiering.join_servers.map(JoinServers::as_str),
+            c.tiering.history.as_str(),
+            c.tiering.from_dm,
+            c.tiering.successor_of,
         ],
     )?;
     Ok(())
@@ -2825,6 +2975,7 @@ mod tests {
             suite: "none".to_string(),
             sequencer_did: String::new(),
             co_owners: Vec::new(),
+            tiering: ChannelTiering::current("open", "none"),
         }
     }
 
@@ -3304,6 +3455,91 @@ mod tests {
         String,
         String,
     );
+
+    /// A store from before tiers: every row gets the tier rule 21 maps it to,
+    /// the `#jig/` row first, and opening the store again changes nothing.
+    #[test]
+    fn channels_from_before_tiers_get_their_rule_21_tier_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE channels (
+                 id          TEXT PRIMARY KEY,
+                 slug        TEXT UNIQUE NOT NULL,
+                 visibility  TEXT NOT NULL,
+                 created_at  INTEGER NOT NULL,
+                 owner_did   TEXT NOT NULL,
+                 archived_at INTEGER,
+                 suite       TEXT NOT NULL DEFAULT 'none'
+             );
+             INSERT INTO channels VALUES ('bafy_log', '#jig/manifest', 'open', 1, 'did:jig:zS', NULL, 'none');
+             INSERT INTO channels VALUES ('bafy_priv', '#team', 'restricted', 2, 'did:jig:zA', NULL, 'mls');
+             INSERT INTO channels VALUES ('bafy_srv', '#lobby', 'open', 3, 'did:jig:zA', NULL, 'mls');
+             INSERT INTO channels VALUES ('bafy_open', '#general', 'open', 4, 'did:jig:zA', NULL, 'none');
+             INSERT INTO channels VALUES ('bafy_old', '#secret', 'restricted', 5, 'did:jig:zA', 9, 'none');",
+        )
+        .unwrap();
+        SqliteStore::migrate(&conn).unwrap();
+        let tiers = |conn: &Connection| -> Vec<(String, String, Option<String>, String)> {
+            conn.prepare("SELECT id, tier, join_role, history FROM channels ORDER BY id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let row = |id: &str, tier: &str, join: Option<&str>| {
+            (
+                id.to_string(),
+                tier.to_string(),
+                join.map(str::to_string),
+                "none".to_string(),
+            )
+        };
+        let mapped = tiers(&conn);
+        assert_eq!(
+            mapped,
+            vec![
+                row("bafy_log", "public", None),
+                row("bafy_old", "frozen", None),
+                row("bafy_open", "frozen", None),
+                row("bafy_priv", "private", None),
+                row("bafy_srv", "server", Some("guest")),
+            ]
+        );
+        SqliteStore::migrate(&conn).unwrap();
+        assert_eq!(tiers(&conn), mapped, "the backfill runs once per row");
+        // Every row reads back as a channel.
+        let stored = conn
+            .prepare(&format!(
+                "SELECT {CHANNEL_COLUMNS} FROM channels ORDER BY id"
+            ))
+            .unwrap()
+            .query_map([], row_to_stored_channel)
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(stored[0].tiering, ChannelTiering::of(Tier::Public));
+        assert!(stored[1].tiering.tier.is_frozen());
+    }
+
+    /// A tier this build does not know fails the row, never reads as another.
+    #[test]
+    fn an_unknown_stored_tier_is_corruption() {
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteStore::migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO channels (id, slug, visibility, created_at, owner_did, suite, tier)
+             VALUES ('bafy_x', '#x', 'open', 1, 'did:jig:zA', 'none', 'secret')",
+            [],
+        )
+        .unwrap();
+        let read = conn.query_row(
+            &format!("SELECT {CHANNEL_COLUMNS} FROM channels"),
+            [],
+            row_to_stored_channel,
+        );
+        assert!(read.is_err(), "{read:?}");
+    }
 
     /// A store from before channel terms: `channels` with `UNIQUE(slug)` and
     /// no `sequencer_did`. The migration rebuilds it with
@@ -4164,6 +4400,7 @@ mod tests {
             suite: "none".to_string(),
             sequencer_did: String::new(),
             co_owners: Vec::new(),
+            tiering: ChannelTiering::current("open", "none"),
         };
         store.upsert_channel(&ch).unwrap();
         let fetched = store.get_channel_by_slug("#hello").unwrap().unwrap();
@@ -4210,6 +4447,7 @@ mod tests {
             suite: "none".to_string(),
             sequencer_did: String::new(),
             co_owners: Vec::new(),
+            tiering: ChannelTiering::current("restricted", "none"),
         })
         .unwrap();
         s.upsert_membership(&StoredMembership {
@@ -4289,6 +4527,7 @@ mod tests {
             suite: "none".to_string(),
             sequencer_did: String::new(),
             co_owners: Vec::new(),
+            tiering: ChannelTiering::current("open", "none"),
         }
     }
 

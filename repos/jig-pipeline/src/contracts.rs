@@ -1192,6 +1192,7 @@ pub(crate) mod tests {
                 suite: "none".to_string(),
                 sequencer_did: local.to_string(),
                 co_owners: Vec::new(),
+                tiering: crate::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         store

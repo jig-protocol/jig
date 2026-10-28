@@ -473,6 +473,7 @@ mod tests {
             suite: "none".to_string(),
             sequencer_did: String::new(),
             co_owners: Vec::new(),
+            tiering: crate::persist::ChannelTiering::current(visibility, "none"),
         };
         assert!(DeliveryPolicy::for_channel(&row("open"), vec![]).open);
         assert!(!DeliveryPolicy::for_channel(&row("restricted"), vec![]).open);
@@ -674,6 +675,7 @@ mod tests {
             suite: suite.to_string(),
             sequencer_did: String::new(),
             co_owners: Vec::new(),
+            tiering: crate::persist::ChannelTiering::current(visibility, suite),
         };
         assert!(DeliveryPolicy::for_channel(&row("open", "none"), vec![]).federates);
         assert!(!DeliveryPolicy::for_channel(&row("restricted", "none"), vec![]).federates);

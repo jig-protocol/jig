@@ -277,9 +277,30 @@ pub enum IngestError {
         grant: &'static str,
         via: String,
     },
-    /// A channel term (`sequencer`, `co_owners`) is malformed.
+    /// A channel term (`sequencer`, `co_owners`, a tier term) is malformed.
     #[error("channel-create term `{field}` is invalid: {detail}")]
     InvalidTerms { field: String, detail: String },
+    /// A `channel-create` names no tier this server knows, or names none and
+    /// is a plaintext `open` channel, which a client that predates tiers
+    /// cannot label (JEP-0014 rules 1 and 5).
+    #[error(
+        "channel-create needs a `tier` of `private`, `server`, `shared` or `public` (got {tier}); \
+         a plaintext channel is `public`, and a client that predates tiers must upgrade to create one"
+    )]
+    UnknownTier { tier: String },
+    /// The tier and the suite disagree (JEP-0014 rule 3): `public` is
+    /// plaintext, every other tier is encrypted.
+    #[error(
+        "a `{tier}` channel cannot use suite `{suite}`: `public` is `none`, the other tiers `mls`"
+    )]
+    TierSuiteMismatch { tier: &'static str, suite: String },
+    /// A block that would change a channel's tier, which is fixed for its
+    /// life (JEP-0014 rule 2).
+    #[error(
+        "`{kind}` on `{slug}` refused: a channel's tier is fixed when it is created; \
+         make a new channel instead"
+    )]
+    TierFixed { kind: String, slug: String },
     /// The signer lacks the right the block needs as of its position in the
     /// channel's ingest chain (JEP-0005 rule 7b).
     #[error("`{kind}` on `{slug}` refused: `{sender}` does not hold the `{right}` right")]
@@ -332,13 +353,16 @@ pub enum IngestError {
          create it with suite `mls`, or make it open for plaintext"
     )]
     RestrictedRequiresMls { slug: String },
-    /// Content for a restricted channel created as plaintext before D25. The
-    /// channel is frozen: its history stays, nothing new is accepted.
+    /// A block for a frozen channel: a plaintext channel from before tiers
+    /// that maps to none (JEP-0014 rule 22), or a restricted one created as
+    /// plaintext before D25. Its history stays; nothing new is accepted but an
+    /// archive by its owner.
     #[error(
-        "channel '{slug}' is restricted but was created unencrypted, so it takes no new \
-         content; make a new restricted channel (always end-to-end encrypted) or an open one"
+        "channel '{slug}' is frozen: it was created unencrypted before channel tiers, so its \
+         history stays readable but it takes nothing new; its owner may create an encrypted \
+         successor"
     )]
-    PlaintextRestrictedFrozen { slug: String },
+    ChannelFrozen { slug: String },
     /// The MLS payload of a block on an encrypted channel failed validation.
     #[error("MLS payload refused: {detail}")]
     MlsRejected { detail: String },
@@ -561,6 +585,24 @@ pub async fn ingest(
         });
     }
 
+    // Step 3b': the channel's tier (JEP-0014). It is fixed for the channel's
+    // life, so nothing promotes a channel (rule 2); a frozen channel takes
+    // nothing but an archive by its owner, which the write gate checks
+    // (rule 22).
+    if let Some(chan) = resolved_channel.as_ref() {
+        if kind == BlockKind::ChannelPromote {
+            return Err(IngestError::TierFixed {
+                kind: kind_str.to_string(),
+                slug: chan.slug.clone(),
+            });
+        }
+        if chan.tiering.tier.is_frozen() && kind != BlockKind::ChannelArchive {
+            return Err(IngestError::ChannelFrozen {
+                slug: chan.slug.clone(),
+            });
+        }
+    }
+
     // Step 3c: write authorization — may this sender post to, or change,
     // this channel?
     //
@@ -700,7 +742,24 @@ pub async fn ingest(
             &server_did,
             &source,
         )?;
-        channel_terms(&manifest, &server_did)?;
+        let terms = channel_terms(&manifest, &server_did)?;
+        // JEP-0014 rule 1: an `open` plaintext create without `tier` comes
+        // from a client that cannot show the `public` label, so it is refused
+        // rather than read as `public`. A restricted one without `tier` is
+        // left to the suite gate, which refuses it as before (D25).
+        if terms.tiering.is_none()
+            && crate::visibility::is_open(
+                manifest
+                    .metadata
+                    .get("visibility")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("open"),
+            )
+        {
+            return Err(IngestError::UnknownTier {
+                tier: "none".to_string(),
+            });
+        }
     }
 
     // Step 3: HLC update on receive, within the advertised skew bound. A
@@ -1387,15 +1446,43 @@ pub fn check_create_slug(
 pub const SEQUENCER_KEY: &str = "sequencer";
 /// The metadata key a `channel-create` lists its co-owners under.
 pub const CO_OWNERS_KEY: &str = "co_owners";
+/// The metadata keys of a `channel-create`'s tier terms (JEP-0014).
+pub mod tier_keys {
+    pub const TIER: &str = "tier";
+    pub const JOIN: &str = "join";
+    pub const JOIN_SERVERS: &str = "join_servers";
+    pub const HISTORY: &str = "history";
+    pub const FROM_DM: &str = "from_dm";
+    pub const SUCCESSOR_OF: &str = "successor_of";
+}
 
 /// A `channel-create`'s terms beyond slug, visibility and suite, checked:
 /// the sequencer (this server's DID when absent) and the co-owners, both in
-/// canonical text. The co-owners are deduplicated and never include the
-/// creator, who is the root owner already.
+/// canonical text, and the tier terms. The co-owners are deduplicated and
+/// never include the creator, who is the root owner already.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelTerms {
     pub sequencer: String,
     pub co_owners: Vec<String>,
+    /// The tier and its terms, or `None` for a block without `tier` that no
+    /// rule maps: an `open` plaintext create from a client that predates tiers
+    /// (JEP-0014 rule 1). Ingest refuses that as `UNKNOWN_TIER`; a server
+    /// that stores such a channel anyway reads it by rule 21.
+    pub tiering: Option<crate::persist::ChannelTiering>,
+}
+
+impl ChannelTerms {
+    /// The tiering to store for a channel created by this block.
+    pub fn stored_tiering(
+        &self,
+        slug: &str,
+        visibility: &str,
+        suite: &str,
+    ) -> crate::persist::ChannelTiering {
+        self.tiering
+            .clone()
+            .unwrap_or_else(|| crate::persist::ChannelTiering::legacy(slug, visibility, suite))
+    }
 }
 
 /// Read and check a `channel-create`'s terms (JEP-0005 rules 5 and 6).
@@ -1456,10 +1543,189 @@ pub fn channel_terms(
             ));
         }
     }
+    let tiering = tier_terms(manifest)?;
     Ok(ChannelTerms {
         sequencer,
         co_owners,
+        tiering,
     })
+}
+
+/// For test fixtures that predate tiers: an `open` plaintext `channel-create`
+/// without `tier` gets `tier: public`, as every client that knows tiers sends
+/// it. Encrypted creates are left alone: the server maps those by rule 1, and
+/// the fixtures exercise that.
+#[cfg(test)]
+pub(crate) fn tier_as_a_current_client_would(
+    kind: BlockKind,
+    metadata: &mut std::collections::BTreeMap<String, serde_json::Value>,
+) {
+    let plaintext = metadata
+        .get(crate::mls_gate::keys::SUITE)
+        .is_none_or(|s| s.as_str() == Some("none"));
+    let open = metadata
+        .get("visibility")
+        .is_none_or(|v| v.as_str() == Some("open"));
+    if kind == BlockKind::ChannelCreate
+        && plaintext
+        && open
+        && !metadata.contains_key(tier_keys::TIER)
+    {
+        metadata.insert(
+            tier_keys::TIER.to_string(),
+            serde_json::json!(jig_core::tier::Tier::Public.as_str()),
+        );
+    }
+}
+
+/// Read and check a `channel-create`'s tier terms (JEP-0014 rules 1, 3, 12,
+/// 13, 17, 19 and 23).
+///
+/// - `tier`, when present, names one of the four tiers; anything else is
+///   `UNKNOWN_TIER`. Its suite must fit it (`TIER_SUITE_MISMATCH`), and so
+///   must `visibility` when the block carries one: `private` is
+///   `restricted`, every other tier `open`.
+/// - Without `tier`, a block from a client that predates tiers is mapped as
+///   rule 1 says: `restricted` `mls` is `private`, `open` `mls` is `server`
+///   with `join = guest`. An `open` plaintext one maps to nothing (`None`).
+/// - `join` belongs to `server` and `shared` (default `member`),
+///   `join_servers` to `shared` (default `owner`). `history` defaults to
+///   `none`. `from_dm` and `successor_of` are channel ids.
+pub fn tier_terms(
+    manifest: &jig_core::BlockManifest,
+) -> Result<Option<crate::persist::ChannelTiering>, IngestError> {
+    use jig_core::tier::{HistoryPolicy, JoinRole, JoinServers, Tier};
+    let invalid = |field: &str, detail: String| IngestError::InvalidTerms {
+        field: field.to_string(),
+        detail,
+    };
+    let text = |key: &'static str| -> Result<Option<&str>, IngestError> {
+        match manifest.metadata.get(key) {
+            None => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(s.as_str())),
+            Some(other) => Err(invalid(key, format!("`{other}` is not a string"))),
+        }
+    };
+    // A suite this build does not know is the suite gate's to refuse, with
+    // its own code; the tier checks below only judge suites it does know.
+    let suite = crate::mls_gate::requested_suite(manifest).ok();
+    let visibility = text("visibility")?;
+
+    let Some(raw_tier) = manifest.metadata.get(tier_keys::TIER) else {
+        // No tier terms without a tier: they would mean nothing to the old
+        // client that sent the block, and guessing a tier for them is what
+        // `UNKNOWN_TIER` exists to refuse.
+        for key in [
+            tier_keys::JOIN,
+            tier_keys::JOIN_SERVERS,
+            tier_keys::HISTORY,
+            tier_keys::FROM_DM,
+            tier_keys::SUCCESSOR_OF,
+        ] {
+            if manifest.metadata.contains_key(key) {
+                return Err(invalid(
+                    key,
+                    "is a tier term, and the block names no `tier`".into(),
+                ));
+            }
+        }
+        if suite != Some(jig_core::EncryptionSuite::Mls) {
+            return Ok(None);
+        }
+        let tier = if crate::visibility::is_open(visibility.unwrap_or("open")) {
+            Tier::Server
+        } else {
+            Tier::Private
+        };
+        let mut tiering = crate::persist::ChannelTiering::of(tier);
+        if tier == Tier::Server {
+            tiering.join = Some(JoinRole::Guest);
+        }
+        return Ok(Some(tiering));
+    };
+    let tier = raw_tier
+        .as_str()
+        .and_then(|s| s.parse::<Tier>().ok())
+        .ok_or_else(|| IngestError::UnknownTier {
+            tier: raw_tier
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| raw_tier.to_string()),
+        })?;
+    if let Some(suite) = suite
+        && !tier.admits_suite(suite)
+    {
+        return Err(IngestError::TierSuiteMismatch {
+            tier: tier.as_str(),
+            suite: suite.as_str().to_string(),
+        });
+    }
+    if let Some(visibility) = visibility
+        && visibility != tier.legacy_visibility()
+    {
+        return Err(invalid(
+            "visibility",
+            format!(
+                "a `{tier}` channel is `{}` to clients that predate tiers, not `{visibility}`",
+                tier.legacy_visibility()
+            ),
+        ));
+    }
+    let mut tiering = crate::persist::ChannelTiering::of(tier);
+    if let Some(join) = text(tier_keys::JOIN)? {
+        if !tier.takes_join() {
+            return Err(invalid(
+                tier_keys::JOIN,
+                format!("a `{tier}` channel has no `join` role"),
+            ));
+        }
+        tiering.join = Some(
+            join.parse::<JoinRole>()
+                .map_err(|e| invalid(tier_keys::JOIN, e.to_string()))?,
+        );
+    }
+    if let Some(rule) = text(tier_keys::JOIN_SERVERS)? {
+        if !tier.takes_join_servers() {
+            return Err(invalid(
+                tier_keys::JOIN_SERVERS,
+                format!("only a `shared` channel has `join_servers`, not a `{tier}` one"),
+            ));
+        }
+        tiering.join_servers = Some(
+            rule.parse::<JoinServers>()
+                .map_err(|e| invalid(tier_keys::JOIN_SERVERS, e.to_string()))?,
+        );
+    }
+    if let Some(history) = text(tier_keys::HISTORY)? {
+        let history = history
+            .parse::<HistoryPolicy>()
+            .map_err(|e| invalid(tier_keys::HISTORY, e.to_string()))?;
+        if !tier.is_encrypted() && history != HistoryPolicy::None {
+            return Err(invalid(
+                tier_keys::HISTORY,
+                "a `public` channel's history is readable already; it re-shares none".into(),
+            ));
+        }
+        tiering.history = history;
+    }
+    for (key, slot) in [
+        (tier_keys::FROM_DM, &mut tiering.from_dm),
+        (tier_keys::SUCCESSOR_OF, &mut tiering.successor_of),
+    ] {
+        if let Some(id) = text(key)? {
+            if id.is_empty() {
+                return Err(invalid(key, "is empty; it names a channel by id".into()));
+            }
+            *slot = Some(id.to_string());
+        }
+    }
+    if tiering.from_dm.is_some() && tier != Tier::Private {
+        return Err(invalid(
+            tier_keys::FROM_DM,
+            format!("a group grown from a 1:1 is `private`, not `{tier}`"),
+        ));
+    }
+    Ok(Some(tiering))
 }
 
 /// The membership change a commit-carrying block makes — what
@@ -1532,9 +1798,7 @@ pub fn suite_refusal(refusal: crate::mls_gate::SuiteRefusal, slug: &str) -> Inge
             detail: e.to_string(),
         },
         SuiteRefusal::RestrictedNeedsMls { slug } => IngestError::RestrictedRequiresMls { slug },
-        SuiteRefusal::PlaintextRestricted { slug } => {
-            IngestError::PlaintextRestrictedFrozen { slug }
-        }
+        SuiteRefusal::PlaintextRestricted { slug } => IngestError::ChannelFrozen { slug },
     }
 }
 
@@ -2080,6 +2344,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: crate::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         id
@@ -2143,6 +2408,7 @@ mod tests {
                 .metadata
                 .insert((*k).to_string(), serde_json::json!(v));
         }
+        tier_as_a_current_client_would(kind, &mut manifest.metadata);
         let manifest_bytes = manifest.to_canonical_bytes().unwrap();
         let code_bytes: Vec<u8> = vec![];
         let canonical = serde_json::to_vec(&(&manifest_bytes, &code_bytes)).unwrap();
@@ -2686,6 +2952,7 @@ mod tests {
         if let serde_json::Value::Object(map) = meta {
             manifest.metadata.extend(map);
         }
+        tier_as_a_current_client_would(kind, &mut manifest.metadata);
         manifest.hlc_ts = Some(jig_core::HlcTimestamp {
             wall_ms,
             logical: 0,
@@ -3679,6 +3946,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: crate::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         for did in [bob_did.clone(), shadow.clone()] {
@@ -3739,6 +4007,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: crate::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         // Memberships are keyed by the CID, not the slug.
@@ -3938,6 +4207,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: did_of(&random_signing_key()),
                 co_owners: Vec::new(),
+                tiering: crate::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         let owner = person();
@@ -4382,6 +4652,356 @@ mod tests {
                 .unwrap_or_else(|| panic!("{did} must be a member"));
             assert_eq!(m.role, "owner");
         }
+    }
+
+    // ---- Channel tiers (JEP-0014) -----------------------------------------
+
+    fn tiers_ctx() -> IngestContext {
+        test_ctx_allowing(&[
+            "text-render",
+            "channel-create",
+            "member-add",
+            "channel-archive",
+            "channel-promote",
+        ])
+    }
+
+    /// A block signed as a client that predates tiers signs it: no fixture
+    /// fills in `tier`.
+    fn untiered(
+        key: &SigningKey,
+        kind: BlockKind,
+        meta: serde_json::Value,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let did = Did::from_ed25519_pubkey(key.verifying_key().as_bytes());
+        let mut manifest = BlockManifest::builder()
+            .version(Version::new(0, 1, 0))
+            .author(Author {
+                did,
+                public_key: None,
+                roles: vec![],
+            })
+            .build()
+            .unwrap()
+            .with_kind(kind);
+        if let serde_json::Value::Object(map) = meta {
+            manifest.metadata.extend(map);
+        }
+        let manifest_bytes = manifest.to_canonical_bytes().unwrap();
+        let code_bytes: Vec<u8> = vec![];
+        let canonical = serde_json::to_vec(&(&manifest_bytes, &code_bytes)).unwrap();
+        let sig = key.sign(&canonical).to_bytes().to_vec();
+        (manifest_bytes, code_bytes, sig)
+    }
+
+    fn create_manifest(meta: serde_json::Value) -> BlockManifest {
+        let mut manifest = BlockManifest::builder()
+            .version(Version::new(0, 1, 0))
+            .author(Author {
+                did: Did::from_ed25519_pubkey(random_signing_key().verifying_key().as_bytes()),
+                public_key: None,
+                roles: vec![],
+            })
+            .build()
+            .unwrap()
+            .with_kind(BlockKind::ChannelCreate);
+        if let serde_json::Value::Object(map) = meta {
+            manifest.metadata.extend(map);
+        }
+        manifest
+    }
+
+    /// Rule 1: an old client's `open` plaintext create is refused, not read as
+    /// `public`, because that client cannot show the label. Nothing is stored.
+    #[tokio::test]
+    async fn an_untiered_plaintext_open_create_is_unknown_tier() {
+        let ctx = tiers_ctx();
+        let who = person();
+        for meta in [
+            serde_json::json!({"slug": "#old"}),
+            serde_json::json!({"slug": "#old", "visibility": "open"}),
+            serde_json::json!({"slug": "#old", "visibility": "open", "suite": "none"}),
+        ] {
+            let (mb, cb, sig) = untiered(&who.key, BlockKind::ChannelCreate, meta.clone());
+            let refused =
+                do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 }).await;
+            assert!(
+                matches!(refused, Err(IngestError::UnknownTier { .. })),
+                "{meta}: {refused:?}"
+            );
+        }
+        assert!(ctx.store.get_channel_by_slug("#old").unwrap().is_none());
+        // A restricted one without `tier` is still the suite gate's (D25).
+        let (mb, cb, sig) = untiered(
+            &who.key,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#old", "visibility": "restricted"}),
+        );
+        let refused = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 }).await;
+        assert!(
+            matches!(refused, Err(IngestError::RestrictedRequiresMls { .. })),
+            "{refused:?}"
+        );
+    }
+
+    /// Rule 1's mapping for an old client's encrypted creates: `restricted`
+    /// `mls` is `private`, `open` `mls` is `server` with `join = guest`.
+    #[test]
+    fn untiered_encrypted_creates_map_by_rule_1() {
+        use jig_core::tier::{JoinRole, Tier};
+        let private = tier_terms(&create_manifest(
+            serde_json::json!({"slug": "#a", "visibility": "restricted", "suite": "mls"}),
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(private, crate::persist::ChannelTiering::of(Tier::Private));
+        let server = tier_terms(&create_manifest(
+            serde_json::json!({"slug": "#a", "visibility": "open", "suite": "mls"}),
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(server.tier, Tier::Server.into());
+        assert_eq!(server.join, Some(JoinRole::Guest));
+        assert_eq!(
+            tier_terms(&create_manifest(serde_json::json!({"slug": "#a"}))).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn tier_terms_are_checked() {
+        use jig_core::tier::{HistoryPolicy, JoinRole, JoinServers, Tier};
+        let terms = |meta| tier_terms(&create_manifest(meta));
+        let field = |r: Result<_, IngestError>| match r {
+            Err(IngestError::InvalidTerms { field, .. }) => field,
+            other => panic!("expected INVALID_TERMS, got {other:?}"),
+        };
+
+        // Defaults by tier.
+        let server = terms(serde_json::json!({"slug": "#a", "tier": "server", "suite": "mls"}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.join, Some(JoinRole::Member));
+        assert_eq!(server.join_servers, None);
+        let shared = terms(
+            serde_json::json!({"slug": "#a", "tier": "shared", "suite": "mls",
+            "join": "guest", "join_servers": "granted", "history": "members-may-share"}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(shared.join, Some(JoinRole::Guest));
+        assert_eq!(shared.join_servers, Some(JoinServers::Granted));
+        assert_eq!(shared.history, HistoryPolicy::MembersMayShare);
+        let public = terms(serde_json::json!({"slug": "#a", "tier": "public"}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(public, crate::persist::ChannelTiering::of(Tier::Public));
+
+        // An unknown tier, a tier that is not a string.
+        for bad in [
+            serde_json::json!("secret"),
+            serde_json::json!("Public"),
+            serde_json::json!(1),
+        ] {
+            assert!(
+                matches!(
+                    terms(serde_json::json!({"slug": "#a", "tier": bad})),
+                    Err(IngestError::UnknownTier { .. })
+                ),
+                "{bad}"
+            );
+        }
+        // Rule 3: the suite fits the tier.
+        for (tier, suite) in [
+            ("public", "mls"),
+            ("private", "none"),
+            ("server", "none"),
+            ("shared", "none"),
+        ] {
+            assert!(
+                matches!(
+                    terms(serde_json::json!({"slug": "#a", "tier": tier, "suite": suite})),
+                    Err(IngestError::TierSuiteMismatch { .. })
+                ),
+                "{tier} under {suite}"
+            );
+        }
+        // A tier without a suite is plaintext, so only `public` takes it.
+        assert!(matches!(
+            terms(serde_json::json!({"slug": "#a", "tier": "private"})),
+            Err(IngestError::TierSuiteMismatch { .. })
+        ));
+        // The terms belong to their tiers.
+        assert_eq!(
+            field(terms(
+                serde_json::json!({"slug": "#a", "tier": "private", "suite": "mls", "join": "guest"})
+            )),
+            "join"
+        );
+        assert_eq!(
+            field(terms(
+                serde_json::json!({"slug": "#a", "tier": "server", "suite": "mls", "join_servers": "owner"})
+            )),
+            "join_servers"
+        );
+        assert_eq!(
+            field(terms(
+                serde_json::json!({"slug": "#a", "tier": "server", "suite": "mls", "join": "stranger"})
+            )),
+            "join"
+        );
+        assert_eq!(
+            field(terms(
+                serde_json::json!({"slug": "#a", "tier": "public", "history": "members-may-share"})
+            )),
+            "history"
+        );
+        assert_eq!(
+            field(terms(
+                serde_json::json!({"slug": "#a", "tier": "server", "suite": "mls", "from_dm": "bafy"})
+            )),
+            "from_dm"
+        );
+        assert_eq!(
+            field(terms(
+                serde_json::json!({"slug": "#a", "tier": "private", "suite": "mls", "successor_of": ""})
+            )),
+            "successor_of"
+        );
+        // `visibility`, when present, is the tier's.
+        assert_eq!(
+            field(terms(
+                serde_json::json!({"slug": "#a", "tier": "private", "suite": "mls", "visibility": "open"})
+            )),
+            "visibility"
+        );
+        assert_eq!(
+            field(terms(
+                serde_json::json!({"slug": "#a", "tier": "public", "visibility": "restricted"})
+            )),
+            "visibility"
+        );
+        // No tier terms without a tier.
+        assert_eq!(
+            field(terms(
+                serde_json::json!({"slug": "#a", "suite": "mls", "join": "guest"})
+            )),
+            "join"
+        );
+    }
+
+    /// The stored row carries the tier, and the visibility clients that
+    /// predate tiers go by is the tier's, whatever the block left out.
+    #[tokio::test]
+    async fn a_tiered_channel_is_stored_with_its_tier_and_its_tiers_visibility() {
+        let ctx = tiers_ctx();
+        let owner = person();
+        let cid = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#pub", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        let row = ctx.store.get_channel_by_id(&cid).unwrap().unwrap();
+        assert_eq!(
+            row.tiering,
+            crate::persist::ChannelTiering::of(jig_core::tier::Tier::Public)
+        );
+        assert_eq!(row.visibility, "open");
+        assert_eq!(row.suite, "none");
+    }
+
+    /// Rule 2: the tier is fixed, so `channel-promote` is refused whoever
+    /// signs it.
+    #[tokio::test]
+    async fn a_channel_is_never_promoted() {
+        let ctx = tiers_ctx();
+        let owner = person();
+        let cid = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#pub"}),
+        )
+        .await
+        .unwrap();
+        let promote = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelPromote,
+            serde_json::json!({"channel_id": cid}),
+        )
+        .await;
+        assert!(
+            matches!(promote, Err(IngestError::TierFixed { .. })),
+            "{promote:?}"
+        );
+    }
+
+    /// Rule 22: a frozen channel takes nothing new but its owner's archive.
+    #[tokio::test]
+    async fn a_frozen_channel_takes_nothing_but_its_owners_archive() {
+        let ctx = tiers_ctx();
+        let owner = person();
+        let stranger = person();
+        let frozen = crate::ingest_record::label_cid("a frozen channel");
+        ctx.store
+            .upsert_channel(&crate::persist::StoredChannel {
+                id: frozen.clone(),
+                slug: "#old".to_string(),
+                visibility: "open".to_string(),
+                created_at: 1,
+                owner_did: owner.did.clone(),
+                suite: "none".to_string(),
+                sequencer_did: String::new(),
+                co_owners: Vec::new(),
+                tiering: crate::persist::ChannelTiering::legacy("#old", "open", "none"),
+            })
+            .unwrap();
+        for (who, kind, meta) in [
+            (
+                &owner,
+                BlockKind::TextRender,
+                serde_json::json!({"channel_id": frozen, "body": "hi"}),
+            ),
+            (
+                &owner,
+                BlockKind::MemberAdd,
+                serde_json::json!({"channel_id": frozen, "member_did": stranger.did}),
+            ),
+            (
+                &stranger,
+                BlockKind::TextRender,
+                serde_json::json!({"channel_id": frozen, "body": "hi"}),
+            ),
+        ] {
+            let refused = plain(&ctx, who, kind, meta).await;
+            assert!(
+                matches!(refused, Err(IngestError::ChannelFrozen { .. })),
+                "{kind:?}: {refused:?}"
+            );
+        }
+        let not_owner = plain(
+            &ctx,
+            &stranger,
+            BlockKind::ChannelArchive,
+            serde_json::json!({"channel_id": frozen}),
+        )
+        .await;
+        assert!(
+            matches!(not_owner, Err(IngestError::NotChannelOwner { .. })),
+            "{not_owner:?}"
+        );
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelArchive,
+            serde_json::json!({"channel_id": frozen}),
+        )
+        .await
+        .expect("the owner archives a frozen channel");
     }
 
     // ---- Slug grammar (jig_core::slug) ------------------------------------

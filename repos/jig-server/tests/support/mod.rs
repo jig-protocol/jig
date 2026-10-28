@@ -561,6 +561,7 @@ impl TestServer {
             suite: "none".to_string(),
             sequencer_did: Identity::new(250).did().to_did_jig_string(),
             co_owners: Vec::new(),
+            tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
         };
         store.upsert_channel(&channel).expect("carried channel");
         store

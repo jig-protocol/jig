@@ -158,13 +158,22 @@ fn apply_channel_create_under(
 ) -> anyhow::Result<()> {
     let slug = meta_str(m, "slug")
         .ok_or_else(|| anyhow::anyhow!("channel-create missing `slug` in metadata"))?;
-    let visibility = meta_str(m, "visibility").unwrap_or("open");
     let suite = crate::mls_gate::requested_suite(m)
         .map_err(|_| anyhow::anyhow!("channel-create names an unknown suite"))?;
     let now = chrono::Utc::now().timestamp();
     let owner_did = sender_did_string(m);
     let terms = crate::ingest::channel_terms(m, sequencer)
         .map_err(|e| anyhow::anyhow!("channel-create terms: {e}"))?;
+    let declared = meta_str(m, "visibility").unwrap_or("open");
+    let tiering = terms.stored_tiering(slug, declared, suite.as_str());
+    // The stored visibility is what the read gate and clients that predate
+    // tiers go by, so a tiered channel stores its tier's: `private` is
+    // `restricted` even when the block carries no `visibility`.
+    let visibility = tiering
+        .tier
+        .tier()
+        .map(|tier| tier.legacy_visibility())
+        .unwrap_or(declared);
 
     crate::persist::upsert_channel_on(
         conn,
@@ -175,8 +184,9 @@ fn apply_channel_create_under(
             created_at: now,
             owner_did: owner_did.clone(),
             suite: suite.as_str().to_string(),
-            sequencer_did: terms.sequencer,
+            sequencer_did: terms.sequencer.clone(),
             co_owners: terms.co_owners.clone(),
+            tiering,
         },
     )?;
     // The creator and every co-owner are members, with role `owner`: a
