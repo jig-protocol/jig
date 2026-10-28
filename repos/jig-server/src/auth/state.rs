@@ -333,9 +333,20 @@ impl jig_pipeline::ingest::Admission for AuthState {
     /// A write is refused as `RATE_LIMITED` for the DID's rate or for its
     /// pool's share, and the refusal does not say which: wait for the longer
     /// of the two refills. Lending from idle pools can only make it sooner.
+    ///
+    /// A pool with a share of 0 never refills: its writers take only what
+    /// idle pools lend, and an operator zeroes strangers under a flood. They
+    /// wait for the members' refill, and at least [`ZERO_SHARE_RETRY`], so
+    /// the hint is no invitation to retry hot.
     fn retry_after_ms(&self, sender_did: &str) -> Option<u64> {
-        let pool = self.write_pools.as_ref().and_then(|pools| {
-            pools.refill_interval(self.pool_of(sender_did, chrono::Utc::now().timestamp()))
+        let pool = self.write_pools.as_ref().map(|pools| {
+            pools
+                .refill_interval(self.pool_of(sender_did, chrono::Utc::now().timestamp()))
+                .unwrap_or_else(|| {
+                    pools
+                        .refill_interval(Pool::Member)
+                        .map_or(ZERO_SHARE_RETRY, |member| member.max(ZERO_SHARE_RETRY))
+                })
         });
         self.did_retry_after_ms().max(pool.map(millis))
     }
@@ -380,6 +391,9 @@ fn admission_policy(section: &AdmissionSection, banned_dids: BTreeSet<String>) -
 }
 
 /// `d` in whole milliseconds, rounded up, and at least one.
+/// The least a writer from a pool with a share of 0 is told to wait.
+const ZERO_SHARE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
 fn millis(d: std::time::Duration) -> u64 {
     u64::try_from(d.as_micros().div_ceil(1000))
         .unwrap_or(u64::MAX)
@@ -549,6 +563,11 @@ mod tests {
         // Members' 7 a second, strangers' 2; the DID's 50 is faster than both.
         assert_eq!(state.retry_after_ms(&member), Some(143));
         assert_eq!(state.retry_after_ms(&stranger), Some(500));
+
+        // Strangers zeroed under a flood borrow only: a second, not 20 ms.
+        section.pools.stranger_share_pct = 0;
+        let state = AuthState::from_config(&section).unwrap();
+        assert_eq!(state.retry_after_ms(&stranger), Some(1_000));
 
         section.pools.writes_per_second = 0;
         let state = AuthState::from_config(&section).unwrap();
