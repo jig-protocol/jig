@@ -149,6 +149,20 @@ per_ip_burst = 600
 per_ip_per_second = 100
 replay_per_did = 2000
 
+# Write capacity shared by members, invited and strangers (JEP-0008 rules
+# 21-23). Members are DIDs in [auth.admission] records with no negative score,
+# or DIDs whose admission proof of work is local_member_age_secs old; everyone
+# else is a stranger. Each nonzero share needs at least one write of burst.
+# Strangers get stranger_share_pct of the writes. They borrow members' share
+# only while no member is writing, so a flood of fresh keys cannot crowd out
+# members. writes_per_second = 0 turns the pools off.
+[auth.pools]
+writes_per_second = 1000
+writes_burst = 2000
+stranger_share_pct = 20
+invited_share_pct = 10
+local_member_age_secs = 604800
+
 [keys]
 # What opens the sealed server key at boot. The server never prompts. The
 # systemd credential in jig-server.service (LoadCredentialEncrypted=), bound to
@@ -205,6 +219,14 @@ list_handles = false
 # [federation.records_from]
 # burst = 8
 # per_min = 20
+#
+# How often a follower may relay its clients' writes into one channel you
+# own: a burst, then per_min a minute, for each peer and channel. A write
+# past it is refused with the time to try again. These are the defaults;
+# neither may be 0.
+# [federation.relayed_writes]
+# burst = 30
+# per_min = 120
 #
 # Name suffixes this server attests, published in its manifest. Only
 # root = "dns" with a multi-label suffix; a config-rooted suffix is never

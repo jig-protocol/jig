@@ -68,6 +68,19 @@ pub enum FollowError {
     /// The channel stopped at an earlier fork.
     #[error("channel {channel_id} is stopped at a fork")]
     Stopped { channel_id: String },
+    /// The owner's record at `seq` names a block this server holds in
+    /// another of its channels, `holder`, whose chain names it too. One CID
+    /// is one block, so the record cannot land, and the carried channel
+    /// waits at `seq` ([`CarriedStall`]).
+    #[error(
+        "channel {channel_id} is stalled at seq {seq}: block {block_cid} is held in channel {holder}"
+    )]
+    Held {
+        channel_id: String,
+        seq: u64,
+        block_cid: String,
+        holder: String,
+    },
     /// No accepted share with this sequencer names the channel: this server
     /// never agreed to carry it.
     #[error("no accepted share of channel {channel_id} with {sequencer}")]
@@ -115,7 +128,30 @@ pub struct ChainEvidence {
     pub found_at: i64,
 }
 
-/// The `chain_evidence` table, created by [`SqliteStore`]'s migration.
+/// A carried channel waiting at `seq`: the owner's record there names
+/// `block_cid`, which this server holds in its own channel `holder`
+/// ([`FollowError::Held`]). Kept until a record of the channel lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarriedStall {
+    pub channel_id: String,
+    pub seq: u64,
+    pub block_cid: String,
+    pub holder: String,
+    pub found_at: i64,
+}
+
+impl std::fmt::Display for CarriedStall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "channel {} stalled at seq {}: block {} is held in channel {}",
+            self.channel_id, self.seq, self.block_cid, self.holder
+        )
+    }
+}
+
+/// The `chain_evidence` and `carried_stalls` tables, created by
+/// [`SqliteStore`]'s migration.
 pub(crate) fn migrate(conn: &rusqlite::Connection) -> crate::persist::Result<()> {
     conn.execute_batch(
         r#"
@@ -126,6 +162,13 @@ pub(crate) fn migrate(conn: &rusqlite::Connection) -> crate::persist::Result<()>
             offered    BLOB NOT NULL,
             found_at   INTEGER NOT NULL,
             PRIMARY KEY (channel_id)
+        );
+        CREATE TABLE IF NOT EXISTS carried_stalls (
+            channel_id TEXT PRIMARY KEY,
+            seq        INTEGER NOT NULL,
+            block_cid  TEXT NOT NULL,
+            holder     TEXT NOT NULL,
+            found_at   INTEGER NOT NULL
         );
         "#,
     )?;
@@ -139,6 +182,8 @@ enum Landing {
     Gap(Option<u64>),
     Fork,
     Stopped,
+    /// The block is held in `holder`, another channel; the stall is kept.
+    Held(String),
     /// The block's effect failed; nothing was kept.
     EffectFailed(anyhow::Error),
 }
@@ -159,6 +204,27 @@ impl SqliteStore {
                     seq: r.get::<_, i64>(1)? as u64,
                     held: r.get(2)?,
                     offered: r.get(3)?,
+                    found_at: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The carried channels waiting on a block held in another channel.
+    pub fn carried_stalls(&self) -> crate::persist::Result<Vec<CarriedStall>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT channel_id, seq, block_cid, holder, found_at FROM carried_stalls
+             ORDER BY found_at, channel_id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(CarriedStall {
+                    channel_id: r.get(0)?,
+                    seq: r.get::<_, i64>(1)? as u64,
+                    block_cid: r.get(2)?,
+                    holder: r.get(3)?,
                     found_at: r.get(4)?,
                 })
             })?
@@ -263,7 +329,55 @@ impl SqliteStore {
             }
             None => {}
         }
-        crate::persist::insert_block_on(&tx, block)?;
+        // A block held already in a relayed copy of this channel, set aside
+        // ([`SqliteStore::quarantine_relayed_copy`]): one CID is one block, so
+        // the owner's chain takes it back into the channel. A block held in
+        // any other channel stays where it is, and the insert refuses it: a
+        // block named by slug can sit in this server's own channel of the
+        // same slug, whose chain still names it.
+        let in_copy: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM blocks b JOIN quarantined_copies q
+                 ON b.channel_id = q.copy_id
+             WHERE b.cid = ?1 AND q.channel_id = ?2)",
+            params![block.cid, channel_id],
+            |r| r.get(0),
+        )?;
+        let holder: Option<Option<String>> = tx
+            .query_row(
+                "SELECT channel_id FROM blocks WHERE cid = ?1",
+                [&block.cid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match holder {
+            Some(_) if in_copy => {
+                tx.execute(
+                    "UPDATE blocks SET channel_id = ?2 WHERE cid = ?1",
+                    params![block.cid, channel_id],
+                )?;
+            }
+            Some(holder) => {
+                let holder = holder.unwrap_or_default();
+                tx.execute(
+                    "INSERT INTO carried_stalls
+                         (channel_id, seq, block_cid, holder, found_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(channel_id) DO UPDATE SET
+                         seq = excluded.seq, block_cid = excluded.block_cid,
+                         holder = excluded.holder",
+                    params![
+                        channel_id,
+                        record.seq as i64,
+                        block.cid,
+                        holder,
+                        chrono::Utc::now().timestamp()
+                    ],
+                )?;
+                tx.commit()?;
+                return Ok(Landing::Held(holder));
+            }
+            None => crate::persist::insert_block_on(&tx, block)?,
+        }
         tx.execute(
             "INSERT INTO ingest_records (block_cid, channel_id, seq, record) VALUES (?1, ?2, ?3, ?4)",
             params![record.block_cid, channel_id, record.seq as i64, record_bytes],
@@ -273,6 +387,10 @@ impl SqliteStore {
         if let Err(e) = effect(&tx) {
             return Ok(Landing::EffectFailed(e));
         }
+        tx.execute(
+            "DELETE FROM carried_stalls WHERE channel_id = ?1",
+            [channel_id],
+        )?;
         tx.commit()?;
         Ok(Landing::Landed)
     }
@@ -439,6 +557,23 @@ pub async fn ingest_sequenced(
             return Err(FollowError::Fork { channel_id, seq });
         }
         Landing::Stopped => return Err(FollowError::Stopped { channel_id }),
+        Landing::Held(holder) => {
+            tracing::warn!(
+                channel_id,
+                seq,
+                block_cid,
+                holder,
+                sequencer,
+                "a carried channel is stalled: the owner's record names a block this server \
+                 holds in another channel (`jig-server contracts list` shows it)"
+            );
+            return Err(FollowError::Held {
+                channel_id,
+                seq,
+                block_cid,
+                holder,
+            });
+        }
         Landing::EffectFailed(e) => return Err(FollowError::Other(e)),
         Landing::Landed => {}
     }
@@ -457,7 +592,13 @@ async fn deliver(ctx: &IngestContext, block: &StoredBlock, channel_id: &str) {
                 .list_members(&chan.id)
                 .map(|ms| ms.into_iter().map(|m| m.member_did).collect())
                 .unwrap_or_default();
-            DeliveryPolicy::for_channel(&chan, members)
+            // Not to this server's federation subscribers either: a peer of
+            // this one would take the channel as a copy of its own, and a
+            // channel has one sequencer (JEP-0005 rule 1).
+            DeliveryPolicy {
+                federates: false,
+                ..DeliveryPolicy::for_channel(&chan, members)
+            }
         }
         // Narrow delivery on any doubt, never widen it.
         _ => DeliveryPolicy::default(),
@@ -765,6 +906,71 @@ mod tests {
             take(&follower, &owner, &owner.sent[1]).await.unwrap(),
             Followed::Duplicate { seq: 1, .. }
         ));
+    }
+
+    /// The owner's chain takes back a block only from this channel's relayed
+    /// copy. The same CID held in another of the follower's channels stays
+    /// there, and the record for it does not land.
+    #[tokio::test]
+    async fn a_block_held_in_another_channel_is_not_taken() {
+        let mut owner = Owner::new().await;
+        let text = owner.text("one").await;
+        let follower = owner.follower();
+        let mut held = owner.ctx.store.get_block(&text).unwrap().unwrap();
+        held.channel_id = Some("bafyours".to_string());
+        follower.store.insert_block(&held).unwrap();
+
+        take(&follower, &owner, &owner.sent[0]).await.unwrap();
+        match take(&follower, &owner, &owner.sent[1]).await {
+            Err(FollowError::Held {
+                channel_id,
+                seq: 1,
+                block_cid,
+                holder,
+            }) => {
+                assert_eq!(channel_id, owner.channel);
+                assert_eq!(block_cid, text);
+                assert_eq!(holder, "bafyours");
+            }
+            other => panic!("{other:?}"),
+        }
+        let block = follower.store.get_block(&text).unwrap().unwrap();
+        assert_eq!(block.channel_id.as_deref(), Some("bafyours"));
+        assert_eq!(
+            follower
+                .store
+                .ingest_record_bytes(&owner.channel, 1)
+                .unwrap(),
+            None
+        );
+        // The stall is kept for an operator to see, once, however often the
+        // record comes again.
+        assert!(take(&follower, &owner, &owner.sent[1]).await.is_err());
+        let stalls = follower.store.carried_stalls().unwrap();
+        assert_eq!(stalls.len(), 1);
+        assert_eq!(
+            (stalls[0].channel_id.as_str(), stalls[0].seq),
+            (owner.channel.as_str(), 1)
+        );
+        assert_eq!(
+            stalls[0].to_string(),
+            format!(
+                "channel {} stalled at seq 1: block {text} is held in channel bafyours",
+                owner.channel
+            )
+        );
+
+        // Once the block is out of the way, the record lands and the stall
+        // is gone.
+        follower
+            .store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM blocks WHERE cid = ?1", [&text])
+            .unwrap();
+        take(&follower, &owner, &owner.sent[1]).await.unwrap();
+        assert!(follower.store.carried_stalls().unwrap().is_empty());
     }
 
     #[tokio::test]
