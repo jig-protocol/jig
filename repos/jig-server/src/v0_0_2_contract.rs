@@ -3590,6 +3590,48 @@ mod tests {
         assert_eq!(Pair::head(&p.owner, &channel), Some(head), "it landed once");
     }
 
+    /// `jig send` on a follower: the client's own block builder names the
+    /// carried channel by the id it was given, and the write lands at the
+    /// owner. A slug names the channel only at its owner.
+    #[tokio::test]
+    async fn a_client_on_a_follower_posts_to_a_carried_channel_by_its_id() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.carried("write").await;
+        let user = jig_client::identity::Identity::from_signing_key(SigningKey::from_bytes(
+            &rand::random(),
+        ));
+        let hlc = jig_core::HlcTimestamp {
+            wall_ms: 1_747_680_000_000,
+            logical: 0,
+            server_did: user.did().clone(),
+        };
+        let parts = |block: jig_client::blocks::BuiltBlock| {
+            (block.manifest_bytes, block.code_bytes, block.sender_sig)
+        };
+
+        let by_slug = parts(jig_client::blocks::build_text_render(
+            &user,
+            "#shared",
+            "by slug",
+            hlc.clone(),
+        ));
+        let refused = client_post(&p.follower, &by_slug).await.unwrap_err();
+        assert_eq!(refused.code, "UNKNOWN_CHANNEL", "{refused:?}");
+
+        let by_id = parts(jig_client::blocks::build_text_render(
+            &user, &channel, "by id", hlc,
+        ));
+        let cid = client_post(&p.follower, &by_id).await.unwrap();
+        let block = p
+            .owner
+            .ingest_ctx
+            .store
+            .get_block(&cid)
+            .unwrap()
+            .expect("the owner records it");
+        assert_eq!(block.channel_id.as_deref(), Some(channel.as_str()));
+    }
+
     #[tokio::test]
     async fn a_read_follower_relays_no_content_and_the_owner_refuses_it_too() {
         let p = pair(OfferPolicy::Accept).await;
