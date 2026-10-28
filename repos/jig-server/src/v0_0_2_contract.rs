@@ -645,6 +645,17 @@ impl Contracts {
         if cid != offer.channel_id || manifest.kind != Some(BlockKind::ChannelCreate) {
             return Err(RefuseCode::PolicyRefused);
         }
+        // The creator names the server that orders the channel; a creation
+        // block from before sequencers names none, and binds to no server,
+        // so no client could prove the carried channel either.
+        if manifest
+            .metadata
+            .get(jig_pipeline::ingest::SEQUENCER_KEY)
+            .and_then(|v| v.as_str())
+            .is_none()
+        {
+            return Err(RefuseCode::PolicyRefused);
+        }
         let terms = jig_pipeline::ingest::channel_terms(&manifest, &offer.owner)
             .map_err(|_| RefuseCode::PolicyRefused)?;
         if terms.sequencer != offer.owner {
@@ -1721,6 +1732,18 @@ mod tests {
         assert_eq!(answer_to(&contracts, &owner, &good), None);
         assert_eq!(answer_to(&contracts, &owner, &good), None, "answered again");
 
+        // A creation block naming no sequencer binds to no server: no client
+        // could prove the channel carried.
+        let unbound = creation(&owner, serde_json::json!({"sequencer": null}));
+        assert_eq!(
+            answer_to(
+                &contracts,
+                &owner,
+                &offer_to(&follower, &owner, unbound, &[])
+            )
+            .as_deref(),
+            Some("POLICY_REFUSED")
+        );
         // Rule 9: a suite this server does not carry, with no fallback.
         let suite = creation(&owner, serde_json::json!({"suite": "pq-mls-2"}));
         assert_eq!(

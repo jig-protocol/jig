@@ -1007,6 +1007,42 @@ pub fn prove_channel(
     })
 }
 
+/// [`prove_channel`], for a channel one of `orders` sequences: the serving
+/// server's DIDs for its own channel, or the proven owner's for one it
+/// carries. A creation block that names its sequencer must name one of them,
+/// so a server cannot serve another's channel as its own. One that names
+/// none predates sequencers and proves nothing either way.
+pub fn prove_channel_ordered_by(
+    slug: &str,
+    cid: &str,
+    bundle_b64: &str,
+    sig_b64: &str,
+    orders: &[String],
+) -> Result<ChannelPin, PinError> {
+    let pin = prove_channel(slug, cid, bundle_b64, sig_b64)?;
+    let canonical = jig_pipeline::effect::canonical_did_string;
+    let named = STANDARD
+        .decode(bundle_b64)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<(Vec<u8>, Vec<u8>)>(&b).ok())
+        .and_then(|(m, _)| serde_json::from_slice::<BlockManifest>(&m).ok())
+        .and_then(|m| {
+            m.metadata
+                .get(jig_pipeline::ingest::SEQUENCER_KEY)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+    if let Some(named) = named
+        && !orders.iter().any(|did| canonical(did) == canonical(&named))
+    {
+        return Err(PinError::Unproven {
+            slug: slug.to_string(),
+            reason: format!("its creator named another server to order it, {named}"),
+        });
+    }
+    Ok(pin)
+}
+
 /// Whether `sequencer`, as a listing names it, is a server other than the
 /// one whose DIDs are `server_dids` (its DID and those its key links lead
 /// from). An empty name is the server's own.
@@ -1229,6 +1265,30 @@ mod tests {
             );
         }
         assert!(!served_as("open", None).unwrap().encrypted());
+    }
+
+    /// A server cannot serve a channel another server orders as its own: the
+    /// creation block names who orders it.
+    #[test]
+    fn a_creation_block_names_who_may_serve_it_as_its_own() {
+        let owner = identity();
+        let hlc = HlcTimestamp::now_wall(owner.did().clone());
+        let block = build_channel_create(&owner, "#ops", "open", "did:jig:zelsewhere", hlc);
+        let (bundle, sig) = (
+            STANDARD.encode(block.canonical_bytes()),
+            STANDARD.encode(&block.sender_sig),
+        );
+        let cid = block.cid();
+        let here = vec!["did:jig:zhere".to_string()];
+        assert!(matches!(
+            prove_channel_ordered_by("#ops", &cid, &bundle, &sig, &here),
+            Err(PinError::Unproven { reason, .. }) if reason.contains("another server")
+        ));
+        let elsewhere = vec!["did:jig:zelsewhere".to_string()];
+        assert!(prove_channel_ordered_by("#ops", &cid, &bundle, &sig, &elsewhere).is_ok());
+        // A creation from before sequencers names none.
+        let (bundle, sig, cid) = served(&owner, "#legacy", Some("none"));
+        assert!(prove_channel_ordered_by("#legacy", &cid, &bundle, &sig, &here).is_ok());
     }
 
     #[test]
