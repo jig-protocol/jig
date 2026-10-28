@@ -1467,6 +1467,7 @@ mod tests {
                 code: code.to_string(),
                 ref_cid: None,
                 message: "no".to_string(),
+                retry_after_ms: None,
             }))
             .unwrap()
         };

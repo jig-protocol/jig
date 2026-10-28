@@ -1557,6 +1557,7 @@ mod tests {
             code: EnvelopeGateError::UNSUPPORTED_SUITE_CODE.to_string(),
             ref_cid: None,
             message: "server implements none".to_string(),
+            retry_after_ms: None,
         });
         assert!(matches!(
             pending.interpret(&serde_json::to_string(&unsigned).unwrap()),
