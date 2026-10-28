@@ -434,6 +434,11 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
     epoch with fewer than `beacon_min_reveals` valid reveals has **no beacon**: no tasks are
     drawn in it, carried tasks wait for the next one, and a tribunal panel is drawn from the
     next epoch that has one (JEP-0010 rule 20).
+    - There is **no fallback** to weaker randomness, however long the wait: a fallback is the
+      lever an attacker would stall for.
+    - An epoch without a beacon does not count towards `max_carry` (rule 19).
+    - A provisional measure still expires at its own `provisional_ttl` (JEP-0010 rule 18), so a
+      stall that delays a panel cannot extend a measure.
 40. **Withholding is penalised.** A contributor that committed for epoch `N` and did not reveal
     validly in the window:
     - is reported `beacon-withheld` (rule 29), with weight `beacon_withheld_weight`, citing its
@@ -492,6 +497,12 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
   before it reveals, and can withhold. `c` colluding contributors can so choose among at most
   `2^c` beacons, and each withheld reveal is logged and penalised (rule 40). Contributors that
   all collude control the beacon. A ruleset sizes the witness set against these bounds.
+- **Beacon stalls.** Enough colluding contributors withholding together leave an epoch with
+  fewer than `beacon_min_reveals` and so without a beacon (rule 39). Auditing and panel draws
+  then wait, for as long as the stall lasts: a liveness attack, priced by the penalties of
+  rule 40 on every withholder. Each stalled epoch adds the same logged, machine-checkable
+  evidence against the withholders' seats (JEP-0010 rule 13). A ruleset sets
+  `beacon_min_reveals` low enough that the honest witnesses it expects can always meet it.
 - **Dormant encrypted channels** get no execution check (rule 26).
 - **Liveness.** A task whose workers do not reveal carries forward and can end `unresolved`
   (rule 19). Unresolved is logged, so the gap is visible.
