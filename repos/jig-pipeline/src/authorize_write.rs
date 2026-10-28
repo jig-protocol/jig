@@ -67,6 +67,10 @@ pub struct Membership {
     pub sender: bool,
     /// `member_did` (the member being removed) is a member of the channel.
     pub target: bool,
+    /// The block is a self-join to a `server` or `shared` channel that the
+    /// channel's join rule admits, as the caller judged the joiner's server
+    /// role (JEP-0014 rules 12 and 13).
+    pub self_join: bool,
 }
 
 impl From<bool> for Membership {
@@ -74,6 +78,7 @@ impl From<bool> for Membership {
         Self {
             sender,
             target: false,
+            self_join: false,
         }
     }
 }
@@ -196,7 +201,19 @@ pub fn authorize_block_with(
                 .get("member_did")
                 .and_then(|v| v.as_str())
                 .is_some_and(|member| crate::effect::canonical_did_string(member) == sender);
-            if (adding_self && is_open(&channel.visibility)) || rights.membership {
+            if rights.membership {
+                return Ok(());
+            }
+            // A `server` or `shared` channel takes a self-join on its join
+            // rule alone (JEP-0014 rules 12 and 13), whatever an older client
+            // is told its visibility is. Others as before: an open channel
+            // takes anyone joining themselves.
+            let joined = if channel.tiering.takes_self_join() {
+                adding_self && membership.self_join
+            } else {
+                adding_self && is_open(&channel.visibility)
+            };
+            if joined {
                 return Ok(());
             }
             refuse(sender)
@@ -543,6 +560,7 @@ mod tests {
             Membership {
                 sender: sender_is_member,
                 target: target_is_member,
+                self_join: false,
             },
         )
     }
@@ -744,7 +762,8 @@ mod tests {
                 Some(&c),
                 Membership {
                     sender: true,
-                    target: true
+                    target: true,
+                    self_join: false,
                 },
                 Rights::ADMIN
             ),
@@ -785,7 +804,8 @@ mod tests {
                     Some(&c),
                     Membership {
                         sender: true,
-                        target: true
+                        target: true,
+                        self_join: false,
                     },
                     Rights::ADMIN
                 ),

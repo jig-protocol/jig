@@ -325,6 +325,16 @@ impl jig_pipeline::ingest::Admission for AuthState {
         self.admit_relayed_and_charge(sender_did)
             .map_err(admission_refusal)
     }
+
+    /// JEP-0014 rule 8: a `member` is a DID in the member pool (recorded, or
+    /// aged in); anyone else admission let through is a `guest`.
+    fn server_role(&self, sender_did: &str) -> jig_pipeline::ingest::ServerRole {
+        use jig_pipeline::ingest::ServerRole;
+        match self.pool_of(sender_did, chrono::Utc::now().timestamp()) {
+            Pool::Member => ServerRole::Member,
+            _ => ServerRole::Guest,
+        }
+    }
 }
 
 /// The canonical form of a configured DID: an operator typed it, so it may

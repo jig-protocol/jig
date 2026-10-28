@@ -72,6 +72,12 @@ pub trait Admission: Send + Sync {
     fn admit_relayed(&self, sender_did: &str) -> Result<(), AdmissionRefusal> {
         self.admit(sender_did)
     }
+
+    /// `sender_did`'s server role here (JEP-0014 rule 8), for a self-join.
+    /// A policy that cannot say makes it a stranger, who joins nothing.
+    fn server_role(&self, _sender_did: &str) -> ServerRole {
+        ServerRole::Stranger
+    }
 }
 
 /// Why admission said no. Mirrors the server's admission outcomes without
@@ -109,6 +115,40 @@ impl std::fmt::Display for AdmissionRefusal {
     }
 }
 
+/// A caller's server role (JEP-0014 rule 8): this server's local judgement
+/// of who it is, for the join rules of `server` and `shared` channels.
+/// Ordered: a `member` is also all a `guest` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ServerRole {
+    /// Neither: never self-joins (rule 12).
+    Stranger,
+    /// Proved its key and admitted, but not a member.
+    Guest,
+    /// One the server's admission policy records as a member.
+    Member,
+}
+
+impl ServerRole {
+    /// The role's name in JEP-0014.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServerRole::Stranger => "stranger",
+            ServerRole::Guest => "guest",
+            ServerRole::Member => "member",
+        }
+    }
+
+    /// Whether this role may self-join a channel whose lowest joining role
+    /// is `join` (JEP-0014 rule 12).
+    pub fn may_join(self, join: jig_core::tier::JoinRole) -> bool {
+        use jig_core::tier::JoinRole;
+        match join {
+            JoinRole::Member => self >= ServerRole::Member,
+            JoinRole::Guest => self >= ServerRole::Guest,
+        }
+    }
+}
+
 /// The admission policy of a context that has none: everyone is admitted.
 /// The nameserver and tests use it; the server installs its own.
 pub struct AdmitEveryone;
@@ -116,6 +156,11 @@ pub struct AdmitEveryone;
 impl Admission for AdmitEveryone {
     fn admit(&self, _sender_did: &str) -> Result<(), AdmissionRefusal> {
         Ok(())
+    }
+
+    /// Admitted, and recorded as no one's member.
+    fn server_role(&self, _sender_did: &str) -> ServerRole {
+        ServerRole::Guest
     }
 }
 
@@ -648,11 +693,23 @@ pub async fn ingest(
                         .is_member_by_id(id, &crate::effect::canonical_did_string(target))?,
                     _ => false,
                 },
+                self_join: false,
             },
             None => Default::default(),
         }
     } else {
         Default::default()
+    };
+    let membership = crate::authorize_write::Membership {
+        self_join: self_join_admitted(
+            ctx,
+            kind,
+            &sender,
+            &manifest,
+            resolved_channel.as_ref(),
+            &source,
+        ),
+        ..membership
     };
     // The sender's rights as of this block's position in the channel's
     // chain (JEP-0005 rule 7b): it has no record yet, so every role block
@@ -1230,6 +1287,53 @@ pub struct BlockChannel {
     /// The name as the block carried it — the slug, or the `channel_id` text
     /// — for errors and logs.
     pub named: String,
+}
+
+/// Whether a `member-add` that adds its own signer to a `server` or `shared`
+/// channel passes the channel's join rule (JEP-0014 rules 12 and 13), as
+/// this server judges it where the join arrived:
+///
+/// - from a client of this server: the joiner's server role here meets the
+///   channel's `join`;
+/// - relayed by a follower: the channel lets a granted server's roles count
+///   (`join_servers = granted`). The follower checked the role on its side;
+///   its `member` grant, checked before this, is the owner's trust in that.
+///
+/// Anything else is no self-join: the write gate then needs the
+/// `membership` right, as for adding anyone.
+fn self_join_admitted(
+    ctx: &IngestContext,
+    kind: BlockKind,
+    sender: &jig_core::Did,
+    manifest: &jig_core::BlockManifest,
+    channel: Option<&crate::persist::StoredChannel>,
+    source: &IngestSource,
+) -> bool {
+    use jig_core::tier::{JoinServers, StoredTier, Tier};
+    let Some(channel) = channel else {
+        return false;
+    };
+    let sender = sender.to_did_jig_string();
+    let adds_self = kind == BlockKind::MemberAdd
+        && manifest
+            .metadata
+            .get("member_did")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| crate::effect::canonical_did_string(m) == sender);
+    let tiering = &channel.tiering;
+    if !adds_self || !tiering.takes_self_join() {
+        return false;
+    }
+    match source {
+        IngestSource::LocalClient { .. } => tiering
+            .join
+            .is_some_and(|join| ctx.admission.server_role(&sender).may_join(join)),
+        IngestSource::Relayed { .. } => {
+            tiering.tier == StoredTier::Tier(Tier::Shared)
+                && tiering.join_servers == Some(JoinServers::Granted)
+        }
+        _ => false,
+    }
 }
 
 /// The channel a block belongs to — the ONE rule shared by the write gate,
@@ -4445,6 +4549,91 @@ mod tests {
         meta: serde_json::Value,
     ) -> Result<String, IngestError> {
         submit(ctx, who, kind, jig_core::EncryptionSuite::Unencrypted, meta).await
+    }
+
+    /// An admission policy that records `members` as members and admits
+    /// everyone else as a guest.
+    struct Recorded {
+        members: Vec<String>,
+    }
+
+    impl Admission for Recorded {
+        fn admit(&self, _sender_did: &str) -> Result<(), AdmissionRefusal> {
+            Ok(())
+        }
+
+        fn server_role(&self, sender_did: &str) -> ServerRole {
+            if self.members.iter().any(|m| m == sender_did) {
+                ServerRole::Member
+            } else {
+                ServerRole::Guest
+            }
+        }
+    }
+
+    /// `who` joins `#sealed` by an MLS external commit in a `member-add` it
+    /// signs for itself.
+    async fn join_sealed(ctx: &IngestContext, who: &Person) -> Result<String, IngestError> {
+        let group = ctx.store.get_mls_group("#sealed").unwrap().unwrap();
+        let (_, commit) = who.mls.join_external(&group.group_info.unwrap()).unwrap();
+        plain(
+            ctx,
+            who,
+            BlockKind::MemberAdd,
+            serde_json::json!({
+                "channel": "#sealed",
+                "member_did": who.did,
+                "mls_commit": b64(&commit.commit),
+            }),
+        )
+        .await
+    }
+
+    /// JEP-0014 rule 12: a `server` channel takes a self-join by external
+    /// commit from a DID whose server role meets its `join` (`member` by
+    /// default). A guest is refused; a member joins.
+    #[tokio::test]
+    async fn a_server_channel_takes_a_self_join_on_its_join_role() {
+        let mut ctx = all_channel_kinds();
+        let owner = person();
+        let (guest, member) = (person(), person());
+        ctx.admission = Arc::new(Recorded {
+            members: vec![member.did.clone()],
+        });
+        create_sealed_as(&ctx, &owner, Some("server")).await;
+        let chan = ctx
+            .store
+            .get_channel_by_slug("#sealed")
+            .unwrap()
+            .unwrap()
+            .id;
+
+        assert!(
+            matches!(
+                join_sealed(&ctx, &guest).await,
+                Err(IngestError::NotChannelOwner { .. })
+            ),
+            "a guest is below `member`"
+        );
+        assert!(!ctx.store.is_member_by_id(&chan, &guest.did).unwrap());
+        join_sealed(&ctx, &member).await.unwrap();
+        assert!(ctx.store.is_member_by_id(&chan, &member.did).unwrap());
+    }
+
+    /// Rule 11: a `private` channel takes no self-join, whatever the role.
+    #[tokio::test]
+    async fn a_private_channel_takes_no_self_join() {
+        let mut ctx = all_channel_kinds();
+        let owner = person();
+        let member = person();
+        ctx.admission = Arc::new(Recorded {
+            members: vec![member.did.clone()],
+        });
+        create_sealed_as(&ctx, &owner, Some("private")).await;
+        assert!(matches!(
+            join_sealed(&ctx, &member).await,
+            Err(IngestError::NotChannelOwner { .. })
+        ));
     }
 
     fn seq_of(ctx: &IngestContext, cid: &str) -> u64 {

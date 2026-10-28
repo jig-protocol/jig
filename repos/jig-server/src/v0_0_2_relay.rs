@@ -342,10 +342,72 @@ impl Relay {
         else {
             return Err(Refusal::of(&refused));
         };
+        self.check_self_join(manifest_bytes, channel_id)?;
         let canonical = serde_json::to_vec(&(manifest_bytes, code_bytes))
             .map_err(|e| Refusal::of(&IngestError::BundleMalformed(e.to_string())))?;
         self.relay(&refused, kind, channel_id, sequencer, canonical, sig, conn)
             .await
+    }
+
+    /// A self-join to a carried `shared` channel is relayed only if this
+    /// server's roles count for it (`join_servers = granted`) and the
+    /// joiner's role here meets its `join` (JEP-0014 rule 13). The owner
+    /// cannot check that role: it is this server's judgement, and the
+    /// owner's `member` grant is its trust in it. Any other block is the
+    /// relay's to judge as before.
+    fn check_self_join(&self, manifest_bytes: &[u8], channel_id: &str) -> Result<(), Refusal> {
+        use jig_core::tier::{JoinServers, StoredTier, Tier};
+        let Ok(manifest) = serde_json::from_slice::<jig_core::BlockManifest>(manifest_bytes) else {
+            return Ok(());
+        };
+        let canonical = jig_pipeline::effect::canonical_did_string;
+        let sender = manifest
+            .authors
+            .first()
+            .map(|a| canonical(&a.did.to_string()));
+        let adds_self = manifest.kind == Some(BlockKind::MemberAdd)
+            && manifest
+                .metadata
+                .get("member_did")
+                .and_then(|v| v.as_str())
+                .map(canonical)
+                .is_some_and(|member| Some(&member) == sender.as_ref());
+        let Some(sender) = sender.filter(|_| adds_self) else {
+            return Ok(());
+        };
+        let Some(channel) = self
+            .ctx
+            .store
+            .get_channel_by_id(channel_id)
+            .map_err(|e| Refusal::of(&IngestError::Persist(e)))?
+        else {
+            return Ok(());
+        };
+        let tiering = &channel.tiering;
+        if !tiering.takes_self_join() {
+            return Ok(());
+        }
+        let refused =
+            |message: String| Err(Refusal::new(StatusCode::FORBIDDEN, "JOIN_REFUSED", message));
+        if tiering.tier != StoredTier::Tier(Tier::Shared)
+            || tiering.join_servers != Some(JoinServers::Granted)
+        {
+            return refused(format!(
+                "channel {channel_id} takes self-joins only on the server that orders it, \
+                 `{}`: join there",
+                channel.sequencer_did
+            ));
+        }
+        let role = self.ctx.admission.server_role(&sender);
+        match tiering.join {
+            Some(join) if role.may_join(join) => Ok(()),
+            join => refused(format!(
+                "your role on this server ({}) is below the one channel {channel_id} \
+                 needs to join ({})",
+                role.as_str(),
+                join.map_or("none", |j| j.as_str())
+            )),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
