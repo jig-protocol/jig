@@ -13,7 +13,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use jig_client::blocks::BuiltBlock;
 use jig_client::limits;
 use jig_client::open::open;
-use jig_client::pins::{ChannelPin, Pins, prove_channel};
+use jig_client::pins::{ChannelPin, Pins, names_another_server, prove_carried, prove_channel};
 use jig_client::read_auth::{ReadProof, signable_path};
 use jig_client::secure::{CommitLock, Seen, Session, history_reaches, replay_order};
 use jig_client::{Client, ClientError, DeliveredBlock, Identity};
@@ -30,6 +30,11 @@ use crate::cmd::history::{DEFAULT_HISTORY_LIMIT, history_url, parse_history};
 pub(crate) const MAX_HISTORY_PAGE: usize = 200;
 /// Pages of older history to fetch before giving up on catching up.
 pub(crate) const MAX_CATCH_UP_PAGES: usize = 50;
+/// The first page a catch-up from a known head asks for: a device that
+/// synced recently is usually a few blocks behind, if any. Pages after it
+/// are [`MAX_HISTORY_PAGE`], so [`MAX_CATCH_UP_PAGES`] reach 16 + 49 × 200 =
+/// 9,816 blocks back.
+const SINCE_HEAD_FIRST_PAGE: usize = 16;
 
 /// Packages a DID keeps published, so it can be added while offline.
 const KEY_PACKAGE_TARGET: u64 = 10;
@@ -77,6 +82,13 @@ pub struct ChannelInfo {
     pub slug: String,
     #[serde(default = "none_suite")]
     pub suite: String,
+    /// The server that orders the channel, as the listing says. Taken from
+    /// another server only with `share` ([`Secure::channel`]).
+    #[serde(default)]
+    pub sequencer: String,
+    /// The owner's signed offer, for a channel the server carries.
+    #[serde(default)]
+    pub share: Option<String>,
 }
 
 fn none_suite() -> String {
@@ -119,6 +131,7 @@ pub async fn connect_pinned(server: &str, identity: Identity) -> Result<Client> 
             .server(server)
             .map(|p| p.links.clone())
             .unwrap_or_default(),
+        carried: pins.carried(server),
     };
     let client = Client::connect_with_options(server, identity, options)
         .await
@@ -292,10 +305,15 @@ impl Secure {
             channels: Vec<ChannelInfo>,
         }
         let listing: Listing = self.get_json("/api/v1/channels").await?;
-        let Some(mut info) = listing.channels.into_iter().find(|c| c.slug == slug) else {
+        let ours = Pins::load(&Pins::default_path())?
+            .server(&self.server)
+            .map(|p| p.sequencers())
+            .unwrap_or_default();
+        let Some(mut info) = pick(listing.channels, slug, &ours)? else {
             return Ok(None);
         };
         let pin = self.proven(&info).await?;
+        self.anchor(&info)?;
         if pin.suite != info.suite {
             eprintln!(
                 "warning: the server lists {slug} as `{}`, but its owner created it `{}`; \
@@ -314,6 +332,41 @@ impl Secure {
             );
         }
         Ok(Some(info))
+    }
+
+    /// Pin which server orders `info`'s channel. One the listing says
+    /// another server orders is carried for that owner only if the owner's
+    /// signed offer to this server proves it ([`prove_carried`]); then its
+    /// records are held to the owner. A server cannot name another
+    /// sequencer, or take a carried channel back as its own
+    /// ([`Pins::anchor_channel`]).
+    fn anchor(&self, info: &ChannelInfo) -> Result<()> {
+        let mut pins = Pins::load(&Pins::default_path())?;
+        let ours = pins
+            .server(&self.server)
+            .map(|p| p.sequencers())
+            .unwrap_or_default();
+        let other = names_another_server(&ours, &info.sequencer).then_some(info.sequencer.as_str());
+        let owner = match other {
+            Some(sequencer) => Some(prove_carried(
+                &self.server,
+                &info.slug,
+                &info.id,
+                sequencer,
+                &ours,
+                info.share.as_deref(),
+            )?),
+            None => None,
+        };
+        if pins.anchor_channel(&self.server, &info.slug, &info.id, owner.as_deref())? {
+            eprintln!(
+                "note: {} is now carried here for {}, which orders it; its history is checked \
+                 against that server's records from now on",
+                info.slug,
+                owner.as_deref().unwrap_or_default()
+            );
+        }
+        Ok(())
     }
 
     /// What `info`'s creation block proves, from the pin when it names the
@@ -444,15 +497,86 @@ impl Secure {
             .context("group info is not base64")
     }
 
-    /// Replay the channel's history through the session: join from a
-    /// welcome, follow commits, read messages. Run before building a commit
-    /// so it is built on the channel's current epoch.
+    /// Bring the session up to date with the channel: join from a welcome,
+    /// follow commits, read messages. Run before building a commit so it is
+    /// built on the channel's current epoch. Returns what the blocks it
+    /// processed meant.
     ///
-    /// The newest page usually holds everything this device is missing. When
-    /// it has been away for longer — more than a page of blocks, commits among
-    /// them — older pages are fetched until history reaches back to this
-    /// device's epoch ([`history_reaches`]), or to the start of the channel.
+    /// Every block is processed once, in history order, from the session's
+    /// head ([`Session::head`]) on. That matters for more than cost: MLS lets a
+    /// sender's messages be read only a few generations out of order (openmls
+    /// keeps 5 behind the newest it has read), so a block skipped now could
+    /// never be decrypted later.
+    ///
+    /// The first sync, with no head yet, reads the newest page, and older
+    /// pages until history reaches back to this device's epoch
+    /// ([`history_reaches`]) or to the start of the channel.
     pub async fn sync(&self, slug: &str) -> Result<Synced> {
+        let delivered = match self.session.head(&self.server, slug)? {
+            Some(head) => self.since(slug, &head).await?,
+            None => self.newest_to_epoch(slug).await?,
+        };
+        let synced = self.replay(&delivered);
+        if let Some(newest) = delivered.iter().rev().find_map(|d| open(d).ok()) {
+            self.session.set_head(&self.server, slug, &newest.cid)?;
+        }
+        Ok(synced)
+    }
+
+    /// The blocks after `head`, oldest first. Pages back until a page holds
+    /// `head`: never on a page's length, which a server's byte budget can cut
+    /// short.
+    async fn since(&self, slug: &str, head: &str) -> Result<Vec<DeliveredBlock>> {
+        let at_head = |page: &[DeliveredBlock]| {
+            page.iter()
+                .position(|d| open(d).is_ok_and(|o| o.cid == head))
+        };
+        let mut delivered = self.history_page(slug, SINCE_HEAD_FIRST_PAGE, None).await?;
+        let mut found = at_head(&delivered);
+        let mut pages = 1;
+        loop {
+            if let Some(at) = found {
+                return Ok(delivered.split_off(at + 1));
+            }
+            if pages == MAX_CATCH_UP_PAGES {
+                // About ten thousand blocks: past that, the blocks before
+                // this window are skipped, and MLS will refuse them later.
+                eprintln!(
+                    "warning: more than {} blocks reached {slug} since this device last \
+                     read it. The newest {} are read; every older one is skipped, and \
+                     may never be readable on this device.",
+                    delivered.len(),
+                    delivered.len()
+                );
+                return Ok(delivered);
+            }
+            let Some(oldest) = delivered.first().and_then(|d| open(d).ok()) else {
+                return Ok(delivered);
+            };
+            let mut older = self
+                .history_page(slug, MAX_HISTORY_PAGE, Some(&oldest.cid))
+                .await?;
+            if older.is_empty() {
+                // The head is not in this history: the server dropped it, or
+                // the channel was replaced. Read what there is.
+                eprintln!(
+                    "warning: {slug}'s history no longer holds the last block this \
+                     device read; reading it from the start"
+                );
+                return Ok(delivered);
+            }
+            // Only the new page is searched; it goes in front, so an index
+            // into it is an index into the whole.
+            found = at_head(&older);
+            older.append(&mut delivered);
+            delivered = older;
+            pages += 1;
+        }
+    }
+
+    /// A first catch-up: the newest page, and older pages until history
+    /// reaches back to this device's epoch.
+    async fn newest_to_epoch(&self, slug: &str) -> Result<Vec<DeliveredBlock>> {
         let mut delivered = self.history_page(slug, DEFAULT_HISTORY_LIMIT, None).await?;
         // Only an empty page ends the history. A server may send fewer
         // blocks than asked, to keep a page within a byte budget, so a short
@@ -481,7 +605,40 @@ impl Secure {
             delivered = older;
             pages += 1;
         }
-        Ok(self.replay(&delivered))
+        Ok(delivered)
+    }
+
+    /// The channel's newest `limit` blocks, read, for showing: what `jig read`
+    /// prints and a pane opens with. Syncs first, so every block shown has
+    /// been processed in order, and replaying it only recalls what it meant.
+    /// Departed members to tidy come from the sync.
+    pub async fn recent(&self, slug: &str, limit: usize) -> Result<Synced> {
+        let synced = self.sync(slug).await?;
+        let mut delivered = self
+            .history_page(slug, limit.min(MAX_HISTORY_PAGE), None)
+            .await?;
+        while delivered.len() < limit {
+            let Some(oldest) = delivered.first().and_then(|d| open(d).ok()) else {
+                break;
+            };
+            let mut older = self
+                .history_page(
+                    slug,
+                    (limit - delivered.len()).min(MAX_HISTORY_PAGE),
+                    Some(&oldest.cid),
+                )
+                .await?;
+            if older.is_empty() {
+                break;
+            }
+            older.append(&mut delivered);
+            delivered = older;
+        }
+        let shown = self.replay(&delivered);
+        Ok(Synced {
+            tidy: synced.tidy,
+            ..shown
+        })
     }
 
     /// One page of the channel's history, oldest first: the newest `limit`
@@ -687,6 +844,41 @@ pub fn mls_fields(c: &Commit) -> serde_json::Value {
     v
 }
 
+/// The listed channel `reference` names: the one whose id it is, else the
+/// one this server orders under that slug (`ours`, the server's DIDs). A
+/// slug names a channel only where it is ordered, so a channel this server
+/// carries for its owner is named by its id here, whatever order the listing
+/// is in: a carried channel and this server's own may share a slug.
+fn pick(
+    channels: Vec<ChannelInfo>,
+    reference: &str,
+    ours: &[String],
+) -> Result<Option<ChannelInfo>> {
+    let mut carried = None;
+    let mut by_slug = None;
+    for channel in channels {
+        if !channel.id.is_empty() && channel.id == reference {
+            return Ok(Some(channel));
+        }
+        if channel.slug == reference && by_slug.is_none() {
+            if names_another_server(ours, &channel.sequencer) {
+                carried.get_or_insert(channel);
+            } else {
+                by_slug = Some(channel);
+            }
+        }
+    }
+    match (by_slug, carried) {
+        (Some(own), _) => Ok(Some(own)),
+        (None, Some(c)) => anyhow::bail!(
+            "{reference} here is a channel this server carries for {}; name it by its id, {}",
+            c.sequencer,
+            c.id
+        ),
+        (None, None) => Ok(None),
+    }
+}
+
 fn jig_pipeline_slug(kind: jig_core::BlockKind, m: &jig_core::BlockManifest) -> Option<String> {
     let key = if kind == jig_core::BlockKind::ChannelCreate {
         "slug"
@@ -701,7 +893,47 @@ fn jig_pipeline_slug(kind: jig_core::BlockKind, m: &jig_core::BlockManifest) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::must_encrypt;
+    use super::{ChannelInfo, must_encrypt, pick};
+
+    fn listed(id: &str, slug: &str, sequencer: &str) -> ChannelInfo {
+        ChannelInfo {
+            id: id.to_string(),
+            slug: slug.to_string(),
+            suite: "none".to_string(),
+            sequencer: sequencer.to_string(),
+            share: None,
+        }
+    }
+
+    /// A slug names the channel this server orders, never one it carries,
+    /// whatever order the listing is in; a carried channel is named by id.
+    #[test]
+    fn a_slug_names_the_servers_own_channel_not_a_carried_one() {
+        let ours = vec!["did:jig:zfollower".to_string()];
+        let carried = listed("bafycarried", "#shared", "did:jig:zowner");
+        let own = listed("bafyown", "#shared", "did:jig:zfollower");
+        for listing in [
+            vec![carried.clone(), own.clone()],
+            vec![own.clone(), carried.clone()],
+        ] {
+            let got = pick(listing.clone(), "#shared", &ours).unwrap().unwrap();
+            assert_eq!(got.id, "bafyown");
+            let got = pick(listing, "bafycarried", &ours).unwrap().unwrap();
+            assert_eq!(got.id, "bafycarried");
+        }
+        // Only a carried channel under the slug: refused, naming its id.
+        let error = pick(vec![carried], "#shared", &ours)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bafycarried"), "{error}");
+        // A listing that names no sequencer is the server's own.
+        let legacy = listed("bafylegacy", "#old", "");
+        assert_eq!(
+            pick(vec![legacy], "#old", &ours).unwrap().unwrap().id,
+            "bafylegacy"
+        );
+        assert!(pick(vec![], "#none", &ours).unwrap().is_none());
+    }
 
     /// A server can say anything about a channel's suite. A device that
     /// holds the group never takes its word for "unencrypted" (OP-03).

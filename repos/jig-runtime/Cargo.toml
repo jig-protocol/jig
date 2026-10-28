@@ -17,7 +17,38 @@ component-model = ["wasmtime/component-model"]
 thiserror = "2.0"
 
 # WASM Runtime
-wasmtime = { version = "49.0.2", features = ["cranelift", "pooling-allocator"] }
+# wasmtime's defaults, less `cache`: its on-disk module cache pulls in zstd, whose
+# zstd-safe 7 carries RUSTSEC-2026-0403 and cannot move to the fixed 8.x under zstd 0.13.
+# jig never enabled the cache (`EngineConfig::enable_cache` defaults to false and is now
+# refused). Every wasmtime declaration in the workspace turns defaults off, or Cargo's
+# feature unification would bring `cache` back.
+wasmtime = { version = "49.0.2", default-features = false, features = [
+    "anyhow",
+    "async",
+    "backtrace",
+    "gc",
+    "gc-copying",
+    "gc-drc",
+    "gc-null",
+    "wat",
+    "profiling",
+    "parallel-compilation",
+    "cranelift",
+    "pooling-allocator",
+    "demangle",
+    "addr2line",
+    "coredump",
+    "debug-builtins",
+    "runtime",
+    "component-model",
+    "component-model-async",
+    "threads",
+    "stack-switching",
+    "std",
+    "debug",
+    "compile-time-builtins",
+    "wit-parser",
+] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -32,7 +63,7 @@ jig-core = { path = "../jig-core" }
 [dev-dependencies]
 # Pulley, for tests/block_abi_vectors.rs, which runs every vector on both backends. Test builds
 # only: nothing in the shipped runtime selects Pulley yet.
-wasmtime = { version = "49.0.2", features = ["pulley"] }
+wasmtime = { version = "49.0.2", default-features = false, features = ["pulley"] }
 wat = "1.0"
 # For tests/text_block_component.rs, which runs the real canonical component.
 # text-block depends on no workspace crate, so this adds no cycle; jig-runtime

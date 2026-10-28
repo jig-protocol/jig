@@ -50,7 +50,8 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum ContractsCommand {
-    /// Every offer, with its id, side, state, grant, peer and channel.
+    /// Every offer, with its id, side, state, grant, peer and channel, then
+    /// any carried channel that is stalled, and why.
     List,
     /// Accept an offer held for you.
     Accept {
