@@ -369,14 +369,27 @@ server_healthy() {
   server_scheme >/dev/null
 }
 
+# The address $JIG_HOME/config.toml has jig-server listen on. A re-run keeps
+# an existing config, so this can differ from $JIG_SERVER_LISTEN.
+config_listen() {
+  local cfg="$JIG_HOME/config.toml" host port
+  host="$(sed -n 's/^bind_address = "\(.*\)"$/\1/p' "$cfg" 2>/dev/null | head -1)"
+  port="$(sed -n 's/^port = \([0-9][0-9]*\)$/\1/p' "$cfg" 2>/dev/null | head -1)"
+  [ -n "$host" ] && [ -n "$port" ] || return 1
+  echo "$host:$port"
+}
+
 # The pid of the jig-server this installer started earlier, from
-# $JIG_HOME/jig-server.pid, if that process is still that binary.
+# $JIG_HOME/jig-server.pid, if that process is still that binary and its
+# config has it listen on $JIG_SERVER_LISTEN, so it is the server answering
+# there and not one elsewhere.
 our_server_pid() {
   local pid
   pid="$(cat "$JIG_HOME/jig-server.pid" 2>/dev/null)" || return 1
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   kill -0 "$pid" 2>/dev/null || return 1
   ps -o command= -p "$pid" 2>/dev/null | grep -qF "$JIG_HOME/bin/jig-server" || return 1
+  [ "$(config_listen)" = "$JIG_SERVER_LISTEN" ] || return 1
   echo "$pid"
 }
 
@@ -391,8 +404,8 @@ replaced_server_answering() {
   }
   local pid
   if ! pid="$(our_server_pid)"; then
-    warn "a jig-server this installer did not start is answering on $JIG_SERVER_LISTEN, so it"
-    warn "still runs whatever build it started with. Restart it to run the one just installed."
+    warn "the jig-server answering on $JIG_SERVER_LISTEN is not one this installer started there, so"
+    warn "it still runs whatever build it started with. Restart it to run the one just installed."
     return 0
   fi
   log "stopping jig-server (pid $pid): it runs the build this install replaced"
