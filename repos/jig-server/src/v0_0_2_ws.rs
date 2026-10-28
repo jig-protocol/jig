@@ -649,7 +649,8 @@ async fn handle_client_frame(
             Ok(()) => {
                 session.peer = jig_core::did::Did::from_did_jig_string(&awaiting.peer_did).ok();
                 if let Some(peer) = session.peer.clone() {
-                    let (sender, rx) = crate::v0_0_2_peer::PeerSender::new(peer);
+                    let (sender, rx) =
+                        crate::v0_0_2_peer::PeerSender::with_tiers(peer, session.tiers);
                     session.peer_registration = Some(state.peers.register(sender.clone()));
                     session.peer_sender = Some(sender);
                     session.peer_rx = Some(rx);

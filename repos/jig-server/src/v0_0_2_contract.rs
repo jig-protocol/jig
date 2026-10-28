@@ -334,7 +334,9 @@ impl Contracts {
         {
             Ok(offers) => {
                 for offer in offers {
-                    self.send(&offer.peer_did, OFFER_FRAME, offer.offer);
+                    if self.may_offer(&offer.channel_id, &offer.peer_did) {
+                        self.send(&offer.peer_did, OFFER_FRAME, offer.offer);
+                    }
                 }
             }
             Err(e) => tracing::warn!("listing unanswered offers: {e}"),
@@ -414,8 +416,42 @@ impl Contracts {
             answer: None,
             share_cid: Some(share_cid.to_string()),
         })?;
-        self.send(to, OFFER_FRAME, offer.envelope);
+        if self.may_offer(&channel.id, to) {
+            self.send(to, OFFER_FRAME, offer.envelope);
+        }
         Ok(())
+    }
+
+    /// Whether `channel`'s offer may go to `peer` now. A `shared` channel's
+    /// offer waits for a connection whose handshake says the peer implements
+    /// tiers (JEP-0014): a server without them would carry it as an untiered
+    /// channel. It stays unanswered, and goes out on a later resend once the
+    /// peer has upgraded.
+    fn may_offer(&self, channel_id: &str, peer: &str) -> bool {
+        use jig_core::tier::{StoredTier, Tier};
+        let shared = self
+            .store()
+            .get_channel_by_id(channel_id)
+            .ok()
+            .flatten()
+            .is_some_and(|c| c.tiering.tier == StoredTier::Tier(Tier::Shared));
+        if !shared {
+            return true;
+        }
+        let Ok(did) = Did::from_did_jig_string(peer) else {
+            return false;
+        };
+        match self.peers.sender_for(&did) {
+            Some(sender) if !sender.tiers() => {
+                tracing::info!(
+                    peer,
+                    channel_id,
+                    "a shared channel's offer waits: the peer does not implement tiers"
+                );
+                false
+            }
+            _ => true,
+        }
     }
 
     /// End the live share with `to`, and withdraw any offer to it not yet
@@ -3619,21 +3655,13 @@ mod tests {
         }
     }
 
-    /// JEP-0014 rule 13 across servers: a `shared` MLS channel on its owner,
-    /// shared with a follower. A member whose client is on the follower joins
-    /// by Welcome and posts through it; the owner's member reads the post.
-    /// Neither server ever holds the plaintext.
-    #[tokio::test]
-    async fn a_shared_mls_channel_is_written_through_its_follower_and_read_at_its_owner() {
-        use jig_mls::member::Member;
+    /// A `shared` MLS channel on `p`'s owner, created by its user: the
+    /// channel, the user's MLS member and the group's id.
+    async fn shared_mls_channel(p: &Pair) -> (String, jig_mls::member::Member, Vec<u8>) {
         let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
-        let did = |key: &SigningKey| {
-            jig_core::did::Did::from_ed25519_pubkey(key.verifying_key().as_bytes())
-        };
-        let p = pair(OfferPolicy::Accept).await;
-        let creator = Member::new(&p.user.to_bytes(), &did(&p.user)).unwrap();
+        let did = jig_core::did::Did::from_ed25519_pubkey(p.user.verifying_key().as_bytes());
+        let creator = jig_mls::member::Member::new(&p.user.to_bytes(), &did).unwrap();
         let created = creator.create_group().unwrap();
-        let gid = created.group_id.clone();
         let channel = post(
             &p.owner,
             &p.user,
@@ -3648,6 +3676,51 @@ mod tests {
         )
         .await
         .unwrap();
+        (channel, creator, created.group_id)
+    }
+
+    /// A `shared` channel's offer goes only to a peer whose handshake says
+    /// it implements tiers: one without them would carry it untiered. The
+    /// offer waits, unanswered.
+    #[tokio::test]
+    async fn a_shared_channel_is_not_offered_to_a_peer_without_tiers() {
+        let p = pair(OfferPolicy::Accept).await;
+        let (channel, _, _) = shared_mls_channel(&p).await;
+        // The follower's newest connection is one that did not ask for tiers.
+        let (old, mut old_rx) = PeerSender::new(p.follower.server_did.clone());
+        let _registration = p.owner.peers.register(old);
+        p.share(&channel, "write").await;
+        let offered = eventually("the owner's offer", || {
+            p.offers(Side::Owner, &channel, OfferState::Offered).pop()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(old_rx.try_recv().is_err(), "nothing sent to the old peer");
+        assert!(
+            p.offers(Side::Follower, &channel, OfferState::Accepted)
+                .is_empty(),
+            "the follower never saw it"
+        );
+        assert_eq!(
+            p.offers(Side::Owner, &channel, OfferState::Offered),
+            vec![offered],
+            "the offer waits"
+        );
+    }
+
+    /// JEP-0014 rule 13 across servers: a `shared` MLS channel on its owner,
+    /// shared with a follower. A member whose client is on the follower joins
+    /// by Welcome and posts through it; the owner's member reads the post.
+    /// Neither server ever holds the plaintext.
+    #[tokio::test]
+    async fn a_shared_mls_channel_is_written_through_its_follower_and_read_at_its_owner() {
+        use jig_mls::member::Member;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let did = |key: &SigningKey| {
+            jig_core::did::Did::from_ed25519_pubkey(key.verifying_key().as_bytes())
+        };
+        let p = pair(OfferPolicy::Accept).await;
+        let (channel, creator, gid) = shared_mls_channel(&p).await;
         p.share(&channel, "write").await;
         p.both(&channel, OfferState::Accepted).await;
 

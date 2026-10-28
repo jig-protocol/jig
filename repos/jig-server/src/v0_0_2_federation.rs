@@ -396,9 +396,10 @@ pub(crate) async fn connect_and_relay(
     let (mut sink, mut stream) = ws.split();
     // The handshake proved the peer's DID; peer frames on this connection
     // are from it and go to it ([`crate::v0_0_2_peer`]).
-    let (peer_sender, mut peer_out) = crate::v0_0_2_peer::PeerSender::new(
+    let (peer_sender, mut peer_out) = crate::v0_0_2_peer::PeerSender::with_tiers(
         jig_core::did::Did::from_did_jig_string(&welcome.server_did)
             .map_err(|e| anyhow::anyhow!("the peer's welcome DID: {e}"))?,
+        welcome.capabilities.tiers,
     );
     let registration = state.peers.register(peer_sender.clone());
     info!(peer_url = %peer.url, "federation peer connected");
