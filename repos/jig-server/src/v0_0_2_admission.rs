@@ -134,6 +134,7 @@ fn refuse(status: StatusCode, code: &str, message: impl Into<String>) -> Refusal
         Json(ErrorBody {
             code: code.to_string(),
             message: message.into(),
+            retry_after_ms: None,
         }),
     )
 }

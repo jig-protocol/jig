@@ -213,7 +213,11 @@ impl Refusal {
     /// The refusal for an ingest error, as every surface classifies it.
     pub fn of(e: &IngestError) -> Self {
         let (status, code, message) = crate::v0_0_2_ingest_error::classify_ingest_error(e);
-        Refusal::new(status, code, message)
+        Refusal {
+            retry_after_ms: crate::v0_0_2_ingest_error::retry_after(e)
+                .map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).max(1)),
+            ..Refusal::new(status, code, message)
+        }
     }
 
     /// A refusal with when to post again: in `retry_after_ms`, and in the
@@ -726,6 +730,25 @@ mod tests {
         let mut bytes = Answer::accepted(1, "bafk".to_string()).encode();
         bytes.push(0);
         assert_eq!(Answer::decode(&bytes), None, "trailing bytes");
+    }
+
+    /// A render that missed its deadline tells the client when to post again,
+    /// in the field as well as the message; a block too expensive to render
+    /// is given no wait, because waiting does not change the answer.
+    #[test]
+    fn a_missed_render_deadline_carries_its_wait() {
+        use jig_pipeline::ingest::RenderCause;
+        let render_failed = |cause| IngestError::RenderFailed {
+            kind: "text-render".to_string(),
+            cause,
+            detail: "the render is incomplete".to_string(),
+        };
+        let refusal = Refusal::of(&render_failed(RenderCause::DeadlineExceeded));
+        assert_eq!(refusal.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refusal.retry_after_ms, Some(1000));
+        let refusal = Refusal::of(&render_failed(RenderCause::FuelExhausted));
+        assert_eq!(refusal.code, "BLOCK_TOO_EXPENSIVE");
+        assert_eq!(refusal.retry_after_ms, None);
     }
 
     #[test]

@@ -23,6 +23,19 @@ use std::time::Duration;
 /// second lets a burst drain without the client giving up.
 pub const RENDER_DEADLINE_RETRY: Duration = Duration::from_secs(1);
 
+/// How long the client should wait before posting again, for the ingest
+/// failures that waiting changes. Every surface carries it as
+/// `retry_after_ms`; the classifier's message says it too.
+pub fn retry_after(e: &IngestError) -> Option<Duration> {
+    match e {
+        IngestError::RenderFailed {
+            cause: RenderCause::DeadlineExceeded,
+            ..
+        } => Some(RENDER_DEADLINE_RETRY),
+        _ => None,
+    }
+}
+
 /// Classify an ingest failure into `(status, error_code, message)`. Callers
 /// wrap this triple in whatever JSON body type their endpoint uses.
 pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, String) {
@@ -426,6 +439,22 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(code, "RENDER_FAILED");
         assert!(message.ends_with("(retry_after_ms=1000)"), "{message}");
+        assert_eq!(
+            retry_after(&render_failed(RenderCause::DeadlineExceeded)),
+            Some(RENDER_DEADLINE_RETRY)
+        );
+        for cause in [
+            RenderCause::FuelExhausted,
+            RenderCause::StackExhausted,
+            RenderCause::HostFault,
+        ] {
+            assert_eq!(retry_after(&render_failed(cause)), None, "{cause:?}");
+        }
+        // REST carries the wait in its body, as WS does in its Error frame.
+        let (_, body) = blocks_map_ingest_error(render_failed(RenderCause::DeadlineExceeded));
+        assert_eq!(body.0.retry_after_ms, Some(1000));
+        let (_, body) = blocks_map_ingest_error(render_failed(RenderCause::FuelExhausted));
+        assert_eq!(body.0.retry_after_ms, None);
 
         let (status, code, message) = classify_ingest_error(&render_failed(RenderCause::HostFault));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);

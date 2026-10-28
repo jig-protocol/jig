@@ -250,6 +250,7 @@ async fn per_ip_rate(
         let body = crate::v0_0_2_blocks::ErrorBody {
             code: code.to_string(),
             message,
+            retry_after_ms: None,
         };
         return axum::response::IntoResponse::into_response((status, axum::Json(body)));
     }
