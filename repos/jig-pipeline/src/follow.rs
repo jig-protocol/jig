@@ -91,6 +91,17 @@ pub enum FollowError {
     /// The record is larger than any record is.
     #[error("the record is {len} bytes; a follower takes at most {max}")]
     RecordTooLarge { len: usize, max: usize },
+    /// The owner sequenced an MLS block that does not apply to the group as
+    /// this server mirrors it (JEP-0005 rule 19). It is not delivered; the
+    /// evidence is kept and the channel takes nothing more, as at a fork.
+    #[error(
+        "channel {channel_id} stopped at seq {seq}: the owner's block does not apply to its group: {reason}"
+    )]
+    Unapplied {
+        channel_id: String,
+        seq: u64,
+        reason: String,
+    },
     /// Not followed in this slice.
     #[error("{0}")]
     Unsupported(&'static str),
@@ -209,6 +220,29 @@ impl SqliteStore {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Stop `channel_id` at `seq`, where the owner's record `offered` names a
+    /// block its group refuses; `held` is this server's head before it.
+    fn keep_unapplied(
+        &self,
+        channel_id: &str,
+        seq: u64,
+        held: &[u8],
+        offered: &[u8],
+    ) -> crate::persist::Result<()> {
+        self.conn.lock().expect("poisoned").execute(
+            "INSERT OR IGNORE INTO chain_evidence (channel_id, seq, held, offered, found_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                channel_id,
+                seq as i64,
+                held,
+                offered,
+                chrono::Utc::now().timestamp()
+            ],
+        )?;
+        Ok(())
     }
 
     /// The carried channels waiting on a block held in another channel.
@@ -461,12 +495,8 @@ pub async fn ingest_sequenced(
         if terms.sequencer != crate::effect::canonical_did_string(sequencer) {
             return Err(not_carried());
         }
-        if crate::mls_gate::requested_suite(&manifest).ok()
-            != Some(jig_core::EncryptionSuite::Unencrypted)
-        {
-            return Err(FollowError::Unsupported(
-                "an MLS channel is followed from slice 7",
-            ));
+        if !followed_suite(crate::mls_gate::requested_suite(&manifest).ok()) {
+            return Err(FollowError::Unsupported(UNFOLLOWED_SUITE));
         }
         None
     } else {
@@ -489,10 +519,8 @@ pub async fn ingest_sequenced(
         if !names_it {
             return Err(FollowError::Mismatch("the block names another channel"));
         }
-        if chan.suite != jig_core::EncryptionSuite::Unencrypted.as_str() {
-            return Err(FollowError::Unsupported(
-                "an MLS channel is followed from slice 7",
-            ));
+        if !followed_suite(chan.suite.parse().ok()) {
+            return Err(FollowError::Unsupported(UNFOLLOWED_SUITE));
         }
         Some(chan)
     };
@@ -506,6 +534,15 @@ pub async fn ingest_sequenced(
     }
     // Rule 12: the owner's signature, exactly, and nothing of this server's.
     record.verify(sequencer)?;
+    let mls = mirror_plan(
+        ctx,
+        kind,
+        &sender,
+        &manifest,
+        channel.as_ref(),
+        &record,
+        record_bytes,
+    )?;
 
     let canonical = crate::ingest::bundle_canonical_bytes(bundle.manifest_bytes, bundle.code_bytes)
         .map_err(IngestError::BundleMalformed)?;
@@ -517,7 +554,8 @@ pub async fn ingest_sequenced(
         sender_did: sender.to_did_jig_string(),
         sender_sig: sig,
         bundle_bytes: canonical,
-        is_synthetic: !kind.is_wasm_executable(),
+        // Ciphertext is never executed, here or at the owner.
+        is_synthetic: !kind.is_wasm_executable() || matches!(mls, crate::mls_gate::MlsPlan::Sealed),
         hlc_wall_ms: hlc.map(|h| h.wall_ms).unwrap_or(0),
         hlc_logical: hlc.map(|h| h.logical).unwrap_or(0),
         hlc_origin: hlc.map(|h| h.server_did.to_string()).unwrap_or_default(),
@@ -533,7 +571,8 @@ pub async fn ingest_sequenced(
             &block_cid,
             channel.as_ref(),
             sequencer,
-        )
+        )?;
+        advance_mirror(conn, &channel_id, mls)
     };
     match ctx
         .store
@@ -579,6 +618,129 @@ pub async fn ingest_sequenced(
     }
     deliver(ctx, &stored, &channel_id).await;
     Ok(Followed::Landed { block_cid, seq })
+}
+
+const UNFOLLOWED_SUITE: &str = "only plaintext and MLS channels are followed";
+
+/// The suites a follower carries: plaintext, and MLS through its mirror of
+/// the group's public state.
+fn followed_suite(suite: Option<jig_core::EncryptionSuite>) -> bool {
+    matches!(
+        suite,
+        Some(jig_core::EncryptionSuite::Unencrypted | jig_core::EncryptionSuite::Mls)
+    )
+}
+
+/// What the block does to an MLS channel's group, judged against this
+/// server's mirror of its public state exactly as the owner's gate judged it
+/// (JEP-0005 rule 19). Only the chain's next record is judged: a duplicate,
+/// a gap or a fork is the landing's to tell, and a mirror that moved past or
+/// not yet reached the block would refuse a block that is fine.
+///
+/// A next record that does not apply is the owner sequencing what its own
+/// group refuses: the evidence is kept and the channel stops.
+fn mirror_plan(
+    ctx: &IngestContext,
+    kind: BlockKind,
+    sender: &jig_core::Did,
+    manifest: &jig_core::BlockManifest,
+    channel: Option<&crate::persist::StoredChannel>,
+    record: &IngestRecord,
+    record_bytes: &[u8],
+) -> Result<crate::mls_gate::MlsPlan, FollowError> {
+    let mls = jig_core::EncryptionSuite::Mls;
+    let is_mls = match channel {
+        None => crate::mls_gate::requested_suite(manifest).ok() == Some(mls),
+        Some(chan) => chan.suite == mls.as_str(),
+    };
+    if !is_mls {
+        return Ok(crate::mls_gate::MlsPlan::Nothing);
+    }
+    let head = ctx.store.latest_ingest_record(&record.channel_id)?;
+    let stopped = !ctx.store.chain_evidence(&record.channel_id)?.is_empty();
+    if stopped || record.seq != head.as_ref().map_or(0, |h| h.seq + 1) {
+        return Ok(crate::mls_gate::MlsPlan::Nothing);
+    }
+    let group = match channel {
+        Some(chan) => ctx.store.get_mls_group_by_id(&chan.id)?,
+        None => None,
+    };
+    crate::mls_gate::plan(
+        kind,
+        &sender.to_did_jig_string(),
+        manifest,
+        channel,
+        group.as_ref(),
+    )
+    .or_else(|refusal| {
+        let label = channel.map_or("", |c| c.slug.as_str());
+        let reason = crate::ingest::suite_refusal(refusal, label).to_string();
+        let held = head.map(|h| h.encode()).unwrap_or_default();
+        ctx.store
+            .keep_unapplied(&record.channel_id, record.seq, &held, record_bytes)?;
+        tracing::warn!(
+            channel_id = record.channel_id,
+            seq = record.seq,
+            reason,
+            "the owner sequenced an MLS block its group refuses; the channel is stopped"
+        );
+        Err(FollowError::Unapplied {
+            channel_id: record.channel_id.clone(),
+            seq: record.seq,
+            reason,
+        })
+    })
+}
+
+/// Move the mirror with the block, in its landing's transaction: the group
+/// a new channel starts, or the epoch a commit makes. A commit whose epoch
+/// another landing took first lands nothing, and comes again.
+fn advance_mirror(
+    conn: &rusqlite::Connection,
+    channel_id: &str,
+    plan: crate::mls_gate::MlsPlan,
+) -> anyhow::Result<()> {
+    match plan {
+        crate::mls_gate::MlsPlan::Genesis(group) => {
+            conn.execute(
+                "INSERT OR REPLACE INTO mls_groups (channel_id, group_id, state, epoch, group_info)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    channel_id,
+                    group.group_id,
+                    group.state,
+                    group.epoch as i64,
+                    group.group_info
+                ],
+            )?;
+        }
+        crate::mls_gate::MlsPlan::Advance {
+            from_epoch,
+            state,
+            to_epoch,
+            group_info,
+            ..
+        } => {
+            let advanced = conn.execute(
+                "UPDATE mls_groups SET state = ?3, epoch = ?4, group_info = ?5
+                  WHERE channel_id = ?1 AND epoch = ?2",
+                params![
+                    channel_id,
+                    from_epoch as i64,
+                    state,
+                    to_epoch as i64,
+                    group_info
+                ],
+            )?;
+            if advanced == 0 {
+                anyhow::bail!(
+                    "the group of channel {channel_id} is no longer at epoch {from_epoch}"
+                );
+            }
+        }
+        crate::mls_gate::MlsPlan::Nothing | crate::mls_gate::MlsPlan::Sealed => {}
+    }
+    Ok(())
 }
 
 /// Hand a carried block to this server's own subscribers, under the
@@ -665,6 +827,16 @@ mod tests {
         kind: BlockKind,
         meta: serde_json::Value,
     ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        signed_as(key, kind, meta, jig_core::EncryptionSuite::Unencrypted)
+    }
+
+    /// [`signed`], its content in `suite`.
+    fn signed_as(
+        key: &SigningKey,
+        kind: BlockKind,
+        meta: serde_json::Value,
+        suite: jig_core::EncryptionSuite,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let mut manifest = BlockManifest::builder()
             .version(Version::new(0, 1, 0))
             .author(Author {
@@ -679,6 +851,13 @@ mod tests {
             manifest.metadata.extend(map);
         }
         crate::ingest::tier_as_a_current_client_would(kind, &mut manifest.metadata);
+        if suite != jig_core::EncryptionSuite::Unencrypted {
+            manifest.privacy = Some(jig_core::Privacy {
+                encryption: suite,
+                recipients: vec![],
+                metadata_visibility: Default::default(),
+            });
+        }
         manifest.hlc_ts = Some(jig_core::HlcTimestamp {
             wall_ms: rand::random::<u32>() as u64,
             logical: 0,
@@ -748,6 +927,15 @@ mod tests {
         /// Post through the owner's own gate, and keep what it would send.
         async fn post(&mut self, kind: BlockKind, meta: serde_json::Value) -> String {
             let parts = signed(&self.user, kind, meta);
+            self.post_parts(kind, parts).await
+        }
+
+        /// [`Self::post`] for a block signed already.
+        async fn post_parts(
+            &mut self,
+            kind: BlockKind,
+            parts: (Vec<u8>, Vec<u8>, Vec<u8>),
+        ) -> String {
             let cid = ingest(
                 &self.ctx,
                 bundle(&parts),
@@ -1498,31 +1686,231 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn an_mls_channel_is_not_followed_yet() {
-        let owner = Owner::new().await;
-        let follower = ctx();
-        // An MLS creation block, signed and recorded by the owner's key.
-        let parts = signed(
-            &owner.user,
-            BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#sealed", "suite": "mls"}),
-        );
-        let cid = bundle(&parts).block_cid().unwrap().to_string();
-        share(&follower, &cid, &owner.did());
-        let record = RecordSigner {
-            channel_id: cid.clone(),
-            key: &owner.ctx.server_key,
-            ingest_wall_ms: 1,
-            ingest_logical: 0,
+    /// An owner of an encrypted channel, with its group's first member.
+    struct MlsOwner {
+        owner: Owner,
+        creator: jig_mls::member::Member,
+        group_id: Vec<u8>,
+    }
+
+    impl MlsOwner {
+        async fn new() -> Self {
+            use base64::Engine as _;
+            let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+            let seed: [u8; 32] = rand::random();
+            let user = SigningKey::from_bytes(&seed);
+            let creator = jig_mls::member::Member::new(&seed, &did_of_key(&user)).unwrap();
+            let created = creator.create_group().unwrap();
+            let mut owner = Owner {
+                ctx: ctx(),
+                user,
+                channel: String::new(),
+                sent: Vec::new(),
+            };
+            owner.channel = owner
+                .post(
+                    BlockKind::ChannelCreate,
+                    serde_json::json!({
+                        "slug": "#sealed",
+                        "visibility": "restricted",
+                        "suite": "mls",
+                        "mls_group_info": b64(&created.group_info),
+                        "mls_ratchet_tree": b64(&created.ratchet_tree),
+                    }),
+                )
+                .await;
+            MlsOwner {
+                owner,
+                creator,
+                group_id: created.group_id,
+            }
         }
-        .sign(0, &cid, crate::ingest_record::GENESIS_PREV)
-        .unwrap()
-        .encode();
-        let sent = Sent { parts, record };
+
+        /// The creator adds a fresh member; its commit, as posted.
+        async fn add(&mut self) -> Vec<u8> {
+            use base64::Engine as _;
+            let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+            let seed: [u8; 32] = rand::random();
+            let did = did_of_key(&SigningKey::from_bytes(&seed));
+            let joiner = jig_mls::member::Member::new(&seed, &did).unwrap();
+            let kp = joiner.key_packages(1, false).unwrap().remove(0);
+            let commit = self
+                .creator
+                .add(&self.group_id, &kp, &did.to_did_jig_string())
+                .unwrap();
+            let channel = self.owner.channel.clone();
+            self.owner
+                .post(
+                    BlockKind::MemberAdd,
+                    serde_json::json!({
+                        "channel_id": channel,
+                        "member_did": did.to_did_jig_string(),
+                        "mls_commit": b64(&commit.commit),
+                        "mls_welcome": b64(commit.welcome.as_ref().unwrap()),
+                    }),
+                )
+                .await;
+            self.creator.confirm(&self.group_id).unwrap();
+            commit.commit
+        }
+
+        /// A message the creator seals for the group, as posted.
+        async fn seal(&mut self, text: &str) -> String {
+            let parts = self.sealed(text);
+            self.owner.post_parts(BlockKind::TextRender, parts).await
+        }
+
+        fn sealed(&self, text: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+            self.sealed_in(&self.owner.channel, text)
+        }
+
+        /// A message this group's creator seals, posted into `channel`.
+        fn sealed_in(&self, channel: &str, text: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+            use base64::Engine as _;
+            let (ct, epoch) = self
+                .creator
+                .encrypt(&self.group_id, text.as_bytes())
+                .unwrap();
+            signed_as(
+                &self.owner.user,
+                BlockKind::TextRender,
+                serde_json::json!({
+                    "channel_id": channel,
+                    "mls_message": base64::engine::general_purpose::STANDARD.encode(ct),
+                    "mls_epoch": epoch,
+                }),
+                jig_core::EncryptionSuite::Mls,
+            )
+        }
+    }
+
+    fn did_of_key(key: &SigningKey) -> Did {
+        Did::from_ed25519_pubkey(key.verifying_key().as_bytes())
+    }
+
+    /// Slice 7: a follower carries an MLS channel through its mirror of the
+    /// group's public state, moving with each commit the owner sequenced,
+    /// and stores sealed content as the ciphertext it is.
+    #[tokio::test]
+    async fn a_follower_mirrors_an_mls_channels_group() {
+        let mut o = MlsOwner::new().await;
+        o.add().await;
+        let sealed = o.seal("only the group reads this").await;
+        let follower = o.owner.follower();
+        for sent in &o.owner.sent {
+            take(&follower, &o.owner, sent).await.unwrap();
+        }
+        let ours = follower
+            .store
+            .get_mls_group_by_id(&o.owner.channel)
+            .unwrap()
+            .unwrap();
+        let theirs = o
+            .owner
+            .ctx
+            .store
+            .get_mls_group_by_id(&o.owner.channel)
+            .unwrap()
+            .unwrap();
+        assert_eq!((ours.epoch, &ours.group_id), (1, &theirs.group_id));
+        assert_eq!(
+            ours.state, theirs.state,
+            "the same public state as the owner's"
+        );
+        // The commit again is the block already held, not one the mirror
+        // refuses: only the chain's next record is judged.
         assert!(matches!(
-            take(&follower, &owner, &sent).await,
-            Err(FollowError::Unsupported(_))
+            take(&follower, &o.owner, &o.owner.sent[1]).await,
+            Ok(Followed::Duplicate { .. })
         ));
+        let block = follower.store.get_block(&sealed).unwrap().unwrap();
+        assert!(block.is_synthetic, "ciphertext is never executed");
+        assert!(
+            !String::from_utf8_lossy(&block.bundle_bytes).contains("only the group"),
+            "stored as ciphertext"
+        );
+    }
+
+    /// Rule 19: a commit the owner sequenced that does not apply to the
+    /// mirror is not delivered. The evidence is kept, and the channel takes
+    /// nothing more, as at a fork.
+    #[tokio::test]
+    async fn a_commit_the_mirror_refuses_stops_the_channel() {
+        use base64::Engine as _;
+        let mut o = MlsOwner::new().await;
+        let commit = o.add().await;
+        let follower = o.owner.follower();
+        for sent in &o.owner.sent {
+            take(&follower, &o.owner, sent).await.unwrap();
+        }
+        // The same commit again: the group is past its epoch.
+        let again = signed(
+            &o.owner.user,
+            BlockKind::MemberAdd,
+            serde_json::json!({
+                "channel_id": o.owner.channel,
+                "member_did": "did:jig:zsomeoneelse",
+                "mls_commit": base64::engine::general_purpose::STANDARD.encode(&commit),
+                "mls_welcome": "AA==",
+            }),
+        );
+        let head = IngestRecord::decode(&o.owner.sent.last().unwrap().record).unwrap();
+        let stale = Sent {
+            record: o.owner.sign_at(&again, head.seq + 1, head.hash()),
+            parts: again,
+        };
+        match take(&follower, &o.owner, &stale).await {
+            Err(FollowError::Unapplied { seq, .. }) => assert_eq!(seq, head.seq + 1),
+            other => panic!("{other:?}"),
+        }
+        let cid = bundle(&stale.parts).block_cid().unwrap().to_string();
+        assert!(
+            follower.store.get_block(&cid).unwrap().is_none(),
+            "not delivered"
+        );
+        assert_eq!(
+            follower
+                .store
+                .chain_evidence(&o.owner.channel)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            follower
+                .store
+                .get_mls_group_by_id(&o.owner.channel)
+                .unwrap()
+                .unwrap()
+                .epoch,
+            1,
+            "the mirror did not move"
+        );
+        // Stopped: even a block that would apply is not taken.
+        let later = o.sealed("later");
+        let next = Sent {
+            record: o.owner.sign_at(&later, head.seq + 1, head.hash()),
+            parts: later,
+        };
+        let got = take(&follower, &o.owner, &next).await;
+        assert!(matches!(got, Err(FollowError::Stopped { .. })), "{got:?}");
+    }
+
+    /// A sealed message must be ciphertext for the mirror's group, as at the
+    /// owner: one for another group is refused.
+    #[tokio::test]
+    async fn sealed_content_is_checked_against_the_mirror() {
+        let o = MlsOwner::new().await;
+        let other = MlsOwner::new().await;
+        let follower = o.owner.follower();
+        take(&follower, &o.owner, &o.owner.sent[0]).await.unwrap();
+        let foreign = other.sealed_in(&o.owner.channel, "not for this group");
+        let genesis = IngestRecord::decode(&o.owner.sent[0].record).unwrap();
+        let sent = Sent {
+            record: o.owner.sign_at(&foreign, 1, genesis.hash()),
+            parts: foreign,
+        };
+        let got = take(&follower, &o.owner, &sent).await;
+        assert!(matches!(got, Err(FollowError::Unapplied { .. })), "{got:?}");
     }
 }
