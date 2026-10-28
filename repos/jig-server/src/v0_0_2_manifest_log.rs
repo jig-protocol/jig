@@ -195,6 +195,10 @@ fn log_create(state: &AppState) -> anyhow::Result<Vec<u8>> {
     block(state, BlockKind::ChannelCreate, |m| {
         m.metadata_entry("slug", serde_json::json!(LOG_SLUG))
             .metadata_entry("visibility", serde_json::json!("open"))
+            .metadata_entry(
+                jig_pipeline::ingest::SEQUENCER_KEY,
+                serde_json::json!(state.server_did.to_did_jig_string()),
+            )
     })
 }
 

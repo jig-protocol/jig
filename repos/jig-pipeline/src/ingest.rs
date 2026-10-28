@@ -129,6 +129,10 @@ pub struct IngestContext {
     /// anyway. Wired from `[identity] naively_allow_unknown_handles_fallback`.
     /// Surfaces in `unsafe_options_active`.
     pub naively_allow_unknown_handles_fallback: bool,
+    /// Take a `channel-create` a configured peer relays as a copy this
+    /// server sequences, whatever server it names ([`copies_relayed_create`]).
+    /// Wired from `[federation] naively_accept_peer_relayed_creates`.
+    pub naively_accept_peer_relayed_creates: bool,
     /// Executes canonical Wasm block modules, holding them pre-compiled.
     ///
     /// `None` is a statement that this server does not execute Wasm-backed kinds
@@ -244,9 +248,14 @@ pub enum IngestError {
     /// channel sequenced elsewhere reaches it by contract.
     #[error(
         "channel-create names sequencer `{sequencer}`, but this server is `{server}`; \
-         create the channel on its sequencer, or omit `sequencer`"
+         create the channel on its sequencer"
     )]
     NotSequencer { sequencer: String, server: String },
+    /// A `channel-create` submitted here that does not name its sequencer.
+    /// A channel names the server that orders it in its signed creation
+    /// block, so the block is valid on that server only.
+    #[error("channel-create must name its sequencer, this server `{server}`; upgrade jig")]
+    SequencerRequired { server: String },
     /// A block for a channel another server sequences: this server carries
     /// it, and takes its blocks only from its sequencer (JEP-0005 rule 12).
     #[error(
@@ -700,7 +709,19 @@ pub async fn ingest(
             &server_did,
             &source,
         )?;
-        channel_terms(&manifest, &server_did)?;
+        if copies_relayed_create(ctx, &source) {
+            channel_terms(&as_relayed_copy(&manifest), &server_did)?;
+        } else {
+            channel_terms(&manifest, &server_did)?;
+            // A channel names the server that orders it, so a create signed
+            // for one server is valid on no other. An in-process bridge's
+            // create reaches no other server.
+            if !matches!(source, IngestSource::Bridge)
+                && !manifest.metadata.contains_key(SEQUENCER_KEY)
+            {
+                return Err(IngestError::SequencerRequired { server: server_did });
+            }
+        }
     }
 
     // Step 3: HLC update on receive, within the advertised skew bound. A
@@ -980,11 +1001,12 @@ pub async fn ingest(
                 ctx.store.put_mls_group(&group)?;
             }
             // Step 5: apply effect
-            crate::effect::apply_effect(
+            crate::effect::apply_effect_as(
                 &ctx.store,
                 &bundle,
                 &stored_receipt.receipt_bytes,
                 &block_cid,
+                copies_relayed_create(ctx, &source),
             )
             .await?;
             // Step 6: persist block (+ its record) + receipt
@@ -1385,6 +1407,25 @@ pub fn check_create_slug(
 
 /// The metadata key a `channel-create` names its sequencer under.
 pub const SEQUENCER_KEY: &str = "sequencer";
+
+/// Whether a block from `source` that creates a channel is taken as a copy
+/// this server sequences, whatever server it names: only a block a configured
+/// peer relayed ([`IngestSource::FederatedPeer`]: a connection this server
+/// dialed to a listed peer, its DID checked at the handshake), and only under
+/// `[federation] naively_accept_peer_relayed_creates`. Otherwise a create is
+/// held to the server it names like any other, so a channel reaches a peer
+/// only once it is shared (JEP-0005).
+pub fn copies_relayed_create(ctx: &IngestContext, source: &IngestSource) -> bool {
+    ctx.naively_accept_peer_relayed_creates && matches!(source, IngestSource::FederatedPeer { .. })
+}
+
+/// `manifest` without the server its creator named: what a relayed copy is
+/// judged and stored as ([`copies_relayed_create`]).
+pub(crate) fn as_relayed_copy(manifest: &jig_core::BlockManifest) -> jig_core::BlockManifest {
+    let mut copy = manifest.clone();
+    copy.metadata.remove(SEQUENCER_KEY);
+    copy
+}
 /// The metadata key a `channel-create` lists its co-owners under.
 pub const CO_OWNERS_KEY: &str = "co_owners";
 
@@ -2041,9 +2082,43 @@ mod tests {
         assert!(check_manifest_dids(&fine).is_ok());
     }
 
+    /// The server key of every test context here, so a test's channel-create
+    /// can name this server as its sequencer ([`name_the_test_server`]).
+    fn test_server_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x5e; 32])
+    }
+
+    fn test_server_did() -> String {
+        Did::from_ed25519_pubkey(test_server_key().verifying_key().as_bytes()).to_did_jig_string()
+    }
+
+    /// A channel-create names the server it is created on: the test server,
+    /// unless the test names another, or sets `sequencer` to null to name
+    /// none.
+    fn name_the_test_server(
+        kind: BlockKind,
+        metadata: &mut std::collections::BTreeMap<String, serde_json::Value>,
+    ) {
+        if kind != BlockKind::ChannelCreate {
+            return;
+        }
+        match metadata.get(SEQUENCER_KEY) {
+            Some(serde_json::Value::Null) => {
+                metadata.remove(SEQUENCER_KEY);
+            }
+            Some(_) => {}
+            None => {
+                metadata.insert(
+                    SEQUENCER_KEY.to_string(),
+                    serde_json::json!(test_server_did()),
+                );
+            }
+        }
+    }
+
     fn test_ctx_allowing(kinds: &[&str]) -> IngestContext {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let server_key = random_signing_key();
+        let server_key = test_server_key();
         let server_did = Did::from_ed25519_pubkey(server_key.verifying_key().as_bytes());
         IngestContext {
             store: store.clone(),
@@ -2056,6 +2131,7 @@ mod tests {
             fanout: Arc::new(Fanout::new()),
             server_url: "ws://127.0.0.1:7117".to_string(),
             naively_allow_unknown_handles_fallback: false,
+            naively_accept_peer_relayed_creates: false,
             // Shared, so the ~16ms module compile is paid once for the whole
             // test binary rather than per test.
             executor: Some(crate::executor::BlockExecutor::shared()),
@@ -2143,6 +2219,7 @@ mod tests {
                 .metadata
                 .insert((*k).to_string(), serde_json::json!(v));
         }
+        name_the_test_server(kind, &mut manifest.metadata);
         let manifest_bytes = manifest.to_canonical_bytes().unwrap();
         let code_bytes: Vec<u8> = vec![];
         let canonical = serde_json::to_vec(&(&manifest_bytes, &code_bytes)).unwrap();
@@ -2686,6 +2763,7 @@ mod tests {
         if let serde_json::Value::Object(map) = meta {
             manifest.metadata.extend(map);
         }
+        name_the_test_server(kind, &mut manifest.metadata);
         manifest.hlc_ts = Some(jig_core::HlcTimestamp {
             wall_ms,
             logical: 0,
@@ -3859,10 +3937,80 @@ mod tests {
         );
     }
 
+    /// A create relayed by a configured peer names that peer, or no server.
+    /// By default it is held to the server it names like any other create,
+    /// and refused here; under `naively_accept_peer_relayed_creates` it is a
+    /// copy this server sequences. A client's create naming another server is
+    /// refused either way: only a peer's relay is ever taken as a copy.
     #[tokio::test]
-    async fn a_channel_create_without_a_sequencer_is_this_servers() {
+    async fn a_relayed_create_is_a_copy_only_when_the_operator_opts_in() {
+        let peer = random_signing_key();
+        let relayed = || IngestSource::FederatedPeer {
+            peer_did: Did::from_ed25519_pubkey(peer.verifying_key().as_bytes()),
+            peer_url: "wss://peer".to_string(),
+        };
+        for opted_in in [false, true] {
+            let mut ctx = roles_ctx();
+            ctx.naively_accept_peer_relayed_creates = opted_in;
+            let owner = person();
+            let create = |slug: &str, sequencer: serde_json::Value| {
+                signed_parts(
+                    &owner.key,
+                    BlockKind::ChannelCreate,
+                    jig_core::EncryptionSuite::Unencrypted,
+                    serde_json::json!({"slug": slug, "sequencer": sequencer}),
+                )
+            };
+
+            let (mb, cb, sig) = create("#theirs", serde_json::json!(did_of(&peer)));
+            let named = do_ingest(&ctx, mb, cb, sig, relayed()).await;
+            let (mb, cb, sig) = create("#unnamed", serde_json::Value::Null);
+            let unnamed = do_ingest(&ctx, mb, cb, sig, relayed()).await;
+            if opted_in {
+                for cid in [named.unwrap(), unnamed.unwrap()] {
+                    let row = ctx.store.get_channel_by_id(&cid).unwrap().unwrap();
+                    assert_eq!(row.sequencer_did, ctx.server_did.to_did_jig_string());
+                }
+            } else {
+                assert!(
+                    matches!(named, Err(IngestError::NotSequencer { .. })),
+                    "{named:?}"
+                );
+                assert!(
+                    matches!(unnamed, Err(IngestError::SequencerRequired { .. })),
+                    "{unnamed:?}"
+                );
+            }
+
+            // The same block from a client is never a copy.
+            let (mb, cb, sig) = create("#from-a-client", serde_json::json!(did_of(&peer)));
+            let from_client =
+                do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 }).await;
+            assert!(
+                matches!(from_client, Err(IngestError::NotSequencer { .. })),
+                "opted in: {opted_in}: {from_client:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_channel_create_names_its_sequencer() {
         let ctx = roles_ctx();
         let owner = person();
+        // Submitted here, a create must name this server: one signed for a
+        // server is valid on no other.
+        let refused = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#mine", "sequencer": null}),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(IngestError::SequencerRequired { .. })),
+            "{refused:?}"
+        );
+        assert!(ctx.store.get_channel_by_slug("#mine").unwrap().is_none());
         let cid = plain(
             &ctx,
             &owner,

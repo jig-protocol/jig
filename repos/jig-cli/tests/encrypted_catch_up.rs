@@ -160,6 +160,7 @@ async fn a_device_away_for_more_than_a_page_reads_every_message() {
         BlockKind::ChannelCreate,
         owner.hlc(),
         json!({"slug": "#sec", "suite": "mls", "visibility": "open",
+               "sequencer": server.server_did_string,
                "mls_group_info": STANDARD.encode(&created.group_info),
                "mls_ratchet_tree": STANDARD.encode(&created.ratchet_tree)}),
     );

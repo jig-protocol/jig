@@ -124,6 +124,10 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         // rule 5). Policy, not a malformed request: the same block is fine
         // on the server it names.
         IngestError::NotSequencer { .. } => (StatusCode::FORBIDDEN, "NOT_SEQUENCER", e.to_string()),
+        // 400: the block itself lacks a field this server requires.
+        IngestError::SequencerRequired { .. } => {
+            (StatusCode::BAD_REQUEST, "SEQUENCER_REQUIRED", e.to_string())
+        }
         IngestError::BundleTooLarge { .. } => (
             StatusCode::PAYLOAD_TOO_LARGE,
             "BUNDLE_TOO_LARGE",
@@ -304,6 +308,9 @@ mod tests {
             },
             IngestError::NotSequencer {
                 sequencer: "did:jig:zElsewhere".to_string(),
+                server: "did:jig:zHere".to_string(),
+            },
+            IngestError::SequencerRequired {
                 server: "did:jig:zHere".to_string(),
             },
             IngestError::CarriedChannel {

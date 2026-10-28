@@ -645,6 +645,17 @@ impl Contracts {
         if cid != offer.channel_id || manifest.kind != Some(BlockKind::ChannelCreate) {
             return Err(RefuseCode::PolicyRefused);
         }
+        // The creator names the server that orders the channel; a creation
+        // block from before sequencers names none, and binds to no server,
+        // so no client could prove the carried channel either.
+        if manifest
+            .metadata
+            .get(jig_pipeline::ingest::SEQUENCER_KEY)
+            .and_then(|v| v.as_str())
+            .is_none()
+        {
+            return Err(RefuseCode::PolicyRefused);
+        }
         let terms = jig_pipeline::ingest::channel_terms(&manifest, &offer.owner)
             .map_err(|_| RefuseCode::PolicyRefused)?;
         if terms.sequencer != offer.owner {
@@ -1252,10 +1263,17 @@ mod tests {
         state: &AppState,
         key: &SigningKey,
         kind: BlockKind,
-        meta: serde_json::Value,
+        mut meta: serde_json::Value,
         hlc: Option<jig_core::HlcTimestamp>,
     ) -> Result<String, IngestError> {
         use ed25519_dalek::Signer as _;
+        // A channel-create names the server it is created on.
+        if kind == BlockKind::ChannelCreate
+            && meta.get(jig_pipeline::ingest::SEQUENCER_KEY).is_none()
+        {
+            meta[jig_pipeline::ingest::SEQUENCER_KEY] =
+                serde_json::json!(state.server_did.to_did_jig_string());
+        }
         let mut builder = BlockManifest::builder()
             .version(semver::Version::new(0, 1, 0))
             .author(Author {
@@ -1714,6 +1732,18 @@ mod tests {
         assert_eq!(answer_to(&contracts, &owner, &good), None);
         assert_eq!(answer_to(&contracts, &owner, &good), None, "answered again");
 
+        // A creation block naming no sequencer binds to no server: no client
+        // could prove the channel carried.
+        let unbound = creation(&owner, serde_json::json!({"sequencer": null}));
+        assert_eq!(
+            answer_to(
+                &contracts,
+                &owner,
+                &offer_to(&follower, &owner, unbound, &[])
+            )
+            .as_deref(),
+            Some("POLICY_REFUSED")
+        );
         // Rule 9: a suite this server does not carry, with no fallback.
         let suite = creation(&owner, serde_json::json!({"suite": "pq-mls-2"}));
         assert_eq!(
@@ -2445,7 +2475,11 @@ mod tests {
     }
 
     async fn legacy() -> Legacy {
-        let mut a = state_with(vec![], &[]);
+        // A peer's channel-create reaches `a` over the relay only when its
+        // operator opts in to copying them.
+        let mut a = state_tuned(vec![], &[], |config| {
+            config.federation.naively_accept_peer_relayed_creates = true;
+        });
         let b = state_with(
             vec![peer(
                 "ws://127.0.0.1:1",
@@ -2932,6 +2966,8 @@ mod tests {
             let mut config = JigServerConfig::default();
             config.federation.dangerously_allow_plaintext_federation = true;
             config.federation.peers = vec![peer("ws://127.0.0.1:1", did_of(other), offers)];
+            // The relay's copies this guards are made only on opting in.
+            config.federation.naively_accept_peer_relayed_creates = true;
             AppState::for_test_from(
                 config,
                 Arc::new(jig_pipeline::persist::SqliteStore::open_in_memory().unwrap()),

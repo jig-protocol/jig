@@ -106,6 +106,15 @@ impl TestJigServer {
         Self::start().await
     }
 
+    /// Start a server that copies the channels its peers create, under
+    /// `[federation] naively_accept_peer_relayed_creates`: the legacy relay's
+    /// behaviour, for tests of that relay.
+    pub async fn start_copying_peers_channels() -> Result<Self> {
+        let mut config = base_config()?;
+        config.federation.naively_accept_peer_relayed_creates = true;
+        Self::start_with_config(config).await
+    }
+
     /// Start in nameserver mode pointed at the given NS. `alias_suffix` is
     /// the `.jig` namespace the NS is authoritative for (e.g. `"dj.jig"`).
     pub async fn start_with_nameserver(ns: &TestNameserver, _alias_suffix: &str) -> Result<Self> {
@@ -331,7 +340,13 @@ impl TestJigServer {
             logical: 0,
             server_did: owner.did().clone(),
         };
-        let block = jig_client::blocks::build_channel_create(owner, slug, visibility, hlc);
+        let block = jig_client::blocks::build_channel_create(
+            owner,
+            slug,
+            visibility,
+            &self.server_did_string,
+            hlc,
+        );
         let client = reqwest::Client::new();
         let resp = client
             .post(format!("{}/api/v1/channels", self.http_url()))
@@ -366,6 +381,7 @@ impl TestJigServer {
             serde_json::json!({
                 "slug": slug,
                 "visibility": "restricted",
+                "sequencer": self.server_did_string,
                 "suite": "mls",
                 "mls_group_info": b64.encode(&created.group_info),
                 "mls_ratchet_tree": b64.encode(&created.ratchet_tree),

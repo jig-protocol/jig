@@ -184,6 +184,20 @@ pub async fn create(
     Ok(())
 }
 
+/// The DID the configured server proved at the handshake, now: a connection
+/// checks it against the pin and follows the server's key links, so a
+/// rotated key is the current one.
+async fn verified_server_did(ctx: &CliContext) -> Result<String> {
+    let server = ctx.server_url()?;
+    let client = crate::cmd::secure::connect_pinned(&server, ctx.identity()?)
+        .await
+        .with_context(|| format!("connecting to {server}"))?;
+    client
+        .welcome()
+        .map(|w| w.server_did.clone())
+        .with_context(|| format!("{server} sent no welcome to name its DID"))
+}
+
 /// Create a channel; `extra` is merged into the creation block's metadata.
 /// Returns whether this call created it (`false`: it already existed and
 /// `exist_ok` was set).
@@ -204,8 +218,15 @@ pub(crate) async fn create_with(
     let encrypted = encrypted || visibility == "restricted";
 
     let id = ctx.identity()?;
+    // The block names the server it is created on, and is valid there only:
+    // its DID as this device verified it at the handshake.
+    let sequencer = verified_server_did(ctx).await?;
     let hlc = HlcTimestamp::now_wall(id.did().clone());
-    let mut meta = json!({"slug": slug, "visibility": visibility});
+    let mut meta = json!({
+        "slug": slug,
+        "visibility": visibility,
+        "sequencer": sequencer,
+    });
     merge(&mut meta, extra);
 
     // An encrypted channel is one MLS group, started here with the creator

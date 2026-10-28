@@ -33,10 +33,10 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 #[tokio::test]
 async fn two_server_federation_chat_with_receipt_parity() {
     // Boot two TOFU-mode servers (federation handshake doesn't require NS).
-    let server_a = TestJigServer::start_with_full_kinds()
+    let server_a = TestJigServer::start_copying_peers_channels()
         .await
         .expect("start server_a");
-    let server_b = TestJigServer::start_with_full_kinds()
+    let server_b = TestJigServer::start_copying_peers_channels()
         .await
         .expect("start server_b");
 
@@ -50,8 +50,9 @@ async fn two_server_federation_chat_with_receipt_parity() {
     let (_bob, _bob_dir) = test_identity_with_dir();
 
     // Alice creates the channel on server_a. The channel-create federates
-    // like any block of an open channel, and server_b ingests it, so #hello
-    // exists on both.
+    // like any block of an open channel, and server_b, which copies its
+    // peers' channels (`naively_accept_peer_relayed_creates`), ingests it,
+    // so #hello exists on both.
     server_a
         .create_channel(&alice, "#hello", "open")
         .await
@@ -267,10 +268,10 @@ fn inject_forged_block_into_a(
 #[tokio::test]
 async fn federated_block_with_forged_author_did_is_rejected() {
     // Two TOFU-mode servers, bidirectionally peered.
-    let srv_a = TestJigServer::start_with_full_kinds()
+    let srv_a = TestJigServer::start_copying_peers_channels()
         .await
         .expect("srv_a start");
-    let srv_b = TestJigServer::start_with_full_kinds()
+    let srv_b = TestJigServer::start_copying_peers_channels()
         .await
         .expect("srv_b start");
     srv_a.add_peer(&srv_b).await.expect("a -> b peer");

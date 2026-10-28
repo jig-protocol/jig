@@ -297,7 +297,7 @@ impl TestServer {
         let me = owner.as_client();
         let hlc = HlcTimestamp::now_wall(me.did().clone());
         let block = if visibility == "open" {
-            build_channel_create(&me, slug, visibility, hlc)
+            build_channel_create(&me, slug, visibility, &self.server_did(), hlc)
         } else {
             let mut meta = self.mls_genesis(owner, slug);
             meta["slug"] = slug.into();
@@ -325,6 +325,7 @@ impl TestServer {
             .insert((owner.did().to_did_jig_string(), slug.to_string()), 0);
         serde_json::json!({
             "suite": "mls",
+            "sequencer": self.server_did(),
             "mls_group_info": b64.encode(&created.group_info),
             "mls_ratchet_tree": b64.encode(&created.ratchet_tree),
         })
