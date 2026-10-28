@@ -198,6 +198,8 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         IngestError::TierUnsupported { .. } => {
             (StatusCode::FORBIDDEN, "TIER_UNSUPPORTED", e.to_string())
         }
+        // 409: the block is well formed; a 1:1 adds nobody (rule 18).
+        IngestError::DmIsAPair { .. } => (StatusCode::CONFLICT, "DM_IS_A_PAIR", e.to_string()),
         // 409: someone else committed first. The client catches up and
         // rebuilds; nothing about the request itself was wrong.
         IngestError::StaleEpoch { .. } => (StatusCode::CONFLICT, "STALE_EPOCH", e.to_string()),
@@ -321,6 +323,10 @@ mod tests {
             },
             IngestError::TierUnsupported {
                 slug: "#news".to_string(),
+            },
+            IngestError::DmIsAPair {
+                slug: "#dm/0123456789abcdef".to_string(),
+                member: "did:jig:zThird".to_string(),
             },
             IngestError::StaleEpoch {
                 slug: "#sealed".to_string(),

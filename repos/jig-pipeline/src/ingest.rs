@@ -315,6 +315,13 @@ pub enum IngestError {
          This client does not support channel tiers, so it cannot say so; upgrade it to post here"
     )]
     TierUnsupported { slug: String },
+    /// A `member-add` to a 1:1 of a DID that is not one of its pair
+    /// (JEP-0014 rule 18).
+    #[error(
+        "'{slug}' is a 1:1 and stays one: `{member}` is not one of its two people. \
+         To talk as a group, create a new channel linked to it with `from_dm`"
+    )]
+    DmIsAPair { slug: String, member: String },
     /// The signer lacks the right the block needs as of its position in the
     /// channel's ingest chain (JEP-0005 rule 7b).
     #[error("`{kind}` on `{slug}` refused: `{sender}` does not hold the `{right}` right")]
@@ -628,6 +635,26 @@ pub async fn ingest(
                 slug: chan.slug.clone(),
             });
         }
+        // Rule 18: a 1:1 stays a pair. Its slug is derived from its two DIDs,
+        // so it adds nobody but the other of them; a group grows from it as a
+        // new channel instead (rule 19).
+        if kind == BlockKind::MemberAdd
+            && jig_core::slug::reserved_class(&chan.slug) == Some(jig_core::slug::SlugClass::Dm)
+        {
+            let member = manifest
+                .metadata
+                .get("member_did")
+                .and_then(|v| v.as_str())
+                .map(crate::effect::canonical_did_string)
+                .unwrap_or_default();
+            let owner = crate::effect::canonical_did_string(&chan.owner_did);
+            if member != owner && jig_core::dm::dm_slug(&owner, &member) != chan.slug {
+                return Err(IngestError::DmIsAPair {
+                    slug: chan.slug.clone(),
+                    member,
+                });
+            }
+        }
     }
 
     // Step 3c: write authorization — may this sender post to, or change,
@@ -770,6 +797,9 @@ pub async fn ingest(
             &source,
         )?;
         let terms = channel_terms(&manifest, &server_did)?;
+        if let Some(tiering) = &terms.tiering {
+            check_linked_channels(&ctx.store, tiering, sender.as_str())?;
+        }
         // JEP-0014 rule 1: an `open` plaintext create without `tier` comes
         // from a client that cannot show the `public` label, so it is refused
         // rather than read as `public`. A restricted one without `tier` is
@@ -1603,6 +1633,77 @@ pub(crate) fn tier_as_a_current_client_would(
             serde_json::json!(jig_core::tier::Tier::Public.as_str()),
         );
     }
+}
+
+/// Check the channels a `channel-create` links to (JEP-0014 rules 19 and 23),
+/// which [`tier_terms`] reads but cannot see:
+///
+/// - `from_dm` names a 1:1 on this server that the creator is in;
+/// - `successor_of` names a frozen channel the creator is a root owner of,
+///   and the successor is encrypted ("an encrypted successor"; nothing turns
+///   a channel's conversation `public`, rule 4).
+pub fn check_linked_channels(
+    store: &crate::persist::SqliteStore,
+    tiering: &crate::persist::ChannelTiering,
+    creator: &str,
+) -> Result<(), IngestError> {
+    let invalid = |field: &str, detail: String| IngestError::InvalidTerms {
+        field: field.to_string(),
+        detail,
+    };
+    if let Some(id) = &tiering.from_dm {
+        let dm = store
+            .get_channel_by_id(id)?
+            .filter(|c| {
+                jig_core::slug::reserved_class(&c.slug) == Some(jig_core::slug::SlugClass::Dm)
+            })
+            .ok_or_else(|| {
+                invalid(
+                    tier_keys::FROM_DM,
+                    format!("`{id}` is no 1:1 on this server"),
+                )
+            })?;
+        if !store.is_member_by_id(&dm.id, creator)? {
+            return Err(invalid(
+                tier_keys::FROM_DM,
+                format!("the creator is not in the 1:1 `{id}`"),
+            ));
+        }
+    }
+    if let Some(id) = &tiering.successor_of {
+        let old = store.get_channel_by_id(id)?.ok_or_else(|| {
+            invalid(
+                tier_keys::SUCCESSOR_OF,
+                format!("`{id}` is no channel on this server"),
+            )
+        })?;
+        if !old.tiering.tier.is_frozen() {
+            return Err(invalid(
+                tier_keys::SUCCESSOR_OF,
+                format!(
+                    "`{}` is not frozen; only a frozen channel has a successor",
+                    old.slug
+                ),
+            ));
+        }
+        if !old.is_root_owner(creator) {
+            return Err(invalid(
+                tier_keys::SUCCESSOR_OF,
+                format!("only an owner of `{}` creates its successor", old.slug),
+            ));
+        }
+        if !tiering
+            .tier
+            .tier()
+            .is_some_and(jig_core::tier::Tier::is_encrypted)
+        {
+            return Err(invalid(
+                tier_keys::SUCCESSOR_OF,
+                "a frozen channel's successor is encrypted".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Read and check a `channel-create`'s tier terms (JEP-0014 rules 1, 3, 12,
@@ -5437,6 +5538,170 @@ mod tests {
         )
         .await
         .expect("membership is not content");
+    }
+
+    fn tiered_row(
+        id: &str,
+        slug: &str,
+        owner: &str,
+        tiering: crate::persist::ChannelTiering,
+    ) -> crate::persist::StoredChannel {
+        crate::persist::StoredChannel {
+            id: id.to_string(),
+            slug: slug.to_string(),
+            visibility: "restricted".to_string(),
+            created_at: 1,
+            owner_did: owner.to_string(),
+            suite: "none".to_string(),
+            sequencer_did: String::new(),
+            co_owners: Vec::new(),
+            tiering,
+        }
+    }
+
+    fn member_of(ctx: &IngestContext, channel_id: &str, did: &str) {
+        ctx.store
+            .upsert_membership(&crate::persist::StoredMembership {
+                channel_id: channel_id.to_string(),
+                member_did: did.to_string(),
+                role: "member".to_string(),
+                joined_at: 1,
+                source_block_cid: channel_id.to_string(),
+            })
+            .unwrap();
+    }
+
+    /// Rule 18: a 1:1 adds the other of its pair, and nobody else.
+    #[tokio::test]
+    async fn a_dm_adds_only_the_other_of_its_pair() {
+        let ctx = tiers_ctx();
+        let (a, b, c) = (person(), person(), person());
+        let dm = crate::ingest_record::label_cid("a dm");
+        let slug = jig_core::dm::dm_slug(&a.did, &b.did);
+        ctx.store
+            .upsert_channel(&tiered_row(
+                &dm,
+                &slug,
+                &a.did,
+                crate::persist::ChannelTiering::of(jig_core::tier::Tier::Private),
+            ))
+            .unwrap();
+        member_of(&ctx, &dm, &a.did);
+        let add = |who: &str| {
+            plain(
+                &ctx,
+                &a,
+                BlockKind::MemberAdd,
+                serde_json::json!({"channel_id": dm, "member_did": who}),
+            )
+        };
+        match add(&c.did).await {
+            Err(IngestError::DmIsAPair {
+                slug: refused,
+                member,
+            }) => {
+                assert_eq!(refused, slug);
+                assert_eq!(member, c.did);
+            }
+            other => panic!("expected DM_IS_A_PAIR, got {other:?}"),
+        }
+        add(&b.did).await.expect("the other of the pair is added");
+    }
+
+    /// Rule 19: `from_dm` names a 1:1 here that the creator is in.
+    #[test]
+    fn from_dm_names_a_dm_the_creator_is_in() {
+        use crate::persist::ChannelTiering;
+        use jig_core::tier::Tier;
+        let ctx = tiers_ctx();
+        let (a, b, c) = (person(), person(), person());
+        let dm = crate::ingest_record::label_cid("a dm");
+        ctx.store
+            .upsert_channel(&tiered_row(
+                &dm,
+                &jig_core::dm::dm_slug(&a.did, &b.did),
+                &a.did,
+                ChannelTiering::of(Tier::Private),
+            ))
+            .unwrap();
+        member_of(&ctx, &dm, &a.did);
+        let room = crate::ingest_record::label_cid("a room");
+        ctx.store
+            .upsert_channel(&tiered_row(
+                &room,
+                "#room",
+                &a.did,
+                ChannelTiering::of(Tier::Private),
+            ))
+            .unwrap();
+        member_of(&ctx, &room, &a.did);
+        let group = |from: &str| ChannelTiering {
+            from_dm: Some(from.to_string()),
+            ..ChannelTiering::of(Tier::Private)
+        };
+        check_linked_channels(&ctx.store, &group(&dm), &a.did).expect("a's 1:1");
+        for (from, who) in [
+            (dm.as_str(), &c.did),
+            (room.as_str(), &a.did),
+            ("bafy_nowhere", &a.did),
+        ] {
+            assert!(
+                matches!(
+                    check_linked_channels(&ctx.store, &group(from), who),
+                    Err(IngestError::InvalidTerms { ref field, .. }) if field == "from_dm"
+                ),
+                "{from} for {who}"
+            );
+        }
+    }
+
+    /// Rule 23: a frozen channel's owner creates its encrypted successor.
+    #[test]
+    fn a_successor_is_an_owners_encrypted_channel_after_a_frozen_one() {
+        use crate::persist::ChannelTiering;
+        use jig_core::tier::Tier;
+        let ctx = tiers_ctx();
+        let (owner, other) = (person(), person());
+        let frozen = crate::ingest_record::label_cid("frozen");
+        ctx.store
+            .upsert_channel(&tiered_row(
+                &frozen,
+                "#old",
+                &owner.did,
+                ChannelTiering::legacy("#old", "open", "none"),
+            ))
+            .unwrap();
+        let live = crate::ingest_record::label_cid("live");
+        ctx.store
+            .upsert_channel(&tiered_row(
+                &live,
+                "#new",
+                &owner.did,
+                ChannelTiering::of(Tier::Public),
+            ))
+            .unwrap();
+        let successor = |of: &str, tier: Tier| ChannelTiering {
+            successor_of: Some(of.to_string()),
+            ..ChannelTiering::of(tier)
+        };
+        for tier in [Tier::Private, Tier::Server, Tier::Shared] {
+            check_linked_channels(&ctx.store, &successor(&frozen, tier), &owner.did)
+                .unwrap_or_else(|e| panic!("{tier}: {e}"));
+        }
+        for (of, tier, who) in [
+            (frozen.as_str(), Tier::Public, &owner.did),
+            (frozen.as_str(), Tier::Private, &other.did),
+            (live.as_str(), Tier::Private, &owner.did),
+            ("bafy_nowhere", Tier::Private, &owner.did),
+        ] {
+            assert!(
+                matches!(
+                    check_linked_channels(&ctx.store, &successor(of, tier), who),
+                    Err(IngestError::InvalidTerms { ref field, .. }) if field == "successor_of"
+                ),
+                "{of} as {tier} for {who}"
+            );
+        }
     }
 
     // ---- Slug grammar (jig_core::slug) ------------------------------------

@@ -244,6 +244,29 @@ pub fn tier_label(tier: &str) -> String {
     }
 }
 
+/// The channels a new one links to (JEP-0014): the 1:1 a group grows from
+/// (rule 19), or the frozen channel it succeeds (rule 23). Each is a slug this
+/// server lists, or a channel id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChannelLinks {
+    pub from_dm: Option<String>,
+    pub successor_of: Option<String>,
+}
+
+/// The channel id `channel` names: a channel id as given, or the id of the
+/// channel this server lists under the slug.
+async fn channel_id_of(secure: &Secure, channel: &str) -> Result<String> {
+    if !channel.starts_with('#') {
+        return Ok(channel.to_string());
+    }
+    secure
+        .channel(channel)
+        .await?
+        .map(|info| info.id)
+        .filter(|id| !id.is_empty())
+        .with_context(|| format!("{channel} is not a channel this server lists to you"))
+}
+
 /// Whether the server granted `tiers` in the welcome of a connection that
 /// asked for them (JEP-0014 rule 1).
 async fn server_has_tiers(ctx: &CliContext) -> Result<bool> {
@@ -254,6 +277,19 @@ async fn server_has_tiers(ctx: &CliContext) -> Result<bool> {
             format!("connecting to {server} to see whether it supports channel tiers")
         })?;
     Ok(client.welcome().is_some_and(|w| w.capabilities.tiers))
+}
+
+/// JEP-0014 rule 18: a 1:1 stays a pair. Adding someone means a new group
+/// linked to it, which the server would require anyway.
+fn refuse_growing_a_dm(slug: &str) -> Result<()> {
+    if jig_core::slug::reserved_class(slug) == Some(jig_core::slug::SlugClass::Dm) {
+        anyhow::bail!(
+            "{slug} is a 1:1 and stays one. To talk as a group, make a new channel linked to it: \
+             `jig channel create '#group' --from-dm {slug}`, then `jig channel add '#group'` \
+             each of you"
+        );
+    }
+    Ok(())
 }
 
 /// Rule 5: the creator confirms a `public` channel before it is signed.
@@ -291,6 +327,7 @@ pub async fn create(
     choice: TierChoice,
     exist_ok: bool,
     yes: bool,
+    links: ChannelLinks,
 ) -> Result<()> {
     if choice.tier == Tier::Public {
         use std::io::IsTerminal;
@@ -298,7 +335,17 @@ pub async fn create(
             anyhow::bail!("not created: {slug} was not confirmed as public");
         }
     }
-    create_with(ctx, &slug, choice, exist_ok, json!({})).await?;
+    let mut extra = json!({});
+    if links.from_dm.is_some() || links.successor_of.is_some() {
+        let secure = Secure::open(ctx)?;
+        if let Some(dm) = &links.from_dm {
+            extra["from_dm"] = json!(channel_id_of(&secure, dm).await?);
+        }
+        if let Some(old) = &links.successor_of {
+            extra["successor_of"] = json!(channel_id_of(&secure, old).await?);
+        }
+    }
+    create_with(ctx, &slug, choice, exist_ok, extra).await?;
 
     // A freshly created channel is almost always the one the operator wants
     // to talk in next; without this, a bare `jig send hi` still goes to
@@ -517,6 +564,7 @@ async fn visible_channel(secure: &Secure, slug: &str) -> Result<ChannelInfo> {
 /// this fetches one of the member's key packages and commits their addition;
 /// the welcome rides the same block.
 pub async fn add(ctx: &CliContext, slug: String, who: String) -> Result<()> {
+    refuse_growing_a_dm(&slug)?;
     let did = resolve_who(ctx, &who).await?;
     let secure = Secure::open(ctx)?;
     let info = visible_channel(&secure, &slug).await?;
@@ -1002,6 +1050,15 @@ fn print_channels(channels: &[ChannelView]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dm_is_not_grown_in_place() {
+        let err = refuse_growing_a_dm("#dm/0123456789abcdef")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--from-dm #dm/0123456789abcdef"), "{err}");
+        refuse_growing_a_dm("#team").unwrap();
+    }
 
     #[test]
     fn a_bare_create_is_private_and_tier_names_the_rest() {

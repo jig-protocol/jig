@@ -192,6 +192,16 @@ enum ChannelAction {
         #[arg(long)]
         yes: bool,
 
+        /// Grow a group from a 1:1: link the new channel to that DM (a slug or
+        /// channel id). The group is `private`; the 1:1 goes on unchanged.
+        #[arg(long)]
+        from_dm: Option<String>,
+
+        /// Continue a frozen channel you own (a slug or channel id) in this
+        /// new, encrypted one. No history moves.
+        #[arg(long)]
+        successor_of: Option<String>,
+
         /// Succeed (exit 0) if the channel already exists instead of failing.
         #[arg(long)]
         exist_ok: bool,
@@ -875,6 +885,8 @@ async fn run() -> Result<()> {
                 tier,
                 join,
                 yes,
+                from_dm,
+                successor_of,
                 exist_ok,
                 visibility,
                 encrypted,
@@ -885,7 +897,18 @@ async fn run() -> Result<()> {
                     visibility.as_deref(),
                     encrypted,
                 )?;
-                cmd::channel::create(&ctx, slug, choice, exist_ok, yes).await?;
+                cmd::channel::create(
+                    &ctx,
+                    slug,
+                    choice,
+                    exist_ok,
+                    yes,
+                    cmd::channel::ChannelLinks {
+                        from_dm,
+                        successor_of,
+                    },
+                )
+                .await?;
             }
             ChannelAction::Add { slug, who } => cmd::channel::add(&ctx, slug, who).await?,
             ChannelAction::Kick { slug, who } => cmd::channel::kick(&ctx, slug, who).await?,
