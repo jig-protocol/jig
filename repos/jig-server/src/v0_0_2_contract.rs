@@ -3807,6 +3807,19 @@ mod tests {
             .expect("landed at the owner");
         assert_eq!(at_owner.channel_id.as_deref(), Some(channel.as_str()));
         p.caught_up(&channel).await;
+        // The owner knows which server relayed the member's latest write:
+        // the hint `jig channel members --via` lists after a contract ends.
+        let via = p
+            .owner
+            .ingest_ctx
+            .store
+            .last_relay_by_sender(&channel)
+            .unwrap();
+        assert_eq!(
+            via.get(&remote_did).cloned().flatten(),
+            Some(p.follower.server_did.to_did_jig_string())
+        );
+        assert_eq!(via.get(&did(&p.user).to_did_jig_string()), Some(&None));
 
         // The owner's member reads it from what the owner stored.
         let (stored, _): (Vec<u8>, Vec<u8>) =

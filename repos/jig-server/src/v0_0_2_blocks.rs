@@ -414,6 +414,11 @@ pub struct MemberView {
     pub did: String,
     pub role: String,
     pub joined_at: i64,
+    /// The server that relayed this member's latest write here, if one did
+    /// (JEP-0005 rule 15): a hint at where its client is, for pruning the
+    /// members a follower took with it when its contract ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_via: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -449,11 +454,15 @@ pub async fn list_members(
             format!("no live channel '{channel_ref}' on this server"),
         ));
     };
+    let mut via = store
+        .last_relay_by_sender(&channel.id)
+        .map_err(persist_err)?;
     let members = store
         .list_members(&channel.id)
         .map_err(persist_err)?
         .into_iter()
         .map(|m| MemberView {
+            last_via: via.remove(&m.member_did).flatten(),
             did: m.member_did,
             role: m.role,
             joined_at: m.joined_at,

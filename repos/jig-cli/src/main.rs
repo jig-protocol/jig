@@ -227,6 +227,11 @@ enum ChannelAction {
     Members {
         #[arg()]
         slug: String,
+        /// Only the members whose latest write the server with this DID
+        /// relayed: after its contract ended, those a member may want to
+        /// remove with `jig channel kick`.
+        #[arg(long, value_name = "SERVER_DID")]
+        via: Option<String>,
     },
 
     /// Join an existing channel by adding the caller's DID as a member.
@@ -865,7 +870,7 @@ async fn run() -> Result<()> {
             ChannelAction::Kick { slug, who } => cmd::channel::kick(&ctx, slug, who).await?,
             ChannelAction::Leave { slug } => cmd::channel::leave(&ctx, slug).await?,
             ChannelAction::Promote { slug } => cmd::channel::promote(&ctx, slug).await?,
-            ChannelAction::Members { slug } => cmd::channel::members(&ctx, slug).await?,
+            ChannelAction::Members { slug, via } => cmd::channel::members(&ctx, slug, via).await?,
             ChannelAction::Join { slug } => {
                 cmd::channel::join(&ctx, slug).await?;
             }
