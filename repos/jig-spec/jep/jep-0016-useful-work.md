@@ -237,6 +237,10 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
       group's nameservers under their data contract.
     - A pause is not a ruleset event, is not logged against the DID, and is visible only to the
       group's nameservers and the DID's holder.
+    - A nameserver that refuses a commit for a pause MUST return a signed
+      `uw-paused {v, did, until_epoch}` to that worker only. A worker refused without one, or
+      refused under a pause it did not earn, holds the signed refusal as evidence against the
+      nameserver.
 18. **Assignment stays committed.** The group's nameservers log the `uw-commit` with its
     `assign_commit`, and log the accepted outcome (rule 20). They do not log `π` or the DID.
     - `assign_commit` is opened, by the worker or by the nameserver that verified `π`, only in a
@@ -432,8 +436,9 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
   established DID costs time under JEP-0009 rule 17, and invite budgets bound the rest.
 - **Beacon bias.** The beacon mixes the witnesses' cosignatures into the checkpoint (rule 6a),
   so the log's owner cannot grind it alone: it would have to predict signatures it cannot
-  compute. A witness still chooses whether to cosign in time, and each colluding witness can
-  bias the beacon by that one choice. Tribunal panels (JEP-0010 rule 20) seed from the bare
+  compute. A witness still chooses whether to cosign in time, so `c` colluding witnesses can
+  choose among at most `2^c` beacons by withholding. A ruleset sizes its witness set against
+  that bound. Tribunal panels (JEP-0010 rule 20) seed from the bare
   checkpoint and are exposed to the owner's grinding; they could adopt rule 6a.
 - **Dormant encrypted channels** get no execution check (rule 26).
 - **Liveness.** A task whose workers do not reveal carries forward and can end `unresolved`
@@ -501,9 +506,12 @@ JEP-0009, JEP-0010 and JEP-0014 on `main`, and reviewed by the author.
 3. ~~Separate cap.~~ Agreed with R2.1: `credit_cap_per_period`, inside `accrual_per_period`
    (rule 31).
 4. **Re-execution credit.** D32 lists receipt re-execution as useful work. Here it is the
-   members' check (rule 26), and it earns no credit: members are known, so their assignment
-   cannot be secret, and outsiders cannot re-check an encrypted result. Should members' verified
-   re-executions earn `useful-work` credit anyway, and if so, how is a false one proven?
+   members' check (rule 26), useful but uncredited. Members re-run receipts on plaintext that
+   auditors must never see, so credit for it could not be audited, and unauditable credit is
+   what a farm of DIDs would mint. The options for DJ:
+   - **(a) keep it uncredited** (this draft, and R2.1's view);
+   - **(b) credit it once it has an auditable form**, for example a member-signed receipt hash
+     that other members of the same channel cross-check. That is a separate design.
 
 # Copyright
 
