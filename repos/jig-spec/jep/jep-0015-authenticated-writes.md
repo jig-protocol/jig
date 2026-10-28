@@ -172,6 +172,12 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
     - The server MUST NOT add the feature to a `welcome` the `hello` did not ask for. An old
       client checks the `welcome` signature over bytes it rebuilds from the fields it knows,
       so any unrecognised field in a signed `welcome` makes the signature fail for it.
+    - The feature is advertised only in the `welcome`, never in the server manifest
+      (JEP-0002 rule 12). The manifest decoder refuses unknown keys and any document that
+      does not re-encode to its own bytes, and a client that cannot decode the manifest a
+      `welcome` cites treats it as a contradiction. A new manifest key would therefore make
+      every older client refuse the server for good. Advertising anything there needs a
+      manifest format bump.
 19. Rollout has three steps, each in a release note:
     1. **Report.** Servers verify `client_proof` and REST write proofs when present, and
        count local submissions that would fail rule 4. They refuse nothing new. Clients
@@ -261,8 +267,9 @@ Drafted with an LLM coding assistant from DJ's decisions of 2026-10-26 and the c
 
 1. **The custody rule for an out-of-process bridge.** How a server's config states which
    DIDs a bridge custodies (an explicit list, or a derivation such as the email bridge's
-   shadow DIDs), and whether the delegation is also published, for example in the server's
-   manifest, so other servers can see it.
+   shadow DIDs), and whether the delegation is also published so other servers can see it.
+   It cannot go in the server manifest as that stands (rule 18): it would need a separate
+   signed object, or a manifest format bump.
 2. **Subscriptions on a proven connection.** Whether a proven connection can drop the
    per-subscription proof (rule 9).
 3. **Multi-author blocks.** Whether a co-authored block needs every author's session or
