@@ -645,6 +645,23 @@ pub async fn ingest_peer_block(
         debug!(peer_url = %peer.url, %delivery_cid, channel_id = id, "dropping peer block: the channel is carried by contract");
         return Ok(());
     }
+    // The owner's relay names its posts in the channel by slug, which here
+    // names only channels this server orders: the same drop, before ingest
+    // refuses each one as naming an unknown channel.
+    if let Some(kind) = manifest.kind
+        && kind != BlockKind::ChannelCreate
+        && !manifest
+            .metadata
+            .contains_key(jig_pipeline::ingest::CHANNEL_ID_KEY)
+        && let Some(slug) = jig_pipeline::ingest::channel_slug_of(kind, &manifest)
+        && let Some(carried) = state.ingest_ctx.store.carried_channel_by_slug(slug)?
+        && jig_pipeline::effect::canonical_did_string(&carried.sequencer_did)
+            == jig_pipeline::effect::canonical_did_string(&peer.expected_did)
+        && state.ingest_ctx.store.is_followed(&carried.id)?
+    {
+        debug!(peer_url = %peer.url, %delivery_cid, channel_id = %carried.id, "dropping peer block: the channel is carried by contract");
+        return Ok(());
+    }
     if let Some(kind) = manifest.kind
         && let Some(named) = jig_pipeline::ingest::channel_id_of(
             &state.ingest_ctx.store,
