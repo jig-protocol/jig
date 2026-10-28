@@ -524,8 +524,19 @@ hello_world() {
   # --exist-ok: a re-run (or a server someone already set up) keeps its #hello.
   "$jig" channel create "$JIG_DEFAULT_CHANNEL" --exist-ok >/dev/null \
     || die "could not create $JIG_DEFAULT_CHANNEL"
-  "$jig" send --channel "$JIG_DEFAULT_CHANNEL" "hello, world" >/dev/null
-  log "posted \"hello, world\" to $JIG_DEFAULT_CHANNEL (${SECONDS}s since start)"
+  # A channel created unencrypted before channel tiers is frozen on upgrade
+  # (JEP-0014 rule 21): readable, but it takes nothing new. That is the
+  # upgrade working, not failing.
+  local sent
+  if sent="$("$jig" send --channel "$JIG_DEFAULT_CHANNEL" "hello, world" 2>&1)"; then
+    log "posted \"hello, world\" to $JIG_DEFAULT_CHANNEL (${SECONDS}s since start)"
+  elif printf '%s' "$sent" | grep -q CHANNEL_FROZEN; then
+    log "$JIG_DEFAULT_CHANNEL was created unencrypted before channel tiers, so it is now"
+    log "read-only: its history stays. Make an encrypted channel to keep talking."
+  else
+    printf '%s\n' "$sent" >&2
+    die "could not post to $JIG_DEFAULT_CHANNEL"
+  fi
 }
 
 main() {
