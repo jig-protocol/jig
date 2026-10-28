@@ -6,7 +6,7 @@ type = "Standards Track"
 category = "Security"
 authors = ["DJ <dev@jig.onl>"]
 created = "2026-10-28"
-requires = ["0004", "0008", "0009", "0010", "0014"]
+requires = ["0004", "0006", "0008", "0009", "0010", "0014"]
 replaces = []
 superseded_by = []
 discussions_to = "https://github.com/jig-protocol/jig/issues"
@@ -20,13 +20,15 @@ established clients do for their ruleset group, each earning a flat credit (D32)
 
 This JEP specifies:
 
-- the three kinds of useful work:
+- the four kinds of useful work:
   - log witnessing and checkpoint gossip;
   - evidence validation, the **auditor** role;
+  - receipt re-execution in `public` channels;
   - holding copies and answering retrievability challenges;
 - who is eligible, and how a client enrols and opts out;
-- **secret, self-selected assignment** from verifiable randomness over the group log, proven
-  when the worker submits;
+- the **witness beacon**: per-epoch randomness that the group's witnesses commit to and then
+  reveal, which also seeds tribunal panels (JEP-0010);
+- **secret, self-selected assignment** from the beacon, proven when the worker submits;
 - commit-reveal among redundant workers, escalation when they disagree, and fraud proofs
   against a false verdict;
 - flat credit, as ruleset events that the reference rulesets (R2.1) consume;
@@ -97,18 +99,13 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
 
 4. A **worker** is a client DID that is enrolled (rule 9) and eligible (rule 8).
 5. A **task** is one unit of useful work: one log checkpoint to witness, one evidence sample to
-   validate, or one retrievability challenge to answer. It has a `task_id` (rule 13).
+   validate, one `public` receipt to re-execute, or one retrievability challenge to answer. It
+   has a `task_id` (rule 13).
 6. An **epoch** is the ruleset's epoch, as R2.1 defines it for `f`: a range of positions in the
    group log, never a span of wall-clock time. Every window in this JEP is counted in group-log
    positions or epochs (TM-01, TM-02).
-6a. The **beacon** of an epoch is the labelled BLAKE3 hash of:
-   - (`domain`, `jig-uw-beacon-v1`);
-   - (`checkpoint`, the group log's first checkpoint at or after the epoch's start);
-   - one (`cosig`, signature) part for every cosignature of that checkpoint by a group witness
-     (JEP-0009 rule 33) received within `beacon_positions`, in the order of the witnesses' keys.
-
-   The log's owner fixes the checkpoint before any witness signs it, and cannot compute a
-   witness's signature, so it cannot grind the beacon alone (Security Considerations).
+6a. The **beacon** of an epoch is the witness beacon of section 12: randomness the group's
+   witnesses commit to in the epoch before and reveal in the epoch itself (rules 36–41).
 7. **Content** is anything a channel's members encrypted, and anything inside a franking opening
    (JEP-0010 rule 8). A block's CID, its signed outer fields, `ingest` records, counters, proofs
    and log records are not content.
@@ -136,8 +133,8 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
    - `vrf_key` is an ECVRF-EDWARDS25519-SHA512-TAI public key (RFC 9381 §5.5). It MUST NOT be
      the DID's signing key: the DID key signs the record, and the VRF key is used for nothing
      else.
-   - `kinds` lists the kinds of work the client takes: `witness`, `validate` and `retrieve`
-     (sections 6–8).
+   - `kinds` lists the kinds of work the client takes: `witness`, `validate`, `reexecute`
+     and `retrieve` (sections 6–8).
    - The nameserver logs the record (JEP-0009 rule 31). A log leaf about an enrolment carries
      `subject_commit`, not the DID (JEP-0009 rule 32).
    - A new enrolment replaces the old one from the first epoch whose beacon follows its
@@ -177,7 +174,7 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
     - Nobody but the worker knows it is assigned until it submits. The beacon is public, but
       `out` needs the worker's VRF secret key.
     - The worker cannot grind: its VRF key was fixed before the beacon (rule 9), and the
-      beacon mixes witnesses' cosignatures that the log's owner cannot compute (rule 6a).
+      beacon comes from contributions committed before the epoch began (rule 37).
     - The number assigned varies around `n`. Rule 19 says what happens when too few submit.
 13. **Tasks are derived, not handed out.** Every party computes the epoch's tasks from public
     data, so no one picks a task for a particular worker. Labelled BLAKE3 throughout, with
@@ -188,6 +185,11 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
       index `i` satisfies `int(H(domain, beacon, log origin, i)[0..8]) < (2^64 − 1) ×
       sample_rate`. `task_id` = H(domain, `validate`, log origin, i). Only leaves included
       before the beacon are sampled.
+    - **`reexecute`:** the sample is the positions `s` of each `public` channel (system
+      channels included, JEP-0014 rule 6) whose owner is in the group, where
+      `int(H(domain, beacon, channel_id, s)[0..8]) < (2^64 − 1) × reexecute_rate` and the block
+      at `s` has a receipt. `task_id` = H(domain, `reexecute`, channel_id, s). Only blocks
+      sequenced before the beacon are sampled.
     - **`retrieve`:** one task per stored object per epoch (section 8). `task_id` =
       H(domain, `retrieve`, object CID, epoch).
 14. **Conflicts.** A worker MUST NOT submit for a task whose subject is itself, or a server or
@@ -313,14 +315,19 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
 
     A body that no holder releases before the commit window closes is a result too:
     `{valid: false, reason: "withheld"}`.
-26. **Execution in the encrypted tiers** is checked by members, not auditors. A server
-    executes nothing under an encrypted suite (JEP-0014 rule 25), and the members' clients
-    produce receipts that other members re-execute (JEP-0014 rule 34).
-    - An auditor checks that the receipts a leaf cites are well-formed and signed. It cannot
-      check their outcome, because it cannot read the input.
-    - **Stated limit:** a dormant channel, with no member online to re-execute, gets no
-      execution check. Receipts there are signed claims and nothing more (OP-07).
-    - In `public` channels anyone can re-execute, auditors included.
+26. **Re-execution is split by tier.**
+    - **`public` channels**, system channels included, have no plaintext to protect. A
+      `reexecute` task's worker fetches the sampled block, its inputs and its receipt, runs the
+      block's component as JEP-0006 specifies, and returns `{matches: bool}`. This is
+      creditable useful work, and a false result is a fraud proof like any other (rule 21).
+    - **The encrypted tiers** are checked by their members, uncredited. A server executes
+      nothing under an encrypted suite (JEP-0014 rule 25), and the members' clients produce
+      receipts that other members re-execute (JEP-0014 rule 34). Nobody outside the channel
+      can verify that work without the content, so it earns no credit.
+    - In the encrypted tiers an auditor checks only that the receipts a leaf cites are
+      well-formed and signed. It cannot check their outcome, because it cannot read the input.
+    - **Stated limit:** a dormant encrypted channel, with no member online to re-execute, gets
+      no execution check. Receipts there are signed claims and nothing more (OP-07).
 
 ## 8. Copies and retrievability
 
@@ -341,7 +348,8 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
     - `useful-work`, positive, `ref` = the kind, with `count` = the number of the worker's
       well-formed, on-time reveals in the period, **whatever results it revealed and whatever
       the tasks' outcomes**;
-    - `useful-work-fraud`, negative, citing the fraud proof (rule 21).
+    - `useful-work-fraud`, negative, citing the fraud proof (rule 21);
+    - `beacon-withheld`, negative, about a beacon contributor (rule 40).
 
     `useful-work` is reported **once per worker per period, as an aggregate**, never per task.
     Its evidence is one commitment to the list of the worker's `assign_commit`s for the period,
@@ -384,8 +392,11 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
     | `n[kind]`, `k[kind]` | expected workers per task, and agreeing reveals needed |
     | `n_escalate`, `k_escalate` | the same, for escalation |
     | `sample_rate` | the fraction of log leaves sampled per epoch for `validate` |
+    | `reexecute_rate` | the fraction of `public` channel positions with receipts sampled per epoch for `reexecute` |
     | `retrieve_samples` | chunks per retrievability challenge |
-    | `beacon_positions` | group-log positions after the checkpoint within which cosignatures count towards the beacon |
+    | `beacon_reveal_positions` | the beacon's reveal window, from the epoch's start (rule 38) |
+    | `beacon_min_reveals` | valid reveals an epoch needs to have a beacon (rule 39) |
+    | `beacon_exclusion_epochs`, `beacon_withheld_weight` | the penalties for a withheld reveal (rule 40) |
     | `commit_positions`, `reveal_positions` | the commit and reveal windows, in group-log positions |
     | `max_carry` | epochs a task may carry before it is `unresolved` |
     | `same_subject_cooldown_epochs` | epochs before an auditor may validate the same subject again |
@@ -398,6 +409,47 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
 
     No parameter is in seconds. R2.1 sets the reference values. Its starting points are `n` = 5,
     `k` = 3, `n_escalate` = 11 and `k_escalate` = 7.
+
+## 12. The witness beacon
+
+36. **Contributors.** The beacon's contributors are the group's witnesses (JEP-0009 rule 33),
+    each identified by its DID.
+37. **Commit, in the epoch before.** For epoch `N`, each contributor picks a fresh, uniformly
+    random 32-byte value `r` and logs, in the group log, a signed
+    `beacon-commit {v, witness, ruleset: hash, epoch: N, c}`, where `c` is the labelled BLAKE3
+    hash of (`domain`, `jig-beacon-commit-v1`), (`epoch`, `N` as decimal ASCII) and (`r`).
+    - A commit counts only if it is included in the group log before epoch `N` starts.
+    - A contributor MUST NOT commit twice for one epoch. A second commit voids both.
+38. **Reveal, in the epoch itself.** Within `beacon_reveal_positions` of epoch `N`'s start,
+    each contributor that committed logs `beacon-reveal {v, witness, epoch: N, r}`.
+    - A reveal that does not hash to its commit is void.
+    - A reveal included after the window is late, and counts as missing.
+39. **The beacon** of epoch `N` is the labelled BLAKE3 hash of:
+    - (`domain`, `jig-beacon-v1`);
+    - (`epoch`, `N` as decimal ASCII);
+    - (`prev`, the beacon of the last epoch that had one);
+    - one (`r`, value) part for every valid reveal, in the order of the contributors' DIDs.
+
+    It is fixed when the reveal window closes, and anyone recomputes it from the group log. An
+    epoch with fewer than `beacon_min_reveals` valid reveals has **no beacon**: no tasks are
+    drawn in it, carried tasks wait for the next one, and a tribunal panel is drawn from the
+    next epoch that has one (JEP-0010 rule 20).
+40. **Withholding is penalised.** A contributor that committed for epoch `N` and did not reveal
+    validly in the window:
+    - is reported `beacon-withheld` (rule 29), with weight `beacon_withheld_weight`, citing its
+      commit and the checkpoint that closed the window. Witnesses carry standing as servers do
+      (JEP-0009 rule 11);
+    - forfeits any `useful-work` credit its DID earned in epoch `N`;
+    - is not a contributor for the next `beacon_exclusion_epochs`.
+
+    Every withheld reveal is in the log, so repeated withholding by one seat's witnesses is
+    machine-checkable evidence for an evidence-track case against that seat (JEP-0010 rule 13).
+    Not committing at all is not withholding: it contributes nothing and costs nothing.
+41. **What it seeds.** The beacon is the only randomness for:
+    - assignment (rule 12) and task sampling (rule 13);
+    - retrievability chunks (rule 28);
+    - R2.1's sampling;
+    - tribunal panels (JEP-0010 rule 20).
 
 # Security Considerations (Zero-Trust)
 
@@ -418,8 +470,8 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
 - **Withholding reveals to stall quorums.** Repeated misses pause the worker (rule 17a).
 - **NS-02, equivocation.** Workers witness logs from more than one path, and a split view is
   evidence (rule 22).
-- **OP-07, forged receipts.** Members re-execute in the encrypted tiers and anyone can in
-  `public` (rule 26). Auditors check that receipts exist and are signed.
+- **OP-07, forged receipts.** Assigned workers re-execute sampled receipts in `public`
+  channels, and members re-execute in the encrypted tiers (rule 26).
 - **OP-10.** Standing is recomputable (D34), and this JEP supplies the checks that make the
   recomputation mean something.
 - **GV-02.** Workers are weighed per DID only through the k-of-n quorum, and quorum outcomes are
@@ -434,12 +486,12 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
   (open question 2).
 - **A party with many established DIDs** is assigned in proportion to how many it holds. Each
   established DID costs time under JEP-0009 rule 17, and invite budgets bound the rest.
-- **Beacon bias.** The beacon mixes the witnesses' cosignatures into the checkpoint (rule 6a),
-  so the log's owner cannot grind it alone: it would have to predict signatures it cannot
-  compute. A witness still chooses whether to cosign in time, so `c` colluding witnesses can
-  choose among at most `2^c` beacons by withholding. A ruleset sizes its witness set against
-  that bound. Tribunal panels (JEP-0010 rule 20) seed from the bare
-  checkpoint and are exposed to the owner's grinding; they could adopt rule 6a.
+- **Beacon bias.** Every contribution is committed before the epoch starts (rule 37), so the
+  log's owner cannot grind the beacon, and nobody can set it to a value of their choosing
+  while one contributor is honest. One lever remains: a contributor sees the others' reveals
+  before it reveals, and can withhold. `c` colluding contributors can so choose among at most
+  `2^c` beacons, and each withheld reveal is logged and penalised (rule 40). Contributors that
+  all collude control the beacon. A ruleset sizes the witness set against these bounds.
 - **Dormant encrypted channels** get no execution check (rule 26).
 - **Liveness.** A task whose workers do not reveal carries forward and can end `unresolved`
   (rule 19). Unresolved is logged, so the gap is visible.
@@ -473,7 +525,9 @@ None yet. It follows R2.1's reference rulesets (D31).
 To be added with the reference implementation:
 
 - an enrolment, a VRF proof and the threshold test, for one assigned and one unassigned worker;
+- a beacon: commits, reveals, one withheld reveal, and the resulting beacon (rules 37–39);
 - the task derivation of rule 13 for each kind, from a fixed beacon;
+- a `reexecute` task on a `public` block, with a matching and a mismatching receipt;
 - a commit, a matching reveal, and a reveal whose nonce does not match;
 - a quorum, an escalation and a fraud proof;
 - a retrievability challenge and its answer.
@@ -495,6 +549,12 @@ JEP-0009, JEP-0010 and JEP-0014 on `main`, and reviewed by the author.
   the encrypted tiers' promise (JEP-0014).
 - **Reusing the DID key as the VRF key.** It uses one key for two schemes, and links every
   commit to a DID in public.
+- **A beacon derived from a checkpoint**, alone or mixed with its cosignatures. The log's owner
+  chooses what the checkpoint contains, so it can try checkpoints until one suits it.
+- **An external randomness beacon (drand).** It removes the withholding lever, but makes every
+  ruleset group depend on a service outside it (DJ, 2026-10-28).
+- **Credit for re-execution in the encrypted tiers.** Nobody outside the channel can check it,
+  and credit that cannot be checked is what a farm of DIDs would mint.
 
 # Open Questions
 
@@ -505,13 +565,12 @@ JEP-0009, JEP-0010 and JEP-0014 on `main`, and reviewed by the author.
    learning who is assigned?
 3. ~~Separate cap.~~ Agreed with R2.1: `credit_cap_per_period`, inside `accrual_per_period`
    (rule 31).
-4. **Re-execution credit.** D32 lists receipt re-execution as useful work. Here it is the
-   members' check (rule 26), useful but uncredited. Members re-run receipts on plaintext that
-   auditors must never see, so credit for it could not be audited, and unauditable credit is
-   what a farm of DIDs would mint. The options for DJ:
-   - **(a) keep it uncredited** (this draft, and R2.1's view);
-   - **(b) credit it once it has an auditable form**, for example a member-signed receipt hash
-     that other members of the same channel cross-check. That is a separate design.
+4. ~~Re-execution credit.~~ Decided (DJ, 2026-10-28): split by tier. It is creditable useful
+   work for assigned workers in `public` and system channels, and the members' own uncredited
+   check in the encrypted tiers (rule 26).
+5. **The withholding lever.** Threshold randomness among the witnesses (a publicly verifiable
+   secret sharing, or a threshold signature) would remove the `2^c` choice of rule 40, at the
+   cost of a key ceremony among them. Is that worth it once group sizes are known?
 
 # Copyright
 
