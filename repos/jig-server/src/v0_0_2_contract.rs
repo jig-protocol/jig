@@ -334,7 +334,9 @@ impl Contracts {
         {
             Ok(offers) => {
                 for offer in offers {
-                    self.send(&offer.peer_did, OFFER_FRAME, offer.offer);
+                    if self.may_offer(&offer.channel_id, &offer.peer_did) {
+                        self.send(&offer.peer_did, OFFER_FRAME, offer.offer);
+                    }
                 }
             }
             Err(e) => tracing::warn!("listing unanswered offers: {e}"),
@@ -414,8 +416,42 @@ impl Contracts {
             answer: None,
             share_cid: Some(share_cid.to_string()),
         })?;
-        self.send(to, OFFER_FRAME, offer.envelope);
+        if self.may_offer(&channel.id, to) {
+            self.send(to, OFFER_FRAME, offer.envelope);
+        }
         Ok(())
+    }
+
+    /// Whether `channel`'s offer may go to `peer` now. A `shared` channel's
+    /// offer waits for a connection whose handshake says the peer implements
+    /// tiers (JEP-0014): a server without them would carry it as an untiered
+    /// channel. It stays unanswered, and goes out on a later resend once the
+    /// peer has upgraded.
+    fn may_offer(&self, channel_id: &str, peer: &str) -> bool {
+        use jig_core::tier::{StoredTier, Tier};
+        let shared = self
+            .store()
+            .get_channel_by_id(channel_id)
+            .ok()
+            .flatten()
+            .is_some_and(|c| c.tiering.tier == StoredTier::Tier(Tier::Shared));
+        if !shared {
+            return true;
+        }
+        let Ok(did) = Did::from_did_jig_string(peer) else {
+            return false;
+        };
+        match self.peers.sender_for(&did) {
+            Some(sender) if !sender.tiers() => {
+                tracing::info!(
+                    peer,
+                    channel_id,
+                    "a shared channel's offer waits: the peer does not implement tiers"
+                );
+                false
+            }
+            _ => true,
+        }
     }
 
     /// End the live share with `to`, and withdraw any offer to it not yet
@@ -648,6 +684,13 @@ impl Contracts {
         let terms = jig_pipeline::ingest::channel_terms(&manifest, &offer.owner)
             .map_err(|_| RefuseCode::PolicyRefused)?;
         if terms.sequencer != offer.owner {
+            return Err(RefuseCode::PolicyRefused);
+        }
+        // A tier that stays on its owner's server is not carried here,
+        // whatever its owner offers.
+        if let Some(tiering) = &terms.tiering
+            && !contracts::crosses_servers(tiering.tier)
+        {
             return Err(RefuseCode::PolicyRefused);
         }
         // Rule 9: a suite this server carries, and no fallback.
@@ -1469,6 +1512,55 @@ mod tests {
         );
     }
 
+    /// JEP-0014 rules 12 and 13: a `private` channel never leaves its
+    /// owner's server. Its share is refused when posted, and nothing is sent.
+    #[tokio::test]
+    async fn a_private_channel_is_not_offered() {
+        let p = pair(OfferPolicy::Accept).await;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let did = jig_core::did::Did::from_ed25519_pubkey(p.user.verifying_key().as_bytes());
+        let creator = jig_mls::member::Member::new(&p.user.to_bytes(), &did).unwrap();
+        let created = creator.create_group().unwrap();
+        let channel = post(
+            &p.owner,
+            &p.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({
+                "slug": "#private",
+                "tier": "private",
+                "suite": "mls",
+                "mls_group_info": b64(&created.group_info),
+                "mls_ratchet_tree": b64(&created.ratchet_tree),
+            }),
+        )
+        .await
+        .unwrap();
+        let shared = post(
+            &p.owner,
+            &p.user,
+            BlockKind::ChannelShare,
+            serde_json::json!({
+                "channel_id": channel,
+                "to": p.follower.server_did.to_did_jig_string(),
+                "grant": "read",
+            }),
+        )
+        .await;
+        match shared {
+            Err(e) => assert!(e.to_string().contains("stays on the server"), "{e}"),
+            Ok(cid) => panic!("the share landed: {cid}"),
+        }
+        assert!(
+            p.owner
+                .ingest_ctx
+                .store
+                .contract_offers_in(Side::Owner, OfferState::Offered)
+                .unwrap()
+                .is_empty(),
+            "no offer was made"
+        );
+    }
+
     /// The default: an offer waits for the operator, who may accept it.
     #[tokio::test]
     async fn an_offer_is_held_until_the_operator_answers() {
@@ -1723,6 +1815,21 @@ mod tests {
             answer_to(&contracts, &owner, &offer_to(&follower, &owner, suite, &[])).as_deref(),
             Some("UNSUPPORTED_SUITE")
         );
+        // JEP-0014 rules 12 and 13: `private` and `server` stay on their
+        // owner's server; `shared` crosses.
+        for (tier, refused) in [("private", true), ("server", true), ("shared", false)] {
+            let offered = creation(&owner, serde_json::json!({"tier": tier, "suite": "mls"}));
+            assert_eq!(
+                answer_to(
+                    &contracts,
+                    &owner,
+                    &offer_to(&follower, &owner, offered, &[])
+                )
+                .as_deref(),
+                refused.then_some("POLICY_REFUSED"),
+                "{tier}"
+            );
+        }
         // A suffix this server attests (`dns`, as `Names.Example.org`): the
         // same claim from the owner is no conflict, and the same suffix under
         // another authority is.
@@ -3545,6 +3652,193 @@ mod tests {
 
         fn owner_relay(&self) -> Arc<Relay> {
             self.owner.relay.get().unwrap().clone()
+        }
+    }
+
+    /// A `shared` MLS channel on `p`'s owner, created by its user: the
+    /// channel, the user's MLS member and the group's id.
+    async fn shared_mls_channel(p: &Pair) -> (String, jig_mls::member::Member, Vec<u8>) {
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let did = jig_core::did::Did::from_ed25519_pubkey(p.user.verifying_key().as_bytes());
+        let creator = jig_mls::member::Member::new(&p.user.to_bytes(), &did).unwrap();
+        let created = creator.create_group().unwrap();
+        let channel = post(
+            &p.owner,
+            &p.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({
+                "slug": "#across",
+                "tier": "shared",
+                "suite": "mls",
+                "mls_group_info": b64(&created.group_info),
+                "mls_ratchet_tree": b64(&created.ratchet_tree),
+            }),
+        )
+        .await
+        .unwrap();
+        (channel, creator, created.group_id)
+    }
+
+    /// A `shared` channel's offer goes only to a peer whose handshake says
+    /// it implements tiers: one without them would carry it untiered. The
+    /// offer waits, unanswered.
+    #[tokio::test]
+    async fn a_shared_channel_is_not_offered_to_a_peer_without_tiers() {
+        let p = pair(OfferPolicy::Accept).await;
+        let (channel, _, _) = shared_mls_channel(&p).await;
+        // The follower's newest connection is one that did not ask for tiers.
+        let (old, mut old_rx) = PeerSender::new(p.follower.server_did.clone());
+        let _registration = p.owner.peers.register(old);
+        p.share(&channel, "write").await;
+        let offered = eventually("the owner's offer", || {
+            p.offers(Side::Owner, &channel, OfferState::Offered).pop()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(old_rx.try_recv().is_err(), "nothing sent to the old peer");
+        assert!(
+            p.offers(Side::Follower, &channel, OfferState::Accepted)
+                .is_empty(),
+            "the follower never saw it"
+        );
+        assert_eq!(
+            p.offers(Side::Owner, &channel, OfferState::Offered),
+            vec![offered],
+            "the offer waits"
+        );
+    }
+
+    /// JEP-0014 rule 13 across servers: a `shared` MLS channel on its owner,
+    /// shared with a follower. A member whose client is on the follower joins
+    /// by Welcome and posts through it; the owner's member reads the post.
+    /// Neither server ever holds the plaintext.
+    #[tokio::test]
+    async fn a_shared_mls_channel_is_written_through_its_follower_and_read_at_its_owner() {
+        use jig_mls::member::Member;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let did = |key: &SigningKey| {
+            jig_core::did::Did::from_ed25519_pubkey(key.verifying_key().as_bytes())
+        };
+        let p = pair(OfferPolicy::Accept).await;
+        let (channel, creator, gid) = shared_mls_channel(&p).await;
+        p.share(&channel, "write").await;
+        p.both(&channel, OfferState::Accepted).await;
+
+        // A member whose client is on the follower, added on the owner. Its
+        // key package reaches the creator directly (custodians: Task 8).
+        let remote_key = SigningKey::from_bytes(&rand::random());
+        let remote = Member::new(&remote_key.to_bytes(), &did(&remote_key)).unwrap();
+        let kp = remote.key_packages(1, false).unwrap().remove(0);
+        let remote_did = did(&remote_key).to_did_jig_string();
+        let commit = creator.add(&gid, &kp, &remote_did).unwrap();
+        post(
+            &p.owner,
+            &p.user,
+            BlockKind::MemberAdd,
+            serde_json::json!({
+                "channel_id": channel,
+                "member_did": remote_did,
+                "mls_commit": b64(&commit.commit),
+                "mls_welcome": b64(commit.welcome.as_ref().unwrap()),
+            }),
+        )
+        .await
+        .unwrap();
+        creator.confirm(&gid).unwrap();
+        assert_eq!(
+            remote
+                .join_welcome(commit.welcome.as_ref().unwrap())
+                .unwrap(),
+            gid
+        );
+        p.follows.stream.pull_all();
+        p.caught_up(&channel).await;
+        assert_eq!(
+            p.follower
+                .ingest_ctx
+                .store
+                .get_mls_group_by_id(&channel)
+                .unwrap()
+                .unwrap()
+                .epoch,
+            1,
+            "the follower's mirror moved with the commit"
+        );
+
+        // The remote member posts through the follower.
+        let secret = "the meeting moved to thursday";
+        let (ct, epoch) = remote.encrypt(&gid, secret.as_bytes()).unwrap();
+        let parts = {
+            use ed25519_dalek::Signer as _;
+            let manifest = BlockManifest::builder()
+                .version(semver::Version::new(0, 1, 0))
+                .author(Author {
+                    did: did(&remote_key),
+                    public_key: None,
+                    roles: vec![],
+                })
+                .privacy(jig_core::Privacy {
+                    encryption: jig_core::EncryptionSuite::Mls,
+                    recipients: vec![],
+                    metadata_visibility: Default::default(),
+                })
+                .metadata_entry("channel_id", serde_json::json!(channel))
+                .metadata_entry("mls_message", serde_json::json!(b64(&ct)))
+                .metadata_entry("mls_epoch", serde_json::json!(epoch))
+                .build()
+                .unwrap()
+                .with_kind(BlockKind::TextRender)
+                .to_canonical_bytes()
+                .unwrap();
+            let code: Vec<u8> = Vec::new();
+            let sig = remote_key
+                .sign(&serde_json::to_vec(&(&manifest, &code)).unwrap())
+                .to_bytes()
+                .to_vec();
+            (manifest, code, sig)
+        };
+        let cid = client_post(&p.follower, &parts).await.unwrap();
+        let at_owner = p
+            .owner
+            .ingest_ctx
+            .store
+            .get_block(&cid)
+            .unwrap()
+            .expect("landed at the owner");
+        assert_eq!(at_owner.channel_id.as_deref(), Some(channel.as_str()));
+        p.caught_up(&channel).await;
+        // The owner knows which server relayed the member's latest write:
+        // the hint `jig channel members --via` lists after a contract ends.
+        let via = p
+            .owner
+            .ingest_ctx
+            .store
+            .last_relay_by_sender(&channel)
+            .unwrap();
+        assert_eq!(
+            via.get(&remote_did).cloned().flatten(),
+            Some(p.follower.server_did.to_did_jig_string())
+        );
+        assert_eq!(via.get(&did(&p.user).to_did_jig_string()), Some(&None));
+
+        // The owner's member reads it from what the owner stored.
+        let (stored, _): (Vec<u8>, Vec<u8>) =
+            serde_json::from_slice(&at_owner.bundle_bytes).unwrap();
+        let stored: BlockManifest = serde_json::from_slice(&stored).unwrap();
+        let ct = base64::engine::general_purpose::STANDARD
+            .decode(stored.metadata["mls_message"].as_str().unwrap())
+            .unwrap();
+        let read = creator.decrypt(&gid, &ct).unwrap();
+        assert_eq!(read.plaintext, secret.as_bytes());
+
+        // Neither server holds the plaintext, in any block of the channel.
+        for state in [&p.owner, &p.follower] {
+            for (_, manifest) in kinds_in(state, &channel) {
+                assert!(
+                    !serde_json::to_string(&manifest).unwrap().contains(secret),
+                    "a server holds the plaintext"
+                );
+            }
         }
     }
 

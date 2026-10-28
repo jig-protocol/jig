@@ -2171,6 +2171,27 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// The server that relayed each sender's latest block in `channel_id`
+    /// (`federated_from`), by sender DID: `None` for one that wrote here
+    /// directly. A hint at where a member's client is, no more: a member who
+    /// only reads, or writes from two servers, is not told apart.
+    pub fn last_relay_by_sender(
+        &self,
+        channel_id: &str,
+    ) -> Result<std::collections::HashMap<String, Option<String>>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT b.sender_did, b.federated_from FROM blocks b
+              WHERE b.channel_id = ?1
+                AND b.rowid = (SELECT MAX(rowid) FROM blocks
+                                WHERE channel_id = ?1 AND sender_did = b.sender_did)",
+        )?;
+        let rows = stmt
+            .query_map([channel_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Remove `member_did` from the channel at `slug`. Returns whether a row
     /// was removed.
     ///

@@ -281,6 +281,17 @@ pub fn authorize_block_with(
                     right: Right::Share,
                 });
             }
+            if kind == BlockKind::ChannelShare
+                && !crate::contracts::crosses_servers(channel.tiering.tier)
+            {
+                return Err(WriteRefusal::BadContractBlock {
+                    detail: format!(
+                        "a `{}` channel stays on the server that orders it; only `shared` \
+                         channels are shared with other servers",
+                        channel.tiering.tier
+                    ),
+                });
+            }
             crate::contracts::share_request(kind, manifest)
                 .map(|_| ())
                 .map_err(|e| WriteRefusal::BadContractBlock {

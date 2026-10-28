@@ -488,6 +488,10 @@ pub async fn promote(ctx: &CliContext, slug: String) -> Result<()> {
 struct MemberView {
     did: String,
     role: String,
+    /// The server that relayed the member's latest write, as the channel's
+    /// own server saw it.
+    #[serde(default)]
+    last_via: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -495,8 +499,11 @@ struct MembersResponse {
     members: Vec<MemberView>,
 }
 
-/// Apply `jig channel members <slug>`.
-pub async fn members(ctx: &CliContext, slug: String) -> Result<()> {
+/// Apply `jig channel members <slug>`, or with `via`, only the members whose
+/// latest write was relayed by that server: who a follower took with it
+/// when its contract ended. A hint from the owner's server, not a proof;
+/// remove those it names with `jig channel kick`.
+pub async fn members(ctx: &CliContext, slug: String, via: Option<String>) -> Result<()> {
     let secure = Secure::open(ctx)?;
     let body: MembersResponse = secure
         .get_json(&format!(
@@ -505,7 +512,17 @@ pub async fn members(ctx: &CliContext, slug: String) -> Result<()> {
         ))
         .await?;
     let contacts = &ctx.effective().contacts;
+    let via = via.as_deref().map(canonical_did).transpose()?;
     for m in body.members {
+        if let Some(via) = &via
+            && m.last_via
+                .as_deref()
+                .and_then(|d| canonical_did(d).ok())
+                .as_ref()
+                != Some(via)
+        {
+            continue;
+        }
         let name = contacts.get(&m.did).map(String::as_str).unwrap_or("");
         println!("{:<6}  {:<16}  {}", m.role, name, m.did);
     }
