@@ -2452,7 +2452,11 @@ mod tests {
     }
 
     async fn legacy() -> Legacy {
-        let mut a = state_with(vec![], &[]);
+        // A peer's channel-create reaches `a` over the relay only when its
+        // operator opts in to copying them.
+        let mut a = state_tuned(vec![], &[], |config| {
+            config.federation.naively_accept_peer_relayed_creates = true;
+        });
         let b = state_with(
             vec![peer(
                 "ws://127.0.0.1:1",
@@ -2939,6 +2943,8 @@ mod tests {
             let mut config = JigServerConfig::default();
             config.federation.dangerously_allow_plaintext_federation = true;
             config.federation.peers = vec![peer("ws://127.0.0.1:1", did_of(other), offers)];
+            // The relay's copies this guards are made only on opting in.
+            config.federation.naively_accept_peer_relayed_creates = true;
             AppState::for_test_from(
                 config,
                 Arc::new(jig_pipeline::persist::SqliteStore::open_in_memory().unwrap()),
