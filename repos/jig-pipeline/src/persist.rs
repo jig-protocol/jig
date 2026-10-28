@@ -223,6 +223,46 @@ fn row_to_stored_block(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredBlock> {
 /// History order is (HLC wall, logical, origin, CID). The CID makes it total:
 /// one author's blocks in the same millisecond share the rest, and without it
 /// a page boundary between two of them could skip one.
+/// What a window of history selects: its rows, or each row's id and the
+/// bytes it stores (bundle, signature and receipts), which is enough to
+/// choose the rows of a page before loading any of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Select {
+    Rows,
+    Sizes,
+}
+
+impl Select {
+    /// The select list, with each column qualified by `table` (`b.` or
+    /// `blocks.`). Never empty: the receipt subquery's `receipts` has a
+    /// `cid` of its own, which an unqualified `cid` would name.
+    fn list(self, table: &str) -> String {
+        match self {
+            Select::Rows => BLOCK_COLUMNS
+                .split(", ")
+                .map(|c| format!("{table}{}", c.trim()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            Select::Sizes => format!(
+                "{table}cid, length({table}bundle_bytes) + ifnull(length({table}sender_sig), 0) \
+                 + ifnull((SELECT SUM(length(rc.receipt_bytes)) FROM receipts rc \
+                 WHERE rc.block_cid = {table}cid), 0)"
+            ),
+        }
+    }
+}
+
+/// The newest `?2` blocks of channel `?1`, by the authors' clocks.
+fn history_newest_sql(select: Select) -> String {
+    let columns = select.list("blocks.");
+    format!(
+        "SELECT {columns} FROM blocks \
+         WHERE channel_id = ?1 \
+         ORDER BY hlc_wall_ms DESC, hlc_logical DESC, hlc_origin DESC, cid DESC \
+         LIMIT ?2"
+    )
+}
+
 fn history_sql(with_cursor: bool) -> String {
     if with_cursor {
         format!(
@@ -232,23 +272,19 @@ fn history_sql(with_cursor: bool) -> String {
              LIMIT ?4"
         )
     } else {
-        format!(
-            "SELECT {BLOCK_COLUMNS} FROM blocks \
-             WHERE channel_id = ?1 \
-             ORDER BY hlc_wall_ms DESC, hlc_logical DESC, hlc_origin DESC, cid DESC \
-             LIMIT ?2"
-        )
+        history_newest_sql(Select::Rows)
     }
 }
 
 /// History of a sequenced channel, newest first: by the sequencer's `seq`,
 /// not the authors' clocks (TM-02). `before_seq` bounds it for paging.
 fn sequenced_history_sql(with_before: bool) -> String {
-    let columns = BLOCK_COLUMNS
-        .split(", ")
-        .map(|c| format!("b.{}", c.trim()))
-        .collect::<Vec<_>>()
-        .join(", ");
+    sequenced_window_sql(with_before, Select::Rows)
+}
+
+/// A sequenced channel's window by `seq`, newest first, selecting `select`.
+fn sequenced_window_sql(with_before: bool, select: Select) -> String {
+    let columns = select.list("b.");
     let bound = if with_before { "AND r.seq < ?3" } else { "" };
     format!(
         "SELECT {columns} FROM ingest_records r JOIN blocks b ON b.cid = r.block_cid \
@@ -259,8 +295,15 @@ fn sequenced_history_sql(with_before: bool) -> String {
 /// The statement behind [`SqliteStore::list_blocks_before`]: the page just
 /// older than a cursor block, newest first, on the same index and order.
 fn history_before_sql() -> String {
+    history_before_window_sql(Select::Rows)
+}
+
+/// The window just older than a cursor block, by the authors' clocks,
+/// newest first, selecting `select`.
+fn history_before_window_sql(select: Select) -> String {
+    let columns = select.list("blocks.");
     format!(
-        "SELECT {BLOCK_COLUMNS} FROM blocks \
+        "SELECT {columns} FROM blocks \
          WHERE channel_id = ?1 \
            AND (hlc_wall_ms, hlc_logical, hlc_origin, cid) < (?2, ?3, ?4, ?5) \
          ORDER BY hlc_wall_ms DESC, hlc_logical DESC, hlc_origin DESC, cid DESC \
@@ -1523,6 +1566,65 @@ impl SqliteStore {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         newest_first.reverse();
         Ok(Some(newest_first))
+    }
+
+    /// The window [`Self::list_blocks_by_channel_id`] (no cursor) or
+    /// [`Self::list_blocks_before_by_channel_id`] (`before`) would return,
+    /// newest first, as each block's CID and the bytes it stores: its bundle,
+    /// signature and receipts. Loads none of them, so a caller can choose a
+    /// page by size and load only that. `None` exactly when the `before`
+    /// cursor is not a block of the channel.
+    pub fn history_window_sizes(
+        &self,
+        channel_id: &str,
+        limit: usize,
+        before: Option<&str>,
+    ) -> Result<Option<Vec<(String, u64)>>> {
+        let limit = limit.min(MAX_HISTORY_LIMIT) as i64;
+        let row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(String, u64)> {
+            Ok((r.get(0)?, r.get::<_, i64>(1)?.max(0) as u64))
+        };
+        let Some(before) = before else {
+            let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
+            let sql = if Self::is_sequenced(&conn, channel_id)? {
+                sequenced_window_sql(false, Select::Sizes)
+            } else {
+                history_newest_sql(Select::Sizes)
+            };
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(params![channel_id, limit], row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            return Ok(Some(rows));
+        };
+        let Some(cursor) = self.get_block(before)? else {
+            return Ok(None);
+        };
+        if cursor.channel_id.as_deref() != Some(channel_id) {
+            return Ok(None);
+        }
+        let cursor_seq = self.get_ingest_record(&cursor.cid)?.map(|r| r.seq);
+        let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
+        let rows = if let Some(cursor_seq) = cursor_seq {
+            conn.prepare(&sequenced_window_sql(true, Select::Sizes))?
+                .query_map(params![channel_id, limit, cursor_seq as i64], row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            conn.prepare(&history_before_window_sql(Select::Sizes))?
+                .query_map(
+                    params![
+                        channel_id,
+                        cursor.hlc_wall_ms as i64,
+                        cursor.hlc_logical as i64,
+                        cursor.hlc_origin,
+                        cursor.cid,
+                        limit
+                    ],
+                    row,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(Some(rows))
     }
 
     // --- receipts ---
@@ -4702,6 +4804,98 @@ mod tests {
         assert_eq!(page("bafy_h1", 50), Some(vec![]), "the start of history");
         assert_eq!(page("bafy_o2", 50), None, "another channel's block");
         assert_eq!(page("bafy_nope", 50), None, "an unknown block");
+    }
+
+    /// The size window names the blocks the history window would load, in
+    /// the same order, with what each stores: so a page chosen from it is a
+    /// prefix of the page the full query returns.
+    #[test]
+    fn the_size_window_is_the_history_window_without_the_blocks() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        seed_timeline_channel(&store, "#tie");
+        for cid in ["bafy_t1", "bafy_t2", "bafy_t3", "bafy_t4", "bafy_t5"] {
+            store.insert_block(&timeline_block(cid, "#tie", 0)).unwrap();
+        }
+        let id = store
+            .get_channel_by_slug_including_archived("#tie")
+            .unwrap()
+            .unwrap()
+            .id;
+        // A receipt counts toward its block's size, on every path.
+        store
+            .insert_receipt(&sample_receipt("bafy_r4", "bafy_t4", "srv", None))
+            .unwrap();
+        let receipt_len = sample_receipt("", "", "", None).receipt_bytes.len();
+        let stored = |block: &StoredBlock| {
+            let receipts = if block.cid == "bafy_t4" {
+                receipt_len
+            } else {
+                0
+            };
+            block.bundle_bytes.len() + block.sender_sig.len() + receipts
+        };
+        let check = |rows: Vec<StoredBlock>, sizes: Vec<(String, u64)>| {
+            let newest_first: Vec<&StoredBlock> = rows.iter().rev().collect();
+            assert_eq!(
+                sizes
+                    .iter()
+                    .map(|(cid, _)| cid.as_str())
+                    .collect::<Vec<_>>(),
+                newest_first
+                    .iter()
+                    .map(|b| b.cid.as_str())
+                    .collect::<Vec<_>>(),
+            );
+            for ((_, size), block) in sizes.iter().zip(newest_first) {
+                assert_eq!(*size as usize, stored(block), "{}", block.cid);
+            }
+        };
+        check(
+            store.list_blocks_by_channel_id(&id, 3, None).unwrap(),
+            store.history_window_sizes(&id, 3, None).unwrap().unwrap(),
+        );
+        for before in ["bafy_t5", "bafy_t3", "bafy_t1"] {
+            check(
+                store
+                    .list_blocks_before_by_channel_id(&id, 2, before)
+                    .unwrap()
+                    .unwrap(),
+                store
+                    .history_window_sizes(&id, 2, Some(before))
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            store
+                .history_window_sizes(&id, 2, Some("bafy_nope"))
+                .unwrap(),
+            None
+        );
+
+        // The same channel, sequenced: the window goes by `seq`. The size
+        // query reads no record, so placeholder records will do.
+        {
+            let conn = store.conn.lock().unwrap();
+            for (seq, cid) in ["bafy_t1", "bafy_t2", "bafy_t3", "bafy_t4", "bafy_t5"]
+                .iter()
+                .enumerate()
+            {
+                conn.execute(
+                    "INSERT INTO ingest_records (block_cid, channel_id, seq, record) \
+                     VALUES (?1, ?2, ?3, x'00')",
+                    params![cid, id, seq as i64],
+                )
+                .unwrap();
+            }
+        }
+        let sizes = store.history_window_sizes(&id, 3, None).unwrap().unwrap();
+        assert_eq!(
+            sizes.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(),
+            ["bafy_t5", "bafy_t4", "bafy_t3"]
+        );
+        let t4 = store.get_block("bafy_t4").unwrap().unwrap();
+        assert_eq!(sizes[1].1 as usize, stored(&t4));
     }
 
     #[test]
