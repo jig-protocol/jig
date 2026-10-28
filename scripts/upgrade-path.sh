@@ -48,20 +48,26 @@ JIG_REPO="${JIG_REPO:-jig-protocol/jig}"
 # last step. Each must reproduce on every run, or the run fails: a gap that
 # was fixed is dropped from the list here, and from then on fails if it comes
 # back. See `gap` below.
-#   install-reuses-old-server: re-running install.sh while jig-server runs
-#     replaces the binaries but leaves the old server process answering, so the
-#     new client talks to the old server (alpha.1 → alpha.2: "malformed
-#     handshake frame", and a hint to `jig server forget`). Fixed by #334.
-KNOWN_GAPS="${JIG_UPGRADE_KNOWN_GAPS-install-reuses-old-server}"
+# None today.
+KNOWN_GAPS="${JIG_UPGRADE_KNOWN_GAPS-}"
 # Gaps a published release has, and always will: expected on a release step
 # and reported there, but never counted for KNOWN_GAPS, since a step that
 # cannot change cannot show that a gap is still there.
-#   install-reuses-old-server: above.
+# Each is NAME@TAG: the gap is excused on that release's step only, so a
+# later release that has it again fails the run.
+#   install-reuses-old-server: re-running install.sh while jig-server runs
+#     replaces the binaries but leaves the old server process answering, so the
+#     new client talks to the old server (alpha.1 → alpha.2: "malformed
+#     handshake frame", and a hint to `jig server forget`). Fixed by #334, so
+#     this build's installer fails the run if it leaves the old server up.
 #   rotate-locks-out-clients: after `jig-server keys rotate`, clients follow the
 #     key link but then refuse #jig/manifest, which the server re-created under
 #     its new DID ("is not the channel this device pinned"). Fixed by #335, so
 #     it fails the run when the last step is this build.
-RELEASED_GAPS="install-reuses-old-server rotate-locks-out-clients"
+RELEASED_GAPS="install-reuses-old-server@v0.2.0-alpha.1 install-reuses-old-server@v0.2.0-alpha.2"
+# alpha.3 was cut before #334, so its installer has the gap too; it has #335.
+RELEASED_GAPS="$RELEASED_GAPS install-reuses-old-server@v0.2.0-alpha.3"
+RELEASED_GAPS="$RELEASED_GAPS rotate-locks-out-clients@v0.2.0-alpha.1 rotate-locks-out-clients@v0.2.0-alpha.2"
 ALLOWED_SIGNERS="$(cd "$(dirname "$0")/.." && pwd)/.github/release/allowed_signers"
 
 SUFFIX=upgrade.jig
@@ -123,14 +129,15 @@ cleanup() {
 }
 trap 'cleanup "$@"' EXIT
 
-# A known gap reproduced on a step of KIND (release or mirror). On a release
-# step, one of RELEASED_GAPS is reported and nothing else is allowed. On this
-# build, one of KNOWN_GAPS is reported and counted; anything else fails.
+# A known gap reproduced on STEP, of KIND (release or mirror). On a release
+# step, a RELEASED_GAPS entry for that release is reported and nothing else is
+# allowed. On this build, one of KNOWN_GAPS is reported and counted; anything
+# else fails.
 gap() {
-  local name="$1" what="$2" kind="$3"
+  local name="$1" what="$2" kind="$3" step="$4"
   if [ "$kind" = release ]; then
     case " $RELEASED_GAPS " in
-      *" $name "*)
+      *" $name@$step "*)
         note "released gap \`$name\` (a published release; fixed only in later ones): $what"
         return
         ;;
@@ -440,7 +447,7 @@ for step in "$@"; do
       fi
     fi
     if [ "$reused" = 1 ]; then
-      gap install-reuses-old-server "re-running install.sh ($step) left the previous release's jig-server (pid $old_pid) running" "$kind"
+      gap install-reuses-old-server "re-running install.sh ($step) left the previous release's jig-server (pid $old_pid) running" "$kind" "$step"
     fi
     # The documented path: stop the server, then install.
     stop_server
@@ -473,7 +480,7 @@ note "rotated jig-server's key to $new_did"
 rotate_out="$sandbox/after-rotate.out"
 if ! as alice read '#enc' > "$rotate_out" 2>&1; then
   if grep -q "is not the channel this device pinned" "$rotate_out"; then
-    gap rotate-locks-out-clients "after keys rotate, a client pinned on the old DID refuses the re-created #jig/manifest: $(grep -m1 'not the channel' "$rotate_out" | cut -c1-200)" "$last_kind"
+    gap rotate-locks-out-clients "after keys rotate, a client pinned on the old DID refuses the re-created #jig/manifest: $(grep -m1 'not the channel' "$rotate_out" | cut -c1-200)" "$last_kind" "${*: -1}"
   else
     cat "$rotate_out" >&2
     fail "alice cannot reach the server after its key rotated"

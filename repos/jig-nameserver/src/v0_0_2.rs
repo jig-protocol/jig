@@ -477,6 +477,7 @@ pub fn key_options(
     keys: &jig_config::v0_0_2_server::KeysSection,
 ) -> jig_client::server_key::ServerKeyOptions {
     let mut opts = jig_client::server_key::ServerKeyOptions::new("nameserver", "jig-nameserver");
+    opts.section = jig_client::server_key::KeysTable::V002Keys;
     opts.unlock = keys.unlock.clone();
     opts.plaintext = keys.storage == jig_config::v0_0_2_server::KeyStorage::Plaintext;
     opts

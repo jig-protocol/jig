@@ -369,12 +369,62 @@ server_healthy() {
   server_scheme >/dev/null
 }
 
-start_server_background() {
-  local log_file="$JIG_HOME/logs/jig-server.log"
-  if server_healthy; then
+# The address $JIG_HOME/config.toml has jig-server listen on. A re-run keeps
+# an existing config, so this can differ from $JIG_SERVER_LISTEN.
+config_listen() {
+  local cfg="$JIG_HOME/config.toml" host port
+  host="$(sed -n 's/^bind_address = "\(.*\)"$/\1/p' "$cfg" 2>/dev/null | head -1)"
+  port="$(sed -n 's/^port = \([0-9][0-9]*\)$/\1/p' "$cfg" 2>/dev/null | head -1)"
+  [ -n "$host" ] && [ -n "$port" ] || return 1
+  echo "$host:$port"
+}
+
+# The pid of the jig-server this installer started earlier, from
+# $JIG_HOME/jig-server.pid, if that process is still that binary and its
+# config has it listen on $JIG_SERVER_LISTEN, so it is the server answering
+# there and not one elsewhere.
+our_server_pid() {
+  local pid
+  pid="$(cat "$JIG_HOME/jig-server.pid" 2>/dev/null)" || return 1
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  ps -o command= -p "$pid" 2>/dev/null | grep -qF "$JIG_HOME/bin/jig-server" || return 1
+  [ "$(config_listen)" = "$JIG_SERVER_LISTEN" ] || return 1
+  echo "$pid"
+}
+
+# A server still running the jig-server this run replaced keeps serving the
+# old build, and a new client may not speak to it. Stop it when this installer
+# started it; otherwise say so. Returns 0 when one is still answering.
+replaced_server_answering() {
+  server_healthy || return 1
+  [ -n "${OLD_SERVER_SUM:-}" ] && [ "$OLD_SERVER_SUM" != "$(sha256_of "$JIG_HOME/bin/jig-server")" ] || {
     log "jig-server already answering on $JIG_SERVER_LISTEN — reusing it"
     return 0
+  }
+  local pid
+  if ! pid="$(our_server_pid)"; then
+    warn "the jig-server answering on $JIG_SERVER_LISTEN is not one this installer started there, so"
+    warn "it still runs whatever build it started with. Restart it to run the one just installed."
+    return 0
   fi
+  log "stopping jig-server (pid $pid): it runs the build this install replaced"
+  kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 100); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -0 "$pid" 2>/dev/null && die "jig-server (pid $pid) did not stop; stop it and run this again"
+  for _ in $(seq 1 50); do
+    server_healthy || return 1
+    sleep 0.1
+  done
+  die "something still answers on $JIG_SERVER_LISTEN after jig-server (pid $pid) stopped"
+}
+
+start_server_background() {
+  local log_file="$JIG_HOME/logs/jig-server.log"
+  replaced_server_answering && return 0
   log "starting jig-server on $JIG_SERVER_LISTEN (logs: $log_file)"
   nohup "$JIG_HOME/bin/jig-server" --config "$JIG_HOME/config.toml" >"$log_file" 2>&1 &
   SERVER_PID=$!
@@ -531,6 +581,9 @@ hello_world() {
 main() {
   trap on_exit EXIT
   log "installing jig into $JIG_HOME"
+  # What jig-server was before this run, to restart a server running it.
+  OLD_SERVER_SUM=""
+  if [ -f "$JIG_HOME/bin/jig-server" ]; then OLD_SERVER_SUM="$(sha256_of "$JIG_HOME/bin/jig-server")"; fi
   case "$JIG_INSTALL_FROM" in
     release) install_from_release ;;
     source)  install_from_source ;;
