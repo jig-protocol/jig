@@ -208,6 +208,19 @@ impl AuthState {
         self.did_rate.as_ref().map(|r| millis(r.refill_interval()))
     }
 
+    /// [`Self::did_retry_after_ms`], for a write. A write is also refused
+    /// as `RATE_LIMITED` when its capacity pool is spent, so the wait is the
+    /// longer of the DID's refill and the slowest pool's. `None` when both
+    /// are off.
+    pub fn write_retry_after_ms(&self) -> Option<u64> {
+        let pool = self
+            .write_pools
+            .as_ref()
+            .and_then(WritePools::slowest_refill)
+            .map(millis);
+        self.did_retry_after_ms().max(pool)
+    }
+
     /// [`Self::did_retry_after_ms`], for an address's rate.
     pub fn ip_retry_after_ms(&self) -> Option<u64> {
         self.ip_rate.as_ref().map(|r| millis(r.refill_interval()))

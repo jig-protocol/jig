@@ -644,11 +644,11 @@ pub async fn post(
             .map_err(|e| Refusal::of(&e))
         }
     };
-    // An author refused for its rate (here, or at an owner that gave no
-    // time) gets a token back within one refill of this server's rate.
+    // An author refused for its rate or its pool (here, or at an owner that
+    // gave no time) gets a token back within one refill of this server's.
     posted.map_err(|mut refusal| {
         if refusal.code == "RATE_LIMITED" && refusal.retry_after_ms.is_none() {
-            refusal.retry_after_ms = state.auth.did_retry_after_ms();
+            refusal.retry_after_ms = state.auth.write_retry_after_ms();
         }
         refusal
     })

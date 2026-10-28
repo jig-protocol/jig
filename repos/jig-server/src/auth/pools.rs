@@ -132,6 +132,18 @@ impl WritePools {
         }))
     }
 
+    /// One token's refill in the pool that refills slowest. `None` when
+    /// every share is 0.
+    pub fn slowest_refill(&self) -> Option<Duration> {
+        let buckets = self.buckets.lock().expect("write pools lock poisoned");
+        buckets
+            .iter()
+            .map(|b| b.per_second)
+            .filter(|rate| *rate > 0.0)
+            .min_by(f64::total_cmp)
+            .map(|rate| Duration::from_secs_f64(1.0 / rate))
+    }
+
     /// Take one write's worth for `pool` at `now`: from its own bucket, or
     /// else from an idle pool. False when neither has it.
     pub fn try_take(&self, pool: Pool, now: Instant) -> bool {
@@ -182,6 +194,26 @@ mod tests {
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    /// A refused writer is told the slowest share's refill: invited's 10 a
+    /// second here. A share of 0 never refills, and is not counted.
+    #[test]
+    fn the_retry_wait_is_the_slowest_shares_refill() {
+        let now = Instant::now();
+        assert_eq!(pools(now).slowest_refill(), Some(ms(100)));
+        let no_invited = WritePools::new(
+            &PoolsSection {
+                writes_per_second: 100,
+                writes_burst: 100,
+                invited_share_pct: 0,
+                ..PoolsSection::default()
+            },
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(no_invited.slowest_refill(), Some(ms(50)));
     }
 
     /// The plan's flood test, on injected time: while members are writing, a
