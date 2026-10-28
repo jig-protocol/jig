@@ -19,6 +19,14 @@ use axum::{
 use base64::Engine as _;
 use jig_pipeline::envelope::ReceiptRef;
 use jig_pipeline::persist::MAX_HISTORY_LIMIT;
+
+/// The most a page of history carries, in bytes of its JSON entries, past
+/// its first block, for a client that asks (`budget=1`). A page that would
+/// pass it ends early, with fewer blocks than asked: the client pages on
+/// from the oldest block it got, and only an empty page ends the history.
+/// One block is always sent, so a page can be up to one block envelope
+/// (`jig_core::bundle::MAX_ENVELOPE_BYTES`) larger.
+pub const HISTORY_PAGE_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 use serde::{Deserialize, Serialize};
 
 use crate::v0_0_2::AppState;
@@ -444,6 +452,18 @@ pub struct HistoryQuery {
     /// A block CID: return the page of blocks just newer than it, for paging
     /// forward from where a reader left off. Not with `before`.
     pub after: Option<String>,
+    /// `1`: cut the page at [`HISTORY_PAGE_BUDGET_BYTES`]. Only a client
+    /// that pages on until an empty page asks for it: one that takes a short
+    /// page for the start of the channel (every release through
+    /// v0.2.0-alpha.2) never sends it and gets the whole window.
+    pub budget: Option<u8>,
+}
+
+/// What one block's entry in a history page takes, in JSON, at most: its
+/// stored bytes (bundle, signature, receipts) in base64, and room for its
+/// record and field names.
+fn page_entry_bytes(stored: usize) -> usize {
+    stored.div_ceil(3) * 4 + 16 * 1024
 }
 
 /// One entry of a channel timeline.
@@ -646,6 +666,10 @@ pub(crate) fn refuse(
     err(status, code, message)
 }
 
+/// A channel's history page: see the comment above [`admit_caller`] for the
+/// shape. Asked with `budget=1`, a page stops early once its entries would
+/// pass [`HISTORY_PAGE_BUDGET_BYTES`], keeping the blocks nearest the cursor,
+/// and only those blocks are loaded.
 pub async fn get_channel_history(
     State(state): State<Arc<AppState>>,
     Path(channel_ref): Path<String>,
@@ -693,34 +717,76 @@ pub async fn get_channel_history(
             format!("`{name}` is not a block of {channel_ref}"),
         )
     };
-    let blocks = match (
-        query.before.as_deref(),
-        query.after.as_deref(),
-        channel.as_ref(),
-    ) {
-        (Some(_), Some(_), _) => {
-            return Err(err(
-                StatusCode::BAD_REQUEST,
-                "BAD_CURSOR",
-                "give `before` or `after`, not both".to_string(),
-            ));
+    let (before, after) = (query.before.as_deref(), query.after.as_deref());
+    if before.is_some() && after.is_some() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "BAD_CURSOR",
+            "give `before` or `after`, not both".to_string(),
+        ));
+    }
+    let blocks = if query.budget == Some(1) {
+        // Choose the page from what each block stores, nearest the cursor
+        // first, then load only those blocks: the server holds one page, not
+        // the window. Back from the newest or from `before`, that is newest
+        // first; forward from `after`, oldest first, so the page continues
+        // from the cursor and the client pages on from its last block.
+        let (sizes, newest_first) = match (after, channel.as_ref()) {
+            (None, None) if before.is_some() => return Err(bad_cursor("before")),
+            (None, None) => (Vec::new(), true),
+            (None, Some(channel)) => (
+                store
+                    .history_window_sizes(&channel.id, limit, before)
+                    .map_err(persist_err)?
+                    .ok_or_else(|| bad_cursor("before"))?,
+                true,
+            ),
+            (Some(_), None) => return Err(bad_cursor("after")),
+            (Some(after), Some(channel)) => (
+                store
+                    .history_after_window_sizes(&channel.id, limit, after)
+                    .map_err(persist_err)?
+                    .ok_or_else(|| bad_cursor("after"))?,
+                false,
+            ),
+        };
+        let mut page = Vec::new();
+        let mut bytes = 0usize;
+        for (cid, stored) in sizes {
+            let entry = page_entry_bytes(stored as usize);
+            // Always one block, however large: a page that holds none would
+            // stop a client that pages on.
+            if !page.is_empty() && bytes + entry > HISTORY_PAGE_BUDGET_BYTES {
+                break;
+            }
+            bytes += entry;
+            if let Some(block) = store.get_block(&cid).map_err(persist_err)? {
+                page.push(block);
+            }
         }
-        (None, None, None) => Vec::new(),
-        (None, None, Some(channel)) => store
-            .list_blocks_by_channel_id(&channel.id, limit, None)
-            .map_err(persist_err)?,
-        (Some(before), None, channel) => channel
-            .map(|c| store.list_blocks_before_by_channel_id(&c.id, limit, before))
-            .transpose()
-            .map_err(persist_err)?
-            .flatten()
-            .ok_or_else(|| bad_cursor("before"))?,
-        (None, Some(after), channel) => channel
-            .map(|c| store.list_blocks_after_by_channel_id(&c.id, limit, after))
-            .transpose()
-            .map_err(persist_err)?
-            .flatten()
-            .ok_or_else(|| bad_cursor("after"))?,
+        if newest_first {
+            page.reverse();
+        }
+        page
+    } else {
+        match (before, after, channel.as_ref()) {
+            (None, None, None) => Vec::new(),
+            (None, None, Some(channel)) => store
+                .list_blocks_by_channel_id(&channel.id, limit, None)
+                .map_err(persist_err)?,
+            (Some(before), _, channel) => channel
+                .map(|c| store.list_blocks_before_by_channel_id(&c.id, limit, before))
+                .transpose()
+                .map_err(persist_err)?
+                .flatten()
+                .ok_or_else(|| bad_cursor("before"))?,
+            (None, Some(after), channel) => channel
+                .map(|c| store.list_blocks_after_by_channel_id(&c.id, limit, after))
+                .transpose()
+                .map_err(persist_err)?
+                .flatten()
+                .ok_or_else(|| bad_cursor("after"))?,
+        }
     };
 
     let mut timeline = Vec::with_capacity(blocks.len());
@@ -1215,6 +1281,138 @@ mod tests {
         assert_eq!(text_of(&history[0].bundle_b64), "one");
         assert_eq!(text_of(&history[1].bundle_b64), "two");
         assert!(!history[0].delivery_cid.is_empty());
+    }
+
+    /// Asked for (`budget=1`), a page past the byte budget ends early with
+    /// the newest blocks, and paging on from the oldest one returns every
+    /// block once, in order, ending on an empty page. A request that does not
+    /// ask, from a client that takes a short page for the start of the
+    /// channel, gets the whole window as before.
+    #[tokio::test]
+    async fn a_history_page_past_the_budget_ends_early_and_pages_on() {
+        let state = Arc::new(unauthenticated_state());
+        let router = build_blocks_router(state.clone());
+        let id = test_identity();
+        seed_channel(&state, "#big");
+        // About 1.5 MB of bundle each (the padding is stored, never
+        // rendered): eight of them are twice the budget.
+        let count = 8;
+        for i in 0..count {
+            let mut hlc = test_hlc(&id);
+            hlc.logical = i as u32;
+            let block = jig_client::blocks::build_with_metadata(
+                &id,
+                jig_core::BlockKind::TextRender,
+                hlc,
+                serde_json::json!({"channel": "#big", "body": format!("b{i}"), "pad": "x".repeat(380_000)}),
+            );
+            let submission = serde_json::json!({
+                "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
+                "sig_b64": base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
+            });
+            let (status, body) = post_json(router.clone(), "/api/v1/blocks", submission).await;
+            assert_eq!(status, StatusCode::OK, "submitting block {i}: {body}");
+        }
+
+        // Not asked: the whole window, however large.
+        let (status, body) =
+            get_path(router.clone(), "/api/v1/channels/%23big/blocks?limit=50").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.as_array().unwrap().len(),
+            count,
+            "a client that did not ask gets every block"
+        );
+        let cid_of = |entry: &serde_json::Value| {
+            entry["delivery_cid"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("delivery:")
+                .to_string()
+        };
+        let first = cid_of(&body.as_array().unwrap()[0]);
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut before: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let path = match &before {
+                None => "/api/v1/channels/%23big/blocks?limit=50&budget=1".to_string(),
+                Some(cid) => {
+                    format!("/api/v1/channels/%23big/blocks?limit=50&budget=1&before={cid}")
+                }
+            };
+            let (status, body) = get_path(router.clone(), &path).await;
+            assert_eq!(status, StatusCode::OK);
+            let page = body.as_array().unwrap().clone();
+            if page.is_empty() {
+                break;
+            }
+            pages += 1;
+            let size = serde_json::to_vec(&body).unwrap().len();
+            assert!(
+                size <= HISTORY_PAGE_BUDGET_BYTES + jig_core::bundle::MAX_ENVELOPE_BYTES,
+                "page {pages} is {size} bytes"
+            );
+            if pages == 1 {
+                assert!(page.len() < count, "the first page is cut at the budget");
+            }
+            let texts: Vec<String> = page
+                .iter()
+                .map(|b| text_of(b["bundle_b64"].as_str().unwrap()))
+                .collect();
+            // Older pages go in front: the history reads oldest-first.
+            seen.splice(0..0, texts);
+            before = Some(
+                page[0]["delivery_cid"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("delivery:")
+                    .to_string(),
+            );
+            assert!(pages <= count, "paging does not end");
+        }
+        let want: Vec<String> = (0..count).map(|i| format!("b{i}")).collect();
+        assert_eq!(seen, want, "every block once, in order, over {pages} pages");
+
+        // Forward from the first block (`after`), the same: each page is cut
+        // at the budget and continues from the cursor, oldest first, and
+        // paging on from its newest block ends on an empty page.
+        let mut seen: Vec<String> = Vec::new();
+        let mut after = first;
+        let mut pages = 0;
+        loop {
+            let path = format!("/api/v1/channels/%23big/blocks?limit=50&budget=1&after={after}");
+            let (status, body) = get_path(router.clone(), &path).await;
+            assert_eq!(status, StatusCode::OK);
+            let page = body.as_array().unwrap().clone();
+            if page.is_empty() {
+                break;
+            }
+            pages += 1;
+            let size = serde_json::to_vec(&body).unwrap().len();
+            assert!(
+                size <= HISTORY_PAGE_BUDGET_BYTES + jig_core::bundle::MAX_ENVELOPE_BYTES,
+                "forward page {pages} is {size} bytes"
+            );
+            if pages == 1 {
+                assert!(
+                    page.len() < count - 1,
+                    "the first forward page is cut at the budget"
+                );
+            }
+            seen.extend(
+                page.iter()
+                    .map(|b| text_of(b["bundle_b64"].as_str().unwrap())),
+            );
+            after = cid_of(page.last().unwrap());
+            assert!(pages <= count, "forward paging does not end");
+        }
+        assert_eq!(
+            seen,
+            want[1..].to_vec(),
+            "every later block once, in order, over {pages} pages"
+        );
     }
 
     /// History carries each block's signed record, and the records endpoint
