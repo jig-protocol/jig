@@ -1,6 +1,6 @@
 [package]
 name = "jig-nameserver"
-version = "0.0.1"
+version.workspace = true
 edition = "2024"
 authors = ["Jig Protocol Contributors"]
 license = "MIT OR Apache-2.0"
