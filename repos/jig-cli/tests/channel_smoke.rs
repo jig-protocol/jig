@@ -46,7 +46,7 @@ fn binary_exposes_channel_subcommands() {
 }
 
 #[test]
-fn channel_create_help_mentions_visibility_flag() {
+fn channel_create_help_names_the_tiers() {
     let output = Command::new(env!("CARGO_BIN_EXE_jig"))
         // Never the developer's real keychain; seal test keys with a fixed secret.
         .env("JIG_KEYCHAIN", "none")
@@ -60,9 +60,17 @@ fn channel_create_help_mentions_visibility_flag() {
         .unwrap();
     assert!(output.status.success());
     let help = String::from_utf8_lossy(&output.stdout);
+    // JEP-0014: `--tier` replaces `--visibility`, which stays as a hidden
+    // alias; the help says what `public` means and how to confirm it.
+    for word in ["--tier", "private", "public", "--yes", "server operator"] {
+        assert!(
+            help.contains(word),
+            "`jig channel create --help` should mention `{word}`. got:\n{help}"
+        );
+    }
     assert!(
-        help.contains("--visibility"),
-        "`jig channel create --help` should mention `--visibility`. got:\n{help}"
+        !help.contains("--visibility"),
+        "the old flag is hidden:\n{help}"
     );
 }
 
