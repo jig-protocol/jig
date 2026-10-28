@@ -3189,15 +3189,27 @@ mod tests {
 
     /// Create `#sealed` owned by `owner` and return its MLS group id.
     async fn create_sealed(ctx: &IngestContext, owner: &Person) -> Vec<u8> {
+        create_sealed_as(ctx, owner, None).await
+    }
+
+    /// [`create_sealed`], naming `tier` (a current client's default when
+    /// `None`).
+    async fn create_sealed_as(ctx: &IngestContext, owner: &Person, tier: Option<&str>) -> Vec<u8> {
         let created = owner.mls.create_group().unwrap();
+        let mut meta = serde_json::json!({"slug": "#sealed", "visibility": "restricted", "suite": "mls",
+            "mls_group_info": b64(&created.group_info),
+            "mls_ratchet_tree": b64(&created.ratchet_tree)});
+        if let Some(tier) = tier {
+            // The tier sets what older clients are told it is.
+            meta.as_object_mut().unwrap().remove("visibility");
+            meta["tier"] = serde_json::json!(tier);
+        }
         submit(
             ctx,
             owner,
             BlockKind::ChannelCreate,
             jig_core::EncryptionSuite::Unencrypted,
-            serde_json::json!({"slug": "#sealed", "visibility": "restricted", "suite": "mls",
-                "mls_group_info": b64(&created.group_info),
-                "mls_ratchet_tree": b64(&created.ratchet_tree)}),
+            meta,
         )
         .await
         .unwrap();
@@ -5784,7 +5796,8 @@ mod tests {
         ]);
         let owner = person();
         let bob = person();
-        let gid = create_sealed(&ctx, &owner).await;
+        // Only a `shared` channel is shared with another server.
+        let gid = create_sealed_as(&ctx, &owner, Some("shared")).await;
         add_to_sealed(&ctx, &owner, &bob, &gid).await;
         let to = did_of(&random_signing_key());
 
@@ -5860,7 +5873,8 @@ mod tests {
             .watch_kinds(&[BlockKind::ChannelShare, BlockKind::ChannelUnshare], tx);
         let owner = person();
         let bob = person();
-        let gid = create_sealed(&ctx, &owner).await;
+        // Only a `shared` channel is shared with another server.
+        let gid = create_sealed_as(&ctx, &owner, Some("shared")).await;
         add_to_sealed(&ctx, &owner, &bob, &gid).await;
         let (msg, _) = owner.mls.encrypt(&gid, b"the plan").unwrap();
         submit(

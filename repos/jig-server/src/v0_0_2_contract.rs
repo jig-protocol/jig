@@ -650,6 +650,13 @@ impl Contracts {
         if terms.sequencer != offer.owner {
             return Err(RefuseCode::PolicyRefused);
         }
+        // A tier that stays on its owner's server is not carried here,
+        // whatever its owner offers.
+        if let Some(tiering) = &terms.tiering
+            && !contracts::crosses_servers(tiering.tier)
+        {
+            return Err(RefuseCode::PolicyRefused);
+        }
         // Rule 9: a suite this server carries, and no fallback.
         let suite = jig_pipeline::mls_gate::requested_suite(&manifest)
             .map_err(|_| RefuseCode::UnsupportedSuite)?;
@@ -1469,6 +1476,55 @@ mod tests {
         );
     }
 
+    /// JEP-0014 rules 12 and 13: a `private` channel never leaves its
+    /// owner's server. Its share is refused when posted, and nothing is sent.
+    #[tokio::test]
+    async fn a_private_channel_is_not_offered() {
+        let p = pair(OfferPolicy::Accept).await;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let did = jig_core::did::Did::from_ed25519_pubkey(p.user.verifying_key().as_bytes());
+        let creator = jig_mls::member::Member::new(&p.user.to_bytes(), &did).unwrap();
+        let created = creator.create_group().unwrap();
+        let channel = post(
+            &p.owner,
+            &p.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({
+                "slug": "#private",
+                "tier": "private",
+                "suite": "mls",
+                "mls_group_info": b64(&created.group_info),
+                "mls_ratchet_tree": b64(&created.ratchet_tree),
+            }),
+        )
+        .await
+        .unwrap();
+        let shared = post(
+            &p.owner,
+            &p.user,
+            BlockKind::ChannelShare,
+            serde_json::json!({
+                "channel_id": channel,
+                "to": p.follower.server_did.to_did_jig_string(),
+                "grant": "read",
+            }),
+        )
+        .await;
+        match shared {
+            Err(e) => assert!(e.to_string().contains("stays on the server"), "{e}"),
+            Ok(cid) => panic!("the share landed: {cid}"),
+        }
+        assert!(
+            p.owner
+                .ingest_ctx
+                .store
+                .contract_offers_in(Side::Owner, OfferState::Offered)
+                .unwrap()
+                .is_empty(),
+            "no offer was made"
+        );
+    }
+
     /// The default: an offer waits for the operator, who may accept it.
     #[tokio::test]
     async fn an_offer_is_held_until_the_operator_answers() {
@@ -1723,6 +1779,21 @@ mod tests {
             answer_to(&contracts, &owner, &offer_to(&follower, &owner, suite, &[])).as_deref(),
             Some("UNSUPPORTED_SUITE")
         );
+        // JEP-0014 rules 12 and 13: `private` and `server` stay on their
+        // owner's server; `shared` crosses.
+        for (tier, refused) in [("private", true), ("server", true), ("shared", false)] {
+            let offered = creation(&owner, serde_json::json!({"tier": tier, "suite": "mls"}));
+            assert_eq!(
+                answer_to(
+                    &contracts,
+                    &owner,
+                    &offer_to(&follower, &owner, offered, &[])
+                )
+                .as_deref(),
+                refused.then_some("POLICY_REFUSED"),
+                "{tier}"
+            );
+        }
         // A suffix this server attests (`dns`, as `Names.Example.org`): the
         // same claim from the owner is no conflict, and the same suffix under
         // another authority is.
