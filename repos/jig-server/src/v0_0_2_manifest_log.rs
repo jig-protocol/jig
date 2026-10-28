@@ -584,7 +584,10 @@ pub(crate) mod tests {
                     resources: vec![],
                 },
                 sig,
-                IngestSource::LocalClient { conn_id: 1, tiers: true },
+                IngestSource::LocalClient {
+                    conn_id: 1,
+                    tiers: true,
+                },
             )
             .await
             .unwrap_err();

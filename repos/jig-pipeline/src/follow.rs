@@ -752,7 +752,10 @@ mod tests {
                 &self.ctx,
                 bundle(&parts),
                 parts.2.clone(),
-                IngestSource::LocalClient { conn_id: 1, tiers: true },
+                IngestSource::LocalClient {
+                    conn_id: 1,
+                    tiers: true,
+                },
             )
             .await
             .unwrap();
@@ -1234,7 +1237,10 @@ mod tests {
                     resources: vec![],
                 },
                 sent.parts.2.clone(),
-                IngestSource::LocalClient { conn_id: 1, tiers: true },
+                IngestSource::LocalClient {
+                    conn_id: 1,
+                    tiers: true,
+                },
             )
             .await;
             let too_large = matches!(got, Err(IngestError::BundleTooLarge { .. }));
@@ -1434,7 +1440,10 @@ mod tests {
                 &owner.ctx,
                 bundle(&parts),
                 parts.2.clone(),
-                IngestSource::LocalClient { conn_id: 1, tiers: true }
+                IngestSource::LocalClient {
+                    conn_id: 1,
+                    tiers: true
+                }
             )
             .await
             .is_err(),
@@ -1468,7 +1477,10 @@ mod tests {
             &follower,
             bundle(&parts),
             parts.2.clone(),
-            IngestSource::LocalClient { conn_id: 1, tiers: true },
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
         )
         .await
         {

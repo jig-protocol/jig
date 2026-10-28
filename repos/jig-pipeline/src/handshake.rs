@@ -1476,6 +1476,105 @@ mod tests {
         ));
     }
 
+    /// JEP-0014 rule 1: a server signs `tiers` into a welcome only when the
+    /// hello asked, so a client that predates them never sees them.
+    #[test]
+    fn tiers_are_signed_only_into_a_welcome_whose_hello_asked() {
+        let key = generate_signing_key();
+        let server = |tiers| ServerOffer {
+            capabilities: Capabilities {
+                tiers,
+                ..offer_server().capabilities
+            },
+            ..offer_server()
+        };
+        for (asked, implemented, expect) in [
+            (true, true, true),
+            (false, true, false),
+            (true, false, false),
+            (false, false, false),
+        ] {
+            let (hello, pending) = begin(&ClientOffer {
+                capabilities: Capabilities {
+                    tiers: asked,
+                    ..Capabilities::default()
+                },
+                ..ClientOffer::default()
+            });
+            let Frame::Hello { nonce, .. } = hello.frame else {
+                panic!("hello");
+            };
+            let mut view = hello_view(&nonce);
+            view.capabilities.tiers = asked;
+            let welcome = seal(&key, negotiate(&view, &server(implemented)).unwrap());
+            let text = serde_json::to_string(&welcome).unwrap();
+            assert_eq!(text.contains("\"tiers\""), expect, "{text}");
+            match pending.interpret(&text) {
+                HandshakeResult::Established(verified) => {
+                    assert_eq!(
+                        verified.capabilities.tiers, expect,
+                        "asked {asked}, implemented {implemented}"
+                    )
+                }
+                other => panic!("expected a welcome, got {other:?}"),
+            }
+        }
+    }
+
+    /// A welcome without `tiers` signs exactly the bytes it did before tiers
+    /// existed; with them, those bytes and a tagged section after them.
+    #[test]
+    fn a_welcome_without_tiers_signs_what_it_always_did() {
+        let statement = negotiate(&hello_view("bm9uY2U="), &offer_server()).unwrap();
+        assert!(!statement.capabilities.tiers);
+        let before = statement.canonical_bytes();
+        let mut with = statement.clone();
+        with.capabilities.tiers = true;
+        let after = with.canonical_bytes();
+        assert!(after.len() > before.len() && after.starts_with(&before));
+        // The capabilities' own bytes never carry the flag.
+        assert_eq!(
+            statement.capabilities.canonical_bytes(),
+            with.capabilities.canonical_bytes()
+        );
+    }
+
+    /// A hello and a welcome from before tiers parse, as not asking and not
+    /// granting them; a welcome stripped of a signed `tiers` fails.
+    #[test]
+    fn tiers_parse_absent_and_cannot_be_stripped() {
+        let old: Capabilities = serde_json::from_str(
+            r#"{"block_kinds":[],"execution":false,"federation":true,"max_future_skew_ms":300000}"#,
+        )
+        .unwrap();
+        assert!(!old.tiers);
+        let key = generate_signing_key();
+        let (hello, pending) = begin(&ClientOffer::default());
+        let Frame::Hello {
+            nonce,
+            capabilities,
+            ..
+        } = hello.frame
+        else {
+            panic!("hello");
+        };
+        assert!(capabilities.tiers, "this build asks for tiers");
+        let mut view = hello_view(&nonce);
+        view.capabilities.tiers = true;
+        let mut server = offer_server();
+        server.capabilities.tiers = true;
+        let mut welcome = seal(&key, negotiate(&view, &server).unwrap());
+        if let Frame::Welcome { capabilities, .. } = &mut welcome.frame {
+            capabilities.tiers = false;
+        }
+        let HandshakeResult::FailClosed { reason, .. } =
+            pending.interpret(&serde_json::to_string(&welcome).unwrap())
+        else {
+            panic!("a stripped tiers flag must fail closed");
+        };
+        assert!(reason.contains("signature does not verify"), "{reason}");
+    }
+
     #[test]
     fn tampered_capabilities_fail_the_signature() {
         let key = generate_signing_key();

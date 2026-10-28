@@ -1287,7 +1287,10 @@ mod tests {
             &state.ingest_ctx,
             bundle,
             sig,
-            IngestSource::LocalClient { conn_id: 1, tiers: true },
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
         )
         .await
     }
@@ -3773,7 +3776,8 @@ mod tests {
         let gone = {
             let follower = follower.clone();
             tokio::spawn(async move {
-                crate::v0_0_2_relay::post(&follower, &parts.0, &parts.1, parts.2, 8, "ws:8", true).await
+                crate::v0_0_2_relay::post(&follower, &parts.0, &parts.1, parts.2, 8, "ws:8", true)
+                    .await
             })
         };
         swallowed.recv().await.expect("its relay sent");

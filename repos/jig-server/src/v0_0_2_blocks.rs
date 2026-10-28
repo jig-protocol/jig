@@ -871,6 +871,28 @@ pub fn build_blocks_router(state: Arc<AppState>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_declares_its_features_in_one_header() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        assert!(!declares_feature(&headers, "tiers"));
+        headers.insert(
+            CAPABILITIES_HEADER,
+            HeaderValue::from_static("other, tiers"),
+        );
+        assert!(declares_feature(&headers, "tiers"));
+        headers.insert(
+            CAPABILITIES_HEADER,
+            HeaderValue::from_static("tiersx,Tiers"),
+        );
+        assert!(!declares_feature(&headers, "tiers"), "names match exactly");
+        headers.append(CAPABILITIES_HEADER, HeaderValue::from_static("tiers"));
+        assert!(
+            declares_feature(&headers, "tiers"),
+            "every occurrence counts"
+        );
+    }
     use axum::{Router, body::Body, http::Request};
     use jig_client::{Identity, blocks::build_text_render};
     use jig_core::HlcTimestamp;
