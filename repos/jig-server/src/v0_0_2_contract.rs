@@ -1287,7 +1287,7 @@ mod tests {
             &state.ingest_ctx,
             bundle,
             sig,
-            IngestSource::LocalClient { conn_id: 1 },
+            IngestSource::LocalClient { conn_id: 1, tiers: true },
         )
         .await
     }
@@ -3511,7 +3511,7 @@ mod tests {
         state: &AppState,
         parts: &(Vec<u8>, Vec<u8>, Vec<u8>),
     ) -> Result<String, Refusal> {
-        crate::v0_0_2_relay::post(state, &parts.0, &parts.1, parts.2.clone(), 7, "ws:7").await
+        crate::v0_0_2_relay::post(state, &parts.0, &parts.1, parts.2.clone(), 7, "ws:7", true).await
     }
 
     /// The submit a follower would send for `parts`, into `channel`.
@@ -3773,7 +3773,7 @@ mod tests {
         let gone = {
             let follower = follower.clone();
             tokio::spawn(async move {
-                crate::v0_0_2_relay::post(&follower, &parts.0, &parts.1, parts.2, 8, "ws:8").await
+                crate::v0_0_2_relay::post(&follower, &parts.0, &parts.1, parts.2, 8, "ws:8", true).await
             })
         };
         swallowed.recv().await.expect("its relay sent");

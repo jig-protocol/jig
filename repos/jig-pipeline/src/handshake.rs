@@ -100,6 +100,13 @@ pub struct Capabilities {
     pub federation: bool,
     #[serde(default = "default_future_skew_ms")]
     pub max_future_skew_ms: u64,
+    /// Channel tiers (JEP-0014). In a hello, the client asks for them; in a
+    /// welcome, the server implements them and the hello asked. Never part of
+    /// [`Capabilities::canonical_bytes`]: a welcome signs it under its own tag,
+    /// and only when set, so a client that predates tiers checks the same
+    /// bytes it always did.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tiers: bool,
 }
 
 fn default_future_skew_ms() -> u64 {
@@ -113,6 +120,7 @@ impl Default for Capabilities {
             execution: false,
             federation: false,
             max_future_skew_ms: DEFAULT_FUTURE_SKEW_MS,
+            tiers: false,
         }
     }
 }
@@ -195,7 +203,12 @@ impl Default for ClientOffer {
         Self {
             versions: vec![u64::from(ENVELOPE_VERSION)],
             suites: implemented_suite_names(),
-            capabilities: Capabilities::default(),
+            // This build implements channel tiers (JEP-0014), as a client and
+            // as a dialing server, so it asks for them.
+            capabilities: Capabilities {
+                tiers: true,
+                ..Capabilities::default()
+            },
             pinned_server_did: None,
             pinned_suites: Vec::new(),
             peer_did: None,
@@ -344,6 +357,13 @@ impl WelcomeStatement {
         if !self.prior_key_links.is_empty() {
             push(&mut out, &[3]);
             push(&mut out, &canonical_list(&self.prior_key_links));
+        }
+        // Tiers (JEP-0014), signed only into a welcome to a hello that asked
+        // for them: a client that predates them never asks, and checks the
+        // bytes it always did.
+        if self.capabilities.tiers {
+            push(&mut out, &[4]);
+            push(&mut out, jig_core::tier::TIERS_FEATURE.as_bytes());
         }
         out
     }
@@ -617,7 +637,11 @@ pub fn negotiate(
         frame_suite: EncryptionSuite::Unencrypted.as_str().to_string(),
         server_did: String::new(),
         suites,
-        capabilities: server.capabilities.clone(),
+        capabilities: Capabilities {
+            // Only to a hello that asked: see `Capabilities::tiers`.
+            tiers: server.capabilities.tiers && hello.capabilities.tiers,
+            ..server.capabilities.clone()
+        },
         reputation: Reputation::none(),
         nonce: hello.nonce.clone(),
         server_nonce: fresh_nonce(),

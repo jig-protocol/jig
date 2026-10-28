@@ -551,7 +551,7 @@ mod tests {
             &state.ingest_ctx,
             bundle,
             sig,
-            IngestSource::LocalClient { conn_id: 1 },
+            IngestSource::LocalClient { conn_id: 1, tiers: true },
         )
         .await
         .unwrap_err();

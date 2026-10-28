@@ -91,6 +91,7 @@ pub(crate) fn map_ingest_error(
 /// base64-encoded). Returns `{ "block_cid": "bafy..." }` on success.
 pub async fn submit_block(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<SubmitBody>,
 ) -> Result<Json<SubmitResult>, (StatusCode, Json<ErrorBody>)> {
     let bundle_bytes = base64::engine::general_purpose::STANDARD
@@ -136,11 +137,28 @@ pub async fn submit_block(
         sig,
         0,
         &format!("rest:{author}"),
+        declares_feature(&headers, jig_core::tier::TIERS_FEATURE),
     )
     .await
     .map_err(refusal_response)?;
 
     Ok(Json(SubmitResult { block_cid: cid }))
+}
+
+/// The header a request outside a connection names the features its client
+/// implements in, comma-separated: what a hello's capabilities say on a
+/// connection (JEP-0014 rule 5).
+pub const CAPABILITIES_HEADER: &str = "jig-capabilities";
+
+/// Whether `headers` declare `feature` in [`CAPABILITIES_HEADER`]. Every
+/// occurrence of the header counts; names match exactly, after trimming.
+pub fn declares_feature(headers: &axum::http::HeaderMap, feature: &str) -> bool {
+    headers
+        .get_all(CAPABILITIES_HEADER)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|name| name.trim() == feature)
 }
 
 #[derive(Debug, Serialize)]
