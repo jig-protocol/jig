@@ -118,16 +118,19 @@ impl Server {
             }
         };
         if kind == BlockKind::ChannelCreate {
+            let visibility = meta(manifest, "visibility").unwrap_or("open").to_string();
+            let suite = mls_gate::requested_suite(manifest)
+                .expect("the gate accepted it")
+                .as_str()
+                .to_string();
             self.channel = Some(StoredChannel {
                 id: "vector".to_string(),
                 slug: meta(manifest, "slug").unwrap_or_default().to_string(),
-                visibility: meta(manifest, "visibility").unwrap_or("open").to_string(),
+                tiering: jig_pipeline::persist::ChannelTiering::current(&visibility, &suite),
+                visibility,
                 created_at: 0,
                 owner_did: sender.to_string(),
-                suite: mls_gate::requested_suite(manifest)
-                    .expect("the gate accepted it")
-                    .as_str()
-                    .to_string(),
+                suite,
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
             });

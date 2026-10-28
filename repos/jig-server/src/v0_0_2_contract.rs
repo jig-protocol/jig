@@ -2512,6 +2512,7 @@ mod tests {
                     suite: "none".into(),
                     sequencer_did: String::new(),
                     co_owners: Vec::new(),
+                    tiering: jig_pipeline::persist::ChannelTiering::current("restricted", "none"),
                 })
                 .unwrap();
             id
@@ -3813,6 +3814,10 @@ mod tests {
                 suite: jig_core::EncryptionSuite::Unencrypted.as_str().to_string(),
                 sequencer_did: owner.clone(),
                 co_owners: vec![],
+                tiering: jig_pipeline::persist::ChannelTiering::current(
+                    "open",
+                    &jig_core::EncryptionSuite::Unencrypted.as_str(),
+                ),
             })
             .unwrap();
         store

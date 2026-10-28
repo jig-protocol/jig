@@ -342,6 +342,7 @@ mod tests {
             suite: "none".to_string(),
             sequencer_did: String::new(),
             co_owners: Vec::new(),
+            tiering: crate::persist::ChannelTiering::current(&visibility, "none"),
         }
     }
 

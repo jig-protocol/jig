@@ -319,6 +319,9 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         | IngestError::RelayedOutsideShare { .. }
         | IngestError::GrantRefused { .. }
         | IngestError::InvalidTerms { .. }
+        | IngestError::UnknownTier { .. }
+        | IngestError::TierSuiteMismatch { .. }
+        | IngestError::TierFixed { .. }
         | IngestError::MissingRight { .. }
         | IngestError::RootOwnerRole { .. }
         | IngestError::UnknownRole { .. }
@@ -362,7 +365,7 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         | IngestError::UnknownSuite { .. }
         | IngestError::SuiteMismatch { .. }
         | IngestError::RestrictedRequiresMls { .. }
-        | IngestError::PlaintextRestrictedFrozen { .. }
+        | IngestError::ChannelFrozen { .. }
         | IngestError::MlsRejected { .. }) => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },
@@ -659,6 +662,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         store

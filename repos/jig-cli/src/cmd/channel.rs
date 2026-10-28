@@ -203,9 +203,19 @@ pub(crate) async fn create_with(
     // server refuses a plaintext one. Only an open channel is a choice.
     let encrypted = encrypted || visibility == "restricted";
 
+    // The tier these flags have always meant (JEP-0014 rule 21): restricted
+    // is `private`, open encrypted is `server` joinable by any caller the
+    // server admits, open plaintext is `public`.
+    let tier = match (encrypted, visibility.as_str()) {
+        (true, "restricted") => json!({"tier": "private"}),
+        (true, _) => json!({"tier": "server", "join": "guest"}),
+        (false, _) => json!({"tier": "public"}),
+    };
+
     let id = ctx.identity()?;
     let hlc = HlcTimestamp::now_wall(id.did().clone());
     let mut meta = json!({"slug": slug, "visibility": visibility});
+    merge(&mut meta, tier);
     merge(&mut meta, extra);
 
     // An encrypted channel is one MLS group, started here with the creator
