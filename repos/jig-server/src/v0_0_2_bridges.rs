@@ -323,6 +323,7 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         | IngestError::TierSuiteMismatch { .. }
         | IngestError::TierFixed { .. }
         | IngestError::TierUnsupported { .. }
+        | IngestError::DmIsAPair { .. }
         | IngestError::MissingRight { .. }
         | IngestError::RootOwnerRole { .. }
         | IngestError::UnknownRole { .. }
