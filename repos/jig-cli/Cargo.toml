@@ -61,8 +61,8 @@ cid.workspace = true
 semver = "1.0"
 
 # `jig block build` and `lint`: wrap a core module as a component in-process (the version
-# wasmtime 49 already uses), and read core modules to explain determinism violations.
-wit-component = "0.258"
+# wasmtime 50 already uses), and read core modules to explain determinism violations.
+wit-component = "0.261"
 wasmparser = "0.261"
 rustc-demangle = "0.1"
 blake3.workspace = true
