@@ -221,12 +221,13 @@ impl TestServer {
             tmp.path().join("server.key").to_string_lossy().into_owned();
         config.keys.unlock = Some(jig_client::server_key::credential_for_tests(tmp.path()));
 
-        let state = AppState::new(
-            config,
-            tmp.path().join("jig-test.db"),
-            ExecutionConfig::default(),
-        )
-        .expect("test server boots");
+        // A backstop, not the operator's 250 ms: see `TEST_RENDER_TIMEOUT_MS`.
+        let execution = ExecutionConfig {
+            timeout_ms: jig_pipeline::executor::TEST_RENDER_TIMEOUT_MS,
+            ..ExecutionConfig::default()
+        };
+        let state = AppState::new(config, tmp.path().join("jig-test.db"), execution)
+            .expect("test server boots");
 
         Self {
             state: Arc::new(state),
